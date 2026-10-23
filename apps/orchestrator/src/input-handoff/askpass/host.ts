@@ -22,6 +22,11 @@ const ROUTE_HEADER = 'x-joko-route';
 const PID_HEADER = 'x-joko-pid';
 const PROMPT_MAX_BYTES = 4096;
 
+/** Leave room for mkdtemp's six bytes and the socket name in Darwin's 104-byte sun_path. */
+export function askpassTemporaryRoot(root: string): string {
+  return Buffer.byteLength(path.posix.join(root, 'joko-ih-XXXXXX', 's')) < 104 ? root : '/tmp';
+}
+
 export interface AskpassHostDeps {
   startTerminalPrompt(request: TerminalPromptRequest): { ok: true; abandon?(): void } | { ok: false };
   /** Teammate owner switch, current policy. Resolves true when 代输入 is off for the task. */
@@ -133,25 +138,30 @@ export class AskpassHost {
       if (alive) return;
       await this.close();
     }
-    const dir = await mkdtemp(path.join(this.deps.tmpRoot ?? os.tmpdir(), 'joko-ih-'));
-    await chmod(dir, 0o700);
-    const socket = path.join(dir, 's');
-    await writeFile(path.join(dir, 'askpass'), askpassHelperScript(socket), { mode: 0o700 });
-    const server = http.createServer((req, res) => void this.handle(req, res));
-    // Owners may take minutes to answer; the helper bounds its own wait.
-    server.requestTimeout = 0;
-    server.headersTimeout = 10_000;
-    server.timeout = 0;
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socket, () => {
-        server.off('error', reject);
-        resolve();
+    const dir = await mkdtemp(path.join(askpassTemporaryRoot(this.deps.tmpRoot ?? os.tmpdir()), 'joko-ih-'));
+    try {
+      await chmod(dir, 0o700);
+      const socket = path.join(dir, 's');
+      await writeFile(path.join(dir, 'askpass'), askpassHelperScript(socket), { mode: 0o700 });
+      const server = http.createServer((req, res) => void this.handle(req, res));
+      // Owners may take minutes to answer; the helper bounds its own wait.
+      server.requestTimeout = 0;
+      server.headersTimeout = 10_000;
+      server.timeout = 0;
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socket, () => {
+          server.off('error', reject);
+          resolve();
+        });
       });
-    });
-    await chmod(socket, 0o600).catch(() => undefined);
-    this.dir = dir;
-    this.server = server;
+      await chmod(socket, 0o600).catch(() => undefined);
+      this.dir = dir;
+      this.server = server;
+    } catch (error) {
+      await rm(dir, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

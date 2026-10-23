@@ -16,6 +16,7 @@ import {
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
   snapshotNativeSkills,
+  nativeTextInferenceImages,
   type ApprovedSkillResolver,
   type NativeSkillPolicyResolver,
   type NativeSkillSnapshot,
@@ -3390,7 +3391,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       authorization = await this.#oauthAccount?.runtimeAuthorization(); current();
       if (this.#oauthAccount && !authorization) throw new Error("The native text account is unavailable.");
       directory = await mkdtemp(join(tmpdir(), "joko-text-")); current();
-      const user: ClaudeSdkUserMessage = { type: "user", message: { role: "user", content: input.user }, origin: { kind: "human" }, parent_tool_use_id: null, uuid: randomUUID() };
+      const images = nativeTextInferenceImages(input);
+      const user: ClaudeSdkUserMessage = { type: "user", message: { role: "user", content: images.length ? [{ type: "text", text: input.user },
+        ...images.map(image => ({ type: "image", source: { type: "base64", media_type: image.mimeType, data: Buffer.from(image.data).toString("base64") } }))] : input.user }, origin: { kind: "human" }, parent_tool_use_id: null, uuid: randomUUID() };
       query = await this.#runtime.query({ prompt: (async function* () { yield user; })(), options: {
         abortController: owner, additionalDirectories: [], allowDangerouslySkipPermissions: false, agents: {},
         canUseTool: async () => ({ behavior: "deny", message: "This text inference has no tools." }), cwd: directory,

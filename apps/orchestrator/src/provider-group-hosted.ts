@@ -11,10 +11,12 @@ import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import type { ProviderGroupAssignment } from "./provider-group-router.js";
 import { decideProviderGroupFailure, providerGroupFailureSignals, ProviderGroupUnavailableError } from "./provider-group-failure-policy.js";
 import type { HostedAgentRunPort } from "./hosted-agent-controller.js";
+import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
 
 interface NativeClient extends HostedAgentTransport {
   open(input: HostedAgentOpen, signal: AbortSignal): Promise<{ readonly virtualRoot: string }>;
   call(runId: string, callId: string, command: HostedAgentCall, signal: AbortSignal): Promise<unknown>;
+  infer?(request: HostedNativeInferenceRequest, signal: AbortSignal): Promise<string>;
 }
 export interface ProviderGroupNativeCapture {
   readonly client: NativeClient; readonly poller?: HostedAgentPoller; assertCurrent(): void;
@@ -22,12 +24,17 @@ export interface ProviderGroupNativeCapture {
 }
 export interface ProviderGroupHostedOptions {
   readonly base: HostedAgentHost; readonly runtime: ProviderGroupRuntime; readonly root: string;
-  readonly assertSelection: (principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId" | "modelId">) => void;
+  readonly assertSelection: (principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId" | "modelId">) => void | (() => void);
   /** Captured native-only authority, never a URL, bearer or caller-selected trust. */
   readonly capture: (member: ProviderGroupMember, principal: HostedAgentPrincipal, modelIds: readonly string[], assertCurrent: () => void) => ProviderGroupNativeCapture;
   readonly now?: () => number;
 }
 interface Offer { readonly principal: string; readonly device: string; readonly session: string; readonly target: string; readonly backend: string; readonly provider: string; readonly model: string; readonly at: number; }
+interface InferenceEntry {
+  readonly digest: string; readonly value: Promise<string>; readonly abort: AbortController;
+  readonly principal: HostedAgentPrincipal; readonly request: HostedNativeInferenceRequest;
+  assertCurrent(): void; member?: ProviderGroupMember; ended?: number;
+}
 interface Entry {
   readonly principal: HostedAgentPrincipal; readonly input: HostedAgentOpen; readonly digest: string; readonly scope: string;
   readonly exchange: HostedAgentExchange; readonly virtualRoot: string; readonly lifetime: AbortController;
@@ -46,10 +53,78 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
   readonly #pools = new Map<string, HostedAgentPoller>();
   readonly #wake = new Set<() => void>();
   readonly #polling = new Set<string>();
+  readonly #inferences = new Map<string, InferenceEntry>();
   readonly #timer: ReturnType<typeof setInterval>;
   #closed = false;
   constructor(readonly options: ProviderGroupHostedOptions) {
     this.#timer = setInterval(() => { void this.sweep().catch(() => {}); }, 5000); this.#timer.unref();
+  }
+  async infer(principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest, signal: AbortSignal): Promise<string> {
+    this.#assert(principal); signal.throwIfAborted();
+    const runtime = this.options.runtime, group = { backendId: request.backendId, providerId: request.providerId };
+    if (principal.providerGrant?.groupMember || !runtime.store.snapshot(group).config) {
+      if (!this.options.base.infer) throw new HostedAgentHostError("UNAVAILABLE");
+      return this.options.base.infer(principal, request, signal);
+    }
+    const key = hash([runtime.store.ownerKey, principal.id, principal.deviceId, principal.trust, request.requestId]), digest = hash(request);
+    const previous = this.#inferences.get(key);
+    if (previous) {
+      previous.assertCurrent(); if (previous.digest !== digest) throw new HostedAgentHostError("CONFLICT");
+      const result = await previous.value; previous.assertCurrent(); signal.throwIfAborted(); return result;
+    }
+    if (this.#inferences.size >= 4096) throw new HostedAgentHostError("RESOURCE_EXHAUSTED");
+    const journal = runtime.store.store, old = journal.findSetting<{ format: number; digest: string }>("service", "native-group-inference.v1", key)?.value;
+    if (old) throw new HostedAgentHostError(old.format !== 1 || old.digest !== digest ? "CONFLICT" : "UNAVAILABLE");
+    const selection = this.options.assertSelection(principal, request), abort = new AbortController();
+    const active = AbortSignal.any([signal, abort.signal, AbortSignal.timeout(request.timeoutMs)]);
+    const assertCurrent = () => { this.#assert(principal); active.throwIfAborted(); if (typeof selection === "function") selection(); };
+    assertCurrent(); journal.setSetting("service", "native-group-inference.v1", key, { format: 1, digest, state: "started" });
+    const snapshot = structuredClone(request);
+    let entry!: InferenceEntry;
+    const value = Promise.resolve().then(async () => {
+      let assignment: ProviderGroupAssignment | undefined, capture: ProviderGroupNativeCapture | undefined;
+      const sessionId = `inference:${key}`;
+      const timer = setInterval(() => { try { entry.assertCurrent(); } catch { abort.abort(); } }, 250); timer.unref();
+      try {
+        assertCurrent(); const anchor = runtime.directory.sources().find(source => source.backendId === group.backendId && source.providerId === group.providerId);
+        if (!anchor || anchor.nativeBackendInstanceGeneration !== snapshot.backendInstanceGeneration) throw new ProviderGroupUnavailableError();
+        const excluded = new Set<string>();
+        if (snapshot.images?.length) for (const member of runtime.store.snapshot(group).config!.members) {
+          const source = runtime.directory.sources().find(source => source.key === member.key);
+          const model = source?.models.find(model => model.modelId === snapshot.modelId || (model.logicalId ?? model.modelId) === snapshot.modelId);
+          if (model && !model.supportsImages) excluded.add(member.key);
+        }
+        assignment = await runtime.router.pick({ sessionId, group, profile: { backendId: group.backendId, providerId: group.providerId, modelId: snapshot.modelId, fastMode: false },
+          agentKind: anchor.agentKind, modelId: snapshot.modelId, logicalModelId: snapshot.modelId, ownTask: false, exclude: excluded,
+          ...(principal.providerGrant?.recipient ? { recipient: principal.providerGrant.recipient } : {}) }, active);
+        const selected = assignment, member = selected.member; entry.member = member;
+        entry.assertCurrent = () => { assertCurrent(); anchor.assertCurrent(); selected.assertCurrent(); capture?.assertCurrent(); };
+        entry.assertCurrent();
+        const source = runtime.directory.sources().find(source => source.key === member.key);
+        const nativeGeneration = source?.nativeBackendInstanceGeneration;
+        if (!Number.isSafeInteger(nativeGeneration) || nativeGeneration! < 1) throw new ProviderGroupUnavailableError();
+        const forwarded = { ...snapshot, backendId: member.nativeBackendId, backendInstanceGeneration: nativeGeneration!, providerId: member.providerId, modelId: selected.profile.modelId };
+        runtime.leases.started({ sessionId, memberKey: member.key, backendId: member.backendId, providerId: member.providerId });
+        let result: string;
+        if (member.kind === "local") {
+          const base = this.options.base; if (!base.infer) throw new HostedAgentHostError("UNAVAILABLE");
+          const localPrincipal: HostedAgentPrincipal = { ...principal, assertCurrent: () => entry.assertCurrent(),
+            ...(principal.providerGrant ? { providerGrant: { ...principal.providerGrant, groupMember: true,
+              backendId: member.nativeBackendId, providerId: member.providerId, modelIds: [selected.profile.modelId], assertCurrent: () => entry.assertCurrent() } } : {}) };
+          result = await base.infer(localPrincipal, forwarded, active);
+        } else {
+          capture = this.options.capture(member, principal, [selected.profile.modelId], () => { assertCurrent(); selected.assertCurrent(); });
+          entry.assertCurrent(); if (!capture.client.infer) throw new HostedAgentHostError("UNAVAILABLE");
+          result = await capture.client.infer(forwarded, active);
+        }
+        entry.assertCurrent(); return result;
+      } finally {
+        clearInterval(timer); assignment?.release(); runtime.leases.ended(sessionId); runtime.router.clearTurn(sessionId);
+        entry.ended = this.#now(); journal.setSetting("service", "native-group-inference.v1", key, { format: 1, digest, state: "ended" });
+      }
+    });
+    entry = { digest, value, abort, principal, request: snapshot, assertCurrent }; this.#inferences.set(key, entry); void value.catch(() => {});
+    return value;
   }
   async begin(principal: HostedAgentPrincipal, input: HostedAgentOpen): Promise<{ readonly workspaceRoot: string }> {
     this.#assert(principal);
@@ -165,11 +240,16 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     await this.options.base.closeRelayedGuest(principal, runId, purge);
   }
   activeProviderTurns(backendId: string, providerId: string): number {
-    return [...this.#entries.values()].filter(entry => entry.turn && entry.closed === undefined && entry.binding?.member.kind !== "local" && entry.input.backendId === backendId && entry.input.providerId === providerId).length
+    return [...this.#inferences.values()].filter(entry => entry.ended === undefined && entry.member?.kind !== "local" && entry.request.backendId === backendId && entry.request.providerId === providerId).length
+      + [...this.#entries.values()].filter(entry => entry.turn && entry.closed === undefined && entry.binding?.member.kind !== "local" && entry.input.backendId === backendId && entry.input.providerId === providerId).length
       + this.options.base.activeProviderTurns(backendId, providerId);
   }
   async sweep(): Promise<void> {
     const now = this.#now(); for (const [key, offer] of this.#offers) if (now - offer.at > 600_000) this.#offers.delete(key);
+    for (const [key, entry] of this.#inferences) {
+      if (entry.ended !== undefined && now - entry.ended > 60_000) this.#inferences.delete(key);
+      else if (entry.ended === undefined) try { entry.assertCurrent(); } catch { entry.abort.abort(); }
+    }
     for (const [key, entry] of this.#entries) {
       let expired = this.#closed || now - entry.touched >= 180_000; try { this.#assertEntry(entry); } catch { expired = true; }
       if (expired && entry.closed === undefined) await this.#close(entry).catch(() => {});
@@ -178,7 +258,10 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     await this.options.base.sweep();
   }
   async dispose(): Promise<void> {
-    this.#closed = true; clearInterval(this.#timer); this.#notify(); await allClosed([...this.#entries.values()].map(entry => this.#close(entry)));
+    this.#closed = true; clearInterval(this.#timer); this.#notify();
+    for (const entry of this.#inferences.values()) entry.abort.abort();
+    await Promise.allSettled([...this.#inferences.values()].map(entry => entry.value)); this.#inferences.clear();
+    await allClosed([...this.#entries.values()].map(entry => this.#close(entry)));
     await Promise.all([...this.#pools.values()].map(pool => pool.close())); this.#pools.clear(); for (const entry of this.#entries.values()) entry.exchange.close(); this.#entries.clear(); this.#offers.clear();
   }
   async #open(entry: Entry, retained: ProviderGroupHostedBinding | undefined): Promise<void> {

@@ -33,7 +33,7 @@ import {
 } from "./adapter.js";
 import type { CodexSmartRoutingPreparation } from "./smart-subagent-routing.js";
 import { AppServerHost } from "./host.js";
-import { TransportFault } from "./errors.js";
+import { remoteRpcFault, TransportFault } from "./errors.js";
 import type { JsonObject } from "./protocol.js";
 import { FakeCodexAppServer } from "./testing.js";
 
@@ -44,6 +44,50 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it.each(["success", "unarchive-fails", "resume-fails-again", "other-thread", "missing-path", "busy", "cancel", "stale-host", "ambiguous"] as const)(
+    "recovers only a proven archived native resume before any user turn (%s)", async outcome => {
+      const setup = await createSetup(), owner = new AbortController();
+      const initial = { ...context(setup.target, [], { backendInstanceGeneration: 7 }), signal: owner.signal };
+      const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+      await setup.adapter.closeSession(binding, { ...initial, binding });
+      const transport = setup.fake.transport!, request = transport.request.bind(transport), methods: string[] = [];
+      let archived = true, resumes = 0;
+      transport.request = async (method, params, options) => {
+        options?.beforeDispatch?.(); methods.push(method);
+        if (method === "thread/resume") {
+          resumes++;
+          if (archived || outcome === "resume-fails-again") {
+            if (outcome === "cancel") owner.abort();
+            if (outcome === "stale-host") await setup.host.forceShutdown();
+            if (outcome === "ambiguous") throw new TransportFault("request_timeout", "Unknown preparation outcome", { stateMayHaveChanged: true });
+            const id = outcome === "other-thread" ? "unrelated-thread" : binding.nativeSessionId!;
+            throw remoteRpcFault(-32600, `session ${id} is archived. Run \`codex unarchive ${id}\` to unarchive it first.`, undefined, binding.nativeSessionId!);
+          }
+        }
+        if (method === "thread/unarchive") {
+          expect(params).toEqual({ threadId: binding.nativeSessionId });
+          if (outcome === "unarchive-fails") throw new Error("Native unarchive unavailable");
+          archived = false; return {};
+        }
+        const result = await request(method, params, options);
+        if (method !== "thread/read") return result;
+        const raw = result as JsonObject;
+        return { ...raw, thread: { ...raw["thread"] as JsonObject,
+          ...(outcome === "missing-path" ? {} : { path: `/history/${archived ? "archived_sessions" : "sessions"}/thread.jsonl` }),
+          ...(outcome === "busy" ? { status: { type: "active" } } : {}) } };
+      };
+      const resuming = setup.adapter.resumeSession(binding, { ...initial, binding });
+      if (outcome === "success") {
+        await expect(resuming).resolves.toMatchObject({ binding });
+        expect(transport.requests.findLast(item => item.method === "thread/resume")?.params)
+          .toMatchObject({ threadId: binding.nativeSessionId, path: "/history/sessions/thread.jsonl" });
+      } else await expect(resuming).rejects.toBeDefined();
+      expect(resumes).toBe(outcome === "success" || outcome === "resume-fails-again" ? 2 : 1);
+      expect(methods.filter(method => method === "thread/unarchive")).toHaveLength(
+        ["success", "unarchive-fails", "resume-fails-again"].includes(outcome) ? 1 : 0);
+      expect(methods).not.toContain("thread/start"); expect(methods).not.toContain("turn/start");
+    }
+  );
   it("keeps input handoff on each local thread configuration across start and resume", async () => {
     let revision = 1;
     const taskShellEnv = vi.fn((ctx: AdapterContext) => ({ JOKO_INPUT_HANDOFF_ROUTE: `private-route-${ctx.sessionId}-${revision}`,
@@ -99,10 +143,11 @@ describe("CodexBackendAdapter", () => {
       expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(1);
     }
   });
-  it.each([false, true])("keeps native one-shot inference on an isolated exact-model protocol and original owner (cancelled=%s)", async cancelled => {
-    const setup = await createSetup(), owner = new AbortController(), allowed = vi.fn(); await setup.adapter.describe();
+  it.each([[false, false], [true, false], [false, true]])("keeps native one-shot inference on an isolated exact-model protocol and original owner (cancelled=%s, images=%s)", async (cancelled, withImage) => {
+    const setup = await createSetup(), owner = new AbortController(), allowed = vi.fn();
+    setup.fake.modelList = setup.fake.modelList.map(model => ({ ...model, inputModalities: ["text", "image"] })); await setup.adapter.describe();
     expect(setup.adapter.nativeTextInferenceCapabilities).toEqual({ pluginOneshot: true, maxTokens: false });
-    const result = setup.adapter.inferNativeText({ providerId: "openai", modelId: "gpt-test", system: "Answer exactly", user: "Question", maxTokens: 512,
+    const result = setup.adapter.inferNativeText({ providerId: "openai", modelId: "gpt-test", system: "Answer exactly", user: "Question", images: withImage ? [{ data: new Uint8Array([1, 2, 3]), mimeType: "image/png" }] : [], maxTokens: 512,
       timeoutMs: 10_000, signal: owner.signal, backendInstanceGeneration: 7, assertCurrent: () => owner.signal.throwIfAborted(), assertModelAllowed: allowed });
     await vi.waitFor(() => expect(setup.fake.transport?.requests.some(request => request.method === "turn/start")).toBe(true));
     const start = setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params as JsonObject;
@@ -111,6 +156,7 @@ describe("CodexBackendAdapter", () => {
     if (cancelled) { owner.abort(); await expect(result).rejects.toThrow(); }
     else {
       const turn = setup.fake.transport!.requests.find(request => request.method === "turn/start")!.params as JsonObject;
+      expect(turn["input"]).toEqual([{ type: "text", text: "Question" }, ...withImage ? [{ type: "image", url: "data:image/png;base64,AQID" }] : []]);
       await setup.fake.completeTurn(turn["threadId"] as string, "Exact answer"); await expect(result).resolves.toBe("Exact answer");
     }
     expect(allowed).toHaveBeenCalledWith("openai", "gpt-test");

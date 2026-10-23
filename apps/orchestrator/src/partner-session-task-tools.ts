@@ -11,7 +11,6 @@ const object = (properties: Record<string, unknown>, required: readonly string[]
 const tool = (name: string, description: string, properties: Record<string, unknown>, required: readonly string[] = [], requiresPermission = false): McpToolDescriptor =>
   ({ serverId: providerId, name, description, inputSchema: object(properties, required), requiresPermission });
 export class PartnerSessionTaskTools implements BridgeToolProvider {
-  readonly canonicalPartnerOnly = true;
   readonly id = providerId; readonly generation = 1; readonly available = true;
   readonly tools = [
     tool("get_session_task_models", "Read available enabled Backend/Provider/model routes and supported effort/Fast axes for one independent task. Use a returned id for an explicit model_selection; omit it to use the Partner task preference or effective live model.", {}),
@@ -36,13 +35,17 @@ export class PartnerSessionTaskTools implements BridgeToolProvider {
   ];
   constructor(readonly manager: PartnerSessionTaskManager) {}
   includeForTarget(targetId: string) { const profile = this.manager.partners.partnerForHomeTarget(targetId); return profile?.lifecycle === "active" && profile.initializationState === "ready"; }
+  includeForSession(sessionId: string, targetId: string) {
+    try { this.manager.caller(sessionId).assertCurrent(); return this.manager.store.getSession(sessionId).descriptor.targetId === targetId; }
+    catch { return false; }
+  }
   #caller(context: BridgeToolCallContext, signal: AbortSignal | undefined) {
-    const profile = this.manager.partners.canonicalCaller(context.sessionId), store = this.manager.store;
+    const caller = this.manager.caller(context.sessionId), { profile } = caller, store = this.manager.store;
     const backendId = store.getSession(context.sessionId).descriptor.backendId, backendGeneration = store.getBackend(backendId).descriptor.instanceGeneration;
     const assertCurrent = () => {
-      signal?.throwIfAborted(); const session = store.getSession(context.sessionId).descriptor, current = this.manager.partners.canonicalCaller(context.sessionId);
-      if (context.targetId !== session.targetId || context.targetId !== current.homeTargetId || context.generation !== session.binding.generation
-        || profile.revision !== current.revision || profile.profileVersion !== current.profileVersion || session.remoteWorkspace !== undefined
+      signal?.throwIfAborted(); caller.assertCurrent(); const session = store.getSession(context.sessionId).descriptor, current = this.manager.caller(context.sessionId).profile;
+      if (context.targetId !== session.targetId || !caller.group && context.targetId !== current.homeTargetId || context.generation !== session.binding.generation
+        || profile.revision !== current.revision || profile.profileVersion !== current.profileVersion || !caller.group && session.remoteWorkspace !== undefined
         || !store.getTarget(session.targetId).descriptor.trusted || context.providerGeneration !== undefined && context.providerGeneration !== this.generation
         || backendId !== session.backendId || backendGeneration !== store.getBackend(backendId).descriptor.instanceGeneration) throw new PartnerSessionTaskError("TASK_CALLER_CHANGED", "The independent task caller changed.");
     }; assertCurrent(); return assertCurrent;

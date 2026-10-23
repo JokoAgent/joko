@@ -1,0 +1,284 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/partner_network_plan.proto";
+import "joko/v1/interaction.proto";
+
+// A room is owned by one Orchestrator. Foreign keys authorize only this service.
+message PartnerNetworkActor {
+  string id = 1;
+  string kind = 2;
+  string name = 3;
+  string owner_id = 4;
+  string home_server_id = 5;
+  string partner_id = 6;
+  string role = 7;
+  string state = 8;
+  string guest_access = 9;
+  uint64 access_revision = 10;
+  string description = 11;
+  string nickname = 12;
+}
+message PartnerNetworkAttachment {
+  string id = 1;
+  string name = 2;
+  string media_type = 3;
+  uint64 size_bytes = 4;
+}
+message PartnerNetworkReaction { string emoji = 1; repeated string actor_ids = 2; }
+message PartnerNetworkThreadPreview {
+  string root_id = 1;
+  uint64 reply_count = 2;
+  string latest_reply_id = 3;
+  string author_name = 4;
+  string text = 5;
+}
+message PartnerNetworkTaskCard {
+  string task_id = 1;
+  string home_server_id = 2;
+  string owner_id = 3;
+  string actor_id = 4;
+  string title = 5;
+  string status = 6;
+  uint64 revision = 7;
+  string session_id = 8;
+  uint64 execution = 9;
+  string interaction_kind = 10;
+  string question = 11;
+}
+message PartnerNetworkMessage {
+  string id = 1;
+  uint64 sequence = 2;
+  string author_id = 3;
+  string author_name = 4;
+  string text = 5;
+  repeated string mentions = 6;
+  string thread_root_id = 7;
+  string quote_id = 8;
+  uint64 created_at_ms = 9;
+  bool deleted = 10;
+  repeated PartnerNetworkReaction reactions = 11;
+  repeated PartnerNetworkAttachment attachments = 12;
+  string kind = 14;
+  string event_actor_id = 15;
+  string thread_share_id = 16;
+  PartnerNetworkMessage shared_reply = 17;
+  PartnerNetworkThreadPreview thread_preview = 18;
+  PartnerNetworkTaskCard task = 19;
+  string plan_id = 20;
+}
+message PartnerNetworkRoom {
+  string id = 1;
+  string name = 2;
+  string host_server_id = 3;
+  string host_origin = 4;
+  uint64 revision = 5;
+  string state = 6;
+  repeated PartnerNetworkActor members = 7;
+  uint64 latest_sequence = 8;
+  uint64 read_sequence = 9;
+  string self_id = 10;
+  string join_id = 11;
+  string reply_mode = 12;
+  string speaking_mode = 13;
+  bool removed_from_list = 14;
+  string availability = 15;
+  uint64 updated_at_ms = 16;
+  bool unread = 17;
+  string organizer_id = 18;
+}
+message PartnerNetworkSnapshot {
+  PartnerNetworkRoom room = 1;
+  repeated PartnerNetworkMessage messages = 2;
+  bool has_more = 3;
+  repeated PartnerNetworkExecution executions = 4;
+  repeated PartnerNetworkPlan plans = 5;
+  bool can_continue = 6;
+}
+message PartnerNetworkExecution {
+  string id = 1;
+  string room_id = 2;
+  string actor_id = 3;
+  string requester_id = 4;
+  string source_message_id = 5;
+  string access_mode = 6;
+  uint64 access_revision = 7;
+  string status = 8;
+  uint64 lease = 9;
+  uint64 lease_expires_at_ms = 10;
+  string failure_code = 11;
+  string plan_id = 12;
+  uint32 plan_position = 13;
+  string kind = 14;
+  string decision_mode = 15;
+}
+message PartnerNetworkLink {
+  string id = 1;
+  string room_id = 2;
+  string state = 3;
+  uint64 expires_at_ms = 4;
+  bool reusable = 5;
+}
+message ListPartnerNetworkRequest {}
+message ListPartnerNetworkResponse { repeated PartnerNetworkRoom rooms = 1; }
+message CreatePartnerNetworkRequest { string operation_id = 1; string name = 2; string display_name = 3; repeated string partner_ids = 4; }
+message CreatePartnerNetworkResponse { PartnerNetworkRoom room = 1; }
+message InvitePartnerNetworkRequest { string operation_id = 1; string room_id = 2; uint64 expected_revision = 3; bool reusable = 4; uint64 lifetime_ms = 5; string join_id = 6; }
+message InvitePartnerNetworkResponse { PartnerNetworkLink link = 1; string invitation = 2; }
+message PreviewPartnerNetworkRequest { string invitation = 1; }
+message PreviewPartnerNetworkResponse { PartnerNetworkRoom room = 1; PartnerNetworkLink link = 2; }
+message JoinPartnerNetworkRequest { string operation_id = 1; string invitation = 2; string display_name = 3; }
+message JoinPartnerNetworkResponse { PartnerNetworkRoom room = 1; }
+message GetPartnerNetworkRequest { string room_id = 1; string join_id = 2; uint64 before_sequence = 3; string thread_root_id = 4; }
+message GetPartnerNetworkResponse { PartnerNetworkSnapshot snapshot = 1; }
+message ReadPartnerNetworkFailuresRequest { string room_id = 1; string join_id = 2; repeated string source_message_ids = 3; }
+message ReadPartnerNetworkFailuresResponse { repeated PartnerNetworkExecution executions = 1; }
+message SendPartnerNetworkRequest {
+  string operation_id = 1;
+  string room_id = 2;
+  string join_id = 3;
+  string text = 4;
+  repeated string mentions = 5;
+  bool mention_all = 6;
+  string thread_root_id = 7;
+  string quote_id = 8;
+  repeated PartnerNetworkAttachment attachments = 9;
+  bool force_plan = 10;
+}
+message SendPartnerNetworkResponse { PartnerNetworkMessage message = 1; }
+message ManagePartnerNetworkRequest {
+  string operation_id = 1;
+  string room_id = 2;
+  string join_id = 3;
+  uint64 expected_revision = 4;
+  // rename, archive, restore, dissolve, leave, remove-list, restore-list,
+  // remove-member, set-role, nickname, add-partner, remove-partner, set-access,
+  // revoke-link, mark-read, stop, continue, reply-mode, speaking-mode.
+  string action = 5;
+  string actor_id = 6;
+  string value = 7;
+  uint64 through_sequence = 8;
+  PartnerNetworkActor partner = 9;
+}
+message ManagePartnerNetworkResponse { PartnerNetworkRoom room = 1; }
+message ReactPartnerNetworkRequest { string operation_id = 1; string room_id = 2; string join_id = 3; string message_id = 4; string emoji = 5; bool add = 6; }
+message ReactPartnerNetworkResponse { PartnerNetworkMessage message = 1; }
+message MediaPartnerNetworkRequest { string operation_id = 1; string room_id = 2; string join_id = 3; string media_id = 4; string name = 5; string media_type = 6; uint64 size_bytes = 7; uint64 offset = 8; bytes data = 9; string action = 10; }
+message MediaPartnerNetworkResponse { PartnerNetworkAttachment attachment = 1; uint64 offset = 2; bytes data = 3; bool complete = 4; string download_url = 5; }
+
+// No Connection bearer or arbitrary RPC is accepted by the foreign surface.
+message AcceptPartnerNetworkRequest { string operation_id = 1; string invitation = 2; string home_server_id = 3; string display_name = 4; string credential_sha256 = 5; }
+message AcceptPartnerNetworkResponse { PartnerNetworkRoom room = 1; string member_id = 2; }
+message ClaimPartnerNetworkRequest { string room_id = 1; string actor_id = 2; }
+message ClaimPartnerNetworkResponse { PartnerNetworkExecution execution = 1; PartnerNetworkSnapshot snapshot = 2; }
+message SettlePartnerNetworkRequest {
+  string room_id = 1; string execution_id = 2; uint64 lease = 3; string action = 4; string text = 5; string failure_code = 6;
+  PartnerNetworkPlanDecision decision = 7;
+  repeated PartnerNetworkAttachment attachments = 8;
+  repeated string seen_note_ids = 9;
+  string completion_id = 10;
+}
+message SettlePartnerNetworkResponse { PartnerNetworkExecution execution = 1; }
+message PublishPartnerNetworkActorRequest { string room_id = 1; string actor_id = 2; string operation_id = 3; string text = 4; repeated PartnerNetworkAttachment attachments = 5; PartnerNetworkTaskCard task = 6; }
+message GetPartnerNetworkExecutionRequest { string room_id = 1; string execution_id = 2; uint64 lease = 3; }
+message PlanPartnerNetworkResponse { PartnerNetworkPlan plan = 1; PartnerNetworkSnapshot snapshot = 2; }
+// These controls exist only on the companion owner's normal paired connection.
+message PartnerNetworkOwnerControl { string actor_id = 1; string execution_id = 2; uint64 lease = 3; repeated Interaction interactions = 4; }
+message GetPartnerNetworkOwnerControlsResponse { repeated PartnerNetworkOwnerControl controls = 1; }
+message RespondPartnerNetworkOwnerInteractionRequest {
+  string room_id = 1; string join_id = 2; string execution_id = 3; uint64 lease = 4;
+  string interaction_id = 5; uint64 generation = 6; InteractionResolution resolution = 7; string operation_id = 8;
+}
+message RespondPartnerNetworkOwnerInteractionResponse {}
+
+message InspectPartnerNetworkRequest { string invitation = 1; }
+message InspectPartnerNetworkResponse { PartnerNetworkRoom room = 1; PartnerNetworkLink link = 2; }
+message GetPartnerNetworkOwnerControlsRequest { string room_id = 1; string join_id = 2; uint64 before_sequence = 3; string thread_root_id = 4; }
+message PublishPartnerNetworkActorResponse { PartnerNetworkMessage message = 1; }
+message GetPartnerNetworkExecutionResponse { PartnerNetworkExecution execution = 1; PartnerNetworkSnapshot snapshot = 2; }
+message PartnerNetworkGuestServiceInvitePartnerNetworkRequest { string operation_id = 1; string room_id = 2; uint64 expected_revision = 3; bool reusable = 4; uint64 lifetime_ms = 5; string join_id = 6; }
+message PartnerNetworkGuestServiceInvitePartnerNetworkResponse { PartnerNetworkLink link = 1; string invitation = 2; }
+message PartnerNetworkGuestServiceGetPartnerNetworkRequest { string room_id = 1; string join_id = 2; uint64 before_sequence = 3; string thread_root_id = 4; }
+message PartnerNetworkGuestServiceGetPartnerNetworkResponse { PartnerNetworkSnapshot snapshot = 1; }
+message PartnerNetworkGuestServiceReadPartnerNetworkFailuresRequest { string room_id = 1; string join_id = 2; repeated string source_message_ids = 3; }
+message PartnerNetworkGuestServiceReadPartnerNetworkFailuresResponse { repeated PartnerNetworkExecution executions = 1; }
+message PartnerNetworkGuestServiceSendPartnerNetworkRequest {
+  string operation_id = 1;
+  string room_id = 2;
+  string join_id = 3;
+  string text = 4;
+  repeated string mentions = 5;
+  bool mention_all = 6;
+  string thread_root_id = 7;
+  string quote_id = 8;
+  repeated PartnerNetworkAttachment attachments = 9;
+  bool force_plan = 10;
+}
+message PartnerNetworkGuestServiceSendPartnerNetworkResponse { PartnerNetworkMessage message = 1; }
+message PartnerNetworkGuestServiceManagePartnerNetworkRequest {
+  string operation_id = 1;
+  string room_id = 2;
+  string join_id = 3;
+  uint64 expected_revision = 4;
+  // rename, archive, restore, dissolve, leave, remove-list, restore-list,
+  // remove-member, set-role, nickname, add-partner, remove-partner, set-access,
+  // revoke-link, mark-read, stop, continue, reply-mode, speaking-mode.
+  string action = 5;
+  string actor_id = 6;
+  string value = 7;
+  uint64 through_sequence = 8;
+  PartnerNetworkActor partner = 9;
+}
+message PartnerNetworkGuestServiceManagePartnerNetworkResponse { PartnerNetworkRoom room = 1; }
+message PartnerNetworkGuestServiceReactPartnerNetworkRequest { string operation_id = 1; string room_id = 2; string join_id = 3; string message_id = 4; string emoji = 5; bool add = 6; }
+message PartnerNetworkGuestServiceReactPartnerNetworkResponse { PartnerNetworkMessage message = 1; }
+message PartnerNetworkGuestServiceMediaPartnerNetworkRequest { string operation_id = 1; string room_id = 2; string join_id = 3; string media_id = 4; string name = 5; string media_type = 6; uint64 size_bytes = 7; uint64 offset = 8; bytes data = 9; string action = 10; }
+message PartnerNetworkGuestServiceMediaPartnerNetworkResponse { PartnerNetworkAttachment attachment = 1; uint64 offset = 2; bytes data = 3; bool complete = 4; string download_url = 5; }
+message PartnerNetworkGuestServicePlanPartnerNetworkRequest {
+  string operation_id = 1;
+  string room_id = 2;
+  string join_id = 3;
+  string plan_id = 4;
+  uint64 expected_revision = 5;
+  // start, dismiss, continue, retry, stop, reassign, remove-step, retry-decision.
+  string action = 6;
+  uint32 position = 7;
+  string actor_id = 8;
+  string source_message_id = 9;
+}
+message PartnerNetworkGuestServicePlanPartnerNetworkResponse { PartnerNetworkPlan plan = 1; PartnerNetworkSnapshot snapshot = 2; }
+
+service PartnerNetworkService {
+  rpc ListPartnerNetwork(ListPartnerNetworkRequest) returns (ListPartnerNetworkResponse);
+  rpc CreatePartnerNetwork(CreatePartnerNetworkRequest) returns (CreatePartnerNetworkResponse);
+  rpc InvitePartnerNetwork(InvitePartnerNetworkRequest) returns (InvitePartnerNetworkResponse);
+  rpc PreviewPartnerNetwork(PreviewPartnerNetworkRequest) returns (PreviewPartnerNetworkResponse);
+  rpc JoinPartnerNetwork(JoinPartnerNetworkRequest) returns (JoinPartnerNetworkResponse);
+  rpc GetPartnerNetwork(GetPartnerNetworkRequest) returns (GetPartnerNetworkResponse);
+  rpc ReadPartnerNetworkFailures(ReadPartnerNetworkFailuresRequest) returns (ReadPartnerNetworkFailuresResponse);
+  rpc SendPartnerNetwork(SendPartnerNetworkRequest) returns (SendPartnerNetworkResponse);
+  rpc ManagePartnerNetwork(ManagePartnerNetworkRequest) returns (ManagePartnerNetworkResponse);
+  rpc ReactPartnerNetwork(ReactPartnerNetworkRequest) returns (ReactPartnerNetworkResponse);
+  rpc MediaPartnerNetwork(MediaPartnerNetworkRequest) returns (MediaPartnerNetworkResponse);
+  rpc PlanPartnerNetwork(PlanPartnerNetworkRequest) returns (PlanPartnerNetworkResponse);
+  rpc ConfigurePartnerNetworkProject(ConfigurePartnerNetworkProjectRequest) returns (ConfigurePartnerNetworkProjectResponse);
+  rpc GetPartnerNetworkOwnerControls(GetPartnerNetworkOwnerControlsRequest) returns (GetPartnerNetworkOwnerControlsResponse);
+  rpc RespondPartnerNetworkOwnerInteraction(RespondPartnerNetworkOwnerInteractionRequest) returns (RespondPartnerNetworkOwnerInteractionResponse);
+}
+service PartnerNetworkGuestService {
+  rpc InspectPartnerNetwork(InspectPartnerNetworkRequest) returns (InspectPartnerNetworkResponse);
+  rpc AcceptPartnerNetwork(AcceptPartnerNetworkRequest) returns (AcceptPartnerNetworkResponse);
+  rpc InvitePartnerNetwork(PartnerNetworkGuestServiceInvitePartnerNetworkRequest) returns (PartnerNetworkGuestServiceInvitePartnerNetworkResponse);
+  rpc GetPartnerNetwork(PartnerNetworkGuestServiceGetPartnerNetworkRequest) returns (PartnerNetworkGuestServiceGetPartnerNetworkResponse);
+  rpc ReadPartnerNetworkFailures(PartnerNetworkGuestServiceReadPartnerNetworkFailuresRequest) returns (PartnerNetworkGuestServiceReadPartnerNetworkFailuresResponse);
+  rpc SendPartnerNetwork(PartnerNetworkGuestServiceSendPartnerNetworkRequest) returns (PartnerNetworkGuestServiceSendPartnerNetworkResponse);
+  rpc ManagePartnerNetwork(PartnerNetworkGuestServiceManagePartnerNetworkRequest) returns (PartnerNetworkGuestServiceManagePartnerNetworkResponse);
+  rpc ReactPartnerNetwork(PartnerNetworkGuestServiceReactPartnerNetworkRequest) returns (PartnerNetworkGuestServiceReactPartnerNetworkResponse);
+  rpc MediaPartnerNetwork(PartnerNetworkGuestServiceMediaPartnerNetworkRequest) returns (PartnerNetworkGuestServiceMediaPartnerNetworkResponse);
+  rpc ClaimPartnerNetwork(ClaimPartnerNetworkRequest) returns (ClaimPartnerNetworkResponse);
+  rpc SettlePartnerNetwork(SettlePartnerNetworkRequest) returns (SettlePartnerNetworkResponse);
+  rpc PublishPartnerNetworkActor(PublishPartnerNetworkActorRequest) returns (PublishPartnerNetworkActorResponse);
+  rpc PlanPartnerNetwork(PartnerNetworkGuestServicePlanPartnerNetworkRequest) returns (PartnerNetworkGuestServicePlanPartnerNetworkResponse);
+  rpc GetPartnerNetworkExecution(GetPartnerNetworkExecutionRequest) returns (GetPartnerNetworkExecutionResponse);
+}

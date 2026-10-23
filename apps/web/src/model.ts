@@ -363,6 +363,17 @@ export interface ModelView {
   readonly currencyCode: string;
   /** Declared display facts are separate from the effective admission flags. */
   readonly metadata?: ModelAdvancedMetadataView;
+  readonly source?: ModelSourceView;
+}
+
+export interface ModelSourceView {
+  readonly kind: "local" | "device" | "share" | "group";
+  readonly displayName: string;
+  readonly nodeId: string;
+  readonly nodeName: string;
+  readonly nativeAdapterKind: string;
+  readonly groupMemberCount: number;
+  readonly grouped: boolean;
 }
 
 export interface ModelAdvancedMetadataView {
@@ -6088,6 +6099,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   addExtraDirectory(workspaceId: string, serverPath: string, access: ExtraDirectoryView["access"]): Promise<void>;
   removeExtraDirectory(extraDirectoryId: string): Promise<void>;
   setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean): Promise<void>;
+  getSessionRuntimeControl?(sessionId: string): Promise<import("@joko/contracts").TaskShareRuntimeControl>;
+  setRuntimeModel?(sessionId: string, selection: import("./session-runtime-gateway.js").SessionRuntimeModelSelection): Promise<void>;
   setPermission(sessionId: string, mode: PermissionMode): Promise<void>;
   setPlanMode(sessionId: string, enabled: boolean): Promise<void>;
   compact(sessionId: string, customInstructions?: string): Promise<CompactSessionOutcomeView>;

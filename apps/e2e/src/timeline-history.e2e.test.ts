@@ -34,6 +34,9 @@ describe("mounted Timeline history windows", () => {
             errorCount: document.querySelectorAll(".timeline-history--error").length,
             statusCount: document.querySelectorAll(".timeline-history [role=status]").length,
             renderedPrompts: element.querySelectorAll(".message--user").length,
+            workChildren: [...element.querySelectorAll("[data-work-child-id]")].map(child => ({
+              id: child.getAttribute("data-work-child-id"), open: child.getAttribute("open"), text: child.textContent
+            })),
             navigation: (element as HTMLElement & { timelineScrollObservations?: readonly unknown[] }).timelineScrollObservations
           }), undefined, { timeout: 5_000 })
         }, null, 2));
@@ -73,6 +76,8 @@ describe("mounted Timeline history windows", () => {
     page.on("pageerror", (error) => pageErrors.push(error.name));
     let smallWindow = false;
     let olderRequests = 0;
+    let sourceHistoryRequests = 0;
+    historyFailureState = () => ({ smallWindow, olderRequests, sourceHistoryRequests, reads: adapter.historyReads });
     await page.route("**/joko.v1.EventService/GetSnapshot", async (route) => {
       const bytes = route.request().postDataBuffer();
       if (smallWindow && bytes) {
@@ -88,6 +93,7 @@ describe("mounted Timeline history windows", () => {
       const bytes = route.request().postDataBuffer();
       if (!bytes) throw new Error("Work history request has no protobuf body.");
       const request = fromBinary(ListSessionTimelineRequestSchema, bytes);
+      if (request.sessionId === sessionId) sourceHistoryRequests += 1;
       if (request.beforeCursor) olderRequests += 1;
       if (smallWindow) {
         request.limit = 3;
@@ -168,6 +174,12 @@ describe("mounted Timeline history windows", () => {
     await page.goto(fixture.baseUrl + "/#/tasks/" + encodeURIComponent(nextSessionId), { waitUntil: "domcontentloaded" });
     await page.locator('.timeline[data-timeline-session-id="' + nextSessionId + '"]').waitFor({ state: "visible", timeout: 20_000 });
     expect(await page.locator('[data-timeline-item-ids*="activity-long"],.work-group,.timeline-history-gap').count()).toBe(0);
+    const beforeReturn = sourceHistoryRequests;
+    await page.goto(fixture.baseUrl + "/#/tasks/" + encodeURIComponent(sessionId), { waitUntil: "domcontentloaded" });
+    await page.locator('.timeline[data-timeline-session-id="' + sessionId + '"]').waitFor({ state: "visible", timeout: 20_000 });
+    await assertWorkHistory(page);
+    await frames(page);
+    expect(sourceHistoryRequests).toBe(beforeReturn);
     expect(adapter.sendCalls).toHaveLength(1);
     expect(pageErrors).toEqual([]);
   });

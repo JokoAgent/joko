@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertNoNotificationStartupError, parseCrashReport, parseVirtualMemory, projectOwnedCrash, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, parseCrashReport, parseVirtualMemory, projectOwnedCrash, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+
+test("retries only the pre-test accessibility runner failure with no application requests", () => {
+  const failure = { targetName: "JokoCIUITests", testIdentifierString: "JokoCIUITests-Runner (25861) encountered an error",
+    failureText: "The test runner failed to initialize for UI testing. (Underlying Error: Timed out waiting for AX loaded notification)" };
+  const summary = { result: "Failed", totalTestCount: 1, passedTests: 0, failedTests: 1, skippedTests: 0, testFailures: [failure] };
+  assert.equal(isUiRunnerAccessibilityStartupFailure(summary, 0, 0), true);
+  for (const changed of [undefined, {}, { ...summary, passedTests: 1 }, { ...summary, skippedTests: 1 },
+    { ...summary, testFailures: [failure, failure] }, { ...summary, testFailures: [{ ...failure, failureText: "Assertion failed" }] },
+    { ...summary, testFailures: [{ ...failure, testIdentifierString: "JokoConnectionUITests/testConnectionPageInteractions" }] }]) {
+    assert.equal(isUiRunnerAccessibilityStartupFailure(changed, 0, 0), false);
+  }
+  assert.equal(isUiRunnerAccessibilityStartupFailure(summary, 1, 0), false);
+  assert.equal(isUiRunnerAccessibilityStartupFailure(summary, 0, 1), false);
+});
 
 test("rejects the observed native initialization error without rejecting intended local transport errors", () => {
   assert.throws(() => assertNoNotificationStartupError("ERROR [expo-notifications] Error reading persisted server registration info: private-value"),

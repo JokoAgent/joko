@@ -93,7 +93,7 @@ describe("Claude native Source product Session", () => {
     const client = new HostedAgentConnectClient(createClient(HostedAgentService, createRouterTransport(router => router.service(HostedAgentService,
       createHostedAgentConnectService({ host: nativeHost, authenticate: () => principal })))), principal.assertCurrent);
     const poller = new HostedAgentPoller(client), sourceId = "source-native-claude";
-    const capabilities: Capability[] = ["session.resume", "session.detach", "turn.stream", "turn.abort", "turn.follow_up", "input.text", "input.image", "model.list", "model.switch",
+    const capabilities: Capability[] = ["session.resume", "session.detach", "session.rewind", "session.rewind_to_start", "turn.stream", "turn.abort", "turn.follow_up", "input.text", "input.image", "model.list", "model.switch",
       "permission.change", "context.usage", "runtime.tools", "tool.mcp"].map(key => ({ key, supported: true }));
     capabilities.push({ key: "permission.modes", supported: true, options: ["ask", "bypassPermissions"] });
     const descriptor: BackendDescriptor = { id: sourceId, adapterKind: "hosted", instanceGeneration: 1, displayName: "Claude on paired device", version: "0.3.280",
@@ -154,6 +154,17 @@ describe("Claude native Source product Session", () => {
       const nativeHistory = await client.call(nativeRunId, randomUUID(), { kind: "history" }, new AbortController().signal) as NativeHistoryProjection;
       expect(nativeHistory.events.filter(event => event.projectionKind === "message_user").map(event => event.metadata?.fields["nativeDispatchFingerprint"]))
         .toContain(dispatchFingerprint);
+      const sourceBinding = sourceStore.getSession(sessionId).descriptor.binding;
+      await host.navigateTree(sessionId, { kind: "session_start" }, false, undefined, sourceBinding.generation,
+        { connection, operationId: "rewind-native-source", protocol: { kind: "internal" } }).catch(error => {
+          throw new Error(JSON.stringify({ source: error.storedError, native: nativeFailures.map(error => error instanceof Error ? { ...error, message: error.message } : error) }));
+        });
+      expect(sourceStore.getSession(sessionId).descriptor.binding).toEqual(sourceBinding);
+      const rewound = await client.call(nativeRunId, randomUUID(), { kind: "history" }, new AbortController().signal) as NativeHistoryProjection;
+      expect(rewound.events.filter(event => event.projectionKind === "message_user" || event.projectionKind === "message_assistant")).toEqual([]);
+      expect(new HostedAgentStore(nativeStore).list()[0]?.binding?.generation).toBe(2);
+      expect(nativeStore.listSettingsByKeyPrefix("service", "native-hosted-navigation.v1", "")).toEqual([]);
+      expect(requests).toHaveLength(4);
       await host.dispose(); host = undefined; expect(slots.summary().total).toBe(0);
     } finally {
       await host?.dispose(); await adapter.dispose(); await poller.close(); await nativeHost.dispose(); await sourceMcp?.close(); await sourceRouter.dispose(); gate.close(); sourceStore.close(); nativeStore.close();

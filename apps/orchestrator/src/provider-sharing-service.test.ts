@@ -34,6 +34,9 @@ async function fixture(options: { readonly backendId?: string; readonly createNa
   const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-completions", contextWindow: 32768,
     maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
   const backendId = options.backendId ?? "native";
+  database.upsertBackend({ id: backendId, adapterKind: "native-test", instanceGeneration: 1, displayName: "Provider host",
+    health: "healthy", version: "1", installationState: "installed", authenticationState: "not_required",
+    capabilities: new Map(), models: [model, { ...model, providerId: "foreign-provider", modelId: "foreign-model" }], tools: [], diagnostics: [] });
   const native = new HostedAgentRuntime({ store: database, root: join(root, "native"), artifactCapacityBytes: 1024 * 1024, connections,
     authenticateGuest: context => sharing.authenticateNative(context),
     factories: [{ backendId, providerIds: () => ["provider", "foreign-provider"], isolatedGuests: () => true,

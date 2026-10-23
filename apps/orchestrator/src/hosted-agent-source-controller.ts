@@ -14,11 +14,13 @@ import { terminalEnvironment } from "@joko/tool-terminal";
 import type { ExecutorPathAlias } from "./hosted-agent-workspace.js";
 import type { SourceInputMount } from "./hosted-agent-source-attachments.js";
 import type { HostedAgentSourceMcp } from "./hosted-agent-source-mcp.js";
+import type { HostedAgentPeerWorkspace } from "./hosted-agent-peer-workspace.js";
 
 /** Service-owned tool and Artifact ports behind the transport-only Adapter.
  * Each native occurrence retains the exact original SessionHost callbacks. */
 export function createHostedAgentSourceController(options: {
   readonly poller: HostedAgentPoller; readonly runId: string; readonly shadow: string; readonly context: AdapterContext;
+  readonly remote?: HostedAgentPeerWorkspace;
   readonly binding: () => NativeSessionBinding; readonly temporaryRoot: string;
   readonly readPolicy: (context: AdapterContext) => HostedAgentExecutorPolicy;
   readonly aliases?: (context: AdapterContext) => readonly ExecutorPathAlias[];
@@ -35,6 +37,7 @@ export function createHostedAgentSourceController(options: {
 }): HostedAgentSourceController {
   const owners = new Map<string, HostedAgentOperationOwner>(), port = options.poller.attach(options.runId);
   const executor = (context: AdapterContext) => new HostedAgentExecutor({ context, virtualRoot: options.shadow,
+    ...(options.remote ? { remote: options.remote } : {}),
     ...(options.aliases === undefined ? {} : { aliases: options.aliases(context) }),
     ...(options.inputFiles === undefined ? {} : { inputFiles: () => options.inputFiles!(context) }),
     readPolicy: () => options.readPolicy(context), assertCurrent: () => { options.assertContext(context); options.assertCurrent(); },
@@ -84,7 +87,8 @@ export function createHostedAgentSourceController(options: {
       const authorization = { assertCurrent: () => ownerExecutor.assertCurrent(signal),
         authorize: (actions: Parameters<HostedAgentExecutor["authorizeNativeActions"]>[0], active: AbortSignal) => ownerExecutor.authorizeNativeActions(actions, active) };
       nativeRelay ??= new HostedAgentCodexExecServerRelay({ codexExecutable: options.codexExecutable,
-        cwd: options.context.target.workspaceRoot, workspace: initialExecutor.workspace, sessionId: options.context.sessionId, env: terminalEnvironment(),
+        cwd: options.context.target.workspaceRoot, workspace: initialExecutor.workspace, sessionId: options.context.sessionId,
+        ...(options.remote ? { openProcess: active => options.remote!.openCodex(active) } : { env: terminalEnvironment() }),
         assertCurrent: () => { options.assertContext(options.context); options.assertCurrent(); },
         authorize: (actions, active) => initialExecutor.authorizeNativeActions(actions, active),
         ...(options.commandConcurrencyGate === undefined ? {} : { commandConcurrencyGate: options.commandConcurrencyGate }) });

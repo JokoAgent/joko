@@ -1,4 +1,18 @@
-import type { HostedExecution, PermissionMode, PromptInput, SubagentControlInput, UserShellInput } from "@joko/core";
+import type { HostedExecution, NativeNavigationTarget, PermissionMode, PromptInput, SubagentControlInput, UserShellInput } from "@joko/core";
+
+/** One isolated inference. It carries no task, workspace, tool or credential authority. */
+export interface HostedNativeInferenceRequest {
+  readonly requestId: string;
+  readonly backendId: string;
+  readonly backendInstanceGeneration: number;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly system: string;
+  readonly user: string;
+  readonly timeoutMs: number;
+  readonly maxTokens?: number;
+  readonly images?: readonly { readonly data: string; readonly mimeType: string }[];
+}
 
 /** Closed private values shared by the native Provider actor and its Source
  * Adapter. Public clients use the generated protobuf service envelopes. */
@@ -22,8 +36,12 @@ export type HostedNativeCommand =
   | { readonly kind: "tools" }
   | { readonly kind: "tree" }
   | { readonly kind: "history" }
+  | { readonly kind: "navigate"; readonly target: NativeNavigationTarget; readonly summarize: boolean; readonly instructions?: string }
+  | { readonly kind: "dispatch_during_compaction"; readonly input: PromptInput }
   | { readonly kind: "shell"; readonly input: UserShellInput }
   | { readonly kind: "abort_shell" }
+  | { readonly kind: "cancel_background"; readonly taskId: string }
+  | { readonly kind: "background_output"; readonly taskId: string; readonly maximumBytes: number }
   | { readonly kind: "control_subagent"; readonly input: SubagentControlInput };
 export interface HostedNativeOpen {
   readonly runId: string;

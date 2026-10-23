@@ -110,6 +110,39 @@ import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
+it("restores an ordinary archived owner task atomically with its first queued input and replays the original receipt", async () => {
+  const f = await createFixture();
+  const sessionId = (await f.host.createSession({ operationId: "archived-send-create", connection: f.connection,
+    targetId: "target-one", title: "Continue task", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+  await f.host.closeIfActive(sessionId); f.store.updateSession(sessionId, { archived: true });
+  const send = { operationId: "archived-send", connection: f.connection, sessionId,
+    prompt: { text: "Continue once", images: [], files: [], mentions: [], disposition: "prompt" as const } };
+  expect(() => f.store.runOperation({ id: "archived-send-invalid", kind: "send_input", body: {} }, store => {
+    f.host.commitQueuedInput(store, { ...send, operationId: "archived-send-invalid", restoreArchived: true }); throw new Error("Rollback whole input");
+  })).toThrow("Rollback whole input");
+  expect(f.store.getSession(sessionId).descriptor.archived).toBe(true);
+  expect(f.store.listQueueItems({ sessionId })).toHaveLength(0);
+  const accepted = f.host.enqueueInput(send), replay = f.host.enqueueInput(send);
+  expect(accepted.replayed).toBe(false); expect(replay).toMatchObject({ replayed: true, value: accepted.value });
+  expect(f.store.getSession(sessionId).descriptor.archived).toBe(false);
+  expect(f.store.listQueueItems({ sessionId })).toHaveLength(1);
+});
+
+it("keeps archived service tasks and shared-input admission under their existing lifecycle owners", async () => {
+  const f = await createFixture();
+  const base = { targetId: "target-one", title: "Owned task", permissionMode: "ask" as const, planMode: false, fastMode: false };
+  const serviceId = (await f.host.createServiceSession({ ...base, operationId: "archived-managed-create", serviceKind: "messaging" })).value.sessionId;
+  await f.host.closeIfActive(serviceId); f.store.updateSession(serviceId, { archived: true });
+  const prompt = { text: "Do not revive", images: [], files: [], mentions: [], disposition: "prompt" as const };
+  expect(() => f.host.enqueueInput({ operationId: "archived-managed-send", connection: f.connection, sessionId: serviceId, prompt })).toThrow(/managed task/u);
+  const ordinaryId = (await f.host.createSession({ ...base, operationId: "archived-shared-create", connection: f.connection })).value.sessionId;
+  await f.host.closeIfActive(ordinaryId); f.store.updateSession(ordinaryId, { archived: true });
+  expect(() => f.store.runOperation({ id: "archived-shared-send", kind: "send_input", body: {} }, store =>
+    f.host.commitQueuedInput(store, { operationId: "archived-shared-send", sessionId: ordinaryId, prompt }))).toThrow(/archived or deleted/iu);
+  expect(f.store.getSession(serviceId).descriptor.archived).toBe(true);
+  expect(f.store.getSession(ordinaryId).descriptor.archived).toBe(true);
+});
+
 const CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT = {
   useWorktree: false,
   refreshWorktreeRemote: false,

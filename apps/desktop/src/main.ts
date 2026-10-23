@@ -1974,7 +1974,26 @@ async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise
   foreground.show();
   foreground.focus();
   await waitForPackagedSmokeInspectorCondition(() => foreground.isFocused(), "pre-crash independent focus");
-  owner.webContents.forcefullyCrashRenderer();
+  const ownerContents = owner.webContents;
+  const ownerRendererLost = new Promise<void>((resolveLoss) => ownerContents.once("render-process-gone", () => resolveLoss()));
+  if (process.platform === "win32") {
+    // Crash IPC can remain pending in a background packaged renderer. Exercise
+    // real process loss using the exact owner PID and its OS birth identity.
+    const pid = ownerContents.getOSProcessId();
+    if (pid < 1 || pid === process.pid || pid === foreground.webContents.getOSProcessId()) {
+      throw new Error("Inspector smoke renderer is not an independent owned process.");
+    }
+    const identity = capturePackagedSmokeProcessBirthIdentitySync(pid);
+    if (identity === undefined || ownerContents.isDestroyed() || ownerContents.getOSProcessId() !== pid
+      || capturePackagedSmokeProcessBirthIdentitySync(pid) !== identity) {
+      throw new Error("Inspector smoke renderer changed before process termination.");
+    }
+    process.kill(pid, "SIGKILL");
+  } else {
+    ownerContents.forcefullyCrashRenderer();
+  }
+  await waitForPackagedSmokeDeadline(ownerRendererLost, 10_000, "Inspector owner renderer crash");
+  recordPackagedSmokeProgress("inspector_owner_renderer_gone");
   await waitForPackagedSmokeInspectorDestroyed(crashing, "owner crash");
   if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
     inspectorWindowOccurrence !== undefined) {
@@ -6250,6 +6269,7 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
   childWindow.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
   childWindow.on("close", () => {
     inspectorWindowLifecycle?.markUserClosing(childWindow);
+    if (!quitting) inspectorWindowLifecycle?.returnFocusBeforeClose(childWindow);
   });
   childWindow.webContents.on("render-process-gone", () => {
     if (inspectorWindowLifecycle?.markChildFailed(childWindow) === true && !childWindow.isDestroyed()) {
@@ -6279,7 +6299,6 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
         notifyOwner.send(DESKTOP_CHANNELS.inspectorWindowClosed, Object.freeze({ occurrence, reason: decision.reason }));
       } catch { /* The owner retired after validation. */ }
     }
-    if (decision.returnFocus && !quitting && !owner.isDestroyed() && BrowserWindow.getFocusedWindow() === owner) owner.focus();
   });
 }
 

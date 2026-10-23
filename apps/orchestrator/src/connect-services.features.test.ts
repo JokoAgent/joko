@@ -55,7 +55,7 @@ function stubApplication(overrides: Record<string, unknown>): OrchestratorApplic
   return {
     config: { publicOrigin: "https://orchestrator.example.test" },
     store: {},
-    connections: { authenticate: () => connection },
+    connections: { authenticate: () => connection, fence: () => undefined },
     artifacts: {},
     blobTransfers: {},
     artifactRepository: {},

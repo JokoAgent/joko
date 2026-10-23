@@ -88,6 +88,21 @@ it("provides the original tools through Claude's Query port and rejects withdraw
   lease.release(); expect(f.calls).toHaveLength(1);
 });
 
+it("retires prior native MCP leases and one-use root proofs when the confirmed native context is replaced", async () => {
+  const f = await fixture(), bridge = f.native.pi(), oldLease = f.native.claude().open({ ...f.owner, signal: f.abort.signal });
+  const proof = bridge.captureRootCall!({ requestId: "before-rewind", serverId: "original_tools", toolName: "owner_input", arguments: {}, assertCurrent: () => {} });
+  f.native.replaceOwnerGeneration(2);
+  expect(() => f.native.replaceOwnerGeneration(4)).toThrow("generation");
+  await expect(oldLease.call({ serverId: "original_tools", toolName: "echo", requestId: "late-lease", arguments: {}, signal: f.abort.signal })).rejects.toThrow();
+  const stale = await fetch(bridge.endpoint, { method: "POST", headers: { authorization: "Bearer " + bridge.token, "content-type": "application/json" },
+    body: JSON.stringify({ ...f.owner, generation: 2, requestId: "before-rewind", serverId: "original_tools", toolName: "owner_input", arguments: {}, nativeRootProof: proof }) });
+  expect(stale.ok).toBe(false); expect(f.calls).toHaveLength(0);
+  const nextLease = f.native.claude().open({ ...f.owner, generation: 2, signal: f.abort.signal });
+  expect(await nextLease.call({ serverId: "original_tools", toolName: "echo", requestId: "current-context", arguments: {}, signal: f.abort.signal }))
+    .toMatchObject({ isError: false, structuredContent: { source: "task" } });
+  expect(f.calls).toHaveLength(1); oldLease.release(); nextLease.release();
+});
+
 it("serves the original MCP protocol through Codex's native route and verifies its native root thread", { timeout: 20_000 }, async () => {
   const f = await fixture(); let rootCurrent = true;
   const lease = await f.native.codex({ ...f.owner, signal: f.abort.signal, assertSessionCurrent: () => {}, beginToolCall: threadId => {

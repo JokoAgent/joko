@@ -18,6 +18,7 @@ import {
   X
 } from "lucide-react";
 import type { AppController } from "../controller.js";
+import { ensureNewSessionModelProject } from "../new-session-model-project.js";
 import {
   composerDocumentIsEmpty,
   composerDocumentPlainText,
@@ -360,6 +361,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   const selectionKey = selection === undefined ? "" : newSessionSelectionValue(selection);
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
+  const modelSelectionScope = useMemo(() => ({}), [selection, profileScope, controller.state.connectionGeneration]);
+  const modelSelectionScopeRef = useRef(modelSelectionScope);
+  modelSelectionScopeRef.current = modelSelectionScope;
   useLayoutEffect(() => { builtinSkillIntentRef.current = undefined; }, [profileScope]);
   useLayoutEffect(() => {
     remoteProjectConnectionEpochRef.current += 1;
@@ -688,9 +692,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     && selectedNativeSession.state !== "error"
     && selectedNativeSession.boundSessionId === undefined;
   const execution = resolveNewSessionExecutionOptions(backend, snapshot.models, modelKey);
+  const unifiedModels = snapshot.models.filter((model) => eligibleDialogueBackends.some((candidate) =>
+    candidate.id === model.backendId && candidate.capabilities.get("model.switch")?.supported === true
+      && !((selected?.remoteWorkspace ?? workspace?.remoteWorkspace)?.kind === "ssh"
+        && candidate.capabilities.get("model.remote_execution")?.supported === true)));
   const modelSelection = backend === undefined ? undefined : modelSelectionFor(backend.id, modelKey);
-  const selectedModel = execution.selectedModel ?? snapshot.models.find((model) => model.backendId === backend?.id
+  const catalogSelectedModel = execution.selectedModel ?? snapshot.models.find((model) => model.backendId === backend?.id
     && modelKeyFor(model.providerId, model.modelId) === modelKey);
+  const selectedModel = catalogSelectedModel?.source?.grouped ? { ...catalogSelectedModel, available: false } : catalogSelectedModel;
   const pickerOwnerId = modelPreferenceOwnerId(controller.state.activeProfile?.serverId);
   const appDefault = useAppDefaultModelPreference(pickerOwnerId).current;
   const appDefaultKey = JSON.stringify([pickerOwnerId, appDefault]);
@@ -2832,7 +2841,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                 {voice.supported && <VoiceInputButton phase={voice.phase} held={heldVoice.held} sendTargetActive={heldVoice.sendTargetActive} startedAt={voice.startedAt} ownerWindow={voice.ownerWindow} enabled={hydrated && !submitting} buttonProps={heldVoice.buttonProps} t={t} />}
                 {execution.modelSwitchSupported && <ModelPicker
                   className="new-task-composer__select--model"
-                  models={snapshot.models.filter((model) => model.backendId === backend?.id)}
+                  models={unifiedModels}
                   ownerId={pickerOwnerId}
                   favoriteSettings={snapshot.settings.modelFavorites}
                   onMutateFavorite={controller.updateModelFavorites}
@@ -2848,30 +2857,56 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                   disabledReason={submitting ? t("common.working") : undefined}
                   useMorphPopover
                   onSelectionFocus={() => richEditorRef.current?.focus("end")}
-                  effortEnabled={execution.effortSupported}
-                  fastEnabled={execution.fastModeSupported}
+                  effortEnabled
+                  fastEnabled
                   t={t}
                   onOpen={() => backend === undefined ? undefined : controller.refreshProviderModels(backend.id, undefined, true).catch(() => undefined)}
                   onConnectSource={() => { window.location.hash = "#/settings/providers"; }}
-                  onSelect={(selection) => {
-                    if (selection === undefined) {
+                  onSelect={async (modelChoice) => {
+                    if (modelChoice === undefined) {
                       setModelKey("");
                       setEffort("");
                       setFastMode(false);
                       return;
                     }
-                    const nextModel = execution.availableModels.find((model) =>
-                      model.providerId === selection.providerId && model.modelId === selection.modelId);
-                    if (nextModel === undefined || !nextModel.available) return;
+                    const nextBackend = eligibleDialogueBackends.find(candidate => candidate.id === modelChoice.backendId);
+                    const nextOptions = resolveNewSessionExecutionOptions(nextBackend, snapshot.models, modelKeyFor(modelChoice.providerId, modelChoice.modelId));
+                    const nextModel = nextOptions.selectedModel;
+                    if (!nextBackend || !nextModel?.available) throw new Error("The model source is no longer available.");
+                    const profile = controller.state.activeProfile;
+                    const sourceScope = modelSelectionScopeRef.current;
+                    const sourceGeneration = controller.state.connectionGeneration;
+                    const assertModelOwner = (): void => {
+                      const current = controllerRef.current.state;
+                      if (!mountedRef.current || modelSelectionScopeRef.current !== sourceScope
+                        || current.activeProfile?.id !== profile?.id || current.activeProfile?.serverId !== profile?.serverId
+                        || current.activeProfile?.deviceId !== profile?.deviceId || current.connectionGeneration !== sourceGeneration
+                        || current.connectionState !== "connected" || current.route.kind !== "newSession"
+                        || selected && !current.snapshot.targets.some(row => row.id === selected.id && row.revision === selected.revision && !row.archived)) {
+                        throw new Error("The model source owner or project changed.");
+                      }
+                    };
+                    let nextSelection = selection;
+                    if (nextBackend.id !== backend?.id) {
+                      if (selection?.kind === "target") {
+                        if (!selected || !workspace) throw new Error("The current project is unavailable. Reopen it before changing model sources.");
+                        const targetId = await ensureNewSessionModelProject(controller, snapshot, selected, nextBackend.id, assertModelOwner);
+                        assertModelOwner();
+                        nextSelection = { kind: "target", targetId };
+                      } else nextSelection = { kind: "dialogue", backendId: nextBackend.id };
+                    }
                     setModelKey(modelKeyFor(nextModel.providerId, nextModel.modelId));
-                    const nextEffort = selection.effort !== undefined && nextModel.efforts.includes(selection.effort)
-                      ? selection.effort
-                      : defaultModelEffort(nextModel) ?? "";
-                    const nextFast = execution.fastModeSupported && nextModel.supportsFast && selection.fastMode;
+                    const nextEffort = nextOptions.effortSupported
+                      ? modelChoice.effort !== undefined && nextModel.efforts.includes(modelChoice.effort)
+                        ? modelChoice.effort : defaultModelEffort(nextModel) ?? "" : "";
+                    const nextFast = nextOptions.fastModeSupported && nextModel.supportsFast && modelChoice.fastMode;
                     setEffort(nextEffort);
                     setFastMode(nextFast);
-                    if (backend) setAppDefaultModelPreference(pickerOwnerId, { backendId: backend.id, providerId: nextModel.providerId,
+                    setAppDefaultModelPreference(pickerOwnerId, { backendId: nextBackend.id, providerId: nextModel.providerId,
                       modelId: nextModel.modelId, effort: nextEffort, fastMode: nextFast });
+                    if (nextSelection && newSessionSelectionValue(nextSelection) !== selectionKey) {
+                      setSelection(nextSelection); setStartKind("fresh"); setNativeReference(""); setNativeSelectionWarning(undefined);
+                    }
                   }}
                 />}
                 {execution.permissionSelectable ? <PermissionSelector value={permissionMode} modes={execution.permissionModes} disabled={submitting} disabledReason={submitting ? t("common.working") : undefined} onChange={selectPermissionMode} t={t} /> : <Pill tone="neutral"><Shield aria-hidden="true" />{permissionLabel(execution.permissionModes[0] ?? "ask", t)}</Pill>}

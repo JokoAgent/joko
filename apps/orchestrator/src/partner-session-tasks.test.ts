@@ -2,11 +2,12 @@ import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
-import { OperationalStore, PartnerStore } from "@joko/store";
+import { OperationalStore, PartnerStore, PartnerNetworkStore } from "@joko/store";
 import type { AdapterContext, PromptInput } from "@joko/core";
 import { projectPiInputSchema } from "@joko/adapter-pi";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createClient, Code } from "@connectrpc/connect";
+import { createClient, Code, ConnectError } from "@connectrpc/connect";
+import { create } from "@bufbuild/protobuf";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import * as contract from "@joko/contracts";
 import { ArtifactStore } from "./artifact-store.js";
@@ -20,6 +21,8 @@ import { ConnectionManager } from "./connection-manager.js";
 import { AppDefaultModelCoordinator } from "./app-default-model.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
+import { PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-publisher.js";
+import { PartnerNetworkHost } from "./partner-network-host.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -36,6 +39,106 @@ class RecordedAdapter extends FakeBackendAdapter {
   }
 }
 describe("Partner independent Session tasks", () => {
+  it("admits the active owner group tool, retains its group parent and returns output after that execution ends without waking either lane", async () => {
+    const f = await fixture(), group = await groupFixture(f), tools = new PartnerSessionTaskTools(f.tasks);
+    const session = f.store.getSession(group.sessionId).descriptor;
+    const context = { sessionId: session.id, targetId: session.targetId, generation: session.binding.generation, providerGeneration: 1, effectIdentity: "e".repeat(64) };
+    expect(tools.includeForSession(session.id, session.targetId)).toBe(true);
+    const reply = await tools.callTool("start_session_task", { instruction: "PRIVATE_GROUP_TASK_OBJECTIVE", title: "Group report", working_dir: f.project }, undefined, context);
+    expect(reply.isError).toBe(false); expect(JSON.parse(reply.content[0]!.text)).toMatchObject({ completion_destination: "group" });
+    const task = f.tasks.list(f.partner.id)[0]!;
+    expect(task.parentSessionId).toBe(group.sessionId); expect(task.group).toMatchObject({ roomId: group.room.id, actorId: group.actor.id });
+    expect(group.messages()).toHaveLength(1); expect(group.messages()[0]?.task).toMatchObject({ title: "Group report", status: "running" });
+    expect(JSON.stringify(group.messages())).not.toContain("PRIVATE_GROUP_TASK_OBJECTIVE");
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === task.sessionId)).toBe(true));
+    group.endExecution(); expect(tools.includeForSession(session.id, session.targetId)).toBe(false);
+    expect(() => f.tasks.check(group.sessionId, task.id)).toThrow();
+    const artifact = await f.artifacts.ingestBytes(new TextEncoder().encode("Group report"), { fileName: "group-report.txt", mimeType: "text/plain", expiresAt: Date.now() + 60_000 });
+    f.store.transaction(store => store.adoptSessionArtifact({ sessionId: task.sessionId!, blob: store.getArtifact(artifact.id).blob }));
+    const text = "Full independent result. ".repeat(1200); await f.primary.complete(task.sessionId!, text);
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", deliveredExecution: 1 }));
+    const terminal = group.messages().filter(message => message.task?.status === "completed" || message.kind === "message");
+    expect(terminal.map(message => message.text).join("")).toBe(text); expect(terminal.flatMap(message => message.attachments)).toHaveLength(1);
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]); expect(f.store.listQueueItems({ sessionId: group.sessionId })).toEqual([]);
+    expect(f.store.listSessions()).toHaveLength(3); expect((await f.tasks.check(f.parent, task.id)).parentSessionId).toBe(group.sessionId);
+    await f.tasks.message(f.parent, task.id, "owner-private-followup", { mode: "queue", message: "Add a conclusion" }, () => undefined);
+    await f.tasks.message(f.parent, task.id, "owner-private-followup", { mode: "queue", message: "Add a conclusion" }, () => undefined);
+    const continued = f.tasks.list(f.partner.id)[0]!;
+    expect(continued).toMatchObject({ execution: 2, parentSessionId: group.sessionId });
+    expect(f.tasks.view(continued, f.parent).queue).toHaveLength(1);
+    expect(group.messages().filter(message => message.task?.status === "running").map(message => message.task?.execution)).toEqual([1, 2]);
+    await vi.waitFor(() => expect(f.primary.inputs.filter(item => item.context.sessionId === task.sessionId)).toHaveLength(2));
+    await f.primary.complete(task.sessionId!, "Conclusion added.");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBe(2));
+    expect(f.store.listQueueItems({ sessionId: task.sessionId! })).toHaveLength(2); expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
+  });
+  it("rejects another group scope and durably returns an archived-room result to the owner's existing private lane", async () => {
+    const f = await fixture(), group = await groupFixture(f);
+    const task = await f.tasks.start(group.sessionId, "group-owned-task", { instruction: "Complete the work", workingDir: f.project }, () => undefined);
+    group.changeAccess(); expect(() => f.tasks.check(group.sessionId, task.id)).toThrow("authorized conversation"); group.changeAccess();
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === task.sessionId)).toBe(true));
+    const room = group.host.storage.get(group.room.id);
+    group.host.storage.manage({ operationId: "archive", roomId: room.id, actorId: group.actor.ownerId, expectedRevision: room.revision, action: "archive", targetId: "", value: "", throughSequence: 0 });
+    const artifact = await f.artifacts.ingestBytes(new TextEncoder().encode("Private fallback file"), { fileName: "fallback.txt", mimeType: "text/plain", expiresAt: Date.now() + 60_000 });
+    f.store.transaction(store => store.adoptSessionArtifact({ sessionId: task.sessionId!, blob: store.getArtifact(artifact.id).blob }));
+    group.endExecution(); await f.primary.complete(task.sessionId!, "Retained fallback result");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", groupFallback: true, deliveredExecution: 1 }));
+    expect(f.tasks.view(f.tasks.list(f.partner.id)[0]!)).toMatchObject({ completion_destination: "private" });
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]); expect(f.store.listRuns({ sessionId: f.parent })).toEqual([]);
+    const returned = f.store.listEvents({ sessionId: f.parent }).filter(event => event.payload.type === "message_complete");
+    expect(returned).toHaveLength(1); expect(returned[0]?.payload).toMatchObject({ role: "assistant", blocks: [{ kind: "text", text: "Retained fallback result" }, { kind: "artifact", label: "fallback.txt" }] });
+    expect(returned[0]?.metadata).toMatchObject({ namespace: "joko.partner_task_result", fields: { taskId: task.id, sourceRoomId: group.room.id } });
+    const adopted = f.store.listArtifacts({ sessionId: f.parent }); expect(adopted).toHaveLength(1); expect(adopted[0]?.blob.id).not.toBe(artifact.id);
+    expect(new TextDecoder().decode((await f.artifacts.readBlob(adopted[0]!.blob)).data)).toBe("Private fallback file");
+    expect(f.store.listSessions()).toHaveLength(3); expect(f.store.listQueueItems({ sessionId: task.sessionId! })).toHaveLength(1);
+    await f.tasks.close(); f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now, undefined, group.publisher()); await f.tasks.initialize();
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]); expect(f.store.listEvents({ sessionId: f.parent }).filter(event => event.payload.type === "message_complete")).toHaveLength(1);
+  });
+  it.each(["archived", "replaced"])("persists a failed fallback when its original private destination is %s without selecting another lane", async kind => {
+    const f = await fixture(), group = await groupFixture(f);
+    const task = await f.tasks.start(group.sessionId, `group-fallback-${kind}`, { instruction: "Preserve the independent output", workingDir: f.project }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === task.sessionId)).toBe(true));
+    const room = group.host.storage.get(group.room.id);
+    group.host.storage.manage({ operationId: "archive", roomId: room.id, actorId: group.actor.ownerId, expectedRevision: room.revision, action: "archive", targetId: "", value: "", throughSequence: 0 });
+    let replacement: string | undefined;
+    if (kind === "archived") { const old = f.store.getSession(f.parent); f.store.updateSession(f.parent, { archived: true }, old.revision); }
+    else {
+      replacement = (await f.host.createServiceSession({ operationId: "new-canonical", serviceKind: "partner", targetId: f.partner.homeTargetId, title: "New private lane",
+        providerId: "test", modelId: "text", effort: "medium", fastMode: false, permissionMode: "ask", planMode: false, assertServiceScope() {} })).value.sessionId;
+      const profile = f.partners.getPartner(f.partner.id), changed = f.partnerStore.replaceCanonicalSession({ partnerId: profile.id, expectedRevision: profile.revision,
+        expectedProfileVersion: profile.profileVersion, expectedCanonicalSessionId: f.parent, sessionId: replacement });
+      f.partnerStore.markReady(changed.id, changed.revision);
+    }
+    group.endExecution(); await f.primary.complete(task.sessionId!, "The result remains in the original independent task.");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]?.groupDeliveryError).toContain("original private destination"));
+    expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", groupFallback: true, result: "The result remains in the original independent task." });
+    expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBeUndefined();
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]); expect(f.store.listEvents({ sessionId: f.parent }).filter(event => event.payload.type === "message_complete")).toEqual([]);
+    if (replacement) expect(f.store.listEvents({ sessionId: replacement }).filter(event => event.payload.type === "message_complete")).toEqual([]);
+    const terminal = f.store.listSettings("service", "partner.session-task-group-deliveries").map(row => row.value as { kind: string; state: string });
+    expect(terminal.find(row => row.kind === "terminal")?.state).toBe("failed");
+    await f.tasks.close(); f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now, undefined, group.publisher()); await f.tasks.initialize();
+    expect(f.tasks.view(f.tasks.list(f.partner.id)[0]!)).toHaveProperty("completion_delivery_error"); expect(f.store.listQueueItems({ sessionId: task.sessionId! })).toHaveLength(1);
+  });
+  it("recovers a pending earlier result after restart while a new execution continues without replacing its current state", async () => {
+    const f = await fixture(), group = await groupFixture(f);
+    const task = await f.tasks.start(group.sessionId, "group-pending-result", { instruction: "First round", workingDir: f.project }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === task.sessionId)).toBe(true));
+    group.setResultUnavailable(true); group.endExecution(); await f.primary.complete(task.sessionId!, "First result waiting for the channel.");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]?.status).toBe("completed"));
+    expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBeUndefined();
+    await f.tasks.message(f.parent, task.id, "group-next-round", { mode: "queue", message: "Second round" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs.filter(item => item.context.sessionId === task.sessionId)).toHaveLength(2));
+    expect(f.tasks.list(f.partner.id)[0]?.execution).toBe(2);
+    await f.tasks.close(); group.setResultUnavailable(false); f.advance(1001);
+    f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now, undefined, group.publisher()); await f.tasks.initialize();
+    expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ execution: 2, status: "running" });
+    expect(group.messages().filter(message => message.task?.status === "completed").map(message => message.task?.execution)).toEqual([1]);
+    await f.primary.complete(task.sessionId!, "Second result.");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBe(2));
+    expect(group.messages().filter(message => message.task?.status === "completed").map(message => message.task?.execution)).toEqual([1, 2]);
+    expect(f.store.listQueueItems({ sessionId: task.sessionId! })).toHaveLength(2); expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
+  });
   it("freezes exact Full access on an admitted independent Task while later Tasks use the new profile", async () => {
     const f = await fixture();
     const full = await f.partners.updatePartner(f.partner.id, f.partner.revision, { capabilities: { ...f.partner.capabilities, permissionMode: "bypassPermissions" } });
@@ -380,4 +483,26 @@ async function fixture(streamDelayMs = 30_000, appDefaultModel?: () => { backend
   return { root, managed, project, store, partnerStore, artifacts, primary, secondary, host, partners, partner, parent: partner.canonicalSessionId!, workspaces,
     get tasks() { return tasks; }, set tasks(value: PartnerSessionTaskManager) { tasks = value; }, now: clock, advance(milliseconds: number) { now += milliseconds; },
     route: { backendId: secondary.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false } };
+}
+async function groupFixture(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.tasks.close();
+  await f.host.registerTarget({ id: "group-lane-target", backendId: f.primary.id, workspaceRoot: f.project, trusted: true, managed: false, displayName: "Group project" });
+  const session = await f.host.createServiceSession({ operationId: "group-lane-create", serviceKind: "partner", targetId: "group-lane-target",
+    title: "Group lane", providerId: "test", modelId: "text", effort: "medium", fastMode: false, permissionMode: "ask", planMode: false, assertServiceScope: () => undefined });
+  const sessionId = session.value.sessionId, host = new PartnerNetworkHost({ storage: new PartnerNetworkStore(f.store), serverId: "task-home", origin: "http://127.0.0.1",
+    mediaDirectory: join(f.root, "group-media"), partner: id => ({ id, name: f.partner.displayName, description: "Partner" }) });
+  const room = host.create(create(contract.CreatePartnerNetworkRequestSchema, { operationId: "task-room-create", name: "Task room", displayName: "Owner", partnerIds: [f.partner.id] }));
+  const actor = room.members.find(member => member.kind === "partner")!; let active = true, accessRevision = "1", resultUnavailable = false;
+  const publisher = () => new PartnerSessionTaskGroupPublisher(f.store, {
+    capture: id => id === sessionId && active ? { profile: f.partners.getPartner(f.partner.id), roomId: room.id, joinId: "", hostServerId: "task-home", actorId: actor.id,
+      ownerId: actor.ownerId, sourceMessageId: "group-source", accessRevision, executionId: "owner-execution", executionLease: "1", assertCurrent() { if (!active) throw new Error("The owner execution ended."); } } : undefined,
+    homeServerId: () => "task-home", publish: async (origin, request) => { if (resultUnavailable && request.task?.status === "completed") throw new ConnectError("Channel unavailable", Code.Unavailable); return host.publish(request, origin.ownerId); },
+    media: (origin, request, signal) => host.media(request, origin.ownerId, { signal, assertCurrent() { signal.throwIfAborted(); } }),
+    readArtifact: async blob => (await f.artifacts.readBlob(blob)).data
+  }, f.now);
+  f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now, undefined, publisher()); await f.tasks.initialize();
+  cleanups.push(() => host.close());
+  return { sessionId, room, actor, host, publisher, messages: () => host.storage.messages(room.id), endExecution: () => { active = false; },
+    setResultUnavailable: (value: boolean) => { resultUnavailable = value; },
+    changeAccess: () => { accessRevision = accessRevision === "1" ? "2" : "1"; } };
 }

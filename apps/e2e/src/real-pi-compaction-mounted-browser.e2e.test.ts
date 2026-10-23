@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   CompactionState,
+  GetTaskProviderGroupUsageRequestSchema,
   RunState,
   SessionAttentionAcknowledgementIntent,
   SessionSnapshotScopeSchema,
@@ -129,6 +130,7 @@ describe("mounted Pi compaction product chain", () => {
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     let attentionBeforeResume: bigint | undefined;
     const permittedAttentionErrors: string[] = [];
+    const permittedUsageErrors: string[] = [];
     const permittedAttentionCursors: { submitted: string; current: string; generation: string }[] = [];
     const errors = observeBrowserErrors(page, conflict => {
       if (attentionBeforeResume === undefined || conflict.sessionId !== compactSessionId
@@ -139,6 +141,11 @@ describe("mounted Pi compaction product chain", () => {
       permittedAttentionErrors.push(conflict.responseError, conflict.consoleError);
       permittedAttentionCursors.push({ submitted: conflict.sequence.toString(), current: current.attentionCursor.toString(),
         generation: conflict.generation.toString() });
+    }, stale => {
+      if (attentionBeforeResume === undefined || stale.sessionId !== compactSessionId) return;
+      const generation = BigInt(fixture!.application.store.getSession(compactSessionId).descriptor.binding.generation);
+      if (stale.generation <= 0n || stale.generation >= generation) return;
+      permittedUsageErrors.push(stale.responseError, stale.consoleError);
     });
     await page.goto(taskUrl(compactSessionId), { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -279,7 +286,8 @@ describe("mounted Pi compaction product chain", () => {
       }, null, 2));
     }
     expect(permittedAttentionErrors.length).toBeLessThanOrEqual(2);
-    expect(errors.toSorted()).toEqual(permittedAttentionErrors.toSorted());
+    expect(permittedUsageErrors.length).toBeLessThanOrEqual(2);
+    expect(errors.toSorted()).toEqual([...permittedAttentionErrors, ...permittedUsageErrors].toSorted());
   });
 
   mountedIt.each([
@@ -381,10 +389,11 @@ interface StaleViewedAcknowledgement {
   readonly consoleError: string;
 }
 
-function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: StaleViewedAcknowledgement) => void): string[] {
+function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: StaleViewedAcknowledgement) => void,
+  onStaleUsage?: (stale: { sessionId: string; generation: bigint; responseError: string; consoleError: string }) => void): string[] {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
-  page.on("response", (response) => {
+  page.on("response", async (response) => {
     if (response.status() < 400) return;
     const url = new URL(response.url());
     let operation = "";
@@ -409,6 +418,20 @@ function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: Stale
     }
     const responseError = `response:${response.status()}:${response.request().method()}:${url.origin}${url.pathname}${operation}`;
     errors.push(responseError);
+    // A resume can retire the observed generation between rendering and its read-only quota request.
+    // Admit only the exact old-generation request; the caller checks it against durable server state.
+    if (response.status() === 400 && url.pathname === "/joko.v1.ProviderGroupService/GetTaskProviderGroupUsage") {
+      const request = response.request(), bytes = request.postDataBuffer();
+      if (request.headers()["content-type"]?.startsWith("application/proto") && bytes !== null && bytes.length <= 64 * 1024) {
+        try {
+          const usage = fromBinary(GetTaskProviderGroupUsageRequestSchema, bytes);
+          const failure = await response.json() as { code?: string; message?: string };
+          if (failure.code !== "failed_precondition" || failure.message !== "The original task generation is no longer current.") return;
+          onStaleUsage?.({ sessionId: usage.sessionId, generation: usage.generation, responseError,
+            consoleError: `console:Failed to load resource: the server responded with a status of 400 (Bad Request):${url.origin}${url.pathname}` });
+        } catch { /* Keep unknown responses as failures. */ }
+      }
+    }
     if (response.status() === 409 && acknowledgement !== undefined) onAttentionConflict?.({
       ...acknowledgement, responseError,
       consoleError: `console:Failed to load resource: the server responded with a status of 409 (Conflict):${url.origin}${url.pathname}`

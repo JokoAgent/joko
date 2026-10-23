@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fromJson, toJson, type JsonValue } from "@bufbuild/protobuf";
@@ -24,25 +24,31 @@ import { HostedAgentSourceResources } from "./hosted-agent-source-resources.js";
 import { prepareSourceWorkspaceInput } from "./hosted-agent-source-input.js";
 import { HostedAgentSourceAttachments } from "./hosted-agent-source-attachments.js";
 import { HostedAgentSourceMcp } from "./hosted-agent-source-mcp.js";
+import { COLLABORATION_TOOL_POLICY_ID } from "./session-helper-tool-provider.js";
 import type { McpRouter } from "./mcp-router.js";
 import { join } from "node:path";
 import type { RuntimeTextResourceSeed } from "./resource-manager.js";
 import type { SourceProjectFilesOptions } from "./hosted-agent-project-files.js";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 import type { HostedAgentClaudeWebFetchOptions } from "./hosted-agent-claude-web-network.js";
-import type { BlobRef } from "@joko/core";
+import { nativeTextInferenceImages, type BlobRef } from "@joko/core";
 import type { ProviderSharingDirectoryPort, ProviderSharingReceivedIdentity, ProviderSharingRecipient } from "./provider-sharing-ports.js";
 import { providerSharingBackendId } from "./provider-sharing-ports.js";
 import { createProviderGroupPeerTransport } from "./provider-group-peer.js";
 import { createHostedAgentGuestPeerCapture } from "./hosted-agent-guest-peer-capture.js";
 import type { ProviderGroupGuestSwitch } from "./provider-group-guest-switch.js";
 import type { ProviderGroupStore } from "@joko/store";
+import { captureHostedAgentPeerWorkspace, type HostedAgentPeerWorkspace } from "./hosted-agent-peer-workspace.js";
+import { snapshotPeerSourceProject } from "./hosted-agent-peer-project-files.js";
+import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 
 const SCOPE = "hosted-sources.v1";
 const FORWARDED = new Set(["session.resume", "session.detach", "session.tree", "turn.stream", "turn.abort", "turn.steer", "turn.follow_up", "input.text",
   "input.image", "model.list", "model.switch", "model.effort", "model.fast_mode", "permission.modes", "permission.change", "plan_mode", "context.usage", "context.compact",
   "context.auto_compact", "context.auto_retry", "workspace.files", "workspace.files.watch", "workspace.files.write", "workspace.diff", "workspace.generated_files",
-  "runtime.commands", "runtime.tools", "runtime.user_shell", "interaction.permission", "interaction.question", "interaction.plan_review", "workspace.extra_dirs"]);
+  "runtime.commands", "runtime.tools", "runtime.user_shell", "interaction.permission", "interaction.question", "interaction.plan_review", "workspace.extra_dirs",
+  "subagents.list", "subagents.detail", "subagents.transcript", "subagents.stop", "subagents.steer", "subagents.follow_up", "subagents.resume",
+  "background.tasks", "background.tasks.cancel", "session.rewind", "session.rewind_to_start"]);
 interface SourceRecord {
   readonly format: 1;
   readonly source: HostedAgentDeviceSource;
@@ -54,6 +60,7 @@ interface SourceRecord {
 interface SourceEntry { readonly id: string; record: SourceRecord; catalog: contract.HostedAgentBackendCatalog; available: boolean; }
 interface Pool { readonly client: HostedAgentConnectClient; readonly poller: HostedAgentPoller; readonly assertCurrent: () => void; }
 export interface HostedAgentSourcesOptions {
+  readonly remoteExecution?: Pick<RemoteExecutionRouter, "workspace">;
   readonly store: OperationalStore; readonly peers: DevicePeerOwner; readonly registry: BackendInstanceRegistry;
   readonly host: SessionHost; readonly temporaryRoot: string; readonly readPolicy: (context: AdapterContext) => HostedAgentExecutorPolicy;
   readonly commandConcurrencyGate?: CommandConcurrencyGate;
@@ -211,16 +218,52 @@ export class HostedAgentSources {
   }
   async #install(entry: SourceEntry): Promise<void> {
     const resources = new HostedAgentSourceResources();
+    const peerWorkspaces = new Map<string, HostedAgentPeerWorkspace>();
     const mcps = new Map<string, HostedAgentSourceMcp>(), mcpKey = (context: AdapterContext) => JSON.stringify([context.sessionId, context.generation, context.backendInstanceGeneration]);
     const snapshot = await this.#options.registry.add({ instanceId: entry.id, adapterKind: "hosted", displayName: entry.catalog.displayName,
       create: ({ generation }) => new HostedAgentSourceAdapter({ id: entry.id, source: entry.record.source, describe: () => this.#descriptor(entry),
+        inferNativeText: async input => {
+          const nativeGeneration = Number(entry.catalog.instanceGeneration), providerId = input.providerId, modelId = input.modelId;
+          const assertCurrent = () => {
+            input.signal.throwIfAborted(); input.assertCurrent();
+            const backend = this.#options.store.getBackend(entry.id).descriptor;
+            if (this.#closed || !entry.available || !entry.record.remoteControlEnabled || input.backendInstanceGeneration !== generation
+              || backend.instanceGeneration !== generation || Number(entry.catalog.instanceGeneration) !== nativeGeneration || !providerId || !modelId
+              || !entry.catalog.providers.some(provider => provider.providerId === providerId && provider.connected && provider.remoteInvocationEnabled
+                && provider.models.some(model => model.key?.modelId === modelId))) throw new Error("The isolated Source inference route changed.");
+            input.assertModelAllowed(providerId, modelId);
+          };
+          assertCurrent();
+          const captured = this.#capture(entry, randomUUID()); captured.assertCurrent();
+          const requestId = randomUUID(), images = nativeTextInferenceImages(input);
+          const owner = new AbortController(), signal = AbortSignal.any([owner.signal, input.signal]);
+          const timer = setInterval(() => { try { assertCurrent(); captured.assertCurrent(); } catch (error) { owner.abort(error); } }, 100); timer.unref();
+          try {
+            const result = await captured.client.infer({ requestId, backendId: entry.record.source.backendId,
+              backendInstanceGeneration: nativeGeneration, providerId: providerId!, modelId: modelId!, system: input.system, user: input.user, timeoutMs: input.timeoutMs,
+              ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens }),
+              ...(images.length ? { images: images.map(image => ({ data: Buffer.from(image.data).toString("base64"), mimeType: image.mimeType })) } : {}) }, signal);
+            assertCurrent(); captured.assertCurrent(); return result;
+          } finally { clearInterval(timer); owner.abort(); }
+        },
         onRuntimeUnavailable: context => this.#options.host.invalidateRuntime({ backendId: entry.id, backendInstanceGeneration: generation,
           sessionId: context.sessionId, generation: context.generation }),
         readPolicy: context => {
           const policy = this.#options.readPolicy(context), session = this.#session(context.sessionId);
           return { permissionMode: policy.permissionMode, fastMode: session?.fastMode ?? false, ...(session?.effort === undefined ? {} : { effort: session.effort }) };
         }, assertContext: context => this.#assertContext(context),
-        releaseWorkspace: async context => { const key = mcpKey(context), mcp = mcps.get(key); mcps.delete(key); await mcp?.close(); await this.#attachments?.release(context); await resources.release(context); },
+        ...(this.#options.remoteExecution ? { validateRemoteTarget: async (target: import("@joko/core").TargetDescriptor) => {
+          if (target.remoteWorkspace?.kind !== "device_peer") throw new Error("This Source requires an authorized Device project.");
+          const authority = await this.#options.remoteExecution!.workspace(target.remoteWorkspace); authority.assertCurrent();
+          const canonical = await authority.files.realpath(target.workspaceRoot); authority.assertCurrent();
+          const same = authority.pathStyle === "win32" ? canonical.toLowerCase() === target.workspaceRoot.toLowerCase() : canonical === target.workspaceRoot;
+          const bound = authority.pathStyle === "win32" ? target.remoteWorkspace.workspaceRoot.toLowerCase() === target.workspaceRoot.toLowerCase() : target.remoteWorkspace.workspaceRoot === target.workspaceRoot;
+          if (!same || !bound || (await authority.files.stat(canonical)).kind !== "directory") throw new Error("The Source Device workspace changed."); authority.assertCurrent();
+        } } : {}),
+        releaseWorkspace: async context => { const key = mcpKey(context), mcp = mcps.get(key), peer = peerWorkspaces.get(key); await mcp?.close();
+          if (peer) { try { await peer.dispose(); } catch (error) { if (!this.#options.remoteExecution || !context.target.remoteWorkspace) throw error;
+            const fresh = await this.#options.remoteExecution.workspace(context.target.remoteWorkspace); await peer.dispose(fresh); } }
+          mcps.delete(key); peerWorkspaces.delete(key); await this.#attachments?.release(context); await resources.release(context); },
         deleteWorkspace: async context => { this.#assertContext(context); await this.#attachments?.forget(context.sessionId); },
         prepareInput: (input, context, shadow) => {
           this.#assertContext(context);
@@ -229,6 +272,8 @@ export class HostedAgentSources {
           const workspaceId = session.worktree?.workspaceId
             ?? (typeof value === "string" && value ? value : target.descriptor.id);
           return prepareSourceWorkspaceInput(input, context, { shadow, workspaceId, resources, assertCurrent: () => this.#assertContext(context),
+            ...(peerWorkspaces.get(mcpKey(context)) ? { capturePath: (reference: string, directory: boolean, stageFile: boolean) => peerWorkspaces.get(mcpKey(context))!.captureInput(reference, directory, shadow,
+              join(this.#options.temporaryRoot, "peer-inputs", createHash("sha256").update(JSON.stringify([context.sessionId, context.generation])).digest("hex")), stageFile) } : {}),
             ...(this.#attachments ? { attachments: this.#attachments.begin(context, shadow) } : {}) });
         },
         ...(this.#options.resolveTextResources === undefined && this.#options.resolveNativeSkills === undefined ? {} : {
@@ -241,20 +286,22 @@ export class HostedAgentSources {
           || this.#groupStore?.binding(context.sessionId)?.backendId === entry.id),
         workspace: async context => {
           this.#assertContext(context);
+          const peer = context.target.remoteWorkspace ? peerWorkspaces.get(mcpKey(context)) ?? await captureHostedAgentPeerWorkspace(context, this.#options.remoteExecution ?? missingPeerWorkspace(), () => this.#assertContext(context)) : undefined;
+          if (peer) peerWorkspaces.set(mcpKey(context), peer);
           await this.#attachments?.capture(context);
           const nativeKind = entry.catalog.nativeAdapterKind;
           let isGitRepository = false;
-          try { isGitRepository = (await runFile("git", ["rev-parse", "--is-inside-work-tree"], {
+          try { isGitRepository = peer ? (await peer.process("git", ["rev-parse", "--is-inside-work-tree"], context.target.workspaceRoot, context.signal, 5)).output.toString("utf8").trim() === "true" : (await runFile("git", ["rev-parse", "--is-inside-work-tree"], {
             cwd: context.target.workspaceRoot, signal: context.signal, timeout: 5000, windowsHide: true, maxBuffer: 1024
           })).stdout.trim() === "true"; } catch { context.signal.throwIfAborted(); }
           const skills = this.#options.resolveNativeSkills ? await resources.captureSkills(context,
             await this.#options.resolveNativeSkills(context, context.signal, nativeKind), await this.#options.resolveNativeSkillPolicy?.(context)) : [];
           const textResources = await this.#options.resolveTextResources?.(context, nativeKind) ?? [];
           const skillIds = new Set(skills.map(skill => skill.id));
-          const projectFiles = [...await snapshotSourceProjectFiles(context, { assertCurrent: () => this.#assertContext(context),
-            ...(this.#options.resourceAllowed === undefined ? {} : { resourceAllowed: this.#options.resourceAllowed }) }),
+          const projectFiles = [...(peer ? await snapshotPeerSourceProject(context, peer, nativeKind, this.#options.resourceAllowed) : await snapshotSourceProjectFiles(context, { assertCurrent: () => this.#assertContext(context),
+            ...(this.#options.resourceAllowed === undefined ? {} : { resourceAllowed: this.#options.resourceAllowed }) })),
             ...resources.capture(context, [...skills, ...textResources.filter(seed => !skillIds.has(seed.id))])];
-          const contextFiles = await snapshotSourceInstructions(context, { files: projectFiles,
+          const contextFiles = peer ? projectFiles : await snapshotSourceInstructions(context, { files: projectFiles,
             nativeKind, assertCurrent: () => this.#assertContext(context) });
           const mcpEnabled = this.#options.mcpRouter !== undefined && entry.catalog.capabilities.some(capability => capability.name === "tool.mcp" && capability.support === contract.CapabilitySupport.SUPPORTED);
           if (mcpEnabled) {
@@ -264,23 +311,29 @@ export class HostedAgentSources {
           }
           const memoryInstructions = mcpEnabled ? this.#options.resolveMemoryPrompt?.(context) : undefined;
           this.#assertContext(context);
-          return { platform: process.platform as "win32" | "linux" | "darwin", shell: "bash", isGitRepository, contextFiles,
+          return { platform: peer?.platform ?? process.platform as "win32" | "linux" | "darwin", shell: "bash", isGitRepository, contextFiles,
+            subagentsEnabled: this.#options.includeToolPolicy?.(context, COLLABORATION_TOOL_POLICY_ID) ?? true,
             ...(mcpEnabled ? { mcpEnabled: true as const } : {}), ...(memoryInstructions ? { memoryInstructions } : {}),
             additionalDirectoryIds: this.#options.readPolicy(context).approvedRoots.map(hostedDirectoryId),
             ...(context.appendSystemPrompt === undefined ? {} : { personalInstructions: context.appendSystemPrompt }) };
         },
         capture: async (runId, context) => {
           this.#assertContext(context); const captured = this.#capture(entry, runId), pool = captured.pool;
-          const codexExecutable = await this.#options.resolveCodexExecutable?.(); this.#assertContext(context); pool.assertCurrent();
+          const peer = context.target.remoteWorkspace ? await captureHostedAgentPeerWorkspace(context, this.#options.remoteExecution ?? missingPeerWorkspace(), () => this.#assertContext(context)) : undefined;
+          if (peer) peerWorkspaces.set(mcpKey(context), peer);
+          const codexExecutable = peer ? "codex" : await this.#options.resolveCodexExecutable?.(); this.#assertContext(context); pool.assertCurrent();
           return { client: pool.client, assertCurrent: pool.assertCurrent, close: captured.close,
             createController: input => createHostedAgentSourceController({ ...input, poller: pool.poller, temporaryRoot: this.#options.temporaryRoot,
+              ...(peer ? { remote: peer } : {}),
               ...(mcps.get(mcpKey(input.context)) ? { mcp: mcps.get(mcpKey(input.context))! } : {}),
               readPolicy: sourceContext => {
                 const policy = this.#options.readPolicy(sourceContext), authority = resources.authority(sourceContext, input.shadow), attachments = this.#attachments?.authority(sourceContext, input.shadow);
-                return { ...policy, revision: JSON.stringify([policy.revision, authority.revision, attachments?.revision]), approvedRoots: [...policy.approvedRoots, ...authority.approvedRoots,
-                  ...(attachments?.files.map((file, index) => ({ id: `input:${index}`, path: file.path, access: "read_only" as const })) ?? [])] };
-              }, aliases: sourceContext => [...resources.authority(sourceContext, input.shadow).aliases, ...(this.#attachments?.authority(sourceContext, input.shadow).aliases ?? [])],
-              ...(this.#attachments ? { inputFiles: (sourceContext: AdapterContext) => this.#attachments!.authority(sourceContext, input.shadow).files } : {}),
+                const roots = [...authority.approvedRoots, ...(attachments?.files.map((file, index) => ({ id: `input:${index}`, path: file.path, access: "read_only" as const })) ?? [])];
+                return { ...policy, revision: JSON.stringify([policy.revision, authority.revision, attachments?.revision]), approvedRoots: [...policy.approvedRoots,
+                  ...roots.map(root => peer ? { ...root, path: peer.mountPath(root.path, () => { resources.authority(sourceContext, input.shadow); this.#attachments?.authority(sourceContext, input.shadow); }) } : root)] };
+              }, aliases: sourceContext => { const aliases = [...resources.authority(sourceContext, input.shadow).aliases, ...(this.#attachments?.authority(sourceContext, input.shadow).aliases ?? [])];
+                return peer ? peer.projectAliases(aliases, () => { resources.authority(sourceContext, input.shadow); this.#attachments?.authority(sourceContext, input.shadow); }) : aliases; },
+              ...(this.#attachments ? { inputFiles: (sourceContext: AdapterContext) => { const files = this.#attachments!.authority(sourceContext, input.shadow).files; return peer ? peer.projectInputs(files) : files; } } : {}),
               assertContext: sourceContext => this.#assertContext(sourceContext), assertCurrent: pool.assertCurrent,
               ...(this.#options.reviewTool === undefined ? {} : { reviewTool: this.#options.reviewTool }),
               onGroupSwitch: offer => { this.#assertContext(context); pool.assertCurrent(); this.#groupSwitch?.offer(context.sessionId, entry.id, context.generation, offer); },
@@ -319,7 +372,7 @@ export class HostedAgentSources {
     const native = new Map(entry.catalog.capabilities.map(fromProtoCapability).map(capability => [capability.key, capability]));
     const capabilities = new Map<string, Capability>(CAPABILITIES.map(key => {
       const capability = native.get(key), supported = FORWARDED.has(key) && capability?.supported === true;
-      if (!supported) return [key, { key, supported: false, reason: "not_implemented" }];
+      if (!supported) return [key, { key, supported: false, reason: key === "session.fork" || key === "session.clone" ? "upstream_missing" : "not_implemented" }];
       return [key, key === "permission.modes" && !this.#options.reviewTool
         ? { ...capability!, options: (capability!.options ?? []).filter(mode => mode !== "auto") } : capability!];
     }));
@@ -371,7 +424,7 @@ export class HostedAgentSources {
           || target.revision !== targetRevision || !target.descriptor.trusted
           || current !== undefined && (current.deletedAt !== undefined || current.archived
             || (current.backendId !== context.target.backendId || current.binding.generation !== context.generation || current.targetId !== context.target.id) && !admitsHandoff())
-          || workspace !== undefined && (workspace.root !== context.target.workspaceRoot || workspace.remote)) throw new Error("The original Source task authority changed.");
+          || workspace !== undefined && (workspace.root !== context.target.workspaceRoot || workspace.remote !== (context.target.remoteWorkspace !== undefined))) throw new Error("The original Source task authority changed.");
         workspace?.assertCurrent();
       };
       this.#contextGuards.set(context, guard);
@@ -389,6 +442,7 @@ export class HostedAgentSources {
 function sourceId(source: HostedAgentDeviceSource): string {
   return "hosted-" + createHash("sha256").update(JSON.stringify([source.controllerDeviceId, source.targetDeviceId, source.backendId])).digest("hex").slice(0, 32);
 }
+function missingPeerWorkspace(): never { throw new Error("The Source Device execution capability is unavailable."); }
 function parseRecord(value: unknown): SourceRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The saved native source is invalid.");
   const record = value as SourceRecord;
@@ -404,6 +458,7 @@ function parseRecord(value: unknown): SourceRecord {
 function parseCatalog(json: JsonValue, backendId: string): contract.HostedAgentBackendCatalog {
   const catalog = fromJson(contract.HostedAgentBackendCatalogSchema, json);
   if (!validIdentity(backendId) || catalog.backendId !== backendId || !catalog.displayName || catalog.providers.length > 256
+    || !Number.isSafeInteger(Number(catalog.instanceGeneration)) || catalog.instanceGeneration < 1n
     || new Set(catalog.providers.map(provider => provider.providerId)).size !== catalog.providers.length) throw new Error("The native source catalog is invalid.");
   let count = 0;
   for (const provider of catalog.providers) {

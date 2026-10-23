@@ -27,6 +27,8 @@ export interface PartnerGroupTurnResult {
   readonly status: "completed" | "failed" | "cancelled" | "unknown";
   readonly text: string;
   readonly failure?: "workdir-unavailable";
+  /** Local-only terminal signals. The room receives a fixed public category. */
+  readonly error?: unknown;
 }
 export interface PartnerGroupRuntime {
   /** Retire interrupted inputs before they can resume through the ordinary Queue startup. */

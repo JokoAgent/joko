@@ -5,6 +5,7 @@ import type { HostedAgentFrame } from "./hosted-agent-exchange.js";
 import type { HostedAgentOpen } from "./hosted-agent-host.js";
 import type { HostedAgentTransport } from "./hosted-agent-poller.js";
 import type { HostedAgentCall } from "./hosted-agent-run.js";
+import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
 import { HOSTED_AGENT_WIRE_FORMAT, HostedAgentWireError, assertHostedAgentWireFormat, decodeHostedAgentValue, encodeHostedAgentValue } from "./hosted-agent-wire.js";
 
 /** The saved node/grant owner supplies the authenticated generated client.
@@ -29,6 +30,15 @@ export class HostedAgentConnectClient implements HostedAgentTransport {
     this.#check(signal);
     const result = await this.#client.callHostedAgent(create(contract.CallHostedAgentRequestSchema, { format: HOSTED_AGENT_WIRE_FORMAT, runId, callId, commandJson: encodeHostedAgentValue(command) }), { signal });
     this.#check(signal); assertHostedAgentWireFormat(result.format); return decodeHostedAgentValue(result.resultJson);
+  }
+  async infer(request: HostedNativeInferenceRequest, signal: AbortSignal): Promise<string> {
+    this.#check(signal);
+    const result = await this.#client.callHostedAgent(create(contract.CallHostedAgentRequestSchema, { format: HOSTED_AGENT_WIRE_FORMAT,
+      runId: request.requestId, callId: request.requestId, commandJson: encodeHostedAgentValue({ kind: "infer", request }) }), { signal });
+    this.#check(signal); assertHostedAgentWireFormat(result.format);
+    const text = decodeHostedAgentValue(result.resultJson);
+    if (typeof text !== "string" || text.length > 4_000_000) throw new HostedAgentWireError();
+    return text;
   }
   async poll(cursors: Parameters<HostedAgentTransport["poll"]>[0], signal: AbortSignal): ReturnType<HostedAgentTransport["poll"]> {
     this.#check(signal);

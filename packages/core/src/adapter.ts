@@ -498,6 +498,16 @@ export interface NativeTextInferenceInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly maxTokens?: number;
+  /** Immutable message attachments; no filesystem reference or tool authority. */
+  readonly images?: readonly { readonly data: Uint8Array; readonly mimeType: string }[];
+}
+
+export function nativeTextInferenceImages(input: NativeTextInferenceInput): NonNullable<NativeTextInferenceInput["images"]> {
+  const images = input.images ?? [];
+  if (images.length > 40 || images.reduce((sum, image) => sum + image.data.byteLength, 0) > 20 * 1024 * 1024
+    || images.some(image => !(image.data instanceof Uint8Array) || image.data.byteLength < 1 || image.data.byteLength > 5 * 1024 * 1024
+      || !/^image\/(?:png|jpeg|gif|webp)$/u.test(image.mimeType))) throw new Error("Image attachments exceed the isolated inference capability.");
+  return images;
 }
 
 export interface BackgroundTaskOutputResult {

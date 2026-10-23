@@ -730,12 +730,26 @@ export function requestPluginTextInference(input: Omit<ManagedTextInferenceInput
     anthropicOutputLimit: input.modelOutputLimit });
 }
 
+/** A tool-free group turn carries only the room's authorized input bytes. */
+export function requestConversationInference(input: Omit<ManagedTextInferenceInput, "maxTokens"> & {
+  readonly maxTokens: number; readonly modelOutputLimit: number;
+  readonly images: readonly { readonly mimeType: string; readonly data: Uint8Array }[];
+}): Promise<string> {
+  if (!input.user.trim() || input.user.length > 300_000 || input.system.length > 80_000 || !Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1
+    || !Number.isSafeInteger(input.modelOutputLimit) || input.modelOutputLimit < 1 || input.images.length > 40
+    || input.images.reduce((sum, image) => sum + image.data.byteLength, 0) > 20 * 1024 * 1024
+    || input.images.some(image => !/^image\/(?:png|jpeg|gif|webp)$/u.test(image.mimeType) || image.data.byteLength < 1 || image.data.byteLength > 5 * 1024 * 1024)) throw new RangeError("Conversation inference input exceeds its capability.");
+  return requestInference({ ...input, fetch: input.fetch ?? globalThis.fetch, anthropicOutputLimit: input.modelOutputLimit,
+    images: input.images.map(image => ({ mimeType: image.mimeType, base64: Buffer.from(image.data).toString("base64") })) });
+}
+
 async function requestInference(input: {
   readonly fetch: typeof globalThis.fetch;
   readonly route: ProviderInferenceRoute;
   readonly system: string;
   readonly user: string;
   readonly image?: { readonly mimeType: string; readonly base64: string };
+  readonly images?: readonly { readonly mimeType: string; readonly base64: string }[];
   readonly maxTokens?: number;
   readonly anthropicOutputLimit?: number;
   readonly signal?: AbortSignal;
@@ -814,13 +828,14 @@ function reasoningRetryBudget(value: unknown, api: ProviderInferenceRoute["api"]
 }
 
 function inferenceBody(input: Parameters<typeof requestInference>[0]): unknown {
-  const imageDataUrl = input.image === undefined ? undefined : `data:${input.image.mimeType};base64,${input.image.base64}`;
+  const images = input.images ?? (input.image ? [input.image] : []);
+  const imageDataUrls = images.map(image => `data:${image.mimeType};base64,${image.base64}`);
   if (input.route.api === "anthropic-messages") {
     const content: unknown[] = [];
-    if (input.image !== undefined) {
+    for (const image of images) {
       content.push({
         type: "image",
-        source: { type: "base64", media_type: input.image.mimeType, data: input.image.base64 }
+        source: { type: "base64", media_type: image.mimeType, data: image.base64 }
       });
     }
     content.push({ type: "text", text: input.user });
@@ -833,7 +848,7 @@ function inferenceBody(input: Parameters<typeof requestInference>[0]): unknown {
   }
   if (input.route.api === "openai-responses") {
     const content: unknown[] = [];
-    if (imageDataUrl !== undefined) content.push({ type: "input_image", image_url: imageDataUrl });
+    for (const imageDataUrl of imageDataUrls) content.push({ type: "input_image", image_url: imageDataUrl });
     content.push({ type: "input_text", text: input.user });
     return {
       model: input.route.modelId,
@@ -842,9 +857,9 @@ function inferenceBody(input: Parameters<typeof requestInference>[0]): unknown {
       max_output_tokens: input.maxTokens
     };
   }
-  const content: unknown = imageDataUrl === undefined
+  const content: unknown = imageDataUrls.length === 0
     ? input.user
-    : [{ type: "text", text: input.user }, { type: "image_url", image_url: { url: imageDataUrl } }];
+    : [{ type: "text", text: input.user }, ...imageDataUrls.map(url => ({ type: "image_url", image_url: { url } }))];
   return {
     model: input.route.modelId,
     messages: [{ role: "system", content: input.system }, { role: "user", content }],

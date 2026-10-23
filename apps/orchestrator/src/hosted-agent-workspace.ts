@@ -23,6 +23,8 @@ export interface ExecutorPathAlias {
 }
 
 export interface ExecutorWorkspaceRoots {
+  /** Remote projection is lexical; canonical authority is checked by its file port. */
+  readonly remote?: { readonly pathStyle: "posix" | "win32"; readonly home: string; readonly temporary: string };
   /** 任务工作目录(本机绝对路径)。 */
   workingDir: string;
   /** 额外允许的目录(任务的附加目录)。 */
@@ -63,11 +65,6 @@ export function realPathOrAncestor(target: string): string {
 /** Windows 的 native realpath 可能返回长路径，而 Node 的普通实现保留短路径写法；两者都要覆盖。 */
 function realPathOrAncestorPortable(target: string): string {
   return realPathOrAncestorWith(target, fs.realpathSync);
-}
-
-function isInside(child: string, parent: string): boolean {
-  const relative = path.relative(parent, child);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 /** 影子目录前缀匹配：只认完整路径段(`/a/b` 不匹配 `/a/bc`)，不区分分隔符写法。 */
@@ -508,6 +505,10 @@ export class PathSpellings {
 }
 
 export class ExecutorWorkspace {
+  private readonly paths: typeof path;
+  private readonly remote: ExecutorWorkspaceRoots["remote"];
+  private canonical(value: string): string { return this.remote ? this.paths.resolve(value) : realPathOrAncestor(value); }
+  private exists(value: string): boolean { return this.remote ? false : fs.existsSync(value); }
   readonly workingDir: string;
   private roots: string[];
   private extraDirs: string[];
@@ -515,8 +516,10 @@ export class ExecutorWorkspace {
   private virtualRoot?: string;
 
   constructor(roots: ExecutorWorkspaceRoots) {
-    if (!path.isAbsolute(roots.workingDir)) throw new ExecutorPathError('working directory must be absolute');
-    this.workingDir = path.resolve(roots.workingDir);
+    this.remote = roots.remote;
+    this.paths = roots.remote?.pathStyle === "posix" ? path.posix : roots.remote?.pathStyle === "win32" ? path.win32 : path;
+    if (!this.paths.isAbsolute(roots.workingDir)) throw new ExecutorPathError('working directory must be absolute');
+    this.workingDir = this.paths.resolve(roots.workingDir);
     this.extraDirs = [];
     this.roots = [];
     this.aliases = [];
@@ -528,17 +531,17 @@ export class ExecutorWorkspace {
   setAliases(aliases: readonly ExecutorPathAlias[]): void {
     const expanded: ExecutorPathAlias[] = [];
     for (const alias of aliases) {
-      if (!alias.from || !path.isAbsolute(alias.to)) continue;
+      if (!alias.from || !this.paths.isAbsolute(alias.to)) continue;
       expanded.push(alias);
-      const canonicalPaths = [realPathOrAncestor(alias.to), realPathOrAncestorPortable(alias.to)];
+      const canonicalPaths = this.remote ? [this.paths.resolve(alias.to)] : [realPathOrAncestor(alias.to), realPathOrAncestorPortable(alias.to)];
       for (const canonical of canonicalPaths) {
-        if (path.resolve(canonical) !== path.resolve(alias.to)) expanded.push({ ...alias, to: canonical });
+        if (this.paths.resolve(canonical) !== this.paths.resolve(alias.to)) expanded.push({ ...alias, to: canonical });
       }
     }
     const seen = new Set<string>();
     this.aliases = expanded
       .filter((alias) => {
-        const key = alias.from + '\\0' + path.resolve(alias.to);
+        const key = alias.from + '\\0' + this.paths.resolve(alias.to);
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -558,6 +561,7 @@ export class ExecutorWorkspace {
   }
 
   private unaliasedSearchDirs(): string[] {
+    if (this.remote) return [];
     const dirs: string[] = [];
     for (const entry of (process.env.PATH ?? '').split(path.delimiter)) {
       if (!entry || !path.isAbsolute(entry) || this.toAgentPath(entry) !== entry) continue;
@@ -576,7 +580,7 @@ export class ExecutorWorkspace {
     const native = /^[A-Za-z]:|^\\\\/.test(this.virtualRoot) ? path.win32 : path.posix;
     return dirs.map((dir) => {
       const real = this.resolve(dir);
-      const exact = this.aliases.find((alias) => path.resolve(alias.to) === real);
+      const exact = this.aliases.find((alias) => this.paths.resolve(alias.to) === real);
       if (exact) return exact.from;
       const virtual = native.join(this.virtualRoot!, 'additional', 'runtime-' + this.aliases.length);
       this.setAliases([...this.aliases, { from: virtual, to: real }]);
@@ -586,8 +590,8 @@ export class ExecutorWorkspace {
 
   /** 任务运行中附加目录变化时更新。 */
   setExtraDirs(extraDirs: readonly string[]): void {
-    this.extraDirs = extraDirs.filter((dir) => path.isAbsolute(dir)).map((dir) => path.resolve(dir));
-    this.roots = [this.workingDir, ...this.extraDirs].map((dir) => realPathOrAncestor(dir));
+    this.extraDirs = extraDirs.filter((dir) => this.paths.isAbsolute(dir)).map((dir) => this.paths.resolve(dir));
+    this.roots = [this.workingDir, ...this.extraDirs].map((dir) => this.canonical(dir));
   }
 
   /** 工作目录与附加目录(本机路径，未解析符号链接)。 */
@@ -604,7 +608,7 @@ export class ExecutorWorkspace {
   localPathFromAgent(input: string): string | null {
     for (const alias of this.aliases) {
       const rest = stripAliasPrefix(input, alias.from);
-      if (rest !== null && (alias.kind !== 'file' || !rest)) return rest ? path.join(alias.to, ...rest.split('/')) : alias.to;
+      if (rest !== null && (alias.kind !== 'file' || !rest)) return rest ? this.paths.join(alias.to, ...rest.split('/')) : alias.to;
     }
     return null;
   }
@@ -651,13 +655,13 @@ export class ExecutorWorkspace {
   mapOutputLinesForAgent(lines: readonly string[]): string[] {
     if (!this.virtualRoot) return [...lines];
     const aliases = this.agentAliases();
-    return lines.map(line => projectPathText(line, aliases, 'text', mapped => fs.existsSync(this.mapAlias(mapped)),
+    return lines.map(line => projectPathText(line, aliases, 'text', mapped => this.exists(this.mapAlias(mapped)),
       { continuesName: this.continuesName }));
   }
 
   private projectForAgent(text: string, context: PathTextContext, options: ProjectPathTextOptions = {}): string {
     if (!this.virtualRoot) return text;
-    return projectPathText(text, this.agentAliases(), context, (mapped) => fs.existsSync(this.mapAlias(mapped)),
+    return projectPathText(text, this.agentAliases(), context, (mapped) => this.exists(this.mapAlias(mapped)),
       { ...options, continuesName: this.continuesName });
   }
 
@@ -668,20 +672,20 @@ export class ExecutorWorkspace {
       // A junction/symlink can be resolved differently by the Windows runner and by
       // the process that created the alias. Include the current canonical target at
       // projection time so both spellings still map to the same virtual directory.
-      const targets = [alias.to, realPathOrAncestor(alias.to)];
+      const targets = [alias.to, this.canonical(alias.to)];
       return targets.flatMap((target) => {
         const real = target.replace(/\\/g, '/');
         const entries: ExecutorPathAlias[] = [{ from: real, to: alias.from }];
         // Git Bash / MSYS 的 pwd 和诊断使用 /c/...，而 Node 返回 C:\...。
         if (/^[A-Za-z]:\//.test(real)) entries.push({ from: '/' + real.charAt(0).toLowerCase() + real.slice(2), to: alias.from });
-        if (process.platform === 'win32') {
-          const temporary = os.tmpdir().replace(/\\/g, '/').replace(/\/+$/, '');
+        if ((this.remote?.pathStyle ?? (process.platform === "win32" ? "win32" : "posix")) === "win32") {
+          const temporary = (this.remote?.temporary ?? os.tmpdir()).replace(/\\/g, '/').replace(/\/+$/, '');
           const relative = stripAliasPrefix(real, temporary);
           if (relative !== null) entries.push({ from: '/tmp' + (relative ? '/' + relative : ''), to: alias.from });
         }
         return entries.filter((entry) => {
           const normalizedFrom = entry.from.replace(/\\/g, '/');
-          const keyFrom = process.platform === 'win32' ? normalizedFrom.toLowerCase() : normalizedFrom;
+          const keyFrom = (this.remote?.pathStyle ?? (process.platform === "win32" ? "win32" : "posix")) === "win32" ? normalizedFrom.toLowerCase() : normalizedFrom;
           const key = keyFrom + '\\0' + entry.to;
           if (seen.has(key)) return false;
           seen.add(key);
@@ -710,7 +714,7 @@ export class ExecutorWorkspace {
       if (/[\\/\r\n]/.test(rest.charAt(length - 1))) break;
       if (!segmentEnd(rest, length)) continue;
       checked += 1;
-      if (fs.existsSync(parent.replace(/\/+$/, '') + '/' + name + rest.slice(0, length))) return true;
+      if (this.exists(parent.replace(/\/+$/, '') + '/' + name + rest.slice(0, length))) return true;
     }
     return false;
   };
@@ -728,12 +732,12 @@ export class ExecutorWorkspace {
     const cut = virtual.lastIndexOf('/');
     if (cut <= 0) return false;
     // basename 属于虚拟目录名，父目录则在本机侧检查，确保与 mapAlias 落在同一处。
-    return this.continuesName({ ...alias, from: path.join(this.mapAlias(virtual.slice(0, cut)), virtual.slice(cut + 1)) }, rest);
+    return this.continuesName({ ...alias, from: this.paths.join(this.mapAlias(virtual.slice(0, cut)), virtual.slice(cut + 1)) }, rest);
   };
 
   mapTextFromAgent(text: string, context: PathTextContext = 'text'): string {
     if (!this.virtualRoot) return text;
-    return projectPathText(text, this.agentPathsToLocal(), context, (mapped) => fs.existsSync(mapped), {
+    return projectPathText(text, this.agentPathsToLocal(), context, (mapped) => this.exists(mapped), {
       separators: 'source', continuesName: this.localContinuesName, escapedSeparators: true,
     });
   }
@@ -816,7 +820,7 @@ export class ExecutorWorkspace {
   }
 
   private contentFromAgent(text: string, spellings?: PathSpellings, options: ProjectPathTextOptions = {}, pass?: 'A' | 'B' | 'unique'): string {
-    return projectPathText(text, this.agentPathsToLocal(), 'text', (mapped) => fs.existsSync(mapped), {
+    return projectPathText(text, this.agentPathsToLocal(), 'text', (mapped) => this.exists(mapped), {
       ...options, separators: 'source', wholeSeparators: 'source', spellings: spellings?.restorer(pass), continuesName: this.localContinuesName,
       escapedSeparators: true,
     });
@@ -981,15 +985,15 @@ export class ExecutorWorkspace {
     }
     const trimmed = input.startsWith('@') ? input.slice(1) : input;
     const expanded = trimmed === '~' || trimmed.startsWith('~/')
-      ? path.join(os.homedir(), trimmed.slice(1))
+      ? this.paths.join(this.remote?.home ?? os.homedir(), trimmed.slice(1))
       : trimmed;
-    return path.resolve(this.mapAlias(baseDir), this.mapAlias(expanded));
+    return this.paths.resolve(this.mapAlias(baseDir), this.mapAlias(expanded));
   }
 
   /** 真实路径是否落在工作目录或附加目录内(防符号链接与 `..` 借道)。 */
   contains(absolutePath: string): boolean {
-    const real = realPathOrAncestor(absolutePath);
-    return this.roots.some((root) => isInside(real, root));
+    const real = this.canonical(absolutePath);
+    return this.roots.some(root => { const value = this.paths.relative(root, real); return value === "" || value !== ".." && !value.startsWith(`..${this.paths.sep}`) && !this.paths.isAbsolute(value); });
   }
 
   /**
@@ -997,6 +1001,6 @@ export class ExecutorWorkspace {
    * 执行器同样要求本机确认过才放行。
    */
   isSensitive(absolutePath: string): boolean {
-    return isSensitiveCredentialPath(absolutePath) || isSensitiveCredentialPath(realPathOrAncestor(absolutePath));
+    return isSensitiveCredentialPath(absolutePath) || isSensitiveCredentialPath(this.canonical(absolutePath));
   }
 }

@@ -10,6 +10,17 @@ const context = {
   explicitAllowTools: new Set<string>()
 };
 
+it("uses the task filesystem path style across a different controller platform", () => {
+  const peer = { ...context, mode: "acceptEdits" as const, pathStyle: "posix" as const, workspaceRoot: "/peer/project", extraReadOnlyRoots: ["/peer/docs"] };
+  expect(decideToolCall({ name: "read", args: { path: "/peer/project/src/file.ts" } }, peer).action).toBe("allow");
+  expect(decideToolCall({ name: "read", args: { path: "/PEER/project/private" } }, peer).action).toBe("ask");
+  expect(decideToolCall({ name: "read", args: { path: "/peer/project-other/private" } }, peer).action).toBe("ask");
+  expect(isWithin("C:\\PEER\\project\\file", "c:\\peer\\project", "win32")).toBe(true);
+  const policySnapshot: PolicySnapshot = { generation: "1", backendId: "source", targetId: "peer-target", workspaceRoot: peer.workspaceRoot,
+    rules: [{ id: "private", subjectKind: "file_read", workspaceRelativePathPrefix: "private", effect: "deny", ceiling: "critical", priority: 1, order: 0 }] };
+  expect(decideToolCall({ name: "read", args: { path: "/peer/project/private/file" } }, { ...peer, policySnapshot }).action).toBe("deny");
+});
+
 describe("permission policy", () => {
   it("accepts bounded file edits while continuing to ask for commands and external tools", () => {
     const edits = { ...context, mode: "acceptEdits" as const };
@@ -112,7 +123,9 @@ describe("permission policy", () => {
 
 describe("path containment", () => {
   it("rejects parent traversal", () => {
-    expect(isWithin("..\\secret", "C:\\work\\project")).toBe(false);
-    expect(isWithin("src\\index.ts", "C:\\work\\project")).toBe(true);
+    expect(isWithin("..\\secret", "C:\\work\\project", "win32")).toBe(false);
+    expect(isWithin("src\\index.ts", "C:\\work\\project", "win32")).toBe(true);
+    expect(isWithin("../secret", "/work/project", "posix")).toBe(false);
+    expect(isWithin("src/index.ts", "/work/project", "posix")).toBe(true);
   });
 });

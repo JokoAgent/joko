@@ -1,4 +1,6 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema } from "@joko/contracts";
+import { RemoteHostSchema } from "@joko/contracts";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
 import { SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
 import type { MobileCollaborationRpc } from "./mobile-collaboration";
@@ -6082,6 +6084,153 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.getOperation).toHaveBeenCalledWith(credential, "operation-1", expect.any(AbortSignal));
   });
 
+  it.each([false, true])("keeps an optimistic local conversation editable before creation resolves and recovers a create failure=%s", async fails => {
+    const network = fakeNetwork(), drafts = memoryDraftStores(), identity = { profileId: credential.profileId };
+    let request = 0, release!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "createSession") {
+        await waiting;
+        return create(OperationSchema, { operationId, connectionId: credential.connectionId,
+          state: fails ? OperationState.FAILED : OperationState.SUCCEEDED,
+          ...(fails ? { error: { code: "CREATE_REJECTED", message: "Review the project." } }
+            : { result: { payload: { case: "session", value: snapshot.sessions[0]! } } }) });
+      }
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "queueItem", value: create(QueueItemSchema, { queueItemId: operationId, sessionId: "session", backendId: "backend", targetId: "target" }) } } });
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => `optimistic-${++request}`, undefined, drafts);
+    await app.start();
+    const creating = app.create("target", "Work", plainTextMobileComposerDraft("First"), undefined, undefined, {
+      optimisticConversation: true, signal: new AbortController().signal, waitForLeaveDecision: async () => false, onUploadingChange: () => undefined });
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledOnce());
+    expect(drafts.newTask.readSync(identity)).toMatchObject({ submission: { phase: "creating", input: { text: "First" } }, conversation: { followUps: [], input: { text: "" } } });
+    drafts.newTask.saveConversationInput(identity, "optimistic-1", plainTextMobileComposerDraft("Second"));
+    await drafts.newTask.queueFollowUp(identity, "optimistic-1", "follow-up-second", plainTextMobileComposerDraft("Second"));
+    drafts.newTask.saveConversationInput(identity, "optimistic-1", plainTextMobileComposerDraft("Third"));
+    await drafts.newTask.queueFollowUp(identity, "optimistic-1", "follow-up-third", plainTextMobileComposerDraft("Third"));
+    drafts.newTask.saveConversationInput(identity, "optimistic-1", plainTextMobileComposerDraft("Still editing"));
+    await drafts.newTask.flush(identity);
+    release();
+    await expect(creating).resolves.toMatchObject({ created: !fails, sent: !fails, definitive: true });
+    if (fails) {
+      expect(network.submit).toHaveBeenCalledOnce();
+      expect(drafts.newTask.readSync(identity)).toEqual({ targetId: "target", name: "Work",
+        input: plainTextMobileComposerDraft("First\n\nSecond\n\nThird\n\nStill editing") });
+    } else {
+      expect(vi.mocked(network.submit).mock.calls.map(call => [call[1], call[2].payload.case === "sendInput" ? call[2].payload.value.input?.parts[0]?.content : undefined]))
+        .toEqual([["optimistic-1", undefined], ["optimistic-2", { case: "text", value: "First" }],
+          ["follow-up-second", { case: "text", value: "Second" }], ["follow-up-third", { case: "text", value: "Third" }]]);
+      expect(drafts.newTask.readSync(identity)).toBeNull();
+      expect(drafts.composer.readSync({ ...identity, sessionId: "session" })).toEqual(plainTextMobileComposerDraft("Still editing"));
+    }
+  });
+
+  it.each(["first", "follow-up"])("recovers the original optimistic %s rejection with every unsent follow-up and editor intact", async failsAt => {
+    const network = fakeNetwork(), drafts = memoryDraftStores(), identity = { profileId: credential.profileId };
+    let request = 0;
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "createSession") {
+        drafts.newTask.saveConversationInput(identity, operationId, plainTextMobileComposerDraft("Second"));
+        await drafts.newTask.queueFollowUp(identity, operationId, "follow-up-second", plainTextMobileComposerDraft("Second"));
+        drafts.newTask.saveConversationInput(identity, operationId, plainTextMobileComposerDraft("Editor"));
+        return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+          result: { payload: { case: "session", value: snapshot.sessions[0]! } } });
+      }
+      if (failsAt === "first" || operationId === "follow-up-second") return create(OperationSchema, {
+        operationId, connectionId: credential.connectionId, state: OperationState.FAILED,
+        error: { code: "INPUT_REJECTED", message: "Input declined." } });
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "queueItem", value: create(QueueItemSchema, { queueItemId: operationId, sessionId: "session", backendId: "backend", targetId: "target" }) } } });
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => `optimistic-${++request}`, undefined, drafts);
+    await app.start();
+    await expect(app.create("target", "Work", plainTextMobileComposerDraft("First"), undefined, undefined, {
+      optimisticConversation: true, signal: new AbortController().signal, waitForLeaveDecision: async () => false, onUploadingChange: () => undefined }))
+      .resolves.toMatchObject({ created: true, sent: false, definitive: true });
+    expect(drafts.newTask.readSync(identity)).toBeNull();
+    expect(drafts.composer.readSync({ ...identity, sessionId: "session" })).toEqual(
+      plainTextMobileComposerDraft(failsAt === "first" ? "First\n\nSecond\n\nEditor" : "Second\n\nEditor"));
+    expect(network.submit).toHaveBeenCalledTimes(failsAt === "first" ? 2 : 3);
+  });
+
+  it("uploads an optimistic attachment follow-up with its original operation only after the first message receipt", async () => {
+    const network = projectedNetwork(attachmentSnapshot), drafts = memoryDraftStores(), identity = { profileId: credential.profileId };
+    const input = localAttachmentDraft("Follow-up files");
+    const committedBeforeRemoval: boolean[] = [];
+    const fixture = attachmentFileFixture(id => {
+      const attachment = drafts.newTask.readSync(identity)?.conversation?.followUps[0]?.input.attachments.find(item => item.attachmentId === id);
+      committedBeforeRemoval.push(attachment?.state === "uploaded");
+    });
+    vi.mocked(network.uploadBlob).mockImplementation(async (_credential, source) => committedAttachment(
+      input.attachments.find(item => item.fileName === source.fileName) as MobileLocalComposerAttachment));
+    let request = 0;
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "createSession") {
+        drafts.newTask.saveConversationInput(identity, operationId, input);
+        await drafts.newTask.queueFollowUp(identity, operationId, "follow-up-files", input);
+        return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+          result: { payload: { case: "session", value: attachmentSnapshot.sessions[0]! } } });
+      }
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "queueItem", value: create(QueueItemSchema, { queueItemId: operationId, sessionId: "session", backendId: "backend", targetId: "target" }) } } });
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => `optimistic-${++request}`, undefined, drafts, fixture.files);
+    await app.start();
+    await expect(app.create("target", "Work", plainTextMobileComposerDraft("First"), undefined, undefined, {
+      optimisticConversation: true, signal: new AbortController().signal, waitForLeaveDecision: async () => false, onUploadingChange: () => undefined }))
+      .resolves.toMatchObject({ created: true, sent: true, definitive: true });
+    expect(committedBeforeRemoval).toEqual([true, true]);
+    expect(network.submit).toHaveBeenCalledTimes(3);
+    const followUp = vi.mocked(network.submit).mock.calls[2]!;
+    expect(followUp[1]).toBe("follow-up-files");
+    expect(followUp[2]).toMatchObject({ preconditions: [{ expectedGeneration: 8n }],
+      payload: { case: "sendInput", value: { input: { parts: [
+        { content: { case: "text", value: "Follow-up files" } }, { content: { case: "image" } }, { content: { case: "file" } }
+      ] } } } });
+    expect(vi.mocked(network.uploadBlob).mock.invocationCallOrder[0]).toBeGreaterThan(vi.mocked(network.submit).mock.invocationCallOrder[1]!);
+    expect(drafts.newTask.readSync(identity)).toBeNull();
+  });
+
+  it("observes the same optimistic follow-up after restart without resending accepted messages", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential), drafts = memoryDraftStores(), identity = { profileId: credential.profileId };
+    let request = 0;
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (mutation.payload.case === "createSession") {
+        drafts.newTask.saveConversationInput(identity, operationId, plainTextMobileComposerDraft("Follow-up"));
+        await drafts.newTask.queueFollowUp(identity, operationId, "follow-up-unknown", plainTextMobileComposerDraft("Follow-up"));
+        drafts.newTask.saveConversationInput(identity, operationId, plainTextMobileComposerDraft("Unsent editor"));
+        return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+          result: { payload: { case: "session", value: snapshot.sessions[0]! } } });
+      }
+      if (operationId === "follow-up-unknown") throw new Error("Follow-up response lost");
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "queueItem", value: create(QueueItemSchema, { queueItemId: operationId, sessionId: "session", backendId: "backend", targetId: "target" }) } } });
+    });
+    const app = client(network, saved.storage, undefined, undefined, () => `optimistic-${++request}`, undefined, drafts);
+    await app.start();
+    await expect(app.create("target", "Work", plainTextMobileComposerDraft("First"), undefined, undefined, {
+      optimisticConversation: true, signal: new AbortController().signal, waitForLeaveDecision: async () => false, onUploadingChange: () => undefined }))
+      .resolves.toMatchObject({ created: true, sent: false, definitive: false });
+    expect(drafts.newTask.readSync(identity)).toMatchObject({ submission: { firstInputAccepted: true }, conversation: { followUps: [{ operationId: "follow-up-unknown", state: "dispatching" }] } });
+    expect(drafts.composer.readSync({ ...identity, sessionId: "session" })).toBeNull();
+    await drafts.newTask.flush(identity); app.dispose();
+    const recoveredNetwork = fakeNetwork();
+    vi.mocked(recoveredNetwork.getOperation).mockImplementation(async (_credential, operationId) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "queueItem", value: create(QueueItemSchema, { queueItemId: operationId, sessionId: "session", backendId: "backend", targetId: "target" }) } } }));
+    const driver: MobilePlainStorageDriver = { getItem: async key => drafts.values.get(key) ?? null,
+      setItem: async (key, value) => { drafts.values.set(key, value); }, removeItem: async key => { drafts.values.delete(key); } };
+    const restored = { values: drafts.values, newTask: new MobileNewTaskDraftStore(driver), composer: new MobileComposerDraftStore(driver) };
+    const recovered = client(recoveredNetwork, saved.storage, undefined, undefined, () => `unused-${++request}`, undefined, restored);
+    await recovered.start();
+    expect(recoveredNetwork.submit).not.toHaveBeenCalled();
+    expect(recoveredNetwork.getOperation).toHaveBeenCalledWith(credential, "follow-up-unknown", expect.any(AbortSignal));
+    expect(restored.newTask.readSync(identity)).toBeNull();
+    expect(restored.composer.readSync({ ...identity, sessionId: "session" })).toEqual(plainTextMobileComposerDraft("Unsent editor"));
+    expect(saved.pending()).toEqual([]);
+  });
+
   it("retains a first message, creates with the exact Target revision, and sends with the creation result generation", async () => {
     const network = fakeNetwork();
     const drafts = memoryDraftStores();
@@ -9539,6 +9688,112 @@ describe("native current-task Interaction ownership", () => {
 });
 
 describe("native current-task runtime controls", () => {
+  it("changes an exact remote model source using runtime-control generation rather than the native Session generation", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential);
+    const sourceBackend = create(BackendDescriptorSchema, { ...runtimeBackend, backendId: "opaque-source" });
+    const sourceModel = create(ModelDescriptorSchema, { ...runtimeModels[1]!, backendId: "opaque-source", source: create(ModelSourceDescriptorSchema, {
+      kind: ModelSourceKind.DEVICE, displayName: "Account", nodeName: "Studio", nativeAdapterKind: "native" }) });
+    const owner = create(SnapshotSchema, { ...runtimeControlProjection(), backends: [runtimeBackend, sourceBackend],
+      models: [...runtimeModels, sourceModel], providers: [...runtimeProviders, { ...runtimeProviders[1]!, backendId: "opaque-source" }] });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.getSessionRuntimeControl = vi.fn(async () => create(TaskShareRuntimeControlSchema, { generation: 23n }));
+    const app = client(network, saved.storage); await app.start();
+    const controls = app.taskRuntimeControls()!;
+    await expect(app.setTaskModel(controls.authorityKey, { backendId: "opaque-source", providerId: "beta", modelId: "b", effortId: "high", fastMode: true })).resolves.toBe(true);
+    expect(saved.storage.savePending).toHaveBeenCalledBefore(network.submit as ReturnType<typeof vi.fn>);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({ payload: { case: "setSessionRuntime", value: {
+      sessionId: "session", expectedRuntimeGeneration: 23n, backendId: "opaque-source", providerId: "beta", modelId: "b", effort: "high", fastMode: true } } });
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2].preconditions[0]?.expectedGeneration).toBe(8n);
+    network.getSessionRuntimeControl = vi.fn(async () => create(TaskShareRuntimeControlSchema, { generation: 24n, handoffState: "unknown" }));
+    await expect(app.setTaskModel(app.taskRuntimeControls()!.authorityKey, { backendId: "opaque-source", providerId: "beta", modelId: "b", effortId: "medium", fastMode: false })).rejects.toThrow("Recover");
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it.each(["sshHost", "devicePeer"] as const)("keeps the original %s project and resolves exact remote authority when changing a new-task engine", async kind => {
+    const network = fakeNetwork(), drafts = memoryDraftStores(), base = runtimeControlProjection();
+    const location = create(WorkspaceLocationSchema, { kind: kind === "sshHost"
+      ? { case: "sshHost", value: { hostTargetId: "target", hostId: "ssh-host", workspaceRootDisplay: "/remote/project" } }
+      : { case: "devicePeer", value: { controllerDeviceId: credential.deviceId, targetDeviceId: "task-computer", workspaceRootDisplay: "D:\\project" } } });
+    const source = create(ModelSourceDescriptorSchema, { kind: ModelSourceKind.LOCAL, displayName: "Account", nativeAdapterKind: "native" });
+    let owner = create(SnapshotSchema, { ...base, backends: [...base.backends, create(BackendDescriptorSchema, { ...base.backends[0]!, backendId: "second" })],
+      targets: [create(TargetSchema, { ...base.targets[0]!, workspaceId: "original-workspace", location })],
+      workspaces: [create(WorkspaceDescriptorSchema, { workspaceId: "original-workspace", targetId: "target", kind: WorkspaceKind.USER_PROJECT, serverPathDisplay: "/service/fallback", location })],
+      providers: [...base.providers, ...base.providers.map(provider => create(ProviderDescriptorSchema, { ...provider, backendId: "second" }))],
+      models: [...runtimeModels.map(model => create(ModelDescriptorSchema, { ...model, source })),
+        ...runtimeModels.map(model => create(ModelDescriptorSchema, { ...model, backendId: "second", source }))] });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.listModelSourceRemoteHosts = vi.fn(async () => [create(RemoteHostSchema, { targetId: "target", hostId: "ssh-host", revision: { value: 13n } })]);
+    network.listModelSourceDevicePeers = vi.fn(async () => [create(DevicePeerDescriptorSchema, { route: { targetDeviceId: "task-computer", relationId: "exact-relation", targetDeviceRevision: { value: 2n }, relationRevision: { value: 3n }, routeGeneration: 5n } })]);
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(mutation.payload.case).toBe(kind === "sshHost" ? "createRemoteTarget" : "createDevicePeerTarget");
+      const created = create(TargetSchema, { ...owner.targets[0]!, targetId: "created-project", backendId: "second", workspaceId: "created-workspace" });
+      owner = create(SnapshotSchema, { ...owner, targets: [...owner.targets, created],
+        workspaces: [...owner.workspaces, create(WorkspaceDescriptorSchema, { ...owner.workspaces[0]!, workspaceId: "created-workspace", targetId: "created-project" })] });
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED, result: { payload: { case: "target", value: created } } });
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => "model-project", undefined, drafts); await app.start();
+    const choice = { backendId: "second", providerId: "beta", modelId: "b", effortId: "high", fastMode: true };
+    expect(await app.selectNewTaskModel("target", choice)).toBe("created-project");
+    expect(network.submit).toHaveBeenCalledOnce();
+    const mutation = vi.mocked(network.submit).mock.calls[0]![2];
+    expect(mutation.payload).toMatchObject(kind === "sshHost"
+      ? { case: "createRemoteTarget", value: { backendId: "second", hostTargetId: "target", hostId: "ssh-host", expectedHostRevision: { value: 13n }, workspacePath: "/remote/project", createIfMissing: false } }
+      : { case: "createDevicePeerTarget", value: { backendId: "second", peer: { targetDeviceId: "task-computer", relationId: "exact-relation", routeGeneration: 5n }, workspacePath: "D:\\project", createIfMissing: false } });
+    expect(await app.restoreNewTaskModel("target")).toBe("created-project");
+    expect(await app.selectNewTaskModel("target", choice)).toBe("created-project"); expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it.each(["late", "unknown"])("keeps a %s remote model-project selection from dispatching another target", async mode => {
+    const network = fakeNetwork(), drafts = memoryDraftStores(), base = runtimeControlProjection(); let current = true;
+    const source = create(ModelSourceDescriptorSchema, { kind: ModelSourceKind.LOCAL, displayName: "Account", nativeAdapterKind: "native" });
+    const location = create(WorkspaceLocationSchema, { kind: { case: "devicePeer", value: { controllerDeviceId: credential.deviceId, targetDeviceId: "task-computer", workspaceRootDisplay: "D:\\project" } } });
+    const owner = create(SnapshotSchema, { ...base, backends: [...base.backends, create(BackendDescriptorSchema, { ...base.backends[0]!, backendId: "second" })],
+      targets: [create(TargetSchema, { ...base.targets[0]!, workspaceId: "original-workspace", location })],
+      workspaces: [create(WorkspaceDescriptorSchema, { workspaceId: "original-workspace", targetId: "target", kind: WorkspaceKind.USER_PROJECT, location })],
+      providers: [...base.providers, ...base.providers.map(provider => create(ProviderDescriptorSchema, { ...provider, backendId: "second" }))],
+      models: [...runtimeModels.map(model => create(ModelDescriptorSchema, { ...model, source })), ...runtimeModels.map(model => create(ModelDescriptorSchema, { ...model, backendId: "second", source }))] });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.listModelSourceDevicePeers = vi.fn(async () => {
+      if (mode === "late") current = false;
+      return [create(DevicePeerDescriptorSchema, { route: { targetDeviceId: "task-computer", relationId: "relation", targetDeviceRevision: { value: 2n }, relationRevision: { value: 3n }, routeGeneration: 5n } })];
+    });
+    vi.mocked(network.submit).mockRejectedValue(new Error("Reply lost"));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => "model-project", undefined, drafts); await app.start();
+    const choice = { backendId: "second", providerId: "beta", modelId: "b", effortId: "high", fastMode: true };
+    await expect(app.selectNewTaskModel("target", choice, () => current)).rejects.toThrow(mode === "late" ? "owner changed" : "unconfirmed");
+    if (mode === "late") expect(network.submit).not.toHaveBeenCalled();
+    else {
+      expect(app.state.pending).toMatchObject([{ kind: "model-source-target", targetId: "target", backendId: "second", operationId: "model-project", state: "unknown" }]);
+      await expect(app.selectNewTaskModel("target", choice)).rejects.toThrow("previous model source project");
+      expect(network.submit).toHaveBeenCalledOnce(); expect(network.listModelSourceDevicePeers).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("saves a new-task source choice, restores it after restart, and freezes that exact configuration into creation", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential), drafts = memoryDraftStores();
+    const base = runtimeControlProjection();
+    const source = create(ModelSourceDescriptorSchema, { kind: ModelSourceKind.LOCAL, displayName: "Account", nativeAdapterKind: "native" });
+    const owner = create(SnapshotSchema, { ...base, targets: [create(TargetSchema, { ...base.targets[0]!, workspaceId: "source-workspace",
+      location: create(WorkspaceLocationSchema, { kind: { case: "serviceNode", value: {} } }) })],
+      workspaces: [create(WorkspaceDescriptorSchema, { workspaceId: "source-workspace", targetId: "target", displayName: "Project", kind: WorkspaceKind.USER_PROJECT,
+        serverPathDisplay: "D:\\project", location: { kind: { case: "serviceNode", value: {} } } })],
+      models: runtimeModels.map(model => create(ModelDescriptorSchema, { ...model, source })) });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    const choice = { backendId: "backend", providerId: "beta", modelId: "b", effortId: "high", fastMode: true };
+    expect(await app.selectNewTaskModel("target", choice)).toBe("target"); expect(app.newTaskModelSelection("target")).toEqual(choice);
+    expect(network.submit).not.toHaveBeenCalled();
+    app.setForeground(false);
+    const restarted = client(network, saved.storage, undefined, undefined, () => "create-with-model", undefined, drafts); await restarted.start();
+    await restarted.restoreNewTaskModel("target"); expect(restarted.newTaskModelSelection("target")).toEqual(choice);
+    vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, { operationId: "create-with-model", connectionId: credential.connectionId,
+      state: OperationState.FAILED, error: { code: "CREATE_REJECTED", message: "Controlled refusal" } }));
+    await expect(restarted.create("target", "Task", plainTextMobileComposerDraft("input"))).resolves.toMatchObject({ created: false, definitive: true });
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({ payload: { case: "createSession", value: {
+      backendId: "backend", targetId: "target", model: { model: { providerId: "beta", modelId: "b" }, effortId: "high", fastMode: true } } } });
+  });
   it("retires readonly account usage on background and never sends a model or user input mutation", async () => {
     const network = fakeNetwork();
     const withQuota = (detail: boolean) => {

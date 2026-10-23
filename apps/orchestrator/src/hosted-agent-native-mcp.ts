@@ -21,6 +21,7 @@ const MAXIMUM_BYTES = 2 * 1024 * 1024;
 /** Native-side facade. It uses the provider's SDK root attestation but every
  * actual MCP operation is executed by the original Source Router. */
 export class HostedAgentNativeMcp {
+  #nativeOwner: HostedAgentNativeMcpOptions["owner"];
   readonly #catalog: HostedMcpCatalog;
   readonly #server = createServer((request, response) => { void this.#http(request, response); });
   readonly #token = randomBytes(32).toString("base64url");
@@ -33,7 +34,13 @@ export class HostedAgentNativeMcp {
   readonly #httpRequests = new Set<AbortController>();
   #origin = "";
   #closed = false;
-  private constructor(private readonly options: HostedAgentNativeMcpOptions, catalog: HostedMcpCatalog) { this.#catalog = catalog; }
+  private constructor(private readonly options: HostedAgentNativeMcpOptions, catalog: HostedMcpCatalog) { this.#catalog = catalog; this.#nativeOwner = { ...options.owner }; }
+  /** Called only after the exact previous native runtime confirmed closure. */
+  replaceOwnerGeneration(generation: number): void {
+    this.#assert();
+    if (!Number.isSafeInteger(generation) || generation !== this.#nativeOwner.generation + 1) throw new Error("The native MCP owner generation is invalid.");
+    this.#roots.clear(); this.#nativeOwner = { ...this.#nativeOwner, generation };
+  }
   static async create(options: HostedAgentNativeMcpOptions): Promise<HostedAgentNativeMcp> {
     options.assertCurrent(); const result = await options.execute({ kind: "catalog" }, options.signal);
     const catalog = result.catalog as HostedMcpCatalog;
@@ -58,7 +65,7 @@ export class HostedAgentNativeMcp {
   claude(): ClaudeMcpBridgePort {
     return { open: input => {
       this.#owner(input); let released = false; const pipes = new Set<Pipe>();
-      const assert = () => { this.#assert(); input.signal.throwIfAborted(); if (released) throw new Error("The native MCP Query retired."); };
+      const assert = () => { this.#owner(input); input.signal.throwIfAborted(); if (released) throw new Error("The native MCP Query retired."); };
       const tools = this.#catalog.tools.map(tool => ({ serverId: tool.serverId, name: tool.name, description: tool.description, inputSchema: tool.inputSchema,
         ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}), ...(tool.requiresNativeRoot ? { requiresNativeRoot: true as const } : {}) }));
       return { tools, models: this.#catalog.modelServerIds.map(serverId => ({ serverId, connect: async (transport, callNative) => {
@@ -82,7 +89,7 @@ export class HostedAgentNativeMcp {
   async codex(input: CodexMcpSessionInput): Promise<CodexMcpRuntimeLease> {
     this.#owner(input); input.assertSessionCurrent(); let released = false;
     const paths: string[] = [], servers = new Set([...this.#catalog.tools.map(tool => tool.serverId), ...this.#catalog.modelServerIds]);
-    const assert = () => { this.#assert(); input.signal?.throwIfAborted(); input.assertSessionCurrent(); if (released) throw new Error("The native MCP thread retired."); };
+    const assert = () => { this.#owner(input); input.signal?.throwIfAborted(); input.assertSessionCurrent(); if (released) throw new Error("The native MCP thread retired."); };
     const routes = [...servers].map(serverId => { const path = "/mcp/" + randomUUID(); paths.push(path); this.#codex.set(path, { input, serverId, transports: new Map(), active: true });
       return { serverId, name: "joko_source_" + createHash("sha256").update(serverId).digest("hex").slice(0, 24), url: this.#origin + path }; });
     return { routes, assertCurrent: assert, release: async () => { if (released) return; released = true;
@@ -156,7 +163,7 @@ export class HostedAgentNativeMcp {
         proof?.assertCurrent(); if (!response.destroyed) response.setHeader("content-type", "application/json").end(JSON.stringify(result)); return;
       }
       const route = this.#codex.get(path); if (!route || !route.active) throw new Error("The native MCP route is unavailable.");
-      route.input.assertSessionCurrent(); route.input.signal?.throwIfAborted();
+      this.#owner(route.input); route.input.assertSessionCurrent(); route.input.signal?.throwIfAborted();
       const sessionId = request.headers["mcp-session-id"]; if (sessionId !== undefined && typeof sessionId !== "string") throw new Error("The MCP session is invalid.");
       let session = sessionId === undefined ? undefined : route.transports.get(sessionId);
       const body = request.method === "POST" ? await readBody(request) : undefined;
@@ -178,7 +185,7 @@ export class HostedAgentNativeMcp {
     finally { this.#httpRequests.delete(abort); request.removeListener("aborted", disconnected); response.removeListener("close", disconnected); }
   }
   #owner(input: { readonly sessionId: string; readonly targetId: string; readonly generation: number }): void {
-    this.#assert(); const owner = this.options.owner;
+    this.#assert(); const owner = this.#nativeOwner;
     if (input.sessionId !== owner.sessionId || input.targetId !== owner.targetId || input.generation !== owner.generation) throw new Error("The native MCP owner changed.");
   }
   #assert(): void { if (this.#closed) throw new Error("The native MCP facade is closed."); this.options.signal.throwIfAborted(); this.options.assertCurrent(); }

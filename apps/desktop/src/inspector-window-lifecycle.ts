@@ -3,6 +3,7 @@ export interface InspectorWindowLifecycleOwner {
   isFocused(): boolean;
   isVisible(): boolean;
   isMinimized(): boolean;
+  focus(): void;
 }
 
 export interface InspectorWindowLifecycleChild {
@@ -116,6 +117,15 @@ export class InspectorWindowLifecycle<
       returnFocus: this.#closeKind === "user" && this.#returnFocusRequested && this.#ownerCanReceiveFocus(),
       ...(reason === undefined ? {} : { reason })
     };
+  }
+
+  returnFocusBeforeClose(child: Child): boolean {
+    if (child !== this.#child || !this.#current() || !child.isFocused()
+      || this.closeDecision(child)?.returnFocus !== true) return false;
+    // Transfer activation while the closing child still owns it. Once its
+    // native window is destroyed, Windows may activate another application.
+    this.#owner.focus();
+    return true;
   }
 
   canReveal(child: Child): boolean {

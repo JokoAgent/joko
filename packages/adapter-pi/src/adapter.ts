@@ -14,6 +14,7 @@ import {
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   redactSecrets,
   snapshotNativeSkills,
+  nativeTextInferenceImages,
   assertHostedExecution,
   type ApprovedSkillResolver,
   type NativeSkillPolicyResolver,
@@ -3696,6 +3697,7 @@ export class PiBackendAdapter implements
 
   async inferNativeText(input: NativeTextInferenceInput): Promise<string> {
     this.#assertNotDisposed();
+    const images = nativeTextInferenceImages(input);
     const selected = this.#managedGeneration, options = selected.options, providerId = input.providerId, modelId = input.modelId;
     if (!providerId || !modelId || !options.nativeAuthProviderIds?.includes(providerId) || !options.loadNativeAuth || !options.nativeModels?.some(value => value.providerId === providerId && value.modelId === modelId)
       || !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1000 || input.timeoutMs > 90_000 || input.system.length > 80_000 || input.user.length > 300_000) throw new Error("The selected native text route is unavailable.");
@@ -3712,7 +3714,9 @@ export class PiBackendAdapter implements
       const auth = new InMemoryCredentialStore(); await auth.modify(providerId, async () => credentials[providerId]); current();
       const runtime = await ModelRuntime.create({ credentials: auth, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false, signal }); current();
       const model = runtime.getModel(providerId, modelId); if (!model) throw new Error("The exact native text model is unavailable.");
-      const answer = await runtime.complete(model, { systemPrompt: input.system, messages: [{ role: "user", content: [{ type: "text", text: input.user }], timestamp: Date.now() }] }, { signal, maxTokens: 512, cacheRetention: "none" }); current();
+      if (images.length && !model.input.includes("image")) throw new Error("The selected model does not accept images.");
+      const answer = await runtime.complete(model, { systemPrompt: input.system, messages: [{ role: "user", content: [{ type: "text", text: input.user },
+        ...images.map(image => ({ type: "image" as const, data: Buffer.from(image.data).toString("base64"), mimeType: image.mimeType }))], timestamp: Date.now() }] }, { signal, maxTokens: input.maxTokens ?? 512, cacheRetention: "none" }); current();
       const refreshed = await auth.read(providerId); current();
       if (refreshed && JSON.stringify(refreshed) !== JSON.stringify(credentials[providerId])) {
         if (!options.persistNativeAuth) throw new Error("Native text credential refresh cannot be persisted.");
@@ -4734,6 +4738,7 @@ export class PiBackendAdapter implements
       if (binding) await this.#sessionStore.assertManagedSession(binding.opaqueRef);
       const agentResourceSettings = readAgentResourceSettings(options.readAgentResourceSettings);
       const managedSubagentToolsEnabled = profile.runtimePolicy === "standard"
+        && hosted?.workspace.subagentsEnabled !== false
         && (options.includeManagedSubagentTools?.(context) ?? true);
       const collaborationSettings = managedSubagentToolsEnabled
         ? readCollaborationSettings(options.readCollaborationSettings)

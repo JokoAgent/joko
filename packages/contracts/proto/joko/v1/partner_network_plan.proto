@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package joko.v1;
+
+message PartnerNetworkPlanStep {
+  uint32 position = 1;
+  string actor_id = 2;
+  string task = 3;
+  string status = 4;
+  string result_message_id = 5;
+  uint64 started_at_ms = 6;
+  uint64 finished_at_ms = 7;
+  string failure_code = 8;
+  string execution_id = 9;
+}
+// Public plan state contains no computer-local paths or private Partner context.
+message PartnerNetworkPlan {
+  string id = 1;
+  string room_id = 2;
+  uint64 revision = 3;
+  string status = 4;
+  string source_message_id = 5;
+  string request_text = 6;
+  string requester_id = 7;
+  string organizer_id = 8;
+  repeated PartnerNetworkPlanStep steps = 9;
+  uint32 current_step = 10;
+  repeated string note_message_ids = 11;
+  uint64 created_at_ms = 12;
+  uint64 updated_at_ms = 13;
+  repeated string request_message_ids = 15;
+}
+message PartnerNetworkPlanDraft { string actor_id = 1; string task = 2; }
+message PartnerNetworkPlanDecision { bool needs_plan = 1; repeated PartnerNetworkPlanDraft steps = 2; }
+message PlanPartnerNetworkRequest {
+  string operation_id = 1;
+  string room_id = 2;
+  string join_id = 3;
+  string plan_id = 4;
+  uint64 expected_revision = 5;
+  // start, dismiss, continue, retry, stop, reassign, remove-step, retry-decision.
+  string action = 6;
+  uint32 position = 7;
+  string actor_id = 8;
+  string source_message_id = 9;
+}
+message ConfigurePartnerNetworkProjectRequest {
+  string room_id = 1;
+  string join_id = 2;
+  bool replace = 3;
+  string directory = 4;
+}
+message ConfigurePartnerNetworkProjectResponse { string directory = 1; }

@@ -5,6 +5,8 @@ import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import type { SessionAccess, TaskSource } from "./task-sharing.js";
 import type { TaskSharingApi } from "@joko/contracts";
 import type { ProviderSharingApi, GetHostedAgentCatalogResponse } from "@joko/contracts";
+import type { PartnerNetworkApi } from "./partner-network-api.js";
+import type { PartnerIdentityApi } from "./partner-identity-api.js";
 import type { InputHandoffApi } from "./input-handoff.js";
 import type { ProviderGroupSettingsApi } from "./provider-group-settings.js";
 import { desktopRemoteDesktopViewerOwner, openDesktopRemoteDesktopViewer } from "./remote-desktop-viewer-bridge.js";
@@ -219,6 +221,8 @@ export interface AppController extends OperationApi {
   readonly taskSharing?: TaskSharingApi;
   readonly inputHandoff?: InputHandoffApi;
   readonly providerSharing?: ProviderSharingApi;
+  readonly partnerNetwork?: PartnerNetworkApi;
+  readonly partnerIdentity?: PartnerIdentityApi;
   readonly providerGroups?: ProviderGroupSettingsApi;
   readonly readProviderSharingCatalog?: (signal: AbortSignal) => Promise<GetHostedAgentCatalogResponse>;
   readonly appDefaultModelUi?: AppDefaultModelUiPort;
@@ -2317,7 +2321,7 @@ export function useAppController(): AppController {
       await openDesktopRemoteDesktopViewer({ get state() { return currentState(); } }, expected,
         { deviceId: peer.targetDeviceId, name: "Input window", inputHandoffRequestId: requestId });
       signal.throwIfAborted(); catalogGateway();
-    } : undefined), providerSharing: artifactGateway.providerSharingApi(), providerGroups: artifactGateway.providerGroupSettingsApi(),
+    } : undefined), providerSharing: artifactGateway.providerSharingApi(), partnerNetwork: artifactGateway.partnerNetworkApi(), partnerIdentity: artifactGateway.partnerIdentityApi(), providerGroups: artifactGateway.providerGroupSettingsApi(),
     readProviderSharingCatalog: (signal: AbortSignal) => catalogGateway().providerSharingCatalog(signal) };
   }, [artifactGateway, state.connectionState, state.activeProfile, linkGatewayGeneration, catalogGateway]);
   useEffect(() => {
@@ -3067,6 +3071,10 @@ export function useAppController(): AppController {
     addExtraDirectory: (workspaceId, serverPath, access) => gateway().addExtraDirectory(workspaceId, serverPath, access),
     removeExtraDirectory: (extraDirectoryId) => gateway().removeExtraDirectory(extraDirectoryId),
     setModel: (sessionId, providerId, modelId, effort, fastMode) => gateway().setModel(sessionId, providerId, modelId, effort, fastMode),
+    getSessionRuntimeControl: sessionId => gateway().getSessionRuntimeControl?.(sessionId)
+      ?? Promise.reject(new Error("The task runtime controls are unavailable.")),
+    setRuntimeModel: (sessionId, selection) => gateway().setRuntimeModel?.(sessionId, selection)
+      ?? Promise.reject(new Error("The task runtime selection is unavailable.")),
     setPermission: (sessionId, mode) => gateway().setPermission(sessionId, mode),
     setPlanMode: (sessionId, enabled) => gateway().setPlanMode(sessionId, enabled),
     compact: (sessionId, customInstructions) => gateway().compact(sessionId, customInstructions),

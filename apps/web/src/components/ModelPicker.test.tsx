@@ -42,6 +42,35 @@ afterEach(async () => {
 });
 
 describe("ModelPicker", () => {
+  it("aggregates exact-source favorites and filters both rows and favorites by the selected source while hiding grouped members", async () => {
+    const source = { kind: "local" as const, displayName: "Account", nodeId: "owner", nodeName: "Desk", nativeAdapterKind: "engine", groupMemberCount: 0, grouped: false };
+    const local = { ...models[0]!, source };
+    const remote = { ...models[0]!, backendId: "opaque-device", source: { ...source, kind: "device" as const, nodeId: "other", nodeName: "Studio" } };
+    const member = { ...models[0]!, backendId: "opaque-member", source: { ...source, kind: "device" as const, nodeName: "Grouped", grouped: true } };
+    for (const model of [local, remote, member]) addModelFavorite("owner-one", { backendId: model.backendId, providerId: model.providerId, modelId: model.modelId });
+    await renderPicker(vi.fn(), "owner-one", undefined, false, undefined, [local, remote, member]); await openPicker();
+    expect(document.querySelectorAll('.model-picker__row.is-favorite')).toHaveLength(2);
+    expect(document.querySelector('.model-picker__list')?.textContent).not.toContain("Grouped");
+    const sourceButton = required([...document.querySelectorAll<HTMLButtonElement>('.model-picker__rail button')].find(button => button.textContent?.includes("Studio")));
+    await act(async () => sourceButton.click());
+    const rows = [...document.querySelectorAll('.model-picker__row')];
+    expect(rows).toHaveLength(2); expect(rows.every(row => row.textContent?.includes("Studio"))).toBe(true);
+    expect(rows.filter(row => row.classList.contains("is-favorite"))).toHaveLength(1);
+    expect(readModelPickerOwnerPreferences("owner-one").favorites).toHaveLength(3);
+  });
+
+  it("waits for a model-source save and preserves the open picker after a rejected handoff", async () => {
+    let reject!: (error: Error) => void;
+    const onSelect = vi.fn(() => new Promise<void>((_resolve, failed) => { reject = failed; }));
+    await renderPicker(onSelect); await openPicker();
+    await act(async () => findRow("Small").click());
+    expect(document.querySelector('.model-picker__list')).not.toBeNull();
+    await act(async () => findRow("Large").click()); expect(onSelect).toHaveBeenCalledOnce();
+    await act(async () => reject(new Error("The source changed")));
+    expect(document.querySelector('.model-picker__list')).not.toBeNull();
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("could not be saved");
+  });
+
   it.each([false, true])("shows the exact group member quota after the group owner routes to another Backend (member=%s)", async member => {
     const usage = { group: { backendId: member ? "group-owner" : "backend-picker", providerId: "provider-a" },
       ...(member ? { memberRoute: { backendId: "backend-picker", providerId: "provider-a" } } : {}),

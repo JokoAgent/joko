@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { AdapterContext, AdapterEventMetadata, BackendAdapter, BlobRef, CreateNativeSessionInput, EventPayload, HostedExecution, NativeSessionBinding, PermissionMode, PromptInput, SubagentControlInput, UserShellInput } from "@joko/core";
+import { JokoError } from "@joko/core";
 import type { HostedAgentStore, HostedNativeSessionOwner, HostedNativeProviderGrantOwner } from "@joko/store";
 import { HostedAgentArtifacts } from "./hosted-agent-artifacts.js";
 import { HostedAgentExchange } from "./hosted-agent-exchange.js";
@@ -11,6 +12,7 @@ import { HostedAgentNativeMcp } from "./hosted-agent-native-mcp.js";
 import type { HostedNativeCommand } from "@joko/adapter-hosted";
 import { materializeHostedProjectFiles } from "./hosted-agent-project-files.js";
 import { hostedDirectoryPath } from "./hosted-agent-directories.js";
+import { HostedAgentNavigation } from "./hosted-agent-navigation.js";
 
 export type HostedAgentCall = HostedNativeCommand;
 
@@ -83,6 +85,8 @@ export class HostedAgentRun {
   #activeProvider?: string;
   readonly #toolOwners = new Map<string, { readonly operationId: string; readonly origin: string }>();
   #mcp?: HostedAgentNativeMcp;
+  readonly #navigation: HostedAgentNavigation;
+  #navigating = false;
 
   private constructor(options: HostedAgentRunOptions) {
     if (!options.runId || options.runId.length > 512 || !isAbsolute(options.root) || resolve(options.root) !== options.root
@@ -97,6 +101,7 @@ export class HostedAgentRun {
       targetId: options.source.targetId, nativeSessionId: options.nativeSessionId, backendId: options.backendId, trust: options.trust,
       ...(options.providerCleanup ? { providerGrant: options.providerCleanup } : {}) };
     this.id = options.store.key(this.#owner);
+    this.#navigation = new HostedAgentNavigation(options.store, this.id, this.#leaseId);
     this.#slot = options.slots.reserve(options.source.deviceId);
     try { this.exchange = new HostedAgentExchange({ assertCurrent: () => options.assertCurrent(), onOverflow: () => { void this.close().catch(() => {}); } }); }
     catch (error) { this.#slot.release(); throw error; }
@@ -152,7 +157,7 @@ export class HostedAgentRun {
     return this.#purging ??= (async () => {
       await this.close();
       if (!this.#nativeCleaned) throw new HostedAgentCleanupError(this);
-      if (this.#claimed) await purgeHostedAgentStorage({ root: this.#options.root, store: this.#options.store, key: this.id, leaseId: this.#leaseId });
+      if (this.#claimed) { this.#navigation.clear(); await purgeHostedAgentStorage({ root: this.#options.root, store: this.#options.store, key: this.id, leaseId: this.#leaseId }); }
       this.#slot.release();
     })().catch(error => { this.#purging = undefined; throw error; });
   }
@@ -181,7 +186,9 @@ export class HostedAgentRun {
         ...(this.#options.trust === "owner" ? { trust: "owner" as const } : { trust: "guest" as const, guestHome: root,
           providerId: this.#options.providerId, modelIds: [...this.#options.modelIds] })
       };
-      const nativeOwner = { sessionId: `hosted-session:${this.id}`, targetId: `hosted-target:${this.id}`, generation: prior.binding?.generation ?? 1, backendInstanceGeneration: 1 };
+      const pendingNavigation = this.#navigation.read();
+      const retainedBinding = pendingNavigation?.sourceRetired ? pendingNavigation.binding : prior.binding;
+      const nativeOwner = { sessionId: `hosted-session:${this.id}`, targetId: `hosted-target:${this.id}`, generation: retainedBinding?.generation ?? 1, backendInstanceGeneration: 1 };
       if (hosted.workspace.mcpEnabled) this.#mcp = await HostedAgentNativeMcp.create({ owner: nativeOwner, signal: this.#lifetime.signal,
         assertCurrent: () => this.#assertAuthority(), execute: (request, signal) => this.exchange.tool({ operation: "mcp.request", request }, signal,
           request.kind === "catalog" || request.kind === "model_open" || request.kind === "model_poll" || request.kind === "model_close" ? this.#options.runId : this.#inputOperationId ?? this.#options.runId) });
@@ -193,7 +200,7 @@ export class HostedAgentRun {
       if (this.#adapter.id !== this.#options.backendId || this.#adapter.hostedExecutionCapabilities?.toolsOnSource !== true
         || this.#options.trust === "guest" && this.#adapter.hostedExecutionCapabilities.isolatedGuests !== true) throw new Error("This native Adapter does not support isolated hosted execution.");
       const target = { id: `hosted-target:${this.id}`, backendId: this.#adapter.id, displayName: "Hosted Agent", workspaceRoot: workspace, trusted: false, managed: true };
-      this.#context = { sessionId: `hosted-session:${this.id}`, generation: prior.binding?.generation ?? 1, backendInstanceGeneration: 1, target, hostedExecution: hosted,
+      this.#context = { sessionId: `hosted-session:${this.id}`, generation: retainedBinding?.generation ?? 1, backendInstanceGeneration: 1, target, hostedExecution: hosted,
         signal: this.#lifetime.signal, operationId: this.#options.runId, modelSelection: { providerId: this.#options.providerId, modelId: this.#options.modelId },
         emit: (event, metadata) => this.#emit(event, metadata, this.#options.runId),
         requestInteraction: (interaction, options) => this.exchange.interaction(interaction,
@@ -203,9 +210,27 @@ export class HostedAgentRun {
       const creation: CreateNativeSessionInput = { target, providerId: this.#options.providerId, modelId: this.#options.modelId,
         ...(this.#options.name === undefined ? {} : { name: this.#options.name }),
         permissionMode: this.#options.permissionMode, fastMode: this.#options.fastMode, ...(this.#options.effort ? { effort: this.#options.effort } : {}) };
-      if (prior.binding) {
-        this.#context = { ...this.#context, binding: prior.binding };
-        const resumed = await this.#adapter.resumeSession(prior.binding, this.#context); this.#assertAuthority(); this.#binding = resumed.binding;
+      if (pendingNavigation) {
+        const lifecycle = this.#navigation.lifecycle(this.#context.sessionId, target);
+        const owned = await this.#adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true;
+        if (pendingNavigation.sourceRetired) {
+          if (owned) {
+            if (!this.#adapter.adoptNativeSessionDerivation) throw new Error("The native navigation adoption owner is unavailable.");
+            await this.#adapter.adoptNativeSessionDerivation(lifecycle, this.#lifetime.signal);
+          }
+          this.#navigation.complete(pendingNavigation.binding);
+        } else {
+          if (owned) {
+            if (!this.#adapter.cleanupNativeSessionDerivation) throw new Error("The native navigation cleanup owner is unavailable.");
+            await this.#adapter.cleanupNativeSessionDerivation(lifecycle, this.#lifetime.signal);
+          } else await this.#adapter.deleteSession(pendingNavigation.binding, { ...this.#context,
+            binding: pendingNavigation.binding, generation: pendingNavigation.binding.generation });
+          this.#navigation.clear();
+        }
+      }
+      if (retainedBinding) {
+        this.#context = { ...this.#context, binding: retainedBinding };
+        const resumed = await this.#adapter.resumeSession(retainedBinding, this.#context); this.#assertAuthority(); this.#binding = resumed.binding;
         if (resumed.streaming) this.#activeProvider = resumed.providerId ?? this.#options.providerId;
         this.#context = { ...this.#context, binding: resumed.binding, generation: resumed.binding.generation };
         if (resumed.providerId !== this.#options.providerId || resumed.modelId !== this.#options.modelId) {
@@ -304,7 +329,7 @@ export class HostedAgentRun {
   }
   async #invokeOnce(id: string, digest: string, command: HostedAgentCall): Promise<unknown> {
     this.#assertCurrent();
-    if (["state", "commands", "resources", "tools", "tree", "history"].includes(command.kind)) return this.#invoke(id, command);
+    if (["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind)) return this.#invoke(id, command);
     const prior = this.#options.store.call(this.id, id);
     if (prior) {
       if (prior.digest !== digest) throw new Error("Hosted Agent durable call identity conflicts.");
@@ -323,7 +348,9 @@ export class HostedAgentRun {
     this.#options.store.finishCall(this.id, this.#leaseId, id, digest, { ok: true, value: result }); return result;
   }
   async #invoke(id: string, command: HostedAgentCall): Promise<unknown> {
-    this.#assertCurrent(); const adapter = this.#adapter!, observation = ["state", "commands", "resources", "tools", "tree", "history"].includes(command.kind);
+    this.#assertCurrent();
+    if (this.#navigating) throw new Error("Native history navigation is in progress.");
+    const adapter = this.#adapter!, observation = ["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind);
     const context = this.#operationContext(observation ? this.#options.runId : id);
     switch (command.kind) {
       case "state": return adapter.inspectSession(this.#binding!, context);
@@ -358,6 +385,8 @@ export class HostedAgentRun {
       case "tree": return adapter.getTree(context);
       case "tools": if (!adapter.getRuntimeTools) throw new Error("Hosted runtime tool catalog is unsupported."); return adapter.getRuntimeTools(context);
       case "history": if (!adapter.getNativeHistoryProjection) throw new Error("Hosted native history is unsupported."); return adapter.getNativeHistoryProjection(context);
+      case "dispatch_during_compaction": return await adapter.dispatchDuringCompaction?.(command.input, context) ?? null;
+      case "navigate": return this.#navigate(id, command, context);
       case "shell": {
         if (!adapter.executeUserShell || this.#shellOperationId) throw new Error("Hosted user shell is unavailable.");
         this.#shellOperationId = id;
@@ -366,7 +395,48 @@ export class HostedAgentRun {
       }
       case "abort_shell": if (!adapter.abortUserShell) throw new Error("Hosted user shell is unsupported."); await adapter.abortUserShell(context); return null;
       case "control_subagent": if (!adapter.controlSubagent) throw new Error("Hosted child control is unsupported."); await adapter.controlSubagent(command.input, context); return null;
+      case "cancel_background": if (!adapter.cancelBackgroundTask) throw new Error("Hosted background task cancellation is unsupported."); await adapter.cancelBackgroundTask(context, command.taskId); return null;
+      case "background_output": if (!adapter.getBackgroundTaskOutput) throw new Error("Hosted background task output is unsupported."); return adapter.getBackgroundTaskOutput(context, command.taskId, command.maximumBytes);
     }
+  }
+  async #navigate(id: string, command: Extract<HostedAgentCall, { kind: "navigate" }>, context: AdapterContext): Promise<null> {
+    const adapter = this.#adapter!, sourceBinding = this.#binding!;
+    let nativeConfirmed = false;
+    this.#navigating = true;
+    try {
+      if (this.#navigation.read()) throw new Error("The prior native navigation must be reconciled before another navigation.");
+      const result = await adapter.navigateTree(command.target, command.summarize, context, command.instructions, {
+        recordBinding: binding => this.#navigation.record(id, sourceBinding, binding, command.target)
+      });
+      nativeConfirmed = true;
+      this.#assertCurrent();
+      if (result.kind === "replacement") {
+        const receipt = this.#navigation.read();
+        if (!receipt || receipt.binding.opaqueRef !== result.binding.opaqueRef || receipt.binding.nativeSessionId !== result.binding.nativeSessionId
+          || receipt.binding.generation !== result.binding.generation) throw new Error("The native navigation returned an unregistered context.");
+        await adapter.closeSession(sourceBinding, context); this.#assertCurrent(); this.#navigation.retire();
+        const lifecycle = this.#navigation.lifecycle(context.sessionId, context.target);
+        if (await adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true) {
+          if (!adapter.adoptNativeSessionDerivation) throw new Error("The native navigation adoption owner is unavailable.");
+          await adapter.adoptNativeSessionDerivation(lifecycle, this.#lifetime.signal);
+        }
+        this.#mcp?.replaceOwnerGeneration(result.binding.generation);
+        this.#context = { ...this.#context!, binding: result.binding, generation: result.binding.generation };
+        const state = await adapter.resumeSession(result.binding, this.#operationContext(id)); this.#assertAuthority();
+        if (state.binding.opaqueRef !== result.binding.opaqueRef || state.binding.nativeSessionId !== result.binding.nativeSessionId
+          || state.binding.generation !== result.binding.generation || state.streaming) throw new Error("The native navigation replacement was not confirmed.");
+        this.#binding = state.binding; this.#context = { ...this.#context, binding: state.binding };
+        this.#navigation.complete(state.binding);
+      } else if (this.#navigation.read()) throw new Error("An in-place native navigation registered a replacement.");
+      if (!adapter.getNativeHistoryProjection) throw new Error("The native navigation has no history confirmation.");
+      await adapter.getNativeHistoryProjection(this.#operationContext(id)); this.#assertCurrent();
+      return null;
+    } catch (error) {
+      // A recorded child or unknown SDK mutation cannot accept another input.
+      // Restart reconciles only the exact recorded adoption or cleanup.
+      if (nativeConfirmed || this.#navigation.read() || !(error instanceof JokoError) || error.publicError.stateMayHaveChanged) this.#ready = false;
+      throw error;
+    } finally { this.#navigating = false; }
   }
 }
 

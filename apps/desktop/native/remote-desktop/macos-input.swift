@@ -1105,3 +1105,4 @@ while let line = readLine() {
   print("ok"); fflush(stdout)
 }
 lock.lock(); releaseAll(); lock.unlock()
+#endif

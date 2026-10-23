@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { HostedAgentRun, HostedAgentCleanupError, type HostedAgentCall, type HostedAgentRunOptions } from "./hosted-agent-run.js";
 import { HOSTED_AGENT_UNREAD_LIMIT, type HostedAgentFrame } from "./hosted-agent-exchange.js";
-import type { HostedNativeOpen } from "@joko/adapter-hosted";
+import type { HostedNativeOpen, HostedNativeInferenceRequest } from "@joko/adapter-hosted";
+import { decodeHostedAgentInference } from "./hosted-agent-wire.js";
 import type { HostedNativeProviderGrantOwner } from "@joko/store";
 
 /** Captured by the authenticated service, never deserialized from a caller's
@@ -29,6 +30,8 @@ export interface HostedAgentPollCursor { readonly runId: string; readonly after:
 export interface HostedAgentPollRun { readonly runId: string; readonly cursor: number; readonly finished: boolean; readonly frames: readonly HostedAgentFrame[] }
 type AuthorizedRun = Omit<HostedAgentRunOptions, "runId" | "nativeSessionId" | "start" | "source" | "trust" | "backendId" | "providerId" | "modelId" | "name" | "permissionMode" | "fastMode" | "effort" | "workspace" | "onCreated">;
 export interface HostedAgentHostOptions {
+  readonly authorizeInference?: (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest) => () => void;
+  readonly infer?: (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest, signal: AbortSignal) => Promise<string>;
   readonly authorize: (principal: HostedAgentPrincipal, input: HostedAgentOpen) => AuthorizedRun | Promise<AuthorizedRun>;
   readonly now?: () => number;
   readonly createRun?: (options: HostedAgentRunOptions) => Promise<HostedAgentRun>;
@@ -58,6 +61,8 @@ export class HostedAgentHostError extends Error {
  * share one pending poll. A disconnected controller has three minutes to
  * return; native cleanup owns quota release, including uncertain cleanup. */
 export class HostedAgentHost {
+  readonly #inferences = new Map<string, { readonly principal: HostedAgentPrincipal; readonly digest: string; readonly expiresAt: number;
+    readonly owner: AbortController; readonly promise: Promise<string>; readonly assertAccess: () => void }>();
   readonly #entries = new Map<string, Entry>();
   readonly #expired = new Set<string>();
   readonly #nativeOwners = new Map<string, Entry>();
@@ -70,6 +75,31 @@ export class HostedAgentHost {
   constructor(options: HostedAgentHostOptions) {
     this.#options = options;
     this.#timer = setInterval(() => { void this.sweep().catch(() => {}); }, 5_000); this.#timer.unref();
+  }
+  async infer(principal: HostedAgentPrincipal, value: HostedNativeInferenceRequest, signal: AbortSignal): Promise<string> {
+    this.#assertPrincipal(principal); signal.throwIfAborted();
+    const request = decodeHostedAgentInference(value), key = JSON.stringify([principal.id, principal.deviceId, principal.trust, request.requestId]);
+    const digest = createHash("sha256").update(JSON.stringify(request)).digest("hex"), existing = this.#inferences.get(key);
+    if (existing) {
+      this.#assertPrincipal(existing.principal);
+      existing.assertAccess();
+      if (existing.digest !== digest) throw new HostedAgentHostError("CONFLICT");
+      return existing.promise.then(result => { this.#assertPrincipal(principal); existing.assertAccess(); signal.throwIfAborted(); return result; });
+    }
+    if (!this.#options.infer) throw new HostedAgentHostError("UNAVAILABLE");
+    for (const [id, entry] of this.#inferences) if (entry.expiresAt <= this.#now()) { entry.owner.abort(); this.#inferences.delete(id); }
+    if (this.#inferences.size >= 128) throw new HostedAgentHostError("RESOURCE_EXHAUSTED");
+    const assertAccess = this.#options.authorizeInference?.(principal, request) ?? (() => this.#assertPrincipal(principal)); assertAccess();
+    const owner = new AbortController(), active = AbortSignal.any([owner.signal, signal, AbortSignal.timeout(request.timeoutMs)]);
+    const promise = Promise.resolve().then(async () => {
+      this.#assertPrincipal(principal); assertAccess(); active.throwIfAborted();
+      const text = await this.#options.infer!(principal, request, active);
+      this.#assertPrincipal(principal); assertAccess(); active.throwIfAborted();
+      if (typeof text !== "string" || text.length > 4_000_000) throw new HostedAgentHostError("UNAVAILABLE");
+      return text;
+    });
+    this.#inferences.set(key, { principal, digest, owner, promise, assertAccess, expiresAt: this.#now() + 180_000 });
+    void promise.catch(() => {}); return promise;
   }
   open(principal: HostedAgentPrincipal, input: HostedAgentOpen): Promise<HostedAgentRun> {
     this.#assertPrincipal(principal); validateOpen(input);
@@ -141,6 +171,7 @@ export class HostedAgentHost {
   }
   /** Internal route owner, usable after that route's captured authority ends. */
   async closePrincipal(principal: HostedAgentPrincipal): Promise<void> {
+    for (const entry of this.#inferences.values()) if (entry.principal.id === principal.id && entry.principal.deviceId === principal.deviceId) entry.owner.abort();
     const results = await Promise.allSettled([...this.#entries.values()].filter(entry => entry.principal === principal).map(entry => this.#closeEntry(entry)));
     if (results.some(result => result.status === "rejected")) throw new HostedAgentHostError("UNAVAILABLE");
   }
@@ -207,11 +238,13 @@ export class HostedAgentHost {
     }));
   }
   async dispose(): Promise<void> {
+    for (const entry of this.#inferences.values()) entry.owner.abort();
     if (!this.#disposed) { this.#disposed = true; clearInterval(this.#timer); this.#notify(); }
     const results = await Promise.allSettled([...this.#entries.values()].map(entry => this.#closeEntry(entry)));
     for (const result of results) if (result.status === "rejected") throw new HostedAgentHostError("UNAVAILABLE");
     for (const entry of this.#entries.values()) { entry.detach?.(); entry.run?.disposeExchange(); }
     this.#entries.clear(); this.#expired.clear(); this.#nativeOwners.clear();
+    this.#inferences.clear();
   }
   #closeEntry(entry: Entry): Promise<void> {
     return entry.closing ??= (async () => {

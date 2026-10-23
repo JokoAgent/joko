@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { randomUUID } from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
-import { createMobileStorage } from "./connection-storage";
+import { createMobileStorage, type MobilePlainStorageDriver } from "./connection-storage";
 import { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
 import { MobilePartnerDeletionReceipts } from "./mobile-partner-deletion";
 import { MobilePartnerRestartReceipts } from "./mobile-partner-restart";
@@ -22,10 +22,18 @@ import { MobileUpdateController } from "./mobile-update-controller";
 import { createMobileUpdateRuntimeEnvironment } from "./mobile-update-runtime";
 import { MobilePushDeviceStore } from "./mobile-push-device-store";
 import { MobileFilesPreferenceStore } from "./mobile-files-preferences";
+import { mobileHistoryDiskStorage } from "./mobile-history-disk-storage";
+import { createMobileStorageFullRecovery } from "./mobile-storage-full-recovery";
+import { mobileMessage } from "./mobile-messages";
 
-export const mobilePlainStorage = {
+export const mobilePlainStorage: MobilePlainStorageDriver & {
+  getAllKeys(): Promise<readonly string[]>; multiRemove(keys: readonly string[]): Promise<void>;
+} = {
   getItem: (key: string) => AsyncStorage.getItem(key),
-  setItem: (key: string, value: string) => AsyncStorage.setItem(key, value),
+  setItem: createMobileStorageFullRecovery((key, value) => AsyncStorage.setItem(key, value), async () => {
+    const keys = (await AsyncStorage.getAllKeys()).filter(key => key.startsWith("joko.mobile.offline-cache.v1."));
+    if (keys.length) await AsyncStorage.multiRemove(keys);
+  }, (): string => mobileMessage(mobileLocalePreferences.snapshot.effectiveLocale, "storage.full")),
   removeItem: (key: string) => AsyncStorage.removeItem(key),
   getAllKeys: () => AsyncStorage.getAllKeys(),
   multiRemove: (keys: readonly string[]) => AsyncStorage.multiRemove([...keys])
@@ -49,12 +57,12 @@ export const mobileNewTaskDrafts = new MobileNewTaskDraftStore(mobilePlainStorag
 export const mobileAttachmentFiles = new MobileAttachmentFiles();
 export const mobileAttachmentCamera = new MobileAttachmentCamera(mobileAttachmentFiles);
 export const mobilePhotoLibrary = new MobilePhotoLibrary(mobileAttachmentFiles);
-export const mobileOfflineCache = new MobileOfflineCache(mobilePlainStorage, Date.now, randomUUID);
+export const mobileOfflineCache = new MobileOfflineCache(mobileHistoryDiskStorage, Date.now, randomUUID);
 export const mobileReadOnlyDictionaryCache = new MobileVoiceDictionaryReadOnlyCache(mobilePlainStorage);
 export const mobileThemePreferences = new MobileThemePreferenceStore(mobilePlainStorage);
 export const mobileFilesPreferences = new MobileFilesPreferenceStore(mobilePlainStorage);
 export const mobileDiagnostics = new MobileDiagnosticsStore(mobilePlainStorage, undefined, Date.now, randomUUID);
-export const mobileLocalePreferences = new MobileLocalePreferenceStore(mobilePlainStorage);
+export const mobileLocalePreferences: MobileLocalePreferenceStore = new MobileLocalePreferenceStore(mobilePlainStorage);
 export const mobileVoicePreferences = new MobileVoicePreferencesStore(mobilePlainStorage, Date.now, randomUUID);
 const mobileUpdateRuntime = createMobileUpdateRuntimeEnvironment();
 export const mobileUpdates = new MobileUpdateController({

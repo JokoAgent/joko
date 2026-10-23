@@ -12,6 +12,14 @@ const ERROR_OWNING_RUNTIME_RECOVERY_STATES = new Set<NonNullable<TimelineItemVie
   "failed"
 ]);
 
+function hasVisibleRecoveryThinking(items: readonly TimelineItemView[], recovery: TimelineItemView): boolean {
+  const runId = recovery.runtimeRecovery?.continuationRunId;
+  if (!runId || recovery.runtimeRecovery?.state !== "running") return false;
+  return items.some(item => item.kind === "thinking" && item.runId === runId
+    && (item.lastActivityAt ?? item.createdAt) > recovery.createdAt
+    && (item.text ?? "").replace(/[\s\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/gu, "").length > 0);
+}
+
 export function activeRuntimeRecovery(
   items: readonly TimelineItemView[]
 ): NonNullable<TimelineItemView["runtimeRecovery"]> | undefined {
@@ -20,6 +28,7 @@ export function activeRuntimeRecovery(
     if (
       item.runtimeRecovery === undefined
       || !ACTIVE_RUNTIME_RECOVERY_STATES.has(item.runtimeRecovery.state)
+      || hasVisibleRecoveryThinking(items, item)
     ) continue;
     if (active === undefined || item.sequence >= active.sequence) active = item;
   }
@@ -48,6 +57,7 @@ export function projectRuntimeRecoveryTimeline(
   return items.filter((item) => {
     if (isInternalContinuationTimelineItem(item)) return false;
     if (item.runtimeRecovery?.state === "cancelled") return false;
+    if (hasVisibleRecoveryThinking(items, item)) return false;
     return item.kind !== "error" || item.runId === undefined || !claimedErrorRunIds.has(item.runId);
   });
 }

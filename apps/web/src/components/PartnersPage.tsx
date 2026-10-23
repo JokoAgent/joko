@@ -25,7 +25,8 @@ import { PartnerHomeDialog } from "./PartnerHomeDialog.js";
 import { partnerHomeMessages } from "@joko/contracts";
 import { PartnerResumeDialog } from "./PartnerResumeDialog.js";
 import { PartnerRoutineDialog } from "./PartnerRoutineDialog.js";
-import { PartnerGroupsSection } from "./PartnerGroups.js";
+import { PartnerNetworkSection } from "./PartnerNetwork.js";
+import { PartnerIdentityDirectory } from "./PartnerIdentityDirectory.js";
 import { PartnerImportDialog } from "./PartnerImportDialog.js";
 import { PartnerDiscoveryDialog, partnerDiscoveryTitle } from "./PartnerDiscoveryDialog.js";
 import { PartnerMemoryDialog } from "./PartnerMemoryDialog.js";
@@ -300,7 +301,8 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, preparation
       <div className={catalog.directory.errorCount > 0 ? "is-warning" : undefined}><strong>{catalog.directory.errorCount}</strong><span>{t("partners.needsAttention")}</span></div>
       <Button tone="ghost" onClick={() => load()} disabled={loading}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button>
     </section>}
-    {catalog && catalogCurrent && !showArchived && <PartnerGroupsSection controller={controller} partners={catalog.partners} t={t} />}
+    {catalog && catalogCurrent && <PartnerNetworkSection key={`network:${ownerKey}`} controller={controller} partners={catalog.partners} />}
+    {catalog && catalogCurrent && <PartnerIdentityDirectory key={`identity:${ownerKey}`} controller={controller} partners={catalog.partners} />}
     <div className="partners-toolbar">
       <div className="segmented" role="radiogroup" aria-label={t("partners.filter")}>
         <button type="button" role="radio" aria-checked={!showArchived} className={cx("segmented__item", !showArchived && "is-active")} onClick={() => setShowArchived(false)}>{t("partners.active")}</button>

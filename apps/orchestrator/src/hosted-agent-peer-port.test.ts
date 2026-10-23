@@ -16,6 +16,8 @@ it("pins native route trust to the configured controller and retiring an old rou
   let created = 0, disposed = 0;
   const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-completions", contextWindow: 32768,
     maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  database.upsertBackend({ id: "native", adapterKind: "native", instanceGeneration: 1, displayName: "Native", version: "1", health: "healthy",
+    installationState: "installed", authenticationState: "not_required", capabilities: new Map(), models: [model], tools: [], diagnostics: [] });
   const runtime = new HostedAgentRuntime({ store: database, root, artifactCapacityBytes: 1024,
     connections: { authenticate: () => { throw new Error("Device commands must not borrow an HTTP owner credential."); } } as unknown as ConnectionManager,
     factories: [{ backendId: "native", providerIds: () => ["provider"], models: () => [model], create: () => ({ id: "native",

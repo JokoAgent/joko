@@ -1,6 +1,7 @@
 import type { ListPartnerGroupsResponse } from "@joko/contracts";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobilePartnerRosterSource } from "./mobile-partner-roster";
+import { createMobileDirectoryReadRecovery, isRecoverableMobileDirectoryRead, readMobileDirectory } from "./mobile-directory-read-recovery";
 
 export interface MobilePartnerGroupSourceTransport {
   readonly sourceKey: string;
@@ -29,6 +30,7 @@ export interface MobilePartnerGroupRosterShard {
   readonly source: MobilePartnerRosterSource;
   readonly status: "loading" | "online" | "offline" | "error";
   readonly refreshing: boolean;
+  readonly settled?: boolean;
   readonly display: readonly MobilePartnerGroupDisplay[];
   readonly displayTotal: number;
   readonly catalog?: ListPartnerGroupsResponse;
@@ -88,6 +90,7 @@ export class MobilePartnerGroupRoster {
   #transports = new Map<string, { readonly abort: AbortController; readonly value: MobilePartnerGroupSourceTransport }>();
   #writes = new Map<string, Promise<void>>();
   #cacheEpoch = new Map<string, number>();
+  #recoveries = new Map<string, ReturnType<typeof createMobileDirectoryReadRecovery>>();
   #initialized = false;
   #queue = new Set<string>();
   #timer?: ReturnType<typeof setTimeout>;
@@ -123,6 +126,7 @@ export class MobilePartnerGroupRoster {
       this.#cacheEpoch.set(key, (this.#cacheEpoch.get(key) ?? 0) + 1);
       this.#flights.get(key)?.abort(); this.#flights.delete(key); this.#queue.delete(key);
       this.#transports.get(key)?.abort.abort(); this.#transports.delete(key);
+      this.#recoveries.get(key)?.dispose(); this.#recoveries.delete(key);
       this.#write(key, () => this.storage.removeItem(cacheKey(key)));
     }
     const added = sources.filter(source => !old.has(source.key));
@@ -147,6 +151,7 @@ export class MobilePartnerGroupRoster {
     if (this.#timer) clearTimeout(this.#timer); this.#timer = undefined;
     for (const abort of this.#flights.values()) abort.abort(); this.#flights.clear(); this.#queue.clear();
     for (const { abort } of this.#transports.values()) abort.abort(); this.#transports.clear();
+    for (const recovery of this.#recoveries.values()) recovery.dispose(); this.#recoveries.clear();
     this.#publish(this.#snapshot.map(shard => ({ ...shard, status: "offline", refreshing: false, catalog: undefined })));
     if (active) this.refresh();
   }
@@ -165,20 +170,32 @@ export class MobilePartnerGroupRoster {
       const abort = new AbortController(), epoch = this.#epoch; this.#flights.set(key, abort);
       this.#transports.get(key)?.abort.abort(); this.#transports.delete(key);
       const current = () => !abort.signal.aborted && this.#active && this.#epoch === epoch && this.#snapshot.some(item => item.source.key === key);
-      this.#publish(this.#snapshot.map(item => item.source.key === key ? { ...item, status: item.display.length ? item.status : "loading", refreshing: true, error: undefined } : item));
-      void this.resolve(shard.source.profile.profileId, abort.signal, key).then(async transport => {
+      let recovery = this.#recoveries.get(key);
+      if (!recovery) {
+        recovery = createMobileDirectoryReadRecovery(() => this.refresh(key),
+          () => this.#active && this.#epoch === epoch && this.#snapshot.some(item => item.source.key === key));
+        this.#recoveries.set(key, recovery);
+      }
+      this.#publish(this.#snapshot.map(item => item.source.key === key ? { ...item, status: item.settled ? item.status : "loading", refreshing: true, error: undefined } : item));
+      void readMobileDirectory(abort.signal, async () => {
+        const transport = await this.resolve(shard.source.profile.profileId, abort.signal, key);
         if (!current() || transport.sourceKey !== key) throw new Error("The group source changed during its directory read.");
-        const catalog = await transport.list(abort.signal); if (!current()) return;
+        const catalog = await transport.list(abort.signal);
+        return { transport, catalog };
+      }).then(({ transport, catalog }) => {
+        if (!current()) return;
         if (!transport.isCurrent()) throw new Error("The group directory owner changed.");
+        recovery.succeeded();
         this.#transports.set(key, { abort, value: transport });
         const rows = display(catalog), savedAt = this.now();
-        this.#publish(this.#snapshot.map(item => item.source.key === key ? { source: item.source, status: "online", refreshing: false, display: rows, displayTotal: rows.length, catalog, savedAt } : item));
+        this.#publish(this.#snapshot.map(item => item.source.key === key ? { source: item.source, status: "online", refreshing: false, settled: true, display: rows, displayTotal: rows.length, catalog, savedAt } : item));
         const raw = JSON.stringify({ schema: "joko.mobile.partner-group-roster.v1", sourceKey: key, savedAt, display: rows.slice(0, MAX_CACHE_ROWS), displayTotal: rows.length });
         if (raw.length <= MAX_CACHE_CHARS) this.#write(key, () => current() ? this.storage.setItem(cacheKey(key), raw) : Promise.resolve());
       }).catch((error: unknown) => {
         if (!current()) return;
-        const status = error instanceof TypeError || error instanceof Error && /network|offline|fetch|unreachable|timeout/iu.test(error.message) ? "offline" : "error";
-        this.#publish(this.#snapshot.map(item => item.source.key === key ? { ...item, status, refreshing: false, catalog: undefined, error: error instanceof Error ? error.message : String(error) } : item));
+        const status = isRecoverableMobileDirectoryRead(error) ? "offline" : "error";
+        this.#publish(this.#snapshot.map(item => item.source.key === key ? { ...item, status, refreshing: false, settled: true, catalog: undefined, error: error instanceof Error ? error.message : String(error) } : item));
+        recovery.failed(error); abort.abort();
       }).finally(() => {
         if (this.#flights.get(key) === abort) this.#flights.delete(key); this.#pump();
         if (this.#active && this.#flights.size === 0 && this.#queue.size === 0 && !this.#timer) this.#timer = setTimeout(() => {

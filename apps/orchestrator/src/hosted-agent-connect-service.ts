@@ -3,12 +3,14 @@ import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@conn
 import * as contract from "@joko/contracts";
 import { RevisionConflictError } from "@joko/store";
 import { HostedAgentHostError, type HostedAgentHost, type HostedAgentPrincipal } from "./hosted-agent-host.js";
-import { HostedAgentWireError, HOSTED_AGENT_WIRE_FORMAT, assertHostedAgentWireFormat, decodeHostedAgentCall,
-  decodeHostedAgentOpen, decodeHostedAgentReply, encodeHostedAgentValue } from "./hosted-agent-wire.js";
+import { HostedAgentWireError, HOSTED_AGENT_WIRE_FORMAT, assertHostedAgentWireFormat,
+  decodeHostedAgentOpen, decodeHostedAgentReply, decodeHostedAgentInvocation, encodeHostedAgentValue } from "./hosted-agent-wire.js";
+import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
 import type { HostedAgentSettings, HostedAgentSettingsUpdate } from "./hosted-agent-settings.js";
 import { HostedAgentLimitError, type HostedAgentSessionSlots } from "./hosted-agent-limits.js";
 
 export type HostedAgentEndpointPort = Pick<HostedAgentHost, "call" | "poll" | "reply" | "readArtifact" | "close"> & {
+  infer?(principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest, signal: AbortSignal): Promise<string>;
   begin(principal: HostedAgentPrincipal, input: Parameters<HostedAgentHost["begin"]>[1]): Promise<{ readonly workspaceRoot: string }>;
 };
 export type HostedAgentLifecycleEndpointPort = HostedAgentEndpointPort & Pick<HostedAgentHost, "closePrincipal" | "closeProviderGrant" | "closeRelayedGuest" | "activeProviderTurns" | "sweep" | "dispose">;
@@ -78,7 +80,11 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
       return create(contract.OpenHostedAgentResponseSchema, { format, runId: input.runId, virtualRoot: run.workspaceRoot });
     }),
     callHostedAgent: (request, context) => invoke(request.format, context, async principal => {
-      const result = await options.host.call(principal, identity(request.runId), identity(request.callId), decodeHostedAgentCall(request.commandJson));
+      const command = decodeHostedAgentInvocation(request.commandJson);
+      if (command.kind === "infer" && (request.runId !== command.request.requestId || request.callId !== command.request.requestId)) throw new HostedAgentWireError();
+      if (command.kind === "infer" && !options.host.infer) throw new ConnectError("Isolated native inference is unavailable.", Code.Unimplemented);
+      const result = command.kind === "infer" ? await options.host.infer!(principal, command.request, context.signal)
+        : await options.host.call(principal, identity(request.runId), identity(request.callId), command);
       return create(contract.CallHostedAgentResponseSchema, { format, resultJson: encodeHostedAgentValue(result) });
     }),
     pollHostedAgents: (request, context) => invoke(request.format, context, async principal => {

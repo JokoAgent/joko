@@ -134,6 +134,28 @@ export class PartnerGroupStore {
       return this.get(id);
     });
   }
+  /** Private execution metadata for a server-owned room; this is not a local group creation entry. */
+  createExecutionGroup(input: { readonly requestId: string; readonly partnerId: string }): PartnerGroupRecord {
+    const requestId = identity(input.requestId), partnerId = identity(input.partnerId), fingerprint = operationBodyHash({ partnerId });
+    return this.#write(() => {
+      const previous = this.#db.prepare("SELECT * FROM partner_groups WHERE creation_id = ?").get(requestId) as Row | undefined;
+      if (previous) { if (previous["fingerprint"] !== fingerprint) changed(); return this.#group(previous); }
+      const id = identity(this.#id()), now = this.#time();
+      this.#db.prepare("INSERT INTO partner_groups VALUES (?,?,?,1,?,'all','auto',NULL,NULL,'active',?,?)").run(id, requestId, fingerprint, "Shared conversation", now, now);
+      this.#db.prepare("INSERT INTO group_members VALUES (?,?,0,0,?)").run(id, partnerId, now);
+      return this.get(id);
+    });
+  }
+  /** Server-room execution metadata is private and may add an authorized local step member. */
+  ensureExecutionMember(groupId: string, partnerId: string): PartnerGroupRecord {
+    return this.#write(() => {
+      const group = this.#active(groupId), id = identity(partnerId);
+      if (!group.memberIds.includes(id)) {
+        this.#db.prepare("INSERT INTO group_members VALUES (?,?,?,0,?)").run(group.id, id, group.memberIds.length, this.#time()); this.#touch(group.id);
+      }
+      return this.get(group.id);
+    });
+  }
   update(groupId: string, expectedRevision: number, patch: Partial<Pick<PartnerGroupRecord, "name" | "replyMode" | "speakingMode" | "organizerPartnerId" | "projectDir">>): PartnerGroupRecord {
     return this.#write(() => {
       const current = this.#active(groupId, expectedRevision), next = { ...current, ...patch };

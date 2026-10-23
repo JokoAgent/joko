@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
+import type { RemoteProcessHandle } from "@joko/remote-ssh";
 import type { ExecutorWorkspace } from "./hosted-agent-workspace.js";
 import { HostedAgentExecutorError } from "./hosted-agent-executor.js";
 import { execServerActions, mapExecServerParams, mapExecServerResult, type HostedAgentCodexAction } from "./hosted-agent-codex-mapping.js";
@@ -15,6 +16,7 @@ export interface HostedAgentCodexAuthorization {
   readonly authorize: (actions: readonly HostedAgentCodexAction[], signal: AbortSignal) => Promise<() => void>;
 }
 export interface HostedAgentCodexRelayOptions extends HostedAgentCodexAuthorization {
+  readonly openProcess?: (signal: AbortSignal) => Promise<RemoteProcessHandle>;
   readonly codexExecutable: string;
   readonly cwd: string;
   readonly workspace: ExecutorWorkspace;
@@ -24,7 +26,7 @@ export interface HostedAgentCodexRelayOptions extends HostedAgentCodexAuthorizat
   readonly sessionId: string;
 }
 interface Connection {
-  readonly child: ChildProcessWithoutNullStreams;
+  readonly child: ChildProcessWithoutNullStreams | RemoteProcessHandle;
   readonly lifetime: AbortController;
   readonly decoder: StringDecoder;
   readonly messages: string[];
@@ -76,7 +78,7 @@ export class HostedAgentCodexExecServerRelay {
   }
   async #start(id: string, signal: AbortSignal, authorization: HostedAgentCodexAuthorization): Promise<void> {
     const assert = await authorization.authorize([], signal); assert(); this.#assert(authorization);
-    const child = spawn(this.#options.codexExecutable, ["exec-server", "--listen", "stdio://"], {
+    const child = this.#options.openProcess ? await this.#options.openProcess(signal) : spawn(this.#options.codexExecutable, ["exec-server", "--listen", "stdio://"], {
       cwd: this.#options.cwd, env: this.#options.env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true
     });
     let resolveExit!: () => void;
@@ -107,10 +109,11 @@ export class HostedAgentCodexExecServerRelay {
         if (Buffer.byteLength(connection.buffer) > MAXIMUM_LINE_BYTES) throw new Error("Native record exceeds its limit.");
       } catch { void this.#drop(connection).catch(() => undefined); }
     });
-    await new Promise<void>((resolve, reject) => {
-      const failed = () => { child.removeListener("spawn", ready); reject(new HostedAgentExecutorError("EXECUTOR_FAILED")); };
-      const ready = () => { child.removeListener("error", failed); resolve(); };
-      child.once("spawn", ready); child.once("error", failed);
+    if (!this.#options.openProcess) await new Promise<void>((resolve, reject) => {
+      const local = child as ChildProcessWithoutNullStreams;
+      const failed = () => { local.removeListener("spawn", ready); reject(new HostedAgentExecutorError("EXECUTOR_FAILED")); };
+      const ready = () => { local.removeListener("error", failed); resolve(); };
+      local.once("spawn", ready); local.once("error", failed);
     });
     try { assert(); this.#assert(authorization); signal.throwIfAborted(); }
     catch (error) { await this.#drop(connection); throw error; }

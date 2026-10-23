@@ -36,7 +36,6 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
   return {
     config: { publicOrigin: "https://orchestrator.example.test" },
     store: {},
-    connections: {},
     artifacts: {},
     blobTransfers: {},
     artifactRepository: {},
@@ -47,6 +46,7 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
     browserActivity: [],
     close: async () => undefined,
     ...overrides,
+    connections: { fence: () => undefined, ...(overrides.connections as object ?? {}) },
     sessionHost: {
       getSessionRuntimeControl: () => ({
         generation: 0,

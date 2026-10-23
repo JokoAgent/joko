@@ -101,7 +101,7 @@ export class ProviderGroupRuntime {
       for (const providerId of providerIds) {
         const provider = backend.providers?.find(provider => provider.providerId === providerId);
         const models = backend.models.filter(model => model.providerId === providerId);
-        result.push({ backendId: backend.id, nativeBackendId: backend.id, providerId, key: providerGroupMemberKey(options.nodeId, backend.id, providerId), kind: "local", nodeId: options.nodeId,
+        result.push({ backendId: backend.id, nativeBackendId: backend.id, nativeBackendInstanceGeneration: generation, providerId, key: providerGroupMemberKey(options.nodeId, backend.id, providerId), kind: "local", nodeId: options.nodeId,
           displayName: options.nodeName(), providerName: provider?.displayName ?? providerId, agentKind: backend.adapterKind,
           available: backend.health !== "unavailable" && models.length > 0 && (!provider || ["authenticated", "not_required"].includes(provider.authenticationState)), remotelyEnabled: true, models,
           ...providerBrand(provider?.accessKind, provider?.accessProduct),
@@ -113,14 +113,16 @@ export class ProviderGroupRuntime {
       const models = options.registry.descriptors().find(backend => backend.id === entry.backendId)?.models.filter(model => model.providerId === provider.providerId) ?? [];
       const executionNodeId = entry.catalog.nodeId;
       result.push({ key: providerGroupMemberKey(executionNodeId, entry.source.backendId, provider.providerId, entry.received?.joinId),
-        backendId: entry.backendId, nativeBackendId: entry.source.backendId, providerId: provider.providerId, kind: entry.received ? "share" : "device", nodeId: executionNodeId,
+        backendId: entry.backendId, nativeBackendId: entry.source.backendId, nativeBackendInstanceGeneration: Number(entry.catalog.instanceGeneration),
+        providerId: provider.providerId, kind: entry.received ? "share" : "device", nodeId: executionNodeId,
         displayName: entry.name, providerName: provider.displayName, agentKind: entry.catalog.nativeAdapterKind, available: entry.available && provider.connected,
         remotelyEnabled: provider.remoteInvocationEnabled, models, ...(entry.received ? { received: entry.received } : {}), ...providerBrand(provider.accessKind, provider.accessProduct),
         assertCurrent: () => {
           if (entry.received) { if (!options.sharing) throw new Error("The Provider share directory is unavailable."); options.sharing.assertReceived(entry.received); }
           else options.sources.captureGroupPeer(entry.backendId).assertCurrent();
           const current = options.sources.groupCatalog().find(source => source.backendId === entry.backendId), currentProvider = current?.catalog.providers.find(item => item.providerId === provider.providerId);
-          if (!current?.catalog.nativeAdapterKind || !current.available || !currentProvider?.connected || !currentProvider.remoteInvocationEnabled) throw new Error("The Provider source is unavailable.");
+          if (!current?.catalog.nativeAdapterKind || current.catalog.instanceGeneration !== entry.catalog.instanceGeneration
+            || !current.available || !currentProvider?.connected || !currentProvider.remoteInvocationEnabled) throw new Error("The Provider source is unavailable.");
         } });
     }
     return result;
@@ -140,7 +142,8 @@ export class ProviderGroupRuntime {
     const captures = new Map<string, ReturnType<HostedAgentSources["captureNativeForGroup"]>>();
     const first = options.sources.captureNativeForGroup(member.backendId, "group-capture");
     return { client: { open: (input, signal) => { const captured = options.sources.captureNativeForGroup(member.backendId, input.runId); captures.set(input.runId, captured); return captured.client.open(input, signal); },
-      call: (...args) => first.client.call(...args), poll: (...args) => first.client.poll(...args), reply: (...args) => first.client.reply(...args), readArtifact: (...args) => first.client.readArtifact(...args) },
+      call: (...args) => first.client.call(...args), infer: (request, signal) => { assertCurrent(); first.assertCurrent(); return first.client.infer(request, signal); },
+      poll: (...args) => first.client.poll(...args), reply: (...args) => first.client.reply(...args), readArtifact: (...args) => first.client.readArtifact(...args) },
       poller: first.pool.poller, assertCurrent: () => { assertCurrent(); first.assertCurrent(); }, close: async (runId, signal) => { const captured = captures.get(runId); if (!captured) throw new Error("The original group cleanup was not captured."); await captured.close(signal); } };
   }
   connectOptions(authenticate: ProviderGroupConnectOptions["authenticate"]): ProviderGroupConnectOptions {
@@ -174,7 +177,7 @@ export class ProviderGroupRuntime {
       const current = this.store.snapshot({ backendId, providerId });
       if (current.revision !== group.revision || !current.config || !this.sources().some(source => members.some(member => member.key === source.key) && source.available)) throw new Error("The shared Provider group changed.");
     };
-    return { models, assertCurrent, catalog: create(contract.HostedAgentBackendCatalogSchema, { backendId, displayName: backend.displayName, nativeAdapterKind: backend.adapterKind, nodeId: this.#options.nodeId,
+    return { models, assertCurrent, catalog: create(contract.HostedAgentBackendCatalogSchema, { backendId, instanceGeneration: BigInt(backend.instanceGeneration), displayName: backend.displayName, nativeAdapterKind: backend.adapterKind, nodeId: this.#options.nodeId,
       capabilities: [...backend.capabilities.values()].map(toProtoCapability), version: backend.version,
       providers: [{ providerId, displayName: provider?.displayName ?? providerId, connected: models.length > 0, remoteInvocationEnabled: true,
         accessKind: provider?.accessKind ?? "", accessProduct: provider?.accessProduct ?? "", models: models.map(model => toProtoModelDescriptor(backendId, model)),

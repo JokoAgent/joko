@@ -8,7 +8,9 @@ import {
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
+  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   snapshotNativeSkills,
+  nativeTextInferenceImages,
   type ApprovedSkillResolver,
   type ApprovedSkillSeed,
   type NativeSkillPolicy,
@@ -1441,7 +1443,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
     }
     const response = await this.#resumeNativeThread(
-      { ...inspection.scope, assertCurrent: () => { inspection.scope.assertCurrent(); nativeSkills?.assertCurrent(); } },
+      { ...inspection.scope, assertCurrent: () => { context.signal.throwIfAborted(); inspection.scope.assertCurrent(); nativeSkills?.assertCurrent(); } },
       threadId,
       inspection.workspaceRoot,
       inspection.hostGeneration,
@@ -2785,7 +2787,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           onDisconnect: () => { finish({ failed: true }); }
         });
         assertDispatch();
-        await host.request("turn/start", { threadId, input: [{ type: "text", text: input.user }] },
+        const images = nativeTextInferenceImages(input);
+        if (images.length && !this.#models.some(candidate => candidate.providerId === input.providerId && candidate.modelId === model && candidate.supportsImages)) throw new Error("The selected model does not accept images.");
+        await host.request("turn/start", { threadId, input: [{ type: "text", text: input.user }, ...images.map(image => ({ type: "image", url: `data:${image.mimeType};base64,${Buffer.from(image.data).toString("base64")}` }))] },
           { signal, mutation: true, beforeDispatch: assertDispatch });
         const answer = await result;
         assertDispatch();
@@ -3098,6 +3102,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const assertCurrent = () => {
       scope.assertCurrent();
       this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
+      if (!scope.host.isActiveGeneration(expectedHostGeneration)) throw remoteRuntimeStale();
     };
     assertCurrent();
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
@@ -3107,7 +3112,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ...(this.#hosted?.configuration() ?? {}),
       "features.goals": false
     };
-    const response = await scope.host.request("thread/resume", {
+    const params: JsonObject = {
       threadId,
       cwd: workspaceRoot,
       ...(this.#hosted?.environments() ?? {}),
@@ -3120,7 +3125,39 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         ? developerInstructions === undefined ? {} : { developerInstructions }
         : { developerInstructions: this.#hosted.instructions(developerInstructions) }),
       config: configuration
-    }, { mutation: false, beforeDispatch: assertCurrent });
+    };
+    const resume = () => scope.host.request("thread/resume", params, { mutation: false, beforeDispatch: assertCurrent });
+    const response = await resume().catch(async (error: unknown) => {
+      if (!(error instanceof RpcRemoteFault) || error.archivedResumeThreadId !== threadId) throw error;
+      assertCurrent();
+      if (!scope.host.isActiveGeneration(expectedHostGeneration)) throw error;
+      const read = async () => {
+        const result = await scope.host.request("thread/read", { threadId, includeTurns: false }, { beforeDispatch: assertCurrent });
+        assertCurrent();
+        if (result.hostGeneration !== expectedHostGeneration) throw error;
+        const thread = parseThreadResult(result.value);
+        await assertNativeThreadTarget(thread, threadId, workspaceRoot, "provision", scope.remote);
+        assertCurrent();
+        const raw = objectValue(objectValue(result.value, "archive result")["thread"], "archive thread");
+        const path = raw["path"];
+        const bucket = typeof path === "string" ? path.split(/[\\/]/u).slice(0, -1).reverse()
+          .find(part => part === "sessions" || part === "archived_sessions") : undefined;
+        if (!bucket || thread.status?.["type"] === "active") throw error;
+        return { path: path as string, archived: bucket === "archived_sessions" };
+      };
+      const before = await read();
+      if (before.archived) {
+        assertCurrent();
+        const restored = await scope.host.request("thread/unarchive", { threadId }, { mutation: true, beforeDispatch: assertCurrent });
+        assertCurrent();
+        if (restored.hostGeneration !== expectedHostGeneration) throw error;
+      }
+      const after = await read();
+      if (after.archived) throw error;
+      params["path"] = after.path;
+      // The exact refusal proves no writer was loaded; retry preparation once, before any user turn.
+      return resume();
+    });
     assertCurrent();
     if (response.hostGeneration !== expectedHostGeneration) {
       throw adapterError({
@@ -4441,7 +4478,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
               await (learningTurn?.emit ?? runtime.context.emit)(event, {
                 namespace: "codex.app_server",
-                fields: { method }
+                fields: { method, ...(event.type === "message_complete" && event.nativeHistory?.identity
+                  ? { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } : {}) }
               });
             }
             reconcileRuntimeSettings(runtime, method, params);

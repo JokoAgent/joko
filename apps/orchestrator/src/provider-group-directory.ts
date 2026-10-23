@@ -6,6 +6,7 @@ import type { ProviderGroupQuota, ProviderGroupQuotaReader } from "./provider-gr
 export interface ProviderGroupDirectorySource extends ProviderGroupKey {
   readonly key: string; readonly kind: ProviderGroupMember["kind"]; readonly nodeId: string; readonly displayName: string;
   readonly nativeBackendId: string;
+  readonly nativeBackendInstanceGeneration?: number;
   readonly providerName: string; readonly agentKind: string; readonly available: boolean; readonly remotelyEnabled: boolean;
   readonly models: readonly ProviderModel[]; readonly brand?: string;
   readonly received?: ProviderGroupMember["received"];

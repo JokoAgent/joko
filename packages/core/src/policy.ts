@@ -1,4 +1,4 @@
-import { isAbsolute, normalize, relative, resolve } from "node:path";
+import { isAbsolute, normalize, relative, resolve, posix, win32 } from "node:path";
 import type { PermissionMode } from "./types.js";
 
 export type ToolRisk = "safe_read" | "workspace_write" | "safe_command" | "ambiguous" | "dangerous";
@@ -59,6 +59,7 @@ export interface ToolCall {
 }
 
 export interface PolicyContext {
+  readonly pathStyle?: "posix" | "win32";
   readonly mode: PermissionMode;
   /** Host-owned hard lock used by isolated reviewer sessions; it dominates Full Access. */
   readonly readOnly?: boolean;
@@ -171,7 +172,7 @@ export function evaluateOrderedPolicyRules(
 
 export function policyObservationForToolCall(
   call: ToolCall,
-  context: Pick<PolicyContext, "workspaceRoot" | "extraReadOnlyRoots">,
+  context: Pick<PolicyContext, "workspaceRoot" | "extraReadOnlyRoots" | "pathStyle">,
   risk: ToolRisk = classifyToolCall(call, context)
 ): PolicyObservation {
   const common = { risk: policyRiskForToolRisk(risk), toolName: call.name } as const;
@@ -188,16 +189,16 @@ export function policyObservationForToolCall(
   }
   if (READ_TOOLS.has(call.name) || WRITE_TOOLS.has(call.name)) {
     const candidate = extractPath(call.args);
-    const inWorkspace = candidate !== undefined && isWithin(candidate, context.workspaceRoot);
+    const inWorkspace = candidate !== undefined && isWithin(candidate, context.workspaceRoot, context.pathStyle);
     const inExtraDirectory = candidate !== undefined && !inWorkspace
-      && context.extraReadOnlyRoots.some((root) => isWithin(candidate, root));
+      && context.extraReadOnlyRoots.some((root) => isWithin(candidate, root, context.pathStyle));
     return {
       ...common,
       subjectKind: inExtraDirectory
         ? "extra_directory"
         : READ_TOOLS.has(call.name) ? "file_read" : "file_write",
       ...(inWorkspace && candidate !== undefined
-        ? { workspaceRelativePath: normalizedWorkspaceRelativePath(candidate, context.workspaceRoot) }
+        ? { workspaceRelativePath: normalizedWorkspaceRelativePath(candidate, context.workspaceRoot, context.pathStyle) }
         : {})
     };
   }
@@ -215,21 +216,21 @@ export function policyRiskForToolRisk(risk: ToolRisk): PolicyRisk {
   }
 }
 
-export function classifyToolCall(call: ToolCall, context: Pick<PolicyContext, "workspaceRoot" | "extraReadOnlyRoots">): ToolRisk {
+export function classifyToolCall(call: ToolCall, context: Pick<PolicyContext, "workspaceRoot" | "extraReadOnlyRoots" | "pathStyle">): ToolRisk {
   if (call.name.startsWith("mcp__")) return "ambiguous";
 
   if (READ_TOOLS.has(call.name)) {
     const candidate = extractPath(call.args);
     if (candidate === undefined) return "ambiguous";
     if (CREDENTIAL_PATH.test(candidate)) return "dangerous";
-    return isWithinAny(candidate, [context.workspaceRoot, ...context.extraReadOnlyRoots]) ? "safe_read" : "dangerous";
+    return isWithinAny(candidate, [context.workspaceRoot, ...context.extraReadOnlyRoots], context.pathStyle) ? "safe_read" : "dangerous";
   }
 
   if (WRITE_TOOLS.has(call.name)) {
     const candidate = extractPath(call.args);
     if (candidate === undefined) return "ambiguous";
     if (CREDENTIAL_PATH.test(candidate)) return "dangerous";
-    return isWithin(candidate, context.workspaceRoot) ? "workspace_write" : "dangerous";
+    return isWithin(candidate, context.workspaceRoot, context.pathStyle) ? "workspace_write" : "dangerous";
   }
 
   if (call.name === "bash") {
@@ -251,8 +252,8 @@ function extractPath(args: Readonly<Record<string, unknown>>): string | undefine
   return undefined;
 }
 
-function isWithinAny(candidate: string, roots: readonly string[]): boolean {
-  return roots.some((root) => isWithin(candidate, root));
+function isWithinAny(candidate: string, roots: readonly string[], style?: "posix" | "win32"): boolean {
+  return roots.some((root) => isWithin(candidate, root, style));
 }
 
 function policyRuleMatches(
@@ -286,15 +287,17 @@ function workspacePrefixMatches(candidate: string, prefix: string): boolean {
   return candidate === prefix || candidate.startsWith(`${prefix}/`);
 }
 
-function normalizedWorkspaceRelativePath(candidate: string, workspaceRoot: string): string {
-  const absoluteRoot = resolve(workspaceRoot);
-  const absoluteCandidate = isAbsolute(candidate) ? resolve(normalize(candidate)) : resolve(absoluteRoot, normalize(candidate));
-  return relative(absoluteRoot, absoluteCandidate).split("\\").join("/");
+function normalizedWorkspaceRelativePath(candidate: string, workspaceRoot: string, style?: "posix" | "win32"): string {
+  const paths = style === "posix" ? posix : style === "win32" ? win32 : { resolve, normalize, isAbsolute, relative };
+  const absoluteRoot = paths.resolve(workspaceRoot);
+  const absoluteCandidate = paths.isAbsolute(candidate) ? paths.resolve(paths.normalize(candidate)) : paths.resolve(absoluteRoot, paths.normalize(candidate));
+  return paths.relative(absoluteRoot, absoluteCandidate).split("\\").join("/");
 }
 
-export function isWithin(candidate: string, root: string): boolean {
-  const absoluteRoot = resolve(root);
-  const absoluteCandidate = isAbsolute(candidate) ? resolve(normalize(candidate)) : resolve(absoluteRoot, normalize(candidate));
-  const rel = relative(absoluteRoot, absoluteCandidate);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+export function isWithin(candidate: string, root: string, style?: "posix" | "win32"): boolean {
+  const paths = style === "posix" ? posix : style === "win32" ? win32 : { resolve, normalize, isAbsolute, relative };
+  const absoluteRoot = paths.resolve(root);
+  const absoluteCandidate = paths.isAbsolute(candidate) ? paths.resolve(paths.normalize(candidate)) : paths.resolve(absoluteRoot, paths.normalize(candidate));
+  const rel = paths.relative(absoluteRoot, absoluteCandidate);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${style === "win32" ? "\\" : style === "posix" ? "/" : process.platform === "win32" ? "\\" : "/"}`) && !paths.isAbsolute(rel));
 }

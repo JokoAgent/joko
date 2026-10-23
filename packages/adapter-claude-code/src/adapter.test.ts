@@ -139,15 +139,17 @@ describe("ClaudeCodeAdapter", () => {
       expect(review).toHaveBeenCalledOnce();
     } finally { await adapter.dispose(); }
   });
-  test("uses a temporary tool-free native Query for exact-model text review and retires it", async () => {
+  test.each([false, true])("uses a temporary tool-free native Query for exact-model text/image review and retires it (images=%s)", async withImage => {
     const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk), allowed = vi.fn();
     try {
-      const result = adapter.inferNativeText({ system: "Review the action", user: "Exact action", providerId: "claude-code", modelId: "model-a",
+      const result = adapter.inferNativeText({ system: "Review the action", user: "Exact action", providerId: "claude-code", modelId: "model-a", images: withImage ? [{ data: new Uint8Array([1, 2, 3]), mimeType: "image/png" }] : [],
         maxTokens: 1500, backendInstanceGeneration: INSTANCE_GENERATION, signal: new AbortController().signal, timeoutMs: 10_000, assertCurrent: () => {}, assertModelAllowed: allowed });
       await eventually(() => sdk.queries.length === 1);
       const query = sdk.queries[0]!;
       expect(query.params.options).toMatchObject({ model: "model-a", persistSession: false, tools: [], agents: {}, skills: [], settingSources: [], strictMcpConfig: true, mcpServers: {}, additionalDirectories: [] });
       expect(query.params.options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]).toBe("1500");
+      await eventually(() => query.receivedInputs.length === 1);
+      expect(query.receivedInputs[0]!.message.content).toEqual(withImage ? [{ type: "text", text: "Exact action" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "AQID" } }] : "Exact action");
       query.push(resultMessage(query.params.options.sessionId!, { result: '{"verdict":"allow","reason":"In scope"}', totalCostUsd: 0 }));
       await expect(result).resolves.toContain('"verdict":"allow"');
       expect(allowed).toHaveBeenCalledWith("claude-code", "model-a"); expect(sdk.retiredQueries).toContain(query);

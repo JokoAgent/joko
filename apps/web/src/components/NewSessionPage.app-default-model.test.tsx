@@ -16,6 +16,36 @@ vi.mock("./HomeUsageDashboard.js", () => ({ HomeUsageDashboard: () => null }));
 const roots: Root[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); document.body.replaceChildren(); window.localStorage.clear(); resetModelPickerPreferencesForTests(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+it("does not replace a newly selected project when an older model source project finishes creating", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); window.localStorage.clear();
+  const snapshot: AppSnapshot = { ...emptySnapshot(), backends: ["primary", "source"].map(id => ({ id, name: id, version: "1", health: "healthy", instanceGeneration: 1,
+    capabilities: new Map([...["input.text", "model.switch", "model.effort"].map(name => [name, { name, supported: true, options: [] as string[] }] as const),
+      ["permission.modes", { name: "permission.modes", supported: true, options: ["ask"] }]]) })),
+    targets: ["first", "other"].map(id => ({ id: `target-${id}`, backendId: "primary", name: id, workspaceId: `workspace-${id}`, workspaceName: id, revision: 1n, trusted: true, pinned: false, archived: false })),
+    workspaces: ["first", "other"].map(id => ({ id: `workspace-${id}`, targetId: `target-${id}`, name: id, kind: "userProject", serverPath: `D:\\${id}`, trusted: true, dirty: false, entries: [] })),
+    models: [model("primary", "first"), model("source", "source")] };
+  let finish!: (id: string) => void;
+  const save = vi.fn(async (_draft: NewSessionLocalDraft) => undefined);
+  const controller = { state: { activeProfile: { id: "connection", serverId: "node", origin: "http://127.0.0.1", deviceId: "device" }, snapshot, route: { kind: "newSession" },
+    connectionGeneration: 1, navigationRevision: 1, connectionState: "connected", preferences: { locale: "en", newSessionWorktreeEnabled: false } },
+    readNewSessionDraft: vi.fn(async () => undefined), saveNewSessionDraft: save, prepareTargetWorkspace: vi.fn(async () => undefined), probeTargetWorktree: vi.fn(async () => ({ eligibility: "unavailable" })),
+    listTargetWorktreeSources: vi.fn(async () => []), refreshProviderModels: vi.fn(async () => undefined), setNewSessionWorktreeEnabled: vi.fn(async () => undefined),
+    createTarget: vi.fn(() => new Promise<string>(resolve => { finish = resolve; })) } as unknown as AppController;
+  const container = document.body.appendChild(document.createElement("div")), root = createRoot(container); roots.push(root);
+  const render = (targetId: string) => <NewSessionPage controller={controller} snapshot={snapshot} initialTargetId={targetId} navigationOpen t={key => key}
+    onOpenNavigation={() => undefined} onClose={() => undefined} onSubmit={vi.fn()} />;
+  await act(async () => root.render(render("target-first")));
+  await vi.waitFor(() => expect(save).toHaveBeenCalled());
+  await act(async () => container.querySelector<HTMLButtonElement>(".model-picker-trigger")!.click());
+  const row = [...document.querySelectorAll<HTMLElement>(".model-picker__row")].find(element => element.textContent?.includes("Model source"))!;
+  expect(row).toBeDefined(); await act(async () => row.click()); expect(controller.createTarget).toHaveBeenCalledOnce();
+  await act(async () => root.render(render("target-other")));
+  await vi.waitFor(() => expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ selection: { kind: "target", targetId: "target-other" } })));
+  await act(async () => finish("late-source-target"));
+  expect(readAppDefaultModelPreference("node").current?.backendId).toBe("primary");
+  expect(save).not.toHaveBeenLastCalledWith(expect.objectContaining({ selection: { kind: "target", targetId: "late-source-target" } }));
+});
+
 it("initializes a future task from exact model effort preferences only when no explicit default exists", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); window.localStorage.clear(); resetModelPickerPreferencesForTests();
   setModelConfiguration("node", "primary", "provider", "first", { effort: "high" });

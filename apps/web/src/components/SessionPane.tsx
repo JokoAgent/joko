@@ -276,6 +276,25 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [backgroundStopError, setBackgroundStopError] = useState<string>();
   const [collaborationOpen, setCollaborationOpen] = useState(false);
   const [sharingOpen, setSharingOpen] = useState(false);
+  const [modelRuntimeControl, setModelRuntimeControl] = useState<{
+    readonly sessionId: string; readonly ownerKey: string; readonly control: import("@joko/contracts").TaskShareRuntimeControl;
+  }>();
+  useEffect(() => {
+    if (guest || !controller.getSessionRuntimeControl) return;
+    let current = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = async (): Promise<void> => {
+      try {
+        const control = await controller.getSessionRuntimeControl!(session.id);
+        if (!current || providerGroupOwnerRef.current !== providerGroupOwnerKey) return;
+        setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
+        if (control.pending) timer = setTimeout(() => { void read(); }, 2_000);
+      } catch { /* The current Session snapshot remains authoritative when a read fails. */ }
+    };
+    void read();
+    return () => { current = false; if (timer) clearTimeout(timer); };
+  }, [providerGroupOwnerKey, session.id, session.generation, session.backendId, session.activeRunId, guest,
+    modelRuntimeControl?.control.pendingGeneration, controller.getSessionRuntimeControl]);
   const [objectiveDialogRequest, setObjectiveDialogRequest] = useState<(ObjectiveDialogRequest & { readonly handoffId?: string })>();
   const objectiveDialogRequestIdRef = useRef(0);
   const collaborationButtonRef = useRef<HTMLButtonElement>(null);
@@ -1816,6 +1835,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     } : {})
   });
 
+  const runtimeSelection = modelRuntimeControl?.sessionId === session.id && modelRuntimeControl.ownerKey === providerGroupOwnerKey
+    ? modelRuntimeControl.control.pending ?? modelRuntimeControl.control.effective : undefined;
+  const unifiedSessionModels = !guest && controller.setRuntimeModel ? controller.state.snapshot.models.filter(model =>
+    controller.state.snapshot.backends.some(candidate => candidate.id === model.backendId
+      && candidate.capabilities.get("input.text")?.supported && candidate.capabilities.get("model.switch")?.supported)
+    && controller.state.snapshot.settings.backendSettings.find(setting => setting.backendId === model.backendId)?.enabled !== false)
+    : backendModels;
   const composerControls = partnerRuntimeLocked ? undefined : (
     <div className="composer__controls" aria-label={t("session.controls")}>
       {canSetPermission && <PermissionSelector
@@ -1831,31 +1857,44 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       )}
       {(canSwitchModel || ((canSetEffort || canSetFast) && session.model !== undefined)) && <ModelPicker
         className="control-select"
-        models={canSwitchModel ? backendModels : session.model === undefined ? [] : [session.model]}
+        models={canSwitchModel ? unifiedSessionModels : session.model === undefined ? [] : [session.model]}
         ownerId={modelPreferenceOwnerId(controller.state.activeProfile?.serverId)}
         favoriteSettings={controller.state.snapshot.settings.modelFavorites}
         onMutateFavorite={guest ? undefined : controller.updateModelFavorites}
-        value={session.model === undefined ? undefined : {
+        value={runtimeSelection ? { backendId: runtimeSelection.backendId, providerId: runtimeSelection.providerId,
+          modelId: runtimeSelection.modelId, effort: runtimeSelection.effort, fastMode: runtimeSelection.fastMode }
+          : session.model === undefined ? undefined : {
           backendId: session.backendId,
           providerId: session.model.providerId,
           modelId: session.model.modelId,
           ...(session.effort === undefined ? {} : { effort: session.effort }),
           fastMode: session.fastMode
         }}
-        effortEnabled={canSetEffort}
-        fastEnabled={canSetFast}
+        effortEnabled={!!controller.setRuntimeModel || canSetEffort}
+        fastEnabled={!!controller.setRuntimeModel || canSetFast}
         useMorphPopover
+        retainCurrentSource
         onSelectionFocus={() => setComposerFocusRequest((current) => current + 1)}
         t={t}
         providerGroupUsage={providerGroupUsage}
-        onOpen={() => Promise.allSettled([controller.refreshProviderModels(session.backendId, undefined, true), refreshTaskProviderGroupUsage()]).then(() => undefined)}
+        onOpen={() => Promise.allSettled([controller.refreshProviderModels(session.backendId, undefined, true), refreshTaskProviderGroupUsage(),
+          controller.getSessionRuntimeControl?.(session.id).then(control => {
+            if (providerGroupOwnerRef.current === providerGroupOwnerKey) setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
+          })]).then(() => undefined)}
         onConnectSource={guest ? undefined : () => { window.location.hash = "#/settings/providers"; }}
-        onSelect={(selection) => {
+        onSelect={async (selection) => {
           if (selection === undefined) return;
-          const model = backendModels.find((candidate) =>
-            candidate.providerId === selection.providerId && candidate.modelId === selection.modelId);
-          if (model === undefined || !model.available) return;
-          runAction("model", () => controller.setModel(
+          const model = unifiedSessionModels.find((candidate) => candidate.backendId === selection.backendId
+            && candidate.providerId === selection.providerId && candidate.modelId === selection.modelId);
+          if (!model?.available) throw new Error("The model source is no longer available.");
+          if (!guest && controller.setRuntimeModel) {
+            await controller.setRuntimeModel(session.id, { backendId: model.backendId, providerId: model.providerId,
+              modelId: model.modelId, effort: selection.effort, fastMode: model.supportsFast && selection.fastMode });
+            const control = await controller.getSessionRuntimeControl?.(session.id);
+            if (control && providerGroupOwnerRef.current === providerGroupOwnerKey) setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
+            return;
+          }
+          await controller.setModel(
             session.id,
             model.providerId,
             model.modelId,
@@ -1863,9 +1902,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
               ? selection.effort
               : undefined,
             canSetFast && model.supportsFast && selection.fastMode
-          ));
+          );
         }}
       />}
+      {modelRuntimeControl?.sessionId === session.id && modelRuntimeControl.ownerKey === providerGroupOwnerKey && modelRuntimeControl.control.pending && <Pill>{t("taskSharing.pending")}</Pill>}
     </div>
   );
 

@@ -10,6 +10,7 @@ import type { SourceAttachmentPreparation } from "./hosted-agent-source-attachme
 export async function prepareSourceWorkspaceInput(input: PromptInput, context: AdapterContext, options: {
   readonly shadow: string; readonly workspaceId: string; readonly resources: HostedAgentSourceResources; readonly assertCurrent: () => void;
   readonly attachments?: SourceAttachmentPreparation;
+  readonly capturePath?: (reference: string, directory: boolean, stageFile: boolean) => Promise<{ readonly path: string; readonly nativePath: string; readonly assertCurrent: () => void; readonly validate?: () => Promise<void>; readonly release?: () => Promise<void> }>;
 }): Promise<{ readonly input: PromptInput; readonly assertCurrent: () => void; readonly commit?: (preparation: DurableNativeDispatchPreparation) => Promise<void> }> {
   const guard = () => { context.signal.throwIfAborted(); options.assertCurrent(); };
   guard();
@@ -17,10 +18,12 @@ export async function prepareSourceWorkspaceInput(input: PromptInput, context: A
     || !validInputMentionRanges(input.text, input.mentions, input.mentionRanges ?? [], input.pastedTextRanges ?? [])) throw new Error("The Source input shape is unsupported or invalid.");
   const native = /^[A-Za-z]:|^\\/u.test(options.shadow) ? win32 : posix;
   if (!native.isAbsolute(options.shadow) || options.shadow.length > 16_384 || /[\x00-\x1f\x7f]/u.test(options.shadow)) throw new Error("The Source native workspace is invalid.");
-  const blocks: string[] = [], guards = [guard], files: string[] = [];
+  const blocks: string[] = [], guards = [guard], files: string[] = [], validations: (() => Promise<void>)[] = [];
   for (const [index, file] of input.files.entries()) {
-    const workspace = file.workspacePath === undefined ? undefined : await capturePath(file.workspacePath, false, context, options.shadow, guard);
-    const value = await options.attachments!.file(file, index, workspace); files.push(value.text); guards.push(value.assertCurrent);
+    const workspace = file.workspacePath === undefined ? undefined : await (options.capturePath ? options.capturePath(file.workspacePath, false, true) : capturePath(file.workspacePath, false, context, options.shadow, guard));
+    if (workspace && "validate" in workspace && typeof workspace.validate === "function") validations.push(workspace.validate as () => Promise<void>);
+    try { const value = await options.attachments!.file(file, index, workspace); files.push(value.text); guards.push(value.assertCurrent); }
+    finally { if (workspace && "release" in workspace && typeof workspace.release === "function") await workspace.release(); }
   }
   for (const mention of input.mentions) {
     guard();
@@ -37,7 +40,8 @@ export async function prepareSourceWorkspaceInput(input: PromptInput, context: A
     if (mention.lineRange !== undefined && (mention.kind !== "workspace_file" || !Number.isSafeInteger(mention.lineRange.startLine)
       || !Number.isSafeInteger(mention.lineRange.endLine) || mention.lineRange.startLine < 1 || mention.lineRange.endLine < mention.lineRange.startLine
       || mention.lineRange.endLine > 0xffff_ffff)) throw new Error("The Source line range is invalid.");
-    const value = await capturePath(mention.reference, mention.kind === "workspace_directory", context, options.shadow, guard);
+    const value = await (options.capturePath ? options.capturePath(mention.reference, mention.kind === "workspace_directory", false) : capturePath(mention.reference, mention.kind === "workspace_directory", context, options.shadow, guard));
+    if ("validate" in value && typeof value.validate === "function") validations.push(value.validate as () => Promise<void>);
     guards.push(value.assertCurrent);
     blocks.push(`Workspace ${mention.kind === "workspace_directory" ? "directory" : "file"} reference: ${JSON.stringify({ name: mention.label,
       ...(mention.lineRange === undefined ? {} : { lineRange: { ...mention.lineRange } }) })}\nPath: ${value.nativePath}`);
@@ -45,7 +49,10 @@ export async function prepareSourceWorkspaceInput(input: PromptInput, context: A
   const retained = options.attachments?.retained() ?? [];
   guards.push(...retained.map(file => file.assertCurrent));
   const prepared = projectSourceInput(input, context, blocks, guards, files, retained.map(file => file.text));
-  return { ...prepared, ...(input.files.length || input.mentions.some(mention => mention.kind === "artifact") ? { commit: options.attachments!.commit } : {}) };
+  const attachments = input.files.length || input.mentions.some(mention => mention.kind === "artifact");
+  return { ...prepared, ...(attachments || validations.length ? { commit: async (preparation: DurableNativeDispatchPreparation) => {
+    guard(); for (const validate of validations) { await validate(); guard(); } if (attachments) await options.attachments!.commit(preparation); guard();
+  } } : {}) };
 }
 
 async function capturePath(reference: string, directory: boolean, context: AdapterContext, shadow: string, guard: () => void): Promise<{ readonly path: string; readonly nativePath: string; readonly assertCurrent: () => void }> {

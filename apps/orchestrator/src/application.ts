@@ -101,6 +101,7 @@ import { InputHandoffTools, INPUT_HANDOFF_TOOL_PROVIDER_ID } from "./input-hando
 import { createProviderSharingRuntime, type ProviderSharingRuntime } from "./provider-sharing-runtime.js";
 import { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import { createProviderGroupHostedEndpoint } from "./provider-group-hosted.js";
+import { createHostedNativeTextInference } from "./hosted-native-text-inference.js";
 import { createHostedAgentCodexAdapter } from "./hosted-agent-codex-factory.js";
 import { createHostedAgentClaudeAdapter } from "./hosted-agent-claude-factory.js";
 import { policySnapshotFor } from "./policy-settings.js";
@@ -167,10 +168,15 @@ import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory
 import { PartnerMemoryPreferences } from "./partner-memory-preferences.js";
 import { PartnerConnectionPreferences, PartnerConnectionsManager } from "./partner-connections.js";
 import { PartnerRuntimePromptResolver } from "./partner-runtime-prompt.js";
-import { PartnerGroupStore } from "@joko/store";
+import { PartnerGroupStore, PartnerNetworkStore } from "@joko/store";
 import { PartnerGroupSessionRuntime } from "./partner-group-runtime.js";
+import { PartnerNetworkHost } from "./partner-network-host.js";
+import { PartnerNetworkHome } from "./partner-network-home.js";
+import { PartnerNetworkRuntime } from "./partner-network-runtime.js";
+import { PartnerIdentityDirectory } from "./partner-identity-directory.js";
 import { PartnerGroupManager } from "./partner-group-manager.js";
 import { PartnerGroupWorkspaces } from "./partner-group-workspaces.js";
+import { PartnerNetworkPlanWorkspaces } from "./partner-network-plan-workspaces.js";
 import { PartnerGroupAttachments } from "./partner-group-attachments.js";
 import { PLAN_DECISION_SYSTEM_PROMPT, buildPlanDecisionPrompt, parsePlanDecision } from "./partner-group-division.js";
 import { MessagingManager, type MessagingManagerOptions } from "./messaging-manager.js";
@@ -205,6 +211,7 @@ import { HelpAssistant } from "./help-assistant.js";
 import { HelpFeedbackStore } from "./help-feedback-store.js";
 import { SubagentModelSettings } from "./subagent-model-settings.js";
 import { ModelFavoriteSettings } from "./model-favorite-settings.js";
+import { modelSourceCatalogModels, modelSourceFavoriteUnavailableReason } from "./model-source-catalog.js";
 import { DeferredBackendRestartCoordinator } from "./deferred-backend-restart.js";
 import { VisionBridgeToolProvider } from "./vision-bridge-tool-provider.js";
 import { OperationalBrowserState } from "./operational-browser-state.js";
@@ -243,6 +250,7 @@ import { PartnerHomeInference } from "./partner-home-inference.js";
 import { PartnerHomeProjects } from "./partner-home-projects.js";
 import { PartnerHomeWorkbench } from "./partner-home-workbench.js";
 import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
+import { PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-publisher.js";
 import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { PartnerRoutineStore } from "@joko/store";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
@@ -406,6 +414,7 @@ export function composeCodeHostProviders(
 
 export interface OrchestratorApplication {
   readonly taskSharingHome?: TaskSharingHome;
+  readonly partnerIdentity?: PartnerIdentityDirectory;
   readonly config: OrchestratorConfig;
   readonly store: OperationalStore;
   readonly connections: ConnectionManager;
@@ -500,6 +509,7 @@ export interface OrchestratorApplication {
   readonly partners?: PartnerManager;
   readonly partnerGroupRuntime?: PartnerGroupSessionRuntime;
   readonly partnerGroups?: PartnerGroupManager;
+  readonly partnerNetwork?: PartnerNetworkRuntime;
   readonly appDefaultModels?: AppDefaultModelCoordinator;
   readonly partnerRoutines?: PartnerRoutineManager;
   readonly partnerImports?: PartnerImportManager;
@@ -666,6 +676,8 @@ export async function createOrchestratorApplication(
   try { partnerGroupStore = new PartnerGroupStore(join(config.dataDirectory, "partner-groups.db")); }
   catch (error) { contacts.close(); contactStore.close(); partnerStore.close(); store.close(); throw error; }
   let partnerGroupRuntime: PartnerGroupSessionRuntime | undefined;
+  let partnerNetwork: PartnerNetworkRuntime | undefined;
+  let partnerNetworkLanes: PartnerGroupSessionRuntime | undefined;
   let partnerGroups: PartnerGroupManager | undefined;
   let partnerGroupWorkspaces: PartnerGroupWorkspaces | undefined;
   const privateHomeTarget = (sessionId: string, targetId: string) => {
@@ -674,7 +686,7 @@ export async function createOrchestratorApplication(
       try { if (store.getSession(sessionId).descriptor.targetId !== targetId) return undefined; } catch { /* Native creation precedes its product Session row. */ }
       return home.id;
     }
-    return partnerGroupRuntime?.homeTarget(sessionId, targetId);
+    return partnerGroupRuntime?.homeTarget(sessionId, targetId) ?? partnerNetworkLanes?.homeTarget(sessionId, targetId);
   };
   const privateResourceTarget = (context: AdapterContext) => privateHomeTarget(context.sessionId, context.target.id);
   let voiceDictionaryPeerStore: VoiceDictionaryPeerStore;
@@ -699,6 +711,7 @@ export async function createOrchestratorApplication(
   let inputHandoffNotifications: InputHandoffNotifications | undefined;
   let providerSharing: ProviderSharingRuntime | undefined;
   let providerGroups: ProviderGroupRuntime | undefined;
+  let hostedAgentSources: HostedAgentSources | undefined;
   let personalDevelopmentDoctor: PersonalDevelopmentDoctor | undefined;
   let stopPersonalDevelopmentNotifications = (): void => undefined;
   let personalDevelopmentClose: Promise<void> | undefined;
@@ -728,7 +741,11 @@ export async function createOrchestratorApplication(
       };
     }
   });
-  const modelFavorites = new ModelFavoriteSettings(store);
+  const modelFavorites = new ModelFavoriteSettings(store, {
+    models: backend => modelSourceCatalogModels({ store, hostedAgentSources, providerGroups }, backend),
+    unavailableReason: (backendId, providerId, modelId) => modelSourceFavoriteUnavailableReason(
+      { store, hostedAgentSources, providerGroups }, backendId, providerId, modelId)
+  });
   const codeHostProviders = composeCodeHostProviders(
     dependencies.codeHostProviders,
     new OperationalCodeHostSessionAuthorization(store)
@@ -1636,7 +1653,6 @@ export async function createOrchestratorApplication(
   let startupRoutineRuntime: ExtensionRoutineRuntime | undefined;
   let startupCardRuntime: ExtensionCardRuntime | undefined;
   let startupHostedAgents: HostedAgentRuntime | undefined;
-  let hostedAgentSources: HostedAgentSources | undefined;
   let startupExtensionCards: ExtensionCardsManager | undefined;
   let startupBackendCleanup: Promise<readonly unknown[]> | undefined;
   const cleanupStartupBackendOwners = (): Promise<readonly unknown[]> => {
@@ -1691,6 +1707,7 @@ export async function createOrchestratorApplication(
     authenticateGuest: context => { if (!providerSharing) throw new Error("Provider sharing is unavailable."); return providerSharing.authenticateGuest(context); },
     decorateCatalog: catalog => providerGroups?.decorateCatalog(catalog) ?? catalog,
     resolveSharedProvider: (backendId, providerId) => providerGroups?.sharedProvider(backendId, providerId),
+    inferNativeText: createHostedNativeTextInference({ store, registry: backendInstances, routes: modelRoutes }),
     artifactCapacityBytes: artifacts.maximumBlobBytes, factories: [{ backendId: piBackendId, displayName: store.getBackend(piBackendId).descriptor.displayName,
       isolatedGuests: () => backendInstances.adapter(piBackendId)?.hostedExecutionCapabilities?.isolatedGuests === true,
       describe: () => store.getBackend(piBackendId).descriptor,
@@ -1731,7 +1748,8 @@ export async function createOrchestratorApplication(
           },
           processSupervisor: createDefaultManagedProcessSupervisor(),
           ...(creation.sourceMcp ? { mcpBridge: creation.sourceMcp.pi() } : {}),
-          includeManagedSubagentTools: () => false, readAgentResourceSettings: () => runtimeGovernance.agentResource(),
+          includeManagedSubagentTools: context => context.hostedExecution?.workspace.subagentsEnabled === true,
+          readAgentResourceSettings: () => runtimeGovernance.agentResource(),
           readCollaborationSettings: () => runtimeGovernance.collaboration()
         });
       }
@@ -1819,7 +1837,7 @@ export async function createOrchestratorApplication(
   };
   const partnerRuntimePrompt = new PartnerRuntimePromptResolver(partnerStore, store, partnerMemoryPreferences,
     (partnerId, assertCurrent) => partnerImportStorage.environment.read(partnerId, assertCurrent), makerMemory,
-    (session, partnerId) => partnerGroupRuntime?.validTarget(session, partnerId) === true);
+    (session, partnerId) => partnerGroupRuntime?.validTarget(session, partnerId) === true || partnerNetworkLanes?.validTarget(session, partnerId) === true);
   let partnerSessionTasks: PartnerSessionTaskManager | undefined;
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
   let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
@@ -1875,10 +1893,10 @@ export async function createOrchestratorApplication(
     partnerSessionRetiring: (sessionId) => partnerStore.isPartnerSessionRetiring(sessionId)
       || (partnerHomeRuntime?.blocksExecution(sessionId) ?? partnerHomeStorage.blocksSession(sessionId))
       || partnerStore.isPartnerTargetRetiring(store.getSession(sessionId).descriptor.targetId) || partnerSessionTasks?.isRetiring(sessionId) === true
-      || partnerGroupRuntime?.isRetiring(sessionId) === true,
+      || partnerGroupRuntime?.isRetiring(sessionId) === true || partnerNetworkLanes?.isRetiring(sessionId) === true,
     partnerTargetRetired: (targetId) => partnerStore.isPartnerTargetRetired(targetId) || partnerHomeRuntime?.blocksTarget(targetId) === true,
     partnerSessionRestarting: (sessionId) => partnerStore.isPartnerSessionRestarting(sessionId),
-    partnerSessionPaused: (sessionId) => partnerStore.isPartnerSessionPaused(sessionId) || partnerSessionTasks?.isHeld(sessionId) === true || partnerGroupRuntime?.isHeld(sessionId) === true,
+    partnerSessionPaused: (sessionId) => partnerStore.isPartnerSessionPaused(sessionId) || partnerSessionTasks?.isHeld(sessionId) === true || partnerGroupRuntime?.isHeld(sessionId) === true || partnerNetworkLanes?.isHeld(sessionId) === true,
     partnerSessionPolicy: (sessionId) => {
       const profile = partnerStore.findPartnerByCanonicalSession(sessionId);
       return profile === undefined ? undefined : {
@@ -1952,6 +1970,7 @@ export async function createOrchestratorApplication(
     nativeBackends: new Map([["pi", piBackendId], ["codex", codexBackendId], ["claude-agent-sdk-stdio", claudeCodeBackendId]]),
     allowedSkillIds: context => partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id) });
   hostedAgentSources = new HostedAgentSources({ store, peers: devicePeers, registry: backendInstances, host: sessionHost,
+    remoteExecution,
     sharing: providerSharing.directory, sourceDeviceId: serverId,
     temporaryRoot: join(config.dataDirectory, "hosted-source-transfers"), commandConcurrencyGate,
     mcpRouter, includeToolPolicy: (context, policyId) => toolPolicies.enabledForSession(context.sessionId, context.target.id, policyId),
@@ -1992,7 +2011,10 @@ export async function createOrchestratorApplication(
     } });
   sessionHost.installProviderGroupRuntime(providerGroups);
   hostedAgents.installEndpoint(createProviderGroupHostedEndpoint({ base: hostedAgents.host, runtime: providerGroups,
-    root: join(config.dataDirectory, "hosted-agents"), assertSelection: (principal, input) => hostedAgents.assertGuestSelection(principal, input),
+    root: join(config.dataDirectory, "hosted-agents"), assertSelection: (principal, input) => {
+      const computer = hostedAgents.settings.captureComputer(), provider = hostedAgents.settings.captureProvider(input.backendId, input.providerId);
+      const assertCurrent = () => { computer(); provider(); hostedAgents.assertGuestSelection(principal, input); }; assertCurrent(); return assertCurrent;
+    },
     capture: (member, principal, modelIds, assertCurrent) => providerGroups!.captureHosted(member, principal, modelIds, assertCurrent) }));
   const personalDevelopmentRoot = join(config.dataDirectory, "personal-development");
   personalDevelopmentNativeBroker = new PersonalDevelopmentNativeBroker({
@@ -2130,7 +2152,7 @@ export async function createOrchestratorApplication(
       }
     },
     retireWorkbench: (partnerId, targetId) => partnerWorkbenches.retirePartner(partnerId, targetId),
-    ownedIndependentSessions: (partnerId) => [...partnerSessionTasks?.ownedSessions(partnerId) ?? [], ...partnerGroupRuntime?.ownedSessions(partnerId) ?? []],
+    ownedIndependentSessions: (partnerId) => [...partnerSessionTasks?.ownedSessions(partnerId) ?? [], ...partnerGroupRuntime?.ownedSessions(partnerId) ?? [], ...partnerNetworkLanes?.ownedSessions(partnerId) ?? []],
     forgetIndependentTasks: (partnerId) => partnerSessionTasks?.forgetPartner(partnerId),
     resumeIndependentReturns: async (partnerId) => partnerSessionTasks?.refreshPartner(partnerId)
   });
@@ -2172,7 +2194,23 @@ export async function createOrchestratorApplication(
     homeLocation: partnerId => partnerHomeRuntime ? partnerHomeStorage.current(partnerId, partnerHomeRuntime.local).location : undefined,
     briefs: new PartnerWorkbenchBriefReader(new CodeHostProjectProvider()), sessionTasks: () => partnerSessionTasks, routines: () => partnerRoutines,
     pullRequestProviders: (authorization) => composeCodeHostProviders(dependencies.codeHostProviders, authorization) });
-  partnerSessionTasks = new PartnerSessionTaskManager(store, partners, sessionHost, workspaces, config.dataDirectory, Date.now, partnerHomeProjects);
+  const partnerTaskGroupPublisher = new PartnerSessionTaskGroupPublisher(store, {
+    capture: sessionId => partnerNetwork?.ownerTaskScope(sessionId), homeServerId: () => serverId, locale: () => persistedLocale(store),
+    publish: async (origin, request, signal) => {
+      signal.throwIfAborted();
+      if (origin.joinId) return networkHome.publish(origin.joinId, request);
+      if (origin.hostServerId !== serverId) throw new Error("The task result room authority changed.");
+      return networkHost.publish(request, origin.ownerId);
+    },
+    media: async (origin, request, signal) => {
+      const assertCurrent = () => { signal.throwIfAborted(); };
+      if (origin.joinId) return networkHome.media(request, { deviceId: serverId, signal, assertCurrent });
+      if (origin.hostServerId !== serverId) throw new Error("The task result room authority changed.");
+      return networkHost.media(request, origin.ownerId, { signal, assertCurrent });
+    },
+    readArtifact: async blob => (await artifacts.readBlob(blob)).data
+  });
+  partnerSessionTasks = new PartnerSessionTaskManager(store, partners, sessionHost, workspaces, config.dataDirectory, Date.now, partnerHomeProjects, partnerTaskGroupPublisher);
   const partnerTaskOutputs = new PartnerTaskOutputProjection(store, partnerSessionTasks, partnerStore, workspaceCapture);
   const unregisterPartnerSessionTaskTools = mcpRouter.registerBridgeToolProvider(new PartnerSessionTaskTools(partnerSessionTasks));
   const collaborationGoals = new CollaborationGoalManager({
@@ -2436,7 +2474,7 @@ export async function createOrchestratorApplication(
     reviewNativeTool: createExtensionTaskNativeReviewer({ store, routes: modelRoutes, redact: value => credentials.redactText(value),
       adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter ? [adapter] : []; }) }) });
   sessionHost.setExtensionTaskQueueGuard(item => extensionTasks.assertQueueCurrent(item));
-  sessionHost.setExtensionNativeToolAuthorization(sessionId => extensionTasks.nativeToolAuthorization(sessionId));
+  sessionHost.setExtensionNativeToolAuthorization(sessionId => partnerNetwork?.nativeToolAuthorization(sessionId) ?? extensionTasks.nativeToolAuthorization(sessionId));
   mcpRouter.setNativeToolAdmission((...args) => sessionHost.authorizeNativeBridgeTool(...args));
   piResources.setExtensionTaskRemoval((transaction, resourceId) => extensionTasks.uninstall(transaction, resourceId));
   const extensionCardMedia = new ExtensionCardMedia({ store, vault: credentialVault, artifacts, transfers: blobTransfers });
@@ -2535,7 +2573,7 @@ export async function createOrchestratorApplication(
     routines: partnerRoutines, artifacts, assertOwner: assertImportService,
     supportsRemoteCreation: backendId => backendId === piBackendId,
     hasRemoteModelRoute: (backendId, providerId, modelId) => partnerHomeInference?.available(backendId, providerId, modelId) === true,
-    ownedSessions: partnerId => [...partnerSessionTasks?.ownedSessions(partnerId) ?? [], ...partnerGroupRuntime?.ownedSessions(partnerId) ?? []],
+    ownedSessions: partnerId => [...partnerSessionTasks?.ownedSessions(partnerId) ?? [], ...partnerGroupRuntime?.ownedSessions(partnerId) ?? [], ...partnerNetworkLanes?.ownedSessions(partnerId) ?? []],
     readProfileProjection: async (partnerId, assertCurrent) => {
       const profile = partnerStore.getPartner(partnerId), carried = store.findSetting<{ identity: string; user: string; instructions: string }>("target", profile.homeTargetId, "partner-home.profile")?.value;
       if (carried) return carried;
@@ -2570,7 +2608,8 @@ export async function createOrchestratorApplication(
     decidePlan: async (input, signal, stillCurrent) => {
       const plan = auxiliaryText.capture(), members = new Set(input.members.map(member => member.partnerId));
       const result = await auxiliaryText.run(plan, { system: PLAN_DECISION_SYSTEM_PROMPT, user: buildPlanDecisionPrompt(input), maxTokens: 800,
-        timeoutMs: 20_000, signal, stillCurrent, validate: raw => parsePlanDecision(raw, input.mode, members) === null ? undefined : raw });
+        timeoutMs: 20_000, ...(input.mode === "auto" ? { totalTimeoutMs: 8_000, firstAttemptTimeoutMs: 5_000 } : {}), signal, stillCurrent,
+        validate: raw => parsePlanDecision(raw, input.mode, members) === null ? undefined : raw });
       return result.status === "ok" ? parsePlanDecision(result.text, input.mode, members) : null;
     },
     notifyStep: async (group, plan) => {
@@ -2583,6 +2622,34 @@ export async function createOrchestratorApplication(
       if (!sourceSessionId) return;
       mobilePush.notifyGroupStep({ groupId: group.id, groupTitle: group.name, sourceSessionId,
         subjectSequence: BigInt(partnerGroupStore.latestChangeSequence()), kind: step?.status === "failed" ? "error" : plan.status === "done" ? "done" : "awaiting" });
+    } });
+  const networkLaneStore = new PartnerGroupStore(join(config.dataDirectory, "partner-network-lanes.db"));
+  partnerNetworkLanes = new PartnerGroupSessionRuntime(networkLaneStore, partnerStore, store, sessionHost, workspaces);
+  const networkPartner = (id: string) => {
+    const profile = partners.getPartner(id);
+    if (profile.lifecycle !== "active" || profile.initializationState !== "ready" || !profile.canonicalSessionId || partnerHomeStorage.changing(id)) throw new Error("This Partner is unavailable.");
+    return { id: profile.id, name: profile.displayName, description: profile.description };
+  };
+  const networkHost = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId, origin: config.publicOrigin,
+    mediaDirectory: join(config.dataDirectory, "partner-network-media"), partner: networkPartner, artifacts });
+  const networkHome = new PartnerNetworkHome({ directory: join(config.dataDirectory, "credentials", "partner-network"), serverId,
+    vault: credentialVault, partner: networkPartner, allowInsecureLan: config.allowInsecureLan });
+  partnerNetwork = new PartnerNetworkRuntime({ host: networkHost, home: networkHome, profiles: partnerStore, store,
+    laneStore: networkLaneStore, lanes: partnerNetworkLanes, routes: modelRoutes, adapters: () => backendInstances.availableAdapters(), artifacts,
+    planWorkspaces: new PartnerNetworkPlanWorkspaces(store, networkLaneStore, partnerGroupWorkspaces),
+    decidePlan: async (input, signal, stillCurrent) => {
+      const plan = auxiliaryText.capture(), members = new Set(input.members.map(member => member.partnerId));
+      const result = await auxiliaryText.run(plan, { system: PLAN_DECISION_SYSTEM_PROMPT, user: buildPlanDecisionPrompt(input), maxTokens: 800,
+        timeoutMs: 20_000, ...(input.mode === "auto" ? { totalTimeoutMs: 8_000, firstAttemptTimeoutMs: 5_000 } : {}), signal, stillCurrent,
+        validate: raw => parsePlanDecision(raw, input.mode, members) === null ? undefined : raw });
+      return result.status === "ok" ? parsePlanDecision(result.text, input.mode, members) : null;
+    } });
+  const partnerIdentity = new PartnerIdentityDirectory({ store, serverId, origin: config.publicOrigin, vault: credentialVault, home: taskSharingHome,
+    partner: id => {
+      const profile = partners.getPartner(id);
+      if (profile.lifecycle !== "active" || profile.initializationState !== "ready" || !profile.canonicalSessionId || partnerHomeStorage.changing(id)) throw new Error("This Partner is unavailable.");
+      partners.canonicalCaller(profile.canonicalSessionId);
+      return { id: profile.id, name: profile.displayName, description: profile.description, canonicalSessionId: profile.canonicalSessionId, revision: profile.revision };
     } });
   const promptPrediction = new PromptPredictionService({ store, auxiliary: auxiliaryText });
   const sessionNavigation = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryText, credentials });
@@ -2917,6 +2984,8 @@ export async function createOrchestratorApplication(
     });
     await sessionWorktrees.startRecycleMaintenance(createWorktreeRecycleSafetyCheck({ store, sessionHost, terminals }));
     await partnerGroups.start();
+    await networkHome.initialize();
+    await partnerNetwork.start();
     await partnerSessionTasks.initialize();
     await historyMaintenance.initialize();
     await skillLearning.initialize();
@@ -3249,6 +3318,7 @@ export async function createOrchestratorApplication(
     await attempt(() => sessionNavigation.dispose());
     await attempt(() => partnerWorkingStatus.dispose());
     await attempt(() => partnerGroups?.close());
+    await attempt(() => partnerNetwork?.close());
     await attempt(() => partnerGroupWorkspaces?.dispose());
     await attempt(() => auxiliaryText.dispose());
     helpAssistant.close();
@@ -3355,6 +3425,8 @@ export async function createOrchestratorApplication(
     partners,
     partnerGroupRuntime,
     partnerGroups,
+    partnerNetwork,
+    partnerIdentity,
     appDefaultModels,
     partnerRoutines,
     partnerImports,
@@ -3479,6 +3551,7 @@ export async function createOrchestratorApplication(
         await attempt(() => sessionNavigation.dispose());
         await attempt(() => partnerWorkingStatus.dispose());
         await attempt(() => partnerGroups?.close());
+        await attempt(() => partnerNetwork?.close());
         await attempt(() => partnerGroupWorkspaces?.dispose());
         partnerLearning?.dispose();
         await attempt(() => partnerLearning?.drain());

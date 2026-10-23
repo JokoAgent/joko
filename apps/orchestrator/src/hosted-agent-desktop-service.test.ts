@@ -25,6 +25,8 @@ async function fixture() {
   const createNativeSession = vi.fn(async () => ({ opaqueRef: `context-${++created}`, nativeSessionId: `native-${created}`, generation: 1 }));
   const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-completions", contextWindow: 32768,
     maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  store.upsertBackend({ id: "native", adapterKind: "native", instanceGeneration: 1, displayName: "Native", version: "1", health: "healthy",
+    installationState: "installed", authenticationState: "not_required", capabilities: new Map(), models: [model], tools: [], diagnostics: [] });
   const runtime = new HostedAgentRuntime({ store, root, connections, artifactCapacityBytes: 1024,
     factories: [{ backendId: "native", providerIds: () => ["provider"], models: () => [model], create: () => ({ id: "native",
       hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },

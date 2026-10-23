@@ -15,6 +15,8 @@ export interface HostedExecutionBase {
     readonly personalInstructions?: string;
     readonly memoryInstructions?: string;
     readonly mcpEnabled?: true;
+    /** Source-owned collaboration tool selection, frozen for this runtime. */
+    readonly subagentsEnabled?: boolean;
     /** Source-approved instruction snapshots, already using virtual paths. */
     readonly contextFiles?: readonly { readonly path: string; readonly content: string }[];
   };
@@ -46,6 +48,7 @@ export function assertHostedExecution(hosted: HostedExecution): void {
     || hosted.workspace.personalInstructions !== undefined && (typeof hosted.workspace.personalInstructions !== "string" || hosted.workspace.personalInstructions.length > 1024 * 1024)
     || hosted.workspace.memoryInstructions !== undefined && (typeof hosted.workspace.memoryInstructions !== "string" || hosted.workspace.memoryInstructions.length > 1024 * 1024)
     || hosted.workspace.mcpEnabled !== undefined && hosted.workspace.mcpEnabled !== true
+    || hosted.workspace.subagentsEnabled !== undefined && typeof hosted.workspace.subagentsEnabled !== "boolean"
     || hosted.workspace.contextFiles !== undefined && (!Array.isArray(hosted.workspace.contextFiles) || hosted.workspace.contextFiles.length > 512
       || hosted.workspace.contextFiles.some(file => !file || typeof file.path !== "string" || !file.path || file.path.length > 16_384 || file.path.includes("\0")
         || typeof file.content !== "string" || file.content.length > 1024 * 1024))

@@ -14,7 +14,7 @@ import {
   type PromptInput,
   type UsageSnapshot
 } from "@joko/core";
-import { adapterError } from "./errors.js";
+import { adapterError, publicNativeTurnError } from "./errors.js";
 import {
   commandApprovalAvailability,
   isJsonObject,
@@ -392,7 +392,7 @@ export class CodexEventTranslator {
         if (plan !== undefined) state.activePlan = undefined;
         if (turn.status === "failed") {
           return [
-            { type: "error", error: publicTurnError(turn.error), terminal: true },
+            { type: "error", error: publicNativeTurnError(turn.error), terminal: true },
             { type: "done", outcome: "failed" }
           ];
         }
@@ -461,7 +461,7 @@ export class CodexEventTranslator {
         const record = objectValue(params, "Codex error");
         return [{
           type: "error",
-          error: publicTurnError(isJsonObject(record["error"]) ? record["error"] : undefined),
+          error: publicNativeTurnError(record["error"]),
           terminal: false
         }];
       }
@@ -747,31 +747,6 @@ function usageFromNotification(params: JsonValue, observedFastMode: boolean | un
 
 function finiteToken(value: JsonValue | undefined): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
-}
-
-function publicTurnError(error: JsonObject | undefined | null) {
-  const category = error?.["codexErrorInfo"];
-  const categoryText = typeof category === "string"
-    ? category
-    : isJsonObject(category)
-      ? Object.keys(category)[0]
-      : undefined;
-  const unauthorized = categoryText?.toLowerCase().includes("unauthorized") === true;
-  const rateLimited = categoryText?.toLowerCase().includes("ratelimit") === true || categoryText?.toLowerCase().includes("usage") === true;
-  return {
-    code: unauthorized ? "CODEX_AUTH_REQUIRED" : rateLimited ? "CODEX_RATE_LIMITED" : "CODEX_TURN_FAILED",
-    message: unauthorized
-      ? "Codex authentication is required."
-      : rateLimited
-        ? "Codex could not continue because the active account reached a provider limit."
-        : "The Codex turn failed.",
-    phase: "stream",
-    retryable: !unauthorized,
-    stateMayHaveChanged: true,
-    recovery: unauthorized
-      ? "Sign in to the Codex account and explicitly retry the queued input."
-      : "Inspect the durable timeline and explicitly retry only if another native turn is safe."
-  } as const;
 }
 
 type InteractionQuestionField = Extract<InteractionPayload, { readonly kind: "question" }>["fields"][number];

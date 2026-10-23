@@ -44,6 +44,44 @@ function input(text: string) {
   return plainTextMobileComposerDraft(text);
 }
 
+it("durably owns optimistic follow-ups and restores every unsent structured input after a create failure", async () => {
+  const { driver } = memoryDriver(), store = new MobileNewTaskDraftStore(driver);
+  await store.beginSubmission(first, { targetId: "project", name: "Task", input: input("First") }, authority);
+  await store.openConversation(first, authority.createOperationId);
+  const followUp = structuredInput();
+  store.saveConversationInput(first, authority.createOperationId, followUp);
+  await store.queueFollowUp(first, authority.createOperationId, "follow-up-one", followUp);
+  store.saveConversationInput(first, authority.createOperationId, attachedInput());
+  await store.flush(first);
+  const restored = new MobileNewTaskDraftStore(driver);
+  expect((await restored.read(first))?.conversation).toMatchObject({ followUps: [{ operationId: "follow-up-one", state: "queued", input: followUp }], input: attachedInput() });
+  await expect(restored.queueFollowUp(first, "another-creation", "follow-up-two", attachedInput())).rejects.toThrow(/different creation/);
+  const editable = await restored.clearSubmission(first, authority.createOperationId);
+  expect(editable.input.text).toBe(`First\n\n${followUp.text}`);
+  expect(editable.input.mentions).toHaveLength(followUp.mentions.length);
+  expect(editable.input.atoms).toHaveLength(followUp.atoms.length);
+  expect(editable.input.attachments).toEqual(attachedInput().attachments);
+  expect((await new MobileNewTaskDraftStore(driver).read(first))?.submission).toBeUndefined();
+});
+
+it("persists first-message confirmation and the original follow-up operation before dispatch, then seals edits for transfer", async () => {
+  const { driver } = memoryDriver(), store = new MobileNewTaskDraftStore(driver);
+  await store.beginSubmission(first, { targetId: "project", name: "Task", input: input("First") }, authority);
+  await store.openConversation(first, authority.createOperationId);
+  store.saveConversationInput(first, authority.createOperationId, input("Second"));
+  await store.queueFollowUp(first, authority.createOperationId, "follow-up-one", input("Second"));
+  await expect(store.queueFollowUp(first, authority.createOperationId, "follow-up-one", input("Second"))).rejects.toThrow(/changed/);
+  await store.advanceToSending(first, authority.createOperationId, "session", 7n);
+  await store.setSendOperation(first, authority.createOperationId, "first-send");
+  await store.markFirstInputAccepted(first, authority.createOperationId);
+  await store.updateFollowUp(first, authority.createOperationId, "follow-up-one", { state: "dispatching" });
+  const restored = new MobileNewTaskDraftStore(driver);
+  expect(await restored.read(first)).toMatchObject({ submission: { firstInputAccepted: true }, conversation: { followUps: [{ operationId: "follow-up-one", state: "dispatching" }] } });
+  await restored.updateFollowUp(first, authority.createOperationId, "follow-up-one", { state: "accepted" });
+  await restored.sealConversation(first, authority.createOperationId);
+  expect(() => restored.saveConversationInput(first, authority.createOperationId, input("Too late"))).toThrow(/transferred/);
+});
+
 it("retains the confirmed collaboration source and marks one preparation attempt across restart", async () => {
   const { driver } = memoryDriver(), store = new MobileNewTaskDraftStore(driver);
   const collaboration = { role: "reviewer", targetId: "worker-project", permissionMode: PermissionMode.ASK, initialTask: "", sourceScope: "exact-source" };

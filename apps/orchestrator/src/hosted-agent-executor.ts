@@ -15,6 +15,7 @@ import { isShareCredentialCommand, isShareCredentialPath, shareCredentialGitRead
 import { GitCredentialHistory } from "./hosted-agent-git-credentials.js";
 import { hostedDirectoryId, hostedDirectoryPath } from "./hosted-agent-directories.js";
 import type { SourceInputMount } from "./hosted-agent-source-attachments.js";
+import type { HostedAgentPeerWorkspace } from "./hosted-agent-peer-workspace.js";
 
 const RAW_FILE_LIMIT = 16 * 1024 * 1024;
 const REQUEST_LIMIT = 64 * 1024 * 1024;
@@ -32,6 +33,7 @@ export interface HostedAgentExecutorPolicy {
   readonly confirmCredentials: boolean;
 }
 export interface HostedAgentExecutorOptions {
+  readonly remote?: HostedAgentPeerWorkspace;
   readonly context: AdapterContext;
   readonly virtualRoot: string;
   readonly aliases?: readonly ExecutorPathAlias[];
@@ -92,17 +94,17 @@ export class HostedAgentExecutor {
   readonly #gitCredentials = new GitCredentialHistory();
   readonly #tools = new Map<string, ToolLease>();
   constructor(options: HostedAgentExecutorOptions) {
-    if (options.context.hostedExecution || options.context.target.remoteWorkspace) throw new HostedAgentExecutorError("INVALID_REQUEST");
+    if (options.context.hostedExecution || options.context.target.remoteWorkspace && (!options.remote || options.context.target.remoteWorkspace.kind !== "device_peer")) throw new HostedAgentExecutorError("INVALID_REQUEST");
     options.assertCurrent();
     const native = /^[A-Za-z]:|^\\\\/u.test(options.virtualRoot) ? "\\" : "/";
     const virtual = (name: string) => options.virtualRoot.replace(/[\\/]+$/u, "") + native + "additional" + native + name;
     this.#options = options;
     this.#workspace = new ExecutorWorkspace({ workingDir: options.context.target.workspaceRoot, aliases: [
       { from: options.virtualRoot, to: options.context.target.workspaceRoot },
-      { from: virtual("home"), to: homedir() }, { from: virtual("temporary"), to: tmpdir() },
+      { from: virtual("home"), to: options.remote?.home ?? homedir() }, { from: virtual("temporary"), to: options.remote?.temporary ?? tmpdir() },
       ...(options.context.extraDirectories ?? []).map(directory => ({ from: hostedDirectoryPath(options.virtualRoot, hostedDirectoryId(directory)), to: directory.path })),
       ...(options.aliases ?? [])
-    ] });
+    ], ...(options.remote ? { remote: options.remote.projection } : {}) });
     this.#workspace.setVirtualRoot(options.virtualRoot);
   }
 
@@ -113,17 +115,18 @@ export class HostedAgentExecutor {
    * Source dispatch. Approval of one primitive never grants its connection. */
   async authorizeNativeActions(actions: readonly NativeExecutorAction[], signal: AbortSignal): Promise<() => void> {
     const active = AbortSignal.any([signal, this.#lifetime.signal, this.#options.context.signal]); this.#assertCurrent(active);
+    await this.#options.remote?.synchronize(active);
     if (!Array.isArray(actions) || actions.length > 256) throw new HostedAgentExecutorError("INVALID_REQUEST");
     const fences: (() => void)[] = [];
     for (const action of actions) {
       const callId = randomUUID(), request: ExecutorRequest = { format: 1, callId, requestId: randomUUID(), operation: "tool.begin", payload: {} };
       if (action.kind === "exec") {
-        const cwd = realPathOrAncestor(this.#workspace.resolve(text(action.cwd, 16_384)));
+        const cwd = await this.#canonical(this.#workspace.resolve(text(action.cwd, 16_384)), active);
         const command = this.#workspace.mapCommand(text(action.command, 1024 * 1024));
         fences.push(await this.#authorize(request, { name: "bash", args: { command, cwd } }, active));
       } else {
         if (action.kind !== "read" && action.kind !== "write") throw new HostedAgentExecutorError("INVALID_REQUEST");
-        const requested = this.#workspace.resolve(text(action.path, 16_384)), path = realPathOrAncestor(requested);
+        const requested = this.#workspace.resolve(text(action.path, 16_384)), path = await this.#canonical(requested, active);
         fences.push(await this.#authorize(request, { name: action.kind === "write" ? "write" : action.scope === "tree" ? "ls" : "read", args: { path } }, active, requested));
       }
     }
@@ -150,7 +153,7 @@ export class HostedAgentExecutor {
           const requestedPath = this.#workspace.resolve(name === "bash"
             ? input.cwd === undefined ? "." : text(input.cwd, 16_384)
             : input.path === undefined && ["ls", "find", "grep"].includes(name) ? "." : text(input.path, 16_384));
-          const target = realPathOrAncestor(requestedPath);
+          const target = await this.#canonical(requestedPath, activeSignal);
           const args: Record<string, unknown> = name === "bash" ? { ...input, command: this.#workspace.mapCommand(text(input.command, 1024 * 1024)), cwd: target }
             : { ...input, path: target };
           const assert = await this.#authorize(request, { name, args }, activeSignal, requestedPath); assert();
@@ -169,7 +172,12 @@ export class HostedAgentExecutor {
               || !Number.isSafeInteger(range.maxLineChars) || range.maxLineChars < 1 || range.maxLineChars > 2000)) {
             throw new HostedAgentExecutorError("INVALID_REQUEST");
           }
-          const target = realPathOrAncestor(path()), assert = await this.#authorize(request, { name: "read", args: { path: target } }, activeSignal);
+          const target = await this.#canonical(path(), activeSignal), assert = await this.#authorize(request, { name: "read", args: { path: target } }, activeSignal);
+          if (this.#options.remote) {
+            if (range) { const result = await this.#options.remote.readLines(target, range, activeSignal, this.#workspace); assert(); return result; }
+            const bytes = await this.#options.remote.read(target, maximum, activeSignal); assert();
+            return { data: this.#workspace.mapOutputForAgent(bytes).toString("base64"), sha256: createHash("sha256").update(bytes).digest("hex") };
+          }
           return await this.#withFile(target, "read", assert, async handle => {
             const info = await handle.stat(); if (!info.isFile() || !range && info.size > maximum) throw new HostedAgentExecutorError("RESOURCE_EXHAUSTED");
             if (range) return readAuthorizedLines(handle, range, activeSignal, assert, lines => this.#workspace.mapOutputLinesForAgent(lines));
@@ -182,8 +190,14 @@ export class HostedAgentExecutor {
         }
         case "fs.write": {
           keys(payload, ["path", "data"]);
-          const bytes = decodeBytes(payload.data), target = realPathOrAncestor(path());
+          const bytes = decodeBytes(payload.data), target = await this.#canonical(path(), activeSignal);
           const assert = await this.#authorize(request, { name: "write", args: { path: target } }, activeSignal);
+          if (this.#options.remote) {
+            let original: string | null = null;
+            try { const prior = await this.#options.remote.read(target, RAW_FILE_LIMIT, activeSignal); if (!prior.includes(0) && Buffer.from(prior.toString("utf8")).equals(prior)) original = prior.toString("utf8"); }
+            catch { assert(); }
+            await this.#options.remote.write(target, this.#workspace.mapInputFromAgent(bytes, original), activeSignal); assert(); return {};
+          }
           assert(); await mkdir(dirname(target), { recursive: true }); assert();
           let original: string | null = null;
           try {
@@ -211,39 +225,47 @@ export class HostedAgentExecutor {
         }
         case "fs.access": {
           keys(payload, ["path", "mode"]); if (!["read", "write"].includes(String(payload.mode))) throw new HostedAgentExecutorError("INVALID_REQUEST");
-          const target = realPathOrAncestor(path()), assert = await this.#authorize(request,
+          const target = await this.#canonical(path(), activeSignal), assert = await this.#authorize(request,
             { name: payload.mode === "write" ? "edit" : "read", args: { path: target } }, activeSignal);
+          if (this.#options.remote) { await this.#options.remote.info(target, activeSignal); assert(); return {}; }
           assert(); await access(target, payload.mode === "write" ? constants.R_OK | constants.W_OK : constants.R_OK); assert(); return {};
         }
         case "fs.mkdir": {
           keys(payload, ["path"]);
-          const target = realPathOrAncestor(path()), assert = await this.#authorize(request, { name: "write", args: { path: target } }, activeSignal);
+          const target = await this.#canonical(path(), activeSignal), assert = await this.#authorize(request, { name: "write", args: { path: target } }, activeSignal);
+          if (this.#options.remote) { await this.#options.remote.mkdir(target, activeSignal); assert(); return {}; }
           assert(); await mkdir(target, { recursive: true }); assert(); return {};
         }
         case "fs.stat": {
           keys(payload, ["path"]);
-          const target = realPathOrAncestor(path()), assert = await this.#authorize(request, { name: "read", args: { path: target } }, activeSignal);
+          const target = await this.#canonical(path(), activeSignal), assert = await this.#authorize(request, { name: "read", args: { path: target } }, activeSignal);
+          if (this.#options.remote) { const info = await this.#options.remote.info(target, activeSignal); assert(); return { type: info.kind, size: info.size, mtimeMs: info.modifiedAt }; }
           const info = await stat(target); assert(); return { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "other", size: info.size, mtimeMs: info.mtimeMs };
         }
         case "fs.readdir": {
           keys(payload, ["path"]);
-          const target = realPathOrAncestor(path()), assert = await this.#authorize(request, { name: "ls", args: { path: target } }, activeSignal);
+          const target = await this.#canonical(path(), activeSignal), assert = await this.#authorize(request, { name: "ls", args: { path: target } }, activeSignal);
+          if (this.#options.remote) { const entries = await this.#options.remote.directory(target, activeSignal); assert(); return { entries }; }
           const entries = await readdir(target); assert(); return { entries };
         }
         case "fs.mime": {
           keys(payload, ["path"]);
-          const target = realPathOrAncestor(path()), assert = await this.#authorize(request, { name: "read", args: { path: target } }, activeSignal);
+          const target = await this.#canonical(path(), activeSignal), assert = await this.#authorize(request, { name: "read", args: { path: target } }, activeSignal);
+          if (this.#options.remote) { const header = await this.#options.remote.read(target, 16, activeSignal, true); assert(); return { mime: imageMime(header) }; }
           return await this.#withFile(target, "read", assert, async handle => {
             const header = Buffer.alloc(16), { bytesRead } = await handle.read(header, 0, 16, 0); assert(); return { mime: imageMime(header.subarray(0, bytesRead)) };
           });
         }
         case "fs.glob": {
           keys(payload, ["pattern", "cwd", "limit", "ignore"]);
-          const cwd = realPathOrAncestor(this.#workspace.resolve(text(payload.cwd, 16_384))), pattern = text(payload.pattern, 4096);
+          const cwd = await this.#canonical(this.#workspace.resolve(text(payload.cwd, 16_384)), activeSignal), pattern = text(payload.pattern, 4096);
           if (!Number.isSafeInteger(payload.limit) || Number(payload.limit) < 1 || Number(payload.limit) > 100_000
             || !Array.isArray(payload.ignore) || payload.ignore.length > 128 || payload.ignore.some(value => typeof value !== "string" || value.length > 4096)) throw new HostedAgentExecutorError("INVALID_REQUEST");
           const assert = await this.#authorize(request, { name: "find", args: { path: cwd, pattern } }, activeSignal);
           const args = ["--files", "--hidden", "--glob", "!.git", "--glob", pattern, ...(payload.ignore as string[]).flatMap(ignore => ["--glob", "!" + ignore])];
+          if (this.#options.remote) { const result = await this.#options.remote.process("rg", args, cwd, activeSignal, 30); assert();
+            if (result.exitCode !== 0 && result.exitCode !== 1) throw new HostedAgentExecutorError("EXECUTOR_FAILED");
+            return { paths: result.output.toString("utf8").split(/\r?\n/u).filter(Boolean).slice(0, Number(payload.limit)).map(value => this.#workspace.toAgentPath(this.#options.remote!.paths.join(cwd, value))) }; }
           let stdout: string;
           try { ({ stdout } = await runFile(this.#options.ripgrepExecutable ?? "rg", args, { cwd, signal: activeSignal,
             windowsHide: true, timeout: 30_000, maxBuffer: RAW_FILE_LIMIT, encoding: "utf8", env: terminalEnvironment() })); }
@@ -253,19 +275,25 @@ export class HostedAgentExecutor {
         case "pi.grep": {
           keys(payload, ["params"]); const params = record(payload.params);
           keys(params, ["pattern", "path", "glob", "ignoreCase", "literal", "context", "limit"]);
-          const path = realPathOrAncestor(this.#workspace.resolve(params.path === undefined ? "." : text(params.path, 16_384)));
+          const path = await this.#canonical(this.#workspace.resolve(params.path === undefined ? "." : text(params.path, 16_384)), activeSignal);
           text(params.pattern, 16_384);
           if (params.glob !== undefined) text(params.glob, 4096);
           for (const key of ["ignoreCase", "literal"]) if (params[key] !== undefined && typeof params[key] !== "boolean") throw new HostedAgentExecutorError("INVALID_REQUEST");
           for (const key of ["context", "limit"]) if (params[key] !== undefined && (!Number.isSafeInteger(params[key]) || Number(params[key]) < 0 || Number(params[key]) > 100_000)) throw new HostedAgentExecutorError("INVALID_REQUEST");
           const assert = await this.#authorize(request, { name: "grep", args: { ...params, path } }, activeSignal);
+          if (this.#options.remote) { const args = ["--line-number", "--hidden", "--glob", "!.git", ...(params.ignoreCase ? ["-i"] : []), ...(params.literal ? ["-F"] : []),
+            ...(typeof params.glob === "string" ? ["--glob", params.glob] : []), ...(typeof params.context === "number" ? ["-C", String(params.context)] : []), "--", String(params.pattern), path];
+            const result = await this.#options.remote.process("rg", args, this.#options.context.target.workspaceRoot, activeSignal, 30); assert();
+            if (result.exitCode !== 0 && result.exitCode !== 1) throw new HostedAgentExecutorError("EXECUTOR_FAILED");
+            const lines = result.output.toString("utf8").split(/\r?\n/u).filter(Boolean).slice(0, Number(params.limit ?? 100));
+            return { text: this.#workspace.mapTextForAgent(lines.join("\n")), details: {} }; }
           const result = await createGrepToolDefinition(this.#options.context.target.workspaceRoot).execute(request.callId,
             { ...params, path } as GrepToolInput, activeSignal, undefined, {} as ExtensionContext);
           assert(); return { text: this.#workspace.mapTextForAgent(result.content.filter(part => part.type === "text").map(part => part.text).join("\n")), details: result.details };
         }
         case "exec.run": {
           keys(payload, ["command", "cwd", "timeout"]);
-          const command = this.#workspace.mapCommand(text(payload.command, 1024 * 1024)), cwd = realPathOrAncestor(this.#workspace.resolve(text(payload.cwd, 16_384)));
+          const command = this.#workspace.mapCommand(text(payload.command, 1024 * 1024)), cwd = await this.#canonical(this.#workspace.resolve(text(payload.cwd, 16_384)), activeSignal);
           const timeout = payload.timeout === undefined ? 300 : Number(payload.timeout);
           if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 1800) throw new HostedAgentExecutorError("INVALID_REQUEST");
           const assert = await this.#authorize(request, { name: "bash", args: { command, cwd } }, activeSignal);
@@ -273,6 +301,7 @@ export class HostedAgentExecutor {
           if (gate) { const admitted = await gate.acquire({ commandId, sessionId: this.#options.context.sessionId, signal: activeSignal });
             if (admitted !== "immediate" && admitted !== "queued") throw new HostedAgentExecutorError("ACCESS_DENIED"); }
           try {
+            if (this.#options.remote) { const result = await this.#options.remote.execute(command, cwd, timeout, activeSignal, this.#workspace, effects); assert(); return result; }
             assert(); let output = Buffer.alloc(0), pendingOutput = Buffer.alloc(0);
             const marker = `\u001eJOKO_CWD_${randomUUID()}:`;
             const emit = (line: Buffer) => {
@@ -314,15 +343,16 @@ export class HostedAgentExecutor {
       }
     } catch (error) {
       if (error instanceof HostedAgentExecutorError) throw error;
-      if ((error as { code?: unknown })?.code === "ENOENT") throw new HostedAgentExecutorError("NOT_FOUND");
+      if (["ENOENT", "ENOTDIR", "NOT_FOUND", "not_found"].includes(String((error as { code?: unknown })?.code))) throw new HostedAgentExecutorError("NOT_FOUND");
       throw new HostedAgentExecutorError(activeSignal.aborted ? "STALE_AUTHORITY" : "EXECUTOR_FAILED");
     }
   }
 
   #assertCurrent(signal: AbortSignal): void {
     if (signal.aborted || this.#lifetime.signal.aborted) throw new HostedAgentExecutorError("STALE_AUTHORITY");
-    try { this.#options.assertCurrent(); } catch { throw new HostedAgentExecutorError("STALE_AUTHORITY"); }
+    try { this.#options.assertCurrent(); this.#options.remote?.assertCurrent(); } catch { throw new HostedAgentExecutorError("STALE_AUTHORITY"); }
   }
+  #canonical(path: string, signal: AbortSignal): Promise<string> { return this.#options.remote ? this.#options.remote.canonical(path, signal) : Promise.resolve(realPathOrAncestor(path)); }
   async #authorize(request: ExecutorRequest, call: ToolCall, signal: AbortSignal, requestedPath?: string): Promise<() => void> {
     this.#assertCurrent(signal);
     if (request.operation !== "tool.begin") return this.#toolOperation(request, call, signal);
@@ -338,6 +368,7 @@ export class HostedAgentExecutor {
     };
     assert(); this.#workspace.setExtraDirs(policy.approvedRoots.map(root => root.path));
     const context = { workspaceRoot: this.#options.context.target.workspaceRoot, mode: policy.permissionMode,
+      ...(this.#options.remote ? { pathStyle: this.#options.remote.authority.pathStyle } : {}),
       readOnly: this.#options.context.runtimePolicy === "review_read_only", extraReadOnlyRoots: policy.approvedRoots.map(root => root.path),
       explicitDenyTools: new Set<string>(), explicitAllowTools: new Set<string>(), policySnapshot: policy.snapshot };
     const risk = classifyToolCall(call, context);
@@ -350,12 +381,12 @@ export class HostedAgentExecutor {
         evaluateOrderedPolicyRules(policy.snapshot!, policyObservationForToolCall(value, context))?.action === "ask");
     const delegated = await native?.review({ toolName: call.name, input: call.args, signal }); assert();
     if (delegated?.verdict === "block" || delegated?.unavailable) throw new HostedAgentExecutorError("ACCESS_DENIED");
-    const commandOptions = { cwd: String(call.args.cwd ?? this.#options.context.target.workspaceRoot), platform: process.platform,
-      resolveFilePath: (operand: string, cwd: string) => realPathOrAncestor(this.#workspace.resolve(operand, cwd)) };
+    const commandOptions = { cwd: String(call.args.cwd ?? this.#options.context.target.workspaceRoot), platform: this.#options.remote?.authority.pathStyle === "win32" ? "win32" : this.#options.remote ? "linux" : process.platform,
+      resolveFilePath: (operand: string, cwd: string) => this.#options.remote ? this.#workspace.resolve(operand, cwd) : realPathOrAncestor(this.#workspace.resolve(operand, cwd)) };
     let credential = policy.confirmCredentials && !this.#options.credentialConsent?.hasForSession() && (call.name === "bash"
       ? isShareCredentialCommand(String(call.args.command), this.#workspace.allRoots(), commandOptions)
       : isShareCredentialPath(String(call.args.path ?? "")) || isShareCredentialPath(requestedPath ?? ""));
-    if (credential && call.name === "bash") {
+    if (credential && call.name === "bash" && !this.#options.remote) {
       const reads = shareCredentialGitReads(String(call.args.command), this.#workspace.allRoots(), commandOptions);
       if (reads && await this.#gitCredentials.provesSafe(String(call.args.command), reads, signal)) credential = false;
       assert();
@@ -395,7 +426,7 @@ export class HostedAgentExecutor {
       ls: ["fs.stat", "fs.readdir"], find: ["fs.stat", "fs.glob"], grep: ["pi.grep"], bash: ["exec.run"]
     };
     if (!lease || lease.expiresAt <= Date.now() || !operations[lease.name]?.includes(request.operation)) throw new HostedAgentExecutorError("ACCESS_DENIED");
-    const expectedPath = request.operation === "fs.mkdir" ? dirname(lease.path) : lease.path;
+    const expectedPath = request.operation === "fs.mkdir" ? (this.#options.remote?.paths.dirname(lease.path) ?? dirname(lease.path)) : lease.path;
     if (String(call.args.path ?? call.args.cwd) !== expectedPath
       || request.operation === "fs.access" && request.payload.mode === "write" && lease.name !== "edit"
       || request.operation === "fs.glob" && request.payload.pattern !== lease.pattern

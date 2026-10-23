@@ -20,10 +20,13 @@ it("keeps an onward person guest over a real owner Device route and retains only
   const controller = source.createConnection({ id: "group-connection", deviceId: "group-computer", device: { defaultName: "Group", kind: "service", platform: process.platform }, name: "Group", authKeyDigest: "group-digest" });
   const target = source.createConnection({ id: "native-connection", deviceId: "native-computer", device: { defaultName: "Model member", kind: "service", platform: process.platform }, name: "Model member", authKeyDigest: "model-digest" });
   source.setDeviceRemoteControlEnabled(target.deviceId, true);
-  let captured: AdapterContext | undefined, created = 0, cleanupUnknown = false, guestCurrent = true, removed = false;
+  let captured: AdapterContext | undefined, created = 0, inferred = 0, cleanupUnknown = false, guestCurrent = true, removed = false;
   const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "native", contextWindow: 32768,
     maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  modelStore.upsertBackend({ id: "native", adapterKind: "native", instanceGeneration: 1, displayName: "Native", version: "1", health: "healthy",
+    installationState: "installed", authenticationState: "not_required", capabilities: new Map(), models: [model], tools: [], diagnostics: [] });
   const runtime = new HostedAgentRuntime({ store: modelStore, root: join(root, "native"), artifactCapacityBytes: 1024,
+    inferNativeText: async (_backendId, input) => { input.assertCurrent(); input.assertModelAllowed("provider", "model"); inferred++; return "guest inference reply"; },
     connections: { authenticate: () => { throw new Error("No foreign HTTP owner grant."); } } as unknown as ConnectionManager,
     factories: [{ backendId: "native", providerIds: () => ["provider", "foreign"], isolatedGuests: () => true,
       models: () => [model, { ...model, providerId: "foreign", modelId: "foreign-model" }], create: () => ({ id: "native", hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },
@@ -47,6 +50,13 @@ it("keeps an onward person guest over a real owner Device route and retains only
   const active = new AbortController().signal;
   try {
     const catalog = await capturedGuest.client.catalog(active); expect(catalog.backends[0]!.providers.map(row => row.providerId)).toEqual(["provider"]);
+    const inference = { requestId: "guest-inference", backendId: "native", backendInstanceGeneration: 1, providerId: "provider", modelId: "model",
+      system: "Reply briefly", user: "Hello", timeoutMs: 10_000 };
+    expect(await capturedGuest.client.infer(inference, active)).toBe("guest inference reply");
+    expect(await capturedGuest.client.infer(inference, active)).toBe("guest inference reply");
+    expect(inferred).toBe(1); expect(created).toBe(0); expect(new HostedAgentStore(modelStore).list()).toEqual([]);
+    await expect(capturedGuest.client.infer({ ...inference, requestId: "foreign-inference", providerId: "foreign", modelId: "foreign-model" }, active)).rejects.toBeDefined();
+    expect(inferred).toBe(1);
     const input = { runId: "onward-run", nativeSessionId: "onward-context", start: "create" as const, sessionId: "original-task", targetId: "original-workspace", generation: 1,
       backendId: "native", providerId: "provider", modelId: "model", permissionMode: "ask" as const, fastMode: false,
       workspace: { platform: process.platform as "win32" | "linux" | "darwin", shell: "bash", isGitRepository: false } };

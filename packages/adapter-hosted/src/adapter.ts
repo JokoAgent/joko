@@ -3,9 +3,9 @@ import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { AdapterContext, BackendAdapter, BackendDescriptor, BlobRef, CreateNativeSessionInput, DurableNativeDispatchPreparation,
-  NativeHistoryProjection, NativeNavigationTarget, NativeSessionBinding, NativeSessionDerivation, NativeSessionForkResult,
+  BackgroundTaskOutputResult, NativeHistoryProjection, NativeNavigationTarget, NativeSessionBinding, NativeSessionDerivation, NativeSessionForkResult,
   NativeSessionNavigation, NativeSessionNavigationResult, NativeSessionState, PromptInput, ProviderModel, RuntimeCommand, RuntimeResource,
-  RuntimeToolCatalog, SessionTree, SubagentControlInput, TargetDescriptor, UserShellInput, UserShellResult } from "@joko/core";
+  RuntimeToolCatalog, SessionTree, SubagentControlInput, TargetDescriptor, UserShellInput, UserShellResult, NativeTextInferenceInput } from "@joko/core";
 import type { HostedNativeCommand, HostedNativeOpen } from "./protocol.js";
 import { JokoError, toPublicError } from "@joko/core";
 
@@ -36,6 +36,7 @@ export interface HostedAgentSourceConnection {
   readonly close: () => Promise<void>;
 }
 export interface HostedAgentSourceAdapterOptions {
+  readonly inferNativeText?: (input: NativeTextInferenceInput) => Promise<string>;
   readonly id: string;
   readonly source: HostedAgentDeviceSource;
   readonly describe: () => BackendDescriptor | Promise<BackendDescriptor>;
@@ -50,6 +51,7 @@ export interface HostedAgentSourceAdapterOptions {
   readonly readPolicy: (context: AdapterContext) => Pick<NativeSessionState, "permissionMode" | "fastMode" | "effort">;
   readonly assertContext: (context: AdapterContext) => void;
   readonly onRuntimeUnavailable?: (context: AdapterContext) => void;
+  readonly validateRemoteTarget?: (target: TargetDescriptor) => Promise<void>;
   readonly takeGroupSwitch?: (context: AdapterContext) => string | undefined;
   readonly takeNewGroupRound?: (context: AdapterContext) => boolean;
   readonly isGroupMember?: (context: AdapterContext) => boolean;
@@ -83,8 +85,19 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     this.#assertOpen(); const descriptor = await this.#options.describe();
     if (descriptor.id !== this.id) throw new Error("Hosted native instance changed its identity."); return descriptor;
   }
+  async inferNativeText(input: NativeTextInferenceInput): Promise<string> {
+    this.#assertOpen(); input.signal.throwIfAborted(); input.assertCurrent();
+    if (!input.providerId || !input.modelId || !this.#options.inferNativeText) throw new Error("Isolated Source inference is unavailable.");
+    input.assertModelAllowed(input.providerId, input.modelId);
+    const result = await this.#options.inferNativeText(input);
+    this.#assertOpen(); input.signal.throwIfAborted(); input.assertCurrent(); input.assertModelAllowed(input.providerId, input.modelId);
+    return result;
+  }
   async validateTarget(target: TargetDescriptor): Promise<void> {
     this.#assertOpen();
+    if (target.remoteWorkspace?.kind === "device_peer" && target.backendId === this.id && target.trusted && this.#options.validateRemoteTarget) {
+      await this.#options.validateRemoteTarget(target); return;
+    }
     if (target.backendId !== this.id || target.remoteWorkspace || !target.trusted || !isAbsolute(target.workspaceRoot)
       || await realpath(target.workspaceRoot) !== target.workspaceRoot) throw new Error("Hosted native task workspace is unavailable.");
   }
@@ -133,8 +146,20 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     return await this.#call(this.#active(context), { kind: "compact", ...(instructions === undefined ? {} : { instructions }) }, context) as "compacted" | "noop";
   }
   async getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]> {
-    this.#active(context);
-    return this.#options.commands?.(context) ?? await this.#call(this.#active(context), { kind: "commands" }, context) as readonly RuntimeCommand[];
+    const active = this.#active(context), descriptor = await this.describe();
+    const native = descriptor.capabilities.get("runtime.commands")?.supported === true
+      ? await this.#call(active, { kind: "commands" }, context) as readonly RuntimeCommand[] : [];
+    // Native executable extensions belong to the dedicated runtime. Skills and
+    // prompts remain bound to the Source's approved resource identities.
+    const commands = this.#options.commands?.(context) ?? [];
+    const names = new Set(commands.map(command => command.name));
+    return [...commands, ...native.filter(command => command.source === "extension" && !names.has(command.name))
+      .map(({ path: _path, ...command }) => command)];
+  }
+  async dispatchDuringCompaction(input: PromptInput, context: AdapterContext): Promise<PromptInput["disposition"] | undefined> {
+    if (input.files.length || input.mentions.length) return undefined;
+    const value = await this.#call(this.#active(context), { kind: "dispatch_during_compaction", input }, context);
+    return value === "prompt" || value === "steer" || value === "follow_up" ? value : undefined;
   }
   async getResources(context: AdapterContext): Promise<readonly RuntimeResource[]> {
     this.#active(context);
@@ -148,14 +173,29 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   async executeUserShell(input: UserShellInput, context: AdapterContext): Promise<UserShellResult> { return await this.#call(this.#active(context), { kind: "shell", input }, context) as UserShellResult; }
   async abortUserShell(context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "abort_shell" }, context); }
   async controlSubagent(input: SubagentControlInput, context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "control_subagent", input }, context); }
+  async cancelBackgroundTask(context: AdapterContext, taskId: string): Promise<void> { await this.#call(this.#active(context), { kind: "cancel_background", taskId }, context); }
+  async getBackgroundTaskOutput(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult> {
+    return await this.#call(this.#active(context), { kind: "background_output", taskId, maximumBytes }, context) as BackgroundTaskOutputResult;
+  }
   async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     const active = await this.#activate(binding, context, "resume"); await this.#call(active, { kind: "delete" }, context); await this.#close(active); await this.#options.deleteWorkspace?.(context);
   }
   async exportSession(_context: AdapterContext): Promise<BlobRef> { throw new Error("Hosted native export is not connected."); }
-  async navigateTree(_target: NativeNavigationTarget, _summarize: boolean, _context: AdapterContext, _instructions: string | undefined,
-    _navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> { throw new Error("Hosted native navigation is not connected."); }
-  async fork(_entryId: string, _context: AdapterContext, _derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> { throw new Error("Hosted native fork is not connected."); }
-  async clone(_context: AdapterContext, _derivation: NativeSessionDerivation): Promise<NativeSessionBinding> { throw new Error("Hosted native clone is not connected."); }
+  async navigateTree(target: NativeNavigationTarget, summarize: boolean, context: AdapterContext, instructions: string | undefined,
+    _navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> {
+    await this.#call(this.#active(context), { kind: "navigate", target, summarize, ...(instructions === undefined ? {} : { instructions }) }, context);
+    // The alias identifies the Provider-owned context. Actual native replacement
+    // bindings stay in its private journal; the Source reloads the confirmed tree.
+    return { kind: "in_place" };
+  }
+  async fork(_entryId: string, _context: AdapterContext, _derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
+    throw new JokoError({ code: "HOSTED_AGENT_FORK_UNSUPPORTED", message: "This native source does not support task forks.", phase: "session_fork", retryable: false, stateMayHaveChanged: false,
+      recovery: "Continue in the current task or create a new task with an explicitly chosen source." });
+  }
+  async clone(_context: AdapterContext, _derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
+    throw new JokoError({ code: "HOSTED_AGENT_CLONE_UNSUPPORTED", message: "This native source does not support task clones.", phase: "session_clone", retryable: false, stateMayHaveChanged: false,
+      recovery: "Continue in the current task or create a new task with an explicitly chosen source." });
+  }
   async dispose(): Promise<void> {
     this.#closed = true; await Promise.allSettled([...this.#opening.values()]);
     const results = await Promise.allSettled([...this.#sessions.values()].map(active => this.#close(active)));
@@ -254,7 +294,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   async #call(active: ActiveSourceSession, command: HostedNativeCommand, context: AdapterContext,
     fence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>): Promise<unknown> {
     this.#active(context); active.connection.assertCurrent();
-    const observation = ["state", "commands", "resources", "tools", "tree", "history"].includes(command.kind);
+    const observation = ["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind);
     const id = command.kind === "send" ? context.operationId! : context.operationId && !observation
       ? createHash("sha256").update(JSON.stringify([context.operationId, command.kind])).digest("hex") : randomUUID();
     if (!observation) active.controller.registerOperation(id, context, fence, command.kind === "send" ? command.input : undefined);

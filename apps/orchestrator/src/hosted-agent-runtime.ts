@@ -1,4 +1,5 @@
-import type { BackendAdapter, BackendDescriptor, BlobRef, CapabilityManifest, ProviderModel, HostedExecution } from "@joko/core";
+import type { BackendAdapter, BackendDescriptor, BlobRef, CapabilityManifest, ProviderModel, HostedExecution, NativeTextInferenceInput } from "@joko/core";
+import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
 import { HostedAgentStore, type HostedNativeProviderGrantOwner, type OperationalStore } from "@joko/store";
@@ -35,6 +36,7 @@ export interface HostedAgentBackendCreation {
   readonly assertModelAllowed: (providerId: string, modelId: string) => void;
 }
 export interface HostedAgentRuntimeOptions {
+  readonly inferNativeText?: (backendId: string, input: NativeTextInferenceInput) => Promise<string>;
   readonly store: OperationalStore;
   readonly root: string;
   readonly nodeId?: string;
@@ -64,7 +66,7 @@ export class HostedAgentRuntime {
     this.#options = options; this.settings = new HostedAgentSettings(options.store); this.slots = new HostedAgentSessionSlots(() => this.settings.limits());
     this.#factories = new Map(options.factories.map(factory => [factory.backendId, factory]));
     if (this.#factories.size !== options.factories.length) throw new Error("Hosted Agent Backend factories conflict.");
-    this.host = new HostedAgentHost({ authorize: this.#authorize });
+    this.host = new HostedAgentHost({ authorize: this.#authorize, infer: this.#infer, authorizeInference: this.#inferenceAccess });
   }
   connectOptions(): HostedAgentConnectOptions {
     const runtime = this;
@@ -84,7 +86,7 @@ export class HostedAgentRuntime {
         remoteControlEnabled: snapshot.value.remoteControlEnabled,
         backends: [...this.#factories.values()].map(factory => {
           const models = factory.models();
-          return { backendId: factory.backendId, displayName: factory.displayName ?? factory.backendId, nativeAdapterKind: factory.describe?.().adapterKind ?? "", nodeId: this.#options.nodeId ?? "",
+          return { backendId: factory.backendId, instanceGeneration: BigInt(this.#options.store.getBackend(factory.backendId).descriptor.instanceGeneration), displayName: factory.displayName ?? factory.backendId, nativeAdapterKind: factory.describe?.().adapterKind ?? "", nodeId: this.#options.nodeId ?? "",
             capabilities: [...(factory.capabilities?.().values() ?? [])].map(toProtoCapability), version: factory.version?.() ?? "",
             providers: factory.providerIds().map(providerId => {
               const current = models.filter(model => model.providerId === providerId);
@@ -147,7 +149,7 @@ export class HostedAgentRuntime {
     assertCurrent(); const models = factory.models().filter(model => model.providerId === providerId);
     if (!models.length) throw new HostedAgentHostError("UNAVAILABLE");
     const descriptor = factory.describe?.(), provider = descriptor?.providers?.find(item => item.providerId === providerId);
-    const catalog = create(contract.HostedAgentBackendCatalogSchema, { backendId, displayName: factory.displayName ?? backendId, nativeAdapterKind: descriptor?.adapterKind ?? "", nodeId: this.#options.nodeId ?? "",
+    const catalog = create(contract.HostedAgentBackendCatalogSchema, { backendId, instanceGeneration: BigInt(this.#options.store.getBackend(backendId).descriptor.instanceGeneration), displayName: factory.displayName ?? backendId, nativeAdapterKind: descriptor?.adapterKind ?? "", nodeId: this.#options.nodeId ?? "",
       version: factory.version?.() ?? "", capabilities: [...(factory.capabilities?.().values() ?? [])].map(toProtoCapability),
       providers: [{ providerId, displayName: providerId, accessKind: provider?.accessKind ?? "", accessProduct: provider?.accessProduct ?? "",
         remoteInvocationEnabled: true, connected: true, models: models.map(model => toProtoModelDescriptor(backendId, model)) }] });
@@ -169,6 +171,41 @@ export class HostedAgentRuntime {
     return { id: `owner:${connection.id}`, deviceId: connection.deviceId, trust: "owner",
       assertCurrent: () => { this.#options.connections.fence(connection); } };
   }
+  readonly #inferenceAccess = (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest): (() => void) => {
+    const factory = this.#factories.get(request.backendId);
+    if (!factory || !this.#options.inferNativeText || principal.trust === "guest" && factory.isolatedGuests?.() !== true) throw new HostedAgentHostError("UNAVAILABLE");
+    const assertComputer = this.settings.captureComputer(), assertProvider = this.settings.captureProvider(request.backendId, request.providerId);
+    return () => {
+      principal.assertCurrent(); principal.providerGrant?.assertCurrent(); assertComputer(); assertProvider();
+      const descriptor = this.#options.store.getBackend(request.backendId).descriptor;
+      if (descriptor.instanceGeneration !== request.backendInstanceGeneration
+        || !descriptor.models.some(model => model.providerId === request.providerId && model.modelId === request.modelId
+          && (!request.images?.length || model.supportsImages))
+        || !factory.models().some(model => model.providerId === request.providerId && model.modelId === request.modelId
+          && (!request.images?.length || model.supportsImages))) throw new HostedAgentHostError("UNAVAILABLE");
+      this.assertGuestSelection(principal, request);
+    };
+  };
+  readonly #infer = async (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest, signal: AbortSignal): Promise<string> => {
+    const assertAccess = this.#inferenceAccess(principal, request), infer = this.#options.inferNativeText!;
+    const owner = new AbortController(), active = AbortSignal.any([owner.signal, signal]);
+    const assertCurrent = () => {
+      active.throwIfAborted(); assertAccess();
+    };
+    const assertModelAllowed = (providerId: string, modelId: string) => {
+      if (providerId !== request.providerId || modelId !== request.modelId) throw new HostedAgentHostError("ACCESS_DENIED");
+      assertCurrent();
+    };
+    assertCurrent();
+    const timer = setInterval(() => { try { assertCurrent(); } catch (error) { owner.abort(error); } }, 100); timer.unref();
+    try {
+      const result = await infer(request.backendId, { system: request.system, user: request.user, providerId: request.providerId, modelId: request.modelId,
+        backendInstanceGeneration: request.backendInstanceGeneration, timeoutMs: request.timeoutMs, signal: active, assertCurrent, assertModelAllowed,
+        ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
+        ...(request.images === undefined ? {} : { images: request.images.map(image => ({ data: Buffer.from(image.data, "base64"), mimeType: image.mimeType })) }) });
+      assertCurrent(); return result;
+    } finally { clearInterval(timer); owner.abort(); }
+  };
   readonly #authorize: HostedAgentHostOptions["authorize"] = (principal, input) => {
     principal.assertCurrent(); const assertComputer = this.settings.captureComputer(), factory = this.#factories.get(input.backendId);
     if (!factory) throw new HostedAgentHostError("UNAVAILABLE");

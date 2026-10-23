@@ -587,6 +587,8 @@ interface QueuedInput {
   readonly source?: "user" | "schedule" | "system";
   readonly parentRunId?: string;
   readonly overrides?: TurnExecutionOverrides;
+  /** Ordinary owner sends may restore their archived task in the queue transaction. */
+  readonly restoreArchived?: boolean;
 }
 
 export interface EnqueueResult {
@@ -2597,7 +2599,7 @@ export class SessionHost {
           ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId })
         }
       },
-      (store) => this.commitQueuedInput(store, input)
+      (store) => this.commitQueuedInput(store, { ...input, restoreArchived: true })
     );
     if (!execution.replayed) this.drainQueuedInput(input.sessionId, input.source);
     return execution;
@@ -2794,6 +2796,23 @@ export class SessionHost {
   }
 
   /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
+  assertArchivedSessionSendRestorable(sessionId: string): void {
+    const session = this.#store.getSession(sessionId).descriptor;
+    if (session.deletedAt !== undefined) throw new StoreError("Archived or deleted tasks cannot accept input or activate a native runtime.");
+    if (!session.archived) return;
+    if (session.hidden || this.#store.sessionCreationServiceKind(sessionId) !== undefined
+      || this.#store.findSessionRuntimePolicy(sessionId) !== undefined
+      || readPersonalDevelopmentPurpose(this.#store, sessionId) !== undefined
+      || this.#partnerSessionPolicy(sessionId) !== undefined) {
+      throw new StoreError("Restore the managed task through its owner before continuing.");
+    }
+    if (this.#sessionLifecycleFences.has(sessionId) || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined
+      || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) {
+      throw new StoreError("The task lifecycle transition must finish before continuing.");
+    }
+  }
+
+  /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
   commitQueuedInput(store: OperationalStore, input: QueuedInput): EnqueueResult {
     this.#assertOpen();
     if (store !== this.#store) throw new StoreError("Input must be committed by its owning Store.");
@@ -2803,6 +2822,12 @@ export class SessionHost {
     this.assertInputCapabilities(input.sessionId, acceptedPrompt);
     if (this.isReviewReadOnlySession(input.sessionId)) {
       throw new StoreError("Reviewer input is admitted only through the host-owned Review queue.");
+    }
+    if (input.restoreArchived && (input.source ?? "user") === "user" && store.getSession(input.sessionId).descriptor.archived) {
+      this.assertArchivedSessionSendRestorable(input.sessionId);
+      const session = store.getSession(input.sessionId);
+      if (session.descriptor.worktree?.state === "preserved") throw new StoreError("Restore the preserved task workspace before continuing.");
+      store.updateSession(input.sessionId, { archived: false }, session.revision);
     }
     this.assertBackendAdmissionOpen(store.getSession(input.sessionId).descriptor.backendId);
     this.assertSessionNotPendingScheduleDeletion(input.sessionId);

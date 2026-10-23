@@ -16,6 +16,7 @@ import { AppErrorBoundary, routeErrorBoundaryKey } from "./components/ErrorBound
 import { resolveComposerAttachmentPolicy } from "./components/composer-behavior.js";
 import { reviewRunForReviewerSession } from "./components/reviewer-session.js";
 import { mergeTimelineWindows } from "./components/timeline-behavior.js";
+import { TimelineHistoryCache, timelineHistoryOwnerKey } from "./timeline-history-cache.js";
 import { PartnerAvatarProvider } from "./components/PartnerAvatar.js";
 import {
   clampNavigationDragWidth,
@@ -139,7 +140,7 @@ import {
   type WorktreeRemovalPreflightSummary
 } from "./worktree-removal-preflight.js";
 import { PartnerConversationScope } from "./components/PartnerConversation.js";
-import { PartnerGroupPage, PartnerGroupsNavigation } from "./components/PartnerGroups.js";
+import { PartnerNetworkPage, PartnerNetworkNavigation } from "./components/PartnerNetwork.js";
 
 const SessionPane = lazy(async () => ({ default: (await import("./components/SessionPane.js")).SessionPane }));
 
@@ -171,6 +172,8 @@ const JOKO_PRODUCT_FEEDBACK_URL = "https://github.com/JokoAgent/joko/issues/new"
 const JOKO_DOCUMENTATION_URL = "https://github.com/JokoAgent/joko";
 
 interface ActiveTimelineHistory {
+  readonly ownerKey?: string;
+  readonly sourceVersion?: string;
   readonly sessionId: string;
   readonly generation: bigint;
   readonly historyRevision: bigint;
@@ -331,6 +334,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     readonly items: readonly TimelineItemView[];
   }>();
   const [timelineHistory, setTimelineHistory] = useState<ActiveTimelineHistory>();
+  const timelineHistoryCacheRef = useRef(new TimelineHistoryCache());
+  const timelineHistoryConnectionRef = useRef(state.connectionState);
+  useEffect(() => { timelineHistoryCacheRef.current.clear(); }, [state.activeProfile?.id, state.activeProfile?.origin, state.activeProfile?.serverId]);
+  useEffect(() => { if (timelineHistory?.initialized && !timelineHistory.loading && !timelineHistory.error) timelineHistoryCacheRef.current.set(timelineHistory); }, [timelineHistory]);
   const promptRecommendationOwnerRef = useRef<{ readonly initialized: boolean; readonly key?: string }>({ initialized: false });
   const promptRecommendationConnectionOwner = state.activeProfile === undefined ? undefined : JSON.stringify([state.activeProfile.serverId, state.activeProfile.id]);
   const promptRecommendationOwner = promptRecommendationOwnerKey(state.ready && state.connectionState === "connected" ? state.activeProfile : undefined, {
@@ -1133,45 +1140,70 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     generation: bigint,
     historyRevision: bigint,
     beforeCursor: TimelineHistoryCursorView | undefined,
-    reset: boolean
+    reset: boolean,
+    allowCached = true
   ): Promise<void> => {
+    const state = controllerRef.current.state;
+    const selected = state.snapshot.sessions.find(session => session.id === sessionId);
+    const ownerKey = timelineHistoryOwnerKey(state.activeProfile, generation, sessionId, selected?.generation ?? 0n, historyRevision);
+    const sourceVersion = JSON.stringify([selected?.updatedAt, selected?.activeRunId, selected?.state]);
+    const cached = reset && ownerKey ? timelineHistoryCacheRef.current.get(ownerKey) : undefined;
     const requestId = ++timelineHistoryRequestIdRef.current;
-    setTimelineHistory((current) => reset || current?.sessionId !== sessionId || current.generation !== generation
+    if (allowCached && cached && cached.sourceVersion === sourceVersion && selected?.activeRunId === undefined
+      && selected?.state !== "running" && selected?.state !== "waiting" && selected?.state !== "retrying") {
+      setTimelineHistory({ ...cached, loading: false }); return;
+    }
+    setTimelineHistory((previous) => {
+      const current = previous?.ownerKey === ownerKey ? previous : cached;
+      return reset || current?.sessionId !== sessionId || current.generation !== generation
       || current.historyRevision !== historyRevision
       ? {
-          sessionId, generation, historyRevision,
+          sessionId, generation, historyRevision, ownerKey, sourceVersion: current?.sourceVersion,
           items: current?.sessionId === sessionId && current.generation === generation && current.historyRevision === historyRevision
             ? current.items : [],
+          ...(current?.nextBeforeCursor === undefined ? {} : { nextBeforeCursor: current.nextBeforeCursor }),
           initialized: false, loading: true
         }
       : {
           sessionId,
           generation,
           historyRevision,
+          ownerKey,
+          sourceVersion: current.sourceVersion,
           items: current.items,
           ...(current.nextBeforeCursor === undefined ? {} : { nextBeforeCursor: current.nextBeforeCursor }),
           initialized: current.initialized,
           loading: true
-        });
+        };
+    });
     try {
       const page = await controllerRef.current.loadSessionTimelinePage(sessionId, beforeCursor, 240);
       if (timelineHistoryRequestIdRef.current !== requestId) return;
       setTimelineHistory((current) => {
-        if (current?.sessionId !== sessionId || current.generation !== generation
+        if (current?.ownerKey !== ownerKey || current?.sessionId !== sessionId || current.generation !== generation
           || current.historyRevision !== historyRevision) return current;
+        const currentIds = new Set(current.items.map(item => item.id));
+        // An older retained window proves the prefix only when the new page
+        // reaches it. Otherwise its cursor must remain available to fill the gap.
+        const retainsOlder = reset && current.items.length > 0 && page.items.length > 0
+          && current.items[0]!.sequence < page.items[0]!.sequence
+          && page.items.some(item => currentIds.has(item.id));
+        const nextBeforeCursor = retainsOlder ? current.nextBeforeCursor : page.nextBeforeCursor;
         return {
           sessionId,
           generation,
           historyRevision,
-          items: mergeTimelineWindows(current.items, page.items),
-          ...(page.nextBeforeCursor === undefined ? {} : { nextBeforeCursor: page.nextBeforeCursor }),
+          ownerKey,
+          sourceVersion,
+          items: reset ? mergeTimelineWindows(page.items, current.items) : mergeTimelineWindows(current.items, page.items),
+          ...(nextBeforeCursor === undefined ? {} : { nextBeforeCursor }),
           initialized: true,
           loading: false
         };
       });
     } catch (error) {
       if (timelineHistoryRequestIdRef.current !== requestId) return;
-      setTimelineHistory((current) => current?.sessionId !== sessionId || current.generation !== generation
+      setTimelineHistory((current) => current?.ownerKey !== ownerKey || current?.sessionId !== sessionId || current.generation !== generation
         || current.historyRevision !== historyRevision
         ? current
         : { ...current, loading: false, error: messageOf(error, "Unable to load task history.") });
@@ -1179,17 +1211,23 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, []);
 
   useEffect(() => {
+    const stayedConnected = timelineHistoryConnectionRef.current === "connected" && state.connectionState === "connected";
+    timelineHistoryConnectionRef.current = state.connectionState;
     if (activeSession === undefined) {
       timelineHistoryRequestIdRef.current += 1;
       setTimelineHistory(undefined);
       return;
     }
     if (state.connectionState !== "connected") return;
-    void requestTimelineHistoryPage(activeSession.id, state.snapshot.generation, activeTimelineHistoryRevision, undefined, true);
-  }, [activeSession?.id, activeTimelineHistoryRevision, requestTimelineHistoryPage, state.connectionState, state.snapshot.generation]);
+    // A reconnect can precede replay of the Session descriptor. Its old
+    // source version is not evidence that the cached transcript is current.
+    void requestTimelineHistoryPage(activeSession.id, state.snapshot.generation, activeTimelineHistoryRevision, undefined, true, stayedConnected);
+  }, [activeSession?.id, activeSession?.generation, activeTimelineHistoryRevision, requestTimelineHistoryPage, state.connectionState,
+    state.snapshot.generation, state.activeProfile?.id, state.activeProfile?.serverId, state.activeProfile?.origin]);
 
   const recentActiveTimeline = activeSession === undefined ? EMPTY_TIMELINE : state.snapshot.timelineBySession.get(activeSession.id) ?? EMPTY_TIMELINE;
   const activeHistory = activeSession !== undefined && timelineHistory?.sessionId === activeSession.id
+    && timelineHistory.ownerKey === timelineHistoryOwnerKey(state.activeProfile, state.snapshot.generation, activeSession.id, activeSession.generation, activeTimelineHistoryRevision)
     && timelineHistory.generation === state.snapshot.generation
     && timelineHistory.historyRevision === activeTimelineHistoryRevision
     ? timelineHistory
@@ -2198,7 +2236,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       {applicationMenuFeedback}
       {!formalFilesMode && !settingsRoute && <Sidebar
         appShortcutOverrides={shortcutOverrides}
-        groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} /></>}
+        groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerNetworkNavigation controller={controller} onClose={closeNavigation} /></>}
         snapshot={sidebarSnapshot}
         activeSessionId={creatingNewSession ? undefined : activeSession?.id}
         route={state.route}
@@ -2450,7 +2488,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
           {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.effectiveLocale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
-          {state.route.kind === "partners" && (state.route.groupId ? <PartnerGroupPage controller={controller} groupId={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
+          {state.route.kind === "partners" && (state.route.groupId?.startsWith("network:") ? <PartnerNetworkPage controller={controller} route={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
             : <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} preparation={state.route.preparation} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />)}
           {state.route.kind === "sharedTask" && <TaskSharingSession controller={controller} joinId={state.route.joinId} profileId={state.route.profileId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
           {state.route.kind === "tools" && <ToolsPage

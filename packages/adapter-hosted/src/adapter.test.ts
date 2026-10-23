@@ -5,13 +5,13 @@ import type { AdapterContext, BackendDescriptor, NativeSessionBinding } from "@j
 import { expect, it, vi } from "vitest";
 import { HostedAgentSourceAdapter, type HostedAgentSourceConnection, type HostedAgentSourceController, type HostedAgentSourceAdapterOptions } from "./adapter.js";
 
-async function fixture(prepareInput?: HostedAgentSourceAdapterOptions["prepareInput"]) {
+async function fixture(prepareInput?: HostedAgentSourceAdapterOptions["prepareInput"], commands?: HostedAgentSourceAdapterOptions["commands"]) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-source-adapter-")));
   const context: AdapterContext = { sessionId: "task", generation: 1, target: { id: "target", backendId: "source-native", displayName: "Task", workspaceRoot: root,
     managed: true, trusted: true }, operationId: "create-task", modelSelection: { providerId: "provider", modelId: "model" }, signal: new AbortController().signal,
     emit: async () => {}, requestInteraction: async () => ({ kind: "cancelled" }), artifactCapacityBytes: 1024, storeArtifact: async () => { throw new Error("No Artifact in this fixture."); } };
   const descriptor: BackendDescriptor = { id: "source-native", adapterKind: "hosted", instanceGeneration: 1, displayName: "Source", version: "1", health: "healthy",
-    installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] };
+    installationState: "installed", authenticationState: "authenticated", capabilities: new Map([["runtime.commands", { key: "runtime.commands", supported: true }]]), models: [], tools: [], diagnostics: [] };
   const open = vi.fn<HostedAgentSourceConnection["client"]["open"]>(async input => ({ runId: input.runId, virtualRoot: "/provider/private/workspace" }));
   const close = vi.fn(async () => {}), stop = vi.fn(async () => {}), release = vi.fn(async () => {}), forget = vi.fn(async () => {}), owners = new Map<string, AdapterContext>();
   const fences = new Map<string, NonNullable<Parameters<HostedAgentSourceController["registerOperation"]>[2]>>();
@@ -24,6 +24,7 @@ async function fixture(prepareInput?: HostedAgentSourceAdapterOptions["prepareIn
   const adapter = new HostedAgentSourceAdapter({ id: descriptor.id, source: { targetDeviceId: "provider-node", controllerDeviceId: "source-device", backendId: "native" },
     describe: () => descriptor, assertContext: () => {}, readPolicy: () => ({ permissionMode: "ask", fastMode: false }), releaseWorkspace: release, deleteWorkspace: forget,
     ...(prepareInput === undefined ? {} : { prepareInput }),
+    ...(commands === undefined ? {} : { commands }),
     workspace: () => ({ platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false }),
     capture: () => ({ client: { open, call }, close, assertCurrent: () => {}, createController: input => { binding = input.binding; return controller; } }) });
   return { root, context, adapter, open, call, close, stop, release, forget, owners, fences, cleanup: async () => {
@@ -48,6 +49,39 @@ it("retains a Source-owned binding, rejects a substituted node, and resumes the 
     await f.adapter.send({ text: "Exact occurrence", images: [], files: [], mentions: [], disposition: "prompt" },
       { ...f.context, generation: 2, binding: restored.binding, operationId: "original-queue-operation" });
     expect(f.call.mock.calls.at(-1)?.[1]).toBe("original-queue-operation"); expect(f.owners.get("original-queue-operation")?.generation).toBe(2);
+  } finally { await f.cleanup(); }
+});
+
+it("merges loaded native extension commands with approved Source commands and keeps Provider paths private", async () => {
+  const f = await fixture(undefined, () => [{ name: "advice", description: "Approved Source advice", source: "prompt", inputMode: "resource_mention", resourceId: "source-advice", loaded: true }]);
+  try {
+    const binding = await f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false }, f.context);
+    const native = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (...args) => args[2].kind === "commands" ? [
+      { name: "subagents", description: "Manage delegated work", source: "extension", inputMode: "text", loaded: true, path: "/provider/private/extension.ts" },
+      { name: "advice", description: "Provider collision", source: "extension", inputMode: "text", loaded: true },
+      { name: "private", description: "Provider skill", source: "skill", inputMode: "text", loaded: true, path: "/provider/private/SKILL.md" }
+    ] : args[2].kind === "dispatch_during_compaction" ? "steer" : native(...args));
+    expect(await f.adapter.getCommands({ ...f.context, binding })).toEqual([
+      { name: "advice", description: "Approved Source advice", source: "prompt", inputMode: "resource_mention", resourceId: "source-advice", loaded: true },
+      { name: "subagents", description: "Manage delegated work", source: "extension", inputMode: "text", loaded: true }
+    ]);
+    expect(await f.adapter.dispatchDuringCompaction({ text: "/subagents", images: [], files: [], mentions: [], disposition: "prompt" }, { ...f.context, binding })).toBe("steer");
+    expect(f.owners.size).toBe(1);
+  } finally { await f.cleanup(); }
+});
+
+it("forwards exact native rewind and child controls while retaining its Source alias", async () => {
+  const f = await fixture();
+  try {
+    const binding = await f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false }, f.context);
+    const recordBinding = vi.fn();
+    expect(await f.adapter.navigateTree({ kind: "native_entry", entryId: "exact-entry" }, false, { ...f.context, binding, operationId: "rewind" }, undefined, { recordBinding })).toEqual({ kind: "in_place" });
+    expect(f.call.mock.calls.at(-1)?.[2]).toEqual({ kind: "navigate", target: { kind: "native_entry", entryId: "exact-entry" }, summarize: false });
+    expect(recordBinding).not.toHaveBeenCalled();
+    await f.adapter.controlSubagent({ runId: "native-child", childId: "exact-child", action: "resume", message: "Continue the child." }, { ...f.context, binding, operationId: "resume-child" });
+    expect(f.call.mock.calls.at(-1)?.[2]).toEqual({ kind: "control_subagent", input: { runId: "native-child", childId: "exact-child", action: "resume", message: "Continue the child." } });
+    expect((await f.adapter.inspectSession(binding, { ...f.context, binding })).binding).toEqual(binding);
   } finally { await f.cleanup(); }
 });
 

@@ -6011,6 +6011,7 @@ const en = {
   ,"modelPicker.configure": "Configure model"
   ,"modelPicker.configureHint": "Effort and Fast mode are saved when you add this configuration to favorites."
   ,"modelPicker.favoriteEditHint": "This favorite is an independent copy; changes do not affect other copies of the same model."
+  ,"modelPicker.selectionSaveFailed": "The model selection could not be saved. Your current configuration is still in use; try again."
   ,"modelPicker.favoriteSaveFailed": "Favorites changed elsewhere or could not be saved. The latest saved list is still in use; refresh and try again."
   ,"modelPicker.priceTitle": "Input {input} / output {output} micros per million tokens · {currency}"
   ,"modelPicker.free": "Free"
@@ -9783,6 +9784,7 @@ const zhBase: Record<MessageKey, string> = {
   "modelPicker.configure": "配置模型",
   "modelPicker.configureHint": "加入收藏时会一并保存思考强度和 Fast 模式。",
   "modelPicker.favoriteEditHint": "此收藏是独立副本；修改不会影响同一模型的其他副本。",
+  "modelPicker.selectionSaveFailed": "模型选择未能保存，当前配置继续生效，请重试。",
   "modelPicker.favoriteSaveFailed": "收藏已在其他位置发生变化或未能保存。当前仍使用最新已保存列表，请刷新后重试。",
   "modelPicker.priceTitle": "每百万 tokens 输入 {input} / 输出 {output} 微单位 · {currency}",
   "modelPicker.free": "免费",

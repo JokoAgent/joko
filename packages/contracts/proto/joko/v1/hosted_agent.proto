@@ -89,6 +89,8 @@ message HostedAgentBackendCatalog {
   // Stable identity of the actual native execution service, separate from the
   // Device route that may delegate to it.
   string node_id = 7;
+  // Exact native process instance for isolated, task-free inference admission.
+  uint64 instance_generation = 8;
 }
 message GetHostedAgentCatalogRequest { uint32 format = 1; }
 message GetHostedAgentCatalogResponse {

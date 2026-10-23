@@ -9,6 +9,8 @@ import type { ExtensionProject as ProtoExtensionProject } from "@joko/contracts"
 import { AppDefaultModelService } from "@joko/contracts";
 import { HostedAgentService } from "@joko/contracts";
 import { ProviderSharingService, createProviderSharingApi, type ProviderSharingApi, type GetHostedAgentCatalogResponse, type DevicePeerRouteIdentity } from "@joko/contracts";
+import { createPartnerNetworkApi, type PartnerNetworkApi } from "./partner-network-api.js";
+import { createPartnerIdentityApi, type PartnerIdentityApi } from "./partner-identity-api.js";
 import { createInputHandoffGateway } from "./input-handoff-gateway.js";
 import type { InputHandoffApi } from "./input-handoff.js";
 import { watchInputHandoffTasks } from "./input-handoff-task-watch.js";
@@ -964,6 +966,8 @@ import type { ModelWorkingContextView as ProtoModelWorkingContextView } from "@j
 import type { ModelWorkingContextRoute, ModelWorkingContextTarget, ModelWorkingContextView } from "./model.js";
 import { compareExtensionStateOrder } from "./extension-ui-presentation.js";
 import { projectSessionRuntimeRecovery } from "./runtime-recovery.js";
+import { projectModelSourceView } from "./model-source-catalog.js";
+import { createSessionRuntimeGateway, type SessionRuntimeModelSelection } from "./session-runtime-gateway.js";
 
 export type GatewayConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting" | "offline";
 
@@ -1024,6 +1028,8 @@ export interface PairingOutcome {
 export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage">, AppDefaultModelUiPort {
   inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi;
   providerSharingApi(): ProviderSharingApi;
+  partnerNetworkApi(): PartnerNetworkApi;
+  partnerIdentityApi(): PartnerIdentityApi;
   providerSharingCatalog(signal: AbortSignal): Promise<GetHostedAgentCatalogResponse>;
   providerGroupSettingsApi(): ProviderGroupSettingsApi;
   taskSharingApi(): TaskSharingApi;
@@ -1159,6 +1165,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return createProviderSharingApi(rpc, signal => { signal.throwIfAborted(); scope.signal.throwIfAborted();
       if (this.#transport !== scope.transport) throw new Error("The Provider sharing connection changed."); }, scope.signal);
   }
+  partnerNetworkApi(): PartnerNetworkApi {
+    if (this.#taskSharing) throw new GatewayError("The computer owner must open group conversations.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope();
+    return createPartnerNetworkApi(scope.transport, scope.signal, () => { scope.signal.throwIfAborted();
+      if (this.#transport !== scope.transport) throw new Error("The group conversation connection changed."); });
+  }
+  partnerIdentityApi(): PartnerIdentityApi {
+    if (this.#taskSharing) throw new GatewayError("The Home owner must manage Partner identities.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope();
+    return createPartnerIdentityApi(scope.transport, scope.signal, () => { scope.signal.throwIfAborted();
+      if (this.#transport !== scope.transport) throw new Error("The Partner identity connection changed."); });
+  }
   async providerSharingCatalog(signal: AbortSignal): Promise<GetHostedAgentCatalogResponse> {
     if (this.#taskSharing) throw new GatewayError("The computer owner must manage Provider shares.", { code: "ACCESS_DENIED" });
     const scope = this.captureActionScope(signal), value = await createClient(HostedAgentService, scope.transport).getHostedAgentCatalog({ format: 1 }, { signal: scope.signal });
@@ -1284,6 +1302,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ownerKey: () => `${this.#profile?.serverId}:${this.#snapshot?.generation}`,
           changed: tasks => {
             if (this.#abort !== abort || this.#transport !== transport) return;
+            if (!tasks.length && !this.#inputHandoffs.length) return;
             this.#inputHandoffs = tasks;
             if (this.#snapshot) {
               this.#snapshot = { ...this.#snapshot, inputHandoffs: tasks }; this.#callbacks.onSnapshot?.(this.#snapshot);
@@ -2794,6 +2813,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({
       case: "setSessionModel",
       value: { sessionId, model: { model: { providerId, modelId }, effortId: effort ?? "", fastMode } }
+    });
+  }
+
+  getSessionRuntimeControl(sessionId: string): Promise<TaskShareRuntimeControl> {
+    if (this.#taskSharing !== undefined) return this.getSharedTaskRuntimeControl(sessionId);
+    return this.sessionRuntimeGateway().getSessionRuntimeControl(sessionId);
+  }
+
+  setRuntimeModel(sessionId: string, selection: SessionRuntimeModelSelection): Promise<void> {
+    if (this.#taskSharing !== undefined) return this.setSharedTaskRuntime(sessionId, selection);
+    return this.sessionRuntimeGateway().setRuntimeModel(sessionId, selection);
+  }
+
+  private sessionRuntimeGateway() {
+    return createSessionRuntimeGateway({
+      capture: () => {
+        const scope = this.captureActionScope();
+        return { transport: scope.transport, signal: scope.signal, assertCurrent: () => {
+          scope.signal.throwIfAborted();
+          if (this.#transport !== scope.transport) throw new GatewayError("The original task connection changed.");
+        } };
+      },
+      submit: payload => this.submit(payload)
     });
   }
 
@@ -14026,6 +14068,7 @@ function mapModel(
     backendId: model.backendId,
     providerId: model.key?.providerId ?? "",
     providerName: provider?.displayName ?? model.key?.providerId ?? "",
+    source: projectModelSourceView(model.source),
     ...(provider === undefined ? {} : { providerAccessKind: providerKind(provider.kind) }),
     ...(pricingCapability === undefined ? {} : {
       pricingKnown: pricingCapability.support === CapabilitySupport.SUPPORTED

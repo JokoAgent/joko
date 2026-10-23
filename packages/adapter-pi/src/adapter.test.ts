@@ -601,11 +601,11 @@ describe("PiBackendAdapter", () => {
     } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
   });
 
-  it.each([false, true])("uses the exact native account model without tools or durable credential files (revoked=%s)", async revoked => {
+  it.each([[false, false], [true, false], [false, true]])("uses the exact native account model without tools or durable credential files (revoked=%s, images=%s)", async (revoked, withImage) => {
     const home = await mkdtemp(join(tmpdir(), "joko-native-review-")); let current = true;
     const initial = { type: "oauth" as const, access: "private-access", refresh: "private-refresh", expires: Date.now() + 60_000 };
     const refreshed = { ...initial, access: "refreshed-access" }, persisted = vi.fn(async () => ({ catalogGeneration: 2, credentialReferenceId: "native" }));
-    const model = { provider: "openai-codex", id: "exact-native" };
+    const model = { provider: "openai-codex", id: "exact-native", input: ["text", "image"] };
     const complete = vi.fn(async (_model: unknown, _context: unknown, _options: unknown) => {
       if (revoked) current = false;
       await captured!.credentials!.modify("openai-codex", async () => refreshed);
@@ -619,11 +619,12 @@ describe("PiBackendAdapter", () => {
       nativeModels: [{ providerId: "openai-codex", modelId: "exact-native", displayName: "Exact", api: "openai-responses", contextWindow: 32_000, maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
       loadNativeAuth: () => ({ catalogGeneration: 1, credentials: { "openai-codex": initial } }), persistNativeAuth: persisted });
     try {
-      const result = adapter.inferNativeText({ providerId: "openai-codex", modelId: "exact-native", backendInstanceGeneration: 0, system: "Review", user: "Action", timeoutMs: 10_000,
+      const images = withImage ? [{ data: new Uint8Array([1, 2, 3]), mimeType: "image/png" }] : [];
+      const result = adapter.inferNativeText({ providerId: "openai-codex", modelId: "exact-native", backendInstanceGeneration: 0, system: "Review", user: "Action", images, timeoutMs: 10_000,
         signal: new AbortController().signal, assertCurrent: () => { if (!current) throw new Error("Revoked"); }, assertModelAllowed: (provider, id) => { expect([provider, id]).toEqual(["openai-codex", "exact-native"]); } });
       if (revoked) await expect(result).rejects.toThrow("Revoked"); else await expect(result).resolves.toBe("approved");
       expect(captured).toMatchObject({ modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
-      expect(complete).toHaveBeenCalledWith(model, { systemPrompt: "Review", messages: [{ role: "user", content: [{ type: "text", text: "Action" }], timestamp: expect.any(Number) }] }, expect.objectContaining({ cacheRetention: "none", maxTokens: 512 }));
+      expect(complete).toHaveBeenCalledWith(model, { systemPrompt: "Review", messages: [{ role: "user", content: [{ type: "text", text: "Action" }, ...withImage ? [{ type: "image", data: "AQID", mimeType: "image/png" }] : []], timestamp: expect.any(Number) }] }, expect.objectContaining({ cacheRetention: "none", maxTokens: 512 }));
       expect(persisted).toHaveBeenCalledTimes(revoked ? 0 : 1); await expect(access(join(home, "auth.json"))).rejects.toThrow();
     } finally { create.mockRestore(); await adapter.dispose(); await rm(home, { recursive: true, force: true }); }
   });

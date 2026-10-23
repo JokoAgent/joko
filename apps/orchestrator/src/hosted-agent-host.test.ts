@@ -167,3 +167,46 @@ it("persists an SDK binding change before publishing it and resumes that context
     if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
   }
 });
+
+it.each(["complete", "reserved", "source-retired"] as const)("retains exact native rewind ownership across %s replacement and restart without replaying navigation", async failure => {
+  const root = await mkdtemp(join(tmpdir(), "joko-hosted-native-rewind-")), database = new OperationalStore(":memory:"), store = new HostedAgentStore(database);
+  const first = { opaqueRef: "native-first", nativeSessionId: "first", generation: 1 }, next = { opaqueRef: "native-next", nativeSessionId: "next", generation: 2 };
+  const resumed: NativeSessionBinding[] = [], removed: NativeSessionBinding[] = [];
+  let navigations = 0, resumeFailed = false;
+  const state = (binding: NativeSessionBinding) => ({ binding, streaming: false, compacting: false, pendingMessages: 0,
+    providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask" as const });
+  const adapter = (): BackendAdapter => ({ id: "native", hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },
+    createSession: async () => first, inspectSession: async binding => state(binding),
+    resumeSession: async binding => { resumed.push(binding); if (failure === "source-retired" && !resumeFailed) { resumeFailed = true; throw new Error("Native restore confirmation lost."); } return state(binding); },
+    navigateTree: async (_target, _summarize, _context, _instructions, navigation) => {
+      navigations++; navigation.recordBinding(next); if (failure === "reserved") throw new Error("Native rewind confirmation lost.");
+      return { kind: "replacement", binding: next, nativeHistory: { events: [], activeLineage: [] } };
+    }, closeSession: async () => {}, deleteSession: async binding => { removed.push(binding); },
+    getNativeHistoryProjection: async () => ({ events: [], activeLineage: [] }), dispose: async () => {}
+  } satisfies Partial<BackendAdapter>) as unknown as BackendAdapter;
+  const options = { root, runId: "first-run", nativeSessionId: "stable-actor", start: "create" as const, store, slots: new HostedAgentSessionSlots(),
+    source: { authorityId: "controller", deviceId: "source", sessionId: "task", targetId: "workspace", generation: 1 },
+    trust: "owner" as const, backendId: "native", providerId: "provider", modelId: "model", modelIds: ["model"], permissionMode: "ask" as const, fastMode: false,
+    workspace: { platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false }, artifactCapacityBytes: 1024,
+    assertCurrent: () => {}, assertModelAllowed: () => {}, createAdapter: adapter };
+  let run: NativeRun | undefined, restored: NativeRun | undefined;
+  try {
+    run = await NativeRun.create(options);
+    const command = { kind: "navigate" as const, target: { kind: "session_start" as const }, summarize: false };
+    if (failure === "complete") {
+      await expect(run.call("native-rewind", command)).resolves.toBeNull();
+      await expect(run.call("native-rewind", command)).resolves.toBeNull();
+      expect(store.find(run.id)?.binding).toEqual(next);
+    } else await expect(run.call("native-rewind", command)).rejects.toThrow("confirmation lost");
+    await run.close();
+    restored = await NativeRun.create({ ...options, runId: "restored-run", start: "resume" });
+    const expected = failure === "reserved" ? first : next;
+    expect((await restored.call("restored-state", { kind: "state" }) as { binding: unknown }).binding).toEqual(expected);
+    expect(resumed.at(-1)).toEqual(expected); expect(navigations).toBe(1);
+    expect(removed).toEqual(failure === "reserved" ? [next] : []);
+    expect(database.listSettingsByKeyPrefix("service", "native-hosted-navigation.v1", "")).toEqual([]);
+  } finally {
+    await restored?.close(); restored?.disposeExchange(); await run?.close(); run?.disposeExchange(); database.close();
+    if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
+  }
+});
