@@ -424,12 +424,16 @@ describe("SchedulerToolBridgeProvider", () => {
       name: "Missing prompt",
       kind: "manual"
     }))).toMatchObject({ errorCode: "INVALID_PARAMS" });
-    expect(errorData(await call(provider, "schedule_create", {
+    expect(resultData(await call(provider, "schedule_create", {
       name: "Bound script",
       kind: "manual",
       bindToCurrentSession: true,
       executionMode: "script",
       scriptConfig: { command: "node scripts/probe.mjs", capabilities: [] }
+    }))).toMatchObject({ sessionMode: "bound" });
+    expect(errorData(await call(provider, "schedule_create", {
+      name: "Persistent script", kind: "manual", persistentSession: true,
+      executionMode: "script", scriptConfig: { command: "node scripts/probe.mjs", capabilities: [] }
     }))).toMatchObject({ errorCode: "INVALID_PARAMS" });
     expect(errorData(await call(provider, "schedule_create", {
       name: "Silent script",

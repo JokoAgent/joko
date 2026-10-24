@@ -6,6 +6,7 @@ import type { OperationalStore, ScheduleRecord } from "@joko/store";
 import type {
   ScheduleScriptCapability,
   ScheduleScriptCapabilityBroker,
+  ScheduleScriptCapabilityContext,
   ScheduleScriptCapabilityCall
 } from "./schedule-script-runner.js";
 import type { SessionHost } from "./session-host.js";
@@ -44,8 +45,9 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
   async call(
     request: ScheduleScriptCapabilityCall,
     granted: ReadonlySet<ScheduleScriptCapability>,
-    context: { readonly scheduleId: string; readonly runId: string }
+    context: ScheduleScriptCapabilityContext
   ): Promise<unknown> {
+    context.assertCurrent();
     if (request.method === "host.capabilities") {
       assertOnlyKeys(request.params, []);
       return {
@@ -66,18 +68,22 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
     requireCapability(granted, "sessions.dispatch");
     assertOnlyKeys(request.params, ["message", "title", "target_session_id"]);
 
-    const schedule = this.requireScriptSchedule(context.scheduleId);
+    const schedule = this.requireScriptSchedule(context.schedule);
     const message = requiredSafeText(request.params["message"], "message", 262_144);
     const title = request.params["title"] === undefined
       ? schedule.name
       : requiredSafeText(request.params["title"], "title", 256);
     const requestedSessionId = request.params["target_session_id"] === undefined
-      ? undefined
+      ? schedule.sessionMode === "bound" ? schedule.sessionId : undefined
       : requiredText(request.params["target_session_id"], "target_session_id", 256);
+    if (schedule.sessionMode === "bound" && requestedSessionId !== schedule.sessionId) {
+      throw new ScheduleScriptCapabilityError("INVALID_ARGS", "A bound Schedule can only dispatch to its bound task.");
+    }
     const operationId = capabilityOperationId(context.runId, request.id);
     const sessionId = requestedSessionId === undefined
-      ? await this.createSession(schedule, title, operationId, context.runId)
+      ? await this.createSession(schedule, title, operationId, context)
       : this.requireTargetSession(schedule, requestedSessionId);
+    context.assertCurrent();
     const sent = this.host.enqueueServiceInput({
       operationId: `${operationId}-send`,
       sessionId,
@@ -92,9 +98,8 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
     };
   }
 
-  private requireScriptSchedule(scheduleId: string): ScheduleRecord {
-    const schedule = this.store.findSchedule(scheduleId);
-    if (schedule === undefined) {
+  private requireScriptSchedule(schedule: ScheduleRecord): ScheduleRecord {
+    if (this.store.findSchedule(schedule.id) === undefined) {
       throw new ScheduleScriptCapabilityError("NOT_FOUND", "Schedule no longer exists.");
     }
     const target = this.store.getTarget(schedule.targetId).descriptor;
@@ -108,15 +113,17 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
     schedule: ScheduleRecord,
     title: string,
     operationId: string,
-    runId: string
+    context: ScheduleScriptCapabilityContext
   ): Promise<string> {
     const execution = scheduleCreationSnapshot(schedule.executionSnapshot);
     try {
+      context.assertCurrent();
       const created = await this.host.createScheduledSession({
         operationId: `${operationId}-session`,
         targetId: schedule.targetId,
         title,
-        automationOrigin: { scheduleId: schedule.id, scheduleName: schedule.name, runId, scheduleRevision: schedule.revision },
+        automationOrigin: { scheduleId: schedule.id, scheduleName: schedule.name, runId: context.runId, scheduleRevision: schedule.revision },
+        assertServiceScope: context.assertCurrent,
         ...(execution.providerId === undefined ? {} : { providerId: execution.providerId }),
         ...(execution.modelId === undefined ? {} : { modelId: execution.modelId }),
         ...(execution.effort === undefined ? {} : { effort: execution.effort }),
@@ -124,6 +131,7 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
         permissionMode: execution.permissionMode,
         planMode: execution.planMode
       });
+      context.assertCurrent();
       return created.value.sessionId;
     } catch (error) {
       throw new ScheduleScriptCapabilityError(

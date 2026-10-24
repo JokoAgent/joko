@@ -3498,6 +3498,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (scriptMode && draft.scriptCommand.trim().length === 0) {
       throw new GatewayError("Script schedules require a command.");
     }
+    if (scriptMode && draft.sessionMode === "persistent") throw new GatewayError("Script schedules require fresh or bound task mode.");
+    if (draft.sessionMode === "bound" && !draft.sessionId) throw new GatewayError("Choose a task for the bound schedule.");
     if (draft.scriptTimeoutMs !== undefined && (!Number.isSafeInteger(draft.scriptTimeoutMs) || draft.scriptTimeoutMs <= 0)) {
       throw new GatewayError("Script timeout must be a positive whole number of milliseconds.");
     }
@@ -3511,8 +3513,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       displayName: draft.name.trim(),
       backendId: draft.backendId,
       targetId: draft.targetId,
-      sessionId: scriptMode || draft.sessionMode === "fresh" ? "" : draft.sessionId,
-      sessionMode: scriptMode || draft.sessionMode === "fresh"
+      sessionId: draft.sessionMode === "fresh" ? "" : draft.sessionId,
+      sessionMode: draft.sessionMode === "fresh"
         ? ScheduleSessionMode.FRESH
         : draft.sessionMode === "persistent"
           ? ScheduleSessionMode.PERSISTENT

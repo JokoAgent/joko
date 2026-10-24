@@ -90,6 +90,7 @@ import {
   encodePortableSessionProjection
 } from "./portable-session-projection.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
+import type { ScheduleScriptInput, ScheduleScriptCapabilityContext } from "./schedule-script-runner.js";
 import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture, type PartnerLearningHostPort } from "./session-host.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { activeNativeTimeline } from "./snapshot-projector.js";
@@ -9896,6 +9897,61 @@ describe("SessionHost", () => {
     });
   });
 
+  it("freezes script task creation and retains later Schedule edits", async () => {
+    const f = await createFixture(), gate = new AsyncGate(); let fire = 0;
+    const otherRoot = join(f.directory, "other-project"); mkdirSync(otherRoot);
+    await f.host.registerTarget({ id: "target-two", backendId: f.adapter.id, displayName: "Other", workspaceRoot: otherRoot, trusted: true, managed: true });
+    const initial = seedScriptSchedule(f, "script-frozen", { name: "Original", kind: "interval", expression: "10000", anchorAt: 1000, nextRunAt: Date.now() + 60_000 });
+    const executeScript = async (input: ScheduleScriptInput) => {
+      if (++fire === 1) { gate.enter(); await gate.wait; }
+      return dispatchScriptTask(input);
+    };
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { executeScript }); cleanups.push(() => coordinator.stop());
+    const first = coordinator.runNowWithResult(initial.id, "frozen-first");
+    let nextRunAt: number;
+    try {
+      await gate.entered;
+      const current = f.store.getSchedule(initial.id); nextRunAt = Date.now() + 120_000;
+      f.store.upsertSchedule({ ...current, expectedRevision: current.revision, name: "Edited", targetId: "target-two", expression: "20000", nextRunAt,
+        executionSnapshot: { ...(current.executionSnapshot as Record<string, unknown>), providerId: "vision", modelId: "multimodal", effort: "high", permissionMode: "auto", planMode: true } });
+    } finally { gate.release(); }
+    const outcome = await first; expect(outcome.status).toBe("success");
+    expect(f.store.getSession(outcome.sessionId!).descriptor).toMatchObject({ targetId: "target-one", title: "Original", providerId: "test", modelId: "text", permissionMode: "ask", planMode: false });
+    expect(f.store.findScheduleRunByRunId(outcome.runId)).toMatchObject({ sessionId: outcome.sessionId, status: "success" });
+    expect(f.store.getSchedule(initial.id)).toMatchObject({ targetId: "target-two", name: "Edited", expression: "20000", nextRunAt: nextRunAt! });
+    const next = await coordinator.runNowWithResult(initial.id, "frozen-next"); expect(next.status).toBe("success");
+    expect(f.store.getSession(next.sessionId!).descriptor).toMatchObject({ targetId: "target-two", title: "Edited", providerId: "vision", modelId: "multimodal", permissionMode: "auto", planMode: true });
+  });
+
+  it("dispatches bound scripts only to their existing task and keeps that task's own configuration", async () => {
+    const f = await createFixture();
+    const makeTask = (operationId: string) => f.host.createSession({ operationId, connection: f.connection, targetId: "target-one", title: "Existing task",
+      providerId: "vision", modelId: "multimodal", effort: "high", fastMode: false, permissionMode: "auto", planMode: true });
+    const boundId = (await makeTask("bound-task")).value.sessionId, otherId = (await makeTask("other-task")).value.sessionId;
+    seedScriptSchedule(f, "script-bound", { sessionMode: "bound", sessionId: boundId });
+    let retained: ScheduleScriptCapabilityContext | undefined;
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { executeScript: async input => {
+      retained = scriptScope(input);
+      await expect(input.broker.call({ id: "wrong", method: "sessions.dispatch", params: { message: "Do not send", target_session_id: otherId } }, new Set(input.capabilities), retained)).rejects.toMatchObject({ code: "INVALID_ARGS" });
+      expect(f.store.listQueueItems({ sessionId: otherId })).toHaveLength(0);
+      return dispatchScriptTask(input);
+    } }); cleanups.push(() => coordinator.stop());
+    const outcome = await coordinator.runNowWithResult("script-bound", "bound-fire");
+    expect(outcome).toMatchObject({ status: "success", sessionId: boundId }); expect(f.store.listSessions()).toHaveLength(2);
+    expect(f.store.getSession(boundId).descriptor).toMatchObject({ providerId: "vision", modelId: "multimodal", permissionMode: "auto", planMode: true });
+    expect(f.store.listQueueItems({ sessionId: boundId })).toHaveLength(1); expect(() => retained!.assertCurrent()).toThrow();
+  });
+
+  it("closes a late native creation after script cancellation without adopting or queueing it", async () => {
+    const adapter = new GatedFakeAdapter(), f = await createFixture(adapter), gate = adapter.holdCreate(), closed = vi.spyOn(adapter, "closeSession");
+    seedScriptSchedule(f, "script-cancelled");
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { executeScript: dispatchScriptTask }); cleanups.push(() => coordinator.stop());
+    const pending = coordinator.runNowWithResult("script-cancelled", "cancelled-fire");
+    try { await gate.entered; await coordinator.abortSchedule("script-cancelled"); } finally { gate.release(); }
+    expect(await pending).toMatchObject({ status: "aborted" }); expect(adapter.createCalls).toBe(1); expect(closed).toHaveBeenCalledOnce();
+    expect(f.store.listSessions()).toHaveLength(0); expect(f.store.listQueueItems()).toHaveLength(0);
+  });
+
   it("aborts an in-flight script Schedule without creating a product task", async () => {
     const fixture = await createFixture();
     let started!: () => void;
@@ -16002,6 +16058,21 @@ describe("original Partner learning turn authority", () => {
     expect(settled).toHaveBeenCalledWith(expect.any(String), event.id, "aborted");
   });
 });
+
+function seedScriptSchedule(f: Awaited<ReturnType<typeof createFixture>>, id: string, patch: Partial<Parameters<OperationalStore["upsertSchedule"]>[0]> = {}) {
+  return f.store.upsertSchedule({ id, backendId: f.adapter.id, targetId: "target-one", sessionMode: "fresh", name: "Script task", kind: "manual", timezone: "UTC", enabled: true,
+    prompt: { text: "", images: [], files: [], mentions: [], disposition: "prompt" },
+    executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, providerId: "test", modelId: "text", effort: "medium", permissionMode: "ask", planMode: false, fastMode: false,
+      scheduler: { format: 1, silentWhenIdle: false, notify: { desktop: true }, executionMode: "script", scriptConfig: { command: "node ignored.mjs", capabilities: ["sessions.dispatch"] } } },
+    overlapPolicy: "queue", misfirePolicy: "run_once", ...patch });
+}
+function scriptScope(input: ScheduleScriptInput): ScheduleScriptCapabilityContext {
+  return { schedule: input.schedule, runId: input.runId, signal: input.signal!, assertCurrent: input.assertCurrent };
+}
+async function dispatchScriptTask(input: ScheduleScriptInput) {
+  const result = await input.broker.call({ id: "dispatch", method: "sessions.dispatch", params: { message: "Inspect once" } }, new Set(input.capabilities), scriptScope(input)) as { target_session_id: string };
+  return { primarySessionId: result.target_session_id, durationMs: 1, stderr: "", stderrTruncated: false };
+}
 
 async function createFixture(
   adapter: FakeBackendAdapter = new FakeBackendAdapter(PI_LIKE_PROFILE),

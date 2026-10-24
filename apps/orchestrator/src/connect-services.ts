@@ -23548,8 +23548,8 @@ function assertPublicScheduleExecutionCompatibility(
     if (prompt.text.trim() === "") throw invalidArgument("Agent Schedules require a non-empty prompt.");
     return;
   }
-  if (binding.mode !== "fresh" || binding.sessionId !== "") {
-    throw invalidArgument("Script Schedules cannot bind or persist a product task.");
+  if (binding.mode === "persistent") {
+    throw invalidArgument("Script Schedules require fresh or bound Session mode.");
   }
   if (extension.silentWhenIdle) {
     throw invalidArgument("Script Schedules cannot use silent_when_idle.");

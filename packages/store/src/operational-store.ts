@@ -3430,6 +3430,7 @@ export class OperationalStore {
       readonly localRuntimeBackendSelection?: boolean;
       readonly derivationOperationId?: string;
       readonly nativeCatalogAdoptionOperationId?: string;
+      readonly automationOccurrenceRouting?: { readonly backendId: string; readonly targetId: string };
     } = {}
   ): StoredSession {
     return this.write(() => {
@@ -3477,9 +3478,13 @@ export class OperationalStore {
       const derivationOrigin = normalizeSessionDerivationOrigin(descriptor.derivationOrigin);
       if (automationOrigin !== undefined) {
         const schedule = this.getSchedule(automationOrigin.scheduleId);
-        if (schedule.backendId !== descriptor.backendId || schedule.targetId !== descriptor.targetId) {
+        const routing = options.automationOccurrenceRouting ?? schedule;
+        if (options.automationOccurrenceRouting) this.assertScheduleOccurrenceRouting(schedule.id, automationOrigin.runId, options.automationOccurrenceRouting);
+        if (routing.backendId !== descriptor.backendId || routing.targetId !== descriptor.targetId) {
           throw new StoreError("Session automation owner does not match its backend and target.");
         }
+      } else if (options.automationOccurrenceRouting) {
+        throw new StoreError("A frozen occurrence route requires a Schedule owner.");
       }
       if (derivationOrigin !== undefined) {
         if (derivationOrigin.sourceSessionId === descriptor.id) {
@@ -14924,6 +14929,8 @@ export class OperationalStore {
     readonly scheduleId: string;
     readonly runId: string;
     readonly sessionId?: string;
+    /** Frozen routing recorded when this script occurrence started. */
+    readonly occurrenceRouting?: { readonly backendId: string; readonly targetId: string; readonly boundSessionId?: string };
     readonly firedAt?: number;
     readonly finishedAt?: number;
     readonly status: string;
@@ -14931,11 +14938,15 @@ export class OperationalStore {
   }): ScheduleRunRecord {
     return this.write(() => {
       const schedule = this.getSchedule(input.scheduleId);
+      const routing = input.occurrenceRouting ?? schedule;
+      if (input.occurrenceRouting !== undefined) {
+        this.assertScheduleOccurrenceRouting(input.scheduleId, input.runId, input.occurrenceRouting);
+      }
       if (input.sessionId !== undefined) {
         const session = this.getSession(input.sessionId);
         if (
-          schedule.targetId !== session.descriptor.targetId ||
-          schedule.backendId !== session.descriptor.backendId
+          routing.targetId !== session.descriptor.targetId || routing.backendId !== session.descriptor.backendId ||
+          input.occurrenceRouting?.boundSessionId !== undefined && input.occurrenceRouting.boundSessionId !== session.descriptor.id
         ) throw new StoreError("Schedule occurrence Session does not match the schedule routing.");
       }
       const firedAt = input.firedAt ?? this.now();
@@ -14952,6 +14963,15 @@ export class OperationalStore {
         ...(input.detail === undefined ? {} : { detail: input.detail })
       });
     });
+  }
+
+  private assertScheduleOccurrenceRouting(scheduleId: string, runId: string, routing: { readonly backendId: string; readonly targetId: string; readonly boundSessionId?: string }): void {
+    const existing = this.findScheduleRunByRunId(runId), detail = existing?.detail;
+    const frozen = isRecord(detail) && isRecord(detail["routing"]) ? detail["routing"] : undefined;
+    if (existing?.scheduleId !== scheduleId || existing.status !== "running" || frozen?.["backendId"] !== routing.backendId
+      || frozen?.["targetId"] !== routing.targetId || frozen?.["boundSessionId"] !== routing.boundSessionId) {
+      throw new StoreError("Schedule occurrence lost its frozen routing.");
+    }
   }
 
   private upsertScheduleRunHistory(input: {

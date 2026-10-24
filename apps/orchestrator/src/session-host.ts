@@ -514,6 +514,8 @@ export interface CreateSessionInput {
 }
 
 export interface CreateScheduledSessionInput {
+  /** Private occurrence authority; ordinary Schedule creation uses its revision fence. */
+  readonly assertServiceScope?: () => void;
   readonly operationId: string;
   readonly targetId: string;
   readonly title: string;
@@ -1893,6 +1895,7 @@ export class SessionHost {
    * persisted before a scheduled input can be queued. */
   async createScheduledSession(input: CreateScheduledSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
+    input.assertServiceScope?.();
     const target = this.#store.getTarget(input.targetId);
     this.validateFastSelection(
       target.descriptor.backendId,
@@ -10815,6 +10818,7 @@ export class SessionHost {
   }
 
   private async createSessionOnceAdmitted(input: SessionCreationInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
+    if ("assertServiceScope" in input) input.assertServiceScope?.();
     const logicalBody = createSessionOperationBody(input);
     const authorized = "connection" in input;
     const operationKind = authorized
@@ -10841,7 +10845,7 @@ export class SessionHost {
       )
       : this.#store.claimDeferredEffectOperation<{ readonly sessionId: string }>(
         { id: input.operationId, kind: operationKind, body: logicalBody },
-        (store) => { this.assertTargetAcceptsSessionCreation(store, input.targetId); }
+        (store) => { if ("assertServiceScope" in input) input.assertServiceScope?.(); this.assertTargetAcceptsSessionCreation(store, input.targetId); }
       );
     if (!claim.claimed) {
       return { replayed: true, value: claim.value, operation: claim.operation };
@@ -11150,6 +11154,7 @@ export class SessionHost {
                   backendInstanceGeneration, workspaceRoot: runtimeTarget.workspaceRoot });
                 this.#runtimeHandoffs.creationPhase(claim.operation.id, "effect"); groupCreationEffectDispatched = true;
               }
+              if ("assertServiceScope" in input) input.assertServiceScope?.();
               binding = await adapter.createSession({ target: runtimeTarget, name: input.title,
                 ...(!attaching && routedInput.providerId !== undefined ? { providerId: routedInput.providerId } : {}),
                 ...(!attaching && routedInput.modelId !== undefined ? { modelId: routedInput.modelId } : {}),
@@ -11179,6 +11184,7 @@ export class SessionHost {
           }
           createdBinding = binding;
           contextForCleanup = { ...context, binding };
+          if ("assertServiceScope" in input) input.assertServiceScope?.();
           if (!attaching && input.planMode) await adapter.setPlanMode(true, contextForCleanup);
           if (nativeStart.kind === "attach") {
             attachedState = await adapter.inspectSession(binding, contextForCleanup);
@@ -11217,6 +11223,7 @@ export class SessionHost {
           backendInstanceGeneration
         );
         const complete = (store: OperationalStore): { readonly sessionId: string } => {
+            if ("assertServiceScope" in input) input.assertServiceScope?.();
             const catalogAdoption = store.findNativeCatalogAdoption(input.operationId);
             if (catalogAdoption !== undefined) {
               if (catalogBinding === undefined || catalogAdoption.binding.opaqueRef !== binding.opaqueRef) {
@@ -11232,7 +11239,7 @@ export class SessionHost {
             if (duplicate !== undefined) throw nativeBindingConflict(duplicate.descriptor.id);
             if (automationOrigin !== undefined) {
               const currentSchedule = store.getSchedule(automationOrigin.scheduleId);
-              if (currentSchedule.revision !== automationOrigin.scheduleRevision) {
+              if (!("assertServiceScope" in input && input.assertServiceScope) && currentSchedule.revision !== automationOrigin.scheduleRevision) {
                 throw new RevisionConflictError(
                   "Schedule",
                   automationOrigin.scheduleId,
@@ -11293,6 +11300,9 @@ export class SessionHost {
               updatedAt: presentationAt
             };
             const created = store.createSession(descriptor, {
+              ...(automationOrigin && "assertServiceScope" in input && input.assertServiceScope ? {
+                automationOccurrenceRouting: { backendId: target.descriptor.backendId, targetId: input.targetId }
+              } : {}),
               localRuntimeBackendSelection: runtimeBackendId !== undefined || groupAssignment !== undefined,
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined

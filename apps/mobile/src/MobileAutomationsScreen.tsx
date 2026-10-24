@@ -455,8 +455,8 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
     setDraft((current) => mode === "agent" ? { ...current, executionMode: mode } : {
       ...current,
       executionMode: mode,
-      sessionMode: "fresh",
-      sessionId: "",
+      sessionMode: current.sessionMode === "bound" ? "bound" : "fresh",
+      sessionId: current.sessionMode === "bound" ? current.sessionId : "",
       model: undefined,
       planMode: false,
       useWorktree: false,
@@ -635,11 +635,8 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
       <View style={styles.optionRow}>{(["agent", "script"] as const).map((value) => <Choice key={value}
         label={mobileAutomationExecutionModeLabel(locale, value)}
         selected={draft.executionMode === value} colors={colors} disabled={!editable} onPress={() => chooseExecutionMode(value)} />)}</View>
-      {draft.executionMode === "agent" ? <>
-        <EditorInput label={mobileMessage(locale, "automation.editor.scheduledInput")} value={draft.inputText} colors={colors} editable={editable} multiline
-          onChange={(value) => set("inputText", value)} />
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.taskMode")}</Text>
-        <View style={styles.optionRow}>{(["fresh", "persistent", "bound"] as const).map((value) => <Choice key={value}
+        <View style={styles.optionRow}>{(draft.executionMode === "script" ? ["fresh", "bound"] as const : ["fresh", "persistent", "bound"] as const).map((value) => <Choice key={value}
           label={mobileAutomationSessionModeLabel(locale, value)} selected={draft.sessionMode === value} colors={colors}
           disabled={!editable || schedule?.source === "project" && value === "bound"}
           onPress={() => chooseSessionMode(value)} />)}</View>
@@ -649,6 +646,9 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
             selected={draft.sessionId === session.sessionId} colors={colors} disabled={!editable}
             onPress={() => set("sessionId", session.sessionId)} />)}</View>
         </>}
+      {draft.executionMode === "agent" ? <>
+        <EditorInput label={mobileMessage(locale, "automation.editor.scheduledInput")} value={draft.inputText} colors={colors} editable={editable} multiline
+          onChange={(value) => set("inputText", value)} />
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.modelSnapshot")}</Text>
         <View style={styles.optionRow}>
           <Choice label={mobileMessage(locale, "automation.editor.backendDefault")} selected={draft.model === undefined} colors={colors}

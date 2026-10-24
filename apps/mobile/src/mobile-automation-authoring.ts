@@ -335,12 +335,12 @@ export function createMobileAutomationDraft(
     scriptCommand: schedule?.script?.command ?? "",
     scriptTimeoutSeconds: schedule?.script?.timeoutMs === undefined ? "" : String(schedule.script.timeoutMs / 1_000),
     scriptDispatchSessions: schedule?.script?.dispatchSessions ?? false,
-    ...(schedule?.model !== undefined
+    ...(schedule?.executionMode === "script" ? {} : schedule?.model !== undefined
       ? { model: { ...schedule.model, ...(schedule.model.effortId === undefined ? {} : { effortId: schedule.model.effortId }) } }
       : defaultModel === undefined ? {} : { model: defaultModel }),
     permissionMode: schedule?.permissionMode ?? (defaultPermission && permissions.includes(defaultPermission)
       ? defaultPermission : permissions[0] ?? "ask"),
-    planMode: schedule?.planMode ?? (execution?.canSetPlanMode && backendSettings.length === 1
+    planMode: schedule?.executionMode === "script" ? false : schedule?.planMode ?? (execution?.canSetPlanMode && backendSettings.length === 1
       ? backendSettings[0]!.defaultPlanMode : false),
     useWorktree: schedule?.useWorktree ?? false,
     ...(schedule?.worktreeSourceRef === undefined ? {} : { worktreeSourceRef: schedule.worktreeSourceRef }),
@@ -438,12 +438,12 @@ export function buildMobileAutomationScheduleInput(
   }
 
   const scriptMode = draft.executionMode === "script";
-  if (scriptMode && (draft.sessionMode !== "fresh" || draft.sessionId !== "" || draft.useWorktree
+  if (scriptMode && (draft.sessionMode === "persistent" || draft.useWorktree
     || draft.extraDirectoryIds.length > 0 || draft.planMode || draft.silentWhenIdle || draft.model !== undefined)) {
-    throw new Error("Script Automations require a fresh task and cannot use model, Plan, extra-directory, or Worktree options.");
+    throw new Error("Script Automations require fresh or bound task mode and cannot use model, Plan, extra-directory, or Worktree options.");
   }
   let boundSession: Session | undefined;
-  if (!scriptMode && draft.sessionMode === "bound") {
+  if (draft.sessionMode === "bound") {
     boundSession = unique(owner.sessions, (candidate) => candidate.sessionId === draft.sessionId);
     if (!boundSession || !activeSession(boundSession) || boundSession.targetId !== target.targetId
       || boundSession.backendId !== target.backendId || !positiveRevision(boundSession.version?.revision)) {
@@ -544,9 +544,9 @@ export function buildMobileAutomationScheduleInput(
   if (scriptTimeoutMs !== undefined && !Number.isSafeInteger(scriptTimeoutMs)) {
     throw new Error("The script timeout is too large.");
   }
-  const sessionMode = scriptMode || draft.sessionMode === "fresh" ? ScheduleSessionMode.FRESH
+  const sessionMode = draft.sessionMode === "fresh" ? ScheduleSessionMode.FRESH
     : draft.sessionMode === "persistent" ? ScheduleSessionMode.PERSISTENT : ScheduleSessionMode.BOUND;
-  const sessionId = scriptMode || draft.sessionMode === "fresh" ? "" : draft.sessionId;
+  const sessionId = draft.sessionMode === "fresh" ? "" : draft.sessionId;
   const schedule = create(ScheduleInputSchema, {
     displayName: name,
     backendId: target.backendId,

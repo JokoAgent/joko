@@ -779,7 +779,7 @@ export class ScheduleCoordinator {
     const config = input.extension.scriptConfig;
     if (
       config === undefined || input.extension.silentWhenIdle ||
-      input.schedule.sessionMode !== "fresh" || input.schedule.sessionId !== undefined
+      !(input.schedule.sessionMode === "fresh" && input.schedule.sessionId === undefined || input.schedule.sessionMode === "bound" && input.schedule.sessionId !== undefined)
     ) {
       this.recordPreSessionOutcome({
         schedule: input.schedule,
@@ -799,6 +799,8 @@ export class ScheduleCoordinator {
       status: "running",
       detail: {
         ...(input.preRunDetail ?? {}),
+        routing: { backendId: input.schedule.backendId, targetId: input.schedule.targetId,
+          ...(input.schedule.sessionMode === "bound" ? { boundSessionId: input.schedule.sessionId } : {}) },
         script: { status: "running" },
         costAttribution: "zero",
         cadence: {
@@ -807,15 +809,27 @@ export class ScheduleCoordinator {
         }
       }
     });
-    const runningSchedule = this.#store.getSchedule(input.schedule.id);
-    const target = this.#store.getTarget(runningSchedule.targetId).descriptor;
+    const runningSchedule = structuredClone(this.#store.getSchedule(input.schedule.id));
+    const target = this.#store.getTarget(runningSchedule.targetId);
+    let scopeOpen = true;
+    const assertCurrent = () => {
+      input.signal.throwIfAborted();
+      if (!scopeOpen || this.#recovery.wasForceReleased(input.runId) || this.#deletionFences.has(runningSchedule.id) || !this.#store.findSchedule(runningSchedule.id)) {
+        throw new Error("The Schedule occurrence is no longer active.");
+      }
+      const current = this.#store.getTarget(runningSchedule.targetId);
+      if (current.revision !== target.revision || current.descriptor.workspaceRoot !== target.descriptor.workspaceRoot || !current.descriptor.trusted) {
+        throw new Error("The Schedule workspace changed or is no longer trusted.");
+      }
+      if (runningSchedule.sessionMode === "bound") this.requireUsableSession(runningSchedule, runningSchedule.sessionId);
+    };
     try {
-      if (!target.trusted) throw new Error("The Schedule workspace is not trusted.");
+      assertCurrent();
       const result = await this.#executeScript({
         command: config.command,
-        cwd: target.workspaceRoot,
-        scheduleId: runningSchedule.id,
-        scheduleName: runningSchedule.name,
+        cwd: target.descriptor.workspaceRoot,
+        schedule: runningSchedule,
+        assertCurrent,
         runId: input.runId,
         firedAt: input.scheduledAt,
         capabilities: config.capabilities,
@@ -823,6 +837,7 @@ export class ScheduleCoordinator {
         signal: input.signal,
         broker: this.#scriptBroker
       });
+      assertCurrent();
       const sessionId = this.validScriptPrimarySession(runningSchedule, result.primarySessionId);
       const detail = {
         ...(input.preRunDetail ?? {}),
@@ -830,7 +845,7 @@ export class ScheduleCoordinator {
         costAttribution: "zero"
       };
       this.recordScriptSuccess({
-        schedule: this.#store.getSchedule(runningSchedule.id),
+        schedule: runningSchedule,
         operationId: input.operationId,
         runId: input.runId,
         scheduledAt: input.scheduledAt,
@@ -840,11 +855,12 @@ export class ScheduleCoordinator {
       });
       return { runId: input.runId, ...(sessionId === undefined ? {} : { sessionId }), status: "success" };
     } catch (error) {
+      if (this.#recovery.wasForceReleased(input.runId)) return { runId: input.runId, status: "failed" };
       const status = input.signal.aborted ? "aborted" : "failed";
       const current = this.#store.findSchedule(runningSchedule.id);
       if (current !== undefined) {
         this.recordPreSessionOutcome({
-          schedule: current,
+          schedule: runningSchedule,
           operationId: input.operationId,
           runId: input.runId,
           scheduledAt: input.scheduledAt,
@@ -858,6 +874,8 @@ export class ScheduleCoordinator {
         });
       }
       return { runId: input.runId, status };
+    } finally {
+      scopeOpen = false;
     }
   }
 
@@ -888,6 +906,8 @@ export class ScheduleCoordinator {
         store.recordScheduleOccurrence({
           scheduleId: input.schedule.id,
           runId: input.runId,
+          occurrenceRouting: { backendId: input.schedule.backendId, targetId: input.schedule.targetId,
+            ...(input.schedule.sessionMode === "bound" ? { boundSessionId: input.schedule.sessionId } : {}) },
           ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
           firedAt: input.scheduledAt,
           finishedAt,
@@ -909,6 +929,7 @@ export class ScheduleCoordinator {
     }
     return session !== undefined && session.deletedAt === undefined && !session.archived &&
       session.backendId === schedule.backendId && session.targetId === schedule.targetId
+      && (schedule.sessionMode !== "bound" || session.id === schedule.sessionId)
       ? session.id
       : undefined;
   }
@@ -1242,6 +1263,7 @@ function advanceScheduleWithoutSession(
   nextRunAt: number | undefined,
   now: number
 ): void {
+  if (store.getSchedule(schedule.id).revision !== schedule.revision) return;
   store.upsertSchedule(copyScheduleForCoordinator(schedule, {
     enabled: schedule.kind !== "one_shot" && schedule.enabled,
     ...(nextRunAt === undefined ? {} : { nextRunAt }),

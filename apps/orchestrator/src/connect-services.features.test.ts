@@ -4779,8 +4779,7 @@ describe("Connect typed feature boundaries", () => {
       connectionId: connection.id,
       mutation: mutation(create(contract.ScheduleInputSchema, {
         ...schedule([]),
-        sessionMode: contract.ScheduleSessionMode.FRESH,
-        sessionId: "",
+        sessionMode: contract.ScheduleSessionMode.BOUND,
         input: create(contract.InputContentSchema, {}),
         execution: create(contract.ScheduleExecutionSnapshotSchema, {
           executionMode: contract.ScheduleExecutionMode.SCRIPT,
@@ -4796,7 +4795,7 @@ describe("Connect typed feature boundaries", () => {
       }))
     });
     expect(captured).toMatchObject({
-      sessionMode: "fresh",
+      sessionMode: "bound",
       prompt: { text: "" },
       executionSnapshot: {
         scheduler: {
