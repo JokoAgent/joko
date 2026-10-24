@@ -360,6 +360,7 @@ describe("mobile release artifact configuration", () => {
       android: { buildType: "apk" } });
     expect(eas.build.production).toMatchObject({ distribution: "store", channel: "stable",
       android: { buildType: "app-bundle" } });
+    for (const profile of Object.values(eas.build)) expect(profile).toMatchObject({ node: "24.19.0", pnpm: "11.22.0" });
     expect(pkg.scripts["build:native:android"]).toBe("node scripts/build-android-artifacts.mjs");
     expect(pkg.scripts["build:native:ios"]).toBe("node scripts/build-ios-artifact.mjs");
     expect(ignored.split(/\r?\n/u)).toEqual(expect.arrayContaining(["android/", "/ios/", "dist/"]));
