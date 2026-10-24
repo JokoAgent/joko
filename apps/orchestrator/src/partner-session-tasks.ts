@@ -265,7 +265,8 @@ export class PartnerSessionTaskManager {
         const open = this.store.listInteractions({ sessionId: task.sessionId, status: "open" });
         if (open.length && input.message) throw invalid("Resume without input, then answer the pending interaction.");
         this.host.restorePartnerQueue({ sessionId: task.sessionId, operationId, ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
-        task = { ...task, control: "active", deadlineAt: task.deadlineAt + Math.max(0, this.now() - task.pauseAt!), updatedAt: this.now() };
+        task = { ...task, control: "active", deadlineAt: task.deadlineAt + Math.max(0, this.now() - task.pauseAt!),
+          pauseAt: undefined, queuePauseRevision: undefined, updatedAt: this.now() };
         this.#save(task);
         if (input.message || !open.length && this.store.countQueueItems({ sessionId: task.sessionId!, states: ["accepted"] }) === 0) {
           this.#enqueue(task, `${operationId}:resume-input`, input.message ?? "Continue from the existing task history after the requested pause. Check completed actions; do not replay the original request.", "prompt", sessionId);
@@ -304,7 +305,7 @@ export class PartnerSessionTaskManager {
         return this.#reconcile(id);
       }
       if (!isActive(task.status)) task = { ...task, execution: task.execution + 1, executionRunIds: [], runId: undefined,
-        deadlineAt: this.now() + task.timeoutMs, status: "queued", result: undefined, error: undefined };
+        deadlineAt: this.now() + task.timeoutMs, pauseAt: undefined, queuePauseRevision: undefined, status: "queued", result: undefined, error: undefined };
       assertCaller(); this.#enqueue(task, operationId, input.message!, input.mode === "steer" ? "steer" : "prompt", sessionId); return this.#reconcile(id);
     });
   }

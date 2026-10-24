@@ -17,7 +17,7 @@ export async function snapshotPeerSourceProject(context: AdapterContext, peer: H
   const roots = [root, peer.home, ...(context.extraDirectories ?? []).map(value => value.path)];
   const queue: { actual: string; wire: string; depth: number; content: string }[] = []; let bytes = 0, visited = 0;
   const guard = () => { context.signal.throwIfAborted(); peer.assertCurrent(); };
-  const add = async (actual: string, wire: string, depth = 0, permissionSettings = false, exactAncestor = false): Promise<string | undefined> => {
+  const add = async (actual: string, wire: string, depth = 0, permissionSettings = false, exactAncestor = false, nonBlank = false): Promise<string | undefined> => {
     guard(); if (files.size >= 512 || ++visited > 4096 || !wire || wire.length > 1024 || wire.includes("\\") || posix.isAbsolute(wire) || wire.split("/").includes("..")) return;
     const previous = paths.get(actual); if (previous) return previous;
     try {
@@ -26,6 +26,7 @@ export async function snapshotPeerSourceProject(context: AdapterContext, peer: H
       const info = await peer.info(canonical, context.signal); if (info.kind !== "file" || info.size > 512 * 1024) return;
       const contentBytes = await peer.read(canonical, 512 * 1024, context.signal); guard();
       let content = new TextDecoder("utf-8", { fatal: true }).decode(contentBytes);
+      if (nonBlank && !content.trim()) return;
       if (permissionSettings) { const sanitized = sanitizeHostedPermissionSettings(content); if (sanitized === undefined) return; content = sanitized; }
       if (content.includes("\0") || textSpellsOutSecret(content) || redactSecrets(content) !== content || bytes + Buffer.byteLength(content) > 4 * 1024 * 1024) return;
       bytes += Buffer.byteLength(content); paths.set(actual, wire); paths.set(canonical, wire); files.set(wire, { path: wire, content });
@@ -62,8 +63,10 @@ export async function snapshotPeerSourceProject(context: AdapterContext, peer: H
       }
       const parent = peer.paths.dirname(ancestor); if (parent === ancestor || peer.same(ancestor, peer.home)) break; ancestor = parent;
     }
-    for (const name of nativeKind === "codex" ? [".codex/AGENTS.md", ".codex/AGENTS.override.md"] : [".claude/CLAUDE.md", ".claude/CLAUDE.local.md"]) {
-      const actual = peer.paths.join(peer.home, ...name.split("/")); await add(actual, `.claude/rules/source-context/${hash(actual)}.md`);
+    for (const name of nativeKind === "codex" ? [".codex/AGENTS.override.md", ".codex/AGENTS.md"] : [".claude/CLAUDE.md", ".claude/CLAUDE.local.md"]) {
+      const actual = peer.paths.join(peer.home, ...name.split("/"));
+      const selected = await add(actual, `.claude/rules/source-context/${hash(actual)}.md`, 0, false, false, nativeKind === "codex");
+      if (nativeKind === "codex" && selected) break;
     }
   }
   for (let index = 0; index < queue.length; index++) {

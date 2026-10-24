@@ -143,6 +143,14 @@ it("collects the task Device instructions and approved resources without collect
   expect(files.map(value => value.content).join("\n")).toContain("PEER_HOME_GUIDANCE"); expect(files.map(value => value.content).join("\n")).not.toContain("TOKEN=private");
   expect(files.find(value => value.path === "AGENTS.md")?.content).toContain("`@.env`");
 });
+it.each([undefined, " \n", "PEER_OVERRIDE_GUIDANCE"])("selects the first nonempty personal instruction on the task Device (%j)", async override => {
+  const f = fixture(); await f.peer.initialize();
+  f.put("/peer/home/.codex"); f.put("/peer/home/.codex/AGENTS.md", "PEER_FALLBACK_GUIDANCE");
+  if (override !== undefined) f.put("/peer/home/.codex/AGENTS.override.md", override);
+  const files = await snapshotPeerSourceProject(f.context, f.peer, "codex"), text = files.map(value => value.content).join("\n");
+  expect(text).toContain(override?.trim() ? "PEER_OVERRIDE_GUIDANCE" : "PEER_FALLBACK_GUIDANCE");
+  if (override?.trim()) expect(text).not.toContain("PEER_FALLBACK_GUIDANCE");
+});
 it("materializes only explicit read-only input/resource mounts on the peer and checks ownership before cleanup", async () => {
   const f = fixture(); await f.peer.initialize();
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-peer-resource-"))), file = join(root, "readme.md"); await writeFile(file, "APPROVED_RESOURCE");

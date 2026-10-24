@@ -237,8 +237,14 @@ describe("Partner independent Session tasks", () => {
     f.advance(10_000);
     const resumed = await f.tasks.message(f.parent, created.id, "task:resume", { mode: "resume" }, () => undefined);
     expect(resumed.control).toBe("active"); expect(resumed.deadlineAt).toBe(created.deadlineAt + 10_000);
+    expect(resumed.pauseAt).toBeUndefined(); expect(resumed.queuePauseRevision).toBeUndefined();
     expect(f.store.listQueueItems({ sessionId: created.sessionId! })).toHaveLength(2);
     expect(f.store.listQueueItems({ sessionId: created.sessionId! }).filter(item => item.body.text === "Implement the change")).toHaveLength(1);
+    f.advance(5_000);
+    await f.tasks.stop(f.parent, created.id, "task:hold-again", "pause", () => undefined);
+    f.advance(3_000);
+    const resumedAgain = await f.tasks.message(f.parent, created.id, "task:resume-again", { mode: "resume" }, () => undefined);
+    expect(resumedAgain.deadlineAt).toBe(created.deadlineAt + 13_000); expect(resumedAgain.pauseAt).toBeUndefined();
   });
   it("uses the owned queue boundary for edits and rejects consuming input and unavailable steer", async () => {
     const f = await fixture(), created = await f.tasks.start(f.parent, "task:queue", { instruction: "Do work" }, () => undefined);
