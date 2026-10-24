@@ -362,6 +362,7 @@ export function useAppController(): AppController {
   const navigationHashHandoffRef = useRef<NavigationHashHandoff | undefined>(undefined);
   const navigationRequestRef = useRef(0);
   const navigationAbortRef = useRef<AbortController | undefined>(undefined);
+  const connectionLeaveRef = useRef<AbortController | undefined>(undefined);
   const browserInspectorRequestRef = useRef(0);
   routeRef.current = state.route;
   const preferencesRef = useRef<UiPreferences>(DEFAULT_UI_PREFERENCES);
@@ -723,6 +724,7 @@ export function useAppController(): AppController {
         }
       }
       const next = routeFromLocation();
+      connectionLeaveRef.current?.abort();
       const handoff = navigationHashHandoffRef.current;
       if (handoff?.targetHash === requestedHash) {
         navigationHashHandoffRef.current = undefined;
@@ -1113,7 +1115,31 @@ export function useAppController(): AppController {
     return gateway;
   }, [updatePreferences]);
 
-  const connect = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions): Promise<void> => {
+  const beginConnectionLeave = useCallback(() => {
+    connectionLeaveRef.current?.abort();
+    const abort = new AbortController(); connectionLeaveRef.current = abort;
+    const generation = gatewayGenerationRef.current, profile = activeProfileRef.current;
+    const hash = appRouteHash(routeRef.current), revision = navigationRevisionRef.current;
+    const current = () => connectionLeaveRef.current === abort && !abort.signal.aborted && gatewayGenerationRef.current === generation
+      && activeProfileRef.current === profile && appRouteHash(routeRef.current) === hash && navigationRevisionRef.current === revision;
+    return { current, finish: () => { if (connectionLeaveRef.current === abort) connectionLeaveRef.current = undefined; },
+      confirm: async () => {
+        try {
+          const catalog = requestCatalogNavigationLeave(abort.signal);
+          if (catalog !== undefined && !await catalog || !current()) return false;
+          const partner = requestPartnerNavigationLeave(abort.signal);
+          if (partner !== undefined && !await partner || !current()) return false;
+          return await requestWorkspaceDocumentLeave({ reason: "route-change", signal: abort.signal }) && current();
+        } catch { return false; }
+      } };
+  }, []);
+  useEffect(() => {
+    const retire = () => connectionLeaveRef.current?.abort();
+    window.addEventListener("pagehide", retire);
+    return () => { retire(); window.removeEventListener("pagehide", retire); };
+  }, []);
+
+  const adoptConnection = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions): Promise<boolean> => {
     startupManagedLocalAutoPendingRef.current = false;
     const automaticPreferenceIntent = options?.automatic === undefined ? undefined : ++automaticPreferenceIntentRef.current;
     const generation = beginGatewayTransition();
@@ -1136,7 +1162,7 @@ export function useAppController(): AppController {
       // credential. A tampered profile must never redirect an Auth Key to
       // public plain HTTP.
       const identity = await probeOrchestratorOrigin(safeProfile.origin);
-      if (gatewayGenerationRef.current !== generation) return;
+      if (gatewayGenerationRef.current !== generation) return false;
       if (safeProfile.serverId !== identity.serverId) {
         if (safeProfile.managedLocal === true) managedRecoveryReason = "identityConflict";
         throw new Error("This address now belongs to a different Joko node. Pair it again before sending a saved credential.");
@@ -1146,7 +1172,7 @@ export function useAppController(): AppController {
         serverId: identity.serverId
       };
       const authKey = await requireLocal(localRef.current).readAuthKey(profile);
-      if (gatewayGenerationRef.current !== generation) return;
+      if (gatewayGenerationRef.current !== generation) return false;
       if (authKey === undefined) {
         if (safeProfile.managedLocal === true) managedRecoveryReason = "credentialUnavailable";
         throw new Error("The saved connection secret is unavailable. Pair this device again.");
@@ -1159,7 +1185,7 @@ export function useAppController(): AppController {
         await requireLocal(localRef.current).saveProfile(connectedProfile, authKey);
         if (gatewayGenerationRef.current !== generation) {
           bound.disconnect();
-          return;
+          return false;
         }
         activeProfileRef.current = connectedProfile;
         setState((current) => ({
@@ -1198,7 +1224,19 @@ export function useAppController(): AppController {
       }
       throw error;
     }
+    return gatewayGenerationRef.current === generation && connectionStateRef.current === "connected";
   }, [beginGatewayTransition, bindGateway, commitAutomaticConnectionChoice]);
+  const connectProfile = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions, callerIsCurrent = () => true): Promise<boolean> => {
+    const leave = beginConnectionLeave();
+    try {
+      if (!await leave.confirm() || !leave.current() || !callerIsCurrent()) return false;
+      return await adoptConnection(profile, options);
+    } finally { leave.finish(); }
+  }, [adoptConnection, beginConnectionLeave]);
+  const connect = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions): Promise<void> => {
+    const intent = ++machineSwitchIntentRef.current;
+    await connectProfile(profile, options, () => machineSwitchIntentRef.current === intent);
+  }, [connectProfile]);
 
   useEffect(() => {
     if (!state.ready) return;
@@ -1332,7 +1370,7 @@ export function useAppController(): AppController {
     }
   }, [adoptManagedOrchestratorStatus]);
 
-  const pair = useCallback(async (origin: string, code: string, deviceName: string, options?: ConnectionSelectionOptions): Promise<void> => {
+  const pairConnection = useCallback(async (origin: string, code: string, deviceName: string, options?: ConnectionSelectionOptions): Promise<void> => {
     startupManagedLocalAutoPendingRef.current = false;
     const automaticPreferenceIntent = options?.automatic === undefined ? undefined : ++automaticPreferenceIntentRef.current;
     const generation = beginGatewayTransition();
@@ -1430,8 +1468,15 @@ export function useAppController(): AppController {
       throw error;
     }
   }, [beginGatewayTransition, bindGateway, commitAutomaticConnectionChoice, state.profiles]);
+  const pair = useCallback(async (origin: string, code: string, deviceName: string, options?: ConnectionSelectionOptions): Promise<void> => {
+    const intent = ++machineSwitchIntentRef.current, leave = beginConnectionLeave();
+    try {
+      if (!await leave.confirm() || !leave.current() || machineSwitchIntentRef.current !== intent) return;
+      await pairConnection(origin, code, deviceName, options);
+    } finally { leave.finish(); }
+  }, [beginConnectionLeave, pairConnection]);
 
-  const disconnect = useCallback(async (): Promise<void> => {
+  const disconnectNow = useCallback(async (): Promise<void> => {
     explicitDisconnectRef.current = true;
     startupAutoConnectRef.current = undefined;
     startupManagedLocalAutoPendingRef.current = false;
@@ -1459,10 +1504,22 @@ export function useAppController(): AppController {
       statusMessage: undefined
     }));
   }, []);
+  const disconnectProfile = useCallback(async (): Promise<boolean> => {
+    machineSwitchIntentRef.current += 1;
+    const leave = beginConnectionLeave();
+    try {
+      if (!await leave.confirm() || !leave.current()) return false;
+      await disconnectNow(); return true;
+    } finally { leave.finish(); }
+  }, [beginConnectionLeave, disconnectNow]);
+  const disconnect = useCallback(async (): Promise<void> => { await disconnectProfile(); }, [disconnectProfile]);
 
-  const removeProfile = useCallback(async (profileId: string): Promise<void> => {
+  const removeProfile = useCallback(async (profileId: string, leaveConfirmed = false): Promise<void> => {
+    if (activeProfileRef.current?.id === profileId) {
+      if (leaveConfirmed) await disconnectNow();
+      else if (!await disconnectProfile()) return;
+    }
     partnerDirectoryRef.current?.invalidate(profileId);
-    if (state.activeProfile?.id === profileId) await disconnect();
     if (automaticConnectionTargetMatchesProfile(preferencesRef.current.automaticConnectionTarget, profileId, state.profiles)) {
       automaticPreferenceIntentRef.current += 1;
       await updatePreferences({ automaticConnectionTarget: undefined });
@@ -1482,7 +1539,7 @@ export function useAppController(): AppController {
         machinePresenceByProfile
       };
     });
-  }, [disconnect, state.activeProfile?.id, state.profiles, updatePreferences]);
+  }, [disconnectNow, disconnectProfile, state.profiles, updatePreferences]);
 
   const forgetProfile = useCallback(async (profileId: string): Promise<void> => {
     const profile = state.profiles.find((candidate) => candidate.id === profileId);
@@ -1495,6 +1552,9 @@ export function useAppController(): AppController {
   const logoutProfile = useCallback(async (profileId: string): Promise<void> => {
     const profile = state.profiles.find((candidate) => candidate.id === profileId);
     if (profile === undefined) throw new Error("The selected connection profile no longer exists.");
+    const leave = activeProfileRef.current?.id === profileId ? beginConnectionLeave() : undefined;
+    try {
+    if (leave && (!await leave.confirm() || !leave.current())) return;
     await logoutConnectionProfile({
       profile,
       logoutConnection: (connectionId) => {
@@ -1509,9 +1569,10 @@ export function useAppController(): AppController {
         if (status.state !== "disabled") throw new Error("Desktop did not complete local Joko logout.");
         setState((current) => ({ ...current, managedOrchestratorStatus: status }));
       },
-      deleteProfile: () => removeProfile(profileId)
+      deleteProfile: () => removeProfile(profileId, true)
     });
-  }, [removeProfile, state.profiles]);
+    } finally { leave?.finish(); }
+  }, [beginConnectionLeave, removeProfile, state.profiles]);
 
   const navigate = useCallback((route: AppRoute, options?: {
     readonly replace?: boolean;
@@ -1528,6 +1589,7 @@ export function useAppController(): AppController {
       }
     };
     if (!externalOwnerIsCurrent()) return;
+    connectionLeaveRef.current?.abort();
     const previousHandoff = navigationHashHandoffRef.current;
     navigationHashHandoffRef.current = undefined;
     navigationAbortRef.current?.abort();
@@ -1635,6 +1697,7 @@ export function useAppController(): AppController {
   }, [state.ready]);
 
   const openSourcePartner = useCallback(async (sourceKey: string, partnerId: string, destination: "session" | "settings" | "preparation"): Promise<void> => {
+    connectionLeaveRef.current?.abort();
     const intent = ++machineSwitchIntentRef.current;
     const routeHash = appRouteHash(routeRef.current), locationHash = window.location.hash, navigationRevision = navigationRevisionRef.current;
     const abort = new AbortController();
@@ -1654,7 +1717,9 @@ export function useAppController(): AppController {
       const resolved = preparing ? undefined : await directory.resolve(sourceKey, partnerId, abort.signal);
       const originalPartner = preparing ? await directory.resolvePreparationProfile(sourceKey, partnerId, abort.signal) : resolved!.partner;
       if (!current()) return;
-      if (activeProfileRef.current === undefined || partnerSourceKey(activeProfileRef.current) !== sourceKey || connectionStateRef.current !== "connected") await connect(profile);
+      if (activeProfileRef.current === undefined || partnerSourceKey(activeProfileRef.current) !== sourceKey || connectionStateRef.current !== "connected") {
+        if (!await connectProfile(profile, undefined, current)) return;
+      }
       if (!current()) return;
       const active = activeProfileRef.current, gateway = gatewayRef.current, generation = gatewayGenerationRef.current;
       if (active === undefined || partnerSourceKey(active) !== sourceKey || gateway === undefined || connectionStateRef.current !== "connected") throw new Error("The original Partner node could not be adopted.");
@@ -1673,7 +1738,7 @@ export function useAppController(): AppController {
           && partnerSourceKey(activeProfileRef.current) === sourceKey && profilesRef.current.some(candidate => partnerSourceKey(candidate) === sourceKey)
       });
     } finally { window.removeEventListener("pagehide", retire); }
-  }, [connect, navigate]);
+  }, [connectProfile, navigate]);
 
   useEffect(() => {
     const route = state.route;
@@ -1809,6 +1874,7 @@ export function useAppController(): AppController {
   const openMachineCatalog = useCallback(async (
     profileId: string, tab: "extensions" | "skills", signal?: AbortSignal
   ): Promise<boolean> => {
+    connectionLeaveRef.current?.abort();
     const intent = ++machineSwitchIntentRef.current;
     const profile = profilesRef.current.find(candidate => candidate.id === profileId);
     if (!profile) throw new Error("The selected catalog node is no longer saved on this client.");
@@ -1844,15 +1910,14 @@ export function useAppController(): AppController {
         hash = destinationHash; locationHash = window.location.hash; navigationRevision = navigationRevisionRef.current;
       }
       if (needsConnection) {
-        const connecting = connect(profile);
+        if (!await connectProfile(profile, undefined, current)) return false;
         generation = gatewayGenerationRef.current;
-        await connecting;
       }
       if (!current() || activeProfileRef.current === undefined
         || remoteMachineProfileKey(activeProfileRef.current) !== key || connectionStateRef.current !== "connected") return false;
       return true;
     } finally { window.removeEventListener("pagehide", retire); }
-  }, [connect, loadMachineSnapshot, navigate]);
+  }, [connectProfile, loadMachineSnapshot, navigate]);
 
   useEffect(() => {
     const route = state.route;
@@ -1868,6 +1933,7 @@ export function useAppController(): AppController {
   }, [state.ready, state.route, state.navigationRevision, openMachineCatalog]);
 
   const switchMachine = useCallback(async (profileId: string): Promise<void> => {
+    connectionLeaveRef.current?.abort();
     const intent = ++machineSwitchIntentRef.current;
     const profile = profilesRef.current.find((candidate) => candidate.id === profileId);
     if (profile === undefined) throw new Error("The selected machine is no longer saved on this client.");
@@ -1877,16 +1943,17 @@ export function useAppController(): AppController {
     }
     await loadMachineSnapshot(profile);
     if (machineSwitchIntentRef.current !== intent) return;
-    await connect(profile);
+    if (!await connectProfile(profile, undefined, () => machineSwitchIntentRef.current === intent)) return;
     if (machineSwitchIntentRef.current !== intent) return;
     navigate({ kind: "session", profileId });
-  }, [connect, loadMachineSnapshot, navigate]);
+  }, [connectProfile, loadMachineSnapshot, navigate]);
 
   const openMachineSession = useCallback(async (
     profileId: string,
     sessionId: string,
     messageTarget?: MachineSessionMessageTarget
   ): Promise<void> => {
+    connectionLeaveRef.current?.abort();
     const intent = ++machineSwitchIntentRef.current;
     const routeOwner: MachineSessionRouteOwner = {
       hash: appRouteHash(routeRef.current),
@@ -1904,7 +1971,9 @@ export function useAppController(): AppController {
     if (!snapshot.sessions.some((session) => session.id === sessionId)) {
       throw new Error("This cached task no longer exists on the selected machine.");
     }
-    if (activeProfileRef.current?.id !== profile.id || connectionStateRef.current !== "connected") await connect(profile);
+    if (activeProfileRef.current?.id !== profile.id || connectionStateRef.current !== "connected") {
+      if (!await connectProfile(profile, undefined, isCurrentOwner)) return;
+    }
     if (!isCurrentOwner()) return;
     if (!snapshotRef.current.sessions.some((session) => session.id === sessionId)) {
       throw new Error("The task disappeared while the selected machine was connecting.");
@@ -1926,7 +1995,7 @@ export function useAppController(): AppController {
       ...(messageTarget?.messageId === undefined ? {} : { messageId: messageTarget.messageId }),
       ...(messageTarget?.messageEventId === undefined ? {} : { messageEventId: messageTarget.messageEventId })
     });
-  }, [connect, loadMachineSnapshot, navigate]);
+  }, [connectProfile, loadMachineSnapshot, navigate]);
 
   const searchRemoteSessionMessages = useCallback(async (
     query: string,
