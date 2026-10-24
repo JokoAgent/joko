@@ -3,7 +3,8 @@ import { open, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path, { posix, win32, type PlatformPath } from "node:path";
 
-import { workspaceEntryAbsentRevision } from "@joko/contracts";
+import { reviewImageMimeType, workspaceEntryAbsentRevision } from "@joko/contracts";
+import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   RemoteDirectoryEntry,
   RemoteFileStat,
@@ -62,6 +63,24 @@ import {
 const MAXIMUM_PROCESS_OUTPUT = 16 * 1024 * 1024;
 const MAXIMUM_TREE_ENTRIES = 100_000;
 const MAXIMUM_COPY_BYTES = 256 * 1024 * 1024;
+// Adapted from the fixed remote file watcher. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 XD Inc.
+const REMOTE_WORKSPACE_WATCH = String.raw`
+const fs = require('node:fs'), path = require('node:path');
+if (Number(process.versions.node.split('.')[0]) < 22) process.exit(1);
+const root = process.argv[1];
+if (fs.realpathSync(root) !== root || !fs.lstatSync(root).isDirectory()) process.exit(1);
+let timer;
+const watcher = fs.watch(root, { recursive: true }, (_kind, name) => {
+  const parts = name == null ? [] : String(name).split(path.sep);
+  if (parts.includes('.git') || parts.includes('..')) return;
+  if (!timer) timer = setTimeout(() => { timer = undefined; process.stdout.write('change\n'); }, 50);
+});
+const stop = () => { clearTimeout(timer); watcher.close(); };
+watcher.on('error', () => { stop(); process.exitCode = 1; process.stdin.destroy(); });
+process.stdin.resume(); process.stdin.once('end', stop);
+process.stdout.write('ready\n');
+`;
 
 /** Private registered-workspace authority shared by Skill source and runtime owners. */
 export interface RemoteSkillSourceAuthority {
@@ -216,22 +235,43 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
 
   async *watchChanges(scope: WorkspaceFileChangeScope, signal?: AbortSignal): AsyncGenerator<WorkspaceFileChangeRecord> {
     if (scope.kind !== "workspace") throw new Error("Remote workspace owner-wide watch is unavailable.");
-    let sequence = 0n;
-    let previous = await this.invoke<WorkspaceFileIndex>(scope.workspaceId, "listFiles", [signal]);
-    while (signal?.aborted !== true && !this.#closed) {
-      await abortableDelay(2_000, signal);
-      if (isAborted(signal)) return;
-      const current = await this.invoke<WorkspaceFileIndex>(scope.workspaceId, "listFiles", [signal]);
-      if (current.revision === previous.revision) continue;
-      sequence += 1n;
-      yield {
-        workspaceId: scope.workspaceId,
-        kind: "resync",
-        observedAt: Date.now(),
-        sequence,
-        streamRevision: current.revision
-      };
-      previous = current;
+    signal?.throwIfAborted();
+    const registration = this.#require(scope.workspaceId), transports = await this.#transports(registration);
+    const child = await transports.processes.open({
+      executable: registration.remote!.binding.kind === "device_peer" ? DEVICE_PEER_RUNTIME_EXECUTABLES.node : "node",
+      args: ["-e", REMOTE_WORKSPACE_WATCH, registration.root], cwd: registration.root,
+      ...(signal === undefined ? {} : { signal })
+    });
+    let sequence = 0n; const streamId = randomUUID();
+    let buffer = "", ready = false;
+    const stop = () => { child.stdin.end(); child.kill(); child.stdout.destroy(); };
+    const timer = setInterval(() => { try { transports.assertCurrent(); } catch (error) { child.stdout.destroy(error as Error); child.kill(); } }, 2_000);
+    timer.unref?.(); signal?.addEventListener("abort", stop, { once: true });
+    child.stdin.on("error", () => undefined);
+    child.stderr.resume();
+    const onError = (error: Error) => child.stdout.destroy(error);
+    child.on("error", onError);
+    try {
+      if (isAborted(signal)) { stop(); return; }
+      for await (const chunk of child.stdout) {
+        signal?.throwIfAborted(); transports.assertCurrent();
+        buffer += Buffer.from(chunk).toString("utf8");
+        let newline: number;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const frame = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+          if (frame === "ready" && !ready) ready = true;
+          else if (!ready || frame !== "change") throw new Error("Remote workspace watch returned an invalid frame.");
+          sequence += 1n;
+          yield { workspaceId: scope.workspaceId, kind: "resync", observedAt: Date.now(), sequence, streamRevision: hashText(`${streamId}:${sequence}`) };
+        }
+        if (buffer.length > 4_096) throw new WorkspaceScanError("Remote workspace watch returned an invalid frame.", "limit");
+      }
+      if (!isAborted(signal) && !this.#closed) throw new Error(ready ? "Remote workspace watch stopped. Reopen the file browser to reconnect."
+        : "Remote workspace watch could not start. SSH file watching requires Node.js 22 or newer in the remote account PATH.");
+    } catch (error) {
+      if (!isAborted(signal) && !this.#closed) throw error;
+    } finally {
+      clearInterval(timer); signal?.removeEventListener("abort", stop); stop();
     }
   }
 
@@ -425,6 +465,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     input: WorkspaceTextFileWriteInput
   ): Promise<WorkspaceTextFileWriteResult> {
     const path = remoteWorkspacePath(registration, input.path, false);
+    await assertRemoteMutationPath(registration, files, path, true);
     const beforeInfo = await files.stat(path);
     if (beforeInfo.kind !== "file") throw new WorkspaceTextFileWriteError("Remote text save requires a regular file.", "unsupported");
     const before = Buffer.from(await files.read({ path, maximumBytes: Math.max(beforeInfo.size, 1) }));
@@ -440,6 +481,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     if (remoteRevision(current) !== remoteRevision(beforeInfo)) {
       throw new WorkspaceTextFileWriteError("Remote file changed; read it again before saving.", "stale");
     }
+    await assertRemoteMutationPath(registration, files, path, true);
     await files.write({ path, content, mode: beforeInfo.mode & 0o777, atomic: true });
     const after = await files.stat(path);
     const revision = contentRevision(content);
@@ -461,8 +503,9 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     }
     const path = remoteWorkspacePath(registration, input.path, false);
     await expectMissing(files, path);
+    await assertRemoteMutationPath(registration, files, path, false);
     if (input.kind === "directory") await files.mkdir(path, { recursive: false, mode: 0o755 });
-    else await files.write({ path, content: new Uint8Array(), mode: 0o644, atomic: true });
+    else await files.write({ path, content: new Uint8Array(), mode: 0o644, createOnly: true });
     return { entry: remoteEntry(canonicalRelative(input.path), await files.stat(path)) };
   }
 
@@ -473,9 +516,14 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   ): Promise<WorkspaceEntryMutationResult> {
     const source = remoteWorkspacePath(registration, input.sourcePath, false);
     const destination = remoteWorkspacePath(registration, input.destinationPath, false);
+    assertSeparateRemoteDestination(registration, source, destination);
+    await assertRemoteMutationPath(registration, files, source, true);
     const before = await files.stat(source);
     assertRemoteRevision(before, input.expectedRevision);
     await expectMissing(files, destination);
+    await assertRemoteMutationPath(registration, files, destination, false);
+    await assertRemoteMutationPath(registration, files, source, true);
+    assertRemoteRevision(await files.stat(source), input.expectedRevision);
     await files.rename(source, destination);
     return { entry: remoteEntry(canonicalRelative(input.destinationPath), await files.stat(destination)) };
   }
@@ -486,11 +534,14 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     input: { path: string; expectedRevision: string; confirmRecursive: boolean }
   ): Promise<void> {
     const path = remoteWorkspacePath(registration, input.path, false);
+    await assertRemoteMutationPath(registration, files, path, true);
     const before = await files.stat(path);
     assertRemoteRevision(before, input.expectedRevision);
     if (before.kind === "directory" && !input.confirmRecursive) {
       throw new WorkspaceEntryMutationError("Recursive remote deletion requires confirmation.", "unsafe");
     }
+    await assertRemoteMutationPath(registration, files, path, true);
+    assertRemoteRevision(await files.stat(path), input.expectedRevision);
     await files.remove(path, { recursive: before.kind === "directory" });
   }
 
@@ -501,17 +552,21 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   ): Promise<WorkspaceEntryMutationResult> {
     const source = remoteWorkspacePath(registration, input.sourcePath, false);
     const destination = remoteWorkspacePath(registration, input.destinationPath, false);
+    assertSeparateRemoteDestination(registration, source, destination);
+    await assertRemoteMutationPath(registration, files, source, true);
     const before = await files.stat(source);
     assertRemoteRevision(before, input.expectedRevision);
     await expectMissing(files, destination);
-    const budget = { entries: 0, bytes: 0 };
-    await copyRemoteTree(files, pathApi(registration), source, destination, budget);
-    const current = await files.stat(source);
-    if (remoteRevision(current) !== remoteRevision(before)) {
-      await files.remove(destination, { recursive: true }).catch(() => undefined);
-      throw new WorkspaceEntryMutationError("Remote source changed while it was copied.", "stale");
+    const budget = { entries: 0, bytes: 0, effectStarted: false };
+    try {
+      await copyRemoteTree(registration, files, source, destination, budget);
+      const current = await files.stat(source);
+      if (remoteRevision(current) !== remoteRevision(before)) throw new WorkspaceEntryMutationError("Remote source changed while it was copied.", "stale");
+      return { entry: remoteEntry(canonicalRelative(input.destinationPath), await files.stat(destination)) };
+    } catch (error) {
+      if (!budget.effectStarted) throw error;
+      throw new WorkspaceEntryMutationError("Remote copy did not finish. Inspect its destination before retrying.", "effect_failed", { stateMayHaveChanged: true, cause: error });
     }
-    return { entry: remoteEntry(canonicalRelative(input.destinationPath), await files.stat(destination)) };
   }
 
   async #searchPage(
@@ -591,13 +646,15 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const comparison = base === undefined
       ? ""
       : (await runRemote(processes, "git", ["diff", "--no-ext-diff", ...whitespace, base, head ?? "HEAD", ...pathArgs], registration.root, 30_000, MAXIMUM_PROCESS_OUTPUT)).stdout;
+    const headRevision = head ?? await gitOptional(processes, registration.root, ["rev-parse", "--verify", "HEAD^{commit}"]);
+    if (await repositoryRevision(processes, registration.root) !== revision) throw new WorkspaceGitReviewError("Remote Review changed while it was read.", "stale");
     return {
       index,
       workingTree,
       comparison,
       repositoryRevision: revision,
       ...(base === undefined ? {} : { baseRevision: base }),
-      ...(head === undefined ? {} : { headRevision: head })
+      ...(headRevision === undefined ? {} : { headRevision })
     };
   }
 
@@ -636,6 +693,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     let bytes: Buffer;
     if (input.source === "workingTree") {
       const absolute = remoteWorkspacePath(registration, path, false);
+      await assertRemoteMutationPath(registration, transports.files, absolute, true);
       const info = await transports.files.stat(absolute);
       bytes = Buffer.from(await transports.files.read({
         path: absolute,
@@ -656,15 +714,19 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     transports: RemoteTransports,
     input: RemoteGitReviewFileInput
   ): Promise<{ text: string; truncated: boolean; repositoryRevision: string; mergeBaseRevision?: string }> {
+    const before = await this.#gitReviewDiff(registration, transports.processes, input);
+    if (before.repositoryRevision !== input.expectedRepositoryRevision || before.mergeBaseRevision !== input.expectedMergeBaseRevision) throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
     const source = input.source === "unstaged" ? "workingTree" : input.source === "staged" ? "index" : "comparison";
     const file = await this.#readGitDiffFile(registration, transports, {
       path: input.path,
       source,
       expectedRepositoryRevision: input.expectedRepositoryRevision,
-      ...(input.sourceRevision === undefined ? {} : { headRevision: input.sourceRevision }),
+      ...(before.headRevision === undefined ? {} : { headRevision: before.headRevision }),
       ...(input.maximumBytes === undefined ? {} : { maximumBytes: input.maximumBytes })
     });
-    return { ...file, ...(input.expectedMergeBaseRevision === undefined ? {} : { mergeBaseRevision: input.expectedMergeBaseRevision }) };
+    const after = await this.#gitReviewDiff(registration, transports.processes, input);
+    if (after.repositoryRevision !== before.repositoryRevision || after.headRevision !== before.headRevision || after.mergeBaseRevision !== before.mergeBaseRevision) throw new WorkspaceGitReviewError("Remote Review changed while it was read.", "stale");
+    return { ...file, ...(after.mergeBaseRevision === undefined ? {} : { mergeBaseRevision: after.mergeBaseRevision }) };
   }
 
   async #readGitDiffImage(
@@ -672,31 +734,51 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     transports: RemoteTransports,
     input: RemoteGitImageInput
   ): Promise<WorkspaceGitImagePreview> {
-    const current = await repositoryRevision(transports.processes, registration.root);
-    if (current !== input.expectedRepositoryRevision) throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
-    const read = async (objectPath: string | undefined): Promise<WorkspaceGitImageSide> => {
-      if (objectPath === undefined) return { present: false, tooLarge: false };
-      const result = await runRemote(transports.processes, "git", ["show", objectPath], registration.root, 20_000, WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES + 1, undefined, new Set([0, 128]));
-      if (result.exitCode !== 0) return { present: false, tooLarge: false };
-      const bytes = result.stdoutBytes;
-      return { present: true, tooLarge: bytes.byteLength > WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES, path: input.path, mediaType: inferRemoteMediaType(input.path), ...(bytes.byteLength > WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES ? {} : { bytes }) };
+    const path = canonicalRelative(input.path), oldPath = input.oldPath ? canonicalRelative(input.oldPath) : path;
+    if (!reviewImageMimeType(path) && !reviewImageMimeType(oldPath)) throw new WorkspaceGitReviewError("Only approved raster image formats can be previewed.", "unsupported");
+    const before = await this.#gitReviewDiff(registration, transports.processes, input);
+    if (before.repositoryRevision !== input.expectedRepositoryRevision || before.mergeBaseRevision !== input.expectedMergeBaseRevision) {
+      throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
+    }
+    const missing = (path: string): WorkspaceGitImageSide => ({ present: false, tooLarge: false, path });
+    const side = (path: string, size: number, bytes?: Buffer): WorkspaceGitImageSide => ({ present: true,
+      tooLarge: size > WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES, path, mediaType: reviewImageMimeType(path), ...(bytes === undefined ? {} : { bytes }) });
+    const read = async (tree: string | undefined, path: string): Promise<WorkspaceGitImageSide> => {
+      if (tree === undefined) return missing(path);
+      const objectPath = `${tree}:${path}`;
+      const sizeResult = await runRemote(transports.processes, "git", ["cat-file", "-s", objectPath], registration.root, 20_000, 1024, undefined, new Set([0, 128]));
+      if (sizeResult.exitCode !== 0) return missing(path);
+      const size = Number(sizeResult.stdout.trim());
+      if (!Number.isSafeInteger(size) || size < 0) throw new WorkspaceGitReviewError("Remote image size is invalid.", "invalid");
+      if (size > WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES) return side(path, size);
+      const result = await runRemote(transports.processes, "git", ["show", objectPath], registration.root, 20_000, WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES);
+      return side(path, size, result.stdoutBytes);
     };
-    const tree = input.sourceRevision ?? "HEAD";
-    const oldImage = await read(`${tree}:${input.oldPath ?? input.path}`);
+    let oldImage: WorkspaceGitImageSide;
     let newImage: WorkspaceGitImageSide;
     if (input.source === "unstaged") {
-      const absolute = remoteWorkspacePath(registration, input.path, false);
-      try {
-        const info = await transports.files.stat(absolute);
-        const bytes = Buffer.from(await transports.files.read({
-          path: absolute,
-          maximumBytes: Math.min(Math.max(info.size, 1), WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES + 1),
-          allowTruncated: true
-        }));
-        newImage = { present: true, tooLarge: bytes.byteLength > WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES, path: input.path, mediaType: inferRemoteMediaType(input.path), ...(bytes.byteLength > WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES ? {} : { bytes }) };
-      } catch { newImage = { present: false, tooLarge: false }; }
-    } else newImage = await read(input.source === "staged" ? `:${input.path}` : `${tree}:${input.path}`);
-    return { oldImage, newImage, repositoryRevision: current, ...(input.expectedMergeBaseRevision === undefined ? {} : { mergeBaseRevision: input.expectedMergeBaseRevision }) };
+      oldImage = await read("", oldPath);
+      const absolute = remoteWorkspacePath(registration, path, false);
+      let info: RemoteFileStat | undefined;
+      try { info = await transports.files.stat(absolute); } catch { transports.assertCurrent(); }
+      if (info === undefined) newImage = missing(path);
+      else {
+        await assertRemoteMutationPath(registration, transports.files, absolute, true);
+        if (info.kind !== "file") throw new WorkspaceGitReviewError("Remote image must be a regular file.", "unsupported");
+        const bytes = info.size > WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES ? undefined : Buffer.from(await transports.files.read({ path: absolute, maximumBytes: Math.max(info.size, 1) }));
+        newImage = side(path, info.size, bytes);
+      }
+    } else if (input.source === "staged") {
+      oldImage = await read(before.headRevision, oldPath); newImage = await read("", path);
+    } else {
+      oldImage = await read(input.source === "commit" ? before.baseRevision : before.mergeBaseRevision, oldPath);
+      newImage = await read(before.headRevision, path);
+    }
+    const after = await this.#gitReviewDiff(registration, transports.processes, input);
+    if (after.repositoryRevision !== before.repositoryRevision || after.headRevision !== before.headRevision || after.baseRevision !== before.baseRevision || after.mergeBaseRevision !== before.mergeBaseRevision) {
+      throw new WorkspaceGitReviewError("Remote Review changed while the images were read.", "stale");
+    }
+    return { oldImage, newImage, repositoryRevision: after.repositoryRevision, ...(after.mergeBaseRevision === undefined ? {} : { mergeBaseRevision: after.mergeBaseRevision }) };
   }
 
   async #applyGitDiffHunk(registration: WorkspaceRegistration, processes: RemoteProcessTransportPort, input: WorkspaceGitHunkMutation): Promise<string> {
@@ -708,6 +790,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   }
 
   async #applyGitDiff(registration: WorkspaceRegistration, processes: RemoteProcessTransportPort, input: WorkspaceGitMutation): Promise<string> {
+    if (input.action === "revert" && input.confirmRevert !== true) throw new WorkspaceGitReviewError("Remote revert requires confirmation.", "invalid");
     const current = await repositoryRevision(processes, registration.root);
     if (current !== input.expectedRepositoryRevision) throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
     const path = canonicalRelative(input.path);
@@ -715,16 +798,16 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       if (input.action === "stage") await runRemote(processes, "git", ["add", "--", path], registration.root, 20_000, 4 * 1024 * 1024);
       else if (input.action === "unstage") await runRemote(processes, "git", ["restore", "--staged", "--", path], registration.root, 20_000, 4 * 1024 * 1024);
       else {
-        if (input.confirmRevert !== true) throw new WorkspaceGitReviewError("Remote revert requires confirmation.", "invalid");
         await runRemote(processes, "git", ["restore", "--", path], registration.root, 20_000, 4 * 1024 * 1024);
       }
       return repositoryRevision(processes, registration.root);
     }
-    const raw = (await runRemote(processes, "git", input.source === "staged" ? ["diff", "--cached", "--", path] : ["diff", "--", path], registration.root, 20_000, MAXIMUM_PROCESS_OUTPUT)).stdout;
+    const raw = (await runRemote(processes, "git", ["diff", ...(input.source === "staged" ? ["--cached"] : []), ...(input.ignoreWhitespace ? ["--ignore-all-space"] : []), "--", path], registration.root, 20_000, MAXIMUM_PROCESS_OUTPUT)).stdout;
     const patch = selectDiffHunkPatch(selectDiffFilePatch(raw), input.hunkIndex ?? -1);
     const args = ["apply", "--whitespace=nowarn"];
     if (input.action !== "revert") args.push("--cached");
     if (input.action === "unstage" || input.action === "revert") args.push("--reverse");
+    if (await repositoryRevision(processes, registration.root) !== current) throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
     await runRemote(processes, "git", [...args, "-"], registration.root, 20_000, 4 * 1024 * 1024, patch);
     return repositoryRevision(processes, registration.root);
   }
@@ -772,10 +855,28 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const remote = registration.remote!;
     const authority = await this.#remoteExecution.workspace(remote.binding);
     await validateCapturedWorkspaceRoot(registration, authority.files, authority.assertCurrent);
+    const assertCurrent = () => {
+      this.#assertOpen(); authority.assertCurrent();
+      if (this.#registrations.get(registration.id) !== registration) throw new WorkspaceEntryMutationError("The registered remote workspace changed.", "stale");
+    };
+    const guarded = async <T>(operation: () => Promise<T>): Promise<T> => { assertCurrent(); const value = await operation(); assertCurrent(); return value; };
+    assertCurrent();
     return {
-      files: authority.files,
-      processes: authority.processes,
-      assertCurrent: authority.assertCurrent,
+      files: {
+        realpath: (...args) => guarded(() => authority.files.realpath(...args)),
+        stat: (...args) => guarded(() => authority.files.stat(...args)),
+        list: (...args) => guarded(() => authority.files.list(...args)),
+        read: (...args) => guarded(() => authority.files.read(...args)),
+        write: (...args) => guarded(() => authority.files.write(...args)),
+        mkdir: (...args) => guarded(() => authority.files.mkdir(...args)),
+        rename: (...args) => guarded(() => authority.files.rename(...args)),
+        remove: (...args) => guarded(() => authority.files.remove(...args))
+      },
+      processes: { open: async request => {
+        assertCurrent(); const child = await authority.processes.open(request);
+        try { assertCurrent(); } catch (error) { child.kill(); throw error; } return child;
+      } },
+      assertCurrent,
       pathStyle: authority.pathStyle
     };
   }
@@ -910,17 +1011,41 @@ async function expectMissing(files: RemoteFileTransportPort, path: string): Prom
   throw new WorkspaceEntryMutationError("Remote destination already exists.", "conflict");
 }
 
+async function assertRemoteMutationPath(registration: WorkspaceRegistration, files: RemoteFileTransportPort, path: string, existing: boolean): Promise<void> {
+  const parent = pathApi(registration).dirname(path);
+  if (await files.realpath(registration.root) !== registration.root || await files.realpath(parent) !== parent
+    || (await files.stat(parent)).kind !== "directory") {
+    throw new WorkspaceEntryMutationError("Remote paths must stay inside the canonical workspace without symbolic links.", "unsafe");
+  }
+  if (existing) {
+    const info = await files.stat(path);
+    if (await files.realpath(path) !== path || (info.kind !== "file" && info.kind !== "directory")) {
+      throw new WorkspaceEntryMutationError("Remote mutations require a regular file or directory without symbolic links.", "unsafe");
+    }
+  }
+}
+
+function assertSeparateRemoteDestination(registration: WorkspaceRegistration, source: string, destination: string): void {
+  const paths = pathApi(registration), relative = paths.relative(source, destination);
+  if (relative === "" || relative !== ".." && !relative.startsWith(`..${paths.sep}`) && !paths.isAbsolute(relative)) {
+    throw new WorkspaceEntryMutationError("A remote entry cannot be moved or copied into itself.", "unsafe");
+  }
+}
+
 function assertRemoteRevision(info: RemoteFileStat, expected: string): void {
   if (remoteRevision(info) !== expected) throw new WorkspaceEntryMutationError("Remote entry changed; refresh and retry.", "stale");
 }
 
 async function copyRemoteTree(
+  registration: WorkspaceRegistration,
   files: RemoteFileTransportPort,
-  paths: PlatformPath,
   source: string,
   destination: string,
-  budget: { entries: number; bytes: number }
+  budget: { entries: number; bytes: number; effectStarted: boolean }
 ): Promise<void> {
+  const paths = pathApi(registration);
+  await assertRemoteMutationPath(registration, files, source, true);
+  await assertRemoteMutationPath(registration, files, destination, false);
   const info = await files.stat(source);
   if (++budget.entries > MAXIMUM_TREE_ENTRIES) throw new WorkspaceEntryMutationError("Remote copy is too large.", "too_large");
   if (info.kind === "symbolic_link" || info.kind === "other") throw new WorkspaceEntryMutationError("Remote symbolic links cannot be copied.", "unsupported");
@@ -928,13 +1053,18 @@ async function copyRemoteTree(
     budget.bytes += info.size;
     if (budget.bytes > MAXIMUM_COPY_BYTES) throw new WorkspaceEntryMutationError("Remote copy is too large.", "too_large");
     const content = await files.read({ path: source, maximumBytes: Math.max(info.size, 1) });
-    await files.write({ path: destination, content, mode: info.mode & 0o777, createParents: true, atomic: true });
+    await assertRemoteMutationPath(registration, files, source, true);
+    if (remoteRevision(await files.stat(source)) !== remoteRevision(info)) throw new WorkspaceEntryMutationError("Remote source changed while it was copied.", "stale");
+    await assertRemoteMutationPath(registration, files, destination, false);
+    budget.effectStarted = true;
+    await files.write({ path: destination, content, mode: info.mode & 0o777, createOnly: true });
     return;
   }
+  budget.effectStarted = true;
   await files.mkdir(destination, { recursive: false, mode: info.mode & 0o777 });
   for (const entry of await files.list(source)) {
     if (!safeEntryName(entry.name)) throw new WorkspaceEntryMutationError("Remote entry name is unsafe.", "unsafe");
-    await copyRemoteTree(files, paths, paths.join(source, entry.name), paths.join(destination, entry.name), budget);
+    await copyRemoteTree(registration, files, paths.join(source, entry.name), paths.join(destination, entry.name), budget);
   }
 }
 
@@ -958,7 +1088,10 @@ async function runRemote(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
-  const process = await processes.open({ executable, args, cwd, signal: controller.signal });
+  const gitArgs = executable !== "git" ? args : args[0] === "status" ? ["-c", "core.fsmonitor=false", ...args]
+    : ["diff", "show", "log"].includes(args[0] ?? "") ? [args[0]!, "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
+  const process = await processes.open({ executable, args: gitArgs, cwd, signal: controller.signal,
+    ...(executable !== "git" ? {} : { env: { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", GIT_EXTERNAL_DIFF: "", GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" } }) });
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   let bytes = 0;
@@ -1037,8 +1170,19 @@ function parseGitStatus(value: string): GitState["changes"][number] | undefined 
 }
 
 async function repositoryRevision(processes: RemoteProcessTransportPort, cwd: string): Promise<string> {
-  const status = await runRemote(processes, "git", ["status", "--porcelain=v2", "-z", "--branch"], cwd, 20_000, 8 * 1024 * 1024);
-  return hashText(status.stdout);
+  const [status, index, workingTree, untracked] = await Promise.all([
+    runRemote(processes, "git", ["-c", "core.fsmonitor=false", "status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"], cwd, 20_000, MAXIMUM_PROCESS_OUTPUT),
+    runRemote(processes, "git", ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "--no-color"], cwd, 30_000, MAXIMUM_PROCESS_OUTPUT),
+    runRemote(processes, "git", ["diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "--no-color"], cwd, 30_000, MAXIMUM_PROCESS_OUTPUT),
+    runRemote(processes, "git", ["ls-files", "--others", "--exclude-standard", "-z"], cwd, 20_000, MAXIMUM_PROCESS_OUTPUT)
+  ]);
+  const identity = createHash("sha256");
+  for (const path of untracked.stdout.split("\0").filter(Boolean)) {
+    const diff = await runRemote(processes, "git", ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "--no-color", "--", "/dev/null", path],
+      cwd, 30_000, MAXIMUM_PROCESS_OUTPUT, undefined, new Set([0, 1]));
+    identity.update(path).update("\0").update(diff.stdoutBytes).update("\0");
+  }
+  return hashText(JSON.stringify([status.stdout, index.stdout, workingTree.stdout, untracked.stdout, identity.digest("hex")]));
 }
 
 async function gitOptional(processes: RemoteProcessTransportPort, cwd: string, args: readonly string[]): Promise<string | undefined> {
@@ -1089,13 +1233,4 @@ function gitUrlContainsCredential(value: string): boolean {
     const url = new URL(value);
     return url.password !== "" || ((url.protocol === "http:" || url.protocol === "https:") && url.username !== "");
   } catch { return /^[^@/\\:]+:[^@/\\]+@/u.test(value); }
-}
-
-async function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted === true) return;
-  await new Promise<void>((resolvePromise) => {
-    const timer = setTimeout(resolvePromise, milliseconds);
-    timer.unref?.();
-    signal?.addEventListener("abort", () => { clearTimeout(timer); resolvePromise(); }, { once: true });
-  });
 }

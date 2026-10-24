@@ -289,6 +289,7 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
     const files = connection.files!;
 
     await expect(files.mkdir("/workspace/nested", { recursive: true, mode: 0o700 })).resolves.toBeUndefined();
+    await expect(files.mkdir("/workspace/nested", { recursive: false })).rejects.toBeDefined();
     await expect(files.write({
       path: "/workspace/nested/note.txt",
       content: Buffer.from("remote content"),

@@ -934,6 +934,7 @@ class Ssh2RemoteFileTransport implements RemoteFileTransportPort {
             this.#invalidate
           );
         } catch {
+          if (options.recursive !== true) throw fileFailure();
           const info = await callbackOperation<Stats>(
             options.signal,
             (done) => sftp.lstat(current, done),
