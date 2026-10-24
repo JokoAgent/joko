@@ -48,6 +48,8 @@ type SchemaTraversalTask =
       readonly kind: "object";
       readonly schema: Readonly<Record<string, unknown>>;
       readonly prefix: string;
+      readonly identity?: Readonly<Record<string, unknown>>;
+      readonly validateOnly?: boolean;
     }
   | {
       readonly kind: "property";
@@ -55,16 +57,26 @@ type SchemaTraversalTask =
       readonly rawProperty: unknown;
       readonly prefix: string;
       readonly required: ReadonlySet<string>;
+      readonly validateOnly?: boolean;
     }
   | {
       readonly kind: "array";
       readonly schema: Readonly<Record<string, unknown>>;
       readonly path: string;
+      readonly identity?: Readonly<Record<string, unknown>>;
+      readonly validateOnly?: boolean;
     }
   | {
       readonly kind: "array_item";
       readonly item: Readonly<Record<string, unknown>>;
       readonly path: string;
+      readonly validateOnly?: boolean;
+    }
+  | {
+      readonly kind: "union";
+      readonly schema: Readonly<Record<string, unknown>>;
+      readonly path: string;
+      readonly keyword: "anyOf" | "oneOf";
     }
   | {
       readonly kind: "leave";
@@ -134,9 +146,23 @@ export function projectPiInputSchema(raw: unknown, toolName: string): DynamicInp
       active.delete(task.schema);
       continue;
     }
-    if (task.kind === "object") {
+    if (task.kind === "union") {
       enterSchema(task.schema, active);
       tasks.push({ kind: "leave", schema: task.schema });
+      const branches = task.schema[task.keyword] as readonly unknown[];
+      for (let index = branches.length - 1; index >= 0; index -= 1) {
+        const branch = record(branches[index], `${task.path}.${task.keyword}[${index}]`);
+        const type = directSchemaFieldType(branch);
+        projectSchemaField(branch, task.path, type ?? "unknown", false, humanize(task.path), false);
+        if (type === "object") tasks.push({ kind: "object", schema: branch, prefix: task.path, validateOnly: true });
+        if (type === "array") tasks.push({ kind: "array", schema: branch, path: task.path, validateOnly: true });
+      }
+      continue;
+    }
+    if (task.kind === "object") {
+      const identity = task.identity ?? task.schema;
+      enterSchema(identity, active);
+      tasks.push({ kind: "leave", schema: identity });
       const properties = task.schema["properties"] === undefined
         ? {}
         : record(task.schema["properties"], `${task.prefix || "parameters"}.properties`);
@@ -146,19 +172,21 @@ export function projectPiInputSchema(raw: unknown, toolName: string): DynamicInp
       const entries = Object.entries(properties).sort(([left], [right]) => left.localeCompare(right, "en"));
       for (let index = entries.length - 1; index >= 0; index -= 1) {
         const [name, rawProperty] = entries[index]!;
-        tasks.push({ kind: "property", name, rawProperty, prefix: task.prefix, required });
+        tasks.push({ kind: "property", name, rawProperty, prefix: task.prefix, required, validateOnly: task.validateOnly });
       }
       continue;
     }
     if (task.kind === "array") {
-      enterSchema(task.schema, active);
-      tasks.push({ kind: "leave", schema: task.schema });
+      const identity = task.identity ?? task.schema;
+      enterSchema(identity, active);
+      tasks.push({ kind: "leave", schema: identity });
       const rawItems = task.schema["items"];
       if (rawItems !== undefined) {
         tasks.push({
           kind: "array_item",
           item: record(rawItems, `${task.path}.items`),
-          path: task.path
+          path: task.path,
+          validateOnly: task.validateOnly
         });
       }
       continue;
@@ -168,32 +196,42 @@ export function projectPiInputSchema(raw: unknown, toolName: string): DynamicInp
       const path = task.prefix === "" ? task.name : `${task.prefix}.${task.name}`;
       const projected = projectFieldSchema(property, path);
       const type = projected.type;
-      fields.push(projectSchemaField(
+      const field = projectSchemaField(
         projected.schema,
         path,
         type,
         task.required.has(task.name),
         humanize(task.name),
         SECRET_FIELD.test(task.name)
-      ));
-      if (type === "object") tasks.push({ kind: "object", schema: projected.schema, prefix: path });
-      if (type === "array") tasks.push({ kind: "array", schema: projected.schema, path });
+      );
+      if (!task.validateOnly) fields.push(field);
+      // Nullable projection merges metadata into a fresh object. The traversal
+      // fence must retain the original schema occurrence for cycle detection.
+      if (type === "object") tasks.push({ kind: "object", schema: projected.schema, identity: property, prefix: path, validateOnly: task.validateOnly });
+      if (type === "array") tasks.push({ kind: "array", schema: projected.schema, identity: property, path, validateOnly: task.validateOnly });
+      if (type === "unknown") for (const keyword of ["anyOf", "oneOf"] as const) {
+        if (Array.isArray(property[keyword])) tasks.push({ kind: "union", schema: property, path, keyword });
+      }
       continue;
     }
 
     const itemPath = `${task.path}[]`;
     const projected = projectFieldSchema(task.item, itemPath);
     const type = projected.type;
-    fields.push(projectSchemaField(
+    const field = projectSchemaField(
       projected.schema,
       itemPath,
       type,
       true,
       `${humanize(task.path.split(".").at(-1) ?? task.path)} item`,
       SECRET_FIELD.test(task.path)
-    ));
-    if (type === "object") tasks.push({ kind: "object", schema: projected.schema, prefix: itemPath });
-    if (type === "array") tasks.push({ kind: "array", schema: projected.schema, path: itemPath });
+    );
+    if (!task.validateOnly) fields.push(field);
+    if (type === "object") tasks.push({ kind: "object", schema: projected.schema, identity: task.item, prefix: itemPath, validateOnly: task.validateOnly });
+    if (type === "array") tasks.push({ kind: "array", schema: projected.schema, identity: task.item, path: itemPath, validateOnly: task.validateOnly });
+    if (type === "unknown") for (const keyword of ["anyOf", "oneOf"] as const) {
+      if (Array.isArray(task.item[keyword])) tasks.push({ kind: "union", schema: task.item, path: itemPath, keyword });
+    }
   }
   return {
     fields,
@@ -263,11 +301,14 @@ function projectFieldSchema(
 ): { readonly schema: Readonly<Record<string, unknown>>; readonly type: DynamicInputFieldType } {
   const direct = directSchemaFieldType(schema);
   if (direct !== undefined) return { schema, type: direct };
-  if (literalStringUnion(schema["anyOf"], fieldPath) !== undefined) return { schema, type: "string" };
-  const nullable = nullableUnionSchema(schema, fieldPath);
-  if (nullable !== undefined) return nullable;
-  const unionType = scalarUnionType(schema["anyOf"], fieldPath);
-  if (unionType !== undefined) return { schema, type: unionType };
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    if (schema[keyword] === undefined) continue;
+    if (literalStringUnion(schema[keyword], fieldPath, keyword) !== undefined) return { schema, type: "string" };
+    const nullable = nullableUnionSchema(schema, fieldPath, keyword);
+    if (nullable !== undefined) return nullable;
+    const unionType = unionFieldType(schema[keyword], fieldPath, keyword);
+    if (unionType !== undefined) return { schema, type: unionType };
+  }
   throw catalogError(`Pi tool field '${fieldPath}' uses an unsupported schema type.`);
 }
 
@@ -282,11 +323,12 @@ function directSchemaFieldType(schema: Readonly<Record<string, unknown>>): Dynam
 
 function nullableUnionSchema(
   schema: Readonly<Record<string, unknown>>,
-  fieldPath: string
+  fieldPath: string,
+  keyword: "anyOf" | "oneOf"
 ): { readonly schema: Readonly<Record<string, unknown>>; readonly type: DynamicInputFieldType } | undefined {
-  const value = schema["anyOf"];
+  const value = schema[keyword];
   if (!Array.isArray(value) || value.length !== 2) return undefined;
-  const branches = value.map((candidate, index) => record(candidate, `${fieldPath}.anyOf[${index}]`));
+  const branches = value.map((candidate, index) => record(candidate, `${fieldPath}.${keyword}[${index}]`));
   const concrete = branches.filter((branch) => branch["type"] !== "null");
   if (concrete.length !== 1 || branches.filter((branch) => branch["type"] === "null").length !== 1) return undefined;
   const type = directSchemaFieldType(concrete[0]!);
@@ -299,26 +341,29 @@ function nullableUnionSchema(
   };
 }
 
-function scalarUnionType(value: unknown, fieldPath: string): DynamicInputFieldType | undefined {
+function unionFieldType(value: unknown, fieldPath: string, keyword: "anyOf" | "oneOf"): DynamicInputFieldType | undefined {
   if (!Array.isArray(value) || value.length === 0) return undefined;
-  const types = new Set<"string" | "number" | "integer" | "boolean">();
+  const types = new Set<DynamicInputFieldType | "null">();
   for (const [index, candidate] of value.entries()) {
-    const branch = record(candidate, `${fieldPath}.anyOf[${index}]`);
-    const type = branch["type"];
-    if (type !== "string" && type !== "number" && type !== "integer" && type !== "boolean") return undefined;
+    const branch = record(candidate, `${fieldPath}.${keyword}[${index}]`);
+    const type = branch["type"] === "null" ? "null" : directSchemaFieldType(branch);
+    if (type === undefined) return undefined;
     types.add(type);
   }
-  if (types.size === 1) return [...types][0];
+  const scalar = [...types][0];
+  if (types.size === 1 && (scalar === "string" || scalar === "number" || scalar === "integer" || scalar === "boolean")) return scalar;
   if ([...types].every((type) => type === "number" || type === "integer")) return "number";
   // DynamicInputSchema is a display-safe projection rather than the schema
-  // used for invocation. Preserve a valid heterogeneous scalar union without
-  // pretending that one branch describes the whole field.
+  // used for invocation. Preserve a valid heterogeneous union without
+  // pretending that one branch describes the whole field. Structured branches
+  // are validated by the same traversal without inventing unconditional fields.
   return "unknown";
 }
 
 function stringEnum(schema: Readonly<Record<string, unknown>>, fieldPath: string): readonly string[] {
   const value = schema["enum"];
-  const literalUnion = literalStringUnion(schema["anyOf"], fieldPath);
+  const literalUnion = literalStringUnion(schema["anyOf"], fieldPath, "anyOf")
+    ?? literalStringUnion(schema["oneOf"], fieldPath, "oneOf");
   if (literalUnion !== undefined) return literalUnion;
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
@@ -327,12 +372,12 @@ function stringEnum(schema: Readonly<Record<string, unknown>>, fieldPath: string
   return [...new Set(value)];
 }
 
-function literalStringUnion(value: unknown, fieldPath: string): readonly string[] | undefined {
+function literalStringUnion(value: unknown, fieldPath: string, keyword: "anyOf" | "oneOf"): readonly string[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length === 0) return undefined;
   const values: string[] = [];
   for (const [index, candidate] of value.entries()) {
-    const branch = record(candidate, `${fieldPath}.anyOf[${index}]`);
+    const branch = record(candidate, `${fieldPath}.${keyword}[${index}]`);
     if (typeof branch["const"] !== "string" || (branch["type"] !== undefined && branch["type"] !== "string")) return undefined;
     values.push(branch["const"]);
   }

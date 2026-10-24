@@ -157,7 +157,10 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
         expect(mcpOutput).toMatchObject({ output: expect.arrayContaining([expect.objectContaining({ type: "input_text", text: "ORIGINAL_CODEX_MCP_BYTES" })]) });
       } else expect((requests[0]!["tools"] as { name?: string }[]).filter(tool => tool.name?.startsWith("mcp__"))).toEqual([]);
       expect(networkAuthorization).toBe("Bearer model-node-private-key");
-      expect(JSON.stringify(requests[1])).toContain("ORIGINAL CODEX EXTRA DIRECTORY");
+      const commandOutput = (requests[1]!["input"] as Record<string, unknown>[]).find(item =>
+        item["type"] === "function_call_output" && item["call_id"] === "source-tool-call");
+      expect(commandOutput).toMatchObject({ output: expect.stringContaining("Process exited with code 0") });
+      expect(commandOutput!["output"]).toContain("ORIGINAL CODEX EXTRA DIRECTORY");
       expect(captureNativeAuthentication).not.toHaveBeenCalled();
       await expect(readFile(join(nativeHome, "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
       expect(JSON.stringify(requests[0])).toContain("data:image/png;base64," + imageBytes.toString("base64"));

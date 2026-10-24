@@ -123,6 +123,8 @@ import {
   type CodexSmartRoutingPreparation
 } from "./smart-subagent-routing.js";
 import { CodexHostedExecution, type CodexHostedExecutionOptions } from "./hosted-execution.js";
+import { CodexNativeExecutionEnvironment, type CodexNativeExecutionOptions, type CodexNativeProcess } from "./native-execution.js";
+import { nativeWebPolicy, nativeWebPolicyConfiguration } from "./native-web-policy.js";
 import { withoutCodexSpawnModelOverrides } from "./hosted-guest.js";
 import { captureCodexHostedAuthentication, readCodexOwnedAuthentication, type CodexHostedAuthenticationAuthority } from "./hosted-authentication.js";
 
@@ -130,6 +132,8 @@ export interface CodexAdapterOptions extends Omit<CodexInputResolvers, "resolveS
   readonly taskShellEnv?: (context: AdapterContext) => Readonly<Record<string, string>>;
   /** Dedicated native process whose files and commands belong to the Source. */
   readonly hostedExecution?: CodexHostedExecutionOptions;
+  /** Owner-private, same-task native fs/process authorization boundary. */
+  readonly nativeExecution?: CodexNativeExecutionOptions;
   readonly managedProviders?: ManagedProviderRuntimePort;
   /** Spawn-time catalog and runtime revision owned by this exact Backend instance. */
   readonly smartRouting?: CodexSmartRoutingPreparation;
@@ -176,6 +180,8 @@ export interface CodexRemoteRuntime {
   readonly executionDomain: string;
   /** Synchronous target/host/transport generation fence. */
   readonly assertCurrent: () => void;
+  /** Uses the exact installed executable and transport authority of this runtime. */
+  readonly openExecServerProcess?: (signal: AbortSignal) => Promise<CodexNativeProcess>;
   /** Owner-private, Target-bound standard MCP route factory. */
   readonly openMcpBridge?: (input: CodexMcpOpenInput) => Promise<CodexMcpRuntimeLease>;
   /** Uploads service-owned approved generations through this exact SSH lease. */
@@ -286,6 +292,7 @@ interface SessionRuntime {
   readonly profileKey: string;
   readonly remote: boolean;
   readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
+  readonly openExecServerProcess?: CodexRemoteRuntime["openExecServerProcess"];
   readonly nativeAuthenticationAdmission: number | undefined;
   readonly assertExecutionCurrent: () => void;
   managedRoute: ManagedProviderRouteBinding | undefined;
@@ -315,6 +322,8 @@ interface SessionRuntime {
   readonly mcpPending: boolean;
   readonly nativeConfiguration?: JsonObject;
   readonly workingContextWindow: number | undefined;
+  nativeWebMode?: JsonValue;
+  policyRevoked?: boolean;
   readonly nativeSkills?: NativeSkillSnapshot | undefined;
   readonly nativeMemoryDirectory?: string;
   providerId?: string;
@@ -413,6 +422,7 @@ interface CodexReadScope {
   readonly profileKey: string;
   readonly remote: boolean;
   readonly pathStyle: "posix" | "win32";
+  readonly openExecServerProcess?: CodexRemoteRuntime["openExecServerProcess"];
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
   readonly assertAuthorityCurrent: () => void;
@@ -554,6 +564,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #instanceGeneration: number;
   readonly #providerId: string;
   readonly #hosted: CodexHostedExecution | undefined;
+  readonly #nativeExecution: CodexNativeExecutionOptions | undefined;
+  readonly #nativeEnvironments = new Map<string, { readonly generation: number; readonly host: AppServerHost;
+    readonly targetId: string; readonly root: string; readonly environment: CodexNativeExecutionEnvironment }>();
+  readonly #nativePreparationContexts = new Map<string, Set<{ readonly context: AdapterContext }>>();
   #host: AppServerHost;
   readonly #ownsHost: boolean;
   readonly #ownedHostOptions: AppServerHostOptions | undefined;
@@ -620,6 +634,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#instanceGeneration = options.instanceGeneration;
     this.#providerId = options.providerId ?? "openai";
     this.#hosted = options.hostedExecution === undefined ? undefined : new CodexHostedExecution(options.hostedExecution);
+    this.#nativeExecution = options.nativeExecution;
     if (this.#hosted && (options.host !== undefined || options.remoteRuntimes !== undefined
       || options.localMcpBridge !== undefined || options.resolveNativeSkills !== undefined || options.resolveNativeSkillPolicy !== undefined
       || options.resolveNativeMemoryEnabled !== undefined || options.smartRouting !== undefined)) {
@@ -1217,7 +1232,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = smartRoute.modelProviderId;
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
-    nativeConfiguration = workingContextConfiguration({ ...(nativeConfiguration ?? {}), ...this.#taskShellConfiguration(context) }, context, input.providerId, input.modelId);
+    nativeConfiguration = workingContextConfiguration({ ...(nativeConfiguration ?? {}), ...this.#taskShellConfiguration(context),
+      ...nativeWebPolicyConfiguration(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot) }, context, input.providerId, input.modelId);
     const initialConfiguration: JsonObject = {
       ...(managedConfiguration ?? {}),
       ...(nativeConfiguration ?? {}),
@@ -1229,7 +1245,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const previousConfig = (request.params as JsonObject)["config"];
     Object.assign(request.params, {
       config: { ...(isJsonObject(previousConfig) ? previousConfig : {}), ...initialConfiguration },
-      ...(this.#hosted?.environments() ?? {}),
+      ...this.#executionEnvironments(context),
       ...(this.#hosted === undefined ? {} : { developerInstructions: this.#hosted.instructions(input.appendSystemPrompt ?? context.appendSystemPrompt) })
     });
     let response;
@@ -1398,7 +1414,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       nativeAuthenticationEpoch
     );
     const workingContextWindow = resolveWorkingContext(context, context.modelSelection?.providerId, context.modelSelection?.modelId);
-    const mustReloadConfiguration = this.#hosted !== undefined || workingContextWindow !== undefined || managedRoute !== undefined || smartRoute !== undefined
+    const mustReloadConfiguration = this.#hosted !== undefined || this.#nativeExecution !== undefined || nativeWebPolicy(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot) !== undefined
+      || workingContextWindow !== undefined || managedRoute !== undefined || smartRoute !== undefined
       || (!inspection.scope.remote && (inspection.scope.openMcpBridge !== undefined || this.#resolveNativeSkills !== undefined))
       || (inspection.scope.prepareNativeSkills !== undefined && this.#resolveNativeSkills !== undefined);
     if (mustReloadConfiguration) {
@@ -1423,7 +1440,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const preparedSkills = await this.#prepareSkills(inspection.scope, context, preparedMcp.nativeConfiguration).catch(async (error) => {
       managedRoute?.dispose(); smartRoute?.dispose(); await mcp?.release().catch(() => undefined); throw error;
     });
-    const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration, ...this.#taskShellConfiguration(context) }, context,
+    const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration, ...this.#taskShellConfiguration(context),
+      ...nativeWebPolicyConfiguration(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot) }, context,
       context.modelSelection?.providerId, context.modelSelection?.modelId);
     const nativeSkills = preparedSkills.nativeSkills;
     if (mustReloadConfiguration) {
@@ -1452,7 +1470,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       nativeConfiguration,
       smartRoute,
       context.appendSystemPrompt,
-      nativeAuthenticationAdmission
+      nativeAuthenticationAdmission,
+      undefined,
+      this.#executionEnvironments(context)
     ).catch(async (error) => {
       managedRoute?.dispose();
       smartRoute?.dispose();
@@ -1844,6 +1864,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#assertOpen();
     assertDispatchNotCancelled(context.signal);
     this.#assertBackendContext(context);
+    const nativePolicyRevision = context.nativeToolAuthorization?.capture();
     if (yieldDispatch === undefined && isYieldContinuationClientId(context.operationId)) {
       throw reservedYieldContinuationClientId();
     }
@@ -1886,6 +1907,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       await this.refreshModelWorkingContext(context);
       runtime = this.#sessions.get(context.sessionId)!;
     }
+    if (input.disposition !== "steer" && runtime.runtimePolicy === "standard") await this.#prepareNativeWebTurn(runtime, context);
     if (runtime.routeUnknown) throw managedRouteUnavailable(true);
     const hostGeneration = runtime.hostGeneration;
     const dispatchSignal = AbortSignal.any([
@@ -1936,7 +1958,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const assertNativeDispatchReady = (): void => {
       assertDispatchReady();
       nativeInput.assertCurrent();
-      context.nativeToolAuthorization?.assertCurrent();
+      context.nativeToolAuthorization?.assertCurrent(nativePolicyRevision);
     };
     assertNativeDispatchReady();
     // Read native history before entering the record-write queue. Its returned
@@ -1997,7 +2019,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         clientUserMessageId,
         input: [...nativeInput.input],
         cwd: runtime.reviewWorkingDirectory ?? runtime.targetWorkspaceRoot,
-        ...(this.#hosted?.environments() ?? {}),
+        ...this.#executionEnvironments(context),
         ...(runtime.modelId === undefined ? {} : { model: runtime.modelId }),
         ...(runtime.effort === undefined ? {} : { effort: runtime.effort }),
         ...(collaborationMode === undefined ? {} : { collaborationMode }),
@@ -2185,7 +2207,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   override async closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     this.#assertBackendContext(context);
     const runtime = this.#sessions.get(context.sessionId);
-    if (runtime === undefined) return;
+    if (runtime === undefined) {
+      if (this.#nativeEnvironments.get(context.sessionId)?.generation === context.generation) await this.#closeNativeEnvironment(context.sessionId);
+      return;
+    }
     this.#assertRuntimeFence(runtime, context, runtime.hostGeneration, false);
     if (threadIdFromBinding(binding) !== runtime.threadId) {
       throw adapterError({
@@ -2215,6 +2240,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#sessions.delete(context.sessionId);
     this.#cancelPendingServerRequests(runtime);
     await this.#releaseRuntimeSubscription(runtime, true);
+    await this.#closeNativeEnvironment(context.sessionId);
   }
 
   async detachSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
@@ -2242,6 +2268,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#sessions.delete(context.sessionId);
     this.#cancelPendingServerRequests(runtime);
     await this.#releaseRuntimeSubscription(runtime, true);
+    await this.#closeNativeEnvironment(context.sessionId);
   }
 
   override async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
@@ -2618,7 +2645,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const response = await runtime.host.request("thread/resume", {
       threadId: runtime.threadId,
       cwd: runtime.targetWorkspaceRoot,
-      ...(this.#hosted?.environments() ?? {}),
+      ...this.#executionEnvironments(context),
       excludeTurns: true,
       config: { ...runtime.nativeConfiguration, ...this.#taskShellConfiguration(context) },
       ...permissionParams(mode)
@@ -3005,12 +3032,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   dispose(): Promise<void> {
     if (this.#disposeFlight !== undefined) return this.#disposeFlight;
-    if (this.#disposed) return Promise.resolve();
+    if (this.#disposed && this.#nativeEnvironments.size === 0) return Promise.resolve();
     this.#disposed = true;
     for (const flight of this.#nativeTextFlights) flight.abort();
     this.#managedProviders?.dispose();
-    const flight = this.#disposeRuntimes().finally(async () => { await this.#hosted?.close(); await this.#smartRouting?.cleanup(); });
+    const flight = this.#disposeRuntimes().finally(async () => { await this.#closeNativeEnvironments(); await this.#hosted?.close(); await this.#smartRouting?.cleanup(); });
     this.#disposeFlight = flight;
+    void flight.catch(() => { if (this.#disposeFlight === flight) this.#disposeFlight = undefined; });
     return flight;
   }
 
@@ -3019,8 +3047,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#disposed = true;
     for (const flight of this.#nativeTextFlights) flight.abort();
     this.#managedProviders?.dispose();
-    const flight = this.#forceDisposeRuntimes().finally(async () => { await this.#hosted?.close(); await this.#smartRouting?.cleanup(); });
+    const flight = this.#forceDisposeRuntimes().finally(async () => { await this.#closeNativeEnvironments(); await this.#hosted?.close(); await this.#smartRouting?.cleanup(); });
     this.#forceDisposeFlight = flight;
+    void flight.catch(() => { if (this.#forceDisposeFlight === flight) this.#forceDisposeFlight = undefined; });
     return flight;
   }
 
@@ -3097,7 +3126,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     smartRoute?: ManagedProviderSmartRoutingBinding,
     developerInstructions?: string,
     nativeAuthenticationAdmission?: number,
-    permissionMode?: PermissionMode
+    permissionMode?: PermissionMode,
+    executionEnvironments?: JsonObject
   ) {
     const assertCurrent = () => {
       scope.assertCurrent();
@@ -3115,7 +3145,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const params: JsonObject = {
       threadId,
       cwd: workspaceRoot,
-      ...(this.#hosted?.environments() ?? {}),
+      ...(executionEnvironments ?? this.#hosted?.environments() ?? {}),
       ...(permissionMode === undefined ? {} : permissionParams(permissionMode)),
       excludeTurns: true,
       ...(selection === undefined
@@ -3280,6 +3310,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         profileKey: runtime.profileKey,
         remote: true,
         pathStyle,
+        ...(runtime.openExecServerProcess === undefined ? {} : { openExecServerProcess: runtime.openExecServerProcess }),
         ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
         ...(target.remoteWorkspace.kind === "ssh" && runtime.prepareNativeSkills !== undefined
           ? { prepareNativeSkills: runtime.prepareNativeSkills } : {}),
@@ -3361,6 +3392,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         : nativeRuntimePathStyle(runtime.host),
       ...(!runtime.remote && this.#localMcpBridge !== undefined ? { openMcpBridge: this.#localMcpBridge } : {}),
       ...(runtime.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: runtime.prepareNativeSkills }),
+      ...(runtime.openExecServerProcess === undefined ? {} : { openExecServerProcess: runtime.openExecServerProcess }),
       assertAuthorityCurrent,
       assertCurrent: () => {
         assertAuthorityCurrent();
@@ -3992,6 +4024,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const preparedSkills = await this.#prepareSkills(this.#scopeForRuntime(runtime), context, preparedMcp.nativeConfiguration);
       nativeSkills = preparedSkills.nativeSkills;
       const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration, ...this.#taskShellConfiguration(context),
+        ...nativeWebPolicyConfiguration(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot),
         ...(runtime.effort === undefined ? {} : { model_reasoning_effort: runtime.effort }),
         service_tier: runtime.fastMode ? "fast" : null
       }, context, providerId, modelId);
@@ -4006,7 +4039,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         smartRoute,
         context.appendSystemPrompt,
         nativeAuthenticationAdmission,
-        runtime.permissionMode
+        runtime.permissionMode,
+        this.#executionEnvironments(context)
       );
       assertCurrent();
       const record = objectValue(response.value, "route resume response");
@@ -4381,6 +4415,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       profileKey: input.scope.profileKey,
       remote: input.scope.remote,
       ...(input.scope.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: input.scope.prepareNativeSkills }),
+      ...(input.scope.openExecServerProcess === undefined ? {} : { openExecServerProcess: input.scope.openExecServerProcess }),
       nativeAuthenticationAdmission: input.nativeAuthenticationAdmission,
       assertExecutionCurrent: input.scope.assertAuthorityCurrent,
       managedRoute: input.managedRoute,
@@ -4407,6 +4442,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       workingContextWindow: typeof input.nativeConfiguration?.["model_context_window"] === "number"
         ? input.nativeConfiguration["model_context_window"] : undefined,
       ...(input.nativeConfiguration === undefined ? {} : { nativeConfiguration: input.nativeConfiguration }),
+      ...(input.nativeConfiguration?.["web_search"] === undefined ? {} : { nativeWebMode: input.nativeConfiguration["web_search"] }),
       ...(input.nativeSkills === undefined ? {} : { nativeSkills: input.nativeSkills }),
       ...(nativeMemoryDirectory === undefined ? {} : { nativeMemoryDirectory }),
       ...(input.providerId === undefined ? {} : { providerId: input.providerId }),
@@ -4580,7 +4616,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           if (!rootRequest && !descendantRequest) return undefined;
           if (runtime.runtimePolicy === "review_read_only") {
             const response = method === "item/tool/call"
-              ? await executeReviewDynamicTool(runtime.targetWorkspaceRoot, params)
+              ? await executeReviewDynamicTool(runtime.targetWorkspaceRoot, params, runtime.activeTurnContext ?? runtime.context)
               : reviewDeniedServerRequest(method, params);
             if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)
               || runtime.state.activeTurnId !== turnId
@@ -5424,7 +5460,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         threadId: runtime.threadId,
         ...(boundary === undefined ? {} : { lastTurnId: boundary.turnId }),
         cwd: derivation.target.workspaceRoot,
-        ...(this.#hosted?.environments() ?? {}),
+        ...this.#executionEnvironments(context),
         excludeTurns: true,
         ...(forkConfiguration === undefined ? {} : { config: forkConfiguration })
       }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertForkDispatch });
@@ -5665,6 +5701,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#sessions.get(runtime.sessionId) === runtime) this.#sessions.delete(runtime.sessionId);
     this.#cancelPendingServerRequests(runtime);
     await this.#releaseRuntimeSubscription(runtime, true);
+    await this.#closeNativeEnvironment(runtime.sessionId);
   }
 
   async #readRemoteCompleteHistory(
@@ -5940,6 +5977,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   #matchesCoreFence(runtime: SessionRuntime, context: AdapterContext): boolean {
     return !runtime.closed
+      && runtime.policyRevoked !== true
       && runtime.sessionId === context.sessionId
       && runtime.targetId === context.target.id
       && context.target.backendId === this.id
@@ -5962,6 +6000,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #matchesCallbackFence(runtime: SessionRuntime, hostGeneration: number): boolean {
     return this.#isExecutionAuthorityCurrent(runtime)
       && !runtime.closed
+      && runtime.policyRevoked !== true
       && runtime.hostGeneration === hostGeneration
       && runtime.targetId === runtime.context.target.id
       && runtime.context.target.backendId === this.id
@@ -6368,10 +6407,103 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  async setPolicySnapshot(context: AdapterContext): Promise<void> {
+    this.#assertOpen(); this.#assertBackendContext(context);
+    const runtime = this.#sessions.get(context.sessionId), policy = nativeWebPolicy(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot);
+    if (!runtime || runtime.runtimePolicy !== "standard" || runtime.policyRevoked || runtime.nativeWebMode === "disabled"
+      || policy?.action !== "deny" && policy?.action !== "ask"
+      || !runtimeHasProductWork(runtime) && !runtime.nativeTasks.hasActiveTasks()) return;
+    // This synchronous fence precedes the first awaited interrupt. Late text,
+    // native reads, and descendant events from the old turn cannot be adopted.
+    runtime.policyRevoked = true;
+    await this.#retirePolicyRuntime(runtime, context);
+  }
+
+  async #prepareNativeWebTurn(runtime: SessionRuntime, context: AdapterContext): Promise<void> {
+    const policy = nativeWebPolicy(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot), authority = context.nativeToolAuthorization, revision = authority?.capture();
+    const assert = () => { context.signal.throwIfAborted(); this.#assertRuntimeFence(runtime, context, runtime.hostGeneration); authority?.assertCurrent(revision); };
+    assert(); let disabled = policy?.action === "deny" || policy?.action === "ask";
+    if (policy?.action === "ask") {
+      const answer = await context.requestInteraction({ id: `codex-web-policy-${randomUUID()}`, kind: "permission",
+        title: "Allow web search for this turn?", toolName: "web_search",
+        summary: "The current owner policy requires permission for native web search. Allowing it enables searches and page reads chosen by this turn; the permission expires when the turn finishes.",
+        risk: "medium", choices: ["allow_once", "deny_once"] }, { signal: context.signal });
+      assert(); disabled = !(answer.kind === "confirmed" && answer.confirmed || answer.kind === "selected" && answer.value === "allow_once");
+    }
+    if (disabled && runtime.nativeWebMode === "disabled" || !disabled && runtime.nativeWebMode === undefined) return;
+    let mode: JsonValue = "disabled";
+    if (!disabled) {
+      const baseline = await runtime.host.request("config/read", { cwd: runtime.targetWorkspaceRoot, includeLayers: false }, { signal: context.signal, beforeDispatch: assert });
+      assert(); if (baseline.hostGeneration !== runtime.hostGeneration) throw remoteRuntimeStale();
+      const config = objectValue(objectValue(baseline.value, "native web configuration")["config"]!, "native web configuration");
+      const value = config["web_search"];
+      if (value !== undefined && value !== null && !["disabled", "cached", "indexed", "live"].includes(String(value))) throw new ProtocolShapeError("Native web configuration is invalid");
+      mode = value ?? null;
+    }
+    if (mode === runtime.nativeWebMode) return;
+    assert();
+    await this.#resumeNativeThread(this.#scopeForRuntime(runtime), runtime.threadId, runtime.targetWorkspaceRoot, runtime.hostGeneration,
+      runtime.providerId && runtime.modelId ? { providerId: runtime.providerId, modelId: runtime.modelId } : undefined,
+      runtime.managedRoute, { ...runtime.nativeConfiguration, web_search: mode }, runtime.smartRoute, context.appendSystemPrompt,
+      runtime.nativeAuthenticationAdmission, runtime.permissionMode, this.#executionEnvironments(context));
+    assert(); runtime.nativeWebMode = mode;
+  }
+
+  async #retirePolicyRuntime(runtime: SessionRuntime, context: AdapterContext): Promise<void> {
+    const turnId = runtime.state.activeTurnId, owner = runtime.activeTurnContext ?? runtime.pendingTurnStart?.context ?? runtime.context;
+    const owned = runtimeHasProductWork(runtime), generation = runtime.hostGeneration, host = runtime.host;
+    let confirmed = false;
+    try {
+      if (turnId !== undefined) {
+        const interrupted = await runtime.host.request("turn/interrupt", { threadId: runtime.threadId, turnId }, { mutation: true,
+          signal: context.signal, beforeDispatch: () => {
+            context.signal.throwIfAborted(); this.#assertOpen(); runtime.assertExecutionCurrent();
+            if (this.#sessions.get(runtime.sessionId) !== runtime || !runtime.host.isActiveGeneration(generation)) throw remoteRuntimeStale();
+          } });
+        confirmed = interrupted.hostGeneration === generation;
+      } else confirmed = !owned && !runtime.nativeTasks.hasActiveTasks();
+    } catch { /* Keep the fenced runtime when the native outcome is unknown. */ }
+    const error = adapterError({ code: "CODEX_NATIVE_POLICY_CHANGED", message: confirmed
+      ? "The native turn was stopped because its web policy changed." : "The native turn lost policy authority; its stop could not be confirmed.",
+      phase: "dispatch", retryable: false, stateMayHaveChanged: true,
+      recovery: "Inspect the existing native thread under the current policy before explicitly sending further work." }).publicError;
+    if (turnId !== undefined) runtime.state.terminalTurnIds.add(turnId);
+    runtime.state.activeTurnId = undefined; runtime.activeTurnContext = undefined; runtime.pendingTurnStart = undefined;
+    this.#cancelYieldContinuation(runtime); runtime.dispatchLifetime.abort(); this.#cancelPendingServerRequests(runtime);
+    await this.#emitNativeTaskPayloads(runtime, runtime.nativeTasks.terminateActive("failed", error), generation, "runtime/policy_changed", false, false).catch(() => undefined);
+    if (owned) {
+      await owner.emit({ type: "error", error, terminal: true }, { namespace: "codex.app_server", fields: { method: "runtime/policy_changed" } }).catch(() => undefined);
+      await owner.emit({ type: "done", outcome: "failed" }, { namespace: "codex.app_server", fields: { method: "runtime/policy_changed" } }).catch(() => undefined);
+    }
+    try {
+      if (!confirmed && host.isActiveGeneration(generation)) {
+        // An unknown stop cannot leave an engine issuing fresh hosted effects.
+        // Retire only the captured process generation, using ordinary host-fault
+        // projection for its other Sessions. Never shut down a replacement host.
+        await host.forceShutdown();
+      }
+    } finally { await this.#closeNativeEnvironment(runtime.sessionId); }
+    if (confirmed) {
+      runtime.closed = true; this.#sessions.delete(runtime.sessionId);
+      await this.#releaseRuntimeSubscription(runtime, true);
+    } else throw new JokoError(error);
+  }
+
   async #withNativeMutation<T>(context: AdapterContext, action: () => Promise<T>): Promise<T> {
     this.#assertOpen();
     this.#assertBackendContext(context);
     assertDispatchNotCancelled(context.signal);
+    const preparation = { context }, preparations = this.#nativePreparationContexts.get(context.sessionId) ?? new Set<{ readonly context: AdapterContext }>();
+    preparations.add(preparation); this.#nativePreparationContexts.set(context.sessionId, preparations);
+    try {
+      return await this.#withPreparedNativeMutation(context, action);
+    } finally {
+      preparations.delete(preparation);
+      if (preparations.size === 0 && this.#nativePreparationContexts.get(context.sessionId) === preparations) this.#nativePreparationContexts.delete(context.sessionId);
+    }
+  }
+
+  async #withPreparedNativeMutation<T>(context: AdapterContext, action: () => Promise<T>): Promise<T> {
     if (this.#hosted) {
       if (context.runtimePolicy === "review_read_only" || context.target.remoteWorkspace) throw new TypeError("This hosted native execution does not accept another runtime domain.");
       this.#hosted.assertModel(context.modelSelection?.providerId, context.modelSelection?.modelId);
@@ -6381,6 +6513,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           phase: "provision", recovery: "Select the supported native runtime before opening this task's hosted Agent." });
       }
       await this.#hosted.prepare(this.#host, this.#profileDirectory, context.signal);
+    } else if (this.#nativeExecution !== undefined && context.runtimePolicy !== "review_read_only") {
+      await this.#prepareNativeExecution(await this.#readScope(context.target, context.signal), context);
     }
     if (this.#sessions.get(context.sessionId)?.rewindUnknown) throw rewindUnknown();
     const admission = this.#sessionMutations.get(context.sessionId) ?? { count: 0, rewinding: false };
@@ -6389,10 +6523,99 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#sessionMutations.set(context.sessionId, admission);
     try {
       return await action();
+    } catch (error) {
+      // A provisional create has no durable binding for SessionHost to close.
+      // Even an uncertain native start must lose its executor lease here.
+      if (context.binding === undefined && !this.#sessions.has(context.sessionId)
+        && this.#nativeEnvironments.get(context.sessionId)?.generation === context.generation) {
+        try { await this.#closeNativeEnvironment(context.sessionId); }
+        catch (cleanup) { throw new AggregateError([error, cleanup], "The provisional native task failed and its executor cleanup is unconfirmed."); }
+      }
+      throw error;
     } finally {
       admission.count--;
       if (admission.count === 0 && this.#sessionMutations.get(context.sessionId) === admission) this.#sessionMutations.delete(context.sessionId);
     }
+  }
+
+  async #prepareNativeExecution(scope: CodexReadScope, context: AdapterContext): Promise<void> {
+    if (this.#nativeExecution === undefined) return;
+    if (versionFromUserAgent(scope.host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
+      await this.#closeNativeEnvironment(context.sessionId);
+      throw adapterError({ code: "CODEX_NATIVE_EXECUTION_PROTOCOL_UNSUPPORTED", message: `Native execution requires the audited ${AUDITED_APP_SERVER_VERSION} protocol.`,
+        phase: "provision", recovery: "Install the supported native runtime before opening this task." });
+    }
+    let entry = this.#nativeEnvironments.get(context.sessionId);
+    while (entry !== undefined) {
+      let stale: unknown;
+      try { entry.environment.assertCurrent(); } catch (error) { stale = error; }
+      if (stale === undefined && entry.generation === context.generation && entry.host === scope.host
+        && entry.targetId === context.target.id && entry.root === scope.workspaceRoot) break;
+      const runtime = this.#sessions.get(context.sessionId);
+      if (runtime && (runtime.closed || runtime.policyRevoked || runtimeHasProductWork(runtime)
+        || runtime.pendingTurnStart !== undefined || runtime.nativeTasks.hasActiveTasks() || runtime.compaction !== undefined)) {
+        throw stale ?? remoteRuntimeStale();
+      }
+      // A fresh explicit idle mutation may acquire the latest Target lease.
+      // Retire the old listener first: queued records retain only that owner.
+      await this.#closeNativeEnvironment(context.sessionId);
+      context.signal.throwIfAborted(); scope.assertCurrent();
+      entry = this.#nativeEnvironments.get(context.sessionId);
+    }
+    if (entry === undefined) {
+      const generation = context.generation, sessionId = context.sessionId;
+      const assert = () => {
+        this.#assertOpen(); scope.assertAuthorityCurrent(); this.#assertBackendContext(context);
+        const current = this.#nativeEnvironments.get(sessionId), runtime = this.#sessions.get(sessionId);
+        if (!current || current !== entry || current.generation !== generation || current.host !== scope.host
+          || runtime !== undefined && (runtime.closed || runtime.policyRevoked || runtime.sessionGeneration !== generation
+            || runtime.targetId !== context.target.id || runtime.host !== scope.host
+              && (runtimeHasProductWork(runtime) || runtime.pendingTurnStart !== undefined || runtime.nativeTasks.hasActiveTasks() || runtime.compaction !== undefined))) throw remoteRuntimeStale();
+      };
+      const currentContext = () => {
+        assert(); const runtime = this.#sessions.get(sessionId);
+        const preparation = [...(this.#nativePreparationContexts.get(sessionId) ?? [])].at(-1)?.context;
+        const active = runtime && (runtimeHasProductWork(runtime) || runtime.nativeTasks.hasActiveTasks())
+          ? runtime.yieldContinuation?.context ?? runtime.activeTurnContext : undefined;
+        return active ?? runtime?.pendingTurnStart?.context ?? preparation ?? runtime?.context ?? context;
+      };
+      const environment = new CodexNativeExecutionEnvironment({ context, workspaceRoot: scope.workspaceRoot,
+        pathStyle: scope.pathStyle, remote: scope.remote, assertCurrent: assert, currentContext,
+        hasActiveTurn: () => {
+          assert(); const runtime = this.#sessions.get(sessionId);
+          return runtime !== undefined && (runtime.pendingTurnStart !== undefined
+            || runtimeHasProductWork(runtime) || runtime.nativeTasks.hasActiveTasks());
+        },
+        ...(scope.openExecServerProcess === undefined ? {} : { openExecServerProcess: scope.openExecServerProcess }) }, this.#nativeExecution);
+      entry = { generation, host: scope.host, targetId: context.target.id, root: scope.workspaceRoot, environment };
+      this.#nativeEnvironments.set(sessionId, entry);
+    }
+    try { await entry.environment.prepare(scope.host, context.signal); }
+    catch (error) {
+      if (!this.#sessions.has(context.sessionId) && this.#nativeEnvironments.get(context.sessionId) === entry) {
+        try { await this.#closeNativeEnvironment(context.sessionId); }
+        catch (cleanup) { throw new AggregateError([error, cleanup], "The native environment failed and its executor cleanup is unconfirmed."); }
+      }
+      throw error;
+    }
+  }
+
+  #executionEnvironments(context: AdapterContext): JsonObject {
+    if (this.#hosted) return this.#hosted.environments();
+    if (this.#nativeExecution === undefined || context.runtimePolicy === "review_read_only") return {};
+    const entry = this.#nativeEnvironments.get(context.sessionId);
+    if (!entry || entry.generation !== context.generation) throw new Error("The task's native execution environment is not prepared.");
+    return entry.environment.environments(context);
+  }
+
+  async #closeNativeEnvironment(sessionId: string): Promise<void> {
+    const entry = this.#nativeEnvironments.get(sessionId);
+    await entry?.environment.close();
+    if (this.#nativeEnvironments.get(sessionId) === entry) this.#nativeEnvironments.delete(sessionId);
+  }
+
+  async #closeNativeEnvironments(): Promise<void> {
+    await Promise.all([...this.#nativeEnvironments.keys()].map(sessionId => this.#closeNativeEnvironment(sessionId)));
   }
 
   #assertOpen(): void {
@@ -6820,7 +7043,7 @@ function reviewDeniedServerRequest(method: string, _params: JsonValue): JsonValu
   }
 }
 
-async function executeReviewDynamicTool(workspaceRoot: string, params: JsonValue): Promise<JsonValue> {
+async function executeReviewDynamicTool(workspaceRoot: string, params: JsonValue, context?: AdapterContext): Promise<JsonValue> {
   try {
     if (!isJsonObject(params)
       || typeof params["tool"] !== "string"
@@ -6830,6 +7053,11 @@ async function executeReviewDynamicTool(workspaceRoot: string, params: JsonValue
       throw new ReviewToolInputError("The read-only tool request is invalid.");
     }
     const args = params["arguments"];
+    const authority = context?.nativeToolAuthorization, revision = authority?.capture();
+    authority?.assertCurrent(revision);
+    const decision = await authority?.review({ toolName: params["tool"].slice("joko_".length), input: args, signal: context!.signal });
+    authority?.assertCurrent(revision);
+    if (decision?.verdict === "block" || decision?.verdict === "ask" || decision?.unavailable) throw new ReviewToolInputError("The current policy does not authorize this read-only operation.");
     const output = params["tool"] === "joko_read"
       ? await executeReviewRead(workspaceRoot, args)
       : params["tool"] === "joko_grep"
@@ -6837,6 +7065,7 @@ async function executeReviewDynamicTool(workspaceRoot: string, params: JsonValue
         : params["tool"] === "joko_find"
           ? await executeReviewFind(workspaceRoot, args)
           : await executeReviewList(workspaceRoot, args);
+    authority?.assertCurrent(revision);
     return reviewToolResponse(true, output);
   } catch (error) {
     return reviewToolResponse(

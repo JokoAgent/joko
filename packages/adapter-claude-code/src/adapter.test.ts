@@ -139,6 +139,40 @@ describe("ClaudeCodeAdapter", () => {
       expect(review).toHaveBeenCalledOnce();
     } finally { await adapter.dispose(); }
   });
+  test.each(["Read", "Write", "Bash", "mcp__server__read"])("enforces ordinary host policy for automatic %s tools in Full Access", async toolName => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk);
+    const review = vi.fn(async () => ({ verdict: "block" as const, reason: "Ordered owner policy denies this action.", authorizationRevision: "policy-2" }));
+    const authority = { required: false, capture: () => "policy-2", assertCurrent: () => {}, review };
+    const binding = await adapter.createSession(createInput({ permissionMode: "bypassPermissions" }), { ...contextFor().context, nativeToolAuthorization: authority });
+    const source = { ...contextFor(binding, { operationId: "native-policy" }).context, nativeToolAuthorization: authority };
+    try {
+      await adapter.send(textPrompt("Perform the action"), source);
+      const query = sdk.queries.at(-1)!, hook = query.params.options.hooks!.PreToolUse![0]!.hooks[0]!;
+      const input = { hook_event_name: "PreToolUse" as const, session_id: binding.nativeSessionId!, transcript_path: "unused", cwd: target.workspaceRoot,
+        tool_name: toolName, tool_use_id: "automatic-action", tool_input: { file_path: join(target.workspaceRoot, "private.txt"), command: "pwd" } };
+      await expect(hook(input, "automatic-action", { signal: source.signal })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(review).toHaveBeenCalledOnce();
+    } finally { await adapter.dispose(); }
+  });
+  test.each(["allow", "deny", "revoked"] as const)("uses a real owner permission for native Ask in Full Access (%s)", async outcome => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk); let current = true;
+    const authority = { required: false, capture: () => "policy-2", assertCurrent: () => { if (!current) throw new Error("Policy changed"); },
+      review: async () => ({ verdict: "ask" as const, authorizationRevision: "policy-2" }) };
+    const binding = await adapter.createSession(createInput({ permissionMode: "bypassPermissions" }), { ...contextFor().context, nativeToolAuthorization: authority });
+    const requestInteraction = vi.fn(async (): Promise<InteractionDecision> => {
+      if (outcome === "revoked") current = false;
+      return { kind: "selected", value: outcome === "deny" ? "deny" : "allow_once" };
+    });
+    const source = { ...contextFor(binding, { operationId: "native-ask", requestInteraction }).context, nativeToolAuthorization: authority };
+    try {
+      await adapter.send(textPrompt("Read the policy-scoped file"), source);
+      const hook = sdk.queries.at(-1)!.params.options.hooks!.PreToolUse![0]!.hooks[0]!;
+      const input = { hook_event_name: "PreToolUse" as const, session_id: binding.nativeSessionId!, transcript_path: "unused", cwd: target.workspaceRoot,
+        tool_name: "Read", tool_use_id: "read-ask", tool_input: { file_path: join(target.workspaceRoot, "private.txt") } };
+      await expect(hook(input, "read-ask", { signal: source.signal })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: outcome === "allow" ? "allow" : "deny" } });
+      expect(requestInteraction).toHaveBeenCalledOnce();
+    } finally { await adapter.dispose(); }
+  });
   test.each([false, true])("uses a temporary tool-free native Query for exact-model text/image review and retires it (images=%s)", async withImage => {
     const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk), allowed = vi.fn();
     try {

@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import type { BlobRef } from "@joko/core";
-import { OperationalStore, PartnerNetworkStore, type ArtifactRecord } from "@joko/store";
+import { OperationalStore, PartnerNetworkStore, networkHash, type ArtifactRecord } from "@joko/store";
 import { afterEach, expect, it, vi } from "vitest";
 import { PartnerNetworkHost } from "./partner-network-host.js";
 import { PartnerSessionTaskGroupPublisher, type PartnerSessionTaskGroupOrigin, type PartnerSessionTaskGroupPort } from "./partner-session-task-group-publisher.js";
@@ -81,6 +82,38 @@ it("skips a server-refused file, sanitizes approval cards and never sends a dela
   expect(await publisher.terminal({ ...f.task, status: "timed-out", error: "The original time budget ended." })).toBe("delivered");
   expect(f.messages().map(message => message.task?.status)).toEqual(["waiting", "timed-out"]); expect(f.messages()[1]?.attachments).toHaveLength(1);
   expect(publisher.nextAttempt(f.task.id)).toBeUndefined(); publisher.close();
+});
+
+it("retries the original task file after its begin request stops immediately after file creation", async () => {
+  const f = await fixture(); f.add("report.txt", new TextEncoder().encode("complete result"));
+  const normalMedia = f.port.media; let interrupted = false;
+  f.port.media = async (origin, request, signal) => {
+    if (request.action !== "begin" || interrupted) return normalMedia(origin, request, signal);
+    interrupted = true;
+    const id = `media:${networkHash([origin.ownerId, request.operationId])}`;
+    const path = join(f.host.options.mediaDirectory, request.roomId, id.replace(":", "-"));
+    const abort = new AbortController(), requestSignal = AbortSignal.any([signal, abort.signal]);
+    try {
+      return await f.host.media(request, origin.ownerId, { signal: requestSignal, assertCurrent() {
+        if (existsSync(path)) abort.abort();
+        requestSignal.throwIfAborted();
+      } });
+    } catch { throw new ConnectError("The original upload request disconnected.", Code.Unavailable); }
+  };
+  const completed = { ...f.task, status: "completed" as const, result: "Finished" };
+  const first = f.publisher(); expect(await first.terminal(completed)).toBe("retry"); first.close();
+  expect(f.messages()).toEqual([]);
+  f.advance(1001);
+  const recovered = f.publisher();
+  try {
+    expect(await recovered.terminal(completed)).toBe("delivered");
+    const attachment = f.messages()[0]!.attachments[0]!;
+    expect(f.messages()).toHaveLength(1);
+    expect(attachment.name).toBe("report.txt");
+    expect(await readFile(join(f.host.options.mediaDirectory, f.room.id, attachment.id.replace(":", "-")), "utf8")).toBe("complete result");
+    expect(await recovered.terminal(completed)).toBe("delivered");
+    expect(f.messages()).toHaveLength(1);
+  } finally { recovered.close(); }
 });
 
 it("returns a definitive archived-room refusal for private fallback, including a previously accepted message receipt", async () => {

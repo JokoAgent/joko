@@ -36,7 +36,8 @@ describe("workspace ripgrep contracts", () => {
       "--files", "--hidden", "--no-messages", "--", "."
     ]);
     const insensitive = workspaceTextSearchArguments("[literal", false);
-    expect(insensitive.slice(0, 4)).toEqual(["--json", "-F", "--max-count=200", "--hidden"]);
+    expect(insensitive.slice(0, 3)).toEqual(["--json", "-F", "--hidden"]);
+    expect(insensitive).toContain("--crlf");
     expect(insensitive.slice(-4)).toEqual(["-i", "--", "[literal", "."]);
     expect(insensitive).not.toContain("--regexp");
     expect(insensitive.filter((value) => value === "--glob")).toHaveLength(textFileExtensions.length);
@@ -66,7 +67,7 @@ describe("workspace ripgrep contracts", () => {
     expect(capped.revision).not.toBe(first.revision);
   });
 
-  it("searches only supported text files, applies the per-file cap, and streams a terminal count", async () => {
+  it("searches every matching line within the global cap and streams accurate terminal counts", async () => {
     const root = await projectRoot("joko-text-search-");
     await writeFile(join(root, ".gitignore"), "ignored.txt\n", "utf8");
     await writeFile(join(root, "ignored.txt"), "needle\n", "utf8");
@@ -86,10 +87,10 @@ describe("workspace ripgrep contracts", () => {
     const end = events.at(-1);
     // Compose positive whitelist globs with --hidden. ripgrep treats those
     // explicit globs as authoritative and includes the otherwise ignored file.
-    expect(matches).toHaveLength(204);
+    expect(matches).toHaveLength(209);
     expect(matches.some((event) => event.kind === "match" && event.match.data.path.text.includes("binary.png"))).toBe(false);
     expect(matches.some((event) => event.kind === "match" && event.match.data.path.text.includes("ignored.txt"))).toBe(true);
-    expect(end).toMatchObject({ kind: "end", truncated: false, totalMatches: 204, totalFiles: 4 });
+    expect(end).toMatchObject({ kind: "end", truncated: false, totalMatches: 209, totalFiles: 4 });
   });
 
   it("kills at the 1000-result global ceiling and honours cancellation", async () => {
@@ -127,9 +128,31 @@ describe("workspace ripgrep contracts", () => {
 });
 
 describe("WorkspaceService search/index projection", () => {
-  it("adds canonical ranges and per-file content revisions to streamed matches", async () => {
+  it.each([
+    { query: "^", ending: "LF", lineEnding: "\n" },
+    { query: "$", ending: "LF", lineEnding: "\n" },
+    { query: "^", ending: "CRLF", lineEnding: "\r\n" },
+    { query: "$", ending: "CRLF", lineEnding: "\r\n" }
+  ])("keeps legal zero-width $query regex ranges on UTF-8 boundaries with $ending", async ({ query, lineEnding }) => {
+    const root = await projectRoot("joko-search-anchor-"), text = "先🐾abc";
+    await writeFile(join(root, "README.md"), `${text}${lineEnding}${text}${lineEnding}`, "utf8");
+    const service = new WorkspaceService();
+    await service.register({ id: "project", root, displayName: "Project", trusted: true });
+    const result = await service.searchPage("project", query, { regularExpression: true });
+    const byte = query === "^" ? 0 : Buffer.byteLength(text), column = query === "^" ? 1 : text.length + 1;
+    expect(result).toMatchObject({ totalResults: 2, totalFiles: 1, truncated: false, matches: [1, 2].map(line => {
+      const absoluteByte = (line - 1) * Buffer.byteLength(text + lineEnding) + byte;
+      return { path: "README.md", line, preview: text, column, endColumn: column,
+        startByte: absoluteByte, endByte: absoluteByte, submatches: [{ startByte: byte, endByte: byte }] };
+    }) });
+  });
+
+  it.each([
+    { ending: "LF", lineEnding: "\n" },
+    { ending: "CRLF", lineEnding: "\r\n" }
+  ])("adds canonical ranges and per-file content revisions to streamed $ending matches", async ({ lineEnding }) => {
     const root = await projectRoot("joko-search-service-");
-    await writeFile(join(root, "README.md"), `prefix [literal tail\n${MULTILINGUAL_FIXTURES.searchLine}\n`, "utf8");
+    await writeFile(join(root, "README.md"), `prefix [literal tail${lineEnding}${MULTILINGUAL_FIXTURES.searchLine}${lineEnding}`, "utf8");
     const service = new WorkspaceService();
     await service.register({ id: "project", root, displayName: "Project", trusted: true });
 
@@ -161,6 +184,8 @@ describe("WorkspaceService search/index projection", () => {
         line: 2,
         column: 2,
         endColumn: 4,
+        startByte: Buffer.byteLength(`prefix [literal tail${lineEnding}`) + 3,
+        endByte: Buffer.byteLength(`prefix [literal tail${lineEnding}`) + 7,
         preview: MULTILINGUAL_FIXTURES.searchLine,
         submatches: [
           { startByte: 3, endByte: 7 },
@@ -168,5 +193,19 @@ describe("WorkspaceService search/index projection", () => {
         ]
       }
     });
+  });
+
+  it("retains carriage-return content before the final CRLF in streamed previews", async () => {
+    const root = await projectRoot("joko-search-cr-content-");
+    await writeFile(join(root, "README.md"), "先🐾\r\r\n", "utf8");
+    const service = new WorkspaceService();
+    await service.register({ id: "project", root, displayName: "Project", trusted: true });
+    const events = [];
+    for await (const event of service.searchStream("project", "🐾", true)) events.push(event);
+    expect(events[0]).toMatchObject({ kind: "match", match: {
+      preview: "先🐾\r", column: 2, endColumn: 4, startByte: 3, endByte: 7,
+      submatches: [{ startByte: 3, endByte: 7 }]
+    } });
+    expect(events.at(-1)).toMatchObject({ kind: "end", truncated: false, totalResults: 1 });
   });
 });

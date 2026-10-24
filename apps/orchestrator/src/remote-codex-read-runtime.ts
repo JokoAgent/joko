@@ -189,6 +189,14 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       profileKey,
       executionDomain,
       assertCurrent,
+      openExecServerProcess: async (processSignal: AbortSignal) => {
+        assertCurrent(); processSignal.throwIfAborted();
+        // Transfer every opened handle to the relay before its final authority
+        // recheck. The relay owns confirmed retirement even when this await
+        // finishes after revocation; throwing here would strand that handle.
+        return processes.open({ executable: installation.executable, args: ["exec-server", "--listen", "stdio://"],
+          cwd: installation.workspaceRoot, env: { CODEX_HOME: installation.profileRoot }, signal: processSignal });
+      },
       ...(skillAuthority === undefined ? {} : {
         prepareNativeSkills: (seeds: Parameters<RemoteNativeSkillOwner["prepare"]>[0]["seeds"], skillSignal: AbortSignal,
           policy?: Parameters<RemoteNativeSkillOwner["prepare"]>[0]["policy"]) => this.#nativeSkills!.prepare({

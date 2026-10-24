@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, open } from "node:fs/promises";
+import { lstat, mkdir, open } from "node:fs/promises";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -188,7 +188,8 @@ export class PartnerNetworkHost {
         revision: networkInteger(task.revision), sessionId: task.sessionId, execution: networkInteger(task.execution), interactionKind: task.interactionKind, question: task.question } } : {}) }));
   }
   media(request: contract.MediaPartnerNetworkRequest, actorId: string, authority: Pick<PartnerNetworkAuthority, "signal" | "assertCurrent">): Promise<contract.MediaPartnerNetworkResponse> {
-    const key = `${request.roomId}:${request.mediaId || request.operationId}`, previous = this.#mediaFlights.get(key) ?? Promise.resolve();
+    const id = request.action === "begin" ? `media:${networkHash([actorId, networkIdentity(request.operationId)])}` : request.mediaId;
+    const key = `${request.roomId}:${id}`, previous = this.#mediaFlights.get(key) ?? Promise.resolve();
     const task = previous.catch(() => {}).then(() => this.#media(request, actorId, authority)).finally(() => { if (this.#mediaFlights.get(key) === task) this.#mediaFlights.delete(key); });
     this.#mediaFlights.set(key, task); return task;
   }
@@ -200,13 +201,23 @@ export class PartnerNetworkHost {
       const sizeBytes = networkInteger(request.sizeBytes), id = `media:${networkHash([actorId, networkIdentity(request.operationId)])}`;
       if (sizeBytes < 1 || sizeBytes > 100 * 1024 * 1024) throw new PartnerNetworkStoreError("invalid");
       const attachment = { id, name: networkText(request.name, 255), mediaType: networkText(request.mediaType, 200), sizeBytes };
-      try { const old = this.storage.media(request.roomId, id); if (networkHash(old.attachment) !== networkHash(attachment) || old.actorId !== actorId) throw new PartnerNetworkStoreError("changed");
-        return create(contract.MediaPartnerNetworkResponseSchema, { attachment: networkAttachment(old.attachment), offset: BigInt(old.offset), complete: old.complete });
-      } catch (error) { if (!(error instanceof PartnerNetworkStoreError) || error.code !== "not_found") throw error; }
-      await mkdir(directory, { recursive: true, mode: 0o700 }); check();
-      const file = await open(join(directory, id.replace(":", "-")), "wx", 0o600); await file.close(); check();
-      this.storage.saveMedia(request.roomId, { actorId, attachment, complete: false, offset: 0 });
-      return create(contract.MediaPartnerNetworkResponseSchema, { attachment: networkAttachment(attachment) });
+      let saved: ReturnType<PartnerNetworkStore["media"]>;
+      try {
+        saved = this.storage.media(request.roomId, id);
+        if (networkHash(saved.attachment) !== networkHash(attachment) || saved.actorId !== actorId) throw new PartnerNetworkStoreError("changed");
+      } catch (error) {
+        if (!(error instanceof PartnerNetworkStoreError) || error.code !== "not_found") throw error;
+        // The exact upload intent is durable before creating its file. Offset
+        // zero can resume either side of an interrupted file creation.
+        saved = { actorId, attachment, complete: false, offset: 0 };
+        this.storage.saveMedia(request.roomId, saved);
+      }
+      try { await this.#prepareMediaFile(directory, saved, check); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new PartnerNetworkStoreError("not_found");
+        throw error;
+      }
+      return create(contract.MediaPartnerNetworkResponseSchema, { attachment: networkAttachment(saved.attachment), offset: BigInt(saved.offset), complete: saved.complete });
     }
     const saved = this.storage.media(request.roomId, request.mediaId), path = join(directory, saved.attachment.id.replace(":", "-")), offset = networkInteger(request.offset);
     if (request.action === "authorize") {
@@ -239,6 +250,36 @@ export class PartnerNetworkHost {
     const file = await open(path, "r+"); try { check(); await file.write(request.data, 0, request.data.byteLength, offset); await file.sync(); check(); } finally { await file.close(); }
     const next = { ...saved, offset: offset + request.data.byteLength, complete: offset + request.data.byteLength === saved.attachment.sizeBytes };
     this.storage.saveMedia(request.roomId, next); return create(contract.MediaPartnerNetworkResponseSchema, { attachment: networkAttachment(saved.attachment), offset: BigInt(next.offset), complete: next.complete });
+  }
+  async #prepareMediaFile(directory: string, saved: ReturnType<PartnerNetworkStore["media"]>, check: () => void): Promise<void> {
+    await mkdir(directory, { recursive: true, mode: 0o700 }); check();
+    const parent = await lstat(directory); check();
+    if (!parent.isDirectory() || parent.isSymbolicLink()) throw new PartnerNetworkStoreError("changed");
+    const path = join(directory, saved.attachment.id.replace(":", "-"));
+    const openExisting = async () => {
+      const before = await lstat(path); check();
+      if (!before.isFile() || before.isSymbolicLink()) throw new PartnerNetworkStoreError("changed");
+      const handle = await open(path, "r+");
+      try {
+        const opened = await handle.stat(); check();
+        if (opened.dev !== before.dev || opened.ino !== before.ino) throw new PartnerNetworkStoreError("changed");
+        return handle;
+      } catch (error) { await handle.close(); throw error; }
+    };
+    let handle: Awaited<ReturnType<typeof open>>;
+    if (saved.offset === 0 && !saved.complete) {
+      try { handle = await open(path, "wx", 0o600); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        handle = await openExisting();
+      }
+    } else handle = await openExisting();
+    try {
+      const info = await handle.stat(); check();
+      if (!info.isFile() || info.size < saved.offset || info.size > saved.attachment.sizeBytes
+        || saved.complete && info.size !== saved.attachment.sizeBytes) throw new PartnerNetworkStoreError("changed");
+    } finally { await handle.close(); }
+    check();
   }
   async close(): Promise<void> { this.#invites.clear(); await Promise.allSettled(this.#mediaFlights.values()); }
 }

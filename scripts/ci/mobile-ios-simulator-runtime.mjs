@@ -25,6 +25,7 @@ const deadline = setTimeout(() => abort.abort(new Error("iOS startup and UI oper
 const stop = () => abort.abort(new Error("iOS startup observation was cancelled."));
 process.once("SIGINT", stop); process.once("SIGTERM", stop);
 let evidence, udid, deviceName, bundleId, executable, installedExecutable, metro, metroClosed = false;
+let preInputApplication;
 let stage = "preconditions";
 const startupCommandReceipts = [];
 const hostResourceSnapshots = [];
@@ -729,13 +730,19 @@ async function main() {
     installation.installedExecutableVerified = true;
     save("installation-state.json", installation);
     stage = "first native launch";
-    const firstPid = await launch(port), first = await observe("first-launch", firstPid, ocr);
+    const firstStartedAt = Date.now(), firstPid = await launch(port);
+    preInputApplication = { pid: firstPid, startedAt: firstStartedAt };
+    const first = await observe("first-launch", firstPid, ocr);
+    preInputApplication = undefined;
     stage = "explicit app termination";
     await sim("terminate", udid, bundleId);
     for (let count = 0; count < 20 && await alive(firstPid); count++) await delay(250, undefined, { signal: abort.signal });
     if (await alive(firstPid)) throw new Error("The first app occurrence did not terminate.");
     stage = "native reopen";
-    const reopenedPid = await launch(port), reopened = await observe("reopened", reopenedPid, ocr);
+    const reopenedStartedAt = Date.now(), reopenedPid = await launch(port);
+    preInputApplication = { pid: reopenedPid, startedAt: reopenedStartedAt };
+    const reopened = await observe("reopened", reopenedPid, ocr);
+    preInputApplication = undefined;
     const identity = JSON.parse(readFileSync(join(evidence, "identity.json"), "utf8"));
     const gui = await runConnectionUiTests(app, port, identity.sourceCommit, identity.executableSha256, reopenedPid, info.MinimumOSVersion);
     const postGuiFrame = await capturePostUiFrame(ocr, identity, reopenedPid);
@@ -752,7 +759,8 @@ async function main() {
       save("failure.json", { stage, message: error.message, simulatorUdid: udid, bundleId,
         scope: startupDiagnosticsOnly ? "simulator-startup-command-probe" : "joko-app-runtime-and-gui", noGuiSuccessClaimed: true });
       const diagnostics = await collectRuntimeFailureDiagnostics({ bundleId, executable, installedExecutable,
-        simulatorUdid: udid, startedAt: observationStartedAt }).catch(() => ({ collectionFailed: true }));
+        simulatorUdid: udid, startedAt: observationStartedAt,
+        startup: ["first native launch", "native reopen"].includes(stage) ? preInputApplication : undefined }).catch(() => ({ collectionFailed: true }));
       save("runtime-failure-diagnostics.json", diagnostics);
     }
     throw error;

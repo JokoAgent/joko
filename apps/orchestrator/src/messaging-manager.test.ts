@@ -709,7 +709,8 @@ describe("MessagingManager", () => {
   });
 
   it("recovers an acknowledged first album page after a supplemental failure and manager restart", async () => {
-    const remote = { remaining: [albumUpdate(9, 81), albumUpdate(10, 82)], failSupplemental: true, initial: true, silent: false };
+    const firstPage = albumUpdate(9, 81);
+    const remote = { remaining: [firstPage, albumUpdate(10, 82)], failSupplemental: true, initial: true, silent: false };
     const transports: AcknowledgingAlbumTransport[] = [];
     const fixture = await createFixture(() => {
       const transport = new AcknowledgingAlbumTransport(remote); transports.push(transport); return transport;
@@ -721,7 +722,7 @@ describe("MessagingManager", () => {
     const enabled = await replaceCredential(fixture, created, "durable-album", true);
     await vi.waitFor(() => {
       expect(remote.remaining.map(update => update.update_id)).toEqual([10]);
-      expect(fixture.store.findMessagingPollBatch(enabled.id, enabled.generation)?.updates).toEqual([albumUpdate(9, 81)]);
+      expect(fixture.store.findMessagingPollBatch(enabled.id, enabled.generation)?.updates).toEqual([firstPage]);
     });
     await fixture.manager.close();
     remote.failSupplemental = false;

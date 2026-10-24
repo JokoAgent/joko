@@ -256,6 +256,10 @@ import {
   type DesktopMainWindowCloseSettingsStore
 } from "./window-close-settings.js";
 import { DesktopWallpaperStore } from "./wallpaper-store.js";
+import { registerDesktopLoginItemIpc } from "./login-item.js";
+import { DesktopMenuBar, createMenuBarSettingsStore, registerMenuBarIpc } from "./menu-bar.js";
+import { verifyMenuBarHelper } from "./menu-bar-native-host.js";
+import { isMenubarSupportedPlatform } from "@joko/contracts";
 import { DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler } from "./wallpaper-protocol.js";
 import { DesktopMcpAppHost, MCP_APP_SCHEME } from "./mcp-app-host.js";
 import { DesktopExtensionOAuthHost } from "./extension-oauth-host.js";
@@ -793,6 +797,7 @@ const dedicatedHardwarePermissionRecovery = createDedicatedHardwarePermissionRec
   }
 });
 let nativeGamepadRuntime: NativeGamepadRuntime<NativeGamepadClientOwner> | undefined;
+let desktopMenuBar: DesktopMenuBar | undefined;
 const nativeGamepadDocuments = new DesktopNativeGamepadDocumentAuthority<WebContents>(
   () => randomUUID(),
   (owner) => nativeGamepadRuntime?.retireClient(owner)
@@ -1088,6 +1093,7 @@ if (!app.requestSingleInstanceLock()) {
     nativeTaskStatusVisibleSessionsByContents.clear();
     macNativeTaskStatusHost?.dispose();
     macNativeTaskStatusHost = undefined;
+    void desktopMenuBar?.dispose().catch(() => undefined);
     if (nativeTaskStatusDisplayRefresh !== undefined) {
       screen.removeListener("display-added", nativeTaskStatusDisplayRefresh);
       screen.removeListener("display-removed", nativeTaskStatusDisplayRefresh);
@@ -1126,6 +1132,7 @@ if (!app.requestSingleInstanceLock()) {
     desktopWallpaperStore.onChanged(broadcastDesktopWallpaperSettings);
     protocol.handle(DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler(desktopWallpaperStore));
     await initializeDesktopNativeTaskStatus();
+    await initializeDesktopMenuBar();
     if (shouldRunDesktopUpdateStartup()) desktopUpdateStartupPhase = { kind: "checking" };
     await initializeDesktopKeepAwake();
     initializeNativeGamepad();
@@ -1975,6 +1982,21 @@ async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise
   foreground.focus();
   await waitForPackagedSmokeInspectorCondition(() => foreground.isFocused(), "pre-crash independent focus");
   const ownerContents = owner.webContents;
+  const ownerPid = ownerContents.getOSProcessId();
+  const inspectorPid = crashing.webContents.getOSProcessId();
+  const foregroundPid = foreground.webContents.getOSProcessId();
+  recordPackagedSmokeProgress(`inspector_owner_crash_renderer_relationships:${JSON.stringify({
+    ownerPid, inspectorPid, foregroundPid,
+    ownerSharesInspector: ownerPid > 0 && ownerPid === inspectorPid,
+    ownerSharesForeground: ownerPid > 0 && ownerPid === foregroundPid,
+    inspectorSharesForeground: inspectorPid > 0 && inspectorPid === foregroundPid
+  })}`);
+  owner.once("closed", () => recordPackagedSmokeProgress("inspector_crash_owner_native_closed_event"));
+  ownerContents.once("destroyed", () => recordPackagedSmokeProgress("inspector_crash_owner_web_contents_destroyed_event"));
+  crashing.once("closed", () => recordPackagedSmokeProgress("inspector_crash_child_native_closed_event"));
+  crashing.webContents.once("destroyed", () => recordPackagedSmokeProgress("inspector_crash_child_web_contents_destroyed_event"));
+  foreground.once("closed", () => recordPackagedSmokeProgress("inspector_crash_foreground_native_closed_event"));
+  foreground.webContents.once("destroyed", () => recordPackagedSmokeProgress("inspector_crash_foreground_web_contents_destroyed_event"));
   const ownerRendererLost = new Promise<void>((resolveLoss) => ownerContents.once("render-process-gone", () => resolveLoss()));
   if (process.platform === "win32") {
     // Crash IPC can remain pending in a background packaged renderer. Exercise
@@ -1988,18 +2010,26 @@ async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise
       || capturePackagedSmokeProcessBirthIdentitySync(pid) !== identity) {
       throw new Error("Inspector smoke renderer changed before process termination.");
     }
+    recordPackagedSmokeProgress("inspector_owner_crash_native_signal_started");
     process.kill(pid, "SIGKILL");
+    recordPackagedSmokeProgress("inspector_owner_crash_native_signal_returned");
   } else {
+    recordPackagedSmokeProgress("inspector_owner_crash_native_request_started");
     ownerContents.forcefullyCrashRenderer();
+    recordPackagedSmokeProgress("inspector_owner_crash_native_request_returned");
   }
   await waitForPackagedSmokeDeadline(ownerRendererLost, 10_000, "Inspector owner renderer crash");
   recordPackagedSmokeProgress("inspector_owner_renderer_gone");
+  recordPackagedSmokeProgress("inspector_owner_crash_retirement_wait_started");
   await waitForPackagedSmokeInspectorDestroyed(crashing, "owner crash");
+  recordPackagedSmokeProgress("inspector_owner_crash_retirement_observed");
   if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
     inspectorWindowOccurrence !== undefined) {
     throw new Error("Packaged Inspector retained stale state after owner crash.");
   }
+  recordPackagedSmokeProgress("inspector_crash_foreground_native_destroy_started");
   foreground.destroy();
+  recordPackagedSmokeProgress("inspector_crash_foreground_native_destroy_returned");
   recordPackagedSmokeProgress("inspector_owner_crash_retired");
   recordPackagedSmokeProgress("inspector_lifecycle_verified");
 }
@@ -2140,6 +2170,7 @@ async function waitForPackagedSmokeInspectorCondition(
     if (await predicate()) return;
     await waitForPackagedSmokePoll();
   }
+  if (operation === "owner crash") recordPackagedSmokeProgress("inspector_owner_crash_retirement_wait_timed_out");
   throw new Error(`Packaged Inspector did not finish ${operation}.`);
 }
 
@@ -2566,7 +2597,9 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   const peerDraftText = "Joko same-session peer keeps its independent draft";
   await writePackagedSmokeTaskDraft(peerWindow, connection, task.sessionId, peerDraftText);
   await writePackagedSmokeTaskDraft(taskWindow, connection, task.sessionId, crashDraftText);
-  await waitForPackagedSmokeTaskDraft(peerWindow, peerDraftText, true);
+  // Each write above already waited for its own saved badge and verified
+  // IndexedDB. The earlier window's badge can expire during the second write.
+  await waitForPackagedSmokeTaskDraft(peerWindow, peerDraftText, false);
   const firstDocument = await readPackagedSmokeTaskDocumentIdentity(taskWindow);
   const concurrentDocument = await readPackagedSmokeTaskDocumentIdentity(concurrentWindow);
   const peerReloaded = new Promise<void>((resolveLoad) => peerWindow.webContents.once("did-finish-load", () => resolveLoad()));
@@ -6276,7 +6309,9 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
   });
   childWindow.webContents.on("render-process-gone", () => {
     if (inspectorWindowLifecycle?.markChildFailed(childWindow) === true && !childWindow.isDestroyed()) {
+      recordPackagedSmokeProgress("inspector_child_failure_native_destroy_started");
       childWindow.destroy();
+      recordPackagedSmokeProgress("inspector_child_failure_native_destroy_returned");
     }
   });
   childWindow.webContents.on("will-navigate", (event) => event.preventDefault());
@@ -6321,11 +6356,20 @@ function retireInspectorWindow(expectedWindow: BrowserWindow): void {
   inspectorWindowOwner = undefined;
   inspectorWindowLifecycle = undefined;
   inspectorWindowOccurrence = undefined;
+  recordPackagedSmokeProgress("inspector_passive_retirement_fenced");
   // Destroying a window.open guest synchronously from did-start-navigation can
   // cancel the owner's own navigation. Fence the occurrence immediately, then
   // let Chromium finish dispatching the navigation before retiring the guest.
   setImmediate(() => {
-    if (!expectedWindow.isDestroyed()) expectedWindow.destroy();
+    recordPackagedSmokeProgress("inspector_passive_retirement_native_state_check_started");
+    const alreadyDestroyed = expectedWindow.isDestroyed();
+    recordPackagedSmokeProgress(alreadyDestroyed
+      ? "inspector_passive_retirement_native_already_destroyed"
+      : "inspector_passive_retirement_native_destroy_started");
+    if (!alreadyDestroyed) {
+      expectedWindow.destroy();
+      recordPackagedSmokeProgress("inspector_passive_retirement_native_destroy_returned");
+    }
   });
 }
 
@@ -6674,6 +6718,39 @@ async function initializeDesktopWindowInteractionSettings(): Promise<void> {
   await desktopWindowInteractionSettings.initialize();
 }
 
+async function initializeDesktopMenuBar(): Promise<void> {
+  const directory = resolve(app.isPackaged ? process.resourcesPath : sourceDirectory, "native-menu-bar");
+  const resolveHelper = (): string | undefined => verifyMenuBarHelper({ directory, platform: process.platform, architecture: process.arch });
+  desktopMenuBar = new DesktopMenuBar({
+    available: isMenubarSupportedPlatform(process.platform, operatingSystemRelease()) && resolveHelper() !== undefined,
+    store: createMenuBarSettingsStore(join(app.getPath("userData"), "menu-bar-settings.json")),
+    resolveHelper,
+    onSettings: settings => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed() && isTrustedApplicationContents(window.webContents)) {
+          try { window.webContents.send(DESKTOP_CHANNELS.menuBarSettingsChanged, settings); } catch { /* A retiring renderer cannot own native settings. */ }
+        }
+      }
+    },
+    onAction: action => {
+      const contents = mainWindow?.webContents;
+      if (contents && !contents.isDestroyed() && !contents.isLoading() && isTrustedApplicationContents(contents)) {
+        try { contents.send(DESKTOP_CHANNELS.menuBarAction, action); } catch { /* A retired document cannot receive this intent. */ }
+      }
+    },
+    onOpenApp: showMainWindow,
+    onError: () => { process.stderr.write("JOKO_MENU_BAR_FAILED\n"); }
+  });
+  await desktopMenuBar.initialize();
+  powerMonitor.on("suspend", suspendDesktopMenuBar);
+  powerMonitor.on("lock-screen", () => { void desktopMenuBar?.suspend("lock").catch(() => undefined); });
+  powerMonitor.on("resume", resumeDesktopMenuBar);
+  powerMonitor.on("unlock-screen", () => { desktopMenuBar?.resume("lock"); });
+}
+
+function suspendDesktopMenuBar(): void { void desktopMenuBar?.suspend().catch(() => undefined); }
+function resumeDesktopMenuBar(): void { desktopMenuBar?.resume(); }
+
 async function initializeDesktopNativeTaskStatus(): Promise<void> {
   if (!nativeTaskStatusSupported) return;
   if (desktopNativeTaskStatusSettings === undefined) {
@@ -6924,6 +7001,7 @@ function dispatchNativeTaskStatusAction(action: DesktopNativeTaskStatusAction): 
 }
 
 function clearNativeTaskStatusProjection(): void {
+  desktopMenuBar?.clear();
   macNativeTaskStatusHost?.publish({
     ownerId: "desktop-renderer-unavailable",
     revision: "0",
@@ -7681,6 +7759,7 @@ async function stopManagedOrchestratorForCompleteExit(): Promise<void> {
     () => managedOrchestratorExitFence.stop(),
     stopDedicatedHardwareForQuitHandoff,
     stopNativeGamepadForQuitHandoff,
+    () => desktopMenuBar?.suspend("quit") ?? Promise.resolve(),
     () => externalTextInsertionCoordinator.waitForIdle(),
     () => globalVoiceSystemAudio.releaseAll().catch(() => undefined)
   ]);
@@ -7692,6 +7771,7 @@ async function recoverManagedOrchestratorAfterUpdateApplyFailure(): Promise<void
   if (nativeInstallQuitWasPending) quitting = false;
   if (quitting || desktopUpdateLifecycleDisposed) return;
   recoverNativeGamepadAfterQuitFailure();
+  desktopMenuBar?.resume("quit");
   await recoverDedicatedHardwareAfterQuitFailure();
   managedOrchestratorExitFence.releaseForRecovery();
   globalVoiceExitAdmissionClosed = false;
@@ -8629,6 +8709,10 @@ function registerIpc(): void {
     if (parameters.length !== 0) throw new TypeError("Desktop keep-awake get does not accept parameters.");
     return requireDesktopKeepAwakeCoordinator().get();
   });
+  registerDesktopLoginItemIpc({ app, ipc: ipcMain, platform: process.platform, executable: process.execPath, assertSource: assertTrustedIpcSender });
+  if (desktopMenuBar === undefined) throw new Error("Menu bar settings are not initialized.");
+  registerMenuBarIpc({ ipc: ipcMain, menuBar: desktopMenuBar,
+    assertSource: assertTrustedIpcSender, assertDocument: assertCurrentMainApplicationDocumentSender });
   ipcMain.handle(DESKTOP_CHANNELS.keepAwakeSet, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1 || typeof parameters[0] !== "boolean") {

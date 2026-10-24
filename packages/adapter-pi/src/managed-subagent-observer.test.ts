@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -10,6 +10,7 @@ import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./managed-durable-store.js";
 import {
   assertManagedSubagentControlTarget,
+  assertManagedSubagentHostedToolScope,
   ManagedSubagentObserver,
   writeManagedSubagentDurableControl
 } from "./managed-subagent-observer.js";
@@ -17,6 +18,30 @@ import { encodePolicyDecisionRequest } from "./policy-decision-bridge.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("managed Subagent public observation", () => {
+  it("fences hosted child tools to the exact live claimed runner and separates reserved registration from effects", async () => {
+    const root = join(await mkdtemp(join(tmpdir(), "joko-hosted-child-scope-")), "subagent-runs"), sessionId = "hosted-child-session", taskId = "original-parent:step-1";
+    const run = await physicalRun(root, sessionId, taskId, 1, 1, [], undefined, "running");
+    const directory = join(root, managedSubagentSessionKey(sessionId), run.runId);
+    const config = JSON.parse(await readFile(join(directory, "config.json"), "utf8"));
+    const status = JSON.parse(await readFile(join(directory, "status.json"), "utf8"));
+    const owner = JSON.parse(await readFile(join(directory, "owner.json"), "utf8"));
+    const scope = { taskId, runId: run.runId, launchToken: config.launchToken, runnerInstanceId: config.runnerInstanceId, nativeSessionId: config.nativeSessionId };
+    const input = { root, productSessionId: sessionId, productGeneration: 1, scope };
+    await expect(assertManagedSubagentHostedToolScope(input)).resolves.toMatchObject({ taskId });
+    await expect(assertManagedSubagentHostedToolScope({ ...input, scope: { ...scope, launchToken: randomUUID() } })).rejects.toThrow();
+    await expect(assertManagedSubagentHostedToolScope({ ...input, scope: { ...scope, runnerInstanceId: randomUUID() } })).rejects.toThrow();
+    await expect(assertManagedSubagentHostedToolScope({ ...input, scope: { ...scope, nativeSessionId: randomUUID() } })).rejects.toThrow();
+    await expect(assertManagedSubagentHostedToolScope({ ...input, productGeneration: 2 })).rejects.toThrow();
+    await expect(assertManagedSubagentHostedToolScope({ ...input, productSessionId: "another-session" })).rejects.toThrow();
+    await writeFile(join(directory, "status.json"), JSON.stringify({ ...status, state: "completed", endedAt: Date.now() }));
+    await expect(assertManagedSubagentHostedToolScope(input)).rejects.toThrow();
+    await writeFile(join(directory, "owner.json"), JSON.stringify({ ...owner, state: "reserved", runnerPid: 0 }));
+    await writeFile(join(directory, "status.json"), JSON.stringify({ ...status, state: "queued", runnerPid: 0 }));
+    await rm(join(directory, "runner.claim.json"));
+    await expect(assertManagedSubagentHostedToolScope({ ...input, reserved: true })).resolves.toMatchObject({ taskId });
+    await expect(assertManagedSubagentHostedToolScope(input)).rejects.toThrow();
+  });
+
   it("emits a canonical run before a globally sequenced transcript and resumes without replay", async () => {
     const root = join(await mkdtemp(join(tmpdir(), "joko-subagent-observer-")), "subagent-runs");
     const sessionId = `session-${randomUUID()}`;
@@ -919,6 +944,7 @@ async function physicalRun(
     runDir: runDirectory,
     runnerScript,
     runnerScriptSha256,
+    runnerInstanceId,
     productSessionId: sessionId,
     productGeneration: generation,
     parentTaskId: "parent-tool-call",

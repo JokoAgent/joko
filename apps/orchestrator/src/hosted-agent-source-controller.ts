@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import type { AdapterContext, BlobRef, NativeSessionBinding, PromptInput, ToolCall, NativeToolAuthorizationDecision } from "@joko/core";
+import type { AdapterContext, BlobRef, NativeSessionBinding, PromptInput, ToolCall, NativeToolAuthorization, NativeToolAuthorizationDecision } from "@joko/core";
 import type { HostedAgentSourceController } from "@joko/adapter-hosted";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 import { HostedAgentController, type HostedAgentOperationOwner } from "./hosted-agent-controller.js";
@@ -36,6 +36,10 @@ export function createHostedAgentSourceController(options: {
   readonly environmentProxyForTarget?: HostedAgentClaudeWebFetchOptions["environmentProxyForTarget"];
 }): HostedAgentSourceController {
   const owners = new Map<string, HostedAgentOperationOwner>(), port = options.poller.attach(options.runId);
+  const backgroundTasks = new Map<string, { readonly operationId: string; readonly context: AdapterContext;
+    readonly authority: NativeToolAuthorization | undefined; readonly scopeId: string; readonly background: boolean; readonly title: string; executor: HostedAgentExecutor | undefined }>();
+  const activeBackgroundScopes = new Map<string, string>();
+  const backgroundResumes = new Map<string, string>();
   const executor = (context: AdapterContext) => new HostedAgentExecutor({ context, virtualRoot: options.shadow,
     ...(options.remote ? { remote: options.remote } : {}),
     ...(options.aliases === undefined ? {} : { aliases: options.aliases(context) }),
@@ -85,11 +89,13 @@ export function createHostedAgentSourceController(options: {
     if ((input as { operation?: unknown } | null)?.operation === "codex.exec_server") {
       if (!options.codexExecutable) throw new Error("The Source native execution runtime is unavailable.");
       const authorization = { assertCurrent: () => ownerExecutor.assertCurrent(signal),
+        prepareParams: (method: string, params: unknown, actions: Parameters<HostedAgentExecutor["authorizeNativeActions"]>[0], active: AbortSignal) => ownerExecutor.prepareNativeParams(method, params, actions, active),
         authorize: (actions: Parameters<HostedAgentExecutor["authorizeNativeActions"]>[0], active: AbortSignal) => ownerExecutor.authorizeNativeActions(actions, active) };
       nativeRelay ??= new HostedAgentCodexExecServerRelay({ codexExecutable: options.codexExecutable,
         cwd: options.context.target.workspaceRoot, workspace: initialExecutor.workspace, sessionId: options.context.sessionId,
-        ...(options.remote ? { openProcess: active => options.remote!.openCodex(active) } : { env: terminalEnvironment() }),
+        ...(options.remote ? { openProcess: active => options.remote!.openCodex(active), pathStyle: options.remote.authority.pathStyle } : { env: terminalEnvironment() }),
         assertCurrent: () => { options.assertContext(options.context); options.assertCurrent(); },
+        prepareParams: (method, params, actions, active) => initialExecutor.prepareNativeParams(method, params, actions, active),
         authorize: (actions, active) => initialExecutor.authorizeNativeActions(actions, active),
         ...(options.commandConcurrencyGate === undefined ? {} : { commandConcurrencyGate: options.commandConcurrencyGate }) });
       return nativeRelay.execute(input, signal, authorization);
@@ -97,23 +103,96 @@ export function createHostedAgentSourceController(options: {
     return await claudeExecutor.execute(input, signal, claudeAuthorization) ?? ownerExecutor.execute(input, signal);
     };
   };
+  const ownedTools = (operationId: string, ownerExecutor: HostedAgentExecutor, context: AdapterContext, prompt?: PromptInput) => {
+    const ordinary = executeTool(ownerExecutor, context, prompt);
+    return async (input: unknown, signal: AbortSignal): Promise<Record<string, unknown>> => {
+      const value = input as Record<string, unknown> | null;
+      if (value?.operation === "background.register") {
+        const registration = value as { taskId?: unknown; scopeId?: unknown; originalOperationId?: unknown; title?: unknown; parentTaskId?: unknown; background?: unknown };
+        const { taskId, scopeId, originalOperationId, title, parentTaskId } = registration;
+        if (typeof taskId !== "string" || !taskId || taskId.length > 256 || /[\0\r\n]/u.test(taskId)
+          || typeof scopeId !== "string" || !/^[0-9a-f-]{36}$/iu.test(scopeId)
+          || typeof originalOperationId !== "string" || !owners.has(originalOperationId)
+          || typeof title !== "string" || !title || title.length > 512 || typeof registration.background !== "boolean"
+          || parentTaskId !== undefined && (typeof parentTaskId !== "string" || parentTaskId.length > 256)) throw new Error("The original background task identity is unavailable.");
+        options.assertContext(context); options.assertCurrent();
+        const previous = backgroundTasks.get(taskId);
+        if (previous?.scopeId === scopeId) {
+          if (previous.operationId !== originalOperationId) throw new Error("The original background task owner conflicts.");
+          return { registered: true };
+        }
+        if (previous ? previous.operationId !== originalOperationId || backgroundResumes.get(operationId) !== taskId
+          : originalOperationId !== operationId) throw new Error("The original background task owner conflicts.");
+        // Resume is an explicitly authorized child-control occurrence. Its
+        // context retains the completed parent for event ownership; it is not
+        // an ordinary foreground native-tool grant. Child tools retain the
+        // original scoped authority below and recheck it on every effect.
+        if (!previous) context.nativeToolAuthorization?.assertCurrent();
+        if (!previous && backgroundTasks.size >= 65_536) throw new Error("The original background task capacity is unavailable.");
+        const originalContext = previous?.context ?? context;
+        const backgroundAuthority = previous?.authority ?? originalContext.nativeToolAuthorization?.forBackgroundTask?.(taskId);
+        const authority = registration.background ? backgroundAuthority : originalContext.nativeToolAuthorization;
+        if (registration.background && originalContext.nativeToolAuthorization && !authority) throw new Error("The original background task authorization is unavailable.");
+        const assertScope = () => {
+          if (backgroundTasks.get(taskId)?.scopeId !== scopeId || activeBackgroundScopes.get(scopeId) !== taskId) throw new Error("The native background runner was retired.");
+          options.assertContext(originalContext); options.assertCurrent();
+        };
+        const scopedContext: AdapterContext = { ...originalContext, ...(authority === undefined ? {} : { nativeToolAuthorization: {
+          required: authority.required, capture: authority.capture,
+          ...(authority.snapshot === undefined ? {} : { snapshot: () => { assertScope(); return authority.snapshot!(); } }),
+          assertCurrent: revision => { assertScope(); authority.assertCurrent(revision); },
+          review: async request => { assertScope(); const decision = await authority.review(request); assertScope(); return decision; }
+        } }) };
+        const childExecutor = executor(scopedContext);
+        backgroundTasks.set(taskId, { operationId: originalOperationId, context: originalContext, authority: backgroundAuthority,
+          scopeId, background: registration.background, title, executor: childExecutor });
+        if (previous) activeBackgroundScopes.delete(previous.scopeId);
+        activeBackgroundScopes.set(scopeId, taskId);
+        previous?.executor?.dispose();
+        if (registration.background) await originalContext.emit({ type: "background_task", taskId, title, state: "queued",
+          ...(parentTaskId === undefined ? {} : { parentTaskId }) });
+        options.assertContext(context); options.assertCurrent();
+        return { registered: true };
+      }
+      if (value?.backgroundScope !== undefined) {
+        const taskId = typeof value.backgroundScope === "string" ? activeBackgroundScopes.get(value.backgroundScope) : undefined;
+        const task = taskId === undefined ? undefined : backgroundTasks.get(taskId);
+        if (!task?.executor || task.operationId !== operationId) throw new Error("The native background runner was retired.");
+        const { backgroundScope: _scope, ...request } = value;
+        return task.executor.execute(request, signal);
+      }
+      return ordinary(input, signal);
+    };
+  };
   const controller = new HostedAgentController({ port, context: options.context, executor: initialExecutor, binding: options.binding,
     ...(options.onGroupSwitch === undefined ? {} : { onGroupSwitch: options.onGroupSwitch }),
+    onEvent: async event => {
+      if (event.type !== "subagent_run" || !["completed", "failed", "stopped"].includes(event.run.state)) return;
+      const task = backgroundTasks.get(event.run.id);
+      if (!task || event.run.providerRunIds[0] !== task.scopeId) return;
+      activeBackgroundScopes.delete(task.scopeId); task.executor?.dispose(); task.executor = undefined;
+      if (task.background) await task.context.emit({ type: "background_task", taskId: event.run.id, title: event.run.title ?? task.title,
+        state: event.run.state === "stopped" ? "aborted" : event.run.state === "failed" ? "failed" : "completed",
+        ...(event.run.parentTaskId === undefined ? {} : { parentTaskId: event.run.parentTaskId }),
+        ...(event.run.startedAt === undefined ? {} : { startedAt: event.run.startedAt }), endedAt: event.run.endedAt ?? Date.now(),
+        ...(event.run.error === undefined ? {} : { error: event.run.error }) });
+    },
     temporaryRoot: join(options.temporaryRoot, options.runId), assertCurrent: options.assertCurrent, resolveOperation: id => {
       const owner = owners.get(id); if (!owner) throw new Error("The original native dispatch is unavailable."); return owner;
     } });
   return {
-    registerOperation: (id, context, fence, input) => {
+    registerOperation: (id, context, fence, input, backgroundResume) => {
       options.assertContext(context); options.assertCurrent();
       if (!id || id.length > 512 || /[\0\r\n]/u.test(id) || context.sessionId !== options.context.sessionId || context.generation !== options.context.generation
         || context.target.id !== options.context.target.id || context.target.workspaceRoot !== options.context.target.workspaceRoot) throw new Error("The native operation belongs to another Source task.");
       if (owners.has(id)) return;
       if (owners.size >= 65_536) throw new Error("The original native operation capacity is unavailable.");
+      if (backgroundResume?.action === "resume") backgroundResumes.set(id, backgroundResume.runId);
       // New input aliases must project identically in live events and after
       // native history is reloaded with the accepted input receipts.
       if (options.aliases) initialExecutor.workspace.addAliases(options.aliases(context));
       const sourceExecutor = id === options.runId ? initialExecutor : executor(context);
-      owners.set(id, { context, executor: sourceExecutor, executeTool: executeTool(sourceExecutor, context, input), ...(fence === undefined ? {} : {
+      owners.set(id, { context, executor: sourceExecutor, executeTool: ownedTools(id, sourceExecutor, context, input), ...(fence === undefined ? {} : {
         persistFence: async (operationId, preparation) => {
           if (operationId !== id) throw new Error("The native dispatch confirmation belongs to another operation.");
           options.assertContext(context); options.assertCurrent(); await fence(preparation); options.assertContext(context); options.assertCurrent();
@@ -122,6 +201,7 @@ export function createHostedAgentSourceController(options: {
     },
     start: () => controller.start(), abortPending: () => controller.abortPending(),
     projectResult: value => controller.projectResult(value), projectState: state => controller.projectState(state), projectHistory: history => controller.projectHistory(history),
-    stop: async () => { lifetime.abort(); await claudeExecutor.dispose(); await controller.stop(); await nativeRelay?.close(); port.detach(); initialExecutor.dispose(); for (const owner of owners.values()) owner.executor.dispose(); owners.clear(); }
+    stop: async () => { lifetime.abort(); await claudeExecutor.dispose(); await controller.stop(); await nativeRelay?.close(); port.detach(); initialExecutor.dispose(); for (const owner of owners.values()) owner.executor.dispose(); owners.clear();
+      for (const task of backgroundTasks.values()) task.executor?.dispose(); backgroundTasks.clear(); activeBackgroundScopes.clear(); backgroundResumes.clear(); }
   };
 }

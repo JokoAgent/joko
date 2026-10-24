@@ -164,13 +164,14 @@ final class JokoConnectionUITests: XCTestCase {
 
     private func replace(_ field: XCUIElement, with text: String) {
         tap(field)
-        // The iPhone's software keyboard can leave Command-A at the insertion
-        // point. Select the single-line paragraph through its real gesture,
-        // then verify deletion before entering any replacement text.
+        // WKWebView's default hit point and repeated taps can leave the caret
+        // at the start without selecting text. Move to the trailing side of
+        // this short, single-line address, then delete its observed characters
+        // through the real keyboard and verify the empty value before typing.
         let placeholder = field.placeholderValue ?? ""
         if let value = field.value as? String, !value.isEmpty && value != placeholder {
-            field.tap(withNumberOfTaps: 3, numberOfTouches: 1)
-            field.typeText(XCUIKeyboardKey.delete.rawValue)
+            field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
+            field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: value.count))
             let cleared = XCTNSPredicateExpectation(predicate: NSPredicate(
                 format: "value == '' OR value == %@", placeholder), object: field)
             XCTAssertEqual(XCTWaiter.wait(for: [cleared], timeout: 10), .completed,

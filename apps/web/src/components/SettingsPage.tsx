@@ -71,6 +71,8 @@ import { GamepadSettings } from "./GamepadSettings.js";
 import { DedicatedHardwareSettings } from "./DedicatedHardwareSettings.js";
 import { DesktopAutoRelaunchSetting } from "./DesktopAutoRelaunchSetting.js";
 import { DesktopMainWindowCloseSetting } from "./DesktopMainWindowCloseSetting.js";
+import { DesktopLoginItemSetting } from "./DesktopLoginItemSetting.js";
+import { DesktopMenuBarSetting } from "./DesktopMenuBarSetting.js";
 import { DesktopBetaChannelSetting } from "./DesktopBetaChannelSetting.js";
 import { DesktopRemoteDesktopSettings } from "./DesktopRemoteDesktopSettings.js";
 import { PersonalizationMemorySettings } from "./PersonalizationMemorySettings.js";
@@ -1260,6 +1262,8 @@ export function GeneralSettings({ controller, snapshot, runAction, onSuccess, sh
           />
       </div>
       <DesktopMainWindowCloseSetting t={t} />
+      <DesktopLoginItemSetting t={t} />
+      <DesktopMenuBarSetting t={t} />
       {activationClickAvailable && <div className="setting-row">
         <div>
           <strong><MousePointerClick aria-hidden="true" />{t("settings.activationClick")}</strong>

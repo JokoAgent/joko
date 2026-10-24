@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, readFile, readdir } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { availableParallelism, freemem, homedir, loadavg, totalmem } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -120,10 +120,69 @@ export function projectOwnedCrash(report, owner) {
     termination: { namespace: known(namespaces, report.termination?.namespace), code: code(report.termination?.code) } };
 }
 
+export function projectOwnedStartupLogs(records, owner) {
+  const startup = owner.startup;
+  const marker = `/${owner.simulatorUdid}/`, start = owner.installedExecutable?.indexOf(marker) ?? -1;
+  if (!Array.isArray(records) || start < 0 || !owner.bundleId
+    || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(owner.simulatorUdid ?? "")
+    || !Number.isSafeInteger(startup?.pid) || startup.pid <= 1
+    || !Number.isFinite(startup.startedAt) || !Number.isFinite(startup.finishedAt) || startup.finishedAt < startup.startedAt) {
+    throw new Error("No exact pre-input application occurrence is available for startup logs.");
+  }
+  const suffix = owner.installedExecutable.slice(start);
+  const events = { launchMessages: 0, launchFailures: 0, processTerminations: 0, unresponsive: 0,
+    provisionalLoadFailures: 0, loadFailures: 0, finishedLoads: 0 };
+  let ownedRecords = 0, webKitRecords = 0;
+  for (const record of records) {
+    if (record?.processID !== startup.pid || typeof record.processImagePath !== "string" || !record.processImagePath.endsWith(suffix)) continue;
+    const timestamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
+    if (!Number.isFinite(timestamp) || timestamp < startup.startedAt || timestamp > startup.finishedAt) continue;
+    ownedRecords++;
+    if (record.subsystem !== "com.apple.WebKit" || typeof record.eventMessage !== "string") continue;
+    webKitRecords++;
+    // Retain only fixed event counters. Native log messages can contain URLs,
+    // credentials or page text and must never enter the evidence artifact.
+    const message = record.eventMessage;
+    if (message.includes("WebProcessProxy::didFinishLaunching:")) events.launchMessages++;
+    if (message.includes("WebProcessProxy::didFinishLaunching: Invalid connection identifier")) events.launchFailures++;
+    if (message.includes("WebProcessProxy::processDidTerminateOrFailedToLaunch:")) events.processTerminations++;
+    if (message.includes("WebProcessProxy::didBecomeUnresponsive:")) events.unresponsive++;
+    if (message.includes("WebPageProxy::didFailProvisionalLoadForFrame:")) events.provisionalLoadFailures++;
+    if (message.includes("WebPageProxy::didFailLoadForFrame:")) events.loadFailures++;
+    if (message.includes("WebPageProxy::didFinishLoadForFrame:")) events.finishedLoads++;
+  }
+  return { examinedRecords: records.length, ownedRecords, webKitRecords, events };
+}
+
+async function collectOwnedStartupLogs(owner) {
+  const startup = owner.startup;
+  if (!Number.isSafeInteger(startup?.pid) || startup.pid <= 1 || !Number.isFinite(startup.startedAt)
+    || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(owner.simulatorUdid ?? "")
+    || !owner.installedExecutable || !owner.bundleId) return undefined;
+  const seconds = Math.ceil((Date.now() - startup.startedAt) / 1000);
+  if (seconds < 1 || seconds > 600) return { unavailable: true };
+  const options = { timeout: 5_000, maxBuffer: 512 * 1024, signal: AbortSignal.timeout(5_000) };
+  try {
+    const assertOccurrence = async () => {
+      const { stdout } = await exec("/bin/ps", ["-ww", "-p", String(startup.pid), "-o", "comm="], options);
+      if (await realpath(stdout.trim()) !== owner.installedExecutable) throw new Error("The startup process occurrence changed.");
+    };
+    await assertOccurrence();
+    const { stdout } = await exec("xcrun", ["simctl", "spawn", owner.simulatorUdid, "log", "show", "--style", "json", "--info",
+      "--last", `${seconds}s`, "--predicate", `processID == ${startup.pid}`], options);
+    await assertOccurrence();
+    return { pidVerifiedBeforeAndAfter: true, timeoutMs: 5_000, maximumBytes: 512 * 1024,
+      ...projectOwnedStartupLogs(JSON.parse(stdout), { ...owner, startup: { ...startup, finishedAt: Date.now() } }) };
+  } catch { return { unavailable: true, timeoutMs: 5_000, maximumBytes: 512 * 1024 }; }
+}
+
 export async function collectRuntimeFailureDiagnostics(owner) {
   const result = { ...await collectHostResources(),
     installedApplicationLocated: Boolean(owner.installedExecutable), examinedReports: 0, unreadableReports: 0, ownedCrashes: [] };
   if (!owner.installedExecutable || !owner.executable) return result;
+  // The caller supplies startup only before any connection input or XCTest.
+  // Query only the verified app PID inside its exact owned Simulator.
+  if (process.platform === "darwin" && owner.startup) result.preInputStartupLogs = await collectOwnedStartupLogs(owner);
   const directory = join(homedir(), "Library", "Logs", "DiagnosticReports");
   const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
   const candidates = [];

@@ -5476,6 +5476,17 @@ export type NewSessionDraftSelection =
   | { readonly kind: "target"; readonly targetId: string }
   | { readonly kind: "dialogue"; readonly backendId: string };
 
+/** One in-memory UI intent. It never carries input or grants permission to create a task. */
+export interface NewSessionModelRequest {
+  readonly requestId: string;
+  readonly profile: ConnectionProfile;
+  readonly connectionGeneration: number;
+  readonly snapshotGeneration: string;
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+}
+
 /** Owner/connection-scoped delayed-create state. Attachment bytes stay in the
  * local browser draft store. Extra-directory authority is represented only by
  * opaque approved-record IDs and is revalidated against the current snapshot

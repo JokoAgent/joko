@@ -424,7 +424,11 @@ function classifyTool(name: string, input: unknown, control: Control): ToolRisk 
     if (dangerousCommand.test(command) || credentialPath.test(command)) return "dangerous";
     if (shellMeta.test(command)) return "ambiguous";
     const normalized = command.toLowerCase();
-    if (["pwd", "ls", "dir", "git status", "git diff", "git log", "git show"].includes(normalized)) {
+    const args = command.split(/\s+/u);
+    const safeGitInspection = args[0] === "git" && (args[1] === "diff" || args[1] === "show")
+      && args.includes("--no-ext-diff") && args.includes("--no-textconv")
+      && args.slice(2).every(arg => ["--no-ext-diff", "--no-textconv", "--stat"].includes(arg));
+    if (["pwd", "ls", "dir", "git status", "git log"].includes(normalized) || safeGitInspection) {
       return "safe_command";
     }
   }

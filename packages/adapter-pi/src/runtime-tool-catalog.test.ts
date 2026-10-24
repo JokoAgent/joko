@@ -208,6 +208,23 @@ describe("Pi runtime tool catalog projection", () => {
     })).toThrow("invalid tools[0].name");
   });
 
+  it("keeps a live document tool catalog with scalar, blank and formula cell alternatives", () => {
+    const result = projectCatalog({ format: 1, complete: true, activeToolNames: ["make_xlsx"], tools: [{
+      ...tool(0), name: "make_xlsx", parameters: { type: "object", properties: {
+        rows: { type: "array", items: { type: "array", items: { oneOf: [
+          { type: "string" }, { type: "number" }, { type: "boolean" }, { type: "null" },
+          { type: "object", properties: {
+            formula: { type: "string" },
+            result: { oneOf: [{ type: "string" }, { type: "number" }, { type: "boolean" }] }
+          }, required: ["formula", "result"], additionalProperties: false }
+        ] } } }
+      } }
+    }] });
+    expect(result).toMatchObject({ kind: "catalog", tools: [{ name: "make_xlsx", active: true, inputSchema: {
+      fields: [{ fieldPath: "rows", type: "array" }, { fieldPath: "rows[]", type: "array" }, { fieldPath: "rows[][]", type: "unknown" }]
+    } }] });
+  });
+
   it("ignores ordinary extension statuses", () => {
     expect(new PiRuntimeToolCatalogAssembler().consume({
       method: "setStatus",

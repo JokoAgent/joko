@@ -134,6 +134,70 @@ describe("Pi built-in tool catalog", () => {
     });
   });
 
+  it("keeps existing document oneOf metrics, sheet selectors and formula cells in the catalog", () => {
+    const cell = { oneOf: [
+      { type: "string", maxLength: 32_000 }, { type: "number" }, { type: "boolean" }, { type: "null" },
+      { type: "object", properties: {
+        formula: { type: "string", minLength: 1, maxLength: 8_192 },
+        result: { oneOf: [{ type: "string", maxLength: 32_000 }, { type: "number" }, { type: "boolean" }] }
+      }, required: ["formula", "result"], additionalProperties: false }
+    ] };
+    const schema = { type: "object", properties: {
+      slides: { type: "array", items: { type: "object", properties: {
+        metrics: { type: "array", items: { type: "object", properties: {
+          value: { oneOf: [{ type: "string", maxLength: 1_000 }, { type: "number" }] }
+        }, required: ["value"] } }
+      } } },
+      sheet: { oneOf: [{ type: "string", minLength: 1, maxLength: 31 }, { type: "integer", minimum: 1 }] },
+      rows: { type: "array", items: { type: "array", items: cell } }
+    } };
+    const original = JSON.stringify(schema);
+    const result = projectPiInputSchema(schema, "document_tools");
+    expect(result.fields).toEqual(expect.arrayContaining([
+      expect.objectContaining({ fieldPath: "slides[].metrics[].value", type: "unknown", required: true }),
+      expect.objectContaining({ fieldPath: "sheet", type: "unknown", required: false }),
+      expect.objectContaining({ fieldPath: "rows[][]", type: "unknown", required: true })
+    ]));
+    expect(result.fields.some(field => field.fieldPath.startsWith("rows[][]."))).toBe(false);
+    expect(JSON.stringify(schema)).toBe(original);
+  });
+
+  it.each(["anyOf", "oneOf"] as const)("retains nullable and literal %s projections", keyword => {
+    expect(projectPiInputSchema({ type: "object", properties: {
+      mode: { [keyword]: [{ type: "string", const: "read" }, { type: "string", const: "write" }] },
+      settings: { [keyword]: [{ type: "object", properties: { enabled: { type: "boolean" } } }, { type: "null" }] }
+    } }, "union_tools")).toMatchObject({ fields: [
+      { fieldPath: "mode", type: "string", enumValues: ["read", "write"] },
+      { fieldPath: "settings", type: "object" },
+      { fieldPath: "settings.enabled", type: "boolean" }
+    ] });
+  });
+
+  it("rejects malformed, unsupported and cyclic document union branches", () => {
+    const project = (value: unknown) => projectPiInputSchema({ type: "object", properties: { value } }, "document_tools");
+    expect(() => project({ oneOf: [] })).toThrow("unsupported schema type");
+    expect(() => project({ oneOf: [{ type: "string" }, { type: "invented" }] })).toThrow("unsupported schema type");
+    expect(() => project({ oneOf: [{ type: "string" }, false] })).toThrow("invalid value.oneOf[1] object");
+    expect(() => project({ oneOf: [{ type: "string" }, { type: "object", properties: { formula: { type: "invented" } } }] }))
+      .toThrow("unsupported schema type");
+    expect(() => project({ oneOf: [{ type: "string" }, { type: "object", properties: { formula: { type: "string", minLength: -1 } } }] }))
+      .toThrow("invalid value.formula.minLength");
+    const cyclic: Record<string, unknown> = { oneOf: [{ type: "string" }] };
+    (cyclic["oneOf"] as unknown[]).push({ type: "object", properties: { formula: cyclic } });
+    expect(() => project(cyclic)).toThrow("cyclic object graph");
+  });
+
+  it.each(["anyOf", "oneOf"] as const)("retains original identity when rejecting nullable %s cycles", keyword => {
+    const objectUnion: Record<string, unknown> = {};
+    objectUnion[keyword] = [{ type: "object", properties: { again: objectUnion } }, { type: "null" }];
+    expect(() => projectPiInputSchema({ type: "object", properties: { value: objectUnion } }, "document_tools"))
+      .toThrow("cyclic object graph");
+    const arrayUnion: Record<string, unknown> = {};
+    arrayUnion[keyword] = [{ type: "array", items: arrayUnion }, { type: "null" }];
+    expect(() => projectPiInputSchema({ type: "object", properties: { value: arrayUnion } }, "document_tools"))
+      .toThrow("cyclic object graph");
+  });
+
   it("projects more than 256 fields and schemas deeper than eight levels without recursion limits", () => {
     const properties = Object.fromEntries(
       Array.from({ length: 257 }, (_, index) => [`field_${index.toString().padStart(3, "0")}`, {

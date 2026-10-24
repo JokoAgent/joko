@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { execFile, type ChildProcess } from "node:child_process";
 import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, posix } from "node:path";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertArchiveEntrySafe, assertPathWithin } from "./security.js";
@@ -113,6 +113,47 @@ export async function readLlamaCppRecord(file: string): Promise<unknown> {
   return JSON.parse(await readFile(file, "utf8")) as unknown;
 }
 const exec = promisify(execFile);
+
+/** Official native bundles use relative, versioned shared-library links.
+ * Validate the complete graph before tar can traverse any archive entry. */
+function validateRuntimeArchiveLinks(entries: readonly string[], listing: string, platform: NodeJS.Platform): void {
+  const names = new Set<string>();
+  const canonical = (name: string) => {
+    const normalized = posix.normalize(name.replaceAll("\\", "/")).replace(/\/$/u, "");
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  for (const entry of entries) {
+    assertArchiveEntrySafe(entry);
+    if (/[\u0000-\u001f\u007f:]/u.test(entry)) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive contains an invalid path.");
+    const name = canonical(entry);
+    if (names.has(name)) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive contains duplicate paths.");
+    names.add(name);
+  }
+  const links = new Map<string, string>();
+  for (const line of listing.split(/\r?\n/u).filter(Boolean)) {
+    if (/^[-d]/u.test(line)) continue;
+    const symbolic = line.startsWith("l"), hard = line.startsWith("h");
+    const match = (symbolic ? /\s([A-Za-z0-9_./-]+) -> ([A-Za-z0-9_./-]+)$/u
+      : hard ? /\s([A-Za-z0-9_./-]+) link to ([A-Za-z0-9_./-]+)$/u : undefined)?.exec(line);
+    if (!match) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive contains an unsupported entry or link.");
+    const name = canonical(match[1]!), target = match[2]!;
+    const destination = canonical(symbolic ? posix.join(posix.dirname(name), target) : target);
+    if (!names.has(name) || links.has(name) || posix.isAbsolute(target) || destination === ".." || destination.startsWith("../") || !names.has(destination)) {
+      throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive link escapes its owned files.");
+    }
+    links.set(name, destination);
+  }
+  for (const [name, target] of links) {
+    // No file may be extracted through a linked directory, even if its final
+    // target looks contained. Links are supported only for library files.
+    if ([...names].some(candidate => candidate.startsWith(`${name}/`))) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive traverses a linked directory.");
+    const seen = new Set([name]); let destination = target;
+    while (links.has(destination)) {
+      if (seen.has(destination)) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive contains a link cycle.");
+      seen.add(destination); destination = links.get(destination)!;
+    }
+  }
+}
 export async function terminateLlamaCppTree(child: ChildProcess, platform: NodeJS.Platform = process.platform): Promise<boolean> {
   if (!Number.isSafeInteger(child.pid) || child.pid === undefined) return false;
   if (platform === "win32") {
@@ -125,8 +166,7 @@ export async function extractLlamaCppArchive(input: { readonly archivePath: stri
   const run = async (args: string[]) => (await exec(tar, args, { windowsHide: true, signal: input.signal, timeout: 120000, maxBuffer: 4 * 1024 * 1024 })).stdout;
   const entries = (await run(["-tf", input.archivePath])).split(/\r?\n/u).filter(Boolean);
   if (entries.length === 0 || entries.length > 8192) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive is unavailable.");
-  for (const entry of entries) assertArchiveEntrySafe(entry);
-  if ((await run(["-tvf", input.archivePath])).split(/\r?\n/u).some(line => /^[lh]/u.test(line))) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive contains links.");
+  validateRuntimeArchiveLinks(entries, await run(["-tvf", input.archivePath]), input.platform);
   await mkdir(input.destination, { recursive: true, mode: 0o700 });
   await run(["-xf", input.archivePath, "-C", input.destination, "--no-same-owner", "--no-same-permissions"]);
   const root = await realpath(input.destination), found: string[] = [];
@@ -134,7 +174,12 @@ export async function extractLlamaCppArchive(input: { readonly archivePath: stri
     if (depth > 8) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive is nested too deeply.");
     for (const name of await readdir(directory)) {
       const file = join(directory, name), stat = await lstat(file); assertPathWithin(root, file);
-      if (stat.isSymbolicLink()) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive contains links.");
+      if (stat.isSymbolicLink()) {
+        const target = await realpath(file); assertPathWithin(root, target);
+        const linked = await lstat(target);
+        if (!linked.isFile() || name === (input.platform === "win32" ? "llama-server.exe" : "llama-server")) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive link does not resolve to a regular library file.");
+        continue;
+      }
       if (stat.isDirectory()) await visit(file, depth + 1);
       else if (stat.isFile() && name === (input.platform === "win32" ? "llama-server.exe" : "llama-server")) found.push(file);
       else if (!stat.isFile()) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime archive contains an unsupported entry.");

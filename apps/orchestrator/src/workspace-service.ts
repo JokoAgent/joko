@@ -1151,7 +1151,7 @@ export class WorkspaceService {
 
   /**
    * Project search: fixed string only, hidden files included, ignore
-   * files honoured, a 200-line per-file cap and a 1000-line global cap.
+   * files honoured and an explicit 1000-line global cap.
    * Results are yielded as ripgrep produces them so transport cancellation
    * terminates the owned child process instead of merely hiding late UI data.
    */
@@ -1232,6 +1232,7 @@ export class WorkspaceService {
     const scanLimit = offset + pageSize + 1;
     const args = [
       "--json",
+      "--crlf",
       "--line-number",
       "--column",
       "--no-heading",
@@ -3463,7 +3464,7 @@ function workspaceSearchResultFromRipgrep(match: WorkspaceRipgrepMatch): ParsedW
   } catch {
     throw new WorkspaceSearchError(`Workspace search returned a non-canonical path: ${path}`, "search_failed");
   }
-  const preview = match.data.lines.text.replace(/[\r\n]+$/u, "");
+  const preview = match.data.lines.text.replace(/\r?\n$/u, "");
   const previewBytes = Buffer.from(preview, "utf8");
   const byteBoundaries = workspaceSearchUtf8ByteBoundaries(preview);
   if (
@@ -3479,7 +3480,7 @@ function workspaceSearchResultFromRipgrep(match: WorkspaceRipgrepMatch): ParsedW
       !Number.isSafeInteger(submatch.start)
       || !Number.isSafeInteger(submatch.end)
       || submatch.start < 0
-      || submatch.end <= submatch.start
+      || submatch.end < submatch.start
       || submatch.end > previewBytes.byteLength
       || !byteBoundaries.has(submatch.start)
       || !byteBoundaries.has(submatch.end)

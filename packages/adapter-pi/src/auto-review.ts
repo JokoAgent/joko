@@ -132,7 +132,14 @@ export function createPiAutoReviewer(options: PiAutoReviewerOptions = {}): PiAut
   const destructiveCommand = /(?:^|[;&|\s])(?:sudo|doas|runas)(?:\s|$)|(?:^|[;&|\s])(?:rm|rmdir|rd|del|erase|shred|srm|unlink)(?:\s|$)|\b(?:Remove-Item|Clear-Content|Clear-Disk|Remove-Partition|Stop-Computer|Restart-Computer)\b|\bgit\s+(?:reset\s+--hard|clean\s+-[^\s]*f|push\b[^\r\n]*--force|restore\b|branch\s+-[dD]\b|checkout\b[^\r\n]*--\s)|\b(?:mkfs(?:\.[a-z0-9]+)?|diskpart|format|shutdown|reboot|halt|poweroff|truncate)\b|\bdd\b[^\r\n]*\bof\s*=|\b(?:DROP|TRUNCATE)\s+(?:DATABASE|SCHEMA|TABLE)\b|\b(?:chmod|chown)\b[^\r\n]*(?:\/etc|\/usr|\/bin|\/sbin|\/System|[A-Za-z]:[\\/]Windows)/i;
   const destructiveOperation = /(?:^|[_-])(?:delete|destroy|drop|erase|purge|remove|revoke|terminate|truncate|unpublish|wipe)(?:$|[_-])/i;
   const systemPathInText = /(?:^|[\s"'=])(?:\/(?:private\/)?(?:etc|bin|sbin|boot|dev|proc|sys|root|System|Library)(?:\/[^\s"']*)?|\/(?:private\/)?var\/(?:lib|db|run)(?:\/[^\s"']*)?|[A-Za-z]:[\\/](?:Windows|Program Files(?: \(x86\))?|ProgramData)(?:[\\/][^\s"']*)?)(?=$|[\s"'])/i;
-  const safeShell = /^(?:pwd|whoami|hostname|uname(?:\s+-[a-z]+)?|git\s+(?:status(?:\s+--(?:short|porcelain(?:=v\d)?))?|diff(?:\s+--stat)?|log(?:\s+--oneline)?|show(?:\s+--stat)?))$/i;
+  const safeShell = /^(?:pwd|whoami|hostname|uname(?:\s+-[a-z]+)?|git\s+(?:status(?:\s+--(?:short|porcelain(?:=v\d)?))?|log(?:\s+--oneline)?))$/i;
+
+  function safeGitInspection(command: string): boolean {
+    const args = command.split(/\s+/u);
+    return args[0] === "git" && (args[1] === "diff" || args[1] === "show")
+      && args.includes("--no-ext-diff") && args.includes("--no-textconv")
+      && args.slice(2).every(arg => ["--no-ext-diff", "--no-textconv", "--stat"].includes(arg));
+  }
 
   function boundedText(value: string, limit: number, pathLike = false): string {
     const redacted = value
@@ -366,7 +373,7 @@ export function createPiAutoReviewer(options: PiAutoReviewerOptions = {}): PiAut
       const command = field(input, ["command"]);
       if (!command) return { tier: "gray", reason: "Shell command is missing", evidence };
       if (/[><`]|\$\(|\|\||&&|;|\n|\r/.test(command)) return { tier: "gray", reason: "Compound shell command requires contextual review", evidence };
-      if (safeShell.test(command.trim())) return { tier: "green", reason: "Command is a narrowly scoped read-only inspection", evidence };
+      if (safeShell.test(command.trim()) || safeGitInspection(command.trim())) return { tier: "green", reason: "Command is a narrowly scoped read-only inspection", evidence };
       return { tier: "gray", reason: "Shell command requires contextual review", evidence };
     }
 

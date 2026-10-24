@@ -513,6 +513,25 @@ describe("formal Workspace Files gateway", () => {
     gateway.disconnect();
   });
 
+  it.each([["^", 0n, 1], ["$", 5n, 4]] as const)("preserves the zero-width %s UTF-8 submatch", async (query, byte, column) => {
+    const transport = transportFor((method, input) => {
+      if (method.localName !== "searchWorkspace") throw new Error(`Unexpected RPC ${method.localName}`);
+      expect(input.regularExpression).toBe(true);
+      return create(SearchWorkspaceResponseSchema, {
+        matches: [{ relativePath: "unicode.txt", linePreview: "😀x", revision: { opaqueRevision: "file-revision" },
+          range: { startByte: byte, endByte: byte, startLine: 1, endLine: 1, startColumn: column, endColumn: column },
+          submatches: [{ startByte: byte, endByte: byte }] }],
+        revision: { value: 1n, etag: "search-revision" }, totalFiles: 1n, page: { totalSize: 1n }
+      });
+    });
+    const gateway = await connectedGateway(transport);
+    await expect(gateway.searchWorkspacePage("workspace-1", { query, caseSensitive: false, regularExpression: true })).resolves.toMatchObject({
+      matches: [{ submatches: [{ startByte: Number(byte), endByte: Number(byte) }],
+        range: { startByte: Number(byte), endByte: Number(byte), startColumn: column, endColumn: column } }]
+    });
+    gateway.disconnect();
+  });
+
   it("forwards exact search options, wraps the server cursor with its revision, and maps full ranges", async () => {
     const calls: any[] = [];
     const transport = transportFor(async (method, input) => {

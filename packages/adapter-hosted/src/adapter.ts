@@ -19,7 +19,7 @@ export interface HostedAgentSourceController {
   start(): Promise<void>;
   stop(): Promise<void>;
   abortPending(): void;
-  registerOperation(id: string, context: AdapterContext, fence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>, input?: PromptInput): void;
+  registerOperation(id: string, context: AdapterContext, fence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>, input?: PromptInput, backgroundResume?: SubagentControlInput): void;
   projectResult<T>(value: T): T;
   projectState(state: NativeSessionState): NativeSessionState;
   projectHistory(history: NativeHistoryProjection): NativeHistoryProjection;
@@ -297,7 +297,8 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     const observation = ["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind);
     const id = command.kind === "send" ? context.operationId! : context.operationId && !observation
       ? createHash("sha256").update(JSON.stringify([context.operationId, command.kind])).digest("hex") : randomUUID();
-    if (!observation) active.controller.registerOperation(id, context, fence, command.kind === "send" ? command.input : undefined);
+    if (!observation) active.controller.registerOperation(id, context, fence, command.kind === "send" ? command.input : undefined,
+      command.kind === "control_subagent" && command.input.action === "resume" ? command.input : undefined);
     const value = await active.connection.client.call(active.runId, id, command, context.signal);
     this.#check(context); active.connection.assertCurrent(); return active.controller.projectResult(value);
   }

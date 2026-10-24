@@ -92,6 +92,14 @@
       ]
     },
     {
+      "from": "dist/native-menu-bar",
+      "to": "native-menu-bar",
+      "filter": [
+        "manifest.json",
+        "joko-macos-menu-bar-helper"
+      ]
+    },
+    {
       "from": "dist/native-remote-desktop",
       "to": "native-remote-desktop",
       "filter": [

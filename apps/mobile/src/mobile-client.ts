@@ -9633,6 +9633,16 @@ export class MobileClient {
     const credential = this.#ready();
     const authorityKey = this.#taskAuthorityKey();
     if (!authorityKey) throw new Error("The current task authority is unavailable.");
+    const epoch = this.#epoch, signal = this.#abort!.signal, sourceGeneration = this.#taskGeneration();
+    const connectionCurrent = (): boolean => this.#current(epoch) && !signal.aborted && this.#foreground
+      && this.#state.status === "connected" && this.#credential === credential;
+    const isCurrent = (): boolean => {
+      const current = this.#selectedSession();
+      return connectionCurrent() && this.#taskGeneration() === sourceGeneration && this.#state.selectedId === sessionId
+        && current?.sessionId === sessionId && current.backendId === session.backendId && current.targetId === session.targetId
+        && current.nativeBinding?.runtimeGeneration === generation && !current.archived
+        && ![SessionState.CLOSED, SessionState.ARCHIVED].includes(current.state);
+    };
     const mentionControls = this.taskSessionMentionControls();
     const workspaceMentionControls = this.taskWorkspaceMentionControls();
     const workspaceMentionOwnerKey = workspaceMentionControls?.surfaceOwnerKey;
@@ -9660,8 +9670,10 @@ export class MobileClient {
     const draftIdentity = { profileId: this.taskDraftProfileId()!, sessionId };
     this.composerDrafts.save(draftIdentity, sendDraft);
     await this.composerDrafts.flush(draftIdentity);
+    if (!isCurrent()) return false;
     const cardEdits = pendingExtensionCardFormDelivery(extensionCardFormDeliveryScope(credential, sessionId));
     if (cardEdits && !await cardEdits) throw new Error("The card edits could not be saved. Retry the card edit before sending.");
+    if (!isCurrent()) return false;
     const currentSession = this.#selectedSession();
     if (this.#taskAuthorityKey() !== authorityKey || currentSession?.sessionId !== sessionId
       || currentSession.nativeBinding?.runtimeGeneration !== generation
@@ -9687,6 +9699,7 @@ export class MobileClient {
         throw new Error("The Workspace reference owner changed while the structured draft was being saved. Review the retained draft before sending.");
       }
       await this.#revalidateWorkspaceMentionPaths(currentWorkspaceMentionControls, sendDraft);
+      if (!isCurrent()) return false;
       if (this.#taskAuthorityKey() !== authorityKey
         || this.taskWorkspaceMentionControls()?.surfaceOwnerKey !== currentWorkspaceMentionControls.surfaceOwnerKey) {
         throw new Error("The Workspace reference owner changed while its paths were being checked. Review the retained draft before sending.");
@@ -9703,6 +9716,7 @@ export class MobileClient {
         currentWorkspacePathPasteControls.surfaceOwnerKey,
         workspacePathAtoms.map((atom) => atom.relativePath)
       );
+      if (!isCurrent()) return false;
       const latestPathControls = this.taskWorkspacePathPasteControls();
       if (!latestPathControls
         || latestPathControls.surfaceOwnerKey !== currentWorkspacePathPasteControls.surfaceOwnerKey
@@ -9716,6 +9730,7 @@ export class MobileClient {
         throw new Error("The catalog reference owner changed while the structured draft was being saved. Review the retained draft before sending.");
       }
       const catalog = await this.listTaskCatalogMentionCatalog(currentCatalogMentionControls.surfaceOwnerKey);
+      if (!isCurrent()) return false;
       if (this.#taskAuthorityKey() !== authorityKey
         || this.taskCatalogMentionControls()?.surfaceOwnerKey !== currentCatalogMentionControls.surfaceOwnerKey) {
         throw new Error("The catalog reference owner changed while its candidates were being checked. Review the retained draft before sending.");
@@ -9732,8 +9747,10 @@ export class MobileClient {
         credential,
         generation
       );
+      if (!isCurrent()) return false;
       observer.onDispatch?.(sendDraft);
-      const accepted = await this.#submit(create(OperationMutationSchema, {
+      if (!isCurrent()) return false;
+      const receipt = await this.#submitTracked(create(OperationMutationSchema, {
         preconditions: [create(OperationPreconditionSchema, {
           entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }), expectedGeneration: generation
         })],
@@ -9742,7 +9759,9 @@ export class MobileClient {
           input: mobileComposerInput(sendDraft),
           deliveryMode: observer.deliveryMode ?? QueueDeliveryMode.PROMPT
         }) }
-      }), { kind: "send", sessionId }, observer.operationId);
+      }), { kind: "send", sessionId }, false, observer.operationId, true, true,
+        { signal, isCurrent: connectionCurrent, beforeDispatch: isCurrent });
+      const accepted = receipt.accepted;
       if (accepted) {
         try {
           if (await this.composerDrafts.clearIfEqual(draftIdentity, sendDraft)) {
@@ -9754,6 +9773,9 @@ export class MobileClient {
         }
       }
       return accepted;
+    } catch (error) {
+      if (!connectionCurrent()) return false;
+      throw error;
     } finally { this.#releaseMutation(action); }
   }
 
@@ -10136,6 +10158,13 @@ export class MobileClient {
     credential: PairedCredential,
     generation: bigint
   ): Promise<MobileComposerDraft> {
+    const epoch = this.#epoch, signal = this.#abort?.signal;
+    const check = (): void => {
+      if (!this.#current(epoch) || signal?.aborted || this.#credential !== credential) {
+        throw new Error("The task attachment connection changed. Review the retained draft before sending.");
+      }
+    };
+    check();
     if (initial.attachments.every((attachment) => attachment.state === "uploaded")) return initial;
     if (!this.composerDrafts || !this.attachmentFiles) {
       throw new Error("Staged mobile attachment bytes are unavailable.");
@@ -10143,6 +10172,7 @@ export class MobileClient {
     if (!attachmentOwnerKey) throw new Error("The current task attachment authority is unavailable.");
     let current = initial;
     let snapshot = await this.composerDrafts.readSnapshot(identity);
+    check();
     if (snapshot.draft === undefined || !mobileComposerDraftsEqual(snapshot.draft, current)) {
       throw new Error("The retained task draft changed before its attachments could upload.");
     }
@@ -10160,9 +10190,11 @@ export class MobileClient {
       const source = await this.attachmentFiles.verifyForUpload(
         identity.profileId,
         attachment,
-        this.#abort?.signal
+        signal
       );
-      const blob = await this.network.uploadBlob(credential, source, this.#abort?.signal);
+      check();
+      const blob = await this.network.uploadBlob(credential, source, signal);
+      check();
       this.#assertTaskAttachmentUploadOwner(
         identity.sessionId,
         authorityKey,
@@ -10184,12 +10216,15 @@ export class MobileClient {
         throw new Error("The retained task draft changed while an attachment was uploading.");
       }
       await this.composerDrafts.flush(identity);
+      check();
       snapshot = await this.composerDrafts.readSnapshot(identity);
+      check();
       if (snapshot.draft === undefined || !mobileComposerDraftsEqual(snapshot.draft, next)) {
         throw new Error("The committed attachment could not be confirmed in the retained task draft.");
       }
       current = next;
       await this.#removeCommittedAttachmentFile(identity.profileId, attachment);
+      check();
     }
     return current;
   }
@@ -10238,9 +10273,12 @@ export class MobileClient {
     attachment: MobileLocalComposerAttachment
   ): Promise<void> {
     if (!this.attachmentFiles) return;
+    const epoch = this.#epoch, credential = this.#credential;
     try { await this.attachmentFiles.removeVisibleBytes(profileId, attachment); }
     catch (error) {
-      this.#set({ error: `${message(error)} The committed attachment will not be uploaded again.` });
+      if (this.#current(epoch) && this.#credential === credential) {
+        this.#set({ error: `${message(error)} The committed attachment will not be uploaded again.` });
+      }
     }
   }
 

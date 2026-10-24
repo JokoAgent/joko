@@ -306,6 +306,8 @@ export class FakeCodexAppServer {
     switch (method) {
       case "initialize":
         return { userAgent: this.userAgent, codexHome: this.codexHome, platformFamily: "unix", platformOs: "linux" };
+      case "environment/add":
+        return {};
       case "skills/list":
         return {
           data: [{

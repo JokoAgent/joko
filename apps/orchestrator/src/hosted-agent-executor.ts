@@ -13,6 +13,8 @@ import { terminalEnvironment } from "@joko/tool-terminal";
 import { ExecutorWorkspace, realPathOrAncestor, type ExecutorPathAlias } from "./hosted-agent-workspace.js";
 import { isShareCredentialCommand, isShareCredentialPath, shareCredentialGitReads } from "./hosted-agent-credentials.js";
 import { GitCredentialHistory } from "./hosted-agent-git-credentials.js";
+import { reviewNativeToolPolicy } from "./native-tool-policy.js";
+import { tightenNativeCodexFileSystemPolicy } from "./native-codex-filesystem-policy.js";
 import { hostedDirectoryId, hostedDirectoryPath } from "./hosted-agent-directories.js";
 import type { SourceInputMount } from "./hosted-agent-source-attachments.js";
 import type { HostedAgentPeerWorkspace } from "./hosted-agent-peer-workspace.js";
@@ -50,7 +52,8 @@ export interface HostedAgentExecutorOptions {
   };
 }
 export type NativeExecutorAction = { readonly kind: "read"; readonly path: string; readonly scope?: "tree" }
-  | { readonly kind: "write"; readonly path: string } | { readonly kind: "exec"; readonly command: string; readonly cwd: string };
+  | { readonly kind: "write"; readonly path: string; readonly scope?: "tree" } | { readonly kind: "exec"; readonly command: string; readonly cwd: string }
+  | { readonly kind: "network"; readonly url: string; readonly method: string };
 export interface HostedAgentExecutorEffects {
   readonly onOutput?: (chunk: Buffer) => void;
   readonly captureCwd?: boolean;
@@ -111,6 +114,19 @@ export class HostedAgentExecutor {
   dispose(): void { this.#lifetime.abort(); this.#seen.clear(); this.#approvals.clear(); this.#tools.clear(); }
   get workspace(): ExecutorWorkspace { return this.#workspace; }
   assertCurrent(signal: AbortSignal): void { this.#assertCurrent(signal); }
+  async prepareNativeParams(method: string, params: unknown, actions: readonly NativeExecutorAction[], signal: AbortSignal): Promise<unknown> {
+    const policy = this.#options.readPolicy(), native = this.#options.context.nativeToolAuthorization, revision = native?.capture();
+    const assertCurrent = () => {
+      this.#assertCurrent(signal); native?.assertCurrent(revision);
+      if (this.#options.readPolicy().revision !== policy.revision) throw new HostedAgentExecutorError("STALE_AUTHORITY");
+    };
+    assertCurrent();
+    if (policy.snapshot === undefined) return params;
+    const prepared = await tightenNativeCodexFileSystemPolicy({ snapshot: policy.snapshot, method, params, actions,
+      pathStyle: this.#options.remote?.authority.pathStyle ?? (process.platform === "win32" ? "win32" : "posix"), enforcement: "native-os-sandbox",
+      canonicalize: path => this.#canonical(this.#workspace.resolve(path), signal), assertCurrent });
+    assertCurrent(); return prepared;
+  }
   /** A native exec-server primitive is independently authorized by the exact
    * Source dispatch. Approval of one primitive never grants its connection. */
   async authorizeNativeActions(actions: readonly NativeExecutorAction[], signal: AbortSignal): Promise<() => void> {
@@ -120,14 +136,17 @@ export class HostedAgentExecutor {
     const fences: (() => void)[] = [];
     for (const action of actions) {
       const callId = randomUUID(), request: ExecutorRequest = { format: 1, callId, requestId: randomUUID(), operation: "tool.begin", payload: {} };
-      if (action.kind === "exec") {
+      if (action.kind === "network") {
+        fences.push(await this.#authorize(request, { name: "WebFetch", args: { url: text(action.url, 16_384), method: text(action.method, 32) } }, active));
+      } else if (action.kind === "exec") {
         const cwd = await this.#canonical(this.#workspace.resolve(text(action.cwd, 16_384)), active);
         const command = this.#workspace.mapCommand(text(action.command, 1024 * 1024));
         fences.push(await this.#authorize(request, { name: "bash", args: { command, cwd } }, active));
       } else {
         if (action.kind !== "read" && action.kind !== "write") throw new HostedAgentExecutorError("INVALID_REQUEST");
         const requested = this.#workspace.resolve(text(action.path, 16_384)), path = await this.#canonical(requested, active);
-        fences.push(await this.#authorize(request, { name: action.kind === "write" ? "write" : action.scope === "tree" ? "ls" : "read", args: { path } }, active, requested));
+        fences.push(await this.#authorize(request, { name: action.kind === "write" ? "write" : action.scope === "tree" ? "ls" : "read",
+          args: { path, ...(action.scope === "tree" ? { recursive: true } : {}) } }, active, requested));
       }
     }
     const assert = () => { this.#assertCurrent(active); for (const fence of fences) fence(); }; assert(); return assert;
@@ -372,11 +391,15 @@ export class HostedAgentExecutor {
       readOnly: this.#options.context.runtimePolicy === "review_read_only", extraReadOnlyRoots: policy.approvedRoots.map(root => root.path),
       explicitDenyTools: new Set<string>(), explicitAllowTools: new Set<string>(), policySnapshot: policy.snapshot };
     const risk = classifyToolCall(call, context);
+    const nativePolicy = policy.snapshot === undefined ? undefined : reviewNativeToolPolicy(policy.snapshot,
+      { toolName: call.name, input: call.args, signal }, { remote: this.#options.remote !== undefined,
+        ...(this.#options.remote ? { pathStyle: this.#options.remote.authority.pathStyle } : {}), extraReadOnlyRoots: context.extraReadOnlyRoots });
+    if (nativePolicy?.verdict === "block" || nativePolicy?.unavailable) throw new HostedAgentExecutorError("ACCESS_DENIED");
     if (policy.planMode && !["safe_read", "safe_command"].includes(risk)) throw new HostedAgentExecutorError("ACCESS_DENIED");
     const local = decideToolCall(call, context);
     const requested = requestedPath && call.name !== "bash" ? decideToolCall({ ...call, args: { ...call.args, path: requestedPath } }, context) : local;
     if (local.action === "deny" || requested.action === "deny") throw new HostedAgentExecutorError("ACCESS_DENIED");
-    const orderedAsk = policy.snapshot !== undefined && [call, ...(requestedPath && call.name !== "bash"
+    const orderedAsk = nativePolicy?.verdict === "ask" || policy.snapshot !== undefined && [call, ...(requestedPath && call.name !== "bash"
       ? [{ ...call, args: { ...call.args, path: requestedPath } }] : [])].some(value =>
         evaluateOrderedPolicyRules(policy.snapshot!, policyObservationForToolCall(value, context))?.action === "ask");
     const delegated = await native?.review({ toolName: call.name, input: call.args, signal }); assert();

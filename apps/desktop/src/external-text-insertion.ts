@@ -301,11 +301,9 @@ function restoreClipboardIfOwned(
     if (!restoreRawClipboardFormats(value, snapshot.buffers)) restoreCommonClipboardFormats(value, snapshot);
     return true;
   }
-  const commonRestored = restoreCommonClipboardFormats(value, snapshot);
-  const rawFormats = commonRestored
-    ? snapshot.buffers.filter(({ format }) => !isCommonClipboardFormat(format))
-    : snapshot.buffers;
-  if (!restoreRawClipboardFormats(value, rawFormats) && !commonRestored) value.clear();
+  // Every Electron writeBuffer call replaces the entire clipboard. Preserve
+  // the common representations together; raw data is only a fallback.
+  if (!restoreCommonClipboardFormats(value, snapshot) && !restoreRawClipboardFormats(value, snapshot.buffers)) value.clear();
   return true;
 }
 
@@ -390,29 +388,4 @@ function shouldPreferRawClipboardRestore(snapshot: ClipboardSnapshot): boolean {
     const normalized = format.toLowerCase();
     return normalized.includes("file") || normalized.includes("filename");
   });
-}
-
-function isCommonClipboardFormat(format: string): boolean {
-  const normalized = format.trim().toLowerCase();
-  return normalized === "text"
-    || normalized === "string"
-    || normalized === "unicode text"
-    || normalized === "cf_text"
-    || normalized === "cf_unicodetext"
-    || normalized === "html format"
-    || normalized === "rich text format"
-    || normalized === "png"
-    || normalized === "bitmap"
-    || normalized.startsWith("text/plain")
-    || normalized.startsWith("text/html")
-    || normalized.startsWith("text/rtf")
-    || normalized === "text/bookmark"
-    || normalized.startsWith("image/png")
-    || normalized.startsWith("image/tiff")
-    || normalized === "public.utf8-plain-text"
-    || normalized === "public.utf16-external-plain-text"
-    || normalized === "public.html"
-    || normalized === "public.rtf"
-    || normalized === "public.png"
-    || normalized === "public.tiff";
 }

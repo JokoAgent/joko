@@ -9,6 +9,10 @@ import {
   PartnerDelegationStatus,
   PartnerDraftSchema,
   PartnerModelRouteSchema,
+  GetPartnerDelegationRequestSchema,
+  GetPartnerDelegationResponseSchema,
+  CancelPartnerDelegationRequestSchema,
+  CancelPartnerDelegationResponseSchema,
   PermissionMode,
   RunState
 } from "@joko/contracts";
@@ -136,7 +140,15 @@ describe("mounted Partner collaboration product chain", () => {
     await waitFor(async () => fixture!.application.store.findEvent(welcomeId), event => event !== undefined, "the once-only package opening");
     await fixture.application.partnerImports!.recover(); await fixture.application.partnerImports!.recover();
     expect(fixture.application.store.listEvents({ sessionId: row.canonicalSessionId!, limit: 100 }).filter(event => event.id === welcomeId)).toHaveLength(1);
-    await page.keyboard.press("Escape"); await page.getByRole("dialog").waitFor({ state: "hidden" });
+    const configuredWorkspace = page.getByRole("dialog");
+    // The service receipt can precede the browser's autosave completion. Wait
+    // for that exact saved model before exercising the modal's leave guard.
+    await waitFor(() => configuredWorkspace.getByRole("tab", { name: "Activity", exact: true }).getAttribute("aria-selected"),
+      selected => selected === "true", "the configured Partner workspace projection", 30_000);
+    await configuredWorkspace.getByRole("tab", { name: "Profile settings", exact: true }).click();
+    await configuredWorkspace.locator(".partner-editor__status").getByText("Saved", { exact: true }).waitFor({ state: "visible" });
+    expect(await primary.textContent()).toContain("Joko real Pi E2E model");
+    await configuredWorkspace.press("Escape"); await configuredWorkspace.waitFor({ state: "hidden" });
     await page.goto(`${fixture.baseUrl}/#/partners`);
     const navigationScrim = page.locator(".panel-scrim--navigation");
     if (await navigationScrim.isVisible()) await page.locator(".sidebar").getByRole("button", { name: "Close navigation", exact: true }).click();
@@ -357,20 +369,26 @@ describe("mounted Partner collaboration product chain", () => {
     expect(stagedArtifact.fileName).toBe(ARTIFACT_FILE);
 
     await sendPartnerPrompt(fixture, manager, first.canonicalSessionId, CANCEL_COMMAND);
-    await waitFor(
+    const cancellableDelegations = await waitFor(
       () => manager.clients.partner.listPartnerDelegations({ partnerId: first.partnerId }),
       (value) => value.delegations.some((delegation) => delegation.title === CANCEL_TITLE
-        && delegation.status !== PartnerDelegationStatus.PREPARING
-        && delegation.status !== PartnerDelegationStatus.COMPLETED
-        && delegation.status !== PartnerDelegationStatus.FAILED
-        && delegation.status !== PartnerDelegationStatus.CANCELLED),
-      "the cancellable Partner delegation",
+        && delegation.status === PartnerDelegationStatus.RUNNING),
+      "the running cancellable Partner delegation",
       30_000
     );
+    const cancellable = required(cancellableDelegations.delegations.find(delegation => delegation.title === CANCEL_TITLE), "the cancellable delegation");
+    const cancellationRevision = required(cancellable.revision, "the running delegation revision").value;
 
     await page.goto(`${fixture.baseUrl}/#/partners`);
     const firstCard = page.locator(partnerCard(first.partnerId));
     await firstCard.waitFor({ state: "visible", timeout: 30_000 });
+    const currentCardReceipt = Promise.allSettled([page.waitForResponse(response => {
+      if (!response.url().endsWith("/joko.v1.PartnerService/GetPartnerDelegation") || response.status() !== 200) return false;
+      const body = response.request().postDataBuffer();
+      if (body === null) return false;
+      const request = fromBinary(GetPartnerDelegationRequestSchema, body);
+      return request.partnerId === first.partnerId && request.delegationId === cancellable.delegationId;
+    }, { timeout: 30_000 })]);
     await firstCard.getByRole("button", { name: "Open task" }).click();
     await page.waitForURL((url) => url.hash.includes(encodeURIComponent(first.canonicalSessionId)), { timeout: 30_000 }).catch(async (cause: unknown) => {
       let observation: Record<string, unknown> = { available: false };
@@ -404,7 +422,32 @@ describe("mounted Partner collaboration product chain", () => {
       && text.includes("1 files") && text.includes(COMPLETE_REPLY), "the completed inline delegation card", 30_000);
     const cancelCard = page.getByLabel(`Delegated work: ${CANCEL_TITLE}`);
     await cancelCard.waitFor({ state: "visible", timeout: 30_000 });
-    await cancelCard.getByRole("button", { name: "Stop delegation" }).click();
+    const cardReceipt = required((await currentCardReceipt)[0], "the inline card read receipt");
+    if (cardReceipt.status === "rejected") throw cardReceipt.reason;
+    const currentCard = required(fromBinary(GetPartnerDelegationResponseSchema, await cardReceipt.value.body()).delegation, "the inline card projection");
+    expect(currentCard).toMatchObject({ delegationId: cancellable.delegationId, status: PartnerDelegationStatus.RUNNING });
+    const currentCardRevision = required(currentCard.revision, "the inline card revision").value;
+    expect(currentCardRevision).toBeGreaterThanOrEqual(cancellationRevision);
+    await cancelCard.getByText("Running", { exact: true }).waitFor({ state: "visible" });
+    const [cancelledRpc] = await Promise.all([
+      page.waitForResponse(response => {
+        if (!response.url().endsWith("/joko.v1.PartnerService/CancelPartnerDelegation")) return false;
+        const body = response.request().postDataBuffer();
+        if (body === null) return false;
+        const request = fromBinary(CancelPartnerDelegationRequestSchema, body);
+        return request.partnerId === first.partnerId && request.delegationId === cancellable.delegationId;
+      }, { timeout: 30_000 }),
+      cancelCard.getByRole("button", { name: "Stop delegation" }).click()
+    ]);
+    const cancellationRequest = fromBinary(CancelPartnerDelegationRequestSchema, required(cancelledRpc.request().postDataBuffer(), "the cancellation request"));
+    const requestedRevision = required(cancellationRequest.expectedRevision, "the requested delegation revision").value;
+    expect(requestedRevision).toBeGreaterThanOrEqual(currentCardRevision);
+    expect(cancelledRpc.status()).toBe(200);
+    const cancelled = required(fromBinary(CancelPartnerDelegationResponseSchema, await cancelledRpc.body()).delegation, "the cancellation response");
+    expect(cancelled).toMatchObject({ delegationId: cancellable.delegationId, status: PartnerDelegationStatus.CANCELLED });
+    expect(required(cancelled.revision, "the cancelled delegation revision").value).toBeGreaterThan(requestedRevision);
+    const durableCancelled = await manager.clients.partner.getPartnerDelegation({ partnerId: first.partnerId, delegationId: cancellable.delegationId });
+    expect(durableCancelled.delegation).toMatchObject({ revision: cancelled.revision, status: PartnerDelegationStatus.CANCELLED });
     await waitFor(() => cancelCard.textContent(), (text) => text?.includes("Cancelled") === true, "the cancelled inline delegation card", 30_000);
     releaseCancelledChild?.();
     releaseCancelledChild = undefined;

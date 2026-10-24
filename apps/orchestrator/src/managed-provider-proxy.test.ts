@@ -19,7 +19,8 @@ async function fixture(
   const store = new OperationalStore(join(directory, "store.db"));
   const credentials = new CredentialManager({ vault: await CredentialVault.open(join(directory, "vault.key")), storagePath: join(directory, "credentials.json") });
   await credentials.initialize();
-  const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "native-owner" });
+  const disabledModels = new Set<string>();
+  const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "native-owner", modelEnabled: (_backendId, _providerId, modelId) => !disabledModels.has(modelId) });
   providers.initialize();
   const received: { path: string; model: string; authorization: string | undefined }[] = [];
   const receivedBodies: Record<string, unknown>[] = [];
@@ -140,7 +141,8 @@ async function fixture(
       expectedVersion: 1n
     });
   };
-  return { directory, store, providers, proxy, port, owner, received, receivedBodies, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders,
+  return { directory, store, credentials, providers, proxy, port, owner, received, receivedBodies, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders,
+    disableModel: (modelId: string) => disabledModels.add(modelId),
     write, markProviderUnavailable,
     token: port.environment[port.secretEnvironmentNames[0]!]!, toolOutcome: () => toolOutcome,
     hold: () => { hold = true; }, reject: () => { reject = true; },
@@ -156,6 +158,50 @@ async function fixture(
 }
 
 describe("Managed Provider native proxy", () => {
+  it.each(["child-model", "model"])("retains the active smart response after %s is disabled and fences only new route admission", async modelId => {
+    const f = await fixture();
+    try {
+      const child = f.port.listSmartRoutingCandidates!().find(candidate => candidate.model.modelId === "child-model")!;
+      const binding = await f.port.prepareSmartRouting!({ ...f.owner, nativeProviderId: "openai", rootProviderId: "provider", rootModelId: "model", revision: "catalog",
+        routes: [{ providerId: child.providerId, modelId: child.model.modelId, revision: child.revision, native: false }] });
+      binding.bindRoot({ threadId: "root", providerId: "provider", modelId: "model" });
+      const lease = await binding.activate({ operationId: "accepted", signal: new AbortController().signal, assertCurrent: () => undefined });
+      f.hold();
+      const request = (threadId: string, requestedModel: string, parentThreadId?: string, subagent = "collab_spawn") => fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: {
+        "content-type": "application/json", "x-joko-provider-proxy-token": f.token, "thread-id": threadId,
+        ...(parentThreadId ? { "x-codex-parent-thread-id": parentThreadId, "x-openai-subagent": subagent } : {})
+      }, body: JSON.stringify({ model: requestedModel }) });
+      const response = await request("root", "model"), reading = response.text();
+      f.disableModel(modelId); f.finish();
+      expect(await reading).toBe("data: fixture\n\n");
+      if (modelId === "child-model") {
+        expect(() => binding.assertCurrent()).not.toThrow();
+        expect((await request("new-child", "child-model", "root")).status).toBe(502);
+      } else {
+        expect(() => binding.assertCurrent()).toThrow("unavailable");
+        const guardian = await request("existing-turn-guardian", "model", "root", "guardian"); f.finish();
+        expect(await guardian.text()).toBe("data: fixture\n\n");
+        expect((await request("new-root-child", "model", "root")).status).toBe(502);
+      }
+      lease.release(); binding.dispose();
+    } finally { await f.dispose(); }
+  });
+
+  it("still rejects a smart stream when its original credential is revoked", async () => {
+    const f = await fixture();
+    try {
+      const child = f.port.listSmartRoutingCandidates!()[0]!;
+      const binding = await f.port.prepareSmartRouting!({ ...f.owner, nativeProviderId: "openai", rootProviderId: "provider", rootModelId: "model", revision: "catalog",
+        routes: [{ providerId: child.providerId, modelId: child.model.modelId, revision: child.revision, native: false }] });
+      binding.bindRoot({ threadId: "root", providerId: "provider", modelId: "model" });
+      const lease = await binding.activate({ operationId: "accepted", signal: new AbortController().signal, assertCurrent: () => undefined });
+      f.hold();
+      const response = await fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: { "content-type": "application/json", "x-joko-provider-proxy-token": f.token, "thread-id": "root" }, body: JSON.stringify({ model: "model" }) });
+      const reading = response.text().catch(() => "revoked");
+      await f.credentials.delete("credential-0"); f.finish();
+      expect(await reading).toBe("revoked"); lease.release(); binding.dispose();
+    } finally { await f.dispose(); }
+  });
   it("advertises smart candidates only while their Provider is currently available", async () => {
     const f = await fixture();
     try {
@@ -745,7 +791,8 @@ describe("Managed Provider native proxy", () => {
 
       await f.write(1n, "second-private-provider-credential");
       expect(() => binding.assertCurrent()).toThrow("unavailable");
-      expect((await request({ threadId: "root-thread", modelId: "model" })).status).toBe(502);
+      expect(await (await request({ threadId: "root-thread", modelId: "model" })).text()).toBe("data: fixture\n\n");
+      expect(f.received.at(-1)?.authorization).toBe("Bearer first-private-provider-credential");
       nextLease.release();
       expect((await request({ threadId: "root-thread", modelId: "model" })).status).toBe(409);
       binding.dispose();

@@ -133,6 +133,7 @@ import {
 } from "./runtime-command-state.js";
 import { activeNativeTimeline } from "./snapshot-projector.js";
 import { policySnapshotFor } from "./policy-settings.js";
+import { reviewNativeToolPolicy } from "./native-tool-policy.js";
 import { clearProviderRateLimit, recordProviderRateLimit } from "./provider-rate-limit.js";
 import type { CreateFreshReviewerInput, ReviewRuntimeDispatch, ReviewRuntimeOutcome } from "./review-coordinator.js";
 import type { ScheduleRunNotificationController } from "./schedule-run-notifications.js";
@@ -13575,6 +13576,9 @@ export class SessionHost {
             this.#sessionLifecycleFences.has(sessionId)
             || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined
           ) return;
+          // An interrupted dispatcher cannot publish a terminal event using a
+          // replacement binding or overwrite a retired Queue/Attempt outcome.
+          if (!this.dispatchFailureOwnsClaim(item, attemptId)) return;
           const adapterFailure = toPublicError(error, {
               code: "BACKEND_DISPATCH_FAILED",
               phase: "dispatch",
@@ -13672,6 +13676,23 @@ export class SessionHost {
       }
       return true;
     });
+  }
+
+  private dispatchFailureOwnsClaim(admitted: QueueItemRecord, attemptId: string | undefined): boolean {
+    if (attemptId === undefined) return false;
+    try {
+      const current = this.#store.getQueueItem(admitted.id);
+      const run = this.#store.getRun(admitted.runId).descriptor;
+      const attempt = this.#store.getAttempt(attemptId).descriptor;
+      const session = this.#store.getSession(admitted.sessionId).descriptor;
+      return ["dispatching", "backend_accepted"].includes(current.state)
+        && current.runId === admitted.runId && current.attemptId === attemptId
+        && current.backendInstanceGeneration === admitted.backendInstanceGeneration
+        && run.activeAttemptId === attemptId && ["queued", "running", "waiting", "retrying"].includes(run.state)
+        && attempt.runId === admitted.runId && attempt.endedAt === undefined
+        && attempt.backendInstanceGeneration === current.backendInstanceGeneration
+        && attempt.generation === session.binding.generation;
+    } catch { return false; } // Lifecycle cleanup may already have removed this claim.
   }
 
   private targetForSession(stored: StoredSession): TargetDescriptor {
@@ -13776,7 +13797,8 @@ export class SessionHost {
     runtimePolicy?: "review_read_only",
     appendSystemPrompt?: string,
     backendInstanceGenerationOverride?: number,
-    worktree?: SessionDescriptor["worktree"]
+    worktree?: SessionDescriptor["worktree"],
+    nativeBackgroundTaskId?: string
   ): AdapterContext {
     const signal = new AbortController().signal;
     const backend = this.#store.getBackend(target.backendId).descriptor;
@@ -13792,25 +13814,77 @@ export class SessionHost {
         || this.#sessionRuntimeMutationMustDefer(sessionId))
       ? turnBudget.budgets : this.captureModelWorkingContexts(target.backendId);
     const context: AdapterContext = {
-      ...(this.#extensionNativeToolAuthorization === undefined ? {} : { nativeToolAuthorization: {
-        required: this.#extensionNativeToolAuthorization(sessionId)?.required === true,
-        capture: () => this.#extensionNativeToolAuthorization?.(sessionId)?.capture(),
+      nativeToolAuthorization: {
+        required: this.#extensionNativeToolAuthorization?.(sessionId)?.required === true,
+        capture: () => JSON.stringify([policySnapshotFor(this.#store, target).generation, this.#extensionNativeToolAuthorization?.(sessionId)?.capture() ?? null]),
+        snapshot: () => { context.nativeToolAuthorization!.assertCurrent(); return policySnapshotFor(this.#store, target); },
+        ...(nativeBackgroundTaskId !== undefined || runId === undefined || attemptId === undefined || operationId === undefined ? {} : {
+          forBackgroundTask: (taskId: string) => {
+            if (!taskId || taskId.length > 256 || /[\0\r\n]/u.test(taskId)) throw new StoreError("The native background task identity is invalid.");
+            context.nativeToolAuthorization!.assertCurrent();
+            return this.makeContext(sessionId, target, generation, binding, runId, attemptId, operationId, selectedExtraDirectories,
+              runtimePolicy, appendSystemPrompt, backendInstanceGeneration, worktree, taskId).nativeToolAuthorization!;
+          }
+        }),
         assertCurrent: (expectedRevision?: string) => {
-          if (this.#disposed || this.#store.getBackend(target.backendId).descriptor.instanceGeneration !== backendInstanceGeneration
-            || this.#store.getSession(sessionId).descriptor.binding.generation !== generation
-            || runId !== undefined && !["running", "waiting", "retrying"].includes(this.#store.getRun(runId).descriptor.state)) throw new StoreError("The originating native execution is no longer current.");
+          if (this.#disposed || this.#store.getBackend(target.backendId).descriptor.instanceGeneration !== backendInstanceGeneration) {
+            throw new StoreError("The originating native execution is no longer current.");
+          }
+          if (runId !== undefined) {
+            const run = this.#store.getRun(runId).descriptor;
+            // The Run remains queued until its native acceptance arrives. Policy
+            // preparation belongs to the exact durable dispatch claim meanwhile.
+            const attempt = attemptId !== undefined
+              ? this.#store.getAttempt(attemptId).descriptor : undefined;
+            const queue = attempt === undefined ? undefined : this.#store.findQueueItemByRunId(sessionId, runId);
+            const ownsDispatch = attempt !== undefined && queue !== undefined
+              && run.sessionId === sessionId && run.activeAttemptId === attemptId
+              && attempt.runId === runId && attempt.generation === generation
+              && attempt.backendInstanceGeneration === backendInstanceGeneration
+              && queue.attemptId === attemptId && queue.operationId === operationId
+              && queue.backendInstanceGeneration === backendInstanceGeneration;
+            const preparing = ownsDispatch && run.state === "queued" && attempt.endedAt === undefined
+              && (queue.state === "dispatching" || queue.state === "backend_accepted");
+            const foreground = ["running", "waiting", "retrying"].includes(run.state)
+              && (attemptId === undefined || ownsDispatch && attempt.endedAt === undefined);
+            const task = nativeBackgroundTaskId === undefined ? undefined : this.#backgroundTasks.get(sessionId)?.get(nativeBackgroundTaskId);
+            const background = nativeBackgroundTaskId !== undefined && ownsDispatch
+              && task?.generation === generation && task.runId === runId && task.attemptId === attemptId && task.operationId === operationId
+              && (preparing || foreground || run.state === "completed" && run.error === undefined
+                && queue.state === "completed" && attempt.endedAt !== undefined && attempt.error === undefined);
+            if (nativeBackgroundTaskId === undefined ? !preparing && !foreground : !background) {
+              throw new StoreError("The originating native execution is no longer current.");
+            }
+          }
+          const registered = this.#store.getTarget(target.id).descriptor;
+          if (binding !== undefined) {
+            const current = this.#store.getSession(sessionId);
+            if (current.descriptor.binding.generation !== generation || current.descriptor.archived || current.descriptor.deletedAt !== undefined
+              || current.descriptor.targetId !== target.id || current.descriptor.backendId !== target.backendId
+              || artifactWorkspaceAuthority(registered, this.targetForSession(current), current.descriptor.worktree) !== originalArtifactAuthority) throw new StoreError("The native task workspace authority changed.");
+          } else if (artifactWorkspaceAuthority(registered, target, worktree) !== originalArtifactAuthority) throw new StoreError("The provisional native workspace authority changed.");
+          if (expectedRevision !== undefined && expectedRevision !== context.nativeToolAuthorization!.capture()) throw new StoreError("The native policy or originating task authority changed.");
           const authority = this.#extensionNativeToolAuthorization?.(sessionId);
-          if (!authority && expectedRevision !== undefined) throw new StoreError("The original native task authority was retired.");
-          authority?.assertCurrent(expectedRevision);
+          authority?.assertCurrent();
         },
         review: async (request: import("@joko/core").NativeToolAuthorizationRequest) => {
           try {
             context.nativeToolAuthorization!.assertCurrent();
-            const result = await this.#extensionNativeToolAuthorization?.(sessionId)?.review(request) ?? { verdict: "default" as const };
-            context.nativeToolAuthorization!.assertCurrent(result.authorizationRevision); return result;
+            const revision = context.nativeToolAuthorization!.capture();
+            const local = reviewNativeToolPolicy(policySnapshotFor(this.#store, target), request, {
+              ...(target.remoteWorkspace === undefined ? {} : { remote: true, pathStyle: target.remoteWorkspace.workspaceRoot.startsWith("/") ? "posix" as const : "win32" as const }),
+              extraReadOnlyRoots: (context.extraDirectories ?? []).map(directory => directory.path)
+            });
+            if (local.verdict === "block") return { ...local, authorizationRevision: revision };
+            const delegated: import("@joko/core").NativeToolAuthorizationDecision = await this.#extensionNativeToolAuthorization?.(sessionId)?.review(request) ?? { verdict: "default" as const };
+            context.nativeToolAuthorization!.assertCurrent(revision);
+            const result = delegated.verdict === "block" || delegated.unavailable ? delegated
+              : local.verdict === "ask" || delegated.verdict === "ask" ? { verdict: "ask" as const, reason: local.reason ?? delegated.reason }
+                : local.verdict === "allow" ? local : delegated;
+            return { ...result, authorizationRevision: revision };
           } catch { return { verdict: "block" as const, reason: "The originating native task authorization changed." }; }
         }
-      } }),
+      },
       sessionId,
       generation,
       backendInstanceGeneration,
@@ -14351,23 +14425,22 @@ export class SessionHost {
 
   async authorizeNativeBridgeTool(sessionId: string, serverId: string, toolName: string,
     args: Readonly<Record<string, unknown>>, signal: AbortSignal): Promise<() => void> {
-    if (!this.#extensionNativeToolAuthorization?.(sessionId)) return () => {};
-    return this.#authorizeMcpTool(sessionId, serverId, toolName, args, signal);
+    return this.#authorizeMcpTool(sessionId, serverId, toolName, args, signal, true);
   }
 
   async #authorizeMcpTool(sessionId: string, serverId: string, toolName: string,
-    args: Readonly<Record<string, unknown>>, signal: AbortSignal): Promise<() => void> {
+    args: Readonly<Record<string, unknown>>, signal: AbortSignal, nativeBridge = false): Promise<() => void> {
     signal.throwIfAborted();
     const stored = this.#store.getSession(sessionId), target = this.targetForSession(stored);
     const policy = policySnapshotFor(this.#store, target);
     const ordered = evaluateOrderedPolicyRules(policy, { subjectKind: "mcp", risk: policyRiskForToolRisk("ambiguous"), toolProviderId: serverId, toolName });
+    const authority = this.#extensionNativeToolAuthorization?.(sessionId);
     const decision = ordered
-      ?? decideToolCall({ name: `mcp__${serverId}__${toolName}`, args }, {
+      ?? (nativeBridge && !authority ? { action: "allow" as const } : decideToolCall({ name: `mcp__${serverId}__${toolName}`, args }, {
       mode: stored.descriptor.permissionMode, workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
       explicitAllowTools: new Set(), explicitDenyTools: new Set()
-    });
+    }));
     if (decision.action === "deny") throw new StoreError("MCP App tool was denied by target policy.");
-    const authority = this.#extensionNativeToolAuthorization?.(sessionId);
     let revision = authority?.capture();
     const guard = () => {
       signal.throwIfAborted(); authority?.assertCurrent(revision);

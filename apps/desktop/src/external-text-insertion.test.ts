@@ -71,6 +71,33 @@ describe("captured external text insertion", () => {
     expect(state.text()).toBe("before");
   });
 
+  it("restores rich common content without replacing it with an application's private clipboard format", async () => {
+    const state = clipboardHarness();
+    const originalHtml = "<table><tr><td>before</td></tr></table>";
+    state.replace("before", originalHtml);
+    const writeBuffer = vi.fn((_format: string, _buffer: Buffer) => {
+      // Electron replaces every representation on each raw write, rather
+      // than adding another format to a preceding clipboard.write().
+      state.replace("", "");
+    });
+    const clipboard: ExternalClipboard = {
+      ...state.clipboard,
+      availableFormats: () => ["text/plain", "text/html", "application/x-private-table"],
+      readBuffer: () => Buffer.from("private table bytes"),
+      writeBuffer
+    };
+
+    const result = await insertTextIntoCapturedApplication("dictated text", {
+      clipboard, paste: async () => true, delay: async () => undefined
+    });
+    await result.restored;
+
+    expect(result.inserted).toBe(true);
+    expect(state.text()).toBe("before");
+    expect(state.html()).toBe(originalHtml);
+    expect(writeBuffer).not.toHaveBeenCalled();
+  });
+
   it("fails closed before paste when another owner replaces the clipboard payload", async () => {
     const state = clipboardHarness();
     const clipboard: ExternalClipboard = {

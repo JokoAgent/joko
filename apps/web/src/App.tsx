@@ -34,6 +34,7 @@ import { DesktopWindowControls } from "./components/DesktopWindowControls.js";
 import { DesktopPageSearchBar } from "./components/DesktopPageSearchBar.js";
 import { StartupUpdateOverlay } from "./components/StartupUpdateOverlay.js";
 import { NativeTaskStatusBridge } from "./components/NativeTaskStatusBridge.js";
+import { useDesktopMenuBar } from "./desktop-menu-bar.js";
 import { DesktopRemoteDesktopStatus } from "./components/DesktopRemoteDesktopStatus.js";
 import { DesktopGlobalVoiceBridge } from "./components/DesktopGlobalVoiceBridge.js";
 import { RuntimeProcessMonitorBroker } from "./components/RuntimeProcessMonitorBroker.js";
@@ -44,6 +45,7 @@ import { TaskSharingInvitationDialog, TaskSharingNavigation } from "./components
 import { TaskSharingSession } from "./components/TaskSharingSession.js";
 import { offerTaskSharingInvitation, clearTaskSharingInvitation } from "./task-sharing-invitation.js";
 import { PortableSessionDialogHost, type PortableSessionImportRequest } from "./components/PortableSessionDialogHost.js";
+import { portableSessionImportOwnerKey, type PortableSessionImportOwner } from "./portable-session-import-connection.js";
 import { PortableSessionDropTarget } from "./components/PortableSessionDropTarget.js";
 import { SessionSplitView } from "./components/SessionSplitView.js";
 import { WorkspaceFilesRoute } from "./components/WorkspaceFilesRoute.js";
@@ -276,6 +278,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     return () => { unsubscribe?.(); clearTaskSharingInvitation(); };
   }, [auxiliaryApplicationWindow]);
   useAppDefaultModelBridge(controller, !auxiliaryApplicationWindow);
+  useDesktopMenuBar(controller, !auxiliaryApplicationWindow);
   const dedicatedHardwareBridge = typeof window !== "undefined"
     && window.jokoDesktop?.capabilities.includes("hardware.dedicatedInput") === true
     ? window.jokoDesktop.dedicatedHardware
@@ -303,6 +306,29 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [bootConnectionProfileId, setBootConnectionProfileId] = useState<string>();
   const [portableExportSession, setPortableExportSession] = useState<SessionView>();
   const [portableImportRequest, setPortableImportRequest] = useState<PortableSessionImportRequest>();
+  const portableImportConnectionKey = portableSessionImportOwnerKey(state);
+  const portableImportOwner = useMemo<PortableSessionImportOwner | undefined>(() => portableImportConnectionKey === undefined ? undefined : {
+    key: portableImportConnectionKey,
+    api: {
+      inspectPortableSessionImport: controller.inspectPortableSessionImport,
+      unlockPortableSessionImport: controller.unlockPortableSessionImport,
+      cancelPortableSessionImport: controller.cancelPortableSessionImport,
+      commitPortableSessionImport: controller.commitPortableSessionImport,
+      retryPortableSessionActivation: controller.retryPortableSessionActivation
+    }
+  }, [portableImportConnectionKey, controller.inspectPortableSessionImport, controller.unlockPortableSessionImport,
+    controller.cancelPortableSessionImport, controller.commitPortableSessionImport, controller.retryPortableSessionActivation]);
+  const portableImportOwnerRef = useRef(portableImportOwner);
+  portableImportOwnerRef.current = portableImportOwner;
+  useEffect(() => {
+    if (!portableImportRequest) return;
+    if (!portableImportRequest.owner && portableImportOwner) {
+      // A cold OS handoff binds once, when the user establishes its first connection.
+      setPortableImportRequest(current => current === portableImportRequest ? { ...current, owner: portableImportOwner } : current);
+    } else if (portableImportRequest.owner && portableImportRequest.owner.key !== portableImportOwner?.key) {
+      setPortableImportRequest(current => current === portableImportRequest ? undefined : current);
+    }
+  }, [portableImportOwner, portableImportRequest]);
   const [pendingDesktopDeepLinkDelivery, setPendingDesktopDeepLinkDelivery] = useState<PendingDesktopDeepLinkDelivery>();
   const [portableWorktreeTargetIds, setPortableWorktreeTargetIds] = useState<ReadonlySet<string>>(() => new Set());
   const [sessionWindowNavigation, setSessionWindowNavigation] = useState(() => ({
@@ -465,7 +491,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const portableImportTargets = useMemo(() => portableSessionTargetOptions(state.snapshot), [state.snapshot]);
   const portableWorktreeProbeTargetKey = portableSessionWorktreeProbeTargetIds(state.snapshot).join("\u0000");
   useEffect(() => {
-    if (portableImportRequest === undefined) {
+    if (portableImportRequest?.owner === undefined || portableImportRequest.owner.key !== portableImportOwner?.key) {
       setPortableWorktreeTargetIds((current) => current.size === 0 ? current : new Set());
       return;
     }
@@ -483,7 +509,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       if (!abort.signal.aborted) setPortableWorktreeTargetIds(new Set(results.filter((value): value is string => value !== undefined)));
     });
     return () => abort.abort();
-  }, [portableImportRequest?.id, portableWorktreeProbeTargetKey]);
+  }, [portableImportRequest?.id, portableImportRequest?.owner, portableImportOwner?.key, portableWorktreeProbeTargetKey]);
   const bootConnectionAttemptedRef = useRef(false);
   const layoutRouteSessionIdRef = useRef(state.route.kind === "session" ? state.route.sessionId : undefined);
   layoutRouteSessionIdRef.current = state.route.kind === "session" ? state.route.sessionId : undefined;
@@ -682,29 +708,31 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     }
   }, [t]);
   const openPortableSessionImportFile = useCallback((file: File): void => {
-    if (portableImportTargets.length === 0) {
+    const owner = portableImportOwnerRef.current;
+    if (portableImportTargets.length === 0 || owner === undefined) {
       setActionError(t("portable.importFailed"));
       return;
     }
     setActionError(undefined);
-    setPortableImportRequest({ id: ++portableImportRequestIdRef.current, file });
+    setPortableImportRequest({ id: ++portableImportRequestIdRef.current, file, owner });
   }, [portableImportTargets.length, t]);
   const choosePortableSessionImport = useCallback(async (): Promise<void> => {
-    if (portableImportTargets.length === 0) {
+    const owner = portableImportOwnerRef.current;
+    if (portableImportTargets.length === 0 || owner === undefined) {
       setActionError(t("portable.importFailed"));
       return;
     }
     setActionError(undefined);
     const desktop = window.jokoDesktop;
     if (desktop === undefined) {
-      setPortableImportRequest({ id: ++portableImportRequestIdRef.current });
+      setPortableImportRequest({ id: ++portableImportRequestIdRef.current, owner });
       return;
     }
     try {
       const selected = await desktop.choosePortableSessionFile();
-      if (selected !== undefined) openPortableSessionImportFile(browserFileFromDesktopFile(selected));
+      if (selected !== undefined && portableImportOwnerRef.current === owner) openPortableSessionImportFile(browserFileFromDesktopFile(selected));
     } catch (error) {
-      setActionError(messageOf(error, t("portable.importFailed")));
+      if (portableImportOwnerRef.current === owner) setActionError(messageOf(error, t("portable.importFailed")));
     }
   }, [openPortableSessionImportFile, portableImportTargets.length, t]);
   const desktopDeepLinkDeliveryOrderRef = useRef(new DesktopDeepLinkDeliveryOrder());
@@ -726,6 +754,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         setPendingDesktopDeepLinkDelivery({ kind: "portable", delivery, requestId, rendererOccurrence });
         setPortableImportRequest({
           id: requestId,
+          ...(portableImportOwnerRef.current === undefined ? {} : { owner: portableImportOwnerRef.current }),
           ...(navigation.file === undefined ? {} : { file: browserFileFromDesktopFile(navigation.file) })
         });
         return;
@@ -2449,6 +2478,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             initialTargetId={state.route.targetId}
             initialDialogueBackendId={state.route.dialogueBackendId}
             recommendationNonce={state.route.recommendationNonce}
+            initialModel={state.route.initialModel}
             projectPickerRequest={projectPickerRequest}
             onProjectPickerRequestConsumed={(requestId) => setProjectPickerRequest((current) => current?.requestId === requestId ? undefined : current)}
             navigationOpen={navigationOpen}
@@ -2633,10 +2663,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         t={t}
         exportSession={portableExportSession}
         importRequest={portableImportRequest}
+        connectionOwner={portableImportOwner?.key}
         defaultTargetId={settingsTargetIdRef.current}
         worktreeSupportedTargetIds={portableWorktreeTargetIds}
         onCloseExport={() => setPortableExportSession(undefined)}
-        onCloseImport={() => setPortableImportRequest(undefined)}
+        onCloseImport={(requestId) => setPortableImportRequest(current => current?.id === requestId ? undefined : current)}
         onExported={() => setLayoutNotice(t("portable.exported"))}
         onOpenTask={(sessionId) => {
           setPortableImportRequest(undefined);

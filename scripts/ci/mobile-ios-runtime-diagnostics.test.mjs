@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, parseCrashReport, parseVirtualMemory, projectOwnedCrash, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, parseCrashReport, parseVirtualMemory, projectOwnedCrash, projectOwnedStartupLogs, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
 
 test("retries only the pre-test accessibility runner failure with no application requests", () => {
   const failure = { targetName: "JokoCIUITests", testIdentifierString: "JokoCIUITests-Runner (25861) encountered an error",
@@ -81,4 +81,28 @@ test("never projects arbitrary strings, paths, arguments, credentials or report 
   assert.deepEqual(projected, { pid: 412, exception: { type: null, signal: null }, termination: { namespace: null, code: null } });
   assert.equal(JSON.stringify(projected).includes(privateValue), false);
   assert.equal(JSON.stringify(projected).includes("/Users/"), false);
+});
+
+test("projects only fixed WebKit startup counters for the exact pre-input process and time window", () => {
+  const startedAt = Date.parse("2026-10-24T21:12:00Z"), finishedAt = startedAt + 180_000;
+  const startupOwner = { ...owner, startup: { pid: 412, startedAt, finishedAt } };
+  const record = { processID: 412, processImagePath: owner.installedExecutable, timestamp: "2026-10-24 21:12:05.123456+0000",
+    subsystem: "com.apple.WebKit", eventMessage: "WebProcessProxy::didFinishLaunching: Invalid connection identifier private-credential-value" };
+  const result = projectOwnedStartupLogs([record,
+    { ...record, processID: 413 },
+    { ...record, processImagePath: owner.installedExecutable.replace("/current/", "/previous/") },
+    { ...record, timestamp: "2026-10-24T21:11:59Z" },
+    { ...record, timestamp: "2026-10-24T21:15:01Z" },
+    { ...record, timestamp: "private-credential-value" },
+    { ...record, subsystem: "unrelated.application" },
+    { ...record, eventMessage: "WebProcessProxy::didBecomeUnresponsive: https://private.example/token" }
+  ], startupOwner);
+  assert.deepEqual(result, { examinedRecords: 8, ownedRecords: 3, webKitRecords: 2,
+    events: { launchMessages: 1, launchFailures: 1, processTerminations: 0, unresponsive: 1,
+      provisionalLoadFailures: 0, loadFailures: 0, finishedLoads: 0 } });
+  assert.doesNotMatch(JSON.stringify(result), /private|token|https|Users|Joko/u);
+  for (const changed of [{ ...startupOwner, startup: undefined }, { ...startupOwner, installedExecutable: undefined },
+    { ...startupOwner, simulatorUdid: "other-device" }, { ...startupOwner, startup: { pid: -1, startedAt, finishedAt } }]) {
+    assert.throws(() => projectOwnedStartupLogs([record], changed));
+  }
 });

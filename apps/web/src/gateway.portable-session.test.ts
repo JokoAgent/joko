@@ -336,6 +336,73 @@ describe("portable task package gateway", () => {
     await expect(gateway.getPortableReplacementCleanup("imported")).rejects.toBeInstanceOf(GatewayError);
     gateway.disconnect();
   });
+
+  it.each(["inspect", "unlock", "commit"] as const)("cleans only the captured transport and rejects a late %s after reconnect", async stage => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(undefined, { status: 204 })));
+    let release!: () => void, entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const reached = new Promise<void>(resolve => { entered = resolve; });
+    const originalCalls: string[] = [], replacementCalls: string[] = [];
+    const original = portableTransport(async (method, input) => {
+      originalCalls.push(method.localName);
+      if (method.localName === "beginBlobUpload") return response(method, create(BeginBlobUploadResponseSchema, { upload: {
+        uploadId: "upload-1", ticket: { ticketId: "ticket-1", direction: TransferDirection.UPLOAD,
+          relativeEndpoint: "/v1/blob-uploads/ticket-1", maximumBytes: 7n, requiredMediaType: "application/octet-stream" }, expectedByteSize: 7n
+      } }));
+      if (method.localName === "completeBlobUpload") return response(method, create(CompleteBlobUploadResponseSchema, {
+        blob: portableBlob("package-1", "portable-task.jshare", BlobDisposition.ATTACHMENT, 7n)
+      }));
+      if (method.localName === "inspectPortableSessionImport") {
+        if (stage === "inspect") { entered(); await held; }
+        return response(method, create(InspectPortableSessionImportResponseSchema, { draft: previewDraft() }));
+      }
+      if (method.localName === "unlockPortableSessionImport") {
+        entered(); await held;
+        return response(method, create(UnlockPortableSessionImportResponseSchema, { draft: previewDraft() }));
+      }
+      if (method.localName === "commitPortableSessionImport") {
+        entered(); await held;
+        return response(method, create(CommitPortableSessionImportResponseSchema, { result: { sessionId: "original-imported",
+          fidelity: PortableSessionFidelity.FULL, messageCount: 1n, status: PortableSessionImportStatus.READY } }));
+      }
+      if (method.localName === "cancelPortableSessionImport") {
+        expect(input.draftId).toBe("draft-1");
+        return response(method, { cancelled: true });
+      }
+      throw new Error(`Unexpected original RPC ${method.localName}`);
+    });
+    const replacement = portableTransport(async method => {
+      replacementCalls.push(method.localName);
+      throw new Error(`Unexpected replacement RPC ${method.localName}`);
+    });
+    let selected = original;
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret", {}, () => selected
+    );
+    await gateway.connect();
+    const inspection = gateway.inspectPortableSessionImport(new File(["package"], "portable-task.jshare", { type: "application/vnd.joko.session" }));
+    let operation: Promise<unknown> = inspection;
+    if (stage !== "inspect") {
+      await inspection;
+      operation = stage === "unlock" ? gateway.unlockPortableSessionImport("draft-1", "original-password")
+        : gateway.commitPortableSessionImport({ draftId: "draft-1", targetId: "target-1", overwrite: false, useWorktree: false,
+          execution: { fastMode: false, permissionMode: "ask", planMode: false } });
+    }
+    const rejected = expect(operation).rejects.toMatchObject({ name: "AbortError" });
+    await reached;
+    gateway.disconnect(); selected = replacement;
+    await gateway.connect();
+    release();
+    await rejected;
+    expect(originalCalls).toContain("cancelPortableSessionImport");
+    const cancellations = originalCalls.filter(name => name === "cancelPortableSessionImport").length;
+    await gateway.cancelPortableSessionImport("draft-1");
+    await gateway.cancelPortableSessionImport("unknown-draft");
+    expect(originalCalls.filter(name => name === "cancelPortableSessionImport")).toHaveLength(cancellations);
+    expect(replacementCalls).toEqual([]);
+    gateway.disconnect();
+  });
 });
 
 function previewDraft() {

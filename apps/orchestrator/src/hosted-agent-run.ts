@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { AdapterContext, AdapterEventMetadata, BackendAdapter, BlobRef, CreateNativeSessionInput, EventPayload, HostedExecution, NativeSessionBinding, PermissionMode, PromptInput, SubagentControlInput, UserShellInput } from "@joko/core";
 import { JokoError } from "@joko/core";
+import { assertManagedSubagentHostedToolScope, managedSubagentRunRoot, type PiHostedBackgroundScope } from "@joko/adapter-pi";
 import type { HostedAgentStore, HostedNativeSessionOwner, HostedNativeProviderGrantOwner } from "@joko/store";
 import { HostedAgentArtifacts } from "./hosted-agent-artifacts.js";
 import { HostedAgentExchange } from "./hosted-agent-exchange.js";
@@ -52,6 +53,12 @@ interface CallReceipt { readonly digest: string; readonly result: Promise<unknow
 export class HostedAgentCleanupError extends Error {
   constructor(readonly run: HostedAgentRun) { super("Hosted Agent native cleanup could not be confirmed."); }
 }
+function sameBackgroundScope(expected: PiHostedBackgroundScope, value: unknown): value is PiHostedBackgroundScope {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 5) return false;
+  const scope = value as PiHostedBackgroundScope;
+  return scope.taskId === expected.taskId && scope.runId === expected.runId && scope.launchToken === expected.launchToken
+    && scope.runnerInstanceId === expected.runnerInstanceId && scope.nativeSessionId === expected.nativeSessionId;
+}
 
 /** The provider computer owns the actual SDK process. Its reverse tool port,
  * events, interactions and Artifacts remain tied to one authenticated task. */
@@ -83,7 +90,13 @@ export class HostedAgentRun {
   #shellOperationId?: string;
   #inputImages: readonly BlobRef[] = [];
   #activeProvider?: string;
-  readonly #toolOwners = new Map<string, { readonly operationId: string; readonly origin: string }>();
+  readonly #toolOwners = new Map<string, { readonly operationId: string; readonly origin: string; readonly backgroundScope?: string }>();
+  readonly #backgroundOwners = new Map<string, { readonly operationId: string; readonly scope: PiHostedBackgroundScope; readonly generation: number }>();
+  readonly #nativeToolOwners = new Map<string, string>();
+  readonly #nativeToolOwnerWaiters = new Map<string, Set<() => void>>();
+  readonly #backgroundResumes = new Map<string, string>();
+  readonly #backgroundRegistrations = new Set<string>();
+  #nativeHome?: string;
   #mcp?: HostedAgentNativeMcp;
   readonly #navigation: HostedAgentNavigation;
   #navigating = false;
@@ -172,6 +185,7 @@ export class HostedAgentRun {
       if (!info.isDirectory() || info.isSymbolicLink() || await realpath(root) !== root) throw new Error("Hosted Agent storage is unsafe.");
       const prior = this.#options.store.claim(this.#owner, this.#leaseId, this.#options.start); this.#claimed = true;
       await mkdir(home, { recursive: true, mode: 0o700 });
+      this.#nativeHome = home;
       await mkdir(workspace, { recursive: true, mode: 0o700 }); this.#assertAuthority();
       const contextFiles = await materializeHostedProjectFiles({ root: workspace, files: this.#options.workspace.contextFiles ?? [],
         assertCurrent: () => this.#assertAuthority(),
@@ -272,25 +286,119 @@ export class HostedAgentRun {
     // Some native SDK subscriptions retain the creation context. Once a turn
     // is dispatched, its foreground events still belong to that original
     // input operation so the Source can settle its exact queue item.
-    const owner = operationId === this.#options.runId ? this.#inputOperationId ?? operationId : operationId;
+    let owner = operationId === this.#options.runId ? this.#inputOperationId ?? operationId : operationId;
+    if (event.type === "tool_start" && event.name === "subagent" && owner) {
+      const previous = this.#nativeToolOwners.get(event.callId);
+      if (previous !== undefined && previous !== owner) throw new Error("The original native tool owner conflicts.");
+      if (this.#nativeToolOwners.size >= 256 && previous === undefined) throw new Error("The original native tool capacity is unavailable.");
+      this.#nativeToolOwners.set(event.callId, owner);
+      for (const wake of this.#nativeToolOwnerWaiters.get(event.callId) ?? []) wake();
+    }
+    const backgroundId = event.type === "background_task" ? event.taskId : event.type === "subagent_run" ? event.run.id
+      : event.type === "subagent_transcript" ? event.subagentRunId : undefined;
+    if (backgroundId !== undefined) owner = this.#backgroundOwners.get(backgroundId)?.operationId ?? owner;
+    if (event.type === "subagent_run" && ["completed", "failed", "stopped"].includes(event.run.state)) {
+      const scopeId = this.#backgroundOwners.get(event.run.id)?.scope.runId;
+      if (scopeId !== undefined && event.run.providerRunIds[0] === scopeId) this.#retireBackgroundTools(scopeId);
+    }
     this.exchange.emit(event, metadata, owner);
+    if (event.type === "tool_result" && event.name === "subagent") this.#nativeToolOwners.delete(event.callId);
+  }
+  #retireBackgroundTools(scopeId: string): void {
+    for (const [callId, owner] of this.#toolOwners) if (owner.backgroundScope === scopeId) this.#toolOwners.delete(callId);
+  }
+  async #nativeToolOwner(callId: string, signal: AbortSignal): Promise<string> {
+    const current = this.#nativeToolOwners.get(callId);
+    if (current !== undefined) return current;
+    // The private HTTP registration can arrive before stdout's exact tool_start.
+    // Wait for that event; never substitute a later foreground input.
+    await new Promise<void>((resolveOwner, rejectOwner) => {
+      const waiters = this.#nativeToolOwnerWaiters.get(callId) ?? new Set<() => void>();
+      const finish = () => { signal.removeEventListener("abort", aborted); waiters.delete(finish); if (!waiters.size) this.#nativeToolOwnerWaiters.delete(callId); resolveOwner(); };
+      const aborted = () => { waiters.delete(finish); if (!waiters.size) this.#nativeToolOwnerWaiters.delete(callId); rejectOwner(new Error("The original native tool owner is unavailable.")); };
+      waiters.add(finish); this.#nativeToolOwnerWaiters.set(callId, waiters); signal.addEventListener("abort", aborted, { once: true });
+      if (signal.aborted) aborted();
+    });
+    const owner = this.#nativeToolOwners.get(callId);
+    if (!owner) throw new Error("The original native tool owner is unavailable.");
+    return owner;
+  }
+  async #registerBackground(scope: PiHostedBackgroundScope, signal: AbortSignal): Promise<Record<string, unknown>> {
+    if (!scope || typeof scope.taskId !== "string" || !scope.taskId || scope.taskId.length > 256
+      || this.#backgroundRegistrations.has(scope.taskId) || this.#backgroundRegistrations.size >= 256) throw new Error("Hosted child registration is already in progress or invalid.");
+    this.#backgroundRegistrations.add(scope.taskId);
+    try { return await this.#registerBackgroundOnce(scope, AbortSignal.any([signal, AbortSignal.timeout(5_000)])); }
+    finally { this.#backgroundRegistrations.delete(scope.taskId); }
+  }
+  async #registerBackgroundOnce(scope: PiHostedBackgroundScope, signal: AbortSignal): Promise<Record<string, unknown>> {
+    this.#assertCurrent();
+    if (this.#options.backendId !== "pi" || !this.#nativeHome) throw new Error("Hosted child execution is unavailable.");
+    const generation = this.#context!.generation;
+    const previous = scope && this.#backgroundOwners.get(scope.taskId);
+    if (previous && sameBackgroundScope(previous.scope, scope) && previous.generation === generation) return { registered: true };
+    const metadata = await assertManagedSubagentHostedToolScope({ root: managedSubagentRunRoot(this.#nativeHome),
+      productSessionId: this.#context!.sessionId, productGeneration: generation, scope, reserved: true });
+    this.#assertCurrent(); signal.throwIfAborted();
+    const resuming = this.#backgroundResumes.get(scope.taskId);
+    if (previous && (!resuming || previous.generation !== generation || previous.scope.nativeSessionId !== scope.nativeSessionId
+      || previous.scope.runId === scope.runId)) throw new Error("The original background task cannot be replaced by this runner.");
+    if (!previous && this.#backgroundOwners.size >= 65_536) throw new Error("The original background task capacity is unavailable.");
+    const operationId = previous?.operationId ?? (metadata.parentTaskId === undefined ? undefined : await this.#nativeToolOwner(metadata.parentTaskId, signal));
+    if (!operationId) throw new Error("The original background task owner is unavailable.");
+    this.#assertCurrent(); signal.throwIfAborted();
+    if (this.#context!.generation !== generation || this.#backgroundOwners.get(scope.taskId) !== previous) throw new Error("The original background task owner changed.");
+    const registered = { operationId, scope: { ...scope }, generation };
+    this.#backgroundOwners.set(scope.taskId, registered);
+    if (previous) this.#retireBackgroundTools(previous.scope.runId);
+    // A lost registration reply cannot reassign later failure observations to
+    // another input. The native launcher has not spawned yet and records its
+    // exact physical manifest as failed; observation owns terminal cleanup.
+    const result = await this.exchange.tool({ operation: "background.register", ...metadata, scopeId: scope.runId, originalOperationId: operationId }, signal, resuming ?? operationId);
+    if (result.registered !== true) throw new Error("The original background task registration was rejected.");
+    return { registered: true };
   }
   async #executeTool(value: unknown, signal: AbortSignal): Promise<Record<string, unknown>> {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Hosted tool ownership is invalid.");
-    const { origin, ...input } = value as Record<string, unknown>;
+    const { origin, backgroundScope, ...input } = value as Record<string, unknown>;
     if (origin !== "agent" && origin !== "user_shell" || typeof input.callId !== "string") throw new Error("Hosted tool ownership is invalid.");
+    if (input.operation === "background.register") {
+      if (origin !== "agent" || backgroundScope !== undefined || input.format !== 1
+        || !input.payload || typeof input.payload !== "object" || Array.isArray(input.payload)
+        || input.callId !== "background-" + (input.payload as PiHostedBackgroundScope).runId
+        || input.requestId !== input.callId + ":1" || Object.keys(input).length !== 5) throw new Error("Hosted child registration is invalid.");
+      return this.#registerBackground(input.payload as PiHostedBackgroundScope, signal);
+    }
+    if (input.operation === "tool.end" && backgroundScope && typeof backgroundScope === "object") {
+      const scope = backgroundScope as PiHostedBackgroundScope, owner = this.#toolOwners.get(input.callId), scopeId = scope.runId;
+      const current = this.#backgroundOwners.get(scope.taskId);
+      if (owner?.origin === origin && owner.backgroundScope === scopeId && current && sameBackgroundScope(current.scope, scope)) {
+        try { return await this.exchange.tool({ ...input, backgroundScope: scopeId }, signal, owner.operationId); }
+        finally { this.#toolOwners.delete(input.callId); }
+      }
+    }
+    let background: { readonly operationId: string; readonly scope: PiHostedBackgroundScope; readonly generation: number } | undefined;
+    if (backgroundScope !== undefined) {
+      const scope = backgroundScope as PiHostedBackgroundScope;
+      background = scope && this.#backgroundOwners.get(scope.taskId);
+      if (origin !== "agent" || !background || background.generation !== this.#context?.generation
+        || !sameBackgroundScope(background.scope, scope) || !this.#nativeHome) throw new Error("The native background runner was retired.");
+      await assertManagedSubagentHostedToolScope({ root: managedSubagentRunRoot(this.#nativeHome), productSessionId: this.#context!.sessionId,
+        productGeneration: background.generation, scope });
+      this.#assertCurrent(); signal.throwIfAborted();
+      if (this.#backgroundOwners.get(scope.taskId) !== background) throw new Error("The native background runner was retired.");
+    }
     if (input.operation === "codex.exec_server") {
-      if (origin !== "agent") throw new Error("Hosted native execution ownership is invalid.");
+      if (origin !== "agent" || background !== undefined) throw new Error("Hosted native execution ownership is invalid.");
       return this.exchange.tool(input, signal, this.#inputOperationId ?? this.#options.runId);
     }
     let owner = this.#toolOwners.get(input.callId);
     if (input.operation === "tool.begin") {
-      const operationId = origin === "user_shell" ? this.#shellOperationId : this.#inputOperationId;
+      const operationId = background?.operationId ?? (origin === "user_shell" ? this.#shellOperationId : this.#inputOperationId);
       if (!operationId || owner || this.#toolOwners.size >= 256) throw new Error("Hosted tool has no current native owner.");
-      owner = { operationId, origin }; this.#toolOwners.set(input.callId, owner);
+      owner = { operationId, origin, ...(background === undefined ? {} : { backgroundScope: background.scope.runId }) }; this.#toolOwners.set(input.callId, owner);
     }
-    if (!owner || owner.origin !== origin) throw new Error("Hosted tool has no current native owner.");
-    try { return await this.exchange.tool(input, signal, owner.operationId); }
+    if (!owner || owner.origin !== origin || owner.backgroundScope !== background?.scope.runId) throw new Error("Hosted tool has no current native owner.");
+    try { return await this.exchange.tool({ ...input, ...(background === undefined ? {} : { backgroundScope: background.scope.runId }) }, signal, owner.operationId); }
     catch (error) { if (input.operation === "tool.begin") this.#toolOwners.delete(input.callId); throw error; }
     finally { if (input.operation === "tool.end") this.#toolOwners.delete(input.callId); }
   }
@@ -322,7 +430,7 @@ export class HostedAgentRun {
   #assertCurrent(): void { this.#assertAuthority(); if (!this.#ready || !this.#adapter || !this.#context || !this.#binding) throw new Error("Hosted Agent runtime is not active."); }
   #disposeNative(): Promise<void> {
     return this.#cleanup ??= (async () => {
-      await this.#adapter?.dispose(); await this.#mcp?.close(); await this.#artifacts?.close(); this.#toolOwners.clear(); this.#nativeCleaned = true; this.#activeProvider = undefined;
+      await this.#adapter?.dispose(); await this.#mcp?.close(); await this.#artifacts?.close(); this.#toolOwners.clear(); this.#backgroundOwners.clear(); this.#nativeToolOwners.clear(); this.#nativeCleaned = true; this.#activeProvider = undefined;
       try { if (this.#claimed && this.#options.store.find(this.id)?.leaseId === this.#leaseId) this.#options.store.close(this.id, this.#leaseId); }
       finally { if (!this.#purgeRequested) this.#slot.release(); }
     })().catch(error => { this.#cleanup = undefined; throw error; });
@@ -394,7 +502,14 @@ export class HostedAgentRun {
         finally { if (this.#shellOperationId === id) this.#shellOperationId = undefined; }
       }
       case "abort_shell": if (!adapter.abortUserShell) throw new Error("Hosted user shell is unsupported."); await adapter.abortUserShell(context); return null;
-      case "control_subagent": if (!adapter.controlSubagent) throw new Error("Hosted child control is unsupported."); await adapter.controlSubagent(command.input, context); return null;
+      case "control_subagent": {
+        if (!adapter.controlSubagent) throw new Error("Hosted child control is unsupported.");
+        if (command.input.action !== "resume") { await adapter.controlSubagent(command.input, context); return null; }
+        if (this.#backgroundResumes.has(command.input.runId)) throw new Error("Hosted child resume is already in progress.");
+        this.#backgroundResumes.set(command.input.runId, id);
+        try { await adapter.controlSubagent(command.input, context); return null; }
+        finally { this.#backgroundResumes.delete(command.input.runId); }
+      }
       case "cancel_background": if (!adapter.cancelBackgroundTask) throw new Error("Hosted background task cancellation is unsupported."); await adapter.cancelBackgroundTask(context, command.taskId); return null;
       case "background_output": if (!adapter.getBackgroundTaskOutput) throw new Error("Hosted background task output is unsupported."); return adapter.getBackgroundTaskOutput(context, command.taskId, command.maximumBytes);
     }

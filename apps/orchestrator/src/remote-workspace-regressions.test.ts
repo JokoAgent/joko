@@ -98,6 +98,60 @@ it("rejects every remote mutation through an intermediate link before delegating
   } finally { await f.close(); }
 });
 
+it("searches past 200 matches in one remote file with stable pages and exact totals", { timeout: 30_000 }, async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.root, "matches.txt"), Array.from({ length: 305 }, (_, index) => `match ${index + 1}`).join("\n"));
+    const first = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50 });
+    const later = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50, offset: 200 });
+    const final = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50, offset: 300 });
+    expect(first).toMatchObject({ totalResults: 305, totalFiles: 1, truncated: true, nextOffset: 50 });
+    expect(later.matches[0]).toMatchObject({ path: "matches.txt", line: 201 });
+    expect(later.revision).toBe(first.revision); expect(final.revision).toBe(first.revision);
+    expect(final.matches).toHaveLength(5); expect(final.truncated).toBe(false); expect(final.nextOffset).toBeUndefined();
+    expect(f.requests.filter(request => request.executable === "rg").every(request => request.args.includes("--sort") && !request.args.includes("--max-count"))).toBe(true);
+  } finally { await f.close(); }
+});
+
+it.each([
+  { query: "^", ending: "LF", lineEnding: "\n" },
+  { query: "$", ending: "LF", lineEnding: "\n" },
+  { query: "^", ending: "CRLF", lineEnding: "\r\n" },
+  { query: "$", ending: "CRLF", lineEnding: "\r\n" }
+])("keeps remote $query anchor ranges on Unicode $ending lines", { timeout: 30_000 }, async ({ query, lineEnding }) => {
+  const f = await fixture();
+  try {
+    const text = "先🐾abc", byte = query === "^" ? 0 : Buffer.byteLength(text), column = query === "^" ? 1 : text.length + 1;
+    await writeFile(join(f.root, "unicode.txt"), `${text}${lineEnding}${text}${lineEnding}`, "utf8");
+    const result = await f.workspaces.searchPage("workspace", query, { regularExpression: true });
+    expect(result).toMatchObject({ totalResults: 2, totalFiles: 1, truncated: false, matches: [1, 2].map(line => {
+      const absoluteByte = (line - 1) * Buffer.byteLength(text + lineEnding) + byte;
+      return { path: "unicode.txt", line, preview: text, column, endColumn: column,
+        startByte: absoluteByte, endByte: absoluteByte, submatches: [{ startByte: byte, endByte: byte }] };
+    }) });
+  } finally { await f.close(); }
+});
+
+it("serializes the same paired-node file reached through parent and nested workspace roots", { timeout: 30_000 }, async () => {
+  const f = await fixture(); let release!: () => void;
+  try {
+    await mkdir(join(f.root, "nested")); const nested = await realpath(join(f.root, "nested"));
+    await writeFile(join(nested, "note.txt"), "old");
+    await f.workspaces.register({ ...f.registration, id: "nested", root: nested,
+      remote: { ...f.registration.remote, binding: { ...f.registration.remote.binding, workspaceRoot: nested } } });
+    const revision = (await f.workspaces.preview("workspace", "nested/note.txt")).entry.revision;
+    let entered!: () => void; const started = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; }), original = f.files.write.bind(f.files);
+    const write = vi.spyOn(f.files, "write").mockImplementationOnce(async request => { entered(); await blocked; return original(request); });
+    const first = f.workspaces.writeTextFile("workspace", { path: "nested/note.txt", text: "first", expectedRevision: revision });
+    await started;
+    const second = f.workspaces.writeTextFile("nested", { path: "note.txt", text: "second", expectedRevision: revision });
+    release(); await first;
+    await expect(second).rejects.toMatchObject({ code: "WORKSPACE_TEXT_FILE_STALE" });
+    expect(write).toHaveBeenCalledOnce(); expect(await readFile(join(nested, "note.txt"), "utf8")).toBe("first");
+  } finally { release?.(); await f.close(); }
+});
+
 it("keeps a concurrently created destination and retires an old registration before any write", async () => {
   const f = await fixture();
   try {

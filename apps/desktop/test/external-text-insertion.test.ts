@@ -64,7 +64,7 @@ describe("external text insertion", () => {
     })).inserted).toBe(false);
   });
 
-  it("restores app-specific raw formats without rewriting standard text buffers", async () => {
+  it("restores standard text without replacing it with an app-specific raw format", async () => {
     const customFormat = "application/x-joko-editor-state";
     const clipboard = fakeClipboard({
       text: "before",
@@ -82,8 +82,8 @@ describe("external text insertion", () => {
     await result.restored;
 
     expect(clipboard.value.text).toBe("before");
-    expect(clipboard.value.buffers.get(customFormat)).toEqual(Buffer.from([1, 2, 3, 4]));
-    expect(clipboard.writeBufferFormats).toEqual([customFormat]);
+    expect(clipboard.value.buffers.get("text/plain")).toEqual(Buffer.from("before"));
+    expect(clipboard.writeBufferFormats).toEqual([]);
   });
 
   it("prefers exact raw restoration for file clipboard payloads", async () => {
@@ -161,6 +161,11 @@ function fakeClipboard(initial: Partial<{
     },
     writeBuffer: (format, buffer) => {
       writeBufferFormats.push(format);
+      // Electron replaces the clipboard on each raw write.
+      value.text = "";
+      value.html = "";
+      value.rtf = "";
+      value.buffers.clear();
       value.buffers.set(format, Buffer.from(buffer));
     },
     clear: () => {

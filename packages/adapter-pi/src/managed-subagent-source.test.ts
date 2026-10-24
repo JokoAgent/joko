@@ -335,6 +335,21 @@ describe("managed Pi subagent extension", () => {
     expect(MANAGED_SUBAGENT_ACTIVITY_MARKER).toBe("__jokoSubagentActivity");
   });
 
+  it("loads the managed child extension without exposing another child-launch tool at its enforced depth", () => {
+    const entryStart = MANAGED_SUBAGENT_SOURCE.indexOf("export default function jokoManagedSubagent(pi) {");
+    const depthStart = MANAGED_SUBAGENT_SOURCE.indexOf("function readDepth()");
+    const depthEnd = MANAGED_SUBAGENT_SOURCE.indexOf("\n\nfunction installParentWatchdog", depthStart);
+    const maximumDepth = Number(/const MAX_DEPTH = (\d+);/u.exec(MANAGED_SUBAGENT_SOURCE)?.[1]);
+    let watchdogs = 0;
+    const tools: unknown[] = [], commands: unknown[] = [];
+    const entry = Function("process", "DEPTH_ENV", "MAX_DEPTH", "installParentWatchdog",
+      MANAGED_SUBAGENT_SOURCE.slice(depthStart, depthEnd) + "\n" + MANAGED_SUBAGENT_SOURCE.slice(entryStart).replace("export default ", "") + "\nreturn jokoManagedSubagent;")(
+      { env: { JOKO_PI_SUBAGENT_DEPTH: "1" } }, "JOKO_PI_SUBAGENT_DEPTH", maximumDepth, () => { watchdogs++; });
+    entry({ registerTool: (tool: unknown) => tools.push(tool), registerCommand: (command: unknown) => commands.push(command) });
+    expect(watchdogs).toBe(1);
+    expect(tools).toEqual([]); expect(commands).toEqual([]);
+  });
+
   it("executes the generated watchdog logic and exits after its real parent dies", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-subagent-watchdog-"));
     const watchdogPath = join(directory, "watchdog.mjs");

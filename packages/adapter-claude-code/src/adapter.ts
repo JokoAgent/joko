@@ -5820,19 +5820,43 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (input.hook_event_name !== "PreToolUse") return { continue: true };
     const context = runtime.activeTurn?.context ?? runtime.baseContext, authority = context.nativeToolAuthorization;
     const denied = (reason: string): ClaudeSdkHookOutput => ({ continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } });
-    if (context.hostedExecution) {
-      const reason = this.#hostedToolDenial(runtime, input.tool_name, record(input.tool_input) ?? {});
-      if (reason) return denied(reason);
-    }
-    if (!authority || runtime.runtimePolicy === "review_read_only") return { continue: true };
     try {
-      signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent();
+      signal.throwIfAborted(); runtime.assertRuntimeCurrent();
       const toolInput = structuredClone(input.tool_input) as Record<string, unknown>;
-      const result = await authority.review({ toolName: input.tool_name, input: toolInput, signal });
+      if (context.hostedExecution) {
+        const reason = this.#hostedToolDenial(runtime, input.tool_name, toolInput);
+        if (reason) return denied(reason);
+      }
+      if (runtime.runtimePolicy === "review_read_only") {
+        const review = await reviewToolDecision(runtime.target.workspaceRoot, input.tool_name, toolInput);
+        if (review.behavior === "deny") return denied(review.message);
+      }
+      signal.throwIfAborted(); runtime.assertRuntimeCurrent();
+      if (JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while its authorization was being reviewed.");
+      if (!authority) return { continue: true };
+      authority.assertCurrent();
+      const managedMcp = runtime.mcpLease?.tools.find(tool => input.tool_name === `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`);
+      const result = await authority.review({ toolName: managedMcp ? `mcp__${managedMcp.serverId}__${managedMcp.name}` : input.tool_name, input: toolInput, signal });
       signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
       if (JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while its authorization was being reviewed.");
       if (result.verdict === "block") return denied(result.reason ?? "The current delegated task authorization denied this action.");
       if (result.verdict === "default") return { continue: true };
+      if (result.verdict === "ask") {
+        // The service MCP facade evaluates the actual catalog identity again
+        // immediately before execution and owns its one permission prompt.
+        if (managedMcp) return { continue: true };
+        const turn = runtime.activeTurn;
+        if (!turn || !this.#isTurnCurrent(runtime, turn)) return denied("The native operation has no active owner permission channel.");
+        const requestId = `native-policy-${randomUUID()}`, options = { signal, requestId, toolUseID: _toolUseId ?? input.tool_use_id };
+        const answer = await this.#requestInteraction(runtime, turn, { id: interactionId(runtime, requestId), kind: "permission", title: "Allow native tool?",
+          toolName: input.tool_name, summary: permissionSummary(input.tool_name, toolInput, options, this.#projection), risk: permissionRisk(input.tool_name),
+          choices: ["allow_once", "deny"] }, signal);
+        signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
+        if (!this.#isTurnCurrent(runtime, turn) || JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while permission was pending.");
+        if (permissionSelection(answer) !== "allow_once") return denied("The owner denied this native operation.");
+        return { continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: toolInput,
+          permissionDecisionReason: "The owner approved this exact native operation once." } };
+      }
       return { continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: result.verdict,
         permissionDecisionReason: result.reason ?? "Host-verified delegated task scope.", ...(result.verdict === "allow" ? { updatedInput: toolInput } : {}) } };
     } catch { return denied("The originating delegated task authority changed before native execution."); }

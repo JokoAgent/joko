@@ -44,6 +44,215 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it("keeps ordered web Ask disabled until a real bounded owner permission and restores the profile after allowance", async () => {
+    const setup = await createSetup(); setup.fake.reviewConfig["web_search"] = "cached";
+    const policy = (effect: "ask" | "allow", generation = "1") => ({ generation, backendId: setup.adapter.id, targetId: setup.target.id, workspaceRoot: setup.target.workspaceRoot,
+      rules: [{ id: "web-owner", effect, subjectKind: "network" as const, ceiling: "critical" as const, priority: 1, order: 0 }] });
+    const initial = { ...context(setup.target, [], { backendInstanceGeneration: 7 }), policySnapshot: policy("ask") };
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    expect(setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params).toMatchObject({ config: { web_search: "disabled" } });
+    const permission = vi.fn(async (): Promise<InteractionDecision> => ({ kind: "selected", value: "allow_once" }));
+    const first = { ...initial, binding, operationId: "web-allow-one-turn", requestInteraction: permission };
+    await setup.adapter.send(prompt("Read from the web"), first);
+    expect(permission).toHaveBeenCalledOnce();
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params).toMatchObject({ config: { web_search: "cached" } });
+    const thread = setup.fake.threads.get(binding.nativeSessionId!)!, completed = thread.turns.at(-1)!;
+    completed["status"] = "completed"; thread.status = { type: "idle" };
+    await setup.fake.transport!.emitNotification("turn/completed", { threadId: thread.id, turn: completed });
+    const deny = vi.fn(async (): Promise<InteractionDecision> => ({ kind: "selected", value: "deny_once" }));
+    await setup.adapter.send(prompt("Work without searching"), { ...first, operationId: "web-deny-next-turn", requestInteraction: deny });
+    expect(deny).toHaveBeenCalledOnce();
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params).toMatchObject({ config: { web_search: "disabled" } });
+    const next = thread.turns.at(-1)!; next["status"] = "completed"; thread.status = { type: "idle" };
+    await setup.fake.transport!.emitNotification("turn/completed", { threadId: thread.id, turn: next });
+    await setup.adapter.send(prompt("Owner policy now allows searching"), { ...first, operationId: "web-policy-allowed", policySnapshot: policy("allow", "2") });
+    expect(permission).toHaveBeenCalledOnce();
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params).toMatchObject({ config: { web_search: "cached" } });
+  });
+
+  it("hot-fences an active native turn before interrupting a new web deny and rejects its late output", async () => {
+    const setup = await createSetup(), events: EventPayload[] = [];
+    const initial = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    const active = { ...initial, binding, operationId: "before-web-policy" };
+    await setup.adapter.send(prompt("Use the web"), active);
+    const thread = setup.fake.threads.get(binding.nativeSessionId!)!, turnId = String(thread.turns.at(-1)!["id"]);
+    const denied = { ...active, policySnapshot: { generation: "2", backendId: setup.adapter.id, targetId: setup.target.id, workspaceRoot: setup.target.workspaceRoot,
+      rules: [{ id: "deny-web", effect: "deny" as const, subjectKind: "network" as const, ceiling: "critical" as const, priority: 0, order: 0 }] } };
+    await setup.adapter.setPolicySnapshot(denied);
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "turn/interrupt")!.params).toMatchObject({ threadId: thread.id, turnId });
+    const beforeLate = events.length;
+    await setup.fake.transport!.emitNotification("item/agentMessage/delta", { threadId: thread.id, turnId, itemId: "late-web", delta: "must not be adopted" });
+    expect(events).toHaveLength(beforeLate);
+    expect(events).toContainEqual(expect.objectContaining({ type: "error", error: expect.objectContaining({ code: "CODEX_NATIVE_POLICY_CHANGED" }) }));
+    thread.status = { type: "idle" };
+    await setup.adapter.send(prompt("Continue under the new policy"), { ...denied, operationId: "after-web-policy" });
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params).toMatchObject({ config: { web_search: "disabled" } });
+  });
+
+  it.each([false, true])("retires only the captured host generation when a web policy interrupt is unknown (replacement=%s)", async replacement => {
+    const setup = await createSetup(), events: EventPayload[] = [];
+    const initial = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    await setup.adapter.send(prompt("Native work"), { ...initial, binding, operationId: "web-unknown-interrupt" });
+    const transport = setup.fake.transport!, request = transport.request.bind(transport), force = vi.spyOn(setup.host, "forceShutdown");
+    transport.request = async (method, params, options) => {
+      if (method !== "turn/interrupt") return request(method, params, options);
+      if (replacement) { await transport.exit(); await setup.host.ensureStarted(); }
+      throw remoteRpcFault(-32000, "interrupt unavailable", undefined);
+    };
+    const generation = setup.host.generation;
+    await expect(setup.adapter.setPolicySnapshot({ ...initial, binding, policySnapshot: {
+      generation: "2", backendId: setup.adapter.id, targetId: setup.target.id, workspaceRoot: setup.target.workspaceRoot,
+      rules: [{ id: "deny-web", effect: "deny", subjectKind: "network", ceiling: "critical", priority: 0, order: 0 }]
+    } })).rejects.toMatchObject({ publicError: { code: "CODEX_NATIVE_POLICY_CHANGED", stateMayHaveChanged: true } });
+    expect(force).toHaveBeenCalledTimes(replacement ? 0 : 1);
+    expect(setup.host.isActiveGeneration(generation)).toBe(false);
+    if (replacement) expect(setup.host.isActiveGeneration(setup.host.generation)).toBe(true);
+    expect(events.filter(event => event.type === "done" && event.outcome === "failed")).toHaveLength(1);
+  });
+
+  it("keeps ordinary native execution environments task-owned across start, turn, resume, and close", async () => {
+    const opened: import("./native-execution.js").CodexNativeExecutionInput[] = [], closed: string[] = [];
+    const setup = await createSetup(7, { nativeExecution: { openExecServer: async input => {
+      opened.push(input);
+      return { execServerUrl: "ws://127.0.0.1:43123/ws/exec-server", authBearerToken: "x".repeat(43), assertCurrent: () => {}, close: async () => { closed.push(input.context.sessionId); } };
+    } } });
+    const initial = context(setup.target, [], { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    const other = { ...initial, sessionId: "second-native-task" };
+    await setup.adapter.createSession(sessionInput(setup.target), other);
+    const starts = setup.fake.transport!.requests.filter(request => request.method === "thread/start");
+    const firstEnvironments = (starts[0]!.params as JsonObject)["environments"];
+    expect(firstEnvironments).toMatchObject([{ cwd: setup.target.workspaceRoot, runtimeWorkspaceRoots: [setup.target.workspaceRoot] }]);
+    expect((starts[1]!.params as JsonObject)["environments"]).not.toEqual(firstEnvironments);
+    const turn = context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: "native-current-turn" });
+    await setup.adapter.send(prompt("Work in the project"), turn);
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "turn/start")!.params).toMatchObject({ environments: firstEnvironments });
+    expect(opened[0]!.currentContext().operationId).toBe("native-current-turn");
+    const thread = setup.fake.threads.get(binding.nativeSessionId!)!, completed = thread.turns.at(-1)!;
+    completed["status"] = "completed"; thread.status = { type: "idle" };
+    await setup.fake.transport!.emitNotification("turn/completed", { threadId: thread.id, turn: completed });
+    const transport = setup.fake.transport!, request = transport.request.bind(transport);
+    transport.request = (method, params, options) => {
+      if (method === "thread/resume") {
+        expect(opened[0]!.currentContext().operationId).toBe("native-preparation-owner");
+        expect(opened[0]!.hasActiveTurn!()).toBe(false);
+      }
+      return request(method, params, options);
+    };
+    await setup.adapter.setPermissionMode("auto", { ...turn, operationId: "native-preparation-owner" });
+    transport.request = request;
+    await setup.adapter.closeSession(binding, { ...initial, binding });
+    expect(closed).toEqual([initial.sessionId]);
+    expect(() => opened[0]!.assertCurrent()).toThrow();
+    await setup.adapter.resumeSession(binding, { ...initial, binding });
+    expect(opened).toHaveLength(3);
+    const resumed = setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params as JsonObject;
+    expect(resumed["environments"]).not.toEqual(firstEnvironments);
+    expect(setup.fake.transport!.requests.filter(request => request.method === "environment/add")).toHaveLength(3);
+  });
+
+  it("renews an invalidated native Target lease on the next idle turn after closing its original environment", async () => {
+    let revision = 1;
+    const opened: import("./native-execution.js").CodexNativeExecutionInput[] = [], close = vi.fn(async () => {});
+    const setup = await createSetup(7, { nativeExecution: { openExecServer: async input => {
+      const original = revision; opened.push(input);
+      return { execServerUrl: "ws://127.0.0.1:43123/ws/exec-server", authBearerToken: "x".repeat(43),
+        assertCurrent: () => { if (original !== revision) throw new Error("Target revision changed"); }, close };
+    } } });
+    const initial = context(setup.target, [], { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    const first = (setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params as JsonObject)["environments"];
+    revision++;
+    await setup.adapter.send(prompt("Use the current Target metadata"), { ...initial, binding, operationId: "renewed-idle-turn" });
+    expect(close).toHaveBeenCalledOnce(); expect(opened).toHaveLength(2);
+    expect(opened[0]!.signal!.aborted).toBe(true); expect(() => opened[0]!.assertCurrent()).toThrow();
+    expect(opened[1]!.currentContext().operationId).toBe("renewed-idle-turn");
+    const next = setup.fake.transport!.requests.findLast(request => request.method === "turn/start")!.params as JsonObject;
+    expect(next["environments"]).not.toEqual(first);
+    expect(setup.fake.transport!.requests.filter(request => request.method === "environment/add")).toHaveLength(2);
+  });
+
+  it("does not renew an invalidated Target lease while its original native turn still owns work", async () => {
+    let revision = 1;
+    const close = vi.fn(async () => {}), openExecServer = vi.fn(async () => {
+      const original = revision;
+      return { execServerUrl: "ws://127.0.0.1:43123/ws/exec-server", authBearerToken: "x".repeat(43),
+        assertCurrent: () => { if (original !== revision) throw new Error("Target revision changed"); }, close };
+    });
+    const setup = await createSetup(7, { nativeExecution: { openExecServer } });
+    const initial = context(setup.target, [], { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    await setup.adapter.send(prompt("Original accepted work"), { ...initial, binding, operationId: "original-turn" });
+    revision++;
+    await expect(setup.adapter.send({ ...prompt("Cannot borrow a fresh environment"), disposition: "steer" },
+      { ...initial, binding, operationId: "stale-steer" })).rejects.toThrow("Target revision changed");
+    expect(openExecServer).toHaveBeenCalledOnce(); expect(close).not.toHaveBeenCalled();
+    expect(setup.fake.transport!.requests.filter(request => request.method === "environment/add")).toHaveLength(1);
+    expect(setup.fake.transport!.requests.some(request => request.method === "turn/steer")).toBe(false);
+  });
+
+  it("fails closed before starting a native thread if its owned execution environment cannot register", async () => {
+    const setup = await createSetup(7, { nativeExecution: { openExecServer: async () => { throw new Error("Execution authority unavailable"); } } });
+    await expect(setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }))).rejects.toThrow("Execution authority unavailable");
+    expect(setup.fake.transport!.requests.some(request => request.method === "thread/start")).toBe(false);
+  });
+
+  it("revokes a provisional executor when native thread creation rejects after environment registration", async () => {
+    let opened: import("./native-execution.js").CodexNativeExecutionInput | undefined;
+    const close = vi.fn(async () => {});
+    const setup = await createSetup(7, { nativeExecution: { openExecServer: async input => {
+      opened = input; return { execServerUrl: "ws://127.0.0.1:43123/ws/exec-server", authBearerToken: "x".repeat(43), assertCurrent: () => {}, close };
+    } } });
+    await setup.host.ensureStarted();
+    const transport = setup.fake.transport!, request = transport.request.bind(transport);
+    transport.request = (method, params, options) => method === "thread/start" ? Promise.reject(remoteRpcFault(-32000, "start denied", undefined)) : request(method, params, options);
+    await expect(setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }))).rejects.toBeDefined();
+    expect(close).toHaveBeenCalledOnce(); expect(opened!.signal!.aborted).toBe(true);
+    expect(() => opened!.assertCurrent()).toThrow();
+  });
+
+  it("cancels a pending executor factory and joins cleanup of its late lease during backend disposal", async () => {
+    let factory!: () => void, entered!: () => void, cancelled!: () => void;
+    const gate = new Promise<void>(resolve => { factory = resolve; }), ready = new Promise<void>(resolve => { entered = resolve; }), aborted = new Promise<void>(resolve => { cancelled = resolve; });
+    const close = vi.fn(async () => {});
+    const setup = await createSetup(7, { nativeExecution: { openExecServer: async input => {
+      input.signal!.addEventListener("abort", cancelled, { once: true }); entered(); await gate;
+      return { execServerUrl: "ws://127.0.0.1:43123/ws/exec-server", authBearerToken: "x".repeat(43), assertCurrent: () => {}, close };
+    } } });
+    const creation = setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const rejected = expect(creation).rejects.toBeDefined(); await ready;
+    let disposed = false; const disposal = setup.adapter.dispose().then(() => { disposed = true; });
+    await aborted; expect(disposed).toBe(false); factory(); await rejected; await disposal;
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("retains the executor cleanup owner when closing fails and retries that same lease", async () => {
+    let attempts = 0;
+    const close = vi.fn(async () => { if (++attempts === 1) throw new Error("Native cleanup is unconfirmed"); });
+    const setup = await createSetup(7, { nativeExecution: { openExecServer: async () => ({
+      execServerUrl: "ws://127.0.0.1:43123/ws/exec-server", authBearerToken: "x".repeat(43), assertCurrent: () => {}, close
+    }) } });
+    await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+    await expect(setup.adapter.dispose()).rejects.toMatchObject({ errors: [expect.objectContaining({ message: "Native cleanup is unconfirmed" })] });
+    await expect(setup.adapter.dispose()).resolves.toBeUndefined();
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains partial factory resources even when initialization cannot return a lease", async () => {
+    let attempts = 0;
+    const cleanup = vi.fn(async () => { if (++attempts === 1) throw new Error("Partial forwarding cleanup is unconfirmed"); });
+    const setup = await createSetup(7, { nativeExecution: { openExecServer: async input => {
+      input.retainCleanup!(cleanup); throw new Error("Remote forwarding initialization failed");
+    } } });
+    await expect(setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 })))
+      .rejects.toBeInstanceOf(AggregateError);
+    expect(cleanup).toHaveBeenCalledOnce();
+    await expect(setup.adapter.dispose()).resolves.toBeUndefined();
+    expect(cleanup).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["success", "unarchive-fails", "resume-fails-again", "other-thread", "missing-path", "busy", "cancel", "stale-host", "ambiguous"] as const)(
     "recovers only a proven archived native resume before any user turn (%s)", async outcome => {
       const setup = await createSetup(), owner = new AbortController();

@@ -545,6 +545,30 @@ describe("SessionHost", () => {
     await expect(f.host.authorizeMcpAppTool(sessionId, "server__name", "submit", {}, new AbortController().signal)).rejects.toThrow("denied by target policy");
     expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
   });
+  it("enforces ordinary native MCP deny and ask without duplicating unmatched native permission prompts", async () => {
+    const f = await createFixture();
+    const { sessionId } = (await f.host.createSession({ operationId: "native-mcp-policy", connection: f.connection,
+      targetId: "target-one", title: "Native MCP", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    const signal = new AbortController().signal;
+    const unruled = await f.host.authorizeNativeBridgeTool(sessionId, "server__name", "submit", {}, signal);
+    unruled(); expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
+    const update = (effect: contract.PolicyEffect) => f.store.setSetting("service", "orchestrator", "settings.policy", create(contract.PolicySettingsSchema, {
+      rules: [{ policyRuleId: "native-mcp", effect, subjectKind: contract.PolicySubjectKind.MCP,
+        toolProviderId: "server__name", toolName: "submit", ceiling: contract.PermissionRisk.CRITICAL, enabled: true }]
+    }));
+    update(contract.PolicyEffect.DENY);
+    expect(unruled).toThrow();
+    await expect(f.host.authorizeNativeBridgeTool(sessionId, "server__name", "submit", {}, signal)).rejects.toThrow("denied by target policy");
+    update(contract.PolicyEffect.ASK);
+    const pending = f.host.authorizeNativeBridgeTool(sessionId, "server__name", "submit", { selected: 2 }, signal);
+    await eventually(() => f.store.listInteractions({ sessionId, status: "open" }).length === 1);
+    const opened = f.store.listInteractions({ sessionId, status: "open" })[0]!;
+    f.host.resolveInteraction(opened.id, opened.generation, { kind: "permission", decision: "allow_once" }, "native-mcp-approve");
+    const guard = await pending; guard();
+    update(contract.PolicyEffect.DENY);
+    expect(guard).toThrow();
+    expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
+  });
   it("rejects queued MCP App input after its live View is revoked before dispatch", async () => {
     const f = await createFixture();
     const { sessionId } = (await f.host.createSession({ operationId: "app-create", connection: f.connection,
@@ -4507,6 +4531,167 @@ describe("SessionHost", () => {
     );
     await denial;
     expect(policyAdapter.inputs).toHaveLength(2);
+  });
+
+  it("authorizes native policy preparation while the exact claimed Run is still queued and retires it at completion", async () => {
+    const adapter = new FakeBackendAdapter(CODEX_LIKE_PROFILE), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "native-preparation-create", connection: fixture.connection,
+      targetId: "target-one", title: "Native preparation", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    let context: AdapterContext | undefined, release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; }), send = adapter.send.bind(adapter);
+    vi.spyOn(adapter, "send").mockImplementation(async (input, current) => {
+      context = current;
+      await pending;
+      current.nativeToolAuthorization!.snapshot!();
+      await send(input, current);
+    });
+    const accepted = fixture.host.enqueueInput({ operationId: "native-preparation-input", connection: fixture.connection, sessionId,
+      prompt: { text: "Prepare the native turn", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    try {
+      await eventually(() => context !== undefined);
+      expect(fixture.store.getRun(accepted.runId).descriptor.state).toBe("queued");
+      expect(fixture.store.getQueueItem(accepted.queueItemId).state).toBe("dispatching");
+      expect(() => context!.nativeToolAuthorization!.snapshot!()).not.toThrow();
+      fixture.store.updateQueueState({ queueItemId: accepted.queueItemId, state: "backend_accepted", traceId: "native-preparation-accepted" });
+      expect(() => context!.nativeToolAuthorization!.snapshot!()).not.toThrow();
+    } finally { release(); }
+    await eventually(() => fixture.store.getRun(accepted.runId).descriptor.state === "completed");
+    expect(() => context!.nativeToolAuthorization!.snapshot!()).toThrow("no longer current");
+  });
+
+  it.each(["queue", "attempt", "binding"] as const)("revokes queued native preparation when its %s owner retires", async (boundary) => {
+    let drainsSettled = 0;
+    const adapter = new FakeBackendAdapter(CODEX_LIKE_PROFILE), fixture = await createFixture(adapter, {
+      onBackendMayBeIdle: () => { drainsSettled += 1; }
+    });
+    const sessionId = (await fixture.host.createSession({ operationId: "native-preparation-retire-create", connection: fixture.connection,
+      targetId: "target-one", title: "Retire native preparation", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    let context: AdapterContext | undefined, release!: () => void, finished = false;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(adapter, "send").mockImplementation(async (_input, current) => {
+      context = current;
+      try { await pending; current.nativeToolAuthorization!.snapshot!(); }
+      finally { finished = true; }
+    });
+    const accepted = fixture.host.enqueueInput({ operationId: "native-preparation-retire-input", connection: fixture.connection, sessionId,
+      prompt: { text: "Hold before native acceptance", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    let retired: { queue: ReturnType<OperationalStore["getQueueItem"]>; run: ReturnType<OperationalStore["getRun"]>;
+      attempt: ReturnType<OperationalStore["getAttempt"]> } | undefined;
+    let settledBeforeRelease = 0;
+    try {
+      await eventually(() => context !== undefined);
+      const authority = context!.nativeToolAuthorization!;
+      expect(() => authority.snapshot!()).not.toThrow();
+      if (boundary === "queue") {
+        fixture.store.updateQueueState({ queueItemId: accepted.queueItemId, state: "dispatch_unknown", traceId: "native-preparation-retire" });
+      } else if (boundary === "attempt") {
+        fixture.store.finishAttempt(fixture.store.getRun(accepted.runId).descriptor.activeAttemptId!);
+      } else {
+        const stored = fixture.store.getSession(sessionId);
+        fixture.store.updateSession(sessionId, { binding: { ...stored.descriptor.binding, generation: stored.descriptor.binding.generation + 1 } }, stored.revision);
+      }
+      expect(() => authority.snapshot!()).toThrow();
+      retired = { queue: fixture.store.getQueueItem(accepted.queueItemId), run: fixture.store.getRun(accepted.runId),
+        attempt: fixture.store.getAttempt(fixture.store.getRun(accepted.runId).descriptor.activeAttemptId!) };
+      settledBeforeRelease = drainsSettled;
+    } finally { release(); }
+    await eventually(() => finished && drainsSettled > settledBeforeRelease);
+    expect(fixture.store.getQueueItem(accepted.queueItemId)).toEqual(retired!.queue);
+    expect(fixture.store.getRun(accepted.runId)).toEqual(retired!.run);
+    expect(fixture.store.getAttempt(retired!.attempt.descriptor.id)).toEqual(retired!.attempt);
+  });
+
+  it.each([false, true])("records current native preparation failure with uncertain effect=%s without redispatch", async uncertain => {
+    let drainsSettled = 0;
+    const adapter = new FakeBackendAdapter(CODEX_LIKE_PROFILE), fixture = await createFixture(adapter, {
+      onBackendMayBeIdle: () => { drainsSettled += 1; }
+    });
+    const sessionId = (await fixture.host.createSession({ operationId: "native-preparation-failure-create", connection: fixture.connection,
+      targetId: "target-one", title: "Current native preparation failure", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const send = vi.spyOn(adapter, "send").mockImplementation(async (_input, context) => {
+      expect(() => context.nativeToolAuthorization!.snapshot!()).not.toThrow();
+      throw new JokoError({ code: "NATIVE_PREPARATION_REJECTED", message: "The original native preparation failed.", phase: "dispatch",
+        retryable: !uncertain, stateMayHaveChanged: uncertain, recovery: "Inspect the original native request before retrying." });
+    });
+    const settledBeforeSend = drainsSettled;
+    const accepted = fixture.host.enqueueInput({ operationId: "native-preparation-failure-input", connection: fixture.connection, sessionId,
+      prompt: { text: "Reject this original native dispatch", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    const state = uncertain ? "dispatch_unknown" : "failed";
+    await eventually(() => drainsSettled > settledBeforeSend && fixture.store.getQueueItem(accepted.queueItemId).state === state
+      && fixture.store.getRun(accepted.runId).descriptor.state === state);
+    const run = fixture.store.getRun(accepted.runId).descriptor;
+    expect(run.error).toMatchObject({ code: "NATIVE_PREPARATION_REJECTED", stateMayHaveChanged: uncertain });
+    expect(fixture.store.getAttempt(run.activeAttemptId!).descriptor.endedAt).toBeDefined();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it.each(["child", "parent", "session", "backend", "permission"] as const)("keeps the exact native background owner after normal parent completion and rejects retired %s authority", async boundary => {
+    const adapter = new FakeBackendAdapter(CODEX_LIKE_PROFILE), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "native-background-create", connection: fixture.connection,
+      targetId: "target-one", title: "Native background authority", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    let revoked = false, context: AdapterContext | undefined, background: NonNullable<AdapterContext["nativeToolAuthorization"]> | undefined;
+    fixture.host.setExtensionNativeToolAuthorization(() => ({ required: false, capture: () => "original-background-grant",
+      assertCurrent: () => { if (revoked) throw new Error("The original grant was revoked."); }, review: async () => ({ verdict: "allow" }) }));
+    const send = adapter.send.bind(adapter);
+    vi.spyOn(adapter, "send").mockImplementation(async (input, current) => {
+      context = current;
+      background = current.nativeToolAuthorization!.forBackgroundTask!("original-child");
+      await current.emit({ type: "background_task", taskId: "original-child", title: "Original child", state: "queued" });
+      if (boundary === "parent") throw new JokoError({ code: "PARENT_FAILED", message: "The original parent failed.", phase: "dispatch",
+        retryable: false, stateMayHaveChanged: false, recovery: "Inspect the original parent." });
+      await send(input, current);
+    });
+    const accepted = fixture.host.enqueueInput({ operationId: "native-background-parent", connection: fixture.connection, sessionId,
+      prompt: { text: "Run the original background child", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await eventually(() => fixture.store.getRun(accepted.runId).descriptor.state === (boundary === "parent" ? "failed" : "completed"));
+    expect(background).toBeDefined();
+    expect(background!.forBackgroundTask).toBeUndefined();
+    expect(() => context!.nativeToolAuthorization!.assertCurrent()).toThrow("no longer current");
+    if (boundary !== "parent") expect(() => background!.snapshot!()).not.toThrow();
+    if (boundary === "child") await context!.emit({ type: "background_task", taskId: "original-child", title: "Original child", state: "completed", endedAt: Date.now() });
+    if (boundary === "session") {
+      const stored = fixture.store.getSession(sessionId);
+      fixture.store.updateSession(sessionId, { binding: { ...stored.descriptor.binding, generation: stored.descriptor.binding.generation + 1 } }, stored.revision);
+    }
+    if (boundary === "backend") {
+      const backend = fixture.store.getBackend(adapter.id).descriptor;
+      fixture.store.upsertBackend({ ...backend, instanceGeneration: backend.instanceGeneration + 1 });
+    }
+    if (boundary === "permission") revoked = true;
+    expect(() => background!.snapshot!()).toThrow();
+    await expect(background!.review({ toolName: "Read", input: { file_path: "proof.txt" }, signal: new AbortController().signal }))
+      .resolves.toMatchObject({ verdict: "block" });
+  });
+
+  it("applies live ordered policy to ordinary native tools and retires pending authorization revisions", async () => {
+    class NativePolicyAdapter extends FakeBackendAdapter {
+      latest?: AdapterContext;
+      override async getResources(context: AdapterContext) { this.latest = context; return super.getResources(context); }
+    }
+    const adapter = new NativePolicyAdapter({ ...CODEX_LIKE_PROFILE, permissionModes: ["ask", "auto", "bypassPermissions"] }), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "native-policy-session", connection: fixture.connection,
+      targetId: "target-one", title: "Native policy", fastMode: false, permissionMode: "bypassPermissions", planMode: false })).value.sessionId;
+    const delegated = vi.fn(async () => ({ verdict: "allow" as const }));
+    fixture.host.setExtensionNativeToolAuthorization(() => ({ required: false, capture: () => "delegated-scope", assertCurrent: () => {}, review: delegated }));
+    await fixture.host.getResources(sessionId);
+    const authority = adapter.latest!.nativeToolAuthorization!, original = authority.capture();
+    const update = (effect: contract.PolicyEffect) => fixture.store.setSetting("service", "orchestrator", "settings.policy", create(contract.PolicySettingsSchema, {
+      rules: [create(contract.PolicyRuleSchema, { policyRuleId: "native-private-read", effect, subjectKind: contract.PolicySubjectKind.FILE_READ,
+        workspaceRelativePathPrefix: "private", enabled: true, ceiling: contract.PermissionRisk.CRITICAL })]
+    }));
+    update(contract.PolicyEffect.DENY);
+    expect(() => authority.assertCurrent(original)).toThrow();
+    await expect(authority.review({ toolName: "Read", input: { file_path: "private/file.txt" }, signal: new AbortController().signal }))
+      .resolves.toMatchObject({ verdict: "block" });
+    expect(delegated).not.toHaveBeenCalled();
+    update(contract.PolicyEffect.ASK);
+    const decision = await authority.review({ toolName: "Read", input: { file_path: "private/file.txt" }, signal: new AbortController().signal });
+    expect(decision.verdict).toBe("ask");
+    expect(delegated).toHaveBeenCalledOnce();
+    update(contract.PolicyEffect.ALLOW);
+    expect(() => authority.assertCurrent(decision.authorizationRevision)).toThrow();
+    await expect(authority.review({ toolName: "Read", input: { file_path: "public/file.txt" }, signal: new AbortController().signal }))
+      .resolves.toMatchObject({ verdict: "allow" });
   });
 
   it("hot-applies ordered owner rules to active user shell authorization and revokes stale approval", async () => {
@@ -9974,6 +10159,82 @@ describe("SessionHost", () => {
       status: "success",
       detail: { script: { resultText: "task queued" }, costAttribution: "zero" }
     });
+  });
+
+  it.each([1, 2])("scans later due Schedules while a script retains one of %i execution slots", async maximum => {
+    const f = await createFixture(), gate = new AsyncGate();
+    let now = Date.now();
+    seedScriptSchedule(f, "slow-script", { kind: "one_shot", nextRunAt: now });
+    seedScriptSchedule(f, "later-script", { kind: "one_shot", nextRunAt: now + 100, misfirePolicy: "skip" });
+    const executeScript = vi.fn(async (input: ScheduleScriptInput) => {
+      if (input.schedule.id === "slow-script") { gate.enter(); await gate.wait; }
+      input.assertCurrent();
+      return { durationMs: 1, stderr: "", stderrTruncated: false };
+    });
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { now: () => now, maxConcurrentRuns: maximum, executeScript });
+    cleanups.push(() => coordinator.stop());
+    const first = coordinator.tick();
+    try {
+      await gate.entered;
+      now += 100;
+      await coordinator.tick();
+      await coordinator.tick();
+      expect(executeScript.mock.calls.filter(([input]) => input.schedule.id === "slow-script")).toHaveLength(1);
+      expect(executeScript.mock.calls.filter(([input]) => input.schedule.id === "later-script")).toHaveLength(maximum === 2 ? 1 : 0);
+      expect(coordinator.runtimeSnapshot().slotsInUse).toBe(1);
+      if (maximum === 1) expect(coordinator.runtimeSnapshot().waitingSchedules).toMatchObject([{ scheduleId: "later-script" }]);
+      else expect(f.store.listScheduleRuns("later-script")).toMatchObject([{ status: "success" }]);
+    } finally { gate.release(); await first; }
+    await coordinator.tick();
+    expect(f.store.listScheduleRuns("later-script")).toMatchObject([{ status: "success" }]);
+    expect(executeScript.mock.calls.filter(([input]) => input.schedule.id === "later-script")).toHaveLength(1);
+    expect(coordinator.runtimeSnapshot().slotsInUse).toBe(0);
+  });
+
+  it("admits a later Schedule beyond a page of 100 active scripts when the 101st slot is free", async () => {
+    const f = await createFixture(), gate = new AsyncGate();
+    let now = Date.now(), started = 0;
+    const activeIds = Array.from({ length: 100 }, (_, index) => `active-script-${String(index).padStart(3, "0")}`);
+    for (const id of activeIds) seedScriptSchedule(f, id, { kind: "one_shot", nextRunAt: now });
+    seedScriptSchedule(f, "later-script", { kind: "one_shot", nextRunAt: now + 100 });
+    const executeScript = vi.fn(async (input: ScheduleScriptInput) => {
+      if (input.schedule.id !== "later-script") {
+        if (++started === activeIds.length) gate.enter();
+        await gate.wait;
+      }
+      input.assertCurrent();
+      return { durationMs: 1, stderr: "", stderrTruncated: false };
+    });
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { now: () => now, maxConcurrentRuns: 101, executeScript });
+    cleanups.push(() => coordinator.stop());
+    const first = coordinator.tick();
+    try {
+      await gate.entered;
+      expect(coordinator.runtimeSnapshot().slotsInUse).toBe(100);
+      now += 100;
+      await coordinator.tick();
+      await coordinator.tick();
+      expect(executeScript).toHaveBeenCalledTimes(101);
+      expect(executeScript.mock.calls.filter(([input]) => input.schedule.id === "later-script")).toHaveLength(1);
+      expect(f.store.listScheduleRuns("later-script")).toMatchObject([{ status: "success" }]);
+      expect(coordinator.runtimeSnapshot().slotsInUse).toBe(100);
+    } finally { gate.release(); await first; }
+    for (const id of activeIds) expect(f.store.listScheduleRuns(id)).toMatchObject([{ status: "success" }]);
+    expect(coordinator.runtimeSnapshot().slotsInUse).toBe(0);
+  });
+
+  it("captures all due pages before synchronous misfire skips advance the due set", async () => {
+    const f = await createFixture(), now = Date.now();
+    const ids = Array.from({ length: 101 }, (_, index) => `misfired-script-${String(index).padStart(3, "0")}`);
+    for (const id of ids) seedScriptSchedule(f, id, { kind: "one_shot", nextRunAt: now - 1, misfirePolicy: "skip" });
+    const executeScript = vi.fn(async () => ({ durationMs: 1, stderr: "", stderrTruncated: false }));
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { now: () => now, maxConcurrentRuns: 101, misfireGraceMs: 0, executeScript });
+    cleanups.push(() => coordinator.stop());
+    await coordinator.tick();
+    expect(executeScript).not.toHaveBeenCalled();
+    for (const id of ids) expect(f.store.listScheduleRuns(id)).toMatchObject([{ status: "skipped" }]);
+    expect(f.store.listDueSchedules(now)).toEqual([]);
+    expect(coordinator.runtimeSnapshot().slotsInUse).toBe(0);
   });
 
   it("freezes script task creation and retains later Schedule edits", async () => {

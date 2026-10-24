@@ -67,6 +67,7 @@ interface ActiveSmartOperation {
   readonly descendants: Map<string, string>;
   readonly descendantRoutes: Map<string, ActiveSmartThreadRoute>;
   readonly terminalDescendants: Set<string>;
+  readonly root: ActiveSmartThreadRoute;
 }
 
 interface ActiveSmartThreadRoute {
@@ -75,6 +76,8 @@ interface ActiveSmartThreadRoute {
   readonly modelId: string;
   readonly revision?: string;
   readonly native: boolean;
+  readonly route?: ProviderInferenceRoute;
+  readonly assertCredentialsCurrent?: () => void;
 }
 
 interface SmartBindingState {
@@ -384,7 +387,7 @@ export class ManagedProviderProxy {
             state.rootThreadId = threadId;
           },
           registerDescendant: (childThreadId, parentThreadId) => {
-            assertCurrent();
+            this.#assertSmartBinding(state, false);
             const active = state.active;
             // Historical projection may be installed while no user operation
             // owns Provider authority. It remains display-only; the first live
@@ -428,7 +431,8 @@ export class ManagedProviderProxy {
               release,
               descendants: new Map(),
               descendantRoutes: new Map(),
-              terminalDescendants: new Set()
+              terminalDescendants: new Set(),
+              root: this.#captureSmartThreadRoute(state, { ...smartRootRoute(state), kind: "internal" })
             };
             state.active = active;
             operation.signal.addEventListener("abort", release, { once: true });
@@ -479,17 +483,11 @@ export class ManagedProviderProxy {
     subtask.assertCurrent();
   }
 
-  #assertSmartBinding(state: SmartBindingState): void {
+  #assertSmartBinding(state: SmartBindingState, admission = true): void {
     if (this.#closed || state.runtime.retired || state.lineageExhausted
       || this.#smartBindings.get(state.id) !== state) throw unavailable();
     state.runtime.assertCurrent();
-    for (const route of state.routes.values()) {
-      if (route.native) continue;
-      if (this.#providers.describeInferenceRoute(state.owner.backendId, route.providerId, route.modelId)?.generationId !== route.revision) {
-        throw unavailable();
-      }
-    }
-    if (state.rootRevision !== undefined) {
+    if (admission && state.rootRevision !== undefined) {
       if (state.rootProviderId === undefined || state.rootModelId === undefined
         || this.#providers.describeInferenceRoute(state.owner.backendId, state.rootProviderId, state.rootModelId)?.generationId !== state.rootRevision) {
         throw unavailable();
@@ -498,10 +496,18 @@ export class ManagedProviderProxy {
   }
 
   #assertSmartOperation(state: SmartBindingState, operation: ActiveSmartOperation): void {
-    this.#assertSmartBinding(state);
+    this.#assertSmartBinding(state, false);
     this.#assertOwner(state.owner);
     if (state.active !== operation || operation.abort.signal.aborted || state.rootThreadId === undefined) throw unavailable();
     operation.assertCurrent();
+    operation.root.assertCredentialsCurrent?.();
+  }
+
+  #captureSmartThreadRoute(state: SmartBindingState, selected: ActiveSmartThreadRoute): ActiveSmartThreadRoute {
+    if (selected.native) return selected;
+    const route = this.#providers.resolveInferenceRoute(state.owner.backendId, selected.providerId, selected.modelId);
+    if (selected.revision === undefined || route?.generationId !== selected.revision || route.api !== "openai-responses") throw unavailable();
+    return { ...selected, route, assertCredentialsCurrent: this.#providers.captureInferenceCredentialAuthority(route) };
   }
 
   #registerSmartDescendant(
@@ -539,7 +545,7 @@ export class ManagedProviderProxy {
     operation: ActiveSmartOperation,
     request: IncomingMessage,
     requestedModel: string
-  ): { readonly route?: ProviderInferenceRoute; readonly native: boolean } {
+  ): { readonly route?: ProviderInferenceRoute; readonly native: boolean; readonly assertCurrent?: () => void } {
     if (state.rootProviderId === undefined || state.rootModelId === undefined) throw unavailable();
     const threadId = singleHeader(request, "thread-id");
     const parentThreadId = singleHeader(request, "x-codex-parent-thread-id");
@@ -559,7 +565,7 @@ export class ManagedProviderProxy {
         proposed = { kind: "collab_spawn", ...candidate };
       }
       const existing = operation.descendantRoutes.get(threadId);
-      if (existing === undefined) operation.descendantRoutes.set(threadId, proposed);
+      if (existing === undefined) { proposed = this.#captureSmartThreadRoute(state, proposed); operation.descendantRoutes.set(threadId, proposed); }
       else if (!sameSmartThreadRoute(existing, proposed)) throw unavailable();
       selected = existing ?? proposed;
     } else if (subagent !== "") {
@@ -571,7 +577,7 @@ export class ManagedProviderProxy {
       if (operation.terminalDescendants.has(threadId)) throw unavailable();
       const root = smartRootRoute(state);
       if (requestedModel !== root.modelId) throw unavailable();
-      const proposed: ActiveSmartThreadRoute = { ...root, kind: "internal" };
+      const proposed: ActiveSmartThreadRoute = { ...operation.root, kind: "internal" };
       const existing = operation.descendantRoutes.get(threadId);
       if (existing === undefined) operation.descendantRoutes.set(threadId, proposed);
       else if (!sameSmartThreadRoute(existing, proposed)) throw unavailable();
@@ -579,16 +585,17 @@ export class ManagedProviderProxy {
     } else if (parentThreadId !== "" || threadId !== state.rootThreadId || requestedModel !== state.rootModelId) {
       throw unavailable();
     } else {
-      selected = smartRootRoute(state);
+      selected = operation.root;
     }
     if (selected.native) {
       if (selected.providerId !== state.nativeProviderId) throw unavailable();
       return { native: true };
     }
-    const route = this.#providers.resolveInferenceRoute(state.owner.backendId, selected.providerId, selected.modelId);
+    const route = selected.route;
     if (selected.revision === undefined || route?.generationId !== selected.revision
       || route.api !== "openai-responses") throw unavailable();
-    return { route, native: false };
+    selected.assertCredentialsCurrent?.();
+    return { route, native: false, ...(selected.assertCredentialsCurrent ? { assertCurrent: selected.assertCredentialsCurrent } : {}) };
   }
 
   async #handleSmart(request: IncomingMessage, response: ServerResponse, state: SmartBindingState, path: string): Promise<void> {
@@ -669,7 +676,7 @@ export class ManagedProviderProxy {
         body: upstream.body,
         response,
         signal,
-        assertCurrent: () => this.#assertSmartOperation(state, operation),
+        assertCurrent: () => { this.#assertSmartOperation(state, operation); selected.assertCurrent?.(); },
         repair: selected.native ? undefined : createManagedResponsesSseRepair({
           protocol: "openai-responses",
           contentType: upstream.headers.get("content-type") ?? ""

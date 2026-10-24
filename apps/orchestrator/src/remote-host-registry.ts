@@ -303,9 +303,11 @@ export class RemoteHostRegistry {
   async execute(
     targetId: string,
     id: string,
-    options: RemoteSshExecutionOptions
+    options: RemoteSshExecutionOptions,
+    assertCallerCurrent: () => void = () => undefined
   ): Promise<RemoteHostCommandOutcome> {
     this.assertOpen();
+    assertCallerCurrent();
     if (!this.#commandExecutionSupported) {
       throw new RemoteSshError(
         "EXECUTION_UNAVAILABLE",
@@ -321,13 +323,19 @@ export class RemoteHostRegistry {
         false
       );
     }
+    const managed = this.controllerFor(current);
     const connected = await this.connect(targetId, id, current.revision, options.signal);
     if (!connected.ok) throw connectionOutcomeError(connected);
-    const managed = this.#controllers.get(controllerKey(targetId, id));
-    if (managed === undefined) {
+    if (this.#controllers.get(controllerKey(targetId, id)) !== managed) {
       throw new RemoteSshError("EXECUTION_UNAVAILABLE", "Remote Host command execution is unavailable.", false);
     }
+    // A successful delayed handshake cannot renew the product caller's grant.
+    assertCallerCurrent();
     const result = await managed.controller.execute(managed.scope, options);
+    assertCallerCurrent();
+    if (this.#controllers.get(controllerKey(targetId, id)) !== managed) {
+      throw new RemoteSshError("EXECUTION_UNAVAILABLE", "Remote Host command authority changed.", false);
+    }
     return Object.freeze({ host: this.get(targetId, id), result });
   }
 

@@ -30,6 +30,16 @@ export interface PiHostedExecutorConfiguration {
   readonly providerId?: string;
   readonly modelIds?: readonly string[];
   readonly environmentNote?: string;
+  readonly backgroundScope?: PiHostedBackgroundScope;
+}
+
+/** Owner-private identity copied into one detached native runner's config. */
+export interface PiHostedBackgroundScope {
+  readonly taskId: string;
+  readonly runId: string;
+  readonly launchToken: string;
+  readonly runnerInstanceId: string;
+  readonly nativeSessionId: string;
 }
 
 /** Closure-free factory provisioned next to the native bridge. Every operation
@@ -42,6 +52,12 @@ export function createPiHostedExecutor(sdk: ToolSdk, config: PiHostedExecutorCon
     || !["win32", "darwin", "linux"].includes(config.platform) || typeof config.shell !== "string"
     || !["owner", "guest"].includes(config.trust)
     || config.environmentNote !== undefined && typeof config.environmentNote !== "string"
+    || config.backgroundScope !== undefined && (!config.backgroundScope || typeof config.backgroundScope !== "object"
+      || Object.keys(config.backgroundScope).length !== 5
+      || typeof config.backgroundScope.taskId !== "string" || !config.backgroundScope.taskId || config.backgroundScope.taskId.length > 256
+      || /[\0\r\n]/u.test(config.backgroundScope.taskId)
+      || [config.backgroundScope.runId, config.backgroundScope.launchToken, config.backgroundScope.runnerInstanceId, config.backgroundScope.nativeSessionId]
+        .some(value => typeof value !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)))
     || Buffer.byteLength(JSON.stringify(config)) > 8 * 1024 * 1024
     || config.trust === "guest" && (!config.providerId || !Array.isArray(config.modelIds) || !config.modelIds.length
       || config.modelIds.some(id => typeof id !== "string" || !id || id.length > 512))) throw new Error("Hosted execution channel is invalid.");
@@ -64,7 +80,8 @@ export function createPiHostedExecutor(sdk: ToolSdk, config: PiHostedExecutorCon
       const activeSignal = signal && operationSignal && signal !== operationSignal ? AbortSignal.any([signal, operationSignal]) : operationSignal;
       activeSignal?.throwIfAborted();
       if (++sequence > 1024) throw new Error("Hosted tool operation limit exceeded.");
-      const body = JSON.stringify({ format: 1, callId: executionId, requestId: `${executionId}:${sequence}`, operation, payload, origin });
+      const body = JSON.stringify({ format: 1, callId: executionId, requestId: `${executionId}:${sequence}`, operation, payload, origin,
+        ...(config.backgroundScope === undefined ? {} : { backgroundScope: config.backgroundScope }) });
       if (Buffer.byteLength(body) > maximumBytes) throw new Error("Hosted tool request exceeds its limit.");
       const response = await fetcher(endpoint, { method: "POST", redirect: "error", signal: activeSignal,
         headers: { authorization: `Bearer ${config.bearer}`, "content-type": "application/json" }, body });

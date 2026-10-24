@@ -75,7 +75,7 @@ test("an invalid exact helper identity blocks the outer seal", async () => {
 });
 
 test("every signed helper owner is audited before the configured signer may mutate files", async () => {
-  for (const kind of ["gamepad", "frontmost"]) {
+  for (const kind of ["gamepad", "menuBar", "frontmost"]) {
     const fixture = await create();
     try {
       const artifact = fixture.simple.find(item => item.kind === kind);
@@ -110,7 +110,7 @@ async function create() {
   const resource = Buffer.from('{}'); await writeFile(join(root, bundle, "credentials.json"), resource);
   const original = digest(bytes);
   const simple = [];
-  for (const kind of ["gamepad", "frontmost"]) {
+  for (const kind of ["gamepad", "menuBar", "frontmost"]) {
     const artifact = SIMPLE_NATIVE_ARTIFACTS[kind], helper = artifact.helpers.darwin;
     const location = join(app, "Contents", "Resources", artifact.directory), path = join(location, helper);
     await mkdir(location, { recursive: true });

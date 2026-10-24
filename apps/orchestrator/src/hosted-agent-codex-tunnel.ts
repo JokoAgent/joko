@@ -19,18 +19,8 @@ interface Connection {
 /** Private Model Host listener. It delegates every native record to the Source. */
 export async function createHostedAgentCodexTunnel(execution: HostedExecution): Promise<CodexHostedExecServerLease> {
   assertHostedExecution(execution);
-  const bearer = randomBytes(32).toString("base64url"), expected = Buffer.from("Bearer " + bearer);
-  const server = createServer((_request, response) => response.writeHead(404).end());
-  const sockets = new WebSocketServer({ noServer: true, maxPayload: MAXIMUM_NATIVE_BYTES, perMessageDeflate: false });
-  const lifetime = new AbortController(), connections = new Set<Connection>();
-  let closing: Promise<void> | undefined;
-  const assertCurrent = () => { lifetime.signal.throwIfAborted(); assertHostedExecution(execution); };
-  const request = async (connection: Connection, kind: "open" | "message" | "poll" | "close", data?: string): Promise<Record<string, unknown>> => {
-    assertCurrent();
-    const signal = AbortSignal.any([lifetime.signal, connection.lifetime.signal, AbortSignal.timeout(kind === "poll" ? 60_000 : 10 * 60_000)]);
-    const body = JSON.stringify({ format: 1, origin: "agent", callId: connection.id, requestId: randomUUID(),
-      operation: "codex.exec_server", payload: { kind, connectionId: connection.id, ...(data === undefined ? {} : { data }) } });
-    if (Buffer.byteLength(body) > MAXIMUM_WIRE_BYTES) throw new Error("Native execution record exceeds its limit.");
+  return createCodexExecServerTunnel({ assertCurrent: () => assertHostedExecution(execution), execute: async (request, signal) => {
+    const body = JSON.stringify(request);
     const response = await fetch(execution.channel.endpoint + "/execute", { method: "POST", redirect: "error", signal,
       headers: { authorization: "Bearer " + execution.channel.bearer, "content-type": "application/json" }, body });
     const chunks: Uint8Array[] = []; let bytes = 0;
@@ -42,12 +32,38 @@ export async function createHostedAgentCodexTunnel(execution: HostedExecution): 
         chunks.push(part.value);
       }
     } finally { reader.releaseLock(); }
-    assertCurrent(); signal.throwIfAborted();
+    assertHostedExecution(execution); signal.throwIfAborted();
     const decoded: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     if (!response.ok || !decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new Error("The task executor is unavailable.");
     const result = decoded as Record<string, unknown>;
     if (result.format !== 1 || result.ok !== true || !result.value || typeof result.value !== "object" || Array.isArray(result.value)) throw new Error("The task executor rejected the native operation.");
     return result.value as Record<string, unknown>;
+  } });
+}
+
+/** Same private authenticated native listener for local and Source execution.
+ * The execute port is in-memory service authority, never a public endpoint. */
+export async function createCodexExecServerTunnel<Owner = unknown>(options: {
+  readonly assertCurrent: () => void;
+  /** Capture at wire ingress, before either delivery queue can change turns. */
+  readonly capture?: () => Owner;
+  readonly execute: (request: Readonly<Record<string, unknown>>, signal: AbortSignal, owner?: Owner) => Promise<Record<string, unknown>>;
+}): Promise<CodexHostedExecServerLease> {
+  options.assertCurrent();
+  const bearer = randomBytes(32).toString("base64url"), expected = Buffer.from("Bearer " + bearer);
+  const server = createServer((_request, response) => response.writeHead(404).end());
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: MAXIMUM_NATIVE_BYTES, perMessageDeflate: false });
+  const lifetime = new AbortController(), connections = new Set<Connection>();
+  let closing: Promise<void> | undefined;
+  const assertCurrent = () => { lifetime.signal.throwIfAborted(); options.assertCurrent(); };
+  const request = async (connection: Connection, kind: "open" | "message" | "poll" | "close", data?: string, owner?: Owner): Promise<Record<string, unknown>> => {
+    assertCurrent();
+    const signal = AbortSignal.any([lifetime.signal, connection.lifetime.signal, AbortSignal.timeout(kind === "poll" ? 60_000 : 10 * 60_000)]);
+    const input = { format: 1, origin: "agent", callId: connection.id, requestId: randomUUID(),
+      operation: "codex.exec_server", payload: { kind, connectionId: connection.id, ...(data === undefined ? {} : { data }) } };
+    if (Buffer.byteLength(JSON.stringify(input)) > MAXIMUM_WIRE_BYTES) throw new Error("Native execution record exceeds its limit.");
+    const result = await options.execute(input, signal, owner);
+    assertCurrent(); signal.throwIfAborted(); return result;
   };
   const drop = (connection: Connection) => {
     connection.lifetime.abort(); connection.socket.terminate(); connections.delete(connection);
@@ -89,10 +105,12 @@ export async function createHostedAgentCodexTunnel(execution: HostedExecution): 
       if (binary || connection.queuedBytes + bytes.byteLength > MAXIMUM_WIRE_BYTES || bytes.includes(0)) { drop(connection); return; }
       const text = bytes.toString("utf8");
       if (!Buffer.from(text).equals(bytes)) { drop(connection); return; }
+      let owner: Owner | undefined;
+      try { assertCurrent(); owner = options.capture?.(); } catch { drop(connection); return; }
       connection.queuedBytes += bytes.byteLength;
       connection.tail = connection.tail.then(async () => {
         if (!connection.opened) return;
-        try { await request(connection, "message", text); }
+        try { await request(connection, "message", text, owner); }
         finally { connection.queuedBytes -= bytes.byteLength; }
       }).catch(() => drop(connection));
     });

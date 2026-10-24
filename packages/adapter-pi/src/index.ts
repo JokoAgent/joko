@@ -5,6 +5,8 @@ export * from "./config.js";
 export * from "./durable-subagent-runs.js";
 export * from "./errors.js";
 export * from "./managed-subagent.js";
+export { assertManagedSubagentHostedToolScope } from "./managed-subagent-observer.js";
+export type { PiHostedBackgroundScope } from "./hosted-executor.js";
 export * from "./managed-durable-store.js";
 export * from "./managed-subagent-process-inspector.js";
 export * from "./managed-subagent-runner-source.js";

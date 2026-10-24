@@ -167,6 +167,11 @@ jobs:
         id: signing
         run: node --test --test-reporter=spec apps/desktop/scripts/sign-mac-native-credentials.test.mjs apps/desktop/scripts/seal-windows-native-hardware.test.mjs apps/desktop/scripts/seal-windows-native-remote-desktop.test.mjs 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/signing-transaction.log"
 
+      - name: Compile both macOS menu bar helper targets
+        id: menu-bar
+        run: |
+          node --input-type=module -e 'import {buildNativeMenuBar} from "./apps/desktop/scripts/build-native-menu-bar.mjs"; import {join} from "node:path"; for (const architecture of ["x64","arm64"]) buildNativeMenuBar({platform:"darwin",architecture,output:join(process.env.RUNNER_TEMP,"joko-native-menu-bar",architecture)});' 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/menu-bar-compile.log"
+
       - name: Record macOS check scope and retain short logs
         if: always()
         run: |
@@ -178,6 +183,7 @@ jobs:
           printf '%s\n' \
             'macOS source checks on macos-15:' \
             '- Native signing transaction fixtures: ${{ steps.signing.outcome }}' \
+            '- Menu bar helper Swift compilation, x64 and arm64 at macOS 14.0: ${{ steps.menu-bar.outcome }}' \
             '' \
             'Scope: existing Node test files outside the Vitest include patterns. Signing uses controlled fixtures; no real signing identity, notarization, simulator session, GUI, Accessibility/Input Monitoring/Screen Recording grant, or physical device was exercised.' \
             'Only the last 200 lines of each log are retained. Swift receiver execution is covered by the Mobile workflow and is not repeated here.' \

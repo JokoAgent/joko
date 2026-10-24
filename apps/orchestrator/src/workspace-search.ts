@@ -6,7 +6,6 @@ import { createInterface, type Interface as ReadlineInterface } from "node:readl
 export const WORKSPACE_FILE_INDEX_CAP = 30_000;
 /** Count ripgrep JSON match records (matching lines), not submatches. */
 export const WORKSPACE_SEARCH_MAX_MATCHES = 1_000;
-const WORKSPACE_SEARCH_MAX_MATCHES_PER_FILE = 200;
 const KILL_GRACE_MS = 200;
 
 import { textFileExtensions, textFileNames } from "@joko/contracts";
@@ -45,8 +44,8 @@ export function workspaceTextSearchArguments(query: string, caseSensitive: boole
   const args: string[] = [
     "--json",
     "-F",
-    `--max-count=${WORKSPACE_SEARCH_MAX_MATCHES_PER_FILE}`,
-    "--hidden"
+    "--hidden",
+    "--crlf"
   ];
   for (const extension of textFileExtensions) args.push("--glob", `*${extension}`);
   for (const filename of textFileNames) args.push("--iglob", filename);

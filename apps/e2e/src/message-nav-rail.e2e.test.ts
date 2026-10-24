@@ -51,6 +51,8 @@ describe("mounted message navigation rail", () => {
     if (challenge.challenge === undefined) throw new Error("Mounted rail pairing returned no challenge.");
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1600, height: 960 }, reducedMotion: "reduce" });
+    // Keep a stalled action's locator and call log inside the overall test deadline.
+    page.setDefaultTimeout(20_000);
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.name));
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });

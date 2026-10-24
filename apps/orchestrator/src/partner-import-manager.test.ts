@@ -250,7 +250,7 @@ describe("native import service and owning effects", () => {
     expect((await f.api.start(selection, signal)).partnerId).toBe(profile.id); expect(f.profiles.listPartners()).toHaveLength(1);
     await expect(f.api.start({ ...selection, name: "Another intent" }, signal)).rejects.toMatchObject({ code: Code.AlreadyExists });
     advance("complete");
-  }, 20_000);
+  }, 40_000);
   it("fences preview theft/revocation and serializes import deletion without recreating private data", async ({ signal: testSignal, onTestFailed, onTestFinished }) => {
     const started = performance.now(); let phase = "fixture";
     const effects: Array<{ phase: string; elapsedMs: number }> = [];

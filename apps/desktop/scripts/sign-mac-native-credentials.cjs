@@ -2,9 +2,9 @@ const { createHash } = require("node:crypto");
 const { lstat, readFile, realpath, writeFile } = require("node:fs/promises");
 const { createRequire } = require("node:module");
 const { join, resolve, sep } = require("node:path");
-const { auditNativeRemoteDesktop, auditNativeGamepad, auditNativeSystemFrontmostInput } = require("./audit-packaged.cjs");
+const { auditNativeRemoteDesktop, auditNativeGamepad, auditNativeMenuBar, auditNativeSystemFrontmostInput } = require("./audit-packaged.cjs");
 const { SIMPLE_NATIVE_ARTIFACTS, REMOTE_NATIVE_DIGEST_ARTIFACTS, boundedRegularFile, refreshSimpleNativeManifest } = require("./native-helper-artifacts.cjs");
-const simpleAudits = { gamepad: auditNativeGamepad, frontmost: auditNativeSystemFrontmostInput };
+const simpleAudits = { gamepad: auditNativeGamepad, menuBar: auditNativeMenuBar, frontmost: auditNativeSystemFrontmostInput };
 
 // The pinned signer signs inner Mach-O files before asking for the outer App's
 // options. Refresh those final digests here, before the outer resource seal.

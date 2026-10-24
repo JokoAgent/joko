@@ -184,6 +184,32 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Prepare the pinned complete Codex package for native integration tests
+        id: codex_native
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full') }}
+        timeout-minutes: 20
+        shell: bash
+        run: node scripts/ci/prepare-codex-native.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/codex-native-prepare.log"
+
+      - name: Prepare Ubuntu user namespaces for native Codex filesystem tests
+        id: codex_sandbox
+        if: ${{ !cancelled() && steps.codex_native.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          exec > >(tee "$RUNNER_TEMP/joko-ci-logs/codex-native-sandbox.log") 2>&1
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- install --no-install-recommends --yes bubblewrap apparmor-profiles
+          node scripts/ci/configure-linux-codex-sandbox.mjs
+
+      - name: Upload native Codex preparation evidence
+        if: ${{ always() && (steps.codex_native.outcome == 'success' || steps.codex_native.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-codex-native-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/codex-native-*
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Check Windows SSH key permissions
         id: ssh_key_permissions
         if: ${{ matrix.workload == 'product' && (inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && !cancelled() && steps.source_check.outcome == 'success' && runner.os == 'Windows' }}
@@ -231,7 +257,7 @@ jobs:
 
       - name: Run workspace package tests (Linux)
         id: workspace_packages_linux
-        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.codex_native.outcome == 'success' && steps.codex_sandbox.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm -r --workspace-concurrency=1 --no-bail --if-present --filter '!@joko/orchestrator' --filter '!@joko/e2e' test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-packages.log"
         env:
@@ -240,12 +266,12 @@ jobs:
 
       - name: Run workspace package tests (Windows/macOS)
         id: workspace_packages_desktop
-        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.codex_native.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm -r --workspace-concurrency=1 --no-bail --if-present --filter '!@joko/orchestrator' --filter '!@joko/e2e' test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-packages.log"
 
       - name: Upload completed workspace package test logs
-        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.codex_native.outcome == 'success' && (runner.os != 'Linux' || steps.codex_sandbox.outcome == 'success') && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-workspace-packages-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -255,7 +281,7 @@ jobs:
 
       - name: Run Orchestrator tests (Linux)
         id: workspace_orchestrator_linux
-        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.codex_native.outcome == 'success' && steps.codex_sandbox.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/orchestrator test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-orchestrator.log"
         env:
@@ -264,12 +290,12 @@ jobs:
 
       - name: Run Orchestrator tests (Windows/macOS)
         id: workspace_orchestrator_desktop
-        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.codex_native.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm --filter @joko/orchestrator test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-orchestrator.log"
 
       - name: Upload completed Orchestrator test logs
-        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.codex_native.outcome == 'success' && (runner.os != 'Linux' || steps.codex_sandbox.outcome == 'success') && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-workspace-orchestrator-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}

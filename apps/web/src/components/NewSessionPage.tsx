@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import type { AppController } from "../controller.js";
 import { ensureNewSessionModelProject } from "../new-session-model-project.js";
+import { resolveNewSessionModelRequest } from "../new-session-provider-model.js";
 import {
   composerDocumentIsEmpty,
   composerDocumentPlainText,
@@ -45,6 +46,7 @@ import type {
   NativeSessionCandidateView,
   NewSessionDraftSelection,
   NewSessionLocalDraft,
+  NewSessionModelRequest,
   PermissionMode,
   PendingExtensionSuggestionView,
   SessionView,
@@ -144,6 +146,7 @@ interface NewSessionPageProps {
   readonly initialTargetId?: string;
   readonly initialDialogueBackendId?: string;
   readonly recommendationNonce?: string;
+  readonly initialModel?: NewSessionModelRequest;
   readonly projectPickerRequest?: NewSessionProjectPickerRequest;
   readonly onProjectPickerRequestConsumed?: (requestId: number) => void;
   readonly navigationOpen: boolean;
@@ -187,7 +190,7 @@ interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation
 }
 
 /** Delayed-create route rendered within Joko's visual language. */
-export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
+export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, initialModel, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
   const projectTargets = snapshot.targets.filter((target) => !target.archived);
   const activeTargets = newSessionTargets(projectTargets, snapshot.settings.backendSettings).filter((target) => {
     const candidate = snapshot.backends.find((backend) => backend.id === target.backendId);
@@ -317,6 +320,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
   const latestDraftRef = useRef<{ readonly controller: AppController; readonly draft: NewSessionLocalDraft } | undefined>(undefined);
   const restoredExecutionRef = useRef<NewSessionLocalDraft | undefined>(undefined);
+  const consumedModelRequestRef = useRef<string | undefined>(undefined);
   const typedPaletteTriggerRef = useRef<"/" | "@" | undefined>(undefined);
   const inlineMentionActivationRef = useRef<NewTaskInlineMentionActivation | undefined>(undefined);
   const suppressedInlineMentionFromRef = useRef<number | undefined>(undefined);
@@ -1229,17 +1233,17 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       : availableOptions.availableModels.find((model) =>
           model.providerId === defaultRoute.providerId && model.modelId === defaultRoute.modelId);
     const options = resolveNewSessionExecutionOptions(backend, snapshot.models, defaultModel === undefined ? "" : modelKeyFor(defaultModel.providerId, defaultModel.modelId));
-    const initialModel = options.modelSwitchSupported ? options.selectedModel : undefined;
+    const initialModelChoice = options.modelSwitchSupported ? options.selectedModel : undefined;
     setModelKey(!options.modelSwitchSupported ? "" : defaultRoute !== undefined
       ? modelKeyFor(defaultRoute.providerId, defaultRoute.modelId)
-      : initialModel === undefined ? "" : modelKeyFor(initialModel.providerId, initialModel.modelId));
-    const initialEffort = initialModel === undefined ? "" : preferredModelEffort(readModelPickerOwnerPreferences(pickerOwnerId), initialModel) ?? "";
+      : initialModelChoice === undefined ? "" : modelKeyFor(initialModelChoice.providerId, initialModelChoice.modelId));
+    const initialEffort = initialModelChoice === undefined ? "" : preferredModelEffort(readModelPickerOwnerPreferences(pickerOwnerId), initialModelChoice) ?? "";
     setEffort(options.effortSupported ? defaultRoute?.effort ?? initialEffort : "");
-    setFastMode(initialModel === undefined && defaultRoute !== undefined ? defaultRoute.fastMode
-      : options.fastModeSupported && initialModel?.supportsFast === true && (defaultRoute?.fastMode ?? false));
-    if (!preference && initialModel?.available) setAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId, {
-      backendId: backend.id, providerId: initialModel.providerId, modelId: initialModel.modelId,
-      effort: options.effortSupported ? defaultRoute?.effort ?? initialEffort : "", fastMode: options.fastModeSupported && initialModel.supportsFast && (defaultRoute?.fastMode ?? false)
+    setFastMode(initialModelChoice === undefined && defaultRoute !== undefined ? defaultRoute.fastMode
+      : options.fastModeSupported && initialModelChoice?.supportsFast === true && (defaultRoute?.fastMode ?? false));
+    if (!preference && initialModelChoice?.available) setAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId, {
+      backendId: backend.id, providerId: initialModelChoice.providerId, modelId: initialModelChoice.modelId,
+      effort: options.effortSupported ? defaultRoute?.effort ?? initialEffort : "", fastMode: options.fastModeSupported && initialModelChoice.supportsFast && (defaultRoute?.fastMode ?? false)
     });
     const defaultPermission = defaults?.permissionMode ?? snapshot.settings.policy.defaultMode;
     setPermissionMode(options.permissionModes.includes(defaultPermission) ? defaultPermission : options.permissionModes[0] ?? "ask");
@@ -1250,7 +1254,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setStartKind("fresh");
     setNativeReference("");
     setNativeSelectionWarning(undefined);
-    replaceMentions([], []);
+    if (!initialModel || consumedModelRequestRef.current === initialModel.requestId
+      || initialModel.backendId !== backend.id || !resolveNewSessionModelRequest(initialModel, controllerRef.current.state)) replaceMentions([], []);
     setExtraDirectoryIds([]);
     inlineMentionActivationRef.current = undefined;
     setInlineMentionActivation(undefined);
@@ -1261,6 +1266,29 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setPalette(undefined);
     typedPaletteTriggerRef.current = undefined;
   }, [backend?.id, hydrationRevision, selectionKey]);
+
+  useEffect(() => {
+    if (!initialModel || consumedModelRequestRef.current === initialModel.requestId || !hydrated
+      || hydratedProfileScope !== profileScope || submitting || recommendationNonce !== undefined) return;
+    const model = resolveNewSessionModelRequest(initialModel, controllerRef.current.state);
+    if (!model) { consumedModelRequestRef.current = initialModel.requestId; return; }
+    if (backend?.id !== model.backendId) {
+      // Keep the current composer and media in memory. This is a picker intent, not draft hydration.
+      setSelection({ kind: "dialogue", backendId: model.backendId });
+      return;
+    }
+    consumedModelRequestRef.current = initialModel.requestId;
+    const options = resolveNewSessionExecutionOptions(backend, snapshot.models, modelKeyFor(model.providerId, model.modelId));
+    const nextEffort = options.effortSupported ? preferredModelEffort(readModelPickerOwnerPreferences(pickerOwnerId), model) ?? "" : "";
+    setModelKey(modelKeyFor(model.providerId, model.modelId));
+    setEffort(nextEffort);
+    setFastMode(false);
+    setAppDefaultModelPreference(pickerOwnerId, { backendId: model.backendId, providerId: model.providerId, modelId: model.modelId,
+      effort: nextEffort, fastMode: false });
+    setStartKind("fresh");
+    setNativeReference("");
+    setNativeSelectionWarning(undefined);
+  }, [initialModel, hydrated, hydratedProfileScope, profileScope, submitting, recommendationNonce, backend?.id, hydrationRevision, selectionKey]);
 
   useLayoutEffect(() => {
     if (observedAppDefault.current === appDefaultKey) return;

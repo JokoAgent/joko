@@ -273,6 +273,74 @@ describe("RemoteHostToolBridgeProvider", () => {
     expect(safeJson(fixture.store.listEvents({ limit: 1_000 }))).not.toContain(COMMAND);
   });
 
+  it.each(["trust", "generation", "scope", "grant", "host"] as const)("does not execute after %s retires during SSH authentication", async retirement => {
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const execute = vi.fn(async () => ({ stdout: "unexpected", stderr: "", exitCode: 0, outputCapped: false }));
+    const connector: ResolvedAgentAuthConnectorPort = {
+      capabilities: { commandExecution: true, processStreaming: false, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false },
+      async connect(request) {
+        request.onAuthenticating();
+        await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(3, 4, 5) });
+        entered(); await blocked;
+        return { close: async () => undefined, execute };
+      }
+    };
+    const fixture = createFixture({ connector, resolve: () => SECRET });
+    fixture.registry.create({ targetId: "target-a", id: "executor", hostname: "executor.example.test", user: "maker", source: "manual", credentialReferenceId: "agent:executor" });
+    let grantCurrent = true;
+    const pending = call(fixture.provider, "remote_host_execute", { host: "executor", command: COMMAND }, {
+      sessionId: "session-a", targetId: "target-a", generation: 7,
+      assertCurrent: () => { if (!grantCurrent) throw new Error("Original grant retired."); }
+    });
+    await started;
+    try {
+      const target = fixture.store.getTarget("target-a").descriptor;
+      if (retirement === "trust") fixture.store.upsertTarget({ ...target, trusted: false });
+      if (retirement === "scope") fixture.store.upsertTarget({ ...target, remoteWorkspace: { kind: "ssh", hostTargetId: "target-b", hostId: "executor", workspaceRoot: "/replacement" } });
+      if (retirement === "generation") {
+        const session = fixture.store.getSession("session-a");
+        fixture.store.updateSession("session-a", { binding: { ...session.descriptor.binding, generation: 8 } }, session.revision);
+      }
+      if (retirement === "grant") grantCurrent = false;
+      if (retirement === "host") {
+        const host = fixture.registry.get("target-a", "executor");
+        expect(() => fixture.registry.update({ targetId: host.targetId, id: host.id,
+          expectedRevision: host.revision, hostname: "replacement.example.test" }))
+          .toThrow("An active Remote Host cannot change routing or credential metadata.");
+        const disconnected = await fixture.registry.disconnect(host.targetId, host.id, host.revision);
+        expect(disconnected.status.state).toBe("disconnected");
+        fixture.registry.update({ targetId: host.targetId, id: host.id,
+          expectedRevision: disconnected.revision, hostname: "replacement.example.test" });
+      }
+    } finally { release(); }
+    expect((await pending).isError).toBe(true);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("does not adopt a command result after the original caller grant retires", async () => {
+    let current = true;
+    const execute = vi.fn(async () => { current = false; return { stdout: "private result", stderr: "", exitCode: 0, outputCapped: false }; });
+    const fixture = createFixture({ resolve: () => SECRET, connector: {
+      capabilities: { commandExecution: true, processStreaming: false, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false },
+      async connect(request) {
+        request.onAuthenticating();
+        await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(3, 4, 5) });
+        return { close: async () => undefined, execute };
+      }
+    } });
+    fixture.registry.create({ targetId: "target-a", id: "executor", hostname: "executor.example.test", user: "maker", source: "manual", credentialReferenceId: "agent:executor" });
+    const result = await call(fixture.provider, "remote_host_execute", { host: "executor", command: COMMAND }, {
+      sessionId: "session-a", targetId: "target-a", generation: 7,
+      assertCurrent: () => { if (!current) throw new Error("Original grant retired."); }
+    });
+    expect(result.isError).toBe(true);
+    expect(safeJson(result)).not.toContain("private result");
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
   it("fences untrusted, stale, ambiguous, and raw connector failures without disclosure", async () => {
     const connector: ResolvedAgentAuthConnectorPort = {
       capabilities: {

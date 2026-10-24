@@ -16,6 +16,17 @@ import {
 } from "./runtime-tool-catalog.js";
 
 describe("managed Pi bridge boundaries", () => {
+  it("keeps executable Git converters out of the real Plan-mode read-only classifier", () => {
+    const start = MANAGED_BRIDGE_SOURCE.indexOf("function classifyTool("), end = MANAGED_BRIDGE_SOURCE.indexOf("function policyRisk(", start);
+    const output = ts.transpileModule(MANAGED_BRIDGE_SOURCE.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+    const classify = new Function("mcp", "credentialPath", "dangerousCommand", "shellMeta", `${output}; return classifyTool;`)(undefined, /credential/u, /NEVER_MATCH/u, /[|;<>`]/u) as (name: string, input: unknown, control: unknown) => string;
+    for (const command of ["git diff", "git show", "git diff --stat", "git show --no-ext-diff", "git diff --no-textconv", "git diff --no-ext-diff --no-textconv --output=patch"]) {
+      expect(classify("bash", { command }, {}), command).toBe("ambiguous");
+    }
+    for (const command of ["git diff --no-ext-diff --no-textconv", "git show --no-textconv --stat --no-ext-diff"]) {
+      expect(classify("bash", { command }, {}), command).toBe("safe_command");
+    }
+  });
   it("normalizes the public bash deadline without widening its upper bound", () => {
     expect(DEFAULT_MANAGED_BASH_TIMEOUT_SECONDS).toBe(300);
     expect(MAXIMUM_MANAGED_BASH_TIMEOUT_SECONDS).toBe(1_800);

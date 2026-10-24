@@ -842,6 +842,7 @@ function connectedState(options: {
   return {
     ready: true,
     connectionState: "connected",
+    connectionGeneration: 1,
     profiles: [{ id: "profile-a", deviceId: "device-a", serverId: "server-a", name: "Local", origin: "http://127.0.0.1" }],
     machineCaches: [],
     machinePresenceByProfile: {},

@@ -1,4 +1,4 @@
-import type { DesktopRemoteDesktopViewerOwner } from "@joko/contracts";
+import type { DesktopRemoteDesktopViewerOwner, MenubarState, MenubarSettings, DesktopMenubarSnapshot, DesktopMenubarAction } from "@joko/contracts";
 import type {
   DesktopAppInfo,
   DesktopAttentionKey,
@@ -27,6 +27,7 @@ import type {
   DesktopGlobalVoiceShortcutResult,
   DesktopGlobalVoiceStatus,
   DesktopKeepAwakeSettings,
+  DesktopLoginItemState,
   DesktopMainWindowCloseSettings,
   DesktopMainWindowCloseSettingsChange,
   DesktopWallpaperSettings,
@@ -175,6 +176,13 @@ const DESKTOP_CHANNELS = {
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
   keepAwakeChanged: "joko:power:keep-awake:changed",
+  loginItemGet: "joko:login-item:get",
+  loginItemSet: "joko:login-item:set",
+  menuBarGet: "joko:menu-bar:get",
+  menuBarSetEnabled: "joko:menu-bar:set-enabled",
+  menuBarPublish: "joko:menu-bar:publish",
+  menuBarAction: "joko:menu-bar:action",
+  menuBarSettingsChanged: "joko:menu-bar:settings-changed",
   providerModelRefreshLifecycle: "joko:provider-models:refresh-lifecycle",
   microphoneGetPermission: "joko:microphone:permission:get",
   microphoneOpenSettings: "joko:microphone:settings:open",
@@ -331,7 +339,9 @@ const desktopCapabilities = Object.freeze([
   "provider.modelCatalogLifecycle",
   ...(attentionBadgeSupported ? ["attention.badge" as const] : []),
   ...(nativeTaskStatusSupported ? ["native.taskStatus" as const] : []),
+  ...(process.platform === "darwin" ? ["native.menuBar" as const] : []),
   "power.keepAwake",
+  ...((process.platform === "win32" || process.platform === "darwin") ? ["window.loginItem" as const] : []),
   "selection.quote.contextMenu",
   "runtime.desktopProcessUsage",
   "runtime.processMonitorWindow",
@@ -369,6 +379,36 @@ const desktopApi = Object.freeze({
   platform: process.platform,
   preferredSystemLocale,
   capabilities: desktopCapabilities,
+  menuBar: Object.freeze({
+    get: (): Promise<MenubarState> => ipcRenderer.invoke(DESKTOP_CHANNELS.menuBarGet).then(nativeTaskStatusContract.parseMenubarState),
+    setEnabled: (enabled: boolean): Promise<MenubarState> => {
+      if (typeof enabled !== "boolean") return Promise.reject(new TypeError("Invalid menu bar toggle."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.menuBarSetEnabled, enabled).then(nativeTaskStatusContract.parseMenubarState);
+    },
+    publish: (snapshot: DesktopMenubarSnapshot): Promise<void> => {
+      if (!mainDocumentOccurrence) return Promise.reject(new Error("The main document is unavailable."));
+      const parsed = nativeTaskStatusContract.parseMenubarSnapshot(snapshot);
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.menuBarPublish, mainDocumentOccurrence, parsed).then(() => undefined);
+    },
+    onAction: (listener: (action: DesktopMenubarAction) => void): (() => void) => {
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        let parsed: DesktopMenubarAction;
+        try { parsed = nativeTaskStatusContract.parseMenubarAction(value); } catch { return; }
+        listener(parsed);
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.menuBarAction, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.menuBarAction, wrapped);
+    },
+    onSettings: (listener: (settings: MenubarSettings) => void): (() => void) => {
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        let parsed: MenubarSettings;
+        try { parsed = nativeTaskStatusContract.parseMenubarSettings(value); } catch { return; }
+        listener(parsed);
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.menuBarSettingsChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.menuBarSettingsChanged, wrapped);
+    }
+  }),
   ...(mainDocumentOccurrence === undefined ? {} : { remoteDesktopViewer: Object.freeze({
     bind: (owner: DesktopRemoteDesktopViewerOwner): Promise<void> =>
       ipcRenderer.invoke("joko:remote-desktop-viewer:bind", mainDocumentOccurrence, owner),
@@ -693,6 +733,13 @@ const desktopApi = Object.freeze({
       };
       ipcRenderer.on(DESKTOP_CHANNELS.nativeTaskStatusSettingsChanged, wrapped);
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.nativeTaskStatusSettingsChanged, wrapped);
+    }
+  }),
+  loginItem: Object.freeze({
+    get: (): Promise<DesktopLoginItemState> => ipcRenderer.invoke(DESKTOP_CHANNELS.loginItemGet).then(parseDesktopLoginItemState),
+    set: (enabled: boolean): Promise<DesktopLoginItemState> => {
+      if (typeof enabled !== "boolean") return Promise.reject(new TypeError("Login startup requires one boolean."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.loginItemSet, enabled).then(parseDesktopLoginItemState);
     }
   }),
   power: Object.freeze({
@@ -1899,6 +1946,18 @@ function parseDesktopKeepAwakeSettings(value: unknown): DesktopKeepAwakeSettings
     throw new TypeError("Desktop keep-awake settings are invalid.");
   }
   return Object.freeze({ enabled: (value as { readonly enabled: boolean }).enabled });
+}
+
+function parseDesktopLoginItemState(value: unknown): DesktopLoginItemState {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Login startup state is invalid.");
+  const entry = value as Record<string, unknown>;
+  if (typeof entry["available"] !== "boolean" || typeof entry["enabled"] !== "boolean" || typeof entry["requiresApproval"] !== "boolean"
+    || Object.keys(entry).sort().join(",") !== (entry["available"] ? "available,enabled,requiresApproval" : "available,enabled,requiresApproval,unavailableReason")
+    || !entry["available"] && (entry["enabled"] || entry["requiresApproval"] || !["platform", "development"].includes(entry["unavailableReason"] as string))) {
+    throw new TypeError("Login startup state is invalid.");
+  }
+  return Object.freeze({ available: entry["available"], enabled: entry["enabled"], requiresApproval: entry["requiresApproval"],
+    ...(!entry["available"] ? { unavailableReason: entry["unavailableReason"] as "platform" | "development" } : {}) });
 }
 
 function requireDesktopWallpaperRevision(value: unknown): number {

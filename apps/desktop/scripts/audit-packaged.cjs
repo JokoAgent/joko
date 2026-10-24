@@ -80,6 +80,9 @@ module.exports = async function auditPackaged(context) {
   const { buildNativeGamepad } = await import(
     pathToFileURL(resolve(__dirname, "build-native-gamepad.mjs")).href
   );
+  const { buildNativeMenuBar } = await import(
+    pathToFileURL(resolve(__dirname, "build-native-menu-bar.mjs")).href
+  );
   const { buildNativeRemoteDesktop, assertNativeRemoteDesktopBuildTarget } = await import(
     pathToFileURL(resolve(__dirname, "build-native-remote-desktop.mjs")).href
   );
@@ -96,6 +99,11 @@ module.exports = async function auditPackaged(context) {
     platform: context.electronPlatformName,
     architecture: targetArch,
     output: resolve(resourcesRoot, "native-gamepad")
+  });
+  buildNativeMenuBar({
+    platform: context.electronPlatformName,
+    architecture: targetArch,
+    output: resolve(resourcesRoot, "native-menu-bar")
   });
   await restoreWindowsNativeRemoteDesktop(context, auditNativeRemoteDesktop);
   await prepareNativeRemoteDesktopForPackage(
@@ -134,6 +142,7 @@ module.exports = async function auditPackaged(context) {
   await sealWindowsNativeHardware(context, targetArch, auditNativeHardware);
   await auditNativeHardware(resolve(resourcesRoot, "native-hardware"), context.electronPlatformName, targetArch);
   await auditNativeGamepad(resolve(resourcesRoot, "native-gamepad"), context.electronPlatformName, targetArch);
+  await auditNativeMenuBar(resolve(resourcesRoot, "native-menu-bar"), context.electronPlatformName, targetArch);
 
   const applicationEntries = await readdir(applicationRoot, { withFileTypes: true });
   const unexpectedApplicationRoot = applicationEntries.find((entry) =>
@@ -323,6 +332,7 @@ module.exports.auditDedicatedHardwareSdkDirectory = auditDedicatedHardwareSdkDir
 module.exports.auditNativeSystemFrontmostInput = auditNativeSystemFrontmostInput;
 module.exports.auditNativeHardware = auditNativeHardware;
 module.exports.auditNativeGamepad = auditNativeGamepad;
+module.exports.auditNativeMenuBar = auditNativeMenuBar;
 module.exports.createDedicatedHardwareSdkDirectoryIntegrity = createDedicatedHardwareSdkDirectoryIntegrity;
 module.exports.createDedicatedHardwareSdkManifestIntegrity = createDedicatedHardwareSdkManifestIntegrity;
 module.exports.dedicatedHardwareSdkHandshakeBytes = dedicatedHardwareSdkHandshakeBytes;
@@ -866,38 +876,46 @@ async function auditNativeHardware(root, platform, targetArch) {
 }
 
 async function auditNativeGamepad(root, platform, targetArch) {
-  const helper = SIMPLE_NATIVE_ARTIFACTS.gamepad.helpers[platform] ?? null;
+  return auditNativeMacHelper(root, platform, targetArch, SIMPLE_NATIVE_ARTIFACTS.gamepad, "native gamepad");
+}
+
+async function auditNativeMenuBar(root, platform, targetArch) {
+  return auditNativeMacHelper(root, platform, targetArch, SIMPLE_NATIVE_ARTIFACTS.menuBar, "native menu bar");
+}
+
+async function auditNativeMacHelper(root, platform, targetArch, artifact, label) {
+  const helper = artifact.helpers[platform] ?? null;
   const expected = ["manifest.json", ...(helper === null ? [] : [helper])].sort();
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
   const names = entries.map(entry => entry.name).sort();
   if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
-    throw new Error("The packaged native gamepad directory is incomplete or contains unexpected files.");
+    throw new Error(`The packaged ${label} directory is incomplete or contains unexpected files.`);
   }
   for (const entry of entries) {
-    await assertCanonicalRegularFile(resolve(root, entry.name), "The packaged native gamepad file is unsafe.");
+    await assertCanonicalRegularFile(resolve(root, entry.name), `The packaged ${label} file is unsafe.`);
   }
-  const manifest = await readJsonManifest(resolve(root, "manifest.json"), "native gamepad");
+  const manifest = await readJsonManifest(resolve(root, "manifest.json"), label);
   if (Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion,sha256" ||
       manifest.platform !== platform || manifest.architecture !== targetArch || manifest.protocolVersion !== 1 ||
       manifest.helper !== helper || (helper === null ? manifest.sha256 !== null :
         typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.sha256))) {
-    throw new Error("The packaged native gamepad identity does not match the artifact target.");
+    throw new Error(`The packaged ${label} identity does not match the artifact target.`);
   }
   if (helper === null) return;
   if (!["x64", "arm64"].includes(targetArch)) {
-    throw new Error("The native gamepad helper architecture is unsupported.");
+    throw new Error(`The ${label} helper architecture is unsupported.`);
   }
   const path = resolve(root, helper);
   const info = await lstat(path);
-  if (info.size < 32 || info.size > 16 * 1024 * 1024 ||
+  if (info.size < 32 || info.size > artifact.maximumBytes ||
       (process.platform !== "win32" && (info.mode & 0o111) === 0)) {
-    throw new Error("The packaged native gamepad helper binary does not match its identity.");
+    throw new Error(`The packaged ${label} helper binary does not match its identity.`);
   }
   const bytes = await readFile(path);
   if (createHash("sha256").update(bytes).digest("hex") !== manifest.sha256 ||
       bytes.readUInt32LE(0) !== 0xfeedfacf ||
       bytes.readUInt32LE(4) !== (targetArch === "arm64" ? 0x0100000c : 0x01000007)) {
-    throw new Error("The packaged native gamepad helper binary does not match its identity.");
+    throw new Error(`The packaged ${label} helper binary does not match its identity.`);
   }
 }
 

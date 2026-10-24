@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync, lstatSync, readFileSync } from "node:fs";
 import { lstat, mkdir, open, realpath, rename, rm, writeFile } from "node:fs/promises";
@@ -8,6 +7,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { OperationalStore } from "@joko/store";
 
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
+import { executeSourceGit } from "./source-git-executor.js";
 import {
   isExtensionLibraryDescriptor,
   parseExtensionRuntime,
@@ -109,7 +109,7 @@ export interface ExtensionSourceGitResult {
 
 export type ExtensionSourceGitExecutor = (
   args: readonly string[],
-  options: { readonly cwd?: string; readonly timeoutMs: number }
+  options: { readonly cwd?: string; readonly timeoutMs: number; readonly signal?: AbortSignal }
 ) => Promise<ExtensionSourceGitResult>;
 
 export type ExtensionSourceErrorCode =
@@ -201,28 +201,7 @@ const MINIMUM_GIT_VERSION = { major: 2, minor: 25 } as const;
 const GIT_OPERATION_TIMEOUT_MS = 5 * 60_000;
 const SOURCE_FAILURE_MAXIMUM_CHARACTERS = 512;
 
-const defaultGitExecutor: ExtensionSourceGitExecutor = (args, options) => new Promise((resolvePromise, reject) => {
-  execFile("git", ["-c", "core.longpaths=true", ...args], {
-    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    timeout: options.timeoutMs,
-    maxBuffer: 16 * 1024 * 1024,
-    windowsHide: true,
-    env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
-      GCM_INTERACTIVE: "never",
-      GIT_ASKPASS: "",
-      SSH_ASKPASS: "",
-      LC_ALL: "C"
-    }
-  }, (error, stdout, stderr) => {
-    if (error !== null) {
-      reject(Object.assign(error, { stderr }));
-      return;
-    }
-    resolvePromise({ stdout, stderr });
-  });
-});
+const defaultGitExecutor: ExtensionSourceGitExecutor = executeSourceGit;
 
 /** Current-v1 parser. It performs no network or filesystem access and never
  * returns an input containing URL credentials. */

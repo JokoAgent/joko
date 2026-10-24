@@ -1231,6 +1231,7 @@ async function launchDurableJob(pi, job, message, resumeSessionPath, onUpdate) {
 }
 
 async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onUpdate) {
+  if (hostedExecution?.backgroundScope) throw new Error("nested hosted child execution is unavailable");
   const sessionDirectory = ensureDurableRoot();
   const nodeExecutable = validatedNodeExecutable();
   const parentHomeValue = process.env[CONFIG_HOME_ENV];
@@ -1277,7 +1278,6 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
     copyPrivateSnapshot(paths.hostedExecutor, hostedExecutorPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.shellPolicy, shellPolicyPath, MAX_DURABLE_JSON_BYTES, true);
     const childHostedExecutionPath = hostedExecution ? join(runtimeDirectory, "hosted-execution.json") : undefined;
-    if (childHostedExecutionPath) copyPrivateSnapshot(hostedExecutionPath, childHostedExecutionPath, 8 * 1024 * 1024, true);
     copyPrivateSnapshot(paths.runner, runnerScript, MAX_DURABLE_JSON_BYTES, true);
     const runnerScriptSha256 = createHash("sha256").update(readFileSync(runnerScript)).digest("hex");
     let runnerReservation;
@@ -1424,6 +1424,21 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
     atomicWritePrivateJson(join(runDirectory, "config.json"), config);
     atomicWritePrivateJson(join(runDirectory, "owner.json"), owner);
     atomicWritePrivateJson(join(runDirectory, "status.json"), queued);
+    if (childHostedExecutionPath) {
+      const scope = { taskId: job.id, runId: runId, launchToken: launchToken, runnerInstanceId: runnerInstanceId, nativeSessionId: nativeSessionId };
+      const registrationId = "background-" + runId;
+      const response = await fetch(hostedExecution.endpoint.replace(/\/$/u, "") + "/execute", {
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS),
+        headers: { authorization: "Bearer " + hostedExecution.bearer, "content-type": "application/json" },
+        body: JSON.stringify({ format: 1, callId: registrationId, requestId: registrationId + ":1", origin: "agent",
+          operation: "background.register", payload: scope })
+      });
+      const reply = await response.json();
+      if (!response.ok || reply?.format !== 1 || reply?.ok !== true || reply?.value?.registered !== true) {
+        throw new Error("hosted child execution registration was rejected");
+      }
+      atomicWritePrivateJson(childHostedExecutionPath, Object.assign({}, hostedExecution, { backgroundScope: scope }));
+    }
     const runner = spawn(nodeExecutable, [runnerScript, join(runDirectory, "config.json")], {
       cwd: runDirectory,
       env: durableRunnerEnvironment(job.route.provider),

@@ -67,6 +67,19 @@ function fixture(result: AutoReviewCompletion | ((ctx: { signal: AbortSignal }) 
 }
 
 describe("Pi auto-review deterministic policy", () => {
+  it.each(["git diff", "git show", "git diff --stat", "git show --stat", "git diff --no-ext-diff", "git show --no-textconv"])(
+    "reviews Git inspection that can execute configured converters: %s", command => {
+      const reviewer = createPiAutoReviewer();
+      expect(reviewer.classify(fixture().request("bash", { command }))).toMatchObject({ tier: "gray" });
+    }
+  );
+
+  it.each(["git diff --no-ext-diff --no-textconv", "git show --no-textconv --stat --no-ext-diff"])(
+    "permits bounded Git inspection with both executable converters disabled: %s", command => {
+      const reviewer = createPiAutoReviewer();
+      expect(reviewer.classify(fixture().request("bash", { command }))).toMatchObject({ tier: "green" });
+    }
+  );
   it("green-lights scoped reads, workspace writes, and narrow read-only commands", () => {
     const reviewer = createPiAutoReviewer({ platform: process.platform });
     const fx = fixture();

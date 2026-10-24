@@ -1147,6 +1147,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   #eventRefreshQueued = false;
   readonly #artifactUrls = new Map<string, ArtifactUrlLease>();
   readonly #workspaceTextPreviews = new WorkspaceTextPreviewCache();
+  readonly #portableImportDrafts = new Map<string, { readonly expiresAt: number; readonly cancel: () => Promise<void>; readonly release: () => void }>();
   #inputHandoffs: NonNullable<AppSnapshot["inputHandoffs"]> = [];
   #stopInputHandoffWatch = () => {};
 
@@ -3091,8 +3092,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         { package: packageBlob },
         { signal: scope.signal }
       );
+      const draft = mapPortableSessionImportDraft(response.draft);
+      this.retainPortableImportDraft(draft, scope);
       scope.signal.throwIfAborted();
-      return mapPortableSessionImportDraft(response.draft);
+      return draft;
     } catch (error) {
       scope.signal.throwIfAborted();
       if (error instanceof GatewayError) throw error;
@@ -3104,14 +3107,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async unlockPortableSessionImport(draftId: string, password: string): Promise<PortableSessionImportDraftView> {
-    const client = createClient(PortableSessionService, this.requireTransport());
+    const scope = this.captureActionScope();
+    const client = createClient(PortableSessionService, scope.transport);
     try {
       const response = await client.unlockPortableSessionImport(
         { draftId, password },
-        this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+        { signal: scope.signal }
       );
-      return mapPortableSessionImportDraft(response.draft);
+      const draft = mapPortableSessionImportDraft(response.draft);
+      this.retainPortableImportDraft(draft, scope);
+      scope.signal.throwIfAborted();
+      return draft;
     } catch (error) {
+      scope.signal.throwIfAborted();
       const connected = ConnectError.from(error);
       throw new GatewayError(connected.rawMessage, {
         cause: error,
@@ -3121,11 +3129,32 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async cancelPortableSessionImport(draftId: string): Promise<void> {
-    const client = createClient(PortableSessionService, this.requireTransport());
-    await client.cancelPortableSessionImport(
-      { draftId },
-      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
-    );
+    const retained = this.#portableImportDrafts.get(draftId);
+    if (retained !== undefined) return retained.cancel();
+    // An already-released or unknown draft has no captured cleanup authority.
+    // Its server TTL remains the fallback; never use the current business route.
+  }
+
+  private retainPortableImportDraft(draft: PortableSessionImportDraftView, scope: GatewayActionScope): void {
+    this.#portableImportDrafts.get(draft.draftId)?.release();
+    for (const retained of this.#portableImportDrafts.values()) {
+      if (retained.expiresAt <= Date.now() || this.#portableImportDrafts.size >= 32) void retained.cancel().catch(() => undefined);
+    }
+    const client = createClient(PortableSessionService, scope.transport);
+    const release = (): void => {
+      scope.signal.removeEventListener("abort", retire);
+      if (this.#portableImportDrafts.get(draft.draftId)?.release === release) this.#portableImportDrafts.delete(draft.draftId);
+    };
+    const cancel = async (): Promise<void> => {
+      release();
+      // An idempotent cleanup is allowed on the captured transport even after
+      // the business scope retires. It must never adopt another connection.
+      await client.cancelPortableSessionImport({ draftId: draft.draftId }, { signal: AbortSignal.timeout(5_000) });
+    };
+    const retire = (): void => { void cancel().catch(() => undefined); };
+    this.#portableImportDrafts.set(draft.draftId, { expiresAt: draft.expiresAt, cancel, release });
+    if (scope.signal.aborted) retire();
+    else scope.signal.addEventListener("abort", retire, { once: true });
   }
 
   async commitPortableSessionImport(input: {
@@ -3137,8 +3166,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     readonly worktreeSourceRef?: string;
     readonly refreshWorktreeRemote?: boolean;
   }): Promise<PortableSessionImportResultView> {
-    const client = createClient(PortableSessionService, this.requireTransport());
-    const options = this.#abort === undefined ? undefined : { signal: this.#abort.signal };
+    const scope = this.captureActionScope();
+    const client = createClient(PortableSessionService, scope.transport);
+    const options = { signal: scope.signal };
     const hasModel = input.execution.providerId !== undefined && input.execution.providerId !== ""
       && input.execution.modelId !== undefined && input.execution.modelId !== "";
     const intent = JSON.stringify([
@@ -3157,6 +3187,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       input.useWorktree && input.refreshWorktreeRemote === true
     ]);
     const digest = await sha256Hex(new TextEncoder().encode(intent).buffer as ArrayBuffer);
+    scope.signal.throwIfAborted();
     const operationId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
     try {
       const response = await client.commitPortableSessionImport({
@@ -3182,6 +3213,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           : {}),
         refreshWorktreeRemote: input.useWorktree && input.refreshWorktreeRemote === true
       }, options);
+      this.#portableImportDrafts.get(input.draftId)?.release();
+      scope.signal.throwIfAborted();
       const result = response.result;
       if (result === undefined || result.sessionId.trim() === "") {
         throw new GatewayError("Orchestrator completed portable task import without a task result.");
@@ -3197,6 +3230,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         ...(result.activationError === undefined ? {} : { activationError: mapError(result.activationError) })
       };
     } catch (error) {
+      scope.signal.throwIfAborted();
       if (error instanceof GatewayError) throw error;
       const connected = ConnectError.from(error);
       throw new GatewayError(connected.rawMessage, {
@@ -3209,12 +3243,14 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async retryPortableSessionActivation(sessionId: string): Promise<PortableSessionActivationResultView> {
-    const client = createClient(PortableSessionService, this.requireTransport());
+    const scope = this.captureActionScope();
+    const client = createClient(PortableSessionService, scope.transport);
     try {
       const response = await client.retryPortableSessionActivation(
         { sessionId },
-        this.#abort === undefined ? undefined : { signal: this.#abort.signal }
+        { signal: scope.signal }
       );
+      scope.signal.throwIfAborted();
       if (response.sessionId !== sessionId) {
         throw new GatewayError("Orchestrator returned portable activation for a different task.");
       }
@@ -3224,6 +3260,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         ...(response.activationError === undefined ? {} : { activationError: mapError(response.activationError) })
       };
     } catch (error) {
+      scope.signal.throwIfAborted();
       if (error instanceof GatewayError) throw error;
       const connected = ConnectError.from(error);
       throw new GatewayError(connected.rawMessage, {
@@ -15062,7 +15099,7 @@ function mapWorkspaceSearchMatch(match: WorkspaceSearchMatch, pageToken?: string
     if (
       startByte === undefined
       || endByte === undefined
-      || endByte <= startByte
+      || endByte < startByte
       || !previewBoundaries.has(startByte)
       || !previewBoundaries.has(endByte)
     ) {

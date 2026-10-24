@@ -138,6 +138,16 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
     signal?.throwIfAborted();
     try {
       this.#requireCaller(context);
+      const targetRevision = this.#store.getTarget(context.targetId).revision;
+      const assertCurrent = (): void => {
+        signal?.throwIfAborted();
+        context.assertCurrent?.();
+        this.#requireCaller(context);
+        if (this.#store.getTarget(context.targetId).revision !== targetRevision) {
+          throw new RemoteHostToolError("STALE_SCOPE", "Remote Host task authority changed.");
+        }
+      };
+      assertCurrent();
       if (name === "remote_host_list_hosts") {
         requireOnlyKeys(arguments_, []);
         return success({ hosts: targetHosts(this.#registry, context.targetId).map(publicHost) });
@@ -169,8 +179,8 @@ export class RemoteHostToolBridgeProvider implements BridgeToolProvider {
           ...(input === undefined ? {} : { input }),
           timeoutMs,
           ...(signal === undefined ? {} : { signal })
-        });
-        signal?.throwIfAborted();
+        }, assertCurrent);
+        assertCurrent();
         return success(publicExecution(outcome.host.id, outcome.result, this.#outputRedactor));
       }
       throw new RemoteHostToolError("UNKNOWN_TOOL", "Remote Host tool is not part of this runtime snapshot.");

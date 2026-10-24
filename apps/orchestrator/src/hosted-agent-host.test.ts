@@ -1,7 +1,9 @@
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
-import type { BackendAdapter, NativeSessionBinding } from "@joko/core";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import type { AdapterContext, BackendAdapter, NativeSessionBinding } from "@joko/core";
+import { managedSubagentRunRoot, managedSubagentSessionKey, type PiHostedBackgroundScope } from "@joko/adapter-pi";
 import { expect, it, vi, afterEach } from "vitest";
 import { HostedAgentStore, OperationalStore } from "@joko/store";
 import { HostedAgentExchange } from "./hosted-agent-exchange.js";
@@ -164,6 +166,103 @@ it("persists an SDK binding change before publishing it and resumes that context
     expect(resumed).toEqual(next); expect((await restored.call("observe-resumed", { kind: "state" }) as { binding: unknown }).binding).toEqual(next);
   } finally {
     await restored?.close(); restored?.disposeExchange(); await run?.close(); run?.disposeExchange(); database.close();
+    if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("reserves one original child registration before its tool owner arrives and grants no effects to either reserved runner", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-hosted-child-registration-")), database = new OperationalStore(":memory:"), store = new HostedAgentStore(database);
+  let context!: AdapterContext;
+  const binding = { opaqueRef: "controlled-native", nativeSessionId: "controlled-native", generation: 1 };
+  const adapter = { id: "pi", hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },
+    createSession: async (_input, current) => { context = current; return binding; },
+    send: async (_input, current) => { context = current; }, dispose: async () => {} } satisfies Partial<BackendAdapter>;
+  let run: NativeRun | undefined;
+  try {
+    run = await NativeRun.create({ root, runId: "registered-source", nativeSessionId: "stable-source", start: "create", store, slots: new HostedAgentSessionSlots(),
+      source: { authorityId: "controller", deviceId: "source", sessionId: "task", targetId: "workspace", generation: 1 },
+      trust: "owner", backendId: "pi", providerId: "provider", modelId: "model", modelIds: ["model"], permissionMode: "ask", fastMode: false,
+      workspace: { platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false, subagentsEnabled: true },
+      artifactCapacityBytes: 1024, assertCurrent: () => {}, assertModelAllowed: () => {}, createAdapter: () => adapter as unknown as BackendAdapter });
+    await run.call("original-parent", { kind: "send", input: { text: "Register the exact child", images: [], files: [], mentions: [], disposition: "prompt" } });
+    const original = context, taskId = "native-parent-tool:step-1";
+    const reserved = async (): Promise<PiHostedBackgroundScope> => {
+      const scope = { taskId, runId: randomUUID(), launchToken: randomUUID(), runnerInstanceId: randomUUID(), nativeSessionId: randomUUID() };
+      const directory = join(managedSubagentRunRoot(join(root, run!.id, "native")), managedSubagentSessionKey(context.sessionId), scope.runId);
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const runnerScript = join(directory, "joko-managed-subagent-runner.cjs"), transcriptPath = join(directory, "transcript.jsonl"), script = "// controlled runner\n";
+      const identity = { format: 1, runId: scope.runId, launchToken: scope.launchToken, runnerInstanceId: scope.runnerInstanceId,
+        productSessionId: context.sessionId, taskId, runnerScript, runnerScriptSha256: createHash("sha256").update(script).digest("hex") };
+      await Promise.all([writeFile(runnerScript, script), writeFile(transcriptPath, ""),
+        writeFile(join(directory, "config.json"), JSON.stringify({ ...identity, productGeneration: 1, nativeSessionId: scope.nativeSessionId,
+          parentTaskId: "native-parent-tool", title: "Controlled child", background: true, transcriptPath })),
+        writeFile(join(directory, "owner.json"), JSON.stringify({ ...identity, state: "reserved", runnerPid: 0 })),
+        writeFile(join(directory, "status.json"), JSON.stringify({ ...identity, state: "queued", runnerPid: 0, nativeSessionId: scope.nativeSessionId,
+          transcriptPath, createdAt: Date.now(), heartbeatAt: Date.now() }))]);
+      return scope;
+    };
+    const scopes = await Promise.all([reserved(), reserved()]);
+    const post = async (scope: PiHostedBackgroundScope, register: boolean, occurrence?: string, scoped = true) => {
+      const callId = occurrence ?? (register ? "background-" + scope.runId : "tool-" + randomUUID());
+      const channel = context.hostedExecution!.channel;
+      const response = await fetch(channel.endpoint + "/execute", { method: "POST", signal: AbortSignal.timeout(10_000),
+        headers: { authorization: "Bearer " + channel.bearer, "content-type": "application/json" },
+        body: JSON.stringify({ format: 1, callId, requestId: callId + ":1", origin: "agent", operation: register ? "background.register" : "tool.begin",
+          payload: register ? scope : { name: "read", input: { path: "proof.txt" } }, ...(register || !scoped ? {} : { backgroundScope: scope }) }) });
+      return await response.json() as { ok: boolean; error?: { code: string } };
+    };
+    const registering = scopes.map(scope => post(scope, true));
+    for (const pending of registering) void pending.catch(() => {});
+    const blocked = await Promise.race(registering);
+    expect(blocked).toMatchObject({ ok: false, error: { code: "EXECUTOR_FAILED" } });
+    // Only the first registration is waiting for this exact native tool event.
+    await original.emit({ type: "tool_start", callId: "native-parent-tool", name: "subagent", input: "{}" });
+    await run.call("later-input", { kind: "send", input: { text: "Another foreground input", images: [], files: [], mentions: [], disposition: "prompt" } });
+    let registration: Extract<import("./hosted-agent-exchange.js").HostedAgentFrame["payload"], { kind: "request" }> | undefined;
+    await vi.waitFor(async () => {
+      const frames = (await run!.exchange.poll(0, new AbortController().signal, 0)).frames.filter(frame => frame.payload.kind === "request");
+      expect(frames).toHaveLength(1);
+      const payload = frames[0]!.payload;
+      if (payload.kind === "request") registration = payload;
+    });
+    expect(registration!.operationId).toBe("original-parent");
+    run.exchange.reply(registration!.id, { ok: true, value: { registered: true } });
+    expect((await Promise.all(registering)).map(reply => reply.ok).sort()).toEqual([false, true]);
+    for (const scope of scopes) expect((await post(scope, false)).ok).toBe(false);
+    const registeredScopeId = registration!.request.kind === "tool" ? (registration!.request.input as { scopeId: string }).scopeId : undefined;
+    const scope = scopes.find(candidate => candidate.runId === registeredScopeId)!;
+    const directory = join(managedSubagentRunRoot(join(root, run.id, "native")), managedSubagentSessionKey(context.sessionId), scope.runId);
+    const status = JSON.parse(await readFile(join(directory, "status.json"), "utf8"));
+    const owner = JSON.parse(await readFile(join(directory, "owner.json"), "utf8"));
+    await Promise.all([writeFile(join(directory, "owner.json"), JSON.stringify({ ...owner, state: "running", runnerPid: process.pid })),
+      writeFile(join(directory, "status.json"), JSON.stringify({ ...status, state: "running", runnerPid: process.pid })),
+      writeFile(join(directory, "runner.claim.json"), JSON.stringify({ format: 1, runId: scope.runId, launchToken: scope.launchToken,
+        runnerPid: process.pid, runnerInstanceId: scope.runnerInstanceId, runnerScriptSha256: owner.runnerScriptSha256 }))]);
+    let replied = 1;
+    const confirmTool = async (expectedOperationId: string) => {
+      let request: typeof registration;
+      await vi.waitFor(async () => {
+        const requests = (await run!.exchange.poll(0, new AbortController().signal, 0)).frames.filter(frame => frame.payload.kind === "request");
+        expect(requests).toHaveLength(replied + 1);
+        const payload = requests.at(-1)!.payload; if (payload.kind === "request") request = payload;
+      });
+      expect(request!.operationId).toBe(expectedOperationId);
+      run!.exchange.reply(request!.id, { ok: true, value: {} }); replied++;
+    };
+    const heldCallId = "tool-" + randomUUID(), childBegin = post(scope, false, heldCallId);
+    await confirmTool("original-parent"); expect((await childBegin).ok).toBe(true);
+    await writeFile(join(directory, "status.json"), JSON.stringify({ ...status, state: "aborted", runnerPid: process.pid, endedAt: Date.now() }));
+    await original.emit({ type: "subagent_run", run: { id: taskId, sessionId: original.sessionId, logicalAgentId: taskId,
+      identityAliases: [scope.nativeSessionId], providerRunIds: [scope.runId], state: "stopped", title: "Cancelled child",
+      startedAt: 1, updatedAt: Date.now(), endedAt: Date.now(), activity: [], capabilities: { viewActivity: true, viewReturnedResult: true,
+        viewFullTranscript: true, stop: false, steer: false, followUp: false, resume: true, parentContext: "none" } } });
+    expect((await post(scope, false)).ok).toBe(false);
+    // Cancellation retired the child occurrence. Its ID is available to an
+    // independently owned foreground call, without reviving the old scope.
+    const foregroundBegin = post(scope, false, heldCallId, false);
+    await confirmTool("later-input"); expect((await foregroundBegin).ok).toBe(true);
+  } finally {
+    await run?.close(); run?.disposeExchange(); database.close();
     if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
   }
 });

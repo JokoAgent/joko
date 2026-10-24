@@ -3,6 +3,7 @@ import type { JSX } from "react";
 
 import type { OperationApi, SessionView } from "../model.js";
 import type { AppSnapshot } from "../model.js";
+import type { PortableSessionImportOwner } from "../portable-session-import-connection.js";
 import {
   portableSessionExecutionForTarget,
   portableSessionTargetOptions
@@ -27,6 +28,8 @@ type PortableSessionController = Pick<OperationApi,
 export interface PortableSessionImportRequest {
   readonly id: number;
   readonly file?: File;
+  /** Unbound only for an OS handoff received before the first connection. */
+  readonly owner?: PortableSessionImportOwner;
 }
 
 export function PortableSessionDialogHost({
@@ -36,6 +39,7 @@ export function PortableSessionDialogHost({
   t,
   exportSession,
   importRequest,
+  connectionOwner,
   defaultTargetId,
   worktreeSupportedTargetIds,
   onCloseExport,
@@ -49,10 +53,11 @@ export function PortableSessionDialogHost({
   readonly t: Translator;
   readonly exportSession?: SessionView;
   readonly importRequest?: PortableSessionImportRequest;
+  readonly connectionOwner?: string;
   readonly defaultTargetId?: string;
   readonly worktreeSupportedTargetIds: ReadonlySet<string>;
   readonly onCloseExport: () => void;
-  readonly onCloseImport: () => void;
+  readonly onCloseImport: (requestId: number) => void;
   readonly onExported: (fidelity: PortableSessionFidelity) => void;
   readonly onOpenTask: (sessionId: string) => void;
 }): JSX.Element {
@@ -61,6 +66,8 @@ export function PortableSessionDialogHost({
   const validDefaultTargetId = defaultTargetId !== undefined && targets.some((target) => target.id === defaultTargetId)
     ? defaultTargetId
     : targets[0]?.id;
+  const request = importRequest?.owner !== undefined && importRequest.owner.key === connectionOwner ? importRequest : undefined;
+  const importApi = request?.owner?.api;
   return <>
     <PortableSessionExportDialog
       key={JSON.stringify(["export", exportSession?.id])}
@@ -73,22 +80,22 @@ export function PortableSessionDialogHost({
         : controller.exportPortableSession(exportSession.id, options, context)}
       onExported={onExported}
     />
-    <PortableSessionImportDialog
-      key={JSON.stringify(["import", importRequest?.id])}
-      open={importRequest !== undefined}
-      initialFile={importRequest?.file}
+    {request !== undefined && importApi !== undefined && <PortableSessionImportDialog
+      key={JSON.stringify(["import", request.id, request.owner!.key])}
+      open
+      initialFile={request.file}
       labels={labels}
       targets={targets}
       defaultTargetId={validDefaultTargetId}
       executionForTarget={(targetId) => portableSessionExecutionForTarget(snapshot, targetId)}
-      onClose={onCloseImport}
-      onInspect={(file) => controller.inspectPortableSessionImport(file)}
-      onUnlock={(draftId, password) => controller.unlockPortableSessionImport(draftId, password)}
-      onCancelDraft={(draftId) => controller.cancelPortableSessionImport(draftId)}
-      onCommit={(input) => controller.commitPortableSessionImport(input)}
-      onRetryActivation={(sessionId) => controller.retryPortableSessionActivation(sessionId)}
+      onClose={() => onCloseImport(request.id)}
+      onInspect={(file) => importApi.inspectPortableSessionImport(file)}
+      onUnlock={(draftId, password) => importApi.unlockPortableSessionImport(draftId, password)}
+      onCancelDraft={(draftId) => importApi.cancelPortableSessionImport(draftId)}
+      onCommit={(input) => importApi.commitPortableSessionImport(input)}
+      onRetryActivation={(sessionId) => importApi.retryPortableSessionActivation(sessionId)}
       onOpenTask={onOpenTask}
-    />
+    />}
   </>;
 }
 

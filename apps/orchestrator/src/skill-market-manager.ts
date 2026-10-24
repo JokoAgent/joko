@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream, existsSync, lstatSync, readFileSync } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rm, rmdir, writeFile } from "node:fs/promises";
@@ -9,6 +8,7 @@ import { createGunzip } from "node:zlib";
 
 import type { OperationalStore } from "@joko/store";
 import { extract as extractTarArchive } from "tar";
+import { executeSourceGit } from "./source-git-executor.js";
 
 import {
   externalPublicSkillAccess,
@@ -479,29 +479,7 @@ const DEFAULT_INSTALL_PLAN_TTL_MS = 10 * 60_000;
 const MINIMUM_GIT_VERSION = { major: 2, minor: 25 } as const;
 const GIT_OPERATION_TIMEOUT_MS = 5 * 60_000;
 
-const defaultGitExecutor: SkillMarketGitExecutor = (args, options) => new Promise((resolvePromise, reject) => {
-  execFile("git", ["-c", "core.longpaths=true", ...args], {
-    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    timeout: options.timeoutMs,
-    ...(options.signal === undefined ? {} : { signal: options.signal }),
-    maxBuffer: 16 * 1024 * 1024,
-    windowsHide: true,
-    env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
-      GCM_INTERACTIVE: "never",
-      GIT_ASKPASS: "",
-      SSH_ASKPASS: "",
-      LC_ALL: "C"
-    }
-  }, (error, stdout, stderr) => {
-    if (error !== null) {
-      reject(Object.assign(error, { stderr }));
-      return;
-    }
-    resolvePromise({ stdout, stderr });
-  });
-});
+const defaultGitExecutor: SkillMarketGitExecutor = executeSourceGit;
 
 /** Current-v1 source parser. It never returns a Git URL containing credentials. */
 export function normalizeSkillMarketSourceInput(
@@ -806,8 +784,8 @@ export class SkillMarketManager {
     };
   }
 
-  async gitPreflight(): Promise<SkillMarketGitPreflight> {
-    const version = await gitVersion(this.#git);
+  async gitPreflight(signal?: AbortSignal): Promise<SkillMarketGitPreflight> {
+    const version = await gitVersion(this.#git, signal);
     return {
       available: version !== undefined && supportsGitVersion(version),
       ...(version === undefined ? {} : { version: `${version.major}.${version.minor}.${version.patch}` }),
@@ -827,7 +805,7 @@ export class SkillMarketManager {
       if (source.kind === "local") {
         source = { kind: "local", path: await canonicalDirectory(source.path, "Local Skill market source") };
       } else {
-        const preflight = await this.gitPreflight();
+        const preflight = await this.gitPreflight(signal);
         if (!preflight.available) throw marketError("SOURCE_GIT_UNAVAILABLE", `Git ${preflight.minimumVersion} or newer is required.`);
       }
       const sourceIdentity = skillMarketSourceIdentity(source);
@@ -862,7 +840,9 @@ export class SkillMarketManager {
           refreshedAt: now,
           ...(acquired.generation === undefined ? {} : { activeGeneration: acquired.generation })
         };
+        signal?.throwIfAborted();
         if (source.kind === "git") await this.#writeCurrentGeneration(record, acquired.generation!);
+        signal?.throwIfAborted();
         const next = new Map(this.#records).set(id, record);
         try {
           this.#persist(next, this.#catalogRevision + 1n);
@@ -874,6 +854,7 @@ export class SkillMarketManager {
         return publicSource(record);
       } catch (error) {
         if (source.kind === "git") await this.#removeGenerationPath(this.#slotFor(id, sourceIdentity), () => false).catch(() => undefined);
+        if (signal?.aborted || isAbortError(error)) throw error;
         throw normalizeMarketError(error);
       }
     });
@@ -926,14 +907,17 @@ export class SkillMarketManager {
           ...(acquired.generation === undefined ? {} : { activeGeneration: acquired.generation })
         };
         const oldGeneration = current.activeGeneration;
-        if (current.source.kind === "git") await this.#writeCurrentGeneration(nextRecord, acquired.generation!);
         const next = new Map(this.#records).set(current.id, nextRecord);
         try {
+          signal?.throwIfAborted();
+          if (current.source.kind === "git") await this.#writeCurrentGeneration(nextRecord, acquired.generation!);
+          signal?.throwIfAborted();
           this.#persist(next, this.#catalogRevision + 1n);
         } catch (error) {
           publicationFailed = true;
           if (current.source.kind === "git") {
             if (oldGeneration !== undefined) await this.#writeCurrentGeneration(current, oldGeneration);
+            else await rm(join(this.#slot(current), "current"), { force: true });
             await this.#removeGenerationPath(acquired.root, () => false).catch(() => undefined);
           }
           throw error;
@@ -1625,16 +1609,21 @@ export class SkillMarketManager {
     await this.#removeGenerationPath(incomingRoot, () => false);
     await mkdir(incomingRoot, { recursive: true, mode: 0o700 });
     const incoming = join(incomingRoot, randomUUID());
+    let version: string | undefined;
     try {
       const revision = await cloneGitSource(source, incoming, this.#git, signal);
+      signal?.throwIfAborted();
       const generation = randomUUID();
-      const version = join(slot, "versions", generation);
+      version = join(slot, "versions", generation);
       await mkdir(dirname(version), { recursive: true, mode: 0o700 });
+      signal?.throwIfAborted();
       await renameWithRetry(incoming, version);
       signal?.throwIfAborted();
       return { root: version, revision, generation };
     } catch (error) {
       await this.#removeGenerationPath(incoming, () => false).catch(() => undefined);
+      if (version !== undefined) await this.#removeGenerationPath(version, () => false).catch(() => undefined);
+      if (signal?.aborted || isAbortError(error)) throw error;
       throw normalizeMarketError(error);
     }
   }
@@ -3243,12 +3232,15 @@ async function cloneGitSource(
   }
 }
 
-async function gitVersion(git: SkillMarketGitExecutor): Promise<{ readonly major: number; readonly minor: number; readonly patch: number } | undefined> {
+async function gitVersion(git: SkillMarketGitExecutor, signal?: AbortSignal): Promise<{ readonly major: number; readonly minor: number; readonly patch: number } | undefined> {
   try {
-    const output = (await git(["--version"], { timeoutMs: 10_000 })).stdout;
+    signal?.throwIfAborted();
+    const output = (await git(["--version"], { timeoutMs: 10_000, ...(signal === undefined ? {} : { signal }) })).stdout;
+    signal?.throwIfAborted();
     const match = /git version (\d+)\.(\d+)(?:\.(\d+))?/u.exec(output);
     return match === null ? undefined : { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3] ?? 0) };
   } catch {
+    signal?.throwIfAborted();
     return undefined;
   }
 }

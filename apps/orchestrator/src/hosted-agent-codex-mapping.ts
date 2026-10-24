@@ -7,7 +7,8 @@ import type { ExecutorWorkspace } from "./hosted-agent-workspace.js";
 
 export type HostedAgentCodexAction =
   | { readonly kind: "read"; readonly path: string; readonly scope?: "tree" }
-  | { readonly kind: "write"; readonly path: string }
+  | { readonly kind: "write"; readonly path: string; readonly scope?: "tree" }
+  | { readonly kind: "network"; readonly url: string; readonly method: string }
   | { readonly kind: "exec"; readonly command: string; readonly cwd: string };
 
 function readExistingTextSync(target: string): string | null {
@@ -30,23 +31,24 @@ export function execServerCommand(argv: unknown): string | null {
   return parts.join(' ');
 }
 
-function fromFileUrl(value: unknown, base: string): string | null {
+function fromFileUrl(value: unknown, base: string, pathStyle?: "posix" | "win32"): string | null {
   if (typeof value !== 'string' || !value) return null;
-  if (value.startsWith('file://')) {
+  if (/^file:/iu.test(value)) {
     try {
-      return fileURLToPath(value);
+      return pathStyle === undefined ? fileURLToPath(value) : fileURLToPath(value, { windows: pathStyle === "win32" });
     } catch {
       return null;
     }
   }
-  return path.isAbsolute(value) ? value : path.resolve(base, value);
+  const paths = pathStyle === "win32" ? path.win32 : pathStyle === "posix" ? path.posix : path;
+  return paths.isAbsolute(value) ? value : paths.resolve(base, value);
 }
 
 // exec-server 的只读操作按读取过闸门；不在下面几组里的 `fs/` 方法一律按写入处理(新版 Codex 新增的
 // 方法先从严)。`fs/walk`、`fs/canonicalize`、`fs/open` 曾落进写入：计划模式下工作区里的项目 Skill
 // 加载被拒，工作区外的单文件读取也被当成区外写入拒掉(#5764)。
 
-/** 读单个文件或单层目录；fs/open 的显式写入模式在下方按写入处理。 */
+/** 读单个文件或单层目录；固定协议的 fs/open 始终只读。 */
 const READ_METHODS = new Set(['fs/readFile', 'fs/open', 'fs/readDirectory', 'fs/readDir', 'fs/listDirectory']);
 /** 递归遍历：按目录级读取过闸门，根在工作区外与本机任务的搜索一样要本机确认。 */
 const TREE_READ_METHODS = new Set(['fs/walk']);
@@ -54,40 +56,65 @@ const TREE_READ_METHODS = new Set(['fs/walk']);
 const METADATA_METHODS = new Set(['fs/getMetadata', 'fs/exists', 'fs/stat', 'fs/canonicalize']);
 
 /** 把一个 exec-server 请求换成要过闸门的操作。 */
-export function execServerActions(method: string, params: unknown, cwd: string): HostedAgentCodexAction[] {
+export function execServerActions(method: string, params: unknown, cwd: string, pathStyle?: "posix" | "win32"): HostedAgentCodexAction[] {
   const record = params && typeof params === 'object' ? params as Record<string, unknown> : {};
   if (method === 'process/start') {
     const command = execServerCommand(record.argv);
-    const processCwd = fromFileUrl(record.cwd, cwd) ?? cwd;
+    const processCwd = fromFileUrl(record.cwd, cwd, pathStyle) ?? cwd;
     return command ? [{ kind: 'exec', command, cwd: processCwd }] : [{ kind: 'exec', command: '<unknown>', cwd: processCwd }];
+  }
+  if (method === 'http/request') return [{ kind: 'network',
+    url: typeof record.url === 'string' ? record.url : '<unknown>',
+    method: typeof record.method === 'string' ? record.method : '<unknown>' }];
+  if (method === 'capabilityRoots/discoverV1') {
+    const roots = Array.isArray(record.roots) ? record.roots : [];
+    return roots.flatMap(root => {
+      const target = fromFileUrl(asJsonRecord(root)?.path, cwd, pathStyle);
+      return target ? [{ kind: 'read' as const, path: target, scope: 'tree' as const }] : [];
+    });
   }
   if (!method.startsWith('fs/') || METADATA_METHODS.has(method)) return [];
   const paths = ['path', 'sourcePath', 'destinationPath', 'source', 'destination', 'from', 'to', 'target']
-    .map((key) => fromFileUrl(record[key], cwd))
+    .map((key) => fromFileUrl(record[key], cwd, pathStyle))
     .filter((value): value is string => !!value);
   if (TREE_READ_METHODS.has(method)) return paths.map((target) => ({ kind: 'read', path: target, scope: 'tree' }));
-  // Pinned Codex 0.159.2 uses a read-only fs/open and writes through fs/writeFile.
-  // Keep explicit non-read modes fail-closed for newer protocols; they are not evidence that
-  // their later handle-based write methods are supported by this relay.
-  const readOnlyOpen = method !== 'fs/open' || record.mode === undefined || record.mode === 'read';
-  const kind = READ_METHODS.has(method) && readOnlyOpen ? 'read' : 'write';
-  return paths.map((target) => ({ kind, path: target }) as HostedAgentCodexAction);
+  if (method === 'fs/copy') {
+    const source = fromFileUrl(record.sourcePath, cwd, pathStyle), destination = fromFileUrl(record.destinationPath, cwd, pathStyle);
+    return [...(source ? [{ kind: 'read' as const, path: source, ...(record.recursive === true ? { scope: 'tree' as const } : {}) }] : []),
+      ...(destination ? [{ kind: 'write' as const, path: destination, ...(record.recursive === true ? { scope: 'tree' as const } : {}) }] : [])];
+  }
+  // The pinned fs/open ignores unknown fields, including mode, and always opens for reading.
+  // An explicit future write mode therefore needs both effects until its protocol is supported.
+  if (method === 'fs/open') return paths.flatMap(target => [
+    { kind: 'read' as const, path: target },
+    ...(record.mode === undefined || record.mode === 'read' ? [] : [{ kind: 'write' as const, path: target }])
+  ]);
+  const kind = READ_METHODS.has(method) ? 'read' : 'write';
+  return paths.map((target) => ({ kind, path: target,
+    ...(method === 'fs/remove' && record.recursive === true ? { scope: 'tree' as const } : {}) }) as HostedAgentCodexAction);
 }
 
 /** 映射协议路径、命令和可逆的 UTF-8 文件数据；二进制内容保持原样。 */
 export function mapExecServerParams(value: unknown, workspace: ExecutorWorkspace, method?: string, mapFileData = true): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const result = { ...value as Record<string, unknown> };
+  const windowsAgent = agentUsesWindowsPaths(workspace);
   for (const key of ['cwd', 'path', 'sourcePath', 'destinationPath', 'source', 'destination', 'from', 'to', 'target']) {
     const item = result[key];
     if (typeof item !== 'string') continue;
-    if (item.startsWith('file://')) {
-      const url = new URL(item);
-      const foreign = decodeURIComponent(url.pathname).replace(/^\/([A-Za-z]:)/, '$1');
-      result[key] = pathToFileURL(workspace.resolve(foreign)).href;
+    if (/^file:/iu.test(item)) {
+      const foreign = fileURLToPath(item, { windows: windowsAgent });
+      result[key] = sourcePathUri(workspace.resolve(foreign), workspace);
     } else result[key] = workspace.resolve(item);
   }
-  if (Array.isArray(result.argv)) result.argv = result.argv.map((part) => typeof part === 'string' ? workspace.mapCommand(part, resolveExecutorShell().dialect) : part);
+  if (method === 'capabilityRoots/discoverV1' && Array.isArray(result.roots)) {
+    result.roots = result.roots.map(root => mapExecServerParams(root, workspace, undefined, false));
+  }
+  if (Array.isArray(result.argv)) result.argv = result.argv.map((part, index) => typeof part === 'string'
+    // argv[0] is an executable filename, so shell quoting becomes part of the
+    // filename when the native executor calls CreateProcess or exec directly.
+    ? index === 0 ? workspace.mapAlias(part) : workspace.mapCommand(part, resolveExecutorShell().dialect)
+    : part);
   if (typeof result.command === 'string') result.command = workspace.mapCommand(result.command, resolveExecutorShell().dialect);
   if (result.sandbox !== undefined) result.sandbox = mapExecServerSandbox(result.sandbox, workspace);
   return mapFileData ? mapExecServerFileData(result, workspace, method) : result;
@@ -99,14 +126,34 @@ function asJsonRecord(value: unknown): JsonRecord | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : null;
 }
 
-/**
- * 本机能用的绝对路径：任务电脑是 Windows 时必须带盘符或是 UNC，以 `/` 开头的 POSIX 路径不算；
- * 是 POSIX 时 `//server/share` 是 Windows 网络路径(本机 exec-server 不认带主机名的 file URI)，也不算。
- */
-function isLocalAbsolutePath(value: string): boolean {
-  return process.platform === 'win32'
-    ? /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/.test(value)
-    : path.posix.isAbsolute(value) && !/^[\\/]{2}/.test(value);
+function sourceUsesWindowsPaths(workspace: ExecutorWorkspace): boolean {
+  return /^(?:[A-Za-z]:[\\/]|[\\/]{2})/u.test(workspace.workingDir);
+}
+
+function agentUsesWindowsPaths(workspace: ExecutorWorkspace): boolean {
+  const prefix = workspace.agentPathPrefixes()[0];
+  return prefix === undefined ? sourceUsesWindowsPaths(workspace) : /^(?:[A-Za-z]:|[\\/]{2})/u.test(prefix);
+}
+
+function sourcePathUri(value: string, workspace: ExecutorWorkspace): string {
+  return pathToFileURL(value, { windows: sourceUsesWindowsPaths(workspace) }).href;
+}
+
+/** Unmapped deny entries keep their Source meaning; malformed entries still fail closed there. */
+function sourceCanInterpretUri(value: unknown, workspace: ExecutorWorkspace): boolean {
+  if (typeof value !== 'string') return true;
+  const windows = sourceUsesWindowsPaths(workspace);
+  try {
+    fileURLToPath(value, { windows });
+    return true;
+  } catch {
+    try {
+      const uri = new URL(value);
+      if (uri.protocol !== 'file:') return true;
+      if (!windows) return uri.hostname === '' || uri.hostname === 'localhost';
+      return uri.hostname !== '' && uri.hostname !== 'localhost' || /^\/[A-Za-z]:[\\/]/u.test(decodeURIComponent(uri.pathname));
+    } catch { return true; }
+  }
 }
 
 /** 转换沙箱用到的 Agent 一侧信息：它的路径约定按虚拟工作区(Agent 主机上的路径)判断，不按单个 URI 的长相猜。 */
@@ -117,13 +164,9 @@ interface SandboxMapping {
 
 /** Agent 发来的 file URI 还原成它那边的路径写法(Windows Agent：`file:///C:/x` → `C:/x`；UNC 带回主机名)。 */
 function agentPathFromUri(value: unknown, windowsAgent: boolean): string | null {
-  if (typeof value !== 'string' || !value.startsWith('file://')) return null;
+  if (typeof value !== 'string' || !/^file:/iu.test(value)) return null;
   try {
-    const url = new URL(value);
-    const pathname = decodeURIComponent(url.pathname);
-    if (url.host) return `//${url.host}${pathname}`;
-    // POSIX 上 `/C:/secret` 是根目录下的普通路径，只有 Windows Agent 才去掉盘符前的 `/`。
-    return windowsAgent ? pathname.replace(/^\/([A-Za-z]:)/, '$1') : pathname;
+    return fileURLToPath(value, { windows: windowsAgent });
   } catch {
     return null;
   }
@@ -133,7 +176,7 @@ function agentPathFromUri(value: unknown, windowsAgent: boolean): string | null 
 function localUriFromAgent(value: unknown, { workspace, windowsAgent }: SandboxMapping): string | null {
   const agentPath = agentPathFromUri(value, windowsAgent);
   const local = agentPath === null ? null : workspace.localPathFromAgent(agentPath);
-  return local === null ? null : pathToFileURL(local).href;
+  return local === null ? null : sourcePathUri(local, workspace);
 }
 
 /**
@@ -172,8 +215,7 @@ function mapSandboxEntry(entry: unknown, mapping: SandboxMapping): unknown[] {
   if (target.type === 'path') {
     const local = localUriFromAgent(target.path, mapping);
     if (local !== null) return [{ ...record, path: { ...target, path: local } }];
-    const agentPath = agentPathFromUri(target.path, mapping.windowsAgent);
-    return deny && agentPath !== null && isLocalAbsolutePath(agentPath) ? [entry] : [];
+    return deny && sourceCanInterpretUri(target.path, mapping.workspace) ? [entry] : [];
   }
   if (target.type === 'glob_pattern' && typeof target.pattern === 'string') {
     const local = mapping.workspace.localGlobFromAgent(target.pattern);
@@ -210,7 +252,7 @@ function mapExecServerSandbox(value: unknown, workspace: ExecutorWorkspace): unk
  * 授权通过后、实际转发前才读写入目标的原内容，排队中的请求也在出队后读取最新内容。
  * 路径与命令的映射仍在权限检查前完成，确保 gate 检查的是实际执行的操作。
  */
-function mapExecServerFileData(value: unknown, workspace: ExecutorWorkspace, method?: string): unknown {
+export function mapExecServerFileData(value: unknown, workspace: ExecutorWorkspace, method?: string): unknown {
   if (!method?.startsWith('fs/write') || !value || typeof value !== 'object' || Array.isArray(value)) return value;
   const result = value as Record<string, unknown>;
   if (typeof result.dataBase64 !== 'string') return value;
@@ -233,15 +275,12 @@ function existingTextFor(target: unknown, workspace: ExecutorWorkspace): string 
 /** JSON 层逐字符串投影；文件 base64 数据保持原始字节，进程输出单独解码。 */
 export function mapExecServerResult(value: unknown, workspace: ExecutorWorkspace, method?: string): unknown {
   if (typeof value === 'string') {
-    if (value.startsWith('file://')) {
+    if (/^file:/iu.test(value)) {
       try {
-        const uri = new URL(value);
-        const real = fileURLToPath(uri);
+        const real = fileURLToPath(value, { windows: sourceUsesWindowsPaths(workspace) });
         const virtual = workspace.toAgentPath(real);
         if (virtual === real) return value;
-        uri.host = '';
-        uri.pathname = virtual.replace(/\\/g, '/');
-        return uri.href;
+        return pathToFileURL(virtual, { windows: agentUsesWindowsPaths(workspace) }).href;
       } catch { return value; }
     }
     return workspace.mapTextForAgent(value);
@@ -255,7 +294,7 @@ export function mapExecServerResult(value: unknown, workspace: ExecutorWorkspace
     const directories = [info.userHomeDir, info.tempDir, ...(Array.isArray(info.temporaryDirectories) ? info.temporaryDirectories : [])];
     workspace.virtualizeDirs(directories.flatMap((dir) => {
       if (typeof dir !== 'string') return [];
-      try { return [dir.startsWith('file://') ? fileURLToPath(dir) : dir]; } catch { return []; }
+      try { return [/^file:/iu.test(dir) ? fileURLToPath(dir, { windows: sourceUsesWindowsPaths(workspace) }) : dir]; } catch { return []; }
     }));
   }
   const currentMethod = typeof record.method === 'string' ? record.method : method;

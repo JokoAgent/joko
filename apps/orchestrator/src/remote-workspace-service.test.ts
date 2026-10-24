@@ -43,6 +43,7 @@ describe("RemoteWorkspaceService", () => {
               data: {
                 path: { text: "README.md" },
                 line_number: 1,
+                absolute_offset: 0,
                 lines: { text: "hello remote workspace\n" },
                 submatches: [{ start: 6, end: 12 }]
               }
@@ -181,6 +182,134 @@ describe("RemoteWorkspaceService", () => {
     await workspaces.close();
   });
 
+  it.each(["aliases", "nested roots"] as const)("serializes old-revision saves across remote workspace %s", async kind => {
+    const f = await memoryWorkspaceFixture();
+    let release!: () => void;
+    try {
+      const file = kind === "nested roots" ? "sub/note.txt" : "note.txt", aliasRoot = kind === "nested roots" ? "/workspace/sub" : "/workspace";
+      if (kind === "nested roots") await f.files.mkdir("/workspace/sub");
+      await f.files.write({ path: `/workspace/${file}`, content: Buffer.from("old") });
+      const revision = (await f.workspaces.preview("workspace", file)).entry.revision;
+      await f.workspaces.register({ ...f.registration, id: "workspace-alias", root: aliasRoot,
+        remote: { ...f.registration.remote, binding: { ...f.registration.remote.binding, workspaceRoot: aliasRoot } } });
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      const original = f.files.write.bind(f.files);
+      const write = vi.spyOn(f.files, "write").mockImplementationOnce(async request => { entered(); await blocked; return original(request); });
+      const first = f.workspaces.writeTextFile("workspace", { path: file, text: "first", expectedRevision: revision });
+      await started;
+      const second = f.workspaces.writeTextFile("workspace-alias", { path: "./note.txt", text: "second", expectedRevision: revision });
+      await vi.waitFor(() => expect(f.capture).toHaveBeenCalledTimes(3));
+      await new Promise<void>(done => setImmediate(done));
+      release();
+      await expect(first).resolves.toMatchObject({ revision: expect.stringContaining("sha256:") });
+      await expect(second).rejects.toMatchObject({ code: "WORKSPACE_TEXT_FILE_STALE" });
+      expect(write).toHaveBeenCalledOnce();
+      expect(Buffer.from(await f.files.read({ path: `/workspace/${file}`, maximumBytes: 100 })).toString()).toBe("first");
+    } finally { release?.(); vi.restoreAllMocks(); await f.workspaces.close(); }
+  });
+
+  it("retires a queued write's original registration instead of adopting a replacement route", async () => {
+    const f = await memoryWorkspaceFixture();
+    let release!: () => void;
+    try {
+      await f.files.write({ path: "/workspace/note.txt", content: Buffer.from("old") });
+      await f.workspaces.register({ ...f.registration, id: "workspace-alias" });
+      const revision = (await f.workspaces.preview("workspace", "note.txt")).entry.revision;
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      const original = f.files.write.bind(f.files);
+      const write = vi.spyOn(f.files, "write").mockImplementationOnce(async request => { entered(); await blocked; return original(request); });
+      const first = f.workspaces.writeTextFile("workspace", { path: "note.txt", text: "first", expectedRevision: revision });
+      await started;
+      const pending = f.workspaces.writeTextFile("workspace-alias", { path: "note.txt", text: "second", expectedRevision: revision });
+      await vi.waitFor(() => expect(f.capture).toHaveBeenCalledTimes(3));
+      await new Promise<void>(done => setImmediate(done));
+      await f.workspaces.register({ ...f.registration, id: "workspace-alias", remote: { ...f.registration.remote, binding: { ...f.registration.remote.binding, hostId: "replacement" } } });
+      release(); await first;
+      await expect(pending).rejects.toThrow("registered remote workspace changed");
+      expect(write).toHaveBeenCalledOnce(); expect(f.capture).toHaveBeenCalledTimes(3);
+    } finally { release?.(); vi.restoreAllMocks(); await f.workspaces.close(); }
+  });
+
+  it.each(["host", "root"] as const)("does not block an independent remote %s while a save waits", async kind => {
+    const f = await memoryWorkspaceFixture(), other = kind === "host" ? new MemoryRemoteFiles() : f.files;
+    let release!: () => void;
+    try {
+      const otherRoot = kind === "host" ? "/workspace" : "/workspace-other", otherHost = kind === "host" ? "other-host" : "host";
+      await f.files.write({ path: "/workspace/note.txt", content: Buffer.from("old") });
+      await other.mkdir(otherRoot, { recursive: true }); await other.write({ path: `${otherRoot}/note.txt`, content: Buffer.from("other") });
+      f.capture.mockImplementation(async binding => ({ kind: "ssh", binding, executionIdentity: binding.hostId, authorityIdentity: "route", pathStyle: "posix",
+        files: binding.hostId === "host" ? f.files : other, processes: f.processes, assertCurrent: () => undefined, assertFilesCurrent: () => undefined, assertForwardingCurrent: () => undefined }));
+      await f.workspaces.register({ ...f.registration, id: "other", root: otherRoot,
+        remote: { ...f.registration.remote, binding: { ...f.registration.remote.binding, hostId: otherHost, workspaceRoot: otherRoot } } });
+      const firstRevision = (await f.workspaces.preview("workspace", "note.txt")).entry.revision;
+      const otherRevision = (await f.workspaces.preview("other", "note.txt")).entry.revision;
+      let entered!: () => void; const started = new Promise<void>(resolve => { entered = resolve; });
+      const blocked = new Promise<void>(resolve => { release = resolve; }), original = f.files.write.bind(f.files);
+      vi.spyOn(f.files, "write").mockImplementationOnce(async request => { entered(); await blocked; return original(request); });
+      const first = f.workspaces.writeTextFile("workspace", { path: "note.txt", text: "first", expectedRevision: firstRevision });
+      await started;
+      let otherSaved = false;
+      const second = f.workspaces.writeTextFile("other", { path: "note.txt", text: "independent", expectedRevision: otherRevision }).then(() => { otherSaved = true; });
+      await vi.waitFor(() => expect(otherSaved).toBe(true));
+      release(); await Promise.all([first, second]);
+    } finally { release?.(); vi.restoreAllMocks(); await f.workspaces.close(); }
+  });
+
+  it("pages the complete sorted search set and reports stream truncation accurately", async () => {
+    const requests: RemoteProcessStartRequest[] = [];
+    const lines = Array.from({ length: 1_001 }, (_, index) => JSON.stringify({ type: "match", data: { path: { text: index < 1_000 ? "note.txt" : "z.txt" },
+      absolute_offset: index * 5, line_number: index + 1, lines: { text: "match\n" }, submatches: [{ start: 0, end: 5 }] } }));
+    const f = await memoryWorkspaceFixture({ open: async request => { requests.push(request); return new CompletedRemoteProcess({ stdout: lines.slice().reverse().join("\n") }); } });
+    try {
+      const first = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50 });
+      expect(first).toMatchObject({ totalResults: 1_001, totalFiles: 2, truncated: true, nextOffset: 50 });
+      expect(first.matches).toHaveLength(50); expect(first.matches[0]?.line).toBe(1);
+      const later = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50, offset: 200 });
+      expect(later.matches[0]?.line).toBe(201); expect(later.revision).toBe(first.revision);
+      const last = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50, offset: 1_000 });
+      expect(last).toMatchObject({ totalResults: 1_001, totalFiles: 2, truncated: false }); expect(last.nextOffset).toBeUndefined(); expect(last.matches).toHaveLength(1);
+      const events = [];
+      for await (const event of f.workspaces.searchStream("workspace", "match", false)) events.push(event);
+      expect(events.filter(event => event.kind === "match")).toHaveLength(1_000);
+      expect(events.at(-1)).toMatchObject({ kind: "end", truncated: true, totalResults: 1_001, totalFiles: 2, revision: first.revision });
+      expect(requests.every(request => request.args.includes("--sort") && !request.args.includes("--max-count"))).toBe(true);
+    } finally { await f.workspaces.close(); }
+  });
+
+  it("cancels the owned remote search process without accepting a late terminal result", async () => {
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const events = new EventEmitter();
+    const child = Object.assign(events, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      exitCode: null, signalCode: null, kill: vi.fn(() => { events.emit("exit", null, "SIGKILL"); return true; }) });
+    const f = await memoryWorkspaceFixture({ open: async () => { entered(); return child; } });
+    try {
+      const controller = new AbortController(), stream = f.workspaces.searchStream("workspace", "match", false, controller.signal);
+      const pending = stream.next(); await started; controller.abort();
+      await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+      expect(child.kill).toHaveBeenCalled(); expect(f.capture).toHaveBeenCalledOnce();
+    } finally { await f.workspaces.close(); }
+  });
+
+  it.each([
+    { ending: "LF", lineEnding: "\n", preview: "😀" },
+    { ending: "CRLF", lineEnding: "\r\n", preview: "😀" },
+    { ending: "CRLF after a content CR", lineEnding: "\r\r\n", preview: "😀\r" }
+  ])("preserves zero-width regular-expression anchors and Unicode byte boundaries with $ending", async ({ lineEnding, preview }) => {
+    const f = await memoryWorkspaceFixture({ open: async () => new CompletedRemoteProcess({ stdout: JSON.stringify({ type: "match", data: {
+      path: { text: "unicode.txt" }, line_number: 2, absolute_offset: 20, lines: { text: `😀${lineEnding}` }, submatches: [{ start: 0, end: 0 }, { start: 4, end: 4 }]
+    } }) }) });
+    try {
+      const result = await f.workspaces.searchPage("workspace", "^|$", { regularExpression: true });
+      expect(result).toMatchObject({ totalResults: 1, truncated: false, matches: [{ path: "unicode.txt", line: 2, preview, column: 1, endColumn: 1,
+        startByte: 20, endByte: 20, submatches: [{ startByte: 0, endByte: 0 }, { startByte: 4, endByte: 4 }] }] });
+    } finally { await f.workspaces.close(); }
+  });
+
   it("keeps HTML resources and reloads on the original remote lease and registration across delayed reads", async () => {
     const files = new MemoryRemoteFiles();
     await files.mkdir("/workspace", { recursive: true });
@@ -305,6 +434,22 @@ describe("RemoteWorkspaceService", () => {
     await workspaces.close();
   });
 });
+
+async function memoryWorkspaceFixture(processes: RemoteProcessTransportPort = { open: async () => new CompletedRemoteProcess({}) }) {
+  const files = new MemoryRemoteFiles(); await files.mkdir("/workspace", { recursive: true });
+  const binding: Extract<import("@joko/core").RemoteWorkspaceBinding, { kind: "ssh" }> = {
+    kind: "ssh", hostTargetId: "target", hostId: "host", workspaceRoot: "/workspace"
+  };
+  const capture = vi.fn(async (binding: Extract<import("@joko/core").RemoteWorkspaceBinding, { kind: "ssh" }>) => ({
+    kind: "ssh" as const, binding, executionIdentity: binding.hostId, authorityIdentity: "route", pathStyle: "posix" as const,
+    files, processes, assertCurrent: () => undefined, assertFilesCurrent: () => undefined, assertForwardingCurrent: () => undefined
+  }));
+  const router = { workspace: capture, files: capture } as unknown as RemoteExecutionRouter;
+  const remote = new RemoteWorkspaceService(router), workspaces = new WorkspaceService({ remoteDelegate: remote });
+  const registration = { id: "workspace", root: "/workspace", displayName: "Remote", trusted: true, remote: { targetId: "target", binding } };
+  await workspaces.register(registration);
+  return { files, processes, capture, remote, workspaces, registration };
+}
 
 type MemoryEntry =
   | { kind: "directory"; mode: number; modifiedAt: number }

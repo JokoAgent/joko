@@ -1,4 +1,4 @@
-import type { AdapterContext, DurableNativeDispatchPreparation, NativeHistoryProjection, NativeSessionBinding, NativeSessionState } from "@joko/core";
+import type { AdapterContext, DurableNativeDispatchPreparation, EventPayload, NativeHistoryProjection, NativeSessionBinding, NativeSessionState } from "@joko/core";
 import { receiveHostedAgentArtifact } from "./hosted-agent-artifacts.js";
 import { HostedAgentExecutor, HostedAgentExecutorError } from "./hosted-agent-executor.js";
 import type { HostedAgentFrame } from "./hosted-agent-exchange.js";
@@ -29,6 +29,7 @@ export class HostedAgentController {
   readonly #persistFence: ((operationId: string, preparation: DurableNativeDispatchPreparation) => Promise<void>) | undefined;
   readonly #resolveOperation: ((operationId: string) => HostedAgentOperationOwner) | undefined;
   readonly #onGroupSwitch: ((offer: string) => void) | undefined;
+  readonly #onEvent: ((event: EventPayload) => void | Promise<void>) | undefined;
   readonly #lifetime = new AbortController();
   readonly #requests = new Map<string, { readonly abort: AbortController; readonly promise: Promise<void> }>();
   readonly #seen = new Set<string>();
@@ -39,11 +40,13 @@ export class HostedAgentController {
     readonly binding: () => NativeSessionBinding;
     readonly resolveOperation?: (operationId: string) => HostedAgentOperationOwner;
     readonly onGroupSwitch?: (offer: string) => void;
+    readonly onEvent?: (event: EventPayload) => void | Promise<void>;
     readonly temporaryRoot: string; readonly assertCurrent: () => void; readonly persistFence?: (operationId: string, preparation: DurableNativeDispatchPreparation) => Promise<void> }) {
     this.#port = options.port; this.#context = options.context; this.#executor = options.executor; this.#temporaryRoot = options.temporaryRoot;
     this.#assertAuthority = options.assertCurrent; this.#persistFence = options.persistFence;
     this.#resolveOperation = options.resolveOperation;
     this.#onGroupSwitch = options.onGroupSwitch;
+    this.#onEvent = options.onEvent;
     this.#projection = new HostedAgentProjection(options.executor.workspace, options.context, options.binding);
   }
   start(): Promise<void> { return this.#pump ??= this.#consume(); }
@@ -71,6 +74,7 @@ export class HostedAgentController {
             const owner = this.#owner(frame.payload.operationId);
             const event = this.#projection.event(frame.payload.event);
             await owner.context.emit(event, frame.payload.metadata === undefined ? undefined : this.#projection.metadata(frame.payload.metadata)); this.#assertCurrent(signal);
+            if (this.#onEvent) await this.#onEvent(event);
           } else if (frame.payload.kind === "group_switch") {
             if (!/^[a-f0-9]{64}$/u.test(frame.payload.offer)) throw new Error("Invalid Provider group switch offer.");
             this.#onGroupSwitch?.(frame.payload.offer);

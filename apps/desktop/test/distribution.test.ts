@@ -120,6 +120,7 @@ describe("Desktop distribution", () => {
       { from: "dist/native-system-frontmost-input", to: "native-system-frontmost-input" },
       { from: "dist/native-hardware", to: "native-hardware" },
       { from: "dist/native-gamepad", to: "native-gamepad" },
+      { from: "dist/native-menu-bar", to: "native-menu-bar" },
       { from: "dist/native-remote-desktop", to: "native-remote-desktop" },
       { from: "dist/orchestrator-runtime", to: "orchestrator-runtime" },
       { from: "dist/orchestrator-runtime/node_modules", to: "orchestrator-runtime/node_modules" }
@@ -208,8 +209,8 @@ describe("Desktop distribution", () => {
       .toBeLessThan(switch2Emission.indexOf("nintendoUsesSwitch2Usb = true"));
 
     const packagedGamepadAudit = packagedAudit.slice(
-      packagedAudit.indexOf("async function auditNativeGamepad("),
-      packagedAudit.indexOf("async function auditNativeVoiceShortcut(")
+      packagedAudit.indexOf("async function auditNativeMacHelper("),
+      packagedAudit.indexOf("async function prepareNativeRemoteDesktopForPackage(")
     );
     expect(packagedGamepadAudit.indexOf("info.size < 32"))
       .toBeLessThan(packagedGamepadAudit.indexOf("const bytes = await readFile(path)"));

@@ -76,6 +76,13 @@ export const DESKTOP_CHANNELS = {
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
   keepAwakeChanged: "joko:power:keep-awake:changed",
+  loginItemGet: "joko:login-item:get",
+  loginItemSet: "joko:login-item:set",
+  menuBarGet: "joko:menu-bar:get",
+  menuBarSetEnabled: "joko:menu-bar:set-enabled",
+  menuBarPublish: "joko:menu-bar:publish",
+  menuBarAction: "joko:menu-bar:action",
+  menuBarSettingsChanged: "joko:menu-bar:settings-changed",
   providerModelRefreshLifecycle: "joko:provider-models:refresh-lifecycle",
   microphoneGetPermission: "joko:microphone:permission:get",
   microphoneOpenSettings: "joko:microphone:settings:open",
@@ -702,6 +709,13 @@ export type DesktopNativeTaskStatusAction =
 
 export interface DesktopKeepAwakeSettings {
   readonly enabled: boolean;
+}
+
+export interface DesktopLoginItemState {
+  readonly available: boolean;
+  readonly enabled: boolean;
+  readonly requiresApproval: boolean;
+  readonly unavailableReason?: "platform" | "development";
 }
 
 export type DesktopNativeGamepadFamily = "xbox" | "playstation" | "nintendo" | "generic";

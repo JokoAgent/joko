@@ -267,17 +267,13 @@ export function PortableSessionImportDialog({
   const [inspecting, setInspecting] = useState(false);
   const [unlocking, setUnlocking] = useState(false);
   const [retryingActivation, setRetryingActivation] = useState(false);
-  const liveDraftIdRef = useRef<string | undefined>(undefined);
+  const liveDraftRef = useRef<{ readonly id: string; readonly cancel: typeof onCancelDraft } | undefined>(undefined);
   const lifecycleRef = useRef(0);
-  const cancelDraftRef = useRef(onCancelDraft);
   const targetOptionsRef = useRef(targets);
   const defaultTargetIdRef = useRef(defaultTargetId);
   const openRef = useRef(open);
   const passwordRef = useRef<HTMLInputElement>(null);
-  const scopeRef = useRef<object | undefined>(undefined);
-  const requestRef = useRef<AbortController | undefined>(undefined);
   const fileRef = useRef<HTMLInputElement>(null);
-  cancelDraftRef.current = onCancelDraft;
   targetOptionsRef.current = targets;
   defaultTargetIdRef.current = defaultTargetId;
   openRef.current = open;
@@ -286,11 +282,11 @@ export function PortableSessionImportDialog({
   const selectedTarget = targets.find((target) => target.id === targetId);
   const selectedExecution = executionForTarget(targetId);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     lifecycleRef.current += 1;
-    const activeDraftId = liveDraftIdRef.current;
-    liveDraftIdRef.current = undefined;
-    if (activeDraftId !== undefined) void cancelDraftRef.current(activeDraftId).catch(() => undefined);
+    const activeDraft = liveDraftRef.current;
+    liveDraftRef.current = undefined;
+    if (activeDraft !== undefined) void activeDraft.cancel(activeDraft.id).catch(() => undefined);
     if (!open) return;
     const availableTargets = targetOptionsRef.current;
     const preferredTargetId = defaultTargetIdRef.current;
@@ -326,28 +322,30 @@ export function PortableSessionImportDialog({
     if (step === "password") passwordRef.current?.focus();
   }, [step]);
 
-  useEffect(() => () => {
+  useLayoutEffect(() => () => {
     lifecycleRef.current += 1;
-    const activeDraftId = liveDraftIdRef.current;
-    liveDraftIdRef.current = undefined;
-    if (activeDraftId !== undefined) void cancelDraftRef.current(activeDraftId).catch(() => undefined);
+    const activeDraft = liveDraftRef.current;
+    liveDraftRef.current = undefined;
+    if (activeDraft !== undefined) void activeDraft.cancel(activeDraft.id).catch(() => undefined);
   }, []);
 
   const inspect = async (file: File): Promise<void> => {
     const lifecycle = ++lifecycleRef.current;
-    const previousDraftId = liveDraftIdRef.current;
-    liveDraftIdRef.current = undefined;
+    const cancel = onCancelDraft;
+    const previousDraft = liveDraftRef.current;
+    liveDraftRef.current = undefined;
     setDraft(undefined);
-    if (previousDraftId !== undefined) await cancelDraftRef.current(previousDraftId).catch(() => undefined);
+    if (previousDraft !== undefined) await previousDraft.cancel(previousDraft.id).catch(() => undefined);
+    if (lifecycle !== lifecycleRef.current || !openRef.current) return;
     setError(undefined);
     setInspecting(true);
     try {
       const next = await onInspect(file);
       if (lifecycle !== lifecycleRef.current || !openRef.current) {
-        await cancelDraftRef.current(next.draftId).catch(() => undefined);
+        await cancel(next.draftId).catch(() => undefined);
         return;
       }
-      liveDraftIdRef.current = next.draftId;
+      liveDraftRef.current = { id: next.draftId, cancel };
       setDraft(next);
       setStep(next.passwordRequired ? "password" : "preview");
     } catch {
@@ -369,10 +367,10 @@ export function PortableSessionImportDialog({
 
   const cancelDraft = async (): Promise<void> => {
     lifecycleRef.current += 1;
-    const activeDraftId = liveDraftIdRef.current;
-    liveDraftIdRef.current = undefined;
+    const activeDraft = liveDraftRef.current;
+    liveDraftRef.current = undefined;
     setDraft(undefined);
-    if (activeDraftId !== undefined) await cancelDraftRef.current(activeDraftId).catch(() => undefined);
+    if (activeDraft !== undefined) await activeDraft.cancel(activeDraft.id).catch(() => undefined);
   };
   const close = (): void => {
     if (busy) return;
@@ -382,13 +380,17 @@ export function PortableSessionImportDialog({
   const unlock = async (): Promise<void> => {
     if (draft === undefined || password === "") return;
     const lifecycle = lifecycleRef.current;
+    const cancel = liveDraftRef.current?.cancel ?? onCancelDraft;
     setUnlocking(true);
     setPasswordError(false);
     setError(undefined);
     try {
       const next = await onUnlock(draft.draftId, password);
-      if (lifecycle !== lifecycleRef.current || !openRef.current) return;
-      liveDraftIdRef.current = next.draftId;
+      if (lifecycle !== lifecycleRef.current || !openRef.current) {
+        await cancel(next.draftId).catch(() => undefined);
+        return;
+      }
+      liveDraftRef.current = { id: next.draftId, cancel };
       setDraft(next);
       setPassword("");
       setStep("preview");
@@ -414,7 +416,7 @@ export function PortableSessionImportDialog({
         useWorktree: preview?.workspaceKind === "project" && selectedTarget?.worktreeSupported === true && useWorktree
       });
       if (lifecycle !== lifecycleRef.current || !openRef.current) return;
-      liveDraftIdRef.current = undefined;
+      liveDraftRef.current = undefined;
       setDraft(undefined);
       setResult(imported);
       setStep("done");

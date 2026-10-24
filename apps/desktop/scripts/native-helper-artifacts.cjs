@@ -8,6 +8,8 @@ const SIMPLE_NATIVE_ARTIFACTS = Object.freeze({
     helpers: Object.freeze({ win32: "joko-windows-micro-helper.exe" }) }),
   gamepad: Object.freeze({ directory: "native-gamepad", maximumBytes: 16 * 1024 * 1024,
     helpers: Object.freeze({ darwin: "joko-macos-gamepad-helper" }) }),
+  menuBar: Object.freeze({ directory: "native-menu-bar", maximumBytes: 16 * 1024 * 1024,
+    helpers: Object.freeze({ darwin: "joko-macos-menu-bar-helper" }) }),
   frontmost: Object.freeze({ directory: "native-system-frontmost-input", maximumBytes: 2 * 1024 * 1024,
     helpers: Object.freeze({ win32: "joko-windows-frontmost-input.node", darwin: "joko-macos-frontmost-input.node", linux: "joko-linux-frontmost-input.node" }) })
 });

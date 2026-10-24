@@ -68,6 +68,10 @@ const GIT_METHODS = new Set([
   "gitState", "gitDiff", "gitReviewDiff", "readGitDiffFile", "readGitReviewFile", "readGitDiffImage",
   "applyGitDiffHunk", "applyGitDiff", "commitGitReview", "pushGitReview"
 ]);
+const MUTATION_METHODS = new Set([
+  "writeTextFile", "createEntry", "moveEntry", "deleteEntry", "copyEntry",
+  "applyGitDiffHunk", "applyGitDiff", "commitGitReview", "pushGitReview"
+]);
 const REMOTE_WORKSPACE_WATCH = String.raw`
 const fs = require('node:fs'), path = require('node:path');
 if (Number(process.versions.node.split('.')[0]) < 22) process.exit(1);
@@ -103,6 +107,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   readonly #remoteExecution: RemoteExecutionRouter;
   readonly #cache: RemoteFileVersionCache | undefined;
   readonly #registrations = new Map<string, WorkspaceRegistration>();
+  readonly #mutations = new Map<string, Set<RemoteMutationLease>>();
   #closed = false;
 
   constructor(remoteExecution: RemoteExecutionRouter, options: { readonly cache?: RemoteFileVersionCache } = {}) {
@@ -128,6 +133,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   async close(): Promise<void> {
     this.#closed = true;
     this.#registrations.clear();
+    await Promise.allSettled([...this.#mutations.values()].flatMap(leases => [...leases].map(lease => lease.completion)));
   }
 
   async captureSkillSourceAuthority(workspaceId: string, signal?: AbortSignal): Promise<RemoteSkillSourceAuthority> {
@@ -193,44 +199,52 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     this.#assertOpen();
     const registration = this.#require(workspaceId);
     const transports = await this.#transports(registration);
-    if (GIT_METHODS.has(method) && !await requireRemoteGitRoot(registration, transports, method === "gitState")) {
-      if (method !== "gitState") throw new WorkspaceGitReviewError("Remote workspace is not a Git repository.", "unsupported");
-      return { repository: false, detachedHead: false, operationInProgress: false, unmerged: false, dirty: false, changes: [] } as Result;
-    }
-    let result: unknown;
-    switch (method) {
-      case "list": result = await this.#list(registration, transports.files, args[0] as string, args[1] as WorkspaceEntryListingOptions | undefined); break;
-      case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number, args[2] as number | undefined, undefined, transports.assertCurrent); break;
-      case "materializeFile": result = await this.#materialize(registration, transports.files, args, transports.assertCurrent); break;
-      case "listFiles": result = await this.#listFiles(registration, transports.files); break;
-      case "writeTextFile": result = await this.#writeTextFile(registration, transports.files, args[0] as WorkspaceTextFileWriteInput); break;
-      case "createEntry": result = await this.#createEntry(registration, transports.files, args[0] as { path: string; kind: "file" | "directory"; expectedRevision: string }); break;
-      case "moveEntry": result = await this.#moveEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
-      case "deleteEntry": result = await this.#deleteEntry(registration, transports.files, args[0] as { path: string; expectedRevision: string; confirmRecursive: boolean }); break;
-      case "copyEntry": result = await this.#copyEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
-      case "search": result = (await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined)).matches; break;
-      case "searchPage": result = await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined); break;
-      case "gitState": result = await this.#gitState(registration, transports); break;
-      case "gitDiff": result = await this.#gitDiff(registration, transports, args[0] as readonly string[], args[1] as Record<string, unknown>); break;
-      case "gitReviewDiff": result = await this.#gitReviewDiff(registration, transports, args[0] as WorkspaceGitReviewDiffInput); break;
-      case "readGitDiffFile": result = await this.#readGitDiffFile(registration, transports, args[0] as RemoteGitDiffFileInput); break;
-      case "readGitReviewFile": result = await this.#readGitReviewFile(registration, transports, args[0] as RemoteGitReviewFileInput); break;
-      case "readGitDiffImage": result = await this.#readGitDiffImage(registration, transports, args[0] as RemoteGitImageInput); break;
-      case "applyGitDiffHunk": result = await this.#applyGitDiffHunk(registration, transports, args[0] as WorkspaceGitHunkMutation); break;
-      case "applyGitDiff": result = await this.#applyGitDiff(registration, transports, args[0] as WorkspaceGitMutation); break;
-      case "commitGitReview": result = await this.#commit(registration, transports, args[0] as { message: string; expectedRepositoryRevision: string; includeUnstaged?: boolean }); break;
-      case "pushGitReview": result = await this.#push(registration, transports, args[0] as RemoteGitPushInput); break;
-      default: throw new Error("Remote workspace operation is unavailable.");
-    }
-    transports.assertCurrent();
-    return result as Result;
+    const execute = async (): Promise<Result> => {
+      transports.assertCurrent();
+      if (GIT_METHODS.has(method) && !await requireRemoteGitRoot(registration, transports, method === "gitState")) {
+        if (method !== "gitState") throw new WorkspaceGitReviewError("Remote workspace is not a Git repository.", "unsupported");
+        return { repository: false, detachedHead: false, operationInProgress: false, unmerged: false, dirty: false, changes: [] } as Result;
+      }
+      let result: unknown;
+      switch (method) {
+        case "list": result = await this.#list(registration, transports.files, args[0] as string, args[1] as WorkspaceEntryListingOptions | undefined); break;
+        case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number, args[2] as number | undefined, undefined, transports.assertCurrent); break;
+        case "materializeFile": result = await this.#materialize(registration, transports.files, args, transports.assertCurrent); break;
+        case "listFiles": result = await this.#listFiles(registration, transports.files); break;
+        case "writeTextFile": result = await this.#writeTextFile(registration, transports.files, args[0] as WorkspaceTextFileWriteInput); break;
+        case "createEntry": result = await this.#createEntry(registration, transports.files, args[0] as { path: string; kind: "file" | "directory"; expectedRevision: string }); break;
+        case "moveEntry": result = await this.#moveEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
+        case "deleteEntry": result = await this.#deleteEntry(registration, transports.files, args[0] as { path: string; expectedRevision: string; confirmRecursive: boolean }); break;
+        case "copyEntry": result = await this.#copyEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
+        case "search": result = (await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined)).matches; break;
+        case "searchPage": result = await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined); break;
+        case "gitState": result = await this.#gitState(registration, transports); break;
+        case "gitDiff": result = await this.#gitDiff(registration, transports, args[0] as readonly string[], args[1] as Record<string, unknown>); break;
+        case "gitReviewDiff": result = await this.#gitReviewDiff(registration, transports, args[0] as WorkspaceGitReviewDiffInput); break;
+        case "readGitDiffFile": result = await this.#readGitDiffFile(registration, transports, args[0] as RemoteGitDiffFileInput); break;
+        case "readGitReviewFile": result = await this.#readGitReviewFile(registration, transports, args[0] as RemoteGitReviewFileInput); break;
+        case "readGitDiffImage": result = await this.#readGitDiffImage(registration, transports, args[0] as RemoteGitImageInput); break;
+        case "applyGitDiffHunk": result = await this.#applyGitDiffHunk(registration, transports, args[0] as WorkspaceGitHunkMutation); break;
+        case "applyGitDiff": result = await this.#applyGitDiff(registration, transports, args[0] as WorkspaceGitMutation); break;
+        case "commitGitReview": result = await this.#commit(registration, transports, args[0] as { message: string; expectedRepositoryRevision: string; includeUnstaged?: boolean }); break;
+        case "pushGitReview": result = await this.#push(registration, transports, args[0] as RemoteGitPushInput); break;
+        default: throw new Error("Remote workspace operation is unavailable.");
+      }
+      transports.assertCurrent();
+      return result as Result;
+    };
+    return MUTATION_METHODS.has(method) ? this.#serializeMutation(transports.mutationScope, execute) : execute();
   }
 
   async *stream<Result>(workspaceId: string, method: string, args: readonly unknown[]): AsyncGenerator<Result> {
     if (method !== "searchStream") throw new Error("Remote workspace stream is unavailable.");
+    const signal = args[2] as AbortSignal | undefined;
+    signal?.throwIfAborted();
     const options: WorkspaceSearchOptions = { caseSensitive: args[1] as boolean };
-    const page = await this.invoke<WorkspaceSearchPage>(workspaceId, "searchPage", [args[0], options]);
-    for (const match of page.matches) yield { kind: "match", match } as Result;
+    const registration = this.#require(workspaceId), transports = await this.#transports(registration, signal);
+    const page = await this.#searchPage(registration, transports, args[0] as string, options, signal);
+    for (const match of page.matches) { signal?.throwIfAborted(); transports.assertCurrent(); yield { kind: "match", match } as Result; }
+    signal?.throwIfAborted(); transports.assertCurrent();
     yield {
       kind: "end",
       truncated: page.truncated,
@@ -477,7 +491,9 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     await assertRemoteMutationPath(registration, files, path, true);
     const beforeInfo = await files.stat(path);
     if (beforeInfo.kind !== "file") throw new WorkspaceTextFileWriteError("Remote text save requires a regular file.", "unsupported");
-    const before = Buffer.from(await files.read({ path, maximumBytes: Math.max(beforeInfo.size, 1) }));
+    if (beforeInfo.size > WORKSPACE_TEXT_FILE_MAXIMUM_BYTES) throw new WorkspaceTextFileWriteError("Existing remote text exceeds the save limit.", "too_large");
+    const before = Buffer.from(await files.read({ path, maximumBytes: Math.max(beforeInfo.size, 1),
+      ...(beforeInfo.version === undefined ? {} : { expectedVersion: beforeInfo.version }) }));
     const beforeRevision = contentRevision(before);
     if (input.expectedRevision !== beforeRevision && input.expectedRevision !== remoteRevision(beforeInfo)) {
       throw new WorkspaceTextFileWriteError("Remote file changed; read it again before saving.", "stale");
@@ -493,6 +509,11 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     await assertRemoteMutationPath(registration, files, path, true);
     await files.write({ path, content, mode: beforeInfo.mode & 0o777, atomic: true });
     const after = await files.stat(path);
+    const readback = Buffer.from(await files.read({ path, maximumBytes: WORKSPACE_TEXT_FILE_MAXIMUM_BYTES,
+      ...(after.version === undefined ? {} : { expectedVersion: after.version }) }));
+    if (!readback.equals(content) || remoteRevision(await files.stat(path)) !== remoteRevision(after)) {
+      throw new WorkspaceTextFileWriteError("Remote file changed while the save was committed. Read it again before retrying.", "stale");
+    }
     const revision = contentRevision(content);
     return {
       entry: remoteEntry(canonicalRelative(input.path), after, revision),
@@ -582,24 +603,33 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     registration: WorkspaceRegistration,
     transports: RemoteTransports,
     query: string,
-    options?: WorkspaceSearchOptions
+    options?: WorkspaceSearchOptions,
+    signal?: AbortSignal
   ): Promise<WorkspaceSearchPage> {
+    signal?.throwIfAborted(); transports.assertCurrent();
     const value = query.trim();
     if (value === "") return { matches: [], totalResults: 0, totalFiles: 0, truncated: false, revision: hashText("") };
-    const maximum = Math.min(Math.max(options?.maximumResults ?? 1_000, 1), 5_000);
-    const args = ["--json", "--hidden", "--glob", "!.git/**", "--max-count", "200"];
+    const maximum = options?.maximumResults ?? 1_000, requestedOffset = options?.offset ?? 0;
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 5_000 || !Number.isSafeInteger(requestedOffset) || requestedOffset < 0 || requestedOffset > 100_000) {
+      throw new WorkspaceSearchError("Remote search page size or offset is invalid.", "invalid");
+    }
+    // Read one bounded complete result set. A per-file cap or page-sized parse
+    // silently loses the sentinel and makes every page look complete.
+    const args = ["--json", "--crlf", "--hidden", "--glob", "!.git/**", "--sort", "path", "--no-require-git"];
     if (options?.caseSensitive !== true) args.push("--ignore-case");
     if (options?.regularExpression !== true) args.push("--fixed-strings");
     if (options?.glob !== undefined) args.push("--glob", options.glob);
     args.push("--", value, ".");
     let output: string;
     try {
-      output = (await runRemote(transports.processes, "rg", args, registration.root, 60_000, MAXIMUM_PROCESS_OUTPUT, undefined, new Set([0, 1]))).stdout;
+      output = (await runRemote(transports.processes, "rg", args, registration.root, 60_000, MAXIMUM_PROCESS_OUTPUT, undefined, new Set([0, 1]), signal)).stdout;
     } catch {
+      signal?.throwIfAborted(); transports.assertCurrent();
       throw new WorkspaceSearchError("Remote workspace search failed.", "search_failed");
     }
-    const matches = parseRipgrepJson(output, maximum + (options?.offset ?? 0));
-    const offset = Math.min(Math.max(options?.offset ?? 0, 0), matches.length);
+    signal?.throwIfAborted(); transports.assertCurrent();
+    const matches = parseRipgrepJson(output, transports.pathStyle);
+    const offset = Math.min(requestedOffset, matches.length);
     const selected = matches.slice(offset, offset + maximum);
     const files = new Set(matches.map((match) => match.path));
     const revision = hashText(JSON.stringify(matches));
@@ -938,12 +968,13 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     return registration;
   }
 
-  async #transports(registration: WorkspaceRegistration): Promise<RemoteTransports> {
+  async #transports(registration: WorkspaceRegistration, signal?: AbortSignal): Promise<RemoteTransports> {
     const remote = registration.remote!;
-    const authority = await this.#remoteExecution.workspace(remote.binding);
-    await validateCapturedWorkspaceRoot(registration, authority.files, authority.assertCurrent);
+    signal?.throwIfAborted();
+    const authority = await this.#remoteExecution.workspace(remote.binding, signal);
+    await validateCapturedWorkspaceRoot(registration, authority.files, authority.assertCurrent, signal);
     const assertCurrent = () => {
-      this.#assertOpen(); authority.assertCurrent();
+      signal?.throwIfAborted(); this.#assertOpen(); authority.assertCurrent();
       if (this.#registrations.get(registration.id) !== registration) throw new WorkspaceEntryMutationError("The registered remote workspace changed.", "stale");
     };
     const guarded = async <T>(operation: () => Promise<T>): Promise<T> => { assertCurrent(); const value = await operation(); assertCurrent(); return value; };
@@ -964,8 +995,32 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         try { assertCurrent(); } catch (error) { child.kill(); throw error; } return child;
       } },
       assertCurrent,
+      mutationScope: { executionIdentity: authority.executionIdentity, pathStyle: authority.pathStyle,
+        root: authority.pathStyle === "win32" ? win32.normalize(registration.root).toLowerCase() : posix.normalize(registration.root) },
       pathStyle: authority.pathStyle
     };
+  }
+
+  async #serializeMutation<Result>(scope: RemoteMutationScope, execute: () => Promise<Result>): Promise<Result> {
+    const identity = JSON.stringify([scope.executionIdentity, scope.pathStyle]);
+    const leases = this.#mutations.get(identity) ?? new Set<RemoteMutationLease>();
+    const paths = scope.pathStyle === "win32" ? win32 : posix;
+    const overlaps = (otherRoot: string): boolean => {
+      const contains = (parent: string, candidate: string): boolean => {
+        const suffix = paths.relative(parent, candidate);
+        return suffix === "" || suffix !== ".." && !suffix.startsWith(`..${paths.sep}`) && !paths.isAbsolute(suffix);
+      };
+      return contains(scope.root, otherRoot) || contains(otherRoot, scope.root);
+    };
+    // A project can legally register both /repo and /repo/sub. Their absolute
+    // files overlap even though their workspace IDs and roots are different.
+    const previous = [...leases].filter(lease => overlaps(lease.root)).map(lease => lease.completion);
+    let release!: () => void;
+    const current: RemoteMutationLease = { root: scope.root, completion: new Promise<void>(resolve => { release = resolve; }) };
+    leases.add(current); this.#mutations.set(identity, leases);
+    await Promise.all(previous);
+    try { return await execute(); }
+    finally { release(); leases.delete(current); if (leases.size === 0 && this.#mutations.get(identity) === leases) this.#mutations.delete(identity); }
   }
 
   #assertOpen(): void {
@@ -974,10 +1029,22 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
 }
 
 interface RemoteTransports {
+  readonly mutationScope: RemoteMutationScope;
   readonly files: RemoteFileTransportPort;
   readonly processes: RemoteProcessTransportPort;
   readonly pathStyle: "posix" | "win32";
   readonly assertCurrent: () => void;
+}
+
+interface RemoteMutationScope {
+  readonly executionIdentity: string;
+  readonly pathStyle: "posix" | "win32";
+  readonly root: string;
+}
+
+interface RemoteMutationLease {
+  readonly root: string;
+  readonly completion: Promise<void>;
 }
 
 async function validateCapturedWorkspaceRoot(
@@ -1192,25 +1259,36 @@ async function runRemote(
   timeoutMs: number,
   maximumBytes: number,
   input?: string,
-  accepted = new Set([0])
+  accepted = new Set([0]),
+  externalSignal?: AbortSignal
 ): Promise<RemoteProcessResult> {
   const controller = new AbortController();
+  const signal = externalSignal === undefined ? controller.signal : AbortSignal.any([controller.signal, externalSignal]);
+  signal.throwIfAborted();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
   const gitArgs = executable !== "git" ? args : args[0] === "status" ? ["-c", "core.fsmonitor=false", ...args]
     : ["diff", "show", "log"].includes(args[0] ?? "") ? [args[0]!, "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
-  const process = await processes.open({ executable, args: gitArgs, cwd, signal: controller.signal,
-    ...(executable !== "git" ? {} : { env: { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", GIT_EXTERNAL_DIFF: "", GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" } }) });
+  let process: RemoteProcessHandle;
+  try {
+    process = await processes.open({ executable, args: gitArgs, cwd, signal,
+      ...(executable !== "git" ? {} : { env: { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", GIT_EXTERNAL_DIFF: "", GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" } }) });
+  } catch (error) { clearTimeout(timer); throw error; }
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   let bytes = 0;
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => { clearTimeout(timer); signal.removeEventListener("abort", abort); };
     const fail = (error: unknown): void => {
-      clearTimeout(timer);
-      process.kill("SIGKILL");
+      if (settled) return;
+      settled = true; cleanup();
+      try { process.kill("SIGKILL"); } catch { /* The captured process may have already exited. */ }
       reject(error);
     };
+    const abort = (): void => fail(signal.reason ?? new DOMException("Remote process cancelled.", "AbortError"));
     const collect = (target: Buffer[]) => (chunk: Buffer | string): void => {
+      if (settled) return;
       const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       bytes += value.byteLength;
       if (bytes > maximumBytes) {
@@ -1221,11 +1299,12 @@ async function runRemote(
     };
     process.stdout.on("data", collect(stdout));
     process.stderr.on("data", collect(stderr));
+    process.stdout.on("error", fail); process.stderr.on("error", fail); process.stdin.on("error", fail);
     process.once("error", fail);
-    if (input === undefined) process.stdin.end();
-    else process.stdin.end(input, "utf8");
+    signal.addEventListener("abort", abort, { once: true });
     process.once("exit", (code) => {
-      clearTimeout(timer);
+      if (settled) return;
+      settled = true; cleanup();
       const stdoutBytes = Buffer.concat(stdout);
       const result = {
         stdout: stdoutBytes.toString("utf8"),
@@ -1236,37 +1315,46 @@ async function runRemote(
       if (!accepted.has(result.exitCode)) reject(new Error("Remote process failed safely."));
       else resolve(result);
     });
+    if (signal.aborted) abort();
+    else if (input === undefined) process.stdin.end();
+    else process.stdin.end(input, "utf8");
   });
 }
 
-function parseRipgrepJson(output: string, maximum: number): WorkspaceSearchResult[] {
+function parseRipgrepJson(output: string, pathStyle: "posix" | "win32"): WorkspaceSearchResult[] {
   const matches: WorkspaceSearchResult[] = [];
   for (const line of output.split("\n")) {
     if (line === "") continue;
     let record: any;
     try { record = JSON.parse(line); } catch { throw new WorkspaceSearchError("Remote search returned malformed output.", "search_failed"); }
     if (record?.type !== "match") continue;
-    const path = canonicalRelative(String(record.data?.path?.text ?? ""));
-    const lineNumber = Number(record.data?.line_number ?? 0);
-    const text = String(record.data?.lines?.text ?? "").replace(/[\r\n]+$/u, "");
-    for (const submatch of record.data?.submatches ?? []) {
-      const start = Number(submatch.start ?? 0);
-      const end = Number(submatch.end ?? start);
-      matches.push({
-        path,
-        line: lineNumber,
-        column: start + 1,
-        endColumn: end + 1,
-        startByte: start,
-        endByte: end,
-        preview: text,
-        submatches: [{ startByte: start, endByte: end }],
-        revision: hashText(`${path}\0${lineNumber}\0${text}`)
-      });
-      if (matches.length >= maximum) return matches;
+    const rawPath = String(record.data?.path?.text ?? "");
+    const path = canonicalRelative(pathStyle === "win32" ? rawPath.replaceAll("\\", "/") : rawPath);
+    const lineNumber = Number(record.data?.line_number), absoluteOffset = Number(record.data?.absolute_offset);
+    const text = String(record.data?.lines?.text ?? "").replace(/\r?\n$/u, "");
+    if (!Number.isSafeInteger(lineNumber) || lineNumber < 1 || !Number.isSafeInteger(absoluteOffset) || absoluteOffset < 0) {
+      throw new WorkspaceSearchError("Remote search returned an invalid line or byte range.", "search_failed");
     }
+    const boundaries = new Map<number, number>([[0, 0]]);
+    let byteOffset = 0, utf16Offset = 0;
+    for (const character of text) {
+      byteOffset += Buffer.byteLength(character, "utf8"); utf16Offset += character.length; boundaries.set(byteOffset, utf16Offset);
+    }
+    const submatches: WorkspaceSearchResult["submatches"][number][] = [];
+    for (const submatch of record.data?.submatches ?? []) {
+      const start = Number(submatch.start), end = Number(submatch.end);
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || !boundaries.has(start) || !boundaries.has(end)
+        || !Number.isSafeInteger(absoluteOffset + end)) throw new WorkspaceSearchError("Remote search returned an invalid UTF-8 submatch.", "search_failed");
+      submatches.push({ startByte: start, endByte: end });
+    }
+    const first = submatches[0];
+    if (first === undefined) continue;
+    matches.push({ path, line: lineNumber, column: boundaries.get(first.startByte)! + 1, endColumn: boundaries.get(first.endByte)! + 1,
+      startByte: absoluteOffset + first.startByte, endByte: absoluteOffset + first.endByte, preview: text, submatches,
+      revision: hashText(`${path}\0${lineNumber}\0${text}`) });
   }
-  return matches;
+  return matches.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
+    || left.startByte - right.startByte || left.endByte - right.endByte);
 }
 
 function parseGitStatus(value: string): GitState["changes"][number] | undefined {

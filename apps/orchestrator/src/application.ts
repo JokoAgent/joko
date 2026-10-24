@@ -187,6 +187,7 @@ import type { ModelWorkingContextCoordinator } from "./model-working-context.js"
 import { composeModelWorkingContext } from "./model-working-context-system.js";
 import { createOutboundStreamingFetch } from "./outbound-streaming-fetch.js";
 import { LocalCodexRuntime } from "./local-codex-runtime.js";
+import { createNativeCodexExecution } from "./native-codex-execution.js";
 import { ManagedChildWorktreeOwner } from "./managed-child-worktree-owner.js";
 import { McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
 import { NativeAuthRecoveryStore } from "./native-auth-recovery.js";
@@ -1488,7 +1489,9 @@ export async function createOrchestratorApplication(
             includeToolPolicy: (sessionId, targetId, policyId) =>
               toolPolicies.enabledForSession(sessionId, targetId, policyId)
           });
+          const codexExecutable = await localBackendRuntimeSetup.resolveExecutable() ?? "codex";
           return createCodexAdapter({
+            nativeExecution: createNativeCodexExecution({ store, remoteExecution, executable: codexExecutable, commandConcurrencyGate }),
             taskShellEnv: context => inputHandoff?.envFor(context) ?? {},
             id: instanceId,
             instanceGeneration: generation,
@@ -1508,7 +1511,7 @@ export async function createOrchestratorApplication(
             profileDirectory: codexHome,
             appServer: {
               transport: {
-                command: await localBackendRuntimeSetup.resolveExecutable() ?? "codex",
+                command: codexExecutable,
                 processOwner: {
                   rootDirectory: join(config.dataDirectory, "backend-runtime", instanceId, "processes"),
                   instanceId,

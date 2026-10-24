@@ -23,6 +23,22 @@ afterEach(async () => {
 });
 
 describe("RemoteCodexRuntimeResolver", () => {
+  it.each([{ label: "SSH", options: {} as FixtureOptions }, { label: "Device", options: { peerWin32: true } as FixtureOptions }])(
+    "opens the exact audited $label exec-server on its captured transport and rejects a retired authority", async ({ options }) => {
+      const fixture = createFixture(options);
+      cleanups.push(() => fixture.resolver.forceShutdown());
+      const runtime = await fixture.resolver.resolve(fixture.target), signal = new AbortController().signal;
+      const child = await runtime.openExecServerProcess!(signal);
+      try {
+        expect(fixture.processes.requests.at(-1)).toMatchObject({
+          executable: options.peerWin32 ? DEVICE_PEER_RUNTIME_EXECUTABLES.codex : "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
+          args: ["exec-server", "--listen", "stdio://"], cwd: runtime.workspaceRoot,
+          env: { CODEX_HOME: options.peerWin32 ? "C:\\work\\project\\.joko\\runtime\\v1\\codex-home" : "/home/test/.joko/runtime/v1/codex-home" }
+        });
+        fixture.authorityCurrent = false;
+        await expect(runtime.openExecServerProcess!(signal)).rejects.toThrow();
+      } finally { child.kill(); }
+    });
   it("runs the audited Codex locator on a Win32 Device peer without PATH probing", async () => {
     const fixture = createFixture({ peerWin32: true });
     cleanups.push(() => fixture.resolver.forceShutdown());
@@ -374,6 +390,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
       return processHandle;
     }
     const command = request.args.join(" ");
+    if (command === "exec-server --listen stdio://") return new FakeRemoteProcess();
     if (command === "app-server daemon version") {
       const processHandle = new FakeRemoteProcess();
       setImmediate(() => {

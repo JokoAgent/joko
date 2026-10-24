@@ -124,3 +124,6 @@ export * from "./gen/joko/v1/partner_identity_pb.js";
 export * from "./partner-identity.js";
 export * from "./partner-identity-messages.js";
 export * from "./partner-network-failure.js";
+export * from "./desktop-menu-bar.js";
+export * from "./desktop-menu-bar-projection.js";
+export * from "./desktop-menu-bar-messages.js";

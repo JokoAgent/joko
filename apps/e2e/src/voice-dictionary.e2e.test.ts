@@ -733,6 +733,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
             return { configurationRevision: String(status.configurationRevision), available: status.available,
               enabled: status.enabled, phase: status.phase, errorCode: status.errorCode,
               peers: status.peers.map(peer => ({ online: peer.online, hasRoute: peer.route !== undefined,
+                candidateVisible: status.candidates.some(candidate => candidate.nodeId === peer.peerId),
                 sinceLastSyncMs: peer.lastSyncAt === undefined ? undefined : Math.max(0, Date.now() - peer.lastSyncAt) })) };
           }) }));
       } catch { /* Preserve the original product failure. */ }
@@ -812,7 +813,8 @@ async function dictionaryDeadline<T>(operation: Promise<T>, milliseconds: number
 function observeDictionaryConnectionTiming() {
   const loop = monitorEventLoopDelay({ resolution: 20 }); loop.enable();
   const connections: Array<{ completedAt: number; connected: boolean; connectMs?: number; elapsedMs: number;
-    bytesRead: number; bytesWritten: number; hadError: boolean; errorCode?: string }> = [];
+    bytesRead: number; bytesWritten: number; hadError: boolean; errorCode?: string;
+    phase: "connecting" | "connected" | "request_sent" | "response_received" }> = [];
   const cleanups = new Set<() => void>();
   const socketErrors = new Map<string, number>();
   let totalConnections = 0, maximumObservedConnections = 0;
@@ -837,6 +839,8 @@ function observeDictionaryConnectionTiming() {
         connections.push({ completedAt, connected: connectMs !== undefined,
           ...(connectMs === undefined ? {} : { connectMs }), elapsedMs,
           bytesRead: socket.bytesRead, bytesWritten: socket.bytesWritten, hadError,
+          phase: socket.bytesRead > 0 ? "response_received" : socket.bytesWritten > 0 ? "request_sent"
+            : connectMs !== undefined ? "connected" : "connecting",
           ...(errorCode === undefined ? {} : { errorCode }) });
         if (connections.length > 64) connections.shift();
       }

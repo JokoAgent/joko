@@ -21,6 +21,7 @@ import { handlePolicyDecisionExtensionRequest } from "./policy-decision-bridge.j
 import { redactManagedSecrets } from "./errors.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./managed-durable-store.js";
+import type { PiHostedBackgroundScope } from "./hosted-executor.js";
 
 const FORMAT = 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -545,6 +546,36 @@ export class ManagedSubagentObserver {
     const taskKey = createHash("sha256").update(taskId).digest("hex").slice(0, 40);
     return join(observationDirectory, `${taskKey}.json`);
   }
+}
+
+/** The hosted reverse-tool port uses the same private manifest and runner-claim
+ * validation as observation. A reserved identity never authorizes tool effects. */
+export async function assertManagedSubagentHostedToolScope(input: {
+  readonly root: string;
+  readonly productSessionId: string;
+  readonly productGeneration: number;
+  readonly scope: PiHostedBackgroundScope;
+  readonly reserved?: boolean;
+}): Promise<{ readonly taskId: string; readonly parentTaskId?: string; readonly title: string; readonly background: boolean }> {
+  const scope = input.scope;
+  if (!scope || typeof scope !== "object" || Object.keys(scope).length !== 5
+    || typeof scope.taskId !== "string" || !scope.taskId || scope.taskId.length > 256 || /[\0\r\n]/u.test(scope.taskId)
+    || [scope.runId, scope.launchToken, scope.runnerInstanceId, scope.nativeSessionId].some(value => typeof value !== "string" || !UUID_PATTERN.test(value))) {
+    throw new Error("Hosted child execution identity is invalid.");
+  }
+  const physical = await readPhysicalRun(join(normalizedRoot(input.root), managedSubagentSessionKey(input.productSessionId), scope.runId),
+    input.productSessionId, input.productGeneration, [], new Map());
+  const { config, status } = physical;
+  if (config["productGeneration"] !== input.productGeneration || config["taskId"] !== scope.taskId || status["taskId"] !== scope.taskId
+    || config["launchToken"] !== scope.launchToken || config["runnerInstanceId"] !== scope.runnerInstanceId || status["runnerInstanceId"] !== scope.runnerInstanceId
+    || config["nativeSessionId"] !== scope.nativeSessionId || status["nativeSessionId"] !== scope.nativeSessionId
+    || (input.reserved === true ? status["state"] !== "queued" || status["runnerPid"] !== 0
+      : status["state"] !== "running" || !(typeof status["runnerPid"] === "number" && status["runnerPid"] > 0) || !physical.controlSafe)) {
+    throw new Error("Hosted child execution is no longer current.");
+  }
+  const parentTaskId = config["parentTaskId"];
+  return { taskId: scope.taskId, title: requiredString(config["title"], 512), background: config["background"] === true,
+    ...(typeof parentTaskId === "string" ? { parentTaskId } : {}) };
 }
 
 export async function assertManagedSubagentControlTarget(input: {

@@ -411,14 +411,31 @@ async function runNpmWithoutAmbientCredentials(
   );
 }
 
-function isolatedProcessEnvironment(home: string): NodeJS.ProcessEnv {
+export function isolatedProcessEnvironment(home: string, source: Readonly<NodeJS.ProcessEnv> = process.env): NodeJS.ProcessEnv {
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
   const env: NodeJS.ProcessEnv = {
     HOME: home,
     USERPROFILE: home,
+    XDG_CONFIG_HOME: join(home, ".config"),
+    LC_ALL: "C",
+    LANG: "C",
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+    GIT_CONFIG_SYSTEM: nullDevice,
+    GIT_CONFIG_GLOBAL: nullDevice,
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "credential.helper",
+    GIT_CONFIG_VALUE_0: "",
+    GIT_CONFIG_KEY_1: "core.hooksPath",
+    GIT_CONFIG_VALUE_1: join(home, ".joko-disabled-hooks").replaceAll("\\", "/"),
+    GCM_INTERACTIVE: "never",
+    GIT_ASKPASS: "",
+    SSH_ASKPASS: "",
     SSH_ASKPASS_REQUIRE: "never",
+    // HOME alone does not stop OpenSSH reading the OS account's default keys.
+    // Public acquisition has no SSH credential grant, including agent keys.
+    GIT_SSH_COMMAND: `ssh -F ${nullDevice} -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o PreferredAuthentications=none -o UserKnownHostsFile=${nullDevice} -o GlobalKnownHostsFile=${nullDevice} -o StrictHostKeyChecking=yes`,
     npm_config_userconfig: join(home, ".npmrc"),
     npm_config_audit: "false",
     npm_config_fund: "false",
@@ -427,7 +444,7 @@ function isolatedProcessEnvironment(home: string): NodeJS.ProcessEnv {
     npm_config_loglevel: "silent"
   };
   for (const key of ["PATH", "Path", "PATHEXT", "SYSTEMROOT", "SystemRoot", "WINDIR", "COMSPEC", "TEMP", "TMP"] as const) {
-    const value = process.env[key];
+    const value = source[key];
     if (value !== undefined) env[key] = value;
   }
   return env;

@@ -7824,6 +7824,73 @@ describe("native current-task message and Queue actions", () => {
     expect(JSON.stringify(saved.pending())).not.toContain("blob-image-one");
   });
 
+  it.each(["saved-uploaded", "uploaded-write", "local-cleanup"] as const)(
+    "keeps an existing task's input on its original node when %s finishes after background, reconnect and switching",
+    async stage => {
+      const network = projectedNetwork(attachmentSnapshot), drafts = memoryDraftStores();
+      const remote = { ...otherCredential, origin: "http://192.168.1.21:4318", serverId: "node-2" };
+      const remoteSnapshot = create(SnapshotSchema, { ...attachmentSnapshot,
+        server: { ...attachmentSnapshot.server!, serverId: remote.serverId }, connections: [otherConnection], devices: [otherDevice] });
+      vi.mocked(network.inspect).mockImplementation(async origin => origin === remote.origin ? { ...node, serverId: remote.serverId } : node);
+      vi.mocked(network.readOwner).mockImplementation(async value => value.serverId === remote.serverId
+        ? { connection: otherConnection, device: otherDevice, snapshot: remoteSnapshot }
+        : { connection, device, snapshot: attachmentSnapshot });
+      vi.mocked(network.readSession).mockImplementation(async value => value.serverId === remote.serverId ? remoteSnapshot : attachmentSnapshot);
+      const fixture = attachmentFileFixture(), identity = { profileId: credential.profileId, sessionId: "session" };
+      const local = localAttachmentDraft("Private existing-task input").attachments[0] as MobileLocalComposerAttachment;
+      const draft = { ...plainTextMobileComposerDraft("Private existing-task input"),
+        attachments: stage === "saved-uploaded" ? [{ ...local, state: "uploaded" as const, blobId: "blob-image-one" }] : [local] };
+      vi.mocked(network.uploadBlob).mockResolvedValue(committedAttachment(local));
+      let release!: () => void, entered!: () => void, held = false;
+      const waiting = new Promise<void>(resolve => { release = resolve; });
+      const reached = new Promise<void>(resolve => { entered = resolve; });
+      const hold = async (): Promise<void> => { if (!held) { held = true; entered(); await waiting; } };
+      if (stage === "local-cleanup") {
+        const remove = vi.mocked(fixture.driver.remove).getMockImplementation()!;
+        vi.mocked(fixture.driver.remove).mockImplementation(async (profileId, attachmentId) => {
+          await hold(); await remove(profileId, attachmentId);
+        });
+      } else {
+        const write = drafts.composer.driver.setItem.bind(drafts.composer.driver);
+        drafts.composer.driver.setItem = async (key, value) => {
+          const record = JSON.parse(value) as { identity?: { profileId?: string }; draft?: MobileComposerDraft };
+          if (record.identity?.profileId === identity.profileId && record.draft?.attachments[0]?.state === "uploaded") await hold();
+          await write(key, value);
+        };
+      }
+      const storage = memoryStorage([credential, remote], credential.profileId);
+      const app = client(network, storage.storage, undefined, undefined, () => "original-existing-send", undefined, drafts, fixture.files);
+      await app.start();
+      const dispatched = vi.fn(), sending = app.send(draft, { onDispatch: dispatched });
+      await reached;
+
+      app.setForeground(false); app.setForeground(true);
+      await vi.waitFor(() => expect(app.state).toMatchObject({ status: "connected", busy: false }));
+      await app.connectSaved(remote.profileId);
+      expect(app.state.activeProfileId).toBe(remote.profileId);
+      release();
+
+      await expect(sending).resolves.toBe(false);
+      expect(network.submit).not.toHaveBeenCalled();
+      expect(dispatched).not.toHaveBeenCalled();
+      expect(drafts.composer.readSync(identity)).toMatchObject({ text: draft.text,
+        attachments: [{ attachmentId: local.attachmentId, state: "uploaded", blobId: "blob-image-one" }] });
+      expect(drafts.composer.readSync({ profileId: remote.profileId, sessionId: "session" })).toBeNull();
+      expect(storage.pending()).toEqual([]);
+      expect(vi.mocked(network.uploadBlob).mock.calls.every(([value]) => value.profileId === credential.profileId)).toBe(true);
+    }
+  );
+
+  it("retires existing-task dispatch if its original epoch changes in the dispatch observer", async () => {
+    const network = projectedNetwork(attachmentSnapshot), drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const draft = plainTextMobileComposerDraft("Keep this original draft");
+    await expect(app.send(draft, { onDispatch: () => { app.setForeground(false); app.setForeground(true); } })).resolves.toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(draft);
+  });
+
   it("does not overwrite a newer current-task draft or delete staged bytes after an upload CAS conflict", async () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
@@ -8249,20 +8316,33 @@ describe("native current-task message and Queue actions", () => {
   });
 
   it("revalidates a referenced Session after durable draft flush and never dispatches a retired source", async () => {
+    vi.useFakeTimers();
     const network = projectedNetwork(sessionMentionSnapshot);
+    const emit = eventFeed(network);
     const drafts = memoryDraftStores();
     const retired = create(SnapshotSchema, {
       ...sessionMentionSnapshot,
+      resumeCursor: event("reference-retired", 11n).cursor,
       sessions: [sessionMentionSnapshot.sessions[0]!]
     });
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
     await app.start();
+    // Read under the adopted connection epoch; startup's owner read belongs
+    // to the separate connection attempt, before that live epoch exists.
+    await app.refresh();
+    const sourceSignal = vi.mocked(network.readOwner).mock.calls.at(-1)![2];
     const flush = drafts.composer.flush.bind(drafts.composer);
     vi.spyOn(drafts.composer, "flush").mockImplementationOnce(async (identity) => {
       await flush(identity);
       vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: retired });
       vi.mocked(network.readSession).mockResolvedValue(retired);
-      await app.refresh();
+      // Update the current projection without retiring the original send's
+      // connection epoch, so the reference check itself must reject dispatch.
+      emit(event("reference-retired", 11n));
+      await vi.advanceTimersByTimeAsync(180);
+      expect(app.state.owner).toBe(retired);
+      expect(vi.mocked(network.readOwner).mock.calls.at(-1)![2]).toBe(sourceSignal);
+      expect(sourceSignal?.aborted).toBe(false);
     });
     const draft = sessionMentionDraft();
 
@@ -8273,10 +8353,13 @@ describe("native current-task message and Queue actions", () => {
   });
 
   it("revalidates the exact Target authority after durable structured-draft flush", async () => {
+    vi.useFakeTimers();
     const network = projectedNetwork(sessionMentionSnapshot);
+    const emit = eventFeed(network);
     const drafts = memoryDraftStores();
     const changed = create(SnapshotSchema, {
       ...sessionMentionSnapshot,
+      resumeCursor: event("target-changed", 11n).cursor,
       targets: [create(TargetSchema, {
         ...sessionMentionSnapshot.targets[0]!,
         version: create(EntityVersionSchema, {
@@ -8286,12 +8369,18 @@ describe("native current-task message and Queue actions", () => {
     });
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
     await app.start();
+    await app.refresh();
+    const sourceSignal = vi.mocked(network.readOwner).mock.calls.at(-1)![2];
     const flush = drafts.composer.flush.bind(drafts.composer);
     vi.spyOn(drafts.composer, "flush").mockImplementationOnce(async (identity) => {
       await flush(identity);
       vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: changed });
       vi.mocked(network.readSession).mockResolvedValue(changed);
-      await app.refresh();
+      emit(event("target-changed", 11n));
+      await vi.advanceTimersByTimeAsync(180);
+      expect(app.state.owner).toBe(changed);
+      expect(vi.mocked(network.readOwner).mock.calls.at(-1)![2]).toBe(sourceSignal);
+      expect(sourceSignal?.aborted).toBe(false);
     });
     const draft = sessionMentionDraft();
 

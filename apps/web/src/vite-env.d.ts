@@ -117,6 +117,13 @@ interface JokoDesktopMainWindowCloseSettings {
   readonly revision: number;
 }
 
+interface JokoDesktopLoginItemState {
+  readonly available: boolean;
+  readonly enabled: boolean;
+  readonly requiresApproval: boolean;
+  readonly unavailableReason?: "platform" | "development";
+}
+
 interface JokoDesktopWallpaperSettings {
   readonly version: 1;
   readonly revision: number;
@@ -248,6 +255,8 @@ type JokoDesktopCapability =
   | "notifications.session"
   | "page.search"
   | "power.keepAwake"
+  | "window.loginItem"
+  | "native.menuBar"
   | "provider.modelCatalogLifecycle"
   | "runtime.desktopProcessUsage"
   | "runtime.processMonitorWindow"
@@ -447,6 +456,17 @@ type DesktopRuntimeProcessMonitorResponse = {
 };
 
 interface JokoDesktopApi {
+  readonly menuBar?: {
+    get(): Promise<import("@joko/contracts").MenubarState>;
+    setEnabled(enabled: boolean): Promise<import("@joko/contracts").MenubarState>;
+    publish(snapshot: import("@joko/contracts").DesktopMenubarSnapshot): Promise<void>;
+    onAction(listener: (action: import("@joko/contracts").DesktopMenubarAction) => void): () => void;
+    onSettings(listener: (settings: import("@joko/contracts").MenubarSettings) => void): () => void;
+  };
+  readonly loginItem?: {
+    get(): Promise<JokoDesktopLoginItemState>;
+    set(enabled: boolean): Promise<JokoDesktopLoginItemState>;
+  };
   readonly extensionOAuth?: {
     authorize(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, bytes: Uint8Array): Promise<Uint8Array>;
     cancel(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, flowId: string): Promise<void>;

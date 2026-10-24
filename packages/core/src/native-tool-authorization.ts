@@ -1,4 +1,4 @@
-/** Private service authority for an extension-owned native execution. This is
+/** Private service authority for a native execution. This is
  * never accepted from a model, a plugin page, a client contract or native text. */
 export interface NativeToolAuthorizationRequest {
   readonly toolName: string;
@@ -16,6 +16,12 @@ export interface NativeToolAuthorization {
    * through their existing approval protocol rather than bypassing the host. */
   readonly required: boolean;
   readonly capture: () => string | undefined;
+  /** Current ordered policy, read only by owner-private execution boundaries.
+   * The caller must retain the matching capture/assertCurrent revision fence. */
+  readonly snapshot?: () => import("./policy.js").PolicySnapshot;
+  /** A service-registered background task retains this exact original dispatch.
+   * The caller must separately fence its private native runner occurrence. */
+  readonly forBackgroundTask?: (taskId: string) => NativeToolAuthorization;
   readonly assertCurrent: (expectedRevision?: string) => void;
   readonly review: (request: NativeToolAuthorizationRequest) => Promise<NativeToolAuthorizationDecision>;
 }

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NativeTaskStatusLiveSource } from "./native-task-status-sources.js";
 import { nativeTaskStatusAvatar } from "./native-task-status-avatar.js";
+import { readDesktopMenuBarUsage, type DesktopMenuBarSource, type DesktopMenuBarUsage } from "./desktop-menu-bar.js";
+import { bindPortableSessionImportApi } from "./portable-session-import-connection.js";
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import type { SessionAccess, TaskSource } from "./task-sharing.js";
 import type { TaskSharingApi } from "@joko/contracts";
@@ -62,6 +64,7 @@ import type {
   NativeSessionTreeView,
   NewSessionDraft,
   NewSessionLocalDraft,
+  NewSessionModelRequest,
   PendingExtensionSuggestionView,
   PendingExtensionUseView,
   SessionMessageSearchCollectionOptions,
@@ -133,7 +136,7 @@ export type AppRoute =
   | { readonly kind: "sharedTask"; readonly joinId: string; readonly profileId: string }
   | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly partnerId?: string; readonly messageId?: string; readonly messageEventId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
-  | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string }
+  | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string; readonly initialModel?: NewSessionModelRequest }
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "partners"; readonly partnerId?: string; readonly profileId?: string; readonly preparation?: boolean; readonly groupId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
@@ -142,6 +145,8 @@ export type AppRoute =
   | { readonly kind: "settings" };
 
 interface MachineSessionMessageTarget {
+  readonly expectedGeneration?: bigint;
+  readonly isCurrent?: () => boolean;
   readonly partnerId?: string;
   readonly messageId?: string;
   readonly messageEventId?: string;
@@ -218,6 +223,7 @@ export interface ControllerState {
 }
 
 export interface AppController extends OperationApi {
+  readonly readDesktopMenuBarUsage?: (source: DesktopMenuBarSource, signal: AbortSignal, refreshAccounts?: boolean) => Promise<DesktopMenuBarUsage>;
   readonly taskSharing?: TaskSharingApi;
   readonly inputHandoff?: InputHandoffApi;
   readonly providerSharing?: ProviderSharingApi;
@@ -415,6 +421,7 @@ export function useAppController(): AppController {
   const remoteMachineGatewaysRef = useRef(new Map<string, {
     readonly epoch: number;
     readonly profileKey: string;
+    liveEpoch?: number;
     gateway?: OrchestratorGateway;
     connected: boolean;
     snapshot?: AppSnapshot;
@@ -1224,9 +1231,9 @@ export function useAppController(): AppController {
       }
       throw error;
     }
-    return gatewayGenerationRef.current === generation && connectionStateRef.current === "connected";
+    return gatewayGenerationRef.current === generation && (connectionStateRef.current as GatewayConnectionState) === "connected";
   }, [beginGatewayTransition, bindGateway, commitAutomaticConnectionChoice]);
-  const connectProfile = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions, callerIsCurrent = () => true): Promise<boolean> => {
+  const connectProfile = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions, callerIsCurrent: () => boolean = () => true): Promise<boolean> => {
     const leave = beginConnectionLeave();
     try {
       if (!await leave.confirm() || !leave.current() || !callerIsCurrent()) return false;
@@ -1960,22 +1967,31 @@ export function useAppController(): AppController {
       locationHash: window.location.hash,
       navigationRevision: navigationRevisionRef.current
     };
+    let sourceHandoffStarted = false;
+    let destinationHash: string | undefined;
     const isCurrentOwner = (): boolean => machineSwitchIntentRef.current === intent
+      && (sourceHandoffStarted || (messageTarget?.isCurrent?.() ?? true))
       && appRouteHash(routeRef.current) === routeOwner.hash
-      && window.location.hash === routeOwner.locationHash
+      && (window.location.hash === routeOwner.locationHash || window.location.hash === destinationHash)
       && navigationRevisionRef.current === routeOwner.navigationRevision;
     const profile = profilesRef.current.find((candidate) => candidate.id === profileId);
     if (profile === undefined) throw new Error("The selected machine is no longer saved on this client.");
     const snapshot = await loadMachineSnapshot(profile);
     if (!isCurrentOwner()) return;
-    if (!snapshot.sessions.some((session) => session.id === sessionId)) {
+    if (!snapshot.sessions.some((session) => session.id === sessionId
+      && (messageTarget?.expectedGeneration === undefined || session.generation === messageTarget.expectedGeneration))) {
       throw new Error("This cached task no longer exists on the selected machine.");
     }
     if (activeProfileRef.current?.id !== profile.id || connectionStateRef.current !== "connected") {
+      // The selected live stream retires during our own authorized connection change.
+      // After that boundary, the frozen saved profile and Session generation own continuation.
+      sourceHandoffStarted = true;
       if (!await connectProfile(profile, undefined, isCurrentOwner)) return;
     }
     if (!isCurrentOwner()) return;
-    if (!snapshotRef.current.sessions.some((session) => session.id === sessionId)) {
+    if (!profilesRef.current.some(candidate => remoteMachineProfileKey(candidate) === remoteMachineProfileKey(profile))) return;
+    if (!snapshotRef.current.sessions.some((session) => session.id === sessionId
+      && (messageTarget?.expectedGeneration === undefined || session.generation === messageTarget.expectedGeneration))) {
       throw new Error("The task disappeared while the selected machine was connecting.");
     }
     if (messageTarget?.partnerId !== undefined) {
@@ -1987,14 +2003,22 @@ export function useAppController(): AppController {
         throw new Error("The Partner canonical task changed while connecting. Refresh before opening it.");
       }
     }
-    navigate({
+    const destination: AppRoute = {
       kind: "session",
       profileId,
       sessionId,
       ...(messageTarget?.partnerId === undefined ? {} : { partnerId: messageTarget.partnerId }),
       ...(messageTarget?.messageId === undefined ? {} : { messageId: messageTarget.messageId }),
       ...(messageTarget?.messageEventId === undefined ? {} : { messageEventId: messageTarget.messageEventId })
-    });
+    };
+    // The hash changes before its hashchange event commits the route. Accept
+    // only our own destination during that interval; newer navigation still
+    // retires this request through its intent, route and revision fences.
+    destinationHash = appRouteHash(destination);
+    navigate(destination, { isCurrent: () => isCurrentOwner() && activeProfileRef.current !== undefined
+      && remoteMachineProfileKey(activeProfileRef.current) === remoteMachineProfileKey(profile)
+      && connectionStateRef.current === "connected" && snapshotRef.current.sessions.some(session => session.id === sessionId
+        && (messageTarget?.expectedGeneration === undefined || session.generation === messageTarget.expectedGeneration)) });
   }, [connectProfile, loadMachineSnapshot, navigate]);
 
   const searchRemoteSessionMessages = useCallback(async (
@@ -2076,6 +2100,7 @@ export function useAppController(): AppController {
       const binding = {
         epoch,
         profileKey: remoteMachineProfileKey(profile),
+        liveEpoch: undefined as number | undefined,
         gateway: undefined as OrchestratorGateway | undefined,
         connected: false,
         snapshot: undefined as AppSnapshot | undefined,
@@ -2098,6 +2123,7 @@ export function useAppController(): AppController {
       let streamEpoch = epoch;
       const publishActivity = (): void => {
         if (!current()) return;
+        binding.liveEpoch = binding.connected && binding.snapshot ? streamEpoch : undefined;
         setState(value => ({ ...value, nativeTaskStatusLiveSources: [
           ...(value.nativeTaskStatusLiveSources ?? []).filter(source => source.profile.id !== profile.id),
           ...(binding.connected && binding.snapshot ? [{ profile, epoch: streamEpoch, snapshot: binding.snapshot, partners: binding.partners,
@@ -2373,6 +2399,10 @@ export function useAppController(): AppController {
     };
   }, [artifactGateway]);
   const linkGatewayGeneration = gatewayGenerationRef.current;
+  const portableImportApi = useMemo(() => bindPortableSessionImportApi(artifactGateway, () =>
+    artifactGateway !== undefined && gatewayRef.current === artifactGateway
+      && gatewayGenerationRef.current === linkGatewayGeneration && connectionStateRef.current === "connected"
+  ), [artifactGateway, linkGatewayGeneration]);
   const catalogGateway = useCallback((): OrchestratorGateway => {
     if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
       || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
@@ -2961,6 +2991,27 @@ export function useAppController(): AppController {
     return artifactGateway.predictNextPrompt(sessionId, expectedLastActivityAt, expectedGeneration, signal);
   }, [artifactGateway]);
   return useMemo<AppController>(() => ({
+    readDesktopMenuBarUsage: async (source, signal, refreshAccounts) => {
+      const expectedKey = remoteMachineProfileKey(source.profile);
+      const primary = source.epoch === undefined;
+      const generation = gatewayGenerationRef.current;
+      const binding = primary ? undefined : remoteMachineGatewaysRef.current.get(source.profile.id);
+      const original = primary ? gatewayRef.current : binding?.gateway;
+      const current = (): boolean => {
+        signal.throwIfAborted();
+        const saved = profilesRef.current.find(profile => profile.id === source.profile.id);
+        if (!original || !saved || remoteMachineProfileKey(saved) !== expectedKey) return false;
+        if (primary) return gatewayRef.current === original && gatewayGenerationRef.current === generation
+          && source.connectionGeneration === generation && connectionStateRef.current === "connected"
+          && activeProfileRef.current !== undefined && remoteMachineProfileKey(activeProfileRef.current) === expectedKey
+          && snapshotRef.current.generation === source.snapshot.generation;
+        const live = remoteMachineGatewaysRef.current.get(source.profile.id);
+        return live !== undefined && live === binding && live.gateway === original && live.connected && live.profileKey === expectedKey
+          && live.liveEpoch === source.epoch && live.snapshot?.generation === source.snapshot.generation;
+      };
+      if (!current() || !original) throw new Error("The menu bar usage connection is no longer current.");
+      return readDesktopMenuBarUsage(original, signal, current, refreshAccounts ? source.snapshot.providers : []);
+    },
     state,
     ...ownerServices,
     ...(artifactGateway === undefined || state.connectionState !== "connected" ? {} : { taskSharing: artifactGateway.taskSharingApi() }),
@@ -3166,11 +3217,7 @@ export function useAppController(): AppController {
     compact: (sessionId, customInstructions) => gateway().compact(sessionId, customInstructions),
     exportSession,
     exportPortableSession,
-    inspectPortableSessionImport: (file) => gateway().inspectPortableSessionImport(file),
-    unlockPortableSessionImport: (draftId, password) => gateway().unlockPortableSessionImport(draftId, password),
-    cancelPortableSessionImport: (draftId) => gateway().cancelPortableSessionImport(draftId),
-    commitPortableSessionImport: (input) => gateway().commitPortableSessionImport(input),
-    retryPortableSessionActivation: (sessionId) => gateway().retryPortableSessionActivation(sessionId),
+    ...portableImportApi,
     getPortableReplacementCleanup: (importedSessionId) => gateway().getPortableReplacementCleanup(importedSessionId),
     reconcilePortableReplacementCleanup: (importedSessionId) => gateway().reconcilePortableReplacementCleanup(importedSessionId),
     retryPortableReplacementCleanup: (importedSessionId, expectedRevision) =>
@@ -3750,7 +3797,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [catalogGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, catalogGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

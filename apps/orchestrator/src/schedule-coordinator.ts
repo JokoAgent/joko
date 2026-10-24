@@ -315,13 +315,24 @@ export class ScheduleCoordinator {
   async tick(): Promise<void> {
     if (this.#ticking) return;
     this.#ticking = true;
+    const dispatches: Promise<void>[] = [];
     try {
       for (const run of this.#store.listQueuedScheduleRuns()) this.expireQueuedRun(run.runId);
       this.wakeQueuedRuns();
       void this.#host.reconcileScheduledWorktrees?.();
+      const dueAt = this.#now(), dueSchedules: ScheduleRecord[] = [];
+      // Capture every page before dispatch can advance or disable a due row.
+      // Active occurrences can occupy the first page while later rows need slots.
+      for (let offset = 0; ; offset += 100) {
+        const page = this.#store.listDueSchedules(dueAt, 100, offset);
+        dueSchedules.push(...page);
+        if (page.length < 100) break;
+      }
       const waiting: Array<{ readonly scheduleId: string; readonly scheduleName: string; readonly waitingSince: number }> = [];
-      const dispatches: Promise<void>[] = [];
-      for (const schedule of this.#store.listDueSchedules(this.#now(), 100)) {
+      for (const schedule of dueSchedules) {
+        // Loading, hooks and scripts retain their own occurrence until they
+        // settle. A later scan must still admit unrelated due Schedules.
+        if ((this.#activeOccurrences.get(schedule.id)?.size ?? 0) > 0) continue;
         if (!this.#runtime.hasCapacity()) {
           waiting.push({
             scheduleId: schedule.id,
@@ -335,10 +346,12 @@ export class ScheduleCoordinator {
           .catch((error: unknown) => this.recordFailure(schedule, error)));
       }
       this.#runtime.syncWaiting(waiting);
-      await Promise.all(dispatches);
     } finally {
       this.#ticking = false;
     }
+    // Await this scan's work for callers without holding the scan gate for an
+    // entire script or pre-run hook. Per-occurrence ownership prevents replay.
+    await Promise.all(dispatches);
   }
 
   async runNow(scheduleId: string, operationId: string = randomUUID()): Promise<void> {

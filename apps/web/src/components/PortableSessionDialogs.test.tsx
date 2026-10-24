@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptySnapshot, type ArtifactDownloadContext, type PortableSessionExportOutcomeView, type SessionView } from "../model.js";
 import { translate } from "../i18n.js";
-import { PortableSessionDialogHost } from "./PortableSessionDialogHost.js";
+import { PortableSessionDialogHost, type PortableSessionImportRequest } from "./PortableSessionDialogHost.js";
 
 import {
   PortableSessionExportDialog,
@@ -89,7 +89,8 @@ describe("PortableSessionExportDialog", () => {
         locale="en"
         t={(key, values) => translate("en", key, values)}
         exportSession={open ? { id: "7", name: "Exported task" } as SessionView : undefined}
-        importRequest={open ? { id: 7 } : undefined}
+        importRequest={open ? { id: 7, owner: { key: "connection-a", api: controller } } : undefined}
+        connectionOwner="connection-a"
         worktreeSupportedTargetIds={new Set()}
         onCloseExport={vi.fn()} onCloseImport={vi.fn()} onExported={vi.fn()} onOpenTask={vi.fn()}
       />;
@@ -184,6 +185,66 @@ describe("PortableSessionExportDialog", () => {
 });
 
 describe("PortableSessionImportDialog", () => {
+  it.each(["inspect", "unlock", "commit"] as const)(
+    "retires %s on disconnect and never uploads the retained File or adopts its late result on another node",
+    async stage => {
+      const pending = deferred<PortableSessionImportDraftView & PortableSessionImportResultView>();
+      const original = {
+        inspectPortableSessionImport: vi.fn().mockImplementation(() => stage === "inspect" ? pending.promise : Promise.resolve({
+          draftId: "original-draft", expiresAt: Date.now() + 60_000, encrypted: stage === "unlock", passwordRequired: stage === "unlock",
+          ...(stage === "unlock" ? {} : { preview: preview() })
+        })),
+        unlockPortableSessionImport: vi.fn(() => pending.promise), commitPortableSessionImport: vi.fn(() => pending.promise),
+        cancelPortableSessionImport: vi.fn(async () => undefined), retryPortableSessionActivation: vi.fn(), exportPortableSession: vi.fn()
+      };
+      const replacement = { ...original, inspectPortableSessionImport: vi.fn(), unlockPortableSessionImport: vi.fn(),
+        commitPortableSessionImport: vi.fn(), cancelPortableSessionImport: vi.fn() };
+      const request: PortableSessionImportRequest = { id: 1, file: new File(["private original history"], "original.jshare"),
+        owner: { key: "connection-a", api: original } };
+      const base = emptySnapshot();
+      const snapshot = { ...base, backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy" as const,
+        capabilities: new Map([["session.portable_transfer", { name: "session.portable_transfer", supported: true, options: [] }]]) }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n,
+          workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        workspaces: [{ id: "workspace", targetId: "target", name: "Project", kind: "userProject" as const,
+          serverPath: "/project", trusted: true, dirty: false, entries: [] }] };
+      const container = document.body.appendChild(document.createElement("div")), root = createRoot(container);
+      roots.push(root);
+      const onOpenTask = vi.fn();
+      const element = (connectionOwner?: string) => <PortableSessionDialogHost
+        controller={connectionOwner === "connection-b" ? replacement : original} snapshot={snapshot}
+        locale="en" t={(key, values) => translate("en", key, values)} importRequest={request} connectionOwner={connectionOwner}
+        defaultTargetId="target" worktreeSupportedTargetIds={new Set()}
+        onCloseExport={vi.fn()} onCloseImport={vi.fn()} onExported={vi.fn()} onOpenTask={onOpenTask} />;
+      await act(async () => root.render(element("connection-a")));
+      await flush();
+      if (stage === "unlock") {
+        await change(required(container.querySelector<HTMLInputElement>('input[type="password"]')), "private-password");
+        await act(async () => buttonWithText(container, translate("en", "portable.unlock")).click());
+        expect(original.unlockPortableSessionImport).toHaveBeenCalledExactlyOnceWith("original-draft", "private-password");
+      } else if (stage === "commit") {
+        await act(async () => buttonWithText(container, translate("en", "portable.import")).click());
+        expect(original.commitPortableSessionImport).toHaveBeenCalledOnce();
+      }
+      await act(async () => root.render(element()));
+      await act(async () => root.render(element("connection-b")));
+      await act(async () => root.render(null));
+      await act(async () => root.render(element("connection-b")));
+      await act(async () => pending.resolve({ draftId: "original-draft", expiresAt: Date.now() + 60_000,
+        encrypted: false, passwordRequired: false, preview: preview(), sessionId: "imported-original", fidelity: "full",
+        messageCount: 1, mediaCount: 0, workerCount: 0, replacedSessionIds: [], status: "ready" }));
+
+      expect(original.inspectPortableSessionImport).toHaveBeenCalledExactlyOnceWith(request.file);
+      expect(original.cancelPortableSessionImport).toHaveBeenCalledWith("original-draft");
+      expect(replacement.inspectPortableSessionImport).not.toHaveBeenCalled();
+      expect(replacement.unlockPortableSessionImport).not.toHaveBeenCalled();
+      expect(replacement.commitPortableSessionImport).not.toHaveBeenCalled();
+      expect(replacement.cancelPortableSessionImport).not.toHaveBeenCalled();
+      expect(onOpenTask).not.toHaveBeenCalled();
+      expect(container.querySelector(".portable-session-dialog--import")).toBeNull();
+    }
+  );
+
   it("unlocks, previews, confirms replacement, and opens the imported task", async () => {
     const encryptedDraft: PortableSessionImportDraftView = {
       draftId: "draft-1",

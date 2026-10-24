@@ -1548,6 +1548,31 @@ export class ProviderCatalogManager {
     };
   }
 
+  /** A running operation retains its admitted configuration while the exact
+   * credentials it captured remain valid. Catalog visibility/admission is a
+   * separate check and must not terminate an already accepted response. */
+  captureInferenceCredentialAuthority(route: ProviderInferenceRoute): () => void {
+    const entry = this.#require(route.backendId, route.providerId);
+    if (this.describeInferenceRoute(route.backendId, route.providerId, route.modelId)?.generationId !== route.generationId) {
+      throw new Error("The inference route is unavailable.");
+    }
+    const references = new Set<string>();
+    if (entry.provider.apiKeyEnv !== undefined) references.add(entry.credentialBindings[entry.provider.apiKeyEnv]!);
+    for (const source of Object.values(entry.provider.headers ?? {})) references.add(entry.credentialBindings[source.env]!);
+    const credentials = [...references].map(reference => {
+      const credential = this.#credentials.find(reference);
+      if (!credential?.configured) throw new Error("The inference credential is unavailable.");
+      return { reference, generation: credential.generation };
+    });
+    return () => {
+      this.#assertInitialized();
+      for (const original of credentials) {
+        const current = this.#credentials.find(original.reference);
+        if (!current?.configured || current.generation !== original.generation) throw new Error("The original inference credential was revoked or replaced.");
+      }
+    };
+  }
+
   /** Content-free capability check used by Settings projection. */
   hasInferenceRoute(options: { readonly requireImages?: boolean } = {}): boolean {
     this.#assertInitialized();
