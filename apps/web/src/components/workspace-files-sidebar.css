@@ -145,7 +145,7 @@
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--surface-raised);
-  box-shadow: var(--shadow-menu);
+  box-shadow: var(--shadow-lg);
 }
 
 .workspace-files-project-switcher__menu > button {

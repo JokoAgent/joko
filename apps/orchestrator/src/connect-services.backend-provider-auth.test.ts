@@ -251,6 +251,76 @@ describe("Backend-native Provider account routing", () => {
     expect(reconcileBackendProviderAuthentication).toHaveBeenCalledTimes(2);
     expect(acceptedReconciliations).toHaveLength(1);
   });
+
+  it.each([true, false])("fences native credential deletion until retirement and replays only the receipt (native owner: %s)", async nativeCredentialOwner => {
+    const order: string[] = [];
+    let releaseRetirement!: () => void;
+    let retirementStarted!: () => void;
+    const started = new Promise<void>((resolve) => { retirementStarted = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseRetirement = resolve; });
+    const logout = vi.fn(async () => { order.push("remove-credential"); });
+    const revokeProviderAuthentication = vi.fn(async () => {
+      order.push("retire-runtimes");
+      retirementStarted();
+      await blocked;
+      order.push("runtimes-retired");
+    });
+    const refreshPiGeneration = vi.fn(async () => undefined);
+    const { services, completeBackendProviderAuthenticationRetirement } = fixture({
+      beginLogin: async () => ({ method: "api_key" as const }),
+      refreshBackendDescriptor: async () => undefined,
+      managedNative: {
+        nativeCredentialOwner,
+        credentialReferenceId: "native-provider-credential",
+        refreshCredential: async () => undefined,
+        revokeProviderAuthentication,
+        logout
+      },
+      refreshPiGeneration,
+      onFence: () => { order.push("fence"); },
+      onProjection: (state) => { order.push(`project:${state}`); }
+    });
+    const operationId = crypto.randomUUID();
+    const deletion = submitCredentialDeletion(services.operation.submitOperation, operationId);
+    await started;
+    expect(order).toEqual(["fence", "project:pending", "retire-runtimes"]);
+    expect(logout).not.toHaveBeenCalled();
+    expect(completeBackendProviderAuthenticationRetirement).not.toHaveBeenCalled();
+
+    releaseRetirement();
+    await deletion;
+    await submitCredentialDeletion(services.operation.submitOperation, operationId);
+
+    expect(order).toEqual(["fence", "project:pending", "retire-runtimes", "runtimes-retired", "remove-credential"]);
+    expect(revokeProviderAuthentication).toHaveBeenCalledExactlyOnceWith("provider-one");
+    expect(logout).toHaveBeenCalledExactlyOnceWith("provider-one");
+    expect(completeBackendProviderAuthenticationRetirement).toHaveBeenCalledOnce();
+    if (nativeCredentialOwner) expect(refreshPiGeneration).not.toHaveBeenCalled();
+    else expect(refreshPiGeneration).toHaveBeenCalledOnce();
+  });
+
+  it("retains native credentials and the authentication fence when runtime retirement is unconfirmed", async () => {
+    const logout = vi.fn(async () => undefined);
+    const refreshPiGeneration = vi.fn(async () => undefined);
+    const { services, completeBackendProviderAuthenticationRetirement, projectBackendProviderAuthentication } = fixture({
+      beginLogin: async () => ({ method: "api_key" as const }),
+      refreshBackendDescriptor: async () => undefined,
+      managedNative: {
+        credentialReferenceId: "native-provider-credential",
+        refreshCredential: async () => undefined,
+        revokeProviderAuthentication: async () => { throw new Error("Runtime retirement is unconfirmed."); },
+        logout
+      },
+      refreshPiGeneration
+    });
+
+    await expect(submitCredentialDeletion(services.operation.submitOperation, crypto.randomUUID())).rejects.toThrow();
+
+    expect(logout).not.toHaveBeenCalled();
+    expect(refreshPiGeneration).not.toHaveBeenCalled();
+    expect(completeBackendProviderAuthenticationRetirement).not.toHaveBeenCalled();
+    expect(projectBackendProviderAuthentication).toHaveBeenLastCalledWith("native-backend", "provider-one", "error");
+  });
 });
 
 function fixture(options: {
@@ -263,6 +333,8 @@ function fixture(options: {
   readonly onFence?: () => void;
   readonly onProjection?: (state: "pending" | "signed_out" | "error") => void;
   readonly managedNative?: {
+    readonly nativeCredentialOwner?: boolean;
+    readonly credentialReferenceId?: string;
     readonly refreshCredential: () => Promise<void>;
     readonly revokeProviderAuthentication: (providerId: string) => Promise<void>;
     readonly logout: (providerId: string) => Promise<void>;
@@ -415,7 +487,9 @@ function fixture(options: {
           backendId: descriptor.id,
           provider: { id: "provider-one" },
           enabled: true,
-          authenticationState: "authenticated"
+          authenticationState: "authenticated",
+          credentialReferenceIds: options.managedNative?.credentialReferenceId === undefined ? [] : [options.managedNative.credentialReferenceId],
+          nativeCredentialReferenceId: options.managedNative?.credentialReferenceId
         }],
         get: () => ({
           backendId: descriptor.id,
@@ -433,7 +507,7 @@ function fixture(options: {
         logout: options.managedNative.logout
       },
       providerAuth: {
-        canHandle: () => true,
+        canHandle: () => options.managedNative?.nativeCredentialOwner ?? true,
         getFlow: options.managedNative.getLoginFlow ?? (() => undefined)
       },
       refreshPiGeneration: options.refreshPiGeneration
@@ -500,6 +574,16 @@ async function submitLogout(handler: unknown, operationId: string): Promise<unkn
           providerId: "provider-one"
         })
       }
+    })
+  });
+}
+
+async function submitCredentialDeletion(handler: unknown, operationId: string): Promise<unknown> {
+  return invoke(handler, {
+    operationId,
+    connectionId: connection.id,
+    mutation: create(contract.OperationMutationSchema, {
+      payload: { case: "deleteCredential", value: { credentialReferenceId: "native-provider-credential" } }
     })
   });
 }

@@ -4,7 +4,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
-import { buildTaskShareInvitation, JoinedTaskShareSchema, TaskShareSchema, type TaskSharingApi } from "@joko/contracts";
+import { buildTaskShareInvitation, createTaskSharingApi, GetTaskSharingActionReceiptResponseSchema, JoinedTaskShareSchema, TaskShareSchema, type TaskSharingApi, type TaskSharingRpc } from "@joko/contracts";
+import { translate } from "../i18n.js";
 import type { AppController } from "../controller.js";
 import { LocalState } from "../local-state.js";
 import { emptySnapshot } from "../model.js";
@@ -77,7 +78,9 @@ describe("Task Sharing management", () => {
   it("recovers the original unknown action by receipt without generating another invitation", async () => {
     const action = { kind: "invite" as const, operationId: "00000000-0000-4000-8000-000000000001" };
     const f = await fixture({ sessionId: "task", pending: action });
-    f.api.lookupAction.mockResolvedValue({ operationId: action.operationId, kind: "invite", status: "applied", failedShareIds: [] });
+    const rpc = { getTaskSharingActionReceipt: vi.fn(async () => create(GetTaskSharingActionReceiptResponseSchema, { receipt: { operationId: action.operationId, kind: "task_share_invite", status: "applied" } })) };
+    const contractApi = createTaskSharingApi({ rpc: rpc as unknown as TaskSharingRpc, assertCurrent: signal => signal.throwIfAborted() });
+    f.api.lookupAction.mockImplementation((id, signal) => contractApi.lookupAction(id, signal));
     await click(button(f.host, "taskSharing.check"));
     expect(f.api.lookupAction).toHaveBeenCalledExactlyOnceWith(action.operationId, expect.any(AbortSignal));
     expect(f.api.invite).not.toHaveBeenCalled(); expect(f.pending.size).toBe(0);
@@ -98,5 +101,51 @@ describe("Task Sharing management", () => {
     f.api.lookupAction.mockRejectedValue(new ConnectError("still offline", Code.Unavailable));
     await click(button(f.host, "taskSharing.check"));
     expect(f.api.create).toHaveBeenCalledOnce(); expect(f.pending.size).toBe(1);
+    await act(async () => root!.unmount()); root = createRoot(f.host);
+    await act(async () => root!.render(<TaskSharingSettings controller={f.controller} t={key => key} sessionId="task" />));
+    f.api.lookupAction.mockRejectedValue(new ConnectError("not admitted", Code.NotFound));
+    await click(button(f.host, "taskSharing.check"));
+    expect(f.pending.size).toBe(0);
+    expect(f.host.textContent).toContain("taskSharing.notAdmitted");
+    expect(f.host.querySelector<HTMLButtonElement>("[data-task-sharing-start]")?.disabled).toBe(false);
+    expect(f.api.create).toHaveBeenCalledOnce();
+  });
+  it("removes a definite preflight rejection without retaining a blocked operation", async () => {
+    const f = await fixture({ sessionId: "task" }); f.api.create.mockRejectedValue(new ConnectError("rejected", Code.FailedPrecondition));
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-start]")!);
+    expect(f.pending.size).toBe(0);
+    expect(f.host.querySelector<HTMLButtonElement>("[data-task-sharing-start]")?.disabled).toBe(false);
+    expect(f.host.textContent).not.toContain("taskSharing.unknown");
+  });
+  it("clears an unadmitted join intent and does not submit it during receipt recovery", async () => {
+    const action = { kind: "join" as const, operationId: "unadmitted-join" }, f = await fixture({ pending: action });
+    f.api.lookupJoin.mockRejectedValue(new ConnectError("not admitted", Code.NotFound));
+    await click(button(f.host, "taskSharing.check"));
+    expect(f.api.lookupJoin).toHaveBeenCalledExactlyOnceWith(action.operationId, expect.any(AbortSignal));
+    expect(f.pending.size).toBe(0); expect(f.api.join).not.toHaveBeenCalled();
+  });
+  it("shows each dangerous operation's task, member, or affected task count", async () => {
+    const f = await fixture(); f.api.list.mockResolvedValue({ owned: [{ ...share, members: [joined.member!] }], joined: [joined], intents: [] });
+    await act(async () => { window.dispatchEvent(new Event("focus")); });
+    await act(async () => root!.render(<TaskSharingSettings controller={f.controller} t={(key, values) => translate("en", key, values)} />));
+    await click(button(f.host, "Remove participant"));
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Guest");
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Shared task");
+    await click(button(document, "Cancel"));
+    await click(button(f.host, "End all sharing"));
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("all 1 tasks");
+    expect(document.querySelector('[role="dialog"] li')?.textContent).toBe("Shared task");
+  });
+  it("moves shared task tabs with arrows, Home, and End and associates the selected panel", async () => {
+    const f = await fixture(), tabs = [...f.host.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1]);
+    await act(async () => tabs[0]!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true })));
+    expect(tabs[1]!.getAttribute("aria-selected")).toBe("true"); expect(document.activeElement).toBe(tabs[1]);
+    expect(tabs[1]!.classList.contains("button--primary")).toBe(true);
+    expect(f.host.querySelector('[role="tabpanel"]')?.getAttribute("aria-labelledby")).toBe(tabs[1]!.id);
+    await act(async () => tabs[1]!.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true })));
+    expect(tabs[2]!.getAttribute("aria-selected")).toBe("true");
+    await act(async () => tabs[2]!.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true })));
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1]);
   });
 });

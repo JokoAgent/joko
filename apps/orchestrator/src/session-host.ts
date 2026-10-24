@@ -514,6 +514,8 @@ export interface CreateSessionInput {
 }
 
 export interface CreateScheduledSessionInput {
+  /** Private occurrence authority; ordinary Schedule creation uses its revision fence. */
+  readonly assertServiceScope?: () => void;
   readonly operationId: string;
   readonly targetId: string;
   readonly title: string;
@@ -918,6 +920,12 @@ export class SessionHost {
     readonly budgets: ReadonlyMap<string, number | undefined>;
   }>();
   readonly #sessionRuntimeControl = new SessionRuntimeControlRegistry();
+  readonly #runtimeUsageReadings = new Map<string, {
+    readonly bindingKey: string;
+    readonly owner: ActiveSession | undefined;
+    readonly live: UsageSnapshot | undefined;
+    readonly closed: UsageSnapshot | undefined;
+  }>();
   readonly #sessionRuntimeControlTails = new Map<string, Promise<void>>();
   readonly #sessionRuntimeControlEffects = new Set<string>();
   readonly #sessionRuntimeRecoveries = new Map<string, SessionRuntimeRecoveryState>();
@@ -953,6 +961,7 @@ export class SessionHost {
   readonly #sessionResetLocks = new Set<string>();
   readonly #reviewRuntimeFlights = new Map<string, ReviewRuntimeFlight>();
   readonly #scheduledWorktreeCreations = new Set<string>();
+  #scheduleDispatchGate: { acquire(runId: string): boolean; release(runId: string): void } | undefined;
   readonly #workspaceCapture: WorkspaceRunCapture | undefined;
   readonly #prepareProjectGit: ((input: { readonly workspaceRoot: string; readonly assertCurrent: () => void }) => Promise<void>) | undefined;
   readonly #freezeToolPolicies: ((sessionId: string, targetId: string) => void) | undefined;
@@ -1886,6 +1895,7 @@ export class SessionHost {
    * persisted before a scheduled input can be queued. */
   async createScheduledSession(input: CreateScheduledSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
+    input.assertServiceScope?.();
     const target = this.#store.getTarget(input.targetId);
     this.validateFastSelection(
       target.descriptor.backendId,
@@ -1964,6 +1974,18 @@ export class SessionHost {
       handoff.pending === undefined ? undefined : { generation: handoff.pending.generation, source: handoff.pending.source, profile: handoff.pending.profile });
     return { ...this.#sessionRuntimeControl.snapshot(sessionId, sessionRuntimeBaseline(stored.descriptor)),
       ...(handoff?.pending === undefined ? {} : { handoffState: handoff.pending.phase }) };
+  }
+
+  /** Internal native readings for safe task suggestions. Durable usage is only
+   * a lower bound; it cannot replace an observation from this host lifetime. */
+  getSessionRuntimeUsage(sessionId: string) {
+    this.#assertOpen();
+    const session = this.#store.getSession(sessionId).descriptor;
+    const bindingKey = JSON.stringify([session.backendId, session.binding.generation, nativeBindingFingerprint(session.binding.opaqueRef)]);
+    const reading = this.#runtimeUsageReadings.get(sessionId);
+    const current = reading?.bindingKey === bindingKey ? reading : undefined;
+    const durable = materializedSessionRuntimeState(this.#store.findSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY)?.value)?.usage;
+    return { live: current?.live, closed: current?.closed, durable };
   }
 
   async setSessionRuntimeControl(input: {
@@ -3026,6 +3048,7 @@ export class SessionHost {
     const runId = stableId("run", input.operationId);
     const attemptId = stableId("attempt", input.operationId);
     const queueItemId = stableId("queue", input.operationId);
+    const queuedAt = Date.now();
     const body = {
       scheduleId: input.schedule.id,
       scheduleName: input.schedule.name,
@@ -3057,7 +3080,7 @@ export class SessionHost {
           disposition: acceptedPrompt.disposition,
           body: acceptedPrompt,
           ...(overrides === undefined ? {} : { executionOverrides: overrides }),
-          createdAt: input.scheduledAt
+          createdAt: queuedAt
         });
         if (validationFailure !== undefined) {
           store.updateQueueState({
@@ -3110,6 +3133,12 @@ export class SessionHost {
     this.#store.getSession(sessionId);
     if (this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) return;
     void this.drain(sessionId);
+  }
+
+  /** The scheduler owns global slots; the Session dispatcher owns the final claim. */
+  setScheduleDispatchGate(gate: { acquire(runId: string): boolean; release(runId: string): void }): () => void {
+    this.#scheduleDispatchGate = gate;
+    return () => { if (this.#scheduleDispatchGate === gate) this.#scheduleDispatchGate = undefined; };
   }
 
   skipScheduledOccurrence(input: {
@@ -10151,6 +10180,7 @@ export class SessionHost {
     this.#runtimeCommandTails.clear();
     await Promise.allSettled([...this.#nativeStateTails.values()]);
     this.#nativeStateTails.clear();
+    this.#runtimeUsageReadings.clear();
     this.#nativeCompactions.clear();
     this.#compactionEventEpochs.clear();
     this.#explicitCompactionFlights.clear();
@@ -10788,6 +10818,7 @@ export class SessionHost {
   }
 
   private async createSessionOnceAdmitted(input: SessionCreationInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
+    if ("assertServiceScope" in input) input.assertServiceScope?.();
     const logicalBody = createSessionOperationBody(input);
     const authorized = "connection" in input;
     const operationKind = authorized
@@ -10814,7 +10845,7 @@ export class SessionHost {
       )
       : this.#store.claimDeferredEffectOperation<{ readonly sessionId: string }>(
         { id: input.operationId, kind: operationKind, body: logicalBody },
-        (store) => { this.assertTargetAcceptsSessionCreation(store, input.targetId); }
+        (store) => { if ("assertServiceScope" in input) input.assertServiceScope?.(); this.assertTargetAcceptsSessionCreation(store, input.targetId); }
       );
     if (!claim.claimed) {
       return { replayed: true, value: claim.value, operation: claim.operation };
@@ -11123,6 +11154,7 @@ export class SessionHost {
                   backendInstanceGeneration, workspaceRoot: runtimeTarget.workspaceRoot });
                 this.#runtimeHandoffs.creationPhase(claim.operation.id, "effect"); groupCreationEffectDispatched = true;
               }
+              if ("assertServiceScope" in input) input.assertServiceScope?.();
               binding = await adapter.createSession({ target: runtimeTarget, name: input.title,
                 ...(!attaching && routedInput.providerId !== undefined ? { providerId: routedInput.providerId } : {}),
                 ...(!attaching && routedInput.modelId !== undefined ? { modelId: routedInput.modelId } : {}),
@@ -11152,6 +11184,7 @@ export class SessionHost {
           }
           createdBinding = binding;
           contextForCleanup = { ...context, binding };
+          if ("assertServiceScope" in input) input.assertServiceScope?.();
           if (!attaching && input.planMode) await adapter.setPlanMode(true, contextForCleanup);
           if (nativeStart.kind === "attach") {
             attachedState = await adapter.inspectSession(binding, contextForCleanup);
@@ -11190,6 +11223,7 @@ export class SessionHost {
           backendInstanceGeneration
         );
         const complete = (store: OperationalStore): { readonly sessionId: string } => {
+            if ("assertServiceScope" in input) input.assertServiceScope?.();
             const catalogAdoption = store.findNativeCatalogAdoption(input.operationId);
             if (catalogAdoption !== undefined) {
               if (catalogBinding === undefined || catalogAdoption.binding.opaqueRef !== binding.opaqueRef) {
@@ -11205,7 +11239,7 @@ export class SessionHost {
             if (duplicate !== undefined) throw nativeBindingConflict(duplicate.descriptor.id);
             if (automationOrigin !== undefined) {
               const currentSchedule = store.getSchedule(automationOrigin.scheduleId);
-              if (currentSchedule.revision !== automationOrigin.scheduleRevision) {
+              if (!("assertServiceScope" in input && input.assertServiceScope) && currentSchedule.revision !== automationOrigin.scheduleRevision) {
                 throw new RevisionConflictError(
                   "Schedule",
                   automationOrigin.scheduleId,
@@ -11266,6 +11300,9 @@ export class SessionHost {
               updatedAt: presentationAt
             };
             const created = store.createSession(descriptor, {
+              ...(automationOrigin && "assertServiceScope" in input && input.assertServiceScope ? {
+                automationOccurrenceRouting: { backendId: target.descriptor.backendId, targetId: input.targetId }
+              } : {}),
               localRuntimeBackendSelection: runtimeBackendId !== undefined || groupAssignment !== undefined,
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined
@@ -12177,6 +12214,8 @@ export class SessionHost {
     const backendInstanceGeneration = this.requireAdapterGeneration(stored.descriptor.backendId, adapter);
     const resourceCatalogEpoch = this.backendResourceCatalogEpoch(stored.descriptor.backendId);
     const previousBinding = stored.descriptor.binding;
+    const previousUsage = this.#runtimeUsageReadings.get(sessionId);
+    const previousUsageKey = JSON.stringify([stored.descriptor.backendId, previousBinding.generation, nativeBindingFingerprint(previousBinding.opaqueRef)]);
     const nextBinding = { ...previousBinding, generation: previousBinding.generation + 1 };
     stored = this.#store.updateSession(sessionId, { binding: nextBinding }, stored.revision);
     const context = this.contextFor(
@@ -12279,6 +12318,14 @@ export class SessionHost {
       );
       const result = this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch);
       this.setActiveSession(sessionId, result);
+      // A normal attachment advances the execution fence while keeping the
+      // native context. Carry only the confirmed closed reading for that exact
+      // original identity; a replacement context starts without it.
+      if (previousUsage?.bindingKey === previousUsageKey && previousUsage.closed !== undefined
+        && state.binding.opaqueRef === previousBinding.opaqueRef && state.binding.nativeSessionId === previousBinding.nativeSessionId) {
+        const bindingKey = JSON.stringify([stored.descriptor.backendId, stored.descriptor.binding.generation, nativeBindingFingerprint(stored.descriptor.binding.opaqueRef)]);
+        this.#runtimeUsageReadings.set(sessionId, { bindingKey, owner: result, live: undefined, closed: previousUsage.closed });
+      }
       this.persistRuntimeUsage(sessionId, stored.descriptor.binding.generation, state.usage, false, state.providerId, state.modelId);
       await this.refreshNativeStateBestEffort(sessionId, result, "native_state_activation_sync", allowance);
       this.assertSessionProviderAuthenticationAvailable(
@@ -13189,14 +13236,20 @@ export class SessionHost {
         }
         const claimBackendInstanceGeneration = this.#store
           .getBackend(claimSession.descriptor.backendId).descriptor.instanceGeneration;
-        const claimedItem = this.#store.claimNextQueueItem({
-          sessionId,
-          backendInstanceGeneration: claimBackendInstanceGeneration,
-          traceId: `dispatch:${pending.id}`
-        });
+        const scheduleGate = this.#store.getRun(pending.runId).descriptor.source === "schedule"
+          ? this.#scheduleDispatchGate : undefined;
+        if (scheduleGate?.acquire(pending.runId) === false) return;
+        let claimedItem: ReturnType<OperationalStore["claimNextQueueItem"]>;
+        try {
+          claimedItem = this.#store.claimNextQueueItem({
+            sessionId,
+            backendInstanceGeneration: claimBackendInstanceGeneration,
+            traceId: `dispatch:${pending.id}`
+          });
+        } catch (error) { scheduleGate?.release(pending.runId); throw error; }
         // A concurrent pause may land between the control read and durable
         // claim. The resume path owns the next wake-up, so never busy-poll.
-        if (claimedItem === undefined) return;
+        if (claimedItem === undefined) { scheduleGate?.release(pending.runId); return; }
         const dispatchPreparation = this.beginDispatchPreparation(sessionId);
         let item = claimedItem;
         const run = this.#store.getRun(item.runId);
@@ -14786,6 +14839,11 @@ export class SessionHost {
         });
       }
     });
+    const session = this.#store.getSession(sessionId).descriptor;
+    const bindingKey = JSON.stringify([session.backendId, generation, nativeBindingFingerprint(session.binding.opaqueRef)]);
+    const previous = this.#runtimeUsageReadings.get(sessionId);
+    this.#runtimeUsageReadings.set(sessionId, { bindingKey, owner: this.#active.get(sessionId), live: { ...usage },
+      closed: previous?.bindingKey === bindingKey ? previous.closed : undefined });
     return true;
   }
 
@@ -15758,6 +15816,10 @@ export class SessionHost {
 
   private deleteActiveSession(sessionId: string, expected?: ActiveSession): void {
     if (expected !== undefined && this.#active.get(sessionId) !== expected) return;
+    const reading = this.#runtimeUsageReadings.get(sessionId);
+    if (reading?.owner !== undefined && reading.owner === this.#active.get(sessionId)) {
+      this.#runtimeUsageReadings.set(sessionId, { ...reading, owner: undefined, live: undefined, closed: reading.live ?? reading.closed });
+    }
     this.#active.delete(sessionId);
     this.#activeResourceCatalogs.delete(sessionId);
     this.#serviceRuntimePrompts.delete(sessionId);

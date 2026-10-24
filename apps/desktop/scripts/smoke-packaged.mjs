@@ -1193,7 +1193,9 @@ function isExactProviderSmokeTimelineInference(body, expectedPrompt = PACKAGED_S
   if (typeof part !== "object" || part === null || Array.isArray(part)
     || Object.keys(part).sort().join(",") !== "text,type"
     || part.type !== "text" || part.text !== expectedPrompt) return false;
-  if (!Array.isArray(body.tools) || body.tools.length !== 14) return false;
+  // The isolated runtime advertises its ready capabilities (including native
+  // shell tools); the request contract does not fix their count.
+  if (!Array.isArray(body.tools) || body.tools.length === 0) return false;
   const names = new Set();
   for (const tool of body.tools) {
     if (typeof tool !== "object" || tool === null || Array.isArray(tool)
@@ -1235,6 +1237,9 @@ function runProviderSmokeClassifierRegressionTests() {
   expect(classifyProviderSmokeInference(timeline) === "timeline", "exact Timeline request is classified");
   expect(classifyProviderSmokeInference({ ...timeline, prompt_cache_key: "packaged-task", prompt_cache_retention: "24h" }) === "timeline",
     "installed Pi cache parameters are accepted");
+  const nativeShell = cloneProviderSmokeFixture(timeline);
+  nativeShell.tools.push({ ...nativeShell.tools[0], function: { ...nativeShell.tools[0].function, name: "powershell" } });
+  expect(classifyProviderSmokeInference(nativeShell) === "timeline", "an advertised native shell keeps the request contract");
   for (const [label, mutate] of [
     ["top-level extra field", (body) => { body.extra = true; }],
     ["invalid cache key", (body) => { body.prompt_cache_key = {}; }],
@@ -1250,6 +1255,7 @@ function runProviderSmokeClassifierRegressionTests() {
     ["malformed system content", (body) => { body.messages[0].content = { text: "system" }; }],
     ["malformed user content", (body) => { body.messages[1].content = { text: PACKAGED_SMOKE_TIMELINE_PROMPT }; }],
     ["malformed tool parameters", (body) => { body.tools[0].function.parameters = []; }],
+    ["empty tools", (body) => { body.tools.length = 0; }],
     ["duplicate tool name", (body) => { body.tools[1].function.name = body.tools[0].function.name; }]
   ]) {
     const body = cloneProviderSmokeFixture(timeline);

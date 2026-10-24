@@ -1,6 +1,6 @@
 import { join } from "node:path";
 
-import { atomicWritePrivateFile, readPrivateFile } from "../secure-files.js";
+import { atomicWritePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 import {
   DEDICATED_HARDWARE_MODEL_IDS,
   DEDICATED_HARDWARE_SETTINGS_MAX_BYTES,

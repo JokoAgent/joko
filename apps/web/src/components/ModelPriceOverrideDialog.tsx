@@ -38,6 +38,7 @@ export function ModelPriceOverrideDialog({ controller, model, variants, t, onClo
   const [error, setError] = useState<"load" | "save" | "reset">();
   const inputRef = useRef<HTMLInputElement>(null);
   const requestEpochRef = useRef(0);
+  const mutationEpochRef = useRef(0);
   const focusWhenReadyRef = useRef(false);
   const candidates = model === undefined
     ? []
@@ -47,17 +48,22 @@ export function ModelPriceOverrideDialog({ controller, model, variants, t, onClo
   const activeModel = candidates.find((candidate) => modelRouteKey(candidate.model) === selectedModelKey)?.model
     ?? candidates.find((candidate) => modelRouteKey(candidate.model) === modelRouteKey(model!))?.model
     ?? candidates[0]?.model;
+  const modelKey = model === undefined ? undefined : modelRouteKey(model);
+  const backendId = activeModel?.backendId, providerId = activeModel?.providerId, modelId = activeModel?.modelId;
+  const { getModelPriceOverride } = controller;
 
   useEffect(() => {
     setSelectedModelKey(model === undefined ? undefined : modelRouteKey(model));
-  }, [model]);
+  }, [modelKey]);
 
   useEffect(() => {
     const epoch = ++requestEpochRef.current;
+    mutationEpochRef.current += 1;
+    setPending(undefined);
     setPrice(undefined);
     setDraft(undefined);
     setError(undefined);
-    if (activeModel === undefined) {
+    if (backendId === undefined || providerId === undefined || modelId === undefined) {
       focusWhenReadyRef.current = false;
       setLoading(false);
       return;
@@ -65,7 +71,7 @@ export function ModelPriceOverrideDialog({ controller, model, variants, t, onClo
     focusWhenReadyRef.current = true;
     const abort = new AbortController();
     setLoading(true);
-    void controller.getModelPriceOverride(activeModel.backendId, activeModel.providerId, activeModel.modelId, abort.signal).then((value) => {
+    void getModelPriceOverride(backendId, providerId, modelId, abort.signal).then((value) => {
       if (requestEpochRef.current !== epoch) return;
       setPrice(value);
       setDraft(modelPriceDraft(modelPriceInitialQuote(value), value.allowedCurrencies[0]));
@@ -75,8 +81,8 @@ export function ModelPriceOverrideDialog({ controller, model, variants, t, onClo
       setError("load");
       setLoading(false);
     });
-    return () => abort.abort();
-  }, [activeModel, controller]);
+    return () => { abort.abort(); requestEpochRef.current += 1; mutationEpochRef.current += 1; };
+  }, [backendId, providerId, modelId, getModelPriceOverride]);
   useEffect(() => {
     if (loading || draft === undefined || !focusWhenReadyRef.current) return;
     focusWhenReadyRef.current = false;
@@ -91,6 +97,7 @@ export function ModelPriceOverrideDialog({ controller, model, variants, t, onClo
   const save = async (): Promise<void> => {
     if (activeModel === undefined || desired === undefined || busy) return;
     const epoch = requestEpochRef.current;
+    const mutation = ++mutationEpochRef.current;
     setPending("save");
     setError(undefined);
     try {
@@ -99,12 +106,13 @@ export function ModelPriceOverrideDialog({ controller, model, variants, t, onClo
     } catch {
       if (requestEpochRef.current === epoch) setError("save");
     } finally {
-      if (requestEpochRef.current === epoch) setPending(undefined);
+      if (mutationEpochRef.current === mutation) setPending(undefined);
     }
   };
   const reset = async (): Promise<void> => {
     if (activeModel === undefined || busy) return;
     const epoch = requestEpochRef.current;
+    const mutation = ++mutationEpochRef.current;
     setPending("reset");
     setError(undefined);
     try {
@@ -115,7 +123,7 @@ export function ModelPriceOverrideDialog({ controller, model, variants, t, onClo
     } catch {
       if (requestEpochRef.current === epoch) setError("reset");
     } finally {
-      if (requestEpochRef.current === epoch) setPending(undefined);
+      if (mutationEpochRef.current === mutation) setPending(undefined);
     }
   };
 

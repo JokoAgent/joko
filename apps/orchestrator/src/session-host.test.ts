@@ -90,6 +90,7 @@ import {
   encodePortableSessionProjection
 } from "./portable-session-projection.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
+import type { ScheduleScriptInput, ScheduleScriptCapabilityContext } from "./schedule-script-runner.js";
 import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture, type PartnerLearningHostPort } from "./session-host.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { activeNativeTimeline } from "./snapshot-projector.js";
@@ -109,6 +110,218 @@ import { MANAGED_GGUF_PROVIDER_ID } from "./managed-gguf-provider.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
+
+it("retains closed native usage through placeholder readings and fences it when the native binding changes", async () => {
+  class UsageAdapter extends FakeBackendAdapter {
+    placeholder = false;
+    override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+      const state = await super.inspectSession(binding, context);
+      return this.placeholder && state.usage ? { ...state, usage: { ...state.usage, contextTokens: 0 } } : state;
+    }
+  }
+  const adapter = new UsageAdapter(PI_LIKE_PROFILE), f = await createFixture(adapter);
+  const sessionId = (await f.host.createSession({ operationId: "usage-readings-create", connection: f.connection,
+    targetId: "target-one", title: "Usage readings", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+  expect(f.host.getSessionRuntimeUsage(sessionId).live?.contextTokens).toBe(20);
+  await f.host.closeIfActive(sessionId);
+  expect(f.host.getSessionRuntimeUsage(sessionId)).toMatchObject({ live: undefined, closed: { contextTokens: 20 } });
+  adapter.placeholder = true;
+  const queued = f.host.enqueueInput({ operationId: "usage-readings-resume", connection: f.connection, sessionId,
+    prompt: { text: "Continue once", images: [], files: [], mentions: [], disposition: "prompt" } });
+  await eventually(() => f.host.getSessionRuntimeUsage(sessionId).live?.contextTokens === 0);
+  expect(f.host.getSessionRuntimeUsage(sessionId).closed?.contextTokens).toBe(20);
+  await eventually(() => f.store.getRun(queued.value.runId).descriptor.state === "completed");
+  await f.host.closeIfActive(sessionId);
+  const session = f.store.getSession(sessionId);
+  f.store.updateSession(sessionId, { binding: { ...session.descriptor.binding, generation: session.descriptor.binding.generation + 1 } });
+  expect(f.host.getSessionRuntimeUsage(sessionId)).toMatchObject({ live: undefined, closed: undefined });
+});
+
+it("counts a startup-unknown Schedule Run before its old lease expires and waits to admit the next automatic occurrence", async () => {
+  const adapter = new ScheduleLifetimeFakeAdapter(), fixture = await createFixture(adapter);
+  let now = Date.now();
+  const schedule = (id: string) => ({
+    id, backendId: adapter.id, targetId: "target-one", sessionMode: "fresh" as const, name: id,
+    kind: "one_shot" as const, timezone: "UTC", enabled: true, nextRunAt: now,
+    prompt: { text: "hold the original execution slot", images: [], files: [], mentions: [], disposition: "prompt" as const },
+    executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue" as const, misfirePolicy: "run_once" as const
+  });
+  fixture.store.upsertSchedule(schedule("schedule-active-before-restart"));
+  const previous = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, schedulerInstanceId: "active-before-restart", maxConcurrentRuns: 1 });
+  cleanups.push(() => previous.stop());
+  await previous.tick();
+  const runId = fixture.store.listScheduleRuns("schedule-active-before-restart")[0]!.runId!;
+  await eventually(() => adapter.contexts.length === 1 && fixture.store.getRun(runId).descriptor.state === "running");
+  let oldLease = fixture.store.getScheduleRuntimeOccurrence(runId);
+  expect(oldLease.leaseExpiresAt).toBeGreaterThan(now);
+  previous.stop();
+  // Repeated occurrence recovery can advance its fence beyond the singleton
+  // owner's generation. Restart must adopt it and fence every old heartbeat.
+  for (let recovery = 0; recovery < 2; recovery += 1) {
+    now = oldLease.leaseExpiresAt + 1;
+    const reclaimed = fixture.store.claimStaleScheduleRuntimeOccurrences({ recoveryOwnerId: oldLease.ownerId,
+      recoveryGenerationFloor: fixture.store.getSchedulerRuntimeOwner()!.generation, claimedAt: now, leaseExpiresAt: now + 60_000 });
+    expect(reclaimed).toHaveLength(1);
+    oldLease = reclaimed[0]!;
+  }
+  const recovered = fixture.store.recoverStartup("schedule-active-restart");
+  expect(recovered.affectedRunIds).toContain(runId);
+  expect(fixture.store.getRun(runId).descriptor.state).toBe("dispatch_unknown");
+  fixture.store.upsertSchedule(schedule("schedule-waiting-after-restart"));
+  const restarted = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, schedulerInstanceId: "active-after-restart", maxConcurrentRuns: 1 });
+  cleanups.push(() => restarted.stop());
+  expect(restarted.runtimeSnapshot()).toMatchObject({ slotsInUse: 1, inFlightRuns: [expect.objectContaining({ runId, source: "automatic" })] });
+  const adopted = fixture.store.getScheduleRuntimeOccurrence(runId);
+  expect(adopted.ownerGeneration).toBeGreaterThan(oldLease.ownerGeneration);
+  expect(adopted.ownerId).toBe("active-after-restart");
+  expect(fixture.store.touchScheduleRuntimeOccurrence({ runId, ownerId: oldLease.ownerId, ownerGeneration: oldLease.ownerGeneration,
+    heartbeatAt: now, leaseExpiresAt: now + 60_000, phase: "running" })).toBeUndefined();
+  await restarted.tick();
+  expect(adapter.contexts).toHaveLength(1);
+  expect(fixture.store.listScheduleRuns("schedule-waiting-after-restart")).toHaveLength(0);
+  // Explicitly settling the unknown product Run releases the observed slot.
+  fixture.store.updateRunState({ runId, state: "aborted", traceId: "settle-original-unknown-schedule" });
+  await eventually(() => restarted.runtimeSnapshot().slotsInUse === 0);
+  await restarted.tick();
+  await eventually(() => adapter.contexts.length === 2);
+  expect(restarted.runtimeSnapshot().slotsInUse).toBe(1);
+  await adapter.contexts[1]!.emit({ type: "done", outcome: "completed" });
+  await eventually(() => restarted.runtimeSnapshot().slotsInUse === 0);
+});
+
+it("retains a Schedule slot when Adapter.send is still pending after dispatch and stall abort grace", async () => {
+  class HeldScheduleSendAdapter extends ScheduleLifetimeFakeAdapter {
+    readonly sendGate = new AsyncGate();
+    abortCalls = 0;
+    override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+      this.contexts.push(context); this.sendGate.enter(); await this.sendGate.wait;
+    }
+    override async abort(_context: AdapterContext): Promise<void> { this.abortCalls += 1; }
+  }
+  const adapter = new HeldScheduleSendAdapter(), fixture = await createFixture(adapter);
+  let now = Date.now(); const initialTime = now;
+  for (const [id, nextRunAt] of [["schedule-send-held", now], ["schedule-send-waiting", now + 1]] as const) fixture.store.upsertSchedule({
+    id, backendId: adapter.id, targetId: "target-one", sessionMode: "fresh", name: id, kind: "one_shot", timezone: "UTC", enabled: true, nextRunAt,
+    prompt: { text: "hold send acceptance", images: [], files: [], mentions: [], disposition: "prompt" },
+    executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once"
+  });
+  const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, maxConcurrentRuns: 1, tickMs: 1_000_000,
+    heartbeatIntervalMs: 5, heartbeatLeaseMs: 500, runStallMs: 100, stallAbortGraceMs: 50, suspendGapMs: 0 });
+  cleanups.push(() => { adapter.sendGate.release(); scheduler.stop(); });
+  scheduler.start(); await adapter.sendGate.entered;
+  const runId = fixture.store.listScheduleRuns("schedule-send-held")[0]!.runId!, sessionId = adapter.contexts[0]!.sessionId;
+  expect(fixture.store.getRun(runId).descriptor.state).toBe("queued");
+  expect(fixture.store.findQueueItemByRunId(sessionId, runId)).toMatchObject({ state: "dispatching", backendInstanceGeneration: expect.any(Number) });
+  now = initialTime + 101;
+  await eventually(() => adapter.abortCalls === 1);
+  now = initialTime + 201;
+  await eventually(() => fixture.store.getSchedulerRuntimeOwner()?.heartbeatAt === now);
+  expect(scheduler.runtimeSnapshot()).toMatchObject({ slotsInUse: 1, inFlightRuns: [expect.objectContaining({ runId, phase: "stalled" })] });
+  expect(fixture.store.findScheduleRuntimeOccurrence(runId)).toMatchObject({ phase: "stalled" });
+  expect(fixture.store.getRun(runId).descriptor.state).toBe("queued");
+  await scheduler.tick(); expect(adapter.contexts).toHaveLength(1);
+  adapter.sendGate.release();
+  await eventually(() => fixture.store.getRun(runId).descriptor.state === "running");
+  await adapter.contexts[0]!.emit({ type: "done", outcome: "completed" });
+  await eventually(() => scheduler.runtimeSnapshot().slotsInUse === 0);
+  await scheduler.tick(); await eventually(() => adapter.contexts.length === 2);
+  await adapter.contexts[1]!.emit({ type: "done", outcome: "completed" });
+  await eventually(() => scheduler.runtimeSnapshot().slotsInUse === 0);
+});
+
+it("restores an accepted Schedule queue lease during Host initialization before the new scheduler starts", async () => {
+  const fixture = await createFixture(new ScheduleLifetimeFakeAdapter());
+  const sessionId = (await fixture.host.createSession({ operationId: "schedule-fast-restart-create", connection: fixture.connection,
+    targetId: "target-one", title: "Queued restart", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+  fixture.store.setQueuePaused({ sessionId, paused: true, traceId: "schedule-fast-restart-pause" });
+  fixture.store.upsertSchedule({
+    id: "schedule-fast-restart", backendId: fixture.adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+    name: "Queued restart", kind: "manual", timezone: "UTC", enabled: true,
+    prompt: { text: "run exactly once after restart", images: [], files: [], mentions: [], disposition: "prompt" },
+    executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once"
+  });
+  const now = Date.now();
+  const previous = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, schedulerInstanceId: "scheduler-before-restart" });
+  cleanups.push(() => previous.stop());
+  const queued = await previous.runNowWithResult("schedule-fast-restart", "schedule-fast-restart-input");
+  const originalLease = fixture.store.getScheduleRuntimeOccurrence(queued.runId);
+  expect(originalLease).toMatchObject({ phase: "queued", source: "run-now" });
+  expect(originalLease.leaseExpiresAt).toBeGreaterThan(now);
+  expect(fixture.store.findQueueItemByRunId(sessionId, queued.runId)?.state).toBe("accepted");
+  previous.stop();
+  await fixture.host.dispose();
+  fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "schedule-fast-restart-unpause" });
+
+  const adapter = new ScheduleLifetimeFakeAdapter();
+  const host = new SessionHost(fixture.store, fixture.artifacts, [adapter]);
+  const restarted = new ScheduleCoordinator(fixture.store, host, { now: () => now,
+    schedulerInstanceId: "scheduler-after-restart", maxConcurrentRuns: 1 });
+  cleanups.push(async () => { restarted.stop(); await host.dispose(); });
+  // Match application startup: the gate exists before Host.initialize, while
+  // ScheduleCoordinator.start and its heartbeat recovery have not run yet.
+  await host.initialize();
+  await eventually(() => adapter.contexts.length === 1 && fixture.store.getRun(queued.runId).descriptor.state === "running");
+  const resumedLease = fixture.store.getScheduleRuntimeOccurrence(queued.runId);
+  expect(resumedLease).toMatchObject({ ownerId: "scheduler-after-restart", phase: "running", source: "run-now" });
+  expect(resumedLease.ownerGeneration).toBeGreaterThan(originalLease.ownerGeneration);
+  expect(restarted.runtimeSnapshot().slotsInUse).toBe(1);
+  expect(fixture.store.listQueueItems({ sessionId })).toHaveLength(1);
+  expect(fixture.store.listScheduleRuns("schedule-fast-restart")).toHaveLength(1);
+  await adapter.contexts[0]!.emit({ type: "done", outcome: "completed" });
+  await eventually(() => restarted.runtimeSnapshot().slotsInUse === 0);
+  expect(fixture.store.findScheduleRuntimeOccurrence(queued.runId)).toBeUndefined();
+});
+
+it("keeps an actual Schedule Run's slot through stall cancellation and beyond abort grace until it terminates", async () => {
+  class IgnoringScheduleAbortAdapter extends ScheduleLifetimeFakeAdapter {
+    abortCalls = 0;
+    override async abort(_context: AdapterContext): Promise<void> { this.abortCalls += 1; }
+  }
+  const adapter = new IgnoringScheduleAbortAdapter();
+  const fixture = await createFixture(adapter);
+  let now = Date.now();
+  const initialTime = now;
+  for (const [id, nextRunAt] of [["schedule-stall-running", now], ["schedule-stall-waiting", now + 1]] as const) {
+    fixture.store.upsertSchedule({
+      id, backendId: adapter.id, targetId: "target-one", sessionMode: "fresh", name: id,
+      kind: "one_shot", timezone: "UTC", enabled: true, nextRunAt,
+      prompt: { text: "retain the real run slot", images: [], files: [], mentions: [], disposition: "prompt" },
+      executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once"
+    });
+  }
+  const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, {
+    now: () => now, maxConcurrentRuns: 1, tickMs: 1_000_000, heartbeatIntervalMs: 5,
+    heartbeatLeaseMs: 500, runStallMs: 100, stallAbortGraceMs: 50, suspendGapMs: 0
+  });
+  cleanups.push(() => scheduler.stop());
+  scheduler.start();
+  await eventually(() => adapter.contexts.length === 1);
+  const runId = fixture.store.listScheduleRuns("schedule-stall-running")[0]!.runId!;
+  await eventually(() => adapter.contexts.length === 1 &&
+    fixture.store.getRun(runId).descriptor.state === "running");
+  now = initialTime + 101;
+  await eventually(() => adapter.abortCalls === 1);
+  expect(scheduler.runtimeSnapshot()).toMatchObject({ slotsInUse: 1,
+    inFlightRuns: [expect.objectContaining({ runId, phase: "stalled" })] });
+  await scheduler.tick();
+  expect(adapter.contexts).toHaveLength(1);
+
+  now = initialTime + 201;
+  await eventually(() => fixture.store.getSchedulerRuntimeOwner()?.heartbeatAt === now);
+  expect(scheduler.runtimeSnapshot().slotsInUse).toBe(1);
+  expect(fixture.store.getScheduleRuntimeOccurrence(runId).phase).toBe("stalled");
+  expect(fixture.store.getRun(runId).descriptor.state).toBe("running");
+  expect(fixture.store.findScheduleRunByRunId(runId)?.status).toBe("running");
+  await scheduler.tick();
+  expect(adapter.contexts).toHaveLength(1);
+  await adapter.contexts[0]!.emit({ type: "done", outcome: "completed" });
+  await eventually(() => scheduler.runtimeSnapshot().slotsInUse === 0);
+  await scheduler.tick();
+  await eventually(() => adapter.contexts.length === 2);
+  expect(scheduler.runtimeSnapshot().slotsInUse).toBe(1);
+  await adapter.contexts[1]!.emit({ type: "done", outcome: "completed" });
+  await eventually(() => scheduler.runtimeSnapshot().slotsInUse === 0);
+});
 
 it("restores an ordinary archived owner task atomically with its first queued input and replays the original receipt", async () => {
   const f = await createFixture();
@@ -8933,6 +9146,7 @@ describe("SessionHost", () => {
     });
     gate.release();
     await dispatch;
+    await eventually(() => scheduler.runtimeSnapshot().inFlight === 0 && scheduler.runtimeSnapshot().slotsInUse === 0);
     expect(scheduler.hasInFlightActivity()).toBe(false);
     expect(scheduler.runtimeSnapshot()).toMatchObject({ inFlight: 0, slotsInUse: 0 });
     expect(onActivityTransition).toHaveBeenCalledTimes(2);
@@ -9451,6 +9665,85 @@ describe("SessionHost", () => {
     }));
   });
 
+  it.each(["validation", "execution"] as const)("rejects a pre-run gate after project trust is revoked during %s", async (phase) => {
+    const fixture = await createFixture();
+    let entered!: () => void, release!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const hookPath = join(fixture.directory, "scripts", "schedule-checks", "guard.mjs");
+    const executePreRunHook = vi.fn(async () => {
+      if (phase === "execution") { entered(); await gate; }
+      return { status: "passed" as const, decision: "run" as const, exitCode: 0, durationMs: 1,
+        stdout: "ready", stderr: "", stdoutTruncated: false, stderrTruncated: false, timedOut: false, aborted: false };
+    });
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, {
+      executePreRunHook,
+      validatePreRunHookBinding: async () => { if (phase === "validation") { entered(); await gate; } return hookPath; }
+    });
+    fixture.store.upsertSchedule({ id: "schedule-trust-gate", backendId: fixture.adapter.id, targetId: "target-one",
+      sessionMode: "fresh", name: "Project trust gate", kind: "manual", timezone: "UTC", enabled: true,
+      prompt: { text: "must remain undispatched", images: [], files: [], mentions: [], disposition: "prompt" },
+      executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, permissionMode: "ask", planMode: false,
+        scheduler: { format: 1, silentWhenIdle: false, notify: { desktop: true }, executionMode: "agent",
+          preRunHook: { command: `joko-node "${hookPath}"`, filePath: hookPath } } },
+      overlapPolicy: "queue", misfirePolicy: "run_once" });
+    const dispatch = scheduler.runNowWithResult("schedule-trust-gate", `trust-gate-${phase}`);
+    await waiting;
+    const target = fixture.store.getTarget("target-one");
+    fixture.store.upsertTarget({ ...target.descriptor, trusted: false }, target.metadata);
+    release();
+    const result = await dispatch;
+    expect(result).toMatchObject({ status: "failed" });
+    expect(executePreRunHook).toHaveBeenCalledTimes(phase === "validation" ? 0 : 1);
+    expect(fixture.store.listSessions()).toHaveLength(0);
+    expect(fixture.store.listQueueItems()).toHaveLength(0);
+    expect(fixture.store.listScheduleRuns("schedule-trust-gate")[0]).toMatchObject({ status: "failed",
+      detail: { preRunHook: { decision: "block" } } });
+    scheduler.stop();
+  });
+
+  it.each([
+    ["validation", "interval"], ["validation", "one_shot"],
+    ["execution", "interval"], ["execution", "one_shot"]
+  ] as const)("preserves an edited %s hook's new %s cadence when its old occurrence aborts", async (phase, kind) => {
+    const fixture = await createFixture(), gate = new AsyncGate();
+    const hookPath = join(fixture.directory, "scripts", "schedule-checks", "edited.mjs");
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, {
+      validatePreRunHookBinding: async () => { if (phase === "validation") { gate.enter(); await gate.wait; } return hookPath; },
+      executePreRunHook: async () => {
+        if (phase === "execution") { gate.enter(); await gate.wait; }
+        return { status: "passed", decision: "run", exitCode: 0, durationMs: 1, stdout: "ready", stderr: "",
+          stdoutTruncated: false, stderrTruncated: false, timedOut: false, aborted: false };
+      }
+    });
+    cleanups.push(() => scheduler.stop());
+    const initial = fixture.store.upsertSchedule({ id: "schedule-edited-hook", backendId: fixture.adapter.id, targetId: "target-one",
+      sessionMode: "fresh", name: "Original cadence", kind: "interval", expression: "10000", anchorAt: 1_000,
+      timezone: "UTC", enabled: true, nextRunAt: Date.now() + 60_000,
+      prompt: { text: "must remain undispatched", images: [], files: [], mentions: [], disposition: "prompt" },
+      executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, permissionMode: "ask", planMode: false,
+        scheduler: { format: 1, silentWhenIdle: false, notify: { desktop: true }, executionMode: "agent",
+          preRunHook: { command: `joko-node "${hookPath}"`, filePath: hookPath } } },
+      overlapPolicy: "queue", misfirePolicy: "run_once" });
+    const dispatch = scheduler.runNowWithResult(initial.id, `edited-hook-${phase}-${kind}`);
+    const nextRunAt = Date.now() + 120_000;
+    try {
+      await gate.entered;
+      const current = fixture.store.getSchedule(initial.id);
+      fixture.store.upsertSchedule({ id: current.id, backendId: current.backendId, targetId: current.targetId,
+        sessionMode: current.sessionMode, name: "Edited cadence", kind, timezone: current.timezone, enabled: true,
+        ...(kind === "interval" ? { expression: "20000", anchorAt: 1_000 } : {}),
+        prompt: current.prompt, executionSnapshot: current.executionSnapshot, overlapPolicy: current.overlapPolicy,
+        misfirePolicy: current.misfirePolicy, nextRunAt, expectedRevision: current.revision });
+    } finally { gate.release(); }
+    const result = await dispatch;
+    expect(result).toMatchObject({ status: "aborted" });
+    expect(fixture.store.getSchedule(initial.id)).toMatchObject({ name: "Edited cadence", kind, enabled: true, nextRunAt });
+    expect(fixture.store.listSessions()).toHaveLength(0); expect(fixture.store.listQueueItems()).toHaveLength(0);
+    expect(fixture.store.listScheduleRuns(initial.id)[0]).toMatchObject({ status: "aborted",
+      detail: { reason: "Schedule changed during its pre-run gate." } });
+  });
+
   it("joins a passed pre-run gate to the same real Run and finalizes its durable history", async () => {
     const fixture = await createFixture();
     const hookPath = join(fixture.directory, "scripts", "schedule-checks", "pass.mjs");
@@ -9681,6 +9974,61 @@ describe("SessionHost", () => {
       status: "success",
       detail: { script: { resultText: "task queued" }, costAttribution: "zero" }
     });
+  });
+
+  it("freezes script task creation and retains later Schedule edits", async () => {
+    const f = await createFixture(), gate = new AsyncGate(); let fire = 0;
+    const otherRoot = join(f.directory, "other-project"); mkdirSync(otherRoot);
+    await f.host.registerTarget({ id: "target-two", backendId: f.adapter.id, displayName: "Other", workspaceRoot: otherRoot, trusted: true, managed: true });
+    const initial = seedScriptSchedule(f, "script-frozen", { name: "Original", kind: "interval", expression: "10000", anchorAt: 1000, nextRunAt: Date.now() + 60_000 });
+    const executeScript = async (input: ScheduleScriptInput) => {
+      if (++fire === 1) { gate.enter(); await gate.wait; }
+      return dispatchScriptTask(input);
+    };
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { executeScript }); cleanups.push(() => coordinator.stop());
+    const first = coordinator.runNowWithResult(initial.id, "frozen-first");
+    let nextRunAt: number;
+    try {
+      await gate.entered;
+      const current = f.store.getSchedule(initial.id); nextRunAt = Date.now() + 120_000;
+      f.store.upsertSchedule({ ...current, expectedRevision: current.revision, name: "Edited", targetId: "target-two", expression: "20000", nextRunAt,
+        executionSnapshot: { ...(current.executionSnapshot as Record<string, unknown>), providerId: "vision", modelId: "multimodal", effort: "high", permissionMode: "auto", planMode: true } });
+    } finally { gate.release(); }
+    const outcome = await first; expect(outcome.status).toBe("success");
+    expect(f.store.getSession(outcome.sessionId!).descriptor).toMatchObject({ targetId: "target-one", title: "Original", providerId: "test", modelId: "text", permissionMode: "ask", planMode: false });
+    expect(f.store.findScheduleRunByRunId(outcome.runId)).toMatchObject({ sessionId: outcome.sessionId, status: "success" });
+    expect(f.store.getSchedule(initial.id)).toMatchObject({ targetId: "target-two", name: "Edited", expression: "20000", nextRunAt: nextRunAt! });
+    const next = await coordinator.runNowWithResult(initial.id, "frozen-next"); expect(next.status).toBe("success");
+    expect(f.store.getSession(next.sessionId!).descriptor).toMatchObject({ targetId: "target-two", title: "Edited", providerId: "vision", modelId: "multimodal", permissionMode: "auto", planMode: true });
+  });
+
+  it("dispatches bound scripts only to their existing task and keeps that task's own configuration", async () => {
+    const f = await createFixture();
+    const makeTask = (operationId: string) => f.host.createSession({ operationId, connection: f.connection, targetId: "target-one", title: "Existing task",
+      providerId: "vision", modelId: "multimodal", effort: "high", fastMode: false, permissionMode: "auto", planMode: true });
+    const boundId = (await makeTask("bound-task")).value.sessionId, otherId = (await makeTask("other-task")).value.sessionId;
+    seedScriptSchedule(f, "script-bound", { sessionMode: "bound", sessionId: boundId });
+    let retained: ScheduleScriptCapabilityContext | undefined;
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { executeScript: async input => {
+      retained = scriptScope(input);
+      await expect(input.broker.call({ id: "wrong", method: "sessions.dispatch", params: { message: "Do not send", target_session_id: otherId } }, new Set(input.capabilities), retained)).rejects.toMatchObject({ code: "INVALID_ARGS" });
+      expect(f.store.listQueueItems({ sessionId: otherId })).toHaveLength(0);
+      return dispatchScriptTask(input);
+    } }); cleanups.push(() => coordinator.stop());
+    const outcome = await coordinator.runNowWithResult("script-bound", "bound-fire");
+    expect(outcome).toMatchObject({ status: "success", sessionId: boundId }); expect(f.store.listSessions()).toHaveLength(2);
+    expect(f.store.getSession(boundId).descriptor).toMatchObject({ providerId: "vision", modelId: "multimodal", permissionMode: "auto", planMode: true });
+    expect(f.store.listQueueItems({ sessionId: boundId })).toHaveLength(1); expect(() => retained!.assertCurrent()).toThrow();
+  });
+
+  it("closes a late native creation after script cancellation without adopting or queueing it", async () => {
+    const adapter = new GatedFakeAdapter(), f = await createFixture(adapter), gate = adapter.holdCreate(), closed = vi.spyOn(adapter, "closeSession");
+    seedScriptSchedule(f, "script-cancelled");
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { executeScript: dispatchScriptTask }); cleanups.push(() => coordinator.stop());
+    const pending = coordinator.runNowWithResult("script-cancelled", "cancelled-fire");
+    try { await gate.entered; await coordinator.abortSchedule("script-cancelled"); } finally { gate.release(); }
+    expect(await pending).toMatchObject({ status: "aborted" }); expect(adapter.createCalls).toBe(1); expect(closed).toHaveBeenCalledOnce();
+    expect(f.store.listSessions()).toHaveLength(0); expect(f.store.listQueueItems()).toHaveLength(0);
   });
 
   it("aborts an in-flight script Schedule without creating a product task", async () => {
@@ -10319,6 +10667,63 @@ describe("SessionHost", () => {
       detail: { reason: "task is busy; overlap policy is skip" }
     });
     expect(fixture.store.listQueueItems({ sessionId: skipSessionId })).toHaveLength(0);
+  });
+
+  it("keeps Schedule slots until the actual Adapter Run ends and enforces the limit on later ticks", async () => {
+    const adapter = new ScheduleLifetimeFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const now = Date.now();
+    for (let index = 0; index < 3; index += 1) fixture.store.upsertSchedule({
+      id: `limited-${index}`, backendId: adapter.id, targetId: "target-one", sessionMode: "fresh",
+      name: `Limited ${index}`, kind: "one_shot", timezone: "UTC", enabled: true,
+      prompt: { text: "long running", images: [], files: [], mentions: [], disposition: "prompt" },
+      executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT,
+      overlapPolicy: "queue", misfirePolicy: "run_once", nextRunAt: now
+    });
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, maxConcurrentRuns: 2 });
+    cleanups.push(() => scheduler.stop());
+    await scheduler.tick();
+    await eventually(() => adapter.contexts.length === 2);
+    expect(scheduler.runtimeSnapshot().slotsInUse).toBe(2);
+    await scheduler.tick();
+    expect(adapter.contexts).toHaveLength(2);
+    await adapter.contexts[0]!.emit({ type: "done", outcome: "completed" });
+    await eventually(() => scheduler.runtimeSnapshot().slotsInUse === 1);
+    await scheduler.tick();
+    await eventually(() => adapter.contexts.length === 3);
+    expect(scheduler.runtimeSnapshot().slotsInUse).toBe(2);
+    for (const context of adapter.contexts.slice(1)) await context.emit({ type: "done", outcome: "completed" });
+    await eventually(() => scheduler.runtimeSnapshot().slotsInUse === 0);
+  });
+
+  it("deduplicates a busy Schedule queue and expires its retained input after restart", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "busy-dedup-session", connection: fixture.connection, targetId: "target-one",
+      title: "Busy", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    let now = Date.now();
+    fixture.store.createRun({ id: "busy-dedup-run", sessionId, source: "user", state: "running", createdAt: now });
+    fixture.store.upsertSchedule({
+      id: "busy-dedup", backendId: fixture.adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+      name: "Busy queue", kind: "manual", timezone: "UTC", enabled: true,
+      prompt: { text: "wait", images: [], files: [], mentions: [], disposition: "prompt" },
+      executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once"
+    });
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now });
+    const first = await scheduler.runNowWithResult("busy-dedup", "first-busy");
+    const second = await scheduler.runNowWithResult("busy-dedup", "second-busy");
+    expect(second.status).toBe("skipped");
+    expect(fixture.store.listQueueItems({ sessionId, states: ["accepted"] })).toHaveLength(1);
+    expect(scheduler.runtimeSnapshot().slotsInUse).toBe(0);
+    scheduler.stop();
+    now += 31 * 60_000;
+    const restarted = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now });
+    cleanups.push(() => restarted.stop());
+    await restarted.tick();
+    expect(fixture.store.findQueueItemByRunId(sessionId, first.runId)?.state).toBe("cancelled");
+    expect(fixture.store.findScheduleRunByRunId(first.runId)?.status).toBe("skipped");
+    expect(fixture.store.listQueueItems({ sessionId, states: ["accepted"] })).toHaveLength(0);
   });
 
   it("records an expired occurrence as skipped when its durable misfire policy says skip", async () => {
@@ -15733,6 +16138,21 @@ describe("original Partner learning turn authority", () => {
   });
 });
 
+function seedScriptSchedule(f: Awaited<ReturnType<typeof createFixture>>, id: string, patch: Partial<Parameters<OperationalStore["upsertSchedule"]>[0]> = {}) {
+  return f.store.upsertSchedule({ id, backendId: f.adapter.id, targetId: "target-one", sessionMode: "fresh", name: "Script task", kind: "manual", timezone: "UTC", enabled: true,
+    prompt: { text: "", images: [], files: [], mentions: [], disposition: "prompt" },
+    executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, providerId: "test", modelId: "text", effort: "medium", permissionMode: "ask", planMode: false, fastMode: false,
+      scheduler: { format: 1, silentWhenIdle: false, notify: { desktop: true }, executionMode: "script", scriptConfig: { command: "node ignored.mjs", capabilities: ["sessions.dispatch"] } } },
+    overlapPolicy: "queue", misfirePolicy: "run_once", ...patch });
+}
+function scriptScope(input: ScheduleScriptInput): ScheduleScriptCapabilityContext {
+  return { schedule: input.schedule, runId: input.runId, signal: input.signal!, assertCurrent: input.assertCurrent };
+}
+async function dispatchScriptTask(input: ScheduleScriptInput) {
+  const result = await input.broker.call({ id: "dispatch", method: "sessions.dispatch", params: { message: "Inspect once" } }, new Set(input.capabilities), scriptScope(input)) as { target_session_id: string };
+  return { primarySessionId: result.target_session_id, durationMs: 1, stderr: "", stderrTruncated: false };
+}
+
 async function createFixture(
   adapter: FakeBackendAdapter = new FakeBackendAdapter(PI_LIKE_PROFILE),
   hostOptions: {
@@ -17739,6 +18159,12 @@ class DisposeTrackingFakeAdapter extends FakeBackendAdapter {
     if (this.failure !== undefined) throw this.failure;
     await super.dispose();
   }
+}
+
+class ScheduleLifetimeFakeAdapter extends FakeBackendAdapter {
+  readonly contexts: AdapterContext[] = [];
+  constructor() { super(PI_LIKE_PROFILE); }
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> { this.contexts.push(context); }
 }
 
 class GatedFakeAdapter extends FakeBackendAdapter {

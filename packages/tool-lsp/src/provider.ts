@@ -152,6 +152,7 @@ export class TypeScriptLspBridge {
       control.check();
       const accepted = validateRequest(request);
       lease = await this.acquireWorkspace(accepted.workspaceRoot, control);
+      await lease.workspace.refresh(control);
       control.check();
       return this.executeInWorkspace(lease.workspace, accepted, control);
     } catch (error) {
@@ -202,7 +203,7 @@ export class TypeScriptLspBridge {
     request: LspToolRequest,
     control: LspOperationControl
   ): LspToolResponse {
-    if (request.action !== "workspace_symbol") workspace.resetProject();
+    if (request.action !== "workspace_symbol") workspace.selectProject(request.file, control, true);
     switch (request.action) {
     case "hover": return this.executeHover(workspace, request, control);
     case "goto_definition": return this.executeDefinition(workspace, request, control);

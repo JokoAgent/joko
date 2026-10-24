@@ -9034,6 +9034,40 @@ function clearManagedProviderRateLimit(
   }
 }
 
+/** Retire credential-bearing runtimes before removing their native account. */
+async function logoutManagedNativeProvider(
+  dependencies: ConnectServiceDependencies,
+  backendId: string,
+  providerId: string
+): Promise<void> {
+  const retirement = dependencies.sessionHost.fenceBackendProviderAuthentication(backendId, providerId);
+  dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "pending");
+  const nativeCredentialOwner = dependencies.providerAuth?.canHandle(providerId) === true;
+  try {
+    await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
+      const revokeProviderAuthentication = (adapter as BackendAdapter & BackendProviderAccountOperations)
+        .revokeProviderAuthentication;
+      if (typeof revokeProviderAuthentication !== "function") {
+        throw new ConnectError(
+          "The selected Backend cannot retire runtime leases for this Provider credential.",
+          Code.Unimplemented
+        );
+      }
+      await revokeProviderAuthentication.call(adapter, providerId);
+    });
+    // Native logout may refresh the immutable Pi generation. Release the exact
+    // Adapter lease first so generation publication cannot wait on its own call.
+    await dependencies.providers!.logout(providerId);
+    clearProviderRateLimit(dependencies.store, backendId, providerId);
+    if (!nativeCredentialOwner) await dependencies.refreshPiGeneration?.();
+    dependencies.sessionHost.completeBackendProviderAuthenticationRetirement(retirement);
+  } catch (error) {
+    dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "error");
+    throw error;
+  }
+  dependencies.messageSearch?.reconcileAvailability();
+}
+
 function mapProviderDescriptor(
   backendId: string,
   item: NativeProviderDescriptor,
@@ -20167,10 +20201,7 @@ async function dispatchMutation(
           throw new ConnectError("Credential is still referenced by managed configuration; remove its bindings first.", Code.FailedPrecondition);
         }
         if (nativeProvider !== undefined) {
-          await dependencies.providers!.logout(nativeProvider.provider.id);
-          clearManagedProviderRateLimit(dependencies, nativeProvider.provider.id);
-          await dependencies.refreshPiGeneration?.();
-          dependencies.messageSearch?.reconcileAvailability();
+          await logoutManagedNativeProvider(dependencies, nativeProvider.backendId, nativeProvider.provider.id);
         } else if (!await dependencies.credentials!.delete(payload.value.credentialReferenceId)) {
           throw new ConnectError("Credential not found.", Code.NotFound);
         }
@@ -20450,35 +20481,7 @@ async function dispatchMutation(
         accepted: true,
         resultCase: "provider",
         entityId: providerId
-      }, async () => {
-        const retirement = dependencies.sessionHost.fenceBackendProviderAuthentication(backendId, providerId);
-        dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "pending");
-        const nativeCredentialOwner = dependencies.providerAuth?.canHandle(providerId) === true;
-        try {
-          await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
-            const revokeProviderAuthentication = (adapter as BackendAdapter & BackendProviderAccountOperations)
-              .revokeProviderAuthentication;
-            if (typeof revokeProviderAuthentication !== "function") {
-              throw new ConnectError(
-                "The selected Backend cannot retire runtime leases for this Provider credential.",
-                Code.Unimplemented
-              );
-            }
-            await revokeProviderAuthentication.call(adapter, providerId);
-          });
-          // ProviderCatalog native logout refreshes the immutable Pi generation.
-          // It must run after the exact Adapter lease above is released because
-          // generation replacement requires SessionHost admission to be idle.
-          await dependencies.providers.logout(providerId);
-          clearProviderRateLimit(dependencies.store, backendId, providerId);
-          if (!nativeCredentialOwner) await dependencies.refreshPiGeneration?.();
-          dependencies.sessionHost.completeBackendProviderAuthenticationRetirement(retirement);
-        } catch (error) {
-          dependencies.projectBackendProviderAuthentication?.(backendId, providerId, "error");
-          throw error;
-        }
-        dependencies.messageSearch?.reconcileAvailability();
-      });
+      }, () => logoutManagedNativeProvider(dependencies, backendId, providerId));
     }
     case "createDiagnosticsBundle": {
       if (dependencies.diagnosticsBundles === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Diagnostics bundle materialization is not configured.");
@@ -23548,8 +23551,8 @@ function assertPublicScheduleExecutionCompatibility(
     if (prompt.text.trim() === "") throw invalidArgument("Agent Schedules require a non-empty prompt.");
     return;
   }
-  if (binding.mode !== "fresh" || binding.sessionId !== "") {
-    throw invalidArgument("Script Schedules cannot bind or persist a product task.");
+  if (binding.mode === "persistent") {
+    throw invalidArgument("Script Schedules require fresh or bound Session mode.");
   }
   if (extension.silentWhenIdle) {
     throw invalidArgument("Script Schedules cannot use silent_when_idle.");

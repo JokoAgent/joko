@@ -3591,6 +3591,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
   const relatedProviderRouteKeys = new Set(relatedProviderRuntimes.map((runtime) => providerPreferenceKey(runtime.backendId, runtime.id)));
   const selectedManagedRuntime = availableModelRuntimes.find((runtime) => runtime.providerRoutes?.some((route) => relatedProviderRouteKeys.has(providerPreferenceKey(route.backendId, route.providerId))));
   const advancedOwnerKey = JSON.stringify([pickerOwnerId, controller.state.activeProfile?.id, controller.state.connectionGeneration, selectedProviderEntry?.id]);
+  useEffect(() => { setPriceModel(undefined); }, [advancedOwnerKey]);
   const chooseManagedRuntime = (runtimeId: string): void => {
     const runtime = availableModelRuntimes.find((candidate) => candidate.id === runtimeId);
     if (runtime === undefined || runtimeAddPending.current) return;

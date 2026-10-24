@@ -1,5 +1,7 @@
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
-import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
+import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
+import { MobileTaskOutboxStore, mobileTaskOutboxModel, mobileTaskOutboxOwnerMatches,
+  type MobileTaskOutboxRecord } from "./mobile-task-outbox";
 import { projectPartnerSessionTask } from "@joko/contracts";
 import { TaskShareMethod, SetSessionRuntimeMutationSchema, type JoinedTaskShare, type TaskSharingApi, type TaskShareRuntimeControl } from "@joko/contracts";
 import { mobileTaskSharingApi, mobileJoinedTaskNetwork, assertMobileSharedTaskSnapshot,
@@ -46,7 +48,7 @@ import {
   ModelSourceKind,
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
   MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
-  OperationPreconditionSchema, OperationState, OperationMutationSchema, RewindSafety,
+  OperationPreconditionSchema, OperationState, OperationMutationSchema, PerTurnOverridesSchema, RewindSafety,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema, TaskTagColor,
   ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
   DeviceSchema, RenameDeviceMutationSchema, ResetDeviceNameMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
@@ -271,6 +273,7 @@ import {
   type MobileUploadedComposerAttachment
 } from "./mobile-attachments";
 import type { MobileAttachmentFiles } from "./mobile-attachment-files";
+import { copiedMobileIncomingShareStorageId } from "./mobile-incoming-share-order";
 import {
   assertMobileCatalogMentionCandidate,
   assertMobileCatalogMentionDraft,
@@ -523,6 +526,7 @@ export interface MobileState {
   readonly historyEnd: boolean;
   readonly before?: EventCursor;
   readonly pending: readonly PendingOperation[];
+  readonly taskOutbox?: readonly MobileTaskOutboxRecord[];
   readonly restoredComposerDraft?: { readonly profileId: string; readonly sessionId: string; readonly sequence: number };
   readonly homeSearchQuery: string;
   readonly homeSearchFilter: MobileHomeStatusFilter;
@@ -908,6 +912,8 @@ export class MobileClient {
   #queueEditLease?: MobileQueueEditLease;
   #queueInteractionLease?: MobileQueueInteractionLease;
   #newTaskSubmissionActive = false;
+  readonly #taskOutbox?: MobileTaskOutboxStore;
+  #taskOutboxFlight?: Promise<void>;
   #newTaskUploadObserver?: MobileNewTaskUploadObserver;
   #composerImageEdit?: MobileComposerImageEditLease;
   #imageGallery?: MobileImageGalleryLease;
@@ -970,7 +976,10 @@ export class MobileClient {
     private readonly partnerCreationReceipts?: MobilePartnerCreationReceipts,
     private readonly partnerDeletionReceipts?: MobilePartnerDeletionReceipts,
     private readonly partnerRestartReceipts?: MobilePartnerRestartReceipts
-  ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
+  ) {
+    this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk);
+    if (composerDrafts) this.#taskOutbox = new MobileTaskOutboxStore(composerDrafts.driver);
+  }
 
   get state(): MobileState { return this.#state; }
 
@@ -4138,12 +4147,19 @@ export class MobileClient {
       const [index, pending] = await Promise.all([
         this.storage.loadConnectionIndex(), this.storage.loadPending()
       ]);
+      await this.#taskOutbox?.load();
+      for (const record of [...(this.#taskOutbox?.records ?? [])]) {
+        if (!index.profiles.some((profile) => mobileTaskOutboxOwnerMatches(record.owner, profile))) continue;
+        if (record.state === "staging") await this.#finishTaskOutboxHandoff(record);
+        else if (record.state === "restoring") await this.#restoreTaskOutboxDraft(record);
+      }
       if (!this.#current(epoch)) return;
       this.#profiles = [...index.profiles];
       this.#automaticProfileId = index.automaticProfileId;
       this.#allPending = pending;
       this.#set({
         pending: [],
+        taskOutbox: this.#taskOutbox?.records,
         selectedId: undefined,
         automaticProfileId: index.automaticProfileId,
         saved: this.#savedViews(),
@@ -4703,6 +4719,8 @@ export class MobileClient {
     this.#profiles = this.#profiles.filter((candidate) => candidate.profileId !== profileId);
     if (this.#automaticProfileId === profileId) this.#automaticProfileId = undefined;
     const cleanupFailures: string[] = [];
+    try { await this.#taskOutbox?.clearProfile(profileId); this.#publishTaskOutbox(); }
+    catch (error) { cleanupFailures.push(`task outbox: ${message(error)}`); }
     try { await this.storage.saveSelection(profileId); }
     catch (error) { cleanupFailures.push(`task selection: ${message(error)}`); }
     try { await this.#dropPendingConnections([profile.connectionId]); }
@@ -9378,6 +9396,9 @@ export class MobileClient {
       this.#set({ error: authority.message });
       return { sessionId: initial.sessionId, created: true, sent: false, definitive: true };
     }
+    const dispatchCredential = this.#ready(), dispatchEpoch = this.#epoch, dispatchSignal = this.#abort!.signal;
+    const dispatchCurrent = (): boolean => !dispatchSignal.aborted && this.#current(dispatchEpoch)
+      && this.#credential === dispatchCredential && this.#newTaskSendAuthority(initial).status === "ready";
     let prepared = initial;
     const uploadObserver = initial.input.attachments.some(attachment => attachment.state === "local") ? this.#newTaskUploadObserver : undefined;
     try {
@@ -9410,7 +9431,9 @@ export class MobileClient {
         input: mobileComposerInput(submission.input),
         deliveryMode: QueueDeliveryMode.PROMPT
       }) }
-    }), { kind: "send", sessionId: submission.sessionId }, sendOperationId);
+    }), { kind: "send", sessionId: submission.sessionId }, sendOperationId, true, true, {
+      signal: dispatchSignal, isCurrent: dispatchCurrent
+    });
     return this.#finishNewTaskFirstInput(identity, submission, result);
   }
 
@@ -9556,6 +9579,9 @@ export class MobileClient {
           await this.#releaseNewTaskConversation(identity, submission, false);
           this.#set({ error: authority.message }); return result(true, false);
         }
+        const dispatchCredential = this.#ready(), dispatchEpoch = this.#epoch, dispatchSignal = this.#abort!.signal;
+        const dispatchCurrent = (): boolean => !dispatchSignal.aborted && this.#current(dispatchEpoch)
+          && this.#credential === dispatchCredential && this.#newTaskSendAuthority({ ...submission, input: followUp.input }).status === "ready";
         let prepared: MobileNewTaskSendSubmission;
         try {
           await this.#validateNewTaskSubmissionInput({ ...submission, input: followUp.input });
@@ -9570,7 +9596,9 @@ export class MobileClient {
             expectedGeneration: BigInt(submission.runtimeGeneration) })],
           payload: { case: "sendInput", value: create(SendInputMutationSchema, { sessionId: submission.sessionId,
             input: mobileComposerInput(prepared.input), deliveryMode: QueueDeliveryMode.PROMPT }) }
-        }), { kind: "send", sessionId: submission.sessionId }, followUp.operationId);
+        }), { kind: "send", sessionId: submission.sessionId }, followUp.operationId, true, true, {
+          signal: dispatchSignal, isCurrent: dispatchCurrent
+        });
       }
       if (!receipt.definitive) return result(false, false);
       const operation = receipt.operation, queued = operation?.result?.payload.case === "queueItem" ? operation.result.payload.value : undefined;
@@ -9588,6 +9616,8 @@ export class MobileClient {
   }
 
   async send(draft: MobileComposerDraft, observer: MobileTaskSendObserver = {}): Promise<boolean> {
+    if (!this.#joinedTask && this.#taskOutbox && (this.#state.status === "offline"
+      || this.taskOutboxItems().length > 0)) return this.#enqueueTaskOutbox(draft, observer);
     const exactDraft = normalizeMobileComposerDraft(draft);
     const sessionId = this.#state.selectedId;
     const session = this.#state.detail?.sessions.find((item) => item.sessionId === sessionId);
@@ -9725,6 +9755,377 @@ export class MobileClient {
       }
       return accepted;
     } finally { this.#releaseMutation(action); }
+  }
+
+  canQueueTaskInput(): boolean {
+    return !this.#joinedTask && this.#taskOutbox !== undefined && this.#state.status === "offline"
+      && this.#taskAuthorityKey(true) !== undefined;
+  }
+
+  taskOutboxItems(): readonly MobileTaskOutboxRecord[] {
+    return (this.#taskOutbox?.records ?? []).filter((record) => record.owner.profileId === this.#activeProfileId
+      && record.sessionId === this.#state.selectedId && record.state !== "settled");
+  }
+
+  async retryTaskOutbox(id: string): Promise<void> {
+    const store = this.#taskOutbox;
+    const record = this.taskOutboxItems().find((item) => item.id === id);
+    if (!store || record?.state !== "failed") throw new Error("Only a failed task input can be retried.");
+    if (this.#state.busy) throw new Error("Finish the current operation before retrying this input.");
+    const operationId = record.failureKind === "rejected" ? this.newId() : record.operationId;
+    if (record.failureKind === "rejected" && operationId === record.operationId) throw new Error("A new operation identity is required to retry a rejected input.");
+    await store.update(record, { state: "queued", attempted: record.failureKind === "rejected" ? false : record.attempted,
+      error: undefined, failureKind: undefined,
+      operationId });
+    this.#publishTaskOutbox();
+    if (this.#state.status === "connected") await this.reconcile();
+  }
+
+  async checkTaskOutbox(id: string): Promise<void> {
+    const store = this.#taskOutbox, record = this.taskOutboxItems().find((item) => item.id === id);
+    if (!store || record?.state !== "failed" || !record.attempted || record.failureKind !== "not-admitted"
+      || this.#state.status !== "connected" || this.#state.busy) throw new Error("The original task operation cannot be checked right now.");
+    await store.update(record, { state: "confirming", failureKind: undefined, error: undefined });
+    this.#publishTaskOutbox(); await this.reconcile();
+  }
+
+  async cancelTaskOutbox(id: string): Promise<void> {
+    const store = this.#taskOutbox;
+    const record = this.taskOutboxItems().find((item) => item.id === id);
+    if (!store || !record || !["staging", "queued", "failed"].includes(record.state)) throw new Error("Check the original operation before removing an input with an unknown result.");
+    if (record.attempted && record.failureKind !== "rejected") throw new Error("Retry or query the original operation before removing an input that may have been accepted.");
+    if (this.#state.busy) throw new Error("Finish the current operation before removing this input.");
+    const settled = await store.update(record, { state: "settled", sourceDraft: undefined, failureKind: undefined });
+    await this.#cleanupTaskOutbox(settled);
+    this.#publishTaskOutbox();
+  }
+
+  async editTaskOutbox(id: string): Promise<void> {
+    const store = this.#taskOutbox, record = this.taskOutboxItems().find((item) => item.id === id);
+    const profile = this.#profiles.find((item) => item.profileId === this.#activeProfileId);
+    if (!store || !record || !profile || !mobileTaskOutboxOwnerMatches(record.owner, profile)
+      || !["queued", "failed"].includes(record.state) || record.attempted && record.failureKind !== "rejected" || this.#state.busy) {
+      throw new Error("Only an unsent or rejected input from this connection can return to its composer.");
+    }
+    const restoring = await store.update(record, { state: "restoring", sourceDraft: undefined, failureKind: undefined });
+    await this.#restoreTaskOutboxDraft(restoring);
+    this.#publishTaskOutbox();
+  }
+
+  async #restoreTaskOutboxDraft(record: MobileTaskOutboxRecord): Promise<void> {
+    const input = normalizeMobileComposerDraft({ ...record.input, attachments: record.input.attachments.map((attachment) => {
+      if (attachment.state !== "uploaded" || !record.storageIds.includes(attachment.attachmentId)) return attachment;
+      const { blobId: _blobId, ...local } = attachment;
+      return { ...local, state: "local" as const };
+    }) });
+    await this.#recoverNewTaskComposerDraft({ profileId: record.owner.profileId }, record.sessionId, input);
+    await this.#taskOutbox!.remove(record);
+    this.#set({ restoredComposerDraft: { profileId: record.owner.profileId, sessionId: record.sessionId,
+      sequence: (this.#state.restoredComposerDraft?.sequence ?? 0) + 1 } });
+  }
+
+  async #finishTaskOutboxHandoff(record: MobileTaskOutboxRecord): Promise<MobileTaskOutboxRecord> {
+    if (record.sourceDraft) {
+      const identity = { profileId: record.owner.profileId, sessionId: record.sessionId };
+      await this.composerDrafts!.read(identity);
+      if (await this.composerDrafts!.clearIfEqual(identity, record.sourceDraft)) {
+        await this.#removeConsumedAppCommandAttachments(record.owner.profileId, record.sourceDraft.attachments);
+      }
+    }
+    return this.#taskOutbox!.update(record, { state: "queued", sourceDraft: undefined });
+  }
+
+  #publishTaskOutbox(): void { this.#set({ taskOutbox: this.#taskOutbox?.records }); }
+
+  async #enqueueTaskOutbox(draft: MobileComposerDraft, observer: MobileTaskSendObserver): Promise<boolean> {
+    const store = this.#taskOutbox!, drafts = this.composerDrafts!;
+    const session = this.#selectedSession(), profile = this.#profiles.find((item) => item.profileId === this.#activeProfileId);
+    const authority = this.#taskAuthorityKey(this.#state.status === "offline");
+    const epoch = this.#epoch;
+    const generation = session?.nativeBinding?.runtimeGeneration;
+    const input = normalizeMobileComposerDraft(draft);
+    const backend = this.#selectedBackend(session);
+    if (!authority || !profile || !session || !generation || generation < 1n || !backend || !supportsText(backend)
+      || session.archived || [SessionState.CLOSED, SessionState.ARCHIVED].includes(session.state)
+      || !input.text.trim() && input.attachments.length === 0) throw new Error("A current task and a message or attachment are required for the outbox.");
+    const action = this.#claimMutation();
+    const storageIds: string[] = [];
+    let committed = false;
+    try {
+      const identity = { profileId: profile.profileId, sessionId: session.sessionId };
+      drafts.save(identity, input); await drafts.flush(identity);
+      const assert = () => {
+        if (!this.#current(epoch) || this.#activeProfileId !== profile.profileId || this.#state.selectedId !== session.sessionId || this.#joinedTask
+          || this.#selectedSession()?.nativeBinding?.runtimeGeneration !== generation
+          || !this.#profiles.some((current) => mobileTaskOutboxOwnerMatches(current, profile))) {
+          throw new Error("The task owner changed before its input could be retained.");
+        }
+      };
+      assert();
+      const model = resolveMobileSessionModelAuthority(this.#state.owner, session);
+      const policy = resolveMobileAttachmentPolicy(backend, model?.supportsImages === true);
+      if (input.attachments.length) {
+        if (!policy || !this.attachmentFiles) throw new Error("This task cannot retain these attachments.");
+        assertMobileAttachmentPolicy(input.attachments, policy);
+      }
+      const attachments: MobileComposerAttachment[] = [];
+      const copied = new Map<string, string>();
+      const copy = async (storageId: string, byteSize: number, sha256Hex: string): Promise<string> => {
+        const existing = copied.get(storageId); if (existing) return existing;
+        const bytes = await this.attachmentFiles!.readOwnedBytes(profile.profileId, storageId, byteSize, sha256Hex);
+        assert();
+        const nextId = distinctAttachmentStorageId(() => copiedMobileIncomingShareStorageId(storageId, this.newId()),
+          ...mobileComposerAttachmentStorageIds(input.attachments), ...storageIds);
+        await this.attachmentFiles!.stageOwnedBytes(profile.profileId, nextId, bytes.bytes, sha256Hex);
+        storageIds.push(nextId); copied.set(storageId, nextId); assert(); return nextId;
+      };
+      for (const attachment of input.attachments) {
+        const attachmentId = attachment.state === "local" ? await copy(attachment.attachmentId, attachment.byteSize, attachment.sha256Hex) : attachment.attachmentId;
+        const source = attachment.annotation?.source;
+        const annotation = source ? { ...attachment.annotation!, source: { ...source,
+          storageId: await copy(source.storageId, source.byteSize, source.sha256Hex) } } : undefined;
+        attachments.push({ ...attachment, attachmentId, ...(annotation ? { annotation } : {}) });
+      }
+      assert();
+      const operationId = observer.operationId ?? this.newId();
+      const modelJson = mobileTaskOutboxModel(session);
+      let record = await store.add({ id: operationId, operationId, owner: profile,
+        sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
+        runtimeGeneration: generation.toString(), createdAt: this.now(), deliveryMode: observer.deliveryMode ?? QueueDeliveryMode.PROMPT,
+        permissionMode: session.permissionMode, planMode: session.planMode,
+        ...(modelJson === undefined ? {} : { modelJson }),
+        input: normalizeMobileComposerDraft({ ...input, attachments }), storageIds, sourceDraft: input, state: "staging", attempted: false });
+      committed = true;
+      record = await this.#finishTaskOutboxHandoff(record);
+      this.#publishTaskOutbox();
+      return true;
+    } catch (error) {
+      if (!committed) await Promise.all(storageIds.map((id) => this.attachmentFiles!.removeOwnedBytes(profile.profileId, id).catch(() => undefined)));
+      else { this.#publishTaskOutbox(); this.#set({ error: `${message(error)} The input remains in the task outbox.` }); return true; }
+      throw error;
+    } finally {
+      this.#releaseMutation(action);
+      if (committed && this.#state.status === "connected") void this.reconcile().catch((error) => this.#set({ error: message(error) }));
+    }
+  }
+
+  async #cleanupTaskOutbox(record: MobileTaskOutboxRecord): Promise<void> {
+    for (const id of record.storageIds) await this.attachmentFiles?.removeOwnedBytes(record.owner.profileId, id);
+    await this.#taskOutbox!.remove(record);
+  }
+
+  #drainTaskOutbox(epoch: number): Promise<void> {
+    if (this.#taskOutboxFlight) return this.#taskOutboxFlight;
+    const flight = this.#runTaskOutbox(epoch).finally(() => {
+      if (this.#taskOutboxFlight === flight) this.#taskOutboxFlight = undefined;
+    });
+    this.#taskOutboxFlight = flight;
+    return flight;
+  }
+
+  async #runTaskOutbox(epoch: number): Promise<void> {
+    const store = this.#taskOutbox, credential = this.#credential;
+    if (!store || !credential || this.#joinedTask || this.#state.status !== "connected" || !this.#current(epoch)
+      || this.#state.busy || this.#mutationOwner || store.records.length === 0) return;
+    const action = this.#claimMutation(), signal = this.#abort!.signal;
+    const assert = () => {
+      if (!this.#current(epoch) || signal.aborted || this.#joinedTask || this.#credential !== credential
+        || this.#state.status !== "connected" || this.#activeProfileId !== credential.profileId
+        || this.#state.node?.serverId !== credential.serverId) throw new Error("The task outbox connection changed.");
+    };
+    const blocked = new Set<string>();
+    try {
+      for (const original of [...store.records]) {
+        if (!mobileTaskOutboxOwnerMatches(original.owner, credential) || blocked.has(original.sessionId)) continue;
+        assert();
+        let record = original;
+        const previouslyAttempted = original.attempted;
+        let preparingDispatch = false, submitInvoked = false;
+        try {
+          if (record.state === "settled") { await this.#cleanupTaskOutbox(record); continue; }
+          if (record.state === "failed") { blocked.add(record.sessionId); continue; }
+          if (record.state === "restoring") { await this.#restoreTaskOutboxDraft(record); continue; }
+          if (record.state === "staging") {
+            record = await this.#finishTaskOutboxHandoff(record);
+          }
+          let operation: Operation | undefined;
+          if (record.state === "confirming") {
+            operation = await this.network.getOperation(credential, record.operationId, signal);
+            assert();
+            if (!operation) {
+              await store.update(record, { state: "failed", failureKind: "not-admitted",
+                error: "The original operation has no durable record on this Joko node. Retry with its original identity or check again explicitly." });
+              blocked.add(record.sessionId); continue;
+            }
+          }
+          else {
+            if (this.#state.pending.some((pending) => pending.kind === "send" && pending.sessionId === record.sessionId)) {
+              blocked.add(record.sessionId); continue;
+            }
+            // An uncertain earlier request can still arrive. A retry must keep
+            // its exact mutation, including Blob identities and preconditions.
+            const input = record.attempted ? record.input : await this.#prepareTaskOutbox(record, credential, signal, assert);
+            assert();
+            const cardEdits = pendingExtensionCardFormDelivery(extensionCardFormDeliveryScope(credential, record.sessionId));
+            if (cardEdits && !await cardEdits) throw new Error("The card edits could not be saved. Retry the card edit before sending.");
+            assert();
+            record = await store.update(record, { input });
+            assert();
+            preparingDispatch = true;
+            record = await store.update(record, { state: "confirming", attempted: true });
+            this.#publishTaskOutbox();
+            assert();
+            submitInvoked = true;
+            operation = await this.network.submit(credential, record.operationId, create(OperationMutationSchema, {
+              preconditions: [create(OperationPreconditionSchema, { entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: record.sessionId }),
+                expectedGeneration: BigInt(record.runtimeGeneration) })],
+              payload: { case: "sendInput", value: create(SendInputMutationSchema, { sessionId: record.sessionId,
+                input: mobileComposerInput(record.input), deliveryMode: record.deliveryMode,
+                overrides: create(PerTurnOverridesSchema, { planMode: record.planMode,
+                  ...([PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS].includes(record.permissionMode)
+                    ? { permissionMode: record.permissionMode } : {}),
+                  ...(record.modelJson === undefined ? {} : { model: fromJsonString(ModelSelectionSchema, record.modelJson) }) }) }) }
+            }), signal);
+          }
+          assert();
+          if (!operation || operation.operationId !== record.operationId || operation.connectionId !== record.owner.connectionId) {
+            blocked.add(record.sessionId); continue;
+          }
+          if (!isTerminal(operation.state)) { blocked.add(record.sessionId); continue; }
+          if (operation.state !== OperationState.SUCCEEDED) {
+            await store.update(record, { state: "failed", failureKind: "rejected",
+              error: (operation.error?.message || "The task input was rejected. Retry or remove it explicitly.").slice(0, 4_096) });
+            blocked.add(record.sessionId); continue;
+          }
+          const queued = operation.result?.payload.case === "queueItem" ? operation.result.payload.value : undefined;
+          if (!queued || queued.sessionId !== record.sessionId || queued.backendId !== record.backendId || queued.targetId !== record.targetId) {
+            blocked.add(record.sessionId); continue;
+          }
+          record = await store.update(record, { state: "settled" });
+          await this.#cleanupTaskOutbox(record);
+        } catch (error) {
+          if (store.records.includes(record) && record.state === "queued" && this.#current(epoch)) {
+            await store.update(record, { state: "failed", failureKind: record.attempted ? "not-admitted" : "preparation",
+              error: message(error).slice(0, 4_096) });
+          } else if (store.records.includes(record) && record.state === "confirming" && preparingDispatch && !submitInvoked) {
+            await store.update(record, { state: "failed", attempted: previouslyAttempted, failureKind: previouslyAttempted ? "not-admitted" : "preparation",
+              error: previouslyAttempted ? "The connection changed before retry. Retry or check its original operation explicitly."
+                : "The connection changed before dispatch. Retry, edit, or remove this retained input explicitly." });
+          }
+          blocked.add(record.sessionId);
+          if (!this.#current(epoch)) return;
+        } finally { this.#publishTaskOutbox(); }
+      }
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async #prepareTaskOutbox(
+    record: MobileTaskOutboxRecord,
+    credential: PairedCredential,
+    signal: AbortSignal,
+    assertCurrent: () => void
+  ): Promise<MobileComposerDraft> {
+    const read = async () => {
+      assertCurrent();
+      const observed = await this.network.readOwner(credential, this.deviceNameSource(), signal);
+      assertCurrent();
+      this.#assertOwner(credential, observed, this.#state.node!);
+      const owner = observed.snapshot;
+      const detail = await this.network.readSession(credential, record.sessionId, signal);
+      assertCurrent();
+      const session = uniqueValue(detail.sessions, (item) => item.sessionId === record.sessionId);
+      const ownerSession = uniqueValue(owner.sessions, (item) => item.sessionId === record.sessionId);
+      const target = uniqueValue(owner.targets, (item) => item.targetId === record.targetId);
+      const detailTarget = uniqueValue(detail.targets, (item) => item.targetId === record.targetId);
+      const backend = uniqueValue(owner.backends, (item) => item.backendId === record.backendId);
+      const detailBackend = uniqueValue(detail.backends, (item) => item.backendId === record.backendId);
+      if (!mobileTaskOutboxOwnerMatches(record.owner, credential) || !session || !ownerSession || !target || !detailTarget
+        || !backend || !detailBackend || !supportsText(backend) || detail.server?.serverId !== credential.serverId
+        || owner.generation < 1n || detail.generation !== owner.generation || !observed.device.connectionIds.includes(credential.connectionId)
+        || session.backendId !== record.backendId || session.targetId !== record.targetId
+        || ownerSession.backendId !== record.backendId || ownerSession.targetId !== record.targetId
+        || session.nativeBinding?.runtimeGeneration?.toString() !== record.runtimeGeneration
+        || ownerSession.nativeBinding?.runtimeGeneration?.toString() !== record.runtimeGeneration
+        || session.archived || ownerSession.archived || [SessionState.CLOSED, SessionState.ARCHIVED].includes(session.state)
+        || [SessionState.CLOSED, SessionState.ARCHIVED].includes(ownerSession.state)
+        || target.state !== TargetState.ACTIVE || detailTarget.state !== TargetState.ACTIVE
+        || target.backendId !== record.backendId || detailTarget.backendId !== record.backendId
+        || entityVersionKey(target.version) !== entityVersionKey(detailTarget.version)
+        || backendAuthorityKey(backend) !== backendAuthorityKey(detailBackend)
+        || session.permissionMode !== record.permissionMode || ownerSession.permissionMode !== record.permissionMode
+        || session.planMode !== record.planMode || ownerSession.planMode !== record.planMode
+        || mobileTaskOutboxModel(session) !== record.modelJson || mobileTaskOutboxModel(ownerSession) !== record.modelJson) {
+        throw new Error("The retained input's task, generation, or execution settings changed. Review the input before retrying.");
+      }
+      const key = JSON.stringify([record.owner, record.sessionId, record.runtimeGeneration, owner.generation.toString(),
+        entityVersionKey(target.version), backendAuthorityKey(backend)]);
+      return { owner, detail, session, backend, key };
+    };
+    const initial = await read();
+    let input = record.input;
+    const controls = (value: Awaited<ReturnType<typeof read>>) => {
+      const session = createMobileSessionMentionControls(value.key, value.owner, value.session, value.backend);
+      const workspace = createMobileWorkspaceMentionControls(value.key, value.owner, value.detail, record.sessionId);
+      const paths = createMobileWorkspacePathPasteControls(value.key, value.owner, value.detail, record.sessionId);
+      const catalog = createMobileCatalogMentionControls(value.key, value.owner, value.detail, record.sessionId);
+      const model = resolveMobileSessionModelAuthority(value.owner, value.session);
+      const attachment = resolveMobileAttachmentPolicy(value.backend, model?.supportsImages === true);
+      assertMobileSessionMentionDraft(session, input);
+      assertMobileWorkspaceMentionDraft(workspace, input);
+      assertMobileWorkspacePathPasteDraft(paths, input);
+      assertMobileCatalogMentionDraft(catalog, input);
+      if (input.attachments.length > 0) {
+        if (!attachment) throw new Error("This task no longer accepts its retained attachments.");
+        assertMobileAttachmentPolicy(input.attachments, attachment);
+      }
+      return { session, workspace, paths, catalog, attachment };
+    };
+    const before = controls(initial);
+    if (input.mentions.some((mention) => mention.kind === "workspace")) {
+      await this.#revalidateNewTaskWorkspaceMentionPaths(credential, before.workspace!, input); assertCurrent();
+    }
+    const pathAtoms = mobileComposerWorkspacePathAtoms(input);
+    let resolutions: MobileWorkspacePathPasteResolution[] = [];
+    if (pathAtoms.length) {
+      for (const [parent, candidates] of groupWorkspacePathPasteCandidates(pathAtoms.map((atom) => atom.relativePath))) {
+        const directory = await this.network.listWorkspaceDirectory(credential, before.paths!.workspaceId, parent, signal);
+        assertCurrent();
+        resolutions.push(...projectMobileWorkspacePathPasteDirectory(before.paths!, parent, directory.entries, directory.revision, candidates));
+      }
+      assertMobileWorkspacePathPasteResolutions(before.paths!, input, resolutions);
+    }
+    let catalog: MobileCatalogMentionCatalog | undefined;
+    if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+      const catalogControls = before.catalog!;
+      const [resources, artifacts] = await Promise.all([
+        catalogControls.policy.resources ? this.network.listSessionResources(credential, record.sessionId, signal) : undefined,
+        catalogControls.policy.artifacts ? this.network.listArtifactReferenceCatalog(credential, record.sessionId, BigInt(record.runtimeGeneration), signal) : undefined
+      ]);
+      assertCurrent();
+      catalog = { ...(resources === undefined ? {} : { resources: projectMobileResourceMentionCatalog(catalogControls, resources) }),
+        ...(artifacts === undefined ? {} : { artifacts: projectMobileArtifactMentionCatalog(catalogControls, artifacts.artifacts, artifacts.revision) }) };
+      assertMobileCatalogMentionDraftCatalog(catalogControls, catalog, input);
+    }
+    for (const candidate of [...input.attachments]) {
+      if (candidate.state === "uploaded") continue;
+      if (!this.attachmentFiles) throw new Error("The retained attachment bytes are unavailable.");
+      const source = await this.attachmentFiles.verifyForUpload(record.owner.profileId, candidate, signal);
+      assertCurrent();
+      const blob = await this.network.uploadBlob(credential, source, signal);
+      assertCurrent();
+      input = normalizeMobileComposerDraft({ ...input,
+        attachments: replaceMobileComposerAttachment(input.attachments, candidate.attachmentId, this.#uploadedAttachment(candidate, blob)) });
+    }
+    const final = await read(), after = controls(final);
+    if (final.key !== initial.key
+      || input.mentions.some((mention) => mention.kind === "workspace") && before.workspace?.surfaceOwnerKey !== after.workspace?.surfaceOwnerKey
+      || pathAtoms.length > 0 && before.paths?.surfaceOwnerKey !== after.paths?.surfaceOwnerKey
+      || catalog && before.catalog?.surfaceOwnerKey !== after.catalog?.surfaceOwnerKey) {
+      throw new Error("The retained input's resource authority changed while it was being prepared.");
+    }
+    if (pathAtoms.length) assertMobileWorkspacePathPasteResolutions(after.paths!, input, resolutions);
+    if (catalog) assertMobileCatalogMentionDraftCatalog(after.catalog, catalog, input);
+    return input;
   }
 
   async #uploadTaskAttachments(
@@ -10337,9 +10738,10 @@ export class MobileClient {
     );
   }
 
-  taskAttachmentControls(): MobileAttachmentControls | undefined {
-    const authorityKey = this.#taskAuthorityKey();
-    const credential = this.#credential;
+  taskAttachmentControls(allowOfflineLocalStaging = false): MobileAttachmentControls | undefined {
+    const authorityKey = this.#taskAuthorityKey(allowOfflineLocalStaging);
+    const credential = this.#credential ?? (allowOfflineLocalStaging
+      ? this.#profiles.find((profile) => profile.profileId === this.#activeProfileId) : undefined);
     const session = this.#selectedSession();
     const model = resolveMobileSessionModelAuthority(this.#joinedTask ? this.#state.detail : this.#state.owner, session);
     const policy = resolveMobileAttachmentPolicy(this.#selectedBackend(session), model?.supportsImages === true);
@@ -15033,6 +15435,7 @@ export class MobileClient {
         if (wasAutomatic) this.#automaticProfileId = undefined;
         await this.storage.saveSelection(profile.profileId).catch(() => undefined);
         await this.newTaskDrafts?.clear({ profileId: profile.profileId }).catch(() => undefined);
+        await this.#taskOutbox?.clearProfile(profile.profileId).catch(() => undefined);
         await this.attachmentFiles?.clearProfile(profile.profileId).catch(() => undefined);
         const offlineCacheFailure = await this.#clearOfflineCache(profile.profileId);
         if (offlineCacheFailure) localCleanupFailures.push(`${profile.displayName}: ${offlineCacheFailure}`);
@@ -15323,6 +15726,7 @@ export class MobileClient {
       }
     }
     await this.#resumeNewTaskSubmission(epoch);
+    await this.#drainTaskOutbox(epoch);
   }
 
   async #resumeNewTaskSubmission(epoch: number): Promise<void> {

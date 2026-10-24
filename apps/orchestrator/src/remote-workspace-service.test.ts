@@ -49,8 +49,11 @@ describe("RemoteWorkspaceService", () => {
             })}\n`
           });
         }
-        if (request.executable === "git" && request.args[0] === "status" && request.args.includes("--porcelain=v1")) {
+        if (request.executable === "git" && request.args.includes("status") && request.args.includes("--porcelain=v1")) {
           return new CompletedRemoteProcess({ stdout: "## main\0 M README.md\0" });
+        }
+        if (request.executable === "git" && request.args.includes("--show-toplevel")) {
+          return new CompletedRemoteProcess({ stdout: "/workspace\n" });
         }
         if (request.executable === "git" && request.args[0] === "rev-parse") {
           return new CompletedRemoteProcess({ stdout: `${"a".repeat(40)}\n` });
@@ -352,6 +355,7 @@ class MemoryRemoteFiles implements RemoteFileTransportPort {
 
   async write(request: RemoteFileWriteRequest): Promise<void> {
     const accepted = normalize(request.path);
+    if (request.createOnly && this.#entries.has(accepted)) throw new Error("Destination exists.");
     if (request.createParents === true) await this.mkdir(parentPath(accepted), { recursive: true });
     if (this.require(parentPath(accepted)).kind !== "directory") throw new Error("Parent is not a directory.");
     this.#entries.set(accepted, {

@@ -30,7 +30,7 @@
 .portable-session-conflict, .portable-session-done { display: grid; gap: 8px; color: var(--text); }
 .portable-session-conflict strong, .portable-session-done strong { font-size: var(--text-12); }
 .portable-session-conflict p, .portable-session-done p { color: var(--text-soft); font-size: var(--text-11); line-height: 1.5; }
-.portable-session-done--warning { padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--amber) 38%, transparent); border-radius: var(--radius-10); background: color-mix(in srgb, var(--amber) 9%, transparent); }
+.portable-session-done--warning { padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--amber) 38%, transparent); border-radius: var(--radius); background: color-mix(in srgb, var(--amber) 9%, transparent); }
 .portable-session-dialog .modal__actions { margin-top: 8px; }
 .portable-session-dialog .modal__actions > .button { min-width: 0; min-height: 32px; padding: 6px 12px; }
 .portable-session-dialog .modal__actions svg { width: 14px; height: 14px; }

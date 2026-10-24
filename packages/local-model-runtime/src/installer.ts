@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createWriteStream, existsSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, statfs, writeFile } from "node:fs/promises";
 import https from "node:https";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
@@ -10,7 +10,6 @@ import { assertArchiveEntrySafe, assertPathWithin } from "./security.js";
 import type { RuntimeInstallProgress, RuntimePreflight } from "./types.js";
 
 export const OFFICIAL_RELEASE_API = "https://api.github.com/repos/ollama/ollama/releases/latest";
-export const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 export const DOWNLOAD_TIMEOUT_MS = 60_000;
 export const EXTRACT_TIMEOUT_MS = 60_000;
 export const MIN_RUNTIME_INSTALL_FREE_BYTES = 1536 * 1024 * 1024;
@@ -61,18 +60,23 @@ export function runtimeInstallPreflight(input: {
   readonly platform: NodeJS.Platform;
   readonly arch: NodeJS.Architecture;
   readonly freeDiskBytes?: number;
+  readonly archiveSizeBytes?: number;
 }): RuntimePreflight {
   const supported = supportsManagedRuntimeInstall(input.platform, input.arch);
+  if (input.archiveSizeBytes !== undefined && !validAssetSize(input.archiveSizeBytes)) {
+    throw new LocalRuntimeError("DOWNLOAD_REJECTED", "The official runtime asset size is invalid.");
+  }
+  const requiredDiskBytes = MIN_RUNTIME_INSTALL_FREE_BYTES + (input.archiveSizeBytes ?? 0);
   const disk = input.freeDiskBytes === undefined
     ? "unknown" as const
-    : input.freeDiskBytes >= MIN_RUNTIME_INSTALL_FREE_BYTES
+    : input.freeDiskBytes >= requiredDiskBytes
       ? "sufficient" as const
       : "insufficient" as const;
   return {
     allowed: supported && disk !== "insufficient",
     memory: "unknown",
     disk,
-    requiredDiskBytes: MIN_RUNTIME_INSTALL_FREE_BYTES,
+    requiredDiskBytes,
     ...(!supported
       ? { publicErrorCode: "UNSUPPORTED_PLATFORM" as const }
       : disk === "insufficient"
@@ -112,9 +116,14 @@ export function selectOfficialAsset(
   const digest = typeof item["digest"] === "string" ? DIGEST_RE.exec(item["digest"].trim()) : null;
   const sizeBytes = item["size"];
   const url = item["browser_download_url"];
-  if (digest?.[1] === undefined || typeof sizeBytes !== "number" || !Number.isSafeInteger(sizeBytes) || sizeBytes <= 0 || sizeBytes > MAX_ARCHIVE_BYTES) return undefined;
+  if (digest?.[1] === undefined || !validAssetSize(sizeBytes)) return undefined;
   if (typeof url !== "string" || !isAllowedDownloadUrl(url, assetName)) return undefined;
   return { version: match[1], assetName, url, sha256: digest[1].toLowerCase(), sizeBytes };
+}
+
+function validAssetSize(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    && value <= Number.MAX_SAFE_INTEGER - MIN_RUNTIME_INSTALL_FREE_BYTES;
 }
 
 async function boundedReleaseJson(response: Response): Promise<unknown> {
@@ -172,7 +181,8 @@ export async function downloadOfficialAsset(input: {
   readonly onProgress?: (completedBytes: number, totalBytes: number) => void;
   readonly get?: typeof https.get;
 }): Promise<void> {
-  if (!isAllowedDownloadUrl(input.asset.url, input.asset.assetName) || input.asset.sizeBytes > MAX_ARCHIVE_BYTES) {
+  if (!isAllowedDownloadUrl(input.asset.url, input.asset.assetName) || !validAssetSize(input.asset.sizeBytes)
+    || !/^[a-f0-9]{64}$/iu.test(input.asset.sha256)) {
     throw new LocalRuntimeError("DOWNLOAD_REJECTED", "The runtime asset is not allowlisted.");
   }
   await mkdir(dirname(input.destination), { recursive: true });
@@ -180,8 +190,13 @@ export async function downloadOfficialAsset(input: {
   const digest = createHash("sha256");
   let completed = 0;
   const get = input.get ?? https.get;
-  const timeout = setTimeout(() => abort(new LocalRuntimeError("DOWNLOAD_TIMEOUT", "The runtime download timed out.")), DOWNLOAD_TIMEOUT_MS);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
   let abort: (error: LocalRuntimeError) => void = () => undefined;
+  const resetTimeout = (): void => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => abort(new LocalRuntimeError("DOWNLOAD_TIMEOUT", "The runtime download stalled.")), DOWNLOAD_TIMEOUT_MS);
+  };
+  const onAbort = (): void => abort(new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled."));
   try {
     await new Promise<void>((resolvePromise, reject) => {
       let settled = false;
@@ -200,7 +215,9 @@ export async function downloadOfficialAsset(input: {
           finish(new LocalRuntimeError("DOWNLOAD_REJECTED", "The runtime download redirected to a blocked location."));
           return;
         }
+        resetTimeout();
         activeRequest = get(url, { headers: { "user-agent": "Joko-Orchestrator" } }, (response) => {
+          resetTimeout();
           const status = response.statusCode ?? 0;
           if (status >= 300 && status < 400 && response.headers.location !== undefined) {
             response.resume();
@@ -208,16 +225,17 @@ export async function downloadOfficialAsset(input: {
             return;
           }
           const declared = Number(response.headers["content-length"] ?? input.asset.sizeBytes);
-          if (status !== 200 || !Number.isFinite(declared) || declared <= 0 || declared > MAX_ARCHIVE_BYTES) {
+          if (status !== 200 || !Number.isSafeInteger(declared) || declared !== input.asset.sizeBytes) {
             response.resume();
-            finish(new LocalRuntimeError(declared > MAX_ARCHIVE_BYTES ? "DOWNLOAD_TOO_LARGE" : "DOWNLOAD_REJECTED", "The runtime download was rejected."));
+            finish(new LocalRuntimeError(declared > input.asset.sizeBytes ? "DOWNLOAD_TOO_LARGE" : "DOWNLOAD_REJECTED", "The runtime download size differs from its verified release."));
             return;
           }
           const output = createWriteStream(temporary, { flags: "wx", mode: 0o600 });
           const fail = () => finish(new LocalRuntimeError("DOWNLOAD_REJECTED", "The runtime download failed."));
           response.on("data", (chunk: Buffer) => {
+            resetTimeout();
             completed += chunk.byteLength;
-            if (completed > MAX_ARCHIVE_BYTES || completed > input.asset.sizeBytes) {
+            if (completed > input.asset.sizeBytes) {
               response.destroy();
               output.destroy();
               finish(new LocalRuntimeError("DOWNLOAD_TOO_LARGE", "The runtime download exceeded its verified size."));
@@ -237,7 +255,7 @@ export async function downloadOfficialAsset(input: {
         finish(new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled."));
         return;
       }
-      input.signal?.addEventListener("abort", () => abort(new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.")), { once: true });
+      input.signal?.addEventListener("abort", onAbort, { once: true });
       follow(input.asset.url, 0);
     });
     if (completed !== input.asset.sizeBytes || digest.digest("hex") !== input.asset.sha256) {
@@ -246,6 +264,7 @@ export async function downloadOfficialAsset(input: {
     await rename(temporary, input.destination);
   } finally {
     clearTimeout(timeout);
+    input.signal?.removeEventListener("abort", onAbort);
     await rm(temporary, { force: true }).catch(() => undefined);
   }
 }
@@ -359,6 +378,7 @@ export async function installManagedRuntime(input: {
   readonly resolveAsset?: typeof resolveOfficialAsset;
   readonly downloadAsset?: typeof downloadOfficialAsset;
   readonly extractArchive?: typeof extractOfficialArchive;
+  readonly readFreeDiskBytes?: (directory: string) => Promise<number>;
 }): Promise<{ readonly version: string; readonly binary: string; readonly archiveSha256: string }> {
   const emit = (progress: RuntimeInstallProgress) => input.onProgress?.(progress);
   emit({ phase: "resolving", done: false });
@@ -370,6 +390,15 @@ export async function installManagedRuntime(input: {
   const versionDirectory = join(root, `v${asset.version}`);
   try {
     await mkdir(downloads, { recursive: true, mode: 0o700 });
+    const freeDiskBytes = input.readFreeDiskBytes === undefined
+      ? await statfs(downloads).then((value) => Number(value.bavail) * Number(value.bsize))
+      : await input.readFreeDiskBytes(downloads);
+    const preflight = runtimeInstallPreflight({ platform: input.platform, arch: input.arch,
+      archiveSizeBytes: asset.sizeBytes, freeDiskBytes });
+    if (!preflight.allowed || !Number.isFinite(freeDiskBytes)) {
+      throw new LocalRuntimeError(preflight.publicErrorCode ?? "DISK_SPACE_LOW", "There is not enough free disk space for the runtime archive and installation.");
+    }
+    if (input.signal?.aborted) throw new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.");
     emit({ phase: "downloading", version: asset.version, completedBytes: 0, totalBytes: asset.sizeBytes, percent: 0, done: false });
     await (input.downloadAsset ?? downloadOfficialAsset)({
       asset,
@@ -387,6 +416,7 @@ export async function installManagedRuntime(input: {
     emit({ phase: "verifying", version: asset.version, percent: 100, done: false });
     emit({ phase: "extracting", version: asset.version, done: false });
     const stagedBinary = await (input.extractArchive ?? extractOfficialArchive)({ archivePath: archive, destination: stage, platform: input.platform, signal: input.signal });
+    if (input.signal?.aborted) throw new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.");
     const binaryRelativeToStage = relative(stage, stagedBinary);
     assertArchiveEntrySafe(binaryRelativeToStage);
     emit({ phase: "promoting", version: asset.version, done: false });

@@ -34,7 +34,7 @@ import {
   type ManagedOutboundProxyVerdict
 } from "@joko/contracts/managed-outbound-proxy";
 
-import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "@joko/device-peer/private-files";
 
 export const MANAGED_ORCHESTRATOR_PUBLIC_PORT = 4318;
 export const MANAGED_ORCHESTRATOR_INTERNAL_PORT = 4317;

@@ -38,6 +38,29 @@ import {
 } from "./mobile-automation-authoring";
 
 describe("mobile Automation authoring", () => {
+  it("preserves a script's bound task and rejects unavailable bindings and persistent scripts", () => {
+    const owner = authoringOwner(), draft = { ...createMobileAutomationDraft(owner), name: "Bound script", executionMode: "script" as const,
+      sessionMode: "bound" as const, sessionId: "session", scriptCommand: "node task.mjs", model: undefined, planMode: false };
+    expect(buildMobileAutomationScheduleInput(owner, draft, undefined, undefined).schedule)
+      .toMatchObject({ sessionMode: ScheduleSessionMode.BOUND, sessionId: "session" });
+    expect(() => buildMobileAutomationScheduleInput(owner, { ...draft, sessionId: "" }, undefined, undefined)).toThrow(/active task/);
+    expect(() => buildMobileAutomationScheduleInput(owner, { ...draft, sessionMode: "persistent" }, undefined, undefined)).toThrow(/fresh or bound/);
+    owner.sessions[0]!.archived = true;
+    expect(() => buildMobileAutomationScheduleInput(owner, draft, undefined, undefined)).toThrow(/active task/);
+  });
+  it("edits a saved bound script without adding the node's default model", () => {
+    const owner = authoringOwner();
+    const existing: MobileAutomationSchedule = { scheduleId: "script", displayName: "Saved script", state: "enabled", source: "dialogue",
+      backendId: "backend", targetId: "target", sessionMode: "bound", sessionId: "session", recurrence: "manual", recurrenceLabel: "Manual", recurrenceExpression: "",
+      timeZone: "UTC", inputText: "", executionMode: "script", script: { command: "node task.mjs", dispatchSessions: true }, permissionMode: "ask", planMode: false,
+      useWorktree: false, refreshWorktreeRemote: false, extraDirectoryIds: [], silentWhenIdle: false, notifyDesktop: true, overlapPolicy: "queue", misfirePolicy: "runOnce",
+      unreadRunCount: 0, recentRuns: [], revision: { value: 2n, etag: "script-r2" }, generation: 1n };
+    const draft = createMobileAutomationDraft(owner, existing);
+    expect(draft.model).toBeUndefined(); expect(draft.sessionId).toBe("session");
+    const saved = buildMobileAutomationScheduleInput(owner, { ...draft, name: "Renamed script" }, existing, undefined).schedule;
+    expect(saved).toMatchObject({ displayName: "Renamed script", sessionMode: ScheduleSessionMode.BOUND, sessionId: "session" });
+    expect(saved.execution?.model).toBeUndefined();
+  });
   it("builds all current v1 agent fields from current target authority", () => {
     const owner = authoringOwner();
     const draft = {

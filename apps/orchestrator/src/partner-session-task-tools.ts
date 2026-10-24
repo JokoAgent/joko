@@ -30,7 +30,7 @@ export class PartnerSessionTaskTools implements BridgeToolProvider {
       idempotency_key: { type: "string", minLength: 1, maxLength: 128 }
     }, ["task_id"], true),
     tool("stop_session_task", "cancel terminates this execution and its pending input. request-stop requests an interrupt of the current turn only. pause holds input on the same task until a deliberate resume. pausing/cancelling is not proof the runtime stopped.", { task_id: id, mode: { type: "string", enum: ["cancel", "request-stop", "pause"] } }, ["task_id"], true),
-    tool("inspect_session_task_route", "Read the current and next frozen configured route for an ended task. An explicit task model has no backup chain. This does not retry work.", { task_id: id }, ["task_id"]),
+    tool("inspect_session_task_route", "Read the current route and a safe next frozen configured route for a failed task. Suggestions require a failure another route can address and enough context headroom. An explicit or owner-selected route outside the chain has no backup. This does not retry work.", { task_id: id }, ["task_id"]),
     tool("advance_session_task_route", "Select the exact next route from the inspected generation/token for your own ended task. This does not change the Partner profile, authorize an interaction or replay work. Send a separate follow-up if needed.", { task_id: id, expected_generation: { type: "integer", minimum: 0 }, selection_token: { type: "string", pattern: "^[a-f0-9]{64}$" } }, ["task_id", "expected_generation", "selection_token"], true)
   ];
   constructor(readonly manager: PartnerSessionTaskManager) {}

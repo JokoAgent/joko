@@ -708,6 +708,47 @@ describe("MessagingManager", () => {
     ]));
   });
 
+  it("recovers an acknowledged first album page after a supplemental failure and manager restart", async () => {
+    const remote = { remaining: [albumUpdate(9, 81), albumUpdate(10, 82)], failSupplemental: true, initial: true, silent: false };
+    const transports: AcknowledgingAlbumTransport[] = [];
+    const fixture = await createFixture(() => {
+      const transport = new AcknowledgingAlbumTransport(remote); transports.push(transport); return transport;
+    });
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createTelegramConnection({
+      ownerProviderUserId: "42", configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" }
+    });
+    const enabled = await replaceCredential(fixture, created, "durable-album", true);
+    await vi.waitFor(() => {
+      expect(remote.remaining.map(update => update.update_id)).toEqual([10]);
+      expect(fixture.store.findMessagingPollBatch(enabled.id, enabled.generation)?.updates).toEqual([albumUpdate(9, 81)]);
+    });
+    await fixture.manager.close();
+    remote.failSupplemental = false;
+    await fixture.restartManager();
+    await vi.waitFor(() => {
+      expect(fixture.store.getMessagingConnection(enabled.id).cursor).toBe("11");
+      expect(fixture.store.listMessagingInboundRequests()).toHaveLength(1);
+    });
+    expect(transports.flatMap(transport => transport.normalizedUpdateIds)).toContainEqual([9, 10]);
+    expect(fixture.store.findMessagingPollBatch(enabled.id, enabled.generation)).toBeUndefined();
+    expect(new Set(fixture.store.listMessagingInboundRequests()[0]!.providerRequestIds)).toEqual(new Set([
+      "telegram-update:9", "telegram-update:10"
+    ]));
+  });
+
+  it("admits the bounded retained Telegram pages instead of looping on a batch larger than durable storage", async () => {
+    const transport = new BoundedAlbumPagesTransport();
+    const fixture = await createFixture(() => transport);
+    const created = fixture.manager.createTelegramConnection({
+      ownerProviderUserId: "42", configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" }
+    });
+    const enabled = await replaceCredential(fixture, created, "bounded-album", true);
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(enabled.id).cursor).toBe("1101"));
+    expect(transport.normalizedSizes).toEqual([1_100]);
+    expect(fixture.store.findMessagingPollBatch(enabled.id, enabled.generation)).toBeUndefined();
+  });
+
   it("delivers verified assistant images as one album and other artifacts as individual files", async () => {
     const transport = new FakeTelegramTransport(directMessageBatch());
     const adapter = new AttachmentFakeAdapter();
@@ -2806,6 +2847,37 @@ class CrossPollAlbumTransport extends FakeTelegramTransport {
   }
 }
 
+class AcknowledgingAlbumTransport extends CrossPollAlbumTransport {
+  constructor(readonly remote: { remaining: TelegramUpdate[]; failSupplemental: boolean; initial: boolean; silent: boolean }) { super(); }
+  override async poll(input: { readonly cursor: string | null; readonly timeoutSeconds?: number; readonly signal?: AbortSignal }): Promise<TelegramPollResult> {
+    if (input.cursor !== null) this.remote.remaining = this.remote.remaining.filter(update => update.update_id >= Number(input.cursor));
+    if (input.cursor === "10" && this.remote.failSupplemental) throw new Error("Connection lost after the provider acknowledged the first page.");
+    const updates = this.remote.initial ? this.remote.remaining.slice(0, 1) : this.remote.remaining;
+    this.remote.initial = false;
+    if (updates.length) return { updates, nextCursor: String(updates.at(-1)!.update_id + 1) };
+    if (!this.remote.silent) { this.remote.silent = true; return { updates: [], nextCursor: input.cursor ?? "1" }; }
+    return waitForAbort(input.signal);
+  }
+}
+
+class BoundedAlbumPagesTransport extends FakeTelegramTransport {
+  pages = 0;
+  readonly normalizedSizes: number[] = [];
+  constructor() { super({ ...directMessageBatch(), events: [] }); }
+  override async poll(input: { readonly cursor: string | null; readonly timeoutSeconds?: number; readonly signal?: AbortSignal }): Promise<TelegramPollResult> {
+    if (this.pages >= 11) return waitForAbort(input.signal);
+    this.pages += 1;
+    const start = Number(input.cursor ?? "1");
+    return { updates: Array.from({ length: 100 }, (_, index) => {
+      const update = albumUpdate(start + index, start + index);
+      return { ...update, message: { ...update.message!, media_group_id: `album-${start + index}` } };
+    }), nextCursor: String(start + 100) };
+  }
+  override normalize(updates: readonly TelegramUpdate[]): TelegramNormalizationResult {
+    this.normalizedSizes.push(updates.length); return super.normalize(updates);
+  }
+}
+
 class AttachmentFakeAdapter extends FakeBackendAdapter {
   blocks: readonly MessageBlock[] = [{ kind: "text", text: "Files are ready." }];
 
@@ -3080,7 +3152,13 @@ async function createFixture(
     store.close();
     rmSync(root, { recursive: true, force: true });
   });
-  return { root, store, artifacts, credentials, adapter, host, manager };
+  return { root, store, artifacts, credentials, adapter, host, get manager() { return manager!; },
+    async restartManager() {
+      await manager?.close();
+      manager = new MessagingManager(options);
+      await manager.initialize();
+    }
+  };
 }
 
 async function replaceCredential(

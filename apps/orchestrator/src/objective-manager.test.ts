@@ -363,13 +363,14 @@ describe("ObjectiveManager", () => {
     }
   });
 
-  it("prefers per-message token usage, ignores unsafe refinement, and persists lifecycle evidence", async () => {
+  it("uses the exact Run ledger, ignores unsafe refinement, and persists lifecycle evidence", async () => {
     const fixture = createFixture();
     const initial = await fixture.manager.set(setInput("lifecycle-start", fixture));
     const pending = fixture.host.admissions[0]!;
     makeRunning(fixture.store, pending);
     const unsafeRefinement = `bad\u0000${"x".repeat(32_001)}`;
     appendAssistant(fixture.store, pending.runId, verdict("complete", "z".repeat(3_000), unsafeRefinement), usage(11));
+    recordTokens(fixture.store, { sourceId: "native-accounting:session", totalTokens: 11, measuredAt: 1, runId: pending.runId });
     fixture.store.appendEvent({
       backendId: "backend-one",
       targetId: "target-one",
@@ -392,6 +393,48 @@ describe("ObjectiveManager", () => {
       expect.objectContaining({ action: "started", objectiveText: initial.text, ownerGeneration: initial.ownerGeneration }),
       expect.objectContaining({ action: "completed", turnsUsed: 1, tokensUsed: 11 })
     ]));
+  });
+
+  it("counts every request and separately billed child once, excluding earlier Session totals and repeated snapshots", async () => {
+    const fixture = createFixture();
+    recordTokens(fixture.store, { sourceId: "native-accounting:session", totalTokens: 100, measuredAt: 1 });
+    await fixture.manager.set({ ...setInput("multi-request-budget", fixture), tokenBudget: 20 });
+    const pending = fixture.host.admissions[0]!;
+    makeRunning(fixture.store, pending);
+    appendAssistant(fixture.store, pending.runId, "Inspecting the task", usage(7));
+    recordTokens(fixture.store, { sourceId: "native-accounting:session", totalTokens: 107, measuredAt: 2, runId: pending.runId });
+    appendAssistant(fixture.store, pending.runId, verdict("continue", "More work remains"), usage(11));
+    recordTokens(fixture.store, { sourceId: "native-accounting:session", totalTokens: 118, measuredAt: 3, runId: pending.runId });
+    recordTokens(fixture.store, { sourceId: "native-accounting:session", totalTokens: 118, measuredAt: 4, runId: pending.runId });
+    recordTokens(fixture.store, { sourceId: "delegated-run:child", totalTokens: 5, measuredAt: 5, runId: pending.runId });
+    recordTokens(fixture.store, { sourceId: "delegated-run:child", totalTokens: 5, measuredAt: 6, runId: pending.runId });
+    fixture.store.appendEvent({ backendId: "backend-one", targetId: "target-one", sessionId: fixture.sessionId,
+      runId: pending.runId, generation: 1, traceId: "objective-session-snapshot",
+      payload: { type: "usage", usage: usage(118) } });
+    finishRunning(fixture.store, pending, "completed");
+
+    await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "completed" });
+    await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "completed" });
+
+    expect(fixture.store.getRun(pending.runId).descriptor.usage).toMatchObject({ totalTokens: 23 });
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "budget_limited", tokensUsed: 23, turnsUsed: 1 });
+    expect(fixture.host.admissions).toHaveLength(1);
+  });
+
+  it("does not manufacture Run accounting from message or Session snapshots when no ledger evidence exists", async () => {
+    const fixture = createFixture();
+    await fixture.manager.set({ ...setInput("unknown-run-usage", fixture), maximumTurns: 1 });
+    const pending = fixture.host.admissions[0]!;
+    makeRunning(fixture.store, pending);
+    appendAssistant(fixture.store, pending.runId, verdict("continue", "More work remains"), usage(11));
+    fixture.store.appendEvent({ backendId: "backend-one", targetId: "target-one", sessionId: fixture.sessionId,
+      runId: pending.runId, generation: 1, traceId: "objective-unowned-session-usage",
+      payload: { type: "usage", usage: usage(999) } });
+    finishRunning(fixture.store, pending, "completed");
+
+    await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "completed" });
+
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "budget_limited", tokensUsed: 0, turnsUsed: 1 });
   });
 });
 
@@ -557,6 +600,19 @@ function appendAssistant(store: OperationalStore, runId: string, text: string, m
 
 function usage(totalTokens: number): UsageSnapshot {
   return { inputTokens: totalTokens, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens, cost: 0 };
+}
+
+function recordTokens(store: OperationalStore, input: {
+  readonly sourceId: string;
+  readonly totalTokens: number;
+  readonly measuredAt: number;
+  readonly runId?: string;
+}): void {
+  store.recordUsageObservation({ ownerId: "objective-owner", sessionId: "session-one", sourceId: input.sourceId,
+    generation: 1, backendId: "backend-one", providerId: "provider-one", modelId: "model-one",
+    measuredAt: input.measuredAt, inputTokens: input.totalTokens, outputTokens: 0, cacheReadTokens: 0,
+    cacheWriteTokens: 0, totalTokens: input.totalTokens, reportedCostMicros: 0, currencyCode: "USD",
+    ...(input.runId === undefined ? {} : { runUsage: { runId: input.runId, currencyCode: "USD" } }) });
 }
 
 function verdict(status: "complete" | "continue" | "blocked", reason: string, refinedObjective?: string): string {

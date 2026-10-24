@@ -53,7 +53,7 @@ export class ProviderSharingStore {
     const found = this.store.findSetting("service", SCOPE, `request:${identity(id)}`); if (!found) throw new ProviderSharingStoreError("NOT_FOUND"); return parseRequest(found.value);
   }
   link(digest: string): ProviderSharingLinkRecord {
-    const found = this.store.findSetting<ProviderSharingLinkRecord>("service", SCOPE, `link:${hash(digest)}`);
+    const found = this.store.findSetting<ProviderSharingLinkRecord>("service", SCOPE, `link:${validatedDigest(digest)}`);
     if (!found || found.value.format !== 1 || found.value.digest !== digest || !["unused", "pending", "consumed", "rejected", "withdrawn", "expired"].includes(found.value.state)) throw new ProviderSharingStoreError("NOT_FOUND");
     return found.value;
   }
@@ -64,7 +64,7 @@ export class ProviderSharingStore {
       if (!share) share = { format: 1, id: identity(input.shareId), generation: 1, backendId: identity(input.backendId), providerId: identity(input.providerId),
         providerName: text(input.providerName), owner: person(input.owner), createdAt: this.now(), revision: 0, members: [] };
       share = this.save({ ...share, providerName: text(input.providerName), owner: person(input.owner) });
-      const link: ProviderSharingLinkRecord = { format: 1, digest: hash(input.linkDigest), shareId: share.id,
+      const link: ProviderSharingLinkRecord = { format: 1, digest: validatedDigest(input.linkDigest), shareId: share.id,
         createdAt: this.now(), expiresAt: this.now() + PROVIDER_SHARING_LINK_TTL, state: "unused" };
       if (this.store.findSetting("service", SCOPE, `link:${link.digest}`)) throw new ProviderSharingStoreError("INVALID");
       this.put(`link:${link.digest}`, link); return { share, link };
@@ -85,7 +85,7 @@ export class ProviderSharingStore {
       if (share.members.some(row => row.homeServerId === input.homeServerId && ["active", "paused"].includes(row.status))) throw new ProviderSharingStoreError("ALREADY_MEMBER");
       if (!/^\d{4}$/u.test(input.pairingCode)) throw new ProviderSharingStoreError("INVALID");
       const request: ProviderSharingRequestRecord = { ...input, id: identity(input.id), homeServerId: identity(input.homeServerId), deviceId: identity(input.deviceId),
-        person: person(input.person), requestDigest: hash(input.requestDigest), credentialDigest: hash(input.credentialDigest), format: 1,
+        person: person(input.person), requestDigest: validatedDigest(input.requestDigest), credentialDigest: validatedDigest(input.credentialDigest), format: 1,
         shareId: share.id, createdAt: this.now(), expiresAt: this.now() + PROVIDER_SHARING_REQUEST_TTL, status: "pending" };
       this.put(`request:${request.id}`, request); this.put(`link:${link.digest}`, { ...link, state: "pending", requestId: request.id }); return request;
     });
@@ -110,12 +110,12 @@ export class ProviderSharingStore {
   }
   withdraw(requestId: string, requestDigest: string): ProviderSharingRequestRecord {
     return this.store.transaction(() => { this.expire(); const request = this.request(requestId);
-      if (request.requestDigest !== hash(requestDigest)) throw new ProviderSharingStoreError("DENIED");
+      if (request.requestDigest !== validatedDigest(requestDigest)) throw new ProviderSharingStoreError("DENIED");
       if (request.status === "withdrawn") return request;
       if (request.status !== "pending") throw new ProviderSharingStoreError("STALE"); return this.setRequest(request, "withdrawn"); });
   }
   lookupCredential(digest: string, allowPaused = false): { share: ProviderSharingShareRecord; member: ProviderSharingMemberRecord } {
-    const ref = this.store.findSetting<{ format: 1; shareId: string; memberId: string }>("service", SCOPE, `member-index:${hash(digest)}`)?.value;
+    const ref = this.store.findSetting<{ format: 1; shareId: string; memberId: string }>("service", SCOPE, `member-index:${validatedDigest(digest)}`)?.value;
     if (!ref || ref.format !== 1) throw new ProviderSharingStoreError("DENIED");
     const share = this.get(ref.shareId), member = share.members.find(row => row.id === ref.memberId);
     if (!member || member.credentialDigest !== digest || member.status !== "active" && !(allowPaused && member.status === "paused")) throw new ProviderSharingStoreError("DENIED");
@@ -196,7 +196,7 @@ export class ProviderSharingStore {
 }
 function identity(value: string): string { if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/u.test(value)) throw new ProviderSharingStoreError("INVALID"); return value; }
 function opaque(value: string): string { if (!/^[A-Za-z0-9_-]{16,64}$/u.test(value)) throw new ProviderSharingStoreError("INVALID"); return value; }
-function hash(value: string): string { if (!/^[a-f0-9]{64}$/u.test(value)) throw new ProviderSharingStoreError("INVALID"); return value; }
+function validatedDigest(value: string): string { if (!/^[a-f0-9]{64}$/u.test(value)) throw new ProviderSharingStoreError("INVALID"); return value; }
 function text(value: string): string { if (!value || value !== value.trim() || value.length > 200 || /[\0-\x1f\x7f]/u.test(value)) throw new ProviderSharingStoreError("INVALID"); return value; }
 function person(value: ProviderSharingPerson): ProviderSharingPerson {
   let avatarUrl: string | null = null;
@@ -207,7 +207,7 @@ function parseShare(value: unknown): ProviderSharingShareRecord {
   const row = value as ProviderSharingShareRecord;
   if (!row || row.format !== 1 || !Array.isArray(row.members) || !Number.isSafeInteger(row.generation) || row.generation < 1 || !Number.isSafeInteger(row.revision)) throw new ProviderSharingStoreError("INVALID");
   identity(row.id); identity(row.backendId); identity(row.providerId); text(row.providerName); person(row.owner);
-  for (const member of row.members) { identity(member.id); identity(member.homeServerId); hash(member.credentialDigest); person(member.person);
+  for (const member of row.members) { identity(member.id); identity(member.homeServerId); validatedDigest(member.credentialDigest); person(member.person);
     if (!Number.isSafeInteger(member.generation) || member.generation < 1 || !Number.isSafeInteger(member.incarnation) || member.incarnation < 1
       || !["active", "paused", "removed", "left"].includes(member.status) || !Array.isArray(member.devices) || member.devices.length > 64) throw new ProviderSharingStoreError("INVALID"); }
   return row;
@@ -216,7 +216,7 @@ function parseRequest(value: unknown): ProviderSharingRequestRecord {
   const row = value as ProviderSharingRequestRecord;
   if (!row || row.format !== 1 || !["pending", "approved", "rejected", "withdrawn", "expired"].includes(row.status)
     || !Number.isSafeInteger(row.expiresAt) || !/^\d{4}$/u.test(row.pairingCode)) throw new ProviderSharingStoreError("INVALID");
-  identity(row.id); identity(row.shareId); identity(row.homeServerId); identity(row.deviceId); hash(row.linkDigest); hash(row.requestDigest); hash(row.credentialDigest); person(row.person); return row;
+  identity(row.id); identity(row.shareId); identity(row.homeServerId); identity(row.deviceId); validatedDigest(row.linkDigest); validatedDigest(row.requestDigest); validatedDigest(row.credentialDigest); person(row.person); return row;
 }
 function parseReshare(value: unknown): ProviderSharingReshareRecord {
   const row = value as ProviderSharingReshareRecord;

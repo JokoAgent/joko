@@ -1,10 +1,32 @@
 import { createConnection } from "node:net";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { createInternalServer, createPublicServer, isExtensionMainViewRequest, ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
 
 describe("Orchestrator Web content security policy", () => {
+  it("allows the served top-level Web to request its own microphone and keeps extension surfaces restricted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-web-permission-policy-"));
+    await writeFile(join(root, "index.html"), "<!doctype html><title>Joko</title>");
+    const application = { config: { publicOrigin: "http://127.0.0.1", webDirectory: root, corsOrigins: [] },
+      store: {}, connections: {}, artifacts: {}, blobTransfers: {}, artifactRepository: {}, workspaces: {},
+      workspaceChanges: {}, scheduler: {}, adapters: [], browserActivity: [], sessionHost: {}
+    } as unknown as OrchestratorApplication;
+    const server = await createPublicServer(application);
+    server.log.level = "silent";
+    try {
+      const page = await server.inject({ method: "GET", url: "/" });
+      expect(page.statusCode).toBe(200);
+      expect(page.headers["permissions-policy"]).toBe("camera=(), microphone=(self), geolocation=()");
+      const extension = await server.inject({ method: "GET",
+        url: `/v1/extensions/main-views/extension_surface_${"a".repeat(32)}/${"b".repeat(64)}/index.html` });
+      expect(extension.headers["permissions-policy"]).toContain("microphone=()");
+    } finally { await server.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("closes unstarted public TCP connections without aborting an in-flight HTTP request", async () => {
     const application = { config: { publicOrigin: "http://127.0.0.1", webDirectory: "unused-server-test-web" },
       store: {}, connections: {}, artifacts: {}, blobTransfers: {}, artifactRepository: {}, workspaces: {},

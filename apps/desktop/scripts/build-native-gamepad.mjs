@@ -13,11 +13,12 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import nativeArtifacts from "./native-helper-artifacts.cjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = join(root, "native", "gamepad");
 const defaultOutput = join(root, "dist", "native-gamepad");
-const helper = "joko-macos-gamepad-helper";
+const helper = nativeArtifacts.SIMPLE_NATIVE_ARTIFACTS.gamepad.helpers.darwin;
 
 export function nativeGamepadCompilerTarget(architecture) {
   const target = {

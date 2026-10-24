@@ -310,6 +310,43 @@ describe("AndroidAutomationRuntime devices and actions", () => {
       .rejects.toMatchObject({ code: "invalid_node" });
   });
 
+  it.each(["tap", "swipe", "inputText", "pressKey", "launchApp", "installArtifact"] as const)(
+    "invalidates every task snapshot for the device changed by %s", async action => {
+      const otherDevice = { ...READY_DEVICE, serial: "second-device" };
+      const adb = adapter({ listDevices: vi.fn(async () => [READY_DEVICE, otherDevice]) });
+      const runtime = new AndroidAutomationRuntime({ platform: "linux", adapter: adb, portProbe: async () => true, now: () => 1_000 });
+      const deviceSerial = READY_DEVICE.serial;
+      for (const sessionId of ["session-a", "session-b"]) await runtime.snapshot({ sessionId, deviceSerial });
+      await runtime.snapshot({ sessionId: "session-c", deviceSerial: otherDevice.serial });
+      const owner = { sessionId: "session-b", deviceSerial };
+      const mutations = {
+        tap: () => runtime.tap({ ...owner, elementIndex: 1 }),
+        swipe: () => runtime.swipe({ ...owner, start: { x: 10, y: 10 }, end: { x: 20, y: 20 } }),
+        inputText: () => runtime.inputText({ ...owner, text: "hello" }),
+        pressKey: () => runtime.pressKey({ ...owner, key: "HOME" }),
+        launchApp: () => runtime.launchApp({ ...owner, packageName: "com.example.other" }),
+        installArtifact: () => runtime.installArtifact({ ...owner, artifactPath: "/approved/application.apk" })
+      };
+      await mutations[action]();
+      for (const sessionId of ["session-a", "session-b"]) {
+        await expect(runtime.tap({ sessionId, deviceSerial, elementIndex: 1 })).rejects.toMatchObject({ code: "invalid_node" });
+      }
+      await expect(runtime.tap({ sessionId: "session-c", deviceSerial: otherDevice.serial, elementIndex: 1 })).resolves.toMatchObject({ deviceSerial: otherDevice.serial });
+      await runtime.snapshot({ sessionId: "session-a", deviceSerial });
+      await expect(runtime.tap({ sessionId: "session-a", deviceSerial, elementIndex: 1 })).resolves.toMatchObject({ deviceSerial });
+    }
+  );
+
+  it("retires other tasks' device observations before an action whose outcome is unavailable", async () => {
+    const adb = adapter({ listDevices: vi.fn(async () => [READY_DEVICE]),
+      pressKey: vi.fn(async () => { throw new Error("Device response was lost after dispatch."); }) });
+    const runtime = new AndroidAutomationRuntime({ platform: "linux", adapter: adb, portProbe: async () => true, now: () => 1_000 });
+    await runtime.snapshot({ sessionId: "session-a" }); await runtime.snapshot({ sessionId: "session-b" });
+    await expect(runtime.pressKey({ sessionId: "session-b", key: "HOME" })).rejects.toThrow("response was lost");
+    await expect(runtime.tap({ sessionId: "session-a", elementIndex: 1 })).rejects.toMatchObject({ code: "invalid_node" });
+    expect(adb.tap).not.toHaveBeenCalled();
+  });
+
   it("checks direct tap and swipe coordinates against the actual screen", async () => {
     const adb = adapter({
       listDevices: vi.fn(async () => [READY_DEVICE]),

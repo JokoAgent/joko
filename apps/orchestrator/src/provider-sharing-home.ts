@@ -197,10 +197,13 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
   }
   private async refreshJoin(joinId: string, auth: ProviderSharingHomeAuthority): Promise<void> {
     this.check(auth); const stored = this.#joins.get(joinId)!; const before = this.parseReceived(stored.value); if (before.state === "removed" || !stored.credential) return;
+    const valueBefore = stored.value, credentialBefore = stored.credential;
+    const current = () => this.#joins.get(joinId) === stored && stored.value === valueBefore && stored.credential === credentialBefore;
     const secret = this.options.vault.open(stored.credential, this.reference(joinId, before));
     try {
       const remote = this.remote({ origin: before.hostOrigin, serverId: before.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, assertCurrent: () => this.check(auth) });
       const result = await remote.guest.readProviderShare({ shareId: before.shareId }, { signal: auth.signal }); this.check(auth);
+      if (!current()) return;
       const share = this.checkPreview(result.share), member = result.member;
       if (share.shareId !== before.shareId || share.hostServerId !== before.hostServerId || share.backendId !== before.nativeBackendId || share.providerId !== before.providerId
         || !member || member.memberId !== before.memberId || member.homeServerId !== this.options.serverId || !["active", "paused"].includes(member.status)) throw invalid();
@@ -213,6 +216,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
       if (value.generation !== before.generation || state !== "active") this.#reshareStates.delete(joinId);
     } catch (error) {
       this.check(auth);
+      if (!current()) return;
       if (error instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(error.code)) {
         stored.value = toJsonString(contract.ProviderSharingReceivedSchema, { ...before, state: "removed", models: [] }); this.eraseMemberCredential(joinId); this.#reshareStates.delete(joinId);
       } else stored.value = toJsonString(contract.ProviderSharingReceivedSchema, { ...before, state: "unavailable" });

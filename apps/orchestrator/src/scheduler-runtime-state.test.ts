@@ -21,23 +21,25 @@ describe("SchedulerRuntimeState", () => {
     now += 1;
   });
 
-  it("does not count pure queue waiting or cancellation finalization as occupied slots", () => {
+  it("releases queue waiting slots while cancellation keeps its slot until settlement", () => {
     const state = new SchedulerRuntimeState({ instanceId: "scheduler-a", maxConcurrentRuns: 1 });
     state.begin({ scheduleId: "schedule-a", runId: "run-a", source: "automatic", phase: "queued" });
     state.begin({ scheduleId: "schedule-b", runId: "run-b", source: "run-now", phase: "cancelling" });
-    expect(state.snapshot()).toMatchObject({ inFlight: 2, slotsInUse: 0 });
+    expect(state.snapshot()).toMatchObject({ inFlight: 2, slotsInUse: 1 });
+    expect(state.hasCapacity()).toBe(false);
+    state.finish("run-b");
     expect(state.hasCapacity()).toBe(true);
     state.transition("run-a", "running");
     expect(state.snapshot().slotsInUse).toBe(1);
     expect(state.hasCapacity()).toBe(false);
   });
 
-  it("projects stalled and recovering phases with only recovery occupying a slot", () => {
+  it("keeps stalled and recovering work counted until its actual owner releases it", () => {
     const state = new SchedulerRuntimeState({ instanceId: "scheduler-a", maxConcurrentRuns: 1 });
     state.begin({ scheduleId: "schedule-a", runId: "run-a", source: "automatic", phase: "stalled" });
-    expect(state.snapshot()).toMatchObject({ inFlight: 1, slotsInUse: 0 });
+    expect(state.snapshot()).toMatchObject({ inFlight: 1, slotsInUse: 1 });
     state.begin({ scheduleId: "schedule-b", runId: "run-b", source: "automatic", phase: "recovering" });
-    expect(state.snapshot()).toMatchObject({ inFlight: 2, slotsInUse: 1 });
+    expect(state.snapshot()).toMatchObject({ inFlight: 2, slotsInUse: 2 });
   });
 
   it("keeps manual runs visible and lets them exceed the automatic gate", () => {

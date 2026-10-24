@@ -154,16 +154,32 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
       const context = owned.current; if (!context) return;
       const signal = context.abort.signal;
       if (leaveOperation) {
-        const receipt = await api.lookupAction(leaveOperation, signal);
+        const receipt = await api.lookupAction(leaveOperation, signal).catch(async cause => {
+          signal.throwIfAborted();
+          if (!(cause instanceof ConnectError) || cause.code !== Code.NotFound) throw cause;
+          await context.local.finishTaskSharingAction(context.leaveOwner, leaveOperation);
+          signal.throwIfAborted(); setLeaveOperation(undefined); setLeave(false); setError(t("taskSharing.notAdmitted"));
+          return undefined;
+        });
+        if (!receipt) return;
+        if (receipt.kind !== "task_share_leave" || receipt.joined?.joinId !== joinId) throw new Error(t("taskSharing.unknown"));
         if (receipt.status === "failed") {
           await context.local.finishTaskSharingAction(context.leaveOwner, leaveOperation);
           signal.throwIfAborted(); setLeaveOperation(undefined); throw new Error(receipt.errorCode || t("taskSharing.unavailable"));
         }
-        if (receipt.status !== "applied" || receipt.kind !== "leave" || receipt.joined?.joinId !== joinId) throw new Error(t("taskSharing.unknown"));
+        if (receipt.status !== "applied") throw new Error(t("taskSharing.unknown"));
       } else {
         const id = randomUuid();
         await context.local.saveTaskSharingAction(context.leaveOwner, { operationId: id, kind: "leave" });
-        signal.throwIfAborted(); setLeaveOperation(id); await api.leave(id, joinId, signal);
+        signal.throwIfAborted(); setLeaveOperation(id);
+        try { await api.leave(id, joinId, signal); }
+        catch (cause) {
+          if (!signal.aborted && cause instanceof ConnectError && [Code.InvalidArgument, Code.PermissionDenied, Code.NotFound, Code.FailedPrecondition].includes(cause.code)) {
+            await context.local.finishTaskSharingAction(context.leaveOwner, id);
+            signal.throwIfAborted(); setLeaveOperation(undefined);
+          }
+          throw cause;
+        }
         await context.local.finishTaskSharingAction(context.leaveOwner, id);
       }
       if (leaveOperation) await context.local.finishTaskSharingAction(context.leaveOwner, leaveOperation);
@@ -183,7 +199,7 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
         navigationOpen={false} inspectorOpen={false} inspectorAvailable={false} t={t} runAction={runAction} onOpenNavigation={onOpenNavigation}
         onOpenInspector={() => { throw new Error(t("taskSharing.unavailable")); }} onRename={() => { throw new Error(t("taskSharing.unavailable")); }}
         onArchive={() => setLeave(true)} onDelete={() => { throw new Error(t("taskSharing.unavailable")); }} /></>}
-    <Modal open={leave} title={t("taskSharing.leave")} onClose={() => setLeave(false)}><p>{leaveOperation ? t("taskSharing.unknown") : t("taskSharing.confirm")}</p>
+    <Modal open={leave} title={t("taskSharing.leave")} onClose={() => setLeave(false)}><p>{leaveOperation ? t("taskSharing.unknown") : t("taskSharing.confirmLeave", { name: session?.name || view?.source.sessionId || joinId })}</p>
       <Button onClick={() => setLeave(false)}>{t("common.cancel")}</Button><Button data-task-sharing-confirm tone="danger" onClick={attemptLeave}>{t(leaveOperation ? "taskSharing.check" : "common.confirm")}</Button></Modal>
   </div>;
 }

@@ -1612,10 +1612,13 @@ export class WorkspaceService {
         throw new WorkspaceGitReviewError("Workspace diff is stale; refresh Review and retry.", "stale");
       }
       const layer = input.source === "staged" ? "index" : "workingTree";
-      const raw = await this.#readLayerDiff(workspace, layer, uniquePaths(oldPath, path), input.ignoreWhitespace === true);
+      let raw = await this.#readLayerDiff(workspace, layer, uniquePaths(oldPath, path), input.ignoreWhitespace === true);
       if (raw === "" && input.target === "file") {
         await this.#applyUntrackedFileMutation(workspace, input.action, path);
         return (await this.#readGitDiff(workspaceId, [], {})).repositoryRevision;
+      }
+      if (raw === "" && input.source === "unstaged") {
+        raw = await this.#readUntrackedDiff(workspace, [path], input.ignoreWhitespace === true);
       }
       const filePatch = selectDiffFilePatch(raw);
       const patch = input.target === "hunk" ? selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1) : filePatch;

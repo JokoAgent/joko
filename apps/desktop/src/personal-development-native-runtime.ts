@@ -3,7 +3,7 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createReadStream, readFileSync, readlinkSync } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath, mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "@joko/device-peer/private-files";
 
 export interface PersonalNativeRuntime {
   readonly id: "original" | "personal"; readonly generation: string;

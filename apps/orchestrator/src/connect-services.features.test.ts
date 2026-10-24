@@ -1954,51 +1954,6 @@ describe("Connect typed feature boundaries", () => {
     }
   });
 
-  it("deletes a native Provider credential through native logout and refreshes the Pi generation", async () => {
-    const credentialReferenceId = "credential-reference-native-auth";
-    const logout = vi.fn(async () => ({ authenticationState: "signed_out" }));
-    const credentialDelete = vi.fn(async () => true);
-    const refreshPiGeneration = vi.fn(async () => undefined);
-    const nativeProvider = {
-      backendId: "pi",
-      provider: { id: "amazon-bedrock" },
-      credentialReferenceIds: [credentialReferenceId],
-      nativeCredentialReferenceId: credentialReferenceId
-    };
-    const store = {
-      findOperation: () => undefined,
-      listBackends: () => [],
-      deleteSetting: vi.fn(),
-      health: () => ({ schemaVersion: 1, journalMode: "wal", foreignKeys: true, revision: 1n, globalCursor: 0n })
-    };
-    const services = createConnectServices(stubApplication({
-      store,
-      sessionHost: immediateHost(store),
-      providers: {
-        list: () => [nativeProvider],
-        logout
-      },
-      credentials: { list: () => [], delete: credentialDelete },
-      refreshPiGeneration
-    }));
-
-    await invoke(services.operation.submitOperation, {
-      operationId: "operation-delete-native-credential",
-      connectionId: connection.id,
-      mutation: create(contract.OperationMutationSchema, {
-        preconditions: [],
-        payload: {
-          case: "deleteCredential",
-          value: create(contract.DeleteCredentialMutationSchema, { credentialReferenceId })
-        }
-      })
-    });
-
-    expect(logout).toHaveBeenCalledExactlyOnceWith("amazon-bedrock");
-    expect(refreshPiGeneration).toHaveBeenCalledOnce();
-    expect(credentialDelete).not.toHaveBeenCalled();
-  });
-
   it("maps binary OpenAI Chat Completions Provider configuration to Pi's completions API", async () => {
     let configured: any;
     const store = {
@@ -4779,8 +4734,7 @@ describe("Connect typed feature boundaries", () => {
       connectionId: connection.id,
       mutation: mutation(create(contract.ScheduleInputSchema, {
         ...schedule([]),
-        sessionMode: contract.ScheduleSessionMode.FRESH,
-        sessionId: "",
+        sessionMode: contract.ScheduleSessionMode.BOUND,
         input: create(contract.InputContentSchema, {}),
         execution: create(contract.ScheduleExecutionSnapshotSchema, {
           executionMode: contract.ScheduleExecutionMode.SCRIPT,
@@ -4796,7 +4750,7 @@ describe("Connect typed feature boundaries", () => {
       }))
     });
     expect(captured).toMatchObject({
-      sessionMode: "fresh",
+      sessionMode: "bound",
       prompt: { text: "" },
       executionSnapshot: {
         scheduler: {

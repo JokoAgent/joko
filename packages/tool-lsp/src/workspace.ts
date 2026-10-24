@@ -58,14 +58,16 @@ interface DirectoryWorkItem {
 
 export class TypeScriptWorkspace {
   readonly root: string;
-  readonly #files: readonly string[];
-  readonly #fileByKey: ReadonlyMap<string, string>;
+  #files: readonly string[];
+  #fileByKey: ReadonlyMap<string, string>;
+  readonly #maximumFiles: number;
   readonly #host: GovernedLanguageServiceHost;
   readonly #service: ts.LanguageService;
   #disposed = false;
 
-  private constructor(scan: WorkspaceScan) {
+  private constructor(scan: WorkspaceScan, maximumFiles: number) {
     this.root = scan.root;
+    this.#maximumFiles = maximumFiles;
     this.#files = scan.files;
     this.#fileByKey = new Map(scan.files.map((fileName) => [pathKey(fileName), fileName]));
     this.#host = new GovernedLanguageServiceHost(scan);
@@ -79,7 +81,18 @@ export class TypeScriptWorkspace {
   ): Promise<TypeScriptWorkspace> {
     const root = await validateWorkspaceRoot(workspaceRoot, control);
     const scan = await scanWorkspace(root, options.maximumFiles, control);
-    return new TypeScriptWorkspace(scan);
+    return new TypeScriptWorkspace(scan, options.maximumFiles);
+  }
+
+  async refresh(control: LspOperationControl): Promise<void> {
+    if (this.#disposed) throw new LspToolError("INTERNAL", "The LSP workspace has been disposed.");
+    const root = await validateWorkspaceRoot(this.root, control);
+    const scan = await scanWorkspace(root, this.#maximumFiles, control);
+    control.check();
+    if (this.#disposed) throw new LspToolError("INTERNAL", "The LSP workspace has been disposed.");
+    this.#files = scan.files;
+    this.#fileByKey = new Map(scan.files.map((fileName) => [pathKey(fileName), fileName]));
+    this.#host.refresh(scan);
   }
 
   run<T>(control: LspOperationControl, operation: (service: ts.LanguageService) => T): T {
@@ -184,11 +197,7 @@ export class TypeScriptWorkspace {
     return this.#files;
   }
 
-  resetProject(): void {
-    this.#host.resetProject();
-  }
-
-  selectProject(anchorFile: string, control: LspOperationControl): void {
+  selectProject(anchorFile: string, control: LspOperationControl, includeUnconfiguredWorkspace = false): void {
     const anchor = this.resolveFile(anchorFile, control);
     let directory = dirname(anchor.fileName);
     let configPath: string | undefined;
@@ -207,7 +216,7 @@ export class TypeScriptWorkspace {
       directory = dirname(directory);
     }
     if (configPath === undefined) {
-      this.#host.setProject([anchor.fileName]);
+      this.#host.setProject(includeUnconfiguredWorkspace ? this.#files : [anchor.fileName]);
       return;
     }
     const readConfig = (path: string): string | undefined => {
@@ -452,9 +461,9 @@ async function readDirectoryIgnoreRules(
 
 class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
   readonly #root: string;
-  readonly #files: readonly string[];
-  readonly #fileByKey: ReadonlyMap<string, string>;
-  readonly #directoryByKey: ReadonlyMap<string, string>;
+  #files: readonly string[];
+  #fileByKey: ReadonlyMap<string, string>;
+  #directoryByKey: ReadonlyMap<string, string>;
   #compilerOptions: ts.CompilerOptions;
   readonly #defaultCompilerOptions: ts.CompilerOptions;
   #projectFiles: readonly string[];
@@ -517,8 +526,11 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
     this.touch();
   }
 
-  resetProject(): void {
-    this.setProject(this.#files);
+  refresh(scan: WorkspaceScan): void {
+    this.#files = scan.files;
+    this.#fileByKey = new Map(scan.files.map((fileName) => [pathKey(fileName), fileName]));
+    this.#directoryByKey = new Map(scan.directories.map((directory) => [pathKey(directory), directory]));
+    this.setProject(scan.files);
   }
 
   getScriptVersion(fileName: string): string {

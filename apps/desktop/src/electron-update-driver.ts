@@ -12,7 +12,7 @@ import {
   type DesktopUpdateDriver,
   type DesktopUpdateDriverProgressInfo
 } from "./update-service.js";
-import { atomicWritePrivateFile, deletePrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, deletePrivateFile } from "@joko/device-peer/private-files";
 
 interface InternalDownloadedUpdateHelper {
   readonly cacheDirForPendingUpdate: string;

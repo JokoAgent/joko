@@ -24,6 +24,8 @@ export interface SchedulePreRunHookInput {
   readonly timeoutMs?: number;
   readonly cwd?: string;
   readonly signal?: AbortSignal;
+  /** Revalidate the original project and occurrence immediately before spawning. */
+  readonly assertCurrent?: () => void;
   readonly stdinPayload: SchedulePreRunHookPayload;
   readonly now?: () => number;
 }
@@ -145,6 +147,7 @@ export async function executeSchedulePreRunHook(
     };
 
     try {
+      input.assertCurrent?.();
       child = spawn(resolved.command, {
         shell: true,
         cwd: input.cwd?.trim() || homedir(),

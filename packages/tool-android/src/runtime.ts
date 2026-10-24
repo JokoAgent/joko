@@ -467,8 +467,8 @@ export class AndroidAutomationRuntime {
       }
       assertPointInScreen(point, screen);
       const adapter = await this.#useAdapter(input.signal);
+      this.#dropSnapshotsForSerial(device.serial);
       await adapter.tap(device.serial, point, input.signal);
-      this.#snapshots.delete(snapshotKey(sessionId, device.serial));
       return { deviceSerial: device.serial, point };
     });
   }
@@ -490,8 +490,8 @@ export class AndroidAutomationRuntime {
       assertPointInScreen(input.start, screen);
       assertPointInScreen(input.end, screen);
       const adapter = await this.#useAdapter(input.signal);
+      this.#dropSnapshotsForSerial(device.serial);
       await adapter.swipe(device.serial, input.start, input.end, durationMs, input.signal);
-      this.#snapshots.delete(snapshotKey(sessionId, device.serial));
       return { deviceSerial: device.serial, start: input.start, end: input.end, durationMs };
     });
   }
@@ -500,12 +500,12 @@ export class AndroidAutomationRuntime {
     readonly deviceSerial: string;
     readonly characterCount: number;
   }> {
-    const sessionId = validateSessionId(input.sessionId);
+    validateSessionId(input.sessionId);
     const device = await this.#targetDevice(input.deviceSerial, input.signal);
     return this.#enqueueDevice(device.serial, async () => {
       const adapter = await this.#useAdapter(input.signal);
+      this.#dropSnapshotsForSerial(device.serial);
       await adapter.inputText(device.serial, input.text, input.signal);
-      this.#snapshots.delete(snapshotKey(sessionId, device.serial));
       return { deviceSerial: device.serial, characterCount: Array.from(input.text).length };
     });
   }
@@ -515,12 +515,12 @@ export class AndroidAutomationRuntime {
     readonly key: AndroidKey;
     readonly keyCode: number;
   }> {
-    const sessionId = validateSessionId(input.sessionId);
+    validateSessionId(input.sessionId);
     const device = await this.#targetDevice(input.deviceSerial, input.signal);
     return this.#enqueueDevice(device.serial, async () => {
       const adapter = await this.#useAdapter(input.signal);
+      this.#dropSnapshotsForSerial(device.serial);
       const keyCode = await adapter.pressKey(device.serial, input.key, input.signal);
-      this.#snapshots.delete(snapshotKey(sessionId, device.serial));
       return { deviceSerial: device.serial, key: input.key, keyCode };
     });
   }
@@ -531,17 +531,17 @@ export class AndroidAutomationRuntime {
     readonly activity?: string;
     readonly output: string;
   }> {
-    const sessionId = validateSessionId(input.sessionId);
+    validateSessionId(input.sessionId);
     const device = await this.#targetDevice(input.deviceSerial, input.signal);
     return this.#enqueueDevice(device.serial, async () => {
       const adapter = await this.#useAdapter(input.signal);
+      this.#dropSnapshotsForSerial(device.serial);
       const output = await adapter.launchApp(
         device.serial,
         input.packageName,
         input.activity,
         input.signal
       );
-      this.#snapshots.delete(snapshotKey(sessionId, device.serial));
       return {
         deviceSerial: device.serial,
         packageName: input.packageName,
@@ -556,17 +556,17 @@ export class AndroidAutomationRuntime {
     readonly installed: true;
     readonly output: string;
   }> {
-    const sessionId = validateSessionId(input.sessionId);
+    validateSessionId(input.sessionId);
     const device = await this.#targetDevice(input.deviceSerial, input.signal);
     return this.#enqueueDevice(device.serial, async () => {
       const adapter = await this.#useAdapter(input.signal);
+      this.#dropSnapshotsForSerial(device.serial);
       const output = await adapter.installArtifact(
         device.serial,
         input.artifactPath,
         input.options,
         input.signal
       );
-      this.#snapshots.delete(snapshotKey(sessionId, device.serial));
       return { deviceSerial: device.serial, installed: true, output };
     });
   }

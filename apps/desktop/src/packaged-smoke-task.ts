@@ -48,6 +48,7 @@ export interface PackagedSmokeTask {
   readonly targetId: string;
   readonly displayName: string;
   readonly generation: bigint;
+  readonly sourceGeneration: bigint;
 }
 
 export interface PackagedSmokeTaskOptions {
@@ -171,7 +172,8 @@ export async function createPackagedSmokeTask(options: PackagedSmokeTaskOptions)
       backendId: session.backendId,
       targetId: session.targetId,
       displayName: session.displayName,
-      generation
+      generation,
+      sourceGeneration: initial.generation
     });
     assertTaskInSnapshot(await ownerSnapshot(eventClient, signal), task);
     return task;
@@ -321,7 +323,7 @@ async function ownerSnapshot(
 ): Promise<Snapshot> {
   const response = await client.getSnapshot({ scope: { kind: { case: "owner", value: {} } } }, { signal });
   if (response.snapshot === undefined || response.snapshot.revision?.value === undefined
-    || response.snapshot.revision.value < 1n) {
+    || response.snapshot.revision.value < 1n || response.snapshot.generation < 1n) {
     throw new Error("Packaged smoke owner Snapshot is unavailable.");
   }
   return response.snapshot;
@@ -487,7 +489,7 @@ function supports(backend: BackendDescriptor, capability: string): boolean {
 
 function assertTaskInSnapshot(snapshot: Snapshot, task: PackagedSmokeTask): void {
   const session = snapshot.sessions.find((candidate) => candidate.sessionId === task.sessionId);
-  if (session === undefined
+  if (session === undefined || snapshot.generation !== task.sourceGeneration
     || session.backendId !== task.backendId
     || session.targetId !== task.targetId
     || session.displayName !== task.displayName

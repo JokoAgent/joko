@@ -888,7 +888,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
   const extraDirectoriesSupported = backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
   const validScriptTimeout = draft.scriptTimeoutMs === undefined || (Number.isSafeInteger(draft.scriptTimeoutMs) && draft.scriptTimeoutMs > 0);
   const valid = draft.name.trim().length > 0 && draft.targetId.length > 0 &&
-    (draft.executionMode === "script" || draft.sessionMode !== "bound" || draft.sessionId.length > 0) &&
+    (draft.sessionMode !== "bound" || draft.sessionId.length > 0) &&
     (draft.executionMode === "script" ? draft.scriptCommand.trim().length > 0 && validScriptTimeout : draft.inputText.trim().length > 0) &&
     worktreeValid &&
     validExpression(draft);
@@ -901,7 +901,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
       ...current,
       targetId,
       backendId: target?.backendId ?? session?.backendId ?? "",
-      sessionId: current.executionMode === "script" ? "" : current.sessionMode === "bound" ? session?.id ?? "" : "",
+      sessionId: current.sessionMode === "bound" ? session?.id ?? "" : "",
       providerId: model?.providerId ?? "",
       modelId: model?.modelId ?? "",
       effort: model?.efforts[0],
@@ -961,8 +961,8 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
             ...current,
             executionMode,
             ...(executionMode === "script" ? {
-              sessionMode: "fresh" as const,
-              sessionId: "",
+              sessionMode: current.sessionMode === "bound" ? "bound" as const : "fresh" as const,
+              sessionId: current.sessionMode === "bound" ? current.sessionId : "",
               silentWhenIdle: false,
               useWorktree: false,
               worktreeSourceRef: undefined,
@@ -970,7 +970,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
             } : {})
           };
         })}><option value="agent">{t("scheduler.executionAgent")}</option><option value="script">{t("scheduler.executionScript")}</option></SelectControl></label>
-        <label className="field"><span>{t("scheduler.sessionMode")}</span><SelectControl disabled={draft.executionMode === "script"} value={draft.sessionMode} onChange={(event) => setDraft((current) => {
+        <label className="field"><span>{t("scheduler.sessionMode")}</span><SelectControl value={draft.sessionMode} onChange={(event) => setDraft((current) => {
           const sessionMode = event.target.value as ScheduleDraft["sessionMode"];
           return {
             ...current,
@@ -986,8 +986,8 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
               refreshWorktreeRemote: false
             })
           };
-        })}><option value="fresh">{t("scheduler.sessionFresh")}</option><option value="persistent">{t("scheduler.sessionPersistent")}</option>{!projectOwned && <option value="bound">{t("scheduler.sessionBound")}</option>}</SelectControl></label>
-        {draft.executionMode === "agent" && draft.sessionMode === "bound" && <label className="field"><span>{t("scheduler.session")}</span><SelectControl required value={draft.sessionId} onChange={(event) => {
+        })}><option value="fresh">{t("scheduler.sessionFresh")}</option>{draft.executionMode === "agent" && <option value="persistent">{t("scheduler.sessionPersistent")}</option>}{!projectOwned && <option value="bound">{t("scheduler.sessionBound")}</option>}</SelectControl></label>
+        {draft.sessionMode === "bound" && <label className="field"><span>{t("scheduler.session")}</span><SelectControl required value={draft.sessionId} onChange={(event) => {
           const session = sessions.find((candidate) => candidate.id === event.target.value);
           setDraft((current) => ({ ...current, sessionId: event.target.value, backendId: session?.backendId ?? current.backendId, providerId: session?.model?.providerId ?? "", modelId: session?.model?.modelId ?? "", effort: session?.effort, fastMode: session?.fastMode ?? false, permissionMode: session?.permissionMode ?? current.permissionMode, planMode: session?.planMode ?? current.planMode }));
         }}><option value="">—</option>{matchingSessions.map((session) => <option value={session.id} key={session.id}>{session.name}</option>)}</SelectControl></label>}

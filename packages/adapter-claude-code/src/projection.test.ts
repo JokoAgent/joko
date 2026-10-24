@@ -1,6 +1,11 @@
 import { expect, it } from "vitest";
 import { SafeProjection } from "./projection.js";
 
+it("preserves an SDK invalid request as a deterministic failure for route selection", () => {
+  expect(new SafeProjection([]).result({ subtype: "error_during_execution", is_error: true }, undefined, "invalid_request").error)
+    .toMatchObject({ code: "INVALID_REQUEST", retryable: false });
+});
+
 it("keeps generation usage separate from normalized inclusive accounting and absent current observations", () => {
   const projection = new SafeProjection([]);
   const native = { inputTokens: 12, outputTokens: 6, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 18, cost: 0,

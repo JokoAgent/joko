@@ -27,6 +27,7 @@ import type { OrchestratorConfig } from "./config.js";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { createInternalServer, createPublicServer } from "./server.js";
 import { VoiceDictionaryPeerManager } from "./voice-dictionary-peer-manager.js";
+import { VoiceDictionarySyncRepository } from "./voice-dictionary-sync-repository.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -35,6 +36,53 @@ afterEach(async () => {
 });
 
 describe("Orchestrator application composition", () => {
+  it("keeps a healthy Backend and the connection service available when Pi initialization fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-application-pi-unavailable-"));
+    const workspace = join(root, "workspace"), dataDirectory = join(root, "data");
+    await mkdir(workspace, { recursive: true });
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1", port: 4318, internalPort: 4317,
+      publicOrigin: "http://127.0.0.1:4318", internalOrigin: "http://127.0.0.1:4317",
+      dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true, allowInsecureLan: false, lanDiscoveryEnabled: false, voiceDictionaryLanDiscoveryEnabled: false,
+      piAgentHome: join(dataDirectory, "pi"), artifactDirectory: join(dataDirectory, "artifacts"),
+      workspace: { id: "workspace-healthy-backend", root: workspace, displayName: "Healthy Backend", trusted: true },
+      webDirectory: join(root, "no-web-build"), corsOrigins: []
+    };
+    const failPi = vi.spyOn(PiBackendAdapter.prototype, "describe")
+      .mockRejectedValueOnce(new Error("controlled Pi session directory provisioning failure"));
+    const healthyCodex = vi.spyOn(CodexBackendAdapter.prototype, "describe").mockResolvedValue({
+      id: "codex", adapterKind: "codex", instanceGeneration: 1, displayName: "Codex", version: "fixture",
+      health: "healthy", installationState: "installed", authenticationState: "not_required",
+      capabilities: new Map(), models: [], tools: [], diagnostics: []
+    });
+    let application: Awaited<ReturnType<typeof createOrchestratorApplication>> | undefined;
+    let server: Awaited<ReturnType<typeof createPublicServer>> | undefined;
+    try {
+      application = await createOrchestratorApplication(config);
+      expect(application.store.getBackend("pi").descriptor).toMatchObject({ health: "unavailable",
+        error: { code: "BACKEND_INSTANCE_INITIALIZATION_FAILED", retryable: true } });
+      expect(application.store.getBackend("codex").descriptor.health).toBe("healthy");
+      expect(application.adapters.some((adapter) => adapter.id === "codex")).toBe(true);
+      expect(application.adapters.some((adapter) => adapter.id === "pi")).toBe(false);
+      expect(application.store.getTarget("workspace-healthy-backend:codex").descriptor.backendId).toBe("codex");
+      await expect(application.refreshPiGeneration?.()).resolves.toBeUndefined();
+      server = await createPublicServer(application);
+      server.log.level = "silent";
+      expect((await server.inject({ method: "GET", url: "/healthz" })).statusCode).toBe(200);
+      const challenge = application.connections.issuePairing("Pi unavailable observer");
+      expect(application.connections.completePairing({ challengeId: challenge.id, code: challenge.code,
+        connectionName: "Pi unavailable observer" }).authKey).not.toBe("");
+      await application.restartBackend("pi");
+      expect(application.store.getBackend("pi").descriptor).toMatchObject({ health: "healthy", instanceGeneration: 2 });
+    } finally {
+      failPi.mockRestore(); healthyCodex.mockRestore();
+      await server?.close();
+      await application?.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
+  }, 30_000);
+
   it("restores only opted-in Hosts through the persisted service and authenticated Connect watch after restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-application-host-autoconnect-"));
     const dataDirectory = join(root, "data");
@@ -345,6 +393,7 @@ describe("Orchestrator application composition", () => {
       .mockRejectedValue(new Error("controlled candidate force-dispose failure"));
     const closeProviderProxy = vi.spyOn(ManagedProviderProxy.prototype, "close");
     const closeDictionaryPeers = vi.spyOn(VoiceDictionaryPeerManager.prototype, "close");
+    const closeDictionary = vi.spyOn(VoiceDictionarySyncRepository.prototype, "close");
     const closeDictionaryPeerStore = vi.spyOn(VoiceDictionaryPeerStore.prototype, "close");
 
     try {
@@ -354,8 +403,11 @@ describe("Orchestrator application composition", () => {
       expect(forceDisposeCandidate).toHaveBeenCalledTimes(4);
       expect(closeProviderProxy).toHaveBeenCalledOnce();
       expect(closeDictionaryPeers).toHaveBeenCalled();
+      expect(closeDictionary).toHaveBeenCalled();
       expect(closeDictionaryPeerStore).toHaveBeenCalled();
       expect(closeDictionaryPeers.mock.invocationCallOrder[0])
+        .toBeLessThan(closeDictionary.mock.invocationCallOrder[0]!);
+      expect(closeDictionary.mock.invocationCallOrder[0])
         .toBeLessThan(closeDictionaryPeerStore.mock.invocationCallOrder[0]!);
     } finally {
       probeCandidate.mockRestore();
@@ -363,6 +415,7 @@ describe("Orchestrator application composition", () => {
       forceDisposeCandidate.mockRestore();
       closeProviderProxy.mockRestore();
       closeDictionaryPeers.mockRestore();
+      closeDictionary.mockRestore();
       closeDictionaryPeerStore.mockRestore();
       await rm(root, { recursive: true, force: true, maxRetries: 3 });
     }
@@ -718,7 +771,7 @@ describe("Orchestrator application composition", () => {
       config: {
         ...config,
         allowInsecureLan: true,
-        corsOrigins: []
+        corsOrigins: ["http://192.168.1.30:4319"]
       }
     });
     lanServer.log.level = "silent";
@@ -736,6 +789,20 @@ describe("Orchestrator application composition", () => {
     expect(corsPreflight.statusCode).toBe(204);
     expect(corsPreflight.headers["access-control-allow-origin"]).toBe("http://192.168.1.30:4319");
     expect(corsPreflight.headers["access-control-allow-credentials"]).toBeUndefined();
+    const unlistedLanCors = await lanServer.inject({
+      method: "OPTIONS", url: "/healthz", remoteAddress: "192.168.1.30",
+      headers: { origin: "http://192.168.1.99:8080", "access-control-request-method": "GET" }
+    });
+    expect(unlistedLanCors.headers["access-control-allow-origin"]).toBeUndefined();
+    const emptyAllowlistServer = await createPublicServer({ ...application,
+      config: { ...config, allowInsecureLan: true, corsOrigins: [] } });
+    emptyAllowlistServer.log.level = "silent";
+    cleanups.push(() => emptyAllowlistServer.close());
+    const emptyAllowlistCors = await emptyAllowlistServer.inject({
+      method: "OPTIONS", url: "/healthz", remoteAddress: "192.168.1.30",
+      headers: { origin: "http://192.168.1.30:4319", "access-control-request-method": "GET" }
+    });
+    expect(emptyAllowlistCors.headers["access-control-allow-origin"]).toBeUndefined();
     const rejectedPublicCors = await lanServer.inject({
       method: "OPTIONS",
       url: "/healthz",

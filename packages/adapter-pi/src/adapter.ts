@@ -6572,7 +6572,7 @@ export class PiBackendAdapter implements
   }
 
   #capabilities(compatibility: PiCompatibilityOutcome): ReadonlyMap<string, Capability> {
-    const supported = new Set<string>(compatibility.status === "compatible" ? [
+    const supported = new Set<KnownCapability>(compatibility.status === "compatible" ? [
       "session.preview",
       "session.discovery",
       "session.resume",

@@ -1,9 +1,57 @@
-import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
-import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { describe, expect, it, vi } from "vitest";
 import { DESKTOP_CHANNELS, isDesktopSessionWindowContext, type DesktopSessionWindowContext } from "../src/channels.js";
 import { buildTaskShareInvitation, type DesktopRemoteDesktopApi } from "@joko/contracts";
+import { compiledPreloadSource } from "./support/preload-source.js";
+import { parseDesktopNativeTaskStatusSnapshot } from "../src/native-task-status.js";
+
+describe("native task-status contract across the actual preload and Main parser", () => {
+  const session = { sessionId: "task-one", title: "Task", detail: "", phase: "running", activityLines: [], updatedAt: 1 };
+  const snapshot = (sessions: readonly unknown[]) => ({ ownerId: "owner", revision: "1", locale: "en", sessions });
+
+  it("publishes remote tasks, private handoffs and the full 500-task mirror through both boundaries", async () => {
+    const f = loadPreload("main-document");
+    const api = f.exposed["nativeTaskStatus"] as { publish(value: unknown): Promise<void> };
+    f.invoke.mockImplementation(async (channel: string, ...parameters: unknown[]) => {
+      const [value] = parameters;
+      expect(channel).toBe(DESKTOP_CHANNELS.nativeTaskStatusPublish);
+      expect(parseDesktopNativeTaskStatusSnapshot(value)).toEqual(value);
+    });
+    for (const sessions of [
+      [{ ...session, remote: { sourceId: "node", runId: "run", silent: false, completionNotification: "none",
+        observedCompletionOnly: true, companion: { name: "Companion", glyph: "J", tint: "#123abc", artwork: "data:image/png;base64,AA==" } } }],
+      [{ ...session, phase: "interaction", inputHandoff: true }],
+      Array.from({ length: 65 }, (_, index) => ({ ...session, sessionId: `task-${index}` })),
+      Array.from({ length: 500 }, (_, index) => ({ ...session, sessionId: `task-${index}` }))
+    ]) {
+      const value = snapshot(sessions);
+      await expect(api.publish(value)).resolves.toBeUndefined();
+      expect(f.invoke).toHaveBeenLastCalledWith(DESKTOP_CHANNELS.nativeTaskStatusPublish, parseDesktopNativeTaskStatusSnapshot(value));
+    }
+  });
+
+  it("rejects the same invalid snapshots before IPC and again at the Main boundary", async () => {
+    const f = loadPreload("main-document");
+    const api = f.exposed["nativeTaskStatus"] as { publish(value: unknown): Promise<void> };
+    const remote = { sourceId: "node", runId: "run", silent: false, completionNotification: "none" };
+    const permission = { interactionId: "interaction", generation: "1", allow: true, allowForSession: false, deny: true };
+    for (const value of [
+      snapshot(Array.from({ length: 501 }, (_, index) => ({ ...session, sessionId: `task-${index}` }))),
+      snapshot([session, session]), snapshot([{ ...session, unexpected: true }]),
+      snapshot([{ ...session, title: "invalid\u0000title" }]),
+      snapshot([{ ...session, inputHandoff: true }]),
+      snapshot([{ ...session, phase: "interaction", inputHandoff: true, permission }]),
+      snapshot([{ ...session, phase: "interaction", inputHandoff: true, interactionKind: "input" }]),
+      snapshot([{ ...session, phase: "interaction", remote, permission }]),
+      snapshot([{ ...session, remote: { ...remote, completionNotification: "invalid" } }]),
+      snapshot([{ ...session, remote: { ...remote, companion: { name: "x", glyph: "J", tint: "red" } } }])
+    ]) {
+      expect(() => parseDesktopNativeTaskStatusSnapshot(value)).toThrow();
+      await expect(api.publish(value)).rejects.toThrow();
+    }
+    expect(f.invoke).not.toHaveBeenCalled();
+  });
+});
 
 it("sends the complete plugin window owner through the real preload and rejects unscoped or extra fields", async () => {
   const f = loadPreload("main-document");
@@ -108,10 +156,7 @@ function loadPreload(
   readonly listeners: Map<string, (...parameters: unknown[]) => void>;
   setPending(value: unknown): void;
 } {
-  const source = readFileSync(new URL("../src/preload.cts", import.meta.url), "utf8");
-  const output = transpileModule(source, {
-    compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2022 }
-  }).outputText;
+  const output = compiledPreloadSource();
   const listeners = new Map<string, (...parameters: unknown[]) => void>();
   let pending: unknown;
   const invoke = vi.fn(async (channel: string, ..._parameters: unknown[]): Promise<unknown> => {

@@ -5,14 +5,11 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
+import nativeArtifacts from "./native-helper-artifacts.cjs";
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputRoot = join(desktopRoot, "dist", "native-system-frontmost-input");
-const helperNames = Object.freeze({
-  win32: "joko-windows-frontmost-input.node",
-  darwin: "joko-macos-frontmost-input.node",
-  linux: "joko-linux-frontmost-input.node"
-});
+const helperNames = nativeArtifacts.SIMPLE_NATIVE_ARTIFACTS.frontmost.helpers;
 const helperName = helperNames[process.platform];
 const output = helperName === undefined ? undefined : join(outputRoot, helperName);
 const manifestPath = join(outputRoot, "manifest.json");

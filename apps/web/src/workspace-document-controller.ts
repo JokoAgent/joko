@@ -123,10 +123,16 @@ export class WorkspaceDocumentController {
       if (choice === undefined || workspaceLeaveAborted(request.signal)) return false;
 
       const current = this.#documents.get(key);
-      if (current?.registrationId !== entry.registrationId) continue;
       if (choice === "cancel") {
-        current.document.focus?.();
+        current?.document.focus?.();
         return false;
+      }
+      if (current?.registrationId !== entry.registrationId) {
+        if (current !== undefined && safeIsDirty(current.document)) {
+          current.document.focus?.();
+          return false;
+        }
+        continue;
       }
 
       try {
@@ -135,7 +141,7 @@ export class WorkspaceDocumentController {
           const saved = await current.document.save();
           if (workspaceLeaveAborted(request.signal)) return false;
           const latest = this.#documents.get(key);
-          if (!saved || (latest?.registrationId === current.registrationId && safeIsDirty(latest.document))) {
+          if (!saved || (latest !== undefined && safeIsDirty(latest.document))) {
             latest?.document.focus?.();
             return false;
           }
@@ -143,7 +149,7 @@ export class WorkspaceDocumentController {
           await current.document.discard();
           if (workspaceLeaveAborted(request.signal)) return false;
           const latest = this.#documents.get(key);
-          if (latest?.registrationId === current.registrationId && safeIsDirty(latest.document)) {
+          if (latest !== undefined && safeIsDirty(latest.document)) {
             latest.document.focus?.();
             return false;
           }
@@ -153,7 +159,7 @@ export class WorkspaceDocumentController {
         return false;
       }
     }
-    return true;
+    return this.#dirtyEntries(request.matches).length === 0;
   }
 
   #dirtyEntries(matches?: (identity: WorkspaceDocumentIdentity) => boolean): readonly (readonly [string, RegisteredDocument])[] {

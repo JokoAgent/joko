@@ -1026,8 +1026,8 @@ function assertExecutionCompatibility(
     }
     return;
   }
-  if (binding.mode !== "fresh" || binding.sessionId !== undefined) {
-    throw new SchedulerToolError("INVALID_PARAMS", "Script schedules cannot bind or persist a product task.");
+  if (binding.mode === "persistent") {
+    throw new SchedulerToolError("INVALID_PARAMS", "Script schedules require fresh or bound task mode.");
   }
   if (extension.silentWhenIdle) {
     throw new SchedulerToolError("INVALID_PARAMS", "Script schedules cannot use silentWhenIdle.");

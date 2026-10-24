@@ -68,6 +68,8 @@ export interface ScheduleDispatchResult {
   readonly status: "queued" | "success" | "skipped" | "failed" | "aborted";
 }
 
+const SCHEDULE_BUSY_WAIT_MS = 30 * 60_000;
+
 /** Durable peer caller for SessionHost. The deterministic operation ID is the distributed claim. */
 export class ScheduleCoordinator {
   readonly #store: OperationalStore;
@@ -85,6 +87,9 @@ export class ScheduleCoordinator {
   readonly #activeOccurrences = new Map<string, Set<AbortController>>();
   readonly #deletionFences = new Map<string, string>();
   readonly #scheduleIdleWaiters = new Map<string, Set<() => void>>();
+  readonly #admittedRuns = new Set<string>();
+  #unsubscribeRuns: (() => void) | undefined;
+  #releaseDispatchGate: (() => void) | undefined;
   #timer: NodeJS.Timeout | undefined;
   #ticking = false;
   #inFlightDispatches = 0;
@@ -119,12 +124,22 @@ export class ScheduleCoordinator {
       onForceRelease: (occurrence, reason, noProgressMs) => {
         this.recordForceReleasedOccurrence(occurrence, reason, noProgressMs);
       },
-      onError: () => this.recordRecoveryFailure()
+      onError: () => this.recordRecoveryFailure(),
+      canForceRelease: (occurrence) => {
+        const run = this.#store.findRun(occurrence.runId)?.descriptor;
+        if (run === undefined || !activeScheduleRunState(run.state)) return true;
+        const item = this.#store.findQueueItemByRunId(run.sessionId, run.id);
+        return run.state === "queued" && item?.state === "accepted" && item.backendInstanceGeneration === undefined;
+      }
     });
+    this.connectRunLifecycle();
+    this.observeAdmittedRuns();
   }
 
   start(): void {
     if (this.#timer !== undefined) return;
+    this.connectRunLifecycle();
+    this.observeAdmittedRuns();
     this.#recovery.start();
     this.reconcileInterruptedScripts();
     void this.#host.reconcileScheduledWorktrees?.();
@@ -137,10 +152,94 @@ export class ScheduleCoordinator {
     if (this.#timer !== undefined) clearInterval(this.#timer);
     this.#timer = undefined;
     this.#recovery.stop();
+    this.#unsubscribeRuns?.();
+    this.#unsubscribeRuns = undefined;
+    this.#releaseDispatchGate?.();
+    this.#releaseDispatchGate = undefined;
     for (const controllers of this.#activeOccurrences.values()) {
       for (const controller of controllers) controller.abort();
     }
     this.#runtime.clear();
+    this.#admittedRuns.clear();
+  }
+
+  private connectRunLifecycle(): void {
+    this.#releaseDispatchGate ??= this.#host.setScheduleDispatchGate?.({
+      acquire: (runId) => this.acquireRunSlot(runId),
+      release: (runId) => { this.#recovery.transition(runId, "queued"); }
+    });
+    this.#unsubscribeRuns ??= this.#store.subscribe((event) => {
+      if (event.runId === undefined || !this.#admittedRuns.has(event.runId)) return;
+      const run = this.#store.findRun(event.runId)?.descriptor;
+      if (run === undefined || !activeScheduleRunState(run.state)) {
+        this.#admittedRuns.delete(event.runId);
+        this.#recovery.finish(event.runId);
+        queueMicrotask(() => { try { this.wakeQueuedRuns(); } catch { this.recordRecoveryFailure(); } });
+      } else if (run.state !== "queued") this.#recovery.progress(event.runId);
+    });
+  }
+
+  private observeAdmittedRuns(): void {
+    for (const schedule of this.#store.listSchedules()) {
+      for (const history of listAllScheduleRuns(this.#store, schedule.id)) {
+        if (this.#runtime.has(history.runId)) continue;
+        const run = this.#store.findRun(history.runId)?.descriptor;
+        if (run === undefined || !activeScheduleRunState(run.state)) continue;
+        const item = this.#store.findQueueItemByRunId(run.sessionId, run.id);
+        const queued = run.state === "queued" && item?.state === "accepted" && item.backendInstanceGeneration === undefined;
+        const prior = this.#store.findScheduleRuntimeOccurrence(run.id);
+        this.#recovery.begin({
+          scheduleId: schedule.id, scheduleName: schedule.name, runId: run.id,
+          source: prior?.source ?? "automatic", executionMode: "agent", scheduledAt: history.firedAt,
+          phase: queued ? "queued" : "running", ...(queued ? { resumeQueued: true } : { resumeActive: true }),
+          abort: () => this.abortSchedule(schedule.id, [history])
+        });
+        this.#admittedRuns.add(run.id);
+      }
+    }
+  }
+
+  private wakeQueuedRuns(): void {
+    if (this.#unsubscribeRuns === undefined) return;
+    for (const run of this.#store.listQueuedScheduleRuns()) {
+      if (run.sessionId !== undefined) this.#host.requestQueueDrain(run.sessionId);
+    }
+  }
+
+  private expireQueuedRun(runId: string): boolean {
+    const history = this.#store.findScheduleRunByRunId(runId);
+    if (history?.sessionId === undefined || history.status !== "queued") return false;
+    const item = this.#store.findQueueItemByRunId(history.sessionId, runId);
+    if (item?.state !== "accepted" || this.#now() - item.createdAt < SCHEDULE_BUSY_WAIT_MS) return false;
+    this.#store.transaction((store) => {
+      store.cancelQueueItem({ queueItemId: item.id, traceId: `schedule:${runId}:busy-expired`, at: this.#now() });
+      if (item.attemptId !== undefined) store.finishAttempt(item.attemptId, undefined, this.#now());
+      store.recordScheduleRun(history.scheduleId, runId, "skipped", {
+        reason: "task remained busy beyond the Schedule queue grace period"
+      }, history.firedAt);
+    });
+    return true;
+  }
+
+  private acquireRunSlot(runId: string): boolean {
+    if (this.expireQueuedRun(runId)) return false;
+    const history = this.#store.findScheduleRunByRunId(runId);
+    if (history === undefined) return true;
+    const current = this.#runtime.find(runId);
+    if (current?.phase === "running") return true;
+    const source = current?.source ?? this.#store.findScheduleRuntimeOccurrence(runId)?.source ?? "automatic";
+    if (source !== "run-now" && !this.#runtime.hasCapacity()) return false;
+    if (current === undefined) {
+      const schedule = this.#store.findSchedule(history.scheduleId);
+      if (schedule === undefined) return true;
+      this.#recovery.begin({
+        scheduleId: schedule.id, scheduleName: schedule.name, runId,
+        source, executionMode: "agent", scheduledAt: history.firedAt,
+        phase: "queued", resumeQueued: true, abort: () => this.abortSchedule(schedule.id, [history])
+      });
+      this.#admittedRuns.add(runId);
+    }
+    return this.#recovery.transition(runId, "running");
   }
 
   /** Pause/delete control path. Pre-run and script processes are interrupted
@@ -217,6 +316,8 @@ export class ScheduleCoordinator {
     if (this.#ticking) return;
     this.#ticking = true;
     try {
+      for (const run of this.#store.listQueuedScheduleRuns()) this.expireQueuedRun(run.runId);
+      this.wakeQueuedRuns();
       void this.#host.reconcileScheduledWorktrees?.();
       const waiting: Array<{ readonly scheduleId: string; readonly scheduleName: string; readonly waitingSince: number }> = [];
       const dispatches: Promise<void>[] = [];
@@ -277,6 +378,11 @@ export class ScheduleCoordinator {
     const scheduledAt = options.scheduledAt ?? schedule.nextRunAt ?? this.#now();
     const operationId = options.operationId ?? occurrenceOperationId(schedule.id, scheduledAt);
     const runtimeRunId = scheduledRunId(operationId);
+    if (this.#admittedRuns.has(runtimeRunId)) {
+      const history = this.#store.findScheduleRunByRunId(runtimeRunId);
+      return { runId: runtimeRunId, ...(history?.sessionId === undefined ? {} : { sessionId: history.sessionId }), status: "queued" };
+    }
+    if (options.source !== "run-now" && !this.#runtime.hasCapacity()) throw new Error("All Schedule execution slots are occupied.");
     let executionMode: "agent" | "script" | undefined;
     try {
       executionMode = scheduleExtensionSnapshot(schedule.executionSnapshot).executionMode;
@@ -292,7 +398,11 @@ export class ScheduleCoordinator {
       ...(executionMode === undefined ? {} : { executionMode }),
       scheduledAt,
       phase: "loading",
-      abort: () => controller.abort()
+      abort: () => {
+        controller.abort();
+        const history = this.#store.findScheduleRunByRunId(runtimeRunId);
+        if (history !== undefined) return this.abortSchedule(schedule.id, [history]);
+      }
     });
     let controllers = this.#activeOccurrences.get(schedule.id);
     if (controllers === undefined) {
@@ -314,7 +424,7 @@ export class ScheduleCoordinator {
         : result.value;
     } finally {
       try {
-        this.#recovery.transition(runtimeRunId, "finalizing");
+        if (!this.#admittedRuns.has(runtimeRunId)) this.#recovery.transition(runtimeRunId, "finalizing");
       } catch {
         // A generation-fenced recovery already owns terminal persistence.
       }
@@ -327,7 +437,7 @@ export class ScheduleCoordinator {
       this.#inFlightDispatches -= 1;
       this.#notifyActivityTransition();
       try {
-        this.#recovery.finish(runtimeRunId);
+        if (!this.#admittedRuns.has(runtimeRunId)) this.#recovery.finish(runtimeRunId);
       } catch {
         // A newer owner can fence this late settle after restart recovery.
         this.#runtime.finish(runtimeRunId);
@@ -455,7 +565,9 @@ export class ScheduleCoordinator {
       if (current === undefined) return { runId, status: "aborted" };
       if (current.revision !== preRunRevision) {
         this.recordPreSessionOutcome({
-          schedule: current,
+          // This occurrence belongs to the captured revision. Recording its
+          // abort must not advance or disable a newly edited cadence.
+          schedule,
           operationId,
           runId,
           scheduledAt,
@@ -540,7 +652,9 @@ export class ScheduleCoordinator {
     }
 
     const busy = this.#store.listRuns({ sessionId, activeOnly: true }).length > 0;
-    const skipForOverlap = busy && schedule.overlapPolicy === "skip";
+    const alreadyQueued = this.#store.listQueuedScheduleRuns().some((run) =>
+      run.scheduleId === schedule.id && run.sessionId === sessionId);
+    const skipForOverlap = (busy && schedule.overlapPolicy === "skip") || alreadyQueued;
     if (skipForOverlap) {
       const skipped = this.#host.skipScheduledOccurrence({
         operationId,
@@ -548,18 +662,20 @@ export class ScheduleCoordinator {
         sessionId,
         scheduledAt,
         ...(nextRunAt === undefined ? {} : { nextRunAt }),
-        reason: "task is busy; overlap policy is skip"
+        reason: alreadyQueued ? "this Schedule already has a queued input for the task" : "task is busy; overlap policy is skip"
       });
       return { runId: skipped.value.runId, sessionId, status: "skipped" };
     }
-    const queued = this.#host.enqueueScheduledInput({
+    this.#admittedRuns.add(runId);
+    this.#recovery.transition(runId, "queued");
+    let queued;
+    try { queued = this.#host.enqueueScheduledInput({
       operationId,
       schedule,
       sessionId,
       scheduledAt,
       ...(nextRunAt === undefined ? {} : { nextRunAt })
-    });
-    this.#recovery.transition(runId, "queued");
+    }); } catch (error) { this.#admittedRuns.delete(runId); throw error; }
     return { runId: queued.value.runId, sessionId, status: "queued" };
   }
 
@@ -571,21 +687,32 @@ export class ScheduleCoordinator {
     signal: AbortSignal
   ): Promise<{ readonly result: SchedulePreRunHookResult; readonly detail: Readonly<Record<string, unknown>> } | undefined> {
     if (hook === undefined) return undefined;
-    const target = this.#store.getTarget(schedule.targetId).descriptor;
+    const capturedTarget = this.#store.getTarget(schedule.targetId);
+    const target = capturedTarget.descriptor;
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      const current = this.#store.getTarget(schedule.targetId);
+      if (this.#deletionFences.has(schedule.id) || this.#recovery.wasForceReleased(runId)
+        || this.#store.findSchedule(schedule.id)?.revision !== schedule.revision
+        || current.revision !== capturedTarget.revision || current.descriptor.workspaceRoot !== target.workspaceRoot
+        || !current.descriptor.trusted) throw new Error("The pre-run hook workspace or Schedule authority changed.");
+    };
     let result: SchedulePreRunHookResult;
     try {
-      if (!target.trusted) throw new Error("The schedule workspace is not trusted.");
+      assertCurrent();
       await this.#validatePreRunHookBinding({
         workspaceRoot: target.workspaceRoot,
         filePath: hook.filePath,
         command: hook.command
       });
+      assertCurrent();
       const previous = findLatestFinishedScheduleRun(this.#store, schedule.id);
       result = await this.#executePreRunHook({
         command: hook.command,
         ...(hook.timeoutMs === undefined ? {} : { timeoutMs: hook.timeoutMs }),
         cwd: target.workspaceRoot,
         signal,
+        assertCurrent,
         stdinPayload: {
           event: "schedule-pre-run",
           scheduleId: schedule.id,
@@ -596,6 +723,7 @@ export class ScheduleCoordinator {
           ...(previous?.finishedAt === undefined ? {} : { lastFinishedAt: previous.finishedAt })
         }
       });
+      assertCurrent();
     } catch (error) {
       result = failedPreRunHookResult(error);
     }
@@ -665,7 +793,7 @@ export class ScheduleCoordinator {
     const config = input.extension.scriptConfig;
     if (
       config === undefined || input.extension.silentWhenIdle ||
-      input.schedule.sessionMode !== "fresh" || input.schedule.sessionId !== undefined
+      !(input.schedule.sessionMode === "fresh" && input.schedule.sessionId === undefined || input.schedule.sessionMode === "bound" && input.schedule.sessionId !== undefined)
     ) {
       this.recordPreSessionOutcome({
         schedule: input.schedule,
@@ -685,6 +813,8 @@ export class ScheduleCoordinator {
       status: "running",
       detail: {
         ...(input.preRunDetail ?? {}),
+        routing: { backendId: input.schedule.backendId, targetId: input.schedule.targetId,
+          ...(input.schedule.sessionMode === "bound" ? { boundSessionId: input.schedule.sessionId } : {}) },
         script: { status: "running" },
         costAttribution: "zero",
         cadence: {
@@ -693,15 +823,27 @@ export class ScheduleCoordinator {
         }
       }
     });
-    const runningSchedule = this.#store.getSchedule(input.schedule.id);
-    const target = this.#store.getTarget(runningSchedule.targetId).descriptor;
+    const runningSchedule = structuredClone(this.#store.getSchedule(input.schedule.id));
+    const target = this.#store.getTarget(runningSchedule.targetId);
+    let scopeOpen = true;
+    const assertCurrent = () => {
+      input.signal.throwIfAborted();
+      if (!scopeOpen || this.#recovery.wasForceReleased(input.runId) || this.#deletionFences.has(runningSchedule.id) || !this.#store.findSchedule(runningSchedule.id)) {
+        throw new Error("The Schedule occurrence is no longer active.");
+      }
+      const current = this.#store.getTarget(runningSchedule.targetId);
+      if (current.revision !== target.revision || current.descriptor.workspaceRoot !== target.descriptor.workspaceRoot || !current.descriptor.trusted) {
+        throw new Error("The Schedule workspace changed or is no longer trusted.");
+      }
+      if (runningSchedule.sessionMode === "bound") this.requireUsableSession(runningSchedule, runningSchedule.sessionId);
+    };
     try {
-      if (!target.trusted) throw new Error("The Schedule workspace is not trusted.");
+      assertCurrent();
       const result = await this.#executeScript({
         command: config.command,
-        cwd: target.workspaceRoot,
-        scheduleId: runningSchedule.id,
-        scheduleName: runningSchedule.name,
+        cwd: target.descriptor.workspaceRoot,
+        schedule: runningSchedule,
+        assertCurrent,
         runId: input.runId,
         firedAt: input.scheduledAt,
         capabilities: config.capabilities,
@@ -709,6 +851,7 @@ export class ScheduleCoordinator {
         signal: input.signal,
         broker: this.#scriptBroker
       });
+      assertCurrent();
       const sessionId = this.validScriptPrimarySession(runningSchedule, result.primarySessionId);
       const detail = {
         ...(input.preRunDetail ?? {}),
@@ -716,7 +859,7 @@ export class ScheduleCoordinator {
         costAttribution: "zero"
       };
       this.recordScriptSuccess({
-        schedule: this.#store.getSchedule(runningSchedule.id),
+        schedule: runningSchedule,
         operationId: input.operationId,
         runId: input.runId,
         scheduledAt: input.scheduledAt,
@@ -726,11 +869,12 @@ export class ScheduleCoordinator {
       });
       return { runId: input.runId, ...(sessionId === undefined ? {} : { sessionId }), status: "success" };
     } catch (error) {
+      if (this.#recovery.wasForceReleased(input.runId)) return { runId: input.runId, status: "failed" };
       const status = input.signal.aborted ? "aborted" : "failed";
       const current = this.#store.findSchedule(runningSchedule.id);
       if (current !== undefined) {
         this.recordPreSessionOutcome({
-          schedule: current,
+          schedule: runningSchedule,
           operationId: input.operationId,
           runId: input.runId,
           scheduledAt: input.scheduledAt,
@@ -744,6 +888,8 @@ export class ScheduleCoordinator {
         });
       }
       return { runId: input.runId, status };
+    } finally {
+      scopeOpen = false;
     }
   }
 
@@ -774,6 +920,8 @@ export class ScheduleCoordinator {
         store.recordScheduleOccurrence({
           scheduleId: input.schedule.id,
           runId: input.runId,
+          occurrenceRouting: { backendId: input.schedule.backendId, targetId: input.schedule.targetId,
+            ...(input.schedule.sessionMode === "bound" ? { boundSessionId: input.schedule.sessionId } : {}) },
           ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
           firedAt: input.scheduledAt,
           finishedAt,
@@ -795,12 +943,18 @@ export class ScheduleCoordinator {
     }
     return session !== undefined && session.deletedAt === undefined && !session.archived &&
       session.backendId === schedule.backendId && session.targetId === schedule.targetId
+      && (schedule.sessionMode !== "bound" || session.id === schedule.sessionId)
       ? session.id
       : undefined;
   }
 
   private async abortStaleOccurrence(occurrence: ScheduleRuntimeOccurrenceRecord): Promise<void> {
     const history = this.#store.findScheduleRunByRunId(occurrence.runId);
+    const run = this.#store.findRun(occurrence.runId)?.descriptor;
+    if (run !== undefined && run.state !== "queued" && activeScheduleRunState(run.state)) {
+      this.#admittedRuns.add(occurrence.runId);
+      return;
+    }
     // A queued/terminal history row proves admission committed before the
     // previous process disappeared. The runtime lease can be reclaimed, but
     // the independently progressing product Run must not be aborted.
@@ -1123,6 +1277,7 @@ function advanceScheduleWithoutSession(
   nextRunAt: number | undefined,
   now: number
 ): void {
+  if (store.getSchedule(schedule.id).revision !== schedule.revision) return;
   store.upsertSchedule(copyScheduleForCoordinator(schedule, {
     enabled: schedule.kind !== "one_shot" && schedule.enabled,
     ...(nextRunAt === undefined ? {} : { nextRunAt }),

@@ -327,6 +327,9 @@ export class CredentialManager {
     if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined || ticket.servicePurpose !== undefined) {
       throw new Error("Ephemeral input tickets cannot be committed as credentials.");
     }
+    if (ticket.credentialReferenceId !== undefined) {
+      throw new Error("Managed credential surface tickets cannot be committed as user credentials.");
+    }
     if (ticket.sealed === undefined) throw new Error("Credential upload ticket has no uploaded value.");
     if (ticket.kind !== undefined && ticket.kind !== input.kind) throw new Error("Credential upload ticket is bound to a different credential kind.");
     if (ticket.providerId !== undefined && ticket.providerId !== input.providerId) throw new Error("Credential upload ticket is bound to a different provider.");
@@ -340,6 +343,7 @@ export class CredentialManager {
       throw new Error("Credential expiry must be in the future.");
     }
     const secret = this.#vault.open(ticket.sealed, ticketReference(ticket.id));
+    this.#claimUploadTicket(ticket);
     try {
       const previous = this.#records.get(reference);
       const record: StoredCredential = {
@@ -363,11 +367,10 @@ export class CredentialManager {
           throw error;
         }
       });
-      ticket.consumed = true;
-      this.#tickets.delete(ticket.id);
       return descriptor(record, now);
-    } finally {
-      // JavaScript strings cannot be zeroed; do not retain or interpolate it.
+    } catch (error) {
+      this.#restoreUploadTicket(ticket);
+      throw error;
     }
   }
 
@@ -437,11 +440,7 @@ export class CredentialManager {
     this.#tickets.set(ticket.id, bound);
     try {
       input.onReserved(reference);
-      const committing = this.commitManagedUpload({ ...input, displayName, connectionId, credentialReferenceId: reference });
-      // commitManagedUpload has synchronously validated/captured this ticket.
-      // Remove the public capability before its persistence await can be interleaved.
-      this.#tickets.delete(ticket.id);
-      return await committing;
+      return await this.commitManagedUpload({ ...input, displayName, connectionId, credentialReferenceId: reference });
     } catch (error) {
       if (!bound.consumed && (this.#tickets.get(ticket.id) === bound || !this.#tickets.has(ticket.id))) this.#tickets.set(ticket.id, ticket);
       if (!this.#records.has(reference)) this.#managedReferences.delete(reference);
@@ -497,6 +496,7 @@ export class CredentialManager {
     validateCredentialKind(input.kind);
     const now = this.#now();
     const secret = this.#vault.open(ticket.sealed, ticketReference(ticket.id));
+    this.#claimUploadTicket(ticket);
     try {
       const previous = this.#records.get(reference);
       const record: StoredCredential = {
@@ -519,11 +519,10 @@ export class CredentialManager {
           throw error;
         }
       });
-      ticket.consumed = true;
-      this.#tickets.delete(ticket.id);
       return descriptor(record, now);
-    } finally {
-      // JavaScript strings cannot be zeroed; do not retain or interpolate it.
+    } catch (error) {
+      this.#restoreUploadTicket(ticket);
+      throw error;
     }
   }
 
@@ -776,6 +775,23 @@ export class CredentialManager {
     const record = this.#records.get(reference);
     if (record === undefined) throw new Error("Credential reference does not exist.");
     return record;
+  }
+
+  #claimUploadTicket(ticket: UploadTicket): void {
+    if (this.#requireTicket(ticket.id) !== ticket) {
+      throw new Error("Credential upload ticket is no longer current.");
+    }
+    // The capability is removed synchronously before persistence can yield.
+    ticket.consumed = true;
+    this.#tickets.delete(ticket.id);
+  }
+
+  #restoreUploadTicket(ticket: UploadTicket): void {
+    // Persistence errors roll back the record. A still-live ticket may be
+    // explicitly retried by its original owner with the same purpose binding.
+    if (ticket.expiresAt <= this.#now() || this.#tickets.has(ticket.id)) return;
+    ticket.consumed = false;
+    this.#tickets.set(ticket.id, ticket);
   }
 
   #assertUserManagedReference(reference: string): void {

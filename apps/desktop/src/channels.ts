@@ -627,50 +627,10 @@ export type DesktopNativeTaskStatusInteractionKind =
   | "input"
   | "editor";
 
-export interface DesktopNativeTaskStatusActivityLine {
-  readonly id: string;
-  readonly kind: "user" | "assistant" | "status" | "tool";
-  readonly text: string;
-}
-
-export interface DesktopNativeTaskStatusPermission {
-  readonly interactionId: string;
-  /** Decimal interaction generation. Kept as text so every IPC/HTML boundary is lossless. */
-  readonly generation: string;
-  readonly allow: boolean;
-  readonly allowForSession: boolean;
-  readonly deny: boolean;
-}
-
-export interface DesktopNativeTaskStatusSession {
-  readonly remote?: {
-    readonly sourceId: string;
-    readonly runId: string;
-    readonly silent: boolean;
-    readonly completionNotification: "none" | "pending" | "teammate";
-    readonly observedCompletionOnly?: boolean;
-    readonly companion?: { readonly name: string; readonly glyph: string; readonly tint: string; readonly artwork?: string };
-  };
-  readonly sessionId: string;
-  readonly title: string;
-  readonly detail: string;
-  readonly phase: DesktopNativeTaskStatusPhase;
-  readonly interactionKind?: DesktopNativeTaskStatusInteractionKind;
-  /** A private owner handoff is pending; it carries no ordinary Interaction or decision. */
-  readonly inputHandoff?: true;
-  readonly activityLines: readonly DesktopNativeTaskStatusActivityLine[];
-  readonly startedAt?: number;
-  readonly updatedAt: number;
-  readonly permission?: DesktopNativeTaskStatusPermission;
-}
-
-export interface DesktopNativeTaskStatusSnapshot {
-  readonly ownerId: string;
-  /** Decimal owner-snapshot revision. */
-  readonly revision: string;
-  readonly locale: DesktopLocale;
-  readonly sessions: readonly DesktopNativeTaskStatusSession[];
-}
+export type DesktopNativeTaskStatusActivityLine = import("@joko/contracts").NativeTaskStatusActivityLine;
+export type DesktopNativeTaskStatusPermission = import("@joko/contracts").NativeTaskStatusPermission;
+export type DesktopNativeTaskStatusSession = import("@joko/contracts").NativeTaskStatusSession;
+export type DesktopNativeTaskStatusSnapshot = import("@joko/contracts").NativeTaskStatusSnapshot;
 
 export type DesktopNativeTaskStatusDisplayTarget =
   | { readonly mode: "all" }

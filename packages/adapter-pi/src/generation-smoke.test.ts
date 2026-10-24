@@ -6,11 +6,63 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, SessionTreeNode, TargetDescriptor } from "@joko/core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { createCommandConcurrencyGate } from "@joko/runtime-governance";
+import { describe, expect, it, vi } from "vitest";
 import { createPiAdapter } from "./adapter.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("real Pi managed generation smoke", () => {
+  it.skipIf(process.platform !== "win32")("isolates real PowerShell tools and enforces their command gate and timeout", { timeout: 45_000 }, async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-real-pi-powershell-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-real-pi-powershell-workspace-"));
+    const command = `& '${process.execPath.replaceAll("'", "''")}' './isolation.mjs'`;
+    await writeFile(join(workspace, "isolation.mjs"), [
+      "import { writeFileSync } from 'node:fs';",
+      "writeFileSync('isolated-environment.json', JSON.stringify({",
+      "  provider: process.env.PROVIDER_API_KEY, proxy: process.env.JOKO_PROVIDER_PROXY_URL,",
+      "  internal: process.env.JOKO_PI_MCP_TOKEN, runtime: process.env.JOKO_PI_TEST_PRIVATE,",
+      "  session: process.env.PI_SESSION_FILE, visible: process.env.JOKO_VISIBLE_FIXTURE",
+      "}));"
+    ].join("\n"));
+    const server = await startOpenAiCompatibleServer([
+      { command, timeout: 1_800.001 }, { command }
+    ]);
+    const address = server.address() as AddressInfo;
+    const gate = createCommandConcurrencyGate({ readMaximum: () => 1 });
+    const acquire = vi.spyOn(gate, "acquire");
+    const adapter = createPiAdapter({
+      agentHome: home, sessionRoot: home, settings: { defaultTools: ["powershell"] }, commandConcurrencyGate: gate,
+      mcpBridge: { endpoint: `http://127.0.0.1:${address.port}/internal/mcp`, token: "synthetic-internal-bridge-token", tools: [] },
+      environment: { PROVIDER_API_KEY: "synthetic-provider-key", JOKO_PROVIDER_PROXY_URL: "synthetic-proxy-credential",
+        JOKO_PI_TEST_PRIVATE: "synthetic-runtime-key", JOKO_VISIBLE_FIXTURE: "visible" },
+      secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_URL"],
+      providers: [{ id: "smoke", baseUrl: `http://127.0.0.1:${address.port}/v1`, api: "openai-completions", keyless: true,
+        models: [{ id: "smoke-model", contextWindow: 16_384, maxTokens: 1_024 }] }]
+    });
+    const target: TargetDescriptor = { id: "powershell-target", backendId: "pi", displayName: "PowerShell isolation",
+      workspaceRoot: workspace, managed: true, trusted: false };
+    const sink = new EventSink();
+    const context = { ...smokeContext(target, 1, sink), sessionId: "powershell-session" };
+    try {
+      const binding = await adapter.createSession({ target, providerId: "smoke", modelId: "smoke-model",
+        fastMode: false, permissionMode: "bypassPermissions" }, context);
+      await adapter.send({ text: "inspect synthetic environment", images: [], files: [], mentions: [], disposition: "prompt" }, { ...context, binding });
+      await sink.waitForDone(1);
+      expect(JSON.parse(await readFile(join(workspace, "isolated-environment.json"), "utf8")))
+        .toEqual({ visible: "visible" });
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(gate.snapshot()).toEqual({ running: 0, queued: 0 });
+      expect(JSON.stringify(sink.events)).not.toContain("synthetic-provider-key");
+      expect(JSON.stringify(sink.events)).not.toContain("synthetic-proxy-credential");
+      expect(JSON.stringify(sink.events)).not.toContain("synthetic-internal-bridge-token");
+    } finally {
+      acquire.mockRestore();
+      await adapter.dispose().catch(() => undefined);
+      gate.close();
+      await closeServer(server);
+    }
+  });
+
   it("persists a detached native start and reopens it without the source conversation or a model request", { timeout: 45_000 }, async () => {
     const home = await mkdtemp(join(tmpdir(), "joko-real-pi-start-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-real-pi-start-workspace-"));
@@ -771,7 +823,8 @@ function blob(bytes: Uint8Array, mimeType = "application/octet-stream", fileName
   };
 }
 
-async function startOpenAiCompatibleServer(): Promise<Server> {
+async function startOpenAiCompatibleServer(powerShellCalls: readonly { readonly command: string; readonly timeout?: number }[] = []): Promise<Server> {
+  let toolCallIndex = 0;
   const server = createServer((request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
       response.writeHead(404).end();
@@ -779,6 +832,7 @@ async function startOpenAiCompatibleServer(): Promise<Server> {
     }
     request.resume();
     request.once("end", () => {
+      const toolInput = powerShellCalls[toolCallIndex++];
       response.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache",
@@ -790,7 +844,10 @@ async function startOpenAiCompatibleServer(): Promise<Server> {
           object: "chat.completion.chunk",
           created: 1,
           model: "smoke-model",
-          choices: [{ index: 0, delta: { role: "assistant", content: "real-pi-smoke" }, finish_reason: null }]
+          choices: [{ index: 0, delta: toolInput === undefined
+            ? { role: "assistant", content: "real-pi-smoke" }
+            : { role: "assistant", tool_calls: [{ index: 0, id: `shell-${toolCallIndex}`, type: "function",
+                function: { name: "powershell", arguments: JSON.stringify(toolInput) } }] }, finish_reason: null }]
         })}\n\n`
       );
       response.write(
@@ -799,7 +856,7 @@ async function startOpenAiCompatibleServer(): Promise<Server> {
           object: "chat.completion.chunk",
           created: 1,
           model: "smoke-model",
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          choices: [{ index: 0, delta: {}, finish_reason: toolInput === undefined ? "stop" : "tool_calls" }],
           usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
         })}\n\n`
       );

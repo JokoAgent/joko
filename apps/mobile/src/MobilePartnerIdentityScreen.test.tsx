@@ -13,7 +13,8 @@ vi.mock("react-native", () => ({
   Text: ({ children, accessibilityRole }: { children?: ReactNode; accessibilityRole?: string }) => createElement("span", { role: accessibilityRole }, children),
   TextInput: ({ accessibilityLabel, value, onChangeText }: { accessibilityLabel?: string; value: string; onChangeText(value: string): void }) => createElement("input", { "aria-label": accessibilityLabel, value, onChange: () => undefined, onInput: (event: { currentTarget: { value: string } }) => onChangeText(event.currentTarget.value) }),
   Pressable: ({ children, accessibilityLabel, disabled, onPress }: { children?: ReactNode; accessibilityLabel: string; disabled?: boolean; onPress(): void }) => createElement("button", { "aria-label": accessibilityLabel, disabled, onClick: onPress }, children),
-  StyleSheet: { create: (styles: unknown) => styles }
+  StyleSheet: { create: (styles: unknown) => styles },
+  ActivityIndicator: ({ accessibilityLabel }: { accessibilityLabel?: string }) => createElement("span", { role: "status", "aria-label": accessibilityLabel })
 }));
 import { MobilePartnerIdentityScreen } from "./MobilePartnerIdentityScreen";
 let root: Root, container: HTMLDivElement;
@@ -35,6 +36,21 @@ it("keeps unknown access recoverable and opens only a confirmed canonical member
   await click("Open conversation"); expect(onOpen).not.toHaveBeenCalled(); expect(container.querySelector('[role="alert"]')?.textContent).toContain("unconfirmed");
   const joined = create(contract.JoinedTaskShareSchema, { joinId: "joined", status: "active", share: { sessionId: "canonical" } });
   f.open.mockResolvedValueOnce(create(contract.OpenPartnerIdentityResponseSchema, { joined })); await click("Open conversation"); expect(onOpen).toHaveBeenCalledExactlyOnceWith(joined);
+});
+it("shows loading instead of an empty identity directory and clears the error after a successful retry", async () => {
+  const f = fixture();
+  let resolve!: (value: contract.ListPartnerIdentitiesResponse) => void;
+  vi.mocked(f.api.listPartnerIdentities).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  await act(async () => root.render(<MobilePartnerIdentityScreen api={f.api} colors={colors} locale="en" onBack={() => undefined} onOpen={async () => {}} />));
+  expect(container.querySelector('[role="status"]')).not.toBeNull();
+  expect(container.textContent).not.toContain("No remote Partner aliases");
+  await act(async () => resolve(create(contract.ListPartnerIdentitiesResponseSchema, {})));
+  vi.mocked(f.api.listPartnerIdentities).mockRejectedValueOnce(new Error("offline"));
+  await click("Refresh");
+  expect(container.querySelector('[role="alert"]')).not.toBeNull();
+  await click("Refresh");
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+  expect(container.textContent).toContain("Alias");
 });
 it("keeps a private issue reply visible after directory refresh and fences a late connection result", async () => {
   const f = fixture(), onOpen = vi.fn(async () => undefined);

@@ -3,6 +3,7 @@ import { StringDecoder } from "node:string_decoder";
 import { TextDecoder } from "node:util";
 
 import { redactSecrets } from "@joko/core";
+import type { ScheduleRecord } from "@joko/store";
 
 const SCRIPT_PROTOCOL = "joko-schedule-script/1" as const;
 const STDERR_CAP_BYTES = 64 * 1024;
@@ -47,11 +48,18 @@ export interface ScheduleScriptCapabilityCall {
   readonly params: Readonly<Record<string, unknown>>;
 }
 
+export interface ScheduleScriptCapabilityContext {
+  readonly schedule: ScheduleRecord;
+  readonly runId: string;
+  readonly signal: AbortSignal;
+  assertCurrent(): void;
+}
+
 export interface ScheduleScriptCapabilityBroker {
   call(
     request: ScheduleScriptCapabilityCall,
     granted: ReadonlySet<ScheduleScriptCapability>,
-    context: { readonly scheduleId: string; readonly runId: string }
+    context: ScheduleScriptCapabilityContext
   ): Promise<unknown>;
   finalizeActiveCalls?(runId: string): void;
 }
@@ -59,8 +67,8 @@ export interface ScheduleScriptCapabilityBroker {
 export interface ExecuteScheduleScriptInput {
   readonly command: string;
   readonly cwd: string;
-  readonly scheduleId: string;
-  readonly scheduleName: string;
+  readonly schedule: ScheduleRecord;
+  readonly assertCurrent: () => void;
   readonly runId: string;
   readonly firedAt: number;
   readonly capabilities: readonly ScheduleScriptCapability[];
@@ -159,9 +167,13 @@ export async function executeScheduleScript(
 ): Promise<ScheduleScriptExecutionResult> {
   const startedAt = Date.now();
   validateInput(input);
+  const schedule = structuredClone(input.schedule), lifetime = new AbortController();
+  const signal = input.signal ? AbortSignal.any([lifetime.signal, input.signal]) : lifetime.signal;
+  const assertCurrent = () => { signal.throwIfAborted(); input.assertCurrent(); };
   if (input.signal?.aborted === true) {
     throw new ScheduleScriptExecutionError("ABORTED", "Schedule script execution was aborted.");
   }
+  assertCurrent();
 
   const timeoutMs = positiveInteger(input.timeoutMs);
   const postExitCallTimeoutMs = positiveInteger(input.postExitCallTimeoutMs)
@@ -229,6 +241,7 @@ export async function executeScheduleScript(
   };
 
   const terminate = (): void => {
+    lifetime.abort();
     if (childExited || killStarted) return;
     killStarted = true;
     stopProcessTree(child, forceExitSettlement);
@@ -298,7 +311,7 @@ export async function executeScheduleScript(
         const result = await input.broker.call(
           { id: frame.id, method: frame.method, params: frame.params },
           granted,
-          { scheduleId: input.scheduleId, runId: input.runId }
+          { schedule, runId: input.runId, signal, assertCurrent }
         );
         if (writeFrame({ type: "call_result", id: frame.id, ok: true, result }) === "invalid") {
           const error = {
@@ -434,8 +447,8 @@ export async function executeScheduleScript(
   writeFrame({
     type: "start",
     context: {
-      scheduleId: input.scheduleId,
-      scheduleName: input.scheduleName,
+      scheduleId: schedule.id,
+      scheduleName: schedule.name,
       runId: input.runId,
       firedAt: input.firedAt,
       workingDir: input.cwd
@@ -521,6 +534,7 @@ export async function executeScheduleScript(
       stderrTruncated: stderrOutput.truncated || stderr.truncated
     };
   } finally {
+    lifetime.abort();
     if (timer !== undefined) clearTimeout(timer);
     if (forceExitTimer !== undefined) clearTimeout(forceExitTimer);
     input.signal?.removeEventListener("abort", onAbort);
@@ -599,8 +613,9 @@ function parseCompleteFrame(value: Readonly<Record<string, unknown>>): CompleteF
 function validateInput(input: ExecuteScheduleScriptInput): void {
   if (!boundedInputString(input.command, 32_768)) invalidInput("command");
   if (!boundedInputString(input.cwd, 32_768)) invalidInput("working directory");
-  if (!boundedInputString(input.scheduleId, 512)) invalidInput("schedule id");
-  if (!boundedInputString(input.scheduleName, 4_096)) invalidInput("schedule name");
+  if (!boundedInputString(input.schedule?.id, 512)) invalidInput("schedule id");
+  if (!boundedInputString(input.schedule?.name, 4_096)) invalidInput("schedule name");
+  if (typeof input.assertCurrent !== "function") invalidInput("occurrence authority");
   if (!boundedInputString(input.runId, 512)) invalidInput("run id");
   if (!Number.isFinite(input.firedAt)) invalidInput("fire timestamp");
   if (!Array.isArray(input.capabilities)) invalidInput("capability list");

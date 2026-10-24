@@ -10,6 +10,12 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["task.outbox", "On this device", "本机待发", "此裝置待傳送", "この端末の送信待ち", "이 기기의 전송 대기"],
+  ["task.outboxQueued", "Waiting to send", "等待发送", "等待傳送", "送信待ち", "전송 대기 중"],
+  ["task.outboxFailed", "Send failed", "发送失败", "傳送失敗", "送信に失敗", "전송 실패"],
+  ["task.outboxRestoring", "Returning to draft", "正在恢复草稿", "正在恢復草稿", "下書きに戻しています", "초안으로 복원 중"],
+  ["task.outboxHint", "Saved on this device. Sends when this node reconnects.", "已保存在本机，重新连接此节点后发送。", "已儲存在此裝置，重新連線此節點後傳送。", "この端末に保存済みです。このノードへの再接続後に送信します。", "이 기기에 저장되었습니다. 이 노드에 다시 연결되면 전송합니다."],
+  ["task.outboxUnknownHint", "Check the original operation. This input will not be sent again automatically.", "请核对原操作，此输入不会自动重新发送。", "請核對原操作，此輸入不會自動重新傳送。", "元の操作を確認してください。この入力は自動再送されません。", "원래 작업을 확인하세요. 이 입력은 자동으로 다시 전송되지 않습니다."],
   ["newTask.leaveUploadTitle", "Leave while uploading?", "附件正在上传，要离开吗？", "附件正在上傳，要離開嗎？", "アップロード中に移動しますか？", "업로드 중에 나가시겠어요?"],
   ["newTask.leaveUploadBody", "Leaving cancels this message. Its input is kept in the created task draft.", "离开会取消发送这条消息，输入会保留在已创建任务的草稿中。", "離開會取消傳送這則訊息，輸入會保留在已建立工作的草稿中。", "移動すると送信を中止します。入力は作成されたタスクの下書きに残ります。", "나가면 메시지 전송을 취소합니다. 입력은 생성된 작업의 초안에 보관됩니다."],
   ["newTask.leaveUploadStay", "Keep waiting", "继续等待", "繼續等待", "待機を続ける", "계속 기다리기"],

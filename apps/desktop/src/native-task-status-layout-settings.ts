@@ -1,5 +1,5 @@
 import type { DesktopNativeTaskStatusDisplay } from "./channels.js";
-import { atomicWritePrivateFile, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 const MAXIMUM_LAYOUT_PREFERENCES = 32;
 const MINIMUM_PERSISTED_WIDTH = 240;

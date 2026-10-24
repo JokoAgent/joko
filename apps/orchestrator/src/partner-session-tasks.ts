@@ -12,6 +12,7 @@ import { checkPartnerWorkbenchProject } from "./partner-workbench-project.js";
 import { persistSessionTaskActivity } from "./session-task-activity.js";
 import type { PartnerHomeProjects } from "./partner-home-projects.js";
 import { readPartnerSessionTaskGroupOrigin, type PartnerSessionTaskGroupOrigin, type PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-publisher.js";
+import { partnerTaskContextUsage, suggestPartnerTaskRoute } from "./partner-task-route.js";
 
 const SCOPE = "partner.session-tasks";
 function sameComputer(target: TargetDescriptor, home: TargetDescriptor): boolean {
@@ -43,7 +44,7 @@ export class PartnerSessionTaskError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = "PartnerSessionTaskError"; }
 }
 type TaskHost = Pick<SessionHost, "createServiceSession" | "registerTarget" | "enqueueServiceInput" | "abort"
-  | "getSessionRuntimeControl" | "setSessionRuntimeControl" | "resolveInteraction" | "isSessionActive"
+  | "getSessionRuntimeControl" | "getSessionRuntimeUsage" | "setSessionRuntimeControl" | "resolveInteraction" | "isSessionActive"
   | "preparePartnerPauseQueue" | "pausePartnerSession" | "restorePartnerQueue" | "wakePartnerSession">;
 
 /** Independent visible tasks have their own durable creation and execution owner.
@@ -264,7 +265,8 @@ export class PartnerSessionTaskManager {
         const open = this.store.listInteractions({ sessionId: task.sessionId, status: "open" });
         if (open.length && input.message) throw invalid("Resume without input, then answer the pending interaction.");
         this.host.restorePartnerQueue({ sessionId: task.sessionId, operationId, ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
-        task = { ...task, control: "active", deadlineAt: task.deadlineAt + Math.max(0, this.now() - task.pauseAt!), updatedAt: this.now() };
+        task = { ...task, control: "active", deadlineAt: task.deadlineAt + Math.max(0, this.now() - task.pauseAt!),
+          pauseAt: undefined, queuePauseRevision: undefined, updatedAt: this.now() };
         this.#save(task);
         if (input.message || !open.length && this.store.countQueueItems({ sessionId: task.sessionId!, states: ["accepted"] }) === 0) {
           this.#enqueue(task, `${operationId}:resume-input`, input.message ?? "Continue from the existing task history after the requested pause. Check completed actions; do not replay the original request.", "prompt", sessionId);
@@ -303,7 +305,7 @@ export class PartnerSessionTaskManager {
         return this.#reconcile(id);
       }
       if (!isActive(task.status)) task = { ...task, execution: task.execution + 1, executionRunIds: [], runId: undefined,
-        deadlineAt: this.now() + task.timeoutMs, status: "queued", result: undefined, error: undefined };
+        deadlineAt: this.now() + task.timeoutMs, pauseAt: undefined, queuePauseRevision: undefined, status: "queued", result: undefined, error: undefined };
       assertCaller(); this.#enqueue(task, operationId, input.message!, input.mode === "steer" ? "steer" : "prompt", sessionId); return this.#reconcile(id);
     });
   }
@@ -331,7 +333,19 @@ export class PartnerSessionTaskManager {
     const task = this.#owned(sessionId, id); this.#assertTaskSession(task);
     if (isActive(task.status) || task.status === "unknown" || this.store.countQueueItems({ sessionId: task.sessionId!, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"] }) > 0) throw invalid("Finish or stop this execution before inspecting the next route.");
     const runtime = this.host.getSessionRuntimeControl(task.sessionId!), current = runtime.pending?.profile ?? runtime.effective;
-    const index = task.routes.findIndex(route => sameRoute(route, current)), next = task.explicitModel ? undefined : task.routes[index + 1];
+    const session = this.store.getSession(task.sessionId!).descriptor;
+    const readings = this.host.getSessionRuntimeUsage(session.id);
+    const usage = partnerTaskContextUsage(readings.live, readings.closed, readings.durable);
+    const windowOf = (route: PartnerModelRouteRecord) => this.store.getBackend(route.backendId).descriptor.models
+      .find(model => model.providerId === route.providerId && model.modelId === route.modelId)?.contextWindow;
+    const currentWindow = current ? windowOf(current) : undefined;
+    const contextWindow = Math.max(usage.contextWindow ?? 0, currentWindow ?? 0);
+    const latest = this.store.listRuns({ sessionId: session.id, limit: 1 })[0]?.descriptor;
+    const next = task.explicitModel || task.status !== "failed" || latest?.state !== "failed" ? undefined : suggestPartnerTaskRoute({
+      chain: task.routes, current, failure: latest.error, visitedRoutes: runtime.visitedRoutes,
+      contextTokens: usage.contextTokens, currentContextWindow: contextWindow > 0 ? contextWindow : null, windowOf,
+      available: route => { try { this.#resolveModel(sessionId, route).assertCurrent(); return true; } catch { return false; } }
+    });
     const selectionToken = next ? hash(JSON.stringify([task.id, task.execution, runtime.generation, next])) : undefined;
     return { generation: runtime.generation, current, next, selection_token: selectionToken };
   }
@@ -339,7 +353,7 @@ export class PartnerSessionTaskManager {
     return this.#serial(id, async () => {
       assertCaller(); const inspected = this.inspectRoute(sessionId, id);
       if (inspected.generation !== generation || inspected.selection_token !== token || !inspected.next) throw changed();
-      const task = this.#owned(sessionId, id); this.partners.resolveTaskModel(sessionId, inspected.next).assertCurrent();
+      const task = this.#owned(sessionId, id); this.#resolveModel(sessionId, inspected.next).assertCurrent();
       const result = await this.host.setSessionRuntimeControl({ sessionId: task.sessionId!, expectedGeneration: generation,
         patch: { backendId: inspected.next.backendId, providerId: inspected.next.providerId, modelId: inspected.next.modelId, ...(inspected.next.effort === undefined ? {} : { effort: inspected.next.effort }), fastMode: inspected.next.fastMode } });
       assertCaller(); return result;
@@ -556,7 +570,6 @@ function invalid(message: string) { return new PartnerSessionTaskError("TASK_INV
 function changed() { return new PartnerSessionTaskError("TASK_CHANGED", "The task owner, directory or runtime changed. Read its current state before continuing."); }
 function uncertain(error: unknown) { return typeof error === "object" && error !== null && "stateMayHaveChanged" in error && error.stateMayHaveChanged === true; }
 function isActive(status: PartnerSessionTaskStatus) { return (activeStates as readonly string[]).includes(status); }
-function sameRoute(route: PartnerModelRouteRecord, current: SessionRuntimeProfile | undefined) { return route.backendId === current?.backendId && route.providerId === current.providerId && route.modelId === current.modelId; }
 function bounded(value: unknown, maximum: number, allowEmpty = false): string {
   if (typeof value !== "string" || value.length > maximum || !allowEmpty && !value.trim() || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value) || redactSecrets(value) !== value) throw invalid("Task text is invalid or exceeds its limit."); return value.trim();
 }

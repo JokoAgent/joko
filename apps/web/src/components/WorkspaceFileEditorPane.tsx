@@ -246,6 +246,8 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
     revealLine: (line) => editorRef.current?.revealLine(line)
   }), [discardLocalChanges, save]);
 
+  const guardCallbacks = useRef({ save, discardLocalChanges });
+  guardCallbacks.current = { save, discardLocalChanges };
   useEffect(() => {
     if (documentGuard === undefined) return;
     const registration = documentGuard.controller.register({
@@ -255,12 +257,12 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
         path: file.path
       },
       isDirty: () => workspaceFileEditorDirty(baselineRef.current, editorTextRef.current),
-      save,
-      discard: discardLocalChanges,
+      save: () => guardCallbacks.current.save(),
+      discard: () => guardCallbacks.current.discardLocalChanges(),
       focus: () => editorRef.current?.focus()
     });
     return () => registration.unregister();
-  }, [discardLocalChanges, documentGuard, file.path, save]);
+  }, [documentGuard?.controller, documentGuard?.sessionId, documentGuard?.workspaceId, file.path]);
 
   const markdown = isWorkspaceMarkdownPath(file.path);
   const markdownTableLabels = useMemo(() => ({

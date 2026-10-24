@@ -6084,6 +6084,75 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.getOperation).toHaveBeenCalledWith(credential, "operation-1", expect.any(AbortSignal));
   });
 
+  it.each(["first", "follow-up"] as const)("keeps the original node through final %s persistence, background, reconnect and node switching", async phase => {
+    const network = fakeNetwork(), drafts = memoryDraftStores(), identity = { profileId: credential.profileId };
+    const remote = { ...otherCredential, origin: "http://192.168.1.21:4318", serverId: "node-2" };
+    const remoteSnapshot = create(SnapshotSchema, { ...snapshot, server: { ...snapshot.server!, serverId: remote.serverId },
+      connections: [otherConnection], devices: [otherDevice] });
+    vi.mocked(network.inspect).mockImplementation(async origin => origin === remote.origin ? { ...node, serverId: remote.serverId } : node);
+    vi.mocked(network.readOwner).mockImplementation(async value => value.serverId === remote.serverId
+      ? { connection: otherConnection, device: otherDevice, snapshot: remoteSnapshot } : { connection, device, snapshot });
+    vi.mocked(network.readSession).mockImplementation(async value => value.serverId === remote.serverId ? remoteSnapshot : snapshot);
+    const storage = memoryStorage([credential, remote], credential.profileId);
+    let request = 0, release!: () => void, entered!: () => void, held = false;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const reached = new Promise<void>(resolve => { entered = resolve; });
+    const write = drafts.newTask.driver.setItem.bind(drafts.newTask.driver);
+    drafts.newTask.driver.setItem = async (key, value) => {
+      const record = JSON.parse(value) as { identity?: { profileId?: string }; draft?: { submission?: { sendOperationId?: string };
+        conversation?: { followUps?: readonly { operationId: string; state: string }[] } } };
+      const finalWrite = phase === "first" ? record.draft?.submission?.sendOperationId !== undefined
+        : record.draft?.conversation?.followUps?.some(item => item.operationId === "original-follow-up" && item.state === "dispatching");
+      if (!held && record.identity?.profileId === identity.profileId && finalWrite) { held = true; entered(); await waiting; }
+      await write(key, value);
+    };
+    vi.mocked(network.submit).mockImplementation(async (value, operationId, mutation) => {
+      if (mutation.payload.case === "createSession") {
+        if (phase === "follow-up") {
+          const input = plainTextMobileComposerDraft("Private original follow-up");
+          drafts.newTask.saveConversationInput(identity, operationId, input);
+          await drafts.newTask.queueFollowUp(identity, operationId, "original-follow-up", input);
+        }
+        return create(OperationSchema, { operationId, connectionId: value.connectionId, state: OperationState.SUCCEEDED,
+          result: { payload: { case: "session", value: snapshot.sessions[0]! } } });
+      }
+      return create(OperationSchema, { operationId, connectionId: value.connectionId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "queueItem", value: create(QueueItemSchema, { queueItemId: operationId,
+          sessionId: "session", backendId: "backend", targetId: "target" }) } } });
+    });
+    const app = client(network, storage.storage, undefined, undefined, () => `original-create-${++request}`, undefined, drafts);
+    await app.start();
+    const sending = app.create("target", "Work", plainTextMobileComposerDraft("Private original first"), undefined, undefined,
+      phase === "follow-up" ? { optimisticConversation: true, signal: new AbortController().signal,
+        waitForLeaveDecision: async () => false, onUploadingChange: () => undefined } : undefined);
+    await reached;
+    app.setForeground(false); app.setForeground(true);
+    await vi.waitFor(() => expect(app.state).toMatchObject({ status: "connected", busy: false }));
+    await app.connectSaved(remote.profileId);
+    expect(app.state.activeProfileId).toBe(remote.profileId);
+    release();
+    await expect(sending).resolves.toMatchObject({ created: true, sent: false, definitive: false });
+    expect(network.submit).toHaveBeenCalledTimes(phase === "first" ? 1 : 2);
+    expect(vi.mocked(network.submit).mock.calls.every(([value]) => value.profileId === credential.profileId)).toBe(true);
+    const retained = drafts.newTask.readSync(identity)!;
+    const operationId = phase === "first" ? retained.submission!.phase === "sending" && retained.submission!.sendOperationId : "original-follow-up";
+    expect(operationId).toBeTruthy();
+    expect(retained.submission).toMatchObject({ phase: "sending", connectionId: credential.connectionId, serverId: credential.serverId });
+    if (phase === "follow-up") expect(retained.conversation?.followUps).toMatchObject([{ operationId, state: "dispatching" }]);
+    expect(drafts.newTask.readSync({ profileId: remote.profileId })).toBeNull();
+    expect(storage.pending()).toEqual([]);
+    app.dispose();
+    const restored = { values: drafts.values, newTask: new MobileNewTaskDraftStore(drafts.newTask.driver),
+      composer: new MobileComposerDraftStore(drafts.composer.driver) };
+    const recovered = client(network, storage.storage, undefined, undefined, () => "never-resend", undefined, restored);
+    await recovered.start();
+    expect(network.getOperation).toHaveBeenCalledWith(credential, operationId, expect.any(AbortSignal));
+    expect(network.submit).toHaveBeenCalledTimes(phase === "first" ? 1 : 2);
+    expect(restored.newTask.readSync(identity)).toBeNull();
+    expect(restored.composer.readSync({ ...identity, sessionId: "session" })?.text)
+      .toBe(phase === "first" ? "Private original first" : "Private original follow-up");
+  });
+
   it.each([false, true])("keeps an optimistic local conversation editable before creation resolves and recovers a create failure=%s", async fails => {
     const network = fakeNetwork(), drafts = memoryDraftStores(), identity = { profileId: credential.profileId };
     let request = 0, release!: () => void;

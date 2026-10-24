@@ -1,4 +1,4 @@
-import { atomicWritePrivateFile, deletePrivateFile, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, deletePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 const DEFAULT_ENABLE_BETA = false;
 

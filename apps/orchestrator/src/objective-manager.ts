@@ -1035,22 +1035,20 @@ function readTurnEvidence(store: OperationalStore, sessionId: string, run: Store
   events.sort((left, right) => left.globalCursor < right.globalCursor ? -1 : left.globalCursor > right.globalCursor ? 1 : 0);
   const assistant: string[] = [];
   let sawToolUse = false;
-  let assistantUsage: Extract<EventPayload, { readonly type: "usage" }>["usage"] | undefined;
-  let genericUsage: Extract<EventPayload, { readonly type: "usage" }>["usage"] | undefined;
   for (const event of events) {
     if (event.payload.type === "message_complete" && event.payload.role === "assistant") {
       assistant.push(event.payload.blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join("\n"));
-      if (event.payload.usage !== undefined) assistantUsage = event.payload.usage;
     } else if (event.payload.type === "tool_start") {
       sawToolUse = true;
-    } else if (event.payload.type === "usage") {
-      genericUsage = event.payload.usage;
     }
   }
   return {
     assistantText: assistant.join("\n"),
     sawToolUse,
-    tokens: Math.max(0, (assistantUsage ?? genericUsage)?.totalTokens ?? 0)
+    // The Store accounts exact Run deltas across native requests and children.
+    // Message usage is per-request on some engines and cumulative on others;
+    // summing it or a Session snapshot would either lose work or count it twice.
+    tokens: run.descriptor.usage?.totalTokens ?? 0
   };
 }
 

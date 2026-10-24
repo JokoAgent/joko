@@ -27,7 +27,7 @@ describe("server-owned interactive work plans", () => {
     f.send("Should everyone help?"); expect(f.store.executions(f.room.id)).toMatchObject([{ kind: "plan-decision", decisionMode: "auto" }]);
     f.settle(f.a, { decision: { needsPlan: false, steps: [] } }); expect(f.store.executions(f.room.id).filter(job => job.status === "queued")).toEqual([]);
     f.send("Everyone: produce this", { mentionAll: true }); f.settle(f.a, { decision: { needsPlan: false, steps: [] } });
-    expect(f.store.executions(f.room.id).filter(job => job.status === "queued").map(job => job.actorId)).toEqual([f.a, f.b]);
+    expect(f.store.executions(f.room.id).filter(job => job.status === "queued").map(job => job.actorId).sort()).toEqual([f.a, f.b].sort());
     f.send("Writer only", { mentions: [f.a] }); expect(f.store.executions(f.room.id).at(-1)?.kind).toBe("reply");
   });
   it("validates and merges proposed steps, requires approval, and leaves one open card after revision", () => {

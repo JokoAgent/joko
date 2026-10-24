@@ -6,6 +6,7 @@ import {
   buildScheduleScriptEnvironment,
   executeScheduleScript,
   type ExecuteScheduleScriptInput,
+  type ScheduleScriptCapabilityContext,
   type ScheduleScriptCapabilityBroker
 } from "./schedule-script-runner.js";
 
@@ -40,7 +41,7 @@ describe("executeScheduleScript", () => {
     expect(call).toHaveBeenCalledWith(
       { id: "dispatch-7", method: "sessions.dispatch", params: { prompt: "inspect" } },
       new Set(["sessions.dispatch"]),
-      { scheduleId: "schedule-1", runId: "run-1" }
+      expect.objectContaining({ schedule: expect.objectContaining({ id: "schedule-1", name: "Daily inspection" }), runId: "run-1", signal: expect.any(AbortSignal), assertCurrent: expect.any(Function) })
     );
     expect(JSON.parse(result.resultText ?? "{}")).toMatchObject({
       protocol,
@@ -131,6 +132,7 @@ describe("executeScheduleScript", () => {
   it("bounds host-call settlement after a script has exited", async () => {
     const finalizeActiveCalls = vi.fn();
     const startedAt = Date.now();
+    let scope: ScheduleScriptCapabilityContext | undefined;
     const pending = executeScheduleScript(baseInput(`
       const emit=(frame)=>process.stdout.write(JSON.stringify({protocol:"${protocol}",...frame})+"\\n");
       emit({type:"call",id:"stuck",method:"sessions.dispatch",params:{}});
@@ -138,7 +140,7 @@ describe("executeScheduleScript", () => {
       setTimeout(()=>process.exit(0),10);
     `, {
       capabilities: ["sessions.dispatch"],
-      broker: { call: async () => new Promise(() => undefined), finalizeActiveCalls },
+      broker: { call: async (_request, _granted, context) => { scope = context; return new Promise(() => undefined); }, finalizeActiveCalls },
       postExitCallTimeoutMs: 60,
       timeoutMs: 5_000
     }));
@@ -146,6 +148,7 @@ describe("executeScheduleScript", () => {
     await expect(pending).rejects.toMatchObject({ code: "HOST_CALL_TIMEOUT" });
     expect(Date.now() - startedAt).toBeLessThan(2_000);
     expect(finalizeActiveCalls).toHaveBeenCalledWith("run-1");
+    expect(scope?.signal.aborted).toBe(true); expect(() => scope!.assertCurrent()).toThrow();
   });
 
   it("fails closed when exit zero has no complete frame", async () => {
@@ -306,8 +309,10 @@ function baseInput(
   return {
     command: nodeEval(source),
     cwd: process.cwd(),
-    scheduleId: "schedule-1",
-    scheduleName: "Daily inspection",
+    schedule: { id: "schedule-1", name: "Daily inspection", backendId: "backend", targetId: "target", sessionMode: "fresh",
+      kind: "one_shot", timezone: "UTC", enabled: true, prompt: { text: "", images: [], files: [], mentions: [], disposition: "prompt" },
+      executionSnapshot: {}, overlapPolicy: "skip", misfirePolicy: "skip", createdAt: 1, updatedAt: 1, revision: 1n },
+    assertCurrent: () => undefined,
     runId: "run-1",
     firedAt: 1_700_000_000_000,
     capabilities: [],

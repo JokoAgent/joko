@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./share-redaction": "./src/components/share-redaction.ts",
     ".": "./src/App.tsx",
     "./bootstrap": "./src/main.tsx",
     "./connection-contract": "./src/connection-contract.ts",

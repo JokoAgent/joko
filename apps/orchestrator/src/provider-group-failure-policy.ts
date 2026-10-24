@@ -27,6 +27,9 @@ const STAY = new Map([
   ["approved-repo-root-changed", "local"], ["approval-working-dir-mismatch", "local"], ["approval-resolver-unavailable", "local"], ["runtime-skills-missing", "local"]
 ]);
 const CODEX_STAY = new Map([["contextWindowExceeded", "context"], ["badRequest", "invalid-request"], ["cyberPolicy", "policy"], ["sandboxError", "local"]]);
+const PUBLIC_STAY = new Map([["INVALID_REQUEST", "invalid-request"], ["INVALID_ARGUMENT", "invalid-request"],
+  ["CLAUDE_CODE_CONTEXT_LIMIT", "context"], ["CLAUDE_CODE_TURN_LIMIT", "context"],
+  ["SANDBOX_ERROR", "local"], ["TOOL_USE_LOOP_DETECTED", "tool-loop"]]);
 /** All group entry points use this policy after the native same-member retry.
  * Classification never publishes the raw error text, which can contain input. */
 export function decideProviderGroupFailure(signals: ProviderGroupFailureSignals | null | undefined, phase: ProviderGroupFailurePhase): ProviderGroupFailureDecision {
@@ -38,7 +41,7 @@ export function decideProviderGroupFailure(signals: ProviderGroupFailureSignals 
   if (code === "PROVIDER_GROUP_UNAVAILABLE") return stay("group-unavailable");
   if (code === "SESSION_CLOSED_MID_TURN" || code === "HOSTED_AGENT_LOCAL_ADMISSION") return stay("local");
   if (phase !== "run" && code && TASK_STATE.has(code)) return stay("task-state");
-  const known = STAY.get(reason) ?? CODEX_STAY.get(signals.codexErrorInfo ?? ""); if (known) return stay(known);
+  const known = STAY.get(reason) ?? CODEX_STAY.get(signals.codexErrorInfo ?? "") ?? PUBLIC_STAY.get(code ?? ""); if (known) return stay(known);
   if (signals.sdkError === "max_output_tokens" || code === "CONTEXT_OVERFLOW" || code === "OUTPUT_LIMIT"
     || /context.{0,20}(?:length|window|limit|overflow|too long)|maximum context|prompt is too long|history.{0,20}(?:too large|oversized)/iu.test(message)) return stay("context");
   if (signals.toolLoop) return stay("tool-loop");

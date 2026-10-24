@@ -28,6 +28,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 import { scheduleDraft } from "./components/SchedulesPage.js";
+import type { ScheduleDraft } from "./model.js";
 
 describe("schedule gateway snapshots", () => {
   it("binds preparation, testing, and recovery to typed Schedule hook requests", async () => {
@@ -122,12 +123,12 @@ describe("schedule gateway snapshots", () => {
     expect(schedule.recurrence.kind.case).toBe("oneShot");
     expect(schedule.recurrence.kind.value.triggerAt.seconds).toBe(BigInt(Date.UTC(2026, 7, 24, 1, 30) / 1_000));
 
-    await gateway.saveSchedule(undefined, {
+    const scriptDraft: ScheduleDraft = {
       name: "Local script",
       backendId: "backend-one",
       targetId: "target-one",
-      sessionMode: "persistent",
-      sessionId: "session-must-not-bind",
+      sessionMode: "bound",
+      sessionId: "session-bound",
       enabled: true,
       kind: "manual",
       expression: "",
@@ -150,9 +151,10 @@ describe("schedule gateway snapshots", () => {
       expireAtExpression: "",
       overlapPolicy: "skip",
       misfirePolicy: "skip"
-    });
+    };
+    await gateway.saveSchedule(undefined, scriptDraft);
     const scriptSchedule = payloads[1]?.value.schedule;
-    expect(scriptSchedule).toMatchObject({ sessionId: "", sessionMode: 1 });
+    expect(scriptSchedule).toMatchObject({ sessionId: "session-bound", sessionMode: 3 });
     expect(scriptSchedule.execution).toMatchObject({
       executionMode: 2,
       planMode: false,
@@ -165,6 +167,7 @@ describe("schedule gateway snapshots", () => {
       }
     });
     expect(scriptSchedule.execution.model).toBeUndefined();
+    await expect(gateway.saveSchedule(undefined, { ...scriptDraft, sessionMode: "persistent" })).rejects.toThrow(/fresh or bound/);
     gateway.disconnect();
   });
 

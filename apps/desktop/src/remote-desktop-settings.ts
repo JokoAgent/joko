@@ -1,4 +1,4 @@
-import { atomicWritePrivateFile, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 export interface DesktopRemoteDesktopSettings {
   readonly enabled: boolean;

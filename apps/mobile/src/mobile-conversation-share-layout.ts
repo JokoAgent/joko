@@ -1,4 +1,4 @@
-import { redactShareMessageText as redactSensitiveText } from "./mobile-share-redaction";
+import { redactShareMessageText as redactSensitiveText } from "@joko/web/share-redaction";
 
 import {
   parseMobileMarkdown,

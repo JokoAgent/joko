@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { DesktopRemoteDesktopViewerOwner } from "@joko/contracts";
-import { atomicWritePrivateFile, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 type PreferenceOwner = Pick<DesktopRemoteDesktopViewerOwner, "profileId" | "serverId" | "deviceId">;
 export interface DesktopRemoteDesktopViewerPreferences { readonly audio: boolean; readonly hostMute: boolean; readonly lockOnExit: boolean; readonly clipboardSync: boolean; readonly privacyScreen: boolean }

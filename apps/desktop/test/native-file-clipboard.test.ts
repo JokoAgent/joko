@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FILE_COPY_MAXIMUM_BYTES, FILE_COPY_RETENTION_MS, FILE_COPY_TOTAL_BYTES, NativeFileClipboard, parseDesktopCopyFileRequest, type FileCopyHelperResult } from "../src/native-file-clipboard.js";
 import { mkdtemp } from "./test-paths.js";
-import * as secureFiles from "../src/secure-files.js";
+import * as secureFiles from "@joko/device-peer/private-files";
 
 const spawn = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({ spawn }));

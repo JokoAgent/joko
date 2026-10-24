@@ -17,17 +17,19 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import nativeArtifacts from "./native-helper-artifacts.cjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = join(root, "native", "remote-desktop");
 const defaultOutput = join(root, "dist", "native-remote-desktop");
-const macHelper = "joko-macos-remote-desktop-input";
-const macCaptureHelper = "joko-macos-remote-desktop-capture";
-const macCredentialHelper = "joko-macos-remote-credentials";
+const artifactName = (platform, field) => nativeArtifacts.REMOTE_NATIVE_DIGEST_ARTIFACTS[platform].find(artifact => artifact.field === field).name;
+const macHelper = artifactName("darwin", "inputHelper");
+const macCaptureHelper = artifactName("darwin", "captureHelper");
+const macCredentialHelper = artifactName("darwin", "credentialHelper");
 const credentialBundle = "JokoRemoteCredentials_JokoRemoteCredentials.bundle";
-const windowsHelper = "joko-windows-remote-desktop-input.exe";
-const windowsHostService = "joko-windows-remote-desktop-host.exe";
-const windowsHostAddon = "joko-windows-remote-desktop-host.node";
+const windowsHelper = artifactName("win32", "inputHelper");
+const windowsHostService = artifactName("win32", "windowsHostService");
+const windowsHostAddon = artifactName("win32", "windowsHostAddon");
 const linuxHelper = "joko-linux-remote-desktop-input";
 const linuxCaptureHelper = "joko-linux-remote-desktop-capture";
 const linuxClipboardHelper = "joko-linux-remote-desktop-clipboard";
@@ -98,7 +100,7 @@ export function buildNativeRemoteDesktop({
   if (!linuxCredentials.startsWith(`${artifactOutput}${sep}`)) throw new Error("Invalid native resource path.");
   rmSync(linuxCredentials, { recursive: true, force: true });
   rmSync(join(artifactOutput, "manifest.json"), { force: true });
-  writeManifest(artifactOutput, platform, architecture, null, null, null, null, null, null, null, null, null);
+  writeManifest({ output: artifactOutput, platform, architecture });
   if (!["darwin", "win32", "linux"].includes(platform)) return;
 
   const cache = mkdtempSync(join(tmpdir(), "joko-native-remote-desktop-build-"));
@@ -234,26 +236,26 @@ export function buildNativeRemoteDesktop({
       ? null
       : stageHelper(artifactOutput, captureHelper, captureBinary);
     const credentialSha256 = credentialBinary === null ? null : stageHelper(artifactOutput, macCredentialHelper, credentialBinary);
-    writeManifest(
-      artifactOutput,
+    writeManifest({
+      output: artifactOutput,
       platform,
       architecture,
       inputHelper,
       inputSha256,
-      captureBinary === null ? null : captureHelper,
+      captureHelper: captureBinary === null ? null : captureHelper,
       captureSha256,
-      credentialBinary === null ? null : macCredentialHelper,
+      credentialHelper: credentialBinary === null ? null : macCredentialHelper,
       credentialSha256,
-      resourceDigest,
-      clipboardBinary === null ? null : linuxClipboardHelper,
-      clipboardBinary === null ? null : stageHelper(artifactOutput, linuxClipboardHelper, clipboardBinary),
-      platform === "linux" ? stageHelper(artifactOutput, linuxViewerScript, join(source, linuxViewerScript)) : null,
-      privacyBinary === null ? null : stageHelper(artifactOutput, linuxPrivacyPlugin, privacyBinary),
-      privacyMetadata === null ? null : stageHelper(artifactOutput, linuxPrivacyMetadata, privacyMetadata, 0o644),
+      credentialBundleSha256: resourceDigest,
+      clipboardHelper: clipboardBinary === null ? null : linuxClipboardHelper,
+      clipboardSha256: clipboardBinary === null ? null : stageHelper(artifactOutput, linuxClipboardHelper, clipboardBinary),
+      viewerDisplaySha256: platform === "linux" ? stageHelper(artifactOutput, linuxViewerScript, join(source, linuxViewerScript)) : null,
+      privacySha256: privacyBinary === null ? null : stageHelper(artifactOutput, linuxPrivacyPlugin, privacyBinary),
+      privacyMetadataSha256: privacyMetadata === null ? null : stageHelper(artifactOutput, linuxPrivacyMetadata, privacyMetadata, 0o644),
       linuxCredentialFiles,
-      hostServiceBinary === null ? null : stageHelper(artifactOutput, windowsHostService, hostServiceBinary),
-      hostAddonBinary === null ? null : stageHelper(artifactOutput, windowsHostAddon, hostAddonBinary)
-    );
+      windowsHostServiceSha256: hostServiceBinary === null ? null : stageHelper(artifactOutput, windowsHostService, hostServiceBinary),
+      windowsHostAddonSha256: hostAddonBinary === null ? null : stageHelper(artifactOutput, windowsHostAddon, hostAddonBinary)
+    });
   } finally {
     const temporaryRoot = resolve(tmpdir());
     if (!resolve(cache).startsWith(`${temporaryRoot}${sep}`)) throw new Error("Invalid native build cache path.");
@@ -351,26 +353,26 @@ export function assertLinuxRemoteDesktopElf(bytes, architecture) {
   }
 }
 
-function writeManifest(
+function writeManifest({
   output,
   platform,
   architecture,
-  inputHelper,
-  inputSha256,
-  captureHelper,
-  captureSha256,
-  credentialHelper,
-  credentialSha256,
-  credentialBundleSha256,
-  clipboardHelper,
-  clipboardSha256,
+  inputHelper = null,
+  inputSha256 = null,
+  captureHelper = null,
+  captureSha256 = null,
+  credentialHelper = null,
+  credentialSha256 = null,
+  credentialBundleSha256 = null,
+  clipboardHelper = null,
+  clipboardSha256 = null,
   viewerDisplaySha256 = null,
   privacySha256 = null,
   privacyMetadataSha256 = null,
   linuxCredentialFiles = null,
   windowsHostServiceSha256 = null,
   windowsHostAddonSha256 = null
-) {
+}) {
   writeFileSync(join(output, "manifest.json"), `${JSON.stringify({
     protocolVersion: 1,
     platform,

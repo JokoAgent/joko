@@ -367,6 +367,9 @@ function usageFromNative(value: unknown, cost: number): UsageSnapshot {
 
 function classifyFailure(subtype: string | undefined, terminalReason: string | undefined, assistantError: string | undefined): PublicError {
   const category = assistantError ?? terminalReason ?? subtype ?? "unknown";
+  if (category === "invalid_request") {
+    return publicFailure("INVALID_REQUEST", "The model service rejected the request as invalid.", false, "Correct the request before retrying.");
+  }
   if (category === "authentication_failed" || category === "oauth_org_not_allowed") {
     return publicFailure("CLAUDE_CODE_AUTHENTICATION_FAILED", "Claude Code could not authenticate this request.", false, "Sign in or repair the configured credential source, then retry.");
   }

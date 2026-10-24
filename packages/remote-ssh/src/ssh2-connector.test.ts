@@ -283,12 +283,13 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
     await connection.close();
   });
 
-  it("uses a real SFTP subsystem for bounded atomic workspace file operations", async () => {
+  it("uses a real SFTP subsystem for bounded atomic workspace file operations", { timeout: 15_000 }, async () => {
     const server = await startSshServer();
     const connection = await connect(server.port);
     const files = connection.files!;
 
     await expect(files.mkdir("/workspace/nested", { recursive: true, mode: 0o700 })).resolves.toBeUndefined();
+    await expect(files.mkdir("/workspace/nested", { recursive: false })).rejects.toBeDefined();
     await expect(files.write({
       path: "/workspace/nested/note.txt",
       content: Buffer.from("remote content"),

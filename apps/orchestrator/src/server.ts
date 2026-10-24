@@ -8,7 +8,7 @@ import { fastifyConnectPlugin } from "@connectrpc/connect-fastify";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import type { OrchestratorApplication } from "./application.js";
-import { isLoopbackHost, isPrivateLanHost, isPrivateLanHttpOrigin, readTls } from "./config.js";
+import { isLoopbackHost, isPrivateLanHost, readTls } from "./config.js";
 import { registerConnectServices } from "./connect-services.js";
 import { registerHostedAgentDesktopService } from "./hosted-agent-desktop-service.js";
 import { registerInputHandoffNativeHost } from "./input-handoff/native-host.js";
@@ -102,7 +102,7 @@ export async function createPublicServer(application: OrchestratorApplication): 
     reply.header("x-content-type-options", "nosniff");
     reply.header("x-frame-options", "DENY");
     reply.header("referrer-policy", "no-referrer");
-    reply.header("permissions-policy", "camera=(), microphone=(), geolocation=()");
+    reply.header("permissions-policy", "camera=(), microphone=(self), geolocation=()");
     reply.header("cross-origin-resource-policy", "same-site");
     reply.header(
       "content-security-policy",
@@ -135,8 +135,7 @@ export async function createPublicServer(application: OrchestratorApplication): 
     methods: ["GET", "POST", "PUT", "OPTIONS"],
     origin(origin, callback) {
       const allowed = origin === undefined || origin === JOKO_DESKTOP_APP_ORIGIN ||
-        application.config.corsOrigins.includes(origin) ||
-        (application.config.allowInsecureLan && origin !== undefined && isPrivateLanHttpOrigin(origin));
+        application.config.corsOrigins.includes(origin);
       callback(null, allowed);
     }
   });

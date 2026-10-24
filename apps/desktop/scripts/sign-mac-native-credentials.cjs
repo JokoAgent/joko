@@ -2,7 +2,9 @@ const { createHash } = require("node:crypto");
 const { lstat, readFile, realpath, writeFile } = require("node:fs/promises");
 const { createRequire } = require("node:module");
 const { join, resolve, sep } = require("node:path");
-const { auditNativeRemoteDesktop } = require("./audit-packaged.cjs");
+const { auditNativeRemoteDesktop, auditNativeGamepad, auditNativeSystemFrontmostInput } = require("./audit-packaged.cjs");
+const { SIMPLE_NATIVE_ARTIFACTS, REMOTE_NATIVE_DIGEST_ARTIFACTS, boundedRegularFile, refreshSimpleNativeManifest } = require("./native-helper-artifacts.cjs");
+const simpleAudits = { gamepad: auditNativeGamepad, frontmost: auditNativeSystemFrontmostInput };
 
 // The pinned signer signs inner Mach-O files before asking for the outer App's
 // options. Refresh those final digests here, before the outer resource seal.
@@ -12,8 +14,16 @@ function createSignHook(sign, audit = auditNativeRemoteDesktop) {
       throw new Error("The native credential signer requires its macOS App owner.");
     }
     const appPath = resolve(options.app);
-    const root = join(appPath, "Contents", "Resources", "native-remote-desktop");
+    const resourcesRoot = join(appPath, "Contents", "Resources");
+    const root = join(resourcesRoot, "native-remote-desktop");
     const credentialHelper = join(root, "joko-macos-remote-credentials");
+    await boundedRegularFile(root, join(root, "manifest.json"), 4096);
+    const { architecture } = JSON.parse(await readFile(join(root, "manifest.json"), "utf8"));
+    if (!["x64", "arm64"].includes(architecture)) throw new Error("The native helper architecture is invalid.");
+    await audit(root, "darwin", architecture);
+    for (const [kind, auditSimple] of Object.entries(simpleAudits)) {
+      await auditSimple(join(resourcesRoot, SIMPLE_NATIVE_ARTIFACTS[kind].directory), "darwin", architecture);
+    }
     const original = options.optionsForFile;
     let sealed = false;
     await sign({
@@ -26,6 +36,10 @@ function createSignHook(sign, audit = auditNativeRemoteDesktop) {
         }
         if (resolve(file) === appPath) {
           await refreshManifest(root, audit);
+          for (const [kind, auditSimple] of Object.entries(simpleAudits)) {
+            const artifact = SIMPLE_NATIVE_ARTIFACTS[kind];
+            await refreshSimpleNativeManifest(join(resourcesRoot, artifact.directory), artifact, "darwin", architecture, auditSimple);
+          }
           sealed = true;
         }
         return defaults;
@@ -55,11 +69,7 @@ async function refreshManifest(root, audit) {
       "windowsHostService", "windowsHostServiceSha256", "windowsHostAddon", "windowsHostAddonSha256", "windowsHostNodeApiVersion"].some(field => manifest[field] !== null)) {
     throw new Error("The native credential manifest does not match its App owner.");
   }
-  for (const [field, name, digest] of [
-    ["inputHelper", "joko-macos-remote-desktop-input", "inputSha256"],
-    ["captureHelper", "joko-macos-remote-desktop-capture", "captureSha256"],
-    ["credentialHelper", "joko-macos-remote-credentials", "credentialSha256"]
-  ]) {
+  for (const { field, name, digest } of REMOTE_NATIVE_DIGEST_ARTIFACTS.darwin) {
     if (manifest[field] !== name) throw new Error("The native credential helper identity is invalid.");
     const binary = join(root, name);
     const [info, canonical] = await Promise.all([lstat(binary), realpath(binary)]);

@@ -175,7 +175,7 @@ export class SchedulerRuntimeState {
   slotsInUse(): number {
     let count = 0;
     for (const run of this.#inFlight.values()) {
-      if (run.phase !== "queued" && run.phase !== "cancelling" && run.phase !== "stalled") count += 1;
+      if (run.phase !== "queued") count += 1;
     }
     return count;
   }

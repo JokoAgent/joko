@@ -138,6 +138,26 @@ describe("ModelPriceOverrideDialog", () => {
     expect(inputFor("Output").value).toBe("");
     expect(button("Save").disabled).toBe(true);
   });
+
+  it("reopens a usable draft while an earlier save is still pending and ignores that retired result", async () => {
+    const value: ModelPriceOverrideView = { backendId: model.backendId, providerId: model.providerId, modelId: model.modelId,
+      reference: { currency: "USD", inputPerMillion: 1, outputPerMillion: 2 }, effective: { currency: "USD", inputPerMillion: 1, outputPerMillion: 2 },
+      allowedCurrencies: ["USD"], referenceAvailable: true };
+    let finish!: (value: ModelPriceOverrideView) => void;
+    const controller = { getModelPriceOverride: vi.fn(async () => value), resetModelPriceOverride: vi.fn(async () => value),
+      setModelPriceOverride: vi.fn(() => new Promise<ModelPriceOverrideView>(resolve => { finish = resolve; })) };
+    const onClose = vi.fn(), root = createRoot(document.body.appendChild(document.createElement("div"))); roots.push(root);
+    const render = (selected?: ModelView) => root.render(<ModelPriceOverrideDialog controller={controller} model={selected} t={(key, values) => translate("en", key, values)} onClose={onClose} />);
+    await act(async () => render(model));
+    await act(async () => button("Save").click());
+    expect(inputFor("Input").disabled).toBe(true);
+    await act(async () => render());
+    await act(async () => render({ ...model }));
+    expect(inputFor("Input").disabled).toBe(false);
+    await act(async () => finish(value));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(inputFor("Input").value).toBe("1");
+  });
 });
 
 const model: ModelView = {

@@ -1,5 +1,5 @@
 import type { DesktopUpdateAutoRelaunchSettings } from "./channels.js";
-import { atomicWritePrivateFile, deletePrivateFile, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, deletePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 const DEFAULT_AUTO_RELAUNCH_ON_IDLE = false;
 

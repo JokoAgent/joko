@@ -55,7 +55,7 @@ async function fixture(options: { readonly backendId?: string; readonly createNa
   for (const providerId of ["provider", "foreign-provider"]) settings = native.settings.update({ kind: "provider", backendId, providerId, enabled: true }, settings.revision);
   sharing = new ProviderSharingHost({ store: database, serverId: "issuer-home", origin: "http://127.0.0.1:43210", native });
   const vault = await CredentialVault.open(join(root, "master.key")), homeDirectory = join(root, "received-home");
-  let loseSubmit = false, submits = 0, seenSecret = "";
+  let loseSubmit = false, submits = 0, seenSecret = "", afterRead: (() => Promise<void>) | undefined;
   const connect = (options: ProviderSharingRemoteOptions): ProviderSharingRemote => {
     const authorization: Interceptor = next => async request => {
       options.assertCurrent(); if (options.serverId && options.serverId !== "issuer-home") throw new ConnectError("Different Home", Code.PermissionDenied);
@@ -64,6 +64,7 @@ async function fixture(options: { readonly backendId?: string; readonly createNa
       if (options.recipientKey) request.header.set(PROVIDER_SHARING_RECIPIENT_HEADER, options.recipientKey);
       if (request.method.name === "SubmitProviderShareRequest") submits++;
       const response = await next(request); options.assertCurrent();
+      if (request.method.name === "ReadProviderShare") await afterRead?.();
       if (loseSubmit && request.method.name === "SubmitProviderShareRequest") { loseSubmit = false; throw new ConnectError("Reply lost", Code.Unavailable); }
       return response;
     };
@@ -84,6 +85,7 @@ async function fixture(options: { readonly backendId?: string; readonly createNa
   return { root, database, connections, native, sharing, connect, authority, issue, apply, approve, open,
     home: () => home, secret: () => seenSecret, submits: () => submits, created: () => created, disposed: () => disposed, captured: () => captured,
     loseSubmit: () => { loseSubmit = true; }, unknownCleanup: (value: boolean) => { cleanupUnknown = value; }, beforeCreate: (value: (() => Promise<void>) | undefined) => { beforeCreate = value; },
+    afterRead: (value: (() => Promise<void>) | undefined) => { afterRead = value; },
     restart: async () => { await home.close(); home = new ProviderSharingHome({ directory: homeDirectory, serverId: "recipient-home", vault, connect }); await home.initialize(); },
     close: async () => { await home.close(); sharing.close(); await native.close(); database.close(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe fixture cleanup."); await rm(root, { recursive: true, force: true }); } };
 }
@@ -99,6 +101,28 @@ it("restores an unknown submitted application with the sealed original credentia
     expect(disk).not.toContain(invitation.link); expect(disk).not.toContain(contract.parseProviderSharingLink(invitation.link).secret); expect(disk).not.toContain("ProviderShareGuest ");
     expect(JSON.stringify(f.database.listSettings().map(row => row.value))).not.toContain(contract.parseProviderSharingLink(invitation.link).secret);
   } finally { await f.close(); }
+});
+it.each([undefined, Code.Unavailable, Code.PermissionDenied])("discards a late refresh after leaving a Provider (%j)", async errorCode => {
+  const f = await fixture(); let release!: () => void, refresh: Promise<void> | undefined;
+  try {
+    const intent = await f.apply(f.issue().link), received = await f.approve(intent.request!.requestId);
+    let reading = false;
+    f.afterRead(async () => {
+      reading = true; await new Promise<void>(resolve => { release = resolve; });
+      if (errorCode !== undefined) throw new ConnectError("Delayed response", errorCode);
+    });
+    refresh = f.home().refresh(f.authority);
+    await vi.waitFor(() => expect(reading).toBe(true));
+    await f.home().leave("leave-during-refresh", received.joinId, f.authority);
+    expect(f.home().listReceived()[0]!.state).toBe("removed");
+    release(); await refresh; f.afterRead(undefined);
+    await f.home().refresh(f.authority);
+    expect(f.home().received()[0]).toMatchObject({ state: "removed", models: [] });
+    const disk = JSON.parse(await readFile(join(f.root, "received-home", "home.json"), "utf8"));
+    expect(disk.joined[0][1].credential).toBeUndefined(); expect(disk.intents[0].memberCredential).toBeUndefined();
+    await f.restart(); expect(f.home().received()[0]).toMatchObject({ state: "removed", models: [] });
+    expect(() => f.home().captureNative(received, "source-computer")).toThrow();
+  } finally { release?.(); f.afterRead(undefined); await refresh?.catch(() => undefined); await f.close(); }
 });
 it("confines a real native guest to the issued Provider and leaves only terminal cleanup after revocation", async () => {
   const f = await fixture(); try {

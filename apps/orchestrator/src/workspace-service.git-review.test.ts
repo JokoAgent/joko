@@ -416,6 +416,27 @@ describe("WorkspaceService Git Review backend", () => {
     expect(outcomes.filter((item) => item.status === "rejected")[0]).toMatchObject({ reason: { kind: "stale" } });
   }, 20_000);
 
+  it.each(["stage", "revert"] as const)("applies the displayed untracked local hunk for %s", async action => {
+    const root = await initializedRepository("joko-review-untracked-hunk-");
+    await writeFile(join(root, "seed.txt"), "base\n"); await git(root, "add", "-A"); await git(root, "commit", "-m", "base");
+    const selected = "new[1].txt", other = "new1.txt";
+    await writeFile(join(root, selected), "first new line\nsecond new line\n");
+    await writeFile(join(root, other), "keep this sibling\n");
+    const service = new WorkspaceService(); await service.register({ id: "hunks", root, displayName: "Hunks", trusted: true });
+    const diff = await service.gitReviewDiff("hunks", { source: "unstaged", paths: [selected] });
+    expect(diff.workingTree).toContain("@@ -0,0 +1,2 @@");
+    const input = { action, source: "unstaged" as const, path: selected, hunkIndex: 0, expectedRepositoryRevision: diff.repositoryRevision };
+    if (action === "revert") await expect(service.applyGitDiffHunk("hunks", input)).rejects.toMatchObject({ kind: "invalid" });
+    const revision = await service.applyGitDiffHunk("hunks", { ...input, confirmRevert: action === "revert" });
+    if (action === "stage") {
+      expect(await git(root, "diff", "--cached", "--name-only")).toBe(selected);
+      await service.applyGitDiffHunk("hunks", { action: "unstage", source: "staged", path: selected, hunkIndex: 0, expectedRepositoryRevision: revision });
+      expect(await git(root, "diff", "--cached")).toBe("");
+      expect(await readFile(join(root, selected), "utf8")).toBe("first new line\nsecond new line\n");
+    } else await expect(readFile(join(root, selected))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(root, other), "utf8")).toBe("keep this sibling\n");
+  }, 20_000);
+
   it("bounds commit messages and performs only explicit non-force pushes", async () => {
     const root = await initializedRepository("joko-review-effects-");
     await writeFile(join(root, "commit.txt"), "base\n", "utf8");

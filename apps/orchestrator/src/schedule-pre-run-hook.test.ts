@@ -24,6 +24,14 @@ const payload: SchedulePreRunHookPayload = {
 };
 
 describe("executeSchedulePreRunHook", () => {
+  it("does not start a command after its original project authority retires", async () => {
+    const result = await executeSchedulePreRunHook({
+      command: nodeEval("process.stdout.write('must-not-execute')"), stdinPayload: payload,
+      assertCurrent: () => { throw new Error("Project trust retired"); }
+    });
+    expect(result).toMatchObject({ status: "failed", decision: "block", stdout: "", exitCode: null,
+      spawnError: "Project trust retired" });
+  });
   it.each([
     [0, "passed", "run"],
     [2, "skipped", "skip"],

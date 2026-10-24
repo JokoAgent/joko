@@ -11,7 +11,7 @@ import {
   type DesktopExtensionLibraryCommitSaveRequest,
   type DesktopExtensionLibraryRevealRequest
 } from "./channels.js";
-import { sameFileIdentity, sameStableFile } from "./secure-files.js";
+import { sameFileIdentity, sameStableFile } from "@joko/device-peer/private-files";
 
 export const EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES = 16 * 1024 * 1024;
 export const EXTENSION_LIBRARY_NATIVE_SAVE_MAXIMUM_BYTES = 8 * 1024 * 1024 * 1024;

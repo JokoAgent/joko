@@ -8,7 +8,8 @@
       "distribution": "internal",
       "environment": "preview",
       "channel": "stable",
-      "node": "22.19.0",
+      "node": "24.19.0",
+      "pnpm": "11.22.0",
       "android": {
         "buildType": "apk"
       },
@@ -20,7 +21,8 @@
       "distribution": "store",
       "environment": "production",
       "channel": "stable",
-      "node": "22.19.0",
+      "node": "24.19.0",
+      "pnpm": "11.22.0",
       "android": {
         "buildType": "app-bundle"
       },

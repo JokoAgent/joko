@@ -153,6 +153,24 @@ it("allows Plan reads but blocks writes and runs shell with the original cwd and
   expect(f.questions).toHaveLength(1);
 });
 
+it("denies git diff output and execution options in Plan before opening command capacity", async () => {
+  const f = await fixture();
+  f.setPolicy({ planMode: true });
+  const outside = join(f.root, "outside.patch");
+  await writeFile(outside, "owner content");
+  for (const command of [
+    `git diff --output=${outside.replace(/\\/gu, "/")}`,
+    "git diff --out=inside.patch", "git diff -oinside.patch", "git diff --ext-diff", "git diff --textconv",
+    "git diff", "git diff --stat"
+  ]) {
+    await expect(f.call("exec.run", { command, cwd: f.agent })).rejects.toMatchObject({ code: "ACCESS_DENIED" });
+  }
+  expect(await readFile(outside, "utf8")).toBe("owner content");
+  await expect(stat(join(f.task, "inside.patch"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(f.questions).toEqual([]);
+  expect(f.gate.snapshot()).toEqual({ running: 0, queued: 0 });
+});
+
 it("maps a Windows Agent path by complete segments onto the actual task filesystem", async () => {
   const f = await fixture();
   const executor = new HostedAgentExecutor({ context: f.context, virtualRoot: "Q:\\private-agent\\workspace",
