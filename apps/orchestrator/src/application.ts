@@ -701,6 +701,8 @@ export async function createOrchestratorApplication(
     throw error;
   }
   let voiceDictionaryPeers!: VoiceDictionaryPeerManager;
+  let voiceDictionaryOwner: VoiceDictionarySyncRepository | undefined;
+  const closeVoiceDictionary = (): void => voiceDictionaryOwner?.close();
   try {
   let sessionWorktrees!: SessionWorktreeCoordinator;
   let personalDevelopment: PersonalDevelopmentOwner | undefined;
@@ -912,7 +914,7 @@ export async function createOrchestratorApplication(
   });
   providers.initialize();
   const modelRoutes = createModelRouteCatalog(store, providers);
-  const voiceDictionary = new VoiceDictionarySyncRepository({ store });
+  const voiceDictionary = voiceDictionaryOwner = new VoiceDictionarySyncRepository({ store });
   let retireVoiceInputConfiguration = (): void => undefined;
   const voiceInputSettings = new VoiceInputSettingsController({ store, credentials, providers,
     dictionaryTerms: () => voiceDictionary.snapshot().dictionary.entries.map((entry) => entry.text),
@@ -1632,20 +1634,6 @@ export async function createOrchestratorApplication(
     }
     throw error;
   });
-  const piCandidate = backendInstances.adapter(piBackendId);
-  if (piCandidate === undefined) {
-    const unavailable = new Error("The required Pi Backend instance is unavailable.");
-    const cleanupErrors: unknown[] = [];
-    try { await backendInstances.dispose(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
-    try { await managedProviderProxy.close(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
-    if (cleanupErrors.length > 0) {
-      throw new AggregateError(
-        [unavailable, ...cleanupErrors],
-        "The required Pi Backend is unavailable and cleanup remained incomplete."
-      );
-    }
-    throw unavailable;
-  }
   let startupSessionHost: SessionHost | undefined;
   let startupSessionWorktrees: SessionWorktreeCoordinator | undefined;
   let startupHistoryMaintenance: HistoryMaintenance | undefined;
@@ -1687,11 +1675,6 @@ export async function createOrchestratorApplication(
   let startupPartnerHomes: PartnerHomeOwner | undefined;
   let startupPartnerImportRuntime: PartnerImportRuntime | undefined;
   try {
-  const currentPi = (): ReturnType<typeof createPiAdapter> => {
-    const current = backendInstances.adapter(piBackendId);
-    if (current === undefined) throw new Error("The required Pi Backend instance is unavailable.");
-    return current as ReturnType<typeof createPiAdapter>;
-  };
   const initialAdapters: readonly BackendAdapter[] = backendInstances.availableAdapters();
   const nativeProviderIds = (id: string) => (store.getBackend(id).descriptor.providers ?? []).map(provider => provider.providerId);
   const nativeRemoteModels = (id: string) => {
@@ -2797,7 +2780,11 @@ export async function createOrchestratorApplication(
     // call order with a replacement that begins in the same event-loop turn.
     return runBackendLifecycle(() => enqueuePiGenerationRefresh(async () => {
       if (closed) return;
-      await refreshPiAdapterGeneration(currentPi(), true);
+      const current = backendInstances.adapter(piBackendId);
+      // Saved settings also apply to the next repair/replacement. There is no
+      // active Pi generation to refresh while this instance is unavailable.
+      if (current === undefined) return;
+      await refreshPiAdapterGeneration(current as ReturnType<typeof createPiAdapter>, true);
     }));
   };
   refreshPiGenerationImpl = refreshPiGeneration;
@@ -3335,6 +3322,7 @@ export async function createOrchestratorApplication(
     await attempt(() => remoteHosts.close());
     await attempt(() => runtimeActivity.close());
     await attempt(() => voiceDictionaryPeers.close());
+    await attempt(closeVoiceDictionary);
     await attempt(() => voiceDictionaryPeerStore.close());
     await attempt(() => contactSync.close());
     await attempt(() => contacts.close());
@@ -3618,7 +3606,7 @@ export async function createOrchestratorApplication(
         await attempt(() => remoteHosts.close());
         await attempt(() => runtimeActivity.close());
         await attempt(() => voiceDictionaryPeers.close());
-        await attempt(() => voiceDictionary.close());
+        await attempt(closeVoiceDictionary);
         await attempt(() => voiceDictionaryPeerStore.close());
         await attempt(() => contactSync.close());
         await attempt(() => contacts.close());
@@ -3681,6 +3669,7 @@ export async function createOrchestratorApplication(
     await attempt(() => sshKeys.close());
     await attempt(() => runtimeActivity.close());
     await attempt(() => voiceDictionaryPeers.close());
+    await attempt(closeVoiceDictionary);
     await attempt(() => voiceDictionaryPeerStore.close());
     await attempt(() => contactSync.close());
     await attempt(() => contacts.close());
@@ -3699,6 +3688,7 @@ export async function createOrchestratorApplication(
   } catch (error) {
     const failures: unknown[] = [];
     try { voiceDictionaryPeers?.close(); } catch (failure) { failures.push(failure); }
+    try { closeVoiceDictionary(); } catch (failure) { failures.push(failure); }
     try { voiceDictionaryPeerStore.close(); } catch (failure) { failures.push(failure); }
     if (failures.length > 0) throw new AggregateError([error, ...failures], "Dictionary peer startup cleanup remained incomplete.");
     throw error;

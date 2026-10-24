@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rmdir } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rename: vi.fn(actual.rename) };
+});
 
 async function fixture(now = 1_800_000_000_000) {
   const root = await mkdtemp(join(tmpdir(), "joko-credentials-"));
@@ -97,6 +102,61 @@ describe("CredentialManager", () => {
     expect(reopened.resolve("cred_provider_test")).toBe(secret);
     expect(stringify(store.listSettings())).not.toContain(secret);
     store.close();
+  });
+
+  it.each([false, true])("claims a %s managed upload before its persistence await", async (managed) => {
+    const { credentials, store } = await fixture();
+    const reference = managed ? "cred_surface_concurrent" : "cred_user_concurrent";
+    if (managed) credentials.reserveManagedSecret({ credentialReferenceId: reference, kind: "api_key" });
+    const ticket = credentials.createUploadTicket({ kind: "api_key", connectionId: "owner",
+      ...(managed ? { credentialReferenceId: reference } : {}) });
+    credentials.upload(ticket.credentialUploadTicketId, "one-time-value", "owner");
+    const input = { credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference,
+      displayName: "Concurrent upload", kind: "api_key" as const, connectionId: "owner" };
+    let release!: () => void;
+    let started!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(rename).mockImplementationOnce(async (source, destination) => {
+      started();
+      await waiting;
+      await actual.rename(source, destination);
+    });
+    const commit = () => managed ? credentials.commitManagedUpload(input) : credentials.commitUpload(input);
+    const committing = commit();
+    try {
+      await entered;
+      await expect(managed ? commit() : credentials.commitUpload({ ...input, credentialReferenceId: "cred_other" }))
+        .rejects.toThrow("invalid, expired, or already consumed");
+    } finally {
+      release();
+      await committing;
+      store.close();
+    }
+    expect(credentials.find("cred_other")).toBeUndefined();
+    await expect(commit()).rejects.toThrow("invalid, expired, or already consumed");
+  });
+
+  it.each([false, true])("restores a %s managed upload to its original owner after persistence failure", async (managed) => {
+    const { root, credentials, store } = await fixture();
+    const reference = managed ? "cred_surface_retry" : "cred_user_retry";
+    if (managed) credentials.reserveManagedSecret({ credentialReferenceId: reference, kind: "api_key" });
+    const ticket = credentials.createUploadTicket({ kind: "api_key", connectionId: "owner",
+      ...(managed ? { credentialReferenceId: reference } : {}) });
+    credentials.upload(ticket.credentialUploadTicketId, "retry-value", "owner");
+    const input = { credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference,
+      displayName: "Retry upload", kind: "api_key" as const, connectionId: "owner" };
+    const commit = () => managed ? credentials.commitManagedUpload(input) : credentials.commitUpload(input);
+    const path = join(root, "credential-records.json");
+    await mkdir(path);
+    try {
+      await expect(commit()).rejects.toThrow("persistence failed");
+      expect(credentials.find(reference)).toBeUndefined();
+      await rmdir(path);
+      await expect(commit()).resolves.toMatchObject({ configured: true, credentialReferenceId: reference });
+      expect(credentials.resolve(reference)).toBe("retry-value");
+    } finally { store.close(); }
   });
 
   it("rejects expired and oversized tickets", async () => {
@@ -208,6 +268,15 @@ describe("CredentialManager", () => {
       credentialReferenceId: reference
     });
     credentials.upload(ticket.credentialUploadTicketId, "surface-secret-value", "connection-one");
+    await expect(credentials.commitUpload({
+      credentialUploadTicketId: ticket.credentialUploadTicketId,
+      credentialReferenceId: "cred_user_redirected",
+      displayName: "Redirected surface",
+      kind: "api_key",
+      providerId: "provider-one",
+      connectionId: "connection-one"
+    })).rejects.toThrow(/surface/u);
+    expect(credentials.find("cred_user_redirected")).toBeUndefined();
     await expect(credentials.commitManagedUpload({
       credentialUploadTicketId: ticket.credentialUploadTicketId,
       credentialReferenceId: reference,

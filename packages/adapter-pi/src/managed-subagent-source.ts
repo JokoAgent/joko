@@ -751,14 +751,15 @@ function extensionPaths() {
   const autoReview = join(directory, "joko-managed-auto-review.mjs");
   const modelCatalog = join(directory, "joko-managed-model-catalog.mjs");
   const hostedExecutor = join(directory, "joko-managed-hosted-executor.mjs");
+  const shellPolicy = join(directory, "joko-managed-shell-policy.mjs");
   const runner = join(directory, RUNNER_FILE_NAME);
-  for (const path of [bridge, subagent, silentEncryptedRetry, autoReview, modelCatalog, hostedExecutor, runner]) {
+  for (const path of [bridge, subagent, silentEncryptedRetry, autoReview, modelCatalog, hostedExecutor, shellPolicy, runner]) {
     const info = lstatSync(path);
     if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_DURABLE_JSON_BYTES || !samePath(realpathSync(path), path)) {
       throw new Error("managed extension path is unsafe: " + basename(path));
     }
   }
-  return { bridge: bridge, subagent: subagent, silentEncryptedRetry: silentEncryptedRetry, autoReview: autoReview, modelCatalog: modelCatalog, hostedExecutor: hostedExecutor, runner: runner };
+  return { bridge: bridge, subagent: subagent, silentEncryptedRetry: silentEncryptedRetry, autoReview: autoReview, modelCatalog: modelCatalog, hostedExecutor: hostedExecutor, shellPolicy: shellPolicy, runner: runner };
 }
 
 function childEnvironment(childHome, providerId) {
@@ -1268,6 +1269,7 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
     const autoReviewPath = join(runtimeDirectory, basename(paths.autoReview));
     const modelCatalogPath = join(runtimeDirectory, basename(paths.modelCatalog));
     const hostedExecutorPath = join(runtimeDirectory, basename(paths.hostedExecutor));
+    const shellPolicyPath = join(runtimeDirectory, basename(paths.shellPolicy));
     const runnerScript = join(runDirectory, RUNNER_FILE_NAME);
     copyPrivateSnapshot(paths.bridge, bridgePath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.subagent, subagentPath, MAX_DURABLE_JSON_BYTES, true);
@@ -1275,6 +1277,7 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
     copyPrivateSnapshot(paths.autoReview, autoReviewPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.modelCatalog, modelCatalogPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.hostedExecutor, hostedExecutorPath, MAX_DURABLE_JSON_BYTES, true);
+    copyPrivateSnapshot(paths.shellPolicy, shellPolicyPath, MAX_DURABLE_JSON_BYTES, true);
     const childHostedExecutionPath = hostedExecution ? join(runtimeDirectory, "hosted-execution.json") : undefined;
     if (childHostedExecutionPath) copyPrivateSnapshot(hostedExecutionPath, childHostedExecutionPath, 8 * 1024 * 1024, true);
     copyPrivateSnapshot(paths.runner, runnerScript, MAX_DURABLE_JSON_BYTES, true);

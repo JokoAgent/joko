@@ -2,6 +2,8 @@ const { createHash } = require("node:crypto");
 const { lstat, readFile, readdir, realpath } = require("node:fs/promises");
 const { basename, extname, isAbsolute, join, relative, resolve, sep } = require("node:path");
 const { pathToFileURL } = require("node:url");
+const { SIMPLE_NATIVE_ARTIFACTS, REMOTE_NATIVE_DIGEST_ARTIFACTS } = require("./native-helper-artifacts.cjs");
+const { sealWindowsNativeHardware, restoreWindowsNativeRemoteDesktop } = require("./seal-windows-native-hardware.cjs");
 
 const FORBIDDEN_SEGMENTS = new Set([
   "__tests__",
@@ -95,6 +97,7 @@ module.exports = async function auditPackaged(context) {
     architecture: targetArch,
     output: resolve(resourcesRoot, "native-gamepad")
   });
+  await restoreWindowsNativeRemoteDesktop(context, auditNativeRemoteDesktop);
   await prepareNativeRemoteDesktopForPackage(
     resolve(resourcesRoot, "native-remote-desktop"), context.electronPlatformName, targetArch,
     { buildNativeRemoteDesktop, assertNativeRemoteDesktopBuildTarget }
@@ -128,6 +131,7 @@ module.exports = async function auditPackaged(context) {
   );
   await auditNativeSystemFrontmostInput(resolve(resourcesRoot, "native-system-frontmost-input"),
     context.electronPlatformName, targetArch);
+  await sealWindowsNativeHardware(context, targetArch, auditNativeHardware);
   await auditNativeHardware(resolve(resourcesRoot, "native-hardware"), context.electronPlatformName, targetArch);
   await auditNativeGamepad(resolve(resourcesRoot, "native-gamepad"), context.electronPlatformName, targetArch);
 
@@ -804,9 +808,7 @@ async function auditNativeTaskStatusSounds(root) {
 
 
 async function auditNativeSystemFrontmostInput(root, platform, targetArch) {
-  const helper = platform === "win32" ? "joko-windows-frontmost-input.node"
-    : platform === "darwin" ? "joko-macos-frontmost-input.node"
-      : platform === "linux" ? "joko-linux-frontmost-input.node" : null;
+  const helper = SIMPLE_NATIVE_ARTIFACTS.frontmost.helpers[platform] ?? null;
   const expected = (helper === null ? ["manifest.json"] : [helper, "manifest.json"]).sort();
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
   const names = entries.map(entry => entry.name).sort();
@@ -834,7 +836,7 @@ async function auditNativeSystemFrontmostInput(root, platform, targetArch) {
 }
 
 async function auditNativeHardware(root, platform, targetArch) {
-  const helper = platform === "win32" ? "joko-windows-micro-helper.exe" : null;
+  const helper = SIMPLE_NATIVE_ARTIFACTS.hardware.helpers[platform] ?? null;
   const expected = ["manifest.json", ...(helper === null ? [] : [helper])].sort();
   const entries = await readdir(root, { withFileTypes: true });
   const names = entries.map(entry => entry.name).sort();
@@ -864,7 +866,7 @@ async function auditNativeHardware(root, platform, targetArch) {
 }
 
 async function auditNativeGamepad(root, platform, targetArch) {
-  const helper = platform === "darwin" ? "joko-macos-gamepad-helper" : null;
+  const helper = SIMPLE_NATIVE_ARTIFACTS.gamepad.helpers[platform] ?? null;
   const expected = ["manifest.json", ...(helper === null ? [] : [helper])].sort();
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
   const names = entries.map(entry => entry.name).sort();
@@ -918,20 +920,17 @@ async function prepareNativeRemoteDesktopForPackage(root, platform, targetArch, 
 }
 
 async function auditNativeRemoteDesktop(root, platform, targetArch) {
-  const inputHelper = platform === "darwin"
-    ? "joko-macos-remote-desktop-input"
-    : platform === "win32"
-      ? "joko-windows-remote-desktop-input.exe"
-      : platform === "linux" ? "joko-linux-remote-desktop-input" : null;
-  const captureHelper = platform === "darwin" ? "joko-macos-remote-desktop-capture"
-    : platform === "linux" ? "joko-linux-remote-desktop-capture" : null;
-  const credentialHelper = platform === "darwin" ? "joko-macos-remote-credentials" : null;
+  const signedArtifacts = REMOTE_NATIVE_DIGEST_ARTIFACTS[platform] ?? [];
+  const artifactName = field => signedArtifacts.find(artifact => artifact.field === field)?.name ?? null;
+  const inputHelper = platform === "linux" ? "joko-linux-remote-desktop-input" : artifactName("inputHelper");
+  const captureHelper = platform === "linux" ? "joko-linux-remote-desktop-capture" : artifactName("captureHelper");
+  const credentialHelper = artifactName("credentialHelper");
   const clipboardHelper = platform === "linux" ? "joko-linux-remote-desktop-clipboard" : null;
   const viewerScript = platform === "linux" ? "linux-viewer-display.py" : null;
   const credentialBundle = platform === "darwin" ? "JokoRemoteCredentials_JokoRemoteCredentials.bundle" : null;
   const linuxCredentials = platform === "linux" ? "linux-credentials" : null;
-  const windowsHostService = platform === "win32" ? "joko-windows-remote-desktop-host.exe" : null;
-  const windowsHostAddon = platform === "win32" ? "joko-windows-remote-desktop-host.node" : null;
+  const windowsHostService = artifactName("windowsHostService");
+  const windowsHostAddon = artifactName("windowsHostAddon");
   const manifestPath = resolve(root, "manifest.json");
   await assertCanonicalRegularFile(manifestPath, "The packaged Remote Desktop manifest is unsafe.");
   const manifestInfo = await lstat(manifestPath);

@@ -7,6 +7,10 @@
     "dist"
   ],
   "exports": {
+    "./private-files": {
+      "types": "./dist/private-files.d.ts",
+      "import": "./dist/private-files.js"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"

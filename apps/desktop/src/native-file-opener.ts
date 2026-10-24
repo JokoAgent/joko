@@ -8,7 +8,7 @@ import type {
   DesktopOpenFileWithAppIpcRequest
 } from "./channels.js";
 import type { NativeFileActionScope } from "./native-file-clipboard.js";
-import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "@joko/device-peer/private-files";
 
 export const FILE_OPEN_MAXIMUM_BYTES = 256 * 1024 * 1024;
 export const FILE_OPEN_TOTAL_BYTES = 512 * 1024 * 1024;

@@ -1,6 +1,6 @@
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { readRegularFileSnapshot } from "./secure-files.js";
+import { readRegularFileSnapshot } from "@joko/device-peer/private-files";
 import { extractHtmlAssetReferences, isRelativeBundleAssetReference } from "./security.js";
 
 const MAXIMUM_ENTRY_BYTES = 4 * 1024 * 1024;

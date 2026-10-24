@@ -7,7 +7,7 @@ import { NoOpLogger, type AppUpdater } from "electron-updater";
 import { describe, expect, it, vi } from "vitest";
 
 import { createElectronUpdateDriver } from "../src/electron-update-driver.js";
-import { atomicWritePrivateFile } from "../src/secure-files.js";
+import { atomicWritePrivateFile } from "@joko/device-peer/private-files";
 import { mkdtemp } from "./test-paths.js";
 
 describe("electron-updater driver", () => {

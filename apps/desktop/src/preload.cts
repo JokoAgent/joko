@@ -92,6 +92,7 @@ import type {
 import type { IpcRendererEvent } from "electron";
 
 const { contextBridge, ipcRenderer } = require("electron") as typeof import("electron");
+const nativeTaskStatusContract = require("./native-task-status-contract.js") as typeof import("./native-task-status-contract.js");
 
 // Keep the sandbox preload self-contained at runtime: sandboxed preloads use
 // Electron's restricted CommonJS loader and cannot require the ESM channels
@@ -1588,48 +1589,7 @@ function parseDesktopNativeTaskStatusDisplays(value: unknown): readonly DesktopN
 }
 
 function parseDesktopNativeTaskStatusSnapshot(value: unknown): DesktopNativeTaskStatusSnapshot {
-  if (!nativeRecord(value) || nativeKeys(value) !== "locale,ownerId,revision,sessions" ||
-    !nativeIdentity(value["ownerId"]) || !nativeDecimal(value["revision"]) ||
-    (value["locale"] !== "en" && value["locale"] !== "zh-CN" && value["locale"] !== "en-XA") ||
-    !Array.isArray(value["sessions"]) || value["sessions"].length > 64) {
-    throw new TypeError("Native task-status snapshot is invalid.");
-  }
-  const seen = new Set<string>();
-  const sessions = value["sessions"].map((entry) => {
-    if (!nativeRecord(entry) || !nativeOnlyKeys(entry, ["activityLines", "detail", "interactionKind", "permission", "phase", "sessionId", "startedAt", "title", "updatedAt"]) ||
-      !Object.hasOwn(entry, "activityLines") || !Object.hasOwn(entry, "detail") || !Object.hasOwn(entry, "phase") || !Object.hasOwn(entry, "sessionId") ||
-      !Object.hasOwn(entry, "title") || !Object.hasOwn(entry, "updatedAt") || !nativeIdentity(entry["sessionId"]) ||
-      typeof entry["title"] !== "string" || entry["title"].length > 160 || typeof entry["detail"] !== "string" ||
-      entry["detail"].length > 600 || !nativePhase(entry["phase"]) || !nativeTimestamp(entry["updatedAt"]) ||
-      (entry["startedAt"] !== undefined && !nativeTimestamp(entry["startedAt"])) ||
-      (entry["interactionKind"] !== undefined && !nativeInteractionKind(entry["interactionKind"])) ||
-      !Array.isArray(entry["activityLines"]) || entry["activityLines"].length > 3 || seen.has(entry["sessionId"])) {
-      throw new TypeError("Native task-status task is invalid.");
-    }
-    seen.add(entry["sessionId"]);
-    const activityLines = entry["activityLines"].map((line) => {
-      if (!nativeRecord(line) || nativeKeys(line) !== "id,kind,text" || !nativeIdentity(line["id"]) ||
-        typeof line["text"] !== "string" || line["text"].length > 300 ||
-        (line["kind"] !== "user" && line["kind"] !== "assistant" && line["kind"] !== "status" && line["kind"] !== "tool")) {
-        throw new TypeError("Native task-status activity line is invalid.");
-      }
-      return Object.freeze({ id: line["id"], kind: line["kind"], text: line["text"] });
-    });
-    const permission = entry["permission"] === undefined ? undefined : parseNativeTaskStatusPermission(entry["permission"]);
-    if (permission !== undefined && entry["phase"] !== "interaction") {
-      throw new TypeError("Native task-status permission is invalid.");
-    }
-    return Object.freeze({
-      sessionId: entry["sessionId"], title: entry["title"], detail: entry["detail"], phase: entry["phase"],
-      ...(entry["interactionKind"] === undefined ? {} : { interactionKind: entry["interactionKind"] }),
-      activityLines: Object.freeze(activityLines),
-      ...(entry["startedAt"] === undefined ? {} : { startedAt: entry["startedAt"] as number }),
-      updatedAt: entry["updatedAt"], ...(permission === undefined ? {} : { permission })
-    });
-  });
-  return Object.freeze({
-    ownerId: value["ownerId"], revision: value["revision"], locale: value["locale"], sessions: Object.freeze(sessions)
-  });
+  return nativeTaskStatusContract.parseSnapshot(value);
 }
 
 function parseNativeTaskStatusVisibleSessionIds(value: unknown): readonly string[] {
@@ -1645,19 +1605,6 @@ function parseNativeTaskStatusVisibleSessionIds(value: unknown): readonly string
     return sessionId;
   });
   return Object.freeze(sessionIds);
-}
-
-function parseNativeTaskStatusPermission(value: unknown): NonNullable<DesktopNativeTaskStatusSnapshot["sessions"][number]["permission"]> {
-  if (!nativeRecord(value) || nativeKeys(value) !== "allow,allowForSession,deny,generation,interactionId" ||
-    !nativeIdentity(value["interactionId"]) || !nativeDecimal(value["generation"]) ||
-    typeof value["allow"] !== "boolean" || typeof value["allowForSession"] !== "boolean" ||
-    typeof value["deny"] !== "boolean") {
-    throw new TypeError("Native task-status permission is invalid.");
-  }
-  return Object.freeze({
-    interactionId: value["interactionId"], generation: value["generation"],
-    allow: value["allow"], allowForSession: value["allowForSession"], deny: value["deny"]
-  });
 }
 
 function parseDesktopNativeTaskStatusAction(value: unknown): DesktopNativeTaskStatusAction | undefined {
@@ -1701,15 +1648,6 @@ function nativeDecimal(value: unknown): value is string {
 
 function nativeTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
-function nativePhase(value: unknown): value is DesktopNativeTaskStatusSnapshot["sessions"][number]["phase"] {
-  return value === "running" || value === "interaction" || value === "completed" || value === "error";
-}
-
-function nativeInteractionKind(value: unknown): value is NonNullable<DesktopNativeTaskStatusSnapshot["sessions"][number]["interactionKind"]> {
-  return value === "permission" || value === "question" || value === "plan" || value === "select" ||
-    value === "confirm" || value === "input" || value === "editor";
 }
 
 function parseDesktopSessionWindowOpenResult(value: unknown): DesktopSessionWindowOpenResult {

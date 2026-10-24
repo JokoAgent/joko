@@ -2,8 +2,10 @@ import {
   CollaborationDispatchStatus,
   CollaborationGoalStatus,
   CollaborationWorkerStatus,
+  GetTaskProviderGroupUsageRequestSchema,
   PermissionMode
 } from "@joko/contracts";
+import { fromBinary } from "@bufbuild/protobuf";
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -89,7 +91,15 @@ describe("mounted Collaboration Goal product chain", () => {
 
     browser = await chromium.launch({ executablePath, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
-    const browserErrors = observeBrowserErrors(page);
+    let generationBeforeRestart: bigint | undefined;
+    const permittedUsageErrors: string[] = [];
+    const { errors: browserErrors, settle: settleBrowserErrors } = observeBrowserErrors(page, stale => {
+      if (generationBeforeRestart === undefined || stale.sessionId !== leadSessionId
+        || stale.generation <= 0n || stale.generation !== generationBeforeRestart || fixture === undefined) return;
+      const current = BigInt(fixture.application.store.getSession(leadSessionId).descriptor.binding.generation);
+      if (stale.generation >= current) return;
+      permittedUsageErrors.push(stale.responseError, stale.consoleError);
+    });
     await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -273,6 +283,7 @@ describe("mounted Collaboration Goal product chain", () => {
     await panel.getByText("开始新的 Goal", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
 
     const authKey = paired.authKey;
+    generationBeforeRestart = BigInt(fixture.application.store.getSession(leadSessionId).descriptor.binding.generation);
     await fixture.close({ removeRoot: false });
     fixture = undefined;
     fixture = await RealPiSystemFixture.start({
@@ -308,7 +319,9 @@ describe("mounted Collaboration Goal product chain", () => {
     await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
       .getByRole("button", { name: /^(?:Connect|连接)$/u }).click();
     await page.getByRole("button", { name: "打开协作面板", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    await settleBrowserErrors();
     browserErrors.splice(0);
+    permittedUsageErrors.splice(0);
     await page.getByRole("button", { name: "打开协作面板", exact: true }).click();
     panel = page.locator(".collaboration-panel");
     await panel.getByText(GOAL_TITLE, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
@@ -317,12 +330,15 @@ describe("mounted Collaboration Goal product chain", () => {
       expect.stringContaining("已归档")
     ]);
     expect(await overflow(page)).toBeLessThanOrEqual(1);
-    expect(browserErrors).toEqual([]);
+    await settleBrowserErrors();
+    expect(permittedUsageErrors.length).toBeLessThanOrEqual(2);
+    expect(browserErrors.toSorted()).toEqual(permittedUsageErrors.toSorted());
     await captureCollaboration(page, "restarted-goal", {
       locale: await page.evaluate(() => document.documentElement.lang),
       goalArchived: tree.goal?.status === CollaborationGoalStatus.ARCHIVED,
       allWorkersReleased: tree.workers.every(worker => worker.runtimeReleased),
-      browserErrors: browserErrors.length
+      browserErrors: browserErrors.length,
+      staleUsageReads: permittedUsageErrors.length / 2
     });
   });
 });
@@ -337,8 +353,11 @@ async function captureCollaboration(page: Page, name: string, state: Record<stri
     ...state, screenshotSha256: createHash("sha256").update(screenshot).digest("hex") }, null, 2) + "\n");
 }
 
-function observeBrowserErrors(page: Page): string[] {
+function observeBrowserErrors(page: Page, onStaleUsage: (stale: {
+  readonly sessionId: string; readonly generation: bigint; readonly responseError: string; readonly consoleError: string;
+}) => void): { readonly errors: string[]; readonly settle: () => Promise<void> } {
   const errors: string[] = [];
+  const pending = new Set<Promise<void>>();
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
   page.on("console", (message) => {
     if (message.type() === "error") {
@@ -347,9 +366,28 @@ function observeBrowserErrors(page: Page): string[] {
     }
   });
   page.on("response", (response) => {
-    if (response.status() >= 400) errors.push(`response:${response.status()}:${response.url()}`);
+    if (response.status() < 400) return;
+    const responseError = `response:${response.status()}:${response.url()}`;
+    errors.push(responseError);
+    const url = new URL(response.url());
+    if (response.status() !== 400 || url.pathname !== "/joko.v1.ProviderGroupService/GetTaskProviderGroupUsage") return;
+    // Resume may advance the binding between the page snapshot and its quota read.
+    // The caller also proves the exact submitted generation is now retired.
+    const observation = (async () => {
+      try {
+        const request = response.request(), bytes = request.postDataBuffer();
+        if (!request.headers()["content-type"]?.startsWith("application/proto") || bytes === null || bytes.length > 64 * 1024) return;
+        const usage = fromBinary(GetTaskProviderGroupUsageRequestSchema, bytes);
+        const failure = await response.json() as { code?: string; message?: string };
+        if (failure.code !== "failed_precondition" || failure.message !== "The original task generation is no longer current.") return;
+        onStaleUsage({ sessionId: usage.sessionId, generation: usage.generation, responseError,
+          consoleError: `console:Failed to load resource: the server responded with a status of 400 (Bad Request):${response.url()}:0` });
+      } catch { /* Unknown responses remain failures; never log request bytes. */ }
+    })();
+    pending.add(observation);
+    void observation.finally(() => pending.delete(observation));
   });
-  return errors;
+  return { errors, settle: async () => { await Promise.all([...pending]); } };
 }
 
 async function overflow(page: Page): Promise<number> {

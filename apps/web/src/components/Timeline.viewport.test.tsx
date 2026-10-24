@@ -4,7 +4,7 @@ import { act, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { TimelineItemView } from "../model.js";
+import type { ArtifactView, TimelineItemView } from "../model.js";
 import { Timeline } from "./Timeline.js";
 import type { Translator } from "./types.js";
 
@@ -116,6 +116,27 @@ afterEach(async () => {
 });
 
 describe("Timeline viewport journeys", () => {
+  it("reloads failed attachments and images after the same task connection recovers", async () => {
+    const artifact: ArtifactView = { id: "recover-image", blobId: "same-blob", kind: "image", fileName: "image.png", title: "Recover image", mediaType: "image/png", byteSize: 8, sourceRevealAvailable: false };
+    const load = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue("blob:recovered-image");
+    const release = vi.fn();
+    await render({ ownerKey: "same-profile:task:1:offline", onArtifactUrl: load, onArtifactUrlRelease: release, items: [
+      { ...item("attachment", 1, "user"), attachments: [artifact] }, { ...item("image", 2, "image"), artifact }
+    ] });
+    await flushFrames();
+    expect(host.querySelectorAll(".image-preview--failed")).toHaveLength(2);
+    expect(load).toHaveBeenCalledOnce();
+    await render({ ownerKey: "same-profile:task:1:connected" });
+    await flushFrames();
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(host.querySelectorAll('img[src="blob:recovered-image"]')).toHaveLength(2);
+    expect(host.querySelector(".image-preview--failed")).toBeNull();
+    expect(release).not.toHaveBeenCalled();
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    expect(release).toHaveBeenCalledExactlyOnceWith("same-blob");
+  });
+
   it("lands Home at the history boundary before virtual-row corrections can interrupt native keyboard scrolling", async () => {
     const loadEarlier = vi.fn(async () => undefined);
     await render({ hasEarlier: true, messageNavRailEnabled: false, onLoadEarlier: loadEarlier });

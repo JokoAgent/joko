@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -8,7 +8,29 @@ import { test } from "node:test";
 
 const { createSealHook } = createRequire(import.meta.url)("./seal-windows-native-remote-desktop.cjs");
 const { auditNativeRemoteDesktop } = createRequire(import.meta.url)("./audit-packaged.cjs");
+const { restoreWindowsNativeRemoteDesktop } = createRequire(import.meta.url)("./seal-windows-native-hardware.cjs");
 const names = ["joko-windows-remote-desktop-input.exe", "joko-windows-remote-desktop-host.exe", "joko-windows-remote-desktop-host.node"];
+
+test("extraResource signatures are restored from audited build inputs before afterPack audit and final signing", async () => {
+  const fixture = await create("x64");
+  try {
+    const source = join(fixture.directory, "build");
+    await cp(fixture.root, source, { recursive: true });
+    for (const name of names.slice(0, 2)) {
+      const path = join(fixture.root, name), bytes = await readFile(path);
+      await writeFile(path, Buffer.concat([bytes, Buffer.from("extraResource-signature")]));
+    }
+    await assert.rejects(auditNativeRemoteDesktop(fixture.root, "win32", "x64"));
+    const context = { electronPlatformName: "win32", arch: 1, appOutDir: fixture.directory, packager: { signIf: async path => {
+      assert.deepEqual(await readFile(path), await readFile(join(source, basename(path))));
+      await writeFile(path, Buffer.concat([await readFile(path), Buffer.from("configured-final-signature")]));
+    } } };
+    await restoreWindowsNativeRemoteDesktop(context, auditNativeRemoteDesktop, source);
+    await auditNativeRemoteDesktop(fixture.root, "win32", "x64");
+    await createSealHook()(context);
+    await auditNativeRemoteDesktop(fixture.root, "win32", "x64");
+  } finally { await rm(fixture.directory, { recursive: true, force: true }); }
+});
 
 test("configured Windows signing updates final executable receipts and reaudits the complete package", async () => {
   const fixture = await create("x64");

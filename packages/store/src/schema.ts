@@ -1685,6 +1685,13 @@ CREATE TABLE messaging_conversations (
         CHECK (status = 'retired' OR retired_at IS NULL)
       ) STRICT;
 
+CREATE TABLE messaging_poll_batches (
+        connection_id TEXT PRIMARY KEY REFERENCES messaging_channels(id) ON DELETE CASCADE,
+        channel_generation INTEGER NOT NULL CHECK (channel_generation >= 1),
+        next_cursor TEXT NOT NULL,
+        updates_json TEXT NOT NULL CHECK (json_valid(updates_json) AND json_type(updates_json) = 'array')
+      ) STRICT;
+
 CREATE TABLE messaging_inbound_requests (
         id TEXT PRIMARY KEY CHECK (
           length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0

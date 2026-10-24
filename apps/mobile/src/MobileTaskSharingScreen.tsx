@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Alert, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { parseTaskShareInvitation, type JoinedTaskShare, type ListTaskSharesResponse, type TaskShare, type TaskSharingApi } from "@joko/contracts";
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobilePlainStorageDriver } from "./connection-storage";
@@ -107,14 +108,25 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
     if (actionsRef.current.length) { setError(t.unknown); return false; }
     const signal = controller.current.signal, operationId = client.newTaskSharingActionId();
     setBusy(true); setError(""); setNotice("");
+    let dispatched = false;
     try {
       await retain([...actionsRef.current, { operationId, kind }].slice(-64)); signal.throwIfAborted();
+      dispatched = true;
       await invoke(api, operationId, signal); signal.throwIfAborted();
       if (currentOwner.current !== ownerKey) return;
       await retain(actionsRef.current.filter(action => action.operationId !== operationId));
       await refresh.current();
       return true;
-    } catch (failure) { if (!signal.aborted && currentOwner.current === ownerKey) setError(`${t.unknown} ${errorText(failure)}`); return false; }
+    } catch (failure) {
+      if (!signal.aborted && currentOwner.current === ownerKey) {
+        const rejected = !dispatched || failure instanceof ConnectError && [
+          Code.InvalidArgument, Code.FailedPrecondition, Code.Unauthenticated, Code.PermissionDenied
+        ].includes(failure.code);
+        if (rejected) await retain(actionsRef.current.filter(action => action.operationId !== operationId));
+        setError(`${rejected ? "" : `${t.unknown} `}${errorText(failure)}`);
+      }
+      return false;
+    }
     finally { if (!signal.aborted && currentOwner.current === ownerKey) setBusy(false); }
   };
   const confirm = (title: string, callback: () => void) => Alert.alert(title, t.warning, [
@@ -134,9 +146,11 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
   const lookup = async (action: Action) => {
     if (!api || currentOwner.current !== ownerKey || !controller.current || busy) return;
     const signal = controller.current.signal; setBusy(true); setError("");
+    let readingReceipt = true;
     try {
       if (action.kind === "join") {
         const response = await api.lookupJoin(action.operationId, signal);
+        readingReceipt = false;
         if (response.intent?.operationId !== action.operationId) throw new Error("The join receipt belongs to another action.");
         if (response.intent.status === "joined" || response.intent.status === "failed") {
           await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
@@ -144,14 +158,22 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
         } else setError(t.unknown);
       } else {
         const receipt = await api.lookupAction(action.operationId, signal);
+        readingReceipt = false;
         if (receipt.status === "applied" || receipt.status === "failed") {
           await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
           setNotice(action.kind === "invite" && receipt.status === "applied" ? t.generated : receipt.status === "failed" ? t.failed : t.active);
         } else setError(t.unknown);
       }
       await refresh.current();
-    } catch (failure) { if (!signal.aborted) setError(errorText(failure)); }
-    finally { if (!signal.aborted) setBusy(false); }
+    } catch (failure) {
+      if (!signal.aborted && currentOwner.current === ownerKey) {
+        if (readingReceipt && failure instanceof ConnectError && failure.code === Code.NotFound) {
+          await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
+          setNotice(locale.startsWith("zh") ? "节点未接纳此操作，可以重新操作。" : "The node did not accept this action. You can try again.");
+        } else setError(errorText(failure));
+      }
+    }
+    finally { if (!signal.aborted && currentOwner.current === ownerKey) setBusy(false); }
   };
   const openJoined = async (joined: JoinedTaskShare) => {
     if (currentOwner.current !== ownerKey || controller.current?.signal.aborted) return;

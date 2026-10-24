@@ -1512,53 +1512,66 @@ export class MessagingManager {
       await this.#deliveryFlights.get(connection.id);
       await this.#processMessagingBatch(connection, transport, normalized, signal, acknowledge);
       const latest = this.#requireWorkerConnection(transport.connectionId, transport.generation);
-      if (
-        latest.runtimeStatus !== "connected" || latest.cursor !== nextCursor
-        || latest.errorCode !== undefined || latest.errorSummary !== undefined
-      ) {
-        this.#store.updateMessagingConnectionRuntime({
-          connectionId: latest.id,
-          expectedRevision: latest.revision,
-          expectedGeneration: latest.generation,
-          runtimeStatus: "connected",
-          cursor: nextCursor,
-          error: null,
-          updatedAt: this.#now()
-        });
-      }
+      this.#store.transaction((store) => {
+        if (
+          latest.runtimeStatus !== "connected" || latest.cursor !== nextCursor
+          || latest.errorCode !== undefined || latest.errorSummary !== undefined
+        ) {
+          store.updateMessagingConnectionRuntime({
+            connectionId: latest.id,
+            expectedRevision: latest.revision,
+            expectedGeneration: latest.generation,
+            runtimeStatus: "connected",
+            cursor: nextCursor,
+            error: null,
+            updatedAt: this.#now()
+          });
+        }
+        if (transport.channel === "telegram") store.clearMessagingPollBatch(latest.id, latest.generation);
+      });
       await this.#drainDeliveries(transport, signal);
     }
   }
 
   /**
    * Telegram may split one media group across getUpdates pages. Keep the
-   * supplemental cursor volatile and persist only after the combined batch is
-   * durably admitted. A crash during this window therefore replays the whole
-   * album from the previous durable cursor instead of losing its first page.
+   * raw pages durable before sending a higher offset, which acknowledges the
+   * previous page remotely. Recovery merges the retained pages before admission.
    */
   async #pollTelegramBatch(
     transport: TelegramTransportPort,
     cursor: string | null,
     signal: AbortSignal
   ): Promise<TelegramPollResult> {
-    let result = await transport.poll({
-      cursor,
-      timeoutSeconds: this.#pollTimeoutSeconds,
-      signal
-    });
+    const retained = this.#store.findMessagingPollBatch(transport.connectionId, transport.generation);
+    let result: TelegramPollResult = retained === undefined
+      ? await transport.poll({ cursor, timeoutSeconds: this.#pollTimeoutSeconds, signal })
+      : { nextCursor: retained.nextCursor, updates: retained.updates as TelegramPollResult["updates"] };
     let updates = [...result.updates];
+    const persist = (): void => this.#store.saveMessagingPollBatch({
+      connectionId: transport.connectionId,
+      channelGeneration: transport.generation,
+      nextCursor: result.nextCursor,
+      updates
+    });
+    persist();
     let unsettledAlbum = telegramAlbumsNeedSettle(updates);
     for (let index = 0;
-      unsettledAlbum && index < TELEGRAM_ALBUM_MAXIMUM_SUPPLEMENTAL_POLLS;
+      unsettledAlbum && updates.length <= 1_000 && index < TELEGRAM_ALBUM_MAXIMUM_SUPPLEMENTAL_POLLS;
       index += 1) {
       const supplemental = await transport.poll({
         cursor: result.nextCursor,
         timeoutSeconds: TELEGRAM_ALBUM_SETTLE_POLL_SECONDS,
         signal
       });
+      const combined = [...updates, ...supplemental.updates];
+      // This response is still unacknowledged. If it would exceed the durable
+      // budget, admit the retained pages first and fetch this response again.
+      if (combined.length > 1_100 || Buffer.byteLength(JSON.stringify(combined)) > 16 * 1024 * 1024) break;
       result = supplemental;
+      updates = combined;
+      persist();
       if (supplemental.updates.length === 0) break;
-      updates.push(...supplemental.updates);
       unsettledAlbum = telegramAlbumsNeedSettle(updates);
     }
     return { updates, nextCursor: result.nextCursor };

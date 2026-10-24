@@ -36,6 +36,7 @@ import {
   type HostComposedCapability,
   type InteractionDecision,
   type InteractionPayload,
+  type KnownCapability,
   type MessageBlock,
   type ManagedProviderRuntimePort,
   type ManagedProviderRouteBinding,
@@ -7583,7 +7584,7 @@ function capabilityManifest(
   textResourcesSupported: boolean,
   accountUsageSupported: boolean
 ): ReadonlyMap<string, Capability> {
-  const supported = new Set<string>([
+  const supported = new Set<KnownCapability>([
     "model.working_context",
     "session.resume",
     "session.clone",
@@ -7624,7 +7625,7 @@ function capabilityManifest(
       "subagents.detail",
       "subagents.transcript",
       "subagents.stop"
-    ]) supported.add(capability);
+    ] as const) supported.add(capability);
   }
   if (supportsLogin) supported.add("provider.login");
   if (supportsLogout) supported.add("provider.logout");

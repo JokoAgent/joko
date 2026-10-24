@@ -9,6 +9,7 @@ import {
   normalizeManagedBashTimeout
 } from "./bridge.js";
 import { DEFAULT_PI_JSONL_RECORD_BYTES } from "./jsonl.js";
+import { createPiShellPolicy, MANAGED_SHELL_POLICY_RUNTIME_SOURCE } from "./managed-shell-policy.js";
 import {
   MAXIMUM_PI_RUNTIME_TOOL_CATALOG_BYTES,
   PI_RUNTIME_TOOL_CATALOG_CHUNK_BYTES
@@ -27,6 +28,21 @@ describe("managed Pi bridge boundaries", () => {
         "Invalid bash timeout: expected a finite number of seconds in (0, 1800]"
       );
     }
+  });
+
+  it("uses the same typed timeout and environment rules in the provisioned runtime", async () => {
+    const runtime = await import(
+      `data:text/javascript;base64,${Buffer.from(MANAGED_SHELL_POLICY_RUNTIME_SOURCE).toString("base64")}`
+    ) as { createPiShellPolicy: typeof createPiShellPolicy };
+    const policy = runtime.createPiShellPolicy(["http_proxy"]);
+    for (const value of [undefined, 0.001, 300, 1_800]) {
+      expect(policy.timeout(value)).toBe(normalizeManagedBashTimeout(value));
+    }
+    for (const value of [null, "300", Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 1_800.001]) {
+      expect(() => policy.timeout(value)).toThrow("Invalid bash timeout");
+    }
+    expect(policy.sanitizeEnvironment({ HTTP_PROXY: "synthetic proxy", JOKO_PI_MCP_TOKEN: "synthetic internal", PATH: "/bin" }))
+      .toEqual({ PATH: "/bin" });
   });
 
   it("keeps managed MCP previews bounded independently of complete artifacts", () => {
@@ -61,7 +77,7 @@ describe("managed Pi bridge boundaries", () => {
   });
 
   it("removes credentialed proxy names from model and direct-user Bash environments", () => {
-    const sanitizeEnvironment = managedEnvironmentSanitizer(["HTTP_PROXY"]);
+    const { sanitizeEnvironment } = createPiShellPolicy(["HTTP_PROXY"]);
     expect(sanitizeEnvironment({
       PATH: "/usr/bin",
       HTTP_PROXY: "http://proxy-user:proxy-passphrase@127.0.0.1:8080",
@@ -159,18 +175,4 @@ function managedMcpDescriptorReader(): (
     "private-token",
     7
   )();
-}
-
-function managedEnvironmentSanitizer(
-  secretEnvironmentNames: readonly string[]
-): (environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv {
-  const start = MANAGED_BRIDGE_SOURCE.indexOf("function sanitizeEnvironment(");
-  const end = MANAGED_BRIDGE_SOURCE.indexOf("\n\ntype PlanReviewResponse", start);
-  if (start < 0 || end < 0) throw new Error("Managed environment sanitizer source is unavailable");
-  const source = MANAGED_BRIDGE_SOURCE.slice(start, end).replaceAll(": NodeJS.ProcessEnv", "");
-  const factory = Function(
-    "secretEnvironmentNames",
-    `${source}\nreturn sanitizeEnvironment;`
-  ) as (names: readonly string[]) => (environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
-  return factory(secretEnvironmentNames);
 }

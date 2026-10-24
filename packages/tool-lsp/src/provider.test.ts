@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +13,57 @@ afterEach(async () => {
 });
 
 describe("TypeScript LSP bridge capabilities", () => {
+  it.each(["tsconfig.json", "jsconfig.json"])("uses %s for position queries and switches between configured projects", async (configName) => {
+    const fixture = await workspaceFixture();
+    const extension = configName === "jsconfig.json" ? "js" : "ts";
+    const main = 'import { configuredValue } from "@app/value";\nexport function run() { return configuredValue(); }';
+    for (const name of ["first", "second"]) {
+      await mkdir(join(fixture.root, name, "src"), { recursive: true });
+      await writeFile(join(fixture.root, name, configName), JSON.stringify({
+        compilerOptions: { allowJs: true, strict: true, module: "ESNext", moduleResolution: "Bundler",
+          baseUrl: ".", paths: { "@app/*": ["src/*"] } }, include: [`**/*.${extension}`]
+      }));
+      await writeFile(join(fixture.root, name, `main.${extension}`), main);
+      await writeFile(join(fixture.root, name, "src", `value.${extension}`),
+        `export function configuredValue() { return "${name}"; }`);
+    }
+    const bridge = new TypeScriptLspBridge();
+    try {
+      for (const name of ["first", "second", "first"]) {
+        const request = { workspaceRoot: fixture.root, file: `${name}/main.${extension}`, ...oneBased(main, "configuredValue()") };
+        expect((await bridge.hover(request)).items[0]?.display).toContain("string");
+        expect((await bridge.gotoDefinition(request)).items.some((item) => item.location.path === `${name}/src/value.${extension}`)).toBe(true);
+        const declaration = { workspaceRoot: fixture.root, file: `${name}/src/value.${extension}`, line: 1, column: 17 };
+        expect((await bridge.findReferences(declaration)).items.some((item) => item.location.path === `${name}/main.${extension}`)).toBe(true);
+        expect((await bridge.incomingCalls(declaration)).items.some((item) => item.from.location.path === `${name}/main.${extension}`)).toBe(true);
+      }
+    } finally { bridge.dispose(); }
+  });
+
+  it("refreshes a cached workspace after additions, renames, deletions and ignore changes", async () => {
+    const fixture = await workspaceFixture();
+    await writeFile(join(fixture.root, "tsconfig.json"), JSON.stringify({ include: ["**/*.ts"] }));
+    const bridge = new TypeScriptLspBridge();
+    const symbols = () => bridge.workspaceSymbol({ workspaceRoot: fixture.root, anchorFile: "main.ts", query: "addedValue" });
+    try {
+      expect((await symbols()).items).toEqual([]);
+      await mkdir(join(fixture.root, "new"));
+      await writeFile(join(fixture.root, "new", "added.ts"), "export const addedValue = 1;");
+      expect((await symbols()).items.map((item) => item.location.path)).toEqual(["new/added.ts"]);
+      expect((await bridge.hover({ workspaceRoot: fixture.root, file: "new/added.ts", line: 1, column: 14 })).items).toHaveLength(1);
+      await rename(join(fixture.root, "new", "added.ts"), join(fixture.root, "renamed.ts"));
+      expect((await symbols()).items.map((item) => item.location.path)).toEqual(["renamed.ts"]);
+      await expect(bridge.outline({ workspaceRoot: fixture.root, file: "new/added.ts" })).rejects.toMatchObject({ code: "FILE_NOT_FOUND" });
+      await writeFile(join(fixture.root, ".gitignore"), "renamed.ts\n");
+      expect((await symbols()).items).toEqual([]);
+      await expect(bridge.outline({ workspaceRoot: fixture.root, file: "renamed.ts" })).rejects.toMatchObject({ code: "FILE_IGNORED" });
+      await writeFile(join(fixture.root, ".gitignore"), "");
+      expect((await symbols()).items.map((item) => item.location.path)).toEqual(["renamed.ts"]);
+      await rm(join(fixture.root, "renamed.ts"));
+      expect((await symbols()).items).toEqual([]);
+      expect(bridge.workspaceCount).toBe(1);
+    } finally { bridge.dispose(); }
+  });
   it("filters declaration locations and selects the anchor's configured project for empty and named queries", async () => {
     const fixture = await workspaceFixture();
     for (const name of ["first", "second"]) {

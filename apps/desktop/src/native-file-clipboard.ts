@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { lstat, open, realpath, rmdir, unlink } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "@joko/device-peer/private-files";
 import type { DesktopCopyFileRequest, DesktopCopyFileResult } from "./channels.js";
 
 export const FILE_COPY_MAXIMUM_BYTES = 256 * 1024 * 1024;

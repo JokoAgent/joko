@@ -28,7 +28,10 @@ async function fixture() {
 it.each([0, HOSTED_AGENT_ARTIFACT_CHUNK_BYTES * 2 + 17])("streams a %i-byte native result into the original task's ArtifactStore", async length => {
   const f = await fixture(), bytes = Buffer.alloc(length, 0xab), path = join(f.host, "native-output.bin"); await writeFile(path, bytes);
   const pending = f.artifacts.store(path, f.signal, { fileName: "native-result.bin" }); void pending.catch(() => {});
-  const frames = await f.exchange.poll(0, f.signal);
+  const frames = await Promise.race([
+    f.exchange.poll(0, f.signal),
+    pending.then(() => { throw new Error("Artifact completed before its offer was accepted."); })
+  ]);
   const frame = frames.frames[0]!; if (frame.payload.kind !== "request" || frame.payload.request.kind !== "artifact") throw new Error("Missing Artifact offer.");
   const offer = frame.payload.request.offer, read = vi.fn((id: string, offset: number, maximum: number) => f.artifacts.read(id, offset, maximum));
   const blob = await receiveHostedAgentArtifact({ offer, context: f.context, temporaryRoot: f.task, signal: f.signal, assertCurrent: () => {}, readChunk: read });

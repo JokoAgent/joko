@@ -2231,7 +2231,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       </div>}
       {activeCompaction !== undefined && <CompactionStatusIndicator compaction={activeCompaction} t={t} />}
       {activeRetry !== undefined && <RetryStatusIndicator retry={activeRetry} t={t} />}
-      {!guest && !reviewReadOnly && controller.inputHandoff && <InputHandoffPanel api={controller.inputHandoff} sessionId={session.id}
+      {!guest && !reviewReadOnly && controller.inputHandoff && <InputHandoffPanel api={controller.inputHandoff} sessionId={session.id} t={t}
         ownerKey={`${timelineResourceOwnerKey}:${controller.state.connectionGeneration}:${session.generation}`}
         viewer={{ deviceId: controller.state.activeProfile?.deviceId ?? null }} />}
       {interaction !== undefined && interaction.kind !== "plan" && partnerConversation?.kind === "partner" && <PartnerWorkingStatus

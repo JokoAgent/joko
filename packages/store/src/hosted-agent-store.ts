@@ -57,7 +57,7 @@ export class HostedAgentStore {
     });
   }
   find(key: string): HostedNativeSessionRecord | undefined {
-    digest(key); const row = this.store.findSetting<unknown>("service", SCOPE, `session:${key}`);
+    assertDigest(key); const row = this.store.findSetting<unknown>("service", SCOPE, `session:${key}`);
     if (!row) return undefined;
     const value = record(row.value);
     if (value.format !== 1 || value.key !== key || !["creating", "ready", "closed", "purging"].includes(value.state as string)) throw new StoreError("The hosted native record is invalid.");
@@ -103,7 +103,7 @@ export class HostedAgentStore {
       this.store.deleteSetting("service", SCOPE, `session:${key}`); });
   }
   claimCall(key: string, leaseId: string, callId: string, bodyDigest: string): HostedNativeCallReceipt {
-    identity(callId); digest(bodyDigest);
+    identity(callId); assertDigest(bodyDigest);
     return this.store.transaction(() => {
       this.assertLease(key, leaseId);
       const prior = this.call(key, callId);
@@ -113,12 +113,12 @@ export class HostedAgentStore {
     });
   }
   call(key: string, callId: string): HostedNativeCallReceipt | undefined {
-    digest(key); identity(callId);
+    assertDigest(key); identity(callId);
     const row = this.store.findSetting<unknown>("service", SCOPE, this.#callKey(key, callId)); if (!row) return undefined;
     const value = record(row.value);
     if (value.format !== 1 || value.sessionKey !== key || value.callId !== callId || !["pending", "completed", "failed"].includes(value.state as string)
       || Object.keys(value).some(name => !["format", "sessionKey", "callId", "digest", "state", "resultJson"].includes(name))) throw new StoreError("The hosted native call receipt is invalid.");
-    digest(value.digest);
+    assertDigest(value.digest);
     if (value.resultJson !== undefined && (typeof value.resultJson !== "string" || Buffer.byteLength(value.resultJson) > 64 * 1024 * 1024)) throw new StoreError("The hosted native result receipt is invalid.");
     if (value.state === "completed" && value.resultJson === undefined) throw new StoreError("The hosted native result is missing.");
     return value as unknown as HostedNativeCallReceipt;
@@ -136,13 +136,13 @@ export class HostedAgentStore {
 }
 function record(value: unknown): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw new StoreError("The hosted native record is invalid."); return value as Record<string, unknown>; }
 function identity(value: unknown): asserts value is string { if (typeof value !== "string" || !value || value.length > 2048 || /[\0\r\n]/u.test(value)) throw new StoreError("The hosted native identity is invalid."); }
-function digest(value: unknown): asserts value is string { if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) throw new StoreError("The hosted native digest is invalid."); }
+function assertDigest(value: unknown): asserts value is string { if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) throw new StoreError("The hosted native digest is invalid."); }
 function validateOwner(owner: HostedNativeSessionOwner): void {
   const value = record(owner);
   for (const field of ["authorityId", "deviceId", "sessionId", "targetId", "nativeSessionId", "backendId"]) identity(value[field]);
   if (!["owner", "guest"].includes(owner.trust) || Object.keys(value).some(name => !["authorityId", "deviceId", "sessionId", "targetId", "nativeSessionId", "backendId", "trust", "providerGrant"].includes(name))) throw new StoreError("The hosted native owner is invalid.");
   if (owner.providerGrant !== undefined) {
-    const grant = record(owner.providerGrant); identity(grant.shareId); identity(grant.memberId); digest(grant.cleanupKey);
+    const grant = record(owner.providerGrant); identity(grant.shareId); identity(grant.memberId); assertDigest(grant.cleanupKey);
     if (owner.trust !== "guest" || !Number.isSafeInteger(grant.incarnation) || (grant.incarnation as number) < 1
       || Object.keys(grant).some(name => !["shareId", "memberId", "incarnation", "cleanupKey"].includes(name))) throw new StoreError("The hosted Provider cleanup owner is invalid.");
   }

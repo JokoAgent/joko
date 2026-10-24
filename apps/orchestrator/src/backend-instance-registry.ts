@@ -198,18 +198,31 @@ export class BackendInstanceRegistry {
   add(factory: BackendInstanceFactory): Promise<BackendInstanceSnapshot> {
     if (this.#closing) throw new Error("Backend instances are closing.");
     validateFactory(factory);
-    const pending = this.#additions.get(factory.instanceId); if (pending) return pending;
-    if (this.#instances.has(factory.instanceId) || this.#factories.has(factory.instanceId)) throw new Error("Backend instance is already registered.");
+    const pending = this.#additions.get(factory.instanceId);
+    if (pending) return pending;
+    if (this.#instances.has(factory.instanceId) || this.#factories.has(factory.instanceId)) {
+      throw new Error("Backend instance is already registered.");
+    }
     const reservation = this.authority.reserveBackendInstanceGeneration({ backendId: factory.instanceId, adapterKind: factory.adapterKind });
     this.#factories.set(factory.instanceId, factory);
     const addition = (async () => {
       const candidate = await this.#prepare(factory, reservation.generation, new Set(this.availableAdapters()));
       try {
-        const published = await this.#publishProvisioned(candidate, reservation); this.#instances.set(factory.instanceId, published); return this.get(factory.instanceId);
-      } catch (error) { if (candidate.state === "available") await this.#cleanupRejectedCandidate(candidate); throw error; }
-    })().catch(error => { if (!this.#instances.has(factory.instanceId)) this.#factories.delete(factory.instanceId); throw error; })
-      .finally(() => { if (this.#additions.get(factory.instanceId) === addition) this.#additions.delete(factory.instanceId); });
-    this.#additions.set(factory.instanceId, addition); return addition;
+        const published = await this.#publishProvisioned(candidate, reservation);
+        this.#instances.set(factory.instanceId, published);
+        return this.get(factory.instanceId);
+      } catch (error) {
+        if (candidate.state === "available") await this.#cleanupRejectedCandidate(candidate);
+        throw error;
+      }
+    })().catch(error => {
+      if (!this.#instances.has(factory.instanceId)) this.#factories.delete(factory.instanceId);
+      throw error;
+    }).finally(() => {
+      if (this.#additions.get(factory.instanceId) === addition) this.#additions.delete(factory.instanceId);
+    });
+    this.#additions.set(factory.instanceId, addition);
+    return addition;
   }
 
   snapshots(): readonly BackendInstanceSnapshot[] {

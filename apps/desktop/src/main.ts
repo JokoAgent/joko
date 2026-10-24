@@ -387,7 +387,7 @@ import {
   deletePrivateFile,
   readPrivateFile,
   readRegularFileSnapshot
-} from "./secure-files.js";
+} from "@joko/device-peer/private-files";
 import { materializeDesktopDeepLinkNavigation } from "./portable-deep-link-materialization.js";
 import { DesktopTaskSharingInvitationBuffer } from "./task-sharing-invitation.js";
 import { verifyPackagedSmokeTaskSharing } from "./packaged-smoke-task-sharing.js";
@@ -2451,12 +2451,15 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   recordPackagedSmokeProgress("task_window_cross_profile_fenced");
 
   if (nativeTaskStatusSupported) {
+    const visibleTaskKey = JSON.stringify([
+      connection.profileId, connection.serverId, task.sourceGeneration.toString(), task.generation.toString(), task.sessionId
+    ]);
     const visibilityDeadline = Date.now() + 5_000;
     while (Date.now() < visibilityDeadline
-      && nativeTaskStatusVisibleSessionsByContents.get(taskContents)?.includes(task.sessionId) !== true) {
+      && nativeTaskStatusVisibleSessionsByContents.get(taskContents)?.includes(visibleTaskKey) !== true) {
       await waitForPackagedSmokePoll();
     }
-    if (nativeTaskStatusVisibleSessionsByContents.get(taskContents)?.includes(task.sessionId) !== true) {
+    if (nativeTaskStatusVisibleSessionsByContents.get(taskContents)?.includes(visibleTaskKey) !== true) {
       throw new Error("Packaged smoke Task window did not publish its visible Task state.");
     }
   }

@@ -5,8 +5,10 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAppController, type AppController } from "./controller.js";
 import { createOrchestratorGateway, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
-import { emptySnapshot, type AppSnapshot, type ConnectionProfile } from "./model.js";
+import { emptySnapshot, type AppSnapshot, type ConnectionProfile, type ModelPriceOverrideView, type ModelView } from "./model.js";
 import { registerCatalogNavigationLeave } from "./catalog-navigation-leave.js";
+import { ModelPriceOverrideDialog } from "./components/ModelPriceOverrideDialog.js";
+import { translate } from "./i18n.js";
 
 vi.mock("./gateway.js", async original => ({ ...await original<typeof import("./gateway.js")>(),
   createOrchestratorGateway: vi.fn(), probeOrchestratorOrigin: vi.fn() }));
@@ -109,8 +111,36 @@ it("opens an independent plugin window on its explicit node and rejects a replac
   expect(replaced.activeConnections).toEqual([]);
 });
 
-async function mount(connectFirst = true) {
+it("keeps a dirty price draft and settles its mutation across background snapshots on the same connection", async () => {
+  const view = await mount(true, true), first = view.app()!;
+  const input = document.querySelector<HTMLInputElement>('input[type="number"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "17");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () => view.emit());
+  expect(view.app()).not.toBe(first);
+  expect(view.app()!.getModelPriceOverride).toBe(first.getModelPriceOverride);
+  expect(document.querySelector<HTMLInputElement>('input[type="number"]')!.value).toBe("17");
+  let finish!: (value: ModelPriceOverrideView) => void;
+  view.savePrice.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await act(async () => document.querySelector<HTMLFormElement>(".model-price-dialog__form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  expect(input.disabled).toBe(true);
+  await act(async () => { view.emit(); finish(price()); });
+  expect(view.closePrice).toHaveBeenCalledOnce();
+  expect(document.querySelector<HTMLInputElement>('input[type="number"]')!.disabled).toBe(false);
+  expect(view.getPrice).toHaveBeenCalledOnce();
+  await act(async () => view.app()!.connect(a));
+  await expect(first.getModelPriceOverride("backend", "provider", "model")).rejects.toThrow("no longer current");
+  await expect(first.setModelPriceOverride("backend", "provider", "model", price().effective)).rejects.toThrow("no longer current");
+  await expect(first.resetModelPriceOverride("backend", "provider", "model")).rejects.toThrow("no longer current");
+  expect(view.savePrice).toHaveBeenCalledOnce();
+});
+
+async function mount(connectFirst = true, showPrice = false) {
   const actions: string[] = [], activeConnections: string[] = [];
+  const getPrice = vi.fn(async () => price()), savePrice = vi.fn(async () => price()), closePrice = vi.fn();
+  let emit = () => {};
   const held = new Map<string, Promise<void>>();
   const probe = vi.mocked(probeOrchestratorOrigin).mockImplementation(async origin => identity([a, b, c].find(value => value.origin === origin)!));
   const auth = vi.fn(async (_owner: ConnectionProfile) => "private-test-bearer");
@@ -121,6 +151,7 @@ async function mount(connectFirst = true) {
   } as unknown as LocalState);
   vi.mocked(createOrchestratorGateway).mockImplementation((owner, _key, callbacks) => {
     const value = owner!, active = callbacks.onExtensionUiEffect !== undefined;
+    if (active) emit = () => callbacks.onSnapshot?.({ ...snapshot(value), models: [{ ...priceModel }] });
     return { connect: async () => {
       if (!active && callbacks.onSnapshot) await held.get(value.id);
       if (active) activeConnections.push(value.id);
@@ -128,19 +159,26 @@ async function mount(connectFirst = true) {
     }, disconnect: () => undefined, taskSharingApi: () => undefined,
     inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined,
     refresh: async () => callbacks.onSnapshot?.(snapshot(value)),
+    getModelPriceOverride: getPrice, setModelPriceOverride: savePrice, resetModelPriceOverride: getPrice,
     listPartners: async () => ({ partners: [], directory: { revision: 1n, templates: [], avatarPresets: [], activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 1 } }),
     setResourceEnabled: async (id: string) => { actions.push(`${value.serverId}:resource:${id}`); },
     setExtensionEnabled: async (id: string) => { actions.push(`${value.serverId}:extension:${id}`); },
     listSkillMarketSources: async () => { actions.push(`${value.serverId}:market`); return { revision: 1n, sources: [] }; }
     } as unknown as OrchestratorGateway;
   });
-  let app: AppController | undefined; function Probe() { app = useAppController(); return null; }
+  let app: AppController | undefined; function Probe() { app = useAppController(); return showPrice && app.state.connectionState === "connected"
+    ? <ModelPriceOverrideDialog controller={app} model={{ ...priceModel }} t={(key, values) => translate("en", key, values)} onClose={closePrice} /> : null; }
   root = createRoot(document.body.appendChild(document.createElement("div")));
   await act(async () => { root!.render(<Probe />); await settle(); });
   await vi.waitFor(() => expect(app?.state.ready).toBe(true));
   if (connectFirst) await act(async () => { await app!.connect(a); await settle(); });
-  return { app: () => app, actions, probe, auth, activeConnections, hold: (id: string, promise: Promise<void>) => held.set(id, promise) };
+  return { app: () => app, actions, probe, auth, activeConnections, hold: (id: string, promise: Promise<void>) => held.set(id, promise), emit: () => emit(), getPrice, savePrice, closePrice };
 }
+const priceModel: ModelView = { backendId: "backend", providerId: "provider", providerName: "Provider", modelId: "model", name: "Model", available: true,
+  supportsImages: false, inputModalities: ["text"], outputModalities: ["text"], supportsFast: false, efforts: [], currencyCode: "USD",
+  contextWindow: 64_000, maximumOutputTokens: 8_192, inputCostMicrosPerMillion: 1_000_000, outputCostMicrosPerMillion: 2_000_000 };
+function price(): ModelPriceOverrideView { return { backendId: priceModel.backendId, providerId: priceModel.providerId, modelId: priceModel.modelId,
+  allowedCurrencies: ["USD"], referenceAvailable: true, reference: { currency: "USD", inputPerMillion: 1, outputPerMillion: 2 }, effective: { currency: "USD", inputPerMillion: 1, outputPerMillion: 2 } }; }
 function profile(id: string): ConnectionProfile { return { id: `connection-${id}`, serverId: `node-${id}`, deviceId: `device-${id}`, origin: `https://${id}.example`, name: id.toUpperCase() }; }
 function identity(owner: ConnectionProfile) { return { serverId: owner.serverId, displayName: owner.name, version: "1", apiVersion: "1", pairingEnabled: true }; }
 function snapshot(owner: ConnectionProfile): AppSnapshot { return { ...emptySnapshot(), generation: 1n,

@@ -3,7 +3,7 @@ import { constants, lstatSync, realpathSync, renameSync } from "node:fs";
 import { lstat, open, readdir, realpath, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { DesktopWallpaperSettings, DesktopWallpaperSettingsChange } from "./channels.js";
-import { ensurePrivateDirectory, readPrivateFile, readRegularFileSnapshot } from "./secure-files.js";
+import { ensurePrivateDirectory, readPrivateFile, readRegularFileSnapshot } from "@joko/device-peer/private-files";
 import { DesktopWallpaperError, WALLPAPER_MAXIMUM_BYTES, assertStoredWallpaperImage, desktopWallpaperImageUrl, prepareWallpaperImage, validDimension, validWallpaperImageId } from "./wallpaper-image.js";
 
 type Image = NonNullable<DesktopWallpaperSettings["customImage"]>;

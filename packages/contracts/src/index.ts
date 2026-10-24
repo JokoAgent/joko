@@ -111,7 +111,8 @@ export * from "./rich-answer.js";
 export * from "./rich-answer-guide.js";
 export * from "./rich-answer-media.js";
 export * from "./youtube-video.js";
-export { NATIVE_TASK_STATUS_SESSION_LIMIT, NativeRemoteTaskTracker, remoteEntryToken, type NativeRemoteTaskObservation } from "./native-task-status.js";
+export { NATIVE_TASK_STATUS_SESSION_LIMIT, NativeRemoteTaskTracker, remoteEntryToken, type NativeRemoteTaskObservation,
+  type NativeTaskStatusActivityLine, type NativeTaskStatusPermission, type NativeTaskStatusSession, type NativeTaskStatusSnapshot } from "./native-task-status.js";
 export * from "./gen/joko/v1/hosted_agent_desktop_pb.js";
 export * from "./gen/joko/v1/provider_sharing_pb.js";
 export * from "./gen/joko/v1/provider_group_pb.js";

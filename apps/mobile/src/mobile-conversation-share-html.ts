@@ -3,7 +3,7 @@ import { mobileCodeHighlight } from "./mobile-code-highlight";
 import { parseMobileMarkdown, type MobileMarkdownBlock, type MobileMarkdownInline } from "./mobile-markdown";
 import { repairMobileMermaidSource } from "./mobile-mermaid-repair";
 import { escapeMobileMarkdownHtml as escapeHtml, mobileMarkdownScriptValue, type MobileMarkdownRichRuntime } from "./mobile-markdown-rich-html";
-import { redactShareMessageText } from "./mobile-share-redaction";
+import { redactShareMessageText } from "@joko/web/share-redaction";
 import type { MobileConversationShareMessage, MobileConversationShareSnapshot } from "./mobile-conversation-share";
 import type { MobileConversationShareColors } from "./mobile-conversation-share-layout";
 

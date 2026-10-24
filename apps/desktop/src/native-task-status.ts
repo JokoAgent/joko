@@ -1,9 +1,7 @@
 import type {
-  DesktopLocale,
   DesktopNativeTaskStatusAction,
   DesktopNativeTaskStatusDecision,
   DesktopNativeTaskStatusDisplay,
-  DesktopNativeTaskStatusPermission,
   DesktopNativeTaskStatusSoundChoice,
   DesktopNativeTaskStatusSoundEvent,
   DesktopNativeTaskStatusSoundId,
@@ -12,7 +10,7 @@ import type {
   DesktopNativeTaskStatusSnapshot
 } from "./channels.js";
 import { NATIVE_TASK_STATUS_SESSION_LIMIT } from "@joko/contracts";
-import { isDesktopLocale } from "./channels.js";
+import { parseSnapshot } from "./native-task-status-contract.js";
 
 export const NATIVE_TASK_STATUS_MIN_DARWIN_MAJOR = 23;
 export const MAXIMUM_NATIVE_TASK_STATUS_SESSIONS = NATIVE_TASK_STATUS_SESSION_LIMIT;
@@ -113,25 +111,7 @@ export function isSilentDesktopNativeTaskStatusSound(choice: DesktopNativeTaskSt
 }
 
 export function parseDesktopNativeTaskStatusSnapshot(value: unknown): DesktopNativeTaskStatusSnapshot {
-  if (!isRecord(value) || !hasExactKeys(value, ["locale", "ownerId", "revision", "sessions"]) ||
-    !isBoundedText(value["ownerId"], 256) || !isDecimalFence(value["revision"]) ||
-    !isDesktopLocale(value["locale"]) || !Array.isArray(value["sessions"]) ||
-    value["sessions"].length > MAXIMUM_NATIVE_TASK_STATUS_SESSIONS) {
-    throw new TypeError("Native task-status snapshot is invalid.");
-  }
-  const seen = new Set<string>();
-  const sessions = value["sessions"].map((raw) => {
-    const session = parseSession(raw);
-    if (seen.has(session.sessionId)) throw new TypeError("Native task-status task identities must be unique.");
-    seen.add(session.sessionId);
-    return session;
-  });
-  return Object.freeze({
-    ownerId: value["ownerId"],
-    revision: value["revision"],
-    locale: value["locale"],
-    sessions: Object.freeze(sessions)
-  });
+  return parseSnapshot(value);
 }
 
 export function parseDesktopNativeTaskStatusVisibleSessionIds(value: unknown): readonly string[] {
@@ -258,69 +238,6 @@ function parseSoundSettings(value: unknown): DesktopNativeTaskStatusSettings["so
   }
 }
 
-function parseSession(value: unknown): DesktopNativeTaskStatusSession {
-  if (!isRecord(value)) throw new TypeError("Native task-status task is invalid.");
-  const required = ["activityLines", "detail", "phase", "sessionId", "title", "updatedAt"];
-  const optional = ["interactionKind", "inputHandoff", "permission", "startedAt", "remote"];
-  if (!hasOnlyKeys(value, required, optional) || !required.every((key) => Object.hasOwn(value, key)) ||
-    !isBoundedText(value["sessionId"], 1024) || !isDisplayText(value["title"], 160) ||
-    !isDisplayText(value["detail"], 600) || !isPhase(value["phase"]) || !isTimestamp(value["updatedAt"]) ||
-    (value["startedAt"] !== undefined && !isTimestamp(value["startedAt"])) ||
-    (value["interactionKind"] !== undefined && !isInteractionKind(value["interactionKind"])) ||
-    (value["inputHandoff"] !== undefined && value["inputHandoff"] !== true) ||
-    !Array.isArray(value["activityLines"]) || value["activityLines"].length > 3) {
-    throw new TypeError("Native task-status task is invalid.");
-  }
-  const activityLines = Object.freeze(value["activityLines"].map(parseActivityLine));
-  const permission = value["permission"] === undefined ? undefined : parsePermission(value["permission"]);
-  const remote = value["remote"] === undefined ? undefined : parseRemote(value["remote"]);
-  if (remote && permission) throw new TypeError("Remote tasks cannot carry local permission actions.");
-  if (permission !== undefined && value["phase"] !== "interaction") {
-    throw new TypeError("Native task-status permission must belong to an interaction task.");
-  }
-  if (value["inputHandoff"] && (value["phase"] !== "interaction" || permission || value["interactionKind"] !== undefined)) {
-    throw new TypeError("A private input handoff cannot carry ordinary interaction decisions.");
-  }
-  return Object.freeze({
-    sessionId: value["sessionId"],
-    title: value["title"],
-    detail: value["detail"],
-    phase: value["phase"],
-    ...(value["interactionKind"] === undefined ? {} : { interactionKind: value["interactionKind"] }),
-    ...(value["inputHandoff"] ? { inputHandoff: true } : {}),
-    activityLines,
-    ...(value["startedAt"] === undefined ? {} : { startedAt: value["startedAt"] }),
-    updatedAt: value["updatedAt"],
-    ...(permission === undefined ? {} : { permission }),
-    ...(remote === undefined ? {} : { remote })
-  });
-}
-
-function parseRemote(value: unknown): NonNullable<DesktopNativeTaskStatusSession["remote"]> {
-  if (!isRecord(value) || !hasOnlyKeys(value, ["sourceId", "runId", "silent", "completionNotification"], ["companion", "observedCompletionOnly"])
-    || !isBoundedText(value["sourceId"], 1024) || !isDisplayText(value["runId"], 256)
-    || typeof value["silent"] !== "boolean" || value["observedCompletionOnly"] !== undefined && typeof value["observedCompletionOnly"] !== "boolean"
-    || !["none", "pending", "teammate"].includes(String(value["completionNotification"]))) throw new TypeError("Invalid remote task activity.");
-  const companion = value["companion"];
-  if (companion !== undefined && (!isRecord(companion) || !hasOnlyKeys(companion, ["name", "glyph", "tint"], ["artwork"])
-    || !isDisplayText(companion["name"], 160) || !isDisplayText(companion["glyph"], 8) || !/^#[a-f0-9]{6}$/iu.test(String(companion["tint"]))
-    || companion["artwork"] !== undefined && (typeof companion["artwork"] !== "string" || companion["artwork"].length > 80_000
-      || !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+=*$/u.test(companion["artwork"])))) throw new TypeError("Invalid remote companion identity.");
-  return Object.freeze({ sourceId: value["sourceId"], runId: value["runId"], silent: value["silent"],
-    completionNotification: value["completionNotification"] as "none" | "pending" | "teammate",
-    ...(value["observedCompletionOnly"] === undefined ? {} : { observedCompletionOnly: value["observedCompletionOnly"] as boolean }),
-    ...(companion === undefined ? {} : { companion: companion as NonNullable<DesktopNativeTaskStatusSession["remote"]>["companion"] }) });
-}
-
-function parseActivityLine(value: unknown): DesktopNativeTaskStatusSession["activityLines"][number] {
-  if (!isRecord(value) || !hasExactKeys(value, ["id", "kind", "text"]) ||
-    !isBoundedText(value["id"], 256) || !isDisplayText(value["text"], 300) ||
-    (value["kind"] !== "user" && value["kind"] !== "assistant" && value["kind"] !== "status" && value["kind"] !== "tool")) {
-    throw new TypeError("Native task-status activity line is invalid.");
-  }
-  return Object.freeze({ id: value["id"], kind: value["kind"], text: value["text"] });
-}
-
 function parseDisplayBounds(value: unknown): DesktopNativeTaskStatusDisplay["bounds"] {
   if (!isRecord(value) || !hasExactKeys(value, ["height", "width", "x", "y"]) ||
     ![value["x"], value["y"], value["width"], value["height"]].every((part) =>
@@ -333,22 +250,6 @@ function parseDisplayBounds(value: unknown): DesktopNativeTaskStatusDisplay["bou
     y: value["y"] as number,
     width: value["width"] as number,
     height: value["height"] as number
-  });
-}
-
-function parsePermission(value: unknown): DesktopNativeTaskStatusPermission {
-  if (!isRecord(value) || !hasExactKeys(value, ["allow", "allowForSession", "deny", "generation", "interactionId"]) ||
-    !isBoundedText(value["interactionId"], 256) || !isDecimalFence(value["generation"]) ||
-    typeof value["allow"] !== "boolean" || typeof value["allowForSession"] !== "boolean" ||
-    typeof value["deny"] !== "boolean") {
-    throw new TypeError("Native task-status permission is invalid.");
-  }
-  return Object.freeze({
-    interactionId: value["interactionId"],
-    generation: value["generation"],
-    allow: value["allow"],
-    allowForSession: value["allowForSession"],
-    deny: value["deny"]
   });
 }
 
@@ -366,25 +267,8 @@ function phasePriority(phase: DesktopNativeTaskStatusSession["phase"]): number {
   return 3;
 }
 
-function isPhase(value: unknown): value is DesktopNativeTaskStatusSession["phase"] {
-  return value === "running" || value === "interaction" || value === "completed" || value === "error";
-}
-
-function isInteractionKind(value: unknown): value is NonNullable<DesktopNativeTaskStatusSession["interactionKind"]> {
-  return value === "permission" || value === "question" || value === "plan" || value === "select" ||
-    value === "confirm" || value === "input" || value === "editor";
-}
-
 function isSoundId(value: unknown): value is DesktopNativeTaskStatusSoundId {
   return typeof value === "string" && (DESKTOP_NATIVE_TASK_STATUS_SOUND_OPTIONS as readonly string[]).includes(value);
-}
-
-function isDecimalFence(value: unknown): value is string {
-  return typeof value === "string" && value.length >= 1 && value.length <= 64 && /^(?:0|[1-9][0-9]*)$/u.test(value);
-}
-
-function isTimestamp(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isBoundedText(value: unknown, maximum: number): value is string {

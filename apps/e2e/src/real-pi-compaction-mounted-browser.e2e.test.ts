@@ -132,7 +132,7 @@ describe("mounted Pi compaction product chain", () => {
     const permittedAttentionErrors: string[] = [];
     const permittedUsageErrors: string[] = [];
     const permittedAttentionCursors: { submitted: string; current: string; generation: string }[] = [];
-    const errors = observeBrowserErrors(page, conflict => {
+    const { errors, settle: settleBrowserErrors } = observeBrowserErrors(page, conflict => {
       if (attentionBeforeResume === undefined || conflict.sessionId !== compactSessionId
         || conflict.intent !== SessionAttentionAcknowledgementIntent.VIEWED) return;
       const current = fixture!.application.store.getSessionAttention(compactSessionId);
@@ -234,6 +234,7 @@ describe("mounted Pi compaction product chain", () => {
     expect(failureStates).not.toContain(CompactionState.NO_OP);
     expect(errors.filter((error) => error.startsWith("pageerror:"))).toEqual([]);
     // The controlled Provider refusal is intentionally surfaced as HTTP 503.
+    await settleBrowserErrors();
     errors.splice(0);
 
     const authKey = manager.authKey;
@@ -255,6 +256,7 @@ describe("mounted Pi compaction product chain", () => {
     await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
     expect(await page.locator(".compact-action-feedback").count()).toBe(0);
     // Background Connect polls may fail while the service is deliberately stopped.
+    await settleBrowserErrors();
     errors.splice(0);
     attentionBeforeResume = fixture.application.store.getSessionAttention(compactSessionId).attentionCursor;
     const continuationRunId = await send(compactSessionId, "The same native Pi context continues after service restart.");
@@ -268,6 +270,7 @@ describe("mounted Pi compaction product chain", () => {
         && attention.readThroughCursor?.sequence === attention.attentionCursor?.sequence
         && attention.readThroughCursor?.generation === attention.attentionCursor?.generation;
     }, "the mounted page to acknowledge the latest resumed projection", 30_000);
+    await settleBrowserErrors();
     if (process.env.RUNNER_TEMP !== undefined) {
       const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "compaction");
       const attention = acknowledged.session!.attention!;
@@ -340,7 +343,7 @@ describe("mounted Pi compaction product chain", () => {
     const pairingCode = fixture.pairingCode(challenge.challenge.challengeId);
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
-    const errors = observeBrowserErrors(page);
+    const { errors } = observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -390,10 +393,12 @@ interface StaleViewedAcknowledgement {
 }
 
 function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: StaleViewedAcknowledgement) => void,
-  onStaleUsage?: (stale: { sessionId: string; generation: bigint; responseError: string; consoleError: string }) => void): string[] {
+  onStaleUsage?: (stale: { sessionId: string; generation: bigint; responseError: string; consoleError: string }) => void
+): { readonly errors: string[]; readonly settle: () => Promise<void> } {
   const errors: string[] = [];
+  const pending = new Set<Promise<void>>();
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
-  page.on("response", async (response) => {
+  const observeResponse = async (response: import("playwright-core").Response) => {
     if (response.status() < 400) return;
     const url = new URL(response.url());
     let operation = "";
@@ -436,6 +441,12 @@ function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: Stale
       ...acknowledgement, responseError,
       consoleError: `console:Failed to load resource: the server responded with a status of 409 (Conflict):${url.origin}${url.pathname}`
     });
+  };
+  page.on("response", response => {
+    if (response.status() < 400) return;
+    const observation = observeResponse(response);
+    pending.add(observation);
+    void observation.finally(() => pending.delete(observation));
   });
   page.on("console", (message) => {
     if (message.type() !== "error") return;
@@ -446,5 +457,5 @@ function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: Stale
     } catch { /* Some browser errors have no source location. */ }
     errors.push(`console:${message.text()}:${location}`);
   });
-  return errors;
+  return { errors, settle: async () => { await Promise.all([...pending]); } };
 }

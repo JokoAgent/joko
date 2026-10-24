@@ -30,6 +30,10 @@ export function publicNativeTurnError(error: unknown): PublicError {
   const rawStatus = networkTag || tag === "responseTooManyFailedAttempts" ? details?.["httpStatusCode"] : undefined;
   const status = typeof rawStatus === "number" && Number.isInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : undefined;
   const code = tag === "usageLimitExceeded" || tag === "sessionBudgetExceeded" ? "QUOTA_EXCEEDED"
+    : tag === "contextWindowExceeded" ? "CONTEXT_OVERFLOW"
+    : tag === "badRequest" || status === 400 || status === 413 || status === 422 ? "INVALID_REQUEST"
+    : tag === "cyberPolicy" ? "CONTENT_POLICY"
+    : tag === "sandboxError" ? "SANDBOX_ERROR"
     : tag === "unauthorized" || status === 401 || status === 403 ? "AUTH_REQUIRED"
     : tag === "serverOverloaded" || status === 529 ? "UPSTREAM_OVERLOADED"
     : status === 402 ? "QUOTA_EXCEEDED"
@@ -37,6 +41,10 @@ export function publicNativeTurnError(error: unknown): PublicError {
     : networkTag ? "NETWORK_ERROR"
     : "CODEX_TURN_FAILED";
   const messages: Record<typeof code, string> = {
+    CONTEXT_OVERFLOW: "The request exceeded the model context limit.",
+    INVALID_REQUEST: "The model service rejected the request as invalid.",
+    CONTENT_POLICY: "The model service declined the request under its content policy.",
+    SANDBOX_ERROR: "The native runtime could not execute within its sandbox.",
     AUTH_REQUIRED: "Codex authentication is required.",
     QUOTA_EXCEEDED: "The active Codex account reached its usage or session budget limit.",
     RATE_LIMITED: "The Codex provider temporarily limited requests.",
@@ -48,7 +56,7 @@ export function publicNativeTurnError(error: unknown): PublicError {
     code,
     message: messages[code],
     phase: "stream",
-    retryable: code !== "AUTH_REQUIRED",
+    retryable: !["AUTH_REQUIRED", "CONTEXT_OVERFLOW", "INVALID_REQUEST", "CONTENT_POLICY", "SANDBOX_ERROR"].includes(code),
     stateMayHaveChanged: true,
     recovery: code === "AUTH_REQUIRED"
       ? "Sign in to the Codex account and explicitly retry the queued input."

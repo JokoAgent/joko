@@ -949,7 +949,18 @@ export function App() {
   return (
     <SafeAreaProvider>
       <MobileAdaptiveWindowProvider>
-      <MobileNavigationFrame dark={dark}>
+      <MobileNavigationFrame dark={dark} onBack={() => {
+        if (!foreground || updates.forced || updates.prompt) return false;
+        if (page === "task-sharing") {
+          setSharingSessionId(undefined); void client.select().then(() => setPage("settings")); return true;
+        }
+        if (page === "partner-identities" || page === "partner-network") { setPage("partner-directory"); return true; }
+        if (page === "device") { setPage("devices"); return true; }
+        if (["settings", "connections", "devices", "automations", "extensions", "partner-resources"].includes(page)) {
+          setPage("home"); return true;
+        }
+        return false;
+      }}>
       <MobilePartnerAvatarProvider transport={client.partnerAvatarTransport()}>
       <MobileMcpAppViewsProvider ownerKey={JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId, state.status])} bind={sessionId => client.mcpAppApi(sessionId)}>
       <MobileExtensionMailReaderProvider ownerKey={JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId, state.status, state.selectedId, page, foreground])}
@@ -3938,6 +3949,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   }, [messageFocusIndex, messageFocusKey]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
+  const localOutbox = client.taskOutboxItems?.() ?? [];
+  const composerAvailable = state.status === "connected" || client.canQueueTaskInput?.() === true;
   const advertisedQueueCapabilities = client.taskQueueCapabilities();
   const queueCapabilities = workerReadOnly ? { ...advertisedQueueCapabilities, edit: false, cancel: false, reorder: false } : advertisedQueueCapabilities;
   const interactions = state.status === "connected" ? client.taskInteractions() : [];
@@ -4014,7 +4027,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     command.loaded
   ]));
   const voiceTransport = state.status === "connected" ? client.taskVoiceTransport() : undefined;
-  const attachmentControls = state.status === "connected" ? client.taskAttachmentControls() : undefined;
+  const attachmentControls = composerAvailable ? client.taskAttachmentControls(true) : undefined;
   const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
   const attachmentGenerationRef = useRef(0);
   const attachmentNativeActivityRef = useRef(false);
@@ -4035,7 +4048,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     setImageEditorLease(undefined);
     attachmentNativeActivityRef.current = false;
     attachmentGenerationRef.current += 1;
-    attachmentOwnerRef.current = client.taskAttachmentControls()?.surfaceOwnerKey;
+    attachmentOwnerRef.current = client.taskAttachmentControls(true)?.surfaceOwnerKey;
     setAttachmentBusy(false);
   }, []);
   const interactionOwnerKey = state.activeProfileId && state.selectedId
@@ -4546,7 +4559,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error, locale);
-  const composerPasteEditable = state.status === "connected" && composerOwnerReady && queueEdit === undefined && !state.busy
+  const composerPasteEditable = composerAvailable && composerOwnerReady && queueEdit === undefined && !state.busy
     && !composerOperationPending && !conversationShare.active
     && !voice.busy && !attachmentBusy;
   composerPasteEditableRef.current = composerPasteEditable;
@@ -4962,7 +4975,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       if (staged.length === 0) return;
       const latest = await waitForMobileAttachmentAuthority(
         { profileId: identity.profileId, surfaceOwnerKey: controls.surfaceOwnerKey },
-        () => client.taskAttachmentControls(),
+        () => client.taskAttachmentControls(true),
         (listener) => client.subscribe(() => listener()),
         {
           signal: controller.signal,
@@ -4973,7 +4986,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
               || current.activeProfileId !== identity.profileId || current.selectedId !== identity.sessionId
               || current.status === "revoked" || current.status === "unpaired"
               || AppState.currentState === "active" && current.status === "connected"
-                && client.taskAttachmentControls() === undefined;
+                && client.taskAttachmentControls(true) === undefined;
           }
         }
       );
@@ -5051,7 +5064,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     photoLibraryLeaseRef.current = undefined;
     setPhotoLibraryLease(undefined);
     attachmentGenerationRef.current += 1;
-    attachmentOwnerRef.current = client.taskAttachmentControls()?.surfaceOwnerKey;
+    attachmentOwnerRef.current = client.taskAttachmentControls(true)?.surfaceOwnerKey;
     setAttachmentBusy(false);
   };
   const addPhotoLibraryAssets = async (assets: readonly MobilePhotoLibraryAsset[]): Promise<void> => {
@@ -5074,7 +5087,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       );
       const latest = await waitForMobileAttachmentAuthority(
         { profileId: identity.profileId, surfaceOwnerKey: lease.controls.surfaceOwnerKey },
-        () => client.taskAttachmentControls(),
+        () => client.taskAttachmentControls(true),
         (listener) => client.subscribe(() => listener()),
         {
           signal: lease.controller.signal,
@@ -5085,7 +5098,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
               || current.activeProfileId !== identity.profileId || current.selectedId !== identity.sessionId
               || current.status === "revoked" || current.status === "unpaired"
               || AppState.currentState === "active" && current.status === "connected"
-                && client.taskAttachmentControls() === undefined;
+                && client.taskAttachmentControls(true) === undefined;
           }
         }
       );
@@ -5480,7 +5493,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         snapshotMatches: (stored) => mobileComposerDraftsEqual(stored ?? emptyMobileComposerDraft(), lease.draft),
         validateAuthority: () => {
           const currentIdentity = draftIdentityRef.current;
-          const latest = client.taskAttachmentControls();
+          const latest = client.taskAttachmentControls(true);
           if (!taskMountedRef.current || imagePasteLeaseRef.current !== lease
             || attachmentGenerationRef.current !== lease.generation
             || attachmentAbortRef.current !== lease.controller || lease.controller.signal.aborted
@@ -6279,7 +6292,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       drawerMounted={drawerMounted}
       pinned={session?.pinned}
       syncing={state.status === "connecting" || state.historyBusy}
-      notice={mobileTaskHeaderNotice({ status: state.status, session, pendingCount: queueItems.length, role: headerRole.role,
+      notice={mobileTaskHeaderNotice({ status: state.status, session, pendingCount: queueItems.length + localOutbox.length, role: headerRole.role,
         queueControls: state.detail?.queueControls ?? [], locale })}
       detailsOnly={headerRole.role === "worker"}
       primaryActionsReady={headerRole.role !== undefined}
@@ -6457,6 +6470,39 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       </MobilePartnerConversationRow> : renderTimelineItem(item)}</View>} />
     </View>
     <View testID="task.controls-viewport" pointerEvents="box-none" style={controlsRegion}>
+    {localOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
+      <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.outbox")}</Text>
+      <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList} keyboardShouldPersistTaps="handled">
+        {localOutbox.map((item, index) => <View key={item.id}
+          style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <Text style={[styles.caption, { color: item.state === "failed" ? colors.negative : colors.muted }]}>
+            {index + 1} · {mobileMessage(locale, item.state === "failed" ? "task.outboxFailed"
+              : item.state === "confirming" ? "task.operationUnknown" : item.state === "restoring"
+                ? "task.outboxRestoring" : item.state === "staging" ? "common.saving" : "task.outboxQueued")}
+          </Text>
+          <Text selectable style={[styles.body, { color: colors.ink }]}>{item.input.text}</Text>
+          {item.input.attachments.map((attachment) => <Text key={attachment.attachmentId} style={[styles.caption, { color: colors.muted }]}>{attachment.fileName}</Text>)}
+          <Text style={[styles.caption, { color: colors.muted }]}>{item.error || mobileMessage(locale,
+            item.state === "confirming" ? "task.outboxUnknownHint" : "task.outboxHint")}</Text>
+          <View style={styles.queueActions}>
+            {item.state === "confirming" ? <Action label={mobileMessage(locale, "receipt.check")} colors={colors} compact
+              disabled={state.status !== "connected" || state.busy} onPress={() => void client.reconcile()} /> : <>
+              {item.state === "failed" && <Action label={mobileMessage(locale, "common.retry")} colors={colors} compact
+                disabled={state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}
+                onPress={() => void client.retryTaskOutbox(item.id).catch((error) => setLocalError(errorText(error)))} />}
+              {item.attempted && item.failureKind !== "rejected" && <Action label={mobileMessage(locale, "receipt.check")} colors={colors} compact
+                disabled={state.status !== "connected" || state.busy} onPress={() => void client.checkTaskOutbox(item.id).catch((error) => setLocalError(errorText(error)))} />}
+              {(item.state === "queued" || item.state === "failed") && (!item.attempted || item.failureKind === "rejected") && <Action label={mobileMessage(locale, "common.edit")} colors={colors} compact
+                disabled={state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}
+                onPress={() => void client.editTaskOutbox(item.id).catch((error) => setLocalError(errorText(error)))} />}
+              {item.state !== "restoring" && (!item.attempted || item.failureKind === "rejected") && <Action label={mobileMessage(locale, "common.remove")} colors={colors} compact
+                disabled={state.busy || voice.busy || attachmentBusy}
+                onPress={() => void client.cancelTaskOutbox(item.id).catch((error) => setLocalError(errorText(error)))} />}
+            </>}
+          </View>
+        </View>)}
+      </ScrollView>
+    </View>}
     {queueItems.length > 0 && <View ref={queueViewportRef} collapsable={false} style={styles.queueRegion}
       onLayout={() => setImageViewportPulse(value => value + 1)}>
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
@@ -6627,17 +6673,17 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           onPress={() => void pasteClipboardText()} />
         {attachmentControls && <Action label={mobileMessage(locale, attachmentBusy ? "common.selecting" : "composer.attach")}
           colors={colors} compact
-          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={!composerAvailable || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("picker")} />}
         {attachmentControls && mobilePhotoLibrarySupported(attachmentControls.policy) && <Action label={mobileMessage(locale, "composer.photos")}
           colors={colors} compact
-          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={!composerAvailable || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={openPhotoLibrary} />}
         {attachmentControls && mobileCameraCaptureSupported(attachmentControls.policy) && <Action label={mobileMessage(locale, "composer.takePhoto")}
           colors={colors} compact
-          disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
+          disabled={!composerAvailable || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady
             || draft.attachments.length >= attachmentControls.policy.maximumItems}
           onPress={() => void addAttachments("camera")} />}
         {draft.mentions.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"
@@ -6662,7 +6708,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           onOpen={setComposerAtomId} />
       </View>}
       {!queueEdit && <MobileAttachmentTray attachments={draft.attachments} colors={colors} locale={locale}
-        disabled={state.status !== "connected" || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
+        disabled={!composerAvailable || state.busy || composerOperationPending || voice.busy || attachmentBusy || !composerOwnerReady}
         busy={state.busy || composerOperationPending || voice.busy || attachmentBusy}
         pendingCount={pastedImageCount}
         onPreview={(attachmentId) => void openImageEditor(attachmentId)} onRemove={removeAttachment} />}
@@ -6750,7 +6796,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           : queueEdit ? "composer.saveEdit" : "composer.send")} colors={colors} compact
           disabled={!composerOwnerReady || (!draft.text.trim() && (queueEdit !== undefined || draft.attachments.length === 0))
             || (!queueEdit && unknown) || attachmentBusy || voice.busy || state.busy || composerOperationPending
-            || state.status !== "connected"}
+            || (queueEdit ? state.status !== "connected" : !composerAvailable)}
           onPress={() => void submitComposer()} />
         {state.taskSource?.kind === "joined" && <Action label={mobileTaskSharingCopy(locale).steer} colors={colors} compact
           disabled={!composerOwnerReady || !draft.text.trim() || unknown || attachmentBusy || state.busy || state.status !== "connected"}

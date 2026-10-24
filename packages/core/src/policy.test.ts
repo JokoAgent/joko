@@ -39,6 +39,38 @@ describe("permission policy", () => {
     expect(credential).toMatchObject({ action: "ask", risk: "dangerous" });
   });
 
+  it.each([
+    "git diff --output=/other/result.patch",
+    "git diff --output result.patch",
+    "git diff --out=result.patch",
+    "git diff --o=result.patch",
+    "git diff -oresult.patch",
+    "git diff --ext-diff",
+    "git diff --ext",
+    "git diff --textconv",
+    "git diff --text",
+    "git diff --'out'put=result.patch",
+    "git diff --out\\put=result.patch",
+    "git diff --no-index C:/other/a C:/other/b",
+    "git diff -- ../../other/file"
+  ])("requires review for git diff side effects or unbounded arguments: %s", (command) => {
+    expect(decideToolCall({ name: "bash", args: { command } }, { ...context, pathStyle: "win32" }))
+      .toMatchObject({ action: "ask", risk: "ambiguous" });
+  });
+
+  it.each(["git diff", "git diff --stat", "git diff --no-ext-diff", "git diff --no-textconv"])(
+    "requires review when configured external diff programs remain enabled: %s", command => {
+      expect(decideToolCall({ name: "bash", args: { command } }, { ...context, mode: "auto" })).toMatchObject({ action: "ask", risk: "ambiguous" });
+    }
+  );
+
+  it.each(["git diff --no-ext-diff --no-textconv", "git diff --no-ext-diff --no-textconv --stat", "git diff --no-ext-diff --no-textconv --cached --name-only", "git diff --no-ext-diff --no-textconv -U3 HEAD -- src/app.ts"])(
+    "allows bounded read-only git diff arguments: %s", (command) => {
+      expect(decideToolCall({ name: "bash", args: { command } }, { ...context, pathStyle: "win32" }))
+        .toMatchObject({ action: "allow", risk: "safe_command" });
+    }
+  );
+
   it("respects explicit deny even in Full Access", () => {
     const decision = decideToolCall(
       { name: "bash", args: { command: "git status" } },
@@ -50,7 +82,7 @@ describe("permission policy", () => {
   it("hard-locks isolated reviewer work to safe reads even when Full Access was inherited", () => {
     const reviewer = { ...context, mode: "bypassPermissions" as const, readOnly: true };
     expect(decideToolCall({ name: "read", args: { path: "src/app.ts" } }, reviewer).action).toBe("allow");
-    expect(decideToolCall({ name: "bash", args: { command: "git diff" } }, reviewer)).toMatchObject({ action: "deny", risk: "safe_command" });
+    expect(decideToolCall({ name: "bash", args: { command: "git diff --no-ext-diff --no-textconv" } }, reviewer)).toMatchObject({ action: "deny", risk: "safe_command" });
     expect(decideToolCall({ name: "write", args: { path: "src/app.ts" } }, reviewer)).toMatchObject({ action: "deny", risk: "workspace_write" });
     expect(decideToolCall({ name: "mcp__remote__create", args: {} }, reviewer)).toMatchObject({ action: "deny" });
     expect(decideToolCall({ name: "read", args: { path: ".pypirc" } }, reviewer)).toMatchObject({ action: "deny", risk: "dangerous" });

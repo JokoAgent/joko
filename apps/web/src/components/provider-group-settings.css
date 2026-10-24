@@ -5,6 +5,7 @@
 .provider-group-settings__member { padding-block: var(--settings-card-padding); border-block-start: 1px solid var(--line); }
 .provider-group-settings__choice { display: flex; align-items: center; flex-wrap: wrap; gap: var(--settings-row-gap); }
 .provider-group-settings__choice strong { overflow-wrap: anywhere; }
+.provider-group-settings__choice input[type="checkbox"] { accent-color: var(--accent); }
 .provider-group-settings__fields, .provider-group-settings__usage-filters { display: flex; align-items: end; flex-wrap: wrap; gap: var(--settings-row-gap); margin-block-start: var(--settings-row-gap); }
 .provider-group-settings__fields > label, .provider-group-settings__usage-filters > label { display: flex; flex-direction: column; min-width: 0; gap: var(--settings-row-gap); }
 .provider-group-settings__fields input { width: 6rem; min-height: var(--settings-control-height); }

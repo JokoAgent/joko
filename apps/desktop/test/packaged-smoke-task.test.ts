@@ -42,7 +42,8 @@ const TASK: PackagedSmokeTask = {
   backendId: "managed-runtime",
   targetId: "target-managed",
   displayName: DISPLAY_NAME,
-  generation: 3n
+  generation: 3n,
+  sourceGeneration: 1n
 };
 
 describe("packaged Desktop durable Task acceptance fixture", () => {
@@ -273,25 +274,27 @@ describe("packaged Desktop durable Task acceptance fixture", () => {
     expect(calls).toEqual(["getServerInfo", "getSnapshot"]);
   });
 
-  it("rechecks the durable Task after the application window retires", async () => {
+  it.each([false, true])("rechecks the durable Task and service generation after the application window retires (replaced=%s)", async (replaced) => {
     const calls: string[] = [];
     const transport = fakeTransport(async (method) => {
       calls.push(method);
       if (method === "getServerInfo") return serverInfo("managed-server");
-      if (method === "getSnapshot") return { snapshot: snapshot([taskSession()]) };
+      if (method === "getSnapshot") return { snapshot: { ...snapshot([taskSession()]), generation: replaced ? 2n : TASK.sourceGeneration } };
       throw new Error(`Unexpected verification call: ${method}`);
     });
     const isAuthorityCurrent = vi.fn(async () => true);
 
-    await expect(verifyPackagedSmokeTask({
+    const verification = verifyPackagedSmokeTask({
       connection: CONNECTION,
       displayName: DISPLAY_NAME,
       readAuthKey: async () => AUTH_KEY,
       isAuthorityCurrent,
       transportFactory: () => transport
-    }, TASK)).resolves.toBeUndefined();
+    }, TASK);
+    if (replaced) await expect(verification).rejects.toThrow("Packaged smoke durable Task is absent or inconsistent.");
+    else await expect(verification).resolves.toBeUndefined();
     expect(calls).toEqual(["getServerInfo", "getSnapshot"]);
-    expect(isAuthorityCurrent).toHaveBeenCalledTimes(3);
+    expect(isAuthorityCurrent).toHaveBeenCalledTimes(replaced ? 2 : 3);
   });
 
   it("admits one exact-generation Timeline turn and waits for its owned durable Run", async () => {

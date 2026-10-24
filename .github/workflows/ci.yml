@@ -359,6 +359,12 @@ jobs:
         shell: bash
         run: pnpm --filter @joko/store exec vitest run src/operational-store.test.ts -t queue 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/store-queue-regressions.log"
 
+      - name: Check native context usage and task route recovery
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 10
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run src/session-host.test.ts src/partner-session-tasks.test.ts src/partner-task-route.test.ts src/hosted-agent-artifacts.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/runtime-task-recovery.log"
+
       - name: Check the Windows document worker regression
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
         timeout-minutes: 2
@@ -430,6 +436,14 @@ jobs:
             ${{ runner.temp }}/joko-standalone-web-evidence/
           if-no-files-found: error
           retention-days: 3
+
+      - name: Check the packaged smoke request and task identities
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          pnpm --filter @joko/desktop exec vitest run test/packaged-smoke-task.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/packaged-smoke-task.log"
+          pnpm --filter @joko/desktop exec node scripts/smoke-packaged.mjs --provider-smoke-classifier-test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/provider-smoke-classifier.log"
 
       - name: Package the current platform Desktop application
         id: desktop_package

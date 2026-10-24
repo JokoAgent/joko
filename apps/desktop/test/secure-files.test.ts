@@ -14,7 +14,7 @@ import {
   sameFileIdentity,
   sameStableFile,
   type FileSnapshot
-} from "../src/secure-files.js";
+} from "@joko/device-peer/private-files";
 import { mkdtemp } from "./test-paths.js";
 
 describe("Desktop secure files", () => {

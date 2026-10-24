@@ -23,6 +23,7 @@ import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
 import { PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-publisher.js";
 import { PartnerNetworkHost } from "./partner-network-host.js";
+import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -36,6 +37,13 @@ class RecordedAdapter extends FakeBackendAdapter {
     const context = this.inputs.filter(item => item.context.sessionId === sessionId).at(-1)!.context;
     await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] });
     await context.emit({ type: "done", outcome: "completed" });
+  }
+  async fail(sessionId: string, text: string) {
+    const context = this.inputs.filter(item => item.context.sessionId === sessionId).at(-1)!.context;
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] });
+    await context.emit({ type: "error", terminal: true, error: { code: "QUOTA_EXCEEDED", message: "Account quota exhausted.",
+      phase: "stream", retryable: false, stateMayHaveChanged: false, recovery: "Select another approved account." } });
+    await context.emit({ type: "done", outcome: "failed" });
   }
 }
 describe("Partner independent Session tasks", () => {
@@ -265,11 +273,21 @@ describe("Partner independent Session tasks", () => {
     await f.tasks.message(f.parent, created.id, "task:new-execution", { mode: "queue", message: "Continue completed work" }, () => undefined);
     const reopened = f.tasks.list(f.partner.id)[0]!; expect(reopened.deadlineAt).toBe(f.now() + 1000); expect(reopened.timeoutMs).toBe(1000); expect(reopened.sessionId).toBe(created.sessionId);
   });
-  it("advances only a frozen configured route after terminal state and explicit selection has no backup", async () => {
+  it("leaves a successful independent task on its current model", async () => {
+    const f = await fixture();
+    await f.partners.updatePartner(f.partner.id, f.partner.revision, { capabilities: { ...f.partner.capabilities,
+      modelChain: [...f.partner.capabilities.modelChain, { ...f.partner.capabilities.modelChain[0]!, modelId: "backup" }] } });
+    const task = await f.tasks.start(f.parent, "task:successful-route", { instruction: "Finish once" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs).toHaveLength(1));
+    await f.primary.complete(task.sessionId!, "Done");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("completed"));
+    expect(f.tasks.inspectRoute(f.parent, task.id).next).toBeUndefined();
+  });
+  it("advances only a frozen configured route after failure and explicit selection has no backup", async () => {
     const f = await fixture(), current = await f.partners.updatePartner(f.partner.id, f.partner.revision, { capabilities: { ...f.partner.capabilities,
       modelChain: [...f.partner.capabilities.modelChain, { ...f.partner.capabilities.modelChain[0]!, modelId: "backup" }] } });
     const created = await f.tasks.start(f.parent, "task:routes", { instruction: "Work" }, () => undefined); await vi.waitFor(() => expect(f.primary.inputs).toHaveLength(1));
-    await f.primary.complete(created.sessionId!, "Done"); await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("completed"));
+    await f.primary.fail(created.sessionId!, "Work stopped at the account limit."); await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("failed"));
     const inspected = f.tasks.inspectRoute(f.parent, created.id); expect(inspected.next?.modelId).toBe("backup");
     await expect(f.tasks.advanceRoute(f.parent, created.id, inspected.generation, "0".repeat(64), () => undefined)).rejects.toThrow("changed");
     await f.tasks.advanceRoute(f.parent, created.id, inspected.generation, inspected.selection_token!, () => undefined);
@@ -288,8 +306,8 @@ describe("Partner independent Session tasks", () => {
     const original = f.store.getSession(task.sessionId!).descriptor;
     expect(f.tasks.fallback({ sessionId: original.id, current: f.host.getSessionRuntimeControl(original.id).effective!,
       visitedRoutes: [], currentHop: 0 })).toEqual({ owned: true, candidate: f.route });
-    await f.primary.complete(task.sessionId!, "Initial work done.");
-    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("completed"));
+    await f.primary.fail(task.sessionId!, "Initial work done.");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("failed"));
     const route = f.tasks.inspectRoute(f.parent, task.id);
     expect(route.next?.backendId).toBe(f.secondary.id);
     await f.tasks.advanceRoute(f.parent, task.id, route.generation, route.selection_token!, () => undefined);
@@ -300,6 +318,30 @@ describe("Partner independent Session tasks", () => {
       backendId: f.secondary.id, permissionMode: original.permissionMode });
     expect(f.secondary.inputs[0]!.input.text).toContain("Initial work done.");
     expect(f.store.listSessions()).toHaveLength(2);
+  });
+  it("rechecks context headroom before adopting a suggestion and leaves owner-selected routes outside the chain alone", async () => {
+    const f = await fixture();
+    await f.partners.updatePartner(f.partner.id, f.partner.revision, { capabilities: { ...f.partner.capabilities,
+      modelChain: [...f.partner.capabilities.modelChain, { ...f.partner.capabilities.modelChain[0]!, modelId: "backup" }] } });
+    const task = await f.tasks.start(f.parent, "task:headroom", { instruction: "Work" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs).toHaveLength(1));
+    await f.primary.fail(task.sessionId!, "Partial work is retained.");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("failed"));
+    const descriptor = f.store.getBackend(f.primary.id).descriptor;
+    f.store.upsertBackend({ ...descriptor, models: descriptor.models.map(model => ({ ...model,
+      contextWindow: model.modelId === "text" ? 1_000_000 : 272_000 })) });
+    const usage = (contextTokens: number) => f.store.setSetting("session", task.sessionId!, SESSION_RUNTIME_STATE_SETTING_KEY,
+      { updatedAt: f.now(), usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+        cost: 0, contextTokens, contextWindow: 1_000_000 } });
+    usage(40_000);
+    const inspected = f.tasks.inspectRoute(f.parent, task.id);
+    expect(inspected.next?.modelId).toBe("backup");
+    usage(220_000);
+    expect(f.tasks.inspectRoute(f.parent, task.id).next).toBeUndefined();
+    await expect(f.tasks.advanceRoute(f.parent, task.id, inspected.generation, inspected.selection_token!, () => undefined)).rejects.toThrow("changed");
+    await f.host.setSessionRuntimeControl({ sessionId: task.sessionId!, expectedGeneration: inspected.generation,
+      patch: { backendId: f.secondary.id, providerId: "test", modelId: "text", fastMode: false } });
+    expect(f.tasks.inspectRoute(f.parent, task.id).next).toBeUndefined();
   });
   it("binds tools to the actual canonical Caller and accepts only discovered explicit routes", async () => {
     const f = await fixture(), tools = new PartnerSessionTaskTools(f.tasks), descriptor = f.store.getSession(f.parent).descriptor;

@@ -3,7 +3,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import * as contract from "@joko/contracts";
 import { providerGroupDraft, providerGroupUsageDateRange, type ProviderGroupSettingsApi } from "../provider-group-settings.js";
-import { Button, SwitchControl } from "./ui.js";
+import { Button, Spinner, SwitchControl } from "./ui.js";
 import "./provider-group-settings.css";
 
 export const providerGroupSettingsMessageKeys = ["title", "body", "provider", "loading", "loadFailed", "saveFailed", "conflict", "saved", "refresh", "save", "delete", "reloadDraft", "strategy",
@@ -72,6 +72,7 @@ function GroupPanel({ api, provider, t }: { readonly api: ProviderGroupSettingsA
   const rows = useMemo(() => [...new Map([...(draft?.members.map(member => ({ member: member.value, available: false })) ?? []), ...candidates].filter(candidate => candidate.member).map(candidate => [candidate.member!.key, candidate])).values()], [draft, candidates]);
   return <div className="settings-card-stack">
     {feedback && <p role={feedback === "saved" ? "status" : "alert"}>{t(`settings.providerGroups.${feedback}`)}</p>}
+    {!draft && <Button disabled={busy} onClick={() => setReadVersion(value => value + 1)}>{t("settings.providerGroups.refresh")}</Button>}
     {busy && !draft && <p role="status">{t("settings.providerGroups.loading")}</p>}
     {draft && <div className="settings-card">
       <label className="setting-row"><span className="setting-row__copy"><strong>{t("settings.providerGroups.strategy")}</strong></span><select value={draft.strategy} disabled={busy} onChange={event => change({ ...draft, strategy: Number(event.target.value) })}>
@@ -116,27 +117,34 @@ function GroupPanel({ api, provider, t }: { readonly api: ProviderGroupSettingsA
 }
 function UsagePanel({ api, provider, t }: { readonly api: ProviderGroupSettingsApi; readonly provider: { readonly backendId: string; readonly providerId: string }; readonly t: ProviderGroupSettingsTranslator }): JSX.Element {
   const [period, setPeriod] = useState<"all" | "30d" | "7d" | "today" | "day">("all"), [date, setDate] = useState(new Date().toISOString().slice(0, 10));
-  const [rows, setRows] = useState<readonly contract.ProviderGroupUsageRow[]>([]), [error, setError] = useState(false);
+  const queryKey = JSON.stringify([provider.backendId, provider.providerId, period, date]);
+  const [readVersion, setReadVersion] = useState(0);
+  const [result, setResult] = useState<{ readonly api: ProviderGroupSettingsApi; readonly queryKey: string; readonly readVersion: number; readonly rows?: readonly contract.ProviderGroupUsageRow[]; readonly failed: boolean }>();
   const [party, setParty] = useState(""), [node, setNode] = useState(""), [model, setModel] = useState("");
-  useEffect(() => { const abort = new AbortController(); setError(false);
+  const current = result?.api === api && result.queryKey === queryKey && result.readVersion === readVersion ? result : undefined;
+  const rows = current?.rows ?? [], error = current?.failed === true, loading = !current;
+  useEffect(() => { const abort = new AbortController();
     void Promise.resolve().then(() => api.getProviderGroupUsage({ key: create(contract.ProviderGroupKeySchema, provider), ...providerGroupUsageDateRange(period, date) }, abort.signal))
-      .then(rows => { if (!abort.signal.aborted) setRows(rows); }).catch(() => { if (!abort.signal.aborted) setError(true); }); return () => abort.abort();
-  }, [api, provider.backendId, provider.providerId, period, date]);
-  const filtered = rows.filter(row => (!party || row.partyId === party) && (!node || row.nodeId === node) && (!model || row.modelId === model));
+      .then(rows => { if (!abort.signal.aborted) setResult({ api, queryKey, readVersion, rows, failed: false }); })
+      .catch(() => { if (!abort.signal.aborted) setResult({ api, queryKey, readVersion, failed: true }); }); return () => abort.abort();
+  }, [api, provider.backendId, provider.providerId, period, date, queryKey, readVersion]);
+  const selectedParty = rows.some(row => row.partyId === party) ? party : "", selectedNode = rows.some(row => row.nodeId === node) ? node : "", selectedModel = rows.some(row => row.modelId === model) ? model : "";
+  const filtered = rows.filter(row => (!selectedParty || row.partyId === selectedParty) && (!selectedNode || row.nodeId === selectedNode) && (!selectedModel || row.modelId === selectedModel));
   const totals = [...new Map(filtered.map(row => [row.currencyCode, row.currencyCode])).keys()].map(currency => ({ currency, turns: filtered.filter(row => row.currencyCode === currency).reduce((sum, row) => sum + row.turns, 0n),
     tokens: filtered.filter(row => row.currencyCode === currency).reduce((sum, row) => sum + row.totalTokens, 0n), cost: filtered.filter(row => row.currencyCode === currency).reduce((sum, row) => sum + row.costMicros, 0n),
     estimated: filtered.some(row => row.currencyCode === currency && row.estimated), incomplete: filtered.some(row => row.currencyCode === currency && (!row.tokensComplete || !row.costComplete)) }));
-  const filter = (label: "person" | "node" | "model", selected: string, change: (value: string) => void, values: readonly [string, string][]) => <label>{t(`settings.providerGroups.${label}`)}<select value={selected} onChange={event => change(event.target.value)}>
+  const filter = (label: "person" | "node" | "model", selected: string, change: (value: string) => void, values: readonly [string, string][]) => <label>{t(`settings.providerGroups.${label}`)}<select value={selected} disabled={loading || error} onChange={event => change(event.target.value)}>
     <option value="">{t("settings.providerGroups.all")}</option>{[...new Map(values).entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></label>;
   return <div className="settings-card settings-card--content provider-group-settings__usage"><h4>{t("settings.providerGroups.usage")}</h4><div className="provider-group-settings__usage-filters">
     <label>{t("settings.providerGroups.period")}<select value={period} onChange={event => setPeriod(event.target.value as typeof period)}>
       {[["all", "all"], ["30d", "last30Days"], ["7d", "last7Days"], ["today", "today"], ["day", "specificDay"]].map(([value, label]) => <option key={value} value={value}>{t(`settings.providerGroups.${label as ProviderGroupSettingsMessage}`)}</option>)}
     </select></label>{period === "day" && <input type="date" value={date} aria-label={t("settings.providerGroups.specificDay")} onChange={event => setDate(event.target.value)} />}
-    {filter("person", party, setParty, rows.map(row => [row.partyId, row.partyName]))}{filter("node", node, setNode, rows.map(row => [row.nodeId, row.nodeName]))}{filter("model", model, setModel, rows.map(row => [row.modelId, row.modelId]))}
-  </div>{error && <p role="alert">{t("settings.providerGroups.loadFailed")}</p>}
-    {!filtered.length ? <p className="muted">{t("settings.providerGroups.noUsage")}</p> : <div className="provider-group-settings__usage-table"><table><thead><tr><th>{t("settings.providerGroups.turns")}</th><th>{t("settings.providerGroups.tokens")}</th><th>{t("settings.providerGroups.cost")}</th></tr></thead>
+    {filter("person", selectedParty, setParty, rows.map(row => [row.partyId, row.partyName]))}{filter("node", selectedNode, setNode, rows.map(row => [row.nodeId, row.nodeName]))}{filter("model", selectedModel, setModel, rows.map(row => [row.modelId, row.modelId]))}
+  </div>{loading && <Spinner label={t("settings.providerGroups.loading")} />}
+    {error && <><p role="alert">{t("settings.providerGroups.loadFailed")}</p><Button onClick={() => setReadVersion(value => value + 1)}>{t("settings.providerGroups.refresh")}</Button></>}
+    {!loading && !error && (!filtered.length ? <p className="muted">{t("settings.providerGroups.noUsage")}</p> : <div className="provider-group-settings__usage-table"><table><thead><tr><th>{t("settings.providerGroups.turns")}</th><th>{t("settings.providerGroups.tokens")}</th><th>{t("settings.providerGroups.cost")}</th></tr></thead>
       <tbody>{totals.map(total => <tr key={total.currency}><td>{total.turns.toString()}</td><td>{total.tokens.toString()}</td><td>{total.currency ? `${total.currency} ${formatMicros(total.cost)}` : "—"}
-        {total.estimated && <span> · {t("settings.providerGroups.estimated")}</span>}{total.incomplete && <span> · {t("settings.providerGroups.incomplete")}</span>}</td></tr>)}</tbody></table></div>}
+        {total.estimated && <span> · {t("settings.providerGroups.estimated")}</span>}{total.incomplete && <span> · {t("settings.providerGroups.incomplete")}</span>}</td></tr>)}</tbody></table></div>)}
   </div>;
 }
 function keyOf(value: { readonly backendId: string; readonly providerId: string }): string { return JSON.stringify([value.backendId, value.providerId]); }

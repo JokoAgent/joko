@@ -2,6 +2,7 @@ import { createCipheriv } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -20,6 +21,55 @@ afterEach(() => {
 });
 
 describe("OperationalStore messaging", () => {
+  it("reopens raw Telegram pages before cursor acknowledgement and commits cursor advancement with batch removal", () => {
+    const fixture = createActiveFixture();
+    const updates = [{ update_id: 9, message: { message_id: 81, media_group_id: "album-one",
+      chat: { id: 42, type: "private" }, from: { id: 42 }, photo: [{ file_id: "photo-one" }] } }];
+    fixture.store.saveMessagingPollBatch({ connectionId: fixture.connectionId, channelGeneration: fixture.generation,
+      nextCursor: "10", updates });
+    fixture.reopen();
+    expect(fixture.store.getMessagingConnection(fixture.connectionId).cursor).toBeUndefined();
+    expect(fixture.store.findMessagingPollBatch(fixture.connectionId, fixture.generation)).toEqual({ nextCursor: "10", updates });
+    const connection = fixture.store.getMessagingConnection(fixture.connectionId);
+    const acknowledge = (store: OperationalStore) => {
+      store.updateMessagingConnectionRuntime({ connectionId: connection.id, expectedRevision: connection.revision,
+        expectedGeneration: connection.generation, runtimeStatus: "connected", cursor: "10", updatedAt: 20 });
+      store.clearMessagingPollBatch(connection.id, connection.generation);
+    };
+    expect(() => fixture.store.transaction(store => { acknowledge(store); throw new Error("interrupted acknowledgement"); }))
+      .toThrow("interrupted acknowledgement");
+    fixture.reopen();
+    expect(fixture.store.getMessagingConnection(fixture.connectionId).cursor).toBeUndefined();
+    expect(fixture.store.findMessagingPollBatch(fixture.connectionId, fixture.generation)).toEqual({ nextCursor: "10", updates });
+    fixture.store.transaction(acknowledge);
+    fixture.reopen();
+    expect(fixture.store.getMessagingConnection(fixture.connectionId).cursor).toBe("10");
+    expect(fixture.store.findMessagingPollBatch(fixture.connectionId, fixture.generation)).toBeUndefined();
+  });
+
+  it("retires retained Telegram raw pages with their transport generation and rejects late old-generation writes", () => {
+    const fixture = createActiveFixture();
+    const batch = { connectionId: fixture.connectionId, channelGeneration: fixture.generation,
+      nextCursor: "10", updates: [{ update_id: 9, message: { message_id: 81, text: "retained page" } }] };
+    fixture.store.saveMessagingPollBatch(batch);
+    fixture.reopen();
+    const connection = fixture.store.getMessagingConnection(fixture.connectionId);
+    const disabled = fixture.store.setMessagingConnectionEnabled({ connectionId: connection.id,
+      expectedRevision: connection.revision, expectedGeneration: connection.generation, enabled: false, updatedAt: 20 });
+    fixture.reopen();
+    expect(fixture.store.findMessagingPollBatch(connection.id, disabled.generation)).toBeUndefined();
+    expect(() => fixture.store.findMessagingPollBatch(connection.id, connection.generation)).toThrow(StaleGenerationError);
+    expect(() => fixture.store.saveMessagingPollBatch(batch)).toThrow(StaleGenerationError);
+    // Check physical retirement as well as generation-fenced access: an old
+    // provider page must not remain hidden in the operational inbox table.
+    fixture.store.close();
+    const reader = new DatabaseSync(fixture.filePath, { readOnly: true });
+    try {
+      expect(reader.prepare("SELECT COUNT(*) AS count FROM messaging_poll_batches WHERE connection_id = ?")
+        .get(connection.id)?.["count"]).toBe(0);
+    } finally { reader.close(); }
+  });
+
   it("persists an enabled connection offline with a bounded failure and clears it on recovery", () => {
     const fixture = createFixture();
     const initial = fixture.store.createMessagingConnection({

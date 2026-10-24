@@ -1,8 +1,7 @@
-import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
-import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { describe, expect, it, vi } from "vitest";
 import { DESKTOP_CHANNELS, type DesktopWallpaperSettings } from "../src/channels.js";
+import { compiledPreloadSource } from "./support/preload-source.js";
 
 interface WallpaperBridge {
   get(): Promise<DesktopWallpaperSettings>;
@@ -17,8 +16,7 @@ const settings: DesktopWallpaperSettings = { version: 1, revision: 3, mode: "cus
 
 /** Execute the actual sandboxed preload source; only Electron's host transport is controlled. */
 function loadPreload() {
-  const source = readFileSync(new URL("../src/preload.cts", import.meta.url), "utf8");
-  const output = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2022 } }).outputText;
+  const output = compiledPreloadSource();
   const listeners = new Map<string, Set<(...parameters: unknown[]) => void>>();
   const invoke = vi.fn(async (channel: string, ..._parameters: unknown[]): Promise<unknown> =>
     channel === DESKTOP_CHANNELS.wallpaperImport ? { cancelled: true } : settings);

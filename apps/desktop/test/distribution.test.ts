@@ -1,6 +1,7 @@
 /// <reference types="node" />
 
 import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 
 interface DesktopManifest {
@@ -42,6 +43,10 @@ interface BuilderConfig {
 const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as DesktopManifest;
 const tsconfig = JSON.parse(readFileSync(new URL("../tsconfig.json", import.meta.url), "utf8")) as DesktopTsConfig;
 const config = JSON.parse(readFileSync(new URL("../electron-builder.json", import.meta.url), "utf8")) as BuilderConfig;
+const nativeArtifacts = createRequire(import.meta.url)("../scripts/native-helper-artifacts.cjs") as {
+  SIMPLE_NATIVE_ARTIFACTS: Record<string, { directory: string; helpers: Record<string, string> }>;
+  REMOTE_NATIVE_DIGEST_ARTIFACTS: Record<string, readonly { name: string }[]>;
+};
 const workspace = readFileSync(new URL("../../../pnpm-workspace.yaml", import.meta.url), "utf8");
 const packagedAudit = readFileSync(new URL("../scripts/audit-packaged.cjs", import.meta.url), "utf8");
 const nativeGamepadBuild = readFileSync(new URL("../scripts/build-native-gamepad.mjs", import.meta.url), "utf8");
@@ -64,7 +69,7 @@ describe("Desktop distribution", () => {
       outDir: "dist",
       tsBuildInfoFile: "dist/tsconfig.tsbuildinfo"
     });
-    expect(manifest.scripts?.["build:runtime-stager"]).toBe("tsc -b tsconfig.json --force");
+    expect(manifest.scripts?.["build:runtime-stager"]).toBe("tsc -b tsconfig.json --force && node scripts/inline-preload-contract.cjs");
   });
 
   it("pins an inert builder toolchain and keeps build-only packages out of production dependencies", () => {
@@ -151,7 +156,8 @@ describe("Desktop distribution", () => {
     expect(manifest.scripts?.build).toContain("pnpm build:native-gamepad");
     expect(manifest.scripts?.["package:dir"]).toContain("node scripts/build-native-gamepad.mjs");
     expect(manifest.scripts?.["package:artifacts"]).toContain("node scripts/build-native-gamepad.mjs");
-    expect(nativeGamepadBuild).toContain('const helper = "joko-macos-gamepad-helper"');
+    expect(config.extraResources.find(item => item.to === nativeArtifacts.SIMPLE_NATIVE_ARTIFACTS["gamepad"]?.directory)?.filter)
+      .toContain(nativeArtifacts.SIMPLE_NATIVE_ARTIFACTS["gamepad"]?.helpers["darwin"]);
     expect(nativeGamepadBuild).toContain('x64: { compilerArchitecture: "x86_64", triple: "x86_64-apple-macos11.0" }');
     expect(nativeGamepadBuild).toContain('arm64: { compilerArchitecture: "arm64", triple: "arm64-apple-macos11.0" }');
     expect(nativeGamepadBuild).toContain('"GameController"');
@@ -217,12 +223,10 @@ describe("Desktop distribution", () => {
     expect(manifest.scripts?.build).toContain("pnpm build:native-remote-desktop");
     expect(manifest.scripts?.["package:dir"]).toContain("node scripts/build-native-remote-desktop.mjs");
     expect(manifest.scripts?.["package:artifacts"]).toContain("node scripts/build-native-remote-desktop.mjs");
-    expect(nativeRemoteDesktopBuild).toContain('const macHelper = "joko-macos-remote-desktop-input"');
-    expect(nativeRemoteDesktopBuild)
-      .toContain('const macCaptureHelper = "joko-macos-remote-desktop-capture"');
-    expect(nativeRemoteDesktopBuild).toContain('const windowsHelper = "joko-windows-remote-desktop-input.exe"');
-    expect(nativeRemoteDesktopBuild).toContain('const windowsHostService = "joko-windows-remote-desktop-host.exe"');
-    expect(nativeRemoteDesktopBuild).toContain('const windowsHostAddon = "joko-windows-remote-desktop-host.node"');
+    const packagedHelpers = config.extraResources.find(item => item.to === "native-remote-desktop")?.filter;
+    for (const artifacts of Object.values(nativeArtifacts.REMOTE_NATIVE_DIGEST_ARTIFACTS)) {
+      for (const artifact of artifacts) expect(packagedHelpers).toContain(artifact.name);
+    }
     expect(nativeRemoteDesktopBuild).toContain("export function buildNativeRemoteDesktop(");
   });
 

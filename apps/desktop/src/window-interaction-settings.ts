@@ -1,5 +1,5 @@
 import type { DesktopWindowInteractionSettings } from "./channels.js";
-import { atomicWritePrivateFile, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 const DEFAULT_SWALLOW_ACTIVATION_CLICK = false;
 

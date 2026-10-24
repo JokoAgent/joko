@@ -79,7 +79,14 @@ export interface PolicyDecision {
 const READ_TOOLS = new Set(["read", "ls", "find", "grep"]);
 const WRITE_TOOLS = new Set(["write", "edit"]);
 const SHELL_META = /(?:\|\||&&|[|;<>`]|\$\(|\r|\n)/;
-const SAFE_COMMANDS = new Set(["git status", "git diff", "git log", "git show", "pwd", "ls", "dir"]);
+const SAFE_COMMANDS = new Set(["git status", "git log", "git show", "pwd", "ls", "dir"]);
+const SAFE_GIT_DIFF_FLAGS = new Set([
+  "--cached", "--staged", "--stat", "--numstat", "--shortstat", "--summary", "--name-only", "--name-status",
+  "--raw", "--patch", "--patch-with-stat", "--patch-with-raw", "--no-patch", "--check", "--exit-code", "--quiet",
+  "--no-ext-diff", "--no-textconv", "--no-color", "--color", "--ignore-space-at-eol", "--ignore-cr-at-eol",
+  "--ignore-space-change", "--ignore-all-space", "--ignore-blank-lines", "--binary", "--full-index",
+  "-p", "-s", "-u", "-w", "-b"
+]);
 const DANGEROUS_COMMAND = /\b(?:rm\s+-rf|rmdir\s+\/s|del\s+\/f|format|diskpart|shutdown|reboot|reg\s+(?:delete|add)|git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f|curl\b.*\|\s*(?:sh|bash)|powershell\b.*-enc)\b/i;
 const CREDENTIAL_PATH = /(?:^|[\\/])(?:\.ssh|\.aws|\.azure|\.config[\\/]gcloud|\.npmrc|\.pypirc|\.netrc|\.env(?:\.[^\\/]*)?|auth\.json|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.[^\\/]*)?|[^\\/]*\.(?:pem|key|p12|pfx)|[^\\/]*(?:credential|secret|token|keychain)[^\\/]*)(?:[\\/]|$)/i;
 
@@ -238,10 +245,40 @@ export function classifyToolCall(call: ToolCall, context: Pick<PolicyContext, "w
     if (command === undefined || command === "") return "ambiguous";
     if (DANGEROUS_COMMAND.test(command) || CREDENTIAL_PATH.test(command)) return "dangerous";
     if (SHELL_META.test(command)) return "ambiguous";
-    return SAFE_COMMANDS.has(command.toLowerCase()) || command.toLowerCase().startsWith("git diff ") ? "safe_command" : "ambiguous";
+    if (/^git\s+diff(?:\s|$)/iu.test(command)) {
+      return isSafeGitDiffCommand(command, context) ? "safe_command" : "ambiguous";
+    }
+    return SAFE_COMMANDS.has(command.toLowerCase()) ? "safe_command" : "ambiguous";
   }
 
   return "ambiguous";
+}
+
+function isSafeGitDiffCommand(
+  command: string,
+  context: Pick<PolicyContext, "workspaceRoot" | "extraReadOnlyRoots" | "pathStyle">
+): boolean {
+  // Only admit literal arguments with known read-only semantics. Shell quoting,
+  // expansion, unknown options and Git's long-option abbreviations need review.
+  const args = command.split(/\s+/u).slice(2);
+  // Git can invoke configured diff/text conversion programs without an
+  // explicit enabling option, so a literal read must disable both mechanisms.
+  if (!args.includes("--no-ext-diff") || !args.includes("--no-textconv")) return false;
+  const roots = [context.workspaceRoot, ...context.extraReadOnlyRoots];
+  let pathsOnly = false;
+  for (const argument of args) {
+    if (!/^[\w./@:=+-]+$/u.test(argument)) return false;
+    if (!pathsOnly && argument === "--") {
+      pathsOnly = true;
+      continue;
+    }
+    if (!pathsOnly && argument.startsWith("-")) {
+      if (SAFE_GIT_DIFF_FLAGS.has(argument) || /^(?:-U\d+|--unified=\d+|--color=(?:always|never|auto))$/u.test(argument)) continue;
+      return false;
+    }
+    if (!isWithinAny(argument, roots, context.pathStyle)) return false;
+  }
+  return true;
 }
 
 function extractPath(args: Readonly<Record<string, unknown>>): string | undefined {

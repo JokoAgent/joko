@@ -51,3 +51,15 @@ it("retires a pending list and clears private invitation drafts when the selecte
   expect(oldSignal?.aborted).toBe(true); await act(async () => finish(create(contract.ListProviderSharesResponseSchema, { owned: [{ providerName: "Stale old Home" }] })));
   expect(container.textContent).not.toContain("Stale old Home"); expect(container.querySelector<HTMLInputElement>("input")?.value).toBe("Next");
 });
+it("navigates sharing tabs with the keyboard and identifies the active panel", async () => {
+  const f = fixture(), { container } = await mount(f), tabs = [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+  expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1]);
+  await act(async () => tabs[0]!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true })));
+  expect(document.activeElement).toBe(tabs[1]);
+  expect(tabs[1]!.getAttribute("aria-selected")).toBe("true");
+  expect(tabs[1]!.classList.contains("button--primary")).toBe(true);
+  expect(container.querySelector('[role="tabpanel"]')?.getAttribute("aria-labelledby")).toBe(tabs[1]!.id);
+  expect(document.getElementById(tabs[1]!.getAttribute("aria-controls")!)).toBe(container.querySelector('[role="tabpanel"]'));
+  await act(async () => tabs[1]!.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true })));
+  expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1]);
+});

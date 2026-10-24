@@ -210,41 +210,7 @@ interface JokoDesktopNativeTaskStatusDisplay {
   readonly bounds: { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
 }
 
-interface JokoDesktopNativeTaskStatusSnapshot {
-  readonly ownerId: string;
-  readonly revision: string;
-  readonly locale: "en" | "zh-CN" | "en-XA";
-  readonly sessions: readonly {
-    readonly remote?: {
-      readonly sourceId: string;
-      readonly runId: string;
-      readonly silent: boolean;
-      readonly completionNotification: "none" | "pending" | "teammate";
-      readonly observedCompletionOnly?: boolean;
-      readonly companion?: { readonly name: string; readonly glyph: string; readonly tint: string; readonly artwork?: string };
-    };
-    readonly sessionId: string;
-    readonly title: string;
-    readonly detail: string;
-    readonly phase: JokoDesktopNativeTaskStatusPhase;
-    readonly interactionKind?: "permission" | "question" | "plan" | "select" | "confirm" | "input" | "editor";
-    readonly inputHandoff?: true;
-    readonly activityLines: readonly {
-      readonly id: string;
-      readonly kind: "user" | "assistant" | "status" | "tool";
-      readonly text: string;
-    }[];
-    readonly startedAt?: number;
-    readonly updatedAt: number;
-    readonly permission?: {
-      readonly interactionId: string;
-      readonly generation: string;
-      readonly allow: boolean;
-      readonly allowForSession: boolean;
-      readonly deny: boolean;
-    };
-  }[];
-}
+type JokoDesktopNativeTaskStatusSnapshot = import("@joko/contracts").NativeTaskStatusSnapshot;
 
 type JokoDesktopNativeTaskStatusAction =
   | { readonly kind: "focus"; readonly sessionId: string; readonly entryToken?: string }

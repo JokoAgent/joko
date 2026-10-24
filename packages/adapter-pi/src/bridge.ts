@@ -7,6 +7,7 @@ import { provisionManagedModelCatalogRuntime } from "./model-catalog-runtime.js"
 import { provisionHostedExecutorRuntime } from "./hosted-executor-runtime.js";
 import { MAXIMUM_PI_HOSTED_CONFIGURATION_BYTES } from "./hosted-executor.js";
 import { atomicWriteFile } from "./config.js";
+import { createPiShellPolicy, MANAGED_SHELL_POLICY_RUNTIME_SOURCE } from "./managed-shell-policy.js";
 import {
   MAXIMUM_PI_RUNTIME_TOOL_CATALOG_BYTES,
   PI_RUNTIME_TOOL_CATALOG_CHUNK_BYTES
@@ -14,21 +15,13 @@ import {
 
 const BRIDGE_FILE_NAME = "joko-managed-bridge.ts";
 
-export const DEFAULT_MANAGED_BASH_TIMEOUT_SECONDS = 300;
-export const MAXIMUM_MANAGED_BASH_TIMEOUT_SECONDS = 1_800;
+const managedShellPolicy = createPiShellPolicy();
+export const DEFAULT_MANAGED_BASH_TIMEOUT_SECONDS = managedShellPolicy.defaultTimeoutSeconds;
+export const MAXIMUM_MANAGED_BASH_TIMEOUT_SECONDS = managedShellPolicy.maximumTimeoutSeconds;
 export const MAXIMUM_MANAGED_MCP_BRIDGE_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 export function normalizeManagedBashTimeout(value: unknown): number {
-  if (value === undefined) return DEFAULT_MANAGED_BASH_TIMEOUT_SECONDS;
-  if (
-    typeof value !== "number" ||
-    !Number.isFinite(value) ||
-    value <= 0 ||
-    value > MAXIMUM_MANAGED_BASH_TIMEOUT_SECONDS
-  ) {
-    throw new Error("Invalid bash timeout: expected a finite number of seconds in (0, 1800]");
-  }
-  return value;
+  return managedShellPolicy.timeout(value);
 }
 
 export async function provisionManagedBridge(agentHome: string): Promise<string> {
@@ -36,6 +29,7 @@ export async function provisionManagedBridge(agentHome: string): Promise<string>
   await provisionManagedAutoReviewRuntime(agentHome);
   await provisionManagedModelCatalogRuntime(agentHome);
   await provisionHostedExecutorRuntime(agentHome);
+  await atomicWriteFile(join(agentHome, "managed", "joko-managed-shell-policy.mjs"), MANAGED_SHELL_POLICY_RUNTIME_SOURCE);
   await atomicWriteFile(path, MANAGED_BRIDGE_SOURCE);
   return path;
 }
@@ -51,13 +45,14 @@ import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, 
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createBashTool, createLocalBashOperations, getPackageDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createBashTool, createPowerShellTool, createLocalBashOperations, getPackageDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import * as piSdk from "@earendil-works/pi-coding-agent";
 import { clampThinkingLevel } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createPiAutoReviewer } from "./joko-managed-auto-review.mjs";
 import { createPiModelCatalogAdditions } from "./joko-managed-model-catalog.mjs";
 import { createPiHostedExecutor } from "./joko-managed-hosted-executor.mjs";
+import { createPiShellPolicy } from "./joko-managed-shell-policy.mjs";
 
 type ApprovedRoot = { path: string; access: "read_only" | "read_write" };
 type Control = { generation: number; policyGeneration: number; permissionMode: "ask" | "auto" | "bypassPermissions"; planMode: boolean; fastMode: boolean; approvedRoots: ApprovedRoot[]; runtimePolicy: "standard" | "review_read_only"; writtenAt: string };
@@ -70,8 +65,6 @@ type McpBridgeErrorCode = "resource_exhausted" | "artifact_unavailable" | "inval
 type NativeBinding = { opaqueRef: string; nativeSessionId?: string; generation: number };
 type ResetDescriptor = { version: 1; operationId: string; sessionId: string; targetId: string; source: NativeBinding; replacementGeneration: number };
 type ResetReceipt = { version: 1; operationId: string; sessionId: string; targetId: string; source: NativeBinding; replacement: NativeBinding };
-const DEFAULT_BASH_TIMEOUT_SECONDS = 300;
-const MAX_BASH_TIMEOUT_SECONDS = 1800;
 const MAX_MCP_BRIDGE_RESPONSE_BYTES = ${MAXIMUM_MANAGED_MCP_BRIDGE_RESPONSE_BYTES};
 const RUNTIME_TOOL_CATALOG_STATUS_KEY = "joko-runtime-tool-catalog/v1";
 const MAX_RUNTIME_TOOL_CATALOG_BYTES = ${MAXIMUM_PI_RUNTIME_TOOL_CATALOG_BYTES};
@@ -109,6 +102,7 @@ try {
 } catch {}
 delete process.env.JOKO_PI_MCP_TOKEN;
 delete process.env.JOKO_PI_SECRET_ENV_NAMES;
+const { timeout: bashTimeout, sanitizeEnvironment } = createPiShellPolicy(secretEnvironmentNames);
 
 async function commandGateRequest(ctx: any, action: "acquire" | "release", toolCallId: string): Promise<void> {
   if (!ctx.hasUI) throw new Error("Orchestrator command capacity control is unavailable");
@@ -147,14 +141,6 @@ function assertPolicyUnchanged(expected: Control): Control {
 
 function advancePolicy(control: Control): Control {
   return { ...control, policyGeneration: control.policyGeneration + 1, writtenAt: new Date().toISOString() };
-}
-
-function bashTimeout(value: unknown): number {
-  if (value === undefined) return DEFAULT_BASH_TIMEOUT_SECONDS;
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > MAX_BASH_TIMEOUT_SECONDS) {
-    throw new Error("Invalid bash timeout: expected a finite number of seconds in (0, 1800]");
-  }
-  return value;
 }
 
 function writeControl(control: Control): void {
@@ -255,17 +241,6 @@ function writeResetReceipt(descriptor: ResetDescriptor, sessionManager: any): vo
     const directory = openSync(location.root, "r");
     try { fsyncSync(directory); } finally { closeSync(directory); }
   } catch {}
-}
-
-function sanitizeEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const denied = new Set(secretEnvironmentNames);
-  denied.add("JOKO_PI_MCP_TOKEN");
-  const clean: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (denied.has(key) || /^JOKO_PI_/i.test(key) || /^PI_CODING_AGENT_/i.test(key) || /(API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)/i.test(key)) continue;
-    clean[key] = value;
-  }
-  return clean;
 }
 
 type PlanReviewResponse = { decision: "execute" | "stay" | "refine"; feedback: string };
@@ -442,7 +417,7 @@ function classifyTool(name: string, input: unknown, control: Control): ToolRisk 
     if (credentialPath.test(path)) return "dangerous";
     return authorizedPathAccess(path, true, control) === "read_write" ? "workspace_write" : "dangerous";
   }
-  if (name === "bash") {
+  if (name === "bash" || name === "powershell") {
     const record = input && typeof input === "object" ? input as Record<string, unknown> : {};
     const command = typeof record.command === "string" ? record.command.trim() : "";
     if (!command) return "ambiguous";
@@ -487,7 +462,7 @@ function policyObservation(name: string, input: unknown, risk: ToolRisk): Policy
       toolName: name,
     };
   }
-  if (name === "bash") return { subjectKind: "command", risk: policyRisk(risk), toolName: name };
+  if (name === "bash" || name === "powershell") return { subjectKind: "command", risk: policyRisk(risk), toolName: name };
   return { subjectKind: "resource", risk: policyRisk(risk), toolName: name };
 }
 
@@ -648,6 +623,24 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
       }
     },
   });
+  if (process.platform === "win32" && !hostedExecutor) {
+    const powershellTool = createPowerShellTool(process.cwd(), {
+      exposeSessionEnvironment: false,
+      spawnHook: ({ command, cwd, env }) => ({ command, cwd, env: sanitizeEnvironment(env) }),
+    });
+    pi.registerTool({
+      ...powershellTool,
+      execute: async (id, params, signal, onUpdate, ctx) => {
+        const timeout = bashTimeout((params as { timeout?: unknown }).timeout);
+        await commandGateRequest(ctx, "acquire", String(id));
+        try {
+          return await powershellTool.execute(id, { ...params, timeout }, signal, onUpdate, ctx);
+        } finally {
+          await commandGateRequest(ctx, "release", String(id)).catch(() => undefined);
+        }
+      },
+    });
+  }
   const hostedToolNames = new Set(["read", "write", "edit", "ls", "find", "grep", "bash"]);
   if (hostedExecutor) {
     const templates = hostedExecutor.createTools("catalog");
@@ -782,6 +775,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
       return { block: true, reason: error instanceof Error ? error.message : "Joko control state unavailable" };
     }
     if (hostedExecutor) {
+      if (event.toolName === "powershell") return { block: true, reason: "PowerShell is unavailable through the task executor" };
       const readOnly = ["read", "ls", "find", "grep"].includes(event.toolName);
       if (control.runtimePolicy === "review_read_only" && !readOnly) {
         return { block: true, reason: "The current execution mode permits only workspace reads" };

@@ -139,7 +139,8 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       record("controlled-keyless-provider-saved-through-public-rpc");
 
       browser = await chromium.launchPersistentContext(join(fixture.root, "browser-profile"), {
-        executablePath: browserExecutable, headless: !headed, viewport: { width: 1440, height: 960 }, locale: "en-US"
+        executablePath: browserExecutable, headless: !headed, viewport: { width: 1440, height: 960 }, locale: "en-US",
+        args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"]
       });
       browserVersion = browser.browser()?.version();
       browser.on("close", () => recordBrowserEvent("context_closed"));
@@ -149,6 +150,13 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       page.on("pageerror", () => { pageErrorCount += 1; });
       page.setDefaultTimeout(20_000);
       await page.goto(`${fixture.baseUrl}/#/tasks/new?target=${encodeURIComponent(target.targetId)}`, { waitUntil: "domcontentloaded" });
+      await browser.grantPermissions(["microphone"], { origin: fixture.baseUrl });
+      expect(await page.evaluate(async () => {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        try { return stream.getAudioTracks().length; }
+        finally { for (const track of stream.getTracks()) track.stop(); }
+      })).toBe(1);
+      record("official-web-page-captured-and-released-a-browser-test-microphone");
       await page.locator(".connection-tabs > button").nth(2).click();
       await page.getByLabel("Joko node address").fill(fixture.baseUrl);
       await page.getByLabel("Device name").fill("Standalone Web browser");

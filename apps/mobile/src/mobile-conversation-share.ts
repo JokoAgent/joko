@@ -1,7 +1,7 @@
 import { richAnswerText, type Event } from "@joko/contracts";
 import { mobileTimelineGalleryPages, type MobileImageGalleryPage } from "./mobile-image-gallery";
 import type { TimelineRow } from "./timeline";
-import { redactShareMessageText } from "./mobile-share-redaction";
+import { redactShareMessageText } from "@joko/web/share-redaction";
 
 export interface MobileConversationShareImage {
   readonly uri: string;

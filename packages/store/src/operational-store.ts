@@ -6406,6 +6406,9 @@ export class OperationalStore {
    * effects from the exact old transport. Dispatching effects remain unknown. */
   private retireMessagingGeneration(connectionId: string, generation: number, at: number): void {
     const revision = asSqlInteger(this.requireActiveRevision());
+    this.database.prepare(
+      "DELETE FROM messaging_poll_batches WHERE connection_id = ? AND channel_generation = ?"
+    ).run(connectionId, generation);
     this.database.prepare(`
       UPDATE messaging_inbound_requests
       SET status = 'cancelled', error_code = NULL, updated_at = ?, revision = ?
@@ -6435,6 +6438,58 @@ export class OperationalStore {
           outcome_code = 'generation_changed', updated_at = ?, revision = ?
       WHERE connection_id = ? AND channel_generation = ? AND status = 'claimed'
     `).run(at, revision, connectionId, generation);
+  }
+
+  /** Raw pages must survive before the next provider cursor acknowledges them. */
+  saveMessagingPollBatch(input: {
+    readonly connectionId: string;
+    readonly channelGeneration: number;
+    readonly nextCursor: string;
+    readonly updates: readonly unknown[];
+  }): void {
+    this.write(() => {
+      const connection = this.getMessagingConnection(input.connectionId);
+      assertMessagingGeneration(connection, input.channelGeneration);
+      if (connection.channel !== "telegram" || !/^\d{1,20}$/u.test(input.nextCursor)) {
+        throw new StoreError("The raw Messaging batch does not match its transport.");
+      }
+      const updatesJson = serializeJson(input.updates);
+      if (!Array.isArray(input.updates) || input.updates.length > 1_100 || Buffer.byteLength(updatesJson) > 16 * 1024 * 1024) {
+        throw new StoreError("The raw Messaging batch exceeds its storage limit.");
+      }
+      this.database.prepare(`
+        INSERT INTO messaging_poll_batches(connection_id, channel_generation, next_cursor, updates_json)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(connection_id) DO UPDATE SET channel_generation = excluded.channel_generation,
+          next_cursor = excluded.next_cursor, updates_json = excluded.updates_json
+      `).run(input.connectionId, input.channelGeneration, input.nextCursor, updatesJson);
+    });
+  }
+
+  findMessagingPollBatch(connectionId: string, channelGeneration: number): {
+    readonly updates: readonly unknown[];
+    readonly nextCursor: string;
+  } | undefined {
+    this.assertOpen();
+    const connection = this.getMessagingConnection(connectionId);
+    assertMessagingGeneration(connection, channelGeneration);
+    const row = this.database.prepare(`
+      SELECT next_cursor, updates_json FROM messaging_poll_batches
+      WHERE connection_id = ? AND channel_generation = ?
+    `).get(connectionId, channelGeneration) as Row | undefined;
+    return row === undefined ? undefined : {
+      nextCursor: stringValue(row["next_cursor"]),
+      updates: parseJson(stringValue(row["updates_json"])) as readonly unknown[]
+    };
+  }
+
+  clearMessagingPollBatch(connectionId: string, channelGeneration: number): void {
+    this.write(() => {
+      assertMessagingGeneration(this.getMessagingConnection(connectionId), channelGeneration);
+      this.database.prepare(
+        "DELETE FROM messaging_poll_batches WHERE connection_id = ? AND channel_generation = ?"
+      ).run(connectionId, channelGeneration);
+    });
   }
 
   createMessagingInboundRequest(
@@ -14958,8 +15013,9 @@ export class OperationalStore {
       id = existing.id;
     }
     this.database.prepare(`
-      UPDATE schedules SET last_run_at = ?, updated_at = ?, revision = ? WHERE id = ?
-    `).run(input.firedAt, input.firedAt, asSqlInteger(this.requireActiveRevision()), input.schedule.id);
+      UPDATE schedules SET last_run_at = MAX(COALESCE(last_run_at, ?), ?),
+        updated_at = MAX(updated_at, ?), revision = ? WHERE id = ?
+    `).run(input.firedAt, input.firedAt, this.now(), asSqlInteger(this.requireActiveRevision()), input.schedule.id);
     return this.getScheduleRun(id);
   }
 
@@ -16087,6 +16143,13 @@ export class OperationalStore {
     `).all(scheduleId, normalizeLimit(limit, 100), normalizeOffset(offset)) as Row[]).map(scheduleRunFromRow);
   }
 
+  listQueuedScheduleRuns(): ScheduleRunRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(
+      "SELECT * FROM schedule_run_history WHERE status = 'queued' ORDER BY fired_at, id"
+    ).all() as Row[]).map(scheduleRunFromRow);
+  }
+
   countScheduleRuns(scheduleId: string): number {
     this.assertOpen();
     const row = this.database.prepare(
@@ -16283,6 +16346,8 @@ export class OperationalStore {
   }
 
   beginScheduleRuntimeOccurrence(input: {
+    readonly resumeQueued?: true;
+    readonly resumeActive?: true;
     readonly runId: string;
     readonly scheduleId: string;
     readonly source: "automatic" | "run-now";
@@ -16309,8 +16374,25 @@ export class OperationalStore {
       if (owner?.ownerId !== ownerId || owner.generation !== ownerGeneration) {
         throw new StoreError("Schedule runtime owner was fenced by a newer generation.");
       }
-      if (this.findScheduleRuntimeOccurrence(runId) !== undefined) {
-        throw new StoreError(`Schedule runtime occurrence ${runId} is already leased.`);
+      const existing = this.findScheduleRuntimeOccurrence(runId);
+      let leasedGeneration = ownerGeneration;
+      if (existing !== undefined) {
+        const run = this.findRun(runId)?.descriptor;
+        const item = run === undefined ? undefined : this.findQueueItemByRunId(run.sessionId, runId);
+        const resumesQueued = input.resumeQueued === true && run?.state === "queued"
+          && item?.state === "accepted" && item.backendInstanceGeneration === undefined;
+        const observesActive = input.resumeActive === true && run?.source === "schedule"
+          && !isTerminalRunState(run.state) && !(run.state === "queued"
+            && item?.state === "accepted" && item.backendInstanceGeneration === undefined);
+        if (existing.scheduleId !== scheduleId || (!resumesQueued && !observesActive)) {
+          throw new StoreError(`Schedule runtime occurrence ${runId} is already leased.`);
+        }
+        leasedGeneration = checkedSchedulerGeneration(Math.max(ownerGeneration, existing.ownerGeneration + 1));
+        // The singleton owner fences the old process. Queue adoption permits a
+        // future claim; active adoption only observes the existing durable Run.
+        this.database.prepare(`
+          DELETE FROM schedule_runtime_occurrences WHERE run_id = ? AND owner_id = ? AND owner_generation = ?
+        `).run(runId, existing.ownerId, existing.ownerGeneration);
       }
       this.database.prepare(`
         INSERT INTO schedule_runtime_occurrences(
@@ -16325,7 +16407,7 @@ export class OperationalStore {
         input.executionMode ?? null,
         phase,
         ownerId,
-        ownerGeneration,
+        leasedGeneration,
         scheduledAt,
         startedAt,
         startedAt,

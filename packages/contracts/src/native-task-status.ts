@@ -1,6 +1,51 @@
 /** Complete current mirror bound, shared by native IPC parser and renderer builder. */
 export const NATIVE_TASK_STATUS_SESSION_LIMIT = 500;
 
+export interface NativeTaskStatusActivityLine {
+  readonly id: string;
+  readonly kind: "user" | "assistant" | "status" | "tool";
+  readonly text: string;
+}
+
+export interface NativeTaskStatusPermission {
+  readonly interactionId: string;
+  /** Decimal interaction generation, kept lossless across IPC and HTML. */
+  readonly generation: string;
+  readonly allow: boolean;
+  readonly allowForSession: boolean;
+  readonly deny: boolean;
+}
+
+export interface NativeTaskStatusSession {
+  readonly sessionId: string;
+  readonly title: string;
+  readonly detail: string;
+  readonly phase: "running" | "interaction" | "completed" | "error";
+  readonly interactionKind?: "permission" | "question" | "plan" | "select" | "confirm" | "input" | "editor";
+  /** Private owner handoff without an ordinary interaction or decision. */
+  readonly inputHandoff?: true;
+  readonly activityLines: readonly NativeTaskStatusActivityLine[];
+  readonly startedAt?: number;
+  readonly updatedAt: number;
+  readonly permission?: NativeTaskStatusPermission;
+  readonly remote?: {
+    readonly sourceId: string;
+    readonly runId: string;
+    readonly silent: boolean;
+    readonly completionNotification: "none" | "pending" | "teammate";
+    readonly observedCompletionOnly?: boolean;
+    readonly companion?: { readonly name: string; readonly glyph: string; readonly tint: string; readonly artwork?: string };
+  };
+}
+
+export interface NativeTaskStatusSnapshot {
+  readonly ownerId: string;
+  /** Decimal owner-snapshot revision. */
+  readonly revision: string;
+  readonly locale: "en" | "zh-CN" | "en-XA";
+  readonly sessions: readonly NativeTaskStatusSession[];
+}
+
 export interface NativeRemoteTaskObservation {
   readonly sessionId: string;
   readonly phase: "running" | "interaction" | "completed" | "error";

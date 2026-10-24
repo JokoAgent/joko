@@ -7,7 +7,7 @@ import monitorArtwork from "../assets/navigation/monitor.png";
 import folderArtwork from "../assets/navigation/folder.png";
 
 /** One native scene hosts UIKit chrome without acquiring a second route stack. */
-export function MobileNavigationFrame({ children, dark = false }: { readonly children: ReactNode; readonly dark?: boolean }) {
+export function MobileNavigationFrame({ children, dark = false }: { readonly children: ReactNode; readonly dark?: boolean; readonly onBack?: () => boolean }) {
   const current = useRef<{ readonly owner: symbol; readonly header: MobileNavigationHeader; readonly target: number } | undefined>(undefined);
   const [slot, setSlot] = useState<typeof current.current>();
   const [height, setHeight] = useState(0);

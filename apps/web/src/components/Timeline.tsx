@@ -1833,26 +1833,36 @@ function TimelineArtifactReferencePreview({ artifact, trigger, ownerKey, t, onAr
 }
 
 type ArtifactImageLoadState =
-  | { readonly status: "loading"; readonly blobId: string }
-  | { readonly status: "ready"; readonly blobId: string; readonly url: string }
-  | { readonly status: "error"; readonly blobId: string };
+  | { readonly status: "loading"; readonly sourceKey: string }
+  | { readonly status: "ready"; readonly sourceKey: string; readonly url: string }
+  | { readonly status: "error"; readonly sourceKey: string };
 
-function useArtifactImageUrl(blobId: string, enabled: boolean, onArtifactUrl: (blobId: string) => Promise<string>): readonly [ArtifactImageLoadState, () => void] {
-  const [state, setState] = useState<ArtifactImageLoadState>({ status: "loading", blobId });
+function useArtifactImageUrl(blobId: string, enabled: boolean, onArtifactUrl: (blobId: string) => Promise<string>, explicitOwnerKey?: string): readonly [ArtifactImageLoadState, () => void] {
+  const { ownerKey } = useContext(TimelinePersonalizationContext);
+  const sourceKey = JSON.stringify([explicitOwnerKey ?? ownerKey, blobId]);
+  const [recovery, setRecovery] = useState(0);
+  const [state, setState] = useState<ArtifactImageLoadState>({ status: "loading", sourceKey });
   const onArtifactUrlRef = useRef(onArtifactUrl);
   onArtifactUrlRef.current = onArtifactUrl;
   useEffect(() => {
     let active = true;
-    setState({ status: "loading", blobId });
+    setState({ status: "loading", sourceKey });
     if (enabled) {
       void onArtifactUrlRef.current(blobId)
-        .then((url) => { if (active) setState({ status: "ready", blobId, url }); })
-        .catch(() => { if (active) setState({ status: "error", blobId }); });
+        .then((url) => { if (active) setState({ status: "ready", sourceKey, url }); })
+        .catch(() => { if (active) setState({ status: "error", sourceKey }); });
     }
     return () => { active = false; };
-  }, [blobId, enabled]);
-  const markFailed = useCallback(() => setState({ status: "error", blobId }), [blobId]);
-  return [state.blobId === blobId ? state : { status: "loading", blobId }, markFailed];
+  }, [blobId, enabled, sourceKey, recovery]);
+  useEffect(() => {
+    if (!enabled || state.sourceKey !== sourceKey || state.status !== "error") return;
+    const retry = (): void => setRecovery(value => value + 1);
+    window.addEventListener("online", retry);
+    window.addEventListener("focus", retry);
+    return () => { window.removeEventListener("online", retry); window.removeEventListener("focus", retry); };
+  }, [enabled, sourceKey, state]);
+  const markFailed = useCallback(() => setState({ status: "error", sourceKey }), [sourceKey]);
+  return [state.sourceKey === sourceKey ? state : { status: "loading", sourceKey }, markFailed];
 }
 
 function ThinkingBlock({ item, locale, t }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator }): JSX.Element {
@@ -2071,7 +2081,7 @@ export function TimelineImageLightbox({ images, startImageId, returnFocus, t, lo
   const startIndex = Math.max(0, images.findIndex((image) => image.id === startImageId));
   const [index, setIndex] = useState(startIndex);
   const current = images[index] ?? images[0];
-  const [image, markImageFailed] = useArtifactImageUrl(current?.blobId ?? "", current !== undefined, loadUrl);
+  const [image, markImageFailed] = useArtifactImageUrl(current?.blobId ?? "", current !== undefined, loadUrl, ownerKey);
   const showPrevious = (): void => setIndex((currentIndex) => moveTimelineGalleryIndex(currentIndex, images.length, -1));
   const showNext = (): void => setIndex((currentIndex) => moveTimelineGalleryIndex(currentIndex, images.length, 1));
 

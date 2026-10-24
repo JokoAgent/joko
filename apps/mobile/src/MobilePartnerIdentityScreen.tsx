@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { randomUUID } from "expo-crypto";
 import { partnerIdentityMessages, type JoinedTaskShare, type PartnerIdentityGrant, type PartnerIdentityLink } from "@joko/contracts";
 import type { MobilePartnerIdentityApi } from "./mobile-partner-identity";
@@ -16,20 +16,22 @@ export function MobilePartnerIdentityScreen({ api, directory, colors, locale, on
   const [links, setLinks] = useState<PartnerIdentityLink[]>([]), [grants, setGrants] = useState<PartnerIdentityGrant[]>([]), [partners, setPartners] = useState<readonly MobilePartnerDirectoryProfile[]>([]);
   const [invitation, setInvitation] = useState(""), [alias, setAlias] = useState(""), [issued, setIssued] = useState(""), [name, setName] = useState("Joko");
   const [busy, setBusy] = useState(false), [error, setError] = useState(""), [reload, setReload] = useState(0);
+  const [loading, setLoading] = useState(Boolean(api)), [loaded, setLoaded] = useState(false);
   const [aliases, setAliases] = useState<Record<string, string>>({});
   useEffect(() => {
     lifetime.current = new AbortController(); const signal = lifetime.current.signal;
+    setLoading(Boolean(api)); setError("");
     if (api) void Promise.all([api.listPartnerIdentities({}, { signal }), directory?.list(signal)]).then(([result, catalog]) => {
-      if (!signal.aborted) { setLinks(result.links); setGrants(result.grants); setPartners(catalog?.partners.filter(partner => partner.lifecycle === "active" && !!partner.canonicalSessionId) ?? []); }
-    }, () => { if (!signal.aborted) setError(m.failed); });
+      if (!signal.aborted) { setLinks(result.links); setGrants(result.grants); setPartners(catalog?.partners.filter(partner => partner.lifecycle === "active" && !!partner.canonicalSessionId) ?? []); setLoaded(true); setError(""); }
+    }, () => { if (!signal.aborted) setError(m.failed); }).finally(() => { if (!signal.aborted) setLoading(false); });
     return () => lifetime.current.abort();
   }, [api?.ownerKey, directory?.ownerKey, reload]);
-  useEffect(() => { setIssued(""); setInvitation(""); }, [api?.ownerKey]);
-  const run = async (work: (value: MobilePartnerIdentityApi, signal: AbortSignal) => Promise<void>) => {
+  useEffect(() => { setIssued(""); setInvitation(""); setLinks([]); setGrants([]); setPartners([]); setLoaded(false); }, [api?.ownerKey]);
+  const run = async (work: (value: MobilePartnerIdentityApi, signal: AbortSignal) => Promise<void | false>) => {
     const value = current.current, signal = lifetime.current.signal;
     if (!value || signal.aborted || active.current) return;
     active.current = true; setBusy(true); setError("");
-    try { await work(value, signal); if (!signal.aborted) setReload(number => number + 1); }
+    try { const refresh = await work(value, signal); if (!signal.aborted && refresh !== false) setReload(number => number + 1); }
     catch { if (!signal.aborted) setError(m.failed); }
     finally { active.current = false; if (!signal.aborted) setBusy(false); }
   };
@@ -42,7 +44,8 @@ export function MobilePartnerIdentityScreen({ api, directory, colors, locale, on
     <TextInput accessibilityLabel={m.alias} placeholder={m.alias} placeholderTextColor={colors.muted} value={alias} onChangeText={setAlias} style={[styles.field, field]} />
     {action(m.add, () => void run(async (value, signal) => { await value.importPartnerIdentity({ invitation, alias }, { signal }); if (!signal.aborted) { setInvitation(""); setAlias(""); } }), busy || !api || !invitation.trim())}
     <TextInput accessibilityLabel={m.name} placeholder={m.name} placeholderTextColor={colors.muted} value={name} onChangeText={setName} style={[styles.field, field]} />
-    {!links.length && <Text style={{ color: colors.muted }}>{m.empty}</Text>}
+    {loading && <ActivityIndicator accessibilityLabel={locale.startsWith("zh") ? "正在读取伙伴身份" : "Loading Partner identities"} color={colors.accent} />}
+    {loaded && !loading && !error && !links.length && <Text style={{ color: colors.muted }}>{m.empty}</Text>}
     {links.map(link => <View key={link.linkId} style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <Text style={{ color: colors.ink }}>{link.alias}</Text><Text style={{ color: colors.muted }}>{link.identity?.displayName} · {link.identity?.authorityServerId}</Text>
       <TextInput accessibilityLabel={`${m.alias}: ${link.alias}`} value={aliases[link.linkId] ?? link.alias} style={[styles.field, field]} onChangeText={next => setAliases(previous => ({ ...previous, [link.linkId]: next }))} />
@@ -50,7 +53,7 @@ export function MobilePartnerIdentityScreen({ api, directory, colors, locale, on
       <View style={styles.row}>{action(m.open, () => void run(async (value, signal) => {
         const response = await value.openPartnerIdentity({ operationId: randomUUID(), linkId: link.linkId, displayName: name }, { signal });
         if (signal.aborted || current.current?.ownerKey !== value.ownerKey) return;
-        if (!response.joined || response.joined.status !== "active") { setError(m.unknown); return; }
+        if (!response.joined || response.joined.status !== "active") { setError(m.unknown); return false; }
         await onOpen(response.joined);
       }), busy || !name.trim())}{action(m.forget, () => void run(async (value, signal) => { await value.forgetPartnerIdentity({ operationId: randomUUID(), linkId: link.linkId }, { signal }); }))}</View>
     </View>)}

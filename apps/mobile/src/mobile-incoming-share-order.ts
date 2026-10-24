@@ -24,6 +24,14 @@ export function parseMobileIncomingSharePartIdentity(value: string): MobileIncom
   return { batchKey: match[1]!, ordinal };
 }
 
+/** A private file copy keeps its position among text and files from one share. */
+export function copiedMobileIncomingShareStorageId(sourceId: string, itemId: string): string {
+  const identity = parseMobileIncomingSharePartIdentity(sourceId);
+  if (!identity) return itemId;
+  assertIncomingShareUuid(itemId, "copied incoming-share item");
+  return `share_${identity.batchKey}_${identity.ordinal.toString(10).padStart(2, "0")}_${itemId.replaceAll("-", "")}`;
+}
+
 function assertIncomingShareUuid(value: string, name: string): void {
   if (!incomingShareUuidPattern.test(value)) throw new Error(`The ${name} identity is invalid.`);
 }

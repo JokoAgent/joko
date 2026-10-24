@@ -3,7 +3,7 @@ import {
   defaultDesktopNativeTaskStatusSettings,
   parseDesktopNativeTaskStatusSettings
 } from "./native-task-status.js";
-import { atomicWritePrivateFile, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 export interface DesktopNativeTaskStatusSettingsStore {
   readonly initialize: () => Promise<DesktopNativeTaskStatusSettings>;

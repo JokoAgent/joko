@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type JSX } from "react";
+import { useEffect, useId, useRef, useState, type JSX } from "react";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { MessageSquare, UsersRound } from "lucide-react";
 import { parseTaskShareInvitation, type JoinedTaskShare, type TaskShare, type TaskShareMember } from "@joko/contracts";
@@ -10,6 +10,7 @@ import { useTaskSharingDirectory } from "../use-task-sharing-directory.js";
 import { clearTaskSharingInvitation, useTaskSharingInvitation } from "../task-sharing-invitation.js";
 import type { Translator } from "./types.js";
 import { Button, ErrorBanner, Modal, Pill, Spinner, cx } from "./ui.js";
+import { moveTablistSelection } from "./tablist-navigation.js";
 import "./task-sharing.css";
 
 type Confirmation = { readonly kind: "end"; readonly share: TaskShare }
@@ -21,6 +22,7 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
   readonly controller: AppController; readonly t: Translator; readonly sessionId?: string; readonly initialInvitation?: string;
 }): JSX.Element {
   const api = controller.taskSharing, directory = useTaskSharingDirectory(api);
+  const tabId = useId();
   const [tab, setTab] = useState<"owned" | "joined" | "join">(initialInvitation ? "join" : "owned");
   const [invitation, setInvitation] = useState(initialInvitation ?? "");
   const [name, setName] = useState("");
@@ -84,6 +86,35 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
         if (result.failedShareIds.length) setNotice(t("taskSharing.partial", { count: result.failedShareIds.length })); }
     });
   };
+  const checkUnknown = async (): Promise<void> => {
+    if (!api || !unknown || !storage.current || flight.current) return;
+    flight.current = true; setBusy(true); setError(undefined);
+    const signal = lifetime.current.signal, local = storage.current, pending = unknown;
+    try {
+      try {
+        if (pending.kind === "join") {
+          const result = await api.lookupJoin(pending.operationId, signal);
+          signal.throwIfAborted();
+          if (!result.intent?.joined && result.intent?.status !== "failed") throw new Error(t("taskSharing.unknown"));
+        } else {
+          const result = await api.lookupAction(pending.operationId, signal);
+          signal.throwIfAborted();
+          if (result.status !== "applied" && result.status !== "failed") throw new Error(t("taskSharing.unknown"));
+          if (result.kind === "task_share_invite" && result.status === "applied") setNotice(t("taskSharing.invitationLost"));
+          if (result.failedShareIds.length > 0) setNotice(t("taskSharing.partial", { count: result.failedShareIds.length }));
+        }
+      } catch (cause) {
+        signal.throwIfAborted();
+        if (!(cause instanceof ConnectError) || cause.code !== Code.NotFound) throw cause;
+        setNotice(t("taskSharing.notAdmitted"));
+      }
+      await local.finishTaskSharingAction(owner, pending.operationId);
+      const remaining = await local.taskSharingActions(owner);
+      signal.throwIfAborted();
+      setUnknown(remaining[0]); setConfirmation(undefined); void directory.refresh();
+    } catch { if (!signal.aborted) setError(t("taskSharing.unknown")); }
+    finally { flight.current = false; if (!signal.aborted) setBusy(false); }
+  };
   const shareCard = (share: TaskShare): JSX.Element => <article className="settings-card settings-card--content" key={share.shareId} data-task-sharing-owned data-share-id={share.shareId} data-session-id={share.sessionId}>
     <h3>{share.title || share.sessionId}</h3><p>{share.hostOrigin}</p>
     <div className="settings-actions"><Button data-task-sharing-invite disabled={busy || !!unknown} onClick={() => copyInvitation(share)}>{t("taskSharing.invite")}</Button>
@@ -99,29 +130,12 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
     {heading}
     {directory.error && <ErrorBanner message={directory.error} retryLabel={t("common.retry")} onRetry={() => { void directory.refresh(); }} />}
     {error && <ErrorBanner message={error} />}{notice && <p role="status">{notice}</p>}
-    {unknown && <div role="status" className="settings-card settings-card--content"><p>{t("taskSharing.unknown")}</p><Button disabled={busy} onClick={() => {
-      if (flight.current) return; flight.current = true; setBusy(true);
-      const signal = lifetime.current.signal, local = storage.current;
-      void (unknown.kind === "join" ? api.lookupJoin(unknown.operationId, signal).then(result => {
-        signal.throwIfAborted();
-        if (!result.intent?.joined && result.intent?.status !== "failed") throw new Error(t("taskSharing.unknown"));
-      }) : api.lookupAction(unknown.operationId, signal).then(result => {
-        signal.throwIfAborted();
-        if (result.status !== "applied" && result.status !== "failed") throw new Error(t("taskSharing.unknown"));
-        if (result.kind === "invite" && result.status === "applied") setNotice(t("taskSharing.invitationLost"));
-        if (result.failedShareIds.length > 0) setNotice(t("taskSharing.partial", { count: result.failedShareIds.length }));
-      })).then(async () => {
-        if (signal.aborted) return;
-        await local?.finishTaskSharingAction(owner, unknown.operationId);
-        const remaining = await local?.taskSharingActions(owner);
-        if (signal.aborted) return;
-        setUnknown(remaining?.[0]); setError(undefined); void directory.refresh();
-      }).catch(() => { if (!signal.aborted) setError(t("taskSharing.unknown")); }).finally(() => { flight.current = false; if (!signal.aborted) setBusy(false); });
-    }}>{t("taskSharing.check")}</Button></div>}
+    {unknown && <div role="status" className="settings-card settings-card--content"><p>{t("taskSharing.unknown")}</p><Button disabled={busy} onClick={() => { void checkUnknown(); }}>{t("taskSharing.check")}</Button></div>}
     {sessionId ? <>
       {selected ? shareCard(selected) : <Button data-task-sharing-start disabled={busy || !!unknown || directory.loading} onClick={() => { void run("create", async (id, signal) => { await api.create(id, sessionId, signal); }); }}>{t("taskSharing.start")}</Button>}
     </> : <>
-      <div role="tablist" aria-label={t("taskSharing.title")}>{(["owned", "joined", "join"] as const).map(value => <Button key={value} role="tab" aria-selected={tab === value} disabled={busy} onClick={() => { setTab(value); setError(undefined); }}>{t(`taskSharing.${value}`)}</Button>)}</div>
+      <div role="tablist" aria-label={t("taskSharing.title")}>{(["owned", "joined", "join"] as const).map(value => <Button key={value} id={`${tabId}-${value}`} role="tab" aria-selected={tab === value} aria-controls={`${tabId}-panel`} tabIndex={tab === value ? 0 : -1} tone={tab === value ? "primary" : "secondary"} disabled={busy} onKeyDown={event => { moveTablistSelection(event, "horizontal"); }} onClick={() => { setTab(value); setError(undefined); }}>{t(`taskSharing.${value}`)}</Button>)}</div>
+      <div role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-${tab}`} tabIndex={0}>
       {directory.loading && !directory.value && <Spinner label={t("common.loading")} />}
       {tab === "owned" && <>{owned.length === 0 && <p>{t("taskSharing.emptyOwned")}</p>}{owned.map(shareCard)}{owned.length > 0 && <Button tone="danger" disabled={busy || !!unknown} onClick={() => setConfirmation({ kind: "endAll", shares: owned })}>{t("taskSharing.endAll")}</Button>}</>}
       {tab === "joined" && <>{joined.length === 0 && <p>{t("taskSharing.emptyJoined")}</p>}{joined.map(item => <article className="settings-card settings-card--content" key={item.joinId}>
@@ -141,9 +155,15 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
           setInvitation(""); setPreview(undefined); clearTaskSharingInvitation(invitation); open(result.intent.joined);
         }); }}>{t("taskSharing.confirmJoin")}</Button><Button disabled={busy} onClick={() => setPreview(undefined)}>{t("common.cancel")}</Button></div></article>}
       </form>}
+      </div>
     </>}
     <Modal open={confirmation !== undefined} title={t("taskSharing.manage")} onClose={() => { if (!busy) setConfirmation(undefined); }}>
-      <p>{t("taskSharing.confirm")}</p><div className="settings-actions"><Button disabled={busy} onClick={() => setConfirmation(undefined)}>{t("common.cancel")}</Button><Button data-task-sharing-confirm tone="danger" disabled={busy} onClick={confirm}>{busy ? t("common.working") : t("common.confirm")}</Button></div>
+      {confirmation && <p>{confirmation.kind === "endAll" ? t("taskSharing.confirmEndAll", { count: confirmation.shares.length })
+        : confirmation.kind === "remove" ? t("taskSharing.confirmRemove", { name: confirmation.member.displayName, task: confirmation.share.title || confirmation.share.sessionId })
+        : confirmation.kind === "leave" ? t("taskSharing.confirmLeave", { name: confirmation.joined.share?.title || confirmation.joined.share?.sessionId || confirmation.joined.joinId })
+        : t("taskSharing.confirmEnd", { name: confirmation.share.title || confirmation.share.sessionId })}</p>}
+      {confirmation?.kind === "endAll" && <ul>{confirmation.shares.map(share => <li key={share.shareId}>{share.title || share.sessionId}</li>)}</ul>}
+      <div className="settings-actions"><Button disabled={busy} onClick={() => setConfirmation(undefined)}>{t("common.cancel")}</Button><Button data-task-sharing-confirm tone="danger" disabled={busy} onClick={confirm}>{busy ? t("common.working") : t("common.confirm")}</Button></div>
     </Modal>
   </section>;
 }

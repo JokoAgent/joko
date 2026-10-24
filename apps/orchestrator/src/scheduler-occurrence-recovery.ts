@@ -34,6 +34,7 @@ export interface ScheduleOccurrenceRecoveryOptions {
     noProgressMs: number
   ) => void;
   readonly onError?: (error: unknown) => void;
+  readonly canForceRelease?: (occurrence: ScheduleRuntimeOccurrenceRecord) => boolean;
 }
 
 interface OccurrenceFence {
@@ -59,6 +60,8 @@ interface RecoveringOccurrence {
 }
 
 export interface ScheduleOccurrenceBeginInput {
+  readonly resumeQueued?: true;
+  readonly resumeActive?: true;
   readonly scheduleId: string;
   readonly scheduleName?: string;
   readonly runId: string;
@@ -97,6 +100,7 @@ export class SchedulerOccurrenceRecovery {
     noProgressMs: number
   ) => void;
   readonly #onError: (error: unknown) => void;
+  readonly #canForceRelease: (occurrence: ScheduleRuntimeOccurrenceRecord) => boolean;
   readonly #tracked = new Map<string, TrackedOccurrence>();
   readonly #recovering = new Map<string, RecoveringOccurrence>();
   readonly #forceReleased = new Set<string>();
@@ -140,6 +144,7 @@ export class SchedulerOccurrenceRecovery {
     this.#onAbortStale = options.onAbortStale ?? (() => undefined);
     this.#onForceRelease = options.onForceRelease ?? (() => undefined);
     this.#onError = options.onError ?? (() => undefined);
+    this.#canForceRelease = options.canForceRelease ?? (() => true);
   }
 
   start(): void {
@@ -164,6 +169,8 @@ export class SchedulerOccurrenceRecovery {
       source: input.source,
       ...(input.executionMode === undefined ? {} : { executionMode: input.executionMode }),
       phase: input.phase ?? "loading",
+      ...(input.resumeQueued === undefined ? {} : { resumeQueued: input.resumeQueued }),
+      ...(input.resumeActive === undefined ? {} : { resumeActive: input.resumeActive }),
       ownerId: owner.ownerId,
       ownerGeneration: owner.generation,
       scheduledAt: input.scheduledAt,
@@ -248,6 +255,13 @@ export class SchedulerOccurrenceRecovery {
   }
 
   finish(runId: string): boolean {
+    const recovering = this.#recovering.get(runId);
+    if (recovering !== undefined) {
+      this.#recovering.delete(runId);
+      const released = this.#store.releaseScheduleRuntimeOccurrence(fenceInput(recovering.occurrence));
+      this.#runtime.finish(runId);
+      return released;
+    }
     const tracked = this.#tracked.get(runId);
     if (tracked === undefined) {
       this.#runtime.finish(runId);
@@ -377,6 +391,7 @@ export class SchedulerOccurrenceRecovery {
   }
 
   #forceReleaseTracked(tracked: TrackedOccurrence, now: number): void {
+    if (!this.#canForceRelease(tracked.occurrence)) return;
     const stall = tracked.stall;
     if (stall === undefined) return;
     const owner = this.#owner;
@@ -460,6 +475,7 @@ export class SchedulerOccurrenceRecovery {
   #finalizeRecovered(runId: string): void {
     const recovery = this.#recovering.get(runId);
     if (recovery === undefined) return;
+    if (!this.#canForceRelease(recovery.occurrence)) return;
     this.#recovering.delete(runId);
     const now = this.#now();
     try {

@@ -143,6 +143,24 @@ describe("WorkspaceDocumentController", () => {
     })).resolves.toBe(true);
   });
 
+  it.each(["cancel", "save", "discard"] as const)("preserves a dirty replacement while a %s prompt is open", async choice => {
+    const controller = new WorkspaceDocumentController();
+    const previous = controller.register(fixture());
+    const selected = deferred<WorkspaceLeaveChoice>();
+    const prompt = vi.fn(() => selected.promise);
+    const leave = controller.requestLeave({ reason: "switch-file", prompt });
+    await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+    previous.unregister();
+    const save = vi.fn(async () => true), discard = vi.fn();
+    const replacement = fixture({ save, discard });
+    controller.register(replacement);
+    selected.resolve(choice);
+    await expect(leave).resolves.toBe(false);
+    expect(replacement.dirty).toBe(true);
+    expect(save).not.toHaveBeenCalled();
+    expect(discard).not.toHaveBeenCalled();
+  });
+
   it("fails closed on invalid identities and normalizes path separators", () => {
     expect(canonicalWorkspaceDocumentPath("src\\a.ts")).toBe("src/a.ts");
     expect(workspaceDocumentKey({ sessionId: "s", workspaceId: "w", path: "src/a.ts" })).toBe('["s","w","src/a.ts"]');

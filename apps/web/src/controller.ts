@@ -2311,6 +2311,23 @@ export function useAppController(): AppController {
     }
     return artifactGateway;
   }, [artifactGateway, linkGatewayGeneration]);
+  const modelPriceApi = useMemo<Pick<AppController, "getModelPriceOverride" | "setModelPriceOverride" | "resetModelPriceOverride">>(() => ({
+    getModelPriceOverride: async (...args) => {
+      const value = await catalogGateway().getModelPriceOverride(...args);
+      catalogGateway();
+      return value;
+    },
+    setModelPriceOverride: async (...args) => {
+      const value = await catalogGateway().setModelPriceOverride(...args);
+      catalogGateway();
+      return value;
+    },
+    resetModelPriceOverride: async (...args) => {
+      const value = await catalogGateway().resetModelPriceOverride(...args);
+      catalogGateway();
+      return value;
+    }
+  }), [catalogGateway]);
   const ownerServices = useMemo(() => {
     if (!artifactGateway || state.connectionState !== "connected") return {};
     const expected = desktopRemoteDesktopViewerOwner(state);
@@ -3200,12 +3217,7 @@ export function useAppController(): AppController {
     getUsageHistory: (days, backendId, providerId, signal) => gateway().getUsageHistory(days, backendId, providerId, signal),
     getUsageReport: usageApi.getUsageReport,
     ...sshKeyApi,
-    getModelPriceOverride: (backendId, providerId, modelId, signal) =>
-      gateway().getModelPriceOverride(backendId, providerId, modelId, signal),
-    setModelPriceOverride: (backendId, providerId, modelId, desired, signal) =>
-      gateway().setModelPriceOverride(backendId, providerId, modelId, desired, signal),
-    resetModelPriceOverride: (backendId, providerId, modelId, signal) =>
-      gateway().resetModelPriceOverride(backendId, providerId, modelId, signal),
+    ...modelPriceApi,
     terminateRuntimeProcess: (process) => gateway().terminateRuntimeProcess(process),
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
     listExtensions: async (options) => catalogGateway().listExtensions(options),
@@ -3669,7 +3681,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-  }), [catalogGateway, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [catalogGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

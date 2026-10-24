@@ -165,7 +165,7 @@ jobs:
 
       - name: Execute the existing macOS native signing transaction fixtures
         id: signing
-        run: node --test --test-reporter=spec apps/desktop/scripts/sign-mac-native-credentials.test.mjs 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/signing-transaction.log"
+        run: node --test --test-reporter=spec apps/desktop/scripts/sign-mac-native-credentials.test.mjs apps/desktop/scripts/seal-windows-native-hardware.test.mjs apps/desktop/scripts/seal-windows-native-remote-desktop.test.mjs 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/signing-transaction.log"
 
       - name: Record macOS check scope and retain short logs
         if: always()

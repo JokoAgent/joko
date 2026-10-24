@@ -3,11 +3,12 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import nativeArtifacts from "./native-helper-artifacts.cjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = join(root, "native", "hardware", "windows-micro-helper");
 const output = join(root, "dist", "native-hardware");
-const helper = "joko-windows-micro-helper.exe";
+const helper = nativeArtifacts.SIMPLE_NATIVE_ARTIFACTS.hardware.helpers.win32;
 mkdirSync(output, { recursive: true });
 // Clear only this build's fixed binary; a failed build must not retain a usable identity.
 rmSync(join(output, helper), { force: true });

@@ -3,7 +3,7 @@ import type {
   DesktopMainWindowCloseSettings,
   DesktopMainWindowCloseSettingsChange
 } from "./channels.js";
-import { atomicWritePrivateFile, readPrivateFile } from "./secure-files.js";
+import { atomicWritePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 export function isMainWindowCloseBehavior(value: unknown, platform: string): value is DesktopMainWindowCloseBehavior | null {
   return (platform === "win32" || platform === "linux") &&

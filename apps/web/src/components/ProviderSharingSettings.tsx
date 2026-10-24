@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type JSX } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type JSX } from "react";
 import type { ProviderSharingApi, GetHostedAgentCatalogResponse, ListProviderSharesResponse, ProviderSharingPreview, ProviderSharingRequest,
   ProviderSharingOwned, ProviderSharingMember } from "@joko/contracts";
 import { Button, Pill } from "./ui.js";
 import { providerSharingText } from "../provider-sharing-text.js";
+import { moveTablistSelection } from "./tablist-navigation.js";
 import "./provider-sharing.css";
 
 export interface ProviderSharingSettingsProps {
@@ -17,6 +18,7 @@ export function ProviderSharingSettings(props: ProviderSharingSettingsProps): JS
 }
 function ProviderSharingPanel({ api, nodeKey, nodeName, catalog, language, initialLink }: ProviderSharingSettingsProps): JSX.Element {
   const text = providerSharingText(language), current = useRef<Owner | undefined>(undefined);
+  const tabId = useId();
   const [value, setValue] = useState<Omit<ListProviderSharesResponse, "$typeName">>(), [loading, setLoading] = useState(true), [busy, setBusy] = useState(false), [error, setError] = useState(false);
   const [tab, setTab] = useState<"owned" | "received">(initialLink ? "received" : "owned");
   const [name, setName] = useState(nodeName), [providerKey, setProviderKey] = useState("");
@@ -58,14 +60,14 @@ function ProviderSharingPanel({ api, nodeKey, nodeName, catalog, language, initi
   const disabled = busy || loading;
   return <section className="provider-sharing-settings" aria-labelledby="provider-sharing-heading">
     <div className="settings-section-heading"><h3 id="provider-sharing-heading">{text.title}</h3><p>{text.body}</p></div>
-    <div role="tablist" aria-label={text.title} className="settings-actions">
-      <Button role="tab" aria-selected={tab === "owned"} onClick={() => setTab("owned")}>{text.owned}</Button>
-      <Button role="tab" aria-selected={tab === "received"} onClick={() => setTab("received")}>{text.received}</Button>
+    <div className="settings-actions"><div role="tablist" aria-label={text.title} className="settings-actions">
+      {(["owned", "received"] as const).map(value => <Button key={value} id={`${tabId}-${value}`} role="tab" aria-selected={tab === value} aria-controls={`${tabId}-panel`} tabIndex={tab === value ? 0 : -1} tone={tab === value ? "primary" : "secondary"} onKeyDown={event => { moveTablistSelection(event, "horizontal"); }} onClick={() => setTab(value)}>{text[value]}</Button>)}
+      </div>
       <Button disabled={disabled} onClick={() => { void read(true); }}>{text.refresh}</Button>
     </div>
     {error && <p role="alert">{text.unknown}</p>}
     {loading && <p role="status">{text.loading}</p>}
-    {tab === "owned" ? <div role="tabpanel" aria-label={text.owned}>
+    {tab === "owned" ? <div role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-owned`} tabIndex={0}>
       <form onSubmit={createLink} className="settings-card">
         <label>{text.name}<input value={name} maxLength={200} onChange={event => setName(event.target.value)} disabled={busy} autoComplete="name" /></label>
         <label>{text.provider}<select value={selected ? JSON.stringify([selected.backendId, selected.providerId]) : ""} onChange={event => setProviderKey(event.target.value)} disabled={busy || !providers.length}>
@@ -95,7 +97,7 @@ function ProviderSharingPanel({ api, nodeKey, nodeName, catalog, language, initi
         </div>)}
         {!share.requests.length && !share.members.length && !share.reshares.length && <p>{text.noMembers}</p>}
       </article>)}
-    </div> : <div role="tabpanel" aria-label={text.received}>
+    </div> : <div role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-received`} tabIndex={0}>
       <form onSubmit={inspect} className="settings-card"><label>{text.paste}<textarea value={link} onChange={event => { setLink(event.target.value); setPreview(undefined); }} disabled={busy} spellCheck={false} /></label>
         <Button type="submit" disabled={disabled || !link.trim()}>{text.preview}</Button>
         {preview && <div><h4>{preview.providerName}</h4><p>{text.from(preview.owner?.name ?? "", preview.hostServerId)}</p><Pill>{text.state(preview.state)}</Pill>
