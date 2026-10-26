@@ -1,4 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { parseDeviceLink, parseDeviceAuthorizationReview, type DeviceAuthorizationReview as Review } from '@joko/connection-transport/device-authorization';
+import { DeviceAuthorizationReview } from './components/DeviceAuthorizationReview.js';
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { AlertTriangle, Bell, CircleAlert, CirclePlus, Info, Menu, RefreshCcw, ServerCrash, Sparkles, X } from "lucide-react";
 import { appRouteHash, useAppController } from "./controller.js";
@@ -150,7 +152,7 @@ type PendingDesktopDeepLinkDelivery =
   | {
     readonly kind: "route";
     readonly delivery: JokoDesktopDeepLinkDelivery;
-    readonly navigation: Exclude<JokoDesktopDeepLinkNavigation, { readonly kind: "portable" }>;
+    readonly navigation: Exclude<JokoDesktopDeepLinkNavigation, { readonly kind: "portable" | 'deviceInvitation' | 'deviceApproval' }>;
     readonly expectedHash: string;
     readonly sourceNavigationRevision: number;
     readonly rendererOccurrence: object;
@@ -261,6 +263,21 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   readonly initialInspectorSubagentFocusRequest?: { readonly sessionId: string; readonly runId: string; readonly requestId: number };
 }): JSX.Element {
   const { state } = controller;
+  const [deviceInvitation, setDeviceInvitation] = useState<string>();
+  const [deviceReview, setDeviceReview] = useState<Review>();
+  useEffect(() => {
+    const receive = () => {
+      if (!window.location.hash.startsWith('#joko=')) return;
+      try {
+        const incoming = parseDeviceLink(window.location.href);
+        if (incoming.kind === 'review') { setDeviceReview(incoming.review); setDeviceInvitation(undefined); }
+        else { setDeviceInvitation(window.location.href); setDeviceReview(undefined); }
+        window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}#/`);
+      } catch { /* Invalid incoming fragments never change the active connection. */ }
+    };
+    receive(); window.addEventListener('hashchange', receive);
+    return () => window.removeEventListener('hashchange', receive);
+  }, []);
   const wallpaper = useWallpaperSettings().state.settings;
   const wallpaperActive = wallpaper?.mode === "custom" && wallpaper.customImage !== null;
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
@@ -748,7 +765,19 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       rendererOccurrence: object,
       signal: AbortSignal
     ): void => {
+      if (navigation.kind === 'deviceApproval') {
+        try { setDeviceReview(parseDeviceAuthorizationReview(navigation.link)); setDeviceInvitation(undefined); } catch { /* Malformed links never change trust. */ }
+        void api.acknowledge({ documentOccurrence: delivery.documentOccurrence, deliveryOccurrence: delivery.deliveryOccurrence }).catch(() => undefined);
+        return;
+      }
+      if (navigation.kind === 'deviceInvitation') {
+        setDeviceReview(undefined);
+        setDeviceInvitation(navigation.invitation);
+        void api.acknowledge({ documentOccurrence: delivery.documentOccurrence, deliveryOccurrence: delivery.deliveryOccurrence }).catch(() => undefined);
+        return;
+      }
       if (navigation.kind === "portable") {
+        setDeviceReview(undefined);
         setActionError(undefined);
         const requestId = ++portableImportRequestIdRef.current;
         setPendingDesktopDeepLinkDelivery({ kind: "portable", delivery, requestId, rendererOccurrence });
@@ -759,6 +788,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         });
         return;
       }
+      setDeviceReview(undefined);
       setPortableImportRequest(undefined);
       const expectedHash = desktopDeepLinkRouteHash(navigation);
       const route = desktopDeepLinkAppRoute(navigation);
@@ -1763,6 +1793,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     </AppErrorBoundary>
   </>;
   if (!state.ready) return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<LoadingScreen label={t("common.loading")} body={t("app.openingState")} /></>;
+  if (deviceReview) return <DeviceAuthorizationReview key={deviceReview.requestId} controller={controller} review={deviceReview} t={t} onClose={() => setDeviceReview(undefined)} />;
+  if (deviceInvitation) return <><Button onClick={() => setDeviceInvitation(undefined)}>{t('common.cancel')}</Button><ConnectionScreen
+    controller={{ ...controller, state: { ...state, initialMode: 'pair' },
+      connectSavedInvitation: controller.connectSavedInvitation && (async (...args) => { await controller.connectSavedInvitation!(...args); setDeviceInvitation(undefined); }), deviceAuthorization: controller.deviceAuthorization && {
+      ...controller.deviceAuthorization, finish: async (signal, automatic) => { await controller.deviceAuthorization!.finish(signal, automatic); setDeviceInvitation(undefined); }
+    } }} initialInvitation={deviceInvitation} t={t} /></>;
   if (state.activeProfile === undefined || state.connectionState === "disconnected") return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<ConnectionScreen controller={controller} t={t} /></>;
   if (state.connectionState === "connecting" && state.snapshot.revision === 0n) return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<ConnectingScreen controller={controller} t={t} /></>;
   if (state.snapshot.revision === 0n && state.connectionState !== "connected") return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<UnavailableScreen controller={controller} t={t} error={state.error} /></>;

@@ -1,5 +1,6 @@
 import { posix, win32 } from "node:path";
 import { parseTaskShareInvitation } from "@joko/contracts";
+import { parseDeviceTarget, parseDeviceAuthorizationReview } from '@joko/connection-transport/device-authorization';
 
 import {
   isDesktopDeepLinkSettingsSection,
@@ -54,6 +55,14 @@ export function isDesktopMainDocumentReplacementNavigation(
 
 /** Parse only the public OS handoff surface. The privileged `joko://app` origin is intentionally rejected. */
 export function parseDesktopDeepLink(value: unknown): ParsedDesktopDeepLink | undefined {
+  if (typeof value === 'string' && value.startsWith('joko://review-device#')) {
+    try { parseDeviceAuthorizationReview(value); return Object.freeze({ kind: 'deviceApproval', link: value }); }
+    catch { return undefined; }
+  }
+  if (typeof value === 'string' && value.startsWith('joko://pair#')) {
+    try { parseDeviceTarget(value); return Object.freeze({ kind: 'deviceInvitation', invitation: value }); }
+    catch { return undefined; }
+  }
   if (typeof value === "string" && value.startsWith("joko://shared-task/")) {
     try { parseTaskShareInvitation(value); return Object.freeze({ kind: "taskShareInvitation", invitation: value }); }
     catch { return undefined; }

@@ -8,6 +8,7 @@ export interface ConnectionScreenProfile {
   readonly serverId: string;
   readonly name: string;
   readonly origin: string;
+  readonly entryId?: string;
   readonly endpointPublicKey?: string;
   readonly transportKind?: import('@joko/connection-transport/trust').EndpointTransportKind;
   readonly managedLocal?: boolean;
@@ -57,6 +58,8 @@ export interface ConnectionScreenLabels {
 }
 
 export interface ConnectionScreenState {
+  readonly connectionEntries?: { readonly profileId: string; readonly entries: readonly import('@joko/connection-transport/entries').ConnectionEntryView[]; readonly returnToPreferred: boolean; readonly notice?: string };
+  readonly invitationLink?: string;
   readonly connectionState: "disconnected" | "connecting" | "connected" | "reconnecting" | "offline";
   readonly profiles: readonly ConnectionScreenProfile[];
   readonly activeProfile?: ConnectionScreenProfile;
@@ -94,6 +97,14 @@ export interface ConnectionScreenState {
 }
 
 export interface ConnectionScreenController {
+  copyDeviceApprovalLink?(link: string): Promise<void>;
+  connectSavedInvitation?(link: string, automatic?: boolean, entryId?: string): Promise<void>;
+  refreshConnectionEntries?(profileId: string): Promise<void>;
+  prepareConnectionEntry?(profileId: string, entryId: string): Promise<void>;
+  selectConnectionEntry?(profileId: string, entryId: string): Promise<void>;
+  setConnectionEntryPolicy?(profileId: string, backupIds: readonly string[], returnToPreferred: boolean): Promise<void>;
+  readonly deviceAuthorization?: import('@joko/connection-transport/device-authorization').DeviceAuthorizationPort;
+  scanDeviceInvitation?(): Promise<string>;
   readonly state: ConnectionScreenState;
   connect(profile: ConnectionScreenProfile, options?: { readonly automatic?: boolean }): Promise<void>;
   pair(origin: string, code: string, deviceName: string, options?: { readonly automatic?: boolean }): Promise<void>;
@@ -118,6 +129,23 @@ export interface ConnectionScreenController {
 
 /** The embedded host accepts only these actions, never arbitrary controller methods. */
 export interface ConnectionScreenActionArguments {
+  readonly copyDeviceApprovalLink: readonly [link: string];
+  readonly connectSavedInvitation: readonly [link: string, automatic?: boolean, entryId?: string];
+  readonly getDeviceAuthorizationEntries: readonly [link: string];
+  readonly resolveDeviceAuthorizationTarget: readonly [link: string, code?: string];
+  readonly createDeviceTransportRequest: readonly [kind: 'iroh' | 'tailcat'];
+  readonly getDeviceTransportRequest: readonly [];
+  readonly cancelDeviceTransportRequest: readonly [requestId: string];
+  readonly refreshConnectionEntries: readonly [profileId: string];
+  readonly prepareConnectionEntry: readonly [profileId: string, entryId: string];
+  readonly selectConnectionEntry: readonly [profileId: string, entryId: string];
+  readonly setConnectionEntryPolicy: readonly [profileId: string, backupIds: readonly string[], returnToPreferred: boolean];
+  readonly startDeviceAuthorization: readonly [link: string, deviceName: string, entryId?: string];
+  readonly refreshDeviceAuthorization: readonly [];
+  readonly cancelDeviceAuthorization: readonly [];
+  readonly finishDeviceAuthorization: readonly [options?: { readonly automatic?: boolean }];
+  readonly discardDeviceAuthorization: readonly [allowUnconfirmed?: boolean];
+  readonly scanDeviceInvitation: readonly [];
   readonly connect: readonly [profileId: string, options?: { readonly automatic?: boolean }];
   readonly pair: readonly [origin: string, code: string, deviceName: string, options?: { readonly automatic?: boolean }];
   readonly disconnect: readonly [];

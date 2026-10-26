@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useReducer, useRef, useState } from "react";
 import { allowsUnpinnedEndpoint, normalizeEndpointPublicKey, parseTrustedNodeInvitation, rememberEndpointTrust, replaceEndpointTrust, type EndpointTrust } from "@joko/connection-transport/trust";
 import type { JSX } from "react";
-import { AlertTriangle, ArrowRight, KeyRound, Laptop, Moon, RefreshCcw, Server, Sun, Trash2, Wifi } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, KeyRound, Laptop, Moon, RefreshCcw, Server, SlidersHorizontal, Sun, Trash2, Wifi } from "lucide-react";
 import { connectionArtworkGroupAt, nextConnectionArtworkGroupIndex } from "../connection-artwork.js";
 import type { ConnectionArtworkVariant } from "../connection-artwork.js";
 import type { ConnectionScreenController, ConnectionScreenManagedStatus, ConnectionScreenMode, ConnectionScreenProfile } from "../connection-contract.js";
@@ -9,17 +9,30 @@ import { isInsecureLanOrigin, normalizeOrchestratorOrigin } from "../connection-
 import { persistentWebSecretEncryptionAvailable } from "../web-crypto.js";
 import type { Translator } from "./types.js";
 import { Button, ErrorBanner, IconButton, Pill, Spinner, formatRelativeTime, CheckboxControl } from "./ui.js";
+import { DeviceAuthorizationEntry } from './DeviceAuthorizationEntry.js';
+import { ConnectionEntries } from './ConnectionEntries.js';
 
-export function ConnectionScreen({ controller, t }: { readonly controller: ConnectionScreenController; readonly t: Translator }): JSX.Element {
+export function ConnectionScreen({ controller, t, initialInvitation }: { readonly controller: ConnectionScreenController; readonly t: Translator; readonly initialInvitation?: string }): JSX.Element {
   const { state } = controller;
   const originHintId = useId();
-  const remoteProfiles = useMemo(() => state.profiles.filter((profile) => profile.managedLocal !== true), [state.profiles]);
+  const remoteProfiles = useMemo(() => {
+    const nodes = new Map<string, ConnectionScreenProfile>();
+    for (const profile of state.profiles.filter(p => p.managedLocal !== true)) {
+      const key = profile.endpointPublicKey ? JSON.stringify([profile.serverId, profile.endpointPublicKey]) : profile.id;
+      const prior = nodes.get(key);
+      if (!prior || profile.id === state.activeProfile?.id || prior.id !== state.activeProfile?.id && (profile.lastConnectedAt ?? 0) > (prior.lastConnectedAt ?? 0)) nodes.set(key, profile);
+    }
+    return [...nodes.values()];
+  }, [state.profiles, state.activeProfile?.id]);
   const [{ mode, artworkGroupIndex, artworkVariant }, dispatchView] = useReducer(connectionViewReducer, {
     mode: state.initialMode ?? (remoteProfiles.length === 0 ? "nearby" : "saved"),
     artworkGroupIndex: 0,
     artworkVariant: "base"
   });
   const artworkGroup = connectionArtworkGroupAt(artworkGroupIndex);
+  useEffect(() => {
+    if (initialInvitation ?? state.invitationLink) { setManualOpen(false); dispatchView({ type: 'selectMode', mode: 'pair' }); }
+  }, [initialInvitation, state.invitationLink]);
   const artwork = artworkGroup[artworkVariant];
   const selectMode = (nextMode: ConnectionMode): void => {
     if (actionsDisabled || actionRef.current !== undefined) return;
@@ -34,6 +47,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
     }
   };
   const [origin, setOrigin] = useState(state.candidate?.origin ?? (state.capabilities?.challengePairing === true ? "" : "http://127.0.0.1:4318"));
+  const [discoveredNode, setDiscoveredNode] = useState<ConnectionScreenController['state']['discoveredNodes'][number]>();
   const [code, setCode] = useState("");
   const [trustedIdentity, setTrustedIdentity] = useState("");
   const [clientPublicKey, setClientPublicKey] = useState('');
@@ -69,6 +83,8 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
     else rememberEndpointTrust({ ...pin, endpointTransport, transportKind: endpointTransport?.kind ?? 'https' });
   };
   const [deviceName, setDeviceName] = useState(() => state.defaultDeviceName ?? defaultDeviceName());
+  const [manualOpen, setManualOpen] = useState(controller.deviceAuthorization === undefined);
+  const [authorizationStage, setAuthorizationStage] = useState<'choice' | 'invite' | 'pending'>('choice');
   const [insecureConfirmed, setInsecureConfirmed] = useState(false);
   const [localError, setLocalError] = useState<string>();
   const [busy, setBusy] = useState<string>();
@@ -170,6 +186,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
   };
 
   const selectDiscovered = (selectedOrigin: string): void => {
+    setDiscoveredNode(state.discoveredNodes.find(node => node.origin === selectedOrigin));
     setOrigin(selectedOrigin);
     setInsecureConfirmed(false);
     selectMode("pair");
@@ -294,7 +311,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
             {state.discoveryState === "discovering" && discoveredNodes.length === 0 ? (
               <div className="discovery-empty" role="status"><Spinner label={t("connection.discovering")} /><span>{t("connection.discovering")}</span></div>
             ) : discoveredNodes.length === 0 ? (
-              <div className="discovery-empty"><Wifi aria-hidden="true" /><strong>{t("connection.noneDiscovered")}</strong><span>{t("connection.discoveryFallback")}</span><Button disabled={actionsDisabled} onClick={() => selectMode("pair")}>{t("connection.enterManually")}</Button></div>
+              <div className="discovery-empty"><Wifi aria-hidden="true" /><strong>{t("connection.noneDiscovered")}</strong><span>{t(controller.deviceAuthorization ? "authorization.linkHelp" : "connection.discoveryFallback")}</span><Button disabled={actionsDisabled} onClick={() => selectMode("pair")}>{t(controller.deviceAuthorization ? "entries.chooseMethod" : "connection.enterManually")}</Button></div>
             ) : (
               <div className="profile-list">
                 {discoveredNodes.map((node) => (
@@ -348,10 +365,20 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
                   onClick={() => runAction("forget", () => controller.forgetProfile(profile.id))}>
                   <Trash2 aria-hidden="true" />
                 </IconButton>}
+                <ConnectionEntries profile={profile} controller={controller} t={t} disabled={actionsDisabled} run={runAction} />
               </article>
             ))}
           </div>
         ) : (
+          <>
+          {controller.deviceAuthorization && !manualOpen && <DeviceAuthorizationEntry controller={controller} t={t} defaultName={deviceName} initialInvitation={initialInvitation ?? state.invitationLink} automatic={automaticEntryAvailable ? rememberAutomatically : undefined} onStageChange={setAuthorizationStage} discoveredNode={discoveredNode} onClearDiscovered={() => setDiscoveredNode(undefined)} />}
+          {(controller.deviceAuthorization === undefined || manualOpen || authorizationStage === 'choice') && <details className="device-authorization__manual" open={manualOpen} onToggle={event => setManualOpen(event.currentTarget.open)}>
+          <summary aria-label={t(manualOpen ? 'authorization.chooseAnother' : 'authorization.manual')}>
+            {manualOpen ? <><ArrowLeft aria-hidden="true" /><span>{t('authorization.chooseAnother')}</span></> : <>
+              <span className="connection-method__icon"><SlidersHorizontal aria-hidden="true" /></span>
+              <span><strong>{t('authorization.manual')}</strong><small>{t('authorization.manualHelp')}</small></span><ArrowRight aria-hidden="true" />
+            </>}
+          </summary>
           <form className="pair-form" onSubmit={(event) => { event.preventDefault(); pair(); }}>
             <div className="pair-form__intro">
               <Laptop aria-hidden="true" />
@@ -386,6 +413,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
                 <option value="relay" disabled={state.capabilities?.irohRelayAvailable !== true}>{t('connection.irohRelayMode')}</option>
               </select><small>{t(state.capabilities?.irohNativeAvailable === true ? 'connection.irohMobileModeHelp' : 'connection.irohNativeUnavailable')}</small>
             </label>}
+            <details className="pair-form__advanced"><summary>{t('authorization.advanced')}</summary><div>
             {selectedTransport !== 'webrtc' && selectedTransport !== 'http-connect' && (selectedTransport === 'tailcat' ? controller.createTailcatClient : controller.createIrohClient) !== undefined && <>
               {selectedTransport === undefined && <small>{t('connection.irohBeforeInvitationHelp')}</small>}
               <Button disabled={actionsDisabled || !clientBindingAvailable} onClick={() => runAction('client-identity', async () => {
@@ -405,6 +433,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
             </>}
             <label className="connection-checkbox"><CheckboxControl checked={replaceIdentity} disabled={actionsDisabled}
               onChange={event => setReplaceIdentity(event.target.checked)} /><span>{t("connection.replaceIdentity")}</span></label>
+            </div></details>
             {insecureLan && <div className="lan-http-warning" role="note">
               <AlertTriangle aria-hidden="true" />
               <div><strong>{t("connection.insecureLanTitle")}</strong><p>{t("connection.insecureLanBody")}</p>{sessionOnlySecret && <p>{t("connection.sessionOnlySecret")}</p>}</div>
@@ -445,8 +474,10 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
             {challengePairing && controller.cancelPairing !== undefined && (busy === "inspect" || busy === "challenge" || busy === "pair") && <Button tone="ghost"
               disabled={state.interactive === false} onClick={cancelPairing}>{t("common.cancel")}</Button>}
           </form>
+          </details>}
+          </>
         )}
-        {(!challengePairing || mode !== "saved") && <label className="connection-auto-choice">
+        {(!challengePairing || mode !== "saved") && (mode !== 'pair' || manualOpen || authorizationStage !== 'choice') && <label className="connection-auto-choice">
           <CheckboxControl
             checked={rememberAutomatically}
             disabled={actionsDisabled || isConnecting || (!automaticEntryAvailable && !rememberAutomatically)}

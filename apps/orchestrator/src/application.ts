@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { publicConnectionCapabilities } from './connection-entries.js';
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { answerDeliveryPrompt } from "./answer-delivery-prompt.js";
 import { createHostedAgentAutoReviewer } from "./hosted-agent-auto-review.js";
@@ -797,6 +798,8 @@ export async function createOrchestratorApplication(
       version: "0.1.0",
       apiVersion: JOKO_API_VERSION,
       pairingEnabled: connections.pairingEnabled,
+      endpointPublicKey: linkspanIdentity.publicKey,
+      ...publicConnectionCapabilities(store, config.publicOrigin),
       lastSeen: Date.now()
     }),
     onError: (message) => {

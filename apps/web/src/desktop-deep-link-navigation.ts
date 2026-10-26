@@ -1,6 +1,6 @@
 import { sessionRouteHash, type AppRoute } from "./controller.js";
 
-type RouteDesktopDeepLinkNavigation = Exclude<JokoDesktopDeepLinkNavigation, { readonly kind: "portable" }>;
+type RouteDesktopDeepLinkNavigation = Exclude<JokoDesktopDeepLinkNavigation, { readonly kind: "portable" | 'deviceInvitation' | 'deviceApproval' }>;
 
 /** Drops a slower pull response after a newer live delivery was already applied. */
 export class DesktopDeepLinkDeliveryOrder {

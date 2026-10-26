@@ -40,6 +40,9 @@ import {
   type SidebarOwnerLayouts
 } from "./sidebar-layout.js";
 
+import { parseDeviceAuthorizationDraft, type DeviceAuthorizationDraft } from '@joko/connection-transport/device-authorization';
+import { connectionEntryOwnerKey, parseSavedConnectionEntries, type SavedConnectionEntries } from '@joko/connection-transport/entries';
+const AUTHORIZATION_DRAFT_KEY = 'device-authorization-request-v1';
 const DATABASE_NAME = "joko-ui";
 const DATABASE_VERSION = 1;
 const PROFILE_STORE = "profiles";
@@ -317,7 +320,7 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const required = ["deviceId", "id", "name", "origin", "serverId"];
-  const allowed = new Set([...required, "lastConnectedAt", "managedLocal", "endpointPublicKey", "transportKind"]);
+  const allowed = new Set([...required, "lastConnectedAt", "managedLocal", "endpointPublicKey", "transportKind", "entryId"]);
   if (required.some((key) => !Object.hasOwn(record, key)) || Object.keys(record).some((key) => !allowed.has(key))) {
     return undefined;
   }
@@ -325,6 +328,7 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
     !validConnectionIdentity(record["id"], 128)
     || !validConnectionIdentity(record["deviceId"], 256)
     || !validConnectionIdentity(record["serverId"], 256)
+    || record['entryId'] !== undefined && (typeof record['entryId'] !== 'string' || !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(record['entryId']))
     || (record["endpointPublicKey"] !== undefined && (typeof record["endpointPublicKey"] !== "string" || !/^ed25519:[a-f0-9]{64}$/u.test(record["endpointPublicKey"])))
     || (record["transportKind"] !== undefined && !['https', 'iroh', 'tailcat', 'webrtc', 'http-connect'].includes(String(record["transportKind"])))
     || (record["transportKind"] !== undefined && record["transportKind"] !== 'https' && record["endpointPublicKey"] === undefined)
@@ -360,6 +364,7 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
     serverId: record["serverId"],
     name: record["name"],
     origin: record["origin"],
+    ...(record['entryId'] === undefined ? {} : { entryId: record['entryId'] as string }),
     ...(record["endpointPublicKey"] === undefined ? {} : { endpointPublicKey: record["endpointPublicKey"] as string }),
     ...(record["transportKind"] === undefined ? {} : { transportKind: record["transportKind"] as ConnectionProfile['transportKind'] }),
     ...(Object.hasOwn(record, "managedLocal") ? { managedLocal: record["managedLocal"] as boolean } : {}),
@@ -375,10 +380,21 @@ function validConnectionIdentity(value: unknown, maximumLength: number): value i
 function endpointTransportOwner(profile: ConnectionProfile): string {
   return JSON.stringify([profile.id, profile.origin, profile.serverId, profile.endpointPublicKey, profile.transportKind]);
 }
+function credentialOwner(profile: ConnectionProfile): string {
+  return JSON.stringify(['device-credential-v1', profile.id, profile.deviceId, profile.serverId, profile.endpointPublicKey ?? profile.origin]);
+}
+function entriesOwner(profile: ConnectionProfile) {
+  if (!profile.endpointPublicKey) throw new Error('Multiple entrances require the saved full node public key.');
+  return { profileId: profile.id, deviceId: profile.deviceId, serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey };
+}
 
 async function endpointTransportCredentialId(profileId: string): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(profileId)));
   return `transport_${Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+async function connectionEntriesCredentialId(profileId: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(profileId)));
+  return `entries_${Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
 function persistedUiPreferences(value: UiPreferences): { -readonly [Key in keyof UiPreferences]?: UiPreferences[Key] } {
@@ -440,6 +456,79 @@ function validSessionDraftSurface(surface: string): surface is SessionDraftSurfa
 }
 
 export class LocalState {
+  #entryChanges: Promise<unknown> = Promise.resolve();
+  async withConnectionEntryLock<T>(profileId: string, action: () => Promise<T>): Promise<T> {
+    if (navigator.locks) return await navigator.locks.request(`joko.node-entries:${profileId}`, action);
+    const result = this.#entryChanges.then(action, action);
+    this.#entryChanges = result.catch(() => undefined); return result;
+  }
+  async readConnectionEntries(profile: ConnectionProfile): Promise<SavedConnectionEntries | undefined> {
+    const owner = entriesOwner(profile), aad = connectionEntryOwnerKey(owner), id = `entries_${profile.id}`;
+    let raw: string | undefined;
+    if (window.jokoDesktop?.credentials) raw = await window.jokoDesktop.credentials.get(await connectionEntriesCredentialId(profile.id));
+    else if (persistentWebSecretEncryptionAvailable()) {
+      const encrypted = await this.get<EncryptedSecret>(SECRET_STORE, id);
+      if (encrypted) raw = new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: encrypted.iv,
+        additionalData: new TextEncoder().encode(aad) }, await this.originKey(), encrypted.ciphertext));
+    } else raw = this.#volatileSecrets.get(id);
+    return raw === undefined ? undefined : parseSavedConnectionEntries(JSON.parse(raw), owner);
+  }
+  async writeConnectionEntries(profile: ConnectionProfile, entries: SavedConnectionEntries): Promise<void> {
+    const owner = entriesOwner(profile), aad = connectionEntryOwnerKey(owner), id = `entries_${profile.id}`;
+    const raw = JSON.stringify(parseSavedConnectionEntries(entries, owner));
+    if (window.jokoDesktop?.credentials) { await window.jokoDesktop.credentials.set(await connectionEntriesCredentialId(profile.id), raw); return; }
+    if (!persistentWebSecretEncryptionAvailable()) throw new Error('Preparing backup entrances requires persistent protected storage.');
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad) }, await this.originKey(), new TextEncoder().encode(raw));
+    await this.put(SECRET_STORE, id, { profileId: profile.id, iv: iv.buffer.slice(iv.byteOffset, iv.byteOffset + iv.byteLength), ciphertext } satisfies EncryptedSecret);
+  }
+  async readDeviceAuthorization(): Promise<DeviceAuthorizationDraft | undefined> {
+    const raw = await this.readProtectedDeviceDraft(AUTHORIZATION_DRAFT_KEY);
+    return raw === undefined ? undefined : parseDeviceAuthorizationDraft(raw);
+  }
+  async writeDeviceAuthorization(draft: DeviceAuthorizationDraft | undefined): Promise<void> {
+    await this.writeProtectedDeviceDraft(AUTHORIZATION_DRAFT_KEY, draft ? parseDeviceAuthorizationDraft(draft) : undefined);
+  }
+  async readDeviceTransportRequest(): Promise<import('@joko/connection-transport/device-authorization').DeviceTransportRequestDraft | undefined> {
+    const raw = await this.readProtectedDeviceDraft('device-transport-request-v1');
+    return raw === undefined ? undefined : (await import('@joko/connection-transport/device-authorization')).parseDeviceTransportRequestDraft(raw);
+  }
+  async writeDeviceTransportRequest(draft: import('@joko/connection-transport/device-authorization').DeviceTransportRequestDraft | undefined): Promise<void> {
+    await this.writeProtectedDeviceDraft('device-transport-request-v1', draft ? (await import('@joko/connection-transport/device-authorization')).parseDeviceTransportRequestDraft(draft) : undefined);
+  }
+  private async readProtectedDeviceDraft(key: string): Promise<unknown> {
+    const desktop = window.jokoDesktop?.credentials;
+    let raw: string | undefined;
+    if (desktop) raw = await desktop.get(key);
+    else if (persistentWebSecretEncryptionAvailable()) {
+      const value = await this.get<EncryptedSecret>(SECRET_STORE, key);
+      if (value) raw = new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: value.iv,
+        additionalData: new TextEncoder().encode(key) }, await this.originKey(), value.ciphertext));
+    } else raw = this.#volatileSecrets.get(key);
+    return raw === undefined ? undefined : JSON.parse(raw);
+  }
+  private async writeProtectedDeviceDraft(key: string, draft: unknown): Promise<void> {
+    const desktop = window.jokoDesktop?.credentials;
+    if (!draft) {
+      if (desktop) await desktop.delete(key);
+      this.#volatileSecrets.delete(key);
+      const transaction = this.#database.transaction(SECRET_STORE, 'readwrite');
+      transaction.objectStore(SECRET_STORE).delete(key);
+      await transactionDone(transaction);
+      return;
+    }
+    const raw = JSON.stringify(draft);
+    if (desktop) {
+      if ((await window.jokoDesktop!.appInfo.get()).persistentCredentialStorage !== true) throw new Error('Device approval requires persistent protected credential storage.');
+      await desktop.set(key, raw); return;
+    }
+    if (!persistentWebSecretEncryptionAvailable()) throw new Error('Device approval requires a secure browser context or the Desktop app. Use manual pairing on this page.');
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv,
+      additionalData: new TextEncoder().encode(key) }, await this.originKey(), new TextEncoder().encode(raw));
+    await this.put(SECRET_STORE, key, { profileId: key,
+      iv: iv.buffer.slice(iv.byteOffset, iv.byteOffset + iv.byteLength), ciphertext } satisfies EncryptedSecret);
+  }
   readonly #database: IDBDatabase;
   readonly #volatileSecrets = new Map<string, string>();
 
@@ -564,7 +653,7 @@ export class LocalState {
     const key = await this.originKey();
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ciphertext = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv, additionalData: new TextEncoder().encode(normalized.origin) },
+      { name: "AES-GCM", iv, additionalData: new TextEncoder().encode(credentialOwner(normalized)) },
       key,
       new TextEncoder().encode(authKey)
     );
@@ -623,6 +712,26 @@ export class LocalState {
   }
 
   async readAuthKey(profile: ConnectionProfile): Promise<string | undefined> {
+    const desktop = window.jokoDesktop;
+    if (profile.managedLocal === true && desktop?.managedOrchestrator !== undefined) {
+      // Desktop owns this bootstrap credential before the first profile save,
+      // and can restart its service on a different loopback port. Match the
+      // current host identity before releasing the key to either occurrence.
+      const managed = await desktop.managedOrchestrator.getConnection();
+      if (!managed || managed.profileId !== profile.id || managed.deviceId !== profile.deviceId
+        || managed.serverId !== profile.serverId || managed.origin !== profile.origin
+        || managed.endpointPublicKey !== profile.endpointPublicKey || (profile.transportKind ?? 'https') !== 'https') return undefined;
+      rememberEndpointTrust(profile);
+      return desktop.credentials.get(profile.id);
+    }
+    const saved = normalizeConnectionProfile(await this.get(PROFILE_STORE, profile.id));
+    if (!saved || credentialOwner(saved) !== credentialOwner(profile)) return undefined;
+    if (saved.origin !== profile.origin || (saved.transportKind ?? 'https') !== (profile.transportKind ?? 'https')) {
+      if (!profile.endpointPublicKey) return undefined;
+      const entries = await this.readConnectionEntries(profile);
+      if (!entries?.entries.some(entry => entry.prepared && entry.origin === profile.origin && entry.kind === (profile.transportKind ?? 'https')
+        && (entry.id === entries.preferredId || entries.backupIds.includes(entry.id)))) return undefined;
+    }
     rememberEndpointTrust(profile);
     const desktopCredentials = window.jokoDesktop?.credentials;
     if (desktopCredentials !== undefined) return desktopCredentials.get(profile.id);
@@ -633,7 +742,7 @@ export class LocalState {
     if (encrypted === undefined) return undefined;
     try {
       const plaintext = await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: encrypted.iv, additionalData: new TextEncoder().encode(profile.origin) },
+        { name: "AES-GCM", iv: encrypted.iv, additionalData: new TextEncoder().encode(credentialOwner(profile)) },
         await this.originKey(),
         encrypted.ciphertext
       );
@@ -644,23 +753,29 @@ export class LocalState {
   }
 
   async deleteAuthKey(profileId: string): Promise<void> {
+    this.#volatileSecrets.delete(`entries_${profileId}`);
+    if (window.jokoDesktop?.credentials) await window.jokoDesktop.credentials.delete(await connectionEntriesCredentialId(profileId));
     this.#volatileSecrets.delete(profileId);
     this.#volatileSecrets.delete(`transport:${profileId}`);
     await window.jokoDesktop?.credentials.delete(profileId);
     if (window.jokoDesktop?.credentials !== undefined) await window.jokoDesktop.credentials.delete(await endpointTransportCredentialId(profileId));
     const transaction = this.#database.transaction(SECRET_STORE, "readwrite");
     transaction.objectStore(SECRET_STORE).delete(profileId);
+    transaction.objectStore(SECRET_STORE).delete(`entries_${profileId}`);
     transaction.objectStore(SECRET_STORE).delete(`transport:${profileId}`);
     await transactionDone(transaction);
   }
 
   async deleteProfile(id: string): Promise<void> {
+    this.#volatileSecrets.delete(`entries_${id}`);
+    if (window.jokoDesktop?.credentials) await window.jokoDesktop.credentials.delete(await connectionEntriesCredentialId(id));
     this.#volatileSecrets.delete(id);
     this.#volatileSecrets.delete(`transport:${id}`);
     await window.jokoDesktop?.credentials.delete(id);
     if (window.jokoDesktop?.credentials !== undefined) await window.jokoDesktop.credentials.delete(await endpointTransportCredentialId(id));
     const transaction = this.#database.transaction([PROFILE_STORE, SECRET_STORE, MACHINE_CACHE_STORE], "readwrite");
     transaction.objectStore(PROFILE_STORE).delete(id);
+    transaction.objectStore(SECRET_STORE).delete(`entries_${id}`);
     transaction.objectStore(SECRET_STORE).delete(id);
     transaction.objectStore(SECRET_STORE).delete(`transport:${id}`);
     transaction.objectStore(MACHINE_CACHE_STORE).delete(id);

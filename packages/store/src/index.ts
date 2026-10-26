@@ -1,4 +1,5 @@
 export * from "./errors.js";
+export * from "./device-authorization-store.js";
 export * from "./task-share-store.js";
 export * from "./hosted-agent-store.js";
 export * from "./session-runtime-handoff-store.js";

@@ -188,6 +188,7 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
     await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
     await page.getByLabel("Device name").fill("Codex mounted Web");

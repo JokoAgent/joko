@@ -6,6 +6,8 @@ import "google/protobuf/timestamp.proto";
 import "joko/v1/app_default_model.proto";
 import "joko/v1/capability.proto";
 import "joko/v1/common.proto";
+import "joko/v1/connection_entry.proto";
+import "joko/v1/device_authorization.proto";
 import "joko/v1/collaboration.proto";
 import "joko/v1/contact.proto";
 import "joko/v1/event.proto";
@@ -35,6 +37,17 @@ import "joko/v1/voice.proto";
 import "joko/v1/workspace.proto";
 
 service ConnectionService {
+  rpc ListConnectionEntries(ListConnectionEntriesRequest) returns (ListConnectionEntriesResponse);
+  rpc PrepareConnectionEntry(PrepareConnectionEntryRequest) returns (PrepareConnectionEntryResponse);
+  rpc GetDeviceAuthorizationEntries(GetDeviceAuthorizationEntriesRequest) returns (GetDeviceAuthorizationEntriesResponse);
+  rpc FindDeviceAuthorizationInvitation(FindDeviceAuthorizationInvitationRequest) returns (FindDeviceAuthorizationInvitationResponse);
+  rpc CreateDeviceAuthorizationInvitation(CreateDeviceAuthorizationInvitationRequest) returns (CreateDeviceAuthorizationInvitationResponse);
+  rpc RequestDeviceAuthorization(RequestDeviceAuthorizationRequest) returns (RequestDeviceAuthorizationResponse);
+  rpc GetDeviceAuthorization(GetDeviceAuthorizationRequest) returns (GetDeviceAuthorizationResponse);
+  rpc ListDeviceAuthorizations(ListDeviceAuthorizationsRequest) returns (ListDeviceAuthorizationsResponse);
+  rpc ResolveDeviceAuthorization(ResolveDeviceAuthorizationRequest) returns (ResolveDeviceAuthorizationResponse);
+  rpc ClaimDeviceAuthorization(ClaimDeviceAuthorizationRequest) returns (ClaimDeviceAuthorizationResponse);
+  rpc CancelDeviceAuthorization(CancelDeviceAuthorizationRequest) returns (CancelDeviceAuthorizationResponse);
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
   // Public, credential-free bootstrap metadata used by the connection screen.
   rpc ListDiscoveredNodes(ListDiscoveredNodesRequest) returns (ListDiscoveredNodesResponse);

@@ -11,7 +11,7 @@ export async function materializeDesktopDeepLinkNavigation(
   intent: Exclude<DesktopInboundOpenIntent, { readonly kind: "focus" | "taskShareInvitation" }>,
   readFileSnapshot: DesktopFileSnapshotReader
 ): Promise<DesktopDeepLinkNavigation> {
-  if (intent.kind === "session" || intent.kind === "settings") return intent;
+  if (intent.kind === "session" || intent.kind === "settings" || intent.kind === 'deviceInvitation' || intent.kind === 'deviceApproval') return intent;
   if (intent.kind === "portable") return Object.freeze({ kind: "portable" });
 
   let file: DesktopFile | undefined;

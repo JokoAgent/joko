@@ -129,6 +129,7 @@ describe("mounted Workspace HTML Browser chain", () => {
     const uiPage = await uiBrowser.newPage();
     await uiPage.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
     await uiPage.locator(".connection-tabs > button").nth(2).click();
+    await uiPage.locator('details.device-authorization__manual > summary').click();
     await uiPage.getByLabel("Joko node address").fill(fixture.baseUrl);
     await uiPage.getByLabel("Pairing code").fill(pairingCode);
     await uiPage.getByLabel("Device name").fill("Mounted E3 Web");

@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/runtime.proto";
+import "joko/v1/connection_entry.proto";
+
+enum DeviceAuthorizationState {
+  DEVICE_AUTHORIZATION_STATE_UNSPECIFIED = 0;
+  DEVICE_AUTHORIZATION_STATE_INVITED = 1;
+  DEVICE_AUTHORIZATION_STATE_PENDING = 2;
+  DEVICE_AUTHORIZATION_STATE_APPROVED = 3;
+  DEVICE_AUTHORIZATION_STATE_CLAIMED = 4;
+  DEVICE_AUTHORIZATION_STATE_DENIED = 5;
+  DEVICE_AUTHORIZATION_STATE_CANCELLED = 6;
+  DEVICE_AUTHORIZATION_STATE_EXPIRED = 7;
+}
+
+// Public projection: no invitation, requester or connection secret/digest.
+message DeviceAuthorization {
+  string invitation_id = 1;
+  string request_id = 2;
+  string user_code = 3;
+  DeviceAuthorizationState state = 4;
+  string device_name = 5;
+  DeviceKind device_kind = 6;
+  string platform = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  Connection connection = 9;
+}
+
+message CreateDeviceAuthorizationInvitationRequest {
+  string invitation_id = 1;
+  string invitation_secret_digest = 2;
+  repeated string entry_ids = 3;
+  string invitation_code_digest = 4;
+  bool allow_knock = 5;
+}
+message CreateDeviceAuthorizationInvitationResponse {
+  DeviceAuthorization authorization = 1;
+  string origin = 2;
+  string server_id = 3;
+  string endpoint_public_key = 4;
+  repeated NodeConnectionEntry entries = 5;
+}
+message GetDeviceAuthorizationEntriesRequest {
+  string invitation_id = 1;
+  string invitation_secret = 2;
+  string invitation_code = 3;
+  bool knock = 4;
+}
+message FindDeviceAuthorizationInvitationRequest { string invitation_code = 1; }
+message FindDeviceAuthorizationInvitationResponse {
+  string invitation_id = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  string origin = 3;
+  string server_id = 4;
+  string endpoint_public_key = 5;
+}
+message GetDeviceAuthorizationEntriesResponse {
+  string server_id = 1;
+  string endpoint_public_key = 2;
+  repeated NodeConnectionEntry entries = 3;
+}
+message RequestDeviceAuthorizationRequest {
+  string invitation_id = 1;
+  string invitation_secret = 2;
+  string request_id = 3;
+  string requester_secret = 4;
+  // Digest of a separate, securely persisted, client-generated 256-bit key.
+  string auth_key_digest = 5;
+  string device_name = 6;
+  DeviceKind device_kind = 7;
+  string platform = 8;
+  string entry_id = 9;
+  string invitation_code = 10;
+  bool knock = 11;
+}
+message RequestDeviceAuthorizationResponse { DeviceAuthorization authorization = 1; }
+message GetDeviceAuthorizationRequest {
+  string invitation_id = 1;
+  string request_id = 2;
+  string requester_secret = 3;
+}
+message GetDeviceAuthorizationResponse { DeviceAuthorization authorization = 1; }
+message ListDeviceAuthorizationsRequest {}
+message ListDeviceAuthorizationsResponse { repeated DeviceAuthorization authorizations = 1; }
+message ResolveDeviceAuthorizationRequest {
+  string invitation_id = 1;
+  // Required to approve/deny one exact request; absent only to cancel an invitation.
+  string request_id = 2;
+  DeviceAuthorizationState decision = 3;
+}
+message ResolveDeviceAuthorizationResponse { DeviceAuthorization authorization = 1; }
+message ClaimDeviceAuthorizationRequest {
+  string invitation_id = 1;
+  string request_id = 2;
+  string requester_secret = 3;
+}
+message ClaimDeviceAuthorizationResponse { DeviceAuthorization authorization = 1; }
+message CancelDeviceAuthorizationRequest {
+  string invitation_id = 1;
+  string request_id = 2;
+  string requester_secret = 3;
+}
+message CancelDeviceAuthorizationResponse { DeviceAuthorization authorization = 1; }

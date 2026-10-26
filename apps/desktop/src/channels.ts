@@ -562,6 +562,8 @@ export function isDesktopDeepLinkSettingsSection(value: unknown): value is Deskt
 }
 
 export type DesktopDeepLinkNavigation =
+  | { readonly kind: 'deviceInvitation'; readonly invitation: string }
+  | { readonly kind: 'deviceApproval'; readonly link: string }
   | {
       readonly kind: "session";
       readonly sessionId: string;

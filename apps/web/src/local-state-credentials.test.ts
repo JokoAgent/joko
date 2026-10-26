@@ -5,8 +5,69 @@ import { LocalState } from "./local-state.js";
 import type { ConnectionProfile } from "./model.js";
 import { webcrypto } from 'node:crypto';
 import { rememberEndpointTransport, trustedEndpointTransport } from '@joko/connection-transport/trust';
+import { initialConnectionEntries, activateConnectionEntry } from '@joko/connection-transport/entries';
 
 afterEach(() => { vi.unstubAllGlobals(); Reflect.deleteProperty(window, 'jokoDesktop'); });
+
+it('reads a managed bootstrap credential only for the current Desktop service identity before a profile is saved', async () => {
+  const connection = { profileId: 'managed-bootstrap', deviceId: 'desktop-device', serverId: 'managed-node',
+    name: 'Local Joko', origin: 'http://127.0.0.1:4318', endpointPublicKey: `ed25519:${'7'.repeat(64)}` };
+  let current: typeof connection | undefined = connection;
+  const read = vi.fn(async () => 'desktop-owned-key');
+  Object.defineProperty(window, 'jokoDesktop', { configurable: true, value: {
+    managedOrchestrator: { getConnection: async () => current }, credentials: { get: read }
+  } });
+  const transaction = vi.fn(() => { throw new Error('No profile has been saved yet.'); });
+  const page = Reflect.construct(LocalState as unknown as Function, [{ transaction }]) as LocalState;
+  const profile: ConnectionProfile = { id: connection.profileId, deviceId: connection.deviceId, serverId: connection.serverId,
+    name: connection.name, origin: connection.origin, endpointPublicKey: connection.endpointPublicKey, managedLocal: true };
+  expect(await page.readAuthKey(profile)).toBe('desktop-owned-key');
+  expect(read).toHaveBeenLastCalledWith(connection.profileId);
+  for (const change of [{ id: 'other-profile' }, { deviceId: 'other-device' }, { serverId: 'other-node' },
+    { origin: 'http://127.0.0.1:9999' }, { origin: 'https://untrusted.example' }, { endpointPublicKey: `ed25519:${'8'.repeat(64)}` },
+    { transportKind: 'webrtc' as const }]) {
+    expect(await page.readAuthKey({ ...profile, ...change })).toBeUndefined();
+  }
+  expect(read).toHaveBeenCalledOnce();
+  current = { ...connection, origin: 'http://127.0.0.1:54321' };
+  expect(await page.readAuthKey(profile)).toBeUndefined();
+  expect(await page.readAuthKey({ ...profile, origin: current.origin })).toBe('desktop-owned-key');
+  current = undefined;
+  expect(await page.readAuthKey(profile)).toBeUndefined();
+  expect(read).toHaveBeenCalledTimes(2);
+  expect(transaction).not.toHaveBeenCalled();
+});
+
+it('reopens prepared entrances privately and releases a credential only within the same node and device owner', async () => {
+  vi.stubGlobal('crypto', webcrypto); vi.stubGlobal('isSecureContext', true);
+  const stores = new Map<string, Map<IDBValidKey, unknown>>();
+  const database = { transaction: () => {
+    const transaction = { oncomplete: null as (() => void) | null, objectStore: (name: string) => {
+      let records = stores.get(name); if (!records) { records = new Map(); stores.set(name, records); }
+      return { get: (id: IDBValidKey) => { const request = { result: records!.get(id), onsuccess: null as (() => void) | null };
+        queueMicrotask(() => request.onsuccess?.()); return request; },
+      put: (value: unknown, id: IDBValidKey) => records!.set(id, value), delete: (id: IDBValidKey) => records!.delete(id) };
+    } }; setTimeout(() => transaction.oncomplete?.(), 0); return transaction;
+  } } as unknown as IDBDatabase;
+  const profile: ConnectionProfile = { id: 'one-node', serverId: 'node', deviceId: 'device', name: 'Node', origin: 'https://home.example', endpointPublicKey: `ed25519:${'a'.repeat(64)}` };
+  const owner = { ...profile, profileId: profile.id, endpointPublicKey: profile.endpointPublicKey! };
+  const initial = initialConnectionEntries(owner, profile);
+  const saved = { ...initial, backupIds: ['private'], entries: [...initial.entries, { id: 'private', provider: 'tailcat', name: 'Private entrance', kind: 'tailcat' as const,
+    origin: 'https://away.example', published: true, prepared: true,
+    transport: { kind: 'tailcat' as const, address: 'tc-private-locator', endpointId: `nodekey:${'b'.repeat(64)}`, port: 4318 } }] };
+  const page = Reflect.construct(LocalState as unknown as Function, [database]) as LocalState;
+  await page.saveProfile(profile, 'original-device-credential'); await page.writeConnectionEntries(profile, saved);
+  expect(JSON.stringify([...stores].map(([name, records]) => [name, [...records]]))).not.toContain('tc-private-locator');
+  const reopened = Reflect.construct(LocalState as unknown as Function, [database]) as LocalState;
+  expect(await reopened.readConnectionEntries(profile)).toEqual(saved);
+  activateConnectionEntry(owner, saved.entries[1]!);
+  expect(await reopened.readAuthKey({ ...profile, origin: 'https://away.example', transportKind: 'tailcat' })).toBe('original-device-credential');
+  await expect(reopened.readAuthKey({ ...profile, origin: 'https://uninvited.example' })).resolves.toBeUndefined();
+  await expect(reopened.readAuthKey({ ...profile, deviceId: 'other-device' })).resolves.toBeUndefined();
+  await expect(reopened.readConnectionEntries({ ...profile, endpointPublicKey: `ed25519:${'c'.repeat(64)}` })).rejects.toThrow();
+  await reopened.deleteAuthKey(profile.id);
+  expect(await reopened.readConnectionEntries(profile)).toBeUndefined();
+});
 
 it('retains an unknown private relay operation across page restarts without persisting lease secrets', async () => {
   const records = new Map<string, unknown>();
@@ -80,7 +141,10 @@ describe("credentials in a restricted LAN HTTP Web page", () => {
         objectStore: (name: string) => {
           const records = stores.get(name);
           if (!records) throw new Error(`Unexpected credential store: ${name}`);
-          return { put: (value: unknown, key: IDBValidKey) => records.set(key, value), delete: (key: IDBValidKey) => records.delete(key) };
+          return { get: (key: IDBValidKey) => {
+            const request = { result: records.get(key), onsuccess: null as (() => void) | null };
+            queueMicrotask(() => request.onsuccess?.()); return request;
+          }, put: (value: unknown, key: IDBValidKey) => records.set(key, value), delete: (key: IDBValidKey) => records.delete(key) };
         }
       };
       setTimeout(() => transaction.oncomplete?.(), 0);

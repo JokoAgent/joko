@@ -1,7 +1,10 @@
 import type { PairedCredential } from "./network";
+import { parseSavedConnectionEntries, type SavedConnectionEntries } from '@joko/connection-transport/entries';
+import { parseDeviceAuthorizationDraft, parseDeviceTransportRequestDraft, type DeviceTransportRequestDraft, type DeviceAuthorizationDraft } from '@joko/connection-transport/device-authorization';
 import { normalizeEndpointTransport, rememberEndpointTransport, retainIrohRelayRequest, selectEndpointTransport, trustedEndpointTransport, type EndpointTransportKind, type RetainedIrohRelayRequest } from '@joko/connection-transport/trust';
 
 export interface MobileConnectionProfile {
+  readonly entryId?: string;
   readonly endpointPublicKey?: string;
   readonly transportKind?: EndpointTransportKind;
   readonly profileId: string;
@@ -58,6 +61,12 @@ export interface PendingOperation {
 }
 
 export interface MobileStorage {
+  readConnectionEntries?(profile: MobileConnectionProfile): Promise<SavedConnectionEntries | undefined>;
+  writeConnectionEntries?(profile: MobileConnectionProfile, entries: SavedConnectionEntries): Promise<void>;
+  readDeviceAuthorization?(): Promise<DeviceAuthorizationDraft | undefined>;
+  writeDeviceAuthorization?(draft: DeviceAuthorizationDraft | undefined): Promise<void>;
+  readDeviceTransportRequest?(): Promise<DeviceTransportRequestDraft | undefined>;
+  writeDeviceTransportRequest?(draft: DeviceTransportRequestDraft | undefined): Promise<void>;
   loadConnectionIndex(): Promise<MobileConnectionIndex>;
   loadCredential(profileId: string): Promise<PairedCredential | undefined>;
   /** Reads only the SDK locator, before the anonymous endpoint proof. */
@@ -217,7 +226,7 @@ export function createMobileStorage(
             "The saved credential could not be removed from protected storage."
           );
         }
-        try { await secure.removeItem(`${transportPrefix}${intent.profileId}`); }
+        try { await secure.removeItem(`${transportPrefix}${intent.profileId}`); await secure.removeItem(`joko.mobile.entries.v1.${intent.profileId}`); }
         catch { throw new MobileCredentialStorageError('unavailable', 'The private transport locator could not be removed from protected storage.'); }
         if (intent.kind === "delete-connection") {
           const profiles = await readProfiles();
@@ -253,6 +262,15 @@ export function createMobileStorage(
   };
 
   return {
+    readConnectionEntries: profile => serialized(async () => {
+      const owner = entryOwner(profile); await secureAvailable();
+      const raw = await secure.getItem(`joko.mobile.entries.v1.${profile.profileId}`);
+      return raw === null ? undefined : parseSavedConnectionEntries(JSON.parse(raw), owner);
+    }),
+    writeConnectionEntries: (profile, entries) => serialized(async () => {
+      const owner = entryOwner(profile); await secureAvailable();
+      await secure.setItem(`joko.mobile.entries.v1.${profile.profileId}`, JSON.stringify(parseSavedConnectionEntries(entries, owner)));
+    }),
     loadConnectionIndex: () => serialized(async () => {
       await recoverConnectionMutation();
       const [profiles, automaticProfileId] = await Promise.all([
@@ -305,6 +323,25 @@ export function createMobileStorage(
       rememberEndpointTransport(profile.origin, profile.endpointPublicKey, transport);
     }),
 
+    readDeviceTransportRequest: () => serialized(async () => {
+      await secureAvailable(); const raw = await secure.getItem('joko.device-transport-request-v1');
+      return raw === null ? undefined : parseDeviceTransportRequestDraft(JSON.parse(raw));
+    }),
+    writeDeviceTransportRequest: draft => serialized(async () => {
+      await secureAvailable();
+      if (draft) await secure.setItem('joko.device-transport-request-v1', JSON.stringify(parseDeviceTransportRequestDraft(draft)));
+      else await secure.removeItem('joko.device-transport-request-v1');
+    }),
+    readDeviceAuthorization: () => serialized(async () => {
+      await secureAvailable();
+      const raw = await secure.getItem('joko.device-authorization-request-v1');
+      return raw === null ? undefined : parseDeviceAuthorizationDraft(JSON.parse(raw));
+    }),
+    writeDeviceAuthorization: draft => serialized(async () => {
+      await secureAvailable();
+      if (draft) await secure.setItem('joko.device-authorization-request-v1', JSON.stringify(parseDeviceAuthorizationDraft(draft)));
+      else await secure.removeItem('joko.device-authorization-request-v1');
+    }),
     saveConnection: (credential) => serialized(async () => {
       const profile = profileFromCredential(credential);
       await secureAvailable();
@@ -382,6 +419,7 @@ export function profileFromCredential(credential: PairedCredential): MobileConne
   return readProfile({
     profileId: credential.profileId,
     origin: credential.origin,
+    ...(credential.entryId === undefined ? {} : { entryId: credential.entryId }),
     ...(credential.endpointPublicKey === undefined ? {} : { endpointPublicKey: credential.endpointPublicKey }),
     ...(credential.transportKind === undefined ? {} : { transportKind: credential.transportKind }),
     serverId: credential.serverId,
@@ -431,6 +469,7 @@ function readProfile(value: unknown): MobileConnectionProfile {
   const profile = {
     profileId: text(record.profileId, 128, "connection profile"),
     origin: text(record.origin, 512, "origin"),
+    ...(record.entryId === undefined ? {} : { entryId: text(record.entryId, 128, 'entry identity') }),
     serverId: text(record.serverId, 128, "server identity"),
     connectionId: text(record.connectionId, 128, "connection identity"),
     deviceId: text(record.deviceId, 128, "device identity"),
@@ -453,6 +492,10 @@ function readProfile(value: unknown): MobileConnectionProfile {
 
 function transportOwner(profile: MobileConnectionProfile): string {
   return JSON.stringify([profile.profileId, profile.origin, profile.serverId, profile.endpointPublicKey, profile.transportKind]);
+}
+function entryOwner(profile: MobileConnectionProfile) {
+  if (!profile.endpointPublicKey) throw new Error('Multiple entrances require the full saved node key.');
+  return { profileId: profile.profileId, deviceId: profile.deviceId, serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey };
 }
 
 function readCredentialValue(value: unknown): PairedCredential {

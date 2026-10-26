@@ -116,7 +116,8 @@ export async function startManagedProviderConnector(application: OrchestratorApp
     });
     throw error;
   }
-  unpublish = registerManagedLinkspanOrigin(store, journalKey, requestId, connector.publicOrigin);
+  unpublish = registerManagedLinkspanOrigin(store, journalKey, requestId, connector.publicOrigin,
+    { id: `linkspan:${entry.id}`, provider: config.provider, ...(endpointTransport ? { transport: endpointTransport } : {}) });
   void connector.closed.then(markClosed).catch(() => {
     unpublish();
     process.stderr.write("A public entrance cleanup is unconfirmed; its original operation is retained.\n");

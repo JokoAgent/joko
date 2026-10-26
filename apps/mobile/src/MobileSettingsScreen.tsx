@@ -26,6 +26,7 @@ import {
 import { mobileMessage, type MobileMessageKey } from "./mobile-messages";
 import { validMobileDeviceName } from "./mobile-device-name";
 import { MobileDevicePairingInvitation } from "./MobileDevicePairingInvitation";
+import { MobileDeviceAuthorizationSettings } from './MobileDeviceAuthorizationSettings';
 import { MobileVoiceDictionaryScreen } from "./MobileVoiceDictionaryScreen";
 import { MobileVoiceDictionaryReadOnlyScreen } from "./MobileVoiceDictionaryReadOnlyScreen";
 import type { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
@@ -53,7 +54,7 @@ export interface MobileSettingsColors {
 }
 
 export type MobileSettingsClient = Pick<MobileClient,
-  "renameCurrentDevice" | "resetCurrentDevice" | "reconcile" | "dismissUnconfirmed"> & Partial<Pick<MobileClient, "authorizeNewDevice" | "cancelDevicePairing">>;
+  "renameCurrentDevice" | "resetCurrentDevice" | "reconcile" | "dismissUnconfirmed"> & Partial<Pick<MobileClient, "authorizeNewDevice" | "cancelDevicePairing" | 'deviceAuthorizationOwner'>>;
 
 export interface MobileSettingsScreenProps {
   readonly colors: MobileSettingsColors;
@@ -434,6 +435,8 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     {!online && current && <Notice colors={colors} text={foreground
       ? t("settings.identityReconnect")
       : t("settings.identityBackground")} />}
+    {current && online && client.deviceAuthorizationOwner && <MobileDeviceAuthorizationSettings key={current.ownerKey}
+      getApi={() => client.deviceAuthorizationOwner!()} colors={colors} locale={locale.effectiveLocale} route={current.profile} node={`${current.profile.displayName} · ${current.profile.origin}`} />}
     {current && client.authorizeNewDevice && client.cancelDevicePairing && <MobileDevicePairingInvitation
       client={{ authorizeNewDevice: client.authorizeNewDevice.bind(client), cancelDevicePairing: client.cancelDevicePairing.bind(client) }}
       owner={current.ownerKey} colors={colors} locale={locale.effectiveLocale} iroh={current.profile.transportKind === 'iroh'} />}

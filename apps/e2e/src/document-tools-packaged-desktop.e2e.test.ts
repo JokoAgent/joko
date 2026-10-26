@@ -307,6 +307,7 @@ tr:nth-child(even) td { background: #fafafa; }
   await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
   console.info("Packaged documents: connection page visible.");
   await page.locator(".connection-tabs > button").nth(2).click();
+  await page.locator('details.device-authorization__manual > summary').click();
   await page.locator('form.pair-form input[type="url"]').fill(fixture.baseUrl);
   await page.locator('form.pair-form input[autocomplete="one-time-code"]')
     .fill(fixture.pairingCode(challenge.challenge.challengeId));

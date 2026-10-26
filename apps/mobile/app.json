@@ -77,6 +77,7 @@
         "android": { "enabled": false }
       }],
       "expo-secure-store",
+      ["expo-camera", { "cameraPermission": "Allow Joko to scan a device invitation or take a photo when you choose to use the camera.", "recordAudioAndroid": false }],
       ["expo-audio", {
         "microphonePermission": "Allow Joko to use your microphone only while you are recording voice input for a task.",
         "recordAudioAndroid": true,
@@ -86,7 +87,7 @@
       "./with-joko-remote-desktop-presentation.cjs",
       ["expo-image-picker", {
         "photosPermission": false,
-        "cameraPermission": "Allow Joko to use your camera only when you choose Take photo for a task attachment.",
+        "cameraPermission": "Allow Joko to scan a device invitation or take a photo when you choose to use the camera.",
         "microphonePermission": "Allow Joko to use your microphone only while you are recording voice input for a task."
       }],
       ["expo-media-library", {

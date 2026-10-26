@@ -71,6 +71,7 @@ type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
   | "browserSettings" | "browserState" | "voiceInput" | "diagnosticsBundles">;
 
 export interface FixtureOptions {
+  readonly tls?: OrchestratorConfig['tls'];
   readonly taskSharing?: boolean;
   readonly collaborationGoals?: boolean;
   readonly serverId?: string;
@@ -226,7 +227,7 @@ export class OrchestratorE2eFixture {
 
   static async start(options: FixtureOptions = {}): Promise<OrchestratorE2eFixture> {
     if (options.webRtc && options.httpConnect) throw new Error("Select one fixture transport.");
-    const publicPort = options.publicPort ?? (options.taskSharing ? await freeFixturePort() : 0);
+    const publicPort = options.publicPort ?? (options.taskSharing || options.tls ? await freeFixturePort() : 0);
     if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535) throw new Error("Invalid fixture public port.");
     const ownsRoot = options.rootDirectory === undefined;
     const requestedRoot = options.rootDirectory ?? await mkdtemp(join(tmpdir(), "joko-e2e-"));
@@ -390,7 +391,8 @@ export class OrchestratorE2eFixture {
       host: "127.0.0.1",
       port: 0,
       internalPort: 4317,
-      publicOrigin: options.taskSharing ? `http://127.0.0.1:${publicPort}` : "http://127.0.0.1",
+      publicOrigin: options.tls ? `https://127.0.0.1:${publicPort}` : options.taskSharing ? `http://127.0.0.1:${publicPort}` : "http://127.0.0.1",
+      ...(options.tls ? { tls: options.tls } : {}),
       internalOrigin: "http://127.0.0.1:4317",
       dataDirectory,
       databasePath,
@@ -572,8 +574,8 @@ export class OrchestratorE2eFixture {
     await server.listen({ host: "127.0.0.1", port: publicPort });
     const address = server.server.address();
     if (address === null || typeof address === "string") throw new Error("Fastify did not expose an ephemeral TCP port.");
-    const baseUrl = `http://127.0.0.1:${address.port}`;
-    const secureServer = options.webRtc || options.httpConnect ? await createPublicServer(application, { secureBridge: true }) : undefined;
+    const baseUrl = `${options.tls ? 'https' : 'http'}://127.0.0.1:${address.port}`;
+    const secureServer = options.tls || options.webRtc || options.httpConnect ? await createPublicServer(application, { secureBridge: true }) : undefined;
     const webRtcRequests = { count: 0, responses: [] as { path: string; status: number }[] };
     secureServer?.addHook('onRequest', async request => { if (request.url === '/_linkspan/webrtc') webRtcRequests.count++; });
     secureServer?.addHook('onResponse', async (request, reply) => {

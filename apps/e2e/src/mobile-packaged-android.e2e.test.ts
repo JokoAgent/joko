@@ -267,6 +267,9 @@ async function runNativeScenario(): Promise<void> {
     await launch();
     try {
       await tap("Add Joko node");
+      await tap("Manual configuration", true);
+      await scrollToNode(node => node.enabled && (node.text === "Joko node address"
+        || node.contentDescription === "Joko node address"), "the expanded manual node address");
       await waitForInitialNodeAddress(() => mobileChallengeId === undefined);
     } catch (error) {
       // This block precedes every address, pin and pairing action. Capture only
@@ -679,9 +682,19 @@ async function waitNode(predicate: (node: AndroidUiNode) => boolean, label: stri
 
 async function scrollToNode(predicate: (node: AndroidUiNode) => boolean, label: string): Promise<AndroidUiNode> {
   for (let attempt = 0; attempt < 7; attempt += 1) {
-    const node = (await nodes()).find(predicate);
+    const items = await nodes();
+    const node = items.find(entry => entry.bounds.x2 > entry.bounds.x1 && entry.bounds.y2 > entry.bounds.y1 && predicate(entry));
     if (node) return node;
-    await interaction("swipe", () => adb("shell", "input", "swipe", "540", "1850", "540", "800", "300"));
+    const viewport = items.filter(entry => entry.scrollable && entry.enabled
+      && entry.bounds.x2 > entry.bounds.x1 && entry.bounds.y2 > entry.bounds.y1)
+      .sort((left, right) => (right.bounds.x2 - right.bounds.x1) * (right.bounds.y2 - right.bounds.y1)
+        - (left.bounds.x2 - left.bounds.x1) * (left.bounds.y2 - left.bounds.y1))[0];
+    if (!viewport) break;
+    const x = Math.round((viewport.bounds.x1 + viewport.bounds.x2) / 2);
+    const inset = Math.max(1, Math.round((viewport.bounds.y2 - viewport.bounds.y1) * 0.15));
+    // Stay inside the observed app viewport: a bottom-edge swipe invokes Home.
+    await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(viewport.bounds.y2 - inset),
+      String(x), String(viewport.bounds.y1 + inset), "300"));
   }
   return waitNode(predicate, label);
 }

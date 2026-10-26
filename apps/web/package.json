@@ -18,6 +18,7 @@
     "preview": "vite preview --host 127.0.0.1 --port 4320"
   },
   "dependencies": {
+    "qrcode-generator": "2.0.4",
     "@jokoagent/linkspan-core": "*",
     "@jokoagent/linkspan-noise": "*",
     "@jokoagent/linkspan-iroh": "*",

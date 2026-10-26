@@ -296,6 +296,7 @@ final class JokoConnectionUITests: XCTestCase {
         XCTAssertTrue(connectionPage.staticTexts["Nearby Joko nodes"].firstMatch.waitForExistence(timeout: 10))
         screenshot("03-nearby")
         tap(tab("Add Joko node"), atCenter: true)
+        tap(connectionPage.buttons["Manual configuration"].firstMatch, atCenter: true)
         let address = connectionPage.textFields["Joko node address"].firstMatch
         let addressExists = address.waitForExistence(timeout: 10)
         if !addressExists { try? recordPreInputSetupFailure(launchArguments: ownedLaunchArguments, stage: "pre-input-address") }

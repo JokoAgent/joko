@@ -3,6 +3,7 @@ import { startQuickTunnel } from "@jokoagent/linkspan-cloudflare";
 import type { OperationalStore } from "@joko/store";
 import type { OrchestratorApplication } from "./application.js";
 import { captureLinkspanProcessIdentity, linkspanProcessIsRetired } from "./linkspan-process-identity.js";
+import { publishConnectionEntry, type PublishedConnectionEntry } from './connection-entries.js';
 
 const JOURNAL = "runtime.linkspan.quick";
 interface ConnectorRecord {
@@ -15,11 +16,12 @@ interface ConnectorRecord {
 const ownedPublicOrigins = new WeakMap<OperationalStore, { readonly requestId: string; readonly origin: string }>();
 const additionalOrigins = new WeakMap<OperationalStore, Map<string, { readonly requestId: string; readonly origin: string }>>();
 
-export function registerManagedLinkspanOrigin(store: OperationalStore, journalKey: string, requestId: string, origin: string): () => void {
+export function registerManagedLinkspanOrigin(store: OperationalStore, journalKey: string, requestId: string, origin: string, entry?: Omit<PublishedConnectionEntry, 'origin'>): () => void {
   let owned = additionalOrigins.get(store);
   if (owned === undefined) { owned = new Map(); additionalOrigins.set(store, owned); }
   owned.set(journalKey, { requestId, origin });
-  return () => { if (owned!.get(journalKey)?.requestId === requestId) owned!.delete(journalKey); };
+  const retire = entry ? publishConnectionEntry(store, { ...entry, origin }) : () => undefined;
+  return () => { retire(); if (owned!.get(journalKey)?.requestId === requestId) owned!.delete(journalKey); };
 }
 /** A restored active journal alone never proves that this runtime owns a live entrance. */
 export function advertisedLinkspanOrigin(store: OperationalStore, fallback: string): string {
@@ -84,7 +86,9 @@ export async function startManagedLinkspanConnector(application: OrchestratorApp
   }
   const identity = captureLinkspanProcessIdentity(tunnel.processId);
   journal = { requestId, processId: tunnel.processId, ...(identity === undefined ? {} : { processIdentity: identity }), state: "active", publicOrigin: tunnel.publicOrigin };
+  let retireEntry: (() => void) | undefined;
   const unpublish = (): void => {
+    retireEntry?.();
     if (ownedPublicOrigins.get(store)?.requestId === requestId) ownedPublicOrigins.delete(store);
   };
   const markClosed = (): void => {
@@ -119,6 +123,7 @@ export async function startManagedLinkspanConnector(application: OrchestratorApp
     throw receiptError;
   }
   ownedPublicOrigins.set(store, { requestId, origin: tunnel.publicOrigin });
+  retireEntry = publishConnectionEntry(store, { id: 'quick:cloudflare', provider: 'cloudflare', origin: tunnel.publicOrigin });
   void tunnel.closed.then(markClosed).catch(() => {
     unpublish();
     process.stderr.write("The public connector cleanup is unconfirmed or its receipt could not be saved.\n");

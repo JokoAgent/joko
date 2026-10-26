@@ -22,6 +22,7 @@ export interface ConnectionProfile {
   readonly serverId: string;
   readonly name: string;
   readonly origin: string;
+  readonly entryId?: string;
   /** Full endpoint key received through a trusted local/bootstrap/invitation channel. */
   readonly endpointPublicKey?: string;
   /** Backend selection only; private SDK locators stay in protected storage. */

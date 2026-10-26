@@ -501,6 +501,7 @@ export interface NearbyMobileNode extends DiscoveredNodeRecord {
 }
 
 export interface MobileState {
+  readonly connectionEntries?: { readonly profileId: string; readonly entries: readonly import('@joko/connection-transport/entries').ConnectionEntryView[]; readonly returnToPreferred: boolean; readonly notice?: string };
   readonly status: "starting" | "unpaired" | "connecting" | "connected" | "offline" | "revoked";
   readonly busy: boolean;
   readonly node?: NodeIdentity;
@@ -838,7 +839,94 @@ function confirmedMobileDeviceName(operation: Operation, deviceId: string, conne
   return confirmed;
 }
 
+import { DeviceAuthorizationReceiver, parseDeviceInvitation, bindDeviceInvitationTransport, type DeviceAuthorizationPort, type DeviceAuthorizationOwner } from '@joko/connection-transport/device-authorization';
+
 export class MobileClient {
+  #entryAttempt?: AbortController;
+  #entryLastSwitch = 0;
+  #entryStableSince = 0;
+  #entryRefreshAt = 0;
+  #entriesBusy = false;
+  #entryChanges: Promise<unknown> = Promise.resolve();
+  #changeEntries<T>(action: () => Promise<T>): Promise<T> {
+    const result = this.#entryChanges.then(action, action); this.#entryChanges = result.catch(() => undefined); return result;
+  }
+  connectionEntrySupported: (kind: import('@joko/connection-transport/trust').EndpointTransportKind) => boolean = kind => kind === 'https';
+  connectionEntryIrohMode: 'native' | 'relay' = 'relay';
+  #authorizationReceiverValue?: DeviceAuthorizationReceiver;
+  #authorizationReceiver(): DeviceAuthorizationReceiver {
+    if (!this.storage.readDeviceAuthorization || !this.storage.writeDeviceAuthorization || !this.network.deviceAuthorizationTransport) throw new Error('Device approval is unavailable in this build.');
+    return this.#authorizationReceiverValue ??= new DeviceAuthorizationReceiver({ read: () => this.storage.readDeviceAuthorization!(), write: draft => this.storage.writeDeviceAuthorization!(draft),
+      readTransportRequest: () => this.storage.readDeviceTransportRequest!(), writeTransportRequest: draft => this.storage.writeDeviceTransportRequest!(draft) },
+      { uuid: this.newId, secret: () => bytesToHex(globalThis.crypto.getRandomValues(new Uint8Array(32))),
+        digest: async value => bytesToHex(sha256(new TextEncoder().encode(value))) }, invitation => this.network.deviceAuthorizationTransport!(invitation));
+  }
+  deviceAuthorizationOwner(): DeviceAuthorizationOwner {
+    const credential = this.#ready(), abort = this.#abort;
+    if (!this.network.deviceAuthorizationOwner) throw new Error('Device approval is unavailable in this build.');
+    return this.network.deviceAuthorizationOwner(credential, () => {
+      if (this.#credential !== credential || this.#abort !== abort || this.#disposed) throw new Error('The original node connection changed.');
+      abort?.signal.throwIfAborted();
+    });
+  }
+  get deviceAuthorization(): DeviceAuthorizationPort {
+    return {
+      transportRequest: (kind, signal) => this.#authorizationReceiver().transportRequest(kind, signal, this.connectionEntryIrohMode),
+      pendingTransportRequest: signal => this.#authorizationReceiver().pendingTransportRequest(signal),
+      cancelTransportRequest: (requestId, signal) => this.#authorizationReceiver().cancelTransportRequest(requestId, signal),
+      resolveTarget: (link, code, signal) => this.#authorizationReceiver().resolveTarget(link, code, signal),
+      entries: async (link, signal) => (await this.#authorizationReceiver().entries(link, signal)).filter(entry => this.connectionEntrySupported(entry.kind)),
+      start: (link, name, signal, entryId) => {
+        const invitation = parseDeviceInvitation(link);
+        if (this.#profiles.some(profile => (profile.origin === invitation.origin || profile.serverId === invitation.serverId)
+          && profile.endpointPublicKey !== undefined && profile.endpointPublicKey !== invitation.endpointPublicKey)) throw new Error('The invitation conflicts with a saved node identity.');
+        return this.#authorizationReceiver().start(link, name, DeviceKind.MOBILE, this.platform, signal, entryId);
+      },
+      refresh: signal => this.#authorizationReceiver().refresh(signal),
+      cancel: signal => this.#authorizationReceiver().cancel(signal),
+      discard: allowUnconfirmed => this.#authorizationReceiver().discard(allowUnconfirmed),
+      finish: async (signal, automatic) => {
+        const { generation, controller } = this.#beginConnectionAttempt();
+        const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+        try {
+          const { draft, authorization } = await this.#authorizationReceiver().claim(combined);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          const connection = authorization.connection!;
+          const credential: PairedCredential = { profileId: connection.connectionProfileId, connectionId: connection.connectionId,
+            deviceId: connection.deviceId, origin: draft.invitation.origin, serverId: draft.invitation.serverId,
+            endpointPublicKey: draft.invitation.endpointPublicKey, transportKind: draft.endpointTransport?.kind ?? 'https', displayName: connection.displayName, authKey: draft.authKey };
+          const node = await this.network.inspect(credential.origin, combined);
+          const owner = await this.network.readOwner(credential, this.deviceNameSource(), combined);
+          this.#assertOwner(credential, owner, node);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          combined.throwIfAborted();
+          await this.storage.saveConnection(credential);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          combined.throwIfAborted();
+          this.#profiles = upsertProfile(this.#profiles, profileFromCredential(credential));
+          if (automatic !== undefined) {
+            await this.storage.saveAutomaticProfile(automatic ? credential.profileId : undefined);
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            combined.throwIfAborted();
+            this.#automaticProfileId = automatic ? credential.profileId : undefined;
+          }
+          if (draft.entryId) {
+            if (!this.storage.readConnectionEntries || !this.storage.writeConnectionEntries) throw new Error('Protected entrance storage is unavailable.');
+            const api = await import('@joko/connection-transport/entries'), profile = profileFromCredential(credential);
+            const entryOwner = { profileId: profile.profileId, deviceId: profile.deviceId, serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey! };
+            const saved = await this.storage.readConnectionEntries(profile) ?? api.initialConnectionEntries(entryOwner, profile);
+            const active = api.activeConnectionEntry(saved, profile);
+            if (!active) throw new Error('The invitation entrance is unavailable.');
+            const selected = await api.prepareSelectedConnectionEntry(entryOwner, saved, draft.entryId, active, credential.authKey,
+              { read: () => this.storage.readConnectionEntries!(profile), write: async value => { combined.throwIfAborted(); await this.storage.writeConnectionEntries!(profile, value); } },
+              this.connectionEntrySupported, combined, { uuid: this.newId, irohMode: this.connectionEntryIrohMode });
+            await this.connectSaved(profile.profileId, automatic, selected.entryId);
+          } else await this.#adoptConnection(generation, controller, credential, node, owner);
+          if (this.#credential?.connectionId === credential.connectionId) await this.#authorizationReceiver().clear(draft.requestId);
+        } catch (error) { this.#failConnectionAttempt(generation, controller, message(error)); throw error; }
+      }
+    };
+  }
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
     historyBusy: false, historyEnd: false, pending: [], homeSearchQuery: "", homeSearchFilter: "active",
@@ -3603,6 +3691,7 @@ export class MobileClient {
   }
 
   #retire(): number {
+    this.#entryAttempt?.abort();
     this.#partnerGroupAttachments = undefined;
     const partnerPrivate = this.#state.partnerPrivate;
     const credentialKey = this.#partnerPrivateCredentialKey(this.#credential);
@@ -4242,18 +4331,34 @@ export class MobileClient {
 
   async setProfileIrohMode(profileId: string, mode: 'native' | 'relay'): Promise<void> {
     if (mode !== 'native' && mode !== 'relay') throw new Error('Select a supported local iroh connection mode.');
-    if (this.#mutationOwner || this.#connectionAttemptAbort || this.#state.busy) throw new Error('Finish the current operation before changing this connection path.');
+    if (this.#mutationOwner || this.#connectionAttemptAbort || this.#entryAttempt || this.#state.busy) throw new Error('Finish the current operation before changing this connection path.');
     const profile = this.#profiles.find(value => value.profileId === profileId);
     if (profile?.transportKind !== 'iroh' || profile.endpointPublicKey === undefined || this.storage.loadEndpointTransport === undefined || this.storage.saveEndpointTransport === undefined) throw new Error('The original protected iroh connection is unavailable.');
     const { rememberEndpointTransport, trustedEndpointTransport } = await import('@joko/connection-transport/trust');
     this.#set({ busy: true });
     try {
-      await this.storage.loadEndpointTransport(profile);
-      const previous = trustedEndpointTransport(profile.origin, profile.endpointPublicKey, 'iroh');
-      if (previous?.kind !== 'iroh') throw new Error('The original private iroh locator is unavailable.');
-      rememberEndpointTransport(profile.origin, profile.endpointPublicKey, { ...previous, mobileMode: mode });
-      try { await this.storage.saveEndpointTransport(profile); }
-      catch (error) { rememberEndpointTransport(profile.origin, profile.endpointPublicKey, previous); throw error; }
+      await this.#changeEntries(async () => {
+        const epoch = this.#epoch, key = profile.endpointPublicKey!;
+        const current = () => { if (!this.#current(epoch) || this.#profiles.find(value => value.profileId === profileId) !== profile) throw new Error('The original node connection changed.'); };
+        const entries = await this.storage.readConnectionEntries?.(profile);
+        const { activeConnectionEntry } = await import('@joko/connection-transport/entries');
+        const entry = entries && activeConnectionEntry(entries, profile);
+        if (!entries) await this.storage.loadEndpointTransport!(profile);
+        const previous = entries ? entry?.transport : trustedEndpointTransport(profile.origin, key, 'iroh');
+        current();
+        if (previous?.kind !== 'iroh') throw new Error('The original private iroh locator is unavailable.');
+        if (entries && entry) {
+          if (!this.storage.writeConnectionEntries) throw new Error('Protected entrance storage is unavailable.');
+          await this.storage.writeConnectionEntries(profile, { ...entries, entries: entries.entries.map(value => value.id === entry.id
+            ? { ...value, irohMode: mode, transport: { ...previous, mobileMode: mode } } : value) });
+          current();
+          rememberEndpointTransport(profile.origin, key, { ...previous, mobileMode: mode });
+        } else {
+          rememberEndpointTransport(profile.origin, key, { ...previous, mobileMode: mode });
+          try { await this.storage.saveEndpointTransport!(profile); }
+          catch (error) { rememberEndpointTransport(profile.origin, key, previous); throw error; }
+        }
+      });
     } finally { this.#set({ busy: false }); }
     if (this.#activeProfileId === profileId && this.#credential) await this.refresh();
   }
@@ -4330,6 +4435,22 @@ export class MobileClient {
     }
     if (trustedEndpointPublicKey(origin) !== challenge.endpointPublicKey
       || challenge.endpointPublicKey !== undefined && trustedEndpointTransportKind(origin, challenge.endpointPublicKey) !== (challenge.transportKind ?? 'https')) throw new Error('The pairing connection path changed. Request pairing again on the original trusted node.');
+    const existing = challenge.endpointPublicKey ? this.#profiles.find(profile => profile.serverId === this.#state.candidate?.node.serverId && profile.endpointPublicKey === challenge.endpointPublicKey) : undefined;
+    if (existing?.endpointPublicKey && this.storage.readConnectionEntries && this.storage.writeConnectionEntries) {
+      const api = await import('@joko/connection-transport/entries'), { trustedEndpointTransport } = await import('@joko/connection-transport/trust');
+      const epoch = this.#epoch, owner = { profileId: existing.profileId, deviceId: existing.deviceId, serverId: existing.serverId, endpointPublicKey: existing.endpointPublicKey };
+      const endpointTransport = trustedEndpointTransport(origin, existing.endpointPublicKey, challenge.transportKind);
+      const entryId = await this.#changeEntries(async () => {
+        let saved = await this.storage.readConnectionEntries!(existing);
+        if (!saved) { await this.storage.loadEndpointTransport?.(existing); saved = api.initialConnectionEntries(owner, existing); }
+        const next = api.acceptInvitedConnectionEntry(owner, saved, { origin, serverId: existing.serverId, endpointPublicKey: existing.endpointPublicKey!,
+          transportKind: challenge.transportKind, endpointTransport }, this.newId());
+        if (!this.#current(epoch) || this.#state.challenge !== challenge) throw new Error('The selected node changed.');
+        await this.storage.writeConnectionEntries!(existing, next.saved); return next.entryId;
+      });
+      if (!this.#current(epoch) || this.#state.challenge !== challenge) return;
+      this.cancel(); await this.connectSaved(existing.profileId, automatic, entryId); return;
+    }
     const { generation, controller } = this.#beginConnectionAttempt();
     try {
       const result = await this.network.completePairing(origin, challenge.id, code, deviceName, this.platform, this.deviceNameSource(), controller.signal);
@@ -4366,6 +4487,7 @@ export class MobileClient {
   }
 
   cancel(cancelPendingPairing = true): void {
+    this.#entryAttempt?.abort();
     const challenge = this.#state.challenge;
     if (cancelPendingPairing && challenge !== undefined && this.network.cancelPairing) {
       void this.network.cancelPairing(challenge.origin, challenge.id, undefined, challenge.endpointPublicKey, challenge.transportKind ?? 'https').catch(error => this.#set({ connectionAttemptError: message(error) }));
@@ -4385,17 +4507,186 @@ export class MobileClient {
     });
   }
 
-  async connectSaved(profileId: string, automatic?: boolean): Promise<void> {
-    const profile = this.#profiles.find((candidate) => candidate.profileId === profileId);
+  async refreshConnectionEntries(profileId: string): Promise<void> {
+    return this.#changeEntries(() => this.#refreshConnectionEntries(profileId));
+  }
+  async connectSavedInvitation(link: string, automatic?: boolean, selectedEntryId?: string): Promise<void> {
+    this.#entryAttempt?.abort();
+    const attempt = new AbortController(); this.#entryAttempt = attempt;
+    const epoch = this.#epoch, signal = AbortSignal.any([attempt.signal, AbortSignal.timeout(30_000)]);
+    const current = () => { signal.throwIfAborted(); if (!this.#current(epoch) || !this.#foreground) throw new Error('The selected node changed.'); };
+    try { return await this.#changeEntries(async () => {
+      current();
+      const invitation = parseDeviceInvitation(link);
+      const profile = this.#profiles.find(p => p.serverId === invitation.serverId && p.endpointPublicKey === invitation.endpointPublicKey);
+      if (!profile?.endpointPublicKey || invitation.expiresAt <= this.now() || !this.storage.readConnectionEntries || !this.storage.writeConnectionEntries) throw new Error('This invitation does not match a saved, verified node.');
+      const api = await import('@joko/connection-transport/entries');
+      const owner = { profileId: profile.profileId, deviceId: profile.deviceId, serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey };
+      let saved = await this.storage.readConnectionEntries(profile);
+      if (!saved) { await this.storage.loadEndpointTransport?.(profile); saved = api.initialConnectionEntries(owner, profile); }
+      const next = api.acceptInvitedConnectionEntry(owner, saved, { ...invitation, transportKind: invitation.endpointTransport?.kind,
+        endpointTransport: bindDeviceInvitationTransport(invitation, invitation.transportRequestId ? await this.storage.readDeviceTransportRequest?.() : undefined) }, this.newId());
+      current();
+      await this.storage.writeConnectionEntries(profile, next.saved);
+      let entryId = next.entryId;
+      if (selectedEntryId) {
+        const bootstrap = await api.resolvePreparedConnection(owner, next.saved, async () => {
+          const credential = await this.storage.loadCredential(profile.profileId);
+          if (!credential || !credentialMatchesProfile(credential, profile)) throw new CredentialIdentityError();
+          return credential.authKey;
+        }, this.connectionEntrySupported, signal, entryId);
+        entryId = (await api.prepareSelectedConnectionEntry(owner, bootstrap.saved, selectedEntryId, bootstrap.entry, bootstrap.authKey,
+          { read: () => this.storage.readConnectionEntries!(profile), write: async value => { current(); await this.storage.writeConnectionEntries!(profile, value); current(); } },
+          this.connectionEntrySupported, signal, { uuid: this.newId, irohMode: this.connectionEntryIrohMode })).entryId;
+      }
+      current(); await this.#connectSaved(profile.profileId, automatic, entryId, false, attempt);
+    }); } finally { if (this.#entryAttempt === attempt) this.#entryAttempt = undefined; }
+  }
+  async #refreshConnectionEntries(profileId: string): Promise<void> {
+    const profile = this.#profiles.find(p => p.profileId === profileId);
+    if (!profile?.endpointPublicKey || !this.storage.readConnectionEntries || !this.storage.writeConnectionEntries) return;
+    const api = await import('@joko/connection-transport/entries'), epoch = this.#epoch;
+    const owner = { profileId, deviceId: profile.deviceId, serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey };
+    let saved = await this.storage.readConnectionEntries(profile);
+    if (!saved) { await this.storage.loadEndpointTransport?.(profile); saved = api.initialConnectionEntries(owner, profile); }
+    const credential = this.#credential;
+    if (credential?.profileId === profileId && this.#state.status === 'connected') {
+      const active = api.activeConnectionEntry(saved, credential);
+      if (!active) throw new Error('The current entrance is absent from the saved directory.');
+      const directory = await api.readConnectionEntryDirectory(owner, active, credential.authKey, AbortSignal.timeout(10_000));
+      if (!this.#current(epoch) || this.#credential !== credential) return;
+      saved = api.mergeConnectionEntryDirectory(saved, owner, directory);
+      await this.storage.writeConnectionEntries(profile, saved);
+      for (const id of api.entriesNeedingRenewal(saved, this.connectionEntrySupported, this.now())) {
+        saved = await api.prepareEntryAndSave(owner, saved, id, active, credential.authKey, { read: () => this.storage.readConnectionEntries!(profile), write: async value => {
+          if (!this.#current(epoch) || this.#credential !== credential) throw new Error('The node connection changed.');
+          await this.storage.writeConnectionEntries!(profile, value);
+        } }, AbortSignal.timeout(25_000), { uuid: this.newId, irohMode: this.connectionEntryIrohMode, renew: true });
+      }
+    }
+    if (!this.#current(epoch)) return;
+    this.#entryRefreshAt = this.now();
+    this.#set({ connectionEntries: { profileId, entries: api.connectionEntryViews(saved, credential?.profileId === profileId ? credential : profile, this.connectionEntrySupported),
+      returnToPreferred: saved.returnToPreferred } });
+  }
+
+  async prepareConnectionEntry(profileId: string, entryId: string): Promise<void> {
+    return this.#changeEntries(() => this.#prepareConnectionEntry(profileId, entryId));
+  }
+  async #prepareConnectionEntry(profileId: string, entryId: string): Promise<void> {
+    const credential = this.#credential, profile = this.#profiles.find(p => p.profileId === profileId);
+    if (!credential || credential.profileId !== profileId || !profile?.endpointPublicKey || this.#state.status !== 'connected'
+      || !this.storage.readConnectionEntries || !this.storage.writeConnectionEntries) throw new Error('Connect to this saved node before preparing a backup.');
+    const api = await import('@joko/connection-transport/entries'), epoch = this.#epoch;
+    const saved = await this.storage.readConnectionEntries(profile);
+    const active = saved ? api.activeConnectionEntry(saved, credential) : undefined;
+    const candidate = saved?.entries.find(e => e.id === entryId);
+    if (!saved || !active || !candidate || !this.connectionEntrySupported(candidate.kind)) throw new Error('This entrance is unavailable on this client.');
+    const current = () => { if (!this.#current(epoch) || this.#credential !== credential) throw new Error('The original connection changed.'); };
+    const next = await api.prepareEntryAndSave({ profileId, deviceId: profile.deviceId, serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey },
+      saved, entryId, active, credential.authKey, { read: () => this.storage.readConnectionEntries!(profile),
+        write: async value => { current(); await this.storage.writeConnectionEntries!(profile, value); current(); } }, AbortSignal.timeout(25_000),
+      { uuid: this.newId, irohMode: this.connectionEntryIrohMode });
+    current(); this.#set({ connectionEntries: { profileId, entries: api.connectionEntryViews(next, credential, this.connectionEntrySupported), returnToPreferred: next.returnToPreferred } });
+  }
+  async setConnectionEntryPolicy(profileId: string, backupIds: readonly string[], returnToPreferred: boolean): Promise<void> {
+    this.#entryAttempt?.abort();
+    this.#entryStableSince = 0;
+    return this.#changeEntries(() => this.#setConnectionEntryPolicy(profileId, backupIds, returnToPreferred));
+  }
+  async #setConnectionEntryPolicy(profileId: string, backupIds: readonly string[], returnToPreferred: boolean): Promise<void> {
+    const profile = this.#profiles.find(p => p.profileId === profileId);
+    if (!profile?.endpointPublicKey || !this.storage.readConnectionEntries || !this.storage.writeConnectionEntries) throw new Error('The saved node is unavailable.');
+    const saved = await this.storage.readConnectionEntries(profile);
+    if (!saved || backupIds.some(id => !saved.entries.some(e => e.id === id && e.prepared && this.connectionEntrySupported(e.kind)))) throw new Error('Prepare each backup before allowing it.');
+    const next = { ...saved, backupIds, returnToPreferred };
+    await this.storage.writeConnectionEntries(profile, next);
+    const { connectionEntryViews } = await import('@joko/connection-transport/entries');
+    this.#set({ connectionEntries: { profileId, entries: connectionEntryViews(next, profile, this.connectionEntrySupported), returnToPreferred } });
+  }
+  async #maintainConnectionEntries(): Promise<boolean> {
+    const profile = this.#profiles.find(p => p.profileId === this.#activeProfileId);
+    if (this.#entriesBusy || this.#entryAttempt || !profile?.endpointPublicKey || !this.#foreground || this.#disposed || this.#state.busy || this.#mutationOwner || !this.storage.readConnectionEntries) return false;
+    this.#entriesBusy = true;
+    const epoch = this.#epoch;
+    let probedEntry: import('@joko/connection-transport/entries').SavedConnectionEntry | undefined;
+    try {
+      const saved = await this.storage.readConnectionEntries(profile);
+      if (!saved || !this.#current(epoch)) return false;
+      if (this.#state.status === 'offline') { await this.connectSaved(profile.profileId, undefined, undefined, true); return true; }
+      if (this.#state.status !== 'connected') return false;
+      if (this.now() - this.#entryRefreshAt > 60_000) await this.refreshConnectionEntries(profile.profileId);
+      const { verifyConnectionEntry, activeConnectionEntry, entryReadiness } = await import('@joko/connection-transport/entries');
+      const preferred = saved.entries.find(e => e.id === saved.preferredId);
+      if (!saved.returnToPreferred || !preferred || entryReadiness(preferred, this.connectionEntrySupported, this.now()) !== 'ready'
+        || preferred.id === activeConnectionEntry(saved, profile)?.id || this.now() - this.#entryLastSwitch < 60_000) { this.#entryStableSince = 0; return false; }
+      probedEntry = preferred;
+      await verifyConnectionEntry({ profileId: profile.profileId, deviceId: profile.deviceId, serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey }, preferred, AbortSignal.timeout(6_000));
+      if (!this.#current(epoch)) return false;
+      this.#entryStableSince ||= this.now();
+      if (this.now() - this.#entryStableSince >= 30_000) { await this.connectSaved(profile.profileId, undefined, preferred.id, true); return true; }
+    } catch (error) {
+      this.#entryStableSince = 0;
+      if (this.#current(epoch) && isEndpointTrustError(error)) {
+        try {
+          await this.#changeEntries(async () => {
+            if (!probedEntry || !this.#current(epoch) || this.#entryAttempt || !this.storage.writeConnectionEntries) return;
+            const latest = await this.storage.readConnectionEntries!(profile);
+            if (!latest || !this.#current(epoch) || this.#entryAttempt
+              || !latest.entries.some(entry => JSON.stringify(entry) === JSON.stringify(probedEntry))) return;
+            const next = { ...latest, entries: latest.entries.map(entry => entry.id === probedEntry!.id ? { ...entry, verification: 'identity-conflict' as const } : entry) };
+            await this.storage.writeConnectionEntries(profile, next);
+            if (!this.#current(epoch)) return;
+            const { connectionEntryViews } = await import('@joko/connection-transport/entries');
+            this.#set({ connectionAttemptError: message(error), connectionEntries: { profileId: profile.profileId,
+              entries: connectionEntryViews(next, profile, this.connectionEntrySupported), returnToPreferred: next.returnToPreferred } });
+          });
+        } catch (failure) { if (this.#current(epoch)) this.#set({ connectionAttemptError: message(failure) }); }
+      }
+    } finally { this.#entriesBusy = false; }
+    return false;
+  }
+
+  async connectSaved(profileId: string, automatic?: boolean, entryId?: string, entryRecovery = false): Promise<void> {
+    this.#entryAttempt?.abort();
+    const attempt = new AbortController(); this.#entryAttempt = attempt;
+    const epoch = this.#epoch;
+    try { return await this.#changeEntries(async () => {
+      if (attempt.signal.aborted || !this.#current(epoch)) return;
+      await this.#connectSaved(profileId, automatic, entryId, entryRecovery, attempt);
+    }); } finally { if (this.#entryAttempt === attempt) this.#entryAttempt = undefined; }
+  }
+  async #connectSaved(profileId: string, automatic: boolean | undefined, entryId: string | undefined, entryRecovery: boolean, entryAttempt: AbortController): Promise<void> {
+    if (entryAttempt.signal.aborted || !this.#foreground || this.#disposed) return;
+    let profile = this.#profiles.find((candidate) => candidate.profileId === profileId);
     if (!profile) throw new Error("This saved Joko connection is no longer available on this device.");
-    if (this.#activeProfileId === profileId && this.#credential) {
+    if (this.#activeProfileId === profileId && this.#credential && entryId === undefined && !entryRecovery) {
       await this.refresh();
       if (this.#state.status === "connected" && automatic !== undefined) {
         await this.setAutomaticEntryForActive(automatic);
       }
       return;
     }
+    const originalProfile = profile, originalEpoch = this.#epoch;
+    const entryApi = await import('@joko/connection-transport/entries');
+    let savedEntries = profile.endpointPublicKey ? await this.storage.readConnectionEntries?.(profile) : undefined;
+    const entryOwner = profile.endpointPublicKey ? { profileId, serverId: profile.serverId, deviceId: profile.deviceId, endpointPublicKey: profile.endpointPublicKey } : undefined;
+    let savedCredential: PairedCredential | undefined;
+    const resolved = savedEntries && entryOwner ? await entryApi.resolvePreparedConnection(entryOwner, savedEntries, async () => {
+      savedCredential = await this.storage.loadCredential(profileId);
+      if (savedCredential && !credentialMatchesProfile(savedCredential, originalProfile)) throw new CredentialIdentityError();
+      return savedCredential?.authKey;
+    }, this.connectionEntrySupported, entryAttempt.signal, entryId, async next => {
+      entryAttempt.signal.throwIfAborted(); if (!this.#current(originalEpoch)) throw new Error('The node connection changed.');
+      await this.storage.writeConnectionEntries!(originalProfile, next); savedEntries = next;
+    }) : undefined;
+    if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || this.#epoch !== originalEpoch || !this.#foreground || this.#disposed) return;
+    if (resolved && entryOwner) {
+      entryApi.activateConnectionEntry(entryOwner, resolved.entry);
+      profile = { ...profile, entryId: resolved.entry.id, origin: resolved.entry.origin, transportKind: resolved.entry.kind };
+    }
     await this.#releaseQueueEditBeforeTransition();
+    if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || this.#epoch !== originalEpoch || !this.#foreground || this.#disposed) return;
     const preserveActiveConnection = this.#hasActiveConnection();
     const { generation, controller } = this.#beginConnectionAttempt();
     this.#set({
@@ -4404,6 +4695,8 @@ export class MobileClient {
       challenge: undefined,
       saved: this.#savedViews(profileId, "checking")
     });
+    const cancelEntryAttempt = () => controller.abort();
+    entryAttempt.signal.addEventListener('abort', cancelEntryAttempt, { once: true });
     let selection: string | undefined;
     let cached: MobileOfflineCacheSnapshot | undefined;
     let cacheLoadWarning: string | undefined;
@@ -4423,7 +4716,7 @@ export class MobileClient {
         }
       }
       // Public identity proof must precede the protected credential read.
-      await this.storage.loadEndpointTransport?.(profile);
+      if (!resolved) await this.storage.loadEndpointTransport?.(profile);
       rememberEndpointTrust(profile);
       const node = await this.network.inspect(profile.origin, controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
@@ -4443,7 +4736,7 @@ export class MobileClient {
         });
         throw new Error(detail);
       }
-      try { credential = await this.storage.loadCredential(profileId); }
+      try { credential = savedCredential ?? await this.storage.loadCredential(profileId); }
       catch (error) {
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
         const failure = credentialFailure(error);
@@ -4459,7 +4752,7 @@ export class MobileClient {
         }
         throw error;
       }
-      if (!credential || !credentialMatchesProfile(credential, profile)) {
+      if (!credential || !credentialMatchesProfile(credential, originalProfile)) {
         offlineEligible = false;
         this.#dropOfflineProjection(profileId);
         const cleanup = await this.#clearOfflineCache(profileId);
@@ -4473,6 +4766,7 @@ export class MobileClient {
         });
         throw new Error(detail);
       }
+      if (resolved) credential = { ...credential, entryId: profile.entryId, origin: profile.origin, transportKind: profile.transportKind };
       const owner = await this.network.readOwner(credential, this.deviceNameSource(), controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
       this.#assertOwner(credential, owner, node);
@@ -4491,6 +4785,17 @@ export class MobileClient {
         }
       }
       preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
+      if (savedEntries && entryOwner) {
+        const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
+        await this.storage.writeConnectionEntries?.(profile, next);
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        await this.storage.saveConnection(credential);
+        this.#profiles = [...(await this.storage.loadConnectionIndex()).profiles];
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        this.#set({ connectionEntries: { profileId, entries: entryApi.connectionEntryViews(next, profile, this.connectionEntrySupported), returnToPreferred: next.returnToPreferred,
+          ...(resolved?.entry.id !== next.preferredId ? { notice: 'Using a prepared backup. Your preferred entrance has not changed.' } : {}) } });
+      }
+      entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt);
       await this.#adoptConnection(generation, controller, credential, node, owner, selected, detail, preferenceError);
     } catch (error) {
       if (!this.#connectionAttemptCurrent(generation, controller)) {
@@ -4523,7 +4828,7 @@ export class MobileClient {
         });
       }
       throw error;
-    }
+    } finally { entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt); }
   }
 
   async #adoptConnection(
@@ -4545,6 +4850,7 @@ export class MobileClient {
     if (!this.#current(epoch)) return;
     const priorProfileId = this.#activeProfileId;
     this.#credential = credential;
+    this.#entryLastSwitch = this.now(); this.#entryStableSince = 0;
     this.#activeProfileId = credential.profileId;
     this.#lastAuthenticatedAt = this.now();
     if (priorProfileId !== credential.profileId) this.#durableSnapshotAt = undefined;
@@ -4583,6 +4889,7 @@ export class MobileClient {
     await this.reconcile(epoch);
     if (this.#current(epoch) && this.#state.automations.open) await this.refreshAutomations();
     if (this.#current(epoch)) this.#schedule();
+    if (this.#current(epoch) && credential.endpointPublicKey) void this.refreshConnectionEntries(credential.profileId).catch(() => undefined);
   }
 
   #failConnectionAttempt(
@@ -4796,6 +5103,10 @@ export class MobileClient {
   }
 
   async forgetConnection(profileId: string): Promise<void> {
+    this.#entryAttempt?.abort();
+    return this.#changeEntries(() => this.#forgetConnection(profileId));
+  }
+  async #forgetConnection(profileId: string): Promise<void> {
     if (this.#mutationOwner || this.#state.busy) {
       throw new Error("Finish the current operation before forgetting a saved connection.");
     }
@@ -4971,7 +5282,7 @@ export class MobileClient {
     }
     if (active) {
       if (this.#credential) void this.refresh();
-      else if (this.#hasOfflineProjection()) void this.connectSaved(this.#activeProfileId!);
+      else if (this.#hasOfflineProjection()) void this.connectSaved(this.#activeProfileId!).catch(() => undefined);
       else void this.start();
     }
   }
@@ -5258,13 +5569,14 @@ export class MobileClient {
   #schedule(): void {
     if (!this.#foreground || this.#disposed || !this.#credential) return;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
-    this.#timer = setTimeout(() => {
+    this.#timer = setTimeout(() => { void (async () => {
+      if (await this.#maintainConnectionEntries()) { this.#schedule(); return; }
       if (this.#state.busy) this.#schedule();
       else if (this.#state.status === "connected" && this.#credential) {
         if (this.#projectionReading) this.#schedule();
         else void this.#syncProjection(this.#epoch, this.#credential, true);
       } else void this.refresh();
-    }, this.#state.liveStatus === "polling" || this.#state.status === "offline" ? 4_000 : 30_000);
+    })(); }, this.#state.liveStatus === "polling" || this.#state.status === "offline" ? 4_000 : 30_000);
   }
 
   #beginStream(epoch: number, credential: PairedCredential, snapshot: Snapshot): void {

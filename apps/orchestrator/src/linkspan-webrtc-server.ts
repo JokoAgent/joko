@@ -3,6 +3,7 @@ import type { ByteChannel } from "@jokoagent/linkspan-core";
 import type { openWebRtcChannel } from "@jokoagent/linkspan-webrtc";
 import type { OrchestratorApplication } from "./application.js";
 import { serveLinkspanChannel } from "./linkspan-server.js";
+import { publishWebRtcConnectionEntry } from './connection-entries.js';
 
 const MAXIMUM_PEERS = 32;
 const MAXIMUM_SDP_BYTES = 64 * 1024;
@@ -125,6 +126,8 @@ export class LinkspanWebRtcSignaling {
 /** Only the process-owned decrypted HTTP bridge exposes signaling. The public
  * encrypted-only listener cannot offer an unauthenticated replacement answer. */
 export function registerLinkspanWebRtcSignaling(server: FastifyInstance, application: OrchestratorApplication): void {
+  let retire = () => {};
+  server.addHook('onReady', async () => { if (application.store && application.config) retire = publishWebRtcConnectionEntry(application.store); });
   const signaling = new LinkspanWebRtcSignaling(application, () => {
     const address = server.server.address();
     if (address === null || typeof address === "string") throw new Error("The original encrypted HTTP bridge is unavailable.");
@@ -144,7 +147,7 @@ export function registerLinkspanWebRtcSignaling(server: FastifyInstance, applica
         .send({ error: error instanceof SignalingError ? error.message : "The selected WebRTC transport could not negotiate a secure data channel." });
     } finally { request.raw.removeListener("aborted", cancelled); reply.raw.removeListener("close", closed); }
   });
-  server.addHook("preClose", async () => { await signaling.close(); });
+  server.addHook("preClose", async () => { retire(); await signaling.close(); });
 }
 
 async function defaultPeer(config: RTCConfiguration): Promise<RTCPeerConnection> {

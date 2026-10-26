@@ -25,6 +25,8 @@ import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
+import { MobileDeviceAuthorizationSettings } from "./MobileDeviceAuthorizationSettings";
+import type { DeviceAuthorizationOwner, DeviceAuthorizationView } from "@joko/connection-transport/device-authorization";
 import { MobileVoiceDictionaryReadOnlyCache } from "./mobile-voice-dictionary-readonly-cache";
 import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
 import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preferences-store";
@@ -38,6 +40,8 @@ const native = vi.hoisted(() => ({
   copied: vi.fn(async (_value: string) => undefined),
   hardwareBack: undefined as (() => boolean) | undefined
 }));
+
+vi.mock('expo-camera', () => ({ CameraView: () => null, useCameraPermissions: () => [undefined, vi.fn()] }));
 
 vi.mock("react-native", async () => {
   const React = await import("react");
@@ -66,7 +70,7 @@ vi.mock("react-native", async () => {
     }, props.children);
   return {
     Alert: { alert: native.alert },
-    AppState: { addEventListener: () => ({ remove: () => undefined }) },
+    AppState: { currentState: "active", addEventListener: () => ({ remove: () => undefined }) },
     BackHandler: { addEventListener: (_name: string, handler: () => boolean) => {
       native.hardwareBack = handler;
       return { remove: () => { if (native.hardwareBack === handler) native.hardwareBack = undefined; } };
@@ -109,6 +113,7 @@ vi.mock("react-native", async () => {
 
 vi.mock("expo-clipboard", () => ({ setStringAsync: native.copied }));
 vi.mock("expo-crypto", () => ({ randomUUID: () => "settings-pairing-request" }));
+vi.mock('react-native-svg', () => ({ default: 'svg', Rect: 'rect' }));
 vi.mock("expo-constants", () => ({ default: { expoConfig: { version: "0.1.0-test" } } }));
 
 const colors: MobileSettingsColors = {
@@ -411,6 +416,30 @@ function deferred<T>() {
 }
 
 describe("MobileSettingsScreen", () => {
+  it('opens a matching review without approving, and refuses a stale request ID', async () => {
+    const container = document.createElement('div'); root = createRoot(container);
+    const review = { serverId: 'node', endpointPublicKey: `ed25519:${'a'.repeat(64)}`, invitationId: '11111111-1111-4111-8111-111111111111', requestId: '22222222-2222-4222-8222-222222222222' };
+    const pending: DeviceAuthorizationView = { ...review, userCode: 'ABCD-EFGH', state: 'pending', deviceName: 'New phone', platform: 'android', expiresAt: Date.now() + 600_000 };
+    const resolve = vi.fn(), api = { list: async () => [pending], resolve } as unknown as DeviceAuthorizationOwner;
+    const route = { origin: 'https://node.example', serverId: review.serverId, endpointPublicKey: review.endpointPublicKey };
+    await act(async () => root!.render(<MobileDeviceAuthorizationSettings key="current" getApi={() => api} colors={colors} locale="en" node="Node" route={route} reviewRequest={review} />));
+    expect(container.textContent).toContain('ABCD-EFGH'); expect(resolve).not.toHaveBeenCalled();
+    await act(async () => root!.render(<MobileDeviceAuthorizationSettings key="stale" getApi={() => api} colors={colors} locale="en" node="Node" route={route} reviewRequest={{ ...review, requestId: '33333333-3333-4333-8333-333333333333' }} />));
+    expect(container.textContent).toContain('request is unavailable'); expect(container.textContent).not.toContain('Allow connection'); expect(resolve).not.toHaveBeenCalled();
+  });
+  it("cancels an unused invitation after reopening without its original secret", async () => {
+    const container = document.createElement("div"); root = createRoot(container);
+    const invitation: DeviceAuthorizationView = { invitationId: "11111111-1111-4111-8111-111111111111", requestId: "", userCode: "",
+      state: "invited", deviceName: "", platform: "", expiresAt: Date.now() + 600_000 };
+    let rows = [invitation];
+    const resolve = vi.fn(async () => { rows = []; return { ...invitation, state: "cancelled" as const }; });
+    const api = { list: async () => rows, resolve } as unknown as DeviceAuthorizationOwner;
+    await act(async () => root!.render(<MobileDeviceAuthorizationSettings getApi={() => api} colors={colors} locale="en" node="Node" />));
+    expect(container.textContent).toContain("Unused invitation");
+    await act(async () => Array.from(container.querySelectorAll("button")).find(button => button.textContent === "Cancel invitation")!.click());
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(invitation.invitationId, "", "cancelled");
+    expect(container.textContent).not.toContain("Unused invitation");
+  });
   it("opens the readonly shared dictionary from Settings and voice preferences, and returns to the initiating surface", async () => {
     const mounted = mount();
     await act(async () => button(mounted.container, "Shared dictionary · read only").click());

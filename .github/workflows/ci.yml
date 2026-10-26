@@ -16,6 +16,7 @@ on:
           - windows-runtime-diagnostics
           - desktop-product
           - browser-regressions
+          - device-authorization
       platform:
         description: Platform for manual verification
         type: choice
@@ -31,10 +32,72 @@ permissions:
   actions: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'browser-regressions' && format('-browser-regressions-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'browser-regressions' && format('-browser-regressions-{0}', github.sha) || inputs.scope == 'device-authorization' && format('-device-authorization-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
   cancel-in-progress: false
 
 jobs:
+  device-authorization:
+    if: ${{ inputs.scope == 'device-authorization' }}
+    name: Device authorization and affected client boundaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: pnpm
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
+      - name: Prepare Linkspan from remote main
+        run: node scripts/prepare-linkspan.mjs
+      - name: Prepare generated contracts and shared client
+        id: authorization_inputs
+        run: |
+          mkdir -p "$RUNNER_TEMP/device-authorization"
+          pnpm install --frozen-lockfile
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/connection-transport build
+          pnpm --filter @joko/device-peer build
+          pnpm --filter @joko/remote-desktop-sync build
+      - name: Check authorization storage and client recovery
+        if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
+        shell: bash
+        run: |
+          pnpm --filter @joko/store exec vitest run src/device-authorization-store.test.ts 2>&1 | tee "$RUNNER_TEMP/device-authorization/store.log"
+          pnpm --filter @joko/connection-transport exec vitest run device-authorization trust entries 2>&1 | tee "$RUNNER_TEMP/device-authorization/client.log"
+      - name: Check affected client types
+        if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/web --filter @joko/mobile -r --workspace-concurrency=2 --no-bail typecheck 2>&1 | tee "$RUNNER_TEMP/device-authorization/types.log"
+      - name: Check authorization RPC and permission boundaries
+        if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run src/device-authorization-service.test.ts src/connection-entries.test.ts src/connect-services.test.ts src/connect-services.audit.test.ts src/connection-manager.test.ts 2>&1 | tee "$RUNNER_TEMP/device-authorization/service.log"
+      - name: Check Web approval and protected storage
+        if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/web exec vitest run DeviceAuthorization DevicePairingInvitation ConnectionScreen local-state-credentials desktop-deep-link 2>&1 | tee "$RUNNER_TEMP/device-authorization/web.log"
+      - name: Check Mobile authority and connection lifecycle
+        if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/mobile exec vitest run device-authorization network mobile-client connection-storage mobile-connection-protocol MobileSharedConnectionScreen MobileSettingsScreen mobile-native-intent 2>&1 | tee "$RUNNER_TEMP/device-authorization/mobile.log"
+      - name: Check Desktop invitation delivery
+        if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/desktop exec vitest run deep-link 2>&1 | tee "$RUNNER_TEMP/device-authorization/desktop.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: device-authorization-behavior-${{ github.sha }}
+          path: ${{ runner.temp }}/device-authorization/
+          if-no-files-found: warn
+          retention-days: 3
   verify:
     if: ${{ inputs.scope != 'windows-runtime-diagnostics' }}
     name: ${{ matrix.os }} / Node 24.19 / ${{ matrix.workload }}${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
@@ -44,7 +107,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(inputs.scope == 'windows-native' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'windows' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'linux' && '["ubuntu-24.04"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'macos' && '["macos-15"]' || '["ubuntu-24.04","windows-latest","macos-15"]') }}
-        workload: ${{ fromJSON(inputs.scope == 'browser-regressions' && '["browser-regressions"]' || (inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && '["product"]' || '["product","e2e-1","e2e-2","e2e-3","e2e-4"]') }}
+        workload: ${{ fromJSON(inputs.scope == 'device-authorization' && '["device-authorization"]' || inputs.scope == 'browser-regressions' && '["browser-regressions"]' || (inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && '["product"]' || '["product","e2e-1","e2e-2","e2e-3","e2e-4"]') }}
 
     steps:
       - name: Check out repository
@@ -236,7 +299,7 @@ jobs:
           retention-days: 3
 
       - name: Prepare Chromium for production Web and standalone backend chains
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope != 'windows-native' }}
         id: browser
         timeout-minutes: 15
         shell: bash
@@ -262,6 +325,22 @@ jobs:
           name: ci-linux-browser-sandbox-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
           path: ${{ runner.temp }}/joko-ci-logs/linux-browser-sandbox.log
           if-no-files-found: error
+          retention-days: 3
+
+      - name: Check production Web device authorization
+        if: ${{ matrix.workload == 'device-authorization' && !cancelled() && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          JOKO_DEVICE_AUTHORIZATION_EVIDENCE_DIR="$RUNNER_TEMP/joko-web-evidence/device-authorization" pnpm --filter @joko/e2e exec vitest run src/device-authorization-mounted-browser.e2e.test.ts src/connection-entries-mounted-browser.e2e.test.ts src/device-authorization-private.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/device-authorization-browser.log"
+
+      - name: Upload device authorization checks
+        if: ${{ always() && matrix.workload == 'device-authorization' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-authorization-${{ runner.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/device-authorization-*.log
+          if-no-files-found: warn
           retention-days: 3
 
       - name: Run workspace package tests (Linux)

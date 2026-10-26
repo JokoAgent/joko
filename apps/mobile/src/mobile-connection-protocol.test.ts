@@ -10,6 +10,15 @@ describe("local shared connection capability bridge", () => {
     expect(parseMobileConnectionMessage(request("pair", ["https://node.example", "123456", "Phone", { automatic: false }]), instanceId))
       .toMatchObject({ name: "pair", args: ["https://node.example", "123456", "Phone", { automatic: false }] });
     expect(parseMobileConnectionMessage(request("connect", ["profile-1", { automatic: true }]), instanceId)?.type).toBe("action");
+    expect(parseMobileConnectionMessage(request('startDeviceAuthorization', ['joko://pair#invitation', 'Phone']), instanceId)?.type).toBe('action');
+    expect(parseMobileConnectionMessage(request('finishDeviceAuthorization', [{ automatic: true }]), instanceId)?.type).toBe('action');
+    expect(parseMobileConnectionMessage(request('finishDeviceAuthorization', [{ authKey: 'forged' }]), instanceId)).toBeUndefined();
+    expect(parseMobileConnectionMessage(request('getDeviceTransportRequest', []), instanceId)?.type).toBe('action');
+    expect(parseMobileConnectionMessage(request('cancelDeviceTransportRequest', ['11111111-1111-4111-8111-111111111111']), instanceId)?.type).toBe('action');
+    expect(parseMobileConnectionMessage(request('cancelDeviceTransportRequest', []), instanceId)).toBeUndefined();
+    expect(parseMobileConnectionMessage(request('copyDeviceApprovalLink', ['joko://pair#secret']), instanceId)).toBeUndefined();
+    expect(parseMobileConnectionMessage(request('startDeviceAuthorization', ['x'.repeat(65537), 'Phone']), instanceId)).toBeUndefined();
+    expect(parseMobileConnectionMessage(request('claimDeviceAuthorization', ['forged-proof']), instanceId)).toBeUndefined();
     expect(parseMobileConnectionMessage(request("selectMode", ["pair"]), instanceId)?.type).toBe("action");
     expect(parseMobileConnectionMessage(request("trustEndpoint", ["https://node.example", `ed25519:${'a'.repeat(64)}`, false, "trusted-node"]), instanceId)?.type).toBe("action");
     expect(parseMobileConnectionMessage(request("trustEndpoint", ["https://node.example", "ed25519:truncated"]), instanceId)).toBeUndefined();

@@ -34,6 +34,10 @@ message DiscoveredNode {
   string api_version = 5;
   bool pairing_enabled = 6;
   google.protobuf.Timestamp last_seen = 7;
+  // Unauthenticated hints only. Never use this key as a saved trust pin.
+  string endpoint_public_key = 8;
+  repeated string connection_kinds = 9;
+  string connection_directory_revision = 10;
 }
 
 enum LanDiscoveryDatagramKind {

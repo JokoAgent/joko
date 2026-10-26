@@ -6,6 +6,7 @@ import { ConnectionScreen } from "./components/ConnectionScreen.js";
 import type { Translator } from "./components/types.js";
 import type { ConnectionScreenActionArguments, ConnectionScreenController, ConnectionScreenState } from "./connection-contract.js";
 import { translate } from "./i18n.js";
+import { parseDeviceAuthorizationProgress, parseDeviceInvitationEntries } from '@joko/connection-transport/device-authorization';
 
 export interface ConnectionEmbeddedSnapshot {
   readonly instanceId: string;
@@ -86,6 +87,36 @@ export function mountConnectionEmbedded(initial: ConnectionEmbeddedSnapshot): Co
     void request(name, args).catch(() => undefined);
   };
   const controller: ConnectionScreenController = {
+    copyDeviceApprovalLink: link => request('copyDeviceApprovalLink', [link]),
+    connectSavedInvitation: (link, automatic, entryId) => request('connectSavedInvitation', [link, automatic, entryId]),
+    refreshConnectionEntries: profileId => request('refreshConnectionEntries', [profileId]),
+    prepareConnectionEntry: (profileId, entryId) => request('prepareConnectionEntry', [profileId, entryId]),
+    selectConnectionEntry: (profileId, entryId) => request('selectConnectionEntry', [profileId, entryId]),
+    setConnectionEntryPolicy: (profileId, backupIds, returnToPreferred) => request('setConnectionEntryPolicy', [profileId, backupIds, returnToPreferred]),
+    deviceAuthorization: {
+      transportRequest: async kind => { const result = await requestResult('createDeviceTransportRequest', [kind]);
+        if (typeof result !== 'string' || result.length > 512) throw unexpectedError(); return result; },
+      pendingTransportRequest: async () => { const result = await requestResult('getDeviceTransportRequest', []);
+        if (result == null) return undefined;
+        if (typeof result !== 'string' || result.length > 512) throw unexpectedError(); return result; },
+      cancelTransportRequest: requestId => request('cancelDeviceTransportRequest', [requestId]),
+      resolveTarget: async (link, code) => { const result = await requestResult('resolveDeviceAuthorizationTarget', code === undefined ? [link] : [link, code]);
+        if (typeof result !== 'string' || result.length > 32768) throw unexpectedError(); return result; },
+      entries: async link => parseDeviceInvitationEntries(await requestResult('getDeviceAuthorizationEntries', [link])),
+      start: async (link, name, _signal, entryId) => {
+        const progress = parseDeviceAuthorizationProgress(await requestResult('startDeviceAuthorization', entryId ? [link, name, entryId] : [link, name]));
+        if (!progress) throw unexpectedError(); return progress;
+      },
+      refresh: async () => parseDeviceAuthorizationProgress(await requestResult('refreshDeviceAuthorization', [])),
+      cancel: async () => parseDeviceAuthorizationProgress(await requestResult('cancelDeviceAuthorization', [])),
+      finish: (_signal, automatic) => request('finishDeviceAuthorization', automatic === undefined ? [] : [{ automatic }]),
+      discard: allowUnconfirmed => request('discardDeviceAuthorization', allowUnconfirmed === undefined ? [] : [allowUnconfirmed])
+    },
+    scanDeviceInvitation: async () => {
+      const result = await requestResult('scanDeviceInvitation', []);
+      if (typeof result !== 'string' || result.length > 65536) throw unexpectedError();
+      return result;
+    },
     get state() { return snapshot.state; },
     connect: (profile, options) => request("connect", options === undefined ? [profile.id] : [profile.id, options]),
     pair: (origin, code, deviceName, options) => request("pair", options === undefined ? [origin, code, deviceName] : [origin, code, deviceName, options]),

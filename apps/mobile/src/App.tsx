@@ -23,6 +23,7 @@ import {
 import type { PartnerLearningSettingsDestination } from "@joko/contracts";
 import { MobilePartnerLearningFooter } from "./MobilePartnerLearningFooter";
 import { MobileSharedConnectionScreen } from "./MobileSharedConnectionScreen";
+import { mobileEntrySupported, mobileEntryIrohMode } from './mobile-entry-capabilities';
 import { MobileLinkspanHost } from './MobileLinkspanHost';
 import { MobileFileTextPreview } from "./MobileFileTextPreview";
 import { useMobileFileTextActions } from "./use-mobile-file-text-actions";
@@ -351,6 +352,8 @@ import { MobileSettingsScreen } from "./MobileSettingsScreen";
 import { MobileAndroidUpdateSheet } from "./MobileAndroidUpdateSheet";
 import { MobileTaskSharingScreen, mobileTaskSharingCopy, MobileSharedTaskEntries } from "./MobileTaskSharingScreen";
 import { parseTaskShareInvitation } from "@joko/contracts";
+import { parseDeviceLink, type DeviceAuthorizationReview } from '@joko/connection-transport/device-authorization';
+import { MobileDeviceAuthorizationReview } from './MobileDeviceAuthorizationReview';
 import { QueueDeliveryMode } from "@joko/contracts";
 import { MobileRemoteDesktopScreen, type MobileRemoteDesktopLifecycleHandler } from "./MobileRemoteDesktopScreen";
 import { mobileRemoteDesktopCopy, mobileRemoteDesktopSessionDeviceId } from "./remote-desktop-presentation";
@@ -400,6 +403,8 @@ const client = new MobileClient(
   mobilePartnerDeletionReceipts,
   mobilePartnerRestartReceipts
 );
+client.connectionEntrySupported = mobileEntrySupported;
+client.connectionEntryIrohMode = mobileEntryIrohMode();
 const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(mobileReadOnlyDictionaryCache,
   (profileId, signal) => client.voiceDictionaryReadOnlyTransport(profileId, signal));
 const partnerRoster = new MobilePartnerRoster(mobilePlainStorage,
@@ -605,6 +610,8 @@ export function App() {
   );
   const [page, setPage] = useState<Page>("home");
   const [taskInvitation, setTaskInvitation] = useState<string>();
+  const [deviceInvitation, setDeviceInvitation] = useState<string>();
+  const [deviceReview, setDeviceReview] = useState<DeviceAuthorizationReview>();
   const [sharingSessionId, setSharingSessionId] = useState<string>();
   const [sharingLeaveJoinId, setSharingLeaveJoinId] = useState<string>();
   useEffect(() => { if (taskInvitation && state.status === "connected") setPage("task-sharing"); }, [taskInvitation, state.status]);
@@ -663,13 +670,23 @@ export function App() {
   if (externalIntentFenceRef.current === null) externalIntentFenceRef.current = new MobileExternalIntentFence();
   const offerNativeUrl = useCallback((url: string): boolean => {
     try {
+      const incoming = parseDeviceLink(url);
+      externalNavigationRevisionRef.current++;
+      nativeIntentDeliveryRef.current!.invalidate();
+      if (nativeIntentConnectingRef.current) client.cancel();
+      if (incoming.kind === 'review') { setDeviceReview(incoming.review); setDeviceInvitation(undefined); }
+      else { setDeviceReview(undefined); setDeviceInvitation(url); client.setConnectionMode('add'); setPage('connection'); }
+      return true;
+    } catch { /* Other links use their own parsers. */ }
+    try {
       parseTaskShareInvitation(url);
       externalNavigationRevisionRef.current++;
       nativeIntentDeliveryRef.current!.invalidate();
       if (nativeIntentConnectingRef.current) client.cancel();
-      setTaskInvitation(url); setPage("task-sharing"); return true;
+      setDeviceReview(undefined); setTaskInvitation(url); setPage("task-sharing"); return true;
     } catch { /* Other native intents have their own parser. */ }
     if (isMobileIncomingShareUrl(url)) {
+      setDeviceReview(undefined);
       externalNavigationRevisionRef.current++;
       externalIntentFenceRef.current!.offerShare();
       nativeIntentDeliveryRef.current!.invalidate();
@@ -680,6 +697,7 @@ export function App() {
     }
     const intent = parseMobileNativeIntent(url);
     if (intent !== undefined && nativeIntentDeliveryRef.current!.offer(url)) {
+      setDeviceReview(undefined);
       externalNavigationRevisionRef.current++;
       externalIntentFenceRef.current!.offerNative(intent);
       if (nativeIntentConnectingRef.current) client.cancel();
@@ -981,9 +999,13 @@ export function App() {
             || updates.startup === "checking" ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
             <StartupLoading colors={colors} dark={dark} locale={locale.effectiveLocale} />
           </SafeAreaView> :
+            deviceReview ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}><MobileDeviceAuthorizationReview
+              key={deviceReview.requestId} client={client} state={state} review={deviceReview} colors={colors} locale={locale.effectiveLocale} foreground={foreground}
+              onClose={() => { setDeviceReview(undefined); setPage(state.activeProfileId ? 'home' : 'connection'); }} /></SafeAreaView> :
             mobileConnectionStageRequired(state.activeProfileId, page) ? <ConnectionScreen {...common} dark={dark}
-              onBack={connectionRequired ? undefined : () => { client.cancel(); setPage("home"); }}
-              onConnected={() => setPage("home")} /> :
+              invitationLink={deviceInvitation}
+              onBack={connectionRequired ? undefined : () => { setDeviceInvitation(undefined); client.cancel(); setPage("home"); }}
+              onConnected={() => { setDeviceInvitation(undefined); setPage("home"); }} /> :
             <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
               {page === "new" ? <NewTaskScreen {...common} showIncomingShareEmpty={incomingShareRequestRevision > 0}
                 onBack={() => {
@@ -1244,8 +1266,8 @@ function mobileComposerRichTheme(colors: Colors) {
   };
 }
 
-function ConnectionScreen({ state, locale, dark, onBack, onConnected }: ScreenProps & {
-  dark: boolean; onBack?: () => void; onConnected: () => void;
+function ConnectionScreen({ state, locale, dark, onBack, onConnected, invitationLink }: ScreenProps & {
+  dark: boolean; onBack?: () => void; onConnected: () => void; invitationLink?: string;
 }) {
   useEffect(() => {
     if (state.busy || state.connectionAttemptError) return;
@@ -1253,6 +1275,7 @@ function ConnectionScreen({ state, locale, dark, onBack, onConnected }: ScreenPr
     if (state.connectionMode === "saved") void client.refreshSaved();
   }, [state.connectionMode, state.busy, state.connectionAttemptError]);
   return <MobileSharedConnectionScreen client={client} state={state} locale={locale} dark={dark}
+    invitationLink={invitationLink}
     defaultDeviceName={mobileDeviceNameSource(Constants.deviceName, Platform.OS).defaultDisplayName}
     onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
     onBack={onBack} onConnected={onConnected} />;

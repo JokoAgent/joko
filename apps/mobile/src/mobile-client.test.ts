@@ -1847,6 +1847,50 @@ describe("mobile current task delegated reads", () => {
 });
 
 const clients: MobileClient[] = [];
+describe('prepared connection entrance cancellation', () => {
+  it('persists the selected iroh mode in the protected entry directory and keeps the prior mode on write failure', async () => {
+    const entries = await import('@joko/connection-transport/entries');
+    const trust = await import('@joko/connection-transport/trust');
+    const pinned = { ...credential, origin: 'https://mode-choice.example', endpointPublicKey: `ed25519:${'8'.repeat(64)}`, transportKind: 'iroh' as const };
+    const transport = { kind: 'iroh' as const, endpointId: 'c'.repeat(64), ticket: 'mode-choice-ticket', clientKey: 'd'.repeat(64), clientEndpointId: 'e'.repeat(64), mobileMode: 'relay' as const };
+    trust.rememberEndpointTransport(pinned.origin, pinned.endpointPublicKey, transport);
+    const owner = { profileId: pinned.profileId, serverId: pinned.serverId, deviceId: pinned.deviceId, endpointPublicKey: pinned.endpointPublicKey };
+    let saved = entries.initialConnectionEntries(owner, pinned);
+    const memory = memoryStorage(pinned, false);
+    memory.storage.readConnectionEntries = vi.fn(async () => entries.parseSavedConnectionEntries(JSON.parse(JSON.stringify(saved)), owner));
+    memory.storage.writeConnectionEntries = vi.fn(async (_profile, next) => { saved = next; });
+    memory.storage.loadEndpointTransport = vi.fn(async () => {}); memory.storage.saveEndpointTransport = vi.fn(async () => {});
+    const app = client(fakeNetwork(), memory.storage); await app.start();
+    await app.setProfileIrohMode(pinned.profileId, 'native');
+    expect(saved.entries[0]?.transport).toMatchObject({ mobileMode: 'native' });
+    trust.rememberEndpointTransport(pinned.origin, pinned.endpointPublicKey, transport);
+    const restarted = client(fakeNetwork(), memory.storage); await restarted.start();
+    const restored = await memory.storage.readConnectionEntries!(pinned);
+    entries.activateConnectionEntry(owner, restored!.entries[0]!);
+    expect(trust.trustedEndpointTransport(pinned.origin, pinned.endpointPublicKey, 'iroh')).toMatchObject({ mobileMode: 'native' });
+    vi.mocked(memory.storage.writeConnectionEntries).mockRejectedValueOnce(new Error('Protected storage unavailable'));
+    await expect(restarted.setProfileIrohMode(pinned.profileId, 'relay')).rejects.toThrow(/storage/u);
+    expect(saved.entries[0]?.transport).toMatchObject({ mobileMode: 'native' });
+    expect(trust.trustedEndpointTransport(pinned.origin, pinned.endpointPublicKey, 'iroh')).toMatchObject({ mobileMode: 'native' });
+    expect(memory.storage.saveEndpointTransport).not.toHaveBeenCalled();
+  });
+  it('does not read a bearer or adopt a late saved entrance after the user cancels', async () => {
+    const { initialConnectionEntries } = await import('@joko/connection-transport/entries');
+    const pinned = { ...credential, origin: 'https://saved-entrance.example', endpointPublicKey: `ed25519:${'7'.repeat(64)}` };
+    const saved = initialConnectionEntries({ profileId: pinned.profileId, serverId: pinned.serverId, deviceId: pinned.deviceId, endpointPublicKey: pinned.endpointPublicKey }, pinned);
+    const memory = memoryStorage(pinned, false), network = fakeNetwork();
+    let finish!: (value: typeof saved) => void;
+    memory.storage.readConnectionEntries = vi.fn(() => new Promise<typeof saved>(resolve => { finish = resolve; }));
+    memory.storage.writeConnectionEntries = vi.fn(async () => {});
+    const app = client(network, memory.storage); await app.start();
+    vi.mocked(memory.storage.loadCredential).mockClear(); vi.mocked(network.inspect).mockClear();
+    const pending = app.connectSaved(pinned.profileId).catch(error => error);
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    app.cancel(); finish(saved); await pending;
+    expect(memory.storage.loadCredential).not.toHaveBeenCalled(); expect(network.inspect).not.toHaveBeenCalled();
+    expect(memory.storage.saveConnection).not.toHaveBeenCalled(); expect(memory.storage.writeConnectionEntries).not.toHaveBeenCalled();
+  });
+});
 describe("native input handoff captured task owner", () => {
   it("exposes the native input service only for the current owner task and retires its scope on background or runtime replacement", async () => {
     const network = fakeNetwork(), owner = clone(SnapshotSchema, snapshot), detail = clone(SnapshotSchema, snapshot);

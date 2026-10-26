@@ -13,9 +13,16 @@ interface RendererProps {
   readonly onRenderProcessGone: () => boolean;
 }
 const native = vi.hoisted(() => ({
-  renderers: [] as { props: RendererProps; injectJavaScript: ReturnType<typeof vi.fn> }[]
+  renderers: [] as { props: RendererProps; injectJavaScript: ReturnType<typeof vi.fn> }[],
+  appState: 'active',
+  onAppState: undefined as ((state: string) => void) | undefined,
+  scanner: undefined as { onResult(link: string): void; onClose(): void } | undefined
 }));
+vi.mock('./MobileDeviceInvitationScanner', () => ({ MobileDeviceInvitationScanner: (props: { onResult(link: string): void; onClose(): void }) => {
+  native.scanner = props; return createElement('div', { 'data-scanning': true });
+} }));
 vi.mock("./connection-runtime.connjs", () => ({ default: { css: "", script: "" } }));
+vi.mock("expo-clipboard", () => ({ setStringAsync: vi.fn(async () => {}) }));
 vi.mock("./mobile-iroh-native", () => ({ mobileIrohNativeAvailable: () => false }));
 vi.mock("./mobile-http-connect-native", () => ({ mobileHttpConnectNativeAvailable: () => false }));
 vi.mock("./MobileKeyboardAvoidingView", () => ({
@@ -24,7 +31,9 @@ vi.mock("./MobileKeyboardAvoidingView", () => ({
 }));
 vi.mock("react-native", () => ({
   Alert: { alert: vi.fn() },
-  AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
+  AppState: { get currentState() { return native.appState; }, addEventListener: (_event: string, listener: (state: string) => void) => {
+    native.onAppState = listener; return { remove() {} };
+  } },
   Platform: { OS: "ios" }, StyleSheet: { create: (styles: unknown) => styles },
   Text: ({ children, accessibilityRole }: { children?: ReactNode; accessibilityRole?: string }) =>
     createElement("span", { role: accessibilityRole }, children)
@@ -55,7 +64,47 @@ function ready(renderer: (typeof native.renderers)[number]): void {
 }
 
 describe("native connection renderer ownership", () => {
-  beforeEach(() => { native.renderers.length = 0; });
+  beforeEach(() => { native.renderers.length = 0; native.appState = 'active'; native.scanner = undefined; native.onAppState = undefined; });
+  it('stops a background scan and rejects its delayed result after a new scan starts', async () => {
+    const container = document.createElement('div'), root = createRoot(container);
+    const state = { saved: [], nearby: [], status: 'disconnected', connectionMode: 'add', discoveryState: 'idle', busy: false } as unknown as MobileState;
+    try {
+      await act(async () => root.render(createElement(MobileSharedConnectionScreen, {
+        client: { state } as unknown as MobileClient, state, locale: 'en', dark: false, defaultDeviceName: 'Phone', onThemeChange: async () => {}, onConnected() {}
+      })));
+      const renderer = native.renderers[0]!;
+      const scan = (id: number) => renderer.props.onMessage({ nativeEvent: { data: JSON.stringify({ type: 'action', instanceId: instanceId(renderer), id, name: 'scanDeviceInvitation', args: [] }) } });
+      await act(async () => { ready(renderer); scan(1); });
+      const old = native.scanner!; expect(old).toBeDefined();
+      await act(async () => { native.appState = 'background'; native.onAppState!('background'); });
+      expect(container.querySelector('[data-scanning]')).toBeNull();
+      await act(async () => { native.appState = 'active'; native.onAppState!('active'); });
+      await act(async () => scan(2));
+      const current = native.scanner!;
+      await act(async () => old.onResult('stale-invitation'));
+      expect(container.querySelector('[data-scanning]')).not.toBeNull();
+      expect(renderer.injectJavaScript.mock.calls.some(([script]) => script.includes('stale-invitation'))).toBe(false);
+      await act(async () => current.onResult('current-invitation'));
+      expect(renderer.injectJavaScript).toHaveBeenLastCalledWith(expect.stringContaining('settle(2,true,null,"current-invitation")'));
+    } finally { await act(async () => root.unmount()); }
+  });
+  it('does not navigate on an approval result from a retired connection page', async () => {
+    const container = document.createElement('div'), root = createRoot(container);
+    const state = { saved: [], nearby: [], status: 'connected', connectionMode: 'add', discoveryState: 'idle', busy: false } as unknown as MobileState;
+    let settle!: () => void; let signal: AbortSignal | undefined;
+    const onConnected = vi.fn();
+    const client = { state, deviceAuthorization: { finish: (value?: AbortSignal) => { signal = value; return new Promise<void>(resolve => { settle = resolve; }); } } } as unknown as MobileClient;
+    try {
+      await act(async () => root.render(createElement(MobileSharedConnectionScreen, { client, state, locale: 'en', dark: false,
+        defaultDeviceName: 'Phone', onThemeChange: async () => {}, onConnected })));
+      const renderer = native.renderers[0]!;
+      await act(async () => { ready(renderer); renderer.props.onMessage({ nativeEvent: { data: JSON.stringify({ type: 'action', instanceId: instanceId(renderer), id: 1, name: 'finishDeviceAuthorization', args: [] }) } }); });
+      await act(async () => renderer.props.onError());
+      expect(signal?.aborted).toBe(true);
+      await act(async () => settle());
+      expect(onConnected).not.toHaveBeenCalled();
+    } finally { await act(async () => root.unmount()); }
+  });
   it.each(["onError", "onContentProcessDidTerminate", "onRenderProcessGone"] as const)(
     "%s retires only the failed renderer and keeps the replacement bridge usable", async (recovery) => {
       const container = document.createElement("div"); const root = createRoot(container);

@@ -10,6 +10,8 @@ export * from "./gen/joko/v1/capability_pb.js";
 export * from "./gen/joko/v1/code_host_pb.js";
 export * from "./gen/joko/v1/collaboration_pb.js";
 export * from "./gen/joko/v1/common_pb.js";
+export * from "./gen/joko/v1/connection_entry_pb.js";
+export * from "./gen/joko/v1/device_authorization_pb.js";
 export * from "./gen/joko/v1/contact_pb.js";
 export * from "./gen/joko/v1/device_peer_pb.js";
 export * from "./gen/joko/v1/hosted_agent_pb.js";

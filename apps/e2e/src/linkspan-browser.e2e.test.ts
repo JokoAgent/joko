@@ -46,8 +46,9 @@ mountedIt("loads the production secure backend only after the user selects a pin
     expect(secureAssets.filter(asset => requested.has(asset))).toEqual([]);
     expect([...requested].some(path => path.endsWith(".wasm"))).toBe(false);
     await page.locator(".connection-tabs button:last-child").click();
+    await page.locator('details.device-authorization__manual > summary').click();
     await page.locator('input[type="url"]').fill("https://selected-node.invalid");
-    await page.locator('textarea').fill(`ed25519:${"a".repeat(64)}`);
+    await page.locator('.pair-form textarea').fill(`ed25519:${"a".repeat(64)}`);
     await page.locator('input[autocomplete="one-time-code"]').fill("local-fixture-code");
     await page.locator('input[autocomplete="off"]').fill("Selected path device");
     await page.waitForLoadState("networkidle");
@@ -123,6 +124,7 @@ mountedIt('pairs the production Web through selected WebRTC and restores the pin
     await page.goto(fixture.baseUrl); await page.locator('.connection-screen').waitFor(); await page.waitForLoadState('networkidle');
     expect(selectedAssets.some(asset => requested.has(asset))).toBe(false);
     await page.locator('.connection-tabs button:last-child').click();
+    await page.locator('details.device-authorization__manual > summary').click();
     await page.locator('input[type="url"]').fill(fixture.baseUrl);
     await page.locator('.connection-transport-choice button').filter({ hasText: 'WebRTC' }).click();
     await page.locator('input[autocomplete="one-time-code"]').fill('unused-without-a-pin');
@@ -155,7 +157,7 @@ mountedIt('pairs the production Web through selected WebRTC and restores the pin
     await automatic.click(); expect(await automatic.getAttribute('aria-checked')).toBe('true');
     fixture.application.connections.closePairingWindow();
     const invitation = fixture.application.connections.issuePairing('Browser WebRTC owner');
-    await page.locator('textarea').fill(fixture.application.linkspanIdentity!.publicKey);
+    await page.locator('.pair-form textarea').fill(fixture.application.linkspanIdentity!.publicKey);
     expect(await rtc.getAttribute('aria-pressed')).toBe('true');
     await page.locator('input[autocomplete="one-time-code"]').fill(invitation.code);
     await page.locator('.pair-form__submit').click();

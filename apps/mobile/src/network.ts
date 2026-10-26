@@ -145,6 +145,7 @@ import {
 } from "./mobile-extension-library-runtime";
 
 export interface PairedCredential {
+  readonly entryId?: string;
   readonly endpointPublicKey?: string;
   readonly transportKind?: EndpointTransportKind;
   readonly profileId: string;
@@ -199,6 +200,8 @@ export interface MobilePushCapabilityResult {
 }
 
 export interface MobileNetwork {
+  deviceAuthorizationTransport?(invitation: import('@joko/connection-transport/device-authorization').DeviceTarget): Transport;
+  deviceAuthorizationOwner?(credential: PairedCredential, assertCurrent: () => void): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
   listModelSourceRemoteHosts?(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<readonly RemoteHost[]>;
   listModelSourceDevicePeers?(credential: PairedCredential, signal?: AbortSignal): Promise<readonly DevicePeerDescriptor[]>;
   getSessionRuntimeControl?(credential: PairedCredential, sessionId: string,
@@ -1463,6 +1466,7 @@ function normalizedMobilePushToken(value: string): string {
   return token;
 }
 
+import { deviceAuthorizationOwner } from '@joko/connection-transport/device-authorization';
 function credentialTransport(credential: PairedCredential): Transport {
   rememberEndpointTrust(credential);
   return transport(credential.origin, credential.authKey, credential.endpointPublicKey, credential.transportKind ?? 'https');
@@ -1557,6 +1561,8 @@ function validRemoteDesktopDisplayModes(modes: readonly RemoteDesktopDisplayMode
 }
 
 export const mobileNetwork: MobileNetwork = {
+  deviceAuthorizationTransport: invitation => transport(invitation.origin, undefined, invitation.endpointPublicKey, invitation.endpointTransport?.kind ?? 'https'),
+  deviceAuthorizationOwner: (credential, assertCurrent) => deviceAuthorizationOwner(createClient(ConnectionService, credentialTransport(credential)), assertCurrent),
   inputHandoffApi: (credential, scope) => createMobileInputHandoffApi({ credential, scope, transport: credentialTransport(credential) }),
   listInputHandoffTasks: (credential, signal) => readMobileInputHandoffTasks(credentialTransport(credential), signal),
   async inspect(origin, signal) {

@@ -9,6 +9,7 @@ export const SCHEMA_VERSION = 1;
 // shapes are as much a part of the non-migrating first-release baseline as the
 // DDL: changing one must reject an existing development database for rebuild.
 const DURABLE_JSON_SHAPE_BASELINE = [
+  "device-authorization:invitation/request/digests/approval/claim-v1",
   "interaction-question-request:single/multiple.allowOther=required",
   "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",
   "resource-usage-event:exact-v1",

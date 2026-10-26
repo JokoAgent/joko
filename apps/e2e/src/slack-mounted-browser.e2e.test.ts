@@ -52,6 +52,7 @@ describe("mounted Slack Messaging Settings", () => {
     const browserErrors = observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/settings/messaging`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
     await page.getByLabel("Pairing code").fill(pairingCode);
     await page.getByLabel("Device name").fill("Mounted Slack Web");

@@ -5,6 +5,7 @@ import {
   type MobileSecureStorageDriver
 } from "./connection-storage";
 import type { PairedCredential } from "./network";
+import { DeviceKind } from '@joko/contracts';
 import { rememberEndpointTransport, trustedEndpointTransport } from '@joko/connection-transport/trust';
 
 const first: PairedCredential = {
@@ -26,6 +27,24 @@ const second: PairedCredential = {
   displayName: "Phone two",
   authKey: "credential-two"
 };
+
+it('retains the device request only in protected storage across restarts and fails closed while it is unavailable', async () => {
+  const environment = drivers(), storage = createMobileStorage(environment.plain, environment.secure);
+  const draft = { invitation: { origin: 'https://node.example', serverId: 'node', endpointPublicKey: `ed25519:${'a'.repeat(64)}`,
+    invitationId: '11111111-1111-4111-8111-111111111111', invitationSecret: 'b'.repeat(64), expiresAt: Date.now() + 600_000 },
+    requestId: '22222222-2222-4222-8222-222222222222', requesterSecret: 'c'.repeat(64), authKey: 'd'.repeat(64),
+    deviceName: 'Phone', deviceKind: DeviceKind.MOBILE, platform: 'ios' };
+  await storage.writeDeviceAuthorization!(draft);
+  expect([...environment.plainValues.values()].join('')).not.toContain(draft.requesterSecret);
+  const restarted = createMobileStorage(environment.plain, environment.secure);
+  expect(await restarted.readDeviceAuthorization!()).toEqual(draft);
+  environment.setAvailable(false);
+  await expect(restarted.writeDeviceAuthorization!(undefined)).rejects.toThrow(/unavailable/u);
+  environment.setAvailable(true);
+  expect(await restarted.readDeviceAuthorization!()).toEqual(draft);
+  await restarted.writeDeviceAuthorization!(undefined);
+  expect(await restarted.readDeviceAuthorization!()).toBeUndefined();
+});
 
 function drivers() {
   const plainValues = new Map<string, string>();

@@ -9467,6 +9467,7 @@ function registerIpc(): void {
     validateProfileId(profileId);
     validateCredentialSecret(secret);
     if (!secureStorageAvailable()) {
+      if (profileId === 'device-authorization-request-v1' || profileId === 'device-transport-request-v1' || profileId.startsWith('entries_')) throw new Error('Device approval and backup entrances require persistent protected credential storage.');
       volatileCredentials.set(profileId, secret);
       return;
     }

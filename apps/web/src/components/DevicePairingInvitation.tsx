@@ -5,8 +5,13 @@ import type { AppController } from '../controller.js';
 import type { Translator } from './types.js';
 import { Button, ErrorBanner } from './ui.js';
 import { randomUuid } from '../web-crypto.js';
+import { DeviceAuthorizationSettings } from './DeviceAuthorizationSettings.js';
 
 export function DevicePairingInvitation({ controller, t }: { readonly controller: AppController; readonly t: Translator }) {
+  return <>{controller.deviceAuthorizationOwner && <DeviceAuthorizationSettings controller={controller} t={t} />}
+    <details className="device-pairing-advanced"><summary>{t('authorization.manual')}</summary><ManualDevicePairingInvitation controller={controller} t={t} /></details></>;
+}
+function ManualDevicePairingInvitation({ controller, t }: { readonly controller: AppController; readonly t: Translator }) {
   const profile = controller.state.activeProfile;
   const owner = `${profile?.id ?? ''}\u0000${profile?.serverId ?? ''}\u0000${profile?.endpointPublicKey ?? ''}\u0000${profile?.origin ?? ''}\u0000${profile?.transportKind ?? 'https'}`;
   const current = useRef({ owner });
@@ -47,7 +52,7 @@ export function DevicePairingInvitation({ controller, t }: { readonly controller
     try { sharedInvitation = recipientOrigin === invitation.origin ? invitation.trustedInvitation : formatTrustedNodeInvitation({ ...invitation, origin: normalizeOrchestratorOrigin(recipientOrigin) }); }
     catch { /* An address draft never changes the issued secret or its issuer. */ }
   }
-  return <article className="settings-card" aria-busy={busy}>
+  return <article className="settings-card settings-card--content device-pairing-advanced__content" aria-busy={busy}>
     <strong>{t('connection.authorizeDevice')}</strong>
     <p>{t('connection.invitationHelp')}</p>
     {profile?.transportKind === 'iroh' && <>

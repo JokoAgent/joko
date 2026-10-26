@@ -59,6 +59,21 @@ afterAll(() => {
 });
 
 describe("ConnectionScreen connection choice", () => {
+  it('keeps the selected nearby node visible in the progressive invitation flow', async () => {
+    const original = controllerFixture({});
+    const controller = { ...original, state: { ...original.state, initialMode: 'nearby' as const,
+      discoveredNodes: [{ serverId: 'nearby-home', name: 'Home node', origin: 'https://home.example', version: '1', apiVersion: '1', pairingEnabled: true, lastSeenAt: Date.now(), source: 'desktop' as const, transport: 'https' as const }] },
+      deviceAuthorization: { refresh: vi.fn(async () => undefined), start: vi.fn(), cancel: vi.fn(), finish: vi.fn(), discard: vi.fn() } };
+    const container = document.body.appendChild(document.createElement('div')), root = createRoot(container);
+    try {
+      await act(async () => root.render(<ConnectionScreen controller={controller} t={translator} />));
+      const target = container.querySelector<HTMLButtonElement>('.discovery-card button');
+      await act(async () => target!.click());
+      expect(container.querySelector('.device-authorization__node')?.textContent).toContain('Home node');
+      expect(container.textContent).toContain('entries.discoveryUnverified');
+      expect(controller.deviceAuthorization.start).not.toHaveBeenCalled();
+    } finally { await act(async () => root.unmount()); container.remove(); }
+  });
   it("switches both the illustration group and Light/Dark theme from the title icon", async () => {
     const setTheme = vi.fn(async () => undefined);
     const controller = controllerFixture({ setTheme });

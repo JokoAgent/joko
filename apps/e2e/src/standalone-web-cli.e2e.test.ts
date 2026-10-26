@@ -175,6 +175,7 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       })).toBe(1);
       record("official-web-page-captured-and-released-a-browser-test-microphone");
       await page.locator(".connection-tabs > button").nth(2).click();
+      await page.locator('details.device-authorization__manual > summary').click();
       await page.getByLabel("Joko node address").fill(fixture.baseUrl);
       await page.getByLabel("Device name").fill("Standalone Web browser");
       await screenshot("01-pairing-page.png");

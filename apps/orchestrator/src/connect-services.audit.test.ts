@@ -169,6 +169,13 @@ describe("Connect security and protocol audit", () => {
       "joko.v1.ConnectionService/beginPairing",
       // Its private random challenge ID is the cancellation capability.
       "joko.v1.ConnectionService/cancelPairing",
+      'joko.v1.ConnectionService/requestDeviceAuthorization',
+      // Requires the invitation secret, and reveals only its allowed public entrances.
+      'joko.v1.ConnectionService/getDeviceAuthorizationEntries',
+      'joko.v1.ConnectionService/findDeviceAuthorizationInvitation',
+      'joko.v1.ConnectionService/getDeviceAuthorization',
+      'joko.v1.ConnectionService/claimDeviceAuthorization',
+      'joko.v1.ConnectionService/cancelDeviceAuthorization',
       "joko.v1.ConnectionService/completePairing",
       "joko.v1.ConnectionService/getMobilePushCapability",
       "joko.v1.ConnectionService/unregisterMobilePush"
@@ -256,7 +263,7 @@ describe("Connect security and protocol audit", () => {
       origin: "http://192.168.1.20:4318",
       pairingEnabled: true
     });
-    const wireKeys = Object.keys(wire.nodes[0] as object).map((key) => key.toLocaleLowerCase());
+    const wireKeys = Object.keys(wire.nodes[0] as object).filter(key => key !== 'endpointPublicKey').map((key) => key.toLocaleLowerCase());
     expect(wireKeys.some((key) => key.includes("code") || key.includes("key") || key.includes("credential") || key.includes("token"))).toBe(false);
   });
 

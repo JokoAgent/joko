@@ -1,5 +1,6 @@
 import { DEEP_LINK_IDENTITIES } from "./i18n/deep-link-corpus.js";
 import { readFileSync } from "node:fs";
+import { formatDeviceInvitation, formatDeviceAuthorizationReview } from '@joko/connection-transport/device-authorization';
 import { describe, expect, it } from "vitest";
 
 import { DESKTOP_DEEP_LINK_SETTINGS_SECTIONS } from "../src/channels.js";
@@ -20,6 +21,18 @@ import {
 } from "../src/deep-link.js";
 
 describe("Desktop public deep links", () => {
+  it('delivers an exact review link without granting approval or accepting additional actions', () => {
+    const link = formatDeviceAuthorizationReview({ serverId: 'node', endpointPublicKey: `ed25519:${'a'.repeat(64)}`,
+      invitationId: '11111111-1111-4111-8111-111111111111', requestId: '22222222-2222-4222-8222-222222222222' });
+    expect(parseDesktopDeepLink(link)).toEqual({ kind: 'deviceApproval', link });
+    expect(parseDesktopDeepLink(link + '&approve=true')).toBeUndefined();
+  });
+  it('delivers a validated device invitation for explicit preview without interpreting it as a bearer or task route', () => {
+    const link = formatDeviceInvitation({ origin: 'https://node.example', serverId: 'node', endpointPublicKey: `ed25519:${'a'.repeat(64)}`,
+      invitationId: '11111111-1111-4111-8111-111111111111', invitationSecret: 'b'.repeat(64), expiresAt: Date.now() + 600_000 });
+    expect(parseDesktopDeepLink(link)).toEqual({ kind: 'deviceInvitation', invitation: link });
+    expect(parseDesktopDeepLink(link + '&authKey=untrusted')).toBeUndefined();
+  });
   it("round-trips task, machine, and message identities through the canonical task form", () => {
     const link = buildDesktopSessionDeepLink({
       sessionId: DEEP_LINK_IDENTITIES.sessionId,

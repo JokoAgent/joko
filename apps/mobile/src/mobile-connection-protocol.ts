@@ -1,6 +1,12 @@
 import { normalizeEndpointTransport } from '@joko/connection-transport/trust';
+import { parseDeviceAuthorizationReview } from '@joko/connection-transport/device-authorization';
 
 export type MobileConnectionActionName =
+  | 'copyDeviceApprovalLink'
+  | 'createDeviceTransportRequest' | 'getDeviceTransportRequest' | 'cancelDeviceTransportRequest'
+  | 'connectSavedInvitation' | 'getDeviceAuthorizationEntries' | 'resolveDeviceAuthorizationTarget'
+  | 'refreshConnectionEntries' | 'prepareConnectionEntry' | 'selectConnectionEntry' | 'setConnectionEntryPolicy'
+  | 'startDeviceAuthorization' | 'refreshDeviceAuthorization' | 'cancelDeviceAuthorization' | 'finishDeviceAuthorization' | 'discardDeviceAuthorization' | 'scanDeviceInvitation'
   | "connect" | "pair" | "disconnect" | "forgetProfile" | "refreshDiscoveredNodes"
   | "retryManagedOrchestrator" | "cancelAutomaticConnectionAttempt"
   | "setAutomaticConnectionEnabled" | "setTheme" | "inspect" | "requestPairing"
@@ -13,7 +19,7 @@ export type MobileConnectionMessage =
 
 /** Only the local connection surface may request these host capabilities. */
 export function parseMobileConnectionMessage(raw: string, instanceId: string): MobileConnectionMessage | undefined {
-  if (raw.length > 32_768) return undefined;
+  if (raw.length > 98_304) return undefined;
   let value: unknown;
   try { value = JSON.parse(raw); } catch { return undefined; }
   if (!record(value) || value.instanceId !== instanceId) return undefined;
@@ -29,6 +35,23 @@ export function parseMobileConnectionMessage(raw: string, instanceId: string): M
     && exactKeys(args[index], ["automatic"]) && typeof args[index].automatic === "boolean");
   let valid = false;
   switch (value.name) {
+    case 'copyDeviceApprovalLink':
+      try { valid = args.length === 1 && text(0, 1024); if (valid) parseDeviceAuthorizationReview(args[0] as string); } catch { valid = false; } break;
+    case 'createDeviceTransportRequest': valid = args.length === 1 && ['iroh', 'tailcat'].includes(args[0] as string); break;
+    case 'getDeviceTransportRequest': valid = args.length === 0; break;
+    case 'cancelDeviceTransportRequest': valid = args.length === 1 && typeof args[0] === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(args[0]); break;
+    case 'connectSavedInvitation': valid = args.length >= 1 && args.length <= 3 && text(0, 65536) && (args[1] == null || typeof args[1] === 'boolean') && (args[2] == null || text(2, 128)); break;
+    case 'getDeviceAuthorizationEntries': valid = args.length === 1 && text(0, 65536); break;
+    case 'resolveDeviceAuthorizationTarget': valid = (args.length === 1 || args.length === 2) && text(0, 65536) && (args[1] == null || text(1, 16)); break;
+    case 'refreshConnectionEntries': valid = args.length === 1 && text(0, 128); break;
+    case 'prepareConnectionEntry': case 'selectConnectionEntry': valid = args.length === 2 && text(0, 128) && text(1, 128); break;
+    case 'setConnectionEntryPolicy': valid = args.length === 3 && text(0, 128) && Array.isArray(args[1]) && args[1].length <= 8
+      && args[1].every(item => typeof item === 'string' && /^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(item)) && typeof args[2] === 'boolean'; break;
+    case 'startDeviceAuthorization': valid = (args.length === 2 || args.length === 3) && text(0, 65536) && text(1, 128) && (args[2] == null || text(2, 128)); break;
+    case 'finishDeviceAuthorization': valid = args.length <= 1 && choice(0); break;
+    case 'discardDeviceAuthorization': valid = args.length === 0 || args.length === 1 && typeof args[0] === 'boolean'; break;
+    case 'refreshDeviceAuthorization': case 'cancelDeviceAuthorization': case 'scanDeviceInvitation':
+      valid = args.length === 0; break;
     case "connect": valid = (args.length === 1 || args.length === 2) && text(0, 256) && choice(1); break;
     case "pair": valid = (args.length === 3 || args.length === 4)
       && text(0, 2_048) && text(1, 128) && text(2, 256) && choice(3); break;

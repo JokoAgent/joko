@@ -12,6 +12,7 @@ import { linkspanProcessIsRetired, ownLinkspanProcessIdentity } from "./linkspan
 import { operationBodyHash } from "@joko/store";
 import { readIceToken } from "./remote-desktop-ice-configuration.js";
 import { registerIrohRelayIssuer } from "./linkspan-iroh-lease.js";
+import { publishConnectionEntry } from './connection-entries.js';
 
 interface SdkRecord { readonly requestId: string; readonly processId: number; readonly processIdentity: string; readonly state: "starting" | "active" | "closed" }
 
@@ -52,8 +53,10 @@ export async function startLinkspanSdkIngress(application: OrchestratorApplicati
   let closing: Promise<void> | undefined;
   let acceptLoop: Promise<void> | undefined;
   let retireIssuer: (() => void) | undefined;
+  let retireEntry: (() => void) | undefined;
   const markClosed = (): void => { store.setSetting("service", "orchestrator", journal, { requestId, processId: process.pid, processIdentity, state: "closed" }); };
   const close = (): Promise<void> => closing ??= (async () => {
+    retireEntry?.(); retireEntry = undefined;
     retireIssuer?.(); retireIssuer = undefined;
     shutdown.abort(); for (const channel of active) channel.abort();
     await listener?.close(); await acceptLoop; await Promise.all(serving); markClosed();
@@ -113,6 +116,10 @@ export async function startLinkspanSdkIngress(application: OrchestratorApplicati
       current.setSetting("service", "orchestrator", journal, { requestId, processId: process.pid, processIdentity, state: "active" });
       return { state: "active", provider: config.provider, endpointId: endpointTransport.endpointId };
     });
+    retireEntry = publishConnectionEntry(store, { id: `linkspan:${entry.id}`, provider: config.provider,
+      origin: application.config.publicOrigin, transport: endpointTransport,
+      ...(config.provider === 'iroh' ? { managedIrohLease: config.servicesApiSecretPath !== undefined }
+        : { allowedClients: config.allowedClients, allowPrivateAddressPairing: config.allowPrivateAddressPairing === true }) });
     return destination;
   }
   function startServing(): void {

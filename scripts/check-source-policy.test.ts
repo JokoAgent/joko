@@ -16,6 +16,7 @@ describe("source policy boundaries", () => {
     const root = fixture();
     source(root, "apps/web/src/view.ts", [
       'import type { Snapshot } from "@joko/contracts";',
+      'import { DeviceAuthorizationReceiver } from "@joko/connection-transport/device-authorization";',
       'import iconUrl from "@joko/brand-assets/icon-light.svg?url";',
       'export type View = Snapshot;',
       'void iconUrl;'

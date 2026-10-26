@@ -19,6 +19,7 @@ export * from "./browser-settings.js";
 export * from "./browser-tool-bridge.js";
 export * from "./config.js";
 export * from "./connection-manager.js";
+export * from "./connection-entries.js";
 export * from "./linkspan-identity.js";
 export * from "./linkspan-server.js";
 export * from "./linkspan-tcp-server.js";

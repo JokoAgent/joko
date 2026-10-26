@@ -297,6 +297,9 @@ importers:
       expo-build-properties:
         specifier: 57.0.15
         version: 57.0.15(expo@57.0.17)
+      expo-camera:
+        specifier: 57.0.4
+        version: 57.0.4(@types/emscripten@1.41.6)(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)
       expo-clipboard:
         specifier: 57.0.1
         version: 57.0.1(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)
@@ -360,6 +363,9 @@ importers:
       pdfjs-dist:
         specifier: 5.7.284
         version: 5.7.284
+      qrcode-generator:
+        specifier: 2.0.4
+        version: 2.0.4
       react:
         specifier: 19.2.3
         version: 19.2.3
@@ -845,6 +851,9 @@ importers:
       pdfjs-dist:
         specifier: 5.7.284
         version: 5.7.284
+      qrcode-generator:
+        specifier: 2.0.4
+        version: 2.0.4
       react:
         specifier: 19.2.0
         version: 19.2.0

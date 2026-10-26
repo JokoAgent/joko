@@ -26,6 +26,9 @@ export interface DiscoveredNodeRecord {
   readonly apiVersion: string;
   readonly pairingEnabled: boolean;
   readonly lastSeen: number;
+  readonly endpointPublicKey?: string;
+  readonly connectionKinds?: readonly string[];
+  readonly connectionDirectoryRevision?: string;
 }
 
 export type DecodedLanDiscoveryDatagram =
@@ -57,7 +60,8 @@ export function encodeLanDiscoveryAnnouncement(nonce: Uint8Array, node: Discover
       version: node.version,
       apiVersion: node.apiVersion,
       pairingEnabled: node.pairingEnabled,
-      lastSeen: timestamp(node.lastSeen)
+      lastSeen: timestamp(node.lastSeen), endpointPublicKey: node.endpointPublicKey,
+      connectionKinds: [...node.connectionKinds ?? []], connectionDirectoryRevision: node.connectionDirectoryRevision
     })
   }));
   if (encoded.byteLength > LAN_DISCOVERY_MAX_DATAGRAM_BYTES) throw new RangeError("LAN discovery datagram exceeds its byte limit.");
@@ -83,7 +87,10 @@ export function decodeLanDiscoveryDatagram(bytes: Uint8Array, receivedAt = Date.
       apiVersion: value.node.apiVersion,
       pairingEnabled: value.node.pairingEnabled,
       // Cache freshness is based exclusively on the receiver's clock.
-      lastSeen: receivedAt
+      lastSeen: receivedAt,
+      ...(value.node.endpointPublicKey ? { endpointPublicKey: value.node.endpointPublicKey } : {}),
+      ...(value.node.connectionKinds.length ? { connectionKinds: value.node.connectionKinds } : {}),
+      ...(value.node.connectionDirectoryRevision ? { connectionDirectoryRevision: value.node.connectionDirectoryRevision } : {})
     };
     validateDiscoveredNode(node);
     if (value.node.lastSeen === undefined || !validTimestamp(value.node.lastSeen.seconds, value.node.lastSeen.nanos)) return undefined;
@@ -94,6 +101,10 @@ export function decodeLanDiscoveryDatagram(bytes: Uint8Array, receivedAt = Date.
 }
 
 export function validateDiscoveredNode(node: DiscoveredNodeRecord): void {
+  if (node.endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(node.endpointPublicKey)
+    || node.connectionDirectoryRevision !== undefined && !/^[a-f0-9]{64}$/u.test(node.connectionDirectoryRevision)
+    || node.connectionKinds !== undefined && (!Array.isArray(node.connectionKinds) || node.connectionKinds.length > 5
+      || new Set(node.connectionKinds).size !== node.connectionKinds.length || node.connectionKinds.some(kind => !['https', 'webrtc', 'iroh', 'tailcat', 'http-connect'].includes(kind)))) throw new RangeError('Invalid public connection capabilities.');
   boundedUtf8(node.serverId, 128, "server ID", /^[a-z0-9][a-z0-9._:-]*$/iu);
   boundedUtf8(node.displayName, 128, "display name");
   boundedUtf8(node.version, 64, "version");

@@ -1427,6 +1427,11 @@ function parseDesktopDeepLinkNavigation(value: unknown): DesktopDeepLinkNavigati
   if (!nativeRecord(value) || typeof value["kind"] !== "string") {
     throw new TypeError("Desktop deep-link navigation is invalid.");
   }
+  if (value['kind'] === 'deviceInvitation') {
+    if (nativeKeys(value) !== 'invitation,kind' || typeof value['invitation'] !== 'string'
+      || value['invitation'].length > 1800 || !value['invitation'].startsWith('joko://pair#')) throw new TypeError('Invalid device invitation delivery.');
+    return Object.freeze({ kind: 'deviceInvitation', invitation: value['invitation'] });
+  }
   if (value["kind"] === "session") {
     if (!nativeOnlyKeys(value, ["kind", "sessionId", "profileId", "messageId", "messageEventId"]) ||
       !isDesktopNotificationSessionId(value["sessionId"]) ||

@@ -1,7 +1,11 @@
 import type { Locale } from "./model.js";
 import { presentJokoServiceTerminology } from "./i18n/service-terminology.js";
+import { deviceAuthorizationEnglish, deviceAuthorizationChinese } from './i18n/device-authorization.js';
+import { connectionEntriesEnglish, connectionEntriesChinese } from './i18n/connection-entries.js';
 
 const en = {
+  ...connectionEntriesEnglish,
+  ...deviceAuthorizationEnglish,
   "connection.trustedIdentity": "Trusted node invitation or public key",
   "connection.transportIrohHelp": "This invitation selects iroh. Its module loads when you connect; Web clients use a relay. Public relays have variable limits and no availability guarantee.",
   "connection.transport": "Connection transport",
@@ -6447,6 +6451,8 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  ...connectionEntriesChinese,
+  ...deviceAuthorizationChinese,
   "connection.trustedIdentity": "可信节点邀请或公钥",
   "connection.transportIrohHelp": "此邀请选择 iroh，连接时才加载其模块。Web 客户端经中继连接，公共中继的额度与速率不固定，也无可用性保证。",
   "connection.transport": "连接传输",

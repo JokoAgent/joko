@@ -61,6 +61,7 @@ export function projectMobileConnection(state: MobileState, locale: MobileSuppor
   const profiles = state.saved.map((profile) => ({
     id: profile.profileId, deviceId: profile.deviceId, serverId: profile.serverId,
     name: profile.displayName, origin: profile.origin, automatic: profile.automatic,
+    entryId: profile.entryId,
     endpointPublicKey: profile.endpointPublicKey, transportKind: profile.transportKind,
     credentialState: profile.credentialState, statusLabel: savedStatus(profile, locale), error: profile.error,
     identityLabel: mobileMessage(locale, "connection.identity", { id: profile.serverId }),
@@ -73,6 +74,7 @@ export function projectMobileConnection(state: MobileState, locale: MobileSuppor
     connectionState: state.status === "connecting" ? "connecting" : state.status === "connected" ? "connected"
       : state.status === "offline" ? "offline" : "disconnected",
     profiles, activeProfile: profiles.find((profile) => profile.id === state.activeProfileId),
+    connectionEntries: state.connectionEntries,
     discoveredNodes: state.nearby.map((node) => connectionNode(node, node.origin)),
     discoveryState: state.discoveryState === "refreshing" ? "discovering" : state.discoveryState === "idle" ? "idle" : "ready",
     discoveryError: state.discoveryError, automaticConnectionAvailable: true,

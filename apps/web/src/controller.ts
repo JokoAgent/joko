@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createIrohClientIdentity, createTailcatClientIdentity, isEndpointTrustError, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
+import { activateConnectionEntry, activeConnectionEntry, connectionEntryViews, initialConnectionEntries, mergeConnectionEntryDirectory,
+  prepareEntryAndSave, prepareSelectedConnectionEntry, readConnectionEntryDirectory, resolvePreparedConnection, verifyConnectionEntry, entryReadiness, acceptInvitedConnectionEntry, entriesNeedingRenewal,
+  type ConnectionEntryOwner, type ConnectionEntryView, type SavedConnectionEntries } from '@joko/connection-transport/entries';
+import { DeviceKind } from '@joko/contracts';
+import { createConnectTransport } from '@joko/connection-transport';
+import { DeviceAuthorizationReceiver, parseDeviceInvitation, bindDeviceInvitationTransport, type DeviceAuthorizationPort, type DeviceAuthorizationOwner } from '@joko/connection-transport/device-authorization';
+import { createIrohClientIdentity, createTailcatClientIdentity, isEndpointTrustError, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind, trustedEndpointTransport } from "@joko/connection-transport";
 import type { NativeTaskStatusLiveSource } from "./native-task-status-sources.js";
 import { nativeTaskStatusAvatar } from "./native-task-status-avatar.js";
 import { readDesktopMenuBarUsage, type DesktopMenuBarSource, type DesktopMenuBarUsage } from "./desktop-menu-bar.js";
@@ -43,7 +49,7 @@ import {
   withPersonalizationPrompt
 } from "./local-state.js";
 import { isLoopbackHostname, normalizeOrchestratorOrigin } from "./connection-origin.js";
-import { persistentWebSecretEncryptionAvailable, randomUuid } from "./web-crypto.js";
+import { persistentWebSecretEncryptionAvailable, randomUuid, sha256Hex } from "./web-crypto.js";
 import { normalizeNavigationWidth, type NavigationLayout } from "./navigation-layout.js";
 import type { RecentProject } from "./recent-projects.js";
 import { parseWorkspaceFilesHash, workspaceFilesHash } from "./workspace-files-navigation.js";
@@ -176,6 +182,7 @@ export interface BrowserInspectorFocusRequest {
 }
 
 export interface ControllerState {
+  readonly connectionEntries?: { readonly profileId: string; readonly entries: readonly ConnectionEntryView[]; readonly returnToPreferred: boolean; readonly notice?: string };
   readonly ready: boolean;
   readonly connectionState: GatewayConnectionState;
   /** Process-local occurrence of the currently selected Gateway object. */
@@ -225,6 +232,8 @@ export interface ControllerState {
 }
 
 export interface AppController extends OperationApi {
+  readonly deviceAuthorization?: DeviceAuthorizationPort;
+  deviceAuthorizationOwner?(): DeviceAuthorizationOwner;
   readonly readDesktopMenuBarUsage?: (source: DesktopMenuBarSource, signal: AbortSignal, refreshAccounts?: boolean) => Promise<DesktopMenuBarUsage>;
   readonly taskSharing?: TaskSharingApi;
   readonly inputHandoff?: InputHandoffApi;
@@ -238,6 +247,11 @@ export interface AppController extends OperationApi {
   /** True only when the Desktop-managed local Orchestrator reports shutdown-blocking work. */
   probeRuntimeActivity(): Promise<boolean>;
   connect(profile: ConnectionProfile, options?: ConnectionSelectionOptions): Promise<void>;
+  refreshConnectionEntries?(profileId: string): Promise<void>;
+  connectSavedInvitation?(link: string, automatic?: boolean, entryId?: string): Promise<void>;
+  prepareConnectionEntry?(profileId: string, entryId: string): Promise<void>;
+  selectConnectionEntry?(profileId: string, entryId: string): Promise<void>;
+  setConnectionEntryPolicy?(profileId: string, backupIds: readonly string[], returnToPreferred: boolean): Promise<void>;
   pair(origin: string, code: string, deviceName: string, options?: ConnectionSelectionOptions): Promise<void>;
   trustEndpoint?(origin: string, endpointPublicKey: string, replace?: boolean, serverId?: string, endpointTransport?: import('@joko/connection-transport/trust').EndpointTransport): Promise<void>;
   createTailcatClient?(origin: string, endpointPublicKey: string, endpointTransport: import('@joko/connection-transport/trust').EndpointTransport): Promise<{ readonly publicKey: string }>;
@@ -322,6 +336,14 @@ export interface AppController extends OperationApi {
 
 export interface ConnectionSelectionOptions {
   readonly automatic?: boolean;
+  readonly entryId?: string;
+}
+function webEntryOwner(profile: ConnectionProfile): ConnectionEntryOwner {
+  if (!profile.endpointPublicKey) throw new Error('The saved node has no trusted full public key.');
+  return { profileId: profile.id, serverId: profile.serverId, deviceId: profile.deviceId, endpointPublicKey: profile.endpointPublicKey };
+}
+function webEntrySupported(kind: import('@joko/connection-transport/trust').EndpointTransportKind): boolean {
+  return kind !== 'http-connect' || window.jokoDesktop?.linkspan !== undefined;
 }
 
 function withControllerPreferences(
@@ -405,6 +427,9 @@ export function useAppController(): AppController {
   const startupAutoConnectRef = useRef<ConnectionProfile | undefined>(undefined);
   const startupManagedLocalAutoPendingRef = useRef(false);
   const explicitDisconnectRef = useRef(false);
+  const entryAttemptRef = useRef<AbortController | undefined>(undefined);
+  const forgottenProfilesRef = useRef(new Set<string>());
+  const entryLastSwitchRef = useRef(0);
   const managedRetryRef = useRef(false);
   const machineRefreshGenerationRef = useRef(0);
   const machineRefreshPromiseRef = useRef<Promise<void> | undefined>(undefined);
@@ -1147,30 +1172,71 @@ export function useAppController(): AppController {
       } };
   }, []);
   useEffect(() => {
-    const retire = () => connectionLeaveRef.current?.abort();
+    const retire = () => { connectionLeaveRef.current?.abort(); entryAttemptRef.current?.abort(); };
     window.addEventListener("pagehide", retire);
     return () => { retire(); window.removeEventListener("pagehide", retire); };
   }, []);
 
-  const adoptConnection = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions): Promise<boolean> => {
+  const projectEntries = useCallback((profile: ConnectionProfile, saved: SavedConnectionEntries, notice?: string) => {
+    setState(current => ({ ...current, connectionEntries: { profileId: profile.id,
+      entries: connectionEntryViews(saved, profile, webEntrySupported), returnToPreferred: saved.returnToPreferred,
+      ...(notice ? { notice } : {}) } }));
+  }, []);
+  const refreshConnectionEntries = useCallback(async (profileId: string): Promise<void> => requireLocal(localRef.current).withConnectionEntryLock(profileId, async () => {
+    const profile = activeProfileRef.current?.id === profileId ? activeProfileRef.current : profilesRef.current.find(p => p.id === profileId);
+    if (!profile?.endpointPublicKey) return;
+    const local = requireLocal(localRef.current), owner = webEntryOwner(profile), generation = gatewayGenerationRef.current;
+    let saved = await local.readConnectionEntries(profile);
+    if (!saved) { await local.loadEndpointTransport(profile); saved = initialConnectionEntries(owner, profile); }
+    if (activeProfileRef.current?.id === profile.id && connectionStateRef.current === 'connected') {
+      const active = activeConnectionEntry(saved, profile);
+      if (!active) throw new Error('The current entrance is absent from the saved node directory.');
+      const authKey = await local.readAuthKey(profile);
+      if (!authKey) throw new Error('The saved authorization is unavailable.');
+      const response = await readConnectionEntryDirectory(owner, active, authKey, AbortSignal.timeout(10_000));
+      if (gatewayGenerationRef.current !== generation) return;
+      saved = mergeConnectionEntryDirectory(saved, owner, response);
+      await local.writeConnectionEntries(profile, saved);
+      for (const id of entriesNeedingRenewal(saved, webEntrySupported)) {
+        saved = await prepareEntryAndSave(owner, saved, id, active, authKey, { read: () => local.readConnectionEntries(profile), write: async value => {
+          if (gatewayGenerationRef.current !== generation) throw new Error('The node connection changed.');
+          await local.writeConnectionEntries(profile, value);
+        } }, AbortSignal.timeout(25_000), { renew: true });
+      }
+    }
+    if (gatewayGenerationRef.current === generation) projectEntries(profile, saved);
+  }), [projectEntries]);
+
+  const adoptConnectionUnlocked = useCallback(async (profile: ConnectionProfile, options: ConnectionSelectionOptions | undefined, entryAttempt: AbortController): Promise<boolean> => {
+    if (entryAttempt.signal.aborted || forgottenProfilesRef.current.has(profile.id)) return false;
     startupManagedLocalAutoPendingRef.current = false;
+    const originalGeneration = gatewayGenerationRef.current;
+    const local = requireLocal(localRef.current);
+    let savedEntries = profile.endpointPublicKey ? await local.readConnectionEntries?.(profile) : undefined;
+    const resolved = savedEntries ? await resolvePreparedConnection(webEntryOwner(profile), savedEntries,
+      () => local.readAuthKey(profile), webEntrySupported, entryAttempt.signal, options?.entryId, async next => {
+        entryAttempt.signal.throwIfAborted(); if (gatewayGenerationRef.current !== originalGeneration) throw new Error('The node connection changed.');
+        await local.writeConnectionEntries(profile, next); savedEntries = next;
+      }) : undefined;
+    if (entryAttemptRef.current !== entryAttempt || entryAttempt.signal.aborted || gatewayGenerationRef.current !== originalGeneration) return false;
+    if (resolved) activateConnectionEntry(webEntryOwner(profile), resolved.entry);
     const automaticPreferenceIntent = options?.automatic === undefined ? undefined : ++automaticPreferenceIntentRef.current;
     const generation = beginGatewayTransition();
-    let safeProfile = profile;
+    let safeProfile = resolved ? { ...profile, entryId: resolved.entry.id, origin: resolved.entry.origin, transportKind: resolved.entry.kind } : profile;
     let managedRecoveryReason: Extract<JokoDesktopManagedOrchestratorStatus, { readonly state: "recoveryRequired" }>["reason"] | undefined;
     activeProfileRef.current = safeProfile;
     connectionStateRef.current = "connecting";
     setState((current) => ({ ...current, activeProfile: safeProfile, connectionState: "connecting", error: undefined }));
     try {
       try {
-        const normalizedOrigin = normalizeOrchestratorOrigin(profile.origin);
-        safeProfile = normalizedOrigin === profile.origin ? profile : { ...profile, origin: normalizedOrigin };
+        const normalizedOrigin = normalizeOrchestratorOrigin(safeProfile.origin);
+        safeProfile = { ...safeProfile, origin: normalizedOrigin };
       } catch (error) {
         if (profile.managedLocal === true) managedRecoveryReason = "identityConflict";
         throw error;
       }
       activeProfileRef.current = safeProfile;
-      await requireLocal(localRef.current).loadEndpointTransport(safeProfile);
+      if (!resolved) await requireLocal(localRef.current).loadEndpointTransport(safeProfile);
       rememberEndpointTrust(safeProfile);
       setState((current) => ({ ...current, activeProfile: safeProfile }));
       // Validate the transport boundary before decrypting a persisted bearer
@@ -1186,7 +1252,7 @@ export function useAppController(): AppController {
         ...safeProfile,
         serverId: identity.serverId
       };
-      const authKey = await requireLocal(localRef.current).readAuthKey(profile);
+      const authKey = resolved?.authKey ?? await requireLocal(localRef.current).readAuthKey(profile);
       if (gatewayGenerationRef.current !== generation) return false;
       if (authKey === undefined) {
         if (safeProfile.managedLocal === true) managedRecoveryReason = "credentialUnavailable";
@@ -1194,22 +1260,34 @@ export function useAppController(): AppController {
       }
       const bound = bindGateway(verifiedProfile, authKey, generation);
       await bound.connect();
+      entryAttempt.signal.throwIfAborted();
       if (gatewayGenerationRef.current !== generation) bound.disconnect();
       else {
         const connectedProfile = { ...verifiedProfile, lastConnectedAt: Date.now() };
+        if (savedEntries) {
+          const next = options?.entryId ? { ...savedEntries, preferredId: options.entryId,
+            backupIds: savedEntries.backupIds.filter(id => id !== options.entryId) } : savedEntries;
+          await local.writeConnectionEntries(connectedProfile, next);
+          projectEntries(connectedProfile, next, resolved?.entry.id !== next.preferredId ? 'The preferred entrance is unavailable. Using a prepared backup; your preference is unchanged.' : undefined);
+        }
         machineFailureBackoffRef.current.delete(profile.id);
         await requireLocal(localRef.current).saveProfile(connectedProfile, authKey);
+        entryAttempt.signal.throwIfAborted();
         if (gatewayGenerationRef.current !== generation) {
           bound.disconnect();
           return false;
         }
         activeProfileRef.current = connectedProfile;
+        entryLastSwitchRef.current = Date.now();
         setState((current) => ({
           ...current,
           activeProfile: connectedProfile,
           profiles: [...current.profiles.filter((candidate) => candidate.id !== connectedProfile.id), connectedProfile]
         }));
         await commitAutomaticConnectionChoice(connectedProfile, options?.automatic, generation, automaticPreferenceIntent);
+        void refreshConnectionEntries(connectedProfile.id).catch(error => {
+          if (gatewayGenerationRef.current === generation) setState(current => ({ ...current, error: messageOf(error) }));
+        });
       }
     } catch (error) {
       if (gatewayGenerationRef.current === generation) {
@@ -1241,7 +1319,21 @@ export function useAppController(): AppController {
       throw error;
     }
     return gatewayGenerationRef.current === generation && (connectionStateRef.current as GatewayConnectionState) === "connected";
-  }, [beginGatewayTransition, bindGateway, commitAutomaticConnectionChoice]);
+  }, [beginGatewayTransition, bindGateway, commitAutomaticConnectionChoice, projectEntries, refreshConnectionEntries]);
+  const adoptConnection = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions): Promise<boolean> => {
+    entryAttemptRef.current?.abort();
+    const attempt = new AbortController(); entryAttemptRef.current = attempt;
+    const local = requireLocal(localRef.current);
+    try { return await (local.withConnectionEntryLock ? local.withConnectionEntryLock(profile.id, () => adoptConnectionUnlocked(profile, options, attempt))
+      : adoptConnectionUnlocked(profile, options, attempt)); }
+    catch (error) {
+      if (attempt.signal.aborted) return false;
+      const saved = await local.readConnectionEntries?.(profile);
+      if (saved && entryAttemptRef.current === attempt && !forgottenProfilesRef.current.has(profile.id)) projectEntries(activeProfileRef.current?.id === profile.id ? activeProfileRef.current : profile, saved);
+      throw error;
+    }
+    finally { if (entryAttemptRef.current === attempt) entryAttemptRef.current = undefined; }
+  }, [adoptConnectionUnlocked, projectEntries]);
   const connectProfile = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions, callerIsCurrent: () => boolean = () => true): Promise<boolean> => {
     const leave = beginConnectionLeave();
     try {
@@ -1253,6 +1345,127 @@ export function useAppController(): AppController {
     const intent = ++machineSwitchIntentRef.current;
     await connectProfile(profile, options, () => machineSwitchIntentRef.current === intent);
   }, [connectProfile]);
+
+  const prepareConnectionEntry = useCallback((profileId: string, entryId: string): Promise<void> => requireLocal(localRef.current).withConnectionEntryLock(profileId, async () => {
+    const profile = activeProfileRef.current;
+    if (!profile?.endpointPublicKey || profile.id !== profileId || connectionStateRef.current !== 'connected') throw new Error('Connect to this node before preparing another entrance.');
+    const generation = gatewayGenerationRef.current, local = requireLocal(localRef.current), owner = webEntryOwner(profile);
+    const saved = await local.readConnectionEntries(profile);
+    if (!saved) throw new Error('Refresh the entrance directory first.');
+    const active = activeConnectionEntry(saved, profile);
+    const candidate = saved.entries.find(e => e.id === entryId);
+    if (!active || !candidate || !webEntrySupported(candidate.kind)) throw new Error('This entrance is unsupported on this client.');
+    const auth = await local.readAuthKey(profile);
+    if (!auth) throw new Error('The saved authorization is unavailable.');
+    const current = () => { if (gatewayGenerationRef.current !== generation || activeProfileRef.current?.id !== profileId) throw new Error('The node connection changed.'); };
+    current();
+    const next = await prepareEntryAndSave(owner, saved, entryId, active, auth, {
+      read: () => local.readConnectionEntries(profile), write: async value => { current(); await local.writeConnectionEntries(profile, value); current(); }
+    }, AbortSignal.timeout(25_000));
+    current(); projectEntries(profile, next);
+  }), [projectEntries]);
+  const setConnectionEntryPolicy = useCallback(async (profileId: string, backupIds: readonly string[], returnToPreferred: boolean): Promise<void> => {
+    entryAttemptRef.current?.abort();
+    return requireLocal(localRef.current).withConnectionEntryLock(profileId, async () => {
+    const profile = profilesRef.current.find(p => p.id === profileId);
+    if (!profile?.endpointPublicKey) throw new Error('The pinned node is no longer saved.');
+    const local = requireLocal(localRef.current), saved = await local.readConnectionEntries(profile);
+    if (!saved) throw new Error('Load the entrance directory first.');
+    if (backupIds.some(id => !saved.entries.some(e => e.id === id && e.prepared && webEntrySupported(e.kind)))) throw new Error('Prepare each backup before permitting automatic use.');
+    const next = { ...saved, backupIds, returnToPreferred };
+    await local.writeConnectionEntries(profile, next);
+    projectEntries(activeProfileRef.current?.id === profileId ? activeProfileRef.current : profile, next);
+    });
+  }, [projectEntries]);
+  const selectConnectionEntry = useCallback(async (profileId: string, entryId: string): Promise<void> => {
+    const profile = profilesRef.current.find(p => p.id === profileId);
+    if (!profile) throw new Error('The node is no longer saved.');
+    await connect(profile, { entryId });
+  }, [connect]);
+  const connectSavedInvitation = useCallback(async (link: string, automatic?: boolean, selectedEntryId?: string): Promise<void> => {
+    const invitation = parseDeviceInvitation(link);
+    const profile = profilesRef.current.find(p => p.serverId === invitation.serverId && p.endpointPublicKey === invitation.endpointPublicKey);
+    if (!profile || invitation.expiresAt <= Date.now()) throw new Error('This invitation does not match a saved, verified node.');
+    const intent = ++machineSwitchIntentRef.current;
+    entryAttemptRef.current?.abort();
+    const attempt = new AbortController(); entryAttemptRef.current = attempt;
+    const signal = AbortSignal.any([attempt.signal, AbortSignal.timeout(30_000)]);
+    const current = () => { signal.throwIfAborted(); if (machineSwitchIntentRef.current !== intent || forgottenProfilesRef.current.has(profile.id)) throw new Error('The selected node changed.'); };
+    const local = requireLocal(localRef.current);
+    try {
+    const entryId = await local.withConnectionEntryLock(profile.id, async () => {
+      current();
+      let saved = await local.readConnectionEntries(profile);
+      if (!saved) { await local.loadEndpointTransport(profile); saved = initialConnectionEntries(webEntryOwner(profile), profile); }
+      const next = acceptInvitedConnectionEntry(webEntryOwner(profile), saved, { ...invitation, transportKind: invitation.endpointTransport?.kind,
+        endpointTransport: bindDeviceInvitationTransport(invitation, invitation.transportRequestId ? await local.readDeviceTransportRequest() : undefined) }, randomUuid());
+      current();
+      await local.writeConnectionEntries(profile, next.saved);
+      if (selectedEntryId) {
+        const owner = webEntryOwner(profile);
+        const bootstrap = await resolvePreparedConnection(owner, next.saved, () => local.readAuthKey(profile), webEntrySupported, signal, next.entryId);
+        return (await prepareSelectedConnectionEntry(owner, bootstrap.saved, selectedEntryId, bootstrap.entry, bootstrap.authKey,
+          { read: () => local.readConnectionEntries(profile), write: async value => { current(); await local.writeConnectionEntries(profile, value); current(); } }, webEntrySupported, signal)).entryId;
+      }
+      return next.entryId;
+    });
+    current();
+    await connectProfile(profile, { entryId, automatic }, () => machineSwitchIntentRef.current === intent);
+    } finally { if (entryAttemptRef.current === attempt) entryAttemptRef.current = undefined; }
+  }, [connectProfile]);
+
+  useEffect(() => {
+    if (!state.activeProfile?.endpointPublicKey || state.connectionState !== 'connected') return;
+    void refreshConnectionEntries(state.activeProfile.id).catch(() => undefined);
+  }, [state.activeProfile?.id, state.connectionState, refreshConnectionEntries]);
+  useEffect(() => {
+    if (!state.activeProfile?.endpointPublicKey) return;
+    let busy = false, stopped = false, stableSince = 0, refreshedAt = Date.now();
+    const check = async () => {
+      const profile = activeProfileRef.current;
+      if (busy || stopped || entryAttemptRef.current || connectionLeaveRef.current || !profile?.endpointPublicKey || explicitDisconnectRef.current || document.visibilityState === 'hidden') return;
+      busy = true;
+      let probedEntry: SavedConnectionEntries['entries'][number] | undefined;
+      try {
+        const saved = await requireLocal(localRef.current).readConnectionEntries(profile);
+        if (!saved || stopped || activeProfileRef.current !== profile) return;
+        if (connectionStateRef.current === 'offline' || connectionStateRef.current === 'reconnecting') {
+          stableSince = 0;
+          await adoptConnection(profile); return;
+        }
+        if (connectionStateRef.current !== 'connected') return;
+        if (Date.now() - refreshedAt >= 60_000) { refreshedAt = Date.now(); await refreshConnectionEntries(profile.id); }
+        const preferred = saved.entries.find(e => e.id === saved.preferredId);
+        if (!saved.returnToPreferred || !preferred || entryReadiness(preferred, webEntrySupported) !== 'ready' || preferred.id === activeConnectionEntry(saved, profile)?.id
+          || Date.now() - entryLastSwitchRef.current < 60_000) { stableSince = 0; return; }
+        probedEntry = preferred;
+        await verifyConnectionEntry(webEntryOwner(profile), preferred, AbortSignal.timeout(6_000));
+        if (stopped || activeProfileRef.current !== profile) return;
+        stableSince ||= Date.now();
+        if (Date.now() - stableSince >= 30_000) await adoptConnection(profile, { entryId: preferred.id });
+      } catch (error) {
+        stableSince = 0;
+        if (!stopped && isEndpointTrustError(error)) {
+          try {
+            const local = requireLocal(localRef.current);
+            await local.withConnectionEntryLock(profile.id, async () => {
+              if (!probedEntry || stopped || entryAttemptRef.current || activeProfileRef.current !== profile || forgottenProfilesRef.current.has(profile.id)) return;
+              const latest = await local.readConnectionEntries(profile);
+              if (!latest || stopped || activeProfileRef.current !== profile || forgottenProfilesRef.current.has(profile.id)
+                || !latest.entries.some(entry => JSON.stringify(entry) === JSON.stringify(probedEntry))) return;
+              const next = { ...latest, entries: latest.entries.map(entry => entry.id === probedEntry!.id ? { ...entry, verification: 'identity-conflict' as const } : entry) };
+              await local.writeConnectionEntries(profile, next);
+              if (!stopped && activeProfileRef.current === profile && !forgottenProfilesRef.current.has(profile.id)) projectEntries(profile, next, messageOf(error));
+            });
+          } catch (failure) { if (!stopped) setState(current => ({ ...current, error: messageOf(failure) })); }
+        }
+      } finally { busy = false; }
+    };
+    const timer = setInterval(() => { void check(); }, 15_000);
+    const wake = () => { void check(); };
+    window.addEventListener('online', wake); document.addEventListener('visibilitychange', wake);
+    return () => { stopped = true; clearInterval(timer); window.removeEventListener('online', wake); document.removeEventListener('visibilitychange', wake); };
+  }, [state.activeProfile?.id, adoptConnection, refreshConnectionEntries, projectEntries]);
 
   useEffect(() => {
     if (!state.ready) return;
@@ -1492,11 +1705,32 @@ export function useAppController(): AppController {
     const intent = ++machineSwitchIntentRef.current, leave = beginConnectionLeave();
     try {
       if (!await leave.confirm() || !leave.current() || machineSwitchIntentRef.current !== intent) return;
+      const normalized = normalizeOrchestratorOrigin(origin), key = trustedEndpointPublicKey(normalized);
+      if (key) {
+        const identity = await probeOrchestratorOrigin(normalized);
+        if (!leave.current() || machineSwitchIntentRef.current !== intent) return;
+        const profile = profilesRef.current.find(p => p.serverId === identity.serverId && p.endpointPublicKey === key);
+        if (profile) {
+          const local = requireLocal(localRef.current), owner = webEntryOwner(profile), kind = trustedEndpointTransportKind(normalized, key);
+          const endpointTransport = trustedEndpointTransport(normalized, key, kind);
+          const entryId = await local.withConnectionEntryLock(profile.id, async () => {
+            let saved = await local.readConnectionEntries(profile);
+            if (!saved) { await local.loadEndpointTransport(profile); saved = initialConnectionEntries(owner, profile); }
+            const next = acceptInvitedConnectionEntry(owner, saved, { origin: normalized, endpointPublicKey: key, serverId: identity.serverId,
+              transportKind: kind, endpointTransport }, randomUuid());
+            if (!leave.current() || machineSwitchIntentRef.current !== intent || forgottenProfilesRef.current.has(profile.id)) throw new Error('The selected node changed.');
+            await local.writeConnectionEntries(profile, next.saved); return next.entryId;
+          });
+          if (leave.current() && machineSwitchIntentRef.current === intent) await adoptConnection(profile, { ...options, entryId });
+          return;
+        }
+      }
       await pairConnection(origin, code, deviceName, options);
     } finally { leave.finish(); }
-  }, [beginConnectionLeave, pairConnection]);
+  }, [beginConnectionLeave, pairConnection, adoptConnection]);
 
   const disconnectNow = useCallback(async (): Promise<void> => {
+    entryAttemptRef.current?.abort();
     explicitDisconnectRef.current = true;
     startupAutoConnectRef.current = undefined;
     startupManagedLocalAutoPendingRef.current = false;
@@ -1548,7 +1782,12 @@ export function useAppController(): AppController {
     if (machineSelection !== "all" && machineSelection.includes(profileId)) {
       await updatePreferences({ machineSelection: machineSelection.filter((candidate) => candidate !== profileId) });
     }
-    await requireLocal(localRef.current).deleteProfile(profileId);
+    const local = requireLocal(localRef.current);
+    forgottenProfilesRef.current.add(profileId);
+    entryAttemptRef.current?.abort();
+    try { await local.withConnectionEntryLock(profileId, () => local.deleteProfile(profileId)); }
+    catch (error) { forgottenProfilesRef.current.delete(profileId); throw error; }
+    profilesRef.current = profilesRef.current.filter(profile => profile.id !== profileId);
     setState((current) => {
       const machinePresenceByProfile = { ...current.machinePresenceByProfile };
       delete machinePresenceByProfile[profileId];
@@ -3030,7 +3269,66 @@ export function useAppController(): AppController {
     if (artifactGateway === undefined) throw new Error("Connect to Joko before requesting a prompt recommendation.");
     return artifactGateway.predictNextPrompt(sessionId, expectedLastActivityAt, expectedGeneration, signal);
   }, [artifactGateway]);
+  const deviceAuthorization = useMemo<DeviceAuthorizationPort>(() => {
+    const storage = { read: () => requireLocal(localRef.current).readDeviceAuthorization(),
+      readTransportRequest: () => requireLocal(localRef.current).readDeviceTransportRequest(),
+      writeTransportRequest: (draft: import('@joko/connection-transport/device-authorization').DeviceTransportRequestDraft | undefined) => requireLocal(localRef.current).writeDeviceTransportRequest(draft),
+      write: (draft: import('@joko/connection-transport/device-authorization').DeviceAuthorizationDraft | undefined) => requireLocal(localRef.current).writeDeviceAuthorization(draft),
+      exclusive: async <T,>(action: () => Promise<T>): Promise<T> => {
+        if (!navigator.locks) throw new Error('Protected device requests require a secure browser with Web Locks support.');
+        return await navigator.locks.request('joko.device-authorization-request-v1', action);
+      } };
+    const receiver = new DeviceAuthorizationReceiver(storage, { uuid: randomUuid,
+      secret: () => [...crypto.getRandomValues(new Uint8Array(32))].map(byte => byte.toString(16).padStart(2, '0')).join(''),
+      digest: value => sha256Hex(new TextEncoder().encode(value).buffer) },
+      invitation => createConnectTransport({ baseUrl: invitation.origin, endpointPublicKey: invitation.endpointPublicKey, endpointTransport: invitation.endpointTransport,
+        transportKind: invitation.endpointTransport?.kind ?? 'https', useBinaryFormat: true, isolateFailures: true }));
+    return {
+      transportRequest: (kind, signal) => receiver.transportRequest(kind, signal),
+      pendingTransportRequest: signal => receiver.pendingTransportRequest(signal),
+      cancelTransportRequest: (requestId, signal) => receiver.cancelTransportRequest(requestId, signal),
+      resolveTarget: (link, code, signal) => receiver.resolveTarget(link, code, signal),
+      entries: async (link, signal) => (await receiver.entries(link, signal)).filter(entry => webEntrySupported(entry.kind)),
+      start: (link, name, signal, entryId) => {
+        const invitation = parseDeviceInvitation(link);
+        if (profilesRef.current.some(profile => (profile.origin === invitation.origin || profile.serverId === invitation.serverId)
+          && profile.endpointPublicKey !== undefined && profile.endpointPublicKey !== invitation.endpointPublicKey)) throw new Error('The invited identity conflicts with a saved node. Verify it before continuing.');
+        return receiver.start(link, name, window.jokoDesktop ? DeviceKind.DESKTOP : DeviceKind.WEB, window.jokoDesktop ? 'desktop' : 'web', signal, entryId);
+      },
+      refresh: signal => receiver.refresh(signal), cancel: signal => receiver.cancel(signal),
+      discard: allowUnconfirmed => receiver.discard(allowUnconfirmed),
+      finish: async (signal, automatic) => {
+        const generation = gatewayGenerationRef.current;
+        const assertCurrent = () => { signal?.throwIfAborted(); if (generation !== gatewayGenerationRef.current) throw new Error('The connection changed. Resume the original request from Add Joko node.'); };
+        const { draft, authorization } = await receiver.claim(signal); assertCurrent();
+        const connection = authorization.connection!;
+        const profile: ConnectionProfile = { id: connection.connectionProfileId, deviceId: connection.deviceId,
+          serverId: draft.invitation.serverId, name: connection.displayName, origin: draft.invitation.origin,
+          endpointPublicKey: draft.invitation.endpointPublicKey, transportKind: draft.endpointTransport?.kind ?? 'https' };
+        await requireLocal(localRef.current).saveProfile(profile, draft.authKey); assertCurrent();
+        const local = requireLocal(localRef.current);
+        const selectedEntryId = draft.entryId ? await local.withConnectionEntryLock(profile.id, async () => {
+          const owner = webEntryOwner(profile), saved = await local.readConnectionEntries(profile) ?? initialConnectionEntries(owner, profile);
+          const active = activeConnectionEntry(saved, profile);
+          if (!active) throw new Error('The invitation entrance is unavailable.');
+          return (await prepareSelectedConnectionEntry(owner, saved, draft.entryId!, active, draft.authKey,
+            { read: () => local.readConnectionEntries(profile), write: async value => { assertCurrent(); await local.writeConnectionEntries(profile, value); } },
+            webEntrySupported, signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000))).entryId;
+        }) : undefined;
+        setState(current => ({ ...current, profiles: [...current.profiles.filter(value => value.id !== profile.id), profile] }));
+        await connectProfile(profile, { automatic, entryId: selectedEntryId }, () => !signal?.aborted && generation === gatewayGenerationRef.current);
+        if (activeProfileRef.current?.id !== profile.id || connectionStateRef.current !== 'connected') throw new Error('The approved device is saved. Resume its connection from Add Joko node.');
+        await receiver.clear(draft.requestId);
+      }
+    };
+  }, [connectProfile]);
   return useMemo<AppController>(() => ({
+    deviceAuthorization,
+    deviceAuthorizationOwner: () => {
+      const api = gateway().deviceAuthorizationOwner?.();
+      if (!api) throw new Error('Device approval is unavailable on this node.');
+      return api;
+    },
     readDesktopMenuBarUsage: async (source, signal, refreshAccounts) => {
       const expectedKey = remoteMachineProfileKey(source.profile);
       const primary = source.epoch === undefined;
@@ -3062,6 +3360,11 @@ export function useAppController(): AppController {
     },
     probeRuntimeActivity,
     connect,
+    refreshConnectionEntries,
+    connectSavedInvitation,
+    prepareConnectionEntry,
+    selectConnectionEntry,
+    setConnectionEntryPolicy,
     pair,
     authorizeNewDevice: async options => {
       const active = gateway();

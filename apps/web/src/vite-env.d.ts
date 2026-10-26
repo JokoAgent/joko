@@ -283,6 +283,8 @@ type JokoDesktopDeepLinkSettingsSection =
   | "about";
 
 type JokoDesktopDeepLinkNavigation =
+  | { readonly kind: 'deviceInvitation'; readonly invitation: string }
+  | { readonly kind: 'deviceApproval'; readonly link: string }
   | {
       readonly kind: "session";
       readonly sessionId: string;

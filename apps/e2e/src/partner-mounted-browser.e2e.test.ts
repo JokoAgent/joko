@@ -85,6 +85,7 @@ describe("mounted Partner collaboration product chain", () => {
     await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-theme-toggle").click();
     await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
     await page.locator("form.pair-form input[type=url]").fill(fixture.baseUrl);
     await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
     await page.getByLabel("Device name").fill("Partner package Web");
@@ -184,6 +185,7 @@ describe("mounted Partner collaboration product chain", () => {
     page.on("pageerror", (error) => pageErrors.push(error.message));
     await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
     const pairForm = page.locator("form.pair-form");
     try { await pairForm.waitFor({ state: "visible", timeout: 3_000 }); }
     catch { throw new Error(`The pairing form is unavailable: ${JSON.stringify(await page.locator(".connection-card").evaluateAll((nodes) => nodes.map((node) => ({
@@ -305,6 +307,7 @@ describe("mounted Partner collaboration product chain", () => {
     const browserErrors = observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
     await page.getByLabel("Pairing code").fill(pairingCode);
     await page.getByLabel("Device name").fill("Mounted Partner Web");

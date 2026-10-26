@@ -59,6 +59,7 @@ describe("mounted Provider configuration", () => {
     const firstErrors = browserErrors(first);
     await first.goto(`${fixture.baseUrl}/#/settings/providers`, { waitUntil: "domcontentloaded" });
     await first.locator(".connection-tabs > button").nth(2).click();
+    await first.locator('details.device-authorization__manual > summary').click();
     await first.getByLabel("Joko node address").fill(fixture.baseUrl);
     await first.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
     await first.getByLabel("Device name").fill("Provider Web");

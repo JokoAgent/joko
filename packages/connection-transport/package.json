@@ -5,6 +5,8 @@
   "type": "module",
   "files": ["dist"],
   "exports": {
+    "./entries": { "types": "./dist/entries.d.ts", "react-native": "./dist/entries.js", "import": "./dist/entries.js" },
+    "./device-authorization": { "types": "./dist/device-authorization.d.ts", "react-native": "./dist/device-authorization.js", "import": "./dist/device-authorization.js" },
     ".": { "types": "./dist/index.d.ts", "react-native": "./dist/index.js", "browser": "./dist/index.js", "node": "./dist/node-index.js", "import": "./dist/index.js" },
     "./node": { "types": "./dist/node.d.ts", "import": "./dist/node.js" },
     "./trust": { "types": "./dist/trust.d.ts", "react-native": "./dist/trust.js", "import": "./dist/trust.js" },

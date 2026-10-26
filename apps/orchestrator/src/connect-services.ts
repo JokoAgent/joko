@@ -152,6 +152,8 @@ import type { AndroidToolBridgeProvider } from "./android-tool-bridge.js";
 import type { ComputerAutomationSettingsController } from "./computer-automation-settings.js";
 import type { ComputerToolBridgeProvider } from "./computer-tool-bridge.js";
 import { ConnectionAuthenticationError, PairingRequestError, type ConnectionManager } from "./connection-manager.js";
+import { deviceAuthorizationService } from './device-authorization-service.js';
+import { connectionEntryDirectory, prepareConnectionEntry } from './connection-entries.js';
 import {
   MobilePushInputError,
   MobilePushTicketError,
@@ -1563,6 +1565,25 @@ export function createConnectServices(application: OrchestratorApplication, proj
   );
 
   const connection = {
+    listConnectionEntries: (_request, context) => {
+      authenticate(context);
+      return connectionEntryDirectory(application);
+    },
+    prepareConnectionEntry: async (request, context) => {
+      const owner = authenticate(context), revoked = new AbortController();
+      const stop = dependencies.connections.onRevoked(owner.id, () => revoked.abort());
+      const signal = AbortSignal.any([context.signal, revoked.signal]);
+      const assertCurrent = () => {
+        signal.throwIfAborted();
+        const current = authenticate(context);
+        if (current.id !== owner.id || current.authKeyDigest !== owner.authKeyDigest) throw new ConnectError('The original device authorization was revoked.', Code.PermissionDenied);
+      };
+      try { return await prepareConnectionEntry(application, { ...request, connectionId: owner.id, signal, assertCurrent }); }
+      finally { stop(); }
+    },
+    ...deviceAuthorizationService(dependencies.store, authenticate, () => ({ origin: serverPublicOrigin(dependencies),
+      serverId: dependencies.server?.id ?? 'orchestrator', endpointPublicKey: dependencies.server?.endpointPublicKey ?? '',
+      entries: connectionEntryDirectory(application).entries }), now),
     getServerInfo: () => ({ server: serverInfo(dependencies, now()) }),
     listDiscoveredNodes: () => ({
       nodes: (dependencies.discoveredNodes?.() ?? [fallbackDiscoveredNode(dependencies, now())])
@@ -7083,6 +7104,9 @@ function toProtoDiscoveredNode(node: DiscoveredNodeRecord): contract.DiscoveredN
     version: node.version,
     apiVersion: node.apiVersion,
     pairingEnabled: node.pairingEnabled,
+    endpointPublicKey: node.endpointPublicKey ?? '',
+    connectionKinds: [...node.connectionKinds ?? []],
+    connectionDirectoryRevision: node.connectionDirectoryRevision ?? '',
     lastSeen: toProtoTimestamp(node.lastSeen)
   });
 }

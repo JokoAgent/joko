@@ -154,6 +154,7 @@ async function pairPage(page: Page, system: RealPiSystemFixture) {
   const begun = await system.anonymous.connection.beginPairing({ deviceDisplayName: "Group Web" });
   await page.goto(`${system.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
   await page.locator(".connection-tabs > button").nth(2).click();
+  await page.locator('details.device-authorization__manual > summary').click();
   await page.locator("form.pair-form input[type=url]").fill(system.baseUrl);
   await page.getByLabel("Pairing code", { exact: true }).fill(system.pairingCode(begun.challenge!.challengeId));
   await page.getByLabel("Device name", { exact: true }).fill("Group Web");

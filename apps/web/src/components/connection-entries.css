@@ -1,0 +1,20 @@
+.connection-entry-panel { grid-column: 1 / -1; flex-basis: 100%; min-width: 0; width: 100%; }
+.connection-entry-panel > summary { padding: 12px 0; cursor: pointer; }
+.connection-entry-panel__content { display: grid; gap: var(--settings-card-gap); padding: 8px 0 4px; max-width: 480px; }
+.connection-entry-panel__content p { margin: 0; line-height: 1.6; }
+.connection-entry-panel__content > .button { justify-self: start; min-height: 44px; }
+.connection-entry-panel__list { display: grid; gap: 12px; }
+.connection-entry-choice { display: grid; gap: 12px; padding: var(--settings-card-padding); border: 1px solid var(--line); border-radius: var(--radius); min-width: 0; }
+.connection-entry-choice__heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.connection-entry-choice__heading > div { flex: 1; min-width: 120px; overflow-wrap: anywhere; }
+.connection-entry-choice__heading svg, .connection-entry-panel__trust svg { width: 18px; height: 18px; flex-shrink: 0; }
+.connection-entry-choice small, .connection-entry-panel__return small { display: block; margin-top: 4px; line-height: 1.5; }
+.connection-entry-choice__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.connection-entry-choice__actions > button { min-height: 44px; }
+.connection-entry-choice__order { display: flex; align-items: center; gap: 8px; }
+.connection-entry-choice__order small { flex: 1; }
+.connection-entry-choice__order button { min-width: 44px; min-height: 44px; }
+.connection-entry-choice__order svg { width: 16px; height: 16px; }
+.connection-entry-choice__actions label, .connection-entry-panel__return { display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 8px 0; font-size: var(--text-13); }
+.connection-entry-panel__trust { display: flex; align-items: center; gap: 8px; line-height: 1.5; }
+@media (max-width: 420px) { .connection-entry-choice__actions > button { width: 100%; } }

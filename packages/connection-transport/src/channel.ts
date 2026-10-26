@@ -3,7 +3,7 @@ import { isPrivateLanDiscoveryHost } from '@joko/contracts';
 import { captureEndpointTrustFailure, endpointOrigin, isLoopbackEndpoint } from './trust.js';
 import { assertEndpointTransportReady, assertHttpConnectOrigin, localHttpConnectClientBinding, localIrohClientBinding, localTailcatClientBinding, localWebRtcClientBinding, normalizeEndpointTransport, prepareEndpointTransportRuntime, trustedEndpointTransport, type EndpointTransport, type EndpointTransportKind } from './endpoint-transport.js';
 
-export function endpointConnector(origin: string, expectedPublicKey: string, transportKind?: EndpointTransportKind, privateLocator?: EndpointTransport): (options: OperationOptions) => Promise<ByteChannel> {
+export function endpointConnector(origin: string, expectedPublicKey: string, transportKind?: EndpointTransportKind, privateLocator?: EndpointTransport, reportFailure = true): (options: OperationOptions) => Promise<ByteChannel> {
   const transport = privateLocator === undefined ? trustedEndpointTransport(origin, expectedPublicKey, transportKind) : normalizeEndpointTransport(privateLocator);
   const irohBinding = localIrohClientBinding();
   const tailcatBinding = localTailcatClientBinding();
@@ -13,7 +13,7 @@ export function endpointConnector(origin: string, expectedPublicKey: string, tra
   if (transport?.kind === 'http-connect') assertHttpConnectOrigin(transport, origin);
   if (transport !== undefined) return async options => {
     options.signal?.throwIfAborted();
-    const failed = captureEndpointTrustFailure({ origin, endpointPublicKey: expectedPublicKey });
+    const failed = reportFailure ? captureEndpointTrustFailure({ origin, endpointPublicKey: expectedPublicKey }) : (_error: unknown) => {};
     try {
       assertEndpointTransportReady(transport);
       if (transport.kind === 'http-connect') {
@@ -54,7 +54,7 @@ export function endpointConnector(origin: string, expectedPublicKey: string, tra
     options.signal?.throwIfAborted();
     const { connectWebSocket } = await import('@jokoagent/linkspan-noise');
     options.signal?.throwIfAborted();
-    const failed = captureEndpointTrustFailure({ origin, endpointPublicKey: expectedPublicKey });
+    const failed = reportFailure ? captureEndpointTrustFailure({ origin, endpointPublicKey: expectedPublicKey }) : (_error: unknown) => {};
     try {
       const channel = await connectWebSocket({ url: endpoint.href, expectedPublicKey,
         allowInsecureWebSocket: endpoint.protocol === 'ws:', ...options });

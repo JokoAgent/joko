@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Authenticated directory of entrances belonging to this node. No device keys.
+message NodeConnectionEntry {
+  string entry_id = 1;
+  string display_name = 2;
+  string provider = 3;
+  string origin = 4;
+  string transport_kind = 5;
+  bool requires_client_identity = 6;
+  // The running carrier cannot enroll a new device without deployment changes.
+  bool requires_server_setup = 7;
+}
+message ListConnectionEntriesRequest {}
+message ListConnectionEntriesResponse {
+  string server_id = 1;
+  string endpoint_public_key = 2;
+  string revision = 3;
+  repeated NodeConnectionEntry entries = 4;
+}
+message PrepareConnectionEntryRequest {
+  string entry_id = 1;
+  // Retained before dispatch; retries refer to the original preparation.
+  string request_id = 2;
+  string client_public_key = 3;
+}
+message ConnectionEntryIroh {
+  string endpoint_id = 1;
+  string ticket = 2;
+  repeated string relay_urls = 3;
+  string relay_token = 4;
+  google.protobuf.Timestamp relay_token_expires_at = 5;
+}
+message ConnectionEntryTailcat {
+  string endpoint_id = 1;
+  string address = 2;
+  uint32 port = 3;
+  string derp_map_url = 4;
+}
+message ConnectionEntryHttpConnect {
+  string proxy_origin = 1;
+  string authority = 2;
+}
+// Private, device-scoped material. Never publish in discovery/events/settings.
+message PrepareConnectionEntryResponse {
+  NodeConnectionEntry entry = 1;
+  string server_id = 2;
+  string endpoint_public_key = 3;
+  oneof locator {
+    ConnectionEntryIroh iroh = 4;
+    ConnectionEntryTailcat tailcat = 5;
+    ConnectionEntryHttpConnect http_connect = 6;
+  }
+}

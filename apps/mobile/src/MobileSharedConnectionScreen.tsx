@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ForwardRefExoticComponent, type RefAttributes } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ForwardRefExoticComponent, type RefAttributes } from "react";
 import { Alert, AppState, Platform, StyleSheet, Text } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent, type WebViewProps } from "react-native-webview";
@@ -11,8 +11,11 @@ import { mobileConnectionJson, parseMobileConnectionMessage, type MobileConnecti
 import connectionRuntime from "./connection-runtime.connjs";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { mobileIrohNativeAvailable } from './mobile-iroh-native';
+import { mobileEntrySupported, mobileEntryIrohMode } from './mobile-entry-capabilities';
 import { mobileHttpConnectNativeAvailable } from './mobile-http-connect-native';
+import * as Clipboard from 'expo-clipboard';
 import { linkspanRuntimeAssets, linkspanWebRtcRuntimeAssets } from './linkspan-runtime-assets';
+const MobileDeviceInvitationScanner = lazy(() => import('./MobileDeviceInvitationScanner').then(module => ({ default: module.MobileDeviceInvitationScanner })));
 
 interface ConnectionWebViewHandle { injectJavaScript(script: string): void }
 const ConnectionWebView = WebView as unknown as ForwardRefExoticComponent<WebViewProps & RefAttributes<ConnectionWebViewHandle>>;
@@ -20,6 +23,7 @@ const connectionBaseUrl = "https://joko-connection.invalid";
 let surfaceSequence = 0;
 
 interface MobileSharedConnectionScreenProps {
+  readonly invitationLink?: string;
   readonly client: MobileClient;
   readonly state: MobileState;
   readonly locale: MobileSupportedLocale;
@@ -32,11 +36,16 @@ interface MobileSharedConnectionScreenProps {
 
 /** Native authority adapter; layout, controls and gestures run the Web page itself. */
 export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreenProps) {
+  props.client.connectionEntrySupported = mobileEntrySupported;
+  props.client.connectionEntryIrohMode = mobileEntryIrohMode();
   const keyboard = useMobileKeyboardState();
   const safeArea = useSafeAreaInsets();
   const [surface, setSurface] = useState(() => `joko-connection-${++surfaceSequence}`);
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   const [notice, setNotice] = useState("");
+  const [scanner, setScanner] = useState<{ resolve: (link: string) => void; reject: (error: Error) => void }>();
+  const scannerRef = useRef(scanner); scannerRef.current = scanner;
+  const authorizationAbort = useRef(new AbortController());
   const webView = useRef<ConnectionWebViewHandle | null>(null);
   const ready = useRef(false);
   const activeSurface = useRef(surface);
@@ -46,7 +55,7 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
   const projectedState = projectMobileConnection(props.state, props.locale, props.dark, props.defaultDeviceName, props.onBack !== undefined, foreground);
   const publicView = {
     instanceId: surface, locale: props.locale, dark: props.dark,
-    state: { ...projectedState, capabilities: { ...projectedState.capabilities, irohNativeAvailable: mobileIrohNativeAvailable(),
+    state: { ...projectedState, invitationLink: props.invitationLink, capabilities: { ...projectedState.capabilities, irohNativeAvailable: mobileIrohNativeAvailable(),
       irohRelayAvailable: linkspanRuntimeAssets.iroh !== undefined, tailcatRelayAvailable: linkspanRuntimeAssets.tailcat !== undefined,
       webRtcAvailable: linkspanWebRtcRuntimeAssets !== undefined, httpConnectNativeAvailable: mobileHttpConnectNativeAvailable() } },
     messages: mobileConnectionMessages(props.locale)
@@ -64,10 +73,14 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
     // A replacement ref is attached before the retired effect is cleaned up.
     // Close this occurrence's document, never whichever renderer is current.
     const renderer = webView.current;
+    authorizationAbort.current = new AbortController();
     activeSurface.current = surface;
     ready.current = false;
     lastRequestId.current = 0;
     return () => {
+      authorizationAbort.current.abort();
+      scannerRef.current?.reject(new Error('The connection page closed.'));
+      scannerRef.current = undefined;
       if (activeSurface.current === surface) activeSurface.current = "";
       ready.current = false;
       renderer?.injectJavaScript("window.jokoConnection?.close();true;");
@@ -76,14 +89,22 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
 
   useEffect(() => {
     if (ready.current) webView.current?.injectJavaScript(`window.jokoConnection?.update(${mobileConnectionJson(publicView)});true;`);
-  }, [props.state, props.locale, props.dark, props.defaultDeviceName, props.onBack, foreground, surface]);
+  }, [props.state, props.locale, props.dark, props.defaultDeviceName, props.onBack, props.invitationLink, foreground, surface]);
 
   useEffect(() => {
-    const subscription = AppState.addEventListener("change", (state) => setForeground(state === "active"));
+    const subscription = AppState.addEventListener("change", (state) => {
+      setForeground(state === 'active');
+      if (state !== 'active') {
+        authorizationAbort.current.abort();
+        scannerRef.current?.reject(new Error('Scanning stopped while the app is in the background.')); scannerRef.current = undefined; setScanner(undefined);
+      } else authorizationAbort.current = new AbortController();
+    });
     return () => subscription.remove();
   }, []);
 
   const recover = () => {
+    authorizationAbort.current.abort();
+    scannerRef.current?.reject(new Error('The connection page was replaced.')); scannerRef.current = undefined; setScanner(undefined);
     activeSurface.current = "";
     ready.current = false;
     setNotice(mobileMessage(current.current.locale, "connection.repair"));
@@ -105,8 +126,15 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
       if (activeSurface.current !== surface || !ready.current) return;
       webView.current?.injectJavaScript(`window.jokoConnection?.settle(${message.id},${success},${mobileConnectionJson(error)},${mobileConnectionJson(result)});true;`);
     };
-    if (!foreground) { settle(false, mobileMessage(current.current.locale, "connection.repair")); return; }
-    void executeConnectionAction(message, current.current).then(result => settle(true, undefined, result), (error: unknown) => {
+    if (!foreground || AppState.currentState !== 'active') { settle(false, mobileMessage(current.current.locale, "connection.repair")); return; }
+    if (['selectMode', 'goBack', 'connect', 'pair', 'disconnect'].includes(message.name)) {
+      authorizationAbort.current.abort(); authorizationAbort.current = new AbortController();
+      scannerRef.current?.reject(new Error('The connection action changed.')); scannerRef.current = undefined; setScanner(undefined);
+    }
+    const action = message.name === 'scanDeviceInvitation'
+      ? new Promise<string>((resolve, reject) => { scannerRef.current?.reject(new Error('The scan was replaced.')); const next = { resolve, reject }; scannerRef.current = next; setScanner(next); })
+      : executeConnectionAction(message, current.current, authorizationAbort.current.signal);
+    void action.then(result => settle(true, undefined, result), (error: unknown) => {
       settle(false, error instanceof Error ? error.message : mobileMessage(current.current.locale, "connection.repair"));
     });
   };
@@ -114,6 +142,14 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
   return <MobileKeyboardAvoidingView style={[styles.fill, { backgroundColor: props.dark ? "#17130e" : "#fef9ef" }]}
     keyboard={keyboard} consumedBottomInset={safeArea.bottom} behavior={Platform.OS === "android" ? "height" : undefined}>
     <SafeAreaView style={styles.fill}>
+    {scanner && foreground && <Suspense fallback={<Text>{props.locale === 'zh-CN' ? '正在打开相机…' : 'Opening camera…'}</Text>}><MobileDeviceInvitationScanner locale={props.locale} onResult={link => {
+      if (scannerRef.current !== scanner || activeSurface.current !== surface || AppState.currentState !== 'active') return;
+      scanner.resolve(link); scannerRef.current = undefined; setScanner(undefined);
+    }} onClose={() => {
+      if (scannerRef.current !== scanner) return;
+      scanner.reject(new Error(props.locale === 'zh-CN' ? '已停止扫描，可粘贴邀请链接。' : 'Scanning stopped. You can paste the invitation link.'));
+      scannerRef.current = undefined; setScanner(undefined);
+    }} /></Suspense>}
     {notice !== "" && <Text accessibilityRole="alert" style={[styles.notice, { color: props.dark ? "#f2f2f2" : "#0d0d0d" }]}>{notice}</Text>}
     <ConnectionWebView key={surface} ref={webView}
       source={{ html: initialHtml.current.html, baseUrl: connectionBaseUrl }}
@@ -136,11 +172,33 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
 }
 
 async function executeConnectionAction(message: Extract<MobileConnectionMessage, { type: "action" }>,
-  props: MobileSharedConnectionScreenProps): Promise<void | { readonly publicKey: string }> {
+  props: MobileSharedConnectionScreenProps, signal?: AbortSignal): Promise<void | string | { readonly publicKey: string } | import('@joko/connection-transport/device-authorization').DeviceAuthorizationProgress | readonly import('@joko/connection-transport/device-authorization').DeviceInvitationEntry[]> {
   const { client, locale } = props;
   const args = message.args;
   const automatic = (index: number): boolean | undefined => (args[index] as { automatic?: boolean } | undefined)?.automatic;
   switch (message.name) {
+    case 'createDeviceTransportRequest': return client.deviceAuthorization.transportRequest!(args[0] as 'iroh' | 'tailcat', signal);
+    case 'copyDeviceApprovalLink': signal?.throwIfAborted(); await Clipboard.setStringAsync(args[0] as string); return;
+    case 'getDeviceTransportRequest': return client.deviceAuthorization.pendingTransportRequest!(signal);
+    case 'cancelDeviceTransportRequest': return client.deviceAuthorization.cancelTransportRequest!(args[0] as string, signal);
+    case 'connectSavedInvitation': await client.connectSavedInvitation(args[0] as string, args[1] as boolean | undefined, args[2] as string | undefined);
+      signal?.throwIfAborted(); if (client.state.status === 'connected') props.onConnected(); return;
+    case 'getDeviceAuthorizationEntries': return client.deviceAuthorization.entries!(args[0] as string, signal);
+    case 'resolveDeviceAuthorizationTarget': return client.deviceAuthorization.resolveTarget!(args[0] as string, args[1] as string | undefined, signal);
+    case 'refreshConnectionEntries': return client.refreshConnectionEntries(args[0] as string);
+    case 'prepareConnectionEntry': return client.prepareConnectionEntry(args[0] as string, args[1] as string);
+    case 'selectConnectionEntry': return client.connectSaved(args[0] as string, undefined, args[1] as string);
+    case 'setConnectionEntryPolicy': return client.setConnectionEntryPolicy(args[0] as string, args[1] as string[], args[2] as boolean);
+    case 'startDeviceAuthorization': return client.deviceAuthorization.start(args[0] as string, args[1] as string, signal, args[2] as string | undefined);
+    case 'refreshDeviceAuthorization': return client.deviceAuthorization.refresh(signal);
+    case 'cancelDeviceAuthorization': return client.deviceAuthorization.cancel(signal);
+    case 'discardDeviceAuthorization': await client.deviceAuthorization.discard(args[0] as boolean | undefined); return;
+    case 'finishDeviceAuthorization':
+      await client.deviceAuthorization.finish(signal, automatic(0));
+      signal?.throwIfAborted();
+      if (client.state.status === 'connected') props.onConnected();
+      return;
+    case 'scanDeviceInvitation': return;
     case "connect": {
       const profileId = args[0] as string;
       if (!client.state.saved.some((profile) => profile.profileId === profileId)) throw new Error(mobileMessage(locale, "connection.missingSaved"));

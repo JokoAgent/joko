@@ -109,6 +109,7 @@ describe("packaged Desktop Pi compaction", () => {
     const page = await desktop.firstWindow({ timeout: 60_000 });
     await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
     await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
     await page.getByLabel("Joko node address").fill(currentFixture.baseUrl);
     await page.getByLabel("Pairing code").fill(pairingCode);
     await page.getByLabel("Device name").fill(deviceName);
