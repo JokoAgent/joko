@@ -74,9 +74,17 @@ describe("Desktop distribution", () => {
 
   it("pins an inert builder toolchain and keeps build-only packages out of production dependencies", () => {
     expect(manifest.dependencies).toEqual({
+      "@jokoagent/linkspan-core": "*",
+      "@jokoagent/linkspan-iroh": "*",
+      "@jokoagent/linkspan-tailcat": "*",
+      "@jokoagent/linkspan-iroh-node": "*",
+      "@jokoagent/linkspan-tailcat-node": "*",
+      "@jokoagent/linkspan-webrtc": "*",
+      "@jokoagent/linkspan-webrtc-node": "*",
       "@bufbuild/protobuf": "2.14.0",
       "@connectrpc/connect": "2.1.2",
       "@connectrpc/connect-node": "2.1.2",
+      "@joko/connection-transport": "workspace:*",
       "@joko/contracts": "workspace:*",
       "@joko/device-peer": "workspace:*",
       "@joko/remote-desktop-sync": "workspace:*",
@@ -113,7 +121,7 @@ describe("Desktop distribution", () => {
       "!**/WORKSPACE/**",
       "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
     ]));
-    expect(config.extraResources.map(({ from, to }) => ({ from, to }))).toEqual([
+    expect(config.extraResources.filter(item => !item.to.startsWith("app/node_modules/@jokoagent/" )).map(({ from, to }) => ({ from, to }))).toEqual([
       { from: "resources/app-update.yml", to: "app-update.yml" },
       { from: "resources/native-task-status-sounds", to: "native-task-status-sounds" },
       { from: "dist/native-voice-shortcut", to: "native-voice-shortcut" },

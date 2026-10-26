@@ -47,6 +47,7 @@ async function mount(drift = false, initializationState?: "pending" | "error") {
   vi.mocked(probeOrchestratorOrigin).mockImplementation(async origin => ({ serverId: origin === first.origin ? first.serverId : second.serverId, displayName: "Node", version: "1", apiVersion: "1", pairingEnabled: true }));
   vi.spyOn(LocalState, "open").mockResolvedValue({ listProfiles: async () => [first, second], listMachineCaches: async () => [], readPreferences: async () => DEFAULT_UI_PREFERENCES,
     readAuthKey: async () => "private", saveProfile: async () => undefined, saveMachineCache: async () => undefined,
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
     mutatePreferences: async (update: (value: typeof DEFAULT_UI_PREFERENCES) => typeof DEFAULT_UI_PREFERENCES) => update(DEFAULT_UI_PREFERENCES)
   } as unknown as LocalState);
   vi.mocked(createOrchestratorGateway).mockImplementation((owner, _key, callbacks) => {

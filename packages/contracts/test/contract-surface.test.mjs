@@ -6,6 +6,15 @@ import { create, fromBinary, ScalarType, toBinary } from "@bufbuild/protobuf";
 
 import * as contract from "../dist/index.js";
 
+test("Viewer owners retain a selected WebRTC transport and require its trusted endpoint pin", () => {
+  const owner = { profileId: "rtc", serverId: "node", deviceId: "device", origin: "https://node.example",
+    connectionGeneration: 1, transportKind: "webrtc", endpointPublicKey: `ed25519:${"a".repeat(64)}` };
+  assert.deepEqual(contract.parseDesktopRemoteDesktopViewerOwner(owner), owner);
+  assert.equal(contract.sameDesktopRemoteDesktopViewerOwner(owner, { ...owner, transportKind: "https" }), false);
+  assert.throws(() => contract.parseDesktopRemoteDesktopViewerOwner({ ...owner, endpointPublicKey: undefined }));
+  assert.throws(() => contract.parseDesktopRemoteDesktopViewerOwner({ ...owner, endpointTransport: { kind: "webrtc" } }));
+});
+
 test("Runtime command input modes preserve explicit text and selected Resource semantics without private metadata", () => {
   assert.equal(contract.RuntimeCommandInputMode.UNSPECIFIED, 0);
   assert.equal(create(contract.RuntimeCommandSchema).inputMode, contract.RuntimeCommandInputMode.UNSPECIFIED);

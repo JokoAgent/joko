@@ -11,11 +11,11 @@ import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-boots
 import { OperationalStore } from "@joko/store";
 import { expect, it, vi } from "vitest";
 import { ConnectionManager } from "./connection-manager.js";
-import { HostedAgentDesktopDelegates, registerHostedAgentDesktopService } from "./hosted-agent-desktop-service.js";
+import { HostedAgentDesktopDelegates, registerHostedAgentDesktopService, type HostedAgentDesktopServiceOptions } from "./hosted-agent-desktop-service.js";
 import { HostedAgentRuntime } from "./hosted-agent-runtime.js";
 import { encodeHostedAgentValue } from "./hosted-agent-wire.js";
 
-async function fixture() {
+async function fixture(media?: HostedAgentDesktopServiceOptions["media"]) {
   const root = await mkdtemp(join(tmpdir(), "joko-desktop-native-")), store = new OperationalStore(":memory:");
   const connections = new ConnectionManager(store);
   const desktop = connections.issueTrustedDesktopConnection({ desktopInstanceId: randomUUID(), desktopDeviceId: randomUUID(),
@@ -35,7 +35,7 @@ async function fixture() {
     } as unknown as BackendAdapter) }] });
   let settings = runtime.settings.update({ kind: "remote_control", enabled: true }, 0n);
   settings = runtime.settings.update({ kind: "provider", backendId: "native", providerId: "provider", enabled: true }, settings.revision);
-  const delegates = new HostedAgentDesktopDelegates({ runtime, connections, serverId: "managed-hub" });
+  const delegates = new HostedAgentDesktopDelegates({ runtime, connections, serverId: "managed-hub", ...(media === undefined ? {} : { media }) });
   const client = createClient(contract.DesktopHostedAgentService, createRouterTransport(({ service }) => {
     service(contract.DesktopHostedAgentService, delegates.service());
   }));
@@ -51,6 +51,24 @@ async function fixture() {
     async close() { await delegates.close(); await runtime.close(); expect(disposed).toBe(created); store.close();
       if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true }); } };
 }
+
+it("requires private Main proof for media policy and permits only exact cleanup after business revocation", async () => {
+  const retired = vi.fn(async () => {});
+  const f = await fixture({ localUdpRetirementRequired: true, retireLocalMedia: retired });
+  try {
+    await expect(f.client.getDesktopMediaUdpPolicy({ format: 1 }, { headers: f.headers })).rejects.toBeDefined(); f.commit();
+    await expect(f.client.getDesktopMediaUdpPolicy({ format: 1 }, { headers: { authorization: f.headers.authorization } })).rejects.toBeDefined();
+    expect(await f.client.getDesktopMediaUdpPolicy({ format: 1 }, { headers: f.headers })).toEqual({ $typeName: "joko.v1.GetDesktopMediaUdpPolicyResponse", format: 1, retirementRequired: true });
+    const body = { format: 1, connectionId: f.desktop.connection.id, leaseId: "original-lease", attemptId: "original-attempt" };
+    await expect(f.client.retireDesktopMediaUdp(body, { headers: { authorization: f.headers.authorization } })).rejects.toBeDefined(); expect(retired).not.toHaveBeenCalled();
+    f.connections.revoke(f.desktop.connection.id);
+    await expect(f.client.getDesktopMediaUdpPolicy({ format: 1 }, { headers: f.headers })).rejects.toBeDefined();
+    await expect(f.openDelegate()).rejects.toBeDefined();
+    await f.client.retireDesktopMediaUdp(body, { headers: f.headers });
+    expect(retired).toHaveBeenCalledWith(expect.objectContaining({ id: f.desktop.connection.id, state: "revoked" }), "original-lease", "original-attempt");
+    await expect(f.client.retireDesktopMediaUdp({ ...body, connectionId: "another-host" }, { headers: f.headers })).rejects.toBeDefined();
+  } finally { await f.close(); }
+});
 
 it("requires the exact committed Desktop proof in addition to an owner bearer, including across repeated open requests", async () => {
   const f = await fixture();

@@ -131,6 +131,9 @@ import {
   ProviderCatalogManager
 } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
+import { openLinkspanIdentity } from "./linkspan-identity.js";
+import { advertisedLinkspanOrigin } from "./linkspan-connector.js";
+import type { Identity as LinkspanIdentity } from "@jokoagent/linkspan-noise";
 import { McpAppsManager } from "./mcp-apps/manager.js";
 import { McpAppSurfaces } from "./mcp-apps/surface.js";
 import { TaskSharingHome } from "./task-sharing-home.js";
@@ -282,6 +285,10 @@ import {
   type RemoteDesktopIceConfigurationProvider
 } from "./remote-desktop-coordinator.js";
 import { ConfiguredRemoteDesktopIceConfiguration, REMOTE_DESKTOP_ICE_RESPONSE_BYTES } from "./remote-desktop-ice-configuration.js";
+import { LinkspanRemoteDesktopTurnConfiguration } from "./linkspan-turn-configuration.js";
+import { LinkspanRemoteDesktopUdpMapping } from "./linkspan-media-udp.js";
+import { reserveManagedLinkspanResourceCredentials } from "./linkspan-resource-manager.js";
+import { reserveIrohRelayLeaseCredentials } from "./linkspan-iroh-lease.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import { RemoteExecutionRouter } from "./remote-execution-router.js";
 import {
@@ -421,6 +428,9 @@ export interface OrchestratorApplication {
   readonly connections: ConnectionManager;
   /** Stable, public node identity used by ServerInfo and LAN discovery deduplication. */
   readonly serverId: string;
+  readonly linkspanIdentity?: LinkspanIdentity;
+  /** Current published locator; deployment TLS and private bridge configuration stay separate. */
+  readonly advertisedOrigin?: () => string;
   readonly lanDiscovery: LanDiscoveryService;
   readonly artifacts: ArtifactStore;
   readonly artifactMaintenance: ArtifactMaintenance;
@@ -775,6 +785,7 @@ export async function createOrchestratorApplication(
     readMaximum: () => runtimeGovernance.agentResource().maxConcurrentCommands
   });
   const serverId = durableServerId(store);
+  const advertisedOrigin = () => advertisedLinkspanOrigin(store, config.publicOrigin);
   const connections = new ConnectionManager(store);
   nativeInputHandoff = new NativeInputHandoffHost(connections);
   let lastLanDiscoveryDiagnosticAt = 0;
@@ -818,6 +829,7 @@ export async function createOrchestratorApplication(
   const baseSettings = await loadJsonFile<PiManagedSettings>(config.piSettingsFile, {});
   const settings = effectivePiSettings(baseSettings, store.findSetting<unknown>("service", "orchestrator", "settings.pi.pi")?.value);
   const credentialVault = await CredentialVault.open(join(config.dataDirectory, "credentials", "master.key"));
+  const linkspanIdentity = await openLinkspanIdentity({ dataDirectory: config.dataDirectory, serverId, store, vault: credentialVault });
   const taskSharingHome = new TaskSharingHome({ directory: join(config.dataDirectory, "task-sharing-home"),
     vault: credentialVault, serverId });
   let lastContactSyncDiagnosticAt = 0;
@@ -862,6 +874,8 @@ export async function createOrchestratorApplication(
     storagePath: join(config.dataDirectory, "credentials", "records.json")
   });
   await credentials.initialize();
+  reserveManagedLinkspanResourceCredentials({ config, store, credentials });
+  reserveIrohRelayLeaseCredentials({ store, credentials });
   const providerCredentialSurfaces = new ProviderCredentialSurfaceResolver({
     store,
     credentials,
@@ -879,11 +893,22 @@ export async function createOrchestratorApplication(
     defaultSshUser: dependencies.defaultSshUser ?? userInfo().username,
     connector: dependencies.remoteSshConnector ?? new Ssh2ResolvedAgentAuthConnector()
   });
-  const devicePeers = new DevicePeerOwner({ store });
+  const devicePeers = new DevicePeerOwner({ store, localDesktopHostConnection: connection => connections.isLocalDesktopHostConnection(connection) });
+  const mediaUdp = config.remoteDesktopUdp === undefined ? undefined : new LinkspanRemoteDesktopUdpMapping({ config, store, serverId, credentials,
+    isLocalDesktopRoute: identity => devicePeers.isLocalDesktopRoute(identity) });
+  await mediaUdp?.initialize();
+  const hostedTurn = config.remoteDesktopTurn === undefined ? undefined : new LinkspanRemoteDesktopTurnConfiguration({
+    configuration: config.remoteDesktopTurn, store, credentials,
+    fetch: createOutboundFetch(dependencies.resolveOutboundProxy, REMOTE_DESKTOP_ICE_RESPONSE_BYTES)
+  });
+  // Reconcile saved resources before accepting a new media lease. Unknown
+  // generations are retained; this does not replay their issuance.
+  if (dependencies.remoteDesktopIceConfiguration === undefined) await hostedTurn?.initialize();
   const remoteDesktop = new RemoteDesktopCoordinator({
     owner: devicePeers,
+    ...(mediaUdp === undefined ? {} : { udpMapping: mediaUdp }),
     onRevoked: (connectionId, listener) => connections.onRevoked(connectionId, listener),
-    iceConfiguration: dependencies.remoteDesktopIceConfiguration ?? new ConfiguredRemoteDesktopIceConfiguration({
+    iceConfiguration: dependencies.remoteDesktopIceConfiguration ?? hostedTurn ?? new ConfiguredRemoteDesktopIceConfiguration({
       configuration: config.remoteDesktopIce,
       fetch: createOutboundFetch(dependencies.resolveOutboundProxy, REMOTE_DESKTOP_ICE_RESPONSE_BYTES)
     })
@@ -1777,7 +1802,7 @@ export async function createOrchestratorApplication(
         fetch: claudeCodeOAuthFetch, ...(config.claudeCodeExecutable === undefined ? {} : { pathToExecutable: config.claudeCodeExecutable }) })
     }] });
   providerSharing = await createProviderSharingRuntime({ store, directory: join(config.dataDirectory, "provider-sharing"), serverId,
-    origin: config.publicOrigin, vault: credentialVault, native: hostedAgents, connections,
+    origin: advertisedOrigin, endpointPublicKey: linkspanIdentity.publicKey, vault: credentialVault, native: hostedAgents, connections,
     closeNative: (digest, runId) => hostedAgents.endpoint.closeProviderGrant(digest, runId) });
   const resolveSessionContextDefaults = composeSessionContextDefaultsResolver([{
     adapter: { id: piBackendId },
@@ -2616,8 +2641,8 @@ export async function createOrchestratorApplication(
     if (profile.lifecycle !== "active" || profile.initializationState !== "ready" || !profile.canonicalSessionId || partnerHomeStorage.changing(id)) throw new Error("This Partner is unavailable.");
     return { id: profile.id, name: profile.displayName, description: profile.description };
   };
-  const networkHost = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId, origin: config.publicOrigin,
-    mediaDirectory: join(config.dataDirectory, "partner-network-media"), partner: networkPartner, artifacts });
+  const networkHost = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId, origin: advertisedOrigin,
+    endpointPublicKey: linkspanIdentity.publicKey, mediaDirectory: join(config.dataDirectory, "partner-network-media"), partner: networkPartner, artifacts });
   const networkHome = new PartnerNetworkHome({ directory: join(config.dataDirectory, "credentials", "partner-network"), serverId,
     vault: credentialVault, partner: networkPartner, allowInsecureLan: config.allowInsecureLan });
   partnerNetwork = new PartnerNetworkRuntime({ host: networkHost, home: networkHome, profiles: partnerStore, store,
@@ -2630,7 +2655,7 @@ export async function createOrchestratorApplication(
         validate: raw => parsePlanDecision(raw, input.mode, members) === null ? undefined : raw });
       return result.status === "ok" ? parsePlanDecision(result.text, input.mode, members) : null;
     } });
-  const partnerIdentity = new PartnerIdentityDirectory({ store, serverId, origin: config.publicOrigin, vault: credentialVault, home: taskSharingHome,
+  const partnerIdentity = new PartnerIdentityDirectory({ store, serverId, origin: advertisedOrigin, endpointPublicKey: linkspanIdentity.publicKey, vault: credentialVault, home: taskSharingHome,
     partner: id => {
       const profile = partners.getPartner(id);
       if (profile.lifecycle !== "active" || profile.initializationState !== "ready" || !profile.canonicalSessionId || partnerHomeStorage.changing(id)) throw new Error("This Partner is unavailable.");
@@ -2873,6 +2898,7 @@ export async function createOrchestratorApplication(
       store.expireToolLeases(now);
       store.prunePairings({
         expiredBefore: now,
+        expiredCreatedBefore: now - 60_000,
         consumedBefore: now - 24 * 60 * 60_000
       });
       await sessionHost.reapIdleRuntimes();
@@ -3352,6 +3378,8 @@ export async function createOrchestratorApplication(
     store,
     connections,
     serverId,
+    linkspanIdentity,
+    advertisedOrigin,
     lanDiscovery,
     artifacts,
     artifactMaintenance,

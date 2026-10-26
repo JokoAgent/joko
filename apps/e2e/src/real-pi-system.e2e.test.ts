@@ -30,6 +30,7 @@ import {
 } from "@joko/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { createE2eClients } from "./connect-clients.js";
 import {
   compactMutation,
   createSessionMutation,
@@ -60,6 +61,12 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
 
   it("pairs, creates, sends, settles, and projects public plus Pi-native context", { timeout: 60_000 }, async () => {
     fixture = await RealPiSystemFixture.start({ holdProviderResponses: true });
+    const endpointPublicKey = fixture.application.linkspanIdentity!.publicKey;
+    // The production fixture exposes the same identity over its original HTTP
+    // API and its attached encrypted ingress. Other fixture clients stay raw.
+    expect((await fixture.anonymous.connection.getServerInfo({})).server?.endpointPublicKey).toBe(endpointPublicKey);
+    const pinned = createE2eClients(fixture.baseUrl, undefined, 10_000, endpointPublicKey);
+    expect((await pinned.connection.getServerInfo({})).server?.endpointPublicKey).toBe(endpointPublicKey);
     const paired = await fixture.pair();
 
     const backends = await paired.clients.backend.listBackends({});

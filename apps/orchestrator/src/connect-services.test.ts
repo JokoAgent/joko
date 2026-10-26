@@ -247,6 +247,34 @@ describe("Connect service composition", () => {
     expect(response.challenge?.humanCode).toBe("384201");
   });
 
+  it("cancels the exact private challenge and rejects invalid owner credentials before cancellation", () => {
+    const authenticate = vi.fn(() => ({ id: "owner" })), cancelPairing = vi.fn(() => true);
+    const services = createConnectServices(stubApplication({ connections: { authenticate, cancelPairing } }));
+    const cancel = services.connection.cancelPairing as (request: contract.CancelPairingRequest, context: unknown) => { cancelled: boolean };
+    const request = create(contract.CancelPairingRequestSchema, { challengeId: "private-challenge" });
+    expect(cancel(request, { requestHeader: new Headers() }).cancelled).toBe(true);
+    expect(authenticate).not.toHaveBeenCalled(); expect(cancelPairing).toHaveBeenCalledWith("private-challenge");
+    authenticate.mockImplementationOnce(() => { throw new Error("Revoked"); });
+    expect(() => cancel(request, { requestHeader: new Headers({ authorization: "Bearer revoked" }) })).toThrow("Revoked");
+    expect(cancelPairing).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the current published address for pairing and fallback discovery without mutating deployment configuration", () => {
+    let origin = "https://current.trycloudflare.com";
+    const application = stubApplication({ advertisedOrigin: () => origin,
+      connections: { requestPairing: () => ({ id: "pairing", code: "1234-5678", expiresAt: Date.now() + 60_000 }) } });
+    const services = createConnectServices(application);
+    const begin = services.connection.beginPairing as (request: contract.BeginPairingRequest, context: unknown) => contract.BeginPairingResponse;
+    const discover = services.connection.listDiscoveredNodes as () => contract.ListDiscoveredNodesResponse;
+    const context = { requestHeader: new Headers() }, request = create(contract.BeginPairingRequestSchema, { deviceDisplayName: "Guest" });
+    expect(begin(request, context).challenge?.verificationUri).toBe(`${origin}/pair`);
+    expect(discover().nodes[0]?.origin).toBe(origin);
+    origin = application.config.publicOrigin;
+    expect(begin(request, context).challenge?.verificationUri).toBe(`${origin}/pair`);
+    expect(discover().nodes[0]?.origin).toBe(origin);
+    expect(application.config.publicOrigin).toBe("https://orchestrator.example.test");
+  });
+
   it("maps portable task drafts without forwarding a transient password into commit", async () => {
     const connection = {
       id: "connection-one",

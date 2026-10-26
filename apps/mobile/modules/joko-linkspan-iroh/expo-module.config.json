@@ -1,0 +1,5 @@
+{
+  "platforms": ["android", "ios"],
+  "android": { "modules": ["app.joko.linkspan.LinkspanIrohModule"] },
+  "ios": { "modules": ["LinkspanIrohModule"] }
+}

@@ -46,7 +46,7 @@ it("uses only the server-resolved original peer and the same handoff request for
 });
 
 it("clears a provider invitation fragment before routing and keeps it only in current memory for explicit preview", () => {
-  const link = contract.buildProviderSharingLink("https://home.example.test", "a".repeat(43)), replaceState = vi.fn();
+  const link = contract.buildProviderSharingLink("https://home.example.test", "a".repeat(43), `ed25519:${"a".repeat(64)}`), replaceState = vi.fn();
   clearProviderSharingInvitation();
   captureProviderSharingInvitation({ href: link, pathname: "/provider-share/join" }, { replaceState, state: null });
   expect(replaceState).toHaveBeenCalledExactlyOnceWith(null, "", "/#/settings/sharing");

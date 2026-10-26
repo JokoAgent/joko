@@ -6,15 +6,16 @@ import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
 import { OperationalStore, PartnerNetworkStore, networkHash } from "@joko/store";
 import { afterEach, expect, it } from "vitest";
-import { PartnerNetworkHost } from "./partner-network-host.js";
+import { PartnerNetworkHost, parsePartnerNetworkInvitation } from "./partner-network-host.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
 const authority = () => ({ signal: new AbortController().signal, assertCurrent() {} });
 
-async function fixture() {
+async function fixture(origin: string | (() => string) = "http://127.0.0.1") {
   const root = await mkdtemp(join(tmpdir(), "joko-network-media-")), store = new OperationalStore(":memory:");
-  const options = { storage: new PartnerNetworkStore(store), serverId: "media-owner", origin: "http://127.0.0.1",
+  const options = { storage: new PartnerNetworkStore(store), serverId: "media-owner", origin,
+    endpointPublicKey: `ed25519:${"a".repeat(64)}`,
     mediaDirectory: join(root, "media"), partner: (id: string) => ({ id, name: "Partner", description: "" }) };
   let host = new PartnerNetworkHost(options);
   const room = host.create(create(contract.CreatePartnerNetworkRequestSchema, { operationId: "create-room", name: "Files", displayName: "Owner" }));
@@ -26,6 +27,21 @@ async function fixture() {
   return { store, room, request, id, directory, path, get host() { return host; },
     async restart() { await host.close(); host = new PartnerNetworkHost({ ...options, storage: new PartnerNetworkStore(store) }); } };
 }
+
+it("publishes invitations for an existing room through the live entrance without rewriting its stored authority", async () => {
+  let origin = "http://127.0.0.1";
+  const f = await fixture(() => origin);
+  origin = "https://current.trycloudflare.com";
+  const request = create(contract.InvitePartnerNetworkRequestSchema, { operationId: "public-invite", roomId: f.room.id, expectedRevision: f.room.revision, lifetimeMs: 60_000n });
+  const issued = f.host.invite(request, f.host.selfId), parsed = parsePartnerNetworkInvitation(issued.invitation);
+  expect(parsed.origin).toBe(origin); expect(f.host.inspect(issued.invitation).room?.hostOrigin).toBe(origin);
+  expect(f.host.storage.get(f.room.id).hostOrigin).toBe("http://127.0.0.1");
+  origin = "http://127.0.0.1";
+  expect(f.host.invite(request, f.host.selfId).invitation).toBe(issued.invitation);
+  const fresh = parsePartnerNetworkInvitation(f.host.invite(create(contract.InvitePartnerNetworkRequestSchema, { ...request, operationId: "fallback-invite" }), f.host.selfId).invitation);
+  expect(fresh.origin).toBe(origin);
+  expect(f.host.inspect(issued.invitation).room?.hostOrigin).toBe(origin);
+});
 
 it("serializes a begin and write queued in the same tick under the derived media ID", async () => {
   const f = await fixture();

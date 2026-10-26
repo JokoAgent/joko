@@ -148,6 +148,12 @@ export interface MobileExtensionMainViewSurface {
   readonly expiresAt: number;
 }
 
+export interface MobileExtensionMainViewResource {
+  readonly bytes: Uint8Array;
+  readonly mimeType: string;
+}
+export type MobileExtensionResourceKind = "document" | "media" | "script" | "module" | "style" | "style-text";
+
 export interface MobileExtensionCommand {
   readonly name: string;
   readonly description: string;
@@ -205,6 +211,7 @@ export interface MobileExtensionTransport {
   ): Promise<MobileExtensionUseResult>;
   openMainView(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
   probeMainView(expected: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
+  readMainViewResource(expected: MobileExtensionMainViewSurface, url: string, kind: MobileExtensionResourceKind, signal: AbortSignal, text?: string): Promise<MobileExtensionMainViewResource>;
   closeMainView(expected: MobileExtensionMainViewSurface): Promise<boolean>;
   openLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionLibrarySession>;
   callLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, session: MobileExtensionLibrarySession,

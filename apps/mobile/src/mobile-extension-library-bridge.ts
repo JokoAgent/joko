@@ -61,10 +61,18 @@ export class MobileExtensionLibraryBridge {
     readonly current: () => boolean;
     readonly send: (message: string) => void;
     readonly timeoutMs?: number;
+    /** Native messages must come from the exact isolated local document occurrence. */
+    readonly documentUrl?: string;
   }) {}
 
   receive(data: string, url: string): void {
-    if (!this.#current() || !allowMobileExtensionMainViewNavigation(this.context.surface, url)) return;
+    if (!this.#current()) return;
+    if (this.context.documentUrl !== undefined) {
+      try {
+        const candidate = new URL(url); candidate.hash = "";
+        if (candidate.href !== this.context.documentUrl || candidate.username || candidate.password) return;
+      } catch { return; }
+    } else if (!allowMobileExtensionMainViewNavigation(this.context.surface, url)) return;
     let wrapper: unknown;
     try { wrapper = decodeMobileLibraryMessage(data); } catch { return; }
     if (typeof wrapper !== "object" || wrapper === null || Array.isArray(wrapper)) return;

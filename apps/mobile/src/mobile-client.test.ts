@@ -12,6 +12,7 @@ import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemor
   GetPartnerMemoryPreferencesResponseSchema, UpdatePartnerMemoryPreferencesResponseSchema } from "@joko/contracts";
 import { Code } from "@connectrpc/connect";
 import { ConnectError } from "@connectrpc/connect";
+import { EndpointTrustError, rememberEndpointTransport, reportEndpointTrustFailure } from "@joko/connection-transport/trust";
 import { ActorKind, JoinedTaskShareSchema, TaskShareMethod, TaskShareSnapshotSchema, TaskShareEventBatchSchema, type TaskSharingApi } from "@joko/contracts";
 import { PartnerGroupSummarySchema, PartnerGroupMemberSchema, ListPartnerGroupsResponseSchema, GetPartnerGroupResponseSchema,
   GetPartnerGroupCreationResponseSchema, RetirePartnerGroupCreationResponseSchema, PartnerGroupMemberStatus, type PartnerGroupApi } from "@joko/contracts";
@@ -980,6 +981,7 @@ function fakeNetwork(): MobileNetwork {
     inspect: vi.fn(async () => node),
     discover: vi.fn(async () => []),
     requestPairing: vi.fn(async () => ({ challengeId: "challenge", identity: node })),
+    cancelPairing: vi.fn(async () => undefined),
     completePairing: vi.fn(async () => ({ credential, identity: node })),
     readOwner: vi.fn(async () => ({ connection, device, snapshot })),
     listPartners: vi.fn(async () => []),
@@ -989,6 +991,7 @@ function fakeNetwork(): MobileNetwork {
     getExtensionForRuntime: vi.fn(async () => { throw new Error("No runtime-scoped Extension fixture was configured."); }),
     openExtensionMainView: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
     getExtensionMainViewSurface: vi.fn(async () => { throw new Error("No Extension main-view fixture was configured."); }),
+    readExtensionMainViewResource: vi.fn(async () => { throw new Error("No Extension main-view resource fixture was configured."); }),
     closeExtensionMainView: vi.fn(async () => true),
     openExtensionLibrary: vi.fn(async () => { throw new Error("No Library session fixture was configured."); }),
     callExtensionLibrary: vi.fn(async () => { throw new Error("No Library call fixture was configured."); }),
@@ -2069,7 +2072,7 @@ describe("paired Partner group sources", () => {
     const source = await app.partnerGroupRosterSourceTransport(otherCredential.profileId, signal);
     let finish!: (value: NodeIdentity) => void;
     vi.mocked(network.inspect).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-    const late = source.list(signal); app.setForeground(false); finish(node);
+    const late = source.list(signal); await vi.waitFor(() => expect(finish).toBeTypeOf('function')); app.setForeground(false); finish(node);
     await expect(late).rejects.toThrow(); expect(app.partnerGroupSourceClaimCurrent(claim)).toBe(false);
     expect(app.partnerGroupSourceClaimRetained(claim)).toBe(true);
     app.setForeground(true); await vi.waitFor(() => expect(app.state.status).toBe("connected"));
@@ -2146,7 +2149,7 @@ describe("paired Partner source roster", () => {
     vi.mocked(network.inspect).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
     vi.mocked(saved.storage.loadCredential).mockClear();
     const pending = app.partnerRosterSourceTransport(otherCredential.profileId, new AbortController().signal);
-    app.setForeground(false); finish(node);
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function')); app.setForeground(false); finish(node);
     await expect(pending).rejects.toThrow(); expect(saved.storage.loadCredential).not.toHaveBeenCalled();
   });
   it("opens only a fresh original canonical relationship and fails destination identity drift instead of ordinary Task", async () => {
@@ -3087,6 +3090,7 @@ describe("mobile Extension catalog authority", () => {
     network.getExtension = vi.fn(async () => extension);
     network.openExtensionMainView = vi.fn(async () => surface);
     network.getExtensionMainViewSurface = vi.fn(async () => surface);
+    network.readExtensionMainViewResource = vi.fn(async () => ({ bytes: new TextEncoder().encode("<p>Private</p>"), mimeType: "text/html" }));
     const app = client(network, memoryStorage(credential).storage);
     await app.start();
     const transport = app.extensionCatalogTransport()!;
@@ -3100,6 +3104,9 @@ describe("mobile Extension catalog authority", () => {
       expect.any(AbortSignal)
     );
     await expect(transport.probeMainView(opened, new AbortController().signal)).resolves.toEqual(surface);
+    await expect(transport.readMainViewResource(opened, surface.url, "document", new AbortController().signal)).resolves.toMatchObject({ mimeType: "text/html" });
+    expect(network.readExtensionMainViewResource).toHaveBeenCalledWith(credential, surface, surface.url, "document", expect.any(AbortSignal), undefined);
+    expect(network.getExtensionMainViewSurface).toHaveBeenCalledTimes(3);
     await expect(transport.closeMainView(opened)).resolves.toBe(true);
     expect(network.closeExtensionMainView).toHaveBeenCalledWith(credential, surface.surfaceId);
 
@@ -4660,9 +4667,40 @@ describe("native mobile Automation ownership and recovery", () => {
 });
 
 describe("native mobile connection and operation ownership", () => {
+  it('keeps an issued pairing challenge on its original SDK path and refuses to send its code after another selection', async () => {
+    const network = fakeNetwork(), saved = memoryStorage(), app = client(network, saved.storage);
+    const origin = 'https://original-pairing-path.example', endpointPublicKey = `ed25519:${'f'.repeat(64)}`;
+    await app.start();
+    await app.trustEndpoint(origin, endpointPublicKey, false, node.serverId, { kind: 'iroh', ticket: 'original-private-ticket', endpointId: 'b'.repeat(64) });
+    await app.requestPairing(origin, 'Phone');
+    expect(app.state.challenge?.transportKind).toBe('iroh');
+    rememberEndpointTransport(origin, endpointPublicKey, { kind: 'tailcat', address: 'tcOther-private-locator', endpointId: `nodekey:${'c'.repeat(64)}`, port: 4318 });
+    await expect(app.pair(origin, '123456', 'Phone')).rejects.toThrow(/path changed/u);
+    expect(network.completePairing).not.toHaveBeenCalled();
+    await app.cancelPairing();
+    expect(network.cancelPairing).toHaveBeenCalledWith(origin, 'challenge', undefined, endpointPublicKey, 'iroh');
+  });
+
+  it("keeps an unused pairing challenge until server cancellation succeeds and reports a failed cancellation", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(undefined, false), app = client(network, saved.storage);
+    await app.start();
+    await app.requestPairing(credential.origin, "Phone");
+    const challenge = app.state.challenge;
+    let finish!: () => void;
+    network.cancelPairing = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+    const pending = app.cancelPairing();
+    expect(app.state.challenge).toBe(challenge);
+    finish(); await pending;
+    expect(app.state.challenge).toBeUndefined();
+    await app.requestPairing(credential.origin, "Phone");
+    const remaining = app.state.challenge;
+    network.cancelPairing = vi.fn(async () => { throw new Error("Cancellation was not confirmed."); });
+    await expect(app.cancelPairing()).rejects.toThrow(/not confirmed/u);
+    expect(app.state.challenge).toBe(remaining);
+  });
   it("reads a second paired dictionary with its exact proof and credential without replacing the active task, then cancels on background", async () => {
     const network = fakeNetwork();
-    const remote = { ...otherCredential, origin: "http://192.168.1.21:4318", serverId: "node-2" };
+    const remote = { ...otherCredential, origin: "http://192.168.1.21:4318", serverId: "node-2", endpointPublicKey: `ed25519:${"2".repeat(64)}` };
     const saved = memoryStorage([credential, remote]);
     const remoteNode = { ...node, serverId: remote.serverId, displayName: "Office" };
     const remoteOwner = { connection: otherConnection, device: otherDevice,
@@ -4685,9 +4723,11 @@ describe("native mobile connection and operation ownership", () => {
     const iterator = transport.watchVoiceInputDictionaryReadOnly(request.signal)[Symbol.asyncIterator]();
     const initial = iterator.next(); updates.push(readOnlyValue()); await initial;
     const waiting = iterator.next(); const stopped = expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    const ownerReads = vi.mocked(network.readOwner).mock.calls.length;
     app.setForeground(false);
     expect(vi.mocked(network.watchVoiceInputDictionaryReadOnly).mock.calls[0]![1].aborted).toBe(true);
     await stopped; expect(updates.count).toBe(0); expect(transport.isCurrent()).toBe(false);
+    expect(network.readOwner).toHaveBeenCalledTimes(ownerReads);
   });
 
   it("rejects an identity-drift dictionary source before protected reads and clears only that source cache", async () => {
@@ -4703,31 +4743,68 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.saved[0]?.credentialState).toBe("identity-conflict"); expect(saved.key()).toEqual(credential);
   });
 
-  it("rechecks a normally ended idle readonly stream, clears a revoked pair and retires a late GET without touching the active node", async () => {
-    const network = fakeNetwork(); const saved = memoryStorage([credential, otherCredential]);
+  it.each(["EOF", "carrier failure"] as const)("rechecks an idle readonly stream after %s, clears a revoked pair and retires a late GET without touching the active node", async boundary => {
+    const remote = { ...otherCredential, origin: "http://127.0.0.1:4398", endpointPublicKey: `ed25519:${"3".repeat(64)}` };
+    const network = fakeNetwork(); const saved = memoryStorage([credential, remote]);
     const clear = vi.fn(async (_profileId: string) => undefined);
     const app = client(network, saved.storage, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined, undefined, undefined, undefined, undefined, { clear });
     await app.start(); const active = app.state.owner;
     const updates = dictionaryWatchFixture<ReturnType<typeof readOnlyValue>>();
-    vi.mocked(network.watchVoiceInputDictionaryReadOnly).mockImplementation((_credential, signal) => updates.watch(signal));
-    vi.mocked(network.readOwner).mockImplementation(async (value) => value.profileId === otherCredential.profileId
+    vi.mocked(network.watchVoiceInputDictionaryReadOnly).mockImplementation((_credential, signal) => (async function* () {
+      yield* updates.watch(signal);
+      if (boundary === "carrier failure") throw new ConnectError("The WebSocket carrier failed", Code.Unknown);
+    })());
+    vi.mocked(network.readOwner).mockImplementation(async (value) => value.profileId === remote.profileId
       ? { connection: otherConnection, device: otherDevice, snapshot: create(SnapshotSchema, { ...snapshot, connections: [otherConnection], devices: [otherDevice] }) }
       : { connection, device, snapshot });
-    const transport = await app.voiceDictionaryReadOnlyTransport(otherCredential.profileId, new AbortController().signal);
+    const transport = await app.voiceDictionaryReadOnlyTransport(remote.profileId, new AbortController().signal);
     let finish!: (value: ReturnType<typeof readOnlyValue>) => void;
     vi.mocked(network.getVoiceInputDictionaryReadOnly).mockImplementation(async () => await new Promise((resolve) => { finish = resolve; }));
     const reading = transport.getVoiceInputDictionaryReadOnly(); const rejected = expect(reading).rejects.toMatchObject({ name: "AbortError" });
     const iterator = transport.watchVoiceInputDictionaryReadOnly(new AbortController().signal)[Symbol.asyncIterator]();
     const initial = iterator.next(); updates.push(readOnlyValue()); await initial;
     vi.mocked(network.readOwner).mockImplementation(async (value) => {
-      if (value.profileId === otherCredential.profileId) throw { code: Code.Unauthenticated };
+      if (value.profileId === remote.profileId) { expect(value).toEqual(remote); throw { code: Code.Unauthenticated }; }
       return { connection, device, snapshot };
     });
     const ended = iterator.next(); const revoked = expect(ended).rejects.toMatchObject({ code: Code.Unauthenticated });
     updates.end(); await revoked;
     finish(readOnlyValue(99n)); await rejected;
-    expect(clear).toHaveBeenCalledExactlyOnceWith(otherCredential.profileId); expect(saved.key(otherCredential.profileId)).toBeUndefined();
+    expect(clear).toHaveBeenCalledExactlyOnceWith(remote.profileId); expect(saved.key(remote.profileId)).toBeUndefined();
+    expect(saved.key()).toEqual(credential); expect(app.state.owner).toBe(active); expect(app.state.status).toBe("connected");
+  });
+
+  it.each(["offline", "cancelled recheck"] as const)("retains the original pinned dictionary credential after an interrupted watch and %s", async boundary => {
+    const remote = { ...otherCredential, origin: "http://127.0.0.1:4398", endpointPublicKey: `ed25519:${"3".repeat(64)}` };
+    const network = fakeNetwork(), saved = memoryStorage([credential, remote]), clear = vi.fn(async (_profileId: string) => undefined);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, { clear });
+    await app.start(); const active = app.state.owner;
+    vi.mocked(network.readOwner).mockImplementation(async value => value.profileId === remote.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: create(SnapshotSchema, { ...snapshot, connections: [otherConnection], devices: [otherDevice] }) }
+      : { connection, device, snapshot });
+    const transport = await app.voiceDictionaryReadOnlyTransport(remote.profileId, new AbortController().signal);
+    vi.mocked(network.watchVoiceInputDictionaryReadOnly).mockImplementation(async function* () {
+      yield readOnlyValue();
+      throw new ConnectError("The WebSocket carrier failed", Code.Unknown);
+    });
+    const caller = new AbortController(), iterator = transport.watchVoiceInputDictionaryReadOnly(caller.signal)[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({ done: false });
+    let rejectRecheck!: (error: unknown) => void;
+    const pending = new Promise<never>((_resolve, reject) => { rejectRecheck = reject; });
+    vi.mocked(network.readOwner).mockImplementation(async (value, _source, signal) => {
+      expect(value).toEqual(remote); expect(signal?.aborted).toBe(false);
+      return pending;
+    });
+    const readsBefore = vi.mocked(network.readOwner).mock.calls.length;
+    const next = iterator.next();
+    const rejected = expect(next).rejects.toMatchObject(boundary === "offline" ? { code: Code.Unavailable } : { name: "AbortError" });
+    await vi.waitFor(() => expect(network.readOwner).toHaveBeenCalledTimes(readsBefore + 1));
+    if (boundary === "cancelled recheck") caller.abort();
+    rejectRecheck(new ConnectError(boundary === "offline" ? "Node offline" : "Late revoked response", boundary === "offline" ? Code.Unavailable : Code.Unauthenticated));
+    await rejected;
+    expect(clear).not.toHaveBeenCalled(); expect(saved.key(remote.profileId)).toEqual(remote);
     expect(saved.key()).toEqual(credential); expect(app.state.owner).toBe(active); expect(app.state.status).toBe("connected");
   });
 
@@ -5030,6 +5107,35 @@ describe("native mobile connection and operation ownership", () => {
     expect(() => normalizeNodeOrigin("http://169.254.169.254:4318")).toThrow(/private-network/);
     expect(() => normalizeNodeOrigin("https://user:secret@example.com")).toThrow(/without credentials/);
     expect(() => normalizeNodeOrigin("https://example.com/path")).toThrow(/only the Joko node origin/);
+  });
+
+  it("keeps a saved credential unread and suspends the source when the security handshake fails", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential);
+    vi.mocked(network.inspect).mockRejectedValue(new EndpointTrustError());
+    const app = client(network, saved.storage);
+    await app.start();
+    expect(app.state.status).toBe("unpaired");
+    expect(app.state.saved[0]?.credentialState).toBe("identity-conflict");
+    expect(saved.storage.loadCredential).not.toHaveBeenCalled();
+    expect(saved.storage.deleteCredential).not.toHaveBeenCalled();
+    expect(saved.key()).toEqual(credential);
+    await app.refresh();
+    expect(network.inspect).toHaveBeenCalledOnce();
+  });
+
+  it("retires the current Mobile connection immediately after any pinned request fails security", async () => {
+    const pinned = { ...credential, origin: "http://192.168.14.23:4318", endpointPublicKey: `ed25519:${"d".repeat(64)}` };
+    const network = fakeNetwork(), saved = memoryStorage(pinned), app = client(network, saved.storage);
+    await app.start();
+    expect(app.state.status).toBe("connected");
+    reportEndpointTrustFailure(pinned, new EndpointTrustError());
+    await vi.waitFor(() => expect(app.state.status).toBe("unpaired"));
+    expect(app.state.saved[0]?.credentialState).toBe("identity-conflict");
+    expect(saved.key()).toEqual(pinned);
+    expect(saved.storage.deleteCredential).not.toHaveBeenCalled();
+    const calls = vi.mocked(network.inspect).mock.calls.length;
+    await app.refresh();
+    expect(network.inspect).toHaveBeenCalledTimes(calls);
   });
 
   it("probes identity anonymously before a credentialed read and preserves a drifted saved profile", async () => {

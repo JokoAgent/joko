@@ -70,6 +70,7 @@ export class DesktopRemoteDesktopViewerWindows {
     readonly preloadPath?: string;
     readonly windowPlatform?: NodeJS.Platform;
     readonly onOwnerRetired?: () => void;
+    readonly observeNativeCleanup?: (stage: string) => void;
   }) {}
 
   register(): void {
@@ -259,7 +260,9 @@ export class DesktopRemoteDesktopViewerWindows {
           throw new Error("Viewer close authority retired.");
         }
       };
+      this.observeNativeCleanup("viewer_close_ignore_menu_shortcuts_clear_started");
       entry.window.webContents.setIgnoreMenuShortcuts(false);
+      this.observeNativeCleanup("viewer_close_ignore_menu_shortcuts_clear_completed");
       entry.binding.closing = true;
       entry.binding.clipboardSync?.refresh();
       try { await connection.stop(lockScreen, check); check(); entry.presentation.close(); }
@@ -331,7 +334,8 @@ export class DesktopRemoteDesktopViewerWindows {
         this.attachWindow(entry, replacement); return replacement;
       },
       created: replacement => { entry.load = this.loadWindow(entry, replacement); },
-      retire: () => this.deactivate(entry), changed: () => this.publish(entry)
+      retire: (deferNativeCleanup) => this.deactivate(entry, deferNativeCleanup), changed: () => this.publish(entry),
+      ...(this.options.observeNativeCleanup === undefined ? {} : { observeNativeCleanup: this.options.observeNativeCleanup })
     });
     entry.presentation.prewarm();
     entry.load = this.loadWindow(entry, window);
@@ -383,6 +387,8 @@ export class DesktopRemoteDesktopViewerWindows {
   }
 
   private attachWindow(entry: ViewerWindow, window: BrowserWindow): void {
+    window.once("closed", () => this.observeNativeCleanup("viewer_native_closed"));
+    window.webContents.once("destroyed", () => this.observeNativeCleanup("viewer_contents_destroyed"));
     const current = (): boolean => !entry.disposed && entry.window === window && !window.isDestroyed();
     window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     const allowed = (value: string): boolean => isAllowedRemoteDesktopViewerNavigation(value, this.options.navigation);
@@ -396,10 +402,16 @@ export class DesktopRemoteDesktopViewerWindows {
     window.webContents.on("did-fail-load", (_event, code, _description, _url, mainFrame) => {
       if (current() && mainFrame && code !== -3) entry.presentation.failed(window);
     });
-    window.webContents.on("render-process-gone", () => { if (current()) entry.presentation.failed(window); });
+    window.webContents.on("render-process-gone", () => {
+      this.observeNativeCleanup("viewer_render_process_gone_entered");
+      if (current()) entry.presentation.failed(window, true);
+      this.observeNativeCleanup("viewer_render_process_gone_returned");
+    });
     window.on("blur", () => {
       if (!current() || entry.binding === undefined) return;
+      this.observeNativeCleanup("viewer_blur_ignore_menu_shortcuts_clear_started");
       window.webContents.setIgnoreMenuShortcuts(false);
+      this.observeNativeCleanup("viewer_blur_ignore_menu_shortcuts_clear_completed");
       entry.binding.inputRevision++;
       entry.binding.clipboardAbort?.abort();
       entry.binding.clipboardSync?.refresh();
@@ -447,12 +459,14 @@ export class DesktopRemoteDesktopViewerWindows {
       clipboardSyncState: binding.clipboardSync?.snapshot ?? { available: false, active: false, pending: false } };
   }
   private publish(entry: ViewerWindow): void {
-    if (!entry.disposed && !entry.binding?.closing && !entry.window.isDestroyed()) entry.window.webContents.send(REMOTE_DESKTOP_VIEWER_CHANNELS.state, this.state(entry));
+    if (!entry.disposed && entry.presentation.owns(entry.window) && !entry.binding?.closing && !entry.window.isDestroyed()) {
+      entry.window.webContents.send(REMOTE_DESKTOP_VIEWER_CHANNELS.state, this.state(entry));
+    }
   }
-  private deactivate(entry: ViewerWindow): void {
-    if (!entry.window.isDestroyed()) entry.window.webContents.setIgnoreMenuShortcuts(false);
+  private deactivate(entry: ViewerWindow, deferNativeCleanup = false): void {
+    this.clearNativeMenuShortcuts(entry.window, deferNativeCleanup, "viewer_deactivate");
     const binding = entry.binding;
-    if (binding === undefined) { this.destroy(entry); return; }
+    if (binding === undefined) { this.destroy(entry, deferNativeCleanup); return; }
     binding.clipboardAbort?.abort();
     binding.credentials?.retire();
     binding.connection.retire(); binding.connection = this.connection(binding);
@@ -460,7 +474,7 @@ export class DesktopRemoteDesktopViewerWindows {
   }
   private localSender(event: IpcMainInvokeEvent, generation?: unknown): ViewerWindow {
     const entry = [...this.#viewers].find((item) => !item.window.isDestroyed() && item.window.webContents === event.sender);
-    if (entry === undefined || !this.current(entry) || entry.binding?.closing ||
+    if (entry === undefined || !entry.presentation.owns(entry.window) || !this.current(entry) || entry.binding?.closing ||
       (entry.binding !== undefined && !entry.binding.connection.current) || event.senderFrame !== event.sender.mainFrame ||
       event.senderFrame.url !== remoteDesktopViewerEntryUrl(this.options.entryUrl) ||
       (generation !== undefined && generation !== entry.generation)) throw new Error("Viewer document retired.");
@@ -471,27 +485,42 @@ export class DesktopRemoteDesktopViewerWindows {
     if (entry.binding === undefined) throw new Error("Viewer document is unbound.");
     return entry as BoundViewerWindow;
   }
-  private destroy(entry: ViewerWindow): void {
+  private destroy(entry: ViewerWindow, deferNativeCleanup = false): void {
     if (entry.disposed) return;
     entry.disposed = true;
-    if (!entry.window.isDestroyed()) entry.window.webContents.setIgnoreMenuShortcuts(false);
+    this.clearNativeMenuShortcuts(entry.window, deferNativeCleanup, "viewer");
     if (this.#spare === entry) this.#spare = undefined;
     const binding = entry.binding;
     if (binding !== undefined) {
       binding.clipboardAbort?.abort(); binding.credentials?.retire();
       binding.closing = true; binding.clipboardSync?.retire(); binding.connection.retire();
     }
-    this.#viewers.delete(entry); entry.presentation.dispose();
+    this.#viewers.delete(entry);
+    this.observeNativeCleanup("viewer_presentation_dispose_started");
+    entry.presentation.dispose(deferNativeCleanup);
+    this.observeNativeCleanup("viewer_presentation_dispose_completed");
   }
-  retireSource(source: WebContents): void {
+  private clearNativeMenuShortcuts(window: BrowserWindow, deferred: boolean, source: "viewer" | "viewer_deactivate"): void {
+    const contents = deferred && !window.isDestroyed() ? window.webContents : undefined;
+    const clear = (): void => {
+      this.observeNativeCleanup(`${source}_ignore_menu_shortcuts_clear_started`);
+      if (!window.isDestroyed()) (deferred ? contents : window.webContents)?.setIgnoreMenuShortcuts(false);
+      this.observeNativeCleanup(`${source}_ignore_menu_shortcuts_clear_completed`);
+    };
+    if (deferred) setImmediate(clear); else clear();
+  }
+  private observeNativeCleanup(stage: string): void {
+    try { this.options.observeNativeCleanup?.(stage); } catch { /* Diagnostics never own native cleanup. */ }
+  }
+  retireSource(source: WebContents, deferNativeCleanup = false): void {
     this.#generations.delete(source);
-    this.retireOwner(source);
+    this.retireOwner(source, deferNativeCleanup);
   }
   refreshLocale(): void { for (const entry of this.#viewers) this.publish(entry); }
-  private retireOwner(source: WebContents): void {
+  private retireOwner(source: WebContents, deferNativeCleanup = false): void {
     if (this.#owners.has(source)) this.options.onOwnerRetired?.();
     this.#owners.delete(source);
-    for (const entry of [...this.#viewers]) if (entry.binding === undefined || entry.binding.source === source) this.destroy(entry);
+    for (const entry of [...this.#viewers]) if (entry.binding === undefined || entry.binding.source === source) this.destroy(entry, deferNativeCleanup);
   }
   dispose(): void { for (const entry of [...this.#viewers]) this.destroy(entry); this.#owners.clear(); this.#generations.clear(); }
 

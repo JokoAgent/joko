@@ -107,6 +107,7 @@ import {
   shouldRecoverRuntimeProcessMonitorRenderer
 } from "./runtime-process-monitor.js";
 import { InspectorWindowLifecycle } from "./inspector-window-lifecycle.js";
+import { observePackagedSmokeWindowRetirement } from "./packaged-smoke-window-retirement.js";
 import { DesktopRuntimeProcessSampler } from "./desktop-runtime-processes.js";
 import { projectDirectoryAuthorityMatches } from "./project-directory-authority.js";
 import { DesktopRemoteDesktopViewerWindows } from "./remote-desktop-viewer-windows.js";
@@ -381,6 +382,7 @@ import {
 import { createDesktopRemoteDesktopControllerDirectory } from "./remote-desktop-controller-directory.js";
 import { desktopRemoteDesktopWindowsHost, type DesktopRemoteDesktopWindowsSupport } from "./remote-desktop-windows-host.js";
 import type { DesktopRemoteDesktopHost } from "./remote-desktop-host.js";
+import { createDesktopRemoteDesktopUdpRetirement } from "./remote-desktop-udp-retirement.js";
 import {
   createDesktopRemoteDesktopSettingsStore,
   type DesktopRemoteDesktopSettingsStore
@@ -477,6 +479,7 @@ import {
   canonicalExternalUrl,
   createNavigationPolicy,
   DESKTOP_APP_ENTRY_URL,
+  DESKTOP_APP_ORIGIN,
   DESKTOP_APP_SCHEME,
   isAllowedExtensionWindowNavigation,
   extensionWindowEntryUrl,
@@ -498,11 +501,16 @@ import {
   validateCredentialSecret,
   validateProfileId
 } from "./security.js";
+import { createDesktopEndpointRuntimePreparation, installDesktopEndpointRuntimes } from './connection-transport.js';
+import { DesktopLinkspanHost } from './linkspan-host.js';
 
 // fileURLToPath(new URL(".", ...)) retains a trailing separator. Normalize it
 // once here so the managed-runtime resolver's absolute/canonical input fence
 // sees the same path shape in the real Electron entry as it does in tests.
 const sourceDirectory = resolve(fileURLToPath(new URL(".", import.meta.url)));
+const desktopEndpointRuntimeOptions = { packaged: app.isPackaged, resourcesPath: process.resourcesPath, sourceDirectory };
+const prepareDesktopEndpointRuntime = createDesktopEndpointRuntimePreparation(desktopEndpointRuntimeOptions);
+installDesktopEndpointRuntimes(desktopEndpointRuntimeOptions, prepareDesktopEndpointRuntime);
 const developmentUrl = process.env["JOKO_WEB_DEV_URL"];
 const packagedSmokeRequested = process.env["JOKO_DESKTOP_PACKAGED_SMOKE"] === "1";
 const packagedSmokeScope = process.env["JOKO_DESKTOP_SMOKE_SCOPE"] ?? "full";
@@ -528,6 +536,38 @@ const packagedSmokePublicHttpOrigin = process.env["JOKO_DESKTOP_SMOKE_PUBLIC_HTT
 const packagedSmokeProviderOrigin = process.env["JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN"];
 const packagedSmokeClipboardNonce = process.env["JOKO_DESKTOP_SMOKE_CLIPBOARD_NONCE"];
 const packagedSmokeResultPath = process.env["JOKO_DESKTOP_SMOKE_RESULT"];
+if (packagedSmoke) {
+  // Observe once without replacing Electron's original uncaught handler or
+  // changing its modal/exit behavior. Keep locations, never error payloads.
+  process.once("uncaughtExceptionMonitor", (error, origin) => {
+    try {
+      const root = `${resolve(sourceDirectory, "..").replace(/\\/gu, "/")}/`;
+      const frames: string[] = [];
+      for (const line of (typeof error.stack === "string" ? error.stack : "").split("\n").slice(1)) {
+        const match = /((?:file:\/\/\/|node:)[^)]+):(\d+):(\d+)\)?$/u.exec(line);
+        if (match === null) continue;
+        let location = match[1]!;
+        if (location.startsWith("file:")) {
+          const url = new URL(location);
+          if (url.search || url.hash) continue;
+          const path = fileURLToPath(url).replace(/\\/gu, "/");
+          if (!path.toLowerCase().startsWith(root.toLowerCase())) continue;
+          location = `app/${path.slice(root.length)}`;
+          if (!/^[A-Za-z0-9_@.+/ -]+\.(?:js|mjs|cjs)$/u.test(location)) continue;
+        } else if (!/^node:[A-Za-z0-9_./:-]+$/u.test(location)) continue;
+        const frame = `at ${location}:${match[2]}:${match[3]}`;
+        if (frame.length <= 240) frames.push(frame);
+        if (frames.length === 24) break;
+      }
+      const name = /^(?:Error|TypeError|RangeError|ReferenceError|SyntaxError|AggregateError|AbortError)$/u.test(error.name) ? error.name : "Error";
+      const receipt = JSON.stringify({ version: 1, origin, name, messageOmitted: true, stack: frames.join("\n") });
+      if (Buffer.byteLength(receipt, "utf8") > 8 * 1024) return;
+      process.stderr.write(`JOKO_DESKTOP_SMOKE_UNCAUGHT_EXCEPTION ${receipt}\n`);
+      if (packagedSmokeResultPath !== undefined) writeFileSync(`${packagedSmokeResultPath}.uncaught-exception.json`,
+        `${receipt}\n`, { flag: "wx", mode: 0o600 });
+    } catch { /* Observation must never replace or rethrow the original failure. */ }
+  });
+}
 interface PackagedSmokeNativeTaskStatusLifecycleReceipt {
   readonly event: "created" | "bounds-requested" | "load-started" | "load-completed" | "load-failed" |
     "show-inactive" | "destroy-requested" | "renderer-gone" | "closed" | "navigation-prevented";
@@ -592,6 +632,7 @@ const desktopRemoteDesktopViewerPreferences = createDesktopRemoteDesktopViewerPr
   () => join(app.getPath("userData"), "remote-desktop-viewer-preferences.json")
 );
 const desktopRemoteDesktopViewers = new DesktopRemoteDesktopViewerWindows({
+  ...(packagedSmoke ? { observeNativeCleanup: recordPackagedSmokeNativeCleanup } : {}),
   sourceDirectory, entryUrl: navigationPolicy.developmentUrl ?? DESKTOP_APP_ENTRY_URL,
   navigation: navigationPolicy,
   assertSource: (event, occurrence) => { assertCurrentMainApplicationDocumentSender(event, occurrence); },
@@ -601,6 +642,13 @@ const desktopRemoteDesktopViewers = new DesktopRemoteDesktopViewerWindows({
   onOwnerRetired: () => desktopRemoteDesktopViewerPrewarm.cancel()
 });
 const desktopMcpApps = new DesktopMcpAppHost({ assertSource: assertTrustedIpcSender, readAuthKey: readCredential, quitting: () => quitting });
+const desktopLinkspan = new DesktopLinkspanHost({ assertSource: assertTrustedIpcSender,
+  prepare: kind => kind === 'http-connect' ? Promise.resolve() : prepareDesktopEndpointRuntime(kind),
+  createHost: async kind => {
+    if (kind === 'iroh') return (await import('@jokoagent/linkspan-iroh/node')).createIrohBridgeHost();
+    if (kind === 'tailcat') return (await import('@jokoagent/linkspan-tailcat/node')).createTailcatBridgeHost();
+    return (await import('./http-connect-bridge-host.js')).createDesktopHttpConnectBridgeHost();
+  }, quitting: () => quitting });
 const nativeTaskStatusDevelopmentPreview = !app.isPackaged &&
   process.env["JOKO_DESKTOP_TASK_STATUS_PREVIEW"] === "1";
 const nativeTaskStatusSupported = isNativeTaskStatusAvailable({
@@ -854,6 +902,7 @@ const managedOrchestratorExitFence = createManagedExitFence({
   }
 });
 let packagedSmokeFinishing = false;
+let packagedSmokeLateNativeCallbackCount = 0;
 let preferredSystemLocale: DesktopSystemLocale = "en";
 let applicationMenuLocale: DesktopLocale = "en";
 let desktopRemoteDesktopDark: boolean | undefined;
@@ -1001,6 +1050,7 @@ if (!app.requestSingleInstanceLock()) {
     nativeArtifactSourceRevealer?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
+    desktopLinkspan.dispose();
     desktopRemoteDesktopViewerPrewarm.cancel();
     desktopRemoteDesktopViewers.dispose();
     // Route authority ends at quit admission, before renderer beforeunload can
@@ -1036,18 +1086,26 @@ if (!app.requestSingleInstanceLock()) {
     void globalVoiceShortcutRecovery.request();
   });
   app.on("browser-window-focus", () => {
+    const observe = admitPackagedSmokeLateNativeCallback();
+    if (observe) recordPackagedSmokeLateNativePhase("late_native_focus_entered");
     desktopAttentionBadgeController?.setForeground(true);
     macNativeTaskStatusHost?.setApplicationFocused(true);
     providerModelRefreshHostLifecycle.syncApplicationFocused(isProviderModelApplicationForeground());
     void globalVoiceShortcutRecovery.request();
     dedicatedHardwarePermissionRecovery.applicationFocused();
+    if (observe) recordPackagedSmokeLateNativePhase("late_native_focus_returned");
   });
   app.on("browser-window-blur", () => {
     setImmediate(() => {
+      const observe = admitPackagedSmokeLateNativeCallback();
+      if (observe) recordPackagedSmokeLateNativePhase("late_native_blur_entered");
       const foreground = isDesktopApplicationForeground();
+      if (observe) recordPackagedSmokeLateNativePhase("late_native_blur_foreground_checked");
       desktopAttentionBadgeController?.setForeground(foreground);
+      if (observe) recordPackagedSmokeLateNativePhase("late_native_blur_attention_returned");
       macNativeTaskStatusHost?.setApplicationFocused(foreground);
       providerModelRefreshHostLifecycle.syncApplicationFocused(isProviderModelApplicationForeground());
+      if (observe) recordPackagedSmokeLateNativePhase("late_native_blur_returned");
     });
   });
   app.on("will-quit", () => {
@@ -1297,18 +1355,37 @@ function createWindow(): void {
     clearDesktopNativeTaskStatusVisibility(window.webContents);
   });
   window.webContents.on("render-process-gone", (_event, details) => {
-    retireMainWindowDocument(window, window.webContents);
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_entered");
+    retireMainWindowDocument(window, window.webContents, true);
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_document_retired");
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_inspector_retirement_started");
     inspectorWindowLifecycle?.ownerRetired(window);
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_inspector_retirement_completed");
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_voice_shortcut_unregister_started");
     unregisterGlobalVoiceShortcut();
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_voice_shortcut_unregister_completed");
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_voice_capture_stop_started");
     stopGlobalVoiceShortcutCapture(window.webContents);
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_voice_capture_stop_completed");
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_voice_presentation_reset_started");
     resetGlobalVoicePresentation();
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_voice_presentation_reset_completed");
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_menu_reset_started");
     resetMainApplicationMenuState(window.webContents);
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_menu_reset_completed");
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_task_status_clear_started");
     clearNativeTaskStatusProjection();
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_task_status_clear_completed");
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_task_visibility_clear_started");
     clearDesktopNativeTaskStatusVisibility(window.webContents);
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_task_visibility_clear_completed");
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_attention_release_started");
     releaseDesktopAttentionSource(attentionSourceId);
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_attention_release_completed");
     if (!packagedSmoke && !window.isDestroyed() && !quitting) {
       beginMainUiLoadRecovery(desktopRendererLossError("main", details));
     }
+    recordPackagedSmokeNativeCleanup("main_render_process_gone_returned");
   });
   window.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
   installSelectionContextMenu(window, {
@@ -1452,7 +1529,7 @@ function createWindow(): void {
   electronSession.webRequest.onHeadersReceived((details, callback) => {
     observePackagedSmokeRequest(details, "headers");
     if (details.url.startsWith(`${MCP_APP_SCHEME}:`) || desktopMcpApps.isAppFrame(details.frame ?? undefined)
-      || !shouldMergeDesktopFrameContentSecurityPolicy(details.resourceType, details.url)) {
+      || !shouldMergeDesktopFrameContentSecurityPolicy(details.resourceType, details.url, navigationPolicy.developmentOrigin ?? DESKTOP_APP_ORIGIN)) {
       callback({ responseHeaders: details.responseHeaders });
       return;
     }
@@ -1719,8 +1796,12 @@ async function verifyPackagedSmokeDedicatedHardwareState(window: BrowserWindow):
   }
   const raw: unknown = await window.webContents.executeJavaScript([
     "(async () => {",
-    "  if (!document.querySelector('.app') || typeof window.jokoDesktop?.dedicatedHardware?.getDedicatedHardwareState !== 'function') {",
-    "    throw new Error('Dedicated hardware state is unavailable in the product renderer.');",
+    "  const readiness = { appPresent: Boolean(document.querySelector('.app')),",
+    "    bridgePresent: typeof window.jokoDesktop === 'object',",
+    "    dedicatedApiPresent: typeof window.jokoDesktop?.dedicatedHardware?.getDedicatedHardwareState === 'function',",
+    "    connectionScreenPresent: Boolean(document.querySelector('.connection-screen')), aboutRequested: location.hash.includes('about') };",
+    "  if (!readiness.appPresent || !readiness.dedicatedApiPresent) {",
+    "    throw new Error('Dedicated hardware state is unavailable in the product renderer: ' + JSON.stringify(readiness));",
     "  }",
     "  return window.jokoDesktop.dedicatedHardware.getDedicatedHardwareState();",
     "})()"
@@ -1906,17 +1987,23 @@ async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise
 
   initial.focus();
   await waitForPackagedSmokeInspectorCondition(() => initial.isFocused(), "user-close focus");
-  void initial.webContents.executeJavaScript(
-    "(() => { void window.jokoInspectorDesktop?.window.close('user'); return true; })()",
-    true
-  ).catch(() => undefined);
-  recordPackagedSmokeProgress("inspector_user_close_requested");
-  await waitForPackagedSmokeInspectorDestroyed(initial, "user close");
-  await waitForPackagedSmokeInspectorClosedCount(owner, 1);
-  await waitForPackagedSmokeInspectorCondition(() => owner.isFocused(), "safe owner focus return");
-  recordPackagedSmokeProgress("inspector_user_close_returned_focus");
-
-  const reloading = await openPackagedSmokeInspector(owner, initial);
+  const userCloseSurface = observePackagedSmokeInspectorSurfaceRetirement(initial, "user_close");
+  let reloading: BrowserWindow;
+  try {
+    void initial.webContents.executeJavaScript(
+      "(() => { void window.jokoInspectorDesktop?.window.close('user'); return true; })()",
+      true
+    ).catch(() => undefined);
+    recordPackagedSmokeProgress("inspector_user_close_requested");
+    await waitForPackagedSmokeInspectorDestroyed(initial, "user close");
+    await waitForPackagedSmokeInspectorClosedCount(owner, 1);
+    await waitForPackagedSmokeInspectorCondition(() => owner.isFocused(), "safe owner focus return");
+    recordPackagedSmokeProgress("inspector_user_close_returned_focus");
+    const reopenDeadline = Date.now() + 10_000;
+    await userCloseSurface.wait(reopenDeadline);
+    recordPackagedSmokeProgress("inspector_user_close_surface_retired");
+    reloading = await openPackagedSmokeInspector(owner, initial, reopenDeadline);
+  } finally { userCloseSurface.cancel(); }
   await inspectPackagedSmokeInspectorSurface(reloading);
   const foreground = new BrowserWindow({
     width: 320,
@@ -1945,38 +2032,59 @@ async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise
     throw new Error("Packaged Inspector activation stole focus from a foreground window outside its owner.");
   }
   recordPackagedSmokeProgress("inspector_background_activation_rejected");
-  await waitForPackagedSmokeOwnerDocument(owner, "reload", () => owner.reload());
-  await waitForPackagedSmokeInspectorDestroyed(reloading, "owner reload");
-  if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
-    inspectorWindowOccurrence !== undefined) {
-    throw new Error("Packaged Inspector retained stale state after owner reload.");
-  }
-  recordPackagedSmokeProgress("inspector_owner_reload_retired");
-
-  await installPackagedSmokeInspectorCloseObserver(owner);
-  owner.show();
-  const failing = await openPackagedSmokeInspector(owner, reloading);
+  const reloadSurface = observePackagedSmokeInspectorSurfaceRetirement(reloading, "owner_reload");
+  let failing: BrowserWindow;
+  try {
+    await waitForPackagedSmokeOwnerDocument(owner, "reload", () => owner.reload());
+    await waitForPackagedSmokeInspectorDestroyed(reloading, "owner reload");
+    if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
+      inspectorWindowOccurrence !== undefined) {
+      throw new Error("Packaged Inspector retained stale state after owner reload.");
+    }
+    recordPackagedSmokeProgress("inspector_owner_reload_retired");
+    await installPackagedSmokeInspectorCloseObserver(owner);
+    owner.show();
+    const reopenDeadline = Date.now() + 10_000;
+    await reloadSurface.wait(reopenDeadline);
+    recordPackagedSmokeProgress("inspector_owner_reload_surface_retired");
+    failing = await openPackagedSmokeInspector(owner, reloading, reopenDeadline);
+  } finally { reloadSurface.cancel(); }
   await inspectPackagedSmokeInspectorSurface(failing);
   foreground.show();
   foreground.focus();
   await waitForPackagedSmokeInspectorCondition(() => foreground.isFocused(), "pre-child-failure independent focus");
-  const childFailureDispatched = (failing.webContents as unknown as {
-    emit(event: string, eventObject: object, details: { readonly reason: "crashed"; readonly exitCode: number }): boolean;
-  }).emit("render-process-gone", {}, { reason: "crashed", exitCode: 1 });
-  if (!childFailureDispatched) throw new Error("Packaged Inspector child-failure event had no lifecycle listener.");
-  await waitForPackagedSmokeInspectorDestroyed(failing, "child renderer failure");
-  await waitForPackagedSmokeInspectorClosedCount(owner, 1);
-  if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
-    inspectorWindowOccurrence !== undefined) {
-    throw new Error("Packaged Inspector retained stale state after child renderer failure.");
+  // The window-created callback installed this occurrence after the earlier
+  // retirement check. Retain its exact lifecycle across the failure callback.
+  const failingLifecycle = inspectorWindowLifecycle as InspectorWindowLifecycle<BrowserWindow, BrowserWindow> | undefined;
+  if (failingLifecycle === undefined || !failingLifecycle.owns(owner, failing)) {
+    throw new Error("Inspector child failure had no exact captured lifecycle.");
   }
-  if (!foreground.isFocused() || owner.isFocused()) {
-    throw new Error("Packaged Inspector child renderer failure stole focus from another application window.");
-  }
-  recordPackagedSmokeProgress("inspector_child_failure_notified_without_focus_theft");
-
-  owner.show();
-  const crashing = await openPackagedSmokeInspector(owner, failing);
+  const failedSurface = observePackagedSmokeInspectorSurfaceRetirement(failing, "child_failure");
+  let crashing: BrowserWindow;
+  try {
+    const childFailureDispatched = (failing.webContents as unknown as {
+      emit(event: string, eventObject: object, details: { readonly reason: "crashed"; readonly exitCode: number }): boolean;
+    }).emit("render-process-gone", {}, { reason: "crashed", exitCode: 1 });
+    if (!childFailureDispatched) throw new Error("Packaged Inspector child-failure event had no lifecycle listener.");
+    if (failing.isDestroyed() || failingLifecycle.owns(owner, failing)) {
+      throw new Error("Inspector child failure did not fence authority before deferred native retirement.");
+    }
+    await waitForPackagedSmokeInspectorDestroyed(failing, "child renderer failure");
+    await waitForPackagedSmokeInspectorClosedCount(owner, 1);
+    if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
+      inspectorWindowOccurrence !== undefined) {
+      throw new Error("Packaged Inspector retained stale state after child renderer failure.");
+    }
+    if (!foreground.isFocused() || owner.isFocused()) {
+      throw new Error("Packaged Inspector child renderer failure stole focus from another application window.");
+    }
+    recordPackagedSmokeProgress("inspector_child_failure_notified_without_focus_theft");
+    owner.show();
+    const reopenDeadline = Date.now() + 10_000;
+    await failedSurface.wait(reopenDeadline);
+    recordPackagedSmokeProgress("inspector_child_failure_surface_retired");
+    crashing = await openPackagedSmokeInspector(owner, failing, reopenDeadline);
+  } finally { failedSurface.cancel(); }
   await inspectPackagedSmokeInspectorSurface(crashing);
   foreground.show();
   foreground.focus();
@@ -2017,8 +2125,13 @@ async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise
     recordPackagedSmokeProgress("inspector_owner_crash_native_request_started");
     ownerContents.forcefullyCrashRenderer();
     recordPackagedSmokeProgress("inspector_owner_crash_native_request_returned");
+    recordPackagedSmokeProgress(`inspector_owner_crash_native_request_returned_at:${Date.now()}`);
   }
-  await waitForPackagedSmokeDeadline(ownerRendererLost, 10_000, "Inspector owner renderer crash");
+  try { await waitForPackagedSmokeDeadline(ownerRendererLost, 10_000, "Inspector owner renderer crash"); }
+  catch (error) {
+    recordPackagedSmokeProgress("inspector_owner_crash_wait_timed_out");
+    throw error;
+  }
   recordPackagedSmokeProgress("inspector_owner_renderer_gone");
   recordPackagedSmokeProgress("inspector_owner_crash_retirement_wait_started");
   await waitForPackagedSmokeInspectorDestroyed(crashing, "owner crash");
@@ -2053,7 +2166,13 @@ async function installPackagedSmokeInspectorCloseObserver(owner: BrowserWindow):
 
 async function requestPackagedSmokeInspectorOpen(owner: BrowserWindow): Promise<boolean> {
   const opened = await owner.webContents.executeJavaScript(
-    `window.open(${JSON.stringify(INSPECTOR_WINDOW_URL)}, ${JSON.stringify(INSPECTOR_WINDOW_FRAME_NAME)}, ${JSON.stringify(INSPECTOR_WINDOW_FEATURES)}) !== null`,
+    [
+      "(() => {",
+      `  const child = window.open(${JSON.stringify(INSPECTOR_WINDOW_URL)}, ${JSON.stringify(INSPECTOR_WINDOW_FRAME_NAME)}, ${JSON.stringify(INSPECTOR_WINDOW_FEATURES)});`,
+      "  globalThis.__jokoInspectorSmoke.child = child;",
+      "  return child !== null;",
+      "})()"
+    ].join("\n"),
     true
   );
   if (typeof opened !== "boolean") throw new Error("Packaged Inspector open returned an invalid result.");
@@ -2077,11 +2196,38 @@ async function requestPackagedSmokeInspectorMinimize(window: BrowserWindow): Pro
   if (minimized !== true) throw new Error("Packaged Inspector minimize bridge returned an invalid result.");
 }
 
-async function openPackagedSmokeInspector(owner: BrowserWindow, excluded?: BrowserWindow): Promise<BrowserWindow> {
-  if (!await requestPackagedSmokeInspectorOpen(owner)) {
+async function openPackagedSmokeInspector(
+  owner: BrowserWindow,
+  excluded?: BrowserWindow,
+  originalDeadline?: number
+): Promise<BrowserWindow> {
+  const deadline = originalDeadline ?? Date.now() + 10_000;
+  if (Date.now() >= deadline) {
+    throw new Error("Packaged Inspector window did not become available.");
+  }
+  if (excluded !== undefined) {
+    // Native closed/destroyed receipts can precede the opener's WindowProxy
+    // retirement. Opening the same target then returns that stale proxy with
+    // no new native child. Keep the original total reopen budget and observe
+    // the captured proxy before making the single new window.open request.
+    let retired = false;
+    while (Date.now() < deadline) {
+      retired = await waitForPackagedSmokeDeadline(owner.webContents.executeJavaScript(
+        "globalThis.__jokoInspectorSmoke.child == null || globalThis.__jokoInspectorSmoke.child.closed === true",
+        true
+      ), Math.max(1, deadline - Date.now()), "Inspector original WindowProxy retirement") === true;
+      if (retired) break;
+      await waitForPackagedSmokePoll();
+    }
+    if (!retired) throw new Error("Packaged Inspector original WindowProxy did not retire before reopening.");
+    recordPackagedSmokeProgress("inspector_original_renderer_proxy_retired");
+  }
+  if (Date.now() >= deadline) throw new Error("Packaged Inspector window did not become available.");
+  const opened = await waitForPackagedSmokeDeadline(requestPackagedSmokeInspectorOpen(owner),
+    Math.max(1, deadline - Date.now()), "Inspector reopening request");
+  if (!opened) {
     throw new Error("Packaged Inspector window.open request was rejected.");
   }
-  const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     const candidate = inspectorWindow;
     if (candidate !== undefined && candidate !== excluded && !candidate.isDestroyed() &&
@@ -2089,6 +2235,13 @@ async function openPackagedSmokeInspector(owner: BrowserWindow, excluded?: Brows
     await waitForPackagedSmokePoll();
   }
   throw new Error("Packaged Inspector window did not become available.");
+}
+
+function observePackagedSmokeInspectorSurfaceRetirement(window: BrowserWindow, operation: string) {
+  return observePackagedSmokeWindowRetirement({
+    window, contents: window.webContents,
+    observe: stage => recordPackagedSmokeProgress(`inspector_${operation}_${stage}:${Date.now()}`)
+  });
 }
 
 async function inspectPackagedSmokeInspectorSurface(window: BrowserWindow): Promise<void> {
@@ -2175,7 +2328,19 @@ async function waitForPackagedSmokeInspectorCondition(
 }
 
 async function waitForPackagedSmokeInspectorDestroyed(window: BrowserWindow, operation: string): Promise<void> {
-  await waitForPackagedSmokeInspectorCondition(() => window.isDestroyed(), operation);
+  if (window.isDestroyed()) return;
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    // Electron's native closed event is the retirement receipt. Do not poll
+    // or otherwise access the BrowserWindow after receiving that event.
+    const closed = (): void => { clearTimeout(timeout); resolvePromise(); };
+    const timeout = setTimeout(() => {
+      window.removeListener("closed", closed);
+      if (operation === "owner crash") recordPackagedSmokeProgress("inspector_owner_crash_retirement_wait_timed_out");
+      rejectPromise(new Error(`Packaged Inspector did not finish ${operation}.`));
+    }, 5_000);
+    try { window.once("closed", closed); }
+    catch (error) { clearTimeout(timeout); rejectPromise(error); }
+  });
 }
 
 function waitForPackagedSmokeOwnerDocument(
@@ -2644,11 +2809,14 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   recordPackagedSmokeProgress("task_draft_recovered_after_renderer_crash");
 
   await closePackagedSmokeTaskWindow(taskWindow, taskOwner);
+  recordPackagedSmokeProgress("task_window_close_retirement_verified");
   await Promise.all([
     waitForPackagedSmokeTaskPresentation(peerWindow, task, taskOwner),
     waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner)
   ]);
+  recordPackagedSmokeProgress("task_window_close_peer_presentations_verified");
   await waitForPackagedSmokeTaskDraft(peerWindow, peerDraftText, false);
+  recordPackagedSmokeProgress("task_window_close_peer_draft_verified");
   assertPackagedSmokeTaskWindowOwner(peerWindow, taskOwner);
   assertPackagedSmokeTaskWindowOwner(concurrentWindow, concurrentOwner);
   assertPackagedSmokeTaskWindowSet(new Set([peerWindow, concurrentWindow]));
@@ -3186,7 +3354,9 @@ function assertPackagedSmokeTaskWindowSet(expected: ReadonlySet<BrowserWindow>):
 }
 
 async function readPackagedSmokeTaskDocumentIdentity(window: BrowserWindow): Promise<number> {
-  const value = await window.webContents.executeJavaScript("performance.timeOrigin", true) as unknown;
+  const value: unknown = await waitForPackagedSmokeDeadline(
+    window.webContents.executeJavaScript("performance.timeOrigin", true), 2_000, "Task Document identity probe"
+  );
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     throw new Error("Packaged smoke could not identify a live Task Document.");
   }
@@ -3543,16 +3713,45 @@ async function closePackagedSmokeTaskWindow(
   const windowId = window.id;
   const peers = new Set([...sessionWindows.values()].filter((candidate) => candidate !== window && !candidate.isDestroyed()));
   const contents = window.webContents;
-  try {
-    await contents.executeJavaScript("window.jokoDesktop.window.close()", true);
-  } catch (error) {
-    if (!window.isDestroyed()) throw error;
-  }
   const closeDeadline = Date.now() + 10_000;
-  while (Date.now() < closeDeadline && (!window.isDestroyed() || sessionWindows.has(windowId))) {
+  let nativeClosed = window.isDestroyed();
+  let observeClosed!: () => void;
+  const closed = nativeClosed ? Promise.resolve() : new Promise<void>((resolveClosed) => {
+    observeClosed = () => {
+      nativeClosed = true;
+      recordPackagedSmokeProgress("task_window_close_native_closed");
+      resolveClosed();
+    };
+    window.once("closed", observeClosed);
+  });
+  contents.once("destroyed", () => recordPackagedSmokeProgress("task_window_close_contents_destroyed"));
+  const requested = Promise.resolve().then(() => {
+    if (nativeClosed) return;
+    recordPackagedSmokeProgress("task_window_close_request_started");
+    return contents.executeJavaScript("window.jokoDesktop.window.close()", true);
+  }).then(
+    () => { recordPackagedSmokeProgress("task_window_close_request_settled"); },
+    (error: unknown) => {
+      recordPackagedSmokeProgress("task_window_close_request_failed");
+      if (!nativeClosed && !window.isDestroyed()) throw error;
+    }
+  );
+  try {
+    // The close IPC destroys its own Realm, so its JavaScript promise need
+    // not settle. The original native window's closed receipt is authoritative.
+    await waitForPackagedSmokeDeadline(
+      Promise.race([closed, requested.then(() => closed)]),
+      Math.max(1, closeDeadline - Date.now()), "Task window native close"
+    );
+  } finally {
+    if (!nativeClosed) window.removeListener("closed", observeClosed);
+  }
+  while (Date.now() < closeDeadline && (sessionWindows.has(windowId)
+    || sessionWindows.hasContents(contents) || sessionWindows.contextForContents(contents) !== undefined
+    || nativeTaskStatusVisibleSessionsByContents.has(contents))) {
     await waitForPackagedSmokePoll();
   }
-  if (!window.isDestroyed() || sessionWindows.has(windowId)
+  if (sessionWindows.has(windowId)
     || sessionWindows.hasContents(contents)
     || sessionWindows.contextForContents(contents) !== undefined
     || nativeTaskStatusVisibleSessionsByContents.has(contents)) {
@@ -3908,13 +4107,13 @@ async function writePackagedSmokeTaskDraft(
 async function waitForPackagedSmokeTaskDraft(window: BrowserWindow, text: string, requireSaved: boolean): Promise<void> {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    const observation = await window.webContents.executeJavaScript([
+    const observation: unknown = await waitForPackagedSmokeDeadline(window.webContents.executeJavaScript([
       "(() => {",
       "  const pane = document.querySelector('.session-pane');",
       "  const editor = pane?.querySelector('.composer-rich-editor__content');",
       "  return { text: editor?.textContent ?? '', saved: Boolean(pane?.querySelector('.draft-saved')) };",
       "})()"
-    ].join("\n"), true) as unknown;
+    ].join("\n"), true), Math.min(2_000, Math.max(1, deadline - Date.now())), "Task draft probe");
     if (typeof observation === "object" && observation !== null && !Array.isArray(observation)) {
       const result = observation as { readonly text?: unknown; readonly saved?: unknown };
       if (result.text === text && (!requireSaved || result.saved === true)) return;
@@ -4175,6 +4374,15 @@ function finishPackagedSmoke(result: string, exitCode: number): void {
   if (packagedSmokeFinishing) return;
   packagedSmokeFinishing = true;
   recordPackagedSmokeProgress("finish_started");
+  if (process.platform === "darwin") {
+    // One-shot queue receipts distinguish a pending retirement Promise from
+    // stalled Main scheduling after the final renderer-crash probe.
+    process.nextTick(() => recordPackagedSmokeProgress(`finish_main_next_tick:${Date.now()}`));
+    queueMicrotask(() => recordPackagedSmokeProgress(`finish_main_microtask:${Date.now()}`));
+    setImmediate(() => recordPackagedSmokeProgress(`finish_main_immediate:${Date.now()}`));
+    const queueReceipt = setTimeout(() => recordPackagedSmokeProgress(`finish_main_timer:${Date.now()}`), 1_000);
+    queueReceipt.unref();
+  }
   disposeDesktopUpdateLifecycle();
   if (packagedSmokeResultPath !== undefined) {
     try {
@@ -4186,14 +4394,22 @@ function finishPackagedSmoke(result: string, exitCode: number): void {
   }
   const runtime = managedOrchestratorRuntime;
   managedOrchestratorRuntime = undefined;
-  const retirePeerAgent = desktopDevicePeerAgentLifecycle?.dispose() ?? Promise.resolve();
+  recordPackagedSmokeProgress("peer_agent_retirement_started");
+  recordPackagedSmokeProgress(`peer_agent_retirement_started_at:${Date.now()}`);
+  const retirePeerAgent = (desktopDevicePeerAgentLifecycle?.dispose() ?? Promise.resolve()).then(
+    () => { recordPackagedSmokeProgress("peer_agent_retirement_completed"); },
+    (error: unknown) => { recordPackagedSmokeProgress("peer_agent_retirement_failed"); throw error; }
+  );
   if (runtime === undefined) {
     recordPackagedSmokeProgress("finish_without_runtime");
     void retirePeerAgent.finally(() => exitPackagedSmokeProcess(exitCode));
     return;
   }
   recordPackagedSmokeProgress("runtime_stop_started");
-  void retirePeerAgent.then(() => runtime.stop()).then(
+  void retirePeerAgent.then(() => {
+    recordPackagedSmokeProgress("runtime_stop_dispatch_started");
+    return runtime.stop();
+  }).then(
     () => {
       recordPackagedSmokeProgress("runtime_stop_completed");
       exitPackagedSmokeProcess(exitCode);
@@ -4213,6 +4429,23 @@ function recordPackagedSmokeProgress(step: string): void {
   } catch {
     // The terminal result remains authoritative.
   }
+}
+
+function admitPackagedSmokeLateNativeCallback(): boolean {
+  if (!packagedSmoke || !packagedSmokeFinishing || packagedSmokeLateNativeCallbackCount >= 8) return false;
+  packagedSmokeLateNativeCallbackCount += 1;
+  return true;
+}
+
+function recordPackagedSmokeLateNativePhase(phase: string): void {
+  if (!packagedSmoke || !packagedSmokeFinishing) return;
+  try { process.stderr.write(`JOKO_DESKTOP_SMOKE_LATE_NATIVE ${phase}\n`); }
+  catch { /* Diagnostics never own the native callback. */ }
+  recordPackagedSmokeProgress(phase);
+}
+
+function recordPackagedSmokeNativeCleanup(stage: string): void {
+  if (packagedSmoke) recordPackagedSmokeProgress(`native_cleanup_${stage}:${Date.now()}`);
 }
 
 function observePackagedSmokeDesktopOpenIntent(
@@ -5947,24 +6180,37 @@ function createDesktopAttentionPresentation(): DesktopAttentionPresentation {
   };
   return {
     clear: () => {
+      const observe = admitPackagedSmokeLateNativeCallback();
+      if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_clear_entered");
       if (process.platform === "darwin") {
         try {
+          if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_mac_badge_count_call_started");
           app.setBadgeCount(0);
+          if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_mac_badge_count_call_returned");
         } finally {
+          if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_mac_dock_badge_call_started");
           app.dock?.setBadge("");
+          if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_mac_dock_badge_call_returned");
         }
         return;
       }
       if (process.platform === "linux") {
-        if (!app.setBadgeCount(0)) throw new Error("Desktop attention badge could not be cleared.");
+        if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_linux_badge_count_call_started");
+        const cleared = app.setBadgeCount(0);
+        if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_linux_badge_count_call_returned");
+        if (!cleared) throw new Error("Desktop attention badge could not be cleared.");
         return;
       }
       if (process.platform !== "win32") return;
       let failed = false;
       for (const window of applicationWindows()) {
         try {
+          if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_windows_overlay_icon_call_started");
           window.setOverlayIcon(null, "");
+          if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_windows_overlay_icon_call_returned");
+          if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_windows_flash_frame_call_started");
           window.flashFrame(false);
+          if (observe) recordPackagedSmokeLateNativePhase("late_native_attention_windows_flash_frame_call_returned");
         } catch {
           failed = true;
         }
@@ -6154,19 +6400,33 @@ function captureMainWindowDocument(contents: WebContents, claim: string): string
   return capture.current.occurrence;
 }
 
-function retireMainWindowDocument(window: BrowserWindow, contents: WebContents): void {
+function retireMainWindowDocument(window: BrowserWindow, contents: WebContents, deferNativeCleanup = false): void {
   // The captured endpoint remains exact after BrowserWindow.closed, when
   // Electron's webContents getter itself throws Object has been destroyed.
   if (mainWindow !== window || mainWindowContentsByWindow.get(window) !== contents) return;
+  recordPackagedSmokeNativeCleanup("main_document_prewarm_cancel_started");
   desktopRemoteDesktopViewerPrewarm.cancel();
-  desktopRemoteDesktopViewers.retireSource(contents);
+  recordPackagedSmokeNativeCleanup("main_document_prewarm_cancel_completed");
+  recordPackagedSmokeNativeCleanup("main_document_viewers_retire_started");
+  desktopRemoteDesktopViewers.retireSource(contents, deferNativeCleanup);
+  recordPackagedSmokeNativeCleanup("main_document_viewers_retire_completed");
+  recordPackagedSmokeNativeCleanup("main_document_authority_retire_started");
   const retired = mainWindowDocuments.retire(contents);
+  recordPackagedSmokeNativeCleanup("main_document_authority_retire_completed");
   if (retired !== undefined) {
+    recordPackagedSmokeNativeCleanup("main_document_notifications_retire_started");
     desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
+    recordPackagedSmokeNativeCleanup("main_document_notifications_retire_completed");
+    recordPackagedSmokeNativeCleanup("main_document_hardware_catalog_retire_started");
     retireDedicatedHardwareCatalogOwner(retired.endpoint, retired.occurrence);
+    recordPackagedSmokeNativeCleanup("main_document_hardware_catalog_retire_completed");
   }
+  recordPackagedSmokeNativeCleanup("main_document_deep_link_reset_started");
   desktopDeepLinkDelivery.resetRenderer();
+  recordPackagedSmokeNativeCleanup("main_document_deep_link_reset_completed");
+  recordPackagedSmokeNativeCleanup("main_document_invitation_reset_started");
   desktopTaskSharingInvitations.resetDocument();
+  recordPackagedSmokeNativeCleanup("main_document_invitation_reset_completed");
 }
 
 function handleDesktopDeepLinkUrl(value: unknown): boolean {
@@ -6308,10 +6568,13 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
     if (!quitting) inspectorWindowLifecycle?.returnFocusBeforeClose(childWindow);
   });
   childWindow.webContents.on("render-process-gone", () => {
-    if (inspectorWindowLifecycle?.markChildFailed(childWindow) === true && !childWindow.isDestroyed()) {
-      recordPackagedSmokeProgress("inspector_child_failure_native_destroy_started");
-      childWindow.destroy();
-      recordPackagedSmokeProgress("inspector_child_failure_native_destroy_returned");
+    if (inspectorWindowLifecycle?.markChildFailed(childWindow) === true) {
+      setImmediate(() => {
+        if (childWindow.isDestroyed()) return;
+        recordPackagedSmokeProgress("inspector_child_failure_native_destroy_started");
+        childWindow.destroy();
+        recordPackagedSmokeProgress("inspector_child_failure_native_destroy_returned");
+      });
     }
   });
   childWindow.webContents.on("will-navigate", (event) => event.preventDefault());
@@ -7460,7 +7723,7 @@ function sameManagedOrchestratorConnection(
   right: DesktopManagedOrchestratorConnection
 ): boolean {
   return left.profileId === right.profileId && left.deviceId === right.deviceId &&
-    left.serverId === right.serverId && left.name === right.name && left.origin === right.origin;
+    left.serverId === right.serverId && left.name === right.name && left.origin === right.origin && left.endpointPublicKey === right.endpointPublicKey;
 }
 
 function requireDesktopRemoteDesktopSettings(): DesktopRemoteDesktopSettingsStore {
@@ -7506,11 +7769,22 @@ async function setDesktopRemoteDesktopEnabled(
 
 async function broadcastDesktopRemoteDesktopSnapshot(): Promise<void> {
   const generation = ++desktopRemoteDesktopBroadcastGeneration;
-  const snapshot = await desktopRemoteDesktopSnapshot().catch(() => undefined);
-  if (snapshot === undefined || generation !== desktopRemoteDesktopBroadcastGeneration) return;
   const window = mainWindow;
   if (window === undefined || window.isDestroyed() || window.webContents.isDestroyed()) return;
-  try { window.webContents.send(DESKTOP_CHANNELS.remoteDesktopStateChanged, snapshot); }
+  const contents = window.webContents;
+  const occurrence = mainWindowDocuments.currentFor(contents);
+  if (occurrence === undefined) {
+    if (packagedSmoke) recordPackagedSmokeProgress("remote_desktop_snapshot_broadcast_retired_document_skipped");
+    return;
+  }
+  const snapshot = await desktopRemoteDesktopSnapshot().catch(() => undefined);
+  if (snapshot === undefined || generation !== desktopRemoteDesktopBroadcastGeneration) return;
+  if (mainWindow !== window || window.isDestroyed() || contents.isDestroyed()
+    || !mainWindowDocuments.isCurrent(contents, occurrence)) {
+    if (packagedSmoke) recordPackagedSmokeProgress("remote_desktop_snapshot_broadcast_retired_document_skipped");
+    return;
+  }
+  try { contents.send(DESKTOP_CHANNELS.remoteDesktopStateChanged, snapshot); }
   catch { /* The main Document retired while permissions were being inspected. */ }
 }
 
@@ -7519,6 +7793,9 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
   let terminalPort: ReturnType<typeof createAuditedDesktopDevicePeerTerminalPort> | undefined;
   let runtimeExecutables: ReturnType<typeof createAuditedDesktopDevicePeerRuntimeExecutables> | undefined;
   desktopDevicePeerAgentLifecycle = new DesktopDevicePeerAgentLifecycle({
+    observeRetirement: packagedSmoke
+      ? (stage) => recordPackagedSmokeProgress(`peer_agent_${stage}:${Date.now()}`)
+      : undefined,
     async createExecutor(connection) {
       const runtimeRoot = resolveDesktopDevicePeerRuntimeRoot({
         packaged: app.isPackaged,
@@ -7542,7 +7819,11 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
       await settleCompleteExitOperations([...capturedDesktopRemoteDesktopHosts].map((host) => () => host.retire()));
       const settings = requireDesktopRemoteDesktopSettings();
       let remoteDesktop!: DesktopRemoteDesktopHost;
+      const beforeCaptureClose = await createDesktopRemoteDesktopUdpRetirement({ connection,
+        readAuthKey: () => readCredential(connection.profileId), readHostKey: () => readDesktopDevicePeerAgentRouteAuthorization(connection.profileId),
+        current: () => isDesktopDevicePeerAgentAuthorityCurrent(connection) });
       remoteDesktop = createDesktopRemoteDesktopMainHost({
+        ...(beforeCaptureClose === undefined ? {} : { beforeCaptureClose }),
         connectionsAllowed: () => !desktopRemoteDesktopWindowsSetupBusy,
         sourceDirectory,
         inputHandoff: desktopInputHandoffHost,
@@ -7551,7 +7832,7 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
         systemAudioMute: globalVoiceSystemAudio,
         appearance: () => ({ dark: desktopRemoteDesktopDark ?? nativeTheme.shouldUseDarkColors, locale: applicationMenuLocale }),
         controllerDirectory: createDesktopRemoteDesktopControllerDirectory({
-          profileId: connection.profileId, serverId: connection.serverId, deviceId: connection.deviceId, origin: connection.origin,
+          profileId: connection.profileId, serverId: connection.serverId, deviceId: connection.deviceId, origin: connection.origin, endpointPublicKey: connection.endpointPublicKey,
           current: () => isDesktopDevicePeerAgentAuthorityCurrent(connection),
           readAuthKey: () => readCredential(connection.profileId)
         }),
@@ -7577,6 +7858,7 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
         readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent
       }).catch(() => undefined);
       return new DesktopDevicePeerAgentExecutor({
+        ...(packagedSmoke ? { observeRetirement: (stage: string) => recordPackagedSmokeProgress(`peer_agent_${stage}:${Date.now()}`) } : {}),
         recentDirectoriesPath: join(
           app.getPath("userData"),
           "device-peer-agent",
@@ -7751,12 +8033,17 @@ async function stopManagedOrchestratorForUpdateApply(): Promise<void> {
 async function stopManagedOrchestratorForCompleteExit(): Promise<void> {
   globalVoiceExitAdmissionClosed = true;
   globalVoiceSystemAudioOwner = undefined;
+  // The private node must remain reachable until capture UDP retirement is
+  // acknowledged; closing it concurrently could strand an allocated socket.
+  const mediaRetirement = settleCompleteExitOperations([
+    () => desktopDevicePeerAgentLifecycle?.stop() ?? Promise.resolve(),
+    () => settleCompleteExitOperations([...capturedDesktopRemoteDesktopHosts].map((host) => () => host.retire()))
+  ]);
   await settleCompleteExitOperations([
     cancelGlobalVoiceForExit,
-    () => desktopDevicePeerAgentLifecycle?.stop() ?? Promise.resolve(),
-    () => settleCompleteExitOperations([...capturedDesktopRemoteDesktopHosts].map((host) => () => host.retire())),
+    () => mediaRetirement,
     closeDesktopRemoteDesktopClipboardWriter,
-    () => managedOrchestratorExitFence.stop(),
+    async () => { await mediaRetirement; await managedOrchestratorExitFence.stop(); },
     stopDedicatedHardwareForQuitHandoff,
     stopNativeGamepadForQuitHandoff,
     () => desktopMenuBar?.suspend("quit") ?? Promise.resolve(),
@@ -7932,6 +8219,7 @@ function bindDesktopPageSearchResults(contents: WebContents): Map<number, number
 }
 
 function registerIpc(): void {
+  desktopLinkspan.register();
   desktopMcpApps.register();
   desktopExtensionOAuth.register();
   desktopRemoteDesktopViewers.register();
@@ -9677,6 +9965,7 @@ async function launchManagedOrchestratorBootstrap(
     previous,
     readAuthKey: readCredential,
     start: (previousConnection) => startManagedOrchestrator({
+      expectedEndpointPublicKey: previous?.endpointPublicKey,
       orchestratorEntryPath: resolveManagedOrchestratorEntry(sourceDirectory, {
         packaged: app.isPackaged,
         resourcesPath: process.resourcesPath,
@@ -9806,7 +10095,8 @@ async function writeManagedOrchestratorConnection(path: string, connection: Desk
 function validManagedOrchestratorConnection(value: unknown): value is DesktopManagedOrchestratorConnection {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).sort().join(",") !== "deviceId,name,origin,profileId,serverId") return false;
+  if (Object.keys(record).filter(key => key !== "endpointPublicKey").sort().join(",") !== "deviceId,name,origin,profileId,serverId") return false;
+  if (record["endpointPublicKey"] !== undefined && (typeof record["endpointPublicKey"] !== "string" || !/^ed25519:[a-f0-9]{64}$/u.test(record["endpointPublicKey"]))) return false;
   try {
     if (typeof record["profileId"] !== "string") return false;
     validateProfileId(record["profileId"]);
@@ -10690,7 +10980,8 @@ function assertTrustedInspectorWindowSender(event: IpcMainInvokeEvent): BrowserW
     event.sender.getURL() !== INSPECTOR_WINDOW_URL ||
     inspectorWindowOwner === undefined ||
     inspectorWindowOwner.isDestroyed() ||
-    inspectorWindowOwner !== mainWindow?.webContents
+    inspectorWindowOwner !== mainWindow?.webContents ||
+    mainWindow === undefined || inspectorWindowLifecycle?.owns(mainWindow, window) !== true
   ) {
     throw new Error("Inspector IPC did not originate from the trusted detached Inspector main frame.");
   }

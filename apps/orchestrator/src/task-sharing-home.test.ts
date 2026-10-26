@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Client } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -11,7 +11,7 @@ import { TaskSharingHome, type TaskSharingHomeAuthority, type TaskSharingHomeRem
 import { mkdtemp } from "./test-paths.js";
 
 const invitation = contract.buildTaskShareInvitation({ hostOrigin: "http://127.0.0.1:34567", hostServerId: "host-server",
-  shareId: "share-one", shareGeneration: 1n, inviteSecret: "a".repeat(43) });
+  endpointPublicKey: `ed25519:${"a".repeat(64)}`, shareId: "share-one", shareGeneration: 1n, inviteSecret: "a".repeat(43) });
 function authority(): TaskSharingHomeAuthority {
   const controller = new AbortController();
   return { deviceId: "home-device", signal: controller.signal, assertCurrent: () => controller.signal.throwIfAborted() };
@@ -45,7 +45,9 @@ function fixture() {
 async function owner(remote: TaskSharingHomeRemote) {
   const directory = await mkdtemp(join(tmpdir(), "joko-task-sharing-home-"));
   const vault = await CredentialVault.open(join(directory, "master.key"));
-  const home = new TaskSharingHome({ directory, vault, serverId: "home-server", connect: () => remote });
+  const home = new TaskSharingHome({ directory, vault, serverId: "home-server", connect: (origin, pin) => {
+    expect(origin).toBe("http://127.0.0.1:34567"); expect(pin).toBe(contract.parseTaskShareInvitation(invitation).endpointPublicKey); return remote;
+  } });
   await home.initialize(); return { directory, vault, home };
 }
 
@@ -58,8 +60,11 @@ describe("TaskSharingHome", () => {
     expect(first.status).toBe("unknown"); expect(fixtureValue.accept).toHaveBeenCalledTimes(1);
     const disk = await readFile(join(directory, "home.json"), "utf8");
     expect(disk).not.toContain(invitation); expect(disk).not.toContain("TaskShareGuest "); expect(disk).not.toContain('"secret"');
+    expect(JSON.parse(disk).intents[0].endpointPublicKey).toBe(contract.parseTaskShareInvitation(invitation).endpointPublicKey);
     await home.dispose();
-    const restarted = new TaskSharingHome({ directory, vault, serverId: "home-server", connect: () => fixtureValue.remote }); await restarted.initialize();
+    const restarted = new TaskSharingHome({ directory, vault, serverId: "home-server", connect: (_origin, pin) => {
+      expect(pin).toBe(contract.parseTaskShareInvitation(invitation).endpointPublicKey); return fixtureValue.remote;
+    } }); await restarted.initialize();
     const recovered = await restarted.lookup("join-operation", auth);
     expect(recovered.status).toBe("joined"); expect(recovered.joined?.member?.memberId).toBe("member-one");
     expect(fixtureValue.accept).toHaveBeenCalledTimes(1); expect(fixtureValue.lookup).toHaveBeenCalledTimes(1);
@@ -72,6 +77,16 @@ describe("TaskSharingHome", () => {
     value.verify.mockRejectedValueOnce(new ConnectError("Different server.", Code.PermissionDenied));
     await expect(home.snapshot(joined.joined!.joinId, auth)).rejects.toMatchObject({ code: Code.PermissionDenied });
     expect(openCredential).not.toHaveBeenCalled(); expect(value.snapshot).not.toHaveBeenCalled(); await home.dispose();
+  });
+  it("rejects a restored private route whose endpoint key changed while its sealed credential remained", async () => {
+    const value = fixture(), { home, vault, directory } = await owner(value.remote), auth = authority();
+    await home.join("join-operation", invitation, "Guest", auth); await home.dispose();
+    const path = join(directory, "home.json"), disk = JSON.parse(await readFile(path, "utf8"));
+    disk.joined[0].endpointPublicKey = `ed25519:${"b".repeat(64)}`;
+    await writeFile(path, JSON.stringify(disk));
+    const connect = vi.fn(() => value.remote), restored = new TaskSharingHome({ directory, vault, serverId: "home-server", connect });
+    await expect(restored.initialize()).rejects.toMatchObject({ code: Code.Unavailable });
+    expect(connect).not.toHaveBeenCalled();
   });
   it("queries an unknown mutation's original Operation rather than dispatching it again", async () => {
     const value = fixture(), { home } = await owner(value.remote), auth = authority();

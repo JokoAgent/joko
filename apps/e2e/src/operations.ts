@@ -554,9 +554,11 @@ export async function nextEvent(
   const iterator = stream[Symbol.asyncIterator]();
   const timer = setTimeout(() => abort.abort(), timeoutMs);
   try {
-    const result = await iterator.next();
-    if (result.done || result.value.event === undefined) throw new Error("Event stream ended before yielding an Event.");
-    return result.value.event;
+    for (;;) {
+      const result = await iterator.next();
+      if (result.done) throw new Error("Event stream ended before yielding an Event.");
+      if (result.value.event !== undefined) return result.value.event;
+    }
   } finally {
     clearTimeout(timer);
     abort.abort();

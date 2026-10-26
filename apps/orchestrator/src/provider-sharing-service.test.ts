@@ -26,7 +26,7 @@ import { HostedAgentPoller } from "./hosted-agent-poller.js";
 import { createHostedAgentSourceController } from "./hosted-agent-source-controller.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex"), signal = () => new AbortController().signal;
-async function fixture(options: { readonly backendId?: string; readonly createNative?: (creation: HostedAgentBackendCreation) => BackendAdapter | Promise<BackendAdapter> } = {}) {
+async function fixture(options: { readonly backendId?: string; readonly origin?: string | (() => string); readonly createNative?: (creation: HostedAgentBackendCreation) => BackendAdapter | Promise<BackendAdapter> } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-provider-sharing-service-"))), database = new OperationalStore(":memory:"), connections = new ConnectionManager(database);
   database.createConnection({ id: "owner", name: "Owner", authKeyDigest: hash("private-owner-key") });
   let sharing!: ProviderSharingHost, captured: AdapterContext | undefined, created = 0, disposed = 0, cleanupUnknown = false;
@@ -53,10 +53,11 @@ async function fixture(options: { readonly backendId?: string; readonly createNa
       } }] });
   let settings = native.settings.update({ kind: "remote_control", enabled: true }, 0n);
   for (const providerId of ["provider", "foreign-provider"]) settings = native.settings.update({ kind: "provider", backendId, providerId, enabled: true }, settings.revision);
-  sharing = new ProviderSharingHost({ store: database, serverId: "issuer-home", origin: "http://127.0.0.1:43210", native });
+  sharing = new ProviderSharingHost({ store: database, serverId: "issuer-home", origin: options.origin ?? "http://127.0.0.1:43210", endpointPublicKey: `ed25519:${"a".repeat(64)}`, native });
   const vault = await CredentialVault.open(join(root, "master.key")), homeDirectory = join(root, "received-home");
   let loseSubmit = false, submits = 0, seenSecret = "", afterRead: (() => Promise<void>) | undefined;
   const connect = (options: ProviderSharingRemoteOptions): ProviderSharingRemote => {
+    expect(options.endpointPublicKey).toBe(`ed25519:${"a".repeat(64)}`);
     const authorization: Interceptor = next => async request => {
       options.assertCurrent(); if (options.serverId && options.serverId !== "issuer-home") throw new ConnectError("Different Home", Code.PermissionDenied);
       const auth = options.authorization?.(); if (auth) { request.header.set("authorization", auth); if (auth.startsWith("ProviderShareGuest ")) seenSecret = auth; }
@@ -89,6 +90,27 @@ async function fixture(options: { readonly backendId?: string; readonly createNa
     restart: async () => { await home.close(); home = new ProviderSharingHome({ directory: homeDirectory, serverId: "recipient-home", vault, connect }); await home.initialize(); },
     close: async () => { await home.close(); sharing.close(); await native.close(); database.close(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe fixture cleanup."); await rm(root, { recursive: true, force: true }); } };
 }
+
+it("publishes the current Provider entrance while preserving the recipient's pinned locator after withdrawal", async () => {
+  let origin = "http://127.0.0.1:43210";
+  const f = await fixture({ origin: () => origin });
+  try {
+    origin = "https://current.trycloudflare.com";
+    const request = create(contract.CreateProviderShareLinkRequestSchema, { operationId: "public-provider", backendId: "native", providerId: "provider", providerName: "My Provider", owner: { name: "Issuer" } });
+    const invitation = f.sharing.issue(request), parsed = contract.parseProviderSharingLink(invitation.link);
+    expect(parsed.origin).toBe(origin);
+    origin = "http://127.0.0.1:43210";
+    expect(f.sharing.issue(request).link).toBe(invitation.link);
+    const fresh = contract.parseProviderSharingLink(f.sharing.issue(create(contract.CreateProviderShareLinkRequestSchema, { ...request, operationId: "fallback-provider" })).link);
+    expect(fresh.origin).toBe(origin);
+    const preview = await f.home().preview(invitation.link, f.authority);
+    expect(preview.hostOrigin).toBe(parsed.origin);
+    const intent = await f.apply(invitation.link), received = await f.approve(intent.request!.requestId);
+    expect(f.home().received()[0]?.hostOrigin).toBe(parsed.origin);
+    await f.restart(); await f.home().refresh(f.authority);
+    expect(f.home().received()[0]).toMatchObject({ joinId: received.joinId, hostOrigin: parsed.origin, state: "active" });
+  } finally { await f.close(); }
+});
 
 it("restores an unknown submitted application with the sealed original credential and no duplicate submit", async () => {
   const f = await fixture(); try {
@@ -133,7 +155,7 @@ it("confines a real native guest to the issued Provider and leaves only terminal
     await f.captured()!.emit({ type: "run_state", state: "waiting" }); expect(f.native.host.activeProviderTurns("native", "provider")).toBe(1);
     await f.captured()!.emit({ type: "done", outcome: "completed" }); expect(f.native.host.activeProviderTurns("native", "provider")).toBe(0);
     await expect(capture.client.open({ ...input, runId: "foreign", nativeSessionId: "native-foreign", providerId: "foreign-provider", modelId: "foreign-model" }, signal())).rejects.toMatchObject({ code: Code.PermissionDenied });
-    const guestRaw = f.connect({ origin: "http://127.0.0.1:43210", authorization: f.secret, sourceDeviceId: "original-computer", assertCurrent: () => {} });
+    const guestRaw = f.connect({ origin: "http://127.0.0.1:43210", endpointPublicKey: `ed25519:${"a".repeat(64)}`, authorization: f.secret, sourceDeviceId: "original-computer", assertCurrent: () => {} });
     const ownerTransport = createRouterTransport(router => router.service(contract.ProviderSharingService, createProviderSharingConnectService({ host: f.sharing, home: f.home(), connections: f.connections })),
       { transport: { interceptors: [next => async request => { request.header.set("authorization", f.secret()); return next(request); }] } });
     await expect(createClient(contract.ProviderSharingService, ownerTransport).listProviderShares({})).rejects.toBeDefined();
@@ -164,7 +186,7 @@ it("atomically replaces full reshare batches, keeps person consent across pause,
     await opening;
     await expect(relay.client.call("relay-before-revoke", "after-admission-revoke", { kind: "state" }, signal())).rejects.toBeDefined();
     await f.sharing.reconcile(); expect(f.created()).toBe(0); f.beforeCreate(undefined);
-    const guest = f.connect({ origin: "http://127.0.0.1:43210", authorization: f.secret, sourceDeviceId: f.home().localSourceDeviceId, assertCurrent: () => {} }).guest;
+    const guest = f.connect({ origin: "http://127.0.0.1:43210", endpointPublicKey: `ed25519:${"a".repeat(64)}`, authorization: f.secret, sourceDeviceId: f.home().localSourceDeviceId, assertCurrent: () => {} }).guest;
     const batch = { id: "full_batch_identity_1", count: 2 };
     expect((await guest.syncProviderReshares({ entries: [{ key, person: { name: "Third person" } }], batch: { ...batch, index: 0 } })).complete).toBe(false);
     expect(f.sharing.list()[0]!.reshares).toHaveLength(1);

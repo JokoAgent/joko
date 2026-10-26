@@ -21,6 +21,10 @@ import { ExtensionMainViewPage, sameExtensionMainViewSurface } from "./Extension
 const EXTENSION_A = "extension_0123456789abcdef0123456789abcdef";
 const EXTENSION_B = "extension_11111111111111111111111111111111";
 const roots: Root[] = [];
+const { fetchDocument } = vi.hoisted(() => ({ fetchDocument: vi.fn(async () => new Response("<!doctype html><p>private extension</p>", {
+  headers: { "content-security-policy": "default-src 'none'; script-src data:" }
+})) }));
+vi.mock("@joko/connection-transport", () => ({ createConnectionFetch: () => fetchDocument }));
 
 beforeAll(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -50,7 +54,9 @@ describe("Extension main view", () => {
     const iframe = required(rendered.container.querySelector<HTMLIFrameElement>("iframe"));
     expect(iframe.getAttribute("sandbox")).toBe("allow-scripts");
     expect(iframe.getAttribute("referrerpolicy")).toBe("no-referrer");
-    expect(iframe.src).toBe(`https://orchestrator.example${surface.endpoint}`);
+    expect(iframe.src).toMatch(/\/isolated-surface\.html#v1-[a-f0-9]{32}$/u);
+    expect(iframe.src).not.toContain(surface.endpoint);
+    expect(fetchDocument).toHaveBeenCalledWith(`https://orchestrator.example${surface.endpoint}`, expect.objectContaining({ headers: { "x-joko-isolated-document": "1" } }));
     expect(iframe.hasAttribute("allow")).toBe(false);
     await act(async () => iframe.dispatchEvent(new Event("load")));
     expect(rendered.container.textContent).not.toContain("extensions.mainView.loadingContent");
@@ -87,7 +93,7 @@ describe("Extension main view", () => {
     await settle();
 
     expect(required(rendered.container.querySelector<HTMLIFrameElement>("iframe")).src)
-      .toBe(`https://orchestrator.example${surfaceB.endpoint}`);
+      .toMatch(/\/isolated-surface\.html#v1-/u);
     expect(closeExtensionMainView).toHaveBeenCalledWith(surfaceA.id);
     expect(sameExtensionMainViewSurface(surfaceA, surfaceB)).toBe(false);
   });

@@ -17,7 +17,7 @@ beforeEach(() => { (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT
 afterEach(async () => { await act(async () => { root?.unmount(); }); root = undefined; vi.restoreAllMocks(); document.body.replaceChildren(); Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT"); });
 const share = create(TaskShareSchema, { shareId: "share", shareGeneration: 1n, sessionId: "task", hostServerId: "host", hostOrigin: "https://host.example", title: "Shared task", status: "active" });
 const joined = create(JoinedTaskShareSchema, { joinId: "joined", status: "active", share, member: { memberId: "member", memberGeneration: 1n, status: "active", displayName: "Guest" } });
-const invitation = buildTaskShareInvitation({ hostOrigin: "https://host.example", hostServerId: "host", shareId: "share", shareGeneration: 1n, inviteSecret: "a".repeat(48) });
+const invitation = buildTaskShareInvitation({ hostOrigin: "https://host.example", hostServerId: "host", endpointPublicKey: `ed25519:${"a".repeat(64)}`, shareId: "share", shareGeneration: 1n, inviteSecret: "a".repeat(48) });
 async function fixture(options: { readonly sessionId?: string; readonly invitation?: string; readonly pending?: PendingTaskSharingAction } = {}) {
   const pending = new Map<string, PendingTaskSharingAction>(); if (options.pending) pending.set(options.pending.operationId, options.pending);
   const local = { taskSharingActions: vi.fn(async () => [...pending.values()]),

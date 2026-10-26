@@ -18,6 +18,12 @@
     "preview": "vite preview --host 127.0.0.1 --port 4320"
   },
   "dependencies": {
+    "@jokoagent/linkspan-core": "*",
+    "@jokoagent/linkspan-noise": "*",
+    "@jokoagent/linkspan-iroh": "*",
+    "@jokoagent/linkspan-tailcat": "*",
+    "@jokoagent/linkspan-iroh-wasm": "*",
+    "@jokoagent/linkspan-tailcat-wasm": "*",
     "@bufbuild/protobuf": "2.14.0",
     "@codemirror/commands": "6.10.3",
     "@codemirror/lang-cpp": "6.0.3",
@@ -45,6 +51,7 @@
     "@google/model-viewer": "4.3.1",
     "@joko/brand-assets": "workspace:*",
     "@joko/contracts": "workspace:*",
+    "@joko/connection-transport": "workspace:*",
     "@lezer/highlight": "1.2.3",
     "@replit/codemirror-lang-csharp": "6.2.0",
     "@tanstack/react-virtual": "3.13.12",

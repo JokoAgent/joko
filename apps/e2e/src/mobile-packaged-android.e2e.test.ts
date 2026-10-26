@@ -5,6 +5,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { capabilityNames, RunState } from "@joko/contracts";
+import { formatTrustedNodeInvitation } from "@joko/connection-transport/trust";
 import type { AdapterContext, PromptInput, SessionTree } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { parseAndroidUiNodes, type AndroidUiNode } from "@joko/tool-android";
@@ -18,7 +19,7 @@ const evidenceSteps = {
   "validate-apk": { action: "validation", assertions: ["android-manifest", "clean-manifest-source", "application-package", "apk-manifest-sha256"] },
   "install-apk": { action: "installation", assertions: ["fresh-application-data", "installed-apk-sha256"] },
   "prepare-fixture": { action: "fixture-setup", assertions: ["local-orchestrator-ready", "fixture-task-created", "port-reverse-ready"] },
-  "pair-application": { action: "pairing", assertions: ["application-started", "pairing-request-issued"] },
+  "pair-application": { action: "pairing", assertions: ["application-started", "trusted-endpoint-public-key-entered", "pairing-request-issued"] },
   "open-task-header": { action: "navigation", assertions: ["task-title-visible", "title-between-header-controls", "header-actions-within-viewport"] },
   "task-actions-menu": { action: "menu", assertions: ["complete-task-actions", "actions-within-viewport"] },
   "send-native-input": { action: "text-entry", assertions: ["one-completed-run", "exact-fixture-dispatch", "one-active-mobile-connection", "persisted-timeline", "owner-generation-consistent"] },
@@ -38,7 +39,7 @@ type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" |
 type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset"
   | "gallery-dismissed" | "resource-links" | "file-opened" | "file" | "restored"
   | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
-  | "connection-add" | "connection-error" | "actions-scrolled";
+  | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -53,6 +54,8 @@ type EvidenceStep = {
 type AndroidEvidence = {
   schemaVersion: 1;
   platform: "android";
+  transport?: 'https' | 'webrtc' | 'http-connect';
+  httpConnect?: { beforePairing: number; afterPairing?: number; beforeRestart?: number; afterRestore?: number; directPortReversed: false };
   scope: "native-pairing-input-canonical-resources-and-process-reopen";
   backend: "local-instrumented-orchestrator-fixture";
   result: EvidenceResult;
@@ -75,6 +78,7 @@ const serial = process.env.JOKO_ANDROID_TEST_SERIAL?.trim();
 const avd = process.env.JOKO_ANDROID_TEST_AVD?.trim();
 const adbExecutable = process.env.JOKO_ANDROID_ADB?.trim();
 const apkPath = process.env.JOKO_ANDROID_TEST_APK?.trim();
+const connectionTransport = process.env.JOKO_ANDROID_CONNECTION_TRANSPORT ?? 'https';
 const nativeIt = serial && avd && adbExecutable && apkPath ? it : it.skip;
 const packageName = "app.joko.mobile";
 const prompt = "Show the workspace resources";
@@ -137,7 +141,7 @@ afterEach(async () => {
   }
 }, 90_000);
 
-nativeIt("pairs, sends through native rich input, opens canonical resources, and resumes without resending", {
+nativeIt("pairs with a trusted node key, sends through native rich input, opens canonical resources, and resumes without resending", {
   timeout: 360_000
 }, async () => {
   if (!serial || !/^emulator-\d+$/u.test(serial) || !avd?.startsWith("joko-")
@@ -145,9 +149,10 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
     throw new Error("Native Android evidence requires an explicit isolated Joko AVD and absolute tool/artifact paths.");
   }
   evidenceStarted = performance.now();
+  if (!['https', 'webrtc', 'http-connect'].includes(connectionTransport)) throw new Error('Select an explicit supported Android connection transport.');
   evidence = { schemaVersion: 1, platform: "android", scope: "native-pairing-input-canonical-resources-and-process-reopen",
     backend: "local-instrumented-orchestrator-fixture", result: "running", scenarioResult: "running",
-    cleanupResult: "running", elapsedMs: 0, steps: [] };
+    cleanupResult: "running", elapsedMs: 0, steps: [], transport: connectionTransport as AndroidEvidence['transport'] };
   await persistEvidence();
   try {
     await runNativeScenario();
@@ -210,7 +215,8 @@ async function runNativeScenario(): Promise<void> {
     ...PI_LIKE_PROFILE.capabilities,
     { key: capabilityNames.workspaceFiles, supported: true as const }
   ] };
-  fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new AndroidResourceAdapter(entry), collaborationGoals: true });
+  fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new AndroidResourceAdapter(entry), collaborationGoals: true,
+    webRtc: connectionTransport === 'webrtc', httpConnect: connectionTransport === 'http-connect' });
   const current = fixture;
   await mkdir(join(current.workspaceDirectory, "images"));
   await writeFile(join(current.workspaceDirectory, "images", "pixel.png"), Buffer.from(
@@ -242,7 +248,15 @@ async function runNativeScenario(): Promise<void> {
     await persistEvidence();
     console.info(JSON.stringify({ phase: `android-fixture-${phase}`, passed: true, count }));
   }
-  reversedPort = "tcp:" + new URL(current.baseUrl).port;
+  const proxyTransport = current.httpConnectTransport;
+  if (connectionTransport === 'http-connect' && proxyTransport === undefined) throw new Error('The native proxy fixture has no selected locator.');
+  // CONNECT builds receive only the proxy port. The logical HTTP backend is
+  // deliberately not reversed, so direct HTTPS/HTTP fallback cannot pass.
+  reversedPort = "tcp:" + new URL(proxyTransport?.proxyOrigin ?? current.baseUrl).port;
+  if (proxyTransport !== undefined) {
+    expect(new URL(proxyTransport.proxyOrigin).port).not.toBe(new URL(current.baseUrl).port);
+    evidence!.httpConnect = { beforePairing: current.httpConnectRequests, directPortReversed: false };
+  }
   await adb("reverse", reversedPort, reversedPort);
   await completeStep();
 
@@ -253,24 +267,41 @@ async function runNativeScenario(): Promise<void> {
     await launch();
     try {
       await tap("Add Joko node");
+      await waitForInitialNodeAddress(() => mobileChallengeId === undefined);
     } catch (error) {
-      // This first surface has no entered node address or pairing credential.
-      await screenshot("connection-error").catch(() => undefined);
+      // This block precedes every address, pin and pairing action. Capture only
+      // the same owned AVD while no pairing request has been issued.
+      if (mobileChallengeId === undefined) await captureInitialConnectionFailure(() => mobileChallengeId === undefined).catch(() => undefined);
       throw error;
     }
-    await waitFor(nodes, (items) => items.some((node) => node.enabled
-      && (node.text === "Joko node address" || node.contentDescription === "Joko node address"))
-      && items.some((node) => node.enabled && node.className === "android.widget.EditText"
-        && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1), "empty native node address field", 25_000);
     await screenshot("connection-add");
     await fill("Joko node address", current.baseUrl);
-    await tap("Check node identity");
+    const endpointPublicKey = current.application.linkspanIdentity!.publicKey;
+    const invitation = proxyTransport === undefined ? endpointPublicKey : formatTrustedNodeInvitation({
+      origin: current.baseUrl, endpointPublicKey, endpointTransport: proxyTransport
+    });
+    await fill("Trusted node invitation or public key", invitation, true, true);
+    if (connectionTransport === 'webrtc') {
+      await tap('WebRTC', true);
+    }
+    await tap("Check node identity", true);
     await tap("Request pairing", true);
     await waitFor(async () => mobileChallengeId, (value) => value !== undefined, "native pairing request");
     await fill("Pairing code", current.pairingCode(mobileChallengeId!), true);
     await tap("Pair this device", true);
+  } catch (error) {
+    if (connectionTransport !== 'https' && mobileChallengeId === undefined) {
+      await captureTransportIdentityFailure(current, () => mobileChallengeId === undefined).catch(() => undefined);
+    }
+    throw error;
   } finally { removeListener(); }
   await completeStep();
+  if (connectionTransport === 'webrtc') expect(current.webRtcSignalingRequests).toBeGreaterThan(2);
+  if (evidence!.httpConnect !== undefined) {
+    evidence!.httpConnect.afterPairing = current.httpConnectRequests;
+    expect(current.httpConnectRequests).toBeGreaterThan(evidence!.httpConnect.beforePairing);
+    await persistEvidence();
+  }
 
   await beginStep("open-task-header");
   await tap("Open task " + taskName);
@@ -388,6 +419,7 @@ async function runNativeScenario(): Promise<void> {
   await completeStep();
 
   await beginStep("force-stop-and-reconnect");
+  if (evidence!.httpConnect !== undefined) evidence!.httpConnect.beforeRestart = current.httpConnectRequests;
   await interaction("force-stop", () => adb("shell", "am", "force-stop", packageName));
   expect((await adb("shell", "pidof", packageName)).trim()).toBe("");
   await launch();
@@ -405,6 +437,10 @@ async function runNativeScenario(): Promise<void> {
   expect(current.application.store.listRuns({ sessionId })).toHaveLength(1);
   expect(current.application.store.listConnections().filter((connection) => connection.deviceId === mobileDevices[0]!.id)).toHaveLength(1);
   expect(await adb("logcat", "-b", "crash", "-d", "-v", "brief")).not.toMatch(/app\.joko\.mobile|ReactNativeJS|Hermes/u);
+  if (evidence!.httpConnect !== undefined) {
+    evidence!.httpConnect.afterRestore = current.httpConnectRequests;
+    expect(current.httpConnectRequests).toBeGreaterThan(evidence!.httpConnect.beforeRestart!);
+  }
   const run = current.application.store.listRuns({ sessionId })[0]!;
   expect((await manager.clients.run.getRun({ runId: run.descriptor.id })).run?.state).toBe(RunState.SUCCEEDED);
   await completeStep();
@@ -456,8 +492,14 @@ async function interaction<T>(type: EvidenceAction, operation: () => Promise<T>)
 }
 
 async function adb(...args: string[]): Promise<string> {
+  return adbUntil(undefined, ...args);
+}
+
+async function adbUntil(deadline: number | undefined, ...args: string[]): Promise<string> {
+  const timeout = deadline === undefined ? 30_000 : Math.min(30_000, deadline - Date.now());
+  if (timeout <= 0) throw new Error("The initial native connection navigation deadline elapsed.");
   return new Promise((accept, reject) => {
-    execFile(adbExecutable!, ["-s", serial!, ...args], { timeout: 30_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
+    execFile(adbExecutable!, ["-s", serial!, ...args], { timeout, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
       (error, stdout) => {
         // Do not include command arguments or output: pairing input is a transient credential.
         if (error && !(args[0] === "shell" && args[1] === "pidof" && error.code === 1)) {
@@ -526,11 +568,97 @@ async function inspectTaskActions(screenWidth: number): Promise<void> {
   }, (complete) => complete, "the complete visible native task actions", 25_000);
 }
 
-async function nodes(): Promise<readonly AndroidUiNode[]> {
-  const output = await adb("exec-out", "uiautomator", "dump", "/dev/tty");
-  const parsed = parseAndroidUiNodes(output);
+async function nodes(deadline?: number): Promise<readonly AndroidUiNode[]> {
+  const output = await adbUntil(deadline, "exec-out", "uiautomator", "dump", "/dev/tty");
+  const parsed = parseAndroidUiNodes(normalizeNativeXmlAttributes(output));
   if (parsed.truncated) throw new Error("The native Android hierarchy exceeded its bounded node budget.");
   return parsed.nodes.filter((node) => node.packageName === packageName);
+}
+
+function normalizeNativeXmlAttributes(xml: string): string {
+  // Android's serializer uses single-quoted attributes for literal JSON text.
+  // Preserve its complete value and existing entities for the shared parser.
+  return xml.replace(/(\s[\w:-]+)=(?:"[^"]*"|'([^']*)')/gu, (attribute, name: string, single: string | undefined) =>
+    single === undefined ? attribute : `${name}="${single.replaceAll('"', '&quot;')}"`);
+}
+
+async function waitForInitialNodeAddress(isPreInput: () => boolean): Promise<void> {
+  const deadline = Date.now() + 25_000;
+  let retapped = false;
+  while (Date.now() < deadline) {
+    if (!isPreInput()) throw new Error("The initial connection navigation is no longer before pairing.");
+    const items = await nodes(deadline);
+    if (!isPreInput()) throw new Error("The initial connection navigation is no longer before pairing.");
+    if (Date.now() >= deadline) break;
+    const addressLabel = items.some((node) => node.enabled
+      && (node.text === "Joko node address" || node.contentDescription === "Joko node address"));
+    if (addressLabel && items.some((node) => node.enabled && node.className === "android.widget.EditText"
+      && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1)) return;
+    const nearby = items.some((node) => node.enabled && (node.text === "Nearby Joko nodes" || node.contentDescription === "Nearby Joko nodes"));
+    const targets = items.filter((node) => node.enabled && node.clickable
+      && (node.text === "Add Joko node" || node.contentDescription === "Add Joko node")
+      && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1);
+    if (!retapped && !addressLabel && nearby && targets.length === 1) {
+      retapped = true;
+      // A repeated tab selection is navigation only. Never apply this recovery
+      // to identity checks, pairing, or any action after the first input.
+      await interaction("tap", () => {
+        if (!isPreInput()) throw new Error("The initial connection navigation is no longer before pairing.");
+        return tapNode(targets[0]!, false, deadline);
+      });
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(10, Math.max(0, deadline - Date.now()))));
+  }
+  throw new Error("Timed out waiting for empty native node address field.");
+}
+
+async function captureInitialConnectionFailure(isPreInput: () => boolean): Promise<void> {
+  if (!ownedAvd || activeStep?.name !== "pair-application" || !isPreInput()) return;
+  const actualAvd = (await adb("emu", "avd", "name")).split(/\r?\n/u)[0]?.trim();
+  if (actualAvd !== avd) throw new Error("The initial connection evidence no longer belongs to the owned AVD.");
+  if (!isPreInput()) return;
+  try {
+    const hierarchy = await nodes();
+    if (!isPreInput()) return;
+    const directory = join(dirname(apkPath!), "ui-evidence");
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "connection-error-hierarchy.json"), JSON.stringify({
+      scope: "pre-input-connection-navigation", target: { serial, avd: actualAvd }, nodes: hierarchy
+    }, null, 2) + "\n");
+  } finally { if (isPreInput()) await screenshot("connection-error"); }
+}
+
+async function captureTransportIdentityFailure(current: OrchestratorE2eFixture, isPrePairing: () => boolean): Promise<void> {
+  if (!ownedAvd || activeStep?.name !== 'pair-application' || !isPrePairing()) return;
+  const actualAvd = (await adb('emu', 'avd', 'name')).split(/\r?\n/u)[0]?.trim();
+  if (actualAvd !== avd || !isPrePairing()) return;
+  const deadline = Date.now() + 15_000;
+  const [hierarchy, focus, processId] = await Promise.allSettled([
+    adbUntil(deadline, 'exec-out', 'uiautomator', 'dump', '/dev/tty'),
+    adbUntil(deadline, 'shell', 'dumpsys', 'window', 'windows'),
+    adbUntil(deadline, 'shell', 'pidof', packageName)
+  ]);
+  if (!isPrePairing()) return;
+  const parsed = hierarchy.status === 'fulfilled' ? parseAndroidUiNodes(normalizeNativeXmlAttributes(hierarchy.value)) : undefined;
+  const responses = current.webRtcResponses.slice(0, 32);
+  const directory = join(dirname(apkPath!), 'ui-evidence');
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, 'connection-identity-error.json'), JSON.stringify({
+    scope: 'owned-avd-transport-identity-before-pairing', transport: connectionTransport, target: { serial, avd: actualAvd },
+    httpConnectRequests: connectionTransport === 'http-connect' ? current.httpConnectRequests : undefined,
+    transportPhase: connectionTransport === 'http-connect' ? (current.httpConnectRequests > (evidence?.httpConnect?.beforePairing ?? 0) ? 'connect-request-observed' : 'no-mobile-connect-request-observed')
+      : responses.some(response => response.path.startsWith('/joko.v1.')) ? 'application-response-observed'
+      : current.webRtcSignalingRequests > 0 ? 'signaling-request-observed' : 'no-signaling-request-observed',
+    signalingRequests: current.webRtcSignalingRequests, responses,
+    appProcessId: processId.status === 'fulfilled' && /^[0-9\s]*$/u.test(processId.value) ? processId.value.trim().slice(0, 256) : undefined,
+    currentFocus: focus.status === 'fulfilled' ? focus.value.split(/\r?\n/u).filter(line => /mCurrentFocus=|mFocusedApp=|mTopFocusedDisplayId=/u.test(line)).slice(0, 16).map(line => line.slice(0, 512)) : undefined,
+    focusedElements: hierarchy.status === 'fulfilled' ? [...hierarchy.value.matchAll(/<node\b[^>]*\bfocused="true"[^>]*>/gu)].slice(0, 16).map(match => match[0].slice(0, 2048)) : undefined,
+    hierarchyTruncated: parsed?.truncated === true || (parsed?.nodes.length ?? 0) > 256,
+    nodes: parsed?.nodes.slice(0, 256).map(node => ({ packageName: node.packageName, className: node.className,
+      text: node.text?.slice(0, 240), label: node.contentDescription?.slice(0, 240), enabled: node.enabled, focusable: node.focusable, bounds: node.bounds }))
+  }, null, 2) + '\n');
+  // No challenge has been issued and no transient pairing code was entered.
+  if (isPrePairing()) await screenshot('connection-identity-error');
 }
 
 async function waitNode(predicate: (node: AndroidUiNode) => boolean, label: string): Promise<AndroidUiNode> {
@@ -615,22 +743,43 @@ async function tapSurface(label: string, scroll: boolean, leadingText: boolean):
   await tapNode(node, leadingText);
 }
 
-async function tapNode(node: AndroidUiNode, leadingText = false): Promise<void> {
+async function tapNode(node: AndroidUiNode, leadingText = false, deadline?: number): Promise<void> {
   // Native selectable text reports paragraph bounds. Touch the LTR fixture's first glyph, not trailing empty space.
   const x = leadingText && !node.contentDescription ? node.bounds.x1 + Math.min(12, (node.bounds.x2 - node.bounds.x1) / 2)
     : (node.bounds.x1 + node.bounds.x2) / 2;
-  await adb("shell", "input", "tap", String(Math.round(x)),
+  await adbUntil(deadline, "shell", "input", "tap", String(Math.round(x)),
     String(Math.round((node.bounds.y1 + node.bounds.y2) / 2)));
 }
 
-async function fill(label: string, value: string, scroll = false): Promise<void> {
+async function fill(label: string, value: string, scroll = false, verifyTrustedIdentity = false): Promise<void> {
+  if (verifyTrustedIdentity && label !== 'Trusted node invitation or public key' || value.startsWith('{') && !verifyTrustedIdentity) {
+    throw new Error('A native invitation requires its complete trusted input gate.');
+  }
   await interaction("text-entry", async () => {
-    if (!/^[A-Za-z0-9 .,:/_+-]+$/u.test(value)) throw new Error("Native fixture input must be bounded shell-safe ASCII.");
+    if (value.length > 32768 || !/^[A-Za-z0-9 .,:/_+\-{}"\[\]]+$/u.test(value)) throw new Error("Native fixture input must be bounded shell-safe ASCII.");
     await tap(label, scroll);
     await adb("shell", "input", "keyevent", "--longpress", "KEYCODE_MOVE_END");
-    await adb("shell", "input", "text", value.replaceAll(" ", "%s"));
+    // The allowlist excludes apostrophes and every shell expansion character;
+    // remote single quotes preserve the invitation's literal JSON punctuation.
+    if (value.startsWith('{')) {
+      // Bound the entire native text operation by its original 30s command
+      // budget. Each real prefix receipt lets the controlled WebView settle
+      // before more key events; the full-value gate below remains mandatory.
+      const deadline = Date.now() + 30_000;
+      for (let offset = 0; offset < value.length; offset += 48) {
+        const chunk = value.slice(offset, offset + 48), prefix = value.slice(0, offset + chunk.length);
+        await adbUntil(deadline, "shell", "input", "text", "'" + chunk.replaceAll(" ", "%s") + "'");
+        // The final block uses the original complete-value gate below rather
+        // than spending the input budget on the same full hierarchy twice.
+        if (offset + chunk.length < value.length) await waitFor(() => nodes(deadline), items => items.some(node => node.enabled
+          && node.className === 'android.widget.EditText' && node.text === prefix),
+        'complete native invitation input prefix', Math.max(1, deadline - Date.now()));
+      }
+    } else await adb("shell", "input", "text", "'" + value.replaceAll(" ", "%s") + "'");
     await adb("shell", "input", "keyevent", "KEYCODE_BACK");
   });
+  if (verifyTrustedIdentity) await waitNode(node => node.enabled && node.className === 'android.widget.EditText' && node.text === value,
+    'native trusted endpoint public key');
 }
 
 async function launch(): Promise<void> {

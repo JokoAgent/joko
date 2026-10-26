@@ -14,6 +14,7 @@ import {
   type DevicePeerSelectionIdentity
 } from "./device-peer-owner.js";
 import { publicRemoteDesktopIceConfiguration } from "./remote-desktop-ice-configuration.js";
+import type { MediaUdpInput, RemoteDesktopUdpMappingProvider } from "./linkspan-media-udp.js";
 
 const REMOTE_DESKTOP_LEASE_MS = 12_000;
 const REMOTE_DESKTOP_PRESENTATION_PROBE_MS = 3_000;
@@ -29,7 +30,7 @@ const MAXIMUM_TEXT_INPUT_LENGTH = 4_096;
 const MAXIMUM_SCROLL_DELTA = 4_096;
 const MAXIMUM_SDP_BYTES = 64 * 1024;
 const MAXIMUM_ICE_CANDIDATES = 16;
-const MAXIMUM_ICE_CURSOR = 128;
+const MAXIMUM_ICE_CURSOR = contract.REMOTE_DESKTOP_ICE_LIMITS.maxCandidates;
 const MAXIMUM_ICE_CANDIDATE_LENGTH = 2_048;
 const MAXIMUM_JPEG_BYTES = 180_000;
 const MAXIMUM_DISPLAY_MODES = 256;
@@ -86,7 +87,11 @@ export interface RemoteDesktopIceConfigurationProvider {
     readonly targetDeviceId: string;
     readonly leaseId: string;
     readonly signal: AbortSignal;
+    /** Revalidate the original lease immediately before external effects and adoption. */
+    readonly assertCurrent?: () => void;
   }): Promise<readonly contract.RemoteDesktopIceServer[]>;
+  releaseConfiguration?(leaseId: string): Promise<void>;
+  close?(): Promise<void>;
 }
 
 export interface RemoteDesktopCoordinatorOptions {
@@ -94,10 +99,13 @@ export interface RemoteDesktopCoordinatorOptions {
   readonly onRevoked: (connectionId: string, listener: () => void) => () => void;
   readonly now?: () => number;
   readonly iceConfiguration?: RemoteDesktopIceConfigurationProvider;
+  readonly udpMapping?: RemoteDesktopUdpMappingProvider;
 }
 
 interface RemoteDesktopLeaseState {
   readonly leaseId: string;
+  readonly mediaAbort: AbortController;
+  mediaAttempt?: { readonly id: string; readonly hostConnectionId: string; readonly abort: AbortController };
   readonly sourceDisplayId: string;
   captureDisplayId: string;
   readonly controllerConnectionId: string;
@@ -161,6 +169,7 @@ export class RemoteDesktopCoordinator {
   readonly #onRevoked: RemoteDesktopCoordinatorOptions["onRevoked"];
   readonly #now: () => number;
   readonly #iceConfiguration: RemoteDesktopIceConfigurationProvider;
+  readonly #udpMapping: RemoteDesktopUdpMappingProvider | undefined;
   readonly #leases = new Map<string, RemoteDesktopLeaseState>();
   readonly #startFences = new Map<string, RemoteDesktopStartFence>();
   readonly #expiredResumes = new Map<string, RemoteDesktopExpiredResume>();
@@ -168,12 +177,23 @@ export class RemoteDesktopCoordinator {
   readonly #exitAborts = new Set<AbortController>();
   readonly #credentialHandles = new Map<string, RemoteDesktopCredentialOccurrence>();
   #closed = false;
+  #closePromise: Promise<void> | undefined;
 
   constructor(options: RemoteDesktopCoordinatorOptions) {
     this.#owner = options.owner;
     this.#onRevoked = options.onRevoked;
     this.#now = options.now ?? Date.now;
     this.#iceConfiguration = options.iceConfiguration ?? new PublicStunRemoteDesktopIceConfiguration(this.#now);
+    this.#udpMapping = options.udpMapping;
+  }
+
+  get localUdpRetirementRequired(): boolean { return this.#udpMapping !== undefined; }
+  async retireLocalMedia(connection: ConnectionRecord, leaseId: string, attemptId: string): Promise<void> {
+    validateIdentifier(leaseId, "lease_id"); validateAttemptId(attemptId);
+    const state = this.#leases.get(leaseId);
+    if (state?.identity.targetDeviceId === connection.deviceId && state.mediaAttempt?.id === attemptId
+      && state.mediaAttempt.hostConnectionId === connection.id) state.mediaAttempt.abort.abort();
+    await this.#udpMapping?.retireLocalCapture({ hostConnectionId: connection.id, targetDeviceId: connection.deviceId, leaseId, attemptId });
   }
 
   async getCapabilities(
@@ -392,6 +412,7 @@ export class RemoteDesktopCoordinator {
       if (this.#leases.has(value.leaseId)) throw invalidTargetResponse();
       const state: RemoteDesktopLeaseState = {
         leaseId: value.leaseId,
+        mediaAbort: new AbortController(),
         sourceDisplayId: input.displayId,
         captureDisplayId: value.display!.displayId,
         controllerConnectionId: connection.id,
@@ -636,7 +657,8 @@ export class RemoteDesktopCoordinator {
         controllerDeviceId: connection.deviceId,
         targetDeviceId: identity.targetDeviceId,
         leaseId,
-        signal
+        signal: AbortSignal.any([signal, state.mediaAbort.signal]),
+        assertCurrent: () => this.#revalidateLeaseCompletion(state, connection, identity, authority)
       }));
     validateIceServers(servers, this.#now());
     return Object.freeze([...servers]);
@@ -662,6 +684,8 @@ export class RemoteDesktopCoordinator {
       throw invalidArgument("Remote Desktop cursor overlay selection is invalid.");
     }
     const authority = this.#capture(connection, identity);
+    const mediaAttempt = this.#udpMapping === undefined ? undefined : this.#beginMediaAttempt(state, input.attemptId);
+    const mediaSignal = mediaAttempt === undefined ? signal : AbortSignal.any([signal, state.mediaAbort.signal, mediaAttempt.abort.signal]);
     const iceServers = await this.getIceConfiguration(connection, identity, input.leaseId, signal);
     this.#revalidateLeaseCompletion(state, connection, identity, authority);
     signal.throwIfAborted();
@@ -670,9 +694,16 @@ export class RemoteDesktopCoordinator {
         "createRemoteDesktopOffer",
         create(contract.DevicePeerCreateRemoteDesktopOfferActionSchema, { ...input, iceServers: [...iceServers] }),
         "side_effect"
-      ), signal, "remoteDesktopOffer", "joko.v1.RemoteDesktopOfferResult"));
+      ), mediaSignal, "remoteDesktopOffer", "joko.v1.RemoteDesktopOfferResult"));
     if (value.attemptId !== input.attemptId) throw invalidTargetResponse();
     validateSdp(value.answerSdp, "answer_sdp");
+    if (this.#udpMapping && mediaAttempt) {
+      const context = this.#mediaUdpInput(state, connection, identity, authority, mediaAttempt, mediaSignal);
+      context.assertCurrent(); mediaSignal.throwIfAborted();
+      const answerSdp = await this.#udpMapping.mapAnswer(context, value.answerSdp);
+      context.assertCurrent(); mediaSignal.throwIfAborted(); validateSdp(answerSdp, "answer_sdp");
+      return { ...value, answerSdp };
+    }
     return value;
   }
 
@@ -692,15 +723,25 @@ export class RemoteDesktopCoordinator {
     validateIceCursor(input.after);
     validateIceCandidates(input.candidates);
     const authority = this.#capture(connection, identity);
-    const value = await this.#runLeaseBound(state, connection, identity, authority, () =>
+    if (this.#udpMapping && state.mediaAttempt !== undefined && state.mediaAttempt.id !== input.attemptId) throw leaseFailure(contract.RemoteDesktopFailureReason.AUTHORITY_CHANGED, "aborted");
+    const dispatch = async (nativeAfter: number): Promise<contract.RemoteDesktopIceExchangeResult> => {
+      const result = await this.#runLeaseBound(state, connection, identity, authority, () =>
       this.#dispatch<contract.RemoteDesktopIceExchangeResult>(authority, remoteDesktopCommand(
         "exchangeRemoteDesktopIce",
         create(contract.DevicePeerExchangeRemoteDesktopIceActionSchema, {
           ...input,
+          after: nativeAfter,
           candidates: [...input.candidates]
         }),
         "side_effect"
       ), signal, "remoteDesktopIce", "joko.v1.RemoteDesktopIceExchangeResult"));
+      if (result.attemptId !== input.attemptId || result.next < nativeAfter) throw invalidTargetResponse();
+      validateIceCursor(result.next); validateIceCandidates(result.candidates); return result;
+    };
+    const attempt = state.mediaAttempt;
+    const value = this.#udpMapping && attempt?.id === input.attemptId
+      ? await this.#udpMapping.exchangeIce(this.#mediaUdpInput(state, connection, identity, authority, attempt, signal), input.after, dispatch)
+      : await dispatch(input.after);
     if (value.attemptId !== input.attemptId || value.next < input.after) throw invalidTargetResponse();
     validateIceCursor(value.next);
     validateIceCandidates(value.candidates);
@@ -1143,18 +1184,22 @@ export class RemoteDesktopCoordinator {
     return value;
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
-    for (const cancellation of this.#exitAborts) cancellation.abort();
-    const states = [...this.#leases.values()];
-    const credentials = [...this.#credentialHandles.values()];
-    for (const state of states) this.#forget(state);
-    this.#expiredResumes.clear();
-    for (const stop of this.#revocationSubscriptions.values()) stop();
-    this.#revocationSubscriptions.clear();
-    await Promise.allSettled([...states.map((state) => this.#bestEffortStop(state)),
-      ...credentials.map((state) => this.#retireCredentialHandle(state))]);
+  close(): Promise<void> {
+    this.#closePromise ??= (async () => {
+      this.#closed = true;
+      for (const cancellation of this.#exitAborts) cancellation.abort();
+      const states = [...this.#leases.values()];
+      const credentials = [...this.#credentialHandles.values()];
+      for (const state of states) this.#forget(state);
+      this.#expiredResumes.clear();
+      for (const stop of this.#revocationSubscriptions.values()) stop();
+      this.#revocationSubscriptions.clear();
+      await Promise.allSettled([...states.map((state) => this.#bestEffortStop(state)),
+        ...credentials.map((state) => this.#retireCredentialHandle(state))]);
+      await this.#iceConfiguration.close?.();
+      await this.#udpMapping?.close();
+    })();
+    return this.#closePromise;
   }
 
   #capture(connection: ConnectionRecord, identity: DevicePeerSelectionIdentity): DevicePeerAuthority {
@@ -1248,6 +1293,10 @@ export class RemoteDesktopCoordinator {
   #forget(state: RemoteDesktopLeaseState): void {
     if (this.#leases.get(state.leaseId) !== state) return;
     this.#leases.delete(state.leaseId);
+    state.mediaAbort.abort();
+    state.mediaAttempt?.abort.abort();
+    void this.#udpMapping?.releaseLease(state.leaseId).catch(() => undefined);
+    void this.#iceConfiguration.releaseConfiguration?.(state.leaseId).catch(() => undefined);
     this.#stopPresentationPolling(state);
     clearTimeout(state.timer);
     state.routeSubscription?.dispose();
@@ -1257,6 +1306,20 @@ export class RemoteDesktopCoordinator {
       this.#revocationSubscriptions.get(state.controllerConnectionId)?.();
       this.#revocationSubscriptions.delete(state.controllerConnectionId);
     }
+  }
+
+  #beginMediaAttempt(state: RemoteDesktopLeaseState, id: string): NonNullable<RemoteDesktopLeaseState["mediaAttempt"]> {
+    if (state.mediaAttempt?.id === id) return state.mediaAttempt;
+    state.mediaAttempt?.abort.abort();
+    const attempt = { id, hostConnectionId: this.#owner.localDesktopRouteConnectionId?.(state.identity) ?? "", abort: new AbortController() }; state.mediaAttempt = attempt; return attempt;
+  }
+
+  #mediaUdpInput(state: RemoteDesktopLeaseState, connection: ConnectionRecord, identity: DevicePeerSelectionIdentity,
+    authority: DevicePeerAuthority, attempt: NonNullable<RemoteDesktopLeaseState["mediaAttempt"]>, signal: AbortSignal): MediaUdpInput {
+    return { controllerConnectionId: connection.id, hostConnectionId: attempt.hostConnectionId, identity, leaseId: state.leaseId, attemptId: attempt.id, signal,
+      lifetimeSignal: AbortSignal.any([state.mediaAbort.signal, attempt.abort.signal]),
+      assertCurrent: () => { this.#revalidateLeaseCompletion(state, connection, identity, authority);
+        if (state.mediaAttempt !== attempt || attempt.abort.signal.aborted) throw leaseFailure(contract.RemoteDesktopFailureReason.AUTHORITY_CHANGED, "aborted"); } };
   }
 
   #stopPresentationPolling(state: RemoteDesktopLeaseState): void {

@@ -22,6 +22,7 @@ it("keeps live activity independent from task scope, offline caches and optimist
   const preferences = { ...DEFAULT_UI_PREFERENCES, machineSelection: [first.id] };
   vi.spyOn(LocalState, "open").mockResolvedValue({ listProfiles: async () => [first, second], listMachineCaches: async () => [], readPreferences: async () => preferences,
     readAuthKey: async () => "fixture-auth", saveMachineCache: async () => undefined, deleteProfile: async () => undefined,
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
     mutatePreferences: async (update: (value: typeof preferences) => typeof preferences) => update(preferences)
   } as unknown as LocalState);
   const bindings = new Map<string, GatewayCallbacks>();

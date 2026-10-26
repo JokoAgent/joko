@@ -9,7 +9,7 @@ import type { ProviderSharingDirectoryPort } from "./provider-sharing-ports.js";
 import type { ProviderSharingConnectOptions } from "./provider-sharing-connect-service.js";
 
 export interface ProviderSharingRuntimeOptions {
-  readonly store: OperationalStore; readonly directory: string; readonly serverId: string; readonly origin: string | (() => string);
+  readonly store: OperationalStore; readonly directory: string; readonly serverId: string; readonly origin: string | (() => string); readonly endpointPublicKey: string;
   readonly vault: CredentialVault; readonly native: HostedAgentRuntime; readonly connections: ConnectionManager;
   readonly connect?: (options: ProviderSharingRemoteOptions) => ProviderSharingRemote;
   readonly closeNative?: (credentialDigest: string, runId: string) => Promise<void>;

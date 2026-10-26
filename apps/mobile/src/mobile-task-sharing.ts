@@ -1,5 +1,5 @@
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-web";
+import { createConnectTransport } from "@joko/connection-transport";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import {
@@ -24,6 +24,8 @@ export function mobileSharedTaskDraftProfileId(homeProfileId: string, homeServer
 
 export function mobileTaskSharingApi(credential: PairedCredential, current: () => boolean): TaskSharingApi {
   const rpc = createClient(TaskSharingService, createConnectTransport({ baseUrl: credential.origin,
+    endpointPublicKey: credential.endpointPublicKey,
+    transportKind: credential.transportKind ?? 'https',
     useBinaryFormat: true, interceptors: [next => async request => {
       request.header.set("authorization", `Bearer ${credential.authKey}`); return next(request);
     }] }));

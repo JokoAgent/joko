@@ -1,6 +1,7 @@
 import { create, fromBinary, toBinary, type DescMethodUnary, type Message } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, isEndpointTrustError, type EndpointTrust } from "@joko/connection-transport/node";
+import { desktopEndpointTrust } from './connection-transport.js';
 import { isRemoteDesktopViewerDisplayGeometry } from "@joko/device-peer";
 import {
   ConnectionService, RemoteDesktopService, RemoteDesktopFailureSchema, RemoteDesktopFailureReason, DevicePeerRouteIdentitySchema,
@@ -36,7 +37,8 @@ export class DesktopRemoteDesktopViewerConnection {
 
   async #transport(signal: AbortSignal): Promise<Transport> {
     this.check();
-    const factory = this.deps.transport ?? viewerTransport;
+    const trust = await desktopEndpointTrust(this.owner, this.deps.readAuthKey); this.check();
+    const factory = this.deps.transport ?? ((origin: string, key?: string) => viewerTransport(origin, key, trust));
     const info = await createClient(ConnectionService, factory(this.owner.origin)).getServerInfo({}, { signal });
     this.check();
     if (info.server?.serverId !== this.owner.serverId) throw new ConnectError("Node identity changed.", Code.PermissionDenied);
@@ -250,6 +252,10 @@ export class DesktopRemoteDesktopViewerConnection {
       if (name === "stopRemoteDesktop" && this.#lease?.leaseId === requestLeaseId) { this.#lease = undefined; this.#modeUncertain = false; }
       return { ok: true, bytes: toBinary(method.output, response.message) };
     } catch (error: unknown) {
+      if (isEndpointTrustError(error)) {
+        this.retire(false);
+        return { ok: false, code: Code.FailedPrecondition, reason: RemoteDesktopFailureReason.AUTHORITY_CHANGED };
+      }
       const failure = ConnectError.from(error);
       const reason = failure.findDetails(RemoteDesktopFailureSchema)[0]?.reason;
       if (acquiredMode && ![RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE, RemoteDesktopFailureReason.DISPLAY_MODE_MISSING,
@@ -303,10 +309,10 @@ export class DesktopRemoteDesktopViewerConnection {
     if (!reply.ok) throw new ConnectError("Remote Desktop exit could not be confirmed.", reply.code);
   }
 
-  retire(): void {
+  retire(cleanup = true): void {
     const lease = this.#lease, peer = this.#peer, transport = this.#lastTransport;
     // Cleanup retains only the exact old lease; it cannot start, control or adopt another route.
-    if (lease !== undefined && peer !== undefined && transport !== undefined) void createClient(RemoteDesktopService, transport)
+    if (cleanup && lease !== undefined && peer !== undefined && transport !== undefined) void createClient(RemoteDesktopService, transport)
       .stopRemoteDesktop({ peer, leaseId: lease.leaseId }, { timeoutMs: 2000 }).catch(() => undefined);
     this.#retired = true;
     for (const pending of this.#pending) pending.abort();
@@ -317,8 +323,8 @@ export class DesktopRemoteDesktopViewerConnection {
   }
 }
 
-function viewerTransport(origin: string, key?: string): Transport {
-  return createConnectTransport({ baseUrl: origin, httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 30_000,
+function viewerTransport(origin: string, key?: string, trust?: Omit<EndpointTrust, 'origin'>): Transport {
+  return createConnectTransport({ baseUrl: origin, ...trust, httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 30_000,
     interceptors: key === undefined ? [] : [(next) => (request) => {
       request.header.set("authorization", `Bearer ${key}`);
       return next(request);

@@ -1,5 +1,5 @@
 import { createClient, type Interceptor, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, normalizeEndpointPublicKey, requireEndpointTrust } from "@joko/connection-transport/node";
 import { ArtifactService, ConnectionService } from "@joko/contracts";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { isAbsolute, resolve } from "node:path";
@@ -25,7 +25,8 @@ export interface ManagedArtifactSourceResolverOptions {
 export async function resolveManagedArtifactSource(options: ManagedArtifactSourceResolverOptions): Promise<string> {
   const origin = new URL(options.connection.origin).origin;
   if (origin !== options.connection.origin || options.signal.aborted) throw unavailable();
-  const transportFactory = options.transportFactory ?? createManagedArtifactSourceTransport;
+  const endpointPublicKey = options.connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin }) : normalizeEndpointPublicKey(options.connection.endpointPublicKey);
+  const transportFactory = options.transportFactory ?? ((target: string, auth: string | undefined, host: string | undefined) => createManagedArtifactSourceTransport(target, auth, host, endpointPublicKey));
   const identity = await createClient(ConnectionService, transportFactory(origin, undefined, undefined))
     .getServerInfo({}, { signal: options.signal });
   if (identity.server?.serverId !== options.connection.serverId ||
@@ -47,7 +48,8 @@ export async function resolveManagedArtifactSource(options: ManagedArtifactSourc
 function createManagedArtifactSourceTransport(
   origin: string,
   authKey: string | undefined,
-  desktopHostAuthKey: string | undefined
+  desktopHostAuthKey: string | undefined,
+  endpointPublicKey?: string
 ): Transport {
   const interceptors: Interceptor[] = [];
   if (authKey !== undefined || desktopHostAuthKey !== undefined) interceptors.push((next) => (request) => {
@@ -59,6 +61,7 @@ function createManagedArtifactSourceTransport(
   });
   return createConnectTransport({
     baseUrl: origin,
+    endpointPublicKey,
     httpVersion: "1.1",
     useBinaryFormat: true,
     interceptors,

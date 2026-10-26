@@ -4369,6 +4369,15 @@ describe("OperationalStore", () => {
     expect(() => store.prunePairings({ expiredBefore: 100, consumedBefore: Number.NaN })).toThrow(RangeError);
   });
 
+  it("retains recently cancelled challenges until their durable issuance rate window ends", () => {
+    const store = createStore();
+    store.createPairing({ id: "cancelled-recent", codeDigest: "digest-recent", createdAt: 95, expiresAt: 200 });
+    store.cancelPairing("cancelled-recent", 96);
+    expect(store.prunePairings({ expiredBefore: 100, expiredCreatedBefore: 90, consumedBefore: 90 })).toBe(0);
+    expect(store.getPairing("cancelled-recent").expiresAt).toBe(96);
+    expect(store.prunePairings({ expiredBefore: 110, expiredCreatedBefore: 100, consumedBefore: 100 })).toBe(1);
+  });
+
   it("records a redacted failure tombstone for deterministic operation retries", () => {
     const store = createStore();
     expect(() => store.runOperation(

@@ -6,6 +6,9 @@ export interface DesktopRemoteDesktopViewerOwner {
   readonly serverId: string;
   readonly deviceId: string;
   readonly origin: string;
+  readonly endpointPublicKey?: string;
+  /** Only the backend name; SDK locators stay in Desktop protected storage. */
+  readonly transportKind?: 'https' | 'iroh' | 'tailcat' | 'webrtc' | 'http-connect';
   readonly connectionGeneration: number;
 }
 
@@ -78,13 +81,14 @@ export function sameDesktopRemoteDesktopViewerOwner(
 ): boolean {
   return left !== undefined && right !== undefined && left.profileId === right.profileId &&
     left.serverId === right.serverId && left.deviceId === right.deviceId && left.origin === right.origin &&
-    left.connectionGeneration === right.connectionGeneration;
+    left.connectionGeneration === right.connectionGeneration && left.endpointPublicKey === right.endpointPublicKey
+    && (left.transportKind ?? 'https') === (right.transportKind ?? 'https');
 }
 
 export function parseDesktopRemoteDesktopViewerOwner(value: unknown): DesktopRemoteDesktopViewerOwner {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Invalid viewer owner.");
   const record = value as Record<string, unknown>;
-  const fields = ["profileId", "serverId", "deviceId", "origin", "connectionGeneration"];
+  const fields = ["profileId", "serverId", "deviceId", "origin", "connectionGeneration", ...(Object.hasOwn(record, "endpointPublicKey") ? ["endpointPublicKey"] : []), ...(Object.hasOwn(record, 'transportKind') ? ['transportKind'] : [])];
   if (Object.keys(record).length !== fields.length || Object.keys(record).some((key) => !fields.includes(key)) ||
     ![record["profileId"], record["serverId"], record["deviceId"]].every((item) =>
       typeof item === "string" && item.length > 0 && item.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(item)) ||
@@ -93,10 +97,15 @@ export function parseDesktopRemoteDesktopViewerOwner(value: unknown): DesktopRem
     throw new TypeError("Invalid viewer owner.");
   }
   const url = new URL(record["origin"]);
+  if (record["endpointPublicKey"] !== undefined && (typeof record["endpointPublicKey"] !== "string" || !/^ed25519:[a-f0-9]{64}$/u.test(record["endpointPublicKey"]))) throw new TypeError("Invalid viewer endpoint key.");
+  if (record['transportKind'] !== undefined && !['https', 'iroh', 'tailcat', 'webrtc', 'http-connect'].includes(String(record['transportKind']))) throw new TypeError('Invalid viewer connection transport.');
+  if (record['transportKind'] !== undefined && record['transportKind'] !== 'https' && record['endpointPublicKey'] === undefined) throw new TypeError('The selected viewer transport requires its trusted endpoint key.');
   if (url.origin !== record["origin"] || !["https:", "http:"].includes(url.protocol) || url.username || url.password) {
     throw new TypeError("Invalid viewer origin.");
   }
   return Object.freeze({ profileId: record["profileId"] as string, serverId: record["serverId"] as string,
     deviceId: record["deviceId"] as string, origin: record["origin"],
+    ...(record["endpointPublicKey"] === undefined ? {} : { endpointPublicKey: record["endpointPublicKey"] as string }),
+    ...(record['transportKind'] === undefined ? {} : { transportKind: record['transportKind'] as DesktopRemoteDesktopViewerOwner['transportKind'] }),
     connectionGeneration: record["connectionGeneration"] as number });
 }

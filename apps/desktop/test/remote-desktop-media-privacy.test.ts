@@ -45,6 +45,25 @@ beforeEach(() => { Object.defineProperty(process, "platform", { ...platform, val
 afterEach(async () => { for (const media of cleanup.splice(0)) await media.retire(); Object.defineProperty(process, "platform", platform); });
 
 describe("Remote Desktop privacy capture receipt", () => {
+  it("quiesces pixels/input but retains the capture socket owner until the exact UDP publication is retired", async () => {
+    let confirm!: () => void;
+    const retired = vi.fn(() => new Promise<void>(resolve => { confirm = resolve; }));
+    const f = fixture(retired); await f.offer(); const original = h.owner!;
+    f.media.stop(); expect(h.commands.at(-1)?.op).toBe("quiesce"); expect(original.isDestroyed()).toBe(false);
+    await vi.waitFor(() => expect(retired).toHaveBeenCalledWith("lease", "attempt"));
+    const releasing = f.media.release(); expect(original.isDestroyed()).toBe(false); confirm(); await releasing;
+    expect(original.isDestroyed()).toBe(true); expect(retired).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the UDP socket owner after unknown cleanup and retries only the original capture retirement", async () => {
+    let fail = true;
+    const retired = vi.fn(async () => { if (fail) throw new Error("cleanup_unknown"); });
+    const f = fixture(retired); await f.offer(); const original = h.owner!;
+    f.media.stop();
+    await expect(f.media.release()).rejects.toThrow("cleanup_unknown"); expect(original.isDestroyed()).toBe(false);
+    fail = false; await f.media.release(); expect(original.isDestroyed()).toBe(true);
+    expect(retired.mock.calls).toEqual([["lease", "attempt"], ["lease", "attempt"]]);
+  });
   it("captures only the Source's current native window and discards pixels if the request retires during capture", async () => {
     const f = fixture(); let current = true;
     const validateWindow = vi.fn(async () => current);
@@ -144,7 +163,7 @@ function frameRequest() {
   return { displayId: "1", leaseId: "lease", cursorOverlay: false, current: () => true, signal: new AbortController().signal };
 }
 
-function fixture() {
+function fixture(beforeCaptureClose?: (leaseId: string, attemptId: string) => Promise<void>) {
   const children: { readonly process: ChildProcessWithoutNullStreams; readonly stdin: PassThrough; readonly stdout: PassThrough }[] = [], args: string[][] = [];
   const native = new DesktopRemoteDesktopNativeCapture({ platform: "darwin", resolveBinary: async () => "/capture",
     spawn: (_binary, values) => {
@@ -154,7 +173,7 @@ function fixture() {
       const process = Object.assign(new ChildProcess(), { stdin, stdout, stderr, stdio, kill: vi.fn(() => true) });
       children.push({ process, stdin, stdout }); return process;
     } });
-  const media = new DesktopRemoteDesktopMedia("/preload", native); cleanup.push(media);
+  const media = new DesktopRemoteDesktopMedia("/preload", native, undefined, undefined, undefined, beforeCaptureClose); cleanup.push(media);
   const respond = (index: number) => children[index]!.stdout.write(`${JSON.stringify({ jpeg: "AQ==", width: 1, height: 1, cursor: null })}\n`);
   const offer = () => media.offer({ displayId: "1", leaseId: "lease", attemptId: "attempt", offerSdp: "offer", cursorOverlay: false,
     current: () => true, signal: new AbortController().signal });

@@ -168,6 +168,7 @@ module.exports = async function auditPackaged(context) {
   }
   await auditElectronUpdaterRuntime(applicationRoot);
   await auditDesktopUpdateControlRuntime(applicationRoot);
+  await auditDesktopLinkspanRuntime(applicationRoot);
   if (await lstat(resolve(applicationRoot, "dist", "orchestrator-runtime")).catch(() => undefined) !== undefined) {
     throw new Error("The managed Orchestrator runtime must not be embedded in the application tree.");
   }
@@ -333,6 +334,7 @@ module.exports.auditNativeSystemFrontmostInput = auditNativeSystemFrontmostInput
 module.exports.auditNativeHardware = auditNativeHardware;
 module.exports.auditNativeGamepad = auditNativeGamepad;
 module.exports.auditNativeMenuBar = auditNativeMenuBar;
+module.exports.auditDesktopLinkspanRuntime = auditDesktopLinkspanRuntime;
 module.exports.createDedicatedHardwareSdkDirectoryIntegrity = createDedicatedHardwareSdkDirectoryIntegrity;
 module.exports.createDedicatedHardwareSdkManifestIntegrity = createDedicatedHardwareSdkManifestIntegrity;
 module.exports.dedicatedHardwareSdkHandshakeBytes = dedicatedHardwareSdkHandshakeBytes;
@@ -1212,4 +1214,62 @@ function samePath(left, right) {
   return process.platform === "win32"
     ? resolve(left).toLowerCase() === resolve(right).toLowerCase()
     : resolve(left) === resolve(right);
+}
+
+/** Verify the carrier modules from the app's own production tree. The
+ * Orchestrator's isolated dependency tree cannot satisfy Main-process imports. */
+async function auditDesktopLinkspanRuntime(applicationRoot) {
+  const entries = {
+    core: ["dist/index.js", "dist/stream.js"],
+    noise: ["dist/index.js", "dist/THIRD_PARTY_LICENSES.txt", "dist/dependency-inventory.json"],
+    http: ["dist/index.js", "dist/node.js"],
+    "http-connect": ["dist/index.js", "dist/node.js", "dist/connect-parser.js", "dist/CONNECT_PARSER_LICENSE.txt", "dist/connect-parser-input.json"],
+    iroh: ["dist/node.js", "dist/bridge.js"],
+    "iroh-node": ["dist/index.js"],
+    tailcat: ["dist/node.js", "dist/bridge.js"],
+    "tailcat-node": ["dist/index.js"],
+    "tailcat-runtime": ["dist/index.js"],
+    webrtc: ["dist/index.js"],
+    "webrtc-node": ["dist/index.js", "dist/THIRD_PARTY_LICENSES.txt", "dist/dependency-inventory.json", "dist/upstream-patches.json", "THIRD_PARTY_NOTICES.werift.txt"]
+  };
+  const manifests = new Map();
+  let sourceIdentity;
+  for (const [suffix, required] of Object.entries(entries)) {
+    const name = `@jokoagent/linkspan-${suffix}`, root = resolve(applicationRoot, "node_modules", name);
+    await assertCanonicalRegularFile(resolve(root, "package.json"), `The packaged Desktop carrier is missing ${name}.`);
+    const manifest = await readJsonManifest(resolve(root, "package.json"), "Desktop carrier");
+    if (manifest.name !== name || typeof manifest.version !== "string" || manifest.type !== "module") {
+      throw new Error("The packaged Desktop carrier package identity is invalid.");
+    }
+    manifests.set(name, manifest);
+    const receiptPath = resolve(root, "dist", "source-build.json");
+    await assertCanonicalRegularFile(receiptPath, `The packaged Desktop carrier source receipt is missing: ${name}.`);
+    const receipt = await readJsonManifest(receiptPath, "Desktop carrier source receipt");
+    if (receipt.name !== name || !/^[a-f0-9]{40}$/u.test(receipt.sourceCommit ?? "") || !/^[a-f0-9]{40}$/u.test(receipt.sourceTree ?? "")) {
+      throw new Error("The packaged Desktop carrier source receipt is invalid.");
+    }
+    const identity = `${receipt.sourceCommit}:${receipt.sourceTree}`;
+    if (sourceIdentity !== undefined && sourceIdentity !== identity) throw new Error("The packaged Desktop carriers have conflicting source receipts.");
+    sourceIdentity = identity;
+    for (const entry of required) {
+      await assertCanonicalRegularFile(resolve(root, entry), `The packaged Desktop carrier entry is missing: ${name}/${entry}.`);
+    }
+    if (suffix === "webrtc-node") {
+      const patches = await readJsonManifest(resolve(root, "dist", "upstream-patches.json"), "WebRTC engine patch receipt");
+      if (!Array.isArray(patches) || patches.length !== 1 || patches[0]?.package !== "werift" || patches[0]?.version !== "0.25.2"
+        || patches[0]?.file !== "lib/index.mjs" || !Number.isSafeInteger(patches[0]?.inputBytes) || patches[0].inputBytes < 1
+        || !/^[a-f0-9]{64}$/u.test(patches[0]?.inputSha256 ?? "") || !/^[a-f0-9]{64}$/u.test(patches[0]?.outputSha256 ?? "")) {
+        throw new Error("The packaged WebRTC engine patch receipt is invalid.");
+      }
+    }
+  }
+  for (const manifest of manifests.values()) {
+    for (const [name, version] of Object.entries(manifest.dependencies ?? {})) {
+      const dependency = manifests.get(name);
+      if (dependency === undefined || dependency.version !== version) {
+        throw new Error("The packaged Desktop carrier dependency closure is incomplete or has a conflicting generation.");
+      }
+    }
+  }
+  return { packages: manifests.size };
 }

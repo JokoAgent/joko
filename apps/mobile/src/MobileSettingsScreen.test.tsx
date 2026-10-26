@@ -108,6 +108,7 @@ vi.mock("react-native", async () => {
 });
 
 vi.mock("expo-clipboard", () => ({ setStringAsync: native.copied }));
+vi.mock("expo-crypto", () => ({ randomUUID: () => "settings-pairing-request" }));
 vi.mock("expo-constants", () => ({ default: { expoConfig: { version: "0.1.0-test" } } }));
 
 const colors: MobileSettingsColors = {

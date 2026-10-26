@@ -1,0 +1,18 @@
+import groovy.json.JsonSlurper
+
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+group = 'app.joko.linkspan.connect'
+def host = new JsonSlurper().parse(new File(projectDir, '../../../package.json'))
+version = host.version
+def selected = (System.getenv('JOKO_LINKSPAN_BUILD_BACKENDS') ?: '').split(',').collect { it.trim() }.contains('http-connect-native')
+android {
+  namespace 'app.joko.linkspan.connect'
+  defaultConfig { minSdkVersion 24; versionName host.version }
+  sourceSets { main { java.srcDirs = selected ? ['src/selected/java'] : ['src/stub/java'] } }
+}
+dependencies {
+  if (selected) implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0'
+}

@@ -6,10 +6,12 @@ import { promisify } from "node:util";
 
 import { DeviceKind, DevicePeerCapabilityKind } from "@joko/contracts";
 import type { NodeDevicePeerAgentRouteOptions } from "@joko/device-peer";
+import type { EndpointTransport } from "@joko/connection-transport/trust";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   readServiceDevicePeerAuthKey,
+  readServiceDevicePeerTransport,
   createServiceDevicePeerRuntimeExecutables,
   ServiceDevicePeerAgent,
   validateServiceDevicePeerCredentialFile
@@ -23,6 +25,42 @@ afterEach(async () => {
 });
 
 describe("standalone Service Device peer agent", () => {
+  it.each<EndpointTransport>([
+    { kind: "webrtc" },
+    { kind: "http-connect", proxyOrigin: "http://proxy.example:1337", authority: "node.example:443" },
+    { kind: "iroh", endpointId: "a".repeat(64), ticket: "a".repeat(24), clientKey: "b".repeat(64) },
+    { kind: "tailcat", endpointId: `nodekey:${"a".repeat(64)}`, address: "tcprivateLocator", port: 443, clientKey: `privkey:${"b".repeat(64)}` }
+  ])("keeps selected $kind transport material within the original Service authority", async endpointTransport => {
+    const readAuthKey = vi.fn(async () => AUTH_KEY), prepareTransport = vi.fn(async () => {});
+    const readTransport = vi.fn(async () => endpointTransport);
+    let attempt: NodeDevicePeerAgentRouteOptions | undefined;
+    const agent = new ServiceDevicePeerAgent({ config: { ...fixtureConfig("private-auth-key"), endpointPublicKey: `ed25519:${"c".repeat(64)}`,
+      transportKind: endpointTransport.kind, ...(endpointTransport.kind === "webrtc" ? {} : { transportPath: "private-transport.json" }) },
+      readAuthKey, validateCredential: async () => {}, readTransport, prepareTransport,
+      createExecutor: () => ({ capabilities: [DevicePeerCapabilityKind.FILES], execute: vi.fn(), retire: async () => {} }),
+      runRoute: async options => { attempt = options; await aborted(options.signal); }
+    });
+    try {
+      await agent.start(); await eventually(() => attempt !== undefined);
+      expect(attempt!.connection).toMatchObject({ transportKind: endpointTransport.kind, endpointTransport });
+      expect(readAuthKey).not.toHaveBeenCalled();
+      expect(await attempt!.isAuthorityCurrent(attempt!.connection)).toBe(true);
+      expect(await attempt!.isAuthorityCurrent({ ...attempt!.connection, transportKind: "https", endpointTransport: undefined })).toBe(false);
+      if (endpointTransport.kind === "webrtc") { expect(readTransport).not.toHaveBeenCalled(); expect(prepareTransport).not.toHaveBeenCalled(); }
+      else if (endpointTransport.kind === "http-connect") { expect(readTransport).toHaveBeenCalledOnce(); expect(prepareTransport).not.toHaveBeenCalled(); }
+      else { expect(readTransport).toHaveBeenCalledOnce(); expect(prepareTransport).toHaveBeenCalledExactlyOnceWith(endpointTransport.kind); }
+    } finally { await agent.close(); }
+  });
+
+  it.each(["tailcat", "http-connect"] as const)("refuses a private locator for another selected %s backend before starting the route or reading its bearer", async transportKind => {
+    const readAuthKey = vi.fn(async () => AUTH_KEY), runRoute = vi.fn(async () => {}), prepareTransport = vi.fn(async () => {});
+    const agent = new ServiceDevicePeerAgent({ config: { ...fixtureConfig("private-auth-key"), endpointPublicKey: `ed25519:${"c".repeat(64)}`, transportKind, transportPath: "private-transport.json" },
+      validateCredential: async () => {}, readAuthKey, runRoute, prepareTransport,
+      readTransport: async () => ({ kind: "webrtc" }) });
+    try { await expect(agent.start()).rejects.toThrow(/transport is unavailable or unsafe/u); }
+    finally { await agent.close(); }
+    expect(runRoute).not.toHaveBeenCalled(); expect(readAuthKey).not.toHaveBeenCalled(); expect(prepareTransport).not.toHaveBeenCalled();
+  });
   it("resolves Node and bundled runtime identities without PATH lookup", async () => {
     const located = await createServiceDevicePeerRuntimeExecutables({});
     expect(located.node?.executable).toBe(await realpath(process.execPath));
@@ -147,18 +185,26 @@ describe("standalone Service Device peer agent", () => {
     expect(String(failure)).not.toContain(credentialPath);
   });
 
-  it("reads only a stable owner-private credential, including the audited Windows ACL path", async () => {
+  it.each([
+    { kind: "tailcat", endpointId: `nodekey:${"a".repeat(64)}`, address: "tcprivateLocator", port: 443, clientKey: `privkey:${"b".repeat(64)}` },
+    { kind: "http-connect", proxyOrigin: "http://proxy.example:1337", authority: "controller.example.test:443" }
+  ])("reads only a stable owner-private credential and $kind locator, including the audited Windows ACL path", async locator => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "joko-service-peer-key-")));
     roots.push(root);
     if (process.platform === "win32") await makeWindowsDirectoryPrivate(root);
     const directory = join(root, "device-peer-agent");
     await mkdir(directory, { mode: 0o700 });
     const path = join(directory, "auth-key");
-    await writeFile(path, `${AUTH_KEY}\n`, { mode: 0o600, flag: "wx" });
-    await chmod(path, 0o600);
+    await writePrivateFixture(path, `${AUTH_KEY}\n`);
 
     await expect(validateServiceDevicePeerCredentialFile(path)).resolves.toBeUndefined();
     expect(await readServiceDevicePeerAuthKey(path)).toBe(AUTH_KEY);
+    const transport = join(directory, "transport.json");
+    await writePrivateFixture(transport, JSON.stringify(locator));
+    expect(await readServiceDevicePeerTransport(transport)).toEqual(locator);
+    if (process.platform === "win32") await allowWindowsEveryoneRead(transport);
+    else await chmod(transport, 0o644);
+    await expect(readServiceDevicePeerTransport(transport)).rejects.toBeDefined();
     if (process.platform === "win32") await allowWindowsEveryoneRead(path);
     else await chmod(path, 0o644);
     await expect(validateServiceDevicePeerCredentialFile(path)).rejects.toBeDefined();
@@ -199,6 +245,26 @@ async function makeWindowsDirectoryPrivate(path: string): Promise<void> {
     "$sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))); " +
     "[System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl)"
   ], { windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: path } });
+}
+
+async function writePrivateFixture(path: string, content: string): Promise<void> {
+  if (process.platform !== "win32") {
+    await writeFile(path, content, { mode: 0o600, flag: "wx" }); await chmod(path, 0o600); return;
+  }
+  // Match remote-ssh/create-private-file's atomic FileSecurity creation. An
+  // inherited private DACL and chmod alone do not select the file owner when
+  // the Windows host runs with an elevated token.
+  await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+    "$ErrorActionPreference = 'Stop'; " +
+    "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; " +
+    "$acl = New-Object System.Security.AccessControl.FileSecurity; " +
+    "$acl.SetOwner($sid); $acl.SetAccessRuleProtection($true, $false); " +
+    "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow'))); " +
+    "$file = [System.IO.FileStream]::new($env:JOKO_ACL_FIXTURE, [System.IO.FileMode]::CreateNew, " +
+    "[System.Security.AccessControl.FileSystemRights]::FullControl, [System.IO.FileShare]::ReadWrite, 4096, [System.IO.FileOptions]::None, $acl); " +
+    "$file.Dispose()"
+  ], { windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: path } });
+  await writeFile(path, content, { flag: "r+" });
 }
 
 async function allowWindowsEveryoneRead(path: string): Promise<void> {

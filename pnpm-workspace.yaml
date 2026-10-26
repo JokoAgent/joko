@@ -8,6 +8,32 @@ packages:
 virtualStoreDir: .pnpm
 virtualStoreDirMaxLength: 32
 
+# Development packages are built from the remote branch in linkspan.json.
+overrides:
+  '@jokoagent/linkspan-core': file:.runtime/linkspan-packages/core
+  '@jokoagent/linkspan-noise': file:.runtime/linkspan-packages/noise
+  '@jokoagent/linkspan-http': file:.runtime/linkspan-packages/http
+  '@jokoagent/linkspan-http-connect': file:.runtime/linkspan-packages/http-connect
+  '@jokoagent/linkspan-cloudflare': file:.runtime/linkspan-packages/cloudflare
+  '@jokoagent/linkspan-connectors': file:.runtime/linkspan-packages/connectors
+  '@jokoagent/linkspan-connector-runtime': file:.runtime/linkspan-packages/connector-runtime
+  '@jokoagent/linkspan-ngrok': file:.runtime/linkspan-packages/ngrok
+  '@jokoagent/linkspan-ssh': file:.runtime/linkspan-packages/ssh
+  '@jokoagent/linkspan-pinggy': file:.runtime/linkspan-packages/pinggy
+  '@jokoagent/linkspan-dev-tunnels': file:.runtime/linkspan-packages/dev-tunnels
+  '@jokoagent/linkspan-localtunnel': file:.runtime/linkspan-packages/localtunnel
+  '@jokoagent/linkspan-iroh': file:.runtime/linkspan-packages/iroh
+  '@jokoagent/linkspan-iroh-node': file:.runtime/linkspan-packages/iroh-node
+  '@jokoagent/linkspan-iroh-wasm': file:.runtime/linkspan-packages/iroh-wasm
+  '@jokoagent/linkspan-iroh-services': file:.runtime/linkspan-packages/iroh-services
+  '@jokoagent/linkspan-tailcat': file:.runtime/linkspan-packages/tailcat
+  '@jokoagent/linkspan-tailcat-node': file:.runtime/linkspan-packages/tailcat-node
+  '@jokoagent/linkspan-tailcat-wasm': file:.runtime/linkspan-packages/tailcat-wasm
+  '@jokoagent/linkspan-tailcat-runtime': file:.runtime/linkspan-packages/tailcat-runtime
+  '@jokoagent/linkspan-turn': file:.runtime/linkspan-packages/turn
+  '@jokoagent/linkspan-webrtc': file:.runtime/linkspan-packages/webrtc
+  '@jokoagent/linkspan-webrtc-node': file:.runtime/linkspan-packages/webrtc-node
+
 minimumReleaseAge: 10080
 
 minimumReleaseAgeExclude:
@@ -49,3 +75,7 @@ allowBuilds:
   # The transport has a complete pure-JavaScript fallback. Do not run optional native probes.
   cpu-features: false
   ssh2: false
+  '@pinggy/pinggy': false
+  bufferutil: false
+  es5-ext: false
+  utf-8-validate: false

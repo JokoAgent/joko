@@ -12,7 +12,95 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/hosted_agent_desktop.proto.
  */
 export const file_joko_v1_hosted_agent_desktop: GenFile = /*@__PURE__*/
-  fileDesc("CiJqb2tvL3YxL2hvc3RlZF9hZ2VudF9kZXNrdG9wLnByb3RvEgdqb2tvLnYxIlIKJU9wZW5EZXNrdG9wSG9zdGVkQWdlbnREZWxlZ2F0ZVJlcXVlc3QSDgoGZm9ybWF0GAEgASgNEhkKEXJvdXRlX2luc3RhbmNlX2lkGAIgASgJImAKJk9wZW5EZXNrdG9wSG9zdGVkQWdlbnREZWxlZ2F0ZVJlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDRITCgtkZWxlZ2F0ZV9pZBgCIAEoCRIRCglzZXJ2ZXJfaWQYAyABKAkiswEKJ0ludm9rZURlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlUmVxdWVzdBIOCgZmb3JtYXQYASABKA0SEwoLZGVsZWdhdGVfaWQYAiABKAkSHAoUY29udHJvbGxlcl9kZXZpY2VfaWQYAyABKAkSLgoGbWV0aG9kGAQgASgOMh4uam9rby52MS5Ib3N0ZWRBZ2VudFBlZXJNZXRob2QSFQoNcmVxdWVzdF9ieXRlcxgFIAEoDCJSCihJbnZva2VEZXNrdG9wSG9zdGVkQWdlbnREZWxlZ2F0ZVJlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDRIWCg5yZXNwb25zZV9ieXRlcxgCIAEoDCJNCiZDbG9zZURlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlUmVxdWVzdBIOCgZmb3JtYXQYASABKA0SEwoLZGVsZWdhdGVfaWQYAiABKAkiOQonQ2xvc2VEZXNrdG9wSG9zdGVkQWdlbnREZWxlZ2F0ZVJlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDTKwAwoZRGVza3RvcEhvc3RlZEFnZW50U2VydmljZRKBAQoeT3BlbkRlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlEi4uam9rby52MS5PcGVuRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXF1ZXN0Gi8uam9rby52MS5PcGVuRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXNwb25zZRKHAQogSW52b2tlRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGUSMC5qb2tvLnYxLkludm9rZURlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlUmVxdWVzdBoxLmpva28udjEuSW52b2tlRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXNwb25zZRKEAQofQ2xvc2VEZXNrdG9wSG9zdGVkQWdlbnREZWxlZ2F0ZRIvLmpva28udjEuQ2xvc2VEZXNrdG9wSG9zdGVkQWdlbnREZWxlZ2F0ZVJlcXVlc3QaMC5qb2tvLnYxLkNsb3NlRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXNwb25zZWIGcHJvdG8z", [file_joko_v1_hosted_agent]);
+  fileDesc("CiJqb2tvL3YxL2hvc3RlZF9hZ2VudF9kZXNrdG9wLnByb3RvEgdqb2tvLnYxIjEKH0dldERlc2t0b3BNZWRpYVVkcFBvbGljeVJlcXVlc3QSDgoGZm9ybWF0GAEgASgNIk8KIEdldERlc2t0b3BNZWRpYVVkcFBvbGljeVJlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDRIbChNyZXRpcmVtZW50X3JlcXVpcmVkGAIgASgIImsKHFJldGlyZURlc2t0b3BNZWRpYVVkcFJlcXVlc3QSDgoGZm9ybWF0GAEgASgNEhUKDWNvbm5lY3Rpb25faWQYAiABKAkSEAoIbGVhc2VfaWQYAyABKAkSEgoKYXR0ZW1wdF9pZBgEIAEoCSIvCh1SZXRpcmVEZXNrdG9wTWVkaWFVZHBSZXNwb25zZRIOCgZmb3JtYXQYASABKA0iUgolT3BlbkRlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlUmVxdWVzdBIOCgZmb3JtYXQYASABKA0SGQoRcm91dGVfaW5zdGFuY2VfaWQYAiABKAkiYAomT3BlbkRlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlUmVzcG9uc2USDgoGZm9ybWF0GAEgASgNEhMKC2RlbGVnYXRlX2lkGAIgASgJEhEKCXNlcnZlcl9pZBgDIAEoCSKzAQonSW52b2tlRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXF1ZXN0Eg4KBmZvcm1hdBgBIAEoDRITCgtkZWxlZ2F0ZV9pZBgCIAEoCRIcChRjb250cm9sbGVyX2RldmljZV9pZBgDIAEoCRIuCgZtZXRob2QYBCABKA4yHi5qb2tvLnYxLkhvc3RlZEFnZW50UGVlck1ldGhvZBIVCg1yZXF1ZXN0X2J5dGVzGAUgASgMIlIKKEludm9rZURlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlUmVzcG9uc2USDgoGZm9ybWF0GAEgASgNEhYKDnJlc3BvbnNlX2J5dGVzGAIgASgMIk0KJkNsb3NlRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXF1ZXN0Eg4KBmZvcm1hdBgBIAEoDRITCgtkZWxlZ2F0ZV9pZBgCIAEoCSI5CidDbG9zZURlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlUmVzcG9uc2USDgoGZm9ybWF0GAEgASgNMokFChlEZXNrdG9wSG9zdGVkQWdlbnRTZXJ2aWNlEm8KGEdldERlc2t0b3BNZWRpYVVkcFBvbGljeRIoLmpva28udjEuR2V0RGVza3RvcE1lZGlhVWRwUG9saWN5UmVxdWVzdBopLmpva28udjEuR2V0RGVza3RvcE1lZGlhVWRwUG9saWN5UmVzcG9uc2USZgoVUmV0aXJlRGVza3RvcE1lZGlhVWRwEiUuam9rby52MS5SZXRpcmVEZXNrdG9wTWVkaWFVZHBSZXF1ZXN0GiYuam9rby52MS5SZXRpcmVEZXNrdG9wTWVkaWFVZHBSZXNwb25zZRKBAQoeT3BlbkRlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlEi4uam9rby52MS5PcGVuRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXF1ZXN0Gi8uam9rby52MS5PcGVuRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXNwb25zZRKHAQogSW52b2tlRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGUSMC5qb2tvLnYxLkludm9rZURlc2t0b3BIb3N0ZWRBZ2VudERlbGVnYXRlUmVxdWVzdBoxLmpva28udjEuSW52b2tlRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXNwb25zZRKEAQofQ2xvc2VEZXNrdG9wSG9zdGVkQWdlbnREZWxlZ2F0ZRIvLmpva28udjEuQ2xvc2VEZXNrdG9wSG9zdGVkQWdlbnREZWxlZ2F0ZVJlcXVlc3QaMC5qb2tvLnYxLkNsb3NlRGVza3RvcEhvc3RlZEFnZW50RGVsZWdhdGVSZXNwb25zZWIGcHJvdG8z", [file_joko_v1_hosted_agent]);
+
+/**
+ * @generated from message joko.v1.GetDesktopMediaUdpPolicyRequest
+ */
+export type GetDesktopMediaUdpPolicyRequest = Message<"joko.v1.GetDesktopMediaUdpPolicyRequest"> & {
+  /**
+   * @generated from field: uint32 format = 1;
+   */
+  format: number;
+};
+
+/**
+ * Describes the message joko.v1.GetDesktopMediaUdpPolicyRequest.
+ * Use `create(GetDesktopMediaUdpPolicyRequestSchema)` to create a new message.
+ */
+export const GetDesktopMediaUdpPolicyRequestSchema: GenMessage<GetDesktopMediaUdpPolicyRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_hosted_agent_desktop, 0);
+
+/**
+ * @generated from message joko.v1.GetDesktopMediaUdpPolicyResponse
+ */
+export type GetDesktopMediaUdpPolicyResponse = Message<"joko.v1.GetDesktopMediaUdpPolicyResponse"> & {
+  /**
+   * @generated from field: uint32 format = 1;
+   */
+  format: number;
+
+  /**
+   * @generated from field: bool retirement_required = 2;
+   */
+  retirementRequired: boolean;
+};
+
+/**
+ * Describes the message joko.v1.GetDesktopMediaUdpPolicyResponse.
+ * Use `create(GetDesktopMediaUdpPolicyResponseSchema)` to create a new message.
+ */
+export const GetDesktopMediaUdpPolicyResponseSchema: GenMessage<GetDesktopMediaUdpPolicyResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_hosted_agent_desktop, 1);
+
+/**
+ * @generated from message joko.v1.RetireDesktopMediaUdpRequest
+ */
+export type RetireDesktopMediaUdpRequest = Message<"joko.v1.RetireDesktopMediaUdpRequest"> & {
+  /**
+   * @generated from field: uint32 format = 1;
+   */
+  format: number;
+
+  /**
+   * @generated from field: string connection_id = 2;
+   */
+  connectionId: string;
+
+  /**
+   * @generated from field: string lease_id = 3;
+   */
+  leaseId: string;
+
+  /**
+   * @generated from field: string attempt_id = 4;
+   */
+  attemptId: string;
+};
+
+/**
+ * Describes the message joko.v1.RetireDesktopMediaUdpRequest.
+ * Use `create(RetireDesktopMediaUdpRequestSchema)` to create a new message.
+ */
+export const RetireDesktopMediaUdpRequestSchema: GenMessage<RetireDesktopMediaUdpRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_hosted_agent_desktop, 2);
+
+/**
+ * @generated from message joko.v1.RetireDesktopMediaUdpResponse
+ */
+export type RetireDesktopMediaUdpResponse = Message<"joko.v1.RetireDesktopMediaUdpResponse"> & {
+  /**
+   * @generated from field: uint32 format = 1;
+   */
+  format: number;
+};
+
+/**
+ * Describes the message joko.v1.RetireDesktopMediaUdpResponse.
+ * Use `create(RetireDesktopMediaUdpResponseSchema)` to create a new message.
+ */
+export const RetireDesktopMediaUdpResponseSchema: GenMessage<RetireDesktopMediaUdpResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_hosted_agent_desktop, 3);
 
 /**
  * @generated from message joko.v1.OpenDesktopHostedAgentDelegateRequest
@@ -36,7 +124,7 @@ export type OpenDesktopHostedAgentDelegateRequest = Message<"joko.v1.OpenDesktop
  * Use `create(OpenDesktopHostedAgentDelegateRequestSchema)` to create a new message.
  */
 export const OpenDesktopHostedAgentDelegateRequestSchema: GenMessage<OpenDesktopHostedAgentDelegateRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent_desktop, 0);
+  messageDesc(file_joko_v1_hosted_agent_desktop, 4);
 
 /**
  * @generated from message joko.v1.OpenDesktopHostedAgentDelegateResponse
@@ -65,7 +153,7 @@ export type OpenDesktopHostedAgentDelegateResponse = Message<"joko.v1.OpenDeskto
  * Use `create(OpenDesktopHostedAgentDelegateResponseSchema)` to create a new message.
  */
 export const OpenDesktopHostedAgentDelegateResponseSchema: GenMessage<OpenDesktopHostedAgentDelegateResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent_desktop, 1);
+  messageDesc(file_joko_v1_hosted_agent_desktop, 5);
 
 /**
  * @generated from message joko.v1.InvokeDesktopHostedAgentDelegateRequest
@@ -104,7 +192,7 @@ export type InvokeDesktopHostedAgentDelegateRequest = Message<"joko.v1.InvokeDes
  * Use `create(InvokeDesktopHostedAgentDelegateRequestSchema)` to create a new message.
  */
 export const InvokeDesktopHostedAgentDelegateRequestSchema: GenMessage<InvokeDesktopHostedAgentDelegateRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent_desktop, 2);
+  messageDesc(file_joko_v1_hosted_agent_desktop, 6);
 
 /**
  * @generated from message joko.v1.InvokeDesktopHostedAgentDelegateResponse
@@ -126,7 +214,7 @@ export type InvokeDesktopHostedAgentDelegateResponse = Message<"joko.v1.InvokeDe
  * Use `create(InvokeDesktopHostedAgentDelegateResponseSchema)` to create a new message.
  */
 export const InvokeDesktopHostedAgentDelegateResponseSchema: GenMessage<InvokeDesktopHostedAgentDelegateResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent_desktop, 3);
+  messageDesc(file_joko_v1_hosted_agent_desktop, 7);
 
 /**
  * @generated from message joko.v1.CloseDesktopHostedAgentDelegateRequest
@@ -148,7 +236,7 @@ export type CloseDesktopHostedAgentDelegateRequest = Message<"joko.v1.CloseDeskt
  * Use `create(CloseDesktopHostedAgentDelegateRequestSchema)` to create a new message.
  */
 export const CloseDesktopHostedAgentDelegateRequestSchema: GenMessage<CloseDesktopHostedAgentDelegateRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent_desktop, 4);
+  messageDesc(file_joko_v1_hosted_agent_desktop, 8);
 
 /**
  * @generated from message joko.v1.CloseDesktopHostedAgentDelegateResponse
@@ -165,7 +253,7 @@ export type CloseDesktopHostedAgentDelegateResponse = Message<"joko.v1.CloseDesk
  * Use `create(CloseDesktopHostedAgentDelegateResponseSchema)` to create a new message.
  */
 export const CloseDesktopHostedAgentDelegateResponseSchema: GenMessage<CloseDesktopHostedAgentDelegateResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent_desktop, 5);
+  messageDesc(file_joko_v1_hosted_agent_desktop, 9);
 
 /**
  * Main-process-only delegation to this managed Orchestrator's native factories.
@@ -175,6 +263,24 @@ export const CloseDesktopHostedAgentDelegateResponseSchema: GenMessage<CloseDesk
  * @generated from service joko.v1.DesktopHostedAgentService
  */
 export const DesktopHostedAgentService: GenService<{
+  /**
+   * Main-only, same-node media lifetime fencing; no media or provider secret.
+   *
+   * @generated from rpc joko.v1.DesktopHostedAgentService.GetDesktopMediaUdpPolicy
+   */
+  getDesktopMediaUdpPolicy: {
+    methodKind: "unary";
+    input: typeof GetDesktopMediaUdpPolicyRequestSchema;
+    output: typeof GetDesktopMediaUdpPolicyResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.DesktopHostedAgentService.RetireDesktopMediaUdp
+   */
+  retireDesktopMediaUdp: {
+    methodKind: "unary";
+    input: typeof RetireDesktopMediaUdpRequestSchema;
+    output: typeof RetireDesktopMediaUdpResponseSchema;
+  },
   /**
    * @generated from rpc joko.v1.DesktopHostedAgentService.OpenDesktopHostedAgentDelegate
    */

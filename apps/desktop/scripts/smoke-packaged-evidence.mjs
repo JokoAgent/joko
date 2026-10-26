@@ -4,7 +4,8 @@ import { createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, realp
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { canonicalSmokeDirectoryForRemoval } from "./smoke-packaged-helpers.mjs";
 
-const names = ["result.txt", "result.txt.progress", "result.txt.managed-process.json",
+const names = ["result.txt", "result.txt.progress", "result.txt.managed-process.json", "result.txt.native-retirement-sample.json",
+  "result.txt.uncaught-exception.json",
   "result.txt.task-sharing-management.png", "result.txt.task-sharing-guest-ready.png", "result.txt.task-sharing-guest.png",
   "result.txt.task-presentation.png", "result.txt.new-task-draft-recovery.png", "result.txt.native-task-status.png"];
 

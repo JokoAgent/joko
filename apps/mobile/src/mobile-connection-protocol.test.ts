@@ -11,6 +11,14 @@ describe("local shared connection capability bridge", () => {
       .toMatchObject({ name: "pair", args: ["https://node.example", "123456", "Phone", { automatic: false }] });
     expect(parseMobileConnectionMessage(request("connect", ["profile-1", { automatic: true }]), instanceId)?.type).toBe("action");
     expect(parseMobileConnectionMessage(request("selectMode", ["pair"]), instanceId)?.type).toBe("action");
+    expect(parseMobileConnectionMessage(request("trustEndpoint", ["https://node.example", `ed25519:${'a'.repeat(64)}`, false, "trusted-node"]), instanceId)?.type).toBe("action");
+    expect(parseMobileConnectionMessage(request("trustEndpoint", ["https://node.example", "ed25519:truncated"]), instanceId)).toBeUndefined();
+    expect(parseMobileConnectionMessage(request("trustEndpoint", ["https://node.example", `ed25519:${'a'.repeat(64)}`, "replace"]), instanceId)).toBeUndefined();
+    const tailcat = { kind: 'tailcat', endpointId: `nodekey:${'b'.repeat(64)}`, address: 'tcPrivateAddress', port: 4318 };
+    expect(parseMobileConnectionMessage(request('createTailcatClient', ['https://node.example', `ed25519:${'a'.repeat(64)}`, tailcat]), instanceId)?.type).toBe('action');
+    expect(parseMobileConnectionMessage(request('createIrohClient', ['https://node.example', `ed25519:${'a'.repeat(64)}`, tailcat]), instanceId)).toBeUndefined();
+    expect(parseMobileConnectionMessage(request('createIrohClient', []), instanceId)?.type).toBe('action');
+    expect(parseMobileConnectionMessage(request('createIrohClient', ['unbound-partial-input']), instanceId)).toBeUndefined();
     for (const raw of [request("pair", ["https://node.example", "", "Phone"]), request("pair", ["https://node.example", "123", "Phone", { automatic: false, authKey: "forged" }]),
       request("connect", [{ id: "profile-1", authKey: "forged" }]), request("connect", ["profile-1"], { instanceId: "retired" }),
       request("setTheme", ["arbitrary"]), request("selectMode", ["settings"]), request("readCredential", []),

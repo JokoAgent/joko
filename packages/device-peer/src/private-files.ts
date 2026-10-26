@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 const MAXIMUM_PRIVATE_FILE_BYTES = 1024 * 1024;
+const privateFileOperations = new Map<string, Promise<void>>();
 
 export interface FileSnapshot {
   readonly dev: number;
@@ -83,6 +84,10 @@ export async function atomicWritePrivateFile(path: string, bytes: Uint8Array): P
   if (bytes.byteLength === 0 || bytes.byteLength > MAXIMUM_PRIVATE_FILE_BYTES) {
     throw new Error("The encrypted private value has an invalid size.");
   }
+  await withPrivateFileOperation(path, () => writePrivateFileNow(path, bytes));
+}
+
+async function writePrivateFileNow(path: string, bytes: Uint8Array): Promise<void> {
   const directory = dirname(path);
   await ensurePrivateDirectory(directory);
   const existing = await lstat(path).catch((error: NodeJS.ErrnoException) => {
@@ -158,6 +163,10 @@ export async function atomicWriteUserSelectedFile(
 
 export async function readPrivateFile(path: string): Promise<Uint8Array | undefined> {
   assertNormalizedAbsolute(path);
+  return withPrivateFileOperation(path, () => readPrivateFileNow(path));
+}
+
+async function readPrivateFileNow(path: string): Promise<Uint8Array | undefined> {
   await ensurePrivateDirectory(dirname(path));
   try {
     const bytes = await readRegularFileSnapshot(path, MAXIMUM_PRIVATE_FILE_BYTES);
@@ -174,6 +183,10 @@ export async function readPrivateFile(path: string): Promise<Uint8Array | undefi
 
 export async function deletePrivateFile(path: string): Promise<void> {
   assertNormalizedAbsolute(path);
+  await withPrivateFileOperation(path, () => deletePrivateFileNow(path));
+}
+
+async function deletePrivateFileNow(path: string): Promise<void> {
   await ensurePrivateDirectory(dirname(path));
   const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return undefined;
@@ -183,6 +196,21 @@ export async function deletePrivateFile(path: string): Promise<void> {
   assertRegularFile(info, "The private data file is unsafe.");
   await unlink(path);
   await syncDirectory(dirname(path));
+}
+
+function withPrivateFileOperation<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  // On Windows another reader or writer can make atomic replacement fail.
+  // Keep cooperating private-file operations ordered through close and sync;
+  // the snapshot and path checks still reject non-cooperating replacements.
+  const key = process.platform === "win32" ? path.toLowerCase() : path;
+  const previous = privateFileOperations.get(key) ?? Promise.resolve();
+  const result = previous.then(operation);
+  const tail = result.then(() => undefined, () => undefined);
+  privateFileOperations.set(key, tail);
+  void tail.then(() => {
+    if (privateFileOperations.get(key) === tail) privateFileOperations.delete(key);
+  });
+  return result;
 }
 
 export function sameFileIdentity(left: FileSnapshot, right: FileSnapshot): boolean {

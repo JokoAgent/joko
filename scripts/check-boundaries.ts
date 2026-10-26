@@ -19,11 +19,12 @@ interface PackageManifest {
 
 export const WORKSPACE_DEPENDENCY_ALLOWLIST: Readonly<Record<string, ReadonlySet<string>>> = {
   "@joko/brand-assets": new Set(),
+  "@joko/connection-transport": new Set(["@joko/contracts"]),
   "@joko/agent-import": new Set(),
   "@joko/contracts": new Set(),
   "@joko/code-host": new Set(),
   "@joko/core": new Set(),
-  "@joko/device-peer": new Set(["@joko/contracts"]),
+  "@joko/device-peer": new Set(["@joko/contracts", "@joko/connection-transport"]),
   "@joko/remote-desktop-sync": new Set(),
   "@joko/git-safety": new Set(),
   "@joko/outbound-network": new Set(),
@@ -52,11 +53,11 @@ export const WORKSPACE_DEPENDENCY_ALLOWLIST: Readonly<Record<string, ReadonlySet
   "@joko/worktree": new Set(),
   "@joko/personal-development": new Set(),
   "@joko/testkit": new Set(["@joko/contracts", "@joko/core", "@joko/store"]),
-  "@joko/e2e": new Set(["@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-pi", "@joko/contracts", "@joko/core", "@joko/device-peer", "@joko/messaging", "@joko/orchestrator", "@joko/remote-ssh", "@joko/store", "@joko/testkit", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-terminal"]),
-  "@joko/orchestrator": new Set(["@joko/personal-development", "@joko/agent-import", "@joko/code-host", "@joko/contracts", "@joko/core", "@joko/device-peer", "@joko/git-safety", "@joko/local-model-runtime", "@joko/messaging", "@joko/node-sync", "@joko/outbound-network", "@joko/remote-ssh", "@joko/runtime-governance", "@joko/store", "@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-dictation-refinement", "@joko/adapter-hosted", "@joko/adapter-pi", "@joko/adapter-transcription-openai", "@joko/adapter-transcription-realtime", "@joko/adapter-transcription-scribe", "@joko/adapter-transcription-sauc", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-computer", "@joko/tool-document", "@joko/tool-lsp", "@joko/tool-terminal", "@joko/voice-input", "@joko/worktree", "@joko/testkit"]),
-  "@joko/web": new Set(["@joko/brand-assets", "@joko/contracts"]),
-  "@joko/mobile": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/remote-desktop-sync", "@joko/web"]),
-  "@joko/desktop": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/device-peer", "@joko/remote-desktop-sync", "@joko/web"])
+  "@joko/e2e": new Set(["@joko/connection-transport", "@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-pi", "@joko/contracts", "@joko/core", "@joko/device-peer", "@joko/messaging", "@joko/orchestrator", "@joko/remote-ssh", "@joko/store", "@joko/testkit", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-terminal"]),
+  "@joko/orchestrator": new Set(["@joko/connection-transport", "@joko/personal-development", "@joko/agent-import", "@joko/code-host", "@joko/contracts", "@joko/core", "@joko/device-peer", "@joko/git-safety", "@joko/local-model-runtime", "@joko/messaging", "@joko/node-sync", "@joko/outbound-network", "@joko/remote-ssh", "@joko/runtime-governance", "@joko/store", "@joko/adapter-claude-code", "@joko/adapter-codex", "@joko/adapter-dictation-refinement", "@joko/adapter-hosted", "@joko/adapter-pi", "@joko/adapter-transcription-openai", "@joko/adapter-transcription-realtime", "@joko/adapter-transcription-scribe", "@joko/adapter-transcription-sauc", "@joko/tool-android", "@joko/tool-browser", "@joko/tool-computer", "@joko/tool-document", "@joko/tool-lsp", "@joko/tool-terminal", "@joko/voice-input", "@joko/worktree", "@joko/testkit"]),
+  "@joko/web": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/connection-transport"]),
+  "@joko/mobile": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/connection-transport", "@joko/remote-desktop-sync", "@joko/web"]),
+  "@joko/desktop": new Set(["@joko/brand-assets", "@joko/contracts", "@joko/connection-transport", "@joko/device-peer", "@joko/remote-desktop-sync", "@joko/web"])
 };
 
 export interface BoundaryCheckOptions {

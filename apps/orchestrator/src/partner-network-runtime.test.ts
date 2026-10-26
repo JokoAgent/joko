@@ -22,6 +22,8 @@ import { ConnectionManager } from "./connection-manager.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
 import type { ModelRouteCatalog } from "./personalization-inference.js";
+import { createIdentity } from "@jokoagent/linkspan-noise";
+import { attachTestLinkspanTransport } from "./test-linkspan-transport.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
@@ -42,6 +44,7 @@ class ConversationAdapter extends FakeBackendAdapter {
 }
 const authority = () => ({ signal: new AbortController().signal, deviceId: "foreign-browser", assertCurrent() {} });
 async function fixture() {
+  const endpointIdentity = await createIdentity();
   const root = await mkdtemp(join(tmpdir(), "joko-network-runtime-")), serverId = "room-authority";
   const store = new OperationalStore(join(root, "operations.db")), profiles = new PartnerStore(join(root, "profiles.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
@@ -57,7 +60,7 @@ async function fixture() {
     capabilities: { modelChain: [{ backendId: profile.id, providerId: profile.models[0]!.providerId, modelId: profile.models[0]!.modelId, effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
   expect({ state: partner.initializationState, error: partner.initializationErrorCode }).toEqual({ state: "ready", error: undefined });
   const publicPartner = (id: string) => { const current = profiles.getPartner(id); if (current.lifecycle !== "active") throw new Error(); return { id: current.id, name: current.displayName, description: current.description }; };
-  const host = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId, origin: "http://127.0.0.1", mediaDirectory: join(root, "media"), partner: publicPartner, artifacts });
+  const host = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId, origin: "http://127.0.0.1", endpointPublicKey: endpointIdentity.publicKey, mediaDirectory: join(root, "media"), partner: publicPartner, artifacts });
   const home = new PartnerNetworkHome({ directory: join(root, "home"), serverId, vault, partner: publicPartner }); await home.initialize();
   const routes: ModelRouteCatalog = { list: () => [], resolve: () => undefined };
   const f = { root, store, profiles, artifacts, vault, adapter, sessions, lanes, lanePath, laneStore, partner, host, home, partners, workspaces,
@@ -71,6 +74,8 @@ async function fixture() {
     workspaceChanges: {}, scheduler: {}, adapters: [adapter], browserActivity: [], sessionHost: sessions, partners, partnerNetwork: f.network } as unknown as OrchestratorApplication);
   f.server.log.level = "silent";
   const baseUrl = await f.server.listen({ host: "127.0.0.1", port: 0 }); host.options.origin = baseUrl; config.publicOrigin = baseUrl;
+  const retireTransport = attachTestLinkspanTransport(f.server.server, baseUrl, endpointIdentity);
+  cleanups.push(retireTransport);
   const owner = createClient(contract.PartnerNetworkService, createConnectTransport({ baseUrl, httpVersion: "1.1", interceptors: [next => request => { request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request); }] }));
   const room = (await owner.createPartnerNetwork({ operationId: "room-create", name: "Shared room", displayName: "Owner", partnerIds: [partner.id] })).room!;
   const invitation = (await owner.invitePartnerNetwork({ operationId: "invitation", roomId: room.id, expectedRevision: room.revision, lifetimeMs: 86400_000n })).invitation;
@@ -90,6 +95,17 @@ async function upload(f: Awaited<ReturnType<typeof fixture>>, data: Uint8Array, 
 async function finished(f: Awaited<ReturnType<typeof fixture>>) { await vi.waitFor(() => expect(f.host.storage.executions(f.room.id).every(job => !["queued", "running"].includes(job.status))).toBe(true), { timeout: 6_000 }); }
 
 describe("Built-in conversation authority and execution", () => {
+  it("keeps a sealed foreign membership on its original pinned locator when the authority publishes a new entrance", async () => {
+    const f = await fixture();
+    f.host.options.origin = () => "https://current.trycloudflare.com";
+    const request = create(contract.GetPartnerNetworkRequestSchema, { roomId: f.room.id, joinId: f.joined.joinId });
+    expect((await f.foreign.snapshot(request, authority())).room?.hostOrigin).toBe(f.baseUrl);
+    const restored = new PartnerNetworkHome(f.foreignOptions); await restored.initialize(); cleanups.push(() => restored.close());
+    expect(restored.directory()[0]?.hostOrigin).toBe(f.baseUrl);
+    expect((await restored.snapshot(request, authority())).room?.hostOrigin).toBe(f.baseUrl);
+    expect(f.host.snapshot(create(contract.GetPartnerNetworkRequestSchema, { roomId: f.room.id }), f.host.selfId).room?.hostOrigin)
+      .toBe("https://current.trycloudflare.com");
+  });
   it("classifies a structured execution failure, retries only its durable terminal and exposes no diagnostic message or model input", async () => {
     const f = await fixture(), before = f.host.storage.messages(f.room.id).length;
     f.adapter.infer.mockRejectedValueOnce(Object.assign(new Error("PRIVATE_PROMPT /home/private access_token=secret"), { codexErrorInfo: "usageLimitExceeded", errorStatus: 429 }));

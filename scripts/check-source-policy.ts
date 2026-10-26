@@ -66,6 +66,8 @@ function webImportErrors(displayedPath: string, source: string): readonly string
     const specifier = match[1];
     if (specifier?.startsWith("@joko/") === true
       && specifier !== "@joko/contracts"
+      && specifier !== "@joko/connection-transport"
+      && specifier !== "@joko/connection-transport/trust"
       && !specifier.startsWith("@joko/brand-assets/")) {
       errors.push(`${displayedPath}: Web UI may import only generated contracts or inert brand assets from workspace packages (found ${specifier})`);
     }

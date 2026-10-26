@@ -1153,6 +1153,7 @@ export interface DesktopManagedOrchestratorConnection {
   readonly serverId: string;
   readonly name: string;
   readonly origin: string;
+  readonly endpointPublicKey?: string;
 }
 
 export type DesktopManagedOrchestratorRecoveryReason =

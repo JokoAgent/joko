@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 
 import { create } from "@bufbuild/protobuf";
-import { createClient, type Interceptor, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
+import { createConnectTransport, EndpointTrustError, isEndpointTrustError, normalizeEndpointPublicKey, requireEndpointTrust } from "@joko/connection-transport/node";
+import { normalizeEndpointTransport, type EndpointTransport, type EndpointTransportKind } from "@joko/connection-transport/trust";
 import {
   ConnectionService,
   ConnectionState,
@@ -40,27 +41,43 @@ export interface NodeDevicePeerAgentConnection {
   readonly deviceId: string;
   readonly serverId: string;
   readonly origin: string;
+  readonly endpointPublicKey?: string;
+  readonly transportKind?: EndpointTransportKind;
+  readonly endpointTransport?: EndpointTransport;
   readonly expectedDeviceKind: DeviceKind.DESKTOP | DeviceKind.SERVICE;
 }
 
+export type NodeDevicePeerAgentRetirementStage =
+  | "cancel_received"
+  | "split_downstream_retirement_started" | "split_downstream_retirement_completed"
+  | "split_upload_retirement_started" | "split_upload_retirement_completed"
+  | "task_drain_started" | "task_drain_completed"
+  | "executor_retirement_started" | "executor_retirement_completed";
+
 export interface NodeDevicePeerAgentRoutePort {
   /** Anonymous, credential-free stable identity probe. */
-  readServerId(origin: string, signal: AbortSignal): Promise<string>;
+  readServerId(origin: string, signal: AbortSignal, endpointPublicKey?: string, endpoint?: NodeDevicePeerAgentTransport): Promise<string>;
   /** Authenticated proof that the credential owns the exact host Device kind. */
   verifyIdentity(
     origin: string,
     authKey: string,
     connection: NodeDevicePeerAgentConnection,
-    signal: AbortSignal
+    signal: AbortSignal,
+    endpointPublicKey?: string,
+    endpoint?: NodeDevicePeerAgentTransport
   ): Promise<void>;
   /** The purpose-bound route authorization stays only in the transport closure. */
   open(
     origin: string,
     routeAuthorization: string,
     requests: AsyncIterable<OpenDevicePeerAgentRouteRequest>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    endpointPublicKey?: string,
+    observeRetirement?: (stage: NodeDevicePeerAgentRetirementStage) => void,
+    endpoint?: NodeDevicePeerAgentTransport
   ): AsyncIterable<OpenDevicePeerAgentRouteResponse>;
 }
+type NodeDevicePeerAgentTransport = Pick<NodeDevicePeerAgentConnection, "transportKind" | "endpointTransport">;
 
 export interface NodeDevicePeerAgentRouteOptions {
   readonly connection: NodeDevicePeerAgentConnection;
@@ -76,6 +93,8 @@ export interface NodeDevicePeerAgentRouteOptions {
   ) => boolean | Promise<boolean>;
   readonly heartbeatIntervalMs?: number;
   readonly port?: NodeDevicePeerAgentRoutePort;
+  /** Trusted-host diagnostics only; no payload, identity, or authority changes. */
+  readonly observeRetirement?: (stage: NodeDevicePeerAgentRetirementStage) => void;
 }
 
 /**
@@ -87,6 +106,16 @@ export async function runNodeDevicePeerAgentRoute(
   options: NodeDevicePeerAgentRouteOptions
 ): Promise<void> {
   const origin = canonicalOrigin(options.connection.origin);
+  const endpoint: NodeDevicePeerAgentTransport | undefined = options.connection.transportKind === undefined && options.connection.endpointTransport === undefined ? undefined : {
+    ...(options.connection.transportKind === undefined ? {} : { transportKind: options.connection.transportKind }),
+    ...(options.connection.endpointTransport === undefined ? options.connection.transportKind === "webrtc" ? { endpointTransport: { kind: "webrtc" } as const } : {}
+      : { endpointTransport: normalizeEndpointTransport(options.connection.endpointTransport) })
+  };
+  if (endpoint?.transportKind !== undefined && !["https", "webrtc", "iroh", "tailcat", "http-connect"].includes(endpoint.transportKind)
+    || endpoint?.endpointTransport !== undefined && endpoint.transportKind !== undefined && endpoint.transportKind !== endpoint.endpointTransport.kind
+    || (endpoint?.transportKind === "iroh" || endpoint?.transportKind === "tailcat" || endpoint?.transportKind === "http-connect") && endpoint.endpointTransport === undefined
+    || endpoint !== undefined && options.connection.endpointPublicKey === undefined) throw new EndpointTrustError();
+  const endpointPublicKey = options.connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin }) : normalizeEndpointPublicKey(options.connection.endpointPublicKey);
   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
   if (!Number.isSafeInteger(heartbeatIntervalMs)
     || heartbeatIntervalMs < MINIMUM_HEARTBEAT_INTERVAL_MS
@@ -99,15 +128,22 @@ export async function runNodeDevicePeerAgentRoute(
   validateCapabilities(options.executor.capabilities);
 
   const routeController = new AbortController();
-  const abortRoute = (): void => routeController.abort();
-  options.signal.addEventListener("abort", abortRoute, { once: true });
   const port = options.port ?? DEFAULT_NODE_DEVICE_PEER_AGENT_ROUTE_PORT;
   const queue = new BoundedAsyncQueue<OpenDevicePeerAgentRouteRequest>(MAXIMUM_OUTBOUND_FRAMES);
+  const abortRoute = (): void => {
+    // A cancelled response may wait for its upload to finish before returning.
+    // Release this owner's pending upload read before aborting its transport.
+    queue.close();
+    routeController.abort();
+    observeRetirement(options.observeRetirement, "cancel_received");
+  };
+  options.signal.addEventListener("abort", abortRoute, { once: true });
   const commands = new Map<string, AbortController>();
   const commandRequestIds = new Set<string>();
   const tasks = new Set<Promise<void>>();
   const requestIds = new Set<string>();
   let fatal = false;
+  let terminalFailure: unknown;
   let retired = false;
   let heartbeatTask: Promise<void> | undefined;
   let iterator: AsyncIterator<OpenDevicePeerAgentRouteResponse> | undefined;
@@ -122,8 +158,9 @@ export async function runNodeDevicePeerAgentRoute(
 
   try {
     await assertAuthority(options, routeController.signal);
-    const serverId = await port.readServerId(origin, routeController.signal);
-    if (serverId !== options.connection.serverId) throw routeFailure();
+    const serverId = await (endpoint === undefined ? port.readServerId(origin, routeController.signal, endpointPublicKey)
+      : port.readServerId(origin, routeController.signal, endpointPublicKey, endpoint));
+    if (serverId !== options.connection.serverId) throw new EndpointTrustError();
     await assertAuthority(options, routeController.signal);
 
     // Decrypt only after the anonymous endpoint proves the saved stable ID.
@@ -131,7 +168,8 @@ export async function runNodeDevicePeerAgentRoute(
     const authKey = await options.readAuthKey(options.connection.credentialId);
     if (!validAuthKey(authKey)) throw routeFailure();
     await assertAuthority(options, routeController.signal);
-    await port.verifyIdentity(origin, authKey, options.connection, routeController.signal);
+    await (endpoint === undefined ? port.verifyIdentity(origin, authKey, options.connection, routeController.signal, endpointPublicKey)
+      : port.verifyIdentity(origin, authKey, options.connection, routeController.signal, endpointPublicKey, endpoint));
     await assertAuthority(options, routeController.signal);
 
     const routeAuthorization = options.connection.expectedDeviceKind === DeviceKind.DESKTOP
@@ -161,7 +199,9 @@ export async function runNodeDevicePeerAgentRoute(
       }
     }));
 
-    const responses = port.open(origin, routeAuthorization, queue, routeController.signal);
+    const responses = endpoint !== undefined ? port.open(origin, routeAuthorization, queue, routeController.signal, endpointPublicKey, options.observeRetirement, endpoint) : options.observeRetirement === undefined
+      ? port.open(origin, routeAuthorization, queue, routeController.signal, endpointPublicKey)
+      : port.open(origin, routeAuthorization, queue, routeController.signal, endpointPublicKey, options.observeRetirement);
     iterator = responses[Symbol.asyncIterator]();
     const first = await iterator.next();
     if (first.done) throw routeFailure();
@@ -228,8 +268,12 @@ export async function runNodeDevicePeerAgentRoute(
     }
 
     if (!retired && !options.signal.aborted) throw routeFailure();
-  } catch {
-    if (!retired && !options.signal.aborted) fatal = true;
+  } catch (error) {
+    if (!retired && !options.signal.aborted) {
+      fatal = true;
+      if (isEndpointTrustError(error) || error instanceof ConnectError
+        && (error.code === Code.Unauthenticated || error.code === Code.PermissionDenied)) terminalFailure = error;
+    }
   } finally {
     options.signal.removeEventListener("abort", abortRoute);
     routeController.abort();
@@ -237,11 +281,16 @@ export async function runNodeDevicePeerAgentRoute(
     queue.close();
     try { await iterator?.return?.(); }
     catch { if (!options.signal.aborted) fatal = true; }
+    observeRetirement(options.observeRetirement, "task_drain_started");
     await Promise.allSettled([...tasks, ...(heartbeatTask === undefined ? [] : [heartbeatTask])]);
+    observeRetirement(options.observeRetirement, "task_drain_completed");
+    observeRetirement(options.observeRetirement, "executor_retirement_started");
     try { await options.executor.retire(); }
     catch { if (!options.signal.aborted) fatal = true; }
+    observeRetirement(options.observeRetirement, "executor_retirement_completed");
   }
 
+  if (terminalFailure !== undefined) throw terminalFailure;
   if (fatal) throw routeFailure();
 }
 
@@ -466,10 +515,10 @@ class BoundedAsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
 
 export function createNodeDevicePeerAgentRoutePort(): NodeDevicePeerAgentRoutePort {
   return Object.freeze({
-    async readServerId(origin: string, signal: AbortSignal) {
+    async readServerId(origin: string, signal: AbortSignal, endpointPublicKey?: string, endpoint?: NodeDevicePeerAgentTransport) {
       const response = await createClient(
         ConnectionService,
-        createDevicePeerAgentTransport(origin)
+        createDevicePeerAgentTransport(origin, undefined, undefined, endpointPublicKey, endpoint)
       ).getServerInfo({}, { signal });
       const serverId = response.server?.serverId;
       if (serverId === undefined) throw routeFailure();
@@ -479,10 +528,12 @@ export function createNodeDevicePeerAgentRoutePort(): NodeDevicePeerAgentRoutePo
       origin: string,
       authKey: string,
       connection: NodeDevicePeerAgentConnection,
-      signal: AbortSignal
+      signal: AbortSignal,
+      endpointPublicKey?: string,
+      endpoint?: NodeDevicePeerAgentTransport
     ) {
       validateDeviceKind(connection.expectedDeviceKind);
-      const client = createClient(ConnectionService, createDevicePeerAgentTransport(origin, authKey));
+      const client = createClient(ConnectionService, createDevicePeerAgentTransport(origin, authKey, undefined, endpointPublicKey ?? connection.endpointPublicKey, endpoint));
       const [connectionResponse, deviceResponse] = await Promise.all([
         client.getConnection({ connectionId: connection.credentialId }, { signal }),
         client.getDevice({ deviceId: connection.deviceId }, { signal })
@@ -496,19 +547,24 @@ export function createNodeDevicePeerAgentRoutePort(): NodeDevicePeerAgentRoutePo
         || device.deviceId !== connection.deviceId
         || device.kind !== connection.expectedDeviceKind
         || device.revoked
-        || !device.connectionIds.includes(connection.credentialId)) throw routeFailure();
+        || !device.connectionIds.includes(connection.credentialId)) {
+        throw new ConnectError("The Device peer connection requires explicit authorization recovery.", Code.PermissionDenied);
+      }
     },
     open(
       origin: string,
       routeAuthorization: string,
       requests: AsyncIterable<OpenDevicePeerAgentRouteRequest>,
-      signal: AbortSignal
+      signal: AbortSignal,
+      endpointPublicKey?: string,
+      observeRetirement?: (stage: NodeDevicePeerAgentRetirementStage) => void,
+      endpoint?: NodeDevicePeerAgentTransport
     ) {
       const client = createClient(
         DevicePeerService,
-        createDevicePeerAgentTransport(origin, undefined, routeAuthorization)
+        createDevicePeerAgentTransport(origin, undefined, routeAuthorization, endpointPublicKey, endpoint)
       );
-      return openSplitDevicePeerAgentRoute(client, requests, signal);
+      return openSplitDevicePeerAgentRoute(client, requests, signal, observeRetirement);
     }
   });
 }
@@ -518,7 +574,9 @@ export const DEFAULT_NODE_DEVICE_PEER_AGENT_ROUTE_PORT = createNodeDevicePeerAge
 function createDevicePeerAgentTransport(
   origin: string,
   authKey?: string,
-  routeAuthorization?: string
+  routeAuthorization?: string,
+  endpointPublicKey?: string,
+  endpoint?: NodeDevicePeerAgentTransport
 ): Transport {
   const interceptors: Interceptor[] = [];
   if (authKey !== undefined || routeAuthorization !== undefined) interceptors.push((next) => (request) => {
@@ -530,6 +588,8 @@ function createDevicePeerAgentTransport(
   });
   return createConnectTransport({
     baseUrl: origin,
+    endpointPublicKey,
+    ...endpoint,
     httpVersion: "1.1",
     useBinaryFormat: true,
     interceptors
@@ -539,7 +599,8 @@ function createDevicePeerAgentTransport(
 function openSplitDevicePeerAgentRoute(
   client: ReturnType<typeof createClient<typeof DevicePeerService>>,
   requests: AsyncIterable<OpenDevicePeerAgentRouteRequest>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  observer?: (stage: NodeDevicePeerAgentRetirementStage) => void
 ): AsyncIterable<OpenDevicePeerAgentRouteResponse> {
   return (async function* () {
     const routeController = new AbortController();
@@ -588,7 +649,10 @@ function openSplitDevicePeerAgentRoute(
         }
       })();
       upload = client.publishDevicePeerAgentRoute(upstream, { signal: routeController.signal });
-      const uploadClosed = upload.then(() => ({ case: "uploadClosed" as const }));
+      const uploadClosed = upload.then(
+        () => ({ case: "uploadClosed" as const }),
+        (error: unknown) => ({ case: "uploadFailed" as const, error })
+      );
 
       yield create(OpenDevicePeerAgentRouteResponseSchema, {
         targetDeviceId: firstResponse.value.targetDeviceId,
@@ -602,6 +666,7 @@ function openSplitDevicePeerAgentRoute(
           uploadClosed
         ]);
         if (next.case === "uploadClosed") throw routeFailure();
+        if (next.case === "uploadFailed") throw next.error;
         if (next.value.done) return;
         yield create(OpenDevicePeerAgentRouteResponseSchema, {
           targetDeviceId: next.value.value.targetDeviceId,
@@ -613,8 +678,19 @@ function openSplitDevicePeerAgentRoute(
     } finally {
       signal.removeEventListener("abort", abortRoute);
       routeController.abort();
+      observeRetirement(observer, "split_downstream_retirement_started");
       try { await downstream?.return?.(); } catch { /* The route is already closed. */ }
+      observeRetirement(observer, "split_downstream_retirement_completed");
+      observeRetirement(observer, "split_upload_retirement_started");
       if (upload !== undefined) await Promise.allSettled([upload]);
+      observeRetirement(observer, "split_upload_retirement_completed");
     }
   })();
+}
+
+function observeRetirement(
+  observer: ((stage: NodeDevicePeerAgentRetirementStage) => void) | undefined,
+  stage: NodeDevicePeerAgentRetirementStage
+): void {
+  try { observer?.(stage); } catch { /* Diagnostics never own route retirement. */ }
 }

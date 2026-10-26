@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { randomUUID } from "expo-crypto";
+import { createConnectionFetch } from "@joko/connection-transport";
 import {
   MOBILE_FILE_SHARE_MAXIMUM_BYTES,
   type AuthorizedBlobDownload
@@ -231,35 +232,54 @@ const expoMobileFileShareDriver: MobileFileShareDriver = {
     return Sharing.isAvailableAsync();
   },
   async download(source, fileName, operationId, onProgress, signal) {
-    const { Directory, File, Paths } = await import("expo-file-system");
+    signal?.throwIfAborted();
+    const fetcher = createConnectionFetch({ origin: new URL(source.url).origin, endpointPublicKey: source.endpointPublicKey, transportKind: source.transportKind ?? 'https' });
+    const { Directory, File, FileMode, Paths } = await import("expo-file-system");
     const root = new Directory(Paths.cache, FILE_SHARE_ROOT_DIRECTORY);
     root.create({ idempotent: true, intermediates: true });
     const directory = new Directory(root, operationId);
     directory.create();
     const target = new File(directory, fileName);
-    let progressError: Error | undefined;
-    const progressAbort = new AbortController();
-    const transferSignal = signal
-      ? AbortSignal.any([signal, progressAbort.signal])
-      : progressAbort.signal;
+    const lifetime = new AbortController();
+    const transferSignal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(10 * 60_000), ...(signal === undefined ? [] : [signal])]);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let handle: ReturnType<InstanceType<typeof File>["open"]> | undefined;
+    const onAbort = (): void => { void reader?.cancel().catch(() => undefined); };
+    transferSignal.addEventListener("abort", onAbort, { once: true });
     try {
-      const downloaded = await File.downloadFileAsync(source.url, target, {
-        headers: { ...source.headers },
-        idempotent: false,
-        signal: transferSignal,
-        onProgress: ({ bytesWritten, totalBytes }) => {
-          if (!Number.isSafeInteger(bytesWritten) || bytesWritten < 0 || bytesWritten > source.byteSize
-            || totalBytes !== -1 && totalBytes !== source.byteSize) {
-            progressError = new Error("The file-sharing download reported invalid progress.");
-            progressAbort.abort();
-            return;
-          }
-          onProgress(bytesWritten);
-        }
+      const response = await fetcher(source.url, {
+        headers: { ...source.headers }, signal: transferSignal, redirect: "error", cache: "no-store"
       });
-      if (progressError) throw progressError;
-      signal?.throwIfAborted();
-      if (downloaded.uri !== target.uri || !target.exists || target.size !== source.byteSize) {
+      transferSignal.throwIfAborted();
+      reader = response.body?.getReader();
+      if (!response.ok) throw new Error(`File-sharing download failed (${response.status}).`);
+      const declaredLength = response.headers.get("content-length")?.trim();
+      const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+      if (!declaredLength || !/^(0|[1-9][0-9]*)$/u.test(declaredLength) || BigInt(declaredLength) !== BigInt(source.byteSize)
+        || mediaType !== source.mediaType || (!reader && source.byteSize !== 0)) {
+        throw new Error("The file-sharing response did not match its authenticated metadata.");
+      }
+      target.create({ overwrite: false });
+      handle = target.open(FileMode.WriteOnly);
+      let bytesWritten = 0;
+      while (reader) {
+        transferSignal.throwIfAborted();
+        const next = await reader.read();
+        transferSignal.throwIfAborted();
+        if (next.done) break;
+        if (!(next.value instanceof Uint8Array) || bytesWritten + next.value.byteLength > source.byteSize) {
+          throw new Error("The file-sharing response exceeded its authenticated size.");
+        }
+        for (let offset = 0; offset < next.value.byteLength; offset += 64 * 1024) {
+          transferSignal.throwIfAborted();
+          handle.writeBytes(next.value.subarray(offset, Math.min(next.value.byteLength, offset + 64 * 1024)));
+        }
+        bytesWritten += next.value.byteLength;
+        onProgress(bytesWritten);
+      }
+      const completedHandle = handle; handle = undefined; completedHandle.close();
+      transferSignal.throwIfAborted();
+      if (bytesWritten !== source.byteSize || !target.exists || target.size !== source.byteSize) {
         throw new Error("The file-sharing download did not match its authenticated size.");
       }
       onProgress(source.byteSize);
@@ -270,9 +290,16 @@ const expoMobileFileShareDriver: MobileFileShareDriver = {
         byteSize: target.size
       };
     } catch (error) {
-      if (directory.exists) directory.delete();
-      if (progressError) throw progressError;
+      const failedHandle = handle; handle = undefined;
+      try { failedHandle?.close(); }
+      finally { if (directory.exists) directory.delete(); }
       throw error;
+    } finally {
+      transferSignal.removeEventListener("abort", onAbort);
+      lifetime.abort();
+      await reader?.cancel().catch(() => undefined);
+      reader?.releaseLock();
+      handle?.close();
     }
   },
   async verify(temporary, maximumBytes, onProgress, signal) {
@@ -336,5 +363,6 @@ export const mobileFileShare = new MobileFileShare();
 
 export const mobileFileShareTesting = {
   rootDirectory: FILE_SHARE_ROOT_DIRECTORY,
-  verifyChunkBytes: FILE_SHARE_VERIFY_CHUNK_BYTES
+  verifyChunkBytes: FILE_SHARE_VERIFY_CHUNK_BYTES,
+  driver: expoMobileFileShareDriver
 };

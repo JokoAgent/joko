@@ -1,6 +1,76 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, parseCrashReport, parseVirtualMemory, projectOwnedCrash, projectOwnedStartupLogs, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, parseCrashReport, parseVirtualMemory, projectOwnedCrash, projectOwnedStartupLogs, requireSimulatorApplicationContainer, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+
+function containerLookup(replies) {
+  const calls = [], controller = new AbortController();
+  const owner = { simulatorUdid: "12345678-1234-1234-1234-123456789ABC", bundleId: "app.joko.mobile", deviceName: "joko-ci-owned" };
+  let receipt, current = true, retries = 0;
+  return { calls, controller, retire: () => { current = false; }, get retries() { return retries; },
+    options: { owner, signal: controller.signal, isCurrent: () => current, getReceipt: () => receipt,
+      onRetry: () => { retries++; }, command: async (binary, args, options) => {
+        calls.push({ binary, args: [...args], ...options });
+        const reply = replies.shift();
+        assert.notEqual(reply, undefined, "The lookup issued an unexpected extra query.");
+        receipt = { step: options.startupLabel, timeoutMs: options.timeout, elapsedMs: 1,
+          result: "passed", exitCode: 0, signal: null, killed: false, cancelled: false,
+          stdoutBytes: typeof reply === "string" ? Buffer.byteLength(reply) : 0, ...reply?.receipt };
+        if (reply?.error) throw reply.error;
+        return reply;
+      } } };
+}
+
+test("reads only the exact owned application and repeats an empty host reply once", async () => {
+  const container = "/Users/runner/Devices/owned/Joko.app";
+  for (const replies of [[container], ["", container]]) {
+    const lookup = containerLookup([...replies]);
+    assert.equal(await locateInstalledSimulatorApplication(lookup.options), container);
+    assert.equal(lookup.calls.length, replies.length);
+    assert.equal(lookup.retries, replies.length - 1);
+    for (const call of lookup.calls) {
+      assert.equal(call.binary, "xcrun");
+      assert.deepEqual(call.args, ["simctl", "get_app_container", lookup.options.owner.simulatorUdid, "app.joko.mobile", "app"]);
+      assert.equal(call.timeout, 30_000);
+    }
+    assert.deepEqual(lookup.calls.map(call => call.startupLabel),
+      replies.length === 1 ? ["locate-installed-application"] : ["locate-installed-application", "retry-locate-installed-application"]);
+  }
+});
+
+test("rejects empty, relative and multiline container paths without resolving against the repository", async () => {
+  for (const value of ["", "Joko.app", "./Joko.app", "../Joko.app", " /Users/runner/Joko.app", "/Users/runner/Joko.app\nother", "C:\\Joko.app"]) {
+    assert.throws(() => requireSimulatorApplicationContainer(value), /absolute container path/u);
+  }
+  for (const replies of [["", ""], ["", "relative/Joko.app"], ["relative/Joko.app"]]) {
+    const lookup = containerLookup([...replies]);
+    await assert.rejects(locateInstalledSimulatorApplication(lookup.options), /absolute container path/u);
+    assert.equal(lookup.calls.length, replies.length);
+  }
+});
+
+test("keeps the previous killed-query recovery bounded to one read and rejects other command failures", async () => {
+  const error = new Error("The host query failed.");
+  const killed = { error, receipt: { result: "failed", exitCode: null, errorCode: null, signal: "SIGTERM", killed: true, elapsedMs: 30_001 } };
+  const lookup = containerLookup([killed, "/Users/runner/Devices/owned/Joko.app"]);
+  await locateInstalledSimulatorApplication(lookup.options);
+  assert.equal(lookup.calls.length, 2);
+  for (const changed of [{ signal: "SIGKILL" }, { exitCode: 1 }, { cancelled: true }, { elapsedMs: 29_999 }]) {
+    const rejected = containerLookup([{ error, receipt: { ...killed.receipt, ...changed } }]);
+    await assert.rejects(locateInstalledSimulatorApplication(rejected.options), error);
+    assert.equal(rejected.calls.length, 1);
+  }
+});
+
+test("never repeats a query after owner replacement or cancellation", async () => {
+  for (const retire of [lookup => lookup.retire(), lookup => lookup.controller.abort()]) {
+    const lookup = containerLookup([""]);
+    const command = lookup.options.command;
+    lookup.options.command = async (...args) => { const result = await command(...args); retire(lookup); return result; };
+    await assert.rejects(locateInstalledSimulatorApplication(lookup.options));
+    assert.equal(lookup.calls.length, 1);
+    assert.equal(lookup.retries, 0);
+  }
+});
 
 test("retries only the pre-test accessibility runner failure with no application requests", () => {
   const failure = { targetName: "JokoCIUITests", testIdentifierString: "JokoCIUITests-Runner (25861) encountered an error",

@@ -181,7 +181,7 @@ final class RemoteDesktopReceiver: NSObject, RTCPeerConnectionDelegate, RTCDataC
     if failed { pending = nil; scheduleIce(1); return }
     guard let complete = RemoteDesktopBridgeNumber.boolean(message["complete"]),
           let values = message["candidates"] as? [[String: Any]], values.count <= 16,
-          let next = RemoteDesktopBridgeNumber.integer(message["next"]), next == remoteAfter + values.count, next <= 128 else {
+          let next = RemoteDesktopBridgeNumber.integer(message["next"]), next == remoteAfter + values.count, next <= 256 else {
       fail("candidates"); return
     }
     // WebRTC serializes addIceCandidate internally. Mark the batch complete only
@@ -206,7 +206,7 @@ final class RemoteDesktopReceiver: NSObject, RTCPeerConnectionDelegate, RTCDataC
       }
       let key = "\(value["sdpMid"] as? String ?? ""):\(line):\(sdp)"
       if remoteSeen.contains(key) { add(index + 1); return }
-      guard remoteSeen.count < 128 else { fail("candidates"); return }
+      guard remoteSeen.count < 256 else { fail("candidates"); return }
       peer.add(RTCIceCandidate(sdp: sdp, sdpMLineIndex: Int32(line), sdpMid: value["sdpMid"] as? String)) { [weak self] error in
         DispatchQueue.main.async {
           guard let self, !self.stopped else { return }

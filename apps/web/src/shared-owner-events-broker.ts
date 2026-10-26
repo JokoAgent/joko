@@ -1,5 +1,6 @@
 import { toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { isEndpointTrustError } from "@joko/connection-transport/trust";
 import { EventSchema, type Event, type EventCursor } from "@joko/contracts";
 import { normalizeOrchestratorOrigin } from "./connection-origin.js";
 
@@ -8,11 +9,13 @@ export interface SharedOwnerEventsOwner {
   readonly serverId: string;
   readonly deviceId: string;
   readonly origin: string;
+  readonly endpointPublicKey?: string;
 }
 
 export interface SharedOwnerEventsSink {
+  accepted?(): void;
   event(bytes: ArrayBuffer, serial: number): void;
-  error(code: number, message: string): void;
+  error(code: number, message: string, endpointTrustFailed?: true): void;
 }
 
 export interface SharedOwnerEventsSubscription {
@@ -25,7 +28,8 @@ export interface SharedOwnerEventsBrokerOptions {
     owner: SharedOwnerEventsOwner,
     authKey: string,
     afterCursor: EventCursor,
-    signal: AbortSignal
+    signal: AbortSignal,
+    onAccepted: () => void
   ) => AsyncIterable<Event>;
   readonly maxEvents?: number;
   readonly maxBytes?: number;
@@ -53,6 +57,7 @@ interface OwnerGroup {
   floor: EventCursor;
   cursor: EventCursor;
   bytes: number;
+  accepted: boolean;
   closing: boolean;
   task?: Promise<void>;
 }
@@ -89,8 +94,8 @@ export class SharedOwnerEventsBroker {
     if (group === undefined) {
       previous = matching.at(-1)?.task;
       const initial = copyCursor(cursor);
-      group = { owner: Object.freeze({ profileId: owner.profileId, serverId: owner.serverId, deviceId: owner.deviceId, origin: owner.origin }),
-        authKey, abort: new AbortController(), consumers: new Set(), events: [], floor: initial, cursor: initial, bytes: 0, closing: false };
+      group = { owner: Object.freeze({ profileId: owner.profileId, serverId: owner.serverId, deviceId: owner.deviceId, origin: owner.origin, endpointPublicKey: owner.endpointPublicKey }),
+        authKey, abort: new AbortController(), consumers: new Set(), events: [], floor: initial, cursor: initial, bytes: 0, accepted: false, closing: false };
       this.#groups.add(group);
     } else if (cursor.generation !== group.cursor.generation) {
       this.#fail(group, Code.FailedPrecondition);
@@ -109,6 +114,7 @@ export class SharedOwnerEventsBroker {
       },
       close: () => this.#close(consumer)
     };
+    if (group.accepted) this.#accept(consumer);
     this.#pump(consumer);
     group.task ??= this.#consume(group, previous);
     return subscription;
@@ -124,7 +130,12 @@ export class SharedOwnerEventsBroker {
     try {
       await previous;
       if (group.closing) return;
-      for await (const event of this.#options.openStream(group.owner, group.authKey, copyCursor(group.cursor), group.abort.signal)) {
+      const accepted = (): void => {
+        if (group.closing || group.abort.signal.aborted || group.accepted) return;
+        group.accepted = true;
+        for (const consumer of [...group.consumers]) this.#accept(consumer);
+      };
+      for await (const event of this.#options.openStream(group.owner, group.authKey, copyCursor(group.cursor), group.abort.signal, accepted)) {
         if (group.closing || group.abort.signal.aborted) return;
         const cursor = event.cursor;
         if (!validCursor(cursor) || cursor.generation !== group.cursor.generation) {
@@ -142,11 +153,17 @@ export class SharedOwnerEventsBroker {
       }
       if (!group.closing) this.#fail(group, Code.Unavailable);
     } catch (error) {
-      if (!group.closing) this.#fail(group, ConnectError.from(error).code);
+      if (!group.closing) this.#fail(group, ConnectError.from(error).code, isEndpointTrustError(error) ? true : undefined);
     } finally {
       group.closing = true; group.abort.abort(); group.events.length = 0; group.bytes = 0;
       this.#groups.delete(group);
     }
+  }
+
+  #accept(consumer: Consumer): void {
+    if (consumer.closed) return;
+    try { consumer.sink.accepted?.(); }
+    catch { this.#close(consumer); }
   }
 
   #pump(consumer: Consumer): void {
@@ -164,23 +181,24 @@ export class SharedOwnerEventsBroker {
     catch { this.#close(consumer); }
   }
 
-  #close(consumer: Consumer, code?: Code): void {
+  #close(consumer: Consumer, code?: Code, endpointTrustFailed?: true): void {
     if (consumer.closed) return;
     consumer.closed = true; consumer.inflight = undefined;
     const group = consumer.group;
     group.consumers.delete(consumer);
     if (group.consumers.size === 0) { group.closing = true; group.abort.abort(); }
-    if (code !== undefined) sendError(consumer.sink, code);
+    if (code !== undefined) sendError(consumer.sink, code, endpointTrustFailed);
   }
 
-  #fail(group: OwnerGroup, code: Code): void {
+  #fail(group: OwnerGroup, code: Code, endpointTrustFailed?: true): void {
     group.closing = true; group.abort.abort();
-    for (const consumer of [...group.consumers]) this.#close(consumer, code);
+    for (const consumer of [...group.consumers]) this.#close(consumer, code, endpointTrustFailed);
   }
 }
 
 function validOwner(owner: SharedOwnerEventsOwner): boolean {
   if (![owner.profileId, owner.serverId, owner.deviceId].every(value => typeof value === "string" && value.length > 0 && value.length <= 256)) return false;
+  if (owner.endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(owner.endpointPublicKey)) return false;
   try { return normalizeOrchestratorOrigin(owner.origin) === owner.origin; } catch { return false; }
 }
 function validCursor(cursor: EventCursor | undefined): cursor is EventCursor {
@@ -192,12 +210,13 @@ function copyCursor(cursor: EventCursor): EventCursor {
   return { ...cursor, ...(cursor.issuedAt === undefined ? {} : { issuedAt: { ...cursor.issuedAt } }) };
 }
 function sameOwner(left: SharedOwnerEventsOwner, right: SharedOwnerEventsOwner): boolean {
-  return left.profileId === right.profileId && left.serverId === right.serverId && left.deviceId === right.deviceId && left.origin === right.origin;
+  return left.profileId === right.profileId && left.serverId === right.serverId && left.deviceId === right.deviceId && left.origin === right.origin && left.endpointPublicKey === right.endpointPublicKey;
 }
 function rejectSubscription(sink: SharedOwnerEventsSink, code: Code): SharedOwnerEventsSubscription {
   sendError(sink, code); return CLOSED_SUBSCRIPTION;
 }
-function sendError(sink: SharedOwnerEventsSink, code: Code): void {
+function sendError(sink: SharedOwnerEventsSink, code: Code, endpointTrustFailed?: true): void {
+  if (endpointTrustFailed) { try { sink.error(code, "The node security check failed.", true); } catch { /* Retired receiver. */ } return; }
   const message = code === Code.Unauthenticated || code === Code.PermissionDenied ? "The event connection is no longer authorized."
     : code === Code.OutOfRange || code === Code.FailedPrecondition ? "The event cursor must be refreshed."
       : code === Code.InvalidArgument ? "The event subscription is invalid."

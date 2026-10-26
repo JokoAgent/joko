@@ -2,19 +2,20 @@ import { randomUUID } from "node:crypto";
 import { ipcMain, protocol, session, type IpcMainInvokeEvent, type WebContents, type WebFrameMain, type OnBeforeRequestListenerDetails } from "electron";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { createClient, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport } from "@joko/connection-transport/node";
 import { ConnectionService, McpAppService, McpAppNativeService, McpAppOperation, McpAppNativeOperation,
   McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema, mcpAppDirectSandboxDocument, mcpAppFrameUrlAllowed,
   type McpAppServiceOperateRequest, type McpAppNativeDocument } from "@joko/contracts";
 import { DesktopMainDocumentOccurrenceAuthority } from "./main-document-occurrence.js";
 import { isAllowedRendererNetworkUrl } from "./security.js";
+import { desktopEndpointTrust } from './connection-transport.js';
 
 export const MCP_APP_SCHEME = "joko-mcp-app";
 export const MCP_APP_CHANNEL = "joko:mcp-app:operate";
 export const MCP_APP_CAPTURE = "joko:mcp-app:document";
 const FRAME_HEADER = "X-Joko-Mcp-App-Frame";
 const MAX_BYTES = 4 * 1024 * 1024;
-interface Owner { readonly profileId: string; readonly serverId: string; readonly origin: string }
+interface Owner { readonly profileId: string; readonly serverId: string; readonly origin: string; readonly endpointPublicKey?: string; readonly transportKind?: 'https' | 'iroh' | 'tailcat' | 'webrtc' | 'http-connect' }
 interface Route { readonly owner: Owner; readonly transport: Transport; readonly assertCurrent: () => void; readonly uiOwnerId: string }
 interface Entry { readonly localId: string; readonly document: McpAppNativeDocument; readonly contents: WebContents;
   readonly route: Route; readonly request: McpAppServiceOperateRequest; readonly key: string; frame?: WebFrameMain }
@@ -106,8 +107,18 @@ export class DesktopMcpAppHost {
     } catch { return false; }
   }
   isAppFrame(frame: WebFrameMain | undefined): boolean {
-    for (let current = frame; current; current = current.parent ?? undefined) {
-      try { const url = new URL(current.url); if (url.protocol === `${MCP_APP_SCHEME}:` && this.#documents.has(url.hostname.replace(/-view$/u, ""))) return true; } catch { /* No committed frame URL yet. */ }
+    for (let current = frame; current;) {
+      try {
+        if (current.isDestroyed()) return false;
+        const value = current.url;
+        try { const url = new URL(value); if (url.protocol === `${MCP_APP_SCHEME}:` && this.#documents.has(url.hostname.replace(/-view$/u, ""))) return true; }
+        catch { /* An uncommitted child can still have a registered parent. */ }
+        current = current.parent ?? undefined;
+      } catch {
+        // Retired native frames receive the ordinary application CSP; they
+        // cannot grant an MCP exemption or interrupt the response callback.
+        return false;
+      }
     }
     return false;
   }
@@ -122,11 +133,12 @@ export class DesktopMcpAppHost {
         || !sameOwner(this.#owners.get(event.sender), owner)) throw new Error("Application owner retired");
     };
     assertCurrent();
-    const identity = await createClient(ConnectionService, createConnectTransport({ baseUrl: owner.origin, httpVersion: "1.1", defaultTimeoutMs: 5000 })).getServerInfo({});
+    const trust = await desktopEndpointTrust(owner, this.deps.readAuthKey); assertCurrent();
+    const identity = await createClient(ConnectionService, createConnectTransport({ baseUrl: owner.origin, ...trust, httpVersion: "1.1", defaultTimeoutMs: 5000 })).getServerInfo({});
     assertCurrent(); if (identity.server?.serverId !== owner.serverId) throw new Error("Application node identity changed");
     const key = await this.deps.readAuthKey(owner.profileId); assertCurrent();
     if (!key || !/^[A-Za-z0-9_-]{43}$/u.test(key)) throw new Error("Application authorization unavailable");
-    const transport = createConnectTransport({ baseUrl: owner.origin, httpVersion: "1.1", defaultTimeoutMs: 120_000,
+    const transport = createConnectTransport({ baseUrl: owner.origin, ...trust, httpVersion: "1.1", defaultTimeoutMs: 120_000,
       interceptors: [next => request => { request.header.set("authorization", `Bearer ${key}`); return next(request); }] });
     return { owner, transport, assertCurrent, uiOwnerId: `desktop-${event.sender.id}-${occurrence}` };
   }
@@ -197,11 +209,13 @@ export class DesktopMcpAppHost {
     });
   }
 }
-function sameOwner(a: Owner | undefined, b: Owner): boolean { return a?.profileId === b.profileId && a.serverId === b.serverId && a.origin === b.origin; }
+function sameOwner(a: Owner | undefined, b: Owner): boolean { return a?.profileId === b.profileId && a.serverId === b.serverId && a.origin === b.origin && a.endpointPublicKey === b.endpointPublicKey && (a.transportKind ?? 'https') === (b.transportKind ?? 'https'); }
 function parseOwner(value: unknown): Owner {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid application owner");
   const owner = value as Owner;
-  if (Object.keys(owner).sort().join(",") !== "origin,profileId,serverId" || [owner.profileId, owner.serverId, owner.origin].some(item => typeof item !== "string" || !item || item.length > 2048)
+  if (Object.keys(owner).filter(key => key !== "endpointPublicKey" && key !== 'transportKind').sort().join(",") !== "origin,profileId,serverId" || [owner.profileId, owner.serverId, owner.origin].some(item => typeof item !== "string" || !item || item.length > 2048)
     || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/u.test(owner.profileId) || !isAllowedRendererNetworkUrl(owner.origin) || new URL(owner.origin).origin !== owner.origin) throw new Error("Invalid application owner");
+  if (owner.endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(owner.endpointPublicKey)) throw new Error("Invalid endpoint public key.");
+  if (owner.transportKind !== undefined && !['https', 'iroh', 'tailcat', 'webrtc', 'http-connect'].includes(owner.transportKind)) throw new Error('Invalid connection transport.');
   return Object.freeze({ ...owner });
 }

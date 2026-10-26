@@ -148,8 +148,11 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     const firstPair = await fixture.pair("Sharing editor");
     const secondPair = await peerFixture.pair("Sharing phone");
     const first = firstPair.clients.voiceInput;
+    const firstEndpointPublicKey = fixture.application.linkspanIdentity!.publicKey;
     const credential = { profileId: "sharing-phone", origin: peerFixture.baseUrl, serverId: peerFixture.application.serverId,
+      endpointPublicKey: peerFixture.application.linkspanIdentity!.publicKey,
       connectionId: secondPair.connectionId, deviceId: secondPair.deviceId, displayName: "Sharing phone", authKey: secondPair.authKey };
+    expect(credential.endpointPublicKey).not.toBe(firstEndpointPublicKey);
     const dictionaryRequest = create(GetVoiceInputDictionaryRequestSchema);
     for (const [api, term] of [[first, "OfficeTerm"], [secondPair.clients.voiceInput, "PhoneTerm"]] as const) {
       const initial = (await api.getVoiceInputDictionary(dictionaryRequest)).dictionary!;
@@ -223,6 +226,9 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     currentPhoneAbort.abort(); await Promise.all([phoneContent.done, phoneSharing.done]);
     await peerFixture.close({ removeRoot: false });
     peerFixture = await OrchestratorE2eFixture.start({ rootDirectory, dictionaryPeerNodeId: "e2e-dictionary-second" });
+    expect(peerFixture.application.serverId).toBe(credential.serverId);
+    expect(peerFixture.application.linkspanIdentity!.publicKey).toBe(credential.endpointPublicKey);
+    expect(fixture.application.linkspanIdentity!.publicKey).toBe(firstEndpointPublicKey);
     const restoredCredential = { ...credential, origin: peerFixture.baseUrl };
     currentPhoneAbort = new AbortController();
     phoneContent = observedProjection(mobileNetwork.watchVoiceInputDictionary(restoredCredential, currentPhoneAbort.signal), currentPhoneAbort.signal);
@@ -243,10 +249,20 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     expect((await mobileNetwork.getVoiceInputDictionary(restoredCredential)).refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
     await expect(mobileNetwork.syncVoiceInputDictionaryNow(restoredCredential, revoked.configurationRevision, a.nodeId)).rejects.toMatchObject({ code: Code.Unavailable });
     await vi.waitFor(() => expect(phoneSharing.latest).toMatchObject({ configurationRevision: revoked.configurationRevision, peers: [] }));
-    peerFixture.application.connections.revoke(secondPair.connectionId);
-    await Promise.all([phoneContent.done, phoneSharing.done]);
     expect(phoneContent.error).toBeUndefined(); expect(phoneSharing.error).toBeUndefined();
+    expect(currentPhoneAbort.signal.aborted).toBe(false);
+    peerFixture.application.connections.revoke(secondPair.connectionId);
+    await dictionaryDeadline(Promise.all([phoneContent.done, phoneSharing.done]), 5_000);
+    expect(currentPhoneAbort.signal.aborted).toBe(false);
+    // The ingress immediately aborts an authenticated channel on revocation.
+    // Depending on whether the handler's EOF was already delivered, the live
+    // watch ends normally or reports this exact carrier retirement failure.
+    for (const error of [phoneContent.error, phoneSharing.error]) {
+      if (error !== undefined) expect(error).toMatchObject({ name: "ConnectError", code: Code.Unknown,
+        cause: { name: "LinkspanError", code: "transport_error" } });
+    }
     await expect(mobileNetwork.getVoiceInputDictionary(restoredCredential)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    await expect(mobileNetwork.getVoiceInputDictionaryPeerStatus(restoredCredential)).rejects.toMatchObject({ code: Code.Unauthenticated });
     expect(firstContent.error).toBeUndefined(); expect(firstSharing.error).toBeUndefined();
   }, 40_000);
 
@@ -260,31 +276,35 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     const { profileFromCredential } = await import(new URL("../../mobile/src/connection-storage.ts", import.meta.url).href);
     fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "readonly-node-a", keepRoot: true });
     peerFixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "readonly-node-b", keepRoot: true });
-    const originalFetch = globalThis.fetch;
-    const streamSignals: Array<{ method: string; signal: AbortSignal }> = [];
-    const readonlyRequests = new Map<string, { started: number; headersReceived: number; failed: number }>();
-    const fetchProbe = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-      const url = input instanceof Request ? input.url : String(input);
-      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-      if (signal && (url.endsWith("/StreamEvents") || url.endsWith("/WatchVoiceInputDictionaryReadOnly"))) {
-        streamSignals.push({ method: new URL(url).pathname.split("/").at(-1)!, signal });
-      }
-      const phase = ["GetServerInfo", "GetSnapshot", "GetVoiceInputDictionaryReadOnly", "WatchVoiceInputDictionaryReadOnly"]
-        .find((method) => url.endsWith(`/${method}`));
-      const progress = phase === undefined ? undefined : readonlyRequests.get(phase) ?? { started: 0, headersReceived: 0, failed: 0 };
-      if (phase !== undefined && progress) { readonlyRequests.set(phase, progress); progress.started += 1; }
+    const streamSignals: Array<{ method: string; signal: AbortSignal; done: Promise<void> }> = [];
+    const readonlyRequests = new Map<string, { started: number; responses: number; failed: number }>();
+    async function* observeStream<T>(method: string, signal: AbortSignal, stream: AsyncIterable<T>) {
+      let finish!: () => void;
+      streamSignals.push({ method, signal, done: new Promise<void>(resolve => { finish = resolve; }) });
+      const progress = readonlyRequests.get(method) ?? { started: 0, responses: 0, failed: 0 };
+      readonlyRequests.set(method, progress); progress.started += 1;
       try {
-        const response = await originalFetch(input, init);
-        if (progress) progress.headersReceived += 1;
-        return response;
-      } catch (error) { if (progress) progress.failed += 1; throw error; }
-    });
-    streamCleanups.push(async () => { fetchProbe.mockRestore(); });
+        for await (const response of stream) { progress.responses += 1; yield response; }
+      } catch (error) { if (!signal.aborted) progress.failed += 1; throw error; }
+      finally { finish(); }
+    }
+    // Observe the original owner signals and real RPC iterator completion.
+    // Linkspan carries these requests without going through global fetch.
+    const originalOwnerStream = mobileNetwork.streamOwner.bind(mobileNetwork);
+    const originalReadonlyStream = mobileNetwork.watchVoiceInputDictionaryReadOnly.bind(mobileNetwork);
+    const ownerProbe = vi.spyOn(mobileNetwork, "streamOwner").mockImplementation((...args: unknown[]) =>
+      observeStream("StreamEvents", args[2] as AbortSignal, originalOwnerStream(...args)));
+    const readonlyProbe = vi.spyOn(mobileNetwork, "watchVoiceInputDictionaryReadOnly").mockImplementation((...args: unknown[]) =>
+      observeStream("WatchVoiceInputDictionaryReadOnly", args[1] as AbortSignal, originalReadonlyStream(...args)));
+    streamCleanups.push(async () => { ownerProbe.mockRestore(); readonlyProbe.mockRestore(); });
     await expect(fixture.anonymous.voiceInput.getVoiceInputDictionaryReadOnly({})).rejects.toMatchObject({ code: Code.Unauthenticated });
     const pairPhone = async (source: OrchestratorE2eFixture) => {
       const deviceNameSource = { defaultDisplayName: "Fixture readonly phone" };
       const begun = await mobileNetwork.requestPairing(source.baseUrl, "Readonly phone", "android", deviceNameSource);
-      return (await mobileNetwork.completePairing(source.baseUrl, begun.challengeId, source.pairingCode(begun.challengeId), "Readonly phone", "android", deviceNameSource)).credential;
+      const credential = (await mobileNetwork.completePairing(source.baseUrl, begun.challengeId, source.pairingCode(begun.challengeId), "Readonly phone", "android", deviceNameSource)).credential;
+      expect(credential.serverId).toBe(source.application.serverId);
+      expect(credential.endpointPublicKey).toBe(source.application.linkspanIdentity!.publicKey);
+      return credential;
     };
     const a = await pairPhone(fixture); const b = await pairPhone(peerFixture);
     for (const [credential, terms] of [[a, ["OfficeTerm", "DeleteMe"]], [b, ["PhoneTerm"]]] as const) {
@@ -364,7 +384,10 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     const portA = Number(new URL(fixture.baseUrl).port); const portB = Number(new URL(peerFixture.baseUrl).port);
     phone.stop();
     expect(streamSignals.length).toBeGreaterThan(2);
+    expect(streamSignals.some(request => request.method === "StreamEvents")).toBe(true);
+    expect(streamSignals.filter(request => request.method === "WatchVoiceInputDictionaryReadOnly").length).toBeGreaterThanOrEqual(2);
     expect(streamSignals.every((request) => request.signal.aborted)).toBe(true);
+    await dictionaryDeadline(Promise.all(streamSignals.map(request => request.done)), 5_000);
     await peerFixture.close({ removeRoot: false });
     let closed = false;
     void fixture.close({ removeRoot: false }).then(() => { closed = true; });
@@ -375,6 +398,9 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     expect(credentials.has(a.profileId)).toBe(true); expect(credentials.has(b.profileId)).toBe(true);
     fixture = await OrchestratorE2eFixture.start({ rootDirectory: rootA, dictionaryPeerNodeId: "readonly-node-a", publicPort: portA });
     peerFixture = await OrchestratorE2eFixture.start({ rootDirectory: rootB, dictionaryPeerNodeId: "readonly-node-b", publicPort: portB });
+    expect(fixture.application.serverId).toBe(a.serverId); expect(peerFixture.application.serverId).toBe(b.serverId);
+    expect(fixture.application.linkspanIdentity!.publicKey).toBe(a.endpointPublicKey);
+    expect(peerFixture.application.linkspanIdentity!.publicKey).toBe(b.endpointPublicKey);
     expect((await mobileNetwork.getVoiceInputDictionaryReadOnly(a))).toEqual(disabledSnapshot);
     phone.controller.setVisible(false); await phone.app.connectSaved(a.profileId); phone.controller.setVisible(true);
     await vi.waitFor(() => expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]), { timeout: 5_000 });

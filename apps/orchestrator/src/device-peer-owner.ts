@@ -87,10 +87,14 @@ export class DevicePeerAuthorityError extends Error {
 export class DevicePeerOwner {
   readonly #store: OperationalStore;
   readonly #routes: DevicePeerRouteRegistry;
+  readonly #localDesktopHostConnection: ((connection: ConnectionRecord) => boolean) | undefined;
+  readonly #localDesktopRoutes = new Map<string, { readonly connection: ConnectionRecord; readonly generation: number }>();
 
-  constructor(options: { readonly store: OperationalStore; readonly routes?: DevicePeerRouteRegistry }) {
+  constructor(options: { readonly store: OperationalStore; readonly routes?: DevicePeerRouteRegistry;
+    readonly localDesktopHostConnection?: (connection: ConnectionRecord) => boolean }) {
     this.#store = options.store;
     this.#routes = options.routes ?? new DevicePeerRouteRegistry();
+    this.#localDesktopHostConnection = options.localDesktopHostConnection;
   }
 
   registerRoute(
@@ -101,7 +105,23 @@ export class DevicePeerOwner {
     const current = this.#currentConnection(connection);
     const device = this.#store.getDevice(current.deviceId);
     requireAgentDevice(device);
-    return this.#routes.registerRoute(device.id, transport, options);
+    const lease = this.#routes.registerRoute(device.id, transport, options);
+    this.#localDesktopRoutes.delete(device.id);
+    if (this.#localDesktopHostConnection?.(current) === true) this.#localDesktopRoutes.set(device.id, { connection: current, generation: lease.routeGeneration });
+    return lease;
+  }
+
+  /** Registered only from an independently authenticated managed Desktop agent;
+   * never inferred from an SDP address, platform string or Desktop kind. */
+  isLocalDesktopRoute(identity: Pick<DevicePeerSelectionIdentity, "targetDeviceId" | "routeGeneration">): boolean {
+    const proof = this.#localDesktopRoutes.get(identity.targetDeviceId);
+    if (!proof || proof.generation !== identity.routeGeneration || this.#routes.getRoute(identity.targetDeviceId)?.routeGeneration !== identity.routeGeneration) return false;
+    try { return this.#localDesktopHostConnection?.(this.#currentConnection(proof.connection)) === true; }
+    catch { return false; }
+  }
+
+  localDesktopRouteConnectionId(identity: Pick<DevicePeerSelectionIdentity, "targetDeviceId" | "routeGeneration">): string | undefined {
+    return this.isLocalDesktopRoute(identity) ? this.#localDesktopRoutes.get(identity.targetDeviceId)?.connection.id : undefined;
   }
 
   activateRoute(identity: Pick<DevicePeerRouteLease, "targetDeviceId" | "routeGeneration">): DevicePeerRouteLease {
@@ -112,7 +132,9 @@ export class DevicePeerOwner {
     identity: Pick<DevicePeerRouteLease, "targetDeviceId" | "routeGeneration">,
     reason: "replaced" | "connection_closed" | "authority_changed" | "shutdown"
   ): boolean {
-    return this.#routes.retireRoute(identity, reason);
+    const retired = this.#routes.retireRoute(identity, reason);
+    if (retired && this.#localDesktopRoutes.get(identity.targetDeviceId)?.generation === identity.routeGeneration) this.#localDesktopRoutes.delete(identity.targetDeviceId);
+    return retired;
   }
 
   list(controller: ConnectionRecord): readonly DevicePeerSelectionView[] {
@@ -417,6 +439,7 @@ export class DevicePeerOwner {
 
   shutdown(): void {
     this.#routes.shutdown();
+    this.#localDesktopRoutes.clear();
   }
 
   #streamLease(

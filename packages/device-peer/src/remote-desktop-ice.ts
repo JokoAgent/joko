@@ -1,3 +1,5 @@
+import { REMOTE_DESKTOP_ICE_LIMITS } from '@joko/contracts';
+
 /** One bounded ICE candidate exchanged for an active remote-desktop media attempt. */
 export interface RemoteDesktopIceCandidate {
   readonly candidate: string;
@@ -40,8 +42,7 @@ export const REMOTE_DESKTOP_INVOKE_MS = REMOTE_DESKTOP_OFFER_BUDGET.captureReady
   + 5_000;
 
 export const REMOTE_DESKTOP_NETWORK = Object.freeze({
-  maxCandidates: 128,
-  batchSize: 16,
+  ...REMOTE_DESKTOP_ICE_LIMITS,
   pollMs: 250,
   exchangeMs: 30_000,
   disconnectedMs: 5_000,

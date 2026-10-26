@@ -27,6 +27,7 @@ async function mount() {
     displayName: "Node", version: "1", apiVersion: "1", pairingEnabled: false }));
   vi.spyOn(LocalState, "open").mockResolvedValue({ listProfiles: async () => [first, second], listMachineCaches: async () => [],
     readPreferences: async () => DEFAULT_UI_PREFERENCES, readAuthKey: async () => "fixture-auth", saveProfile: async () => undefined,
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
     saveMachineCache: async () => undefined, deleteMachineCache: async () => undefined } as unknown as LocalState);
   const histories = new Map<string, Promise<UsageHistoryView>>(), report = vi.fn(async () => ({ entries: [], nextPageToken: "" }));
   const refreshes: Array<{ profileId: string; backendId: string; providerId: string }> = [], refreshWaits = new Map<string, Promise<void>>();

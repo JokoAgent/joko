@@ -8,7 +8,8 @@
     "types": ["node", "vitest/globals"]
   },
   "references": [
-    { "path": "../contracts" }
+    { "path": "../contracts" },
+    { "path": "../connection-transport" }
   ],
   "include": ["src/**/*.ts"]
 }

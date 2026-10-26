@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient, type Client } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport } from "@joko/connection-transport/node";
 import * as contract from "@joko/contracts";
 import type { OperationalStore } from "@joko/store";
 import type { CredentialVault, EncryptedCredential } from "./credential-vault.js";
@@ -23,6 +23,7 @@ interface Grant {
 }
 interface Link {
   readonly id: string; readonly authorityServerId: string; readonly partnerId: string; readonly origin: string;
+  readonly endpointPublicKey: string;
   readonly grantId: string; readonly sealed: EncryptedCredential; readonly invitationHash: string;
   name: string; description: string; alias: string; status: "active" | "removed";
   joinId: string; pendingOperation: string; pendingShareId: string;
@@ -38,10 +39,12 @@ export class PartnerIdentityDirectory {
   #host: TaskSharingHost | undefined;
   readonly #issueReplies = new Map<string, string>();
   readonly #busy = new Set<string>();
-  constructor(readonly options: { readonly store: OperationalStore; readonly serverId: string; readonly origin: string;
+  constructor(readonly options: { readonly store: OperationalStore; readonly serverId: string; readonly origin: string | (() => string); readonly endpointPublicKey: string;
     readonly vault: CredentialVault; readonly home: TaskSharingHome;
     readonly partner: (id: string) => PartnerIdentityProfile;
-    readonly connect?: (origin: string) => PartnerIdentityRemote }) {}
+    readonly connect?: (origin: string, endpointPublicKey: string) => PartnerIdentityRemote }) {}
+
+  #origin(): string { return contract.taskShareOrigin(typeof this.options.origin === "string" ? this.options.origin : this.options.origin()); }
 
   attachHost(host: TaskSharingHost): void { this.#host = host; }
   #sharing(): TaskSharingHost { if (!this.#host) throw new ConnectError("Task sharing is unavailable.", Code.Unavailable); return this.#host; }
@@ -52,11 +55,12 @@ export class PartnerIdentityDirectory {
   #saveGrant(row: Grant): void { this.options.store.setSetting("service", grantScope, `grant:${row.id}`, row); }
   #link(id: string): Link {
     const row = this.options.store.findSetting<Link>("service", homeScope, contract.taskShareIdentity(id))?.value;
-    if (!row || row.status !== "active") throw new ConnectError("This partner alias is unavailable.", Code.NotFound); return row;
+    if (!row || row.status !== "active") throw new ConnectError("This partner alias is unavailable.", Code.NotFound);
+    contract.taskShareEndpointPublicKey(row.endpointPublicKey); return row;
   }
   #saveLink(row: Link): void { this.options.store.setSetting("service", homeScope, row.id, row); }
-  #reference(row: Pick<Link, "id" | "authorityServerId" | "partnerId" | "grantId">): string {
-    return `partner-identity:${this.options.serverId}:${row.id}:${row.authorityServerId}:${row.partnerId}:${row.grantId}`;
+  #reference(row: Pick<Link, "id" | "authorityServerId" | "partnerId" | "grantId" | "origin" | "endpointPublicKey">): string {
+    return `partner-identity:${this.options.serverId}:${row.id}:${row.authorityServerId}:${row.partnerId}:${row.grantId}:${row.origin}:${contract.taskShareEndpointPublicKey(row.endpointPublicKey)}`;
   }
   #identity(partnerId: string, name: string, description: string, authorityServerId = this.options.serverId): contract.PartnerIdentity {
     return create(contract.PartnerIdentitySchema, { authorityServerId, partnerId, displayName: name, description });
@@ -88,7 +92,7 @@ export class PartnerIdentityDirectory {
       this.#saveGrant({ id, partnerId: profile.id, name: profile.name, description: profile.description, secretHash: digest(secret),
         status: "active", scopeEpoch: 0, shareId: "", sessionId: "" });
       invitation = contract.buildPartnerIdentityInvitation({ authorityServerId: this.options.serverId, partnerId: profile.id,
-        origin: this.options.origin, grantId: id, secret });
+        origin: this.#origin(), endpointPublicKey: this.options.endpointPublicKey, grantId: id, secret });
       return id;
     });
     if (!invitation) throw denied(); this.#issueReplies.set(request.operationId, invitation);
@@ -143,7 +147,7 @@ export class PartnerIdentityDirectory {
     const invited = host.invite({ operationId: op("invite", [grant.id, request.operationId, grant.scopeEpoch]), shareId: grant.shareId });
     return create(contract.ResolvePartnerIdentityResponseSchema, { identity: this.#identity(profile.id, profile.name, profile.description), ...invited });
   }
-  #remote(origin: string): PartnerIdentityRemote { return (this.options.connect ?? createPartnerIdentityRemote)(contract.taskShareOrigin(origin)); }
+  #remote(origin: string, endpointPublicKey: string): PartnerIdentityRemote { return (this.options.connect ?? createPartnerIdentityRemote)(contract.taskShareOrigin(origin), contract.taskShareEndpointPublicKey(endpointPublicKey)); }
   #checkIdentity(value: contract.PartnerIdentity | undefined, row: Pick<Link, "authorityServerId" | "partnerId">): contract.PartnerIdentity {
     if (!value || value.authorityServerId !== row.authorityServerId || value.partnerId !== row.partnerId || !value.displayName.trim()) throw denied(); return value;
   }
@@ -156,7 +160,7 @@ export class PartnerIdentityDirectory {
     if (parsed.authorityServerId === this.options.serverId) throw new ConnectError("Open your own Partner from its directory.", Code.FailedPrecondition);
     const id = `partner-${digest(JSON.stringify([parsed.authorityServerId, parsed.partnerId]))}`;
     return this.#lock(id, async () => {
-      const remote = this.#remote(parsed.origin); auth.assertCurrent(); await remote.verify(parsed.authorityServerId, auth.signal); auth.assertCurrent();
+      const remote = this.#remote(parsed.origin, parsed.endpointPublicKey); auth.assertCurrent(); await remote.verify(parsed.authorityServerId, auth.signal); auth.assertCurrent();
       const response = await remote.client.inspectPartnerIdentity({ grantId: parsed.grantId, partnerId: parsed.partnerId },
         { signal: auth.signal, headers: { authorization: `PartnerIdentity ${parsed.secret}` } }); auth.assertCurrent();
       const identity = this.#checkIdentity(response.identity, parsed);
@@ -167,7 +171,7 @@ export class PartnerIdentityDirectory {
         await this.options.home.leave(op("replace", [id, parsed.grantId, previous.joinId]), previous.joinId, auth); auth.assertCurrent();
       }
       const row: Link = { id, authorityServerId: parsed.authorityServerId, partnerId: parsed.partnerId, grantId: parsed.grantId,
-        origin: parsed.origin, invitationHash: digest(invitation), name: identity.displayName, description: identity.description,
+        origin: parsed.origin, endpointPublicKey: parsed.endpointPublicKey, invitationHash: digest(invitation), name: identity.displayName, description: identity.description,
         alias: validAlias(alias || previous?.alias || identity.displayName), status: "active", joinId: previous?.grantId === parsed.grantId ? previous.joinId : "", pendingOperation: "", pendingShareId: "",
         sealed: this.options.vault.seal(parsed.secret, this.#reference({ id, ...parsed })) };
       this.#saveLink(row); auth.assertCurrent(); return this.#publicLink(row);
@@ -206,14 +210,15 @@ export class PartnerIdentityDirectory {
           this.#saveLink(row);
         }
       }
-      const remote = this.#remote(row.origin);
+      const remote = this.#remote(row.origin, row.endpointPublicKey);
       await remote.verify(row.authorityServerId, auth.signal); auth.assertCurrent();
       const secret = this.options.vault.open(row.sealed, this.#reference(row));
       const response = await remote.client.resolvePartnerIdentity({ operationId: request.operationId, grantId: row.grantId, partnerId: row.partnerId },
         { signal: auth.signal, headers: { authorization: `PartnerIdentity ${secret}` } }); auth.assertCurrent();
       const identity = this.#checkIdentity(response.identity, row), invitation = contract.parseTaskShareInvitation(response.invitation), share = response.share;
-      if (!share || share.status !== "active" || share.hostServerId !== row.authorityServerId || share.hostOrigin !== row.origin
-        || invitation.hostOrigin !== row.origin || invitation.hostServerId !== row.authorityServerId || invitation.shareId !== share.shareId
+      if (!share || share.status !== "active" || share.hostServerId !== row.authorityServerId || share.hostOrigin !== invitation.hostOrigin
+        || invitation.hostServerId !== row.authorityServerId || invitation.shareId !== share.shareId
+        || invitation.endpointPublicKey !== row.endpointPublicKey
         || invitation.shareGeneration !== share.shareGeneration || !share.sessionId) throw denied();
       row = this.#link(row.id);
       if (uncertain) {
@@ -230,7 +235,10 @@ export class PartnerIdentityDirectory {
         this.#saveLink(row); return create(contract.OpenPartnerIdentityResponseSchema, { link: this.#publicLink(row), joined: existing });
       }
       row.pendingOperation = op("join", [row.id, request.operationId, share.shareId]); row.pendingShareId = share.shareId; this.#saveLink(row); auth.assertCurrent();
-      const intent = await this.options.home.join(row.pendingOperation, response.invitation, request.displayName, auth); auth.assertCurrent();
+      // A verified authority may publish a new entrance. This alias keeps the
+      // locator and pin captured at import until the user explicitly replaces it.
+      const pinnedInvitation = contract.buildTaskShareInvitation({ ...invitation, hostOrigin: row.origin });
+      const intent = await this.options.home.join(row.pendingOperation, pinnedInvitation, request.displayName, auth); auth.assertCurrent();
       if (intent.status === "joined" && intent.joined) { row.joinId = intent.joined.joinId; row.pendingOperation = ""; row.pendingShareId = ""; }
       else if (intent.status === "failed") { row.pendingOperation = ""; row.pendingShareId = ""; }
       this.#saveLink(row);
@@ -241,9 +249,22 @@ export class PartnerIdentityDirectory {
 function validAlias(value: string): string {
   const alias = value.trim(); if (!alias || alias.length > 128) throw new ConnectError("A partner alias is required.", Code.InvalidArgument); return alias;
 }
+/** Local recovery revokes every inbound proof; linked foreign identities and history remain. */
+export function revokeAllPartnerIdentityGrants(store: OperationalStore): number {
+  let revoked = 0;
+  for (const row of store.listSettingsByKeyPrefix("service", grantScope, "grant:")) {
+    const grant = row.value as Grant;
+    contract.taskShareIdentity(grant.id);
+    if (!["active", "revoked"].includes(grant.status)) throw denied();
+    if (grant.status === "active") {
+      store.setSetting("service", grantScope, row.key, { ...grant, status: "revoked" }); revoked++;
+    }
+  }
+  return revoked;
+}
 /** Verify the stable node without a credential, then use only the identity scheme. */
-export function createPartnerIdentityRemote(origin: string): PartnerIdentityRemote {
-  const transport = createConnectTransport({ baseUrl: contract.taskShareOrigin(origin), httpVersion: "1.1", useBinaryFormat: true,
+export function createPartnerIdentityRemote(origin: string, endpointPublicKey: string): PartnerIdentityRemote {
+  const transport = createConnectTransport({ baseUrl: contract.taskShareOrigin(origin), endpointPublicKey: contract.taskShareEndpointPublicKey(endpointPublicKey), httpVersion: "1.1", useBinaryFormat: true,
     defaultTimeoutMs: 15_000, readMaxBytes: 4 * 1024 * 1024, writeMaxBytes: 64 * 1024 });
   const identity = createClient(contract.ConnectionService, transport);
   return { client: createClient(contract.PartnerIdentityGuestService, transport), verify: async (serverId, signal) => {

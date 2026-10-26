@@ -27,9 +27,10 @@ export class DesktopRemoteDesktopViewerPresentation {
     readonly create: () => BrowserWindow;
     readonly created: (window: BrowserWindow) => void;
     readonly current: () => boolean;
-    readonly retire: () => void;
+    readonly retire: (deferNativeCleanup?: boolean) => void;
     readonly changed: () => void;
     readonly platform: NodeJS.Platform;
+    readonly observeNativeCleanup?: (stage: string) => void;
   }) { this.#window = window; this.#bind(window); }
 
   get active(): boolean { return this.#visible && !this.#disposed; }
@@ -97,8 +98,9 @@ export class DesktopRemoteDesktopViewerPresentation {
     if (reopen) this.#scheduleOpen(window);
   }
 
-  failed(window: BrowserWindow): void {
-    if (!this.#current(window)) return;
+  failed(window: BrowserWindow, deferNativeCleanup = false): void {
+    this.#observeNativeCleanup("viewer_presentation_failed_entered");
+    if (!this.#current(window)) { this.#observeNativeCleanup("viewer_presentation_failed_inactive"); return; }
     this.#nativeFullscreenTarget = undefined;
     const reopen = this.#visible || this.#pendingOpen;
     this.#clearOpen(); this.#clearStability(); this.#clearLeave();
@@ -106,8 +108,10 @@ export class DesktopRemoteDesktopViewerPresentation {
     this.#ready = false; this.#loading = true; this.#visible = false; this.#pendingOpen = false;
     this.#enteringNativeFullscreen = false;
     this.#window = undefined;
-    this.deps.retire();
-    if (!window.isDestroyed()) window.destroy();
+    this.#observeNativeCleanup("viewer_failed_authority_retire_started");
+    this.deps.retire(deferNativeCleanup);
+    this.#observeNativeCleanup("viewer_failed_authority_retire_completed");
+    this.#destroyNativeWindow(window, deferNativeCleanup, "failed");
     if (!reopen || this.#disposed || !this.deps.current()
       || this.#automaticRecoveryAttempts >= MAX_AUTOMATIC_RECOVERY_ATTEMPTS) return;
     ++this.#automaticRecoveryAttempts;
@@ -140,14 +144,36 @@ export class DesktopRemoteDesktopViewerPresentation {
     } else hide();
   }
 
-  dispose(): void {
-    if (this.#disposed) return;
+  dispose(deferNativeCleanup = false): void {
+    this.#observeNativeCleanup("viewer_native_dispose_entered");
+    if (this.#disposed) { this.#observeNativeCleanup("viewer_native_dispose_already_disposed"); return; }
     this.#nativeFullscreenTarget = undefined;
     this.#clearOpen(); this.#clearStability(); this.#clearLeave();
     this.#disposed = true; ++this.#visibilityGeneration;
     this.#pendingOpen = false; this.#visible = false; this.#enteringNativeFullscreen = false;
     const window = this.#window; this.#window = undefined;
-    if (window && !window.isDestroyed()) window.destroy();
+    if (window) this.#destroyNativeWindow(window, deferNativeCleanup, "dispose");
+    this.#observeNativeCleanup("viewer_native_dispose_returned");
+  }
+
+  #destroyNativeWindow(window: BrowserWindow, deferred: boolean, source: "failed" | "dispose"): void {
+    const destroy = (): void => {
+      this.#observeNativeCleanup(`viewer_${source}_native_state_check_started`);
+      const destroyed = window.isDestroyed();
+      this.#observeNativeCleanup(`viewer_${source}_native_state_check_completed`);
+      if (!destroyed) {
+        this.#observeNativeCleanup(`viewer_${source}_native_destroy_started`);
+        window.destroy();
+        this.#observeNativeCleanup(`viewer_${source}_native_destroy_returned`);
+      }
+    };
+    // Authority is already retired. Keep Chromium's gone callback free of
+    // native destruction, and retain only the original window for cleanup.
+    if (deferred) setImmediate(destroy); else destroy();
+  }
+
+  #observeNativeCleanup(stage: string): void {
+    try { this.deps.observeNativeCleanup?.(stage); } catch { /* Diagnostics never own native cleanup. */ }
   }
 
   #ensureWindow(): BrowserWindow | undefined {

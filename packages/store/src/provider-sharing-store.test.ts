@@ -11,6 +11,21 @@ function setup() {
     person: { name: "Recipient", avatarUrl: null }, requestDigest: hash(`request-${key}`), credentialDigest: hash(`member-${key}`), pairingCode: "0123" }, "issuer-home");
   return { database, store, issue, apply, advance: (ms: number) => { now += ms; } };
 }
+it("retires member proofs, pending requests and unused links together during trusted node recovery", () => {
+  const s = setup(); try {
+    const first = s.issue("approved"), applied = s.apply("approved"); s.store.decide(applied.id, "approve", "member");
+    s.issue("pending"); const pending = s.apply("pending", "second-home"); s.issue("unused");
+    const member = s.store.lookupCredential(applied.credentialDigest).member;
+    const proof = { shareId: first.share.id, memberId: member.id, generation: member.generation, credentialDigest: member.credentialDigest };
+    expect(s.store.authorize(proof).member.status).toBe("active");
+    s.store.revokeAllAccess();
+    expect(() => s.store.authorize(proof)).toThrow(); expect(() => s.store.lookupCredential(member.credentialDigest, true)).toThrow();
+    expect(s.store.request(pending.id).status).toBe("rejected"); expect(() => s.store.decide(pending.id, "approve", "late-member")).toThrow();
+    expect(() => s.apply("unused", "third-home")).toThrow();
+    expect(s.store.get(first.share.id)).toMatchObject({ backendId: "native", providerId: "provider", members: [{ id: "member", status: "removed" }] });
+    expect(s.store.revokeAllAccess()).toEqual({ members: 0, requests: 0, invitations: 0 });
+  } finally { s.database.close(); }
+});
 it("atomically locks only the first submitted applicant and keeps the original four digit receipt", () => {
   const s = setup(); try {
     s.issue("first"); const original = s.apply("first");

@@ -36,6 +36,7 @@ afterEach(async () => {
 });
 
 async function fixture(options: { readonly now?: () => number; readonly ttlMs?: number;
+  readonly maximumAssetBytes?: number;
   readonly onSurfaceRevoked?: (surfaceId: string, connectionId: string) => void } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-extension-main-view-"));
   roots.push(root);
@@ -77,6 +78,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
     rootDirectory: join(root, "surfaces"),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+    ...(options.maximumAssetBytes === undefined ? {} : { maximumAssetBytes: options.maximumAssetBytes }),
     ...(options.onSurfaceRevoked === undefined ? {} : { onSurfaceRevoked: options.onSurfaceRevoked })
   });
   await manager.initialize();
@@ -91,6 +93,28 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
 }
 
 describe("ExtensionMainViewManager", () => {
+  it("materializes only the current declared document and keeps the total response budget", async () => {
+    const f = await fixture();
+    try {
+      const surface = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      const [, surfaceId, token, entry] = /main-views\/([^/]+)\/([^/]+)\/(.+)$/u.exec(surface.endpoint)!;
+      const request = { surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "GET", isolatedDocument: true };
+      const html = await f.manager.serve(request);
+      expect(html.body!.toString()).toContain("data:text/javascript;base64,");
+      expect(html.body!.toString()).not.toContain('src="./app.js"');
+      expect((await f.manager.serve({ ...request, assetPath: "secondary.html" })).body!.toString()).toContain("Secondary");
+      f.setCurrent(false);
+      await expect(f.manager.serve(request)).rejects.toMatchObject({ statusCode: 410 });
+    } finally { await f.manager.close(); }
+    const small = await fixture({ maximumAssetBytes: 200 });
+    try {
+      const surface = await small.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      const [, surfaceId, token, entry] = /main-views\/([^/]+)\/([^/]+)\/(.+)$/u.exec(surface.endpoint)!;
+      await expect(small.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "GET", isolatedDocument: true }))
+        .rejects.toMatchObject({ statusCode: 413 });
+    } finally { await small.manager.close(); }
+  });
+
   it("leases and re-verifies an exact package generation before serving its declared directory", async () => {
     const { manager, acquireInstalledPackage, releases } = await fixture();
     try {
@@ -124,12 +148,63 @@ describe("ExtensionMainViewManager", () => {
       const script = await manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: "app.js", method: "HEAD" });
       expect(script.mimeType).toBe("text/javascript; charset=utf-8");
       expect(script.body).toBeUndefined();
-      expect(assertAuthorityCurrent).toHaveBeenCalledTimes(4);
+      expect(assertAuthorityCurrent).toHaveBeenCalledTimes(6);
       expect(releases()).toBe(0);
     } finally {
       await manager.close();
     }
     expect(releases()).toBe(1);
+  });
+
+  it("does not return an asset authorized before its resource or connection was revoked", async () => {
+    const f = await fixture(); let current = true, retireAfterCheck = false;
+    const assertAuthorityCurrent = async () => {
+      if (!current) throw new Error("Connection was revoked.");
+      if (retireAfterCheck) { retireAfterCheck = false; queueMicrotask(() => { current = false; }); }
+    };
+    try {
+      const surface = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent });
+      const [, surfaceId, token] = /main-views\/([^/]+)\/([^/]+)/u.exec(surface.endpoint)!;
+      retireAfterCheck = true;
+      await expect(f.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: "app.js", method: "GET" })).rejects.toMatchObject({ statusCode: 410 });
+      expect(f.releases()).toBe(1);
+    } finally { await f.manager.close(); }
+  });
+
+  it("limits runtime code and read-only stylesheet transforms to the original surface types", async () => {
+    const f = await fixture();
+    try {
+      const surface = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      const [, surfaceId, token] = /main-views\/([^/]+)\/([^/]+)/u.exec(surface.endpoint)!;
+      const request = { surfaceId: surfaceId!, token: token!, assetPath: "app.js", method: "GET" };
+      const script = await f.manager.serve({ ...request, materializeAsset: "script" });
+      expect(script.mimeType).toBe("text/javascript; charset=utf-8"); expect(script.body!.toString()).toContain("document.body.dataset.ready");
+      const style = await f.manager.serve({ ...request, assetPath: "index.html", method: "POST", materializeAsset: "style", inlineStyle: "body{color:rgb(1,2,3)}" });
+      expect(style.mimeType).toBe("text/css; charset=utf-8"); expect(style.body!.toString()).toContain("color:");
+      await expect(f.manager.serve({ ...request, materializeAsset: "style" })).rejects.toMatchObject({ statusCode: 404 });
+      await expect(f.manager.serve({ ...request, assetPath: "index.html", materializeAsset: "style", inlineStyle: "body{}" })).rejects.toMatchObject({ statusCode: 405 });
+      await expect(f.manager.serve({ ...request, assetPath: "../private.css", method: "POST", materializeAsset: "style", inlineStyle: "body{}" })).rejects.toMatchObject({ statusCode: 404 });
+    } finally { await f.manager.close(); }
+  });
+
+  it("retires existing response lifetimes before queued connection cleanup can run", async () => {
+    const f = await fixture();
+    let hold = false, entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const assertAuthorityCurrent = async () => { if (hold) { hold = false; entered(); await gate; } };
+    try {
+      const surface = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent });
+      const [, surfaceId, token] = /main-views\/([^/]+)\/([^/]+)/u.exec(surface.endpoint)!;
+      const request = { surfaceId: surfaceId!, token: token!, assetPath: "app.js", method: "GET" };
+      const first = await f.manager.serve(request); expect(first.lifetime!.aborted).toBe(false);
+      hold = true;
+      const pending = f.manager.serve(request); await started;
+      const closing = f.manager.closeConnection("connection-a");
+      expect(first.lifetime!.aborted).toBe(true);
+      const rejected = expect(pending).rejects.toMatchObject({ statusCode: 410 });
+      release(); await rejected; await closing; expect(f.releases()).toBe(1);
+    } finally { release(); await f.manager.close(); }
   });
 
   it("fails closed for path escape, unknown media, ranges, methods, and another connection's close", async () => {

@@ -4,15 +4,18 @@ import { createRoot } from "react-dom/client";
 import "@fontsource-variable/jetbrains-mono";
 import { isDesktopRemoteDesktopViewerWindow } from "./remote-desktop-viewer-window.js";
 import "./styles.css";
+import { installDesktopLinkspanBindings } from './desktop-linkspan-binding.js';
 import {
   connectDesktopActivationClickPreference,
   installCurrentWindowActivationClickGuard
 } from "./window-activation-click.js";
 
 captureProviderSharingInvitation(window.location, window.history);
+const disposeDesktopLinkspanBindings = installDesktopLinkspanBindings();
 const disposeActivationClickGuard = installCurrentWindowActivationClickGuard(window);
 const disconnectActivationClickPreference = connectDesktopActivationClickPreference(window.jokoDesktop, window);
 window.addEventListener("pagehide", () => {
+  disposeDesktopLinkspanBindings();
   disposeActivationClickGuard();
   disconnectActivationClickPreference();
 }, { once: true });

@@ -1,5 +1,5 @@
 import { createClient, Code } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-web";
+import { createConnectTransport } from "@joko/connection-transport";
 import { EventService } from "@joko/contracts";
 import { SharedOwnerEventsBroker, type SharedOwnerEventsOwner, type SharedOwnerEventsSubscription } from "./shared-owner-events-broker.js";
 import type { SharedOwnerEventsReply, SharedOwnerEventsRequest } from "./shared-owner-events.js";
@@ -7,8 +7,9 @@ import type { SharedOwnerEventsReply, SharedOwnerEventsRequest } from "./shared-
 // The worker owns only an in-memory, read-only generated API client. Page-local
 // Snapshots, projections, effect ledgers and mutation clients never enter it.
 const broker = new SharedOwnerEventsBroker({
-  async *openStream(owner, authKey, afterCursor, signal) {
+  async *openStream(owner, authKey, afterCursor, signal, onAccepted) {
     const transport = createConnectTransport({ baseUrl: owner.origin, useBinaryFormat: true,
+      endpointPublicKey: owner.endpointPublicKey,
       interceptors: [next => request => {
         request.header.set("authorization", `Bearer ${authKey}`);
         request.header.set("x-joko-client-version", "0.1.0");
@@ -16,6 +17,7 @@ const broker = new SharedOwnerEventsBroker({
       }] });
     const client = createClient(EventService, transport);
     for await (const response of client.streamEvents({ scope: { kind: { case: "owner", value: {} } }, afterCursor }, { signal })) {
+      onAccepted();
       if (response.event !== undefined) yield response.event;
     }
   }
@@ -45,6 +47,7 @@ function close(state: WorkerPort): void {
 function ownerValid(owner: SharedOwnerEventsOwner): boolean {
   if (owner === null || typeof owner !== "object"
     || ![owner.profileId, owner.serverId, owner.deviceId, owner.origin].every(value => typeof value === "string" && value !== "")) return false;
+  if (owner.endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(owner.endpointPublicKey)) return false;
   try {
     const url = new URL(owner.origin);
     return (url.protocol === "https:" || url.protocol === "http:") && !url.username && !url.password && !url.search && !url.hash;
@@ -71,10 +74,12 @@ host.onconnect = ({ ports: incoming }): void => {
       send(state, { type: "error", code: Code.InvalidArgument, message: "The event subscription is invalid." }); close(state); return;
     }
     send(state, { type: "ready" });
-    state.subscription = broker.subscribe(data.owner, data.authKey, data.cursor, {
+    const subscription = broker.subscribe(data.owner, data.authKey, data.cursor, {
+      accepted() { send(state, { type: "accepted" }); },
       event(bytes, serial) { send(state, { type: "event", bytes, serial }, [bytes]); },
-      error(code, message) { send(state, { type: "error", code, message }); queueMicrotask(() => close(state)); }
+      error(code, message, endpointTrustFailed) { send(state, { type: "error", code, message, ...(endpointTrustFailed ? { endpointTrustFailed } : {}) }); queueMicrotask(() => close(state)); }
     });
+    if (state.closed) subscription.close(); else state.subscription = subscription;
   };
   port.onmessageerror = (): void => close(state);
   port.start();

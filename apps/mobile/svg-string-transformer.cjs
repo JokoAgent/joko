@@ -7,6 +7,52 @@ const expoRequire = createRequire(require.resolve("expo/package.json"));
 const upstreamTransformer = expoRequire("@expo/metro-config/babel-transformer");
 const esbuild = require("esbuild");
 const { buildConnectionRuntimeModule, getConnectionRuntimeCacheKey } = require("./connection-runtime-transformer.cjs");
+const linkspanSelectionPath = path.resolve(__dirname, 'dist/linkspan-runtime/selected.json');
+const sameSourcePath = (left, right) => process.platform === 'win32' ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase() : path.resolve(left) === path.resolve(right);
+function linkspanSelection() {
+  if (!fs.existsSync(linkspanSelectionPath)) return { relayBackends: [], nativeIroh: false, nativeHttpConnect: false, webRtc: false };
+  const value = JSON.parse(fs.readFileSync(linkspanSelectionPath, 'utf8'));
+  if (value.schema !== 1 || !Array.isArray(value.relayBackends) || value.relayBackends.length > 2 || new Set(value.relayBackends).size !== value.relayBackends.length
+    || value.relayBackends.some(kind => !['iroh', 'tailcat'].includes(kind)) || typeof value.nativeIroh !== 'boolean'
+    || typeof value.nativeHttpConnect !== 'boolean' || typeof value.webRtc !== 'boolean') throw new Error('The selected Mobile runtime receipt is invalid.');
+  return value;
+}
+function buildLinkspanAssetModule(filename) {
+  if (!sameSourcePath(filename, path.resolve(__dirname, 'src/linkspan-runtime-assets.ts'))) throw new Error('Only the audited Mobile runtime selector may select Asset modules.');
+  const selected = linkspanSelection();
+  const entries = selected.relayBackends.map(kind => {
+    const names = [`${kind}-runtime.lsruntime`, `${kind}.wasm`, `${kind}-notices.lsnotice`];
+    for (const name of names) {
+      const info = fs.lstatSync(path.resolve(__dirname, `dist/linkspan-runtime/${name}`));
+      if (!info.isFile() || info.isSymbolicLink()) throw new Error('The selected Mobile runtime asset is unavailable.');
+    }
+    return `${JSON.stringify(kind)}:Object.freeze([${names.map(name => `require(${JSON.stringify(`../dist/linkspan-runtime/${name}`)})`).join(',')}])`;
+  });
+  let webRtcAssets = 'undefined';
+  if (selected.webRtc) {
+    const names = ['webrtc-runtime.lsruntime', 'webrtc-notices.lsnotice'];
+    for (const name of names) {
+      const info = fs.lstatSync(path.resolve(__dirname, 'dist/linkspan-runtime', name));
+      if (!info.isFile() || info.isSymbolicLink()) throw new Error('The selected WebRTC runtime asset is unavailable.');
+    }
+    webRtcAssets = `Object.freeze([${names.map(name => `require(${JSON.stringify(`../dist/linkspan-runtime/${name}`)})`).join(',')}])`;
+  }
+  let httpConnectNotices = 'undefined';
+  if (selected.nativeHttpConnect) {
+    const name = 'http-connect-notices.lsnotice', path = require('node:path').resolve(__dirname, 'dist/linkspan-runtime', name);
+    const info = fs.lstatSync(path);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error('The selected native proxy notices are unavailable.');
+    httpConnectNotices = `require(${JSON.stringify(`../dist/linkspan-runtime/${name}`)})`;
+  }
+  return `module.exports={linkspanRuntimeAssets:Object.freeze({${entries.join(',')}}),linkspanNativeIrohSelected:${selected.nativeIroh === true},linkspanNativeHttpConnectSelected:${selected.nativeHttpConnect === true},linkspanHttpConnectNoticesAsset:${httpConnectNotices},linkspanWebRtcRuntimeAssets:${webRtcAssets}};`;
+}
+function buildHttpConnectClientModule(src, filename) {
+  if (!sameSourcePath(filename, path.resolve(__dirname, 'src/mobile-http-connect-client.ts'))) throw new Error('Only the audited native proxy binding may select CONNECT code.');
+  if (linkspanSelection().nativeHttpConnect) return src;
+  // Remove the module edges before Metro builds its graph. A runtime boolean
+  // around dynamic import still bundles the parser into unselected Hermes apps.
+  return `import { LinkspanError } from '@jokoagent/linkspan-core'; export async function connectMobileHttpConnect(){throw new LinkspanError('unavailable','The native proxy transport was not selected for this app build.');}`;
+}
 
 const expectedStandardFonts = [
   "FoxitDingbats.pfb",
@@ -180,7 +226,8 @@ module.exports.transform = ({ src, filename, options }) => {
     return buildConnectionRuntimeModule(src, filename)
       .then((transformed) => upstreamTransformer.transform({ src: transformed, filename, options }));
   }
-  const transformed = filename.endsWith(".svg")
+  const transformed = sameSourcePath(filename, path.resolve(__dirname, 'src/mobile-http-connect-client.ts')) ? buildHttpConnectClientModule(src, filename)
+    : sameSourcePath(filename, path.resolve(__dirname, 'src/linkspan-runtime-assets.ts')) ? buildLinkspanAssetModule(filename) : filename.endsWith(".svg")
     ? `module.exports = ${JSON.stringify(src)};`
     : filename.endsWith(".pdfjs") ? buildPdfJsRuntimeModule(src, filename)
       : filename.endsWith(".modeljs") ? buildModelViewerRuntimeModule(src, filename)
@@ -188,9 +235,11 @@ module.exports.transform = ({ src, filename, options }) => {
   return upstreamTransformer.transform({ src: transformed, filename, options });
 };
 
-module.exports.testing = { buildModelViewerRuntimeModule, buildPdfJsRuntimeModule, buildRichMarkdownRuntimeModule, expectedStandardFonts };
+module.exports.testing = { buildModelViewerRuntimeModule, buildPdfJsRuntimeModule, buildRichMarkdownRuntimeModule, buildLinkspanAssetModule, buildHttpConnectClientModule, expectedStandardFonts };
 
 module.exports.getCacheKey = (options) => crypto.createHash("sha256")
+  .update(fs.readFileSync(__filename))
   .update(upstreamTransformer.getCacheKey?.(options) ?? "")
   .update(getConnectionRuntimeCacheKey())
+  .update(fs.existsSync(linkspanSelectionPath) ? fs.readFileSync(linkspanSelectionPath) : 'no-selected-Linkspan-assets')
   .digest("hex");

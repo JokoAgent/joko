@@ -3,6 +3,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { EventCursorSchema, EventSchema, type Event, type EventCursor } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import { SharedOwnerEventsBroker, type SharedOwnerEventsOwner, type SharedOwnerEventsSink } from "./shared-owner-events-broker.js";
+import { EndpointTrustError } from "@joko/connection-transport/trust";
 
 const OWNER: SharedOwnerEventsOwner = { profileId: "connection-one", serverId: "server-one", deviceId: "device-one", origin: "http://127.0.0.1:4318" };
 function cursor(sequence: bigint, generation = 7n): EventCursor {
@@ -15,19 +16,20 @@ function event(sequence: bigint, generation = 7n, text = `Text ${sequence}`): Ev
 function receiver() {
   const events: Array<{ event: Event; serial: number }> = [];
   const errors: Array<{ code: number; message: string }> = [];
-  const sink: SharedOwnerEventsSink = { event: (bytes, serial) => {
+  const accepted = vi.fn();
+  const sink: SharedOwnerEventsSink = { accepted, event: (bytes, serial) => {
     const transferred = structuredClone(bytes, { transfer: [bytes] });
     events.push({ event: fromBinary(EventSchema, new Uint8Array(transferred)), serial });
   }, error: (code, message) => errors.push({ code, message }) };
-  return { sink, events, errors };
+  return { sink, events, errors, accepted };
 }
 function source() {
   const calls: Array<{ owner: SharedOwnerEventsOwner; authKey: string; cursor: EventCursor; signal: AbortSignal;
-    push(event: Event): void; fail(error: Error): void; finish(): void }> = [];
-  const openStream = vi.fn(async function* (owner: SharedOwnerEventsOwner, authKey: string, afterCursor: EventCursor, signal: AbortSignal) {
+    accept(): void; push(event: Event): void; fail(error: Error): void; finish(): void }> = [];
+  const openStream = vi.fn(async function* (owner: SharedOwnerEventsOwner, authKey: string, afterCursor: EventCursor, signal: AbortSignal, onAccepted: () => void = () => undefined) {
     const pending: Event[] = []; let wake: (() => void) | undefined, failed: Error | undefined, ended = false;
     const abort = () => wake?.(); signal.addEventListener("abort", abort);
-    calls.push({ owner, authKey, cursor: afterCursor, signal,
+    calls.push({ owner, authKey, cursor: afterCursor, signal, accept: onAccepted,
       push: value => { pending.push(value); wake?.(); }, fail: error => { failed = error; wake?.(); }, finish: () => { ended = true; wake?.(); } });
     try { while (!signal.aborted) { if (failed) throw failed; if (pending.length) yield pending.shift()!;
       else if (ended) return; else await new Promise<void>(resolve => { wake = resolve; }); } }
@@ -38,6 +40,54 @@ function source() {
 async function settle() { for (let index = 0; index < 20; index++) await Promise.resolve(); }
 
 describe("shared owner event broker", () => {
+  it("forwards only a stable security-failure marker when a handshake fails", async () => {
+    const upstream = source(), broker = new SharedOwnerEventsBroker(upstream), failed = vi.fn();
+    broker.subscribe(OWNER, "credential", cursor(0n), { event() {}, error: failed });
+    await settle(); upstream.calls[0]!.fail(new EndpointTrustError("untrusted details must not cross the port")); await settle();
+    expect(failed).toHaveBeenCalledExactlyOnceWith(Code.Unknown, "The node security check failed.", true);
+  });
+
+  it("reports upstream acceptance independently from subscription and preserves it for joining consumers", async () => {
+    const upstream = source(), broker = new SharedOwnerEventsBroker(upstream), first = receiver(), peer = receiver(), later = receiver();
+    const a = broker.subscribe(OWNER, "credential", cursor(0n), first.sink);
+    const b = broker.subscribe(OWNER, "credential", cursor(0n), peer.sink);
+    await settle();
+    expect(first.accepted).not.toHaveBeenCalled(); expect(peer.accepted).not.toHaveBeenCalled();
+    upstream.calls[0]!.accept(); upstream.calls[0]!.accept();
+    expect(first.accepted).toHaveBeenCalledOnce(); expect(peer.accepted).toHaveBeenCalledOnce();
+    const c = broker.subscribe(OWNER, "credential", cursor(0n), later.sink);
+    expect(later.accepted).toHaveBeenCalledOnce(); expect(upstream.calls).toHaveLength(1);
+    a.close(); b.close(); c.close(); await settle();
+    const replacement = receiver(), next = broker.subscribe(OWNER, "credential", cursor(0n), replacement.sink);
+    await settle(); upstream.calls[0]!.accept();
+    expect(replacement.accepted).not.toHaveBeenCalled();
+    upstream.calls[1]!.accept(); expect(replacement.accepted).toHaveBeenCalledOnce();
+    next.close(); await settle();
+  });
+
+  it("never accepts a failed or retired upstream even if its response callback arrives late", async () => {
+    const upstream = source(), broker = new SharedOwnerEventsBroker(upstream), rejected = receiver();
+    broker.subscribe(OWNER, "credential", cursor(0n), rejected.sink); await settle();
+    upstream.calls[0]!.fail(new ConnectError("Unavailable", Code.Unavailable)); await settle();
+    upstream.calls[0]!.accept();
+    expect(rejected.errors[0]?.code).toBe(Code.Unavailable); expect(rejected.accepted).not.toHaveBeenCalled();
+    const next = receiver(), subscription = broker.subscribe(OWNER, "credential", cursor(0n), next.sink); await settle();
+    subscription.close(); upstream.calls[1]!.accept(); await settle();
+    expect(next.accepted).not.toHaveBeenCalled();
+  });
+
+  it("does not share an upstream across different pinned endpoint identities", async () => {
+    const upstream = source(), broker = new SharedOwnerEventsBroker(upstream), a = receiver(), b = receiver(), rejected = receiver();
+    const first = broker.subscribe({ ...OWNER, endpointPublicKey: `ed25519:${'1'.repeat(64)}` }, "credential", cursor(0n), a.sink);
+    const second = broker.subscribe({ ...OWNER, endpointPublicKey: `ed25519:${'2'.repeat(64)}` }, "credential", cursor(0n), b.sink);
+    broker.subscribe({ ...OWNER, endpointPublicKey: "ed25519:truncated" }, "credential", cursor(0n), rejected.sink);
+    await settle();
+    expect(upstream.calls).toHaveLength(2);
+    expect(rejected.errors[0]?.code).toBe(Code.InvalidArgument);
+    upstream.calls[0]!.push(event(1n)); await settle();
+    expect(a.events).toHaveLength(1); expect(b.events).toHaveLength(0);
+    first.close(); second.close(); await settle();
+  });
   it("shares one upstream while each cursor and exact ACK independently gate original Event bytes", async () => {
     const upstream = source(), broker = new SharedOwnerEventsBroker(upstream), first = receiver(), later = receiver();
     const a = broker.subscribe(OWNER, "credential", cursor(0n), first.sink);

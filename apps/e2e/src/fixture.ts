@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer as createPortProbe } from "node:net";
-import type { IncomingMessage } from "node:http";
+import { createConnection, createServer as createPortProbe } from "node:net";
+import { createServer as createHttpServer, type IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
+import { replaceEndpointTrust, type EndpointTransport } from "@joko/connection-transport/trust";
 
 import type { AdapterContext, BlobRef, PromptInput } from "@joko/core";
 import {
@@ -43,6 +45,9 @@ import {
   CredentialVault,
   TaskSharingHome,
   createPublicServer,
+  createLinkspanIngress,
+  createLinkspanTcpIngress,
+  openLinkspanIdentity,
   type OrchestratorApplication,
   type BackendInstanceFactory,
   type OrchestratorConfig
@@ -71,6 +76,10 @@ export interface FixtureOptions {
   readonly serverId?: string;
   readonly rootDirectory?: string;
   readonly webDirectory?: string;
+  /** Exercise the real private signaling backend, never a public cleartext route. */
+  readonly webRtc?: boolean;
+  /** Exercise CONNECT negotiation and the real process-owned raw Noise target. */
+  readonly httpConnect?: boolean;
   readonly profiles?: readonly FakeAdapterProfile[];
   readonly createAdapter?: (profile: FakeAdapterProfile) => InstrumentedFakeAdapter;
   readonly backendFactories?: readonly BackendInstanceFactory[];
@@ -171,6 +180,10 @@ export class OrchestratorE2eFixture {
   readonly targets: ReadonlyMap<string, string>;
   readonly anonymous: E2eClients;
   readonly #server: Awaited<ReturnType<typeof createPublicServer>>;
+  readonly #secureServer?: Awaited<ReturnType<typeof createPublicServer>>;
+  readonly #webRtcRequests: { count: number; responses: { path: string; status: number }[] };
+  readonly #linkspan: ReturnType<typeof createLinkspanIngress>;
+  readonly #httpConnect?: Awaited<ReturnType<typeof createHttpConnectFixture>>;
   readonly #connections: RecordingConnectionManager;
   readonly #cleanupDelayMs: number;
   readonly #removeRootOnClose: boolean;
@@ -185,6 +198,10 @@ export class OrchestratorE2eFixture {
     adapters: ReadonlyMap<string, InstrumentedFakeAdapter>;
     targets: ReadonlyMap<string, string>;
     server: Awaited<ReturnType<typeof createPublicServer>>;
+    secureServer?: Awaited<ReturnType<typeof createPublicServer>>;
+    webRtcRequests: { count: number; responses: { path: string; status: number }[] };
+    linkspan: ReturnType<typeof createLinkspanIngress>;
+    httpConnect?: Awaited<ReturnType<typeof createHttpConnectFixture>>;
     connections: RecordingConnectionManager;
     cleanupDelayMs: number;
     removeRootOnClose: boolean;
@@ -197,6 +214,10 @@ export class OrchestratorE2eFixture {
     this.adapters = input.adapters;
     this.targets = input.targets;
     this.#server = input.server;
+    this.#secureServer = input.secureServer;
+    this.#webRtcRequests = input.webRtcRequests;
+    this.#linkspan = input.linkspan;
+    this.#httpConnect = input.httpConnect;
     this.#connections = input.connections;
     this.#cleanupDelayMs = input.cleanupDelayMs;
     this.#removeRootOnClose = input.removeRootOnClose;
@@ -204,6 +225,7 @@ export class OrchestratorE2eFixture {
   }
 
   static async start(options: FixtureOptions = {}): Promise<OrchestratorE2eFixture> {
+    if (options.webRtc && options.httpConnect) throw new Error("Select one fixture transport.");
     const publicPort = options.publicPort ?? (options.taskSharing ? await freeFixturePort() : 0);
     if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535) throw new Error("Invalid fixture public port.");
     const ownsRoot = options.rootDirectory === undefined;
@@ -462,6 +484,8 @@ export class OrchestratorE2eFixture {
       serverId, vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key")) }) : undefined;
     await taskSharingHome?.initialize();
     const serviceCleanups = new Set<() => void>();
+    const linkspanIdentity = await openLinkspanIdentity({ dataDirectory, serverId, store,
+      vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key")) });
     const application: OrchestratorApplication = {
       config,
       store,
@@ -469,6 +493,7 @@ export class OrchestratorE2eFixture {
       devicePeers,
       ...(remoteExecution === undefined ? {} : { remoteExecution }),
       serverId,
+      linkspanIdentity,
       lanDiscovery,
       artifacts,
       artifactMaintenance,
@@ -548,6 +573,21 @@ export class OrchestratorE2eFixture {
     const address = server.server.address();
     if (address === null || typeof address === "string") throw new Error("Fastify did not expose an ephemeral TCP port.");
     const baseUrl = `http://127.0.0.1:${address.port}`;
+    const secureServer = options.webRtc || options.httpConnect ? await createPublicServer(application, { secureBridge: true }) : undefined;
+    const webRtcRequests = { count: 0, responses: [] as { path: string; status: number }[] };
+    secureServer?.addHook('onRequest', async request => { if (request.url === '/_linkspan/webrtc') webRtcRequests.count++; });
+    secureServer?.addHook('onResponse', async (request, reply) => {
+      if (webRtcRequests.responses.length < 128 && (request.url === '/_linkspan/webrtc' || /^\/joko\.v1\.[A-Za-z]+\/[A-Za-z]+$/u.test(request.url)))
+        webRtcRequests.responses.push({ path: request.url, status: reply.statusCode });
+    });
+    if (secureServer !== undefined) secureServer.log.level = 'silent';
+    const backendOrigin = secureServer === undefined ? baseUrl : await secureServer.listen({ host: '127.0.0.1', port: 0 });
+    const linkspan = createLinkspanIngress(application, { backendOrigin, server: server.server });
+    const httpConnect = options.httpConnect ? await createHttpConnectFixture(application, backendOrigin, new URL(baseUrl).host) : undefined;
+    // This fixture owns the node key, like a trusted local bootstrap. Reused
+    // ephemeral ports must not inherit another test node's in-memory pin.
+    replaceEndpointTrust({ origin: baseUrl, endpointPublicKey: linkspanIdentity.publicKey, serverId,
+      ...(httpConnect === undefined ? {} : { transportKind: "http-connect", endpointTransport: httpConnect.transport }) });
 
     return new OrchestratorE2eFixture({
       rootDirectory,
@@ -558,6 +598,10 @@ export class OrchestratorE2eFixture {
       adapters,
       targets,
       server,
+      secureServer,
+      webRtcRequests,
+      linkspan,
+      httpConnect,
       connections,
       cleanupDelayMs: Math.min(250, Math.max(0, ...profiles.map((profile) => profile.streamDelayMs ?? 0)) + 25),
       removeRootOnClose: ownsRoot && options.keepRoot !== true
@@ -567,6 +611,11 @@ export class OrchestratorE2eFixture {
   clients(authKey: string): E2eClients {
     return createE2eClients(this.baseUrl, authKey);
   }
+
+  get webRtcSignalingRequests(): number { return this.#webRtcRequests.count; }
+  get webRtcResponses(): readonly { path: string; status: number }[] { return this.#webRtcRequests.responses; }
+  get httpConnectTransport(): Extract<EndpointTransport, { readonly kind: "http-connect" }> | undefined { return this.#httpConnect?.transport; }
+  get httpConnectRequests(): number { return this.#httpConnect?.requests() ?? 0; }
 
   async pair(displayName = "E2E client"): Promise<PairedClient> {
     const begun = await this.anonymous.connection.beginPairing({ deviceDisplayName: displayName });
@@ -635,6 +684,9 @@ export class OrchestratorE2eFixture {
   async close(options: { readonly removeRoot?: boolean } = {}): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    await this.#httpConnect?.close();
+    await this.#linkspan.close();
+    await this.#secureServer?.close();
     await this.#server.close();
     if (this.#cleanupDelayMs > 0) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, this.#cleanupDelayMs));
@@ -644,6 +696,45 @@ export class OrchestratorE2eFixture {
       await rm(this.rootDirectory, { recursive: true, force: true, maxRetries: 3 });
     }
   }
+}
+
+/** A local one-authority CONNECT fixture, not an upstream frps acceptance test. */
+async function createHttpConnectFixture(application: OrchestratorApplication, backendOrigin: string, authority: string) {
+  const ingress = createLinkspanTcpIngress(application, { backendOrigin });
+  const target = await ingress.listen();
+  const sockets = new Set<Duplex>();
+  let requests = 0;
+  const track = (socket: Duplex): void => { sockets.add(socket); socket.once("close", () => sockets.delete(socket)); };
+  const proxy = createHttpServer({ maxHeaderSize: 4096 }, (_request, reply) => { reply.writeHead(404); reply.end(); });
+  proxy.maxConnections = 32;
+  proxy.on("connection", track);
+  proxy.on("connect", (request, socket, head) => {
+    if (request.url !== authority || request.headers.authorization !== undefined || request.headers["proxy-authorization"] !== undefined) {
+      socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"); return;
+    }
+    requests++;
+    const upstream = createConnection({ host: target.address, port: target.port }); track(upstream);
+    socket.on("error", () => upstream.destroy()); upstream.on("error", () => socket.destroy());
+    socket.once("close", () => upstream.destroy());
+    upstream.once("close", () => { if (!upstream.readableEnded) socket.destroy(); });
+    upstream.once("connect", () => {
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) upstream.write(head);
+      socket.pipe(upstream); upstream.pipe(socket);
+    });
+  });
+  try {
+    await new Promise<void>((resolve, reject) => { proxy.once("error", reject); proxy.listen(0, "127.0.0.1", () => { proxy.removeListener("error", reject); resolve(); }); });
+    const address = proxy.address();
+    if (address === null || typeof address === "string") throw new Error("The CONNECT fixture did not acquire a port.");
+    const transport: Extract<EndpointTransport, { readonly kind: "http-connect" }> = { kind: "http-connect", proxyOrigin: `http://127.0.0.1:${address.port}`, authority };
+    return { transport, requests: () => requests,
+      async close(): Promise<void> {
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve, reject) => proxy.close(error => error === undefined ? resolve() : reject(error)));
+        await ingress.close();
+      } };
+  } catch (error) { for (const socket of sockets) socket.destroy(); proxy.close(); await ingress.close(); throw error; }
 }
 
 export function sha256(value: Uint8Array): string {

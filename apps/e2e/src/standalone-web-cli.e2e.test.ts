@@ -6,11 +6,11 @@ import type { AddressInfo } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import {
-  ModelInputModality, OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema,
+  ListRuntimeCommandsRequestSchema, MessageRole, ModelInputModality, OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema,
   ProviderApiCompatibility, ProviderConfigurationSchema, ProviderKind, RunState,
-  SessionSnapshotScopeSchema, SnapshotScopeSchema
+  SessionSnapshotScopeSchema, SnapshotScopeSchema, SubmitOperationRequestSchema
 } from "@joko/contracts";
 import { chromium, type BrowserContext, type Page } from "playwright-core";
 import { expect, it } from "vitest";
@@ -66,6 +66,9 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
     let sessionId: string | undefined;
     let serverId: string | undefined;
     let cliEntrySha256: string | undefined;
+    let firstTurnProviderRequestCount: number | undefined;
+    const inputEvidence: Array<Readonly<Record<string, unknown>>> = [];
+    let observeInput: ((stage: string, timeoutMs?: number) => Promise<void>) | undefined;
     const webIndexSha256 = await sha256File(join(webDirectory, "index.html"));
     const requests: CapturedProviderRequest[] = [];
     const screenshot = async (name: string): Promise<void> => {
@@ -148,6 +151,20 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       page.on("close", () => recordBrowserEvent("page_closed"));
       page.on("crash", () => recordBrowserEvent("page_crashed"));
       page.on("pageerror", () => { pageErrorCount += 1; });
+      page.on("request", request => {
+        try {
+          const url = new URL(request.url());
+          if (url.origin !== fixture?.baseUrl || url.pathname !== "/joko.v1.OperationService/SubmitOperation") return;
+          const bytes = request.postDataBuffer(); if (bytes === null) return;
+          const mutation = fromBinary(SubmitOperationRequestSchema, bytes).mutation;
+          if (mutation?.payload.case !== "sendInput" || inputEvidence.length >= 32) return;
+          const input = mutation.payload.value;
+          inputEvidence.push({ stage: "browser-send-input", elapsedMs: Math.round(performance.now() - startedAt),
+            expectedGeneration: mutation.preconditions.find(item => item.entity?.id === input.sessionId)?.expectedGeneration.toString(),
+            firstPrompt: input.input?.parts.some(part => part.content.case === "text" && part.content.value.includes(firstPrompt)) === true,
+            secondPrompt: input.input?.parts.some(part => part.content.case === "text" && part.content.value.includes(secondPrompt)) === true });
+        } catch { /* Retain no request body or credential when a different wire shape is used. */ }
+      });
       page.setDefaultTimeout(20_000);
       await page.goto(`${fixture.baseUrl}/#/tasks/new?target=${encodeURIComponent(target.targetId)}`, { waitUntil: "domcontentloaded" });
       await browser.grantPermissions(["microphone"], { origin: fixture.baseUrl });
@@ -187,12 +204,49 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       const sessionScope = create(SnapshotScopeSchema, {
         kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId, recentTimelineItems: 100 }) }
       });
+      observeInput = async (stage, timeoutMs = 5_000) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const expired = new Promise<never>((_accept, reject) => {
+          timer = setTimeout(() => reject(new Error("Controlled input evidence exceeded its bound.")), timeoutMs);
+        });
+        try {
+          const observation = await Promise.race([expired, (async () => {
+            const [current, timeline] = await Promise.all([
+              inspector.clients.event.getSnapshot({ scope: sessionScope }, { timeoutMs }),
+              inspector.clients.session.listSessionTimeline({ sessionId: sessionId!, limit: 100 }, { timeoutMs })
+            ]);
+            const snapshot = current.snapshot;
+            const session = snapshot?.sessions.find(item => item.sessionId === sessionId);
+            const ui = await page!.evaluate(({ expectedSessionId, secondPrompt }) => {
+              const pane = document.querySelector<HTMLElement>(".session-pane");
+              const editor = pane?.querySelector<HTMLElement>('[data-composer-editor="true"] [contenteditable]');
+              const send = pane?.querySelector<HTMLButtonElement>(".composer .send-button");
+              const generation = pane?.dataset.inputSessionGeneration;
+              return { sessionMatches: pane?.dataset.inputSessionId === expectedSessionId,
+                generation: generation !== undefined && /^[0-9]{1,20}$/u.test(generation) ? generation : undefined,
+                editorEditable: editor?.getAttribute("contenteditable") === "true",
+                editorEmpty: !editor?.textContent?.trim(), secondPromptInEditor: editor?.textContent?.includes(secondPrompt) === true,
+                sendDisabled: send?.disabled, generationConflict: document.body.textContent?.includes("Generation precondition failed") === true };
+            }, { expectedSessionId: sessionId, secondPrompt });
+            return { stage, elapsedMs: Math.round(performance.now() - startedAt), generation: session?.nativeBinding?.runtimeGeneration.toString(),
+              runtimeAttached: session?.nativeBinding?.runtimeAttached, sessionState: session?.state,
+              succeededRuns: snapshot?.runs.filter(run => run.state === RunState.SUCCEEDED).length,
+              acceptedUserMessages: timeline.events.filter(event => event.payload?.kind.case === "messageStarted"
+                && event.payload.kind.value.role === MessageRole.USER && event.payload.kind.value.userInputAccepted).length,
+              acceptedQueueInputs: snapshot?.queueItems.length,
+              queueInputsWithSecondPrompt: snapshot?.queueItems.filter(item => item.input?.parts.some(part => part.content.case === "text" && part.content.value.includes(secondPrompt))).length,
+              queueStates: snapshot?.queueItems.slice(-8).map(item => item.state), ui };
+          })()]);
+          inputEvidence.push(observation);
+        } finally { clearTimeout(timer); }
+      };
       const completedTurn = await pollOwned(() => inspector.clients.event.getSnapshot({ scope: sessionScope }),
         response => response.snapshot?.runs.some(run => run.state === RunState.SUCCEEDED) === true,
         "the first persisted production Pi turn", 45_000);
       expect(requests.some(request => request.body["model"] === REAL_PI_MODEL_ID
         && JSON.stringify(request.body).includes(firstPrompt))).toBe(true);
       expect(completedTurn.snapshot?.pi?.sessions.some(session => session.productSessionId === sessionId)).toBe(true);
+      firstTurnProviderRequestCount = requests.length;
       await page.locator(".timeline").getByText(controlledReply, { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
       await captureReplies("03-completed-turn.png", 1);
       record("first-input-persisted-and-controlled-provider-reply-rendered", "03-completed-turn.png");
@@ -206,8 +260,38 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       expect(fixture.observations.at(-1)!.generation).toBe(previousGeneration + 1);
       expect((await anonymous.connection.getServerInfo({})).server?.serverId).toBe(serverId);
       expect((await inspector.clients.session.getSession({ sessionId })).session?.sessionId).toBe(sessionId);
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await page.locator(".timeline").getByText(controlledReply, { exact: true }).first().waitFor({ state: "visible", timeout: 45_000 });
+      const recoveryDeadline = Date.now() + 45_000;
+      const remainingRecoveryMs = () => {
+        const remaining = recoveryDeadline - Date.now();
+        if (remaining <= 0) throw new Error("Timed out waiting for the recovered browser input generation after native activation.");
+        return remaining;
+      };
+      // This fixture explicitly pairs the ordinary loopback HTTP origin. Its
+      // existing browser RPC is observable; no inspector call resumes a task.
+      // A durable reply can render before this cold native activation finishes
+      // and advances the generation used by the input admission fence.
+      const activation = page.waitForResponse(response => {
+        const url = new URL(response.url()), bytes = response.request().postDataBuffer();
+        if (url.origin !== fixture!.baseUrl || url.pathname !== "/joko.v1.SessionService/ListRuntimeCommands"
+          || response.status() !== 200 || bytes === null) return false;
+        try { return fromBinary(ListRuntimeCommandsRequestSchema, bytes).sessionId === sessionId; }
+        catch { return false; }
+      }, { timeout: remainingRecoveryMs() });
+      void activation.catch(() => undefined);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: Math.min(20_000, remainingRecoveryMs()) });
+      await page.locator(".timeline").getByText(controlledReply, { exact: true }).first().waitFor({ state: "visible", timeout: remainingRecoveryMs() });
+      const activationResponse = await activation;
+      inputEvidence.push({ stage: "browser-native-activation-response", elapsedMs: Math.round(performance.now() - startedAt), status: activationResponse.status() });
+      await pollOwned(async () => {
+        const session = (await inspector.clients.session.getSession({ sessionId }, { timeoutMs: remainingRecoveryMs() })).session;
+        const pane = page!.locator(".session-pane").first();
+        return session?.nativeBinding !== undefined && session.nativeBinding.runtimeGeneration > 0n
+          && await pane.getAttribute("data-input-session-id", { timeout: remainingRecoveryMs() }) === sessionId
+          && await pane.getAttribute("data-input-session-generation", { timeout: remainingRecoveryMs() }) === session.nativeBinding.runtimeGeneration.toString()
+          && await pane.locator('[data-composer-editor="true"] [contenteditable="true"]').isEditable({ timeout: remainingRecoveryMs() })
+          && Date.now() < recoveryDeadline;
+      }, value => value, "the recovered browser's current input generation after native activation", remainingRecoveryMs());
+      await observeInput("recovered-browser-input-ready", Math.min(5_000, remainingRecoveryMs()));
       const restoredRoute = new URL(new URL(page.url()).hash.slice(1), fixture.baseUrl);
       expect(restoredRoute.pathname).toBe(`/tasks/${encodeURIComponent(sessionId)}`);
       expect(restoredRoute.searchParams.get("profile")).toBe(connectionProfileId);
@@ -226,10 +310,13 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       await pollOwned(() => page!.locator(".timeline").getByText(controlledReply, { exact: true }).count(), count => count >= 2,
         "the second controlled Provider reply in the recovered browser task", 30_000);
       await captureReplies("06-followup-after-restart.png", 2);
+      await observeInput("second-turn-persisted");
+      expect(inputEvidence.at(-1)?.acceptedUserMessages).toBeGreaterThanOrEqual(2);
       record("restored-task-accepted-second-input-and-rendered-reply", "06-followup-after-restart.png");
       expect(pageErrorCount).toBe(0);
       completed = true;
     } catch (error) {
+      await observeInput?.("failure", 2_000).catch(() => undefined);
       await screenshot("failure.png").catch(() => undefined);
       record("chain-failed", "failure.png");
       throw error;
@@ -256,6 +343,8 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
         publicPort: fixture?.publicPort, internalPort: fixture?.internalPort,
         serviceProcesses: fixture?.observations ?? [], providerBoundary: "controlled-loopback-openai-compatible-fixture",
         realModelServiceTested: false, providerRequestCount: requests.length,
+        firstTurnProviderRequestCount, providerRequestsWithSecondPrompt: requests.filter(request => JSON.stringify(request.body).includes(secondPrompt)).length,
+        inputEvidence,
         operations, pageErrorCount, completed, cleanupComplete
       }, null, 2)}\n`, { mode: 0o600 });
       if (cleanupError !== undefined) throw new Error("Standalone Web CLI did not confirm all owned resources were retired.");

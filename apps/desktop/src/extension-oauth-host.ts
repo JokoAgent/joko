@@ -2,13 +2,15 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ipcMain, type IpcMainInvokeEvent, type WebContents } from "electron";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { createClient } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport } from "@joko/connection-transport/node";
+import { createConnectionFetch } from "@joko/connection-transport";
 import { ConnectionService, ExtensionOAuthService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema,
   ExtensionAuthorizationPhase as Phase } from "@joko/contracts";
 import { isAllowedRendererNetworkUrl } from "./security.js";
 import { listenForExtensionOAuth, validateExtensionOAuthOffer } from "./extension-oauth-loopback.js";
+import { desktopEndpointTrust } from './connection-transport.js';
 
-interface Owner { readonly profileId: string; readonly serverId: string; readonly origin: string }
+interface Owner { readonly profileId: string; readonly serverId: string; readonly origin: string; readonly endpointPublicKey?: string; readonly transportKind?: 'https' | 'iroh' | 'tailcat' | 'webrtc' | 'http-connect' }
 interface Entry { readonly contents: WebContents; readonly occurrence: string; readonly owner: Owner; readonly flowId: string; readonly abort: AbortController; readonly cancel: () => Promise<void> }
 export class DesktopExtensionOAuthHost {
   readonly #entries = new Set<Entry>();
@@ -31,11 +33,13 @@ export class DesktopExtensionOAuthHost {
       const entry: Entry = { contents: event.sender, occurrence, owner, flowId, abort, cancel: () => cancelRemote() };
       this.#entries.add(entry); let listener: Awaited<ReturnType<typeof listenForExtensionOAuth>> | undefined, finished = false;
       try {
-      const identity = await createClient(ConnectionService, createConnectTransport({ baseUrl: owner.origin, httpVersion: "1.1", defaultTimeoutMs: 5_000 })).getServerInfo({});
+      const trust = await desktopEndpointTrust(owner, this.deps.readAuthKey); assertCurrent();
+      const uploadCallback = createConnectionFetch({ origin: owner.origin, ...trust });
+      const identity = await createClient(ConnectionService, createConnectTransport({ baseUrl: owner.origin, ...trust, httpVersion: "1.1", defaultTimeoutMs: 5_000 })).getServerInfo({});
       assertCurrent(); if (identity.server?.serverId !== owner.serverId) throw new Error("Plugin authorization node changed.");
       const key = await this.deps.readAuthKey(owner.profileId); assertCurrent();
       if (!key || !/^[A-Za-z0-9_-]{43}$/u.test(key)) throw new Error("Plugin authorization unavailable.");
-      const client = createClient(ExtensionOAuthService, createConnectTransport({ baseUrl: owner.origin, httpVersion: "1.1", defaultTimeoutMs: 10_000,
+      const client = createClient(ExtensionOAuthService, createConnectTransport({ baseUrl: owner.origin, ...trust, httpVersion: "1.1", defaultTimeoutMs: 10_000,
         interceptors: [next => request => { request.header.set("authorization", `Bearer ${key}`); return next(request); }] }));
       let cancelling: Promise<void> | undefined;
       cancelRemote = () => cancelling ??= client.cancelFlow({ flowId }, { timeoutMs: 5_000 }).then(() => undefined, () => undefined);
@@ -55,7 +59,7 @@ export class DesktopExtensionOAuthHost {
               const input = Buffer.from(JSON.stringify(callback), "utf8");
               try {
               if (BigInt(input.byteLength) > ticket.maximumBytes) throw new Error("Plugin callback input is too large.");
-              const response = await fetch(new URL(ticket.relativeEndpoint, owner.origin), { method: "PUT", headers: { authorization: `Bearer ${key}`, "content-type": "application/octet-stream" },
+              const response = await uploadCallback(new URL(ticket.relativeEndpoint, owner.origin), { method: "PUT", headers: { authorization: `Bearer ${key}`, "content-type": "application/octet-stream" },
                 body: input, redirect: "error", signal: abort.signal }); assertCurrent();
               await response.body?.cancel(); if (!response.ok) throw new Error("Plugin callback could not be delivered.");
               await client.completeCallback({ flowId, credentialUploadTicketId: ticket.ticketId }, { signal: abort.signal }); assertCurrent();
@@ -74,11 +78,13 @@ export class DesktopExtensionOAuthHost {
     });
   }
 }
-function sameOwner(a: Owner, b: Owner) { return a.profileId === b.profileId && a.serverId === b.serverId && a.origin === b.origin; }
+function sameOwner(a: Owner, b: Owner) { return a.profileId === b.profileId && a.serverId === b.serverId && a.origin === b.origin && a.endpointPublicKey === b.endpointPublicKey && (a.transportKind ?? 'https') === (b.transportKind ?? 'https'); }
 function parseOwner(value: unknown): Owner {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid plugin authorization owner.");
   const owner = value as Owner;
-  if (Object.keys(owner).sort().join(",") !== "origin,profileId,serverId" || [owner.profileId, owner.serverId, owner.origin].some(item => typeof item !== "string" || !item || item.length > 2048)
+  if (Object.keys(owner).filter(key => key !== "endpointPublicKey" && key !== 'transportKind').sort().join(",") !== "origin,profileId,serverId" || [owner.profileId, owner.serverId, owner.origin].some(item => typeof item !== "string" || !item || item.length > 2048)
     || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/u.test(owner.profileId) || !isAllowedRendererNetworkUrl(owner.origin) || new URL(owner.origin).origin !== owner.origin) throw new Error("Invalid plugin authorization owner.");
+  if (owner.endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(owner.endpointPublicKey)) throw new Error("Invalid endpoint public key.");
+  if (owner.transportKind !== undefined && !['https', 'iroh', 'tailcat', 'webrtc', 'http-connect'].includes(owner.transportKind)) throw new Error('Invalid connection transport.');
   return Object.freeze({ ...owner });
 }

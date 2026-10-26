@@ -15,6 +15,7 @@
     "@joko/adapter-codex": "workspace:*",
     "@joko/adapter-pi": "workspace:*",
     "@joko/contracts": "workspace:*",
+    "@joko/connection-transport": "workspace:*",
     "@joko/core": "workspace:*",
     "@joko/messaging": "workspace:*",
     "@joko/orchestrator": "workspace:*",

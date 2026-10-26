@@ -16,7 +16,7 @@ import {
   PermissionMode,
   RunState
 } from "@joko/contracts";
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type Page, type Route } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { queueRunIdFrom, sendInputMutation, submit } from "./operations.js";
@@ -382,13 +382,47 @@ describe("mounted Partner collaboration product chain", () => {
     await page.goto(`${fixture.baseUrl}/#/partners`);
     const firstCard = page.locator(partnerCard(first.partnerId));
     await firstCard.waitFor({ state: "visible", timeout: 30_000 });
-    const currentCardReceipt = Promise.allSettled([page.waitForResponse(response => {
-      if (!response.url().endsWith("/joko.v1.PartnerService/GetPartnerDelegation") || response.status() !== 200) return false;
-      const body = response.request().postDataBuffer();
-      if (body === null) return false;
-      const request = fromBinary(GetPartnerDelegationRequestSchema, body);
-      return request.partnerId === first.partnerId && request.delegationId === cancellable.delegationId;
-    }, { timeout: 30_000 })]);
+    const cardReadUrl = new URL("/joko.v1.PartnerService/GetPartnerDelegation", fixture.baseUrl).href;
+    type CardReadReceipt = { readonly url: string; readonly method: string; readonly request: Buffer; readonly status: number; readonly body: Buffer };
+    let resolveCardRead!: (value: CardReadReceipt) => void;
+    let rejectCardRead!: (reason: unknown) => void;
+    const ownedCardRead = new Promise<CardReadReceipt>((resolve, reject) => { resolveCardRead = resolve; rejectCardRead = reject; });
+    let cardReadPhase = "awaiting-query", cardReadStatus: number | undefined, cardReadBytes: number | undefined;
+    const cardReadObservation = () => JSON.stringify({ phase: cardReadPhase, status: cardReadStatus, bytes: cardReadBytes });
+    const cardReadDeadline = setTimeout(() => rejectCardRead(new Error(`Timed out retaining the exact inline delegation response: ${cardReadObservation()}`)), 30_000);
+    const closeCardRead = () => rejectCardRead(new Error("The inline delegation response's browser document closed."));
+    page.once("close", closeCardRead);
+    // Establish the receipt before enabling interception: an already scheduled
+    // read can complete while page.route() itself is still being installed.
+    const currentCardReceipt = Promise.allSettled([ownedCardRead.finally(() => {
+      clearTimeout(cardReadDeadline); page.off("close", closeCardRead);
+    })]);
+    let cardReadClaimed = false;
+    const captureCardRead = async (route: Route): Promise<void> => {
+      const request = route.request(), body = request.postDataBuffer();
+      if (cardReadClaimed || request.method() !== "POST" || body === null) { await route.continue(); return; }
+      const query = fromBinary(GetPartnerDelegationRequestSchema, body);
+      if (query.partnerId !== first.partnerId || query.delegationId !== cancellable.delegationId) { await route.continue(); return; }
+      cardReadClaimed = true;
+      try {
+        // Keep this exact service response before navigation can retire CDP's
+        // response-body entry. The browser receives the original status and bytes.
+        cardReadPhase = "fetching";
+        const response = await route.fetch({ maxRedirects: 0, maxRetries: 0, timeout: 30_000 });
+        cardReadStatus = response.status(); cardReadPhase = "response-status";
+        const bytes = await response.body();
+        cardReadBytes = bytes.byteLength; cardReadPhase = "body-retained";
+        if (bytes.byteLength > 16 * 1024 * 1024) throw new Error("The inline delegation response exceeded the fixture body limit.");
+        cardReadPhase = "fulfilling";
+        await route.fulfill({ response, body: bytes });
+        cardReadPhase = "fulfilled";
+        resolveCardRead({ url: request.url(), method: request.method(), request: body, status: response.status(), body: bytes });
+      } catch {
+        rejectCardRead(new Error(`The exact inline delegation response was unavailable: ${cardReadObservation()}`));
+        await route.abort("failed").catch(() => undefined);
+      }
+    };
+    await page.route(cardReadUrl, captureCardRead);
     await firstCard.getByRole("button", { name: "Open task" }).click();
     await page.waitForURL((url) => url.hash.includes(encodeURIComponent(first.canonicalSessionId)), { timeout: 30_000 }).catch(async (cause: unknown) => {
       let observation: Record<string, unknown> = { available: false };
@@ -409,6 +443,18 @@ describe("mounted Partner collaboration product chain", () => {
       } catch { /* Preserve the original navigation failure when its observation is unavailable. */ }
       throw new Error(`The Partner task navigation did not complete: ${JSON.stringify(observation)}`, { cause });
     });
+    const cardReceipt = required((await currentCardReceipt)[0], "the inline card read receipt");
+    await page.unroute(cardReadUrl, captureCardRead);
+    if (cardReceipt.status === "rejected") throw cardReceipt.reason;
+    expect(cardReceipt.value.url).toBe(cardReadUrl);
+    expect(cardReceipt.value.method).toBe("POST");
+    expect(cardReceipt.value.status).toBe(200);
+    expect(fromBinary(GetPartnerDelegationRequestSchema, cardReceipt.value.request))
+      .toMatchObject({ partnerId: first.partnerId, delegationId: cancellable.delegationId });
+    const currentCard = required(fromBinary(GetPartnerDelegationResponseSchema, cardReceipt.value.body).delegation, "the inline card projection");
+    expect(currentCard).toMatchObject({ delegationId: cancellable.delegationId, status: PartnerDelegationStatus.RUNNING });
+    const currentCardRevision = required(currentCard.revision, "the inline card revision").value;
+    expect(currentCardRevision).toBeGreaterThanOrEqual(cancellationRevision);
     const completedCard = page.getByLabel(`Delegated work: ${COMPLETE_TITLE}`);
     try {
       await completedCard.waitFor({ state: "visible", timeout: 10_000 });
@@ -422,12 +468,6 @@ describe("mounted Partner collaboration product chain", () => {
       && text.includes("1 files") && text.includes(COMPLETE_REPLY), "the completed inline delegation card", 30_000);
     const cancelCard = page.getByLabel(`Delegated work: ${CANCEL_TITLE}`);
     await cancelCard.waitFor({ state: "visible", timeout: 30_000 });
-    const cardReceipt = required((await currentCardReceipt)[0], "the inline card read receipt");
-    if (cardReceipt.status === "rejected") throw cardReceipt.reason;
-    const currentCard = required(fromBinary(GetPartnerDelegationResponseSchema, await cardReceipt.value.body()).delegation, "the inline card projection");
-    expect(currentCard).toMatchObject({ delegationId: cancellable.delegationId, status: PartnerDelegationStatus.RUNNING });
-    const currentCardRevision = required(currentCard.revision, "the inline card revision").value;
-    expect(currentCardRevision).toBeGreaterThanOrEqual(cancellationRevision);
     await cancelCard.getByText("Running", { exact: true }).waitFor({ state: "visible" });
     const [cancelledRpc] = await Promise.all([
       page.waitForResponse(response => {

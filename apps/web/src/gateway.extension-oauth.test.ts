@@ -16,7 +16,7 @@ async function fixture() {
         : method.localName === "commitClient" || method.localName === "get" ? { state: { extensionId: "extension", revision: { value: 2n } } } : {};
     return { stream: false, service: method.parent, method, header: new Headers(), trailer: new Headers(), message: create(method.output, value) };
   }), stream: vi.fn() } as unknown as Transport;
-  const profile = { id: "original-profile", deviceId: "device", name: "Desktop", serverId: "original-server", origin: "https://original.example.test" };
+  const profile = { id: "original-profile", deviceId: "device", name: "Desktop", serverId: "original-server", origin: "http://127.0.0.1:4318" };
   const gateway = createOrchestratorGateway(profile, "original-auth-fixture", {}, () => transport); await gateway.connect({ snapshotOnly: true });
   return { gateway, calls, profile };
 }
@@ -25,7 +25,7 @@ it("sends client secrets only through the original protected upload channel", as
   const result = await f.gateway.extensionOAuthApi()!.saveClient({ extensionId: "extension", slotKey: "account", expectedRevision: { value: 1n } }, "application-client", "private-client-secret-fixture", new AbortController().signal);
   expect(result.revision!.value).toBe(2n);
   expect(JSON.stringify(f.calls, (_key, value: unknown) => typeof value === "bigint" ? String(value) : value)).not.toContain("private-client-secret-fixture");
-  const [url, init] = upload.mock.calls[0]!; expect(String(url)).toBe("https://original.example.test/v1/credentials/upload/protected-client");
+  const [url, init] = upload.mock.calls[0]!; expect(String(url)).toBe("http://127.0.0.1:4318/v1/credentials/upload/protected-client");
   expect(new Headers(init?.headers).get("authorization")).toBe("Bearer original-auth-fixture"); expect(ArrayBuffer.isView(init?.body)).toBe(true);
   expect(new Uint8Array(init!.body as Uint8Array).every(value => value === 0)).toBe(true); f.gateway.disconnect();
 });

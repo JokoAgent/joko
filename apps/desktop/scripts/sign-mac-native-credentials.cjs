@@ -24,10 +24,12 @@ function createSignHook(sign, audit = auditNativeRemoteDesktop) {
     for (const [kind, auditSimple] of Object.entries(simpleAudits)) {
       await auditSimple(join(resourcesRoot, SIMPLE_NATIVE_ARTIFACTS[kind].directory), "darwin", architecture);
     }
+    const preservedInputs = await selectedPinggySigningInputs(resourcesRoot, architecture);
     const original = options.optionsForFile;
     let sealed = false;
     await sign({
       ...options,
+      ...(preservedInputs.size === 0 ? {} : { ignore: file => preservedInputs.has(resolve(file)) || ignoredBy(options.ignore, file) }),
       optionsForFile: async file => {
         const defaults = await original?.(file);
         if (resolve(file) === credentialHelper) {
@@ -35,6 +37,12 @@ function createSignHook(sign, audit = auditNativeRemoteDesktop) {
             entitlements: resolve(__dirname, "..", "native", "remote-desktop", "credentials.entitlements.plist") };
         }
         if (resolve(file) === appPath) {
+          for (const [path, expected] of preservedInputs) {
+            await boundedRegularFile(resourcesRoot, path, 268_435_456);
+            if (createHash("sha256").update(await readFile(path)).digest("hex") !== expected) {
+              throw new Error("The selected Pinggy runtime changed before the outer App seal.");
+            }
+          }
           await refreshManifest(root, audit);
           for (const [kind, auditSimple] of Object.entries(simpleAudits)) {
             const artifact = SIMPLE_NATIVE_ARTIFACTS[kind];
@@ -47,6 +55,55 @@ function createSignHook(sign, audit = auditNativeRemoteDesktop) {
     });
     if (!sealed) throw new Error("The native credential manifest was not included in the outer App seal.");
   };
+}
+
+function ignoredBy(ignore, file) {
+  return (Array.isArray(ignore) ? ignore : [ignore]).some(value => typeof value === "function" ? value(file)
+    : value !== undefined && value !== null && file.match(value) !== null);
+}
+
+/** These inputs run in the independent official Node process. Re-signing them
+ * would invalidate their pinned preparation hashes; the outer App is still sealed. */
+async function selectedPinggySigningInputs(resourcesRoot, architecture) {
+  const root = join(resourcesRoot, "orchestrator-runtime", "dist", "linkspan-runtime"), path = join(root, "selected.json");
+  const info = await lstat(path).catch(error => { if (error.code === "ENOENT") return undefined; throw error; });
+  const preserved = new Map();
+  if (info === undefined) return preserved;
+  await boundedRegularFile(root, path, 65_536);
+  const selected = JSON.parse(await readFile(path, "utf8"));
+  if (!Array.isArray(selected.backends)) throw new Error("The selected Linkspan signing receipt is invalid.");
+  if (!selected.backends.includes("pinggy-sdk")) return preserved;
+  const target = `darwin-${architecture}`, sdk = selected.prepared?.pinggy, node = sdk?.nodeRuntime;
+  const sdkDirectory = `pinggy/pinggy-0.5.3/${target}/node-137`, executable = `pinggy/node-v24.16.0/${target}/node`;
+  if (selected.target !== target || sdk?.target !== target || sdk?.version !== "0.5.3" || sdk?.nodeAbi !== "137" || sdk?.sdkDirectory !== sdkDirectory
+    || node?.target !== target || node?.version !== "24.16.0" || node?.nodeAbi !== "137" || node?.executable !== executable
+    || !/^[a-f0-9]{64}$/u.test(node?.sha256 ?? "") || !/^[a-f0-9]{64}$/u.test(node?.archiveSha256 ?? "")) {
+    throw new Error("The selected Pinggy signing identity is invalid.");
+  }
+  const preserve = async (relativePath, expected, maximumBytes) => {
+    const file = join(root, relativePath);
+    await boundedRegularFile(root, file, maximumBytes);
+    if (createHash("sha256").update(await readFile(file)).digest("hex") !== expected) throw new Error("The selected Pinggy signing input was modified.");
+    if (preserved.has(file)) throw new Error("The selected Pinggy signing receipt repeats an input.");
+    preserved.set(file, expected);
+  };
+  await preserve(executable, node.sha256, 268_435_456);
+  await boundedRegularFile(root, join(root, executable, "..", "LICENSE"), 2_097_152);
+  await boundedRegularFile(root, join(root, sdkDirectory, "LICENSE.pinggy-sdk"), 2_097_152);
+  await boundedRegularFile(root, join(root, sdkDirectory, "dist", "index.js"), 16_777_216);
+  const receiptPath = join(root, sdkDirectory, "prepared.json");
+  await boundedRegularFile(root, receiptPath, 65_536);
+  const receipt = JSON.parse(await readFile(receiptPath, "utf8")), files = receipt.archive?.files;
+  if (receipt.version !== "0.5.3" || receipt.target !== target || receipt.nodeAbi !== "137" || receipt.archive?.target !== target || receipt.archive?.abi !== "137"
+    || !Array.isArray(files) || files.length < 1 || files.length > 32 || !files.some(file => file.path === "lib/addon.node")) {
+    throw new Error("The selected Pinggy SDK signing receipt is invalid.");
+  }
+  for (const file of files) {
+    if (!/^lib\/[a-zA-Z0-9_.-]+\.(?:node|dylib)$/u.test(file.path ?? "") || !/^[a-f0-9]{64}$/u.test(file.sha256 ?? "")
+      || !Number.isSafeInteger(file.bytes) || file.bytes < 1 || file.bytes > 134_217_728) throw new Error("The selected Pinggy SDK signing input is invalid.");
+    await preserve(`${sdkDirectory}/${file.path}`, file.sha256, file.bytes);
+  }
+  return preserved;
 }
 
 async function refreshManifest(root, audit) {

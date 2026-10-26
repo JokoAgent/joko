@@ -22,7 +22,7 @@ describe("artifact URL gateway leases", () => {
     const createObjectUrl = vi.spyOn(URL, "createObjectURL").mockReturnValueOnce("blob:shared").mockReturnValueOnce("blob:next");
     const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
     const gateway = createOrchestratorGateway(
-      { id: "connection-artifact", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "connection-artifact", deviceId: "device-test", name: "Desktop", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "secret",
       {},
       () => artifactTransport()
@@ -54,7 +54,7 @@ describe("artifact URL gateway leases", () => {
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:late");
     const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
     const gateway = createOrchestratorGateway(
-      { id: "connection-artifact", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "connection-artifact", deviceId: "device-test", name: "Desktop", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "secret",
       {},
       () => artifactTransport()

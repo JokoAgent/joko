@@ -45,6 +45,12 @@ import {
   type RemoteDesktopPermissions
 } from "@joko/contracts";
 import { mobileNetwork, mobileRemoteDesktopNetworkTesting, type PairedCredential } from "./network";
+import { mobileNetworkFixtureEndpointPublicKey } from "./test/mobile-network-transport";
+
+vi.mock("@joko/connection-transport", async importOriginal => {
+  const { controlledMobileConnectionTransport } = await import("./test/mobile-network-transport");
+  return controlledMobileConnectionTransport(await importOriginal<typeof import("@joko/connection-transport")>());
+});
 import { createMobileRemoteDesktopHostMutePreferenceStore,
   type MobileRemoteDesktopHostMutePreferences } from "./mobile-remote-desktop-host-mute-preference";
 import { createMobileRemoteDesktopLockPreferenceStore } from "./mobile-remote-desktop-lock-preference";
@@ -1771,7 +1777,7 @@ describe("MobileRemoteDesktopController", () => {
     const value = fixture(false, false);
     value.host.platform = "linux"; value.capabilities.platform = "linux";
     value.capabilities.canControl = false; value.capabilities.lockOnExit = true;
-    const credential: PairedCredential = { profileId: "profile-1", serverId: "server-1", deviceId: "phone-1",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile-1", serverId: "server-1", deviceId: "phone-1",
       connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
     const disk = new Map<string, string>();
     const preferences = createMobileRemoteDesktopLockPreferenceStore({ getItem: async key => disk.get(key) ?? null,

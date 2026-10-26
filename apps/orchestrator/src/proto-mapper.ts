@@ -4507,6 +4507,7 @@ function resolvedInteractionFromEvent(
 
 export interface ServerIdentity {
   readonly serverId: string;
+  readonly endpointPublicKey?: string;
   readonly displayName: string;
   readonly version: string;
   readonly apiVersion: string;
@@ -4522,7 +4523,8 @@ export function toProtoServerInfo(identity: ServerIdentity, now = Date.now()): S
     apiVersion: requireText(identity.apiVersion, "server.api_version"),
     serverTime: toProtoTimestamp(now),
     health: identity.health ?? ServerHealth.HEALTHY,
-    pairingEnabled: identity.pairingEnabled
+    pairingEnabled: identity.pairingEnabled,
+    endpointPublicKey: identity.endpointPublicKey ?? ""
   });
 }
 

@@ -311,12 +311,30 @@ describe("native mobile device through the durable product chain", () => {
       write: async (fileName, bytes) => { const file = { fileName, uri: `file:///controlled-cache/${fileName}`, byteSize: bytes.byteLength, bytes: bytes.slice() }; cache.set(fileName, file); return file; },
       remove: async (file) => { cache.delete(file.fileName); } }, async (bytes) => createHash("sha256").update(bytes).digest("hex"));
     const requests: { readonly path: string; readonly method: string; readonly authenticated: boolean }[] = [];
-    const actualFetch = globalThis.fetch;
-    const fetchProbe = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-      const request = new Request(input, init); const url = new URL(request.url);
-      if (url.origin === fixture!.baseUrl) requests.push({ path: url.pathname, method: request.method,
-        authenticated: request.headers.has("authorization") });
-      return actualFetch(input, init);
+    const secureTransport = await import("@joko/connection-transport");
+    const endpointPublicKey = fixture.application.linkspanIdentity!.publicKey;
+    const actualTransport = secureTransport.createConnectTransport;
+    const actualConnectionFetch = secureTransport.createConnectionFetch;
+    // Observe authenticated logical requests inside the real secure adapter.
+    // Encrypted business traffic never passes through globalThis.fetch.
+    const rpcProbe = vi.spyOn(secureTransport, "createConnectTransport").mockImplementation(options => {
+      expect(options.baseUrl).toBe(fixture!.baseUrl);
+      expect(options.endpointPublicKey ?? secureTransport.trustedEndpointPublicKey(options.baseUrl)).toBe(endpointPublicKey);
+      return actualTransport({ ...options, interceptors: [...(options.interceptors ?? []), next => async request => {
+        const url = new URL(request.url);
+        requests.push({ path: url.pathname, method: "POST", authenticated: request.header.has("authorization") });
+        return next(request);
+      }] });
+    });
+    const fetchProbe = vi.spyOn(secureTransport, "createConnectionFetch").mockImplementation(owner => {
+      expect(owner.origin).toBe(fixture!.baseUrl);
+      expect(owner.endpointPublicKey).toBe(endpointPublicKey);
+      const fetcher = actualConnectionFetch(owner);
+      return (input, init) => {
+        const request = new Request(input, init); const url = new URL(request.url);
+        requests.push({ path: url.pathname, method: request.method, authenticated: request.headers.has("authorization") });
+        return fetcher(input, init);
+      };
     });
     const phone = new MobileClient(mobileNetwork, createMobileStorage(memoryDriver(), { ...memoryDriver(), isAvailable: async () => true }),
       { scan: async () => [] }, randomUUID, "android", undefined, undefined, undefined, undefined, undefined, mediaFiles);
@@ -360,7 +378,7 @@ describe("native mobile device through the durable product chain", () => {
       expect(requests.filter((request) => request.method === "GET")).toHaveLength(4);
       phone.closeFiles(); expect(() => generatedCopy.assertCurrent()).toThrow("source changed");
       await vi.waitFor(() => expect(cache.size).toBe(0));
-    } finally { phone.dispose(); fetchProbe.mockRestore(); }
+    } finally { phone.dispose(); fetchProbe.mockRestore(); rpcProbe.mockRestore(); }
   });
 
   it("streams mobile PCM through the authenticated ephemeral Voice Input service without sending a task", async () => {

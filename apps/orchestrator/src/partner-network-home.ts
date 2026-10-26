@@ -3,7 +3,7 @@ import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { create, fromJsonString, toJsonString } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient, type Client, type Interceptor } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport } from "@joko/connection-transport/node";
 import * as contract from "@joko/contracts";
 import { networkHash, networkHumanId, networkIdentity } from "@joko/store";
 import type { CredentialVault, EncryptedCredential } from "./credential-vault.js";
@@ -16,10 +16,12 @@ export interface PartnerNetworkRemote {
 }
 export interface PartnerNetworkRemoteOptions {
   readonly origin: string; readonly serverId: string; readonly authorization?: () => string; readonly assertCurrent: () => void;
+  readonly endpointPublicKey: string;
   readonly allowInsecureLan?: boolean;
 }
 interface Joined {
   readonly id: string; readonly operationId: string; readonly fingerprint: string; readonly origin: string; readonly serverId: string;
+  readonly endpointPublicKey: string;
   readonly roomId: string; readonly memberId: string; readonly deviceId: string; readonly secret: EncryptedCredential;
   readonly displayName: string; status: "prepared" | "unknown" | "joined" | "left"; room: string;
 }
@@ -42,6 +44,7 @@ export class PartnerNetworkHome {
     if (disk.format !== 1 || disk.serverId !== this.options.serverId || !Array.isArray(disk.joined)) throw invalid();
     for (const row of disk.joined) {
       [row.id, row.operationId, row.serverId, row.roomId, row.memberId, row.deviceId].forEach(networkIdentity); partnerNetworkOrigin(row.origin, this.options.allowInsecureLan);
+      contract.taskShareEndpointPublicKey(row.endpointPublicKey);
       if (this.#joined.has(row.id) || !/^[a-f0-9]{64}$/u.test(row.fingerprint) || !["prepared", "unknown", "joined", "left"].includes(row.status)) throw invalid();
       this.#validateRoom(fromJsonString(contract.PartnerNetworkRoomSchema, row.room), row);
       this.#joined.set(row.id, { ...row, status: row.status === "prepared" ? "unknown" : row.status });
@@ -49,12 +52,12 @@ export class PartnerNetworkHome {
   }
   get signal(): AbortSignal { return this.#lifetime.signal; }
   #check(auth?: Pick<PartnerNetworkAuthority, "signal" | "assertCurrent">): void { this.#lifetime.signal.throwIfAborted(); auth?.signal.throwIfAborted(); auth?.assertCurrent(); }
-  #reference(row: Pick<Joined, "id" | "serverId" | "roomId" | "memberId">): string { return `conversation:${this.options.serverId}:${row.id}:${row.serverId}:${row.roomId}:${row.memberId}`; }
+  #reference(row: Pick<Joined, "id" | "serverId" | "roomId" | "memberId" | "origin" | "endpointPublicKey">): string { return `conversation:${this.options.serverId}:${row.id}:${row.serverId}:${row.roomId}:${row.memberId}:${row.origin}:${contract.taskShareEndpointPublicKey(row.endpointPublicKey)}`; }
   #get(joinId: string): Joined { const row = this.#joined.get(networkIdentity(joinId)); if (!row || row.status === "prepared" || row.status === "unknown") throw new ConnectError("Read the original join result before continuing.", Code.FailedPrecondition); return row; }
   #client(row: Joined, auth?: Pick<PartnerNetworkAuthority, "signal" | "assertCurrent">, terminal = false): PartnerNetworkRemote {
     const check = () => { this.#check(auth); if (this.#joined.get(row.id) !== row || row.status !== "joined" && !(terminal && row.status === "left")) throw denied(); };
     partnerNetworkOrigin(row.origin, this.options.allowInsecureLan);
-    return (this.options.connect ?? createPartnerNetworkRemote)({ origin: row.origin, serverId: row.serverId, allowInsecureLan: this.options.allowInsecureLan === true,
+    return (this.options.connect ?? createPartnerNetworkRemote)({ origin: row.origin, serverId: row.serverId, endpointPublicKey: contract.taskShareEndpointPublicKey(row.endpointPublicKey), allowInsecureLan: this.options.allowInsecureLan === true,
       assertCurrent: check, authorization: () => { check(); const secret = JSON.parse(this.options.vault.open(row.secret, this.#reference(row))) as { credential: string };
         if (!/^[A-Za-z0-9_-]{43}$/u.test(secret.credential)) throw denied(); return `Bearer joko-conversation-${secret.credential}`; } });
   }
@@ -62,11 +65,12 @@ export class PartnerNetworkHome {
     this.#check(auth); const parsed = parsePartnerNetworkInvitation(invitation);
     partnerNetworkOrigin(parsed.origin, this.options.allowInsecureLan);
     if (parsed.serverId === this.options.serverId) throw new ConnectError("Open this node's group directly.", Code.FailedPrecondition);
-    const remote = (this.options.connect ?? createPartnerNetworkRemote)({ origin: parsed.origin, serverId: parsed.serverId, allowInsecureLan: this.options.allowInsecureLan === true, assertCurrent: () => this.#check(auth) });
+    const remote = (this.options.connect ?? createPartnerNetworkRemote)({ origin: parsed.origin, serverId: parsed.serverId, endpointPublicKey: parsed.endpointPublicKey, allowInsecureLan: this.options.allowInsecureLan === true, assertCurrent: () => this.#check(auth) });
     await remote.verify(auth.signal); this.#check(auth);
     const result = await remote.client.inspectPartnerNetwork({ invitation }, { signal: auth.signal }); this.#check(auth);
-    if (!result.room || result.room.hostServerId !== parsed.serverId || result.room.hostOrigin !== parsed.origin || !result.link || result.link.roomId !== result.room.id) throw invalid();
-    return create(contract.PreviewPartnerNetworkResponseSchema, { ...result, $typeName: undefined });
+    if (!result.room || result.room.hostServerId !== parsed.serverId || !result.link || result.link.roomId !== result.room.id) throw invalid();
+    contract.taskShareOrigin(result.room.hostOrigin);
+    return create(contract.PreviewPartnerNetworkResponseSchema, { ...result, room: { ...result.room, hostOrigin: parsed.origin }, $typeName: undefined });
   }
   join(request: contract.JoinPartnerNetworkRequest, auth: PartnerNetworkAuthority): Promise<contract.PartnerNetworkRoom> {
     const fingerprint = networkHash([request.invitation, request.displayName, auth.deviceId]), key = networkIdentity(request.operationId);
@@ -77,14 +81,15 @@ export class PartnerNetworkHome {
       if (!row) {
         const preview = await this.preview(request.invitation, auth); this.#check(auth); const room = preview.room!;
         const id = randomUUID(), memberId = networkHumanId(this.options.serverId), credential = randomBytes(32).toString("base64url");
-        const identity = { id, serverId: room.hostServerId, roomId: room.id, memberId };
+        const identity = { id, serverId: room.hostServerId, roomId: room.id, memberId, origin: room.hostOrigin, endpointPublicKey: parsePartnerNetworkInvitation(request.invitation).endpointPublicKey };
         row = { ...identity, operationId: key, fingerprint, deviceId: auth.deviceId, origin: room.hostOrigin, displayName: request.displayName,
+          endpointPublicKey: parsePartnerNetworkInvitation(request.invitation).endpointPublicKey,
           secret: this.options.vault.seal(JSON.stringify({ credential, invitation: request.invitation }), this.#reference(identity)), status: "prepared", room: toJsonString(contract.PartnerNetworkRoomSchema, room) };
         this.#joined.set(id, row); await this.#save(); this.#check(auth);
       }
       row.status = "unknown"; await this.#save(); this.#check(auth);
       const selected = row;
-      const remote = (this.options.connect ?? createPartnerNetworkRemote)({ origin: row.origin, serverId: row.serverId, allowInsecureLan: this.options.allowInsecureLan === true, assertCurrent: () => this.#check(auth) });
+      const remote = (this.options.connect ?? createPartnerNetworkRemote)({ origin: row.origin, serverId: row.serverId, endpointPublicKey: row.endpointPublicKey, allowInsecureLan: this.options.allowInsecureLan === true, assertCurrent: () => this.#check(auth) });
       await remote.verify(auth.signal); this.#check(auth);
       const secret = JSON.parse(this.options.vault.open(row.secret, this.#reference(row))) as { credential: string; invitation: string };
       const result = await remote.client.acceptPartnerNetwork({ operationId: row.operationId, invitation: secret.invitation, homeServerId: this.options.serverId,
@@ -94,7 +99,7 @@ export class PartnerNetworkHome {
     });
   }
   #public(row: Joined): contract.PartnerNetworkRoom {
-    const room = fromJsonString(contract.PartnerNetworkRoomSchema, row.room); return create(contract.PartnerNetworkRoomSchema, { ...room, selfId: row.memberId, joinId: row.id,
+    const room = fromJsonString(contract.PartnerNetworkRoomSchema, row.room); return create(contract.PartnerNetworkRoomSchema, { ...room, hostOrigin: row.origin, selfId: row.memberId, joinId: row.id,
       availability: row.status === "joined" ? room.availability : row.status === "left" ? "denied" : "joining" });
   }
   directory(): contract.PartnerNetworkRoom[] { return [...this.#joined.values()].map(row => this.#public(row)); }
@@ -177,7 +182,8 @@ export class PartnerNetworkHome {
   }
   #room(joinId: string, roomId: string): Joined { const row = this.#get(joinId); if (row.roomId !== roomId) throw denied(); return row; }
   #validateRoom(room: contract.PartnerNetworkRoom, row: Pick<Joined, "roomId" | "serverId" | "origin" | "memberId">): void {
-    if (room.id !== row.roomId || room.hostServerId !== row.serverId || room.hostOrigin !== row.origin || room.revision < 1n
+    contract.taskShareOrigin(room.hostOrigin);
+    if (room.id !== row.roomId || room.hostServerId !== row.serverId || room.revision < 1n
       || room.selfId && room.selfId !== row.memberId || !["active", "archived", "dissolved"].includes(room.state)) throw invalid();
   }
   #single<T>(key: string, task: () => Promise<T>): Promise<T> { const old = this.#flights.get(key); if (old) return old as Promise<T>;
@@ -193,12 +199,12 @@ export class PartnerNetworkHome {
   async close(): Promise<void> { this.#lifetime.abort(); await this.#saveFlight; }
 }
 export function createPartnerNetworkRemote(options: PartnerNetworkRemoteOptions): PartnerNetworkRemote {
-  const baseUrl = partnerNetworkOrigin(options.origin, options.allowInsecureLan), identity = createClient(contract.ConnectionService, createConnectTransport({ baseUrl, httpVersion: "1.1", defaultTimeoutMs: 10_000 }));
+  const baseUrl = partnerNetworkOrigin(options.origin, options.allowInsecureLan), endpointPublicKey = contract.taskShareEndpointPublicKey(options.endpointPublicKey), identity = createClient(contract.ConnectionService, createConnectTransport({ baseUrl, endpointPublicKey, httpVersion: "1.1", defaultTimeoutMs: 10_000 }));
   const verify = async (signal: AbortSignal) => { options.assertCurrent(); signal.throwIfAborted(); const result = await identity.getServerInfo({}, { signal });
     options.assertCurrent(); signal.throwIfAborted(); if (result.server?.serverId !== options.serverId) throw denied(); };
   const authorization: Interceptor = next => async request => { await verify(request.signal); options.assertCurrent(); const secret = options.authorization?.();
     if (secret) request.header.set("authorization", secret); const result = await next(request); options.assertCurrent(); return result; };
-  return { verify, client: createClient(contract.PartnerNetworkGuestService, createConnectTransport({ baseUrl, httpVersion: "1.1", useBinaryFormat: true,
+  return { verify, client: createClient(contract.PartnerNetworkGuestService, createConnectTransport({ baseUrl, endpointPublicKey, httpVersion: "1.1", useBinaryFormat: true,
     readMaxBytes: 1024 * 1024, writeMaxBytes: 1024 * 1024, defaultTimeoutMs: 15_000, interceptors: [authorization] })) };
 }
 export function partnerNetworkOrigin(value: string, allowInsecureLan = false): string {

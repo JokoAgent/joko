@@ -272,7 +272,7 @@ async function connected(beforeTicket?: (signal: AbortSignal) => Promise<void>) 
     }),
     stream: vi.fn(async (method: any) => ({ stream: true, service: method.parent, method, header: new Headers(), trailer: new Headers(), message: idleStream() }))
   } as unknown as Transport;
-  const gateway = createOrchestratorGateway({ id: "owner", deviceId: "device", name: "Node", origin: "https://node.example", serverId: "server" }, "test-key", {}, () => transport);
+  const gateway = createOrchestratorGateway({ id: "owner", deviceId: "device", name: "Node", origin: "http://127.0.0.1:4318", serverId: "server" }, "test-key", {}, () => transport);
   await gateway.connect();
   return gateway;
 }

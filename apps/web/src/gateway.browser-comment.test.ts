@@ -56,7 +56,7 @@ describe("Browser page comments at the send boundary", () => {
       }),
       stream: vi.fn(async (method: any) => response(method, idleStream(), true))
     } as unknown as Transport;
-    const gateway = createOrchestratorGateway({ id: "connection-comment", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" }, "secret", {}, () => transport);
+    const gateway = createOrchestratorGateway({ id: "connection-comment", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
 
     await gateway.send("session-1", {

@@ -86,6 +86,27 @@ describe("guest gateway operation recovery", () => {
     expect(f.api.events).toHaveBeenCalledTimes(2);
     f.gateway.disconnect(); await vi.advanceTimersByTimeAsync(10_000); expect(f.api.events).toHaveBeenCalledTimes(2);
   });
+  it("retains a finite-batch retry failure until the current guest request succeeds, including an empty batch", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
+    const states: string[] = [], errors: string[] = [];
+    const f = fixture([], "active", { onState: state => states.push(state), onError: error => errors.push(error.message) });
+    let reopen!: (batch: Awaited<ReturnType<TaskSharingApi["events"]>>) => void;
+    vi.mocked(f.api.events).mockRejectedValueOnce(new ConnectError("Guest events offline", Code.Unavailable))
+      .mockImplementationOnce(() => new Promise(resolve => { reopen = resolve; }));
+    await f.gateway.connect(); await vi.advanceTimersByTimeAsync(0);
+    const established = states.filter(state => state === "connected").length;
+    expect(states.at(-1)).toBe("offline");
+    await vi.advanceTimersByTimeAsync(350);
+    expect(f.api.events).toHaveBeenCalledTimes(2); expect(states.at(-1)).toBe("offline");
+    expect(errors.at(-1)).toBe("Guest events offline");
+    expect(states.filter(state => state === "connected")).toHaveLength(established);
+    reopen({ generation: 1n, events: [], resyncRequired: false, resumeCursor: create(EventCursorSchema, { generation: 1n, sequence: 0n }) } as never);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(states.at(-1)).toBe("connected");
+    expect(states.filter(state => state === "connected")).toHaveLength(established + 1);
+    f.gateway.disconnect(); await vi.advanceTimersByTimeAsync(0);
+  });
   it("does not resubmit an uncertain guest mutation, fences later writes and only clears authenticated absence", async () => {
     const f = fixture(); await f.gateway.connect({ snapshotOnly: true });
     await expect(f.gateway.setSharedTaskRuntime("task", { effort: "xhigh" })).rejects.toMatchObject({ code: Code.Unavailable });

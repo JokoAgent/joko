@@ -61,6 +61,7 @@ export function projectMobileConnection(state: MobileState, locale: MobileSuppor
   const profiles = state.saved.map((profile) => ({
     id: profile.profileId, deviceId: profile.deviceId, serverId: profile.serverId,
     name: profile.displayName, origin: profile.origin, automatic: profile.automatic,
+    endpointPublicKey: profile.endpointPublicKey, transportKind: profile.transportKind,
     credentialState: profile.credentialState, statusLabel: savedStatus(profile, locale), error: profile.error,
     identityLabel: mobileMessage(locale, "connection.identity", { id: profile.serverId }),
     pendingCount: profile.pendingOperations.length,

@@ -26,6 +26,9 @@ const CHANNELS = Object.freeze({
 });
 
 let peer: RTCPeerConnection | undefined;
+// Retain the actual UDP socket until Main has confirmed public forwarding
+// retirement. Track/input authority is revoked immediately while it is held.
+const heldPeers = new Set<RTCPeerConnection>();
 let stream: MediaStream | undefined;
 let generation = 0;
 let attempt: { readonly leaseId: string; readonly attemptId: string } | undefined;
@@ -218,7 +221,9 @@ class PortalCaptureStream {
 const portal = new PortalCaptureStream();
 window.addEventListener("unload", () => portal.stop(), { once: true });
 
-function stop(): void {
+function stop(notifyMain = true): void {
+  const retiringPeer = peer;
+  const retiringAttempt = attempt;
   generation += 1;
   nativeGeneration += 1;
   exchanging = false;
@@ -247,10 +252,17 @@ function stop(): void {
   attempt = undefined;
   candidates = [];
   remoteCandidates = new Set();
-  peer?.close();
   peer = undefined;
   stream?.getTracks().forEach((track) => track.stop());
   stream = undefined;
+  if (retiringPeer !== undefined) {
+    heldPeers.add(retiringPeer);
+    if (notifyMain && retiringAttempt !== undefined) {
+      void ipcRenderer.invoke(CHANNELS.stopped, retiringAttempt.leaseId, retiringAttempt.attemptId).then(() => {
+        retiringPeer.close(); heldPeers.delete(retiringPeer);
+      }).catch(() => { /* Keep the socket allocated until trusted Main cleanup succeeds. */ });
+    }
+  }
 }
 
 function retireNativeStream(value: MediaStream): void {
@@ -274,7 +286,12 @@ ipcRenderer.on(CHANNELS.command, (_event: IpcRendererEvent, raw: unknown) => {
     return;
   }
   if (command?.op === "stop") {
-    stop();
+    stop(false);
+    for (const retiring of heldPeers) retiring.close(); heldPeers.clear();
+    return;
+  }
+  if (command?.op === "quiesce") {
+    stop(false);
     return;
   }
   if (command?.op === "ice") {
@@ -395,7 +412,6 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         () => {
           if (!alive()) return;
           stop();
-          void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
         },
         (cursor) => { if (current === generation) latestCursor = cursor; },
         command.cursorOverlay ? fps : 15,
@@ -512,7 +528,6 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       })().catch(() => {
         if (current === generation) {
           stop();
-          void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
         }
       }).finally(() => {
         if (current === generation) recovering = false;
@@ -655,7 +670,6 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
             recoverCapture?.();
           } else {
             stop();
-            void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
           }
         }
       };

@@ -15,6 +15,9 @@ import { registerInputHandoffNativeHost } from "./input-handoff/native-host.js";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { ConnectionAuthenticationError } from "./connection-manager.js";
 import { ExtensionMainViewError, surfaceHeaders } from "./extension-main-view-manager.js";
+import { ISOLATED_EXTENSION_CSP } from "./extension-main-view-document.js";
+import { bindResponseLifetime } from "./http-response-lifetime.js";
+import { registerLinkspanWebRtcSignaling } from "./linkspan-webrtc-server.js";
 import type { NativeAuthRunnerProof, RemoteNativeAuthRunnerAttestation } from "./native-auth-recovery.js";
 
 export const JOKO_DESKTOP_APP_ORIGIN = "joko://app";
@@ -37,8 +40,11 @@ export const ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY = [
   "connect-src 'self' blob: https: http: ws: wss:"
 ].join("; ");
 
-export async function createPublicServer(application: OrchestratorApplication): Promise<FastifyInstance> {
-  const tls = readTls(application.config);
+export async function createPublicServer(application: OrchestratorApplication, options: {
+  /** An unadvertised, process-owned loopback bridge for verified Linkspan requests. */
+  readonly secureBridge?: boolean;
+} = {}): Promise<FastifyInstance> {
+  const tls = options.secureBridge ? undefined : readTls(application.config);
   const server = Fastify({
     logger: {
       level: process.env.JOKO_LOG_LEVEL ?? "info",
@@ -75,9 +81,18 @@ export async function createPublicServer(application: OrchestratorApplication): 
   server.addContentTypeParser("application/octet-stream", (request, payload, done) => {
     done(null, payload);
   });
+  server.addContentTypeParser("text/css", { parseAs: "string" }, (_request, body, done) => done(null, body));
+  if (options.secureBridge) registerLinkspanWebRtcSignaling(server, application);
   server.addHook("onRequest", async (request, reply) => {
-    if (tls !== undefined) return;
     const remote = normalizeSocketAddress(request.ip);
+    const metadata = ["/healthz", "/joko.v1.ConnectionService/GetServerInfo", "/joko.v1.ConnectionService/ListDiscoveredNodes"].includes(request.url);
+    const webAsset = ["GET", "HEAD"].includes(request.method) && (request.url === "/" || request.url.startsWith("/assets/")
+      || ["/favicon.svg", "/favicon.ico", "/manifest.webmanifest", "/isolated-surface.html", "/isolated-surface.js"].includes(request.url));
+    const restrictedLanHttp = tls === undefined && application.config.allowInsecureLan && isPrivateLanHost(remote);
+    if (!options.secureBridge && !isLoopbackHost(remote) && !restrictedLanHttp && !metadata && !webAsset) {
+      return reply.code(426).send({ error: "Use the pinned endpoint's encrypted Linkspan connection." });
+    }
+    if (tls !== undefined) return;
     // Fastify injection has no real local socket; production requests always do.
     const local = normalizeSocketAddress(request.raw.socket.localAddress ?? request.ip);
     const permitted = application.config.allowInsecureLan
@@ -85,7 +100,35 @@ export async function createPublicServer(application: OrchestratorApplication): 
       : isLoopbackHost(remote) && isLoopbackHost(local);
     if (!permitted) return reply.code(403).send({ error: "Insecure Orchestrator access is limited to the configured local network." });
   });
+  server.addHook("onRequest", async (request, reply) => {
+    if (options.secureBridge || request.headers.authorization === undefined) return;
+    let connection;
+    try { connection = application.connections.authenticate(request.headers.authorization); }
+    catch (error) { if (error instanceof ConnectionAuthenticationError) return; throw error; }
+    // Direct loopback and explicitly enabled LAN HTTP retain their existing
+    // handlers, while revocation also retires their active transport owner.
+    const stop = application.connections.onRevoked(connection.id, () => {
+      reply.raw.destroy();
+      request.raw.destroy();
+    });
+    const dispose = (): void => {
+      stop();
+      reply.raw.removeListener("finish", dispose);
+      reply.raw.removeListener("close", dispose);
+      request.raw.removeListener("aborted", dispose);
+    };
+    reply.raw.once("finish", dispose);
+    reply.raw.once("close", dispose);
+    request.raw.once("aborted", dispose);
+    try { application.connections.authenticate(request.headers.authorization); }
+    catch (error) { dispose(); throw error; }
+  });
   server.addHook("onSend", async (request, reply, payload) => {
+    if (request.url === "/isolated-surface.html") {
+      reply.header("content-security-policy", "sandbox allow-scripts; object-src 'none'; form-action 'none'");
+      reply.header("cache-control", "no-store"); reply.header("x-content-type-options", "nosniff");
+      return payload;
+    }
     if (/^\/mcp-apps\/(?:proxy|resource|bridge)\/[a-f0-9]{64}$/u.test(request.url)) {
       reply.header("cross-origin-resource-policy", "cross-origin");
       reply.header("x-content-type-options", "nosniff");
@@ -96,6 +139,11 @@ export async function createPublicServer(application: OrchestratorApplication): 
     }
     if (isExtensionMainViewRequest(request.url)) {
       for (const [name, value] of Object.entries(surfaceHeaders())) reply.header(name, value);
+      if (["1", "script", "module", "style", "style-text"].includes(String(request.headers["x-joko-isolated-document"]))) {
+        reply.header("content-security-policy", ISOLATED_EXTENSION_CSP);
+        const origin = request.headers.origin;
+        if (origin !== undefined && (origin === JOKO_DESKTOP_APP_ORIGIN || application.config.corsOrigins.includes(origin))) reply.header("access-control-allow-origin", origin);
+      }
       if (tls !== undefined) reply.header("strict-transport-security", "max-age=31536000; includeSubDomains");
       return payload;
     }
@@ -103,7 +151,9 @@ export async function createPublicServer(application: OrchestratorApplication): 
     reply.header("x-frame-options", "DENY");
     reply.header("referrer-policy", "no-referrer");
     reply.header("permissions-policy", "camera=(), microphone=(self), geolocation=()");
-    reply.header("cross-origin-resource-policy", "same-site");
+    // The sandbox bootstrap has an opaque initiator even when its URL is on the
+    // trusted UI origin. Its public, immutable boot script must be loadable there.
+    reply.header("cross-origin-resource-policy", request.url === "/isolated-surface.js" ? "cross-origin" : "same-site");
     reply.header(
       "content-security-policy",
       ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY
@@ -130,8 +180,8 @@ export async function createPublicServer(application: OrchestratorApplication): 
 
   await server.register(cors, {
     credentials: false,
-    allowedHeaders: ["authorization", "content-type", "connect-protocol-version", "connect-timeout-ms", "x-joko-client-version"],
-    exposedHeaders: ["connect-content-encoding", "connect-accept-encoding", "grpc-status", "grpc-message"],
+    allowedHeaders: ["authorization", "content-type", "connect-protocol-version", "connect-timeout-ms", "x-joko-client-version", "x-joko-isolated-document"],
+    exposedHeaders: ["connect-content-encoding", "connect-accept-encoding", "grpc-status", "grpc-message", "content-security-policy"],
     methods: ["GET", "POST", "PUT", "OPTIONS"],
     origin(origin, callback) {
       const allowed = origin === undefined || origin === JOKO_DESKTOP_APP_ORIGIN ||
@@ -156,14 +206,26 @@ export async function createPublicServer(application: OrchestratorApplication): 
       if (application.extensionMainViews === undefined) {
         return reply.code(404).send({ error: "Extension main view is unavailable." });
       }
+      const abort = new AbortController();
+      const cancel = () => abort.abort();
+      request.raw.once("aborted", cancel);
+      reply.raw.once("close", cancel);
       try {
+        const kind = request.headers["x-joko-isolated-document"];
+        const materializeAsset = kind === "script" || kind === "module" || kind === "style" ? kind : kind === "style-text" ? "style" : undefined;
+        if (kind === "style-text" && (request.method !== "POST" || !request.headers["content-type"]?.startsWith("text/css") || typeof request.body !== "string")) return reply.code(400).send();
         const asset = await application.extensionMainViews.serve({
           surfaceId: request.params.surfaceId,
           token: request.params.token,
           assetPath: request.params["*"],
           method: request.method,
-          rangeRequested: request.headers.range !== undefined
+          rangeRequested: request.headers.range !== undefined,
+          isolatedDocument: request.headers["x-joko-isolated-document"] === "1",
+          ...(materializeAsset === undefined ? {} : { materializeAsset }),
+          ...(kind === "style-text" ? { inlineStyle: request.body as string } : {}),
+          signal: abort.signal
         });
+        if (!bindResponseLifetime(reply, asset.lifetime)) return reply.code(410).send({ error: "Extension main view was revoked." });
         reply.type(asset.mimeType);
         reply.header("content-length", String(asset.contentLength));
         if (request.method === "HEAD") return reply.code(asset.status).send();
@@ -175,6 +237,9 @@ export async function createPublicServer(application: OrchestratorApplication): 
           return reply.code(error.statusCode).send({ error: "Extension main-view asset is unavailable." });
         }
         throw error;
+      } finally {
+        request.raw.removeListener("aborted", cancel);
+        reply.raw.removeListener("close", cancel);
       }
     }
   });
@@ -247,6 +312,7 @@ export async function createPublicServer(application: OrchestratorApplication): 
   const projectionShutdown = new AbortController();
   if (application.hostedAgents) await registerHostedAgentDesktopService(server, {
     runtime: application.hostedAgents, connections: application.connections, serverId: application.serverId,
+    ...(application.remoteDesktop === undefined ? {} : { media: application.remoteDesktop }),
     ...(application.providerGroups ? { groupOptions: application.providerGroups.connectOptions(() => { throw new Error("A current Device route is required."); }) } : {})
   });
   if (application.nativeInputHandoff) await registerInputHandoffNativeHost(server, application.nativeInputHandoff);

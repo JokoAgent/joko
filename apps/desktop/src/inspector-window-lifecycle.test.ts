@@ -164,6 +164,9 @@ describe("detached Inspector owner lifecycle", () => {
     const failed = fixture();
     expect(failed.lifecycle.markReady(failed.child)).toBe(true);
     expect(failed.lifecycle.markChildFailed(failed.child)).toBe(true);
+    expect(failed.lifecycle.owns(failed.owner, failed.child)).toBe(false);
+    expect(failed.lifecycle.markReady(failed.child)).toBe(false);
+    expect(failed.lifecycle.canReveal(failed.child)).toBe(false);
     expect(failed.lifecycle.markUserClosing(failed.child)).toBe(false);
     failed.setChildDestroyed(true);
     expect(failed.lifecycle.closeDecision(failed.child)).toEqual({ notifyOwner: true, returnFocus: false, reason: "child-failure" });

@@ -36,7 +36,11 @@ it.each([0, HOSTED_AGENT_ARTIFACT_CHUNK_BYTES * 2 + 17])("streams a %i-byte nati
   const offer = frame.payload.request.offer, read = vi.fn((id: string, offset: number, maximum: number) => f.artifacts.read(id, offset, maximum));
   const blob = await receiveHostedAgentArtifact({ offer, context: f.context, temporaryRoot: f.task, signal: f.signal, assertCurrent: () => {}, readChunk: read });
   f.exchange.reply(frame.payload.id, { ok: true, value: blob }); expect(await pending).toEqual(blob);
-  expect(f.admitted).toEqual([bytes]); expect(read).toHaveBeenCalledTimes(Math.ceil(length / HOSTED_AGENT_ARTIFACT_CHUNK_BYTES));
+  expect(f.admitted).toHaveLength(1);
+  expect(f.admitted[0]!.byteLength).toBe(length);
+  // Compare every byte without enumerating millions of Buffer object members.
+  expect(f.admitted[0]!.equals(bytes)).toBe(true);
+  expect(read).toHaveBeenCalledTimes(Math.ceil(length / HOSTED_AGENT_ARTIFACT_CHUNK_BYTES));
   expect(await readdir(f.task)).toEqual([]);
   await expect(f.artifacts.read(offer.id, 0, 1)).rejects.toThrow("unavailable");
   expect(JSON.stringify(offer)).not.toContain(f.host);

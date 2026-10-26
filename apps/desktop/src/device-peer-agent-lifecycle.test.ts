@@ -20,6 +20,20 @@ const SECOND: DesktopManagedOrchestratorConnection = Object.freeze({
 });
 
 describe("Desktop Device peer agent lifecycle", () => {
+  it("retires the original managed route when its fixed endpoint key changes", async () => {
+    const attempts: Array<{ connection: DesktopManagedOrchestratorConnection; signal: AbortSignal }> = [];
+    const lifecycle = new DesktopDevicePeerAgentLifecycle({ createExecutor: () => fakeExecutor(), readAuthKey: async () => "A".repeat(43),
+      readDefaultDeviceName: () => "Desktop", readRouteAuthorization: async () => "R".repeat(43), isAuthorityCurrent: () => true,
+      async runRoute(options) { attempts.push({ connection: options.connection, signal: options.signal }); await aborted(options.signal); }, wait: immediateWait });
+    try {
+      lifecycle.setConnection({ ...FIRST, endpointPublicKey: `ed25519:${"1".repeat(64)}` });
+      await eventually(() => attempts.length === 1);
+      lifecycle.setConnection({ ...FIRST, endpointPublicKey: `ed25519:${"2".repeat(64)}` });
+      expect(attempts[0]!.signal.aborted).toBe(true);
+      await eventually(() => attempts.length === 2);
+      expect(attempts[1]!.connection.endpointPublicKey).toBe(`ed25519:${"2".repeat(64)}`);
+    } finally { await lifecycle.dispose(); }
+  });
   it("owns one exact ready route and immediately aborts and retires it on replacement and stop", async () => {
     const attempts: Array<{
       readonly connection: DesktopManagedOrchestratorConnection;
@@ -211,6 +225,42 @@ describe("Desktop Device peer agent lifecycle", () => {
       await eventually(() => routed.length === 2);
       finishProbe(); await new Promise(resolve => setTimeout(resolve, 0));
       expect(routed).toEqual([FIRST, SECOND]);
+    } finally { finishProbe?.(); await lifecycle.dispose(); }
+  });
+
+  it("reports the native recovery wait without allowing diagnostic failures to finish or block retirement", async () => {
+    let finishProbe!: () => void;
+    let probeStarted = false, routeStarted = false;
+    const stages: string[] = [];
+    const executor = fakeExecutor();
+    const lifecycle = new DesktopDevicePeerAgentLifecycle({
+      createExecutor: () => executor,
+      readAuthKey: async () => "A".repeat(43), readRouteAuthorization: async () => "R".repeat(43),
+      readDefaultDeviceName: () => "Desktop", isAuthorityCurrent: () => true,
+      runRoute: async options => { routeStarted = true; await aborted(options.signal); },
+      wait: immediateWait,
+      recoverNativeAgents: async () => {
+        probeStarted = true;
+        await new Promise<void>(resolve => { finishProbe = resolve; });
+        return false;
+      },
+      observeRetirement: stage => {
+        stages.push(stage);
+        throw new Error("A diagnostic observer cannot own retirement.");
+      }
+    });
+    try {
+      lifecycle.setConnection(FIRST);
+      await eventually(() => probeStarted && routeStarted);
+      const retired = lifecycle.dispose();
+      await eventually(() => stages.includes("native_recovery_wait_started"));
+      expect(stages).toEqual(["worker_wait_started", "worker_executor_retirement_started",
+        "worker_executor_retirement_completed", "worker_retry_started", "worker_retry_completed",
+        "worker_wait_completed", "native_recovery_wait_started"]);
+      expect(executor.retire).toHaveBeenCalledOnce();
+      finishProbe();
+      await retired;
+      expect(stages.at(-1)).toBe("native_recovery_wait_completed");
     } finally { finishProbe?.(); await lifecycle.dispose(); }
   });
 });

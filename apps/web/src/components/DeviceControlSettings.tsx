@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import type { AppController } from "../controller.js";
 import type { AppSnapshot, DeviceControlRelationView, DeviceView } from "../model.js";
+import { DevicePairingInvitation } from "./DevicePairingInvitation.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, Pill, StatusDot, cx, formatRelativeTime, SwitchControl } from "./ui.js";
 import { desktopRemoteDesktopViewerOwner, openDesktopRemoteDesktopViewer } from "../remote-desktop-viewer-bridge.js";
@@ -60,6 +61,7 @@ export function DeviceControlSettings({ controller, snapshot, locale, runAction,
   const canReceiveControl = currentDevice.kind === "desktop" || currentDevice.kind === "service";
 
   return <section className="device-control-settings" aria-labelledby="device-control-heading">
+    <DevicePairingInvitation controller={controller} t={t} />
     <div className="device-control-settings__heading">
       <div>
         <h3 id="device-control-heading">{t("settings.deviceControl.title")}</h3>

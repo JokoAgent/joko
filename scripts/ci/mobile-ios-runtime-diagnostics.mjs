@@ -1,10 +1,51 @@
 import { execFile } from "node:child_process";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { availableParallelism, freemem, homedir, loadavg, totalmem } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
+
+export function requireSimulatorApplicationContainer(value) {
+  if (typeof value !== "string" || !posix.isAbsolute(value) || /[\0\r\n]/u.test(value)) {
+    throw new Error("The installed Simulator application query did not return an absolute container path.");
+  }
+  return value;
+}
+
+export async function locateInstalledSimulatorApplication({ owner, command, getReceipt, isCurrent, signal, onRetry }) {
+  const assertOwner = () => {
+    signal.throwIfAborted();
+    if (!owner.simulatorUdid || !owner.bundleId || !owner.deviceName?.startsWith("joko-ci-") || !isCurrent()) {
+      throw new Error("No owned Simulator application is available for the installation query.");
+    }
+  };
+  const args = ["simctl", "get_app_container", owner.simulatorUdid, owner.bundleId, "app"];
+  const query = label => command("xcrun", args, { timeout: 30_000, startupLabel: label });
+  let empty = false;
+  try {
+    assertOwner();
+    const container = await query("locate-installed-application");
+    assertOwner();
+    empty = container === "";
+    return requireSimulatorApplicationContainer(container);
+  } catch (error) {
+    const receipt = getReceipt();
+    assertOwner();
+    const emptySuccess = empty && receipt?.result === "passed" && receipt.exitCode === 0
+      && receipt.signal === null && receipt.killed === false && receipt.stdoutBytes === 0;
+    const killedTimeout = receipt?.result === "failed" && receipt.killed === true && receipt.signal === "SIGTERM"
+      && receipt.exitCode === null && receipt.errorCode === null && receipt.elapsedMs >= receipt.timeoutMs;
+    if (receipt?.step !== "locate-installed-application" || receipt.timeoutMs !== 30_000
+      || receipt.cancelled !== false || !emptySuccess && !killedTimeout) throw error;
+    // Repeat only this read of the same owned application. Neither an empty
+    // successful host reply nor a killed query establishes its installed path.
+    onRetry();
+    const container = await query("retry-locate-installed-application");
+    assertOwner();
+    return requireSimulatorApplicationContainer(container);
+  }
+}
 
 export function isUiRunnerAccessibilityStartupFailure(summary, identityRequests, unexpectedRequests) {
   const failure = summary?.testFailures?.[0];

@@ -25,6 +25,8 @@ import { SessionHost } from "./session-host.js";
 import { ConnectionManager } from "./connection-manager.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
+import { createIdentity } from "@jokoagent/linkspan-noise";
+import { attachTestLinkspanTransport } from "./test-linkspan-transport.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks(); });
@@ -48,6 +50,7 @@ class PlanAdapter extends FakeBackendAdapter {
 }
 const auth = () => ({ deviceId: "foreign-owner", signal: new AbortController().signal, assertCurrent() {} });
 async function fixture() {
+  const endpointIdentity = await createIdentity();
   const root = await mkdtemp(join(tmpdir(), "joko-network-plan-")), store = new OperationalStore(join(root, "operations.db")), profiles = new PartnerStore(join(root, "profiles.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
   const vault = await CredentialVault.open(join(root, "master.key")), adapter = new PlanAdapter(profiles), laneStore = new PartnerGroupStore(join(root, "lanes.db"));
@@ -63,7 +66,7 @@ async function fixture() {
     capabilities: { modelChain: [{ backendId: profile.id, providerId: profile.models[0]!.providerId, modelId: profile.models[0]!.modelId, effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } }));
   expect(members.map(member => member.initializationState)).toEqual(["ready", "ready"]);
   const partner = (id: string) => { const p = profiles.getPartner(id); return { id, name: p.displayName, description: p.description }; };
-  const host = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId: "authority", origin: "http://127.0.0.1", mediaDirectory: join(root, "media"), partner, artifacts });
+  const host = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId: "authority", origin: "http://127.0.0.1", endpointPublicKey: endpointIdentity.publicKey, mediaDirectory: join(root, "media"), partner, artifacts });
   const home = new PartnerNetworkHome({ directory: join(root, "home"), serverId: "authority", vault, partner }); await home.initialize();
   const work = new PartnerGroupWorkspaces(store, root); await work.initialize();
   const planWorkspaces = new PartnerNetworkPlanWorkspaces(store, laneStore, work), decidePlan = vi.fn(async (input: import("./partner-group-division.js").PlanDecisionInput) => ({ needsPlan: true as const,
@@ -75,9 +78,10 @@ async function fixture() {
   const server = await createPublicServer({ serverId: "authority", config, store, connections, artifacts, blobTransfers: {}, artifactRepository: {}, workspaces, workspaceChanges: {}, scheduler: {},
     adapters: [adapter], browserActivity: [], sessionHost: sessions, partners, partnerNetwork: network } as unknown as OrchestratorApplication);
   server.log.level = "silent"; const origin = await server.listen({ host: "127.0.0.1", port: 0 }); host.options.origin = origin; config.publicOrigin = origin;
+  const retireTransport = attachTestLinkspanTransport(server.server, origin, endpointIdentity);
   const owner = createClient(contract.PartnerNetworkService, createConnectTransport({ baseUrl: origin, httpVersion: "1.1", interceptors: [next => request => { request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request); }] }));
   const room = (await owner.createPartnerNetwork({ operationId: "create-room", name: "Plan room", displayName: "Owner", partnerIds: members.map(member => member.id) })).room!;
-  cleanups.push(async () => { await server.close(); await network.close(); work.dispose(); await sessions.dispose(); profiles.close(); store.close(); await rm(root, { recursive: true, force: true }); });
+  cleanups.push(async () => { await retireTransport(); await server.close(); await network.close(); work.dispose(); await sessions.dispose(); profiles.close(); store.close(); await rm(root, { recursive: true, force: true }); });
   const current = () => host.storage.plans.current(room.id)!;
   const act = (action: string) => owner.planPartnerNetwork({ roomId: room.id, operationId: crypto.randomUUID(), planId: current().id, expectedRevision: BigInt(current().revision), action });
   const propose = async () => { await owner.sendPartnerNetwork({ roomId: room.id, operationId: "original-request", text: "Produce the deliverable and review it", forcePlan: true }); await network.tick();

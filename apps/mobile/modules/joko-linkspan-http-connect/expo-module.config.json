@@ -1,0 +1,5 @@
+{
+  "platforms": ["android", "ios"],
+  "android": { "modules": ["app.joko.linkspan.connect.LinkspanHttpConnectModule"] },
+  "ios": { "modules": ["LinkspanHttpConnectModule"] }
+}

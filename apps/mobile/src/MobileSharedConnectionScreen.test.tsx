@@ -16,6 +16,8 @@ const native = vi.hoisted(() => ({
   renderers: [] as { props: RendererProps; injectJavaScript: ReturnType<typeof vi.fn> }[]
 }));
 vi.mock("./connection-runtime.connjs", () => ({ default: { css: "", script: "" } }));
+vi.mock("./mobile-iroh-native", () => ({ mobileIrohNativeAvailable: () => false }));
+vi.mock("./mobile-http-connect-native", () => ({ mobileHttpConnectNativeAvailable: () => false }));
 vi.mock("./MobileKeyboardAvoidingView", () => ({
   MobileKeyboardAvoidingView: ({ children }: { children?: ReactNode }) => createElement("div", {}, children),
   useMobileKeyboardState: () => ({ height: 0, visible: false })
@@ -58,7 +60,8 @@ describe("native connection renderer ownership", () => {
     "%s retires only the failed renderer and keeps the replacement bridge usable", async (recovery) => {
       const container = document.createElement("div"); const root = createRoot(container);
       const state = { saved: [], nearby: [], status: "disconnected", connectionMode: "nearby", discoveryState: "idle", busy: false } as unknown as MobileState;
-      const client = { state, cancel: vi.fn() } as unknown as MobileClient;
+      const cancel = vi.fn();
+      const client = { state, cancel, cancelPairing: vi.fn(async () => { cancel(); }) } as unknown as MobileClient;
       await act(async () => { root.render(createElement(MobileSharedConnectionScreen, {
         client, state, locale: "en", dark: false, defaultDeviceName: "Test device",
         onThemeChange: async () => undefined, onConnected() {}

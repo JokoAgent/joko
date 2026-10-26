@@ -6,10 +6,16 @@ import XCTest
 final class JokoConnectionUITests: XCTestCase {
     private var app: XCUIApplication!
     private var ownedLaunchArguments: [String] = []
+    private var sdkRuntime = "relay"
 
     override func setUpWithError() throws {
         continueAfterFailure = false
         let environment = ProcessInfo.processInfo.environment
+        let selected = environment["JOKO_CI_SDK_RUNTIME"] ?? "relay"
+        guard ["relay", "iroh-native", "http-connect-native"].contains(selected) else {
+            throw NSError(domain: "JokoCI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unknown selected Mobile runtime."])
+        }
+        sdkRuntime = selected
         guard let metro = environment["JOKO_CI_METRO_PORT"], Int(metro) != nil,
               let probe = environment["JOKO_CI_PROBE_PORT"], Int(probe) != nil else {
             throw NSError(domain: "JokoCI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Owned local servers were not passed to the UI runner."])
@@ -162,8 +168,67 @@ final class JokoConnectionUITests: XCTestCase {
         }
     }
 
-    private func replace(_ field: XCUIElement, with text: String) {
+    private func dismissQuickPathIfPresent(until deadline: Date) {
+        let guideText = "Speed up your typing by sliding your finger across the letters to compose a word."
+        let guide = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", guideText)).firstMatch
+        guard guide.exists else { return }
+        let proceed = app.buttons.matching(NSPredicate(format: "label == %@", "Continue")).firstMatch
+        XCTAssertTrue(proceed.waitForExistence(timeout: max(0, deadline.timeIntervalSinceNow)))
+        guard proceed.exists && proceed.isHittable else {
+            XCTFail("The exact QuickPath guide must expose its native Continue button.")
+            return
+        }
+        proceed.tap()
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: guide)
+        let result = XCTWaiter.wait(for: [dismissed], timeout: max(0, deadline.timeIntervalSinceNow))
+        let receipt: [String: Any] = ["scope": "owned-native-quickpath-guide-only",
+            "guideText": guideText, "button": "Continue", "dismissed": result == .completed]
+        if let data = try? JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]) {
+            let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+            attachment.name = "native-quickpath-guide-handled"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        XCTAssertEqual(result, .completed,
+                       "The exact QuickPath guide must disappear after Continue.")
+    }
+
+    private func recordPublicInputMismatch(_ field: XCUIElement, expected text: String, knownPublicInvitation: Bool) {
+        let probe = ProcessInfo.processInfo.environment["JOKO_CI_PROBE_PORT"] ?? ""
+        let publicAddress = field.label == "Joko node address" && (text == "not-an-address"
+            || (!probe.isEmpty && text == "http://127.0.0.1:\(probe)"))
+        guard knownPublicInvitation || publicAddress else { return }
+        // Only the owned public addresses and fixed .example invitation may
+        // produce a bounded field receipt. Never attach a later UI tree.
+        let observed = field.value
+        let value = observed as? String
+        let observedCharacters: Any = value.map { $0.count as Any } ?? NSNull()
+        let observedText: Any = value.map { String($0.prefix(1024)) as Any } ?? NSNull()
+        let diagnostic: [String: Any] = [
+            "scope": knownPublicInvitation ? "fixed-public-connect-invitation-only" : "fixed-public-connection-address-only",
+            "stage": "replace",
+            "valueType": observed.map { String(reflecting: type(of: $0)) } ?? "nil",
+            "expectedCharacters": text.count,
+            "observedCharacters": observedCharacters,
+            "expectedValue": String(text.prefix(1024)),
+            "observedValue": observedText,
+            "valueTruncated": (value?.count ?? 0) > 1024
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: diagnostic, options: [.sortedKeys]) {
+            let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+            attachment.name = knownPublicInvitation ? "11-http-connect-input-mismatch" : "04-public-address-input-mismatch"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
+
+    private func replace(_ field: XCUIElement, with text: String, knownPublicInvitation: Bool = false) {
         tap(field)
+        // The two exact QuickPath checks and final value receipt share the
+        // existing 10s value-gate budget; do not replay keyboard input.
+        let initialGuideCheck = Date()
+        dismissQuickPathIfPresent(until: initialGuideCheck.addingTimeInterval(10))
+        let initialGuideElapsed = Date().timeIntervalSince(initialGuideCheck)
         // WKWebView's default hit point and repeated taps can leave the caret
         // at the start without selecting text. Move to the trailing side of
         // this short, single-line address, then delete its observed characters
@@ -174,12 +239,17 @@ final class JokoConnectionUITests: XCTestCase {
             field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: value.count))
             let cleared = XCTNSPredicateExpectation(predicate: NSPredicate(
                 format: "value == '' OR value == %@", placeholder), object: field)
-            XCTAssertEqual(XCTWaiter.wait(for: [cleared], timeout: 10), .completed,
+            let clearedResult = XCTWaiter.wait(for: [cleared], timeout: 10)
+            XCTAssertEqual(clearedResult, .completed,
                            "The native address field must be empty before replacement.")
         }
         field.typeText(text)
+        let valueDeadline = Date().addingTimeInterval(max(0, 10 - initialGuideElapsed))
+        dismissQuickPathIfPresent(until: valueDeadline)
         let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", text), object: field)
-        XCTAssertEqual(XCTWaiter.wait(for: [changed], timeout: 10), .completed)
+        let result = XCTWaiter.wait(for: [changed], timeout: max(0, valueDeadline.timeIntervalSinceNow))
+        if result != .completed { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation) }
+        XCTAssertEqual(result, .completed)
         // The URL keyboard's real Done accessory dismisses it. On a layout
         // without that accessory, tapping the form heading blurs the field.
         let done = app.buttons["Done"].firstMatch
@@ -231,6 +301,22 @@ final class JokoConnectionUITests: XCTestCase {
         if !addressExists { try? recordPreInputSetupFailure(launchArguments: ownedLaunchArguments, stage: "pre-input-address") }
         XCTAssertTrue(addressExists)
         guard addressExists else { return }
+        let webRtc = connectionPage.switches["WebRTC"].firstMatch
+        XCTAssertTrue(webRtc.waitForExistence(timeout: 10))
+        if sdkRuntime == "http-connect-native" {
+            wait(webRtc, "enabled == false")
+            XCTAssertFalse(webRtc.isEnabled, "An unselected WebRTC runtime must remain unavailable.")
+            screenshot("04-webrtc-unavailable")
+        } else {
+            tap(webRtc)
+            wait(webRtc, "value == '1'")
+            XCTAssertEqual(webRtc.value as? String, "1")
+            screenshot("04-webrtc-mode")
+        }
+        let https = connectionPage.switches["HTTPS / WSS"].firstMatch
+        tap(https)
+        wait(https, "value == '1'")
+        XCTAssertEqual(https.value as? String, "1")
         let inspect = button("Check node identity")
         replace(address, with: "not-an-address")
         wait(inspect, "enabled == false")
@@ -279,6 +365,27 @@ final class JokoConnectionUITests: XCTestCase {
         wait(button("Theme: Dark"), "exists == true AND enabled == true")
         XCTAssertEqual(address.value as? String, origin, "Theme changes must preserve the address draft.")
         screenshot("10-light-theme")
+        if sdkRuntime == "http-connect-native" {
+            // A fixed reserved-domain invitation verifies the delivered native
+            // binding and configuration UI. Do not dispatch a proxy request.
+            let invitation: [String: Any] = ["version": 1, "origin": "https://connect-node.example",
+                "endpointPublicKey": "ed25519:" + String(repeating: "a", count: 64),
+                "endpointTransport": ["kind": "http-connect", "proxyOrigin": "https://proxy.example", "authority": "connect-node.example:443"]]
+            let text = String(data: try JSONSerialization.data(withJSONObject: invitation, options: [.sortedKeys, .withoutEscapingSlashes]), encoding: .utf8)!
+            let trusted = connectionPage.textViews["Trusted node invitation or public key"].firstMatch
+            XCTAssertTrue(trusted.waitForExistence(timeout: 10))
+            replace(trusted, with: text, knownPublicInvitation: true)
+            let helpText = "This invitation uses an HTTP CONNECT proxy. The node public key still verifies the encrypted application connection. Use a Desktop or Mobile build with its native connection binding."
+            let help = connectionPage.staticTexts.matching(NSPredicate(format: "label == %@", helpText)).firstMatch
+            XCTAssertTrue(help.waitForExistence(timeout: 10))
+            wait(inspect, "enabled == true")
+            XCTAssertEqual(address.value as? String, "https://connect-node.example")
+            XCTAssertFalse(button("Create this device's iroh relay identity").exists)
+            XCTAssertEqual(connectionPage.descendants(matching: .any).matching(identifier: "iroh connection mode").count, 0)
+            let unavailableText = "This connection requires a native binding included in a Desktop or Mobile build. An ordinary browser cannot open this proxy connection."
+            XCTAssertFalse(connectionPage.staticTexts.matching(NSPredicate(format: "label == %@", unavailableText)).firstMatch.exists)
+            screenshot("11-http-connect-invitation")
+        }
         XCTAssertEqual(app.state, .runningForeground)
     }
 }

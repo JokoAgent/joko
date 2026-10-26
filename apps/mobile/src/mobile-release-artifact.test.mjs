@@ -363,7 +363,7 @@ describe("mobile release artifact configuration", () => {
     for (const profile of Object.values(eas.build)) expect(profile).toMatchObject({ node: "24.19.0", pnpm: "11.22.0" });
     expect(pkg.scripts["build:native:android"]).toBe("node scripts/build-android-artifacts.mjs");
     expect(pkg.scripts["build:native:ios"]).toBe("node scripts/build-ios-artifact.mjs");
-    expect(ignored.split(/\r?\n/u)).toEqual(expect.arrayContaining(["android/", "/ios/", "dist/"]));
+    expect(ignored.split(/\r?\n/u)).toEqual(expect.arrayContaining(["/android/", "/ios/", "dist/"]));
     expect(rootIgnored.split(/\r?\n/u)).toContain("/.pnpm/");
     expect(workspace).toMatch(/^virtualStoreDir: \.pnpm$/mu);
     expect(workspace).toMatch(/^virtualStoreDirMaxLength: 32$/mu);

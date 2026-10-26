@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createClient, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, EndpointTrustError, isEndpointTrustError } from "@joko/connection-transport/node";
 import { ConnectionService, DesktopHostedAgentService } from "@joko/contracts";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES, devicePeerNativeAgentMethodEffect, type DevicePeerNativeAgentPort } from "@joko/device-peer";
@@ -26,11 +26,11 @@ export async function createDesktopHostedAgentDelegate(options: DesktopHostedAge
     if (!await options.isAuthorityCurrent(connection)) throw new Error("Native Desktop authority has retired.");
   };
   await assertCurrent();
-  const transport = options.transport ?? createConnectTransport({ baseUrl: connection.origin, httpVersion: "1.1", defaultTimeoutMs: 45_000,
+  const transport = options.transport ?? createConnectTransport({ baseUrl: connection.origin, endpointPublicKey: connection.endpointPublicKey, httpVersion: "1.1", defaultTimeoutMs: 45_000,
     readMaxBytes: DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES + 4_096, writeMaxBytes: DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES + 4_096 });
   const initialOptions = options.signal === undefined ? {} : { signal: options.signal };
   const server = await createClient(ConnectionService, transport).getServerInfo({}, initialOptions);
-  if (server.server?.serverId !== connection.serverId) throw new Error("Native Desktop service identity changed.");
+  if (server.server?.serverId !== connection.serverId) throw new EndpointTrustError("Native Desktop service identity changed. Verify the local node before reconnecting.");
   await assertCurrent();
   const [authKey, hostKey] = await Promise.all([options.readAuthKey(connection.profileId), options.readHostKey(connection.profileId)]);
   if (!authKey || !hostKey || !/^[A-Za-z0-9_-]{43}$/u.test(authKey) || !/^[A-Za-z0-9_-]{43}$/u.test(hostKey)) {
@@ -83,7 +83,8 @@ export async function probeDesktopHostedAgentDelegate(options: DesktopHostedAgen
   let delay = 500;
   for (;;) {
     try { await delegate.retire(); return true; }
-    catch {
+    catch (error) {
+      if (isEndpointTrustError(error)) throw error;
       options.signal.throwIfAborted();
       if (!await options.isAuthorityCurrent(options.connection)) throw new Error("Native Desktop recovery authority retired.");
       await new Promise<void>((resolve, reject) => {

@@ -184,7 +184,7 @@ it("reserves one original child registration before its tool owner arrives and g
       trust: "owner", backendId: "pi", providerId: "provider", modelId: "model", modelIds: ["model"], permissionMode: "ask", fastMode: false,
       workspace: { platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false, subagentsEnabled: true },
       artifactCapacityBytes: 1024, assertCurrent: () => {}, assertModelAllowed: () => {}, createAdapter: () => adapter as unknown as BackendAdapter });
-    await run.call("original-parent", { kind: "send", input: { text: "Register the exact child", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await run.call("original-parent", { kind: "send", durableFence: false, input: { text: "Register the exact child", images: [], files: [], mentions: [], disposition: "prompt" } });
     const original = context, taskId = "native-parent-tool:step-1";
     const reserved = async (): Promise<PiHostedBackgroundScope> => {
       const scope = { taskId, runId: randomUUID(), launchToken: randomUUID(), runnerInstanceId: randomUUID(), nativeSessionId: randomUUID() };
@@ -217,7 +217,7 @@ it("reserves one original child registration before its tool owner arrives and g
     expect(blocked).toMatchObject({ ok: false, error: { code: "EXECUTOR_FAILED" } });
     // Only the first registration is waiting for this exact native tool event.
     await original.emit({ type: "tool_start", callId: "native-parent-tool", name: "subagent", input: "{}" });
-    await run.call("later-input", { kind: "send", input: { text: "Another foreground input", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await run.call("later-input", { kind: "send", durableFence: false, input: { text: "Another foreground input", images: [], files: [], mentions: [], disposition: "prompt" } });
     let registration: Extract<import("./hosted-agent-exchange.js").HostedAgentFrame["payload"], { kind: "request" }> | undefined;
     await vi.waitFor(async () => {
       const frames = (await run!.exchange.poll(0, new AbortController().signal, 0)).frames.filter(frame => frame.payload.kind === "request");

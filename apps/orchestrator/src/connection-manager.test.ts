@@ -20,6 +20,40 @@ afterEach(() => {
 });
 
 describe("ConnectionManager", () => {
+  it("persists exact challenge cancellation and prevents fallback redemption after restart", () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-pairing-cancel-"));
+    const path = join(directory, "orchestrator.db");
+    let store = new OperationalStore(path);
+    cleanups.push(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+    let manager = new ConnectionManager(store);
+    const cancelled = manager.issuePairing("Cancelled invitation");
+    const retained = manager.issuePairing("Other invitation");
+    expect(manager.cancelPairing(cancelled.id)).toBe(true);
+    expect(manager.cancelPairing(cancelled.id)).toBe(false);
+    store.close();
+    store = new OperationalStore(path);
+    manager = new ConnectionManager(store);
+    expect(() => manager.completePairing({ challengeId: retained.id, code: cancelled.code, connectionName: "Late" })).toThrow();
+    const paired = manager.completePairing({ challengeId: retained.id, code: retained.code, connectionName: "Retained" });
+    expect(manager.authenticate(`Bearer ${paired.authKey}`).id).toBe(paired.connection.id);
+  });
+  it("retains cancelled issues for the rate window across service restarts", () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-pairing-cancel-rate-"));
+    const path = join(directory, "orchestrator.db");
+    let now = 1_000, store = new OperationalStore(path, { now: () => now });
+    cleanups.push(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+    const options = { now: () => now, maxPairingRequests: 2, pairingRateWindowMs: 1_000 };
+    let manager = new ConnectionManager(store, options);
+    const first = manager.issuePairing(); manager.cancelPairing(first.id);
+    const second = manager.issuePairing(); manager.cancelPairing(second.id);
+    store.close(); store = new OperationalStore(path, { now: () => now });
+    manager = new ConnectionManager(store, options);
+    expect(() => manager.issuePairing()).toThrow(/rate/u);
+    expect(() => manager.issuePairing()).toThrow(/rate/u);
+    now += 1_001;
+    expect(manager.issuePairing().expiresAt).toBeGreaterThan(now);
+    expect(store.listPairings()).toHaveLength(1);
+  });
   it("refreshes only the authenticated Device source and preserves manual names across pairing and native bootstrap", () => {
     const store = new OperationalStore(":memory:", { now: () => 1_000 });
     cleanups.push(() => store.close());
@@ -446,10 +480,14 @@ describe("ConnectionManager", () => {
       .toThrowError(ConnectionAuthenticationError);
     expect(() => manager.authenticateDevicePeerAgent(`Bearer ${desktopHostKey}`))
       .toThrowError(ConnectionAuthenticationError);
+    expect(manager.isLocalDesktopHostConnection(desktop.connection)).toBe(false);
     manager.confirmTrustedDesktopConnection(desktop.connection.id, desktop.authKey);
+    expect(manager.isLocalDesktopHostConnection(desktop.connection)).toBe(true);
+    expect(manager.isLocalDesktopHostConnection(service)).toBe(false);
     expect(manager.authenticateDevicePeerAgent(`Bearer ${desktopHostKey}`).id)
       .toBe(desktop.connection.id);
     manager.revoke(desktop.connection.id);
+    expect(manager.isLocalDesktopHostConnection(desktop.connection)).toBe(false);
     expect(() => manager.authenticateDevicePeerAgent(`Bearer ${desktopHostKey}`))
       .toThrowError(ConnectionAuthenticationError);
   });

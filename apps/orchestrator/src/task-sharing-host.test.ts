@@ -16,7 +16,7 @@ import { createTaskSharingRuntime } from "./task-sharing-runtime.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
-async function fixture() {
+async function fixture(origin: string | (() => string) = "http://127.0.0.1:4327") {
   const directory = mkdtempSync(join(tmpdir(), "joko-task-sharing-host-")), store = new OperationalStore(join(directory, "store.sqlite"));
   store.upsertBackend({ id: "backend", displayName: "Backend", version: "test", health: "healthy", adapterKind: "fixture", instanceGeneration: 0,
     installationState: "installed", authenticationState: "not_required", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
@@ -29,7 +29,7 @@ async function fixture() {
   const runtime: TaskSharingRuntimePort = { canShare: () => true, snapshot: async lease => create(contract.SnapshotSchema, {
     scope: { kind: { case: "session", value: { sessionId: lease.scope.sessionId } } } }), read: async () => new Uint8Array(), prepareOperation: prepare,
     projectEvent: () => undefined };
-  const host = new TaskSharingHost({ store, artifacts, serverId: "host", origin: "http://127.0.0.1:4327", generation: () => 3n, runtime });
+  const host = new TaskSharingHost({ store, artifacts, serverId: "host", origin, endpointPublicKey: `ed25519:${"a".repeat(64)}`, generation: () => 3n, runtime });
   const share = host.create({ operationId: "create", sessionId: "session" }), invitation = host.invite({ operationId: "invite", shareId: share.shareId }).invitation;
   const member = (suffix: string) => {
     const secret = suffix.repeat(43), digest = createHash("sha256").update(secret).digest("hex");
@@ -40,6 +40,19 @@ async function fixture() {
   return { store, artifacts, host, prepare, member, share };
 }
 const signal = () => new AbortController().signal;
+it("uses the current entrance for new invitations and preserves the exact original private operation reply", async () => {
+  let origin = "http://127.0.0.1:4327";
+  const f = await fixture(() => origin);
+  origin = "https://current.trycloudflare.com";
+  const issued = f.host.invite({ operationId: "public-entry", shareId: f.share.shareId });
+  const published = contract.parseTaskShareInvitation(issued.invitation);
+  expect(published.hostOrigin).toBe(origin); expect(issued.share.hostOrigin).toBe(origin);
+  origin = "http://127.0.0.1:4327";
+  expect(f.host.invite({ operationId: "public-entry", shareId: f.share.shareId }).invitation).toBe(issued.invitation);
+  expect(f.host.previewInvitation(issued.invitation).shareId).toBe(f.share.shareId);
+  const fresh = contract.parseTaskShareInvitation(f.host.invite({ operationId: "fallback-entry", shareId: f.share.shareId }).invitation);
+  expect(fresh.hostOrigin).toBe(origin); expect(fresh.endpointPublicKey).toBe(published.endpointPublicKey);
+});
 function operation(operationId: string, sessionId = "session") {
   return toBinary(contract.SubmitOperationRequestSchema, create(contract.SubmitOperationRequestSchema, { operationId,
     mutation: { payload: { case: "resumeSession", value: { sessionId } } } }));
@@ -51,6 +64,16 @@ it("keeps guest credentials outside ordinary authentication and validates receip
   expect(() => ordinary.authenticate(`Bearer ${member.secret}`)).toThrow();
   expect(() => f.host.getJoinReceipt({ intentId: "join-a", credentialSha256Hex: member.lease.proof.credentialSha256Hex }, other.lease)).toThrow(/another participant/);
   expect(f.store.listConnections()).toHaveLength(0);
+});
+it("binds a private invitation to this endpoint key before accepting its secret", async () => {
+  const f = await fixture(), issued = f.host.invite({ operationId: "pin-invitation", shareId: f.share.shareId });
+  const parsed = contract.parseTaskShareInvitation(issued.invitation);
+  expect(parsed.endpointPublicKey).toBe(f.host.options.endpointPublicKey);
+  const replaced = contract.buildTaskShareInvitation({ ...parsed, endpointPublicKey: `ed25519:${"b".repeat(64)}` });
+  expect(() => f.host.previewInvitation(replaced)).toThrow();
+  expect(() => f.host.acceptJoin({ intentId: "substituted-pin", invitation: replaced,
+    credentialSha256Hex: createHash("sha256").update("credential").digest("hex"), displayName: "Guest", homeServerId: "home", homeDeviceId: "device" })).toThrow();
+  expect(f.host.get(f.share.shareId).members).toHaveLength(0);
 });
 it("does not let a task guest dispatch, resume, approve or switch through an owner remote Agent source", async () => {
   const f = await fixture(), guest = f.member("a");

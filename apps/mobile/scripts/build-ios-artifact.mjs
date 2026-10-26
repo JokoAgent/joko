@@ -16,6 +16,8 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { prepareMobileWorkspaceInputs } from "./prepare-workspace-inputs.mjs";
+import { prepareMobileLinkspanNative } from "./prepare-linkspan-native.mjs";
 import {
   assertAllowedArgs,
   assertProductionGitGate,
@@ -186,7 +188,7 @@ function materializeArtifact(ipa, identity, source, runtimeVersion, certificate,
   return { outputDirectory, manifestPath, record };
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   assertAllowedArgs(args, ["execute", "out", "skipGitGate"]);
   if (args.execute !== undefined && args.execute !== true) throw new Error("--execute does not accept a value.");
@@ -197,7 +199,7 @@ function main() {
     "target: signed iOS IPA with the Joko share extension",
     `identity: ${identity.iosBundleIdentifier} + ${identity.shareExtensionBundleIdentifier}`,
     `version: ${identity.version} (${identity.buildNumber})`,
-    "steps: clean prebuild -> exact per-target signing -> archive/export -> identity/runtime/entitlement/signature verification",
+    "steps: shared client inputs -> clean prebuild -> exact per-target signing -> archive/export -> identity/runtime/entitlement/signature verification",
     "signing: certificate and provisioning profiles remain outside the repository",
     ""
   ].join("\n"));
@@ -215,6 +217,8 @@ function main() {
   installProfileIfProvided(signing.appProfilePath, "JOKO_IOS_APP_PROFILE_PATH");
   installProfileIfProvided(signing.shareProfilePath, "JOKO_IOS_SHARE_PROFILE_PATH");
 
+  prepareMobileWorkspaceInputs();
+  await prepareMobileLinkspanNative({ platform: "ios", environment });
   run(process.execPath, [EXPO_CLI, "prebuild", "--platform", "ios", "--clean", "--no-install"], { env: environment });
   const paths = projectPaths();
   if (!existsSync(paths.pbxProject)) throw new Error("Expo prebuild did not produce an Xcode project file.");
@@ -262,7 +266,7 @@ function main() {
   ].join("\n"));
 }
 
-try { main(); }
+try { await main(); }
 catch (error) {
   process.stderr.write(`iOS artifact build failed: ${error instanceof Error ? error.message : "unknown failure"}\n`);
   process.exitCode = 1;

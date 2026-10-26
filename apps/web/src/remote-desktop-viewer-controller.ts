@@ -2,7 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
-  RemoteDesktopStartMode, RemoteDesktopVideoQuality, RemoteDesktopMouseButton, RemoteDesktopInputEventSchema,
+  REMOTE_DESKTOP_ICE_LIMITS, RemoteDesktopStartMode, RemoteDesktopVideoQuality, RemoteDesktopMouseButton, RemoteDesktopInputEventSchema,
   RemoteDesktopFailureReason as Failure, RemoteDesktopFailureSchema,
   type RemoteDesktopCapabilities, type RemoteDesktopLease, type RemoteDesktopDisplayMode,
   type RemoteDesktopVideoSettings, type DesktopRemoteDesktopViewerApi, type DesktopRemoteDesktopViewerState,
@@ -17,7 +17,7 @@ const KEYS = [ ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map((key) => `Key${key}
   "Enter", "Escape", "Tab", "Space", "Backspace", "Delete", "Insert", "Home", "End", "PageUp", "PageDown",
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "ShiftLeft", "ControlLeft", "AltLeft", "MetaLeft",
   "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Slash" ];
-const NETWORK = { iceConfigMs: 10000, iceConfigBridgeMs: 500, maxCandidates: 128, batchSize: 16, pollMs: 250,
+const NETWORK = { iceConfigMs: 10000, iceConfigBridgeMs: 500, ...REMOTE_DESKTOP_ICE_LIMITS, pollMs: 250,
   exchangeMs: 30000, disconnectedMs: 5000, answerMs: 32000, connectMs: 15000, gatherMs: 5000,
   stableMs: 30000, retryMs: [1000, 3000, 8000] };
 

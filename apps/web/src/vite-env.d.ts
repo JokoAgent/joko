@@ -36,6 +36,7 @@ interface JokoDesktopManagedOrchestratorConnection {
   readonly serverId: string;
   readonly name: string;
   readonly origin: string;
+  readonly endpointPublicKey?: string;
 }
 
 type JokoDesktopManagedOrchestratorStatus =
@@ -456,6 +457,7 @@ type DesktopRuntimeProcessMonitorResponse = {
 };
 
 interface JokoDesktopApi {
+  readonly linkspan?: { request(kind: 'iroh' | 'tailcat' | 'http-connect', message: import('@jokoagent/linkspan-core/stream').StreamBridgeRequest): Promise<{ readonly success: true; readonly value?: unknown } | { readonly success: false; readonly code: import('@jokoagent/linkspan-core').LinkspanErrorCode }> };
   readonly menuBar?: {
     get(): Promise<import("@joko/contracts").MenubarState>;
     setEnabled(enabled: boolean): Promise<import("@joko/contracts").MenubarState>;
@@ -468,10 +470,10 @@ interface JokoDesktopApi {
     set(enabled: boolean): Promise<JokoDesktopLoginItemState>;
   };
   readonly extensionOAuth?: {
-    authorize(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, bytes: Uint8Array): Promise<Uint8Array>;
-    cancel(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, flowId: string): Promise<void>;
+    authorize(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string; readonly endpointPublicKey?: string; readonly transportKind?: 'https' | 'iroh' | 'tailcat' | 'webrtc' | 'http-connect' }, bytes: Uint8Array): Promise<Uint8Array>;
+    cancel(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string; readonly endpointPublicKey?: string; readonly transportKind?: 'https' | 'iroh' | 'tailcat' | 'webrtc' | 'http-connect' }, flowId: string): Promise<void>;
   };
-  readonly mcpApps?: { operate(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, bytes: Uint8Array): Promise<Uint8Array> };
+  readonly mcpApps?: { operate(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string; readonly endpointPublicKey?: string; readonly transportKind?: 'https' | 'iroh' | 'tailcat' | 'webrtc' | 'http-connect' }, bytes: Uint8Array): Promise<Uint8Array> };
   readonly platform: string;
   /** OS-preferred locale captured by the trusted Desktop preload for this app start. */
   readonly preferredSystemLocale: "en" | "zh-CN";
@@ -544,7 +546,7 @@ interface JokoDesktopApi {
     clipboardWrite(request: { readonly extensionId: string; readonly bytes: Uint8Array }): Promise<number>;
   };
   readonly projects: {
-    pickDirectory(request: { readonly profileId: string; readonly deviceId: string; readonly serverId: string; readonly origin: string }): Promise<
+    pickDirectory(request: { readonly profileId: string; readonly deviceId: string; readonly serverId: string; readonly origin: string; readonly endpointPublicKey?: string }): Promise<
       { readonly cancelled: true } | { readonly cancelled: false; readonly path: string }
     >;
   };

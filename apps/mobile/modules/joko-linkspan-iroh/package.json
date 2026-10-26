@@ -1,0 +1,7 @@
+{
+  "name": "@joko/mobile-linkspan-iroh",
+  "version": "0.1.0",
+  "description": "Joko host adapter for the explicitly selected Linkspan native iroh stream bridge.",
+  "private": true,
+  "peerDependencies": { "expo": "*" }
+}

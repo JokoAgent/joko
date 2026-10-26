@@ -100,6 +100,14 @@ export class ConnectionManager {
     this.#pairingRequestTimes.length = 0;
   }
 
+  /** The random challenge ID is a private cancellation capability, never discovery data. */
+  cancelPairing(challengeId: string): boolean {
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(challengeId)) {
+      throw invalidPairingError();
+    }
+    return this.#store.cancelPairing(challengeId, this.#now());
+  }
+
   get pairingEnabled(): boolean {
     return this.#pairingWindowExpiresAt > this.#now();
   }
@@ -132,6 +140,7 @@ export class ConnectionManager {
   #reservePairingIssue(now: number): void {
     this.#store.prunePairings({
       expiredBefore: now,
+      expiredCreatedBefore: now - this.#pairingRateWindowMs,
       consumedBefore: now - this.#consumedRetentionMs
     });
     while ((this.#pairingRequestTimes[0] ?? now) <= now - this.#pairingRateWindowMs) this.#pairingRequestTimes.shift();
@@ -507,6 +516,35 @@ export class ConnectionManager {
       if (error instanceof ConnectionAuthenticationError) throw error;
       throw managedDesktopHostAuthorizationUnavailable();
     }
+  }
+
+  /** Same-node Main authority is issued only by the private managed bootstrap.
+   * Call after agent authentication; ordinary paired Desktop bearers cannot
+   * register that route and device kind/address alone never grants this proof. */
+  isLocalDesktopHostConnection(connection: Pick<ConnectionRecord, "id" | "authKeyDigest">): boolean {
+    try {
+      const current = this.fence(connection);
+      const device = this.#store.getDevice(current.deviceId);
+      const marker = readDesktopBootstrapMarker(this.#store.findSetting(
+        "service", "orchestrator", desktopBootstrapSettingKey(current.deviceId)
+      )?.value);
+      return device.kind === "desktop" && device.state === "active" && marker?.state === "committed"
+        && marker.connectionId === current.id && this.#store.findDesktopHostAuthorization(current.id) !== undefined;
+    } catch { return false; }
+  }
+
+  /** Cleanup-only proof for an original Main. Revocation still denies every
+   * business operation; these two captured keys can only retire its own media. */
+  authenticateDesktopMediaRetirement(connectionId: string, authorization: string | undefined, hostAuthorization: string | undefined): ConnectionRecord {
+    const key = parseBearer(authorization), hostKey = parseBearer(hostAuthorization);
+    if (!key || !hostKey) throw managedDesktopHostAuthorizationUnavailable();
+    try {
+      const connection = this.#store.getConnection(connectionId);
+      const host = this.#store.findDesktopHostAuthorization(connectionId);
+      if (this.#store.getDevice(connection.deviceId).kind !== "desktop" || host === undefined
+        || !safeEqual(connection.authKeyDigest, digestAuthKey(key)) || !safeEqual(host.authKeyDigest, digestAuthKey(hostKey))) throw managedDesktopHostAuthorizationUnavailable();
+      return connection;
+    } catch { throw managedDesktopHostAuthorizationUnavailable(); }
   }
 
   onRevoked(connectionId: string, listener: () => void): () => void {

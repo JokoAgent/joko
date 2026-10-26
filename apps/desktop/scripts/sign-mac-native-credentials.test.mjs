@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 const { createSignHook } = createRequire(import.meta.url)("./sign-mac-native-credentials.cjs");
@@ -99,7 +99,62 @@ test("a signer failure leaves all original helper receipts in place", async () =
   } finally { await rm(fixture.directory, { recursive: true, force: true }); }
 });
 
+test("only selected embedded Node and exact SDK native inputs retain their original signed bytes", async () => {
+  const fixture = await create();
+  try {
+    const selected = await selectedPinggy(fixture), ignoredBefore = join(fixture.directory, "original-ignore");
+    let sealed = false;
+    const sign = createSignHook(async options => {
+      for (const path of selected.inputs) assert.equal(options.ignore(path), true);
+      assert.equal(options.ignore(ignoredBefore), true);
+      for (const path of [fixture.app, join(fixture.root, names[0]), selected.unrelated, selected.javascript]) assert.equal(options.ignore(path), false);
+      await options.optionsForFile(fixture.app); sealed = true;
+    });
+    await sign({ platform: "darwin", app: fixture.app, ignore: file => file === ignoredBefore });
+    assert.equal(sealed, true);
+    for (const path of selected.inputs) assert.equal(digest(await readFile(path)), fixture.original);
+    const receipt = JSON.parse(await readFile(selected.receiptPath, "utf8")); receipt.backends = [];
+    await writeFile(selected.receiptPath, JSON.stringify(receipt));
+    await createSignHook(async options => {
+      assert.equal(options.ignore, fixture.ignore);
+      for (const path of selected.inputs) assert.equal(options.ignore(path), false);
+      await options.optionsForFile(fixture.app);
+    })({ platform: "darwin", app: fixture.app, ignore: fixture.ignore });
+  } finally { await rm(fixture.directory, { recursive: true, force: true }); }
+});
+
+test("a changed protected SDK or Node input cannot be ignored or enter the outer seal", async () => {
+  for (const kind of ["node", "sdk"]) {
+    const fixture = await create();
+    try {
+      const selected = await selectedPinggy(fixture), path = selected.inputs[kind === "node" ? 0 : 1];
+      const bytes = await readFile(path); bytes[63] ^= 1; await writeFile(path, bytes);
+      let signed = false;
+      await assert.rejects(createSignHook(async () => { signed = true; })({ platform: "darwin", app: fixture.app }), /signing input was modified/u);
+      assert.equal(signed, false);
+    } finally { await rm(fixture.directory, { recursive: true, force: true }); }
+  }
+});
+
 const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+async function selectedPinggy(fixture) {
+  const root = join(dirname(fixture.root), "orchestrator-runtime", "dist", "linkspan-runtime");
+  const target = "darwin-x64", sdkDirectory = `pinggy/pinggy-0.5.3/${target}/node-137`, executable = `pinggy/node-v24.16.0/${target}/node`;
+  const inputs = [join(root, executable), join(root, sdkDirectory, "lib/addon.node"), join(root, sdkDirectory, "lib/libcrypto.3.dylib")];
+  const bytes = await readFile(join(fixture.root, names[0]));
+  for (const path of inputs) { await mkdir(dirname(path), { recursive: true }); await writeFile(path, bytes); }
+  const javascript = join(root, sdkDirectory, "dist/index.js"); await mkdir(dirname(javascript), { recursive: true }); await writeFile(javascript, "export {};\n");
+  await writeFile(join(dirname(inputs[0]), "LICENSE"), "Official Node license\n");
+  await writeFile(join(root, sdkDirectory, "LICENSE.pinggy-sdk"), "SDK license\n");
+  await writeFile(join(root, sdkDirectory, "prepared.json"), JSON.stringify({ version: "0.5.3", target, nodeAbi: "137", archive: { target, abi: "137", files:
+    ["lib/addon.node", "lib/libcrypto.3.dylib"].map(path => ({ path, bytes: bytes.length, sha256: fixture.original })) } }));
+  const receiptPath = join(root, "selected.json");
+  await writeFile(receiptPath, JSON.stringify({ target, backends: ["pinggy-sdk"], prepared: { pinggy: { sdkDirectory, target, version: "0.5.3", nodeAbi: "137", nodeRuntime: {
+    executable, target, version: "24.16.0", nodeAbi: "137", sha256: fixture.original, archiveSha256: "a".repeat(64)
+  } } } }));
+  return { inputs, receiptPath, javascript, unrelated: join(root, "other-sdk", "lib/addon.node") };
+}
+
 async function create() {
   const directory = await mkdtemp(join(tmpdir(), "joko-native-credential-sign-"));
   const app = join(directory, "Joko.app"), root = join(app, "Contents", "Resources", "native-remote-desktop");

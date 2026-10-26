@@ -3,6 +3,7 @@ import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef,
 import type { AppController } from "../controller.js";
 import type { McpAppApi } from "../model.js";
 import { randomUuid } from "../web-crypto.js";
+import { mountBrowserMcpSurface } from "../mcp-app-browser-surface.js";
 import type { Translator } from "./types.js";
 import { Button, Spinner } from "./ui.js";
 import "./mcp-app-card.css";
@@ -78,7 +79,8 @@ function ApplicationCard({ card, locale, t, actions }: { readonly card: Card; re
     if (element === null || api === undefined || !visible) return;
     let disposed = false, closing = false, frame: HTMLIFrameElement | undefined, opened: McpAppServiceOperateResponse | undefined;
     let closePromise: Promise<unknown> | undefined;
-    const uiOwnerId = actions.uiOwnerId, openId = randomUuid(), abort = new AbortController();
+    let disposeBrowserSurface: (() => void) | undefined;
+    const uiOwnerId = actions.uiOwnerId, openId = randomUuid(), abort = new AbortController(), browserLifetime = new AbortController();
     let timeout: number | undefined;
     setLoading(true); setFailed(false);
     const operate = (operation: McpAppOperation, extra: { viewId?: string; contextJson?: string; displayMode?: string } = {}) =>
@@ -89,6 +91,7 @@ function ApplicationCard({ card, locale, t, actions }: { readonly card: Card; re
       view.current = undefined;
       closePromise = (opened === undefined ? operate(McpAppOperation.CANCEL_OPEN)
         : operate(McpAppOperation.TEARDOWN, { viewId: opened.viewId })).catch(() => undefined);
+      void closePromise.finally(() => { browserLifetime.abort(); disposeBrowserSurface?.(); });
       if (frame !== undefined) {
         // Atomic reparenting retains the live Chromium frame for bounded teardown.
         frame.style.cssText = "position:fixed;width:1px;height:1px;visibility:hidden;pointer-events:none";
@@ -105,9 +108,8 @@ function ApplicationCard({ card, locale, t, actions }: { readonly card: Card; re
       if (!disposed && !closing) { setFailed(true); setLoading(false); setFullscreen(false); }
       void close();
     };
-    const onMessage = (event: MessageEvent) => {
-      if (disposed || closing || frame === undefined || event.source !== frame.contentWindow || event.data === null || typeof event.data !== "object") return;
-      const message = event.data as { method?: string; type?: string; id?: string; url?: string; params?: { height?: number; displayMode?: string } };
+    const present = (message: { method?: string; type?: string; id?: string; url?: string; params?: { height?: number; displayMode?: string } }) => {
+      if (disposed || closing) return;
       if (message.type === "joko:mcp-app-link" && typeof message.id === "string" && typeof message.url === "string") {
         const id = message.id, url = message.url;
         void Promise.resolve().then(() => {
@@ -128,6 +130,10 @@ function ApplicationCard({ card, locale, t, actions }: { readonly card: Card; re
         void operate(McpAppOperation.DISPLAY_MODE, { viewId: opened.viewId, displayMode: "inline" }).catch(fail);
       if (message.method === "ui/notifications/sandbox-failed") fail();
     };
+    const onMessage = (event: MessageEvent) => {
+      if (disposeBrowserSurface !== undefined || disposed || closing || frame === undefined || event.source !== frame.contentWindow || event.data === null || typeof event.data !== "object") return;
+      present(event.data);
+    };
     window.addEventListener("message", onMessage);
     timeout = window.setTimeout(fail, 135_000);
     void api.operate({ sessionId: card.sessionId, cardId: card.cardId, uiOwnerId, openId, operation: McpAppOperation.OPEN,
@@ -144,7 +150,16 @@ function ApplicationCard({ card, locale, t, actions }: { readonly card: Card; re
       frame.setAttribute("sandbox", nativeSurface ? "allow-scripts allow-same-origin" : "allow-scripts");
       frame.setAttribute("allow", "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-write 'none'");
       frame.setAttribute("referrerpolicy", "no-referrer");
-      frame.src = document.proxyUrl; element.appendChild(frame);
+      element.appendChild(frame);
+      if (!nativeSurface && api.openSurface !== undefined) {
+        disposeBrowserSurface = mountBrowserMcpSurface(frame, api.openSurface(document.proxyUrl, browserLifetime.signal), {
+          signal: browserLifetime.signal, failed: fail, present,
+          openLink: async url => {
+            if (disposed || closing || latest.current.actions.openLink === undefined) throw new Error("Application connection changed.");
+            await latest.current.actions.openLink(url);
+          }
+        });
+      } else frame.src = document.proxyUrl;
       if (timeout !== undefined) window.clearTimeout(timeout);
       timeout = window.setTimeout(fail, 45_000);
     }).catch(fail);

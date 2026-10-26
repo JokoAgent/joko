@@ -4,9 +4,10 @@ import { describe, expect, it, vi } from "vitest";
 import { RemoteDesktopService, DevicePeerRouteIdentitySchema, RemoteDesktopFailureSchema, RemoteDesktopFailureReason,
   type DesktopRemoteDesktopViewerOwner } from "@joko/contracts";
 import { DesktopRemoteDesktopViewerConnection } from "../src/remote-desktop-viewer-connection.js";
+import { EndpointTrustError } from "@joko/connection-transport/trust";
 
 const OWNER: DesktopRemoteDesktopViewerOwner = { profileId: "profile", serverId: "node", deviceId: "controller",
-  origin: "https://node.example", connectionGeneration: 1 };
+  origin: "https://node.example", endpointPublicKey: `ed25519:${"e".repeat(64)}`, connectionGeneration: 1 };
 const PEER = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "host", relationId: "relation",
   routeGeneration: 1n, relationRevision: { value: 1n }, targetDeviceRevision: { value: 1n } });
 const LEASE = { leaseId: "lease", display: { displayId: "display", name: "Display", width: 1200, height: 800 },
@@ -39,6 +40,15 @@ function fixture(handlers: Record<string, Handler> = {}) {
 }
 
 describe("Desktop viewer connection authority", () => {
+  it("retires the viewer after a failed security handshake without reading its credential or trying another connection", async () => {
+    const f = fixture({ getServerInfo: () => { throw new EndpointTrustError(); } });
+    expect(await f.request("getRemoteDesktopCapabilities")).toEqual({ ok: false, code: Code.FailedPrecondition, reason: RemoteDesktopFailureReason.AUTHORITY_CHANGED });
+    expect(f.connection.current).toBe(false);
+    expect(f.reads).not.toHaveBeenCalled();
+    await f.request("getRemoteDesktopCapabilities");
+    expect(f.calls.filter(call => call.name === "getServerInfo")).toHaveLength(1);
+  });
+
   it("adopts first and repeated viewer Fit, Restore and physical-mode source receipts on the same lease", async () => {
     const f: ReturnType<typeof fixture> = fixture({
       getRemoteDesktopCapabilities: () => ({ peer: PEER, capabilities: { platform: "linux", displayModes: true, resolutionRestore: true, viewerDisplay: true, viewerDisplayRestore: true } }),

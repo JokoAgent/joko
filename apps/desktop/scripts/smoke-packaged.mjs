@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { preservePackagedSmokeEvidence } from "./smoke-packaged-evidence.mjs";
+import { discoverMacNativeStackTool, runMacNativeStack, selectMacNativeStackArguments } from "./mac-native-stack.mjs";
 
 import {
   claudeSessionElectronSmokeSource,
@@ -25,7 +26,10 @@ import {
   terminalElectronSmokeSource
 } from "../dist/runtime-staging.js";
 import { PACKAGED_SMOKE_TIMELINE_PROMPT, PACKAGED_SMOKE_SHARED_TASK_PROMPT } from "../dist/packaged-smoke-task.js";
-import { capturePackagedSmokeProcessBirthIdentitySync } from "../dist/packaged-smoke-process-identity.js";
+import {
+  capturePackagedSmokeProcessBirthIdentitySync,
+  derivePortablePackagedSmokeProcessBirthIdentity
+} from "../dist/packaged-smoke-process-identity.js";
 import { buildNativeFrontmostSmokeTarget, nativeSystemFrontmostElectronSmokeSource }
   from "./native-system-frontmost-smoke.mjs";
 import {
@@ -35,11 +39,18 @@ import {
   claimSmokeJourneyFailure,
   compareConfiguredExtraResourceMirrors,
   comparePackagedApplicationMirror,
+  createMacNativeSampleCapture,
   finalizeSmokeRun,
+  hasStalledPackagedSmokeInspectorCrash,
+  hasStalledPackagedSmokeResourceRetirement,
+  managedOrchestratorIdentityMatches,
   managedRuntimeCleanupDecision,
   observePrimaryChild,
+  parseManagedConnectionMetadata,
   parseManagedRuntimeProcessMarker,
-  runIdentityFencedProcessEffect
+  parseMacNativeSampleStacks,
+  runIdentityFencedProcessEffect,
+  runOwnedChildDiagnosticEffect
 } from "./smoke-packaged-helpers.mjs";
 
 // Without arguments this exercises the staged development host. `--unpacked`
@@ -246,6 +257,7 @@ async function runSmokeJourney() {
   let child;
   let secondInstance;
   let timeout;
+  let nativeRetirementDiagnostics;
   let timedOut = false;
   let orchestrationError;
   let primaryTermination;
@@ -369,6 +381,10 @@ async function runSmokeJourney() {
       if (decision.terminatePrimary) requestPrimaryTermination();
     }, remainingTimeout(deadline));
     timeout.unref();
+    nativeRetirementDiagnostics = startMacNativeRetirementDiagnostics({
+      child, progressPath: `${markerPath}.progress`,
+      sampleReceiptPath: `${markerPath}.native-retirement-sample.json`, signal: journeyAbort.signal
+    });
     try {
       [result] = await Promise.all([childResult, secondInstance]);
     } catch (error) {
@@ -390,6 +406,8 @@ async function runSmokeJourney() {
     });
     orchestrationError = decision.failure;
   } finally {
+    // Diagnostics never join the primary lifetime or delay its hard termination.
+    await nativeRetirementDiagnostics?.stop();
     if (timeout !== undefined) clearTimeout(timeout);
     if (secondInstance !== undefined) await Promise.allSettled([secondInstance]);
     try {
@@ -414,7 +432,8 @@ async function runSmokeJourney() {
           ? "unreachable"
           : await probeManagedOrchestratorIdentity({
               origin: managedConnection.origin,
-              serverId: managedRuntimeProcessMarker.serverId
+              serverId: managedRuntimeProcessMarker.serverId,
+              endpointPublicKey: managedConnection.endpointPublicKey
             });
         managedRuntimeEndpointState = endpoint;
         const processIdentity = currentManagedRuntimeIdentityState(managedRuntimeProcessMarker);
@@ -628,6 +647,187 @@ function appendBounded(current, chunk) {
   return `${current}${String(chunk)}`.slice(-256 * 1024);
 }
 
+function startMacNativeRetirementDiagnostics({ child, progressPath, sampleReceiptPath, signal }) {
+  if (process.platform !== "darwin") return undefined;
+  let stopped = false;
+  let attempted = false;
+  let attemptedTrigger;
+  let reported = false;
+  let interval;
+  let sampleCapture;
+  let stackRun;
+  let stopPromise;
+  const tools = new Map();
+  const current = () => !stopped && !signal.aborted && child.exitCode === null && child.signalCode === null;
+  const report = (receipt) => {
+    if (reported) return;
+    reported = true;
+    try {
+      process.stdout.write(`${JSON.stringify({ event: "JOKO_DESKTOP_NATIVE_RETIREMENT_SAMPLE", trigger: attemptedTrigger,
+        ...(existsSync(sampleReceiptPath) ? { rawSampleReceipt: "result.txt.native-retirement-sample.json" } : {}), ...receipt })}\n`);
+    } catch { /* A diagnostic cannot own the smoke result. */ }
+  };
+  const stop = () => {
+    if (stopped) return stopPromise ?? Promise.resolve();
+    stopped = true;
+    if (interval !== undefined) clearInterval(interval);
+    signal.removeEventListener("abort", stop);
+    stopPromise = stackRun?.stop("primary_lifetime_ended") ?? Promise.resolve();
+    for (const [tool, deadlineTimer] of tools) {
+      clearTimeout(deadlineTimer);
+      if (tool.exitCode === null && tool.signalCode === null) {
+        try { tool.kill("SIGKILL"); } catch { /* No wait or retry during primary cleanup. */ }
+      }
+    }
+    if (attempted && !reported) report({ status: "unavailable", reason: "primary_lifetime_ended" });
+    return stopPromise;
+  };
+  const runTool = (executablePath, args, timeout, maxBuffer, includeHelp = false, capture) => new Promise((resolveTool) => {
+    if (!current()) { resolveTool({ reason: "primary_lifetime_ended", output: "" }); return; }
+    let tool;
+    let deadlineTimer;
+    let timedOut = false;
+    const finishCapture = reason => {
+      try { capture?.finish(reason); } catch { /* A diagnostic file cannot own the journey. */ }
+    };
+    try {
+      tool = execFile(executablePath, args, {
+        encoding: "utf8", killSignal: "SIGKILL", maxBuffer,
+        env: { LC_ALL: "C", TZ: "UTC0" }, windowsHide: true
+      }, (error, stdout, stderr) => {
+        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        tools.delete(tool);
+        const reason = timedOut ? "tool_timeout" : error === null ? undefined
+          : error.code === "ENOENT" ? "tool_missing"
+          : error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? "output_limit"
+          : error.killed ? "tool_timeout" : "tool_failed";
+        finishCapture(reason);
+        // Raw bytes are private-artifact-only for the explicitly selected sample.
+        resolveTool({ reason, output: includeHelp ? `${stdout}\n${stderr}` : stdout });
+      });
+      if (capture !== undefined) {
+        tool.stdout?.on("data", capture.stdout);
+        tool.stderr?.on("data", capture.stderr);
+      }
+      deadlineTimer = setTimeout(() => {
+        timedOut = true;
+        try { tool.kill("SIGKILL"); } catch { /* Tool failure is diagnostic-only. */ }
+        finishCapture("tool_timeout");
+        resolveTool({ reason: "tool_timeout", output: "" });
+      }, timeout);
+      deadlineTimer.unref();
+      tools.set(tool, deadlineTimer);
+      tool.unref();
+      tool.stdout?.unref?.();
+      tool.stderr?.unref?.();
+    } catch {
+      finishCapture("tool_unavailable");
+      resolveTool({ reason: "tool_unavailable", output: "" });
+    }
+  });
+  const captureIdentity = async (pid) => {
+    if (!Number.isSafeInteger(pid) || pid < 1) return undefined;
+    const captured = await runTool("/bin/ps", ["-p", String(pid), "-o", "ppid=", "-o", "lstart=", "-o", "comm="], 1_000, 8 * 1024);
+    if (captured.reason !== undefined) return undefined;
+    const fields = /^\s*([0-9]+)\s+([^\r\n]+)\r?\n?$/u.exec(captured.output);
+    if (fields === null) return undefined;
+    const parentPid = Number(fields[1]);
+    const processIdentity = derivePortablePackagedSmokeProcessBirthIdentity(pid, "darwin", fields[2]);
+    return Number.isSafeInteger(parentPid) && processIdentity !== undefined ? { parentPid, processIdentity } : undefined;
+  };
+  // Capture the original spawn while it is live; never infer ownership from its name.
+  const originalPid = child.pid;
+  const originalIdentity = captureIdentity(originalPid).catch(() => undefined);
+  const readProgress = () => {
+    const info = lstatSync(progressPath);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 256 * 1024) return undefined;
+    return readFileSync(progressPath, "utf8");
+  };
+  const phaseStillPending = () => {
+    if (!current()) return false;
+    try {
+      const progress = readProgress();
+      return attemptedTrigger === "inspector_owner_crash"
+        ? hasStalledPackagedSmokeInspectorCrash(progress, Date.now())
+        : hasStalledPackagedSmokeResourceRetirement(progress, Date.now());
+    } catch { return false; }
+  };
+  const sample = async () => {
+    try {
+      for (const executablePath of ["/bin/ps"]) {
+        const info = lstatSync(executablePath);
+        if (!info.isFile() || info.isSymbolicLink() || realpathSync(executablePath) !== executablePath) {
+          report({ status: "unavailable", reason: "tool_not_canonical" });
+          return;
+        }
+      }
+      const capabilities = await discoverMacNativeStackTool(runTool);
+      if (capabilities.status !== "available") {
+        report({ status: "unavailable", reason: capabilities.reason });
+        return;
+      }
+      const original = await originalIdentity;
+      if (original === undefined || original.parentPid !== process.pid) {
+        report({ status: "unavailable", reason: "original_identity_unavailable" });
+        return;
+      }
+      const sampleArguments = selectMacNativeStackArguments(capabilities.toolHelp, originalPid);
+      if (sampleArguments === undefined) { report({ status: "unavailable", reason: "sample_arguments_unavailable" }); return; }
+      const ownership = await runOwnedChildDiagnosticEffect({
+        child, pid: originalPid, parentPid: process.pid, expectedIdentity: original.processIdentity,
+        isCurrent: phaseStillPending, captureIdentity,
+        effect: (pid) => {
+          sampleCapture = createMacNativeSampleCapture(sampleReceiptPath, {
+            pid, parentPid: process.pid, processIdentity: original.processIdentity, trigger: attemptedTrigger
+          }, {
+            tool: capabilities.tool, arguments: sampleArguments, symbolicationMode: "disabled",
+            toolHelp: capabilities.toolHelp, toolHelpSource: capabilities.toolHelpSource,
+            supervisorSha256: capabilities.supervisorSha256, launcher: capabilities.launcher
+          });
+          // Exactly the proof-owned target, one second at 10ms, no binary/heap
+          // dump or symbol lookup. The supervisor kills/reaps its own sampler
+          // on timeout or forwarded TERM, within the original 12s tool budget.
+          stackRun = runMacNativeStack({ arguments: sampleArguments, capture: sampleCapture });
+        }
+      });
+      if (ownership !== "effectApplied" || stackRun === undefined) {
+        report({ status: "unavailable", reason: ownership });
+        return;
+      }
+      const captured = await stackRun.done;
+      if (captured.reason !== undefined || !captured.samplerExitConfirmed) {
+        report({ status: "unavailable", reason: captured.reason ?? "sampler_cleanup_unconfirmed" });
+        return;
+      }
+      const stacks = parseMacNativeSampleStacks(captured.output);
+      if (!stacks.threads.some(thread => thread.frames.length > 0)) {
+        report({ status: "tool_completed", format: "spindump", rawReviewRequired: true, sampleSeconds: 1, intervalMs: 10 });
+        return;
+      }
+      report({ status: "captured", sampleSeconds: 1, intervalMs: 10, phaseStillPending: phaseStillPending(), ...stacks });
+    } catch {
+      report({ status: "unavailable", reason: "diagnostic_unavailable" });
+    }
+  };
+  interval = setInterval(() => {
+    if (!current()) { stop(); return; }
+    try {
+      const progress = readProgress();
+      const now = Date.now();
+      attemptedTrigger = hasStalledPackagedSmokeInspectorCrash(progress, now) ? "inspector_owner_crash"
+        : hasStalledPackagedSmokeResourceRetirement(progress, now) ? "resource_retirement" : undefined;
+      if (attemptedTrigger === undefined) return;
+    } catch { return; }
+    attempted = true;
+    clearInterval(interval);
+    void sample();
+  }, 500);
+  interval.unref();
+  signal.addEventListener("abort", stop, { once: true });
+  if (signal.aborted) stop();
+  return { stop };
+}
+
 async function terminateChildTree(child, options = {}) {
   const pid = child.pid;
   if (options.managedRuntime !== undefined) {
@@ -803,24 +1003,7 @@ function readManagedConnectionMetadata(path) {
     throw new Error("Packaged smoke has no canonical managed Orchestrator connection metadata.");
   }
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8"));
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) ||
-      Object.keys(parsed).sort().join(",") !== "deviceId,name,origin,profileId,serverId" ||
-      typeof parsed.profileId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/u.test(parsed.profileId) ||
-      typeof parsed.deviceId !== "string" ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(parsed.deviceId) ||
-      typeof parsed.serverId !== "string" || !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(parsed.serverId) ||
-      typeof parsed.name !== "string" || parsed.name.trim() !== parsed.name || parsed.name.length < 1 || parsed.name.length > 128 ||
-      typeof parsed.origin !== "string") {
-      throw new Error("Packaged smoke managed Orchestrator connection metadata is malformed.");
-    }
-    const origin = new URL(parsed.origin);
-    const port = Number(origin.port);
-    if (origin.protocol !== "http:" || origin.hostname !== "127.0.0.1" || origin.origin !== parsed.origin ||
-      !Number.isSafeInteger(port) || port < 1 || port > 65_535) {
-      throw new Error("Packaged smoke managed Orchestrator origin is not an exact loopback HTTP authority.");
-    }
-    return { origin: origin.origin, serverId: parsed.serverId };
+    return parseManagedConnectionMetadata(readFileSync(path, "utf8"));
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("Packaged smoke managed")) throw error;
     throw new Error("Packaged smoke managed Orchestrator connection metadata is malformed.", { cause: error });
@@ -853,7 +1036,7 @@ async function probeManagedOrchestratorIdentity(connection) {
     } catch {
       return "mismatchedLive";
     }
-    return response.status === 200 && body?.server?.serverId === connection.serverId
+    return response.status === 200 && managedOrchestratorIdentityMatches(connection, body?.server)
       ? "matchedLive"
       : "mismatchedLive";
   } catch (error) {

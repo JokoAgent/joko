@@ -59,7 +59,7 @@ describe("voice input gateway", () => {
       }
       return response(method, idleStream(), true);
     }) } as unknown as Transport;
-    const gateway = createOrchestratorGateway({ id: "voice-connection", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    const gateway = createOrchestratorGateway({ id: "voice-connection", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
     const value = (sequence: bigint) => kind === "content"
       ? create(WatchVoiceInputDictionaryResponseSchema, { sequence, dictionary: dictionaryMessage() })
@@ -158,7 +158,7 @@ describe("voice input gateway", () => {
       if (method === "getVoiceInputSession") return create(GetVoiceInputSessionResponseSchema, { session: sessionMessage() });
       throw new Error(`Unexpected method: ${method}`);
     });
-    const gateway = createOrchestratorGateway({ id: "voice-connection", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" }, "secret", {}, () => transport);
+    const gateway = createOrchestratorGateway({ id: "voice-connection", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
 
     await expect(gateway.getVoiceInputCapabilities()).resolves.toMatchObject({
@@ -252,7 +252,7 @@ describe("voice input gateway", () => {
     const invitation = JSON.stringify({ version: 1, nodeId: "node-b", displayName: "Peer", publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=",
       fingerprint: "b".repeat(64), host: "peer.example", port: 43_121 });
     const gateway = createOrchestratorGateway({ id: "sharing", deviceId: "device-test", name: "Browser",
-      origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+      origin: "http://127.0.0.1:4318", serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
     calls.length = 0;
     try {
@@ -288,7 +288,7 @@ describe("voice input gateway", () => {
     const transport = voiceTransport(() => create(GetVoiceInputDictionaryResponseSchema, {
       ...(invalid === "missing" ? {} : { dictionary })
     }));
-    const gateway = createOrchestratorGateway({ id: "dictionary-invalid", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    const gateway = createOrchestratorGateway({ id: "dictionary-invalid", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
     try { await expect(gateway.getVoiceInputDictionary()).rejects.toThrow(/dictionary/u); }
     finally { gateway.disconnect(); }
@@ -298,7 +298,7 @@ describe("voice input gateway", () => {
     const transport = voiceTransport(() => create(GetVoiceInputDictionaryResponseSchema, {
       dictionary: { ...dictionaryMessage(), suppressedAutomaticTerms: ["Joko"] }
     }));
-    const gateway = createOrchestratorGateway({ id: "dictionary-manual", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    const gateway = createOrchestratorGateway({ id: "dictionary-manual", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
     try { await expect(gateway.getVoiceInputDictionary()).resolves.toMatchObject({ entries: [{ text: "Joko", source: "manual" }], suppressedAutomaticTerms: ["Joko"] }); }
     finally { gateway.disconnect(); }
@@ -312,7 +312,7 @@ describe("voice input gateway", () => {
       });
       throw new Error(`Unexpected method: ${method}`);
     });
-    const gateway = createOrchestratorGateway({ id: "voice-probe", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    const gateway = createOrchestratorGateway({ id: "voice-probe", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
     await expect(gateway.testVoiceInputConnection()).resolves.toEqual({ ok: false, reason: "authenticationFailed" });
     gateway.disconnect();
@@ -323,7 +323,7 @@ describe("voice input gateway", () => {
       if (method === "startVoiceInput") return create(StartVoiceInputResponseSchema);
       throw new Error(`Unexpected method: ${method}`);
     });
-    const gateway = createOrchestratorGateway({ id: "voice-missing", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" }, "secret", {}, () => transport);
+    const gateway = createOrchestratorGateway({ id: "voice-missing", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
     await expect(gateway.startVoiceInput("request-one", "audio/webm")).rejects.toThrow("no voice input session");
     gateway.disconnect();
@@ -359,7 +359,7 @@ describe("voice input gateway", () => {
       }
       throw new Error(`Unexpected method: ${method}`);
     });
-    const gateway = createOrchestratorGateway({ id: "voice-settings", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    const gateway = createOrchestratorGateway({ id: "voice-settings", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" }, "secret", {}, () => transport);
     await gateway.connect();
 
     await gateway.updateVoiceInputServiceSettings({

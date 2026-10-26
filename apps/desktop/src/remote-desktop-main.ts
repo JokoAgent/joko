@@ -91,6 +91,7 @@ export interface DesktopRemoteDesktopMainOptions {
   readonly retired?: () => void;
   readonly controllerDirectory?: DesktopRemoteDesktopControllerDirectory;
   readonly appearance?: () => { readonly dark: boolean; readonly locale: DesktopLocale };
+  readonly beforeCaptureClose?: (leaseId: string, attemptId: string) => Promise<void>;
 }
 
 /** Compose the production Electron adapters without exposing any host value to preload. */
@@ -105,7 +106,7 @@ export function createDesktopRemoteDesktopMainHost(
   let controlledOverlay: DesktopRemoteDesktopControlledOverlay | undefined;
   let privacyRequested = false;
   const media = new DesktopRemoteDesktopMedia(join(options.sourceDirectory, "remote-desktop-capture-preload.cjs"),
-    undefined, (leaseId) => { if (host?.state?.leaseId === leaseId) host.disconnect(); });
+    undefined, (leaseId) => { if (host?.state?.leaseId === leaseId) host.disconnect(); }, undefined, undefined, options.beforeCaptureClose);
   const onPointer = (points: { x: number; y: number }[]) => controlledOverlay?.viewerPointer(points);
   const input = process.platform === "win32"
     ? new DesktopRemoteDesktopWindowsInput(() => host?.releaseControl(true), undefined, undefined, onPointer)

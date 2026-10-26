@@ -377,7 +377,7 @@ describe("portable task package gateway", () => {
     });
     let selected = original;
     const gateway = createOrchestratorGateway(
-      { id: "connection-1", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "connection-1", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "secret", {}, () => selected
     );
     await gateway.connect();
@@ -445,7 +445,7 @@ function portableBlob(
 
 function createGateway(transport: Transport) {
   return createOrchestratorGateway(
-    { id: "connection-1", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
+    { id: "connection-1", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
     "secret",
     {},
     () => transport

@@ -46,7 +46,7 @@ describe("Session export gateway", () => {
     const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
     const fetchDownload = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       calls.push("fetch");
-      expect(String(input)).toBe("https://orchestrator.example/v1/blob-downloads/ticket-export");
+      expect(String(input)).toBe("http://127.0.0.1:4318/v1/blob-downloads/ticket-export");
       expect(init).toMatchObject({
         headers: { authorization: "Bearer secret" },
         cache: "no-store"
@@ -59,7 +59,7 @@ describe("Session export gateway", () => {
     vi.stubGlobal("fetch", fetchDownload);
     const transport = exportTransport(calls, "artifact");
     const gateway = createOrchestratorGateway(
-      { id: "connection-export", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
+      { id: "connection-export", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
       "secret",
       {},
       () => transport
@@ -88,7 +88,7 @@ describe("Session export gateway", () => {
       const fetchDownload = vi.fn();
       vi.stubGlobal("fetch", fetchDownload);
       const gateway = createOrchestratorGateway(
-        { id: "connection-export", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
+        { id: "connection-export", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
         "secret",
         {},
         () => exportTransport(calls, resultKind)
@@ -111,7 +111,7 @@ describe("Session export gateway", () => {
     const fetchDownload = vi.fn();
     vi.stubGlobal("fetch", fetchDownload);
     const gateway = createOrchestratorGateway(
-      { id: "connection-export", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "connection-export", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "secret", {}, () => exportTransport(calls, "artifact", () => pendingResult)
     );
     await gateway.connect();

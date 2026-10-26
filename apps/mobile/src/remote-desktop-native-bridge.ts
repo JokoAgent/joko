@@ -256,7 +256,7 @@ export function parseMobileRemoteDesktopNativeCommand(raw: unknown): MobileRemot
     }
     const candidates = iceCandidates(raw.candidates);
     if (raw.error === false && keys(raw, ["type", "epoch", "attemptId", "exchangeId", "error", "candidates", "next", "complete"])
-      && candidates && safe(raw.next, 0, 128) && typeof raw.complete === "boolean") {
+      && candidates && safe(raw.next, 0, RTC_NETWORK.maxCandidates) && typeof raw.complete === "boolean") {
       return Object.freeze({ type: "ice", ...owned, exchangeId: raw.exchangeId, error: false,
         candidates, next: raw.next, complete: raw.complete });
     }
@@ -353,7 +353,7 @@ export function parseMobileRemoteDesktopNativeEvent(raw: unknown): MobileRemoteD
     return Object.freeze({ ...owned, type: "offer", sdp: value.sdp });
   }
   if (value.type === "ice" && keys(value, ["type", "epoch", "attemptId", "candidates", "after", "exchangeId"])
-    && safe(value.after, 0, 128) && safe(value.exchangeId, 1)) {
+    && safe(value.after, 0, RTC_NETWORK.maxCandidates) && safe(value.exchangeId, 1)) {
     const candidates = iceCandidates(value.candidates);
     if (candidates) return Object.freeze({ ...owned, type: "ice", candidates, after: value.after, exchangeId: value.exchangeId });
   }

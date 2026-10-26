@@ -61,7 +61,7 @@ describe("input preparation and admission", () => {
         header: new Headers(), trailer: new Headers(), message: idleStream() }))
     } as unknown as Transport;
     const gateway = createOrchestratorGateway({ id: "connection", deviceId: "device", serverId: "server", name: "Browser",
-      origin: "https://orchestrator.example" }, "secret", { onSnapshot: value => { snapshot = value; } }, () => transport);
+      origin: "http://127.0.0.1:4318" }, "secret", { onSnapshot: value => { snapshot = value; } }, () => transport);
     await gateway.connect();
     let releaseCommands = () => {};
     if (builtinSkill) {
@@ -111,7 +111,7 @@ describe("input preparation and admission", () => {
 
   it("recognizes local input before admission returns, through uncertain retry and exact-scope history reloads", async () => {
     const profile: ConnectionProfile = { id: "unread-origin", deviceId: "device", serverId: "origin-server",
-      name: "Browser", origin: "https://origin.example" };
+      name: "Browser", origin: "http://127.0.0.1:4319" };
     const generation = 4n;
     const events: Event[] = [];
     const submissions: SubmitOperationRequest[] = [];
@@ -192,7 +192,7 @@ describe("input preparation and admission", () => {
         { name: "same connection after reconnect", profile, sessionId: "task", generation, operationId, local: true },
         { name: "other profile", profile: { ...profile, id: "other-profile" }, sessionId: "task", generation, operationId, local: false },
         { name: "other server", profile: { ...profile, serverId: "other-server" }, sessionId: "task", generation, operationId, local: false },
-        { name: "other origin", profile: { ...profile, origin: "https://other.example" }, sessionId: "task", generation, operationId, local: false },
+        { name: "other origin", profile: { ...profile, origin: "http://127.0.0.1:4320" }, sessionId: "task", generation, operationId, local: false },
         { name: "other session", profile, sessionId: "other-task", generation, operationId, local: false },
         { name: "other generation", profile, sessionId: "task", generation: generation + 1n, operationId, local: false },
         { name: "foreign operation", profile, sessionId: "task", generation, operationId: "foreign-operation", local: false }

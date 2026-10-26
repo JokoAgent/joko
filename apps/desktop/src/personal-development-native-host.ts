@@ -1,5 +1,5 @@
 import { createClient, type Client, type Interceptor } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, EndpointTrustError, isEndpointTrustError, normalizeEndpointPublicKey, requireEndpointTrust } from "@joko/connection-transport/node";
 import { ConnectionService, DesktopDevelopmentCommandKind, DesktopPersonalDevelopmentHostService, PersonalDevelopmentDirectoryKind, type DesktopDevelopmentRuntime } from "@joko/contracts";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import type { DesktopManagedOrchestratorConnection } from "./channels.js";
@@ -31,9 +31,11 @@ export class DesktopPersonalDevelopmentHost {
   }
   close(): void { this.setConnection(undefined); }
   async #client(connection: DesktopManagedOrchestratorConnection, signal: AbortSignal): Promise<HostClient> {
-    const identity = await createClient(ConnectionService, createConnectTransport({ baseUrl: connection.origin, httpVersion: "1.1", defaultTimeoutMs: 5_000 }))
+    const endpointPublicKey = connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin: connection.origin }) : normalizeEndpointPublicKey(connection.endpointPublicKey);
+    const identity = await createClient(ConnectionService, createConnectTransport({ baseUrl: connection.origin, endpointPublicKey, httpVersion: "1.1", defaultTimeoutMs: 5_000 }))
       .getServerInfo({}, { signal });
-    if (identity.server?.serverId !== connection.serverId || !await this.options.isAuthorityCurrent(connection)) throw new Error("Native host service identity changed.");
+    if (identity.server?.serverId !== connection.serverId) throw new EndpointTrustError("Native host service identity changed. Verify the local node before reconnecting.");
+    if (!await this.options.isAuthorityCurrent(connection)) throw new Error("Native host connection retired.");
     const auth = await this.options.readAuthKey(connection.profileId), host = await this.options.readHostKey(connection.profileId);
     if (!auth || !host || !await this.options.isAuthorityCurrent(connection)) throw new Error("Native host authorization is unavailable.");
     const authorize: Interceptor = next => async request => {
@@ -41,7 +43,7 @@ export class DesktopPersonalDevelopmentHost {
       request.header.set("authorization", `Bearer ${auth}`); request.header.set(DESKTOP_HOST_AUTHORIZATION_HEADER, `Bearer ${host}`);
       return next(request);
     };
-    return createClient(DesktopPersonalDevelopmentHostService, createConnectTransport({ baseUrl: connection.origin, httpVersion: "1.1", interceptors: [authorize], defaultTimeoutMs: 20_000 }));
+    return createClient(DesktopPersonalDevelopmentHostService, createConnectTransport({ baseUrl: connection.origin, endpointPublicKey, httpVersion: "1.1", interceptors: [authorize], defaultTimeoutMs: 20_000 }));
   }
   async #run(connection: DesktopManagedOrchestratorConnection, signal: AbortSignal): Promise<void> {
     let retry = 250;
@@ -87,13 +89,15 @@ export class DesktopPersonalDevelopmentHost {
               }
               default: await complete("failed");
             }
-          } catch {
+          } catch (error) {
+            if (isEndpointTrustError(error)) throw error;
             if (command.kind === DesktopDevelopmentCommandKind.HANDOFF) await this.options.versions.abandonHandoff(command.ticketId).catch(() => undefined);
             if (!signal.aborted) await complete("unknown").catch(() => undefined);
           }
           retry = 250;
         }
-      } catch {
+      } catch (error) {
+        if (isEndpointTrustError(error)) return;
         if (!signal.aborted) await new Promise<void>(resolve => {
           const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
           const timer = setTimeout(done, retry); timer.unref(); signal.addEventListener("abort", done, { once: true });

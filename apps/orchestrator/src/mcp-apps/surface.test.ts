@@ -68,3 +68,17 @@ it("revokes document and transport capabilities with their original connection a
   expect(f.released).toHaveBeenCalledOnce();
   expect(f.poll).not.toHaveBeenCalled();
 });
+
+it("supplies the private browser document and original bridge only to the client transport", async () => {
+  const f = await fixture();
+  const response = await f.server.inject({ url: f.url, headers: { "x-joko-isolated-document": "1" } });
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toEqual({ html: "<!doctype html><p>private-view-document</p>", csp: "default-src 'none'; script-src 'unsafe-inline'",
+    bridgeEndpoint: new URL(f.bridgeUrl).pathname });
+  expect((await f.server.inject({ url: f.resourceUrl, headers: { "x-joko-isolated-document": "1" } })).statusCode).toBe(403);
+  const message = { jsonrpc: "2.0", id: "private", method: "ping" };
+  expect((await f.server.inject({ method: "POST", url: f.bridgeUrl, headers: { "x-joko-isolated-document": "1" }, payload: { op: "message", message } })).statusCode).toBe(200);
+  expect(f.dispatch).toHaveBeenCalledExactlyOnceWith("viewer", "task", "view", message);
+  f.revoke();
+  expect((await f.server.inject({ url: f.url, headers: { "x-joko-isolated-document": "1" } })).statusCode).toBe(410);
+});

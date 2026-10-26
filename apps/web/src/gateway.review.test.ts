@@ -93,7 +93,7 @@ describe("isolated Review gateway", () => {
       stream: vi.fn(async (method: any) => response(method, idleStream(), true))
     } as unknown as Transport;
     const gateway = createOrchestratorGateway(
-      { id: "connection-review", deviceId: "device-test", name: "Review", origin: "https://orchestrator.example" , serverId: "server-test" },
+      { id: "connection-review", deviceId: "device-test", name: "Review", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
       "secret",
       {},
       () => transport
@@ -147,7 +147,7 @@ describe("isolated Review gateway", () => {
       stream: vi.fn(async (method: any) => response(method, idleStream(), true))
     } as unknown as Transport;
     const gateway = createOrchestratorGateway(
-      { id: "connection-review", deviceId: "device-test", name: "Review", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "connection-review", deviceId: "device-test", name: "Review", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "secret",
       {},
       () => transport

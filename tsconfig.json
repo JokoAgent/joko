@@ -2,6 +2,7 @@
   "extends": "./tsconfig.base.json",
   "files": [],
   "references": [
+    { "path": "./packages/connection-transport" },
     { "path": "./packages/agent-import" },
     { "path": "./packages/contracts" },
     { "path": "./packages/core" },

@@ -45,7 +45,7 @@ it("keeps the latest node selection while an older request finishes and remounts
   await act(async () => last.resolve(true));
   expect(document.querySelector(".skill-hub")).not.toBeNull();
   expect(document.querySelector('[aria-label="Catalog node"]')?.textContent).toContain("C");
-  expect(view.reads).toHaveBeenCalledTimes(2);
+  await act(async () => { await vi.waitFor(() => expect(view.reads).toHaveBeenCalledTimes(2)); });
 });
 
 it("leaves the original mounted editor intact when its discard decision is declined and blocks mismatched deep-link data", async () => {
@@ -84,7 +84,11 @@ async function mount(openMachineCatalog: AppController["openMachineCatalog"]) {
     await act(async () => root!.render(<ToolsPage controller={controller} snapshot={emptySnapshot()} catalogProfileId={catalogProfileId}
       selectedTab="skills" locale="en" t={t} runAction={(_key, action) => { void action(); }} onOpenNavigation={() => undefined} />));
   };
-  await render(); return { render, reads };
+  await render();
+  // The actual Skill catalog schedules its first read in a zero-delay effect
+  // timer. Establish that original read before selecting another node.
+  await act(async () => { await vi.waitFor(() => expect(reads).toHaveBeenCalledTimes(1)); });
+  return { render, reads };
 }
 async function choose(name: string) {
   await act(async () => (document.querySelector('[aria-label="Catalog node"]') as HTMLButtonElement).click());

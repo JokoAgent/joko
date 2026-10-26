@@ -223,6 +223,7 @@ function browserFixture() {
       port.onmessage = ({ data }) => {
         if (closed) return;
         if (data.type === "ready") { ready = true; return; }
+        if (data.type === "accepted") return;
         if (data.type === "ping") { port.postMessage({ type: "pong" }); return; }
         if (data.type === "error") { errors.push(`code:${Number(data.code)}`); return; }
         if (data.type !== "event" || !(data.bytes instanceof ArrayBuffer)) { errors.push("message"); return; }

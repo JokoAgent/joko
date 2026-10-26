@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createClient, type Client, type Interceptor } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, EndpointTrustError, isEndpointTrustError, normalizeEndpointPublicKey, requireEndpointTrust } from "@joko/connection-transport/node";
 import { screen } from "electron";
 import type { RemoteDesktopHandoffWindow } from "@joko/device-peer";
 import type { RemoteDesktopInput } from "@joko/device-peer";
@@ -82,12 +82,13 @@ export class DesktopInputHandoffHost {
   }
   async #client(connection: DesktopManagedOrchestratorConnection, signal: AbortSignal): Promise<HostClient> {
     const current = async () => { signal.throwIfAborted(); if (!await this.options.isAuthorityCurrent(connection)) throw new Error("Native input host retired."); };
-    const identity = await createClient(ConnectionService, createConnectTransport({ baseUrl: connection.origin, httpVersion: "1.1", defaultTimeoutMs: 5_000 })).getServerInfo({}, { signal });
-    await current(); if (identity.server?.serverId !== connection.serverId) throw new Error("Native input service changed.");
+    const endpointPublicKey = connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin: connection.origin }) : normalizeEndpointPublicKey(connection.endpointPublicKey);
+    const identity = await createClient(ConnectionService, createConnectTransport({ baseUrl: connection.origin, endpointPublicKey, httpVersion: "1.1", defaultTimeoutMs: 5_000 })).getServerInfo({}, { signal });
+    await current(); if (identity.server?.serverId !== connection.serverId) throw new EndpointTrustError("Native input service changed. Verify the local node before reconnecting.");
     const auth = await this.options.readAuthKey(connection.profileId), host = await this.options.readHostKey(connection.profileId); await current();
     if (!auth || !host) throw new Error("Native input host authorization is unavailable.");
     const authorize: Interceptor = next => async request => { await current(); request.header.set("authorization", `Bearer ${auth}`); request.header.set(DESKTOP_HOST_AUTHORIZATION_HEADER, `Bearer ${host}`); return next(request); };
-    return createClient(DesktopInputHandoffHostService, createConnectTransport({ baseUrl: connection.origin, httpVersion: "1.1", interceptors: [authorize], defaultTimeoutMs: 25_000 }));
+    return createClient(DesktopInputHandoffHostService, createConnectTransport({ baseUrl: connection.origin, endpointPublicKey, httpVersion: "1.1", interceptors: [authorize], defaultTimeoutMs: 25_000 }));
   }
   async #run(connection: DesktopManagedOrchestratorConnection, signal: AbortSignal): Promise<void> {
     let retry = 500;
@@ -117,11 +118,11 @@ export class DesktopInputHandoffHost {
           finally { clearInterval(monitor); signal.removeEventListener("abort", abort); active.abort(); command.payload.fill(0); }
           // Completion retries only the receipt. A native effect never runs twice.
           try { for (let attempt = 0; ; attempt++) { try { await client.completeNativeInputHandoffCommand({ ...request, success, payload }, { signal }); break; }
-            catch (error) { if (attempt >= 2 || signal.aborted) throw error; await delay(500 * (attempt + 1), signal); } } }
+            catch (error) { if (attempt >= 2 || signal.aborted || isEndpointTrustError(error)) throw error; await delay(500 * (attempt + 1), signal); } } }
           finally { payload.fill(0); }
           retry = 500;
         }
-      } catch { if (this.#registered?.signal === signal) this.#registered = undefined; if (!signal.aborted) await delay(retry, signal); retry = Math.min(30_000, retry * 2); }
+      } catch (error) { if (this.#registered?.signal === signal) this.#registered = undefined; if (isEndpointTrustError(error)) return; if (!signal.aborted) await delay(retry, signal); retry = Math.min(30_000, retry * 2); }
     }
   }
 }

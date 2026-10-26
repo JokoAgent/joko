@@ -36,6 +36,7 @@
     "!dist/orchestrator-runtime/**",
     "!dist/.orchestrator-runtime-stage-*/**",
     "!dist/.orchestrator-runtime-backup-*/**",
+    "!node_modules/@jokoagent/linkspan-iroh/native/**",
     "!**/*.{map,ts,tsx,cts,mts,proto,tsbuildinfo,c,cc,cpp,cxx,h,hh,hpp,hxx,rs,swift,m,mm,java,go,py,pyi,rb,cs,fs,fsx,scala,kt,kts,jsdoc,keep}",
     "!**/{test,tests,__tests__,coverage,fixtures,workspace}/**",
     "!**/*.test.*",
@@ -151,6 +152,61 @@
         "!**/WORKSPACE/**",
         "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
       ]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-core",
+      "to": "app/node_modules/@jokoagent/linkspan-core",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-noise",
+      "to": "app/node_modules/@jokoagent/linkspan-noise",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-http",
+      "to": "app/node_modules/@jokoagent/linkspan-http",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-http-connect",
+      "to": "app/node_modules/@jokoagent/linkspan-http-connect",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.txt", "dist/connect-parser-input.json", "dist/source-build.json"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-iroh",
+      "to": "app/node_modules/@jokoagent/linkspan-iroh",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-iroh-node",
+      "to": "app/node_modules/@jokoagent/linkspan-iroh-node",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-tailcat",
+      "to": "app/node_modules/@jokoagent/linkspan-tailcat",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-tailcat-node",
+      "to": "app/node_modules/@jokoagent/linkspan-tailcat-node",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-tailcat-runtime",
+      "to": "app/node_modules/@jokoagent/linkspan-tailcat-runtime",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-webrtc",
+      "to": "app/node_modules/@jokoagent/linkspan-webrtc",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
+    },
+    {
+      "from": "dist/orchestrator-runtime/node_modules/@jokoagent/linkspan-webrtc-node",
+      "to": "app/node_modules/@jokoagent/linkspan-webrtc-node",
+      "filter": ["package.json", "dist/**/*.js", "dist/**/*.mjs", "dist/**/*.cjs", "dist/**/*.txt", "dist/dependency-inventory.json", "dist/upstream-patches.json", "dist/source-build.json", "THIRD_PARTY_NOTICES.*"]
     }
   ],
   "afterPack": "scripts/audit-packaged.cjs",

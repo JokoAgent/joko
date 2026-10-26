@@ -29,7 +29,7 @@
     "test:provider:real:paid-smoke:claude-code": "pnpm --filter @joko/adapter-claude-code test:real:paid-smoke",
     "codegen": "buf generate --clean",
     "codegen:check": "buf lint && vitest run scripts/check-codegen.test.ts && tsx scripts/check-codegen.ts",
-    "boundaries": "vitest run scripts/check-boundaries.test.ts scripts/check-source-policy.test.ts && tsx scripts/check-boundaries.ts && tsx scripts/check-source-policy.ts",
+    "boundaries": "node --test scripts/prepare-linkspan.test.mjs && vitest run scripts/check-boundaries.test.ts scripts/check-source-policy.test.ts && tsx scripts/check-boundaries.ts && tsx scripts/check-source-policy.ts && node scripts/check-linkspan-source.mjs",
     "dev": "pnpm --filter @joko/orchestrator dev",
     "dev:web": "pnpm --filter @joko/web dev",
     "preview:task-status": "pnpm --filter @joko/desktop build && pnpm --filter @joko/desktop preview:task-status",

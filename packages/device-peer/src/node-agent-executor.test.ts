@@ -131,18 +131,57 @@ describe("Node Device peer recent project ownership", () => {
   });
   it("settles admitted recent-directory writes before retirement completes", async () => {
     const root = await testRoot();
+    const stages: string[] = [];
     const executor = new NodeDevicePeerAgentExecutor({
-      recentDirectoriesPath: join(root, "private", "recent.json")
+      recentDirectoriesPath: join(root, "private", "recent.json"),
+      observeRetirement: stage => { stages.push(stage); throw new Error("Diagnostics cannot skip admitted writes."); }
     });
     let recorded = false;
     const writing = executor.recordRecentDirectory(root, "Adopted project").then(() => { recorded = true; });
     try {
       await executor.retire();
       expect(recorded).toBe(true);
+      expect(stages).toEqual(["executor_resources_started", "executor_resource_deadline_installing",
+        "executor_resource_deadline_installed", "executor_resource_deadline_ref", "executor_resources_completed",
+        "recent_directories_flush_started", "recent_directories_flush_completed"]);
     } finally {
       await writing;
       await executor.retire();
     }
+  });
+
+  it("observes pending resource retirement without replacing its original five-second deadline", async () => {
+    const root = await testRoot();
+    vi.useFakeTimers();
+    const stages: string[] = [];
+    let finishResource!: () => void;
+    const pendingResource = new Promise<void>(resolveResource => { finishResource = resolveResource; });
+    const fixture = remoteDesktopHost({ retire: () => pendingResource });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "recent.json"), remoteDesktop: fixture.port,
+      observeRetirement: stage => { stages.push(stage); }
+    });
+    let completed = false;
+    const retirement = executor.retire().then(() => { completed = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stages).toEqual([
+      "executor_resources_started", "executor_resource_deadline_installing", "executor_resource_deadline_installed",
+      "executor_resource_deadline_ref", "executor_remote_desktop_retirement_call_started",
+      "executor_remote_desktop_retirement_call_returned"
+    ]);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(completed).toBe(false);
+    expect(stages).not.toContain("executor_resource_deadline_fired");
+    await vi.advanceTimersByTimeAsync(1);
+    await retirement;
+    expect(stages.slice(-4)).toEqual([
+      "executor_resource_deadline_fired", "executor_resources_completed",
+      "recent_directories_flush_started", "recent_directories_flush_completed"
+    ]);
+    expect(stages).not.toContain("executor_remote_desktop_retirement_completed");
+    finishResource();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stages.at(-1)).toBe("executor_remote_desktop_retirement_completed");
   });
 
   it("credentials admit authenticated controller and preserve the signal without a media lease", async () => {

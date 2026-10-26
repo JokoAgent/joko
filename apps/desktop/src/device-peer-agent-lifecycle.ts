@@ -1,6 +1,8 @@
 import {
   NodeDevicePeerAgentLifecycle,
   type NodeDevicePeerAgentConnection,
+  type NodeDevicePeerAgentRetirementStage,
+  type NodeDevicePeerAgentWorkerRetirementStage,
   type NodeDevicePeerAgentLifecycleOptions
 } from "@joko/device-peer";
 import { DeviceKind, DevicePeerCapabilityKind } from "@joko/contracts";
@@ -40,6 +42,9 @@ export interface DesktopDevicePeerAgentLifecycleOptions {
   /** A Main-only proof probe. A transient native service failure leaves the
    * file/process route available; successful recovery republishes that route. */
   readonly recoverNativeAgents?: (connection: DesktopManagedOrchestratorConnection, signal: AbortSignal) => Promise<boolean>;
+  readonly observeRetirement?: (stage: NodeDevicePeerAgentRetirementStage | NodeDevicePeerAgentWorkerRetirementStage
+    | "worker_wait_started" | "worker_wait_completed"
+    | "native_recovery_wait_started" | "native_recovery_wait_completed") => void;
 }
 
 interface NativeRecovery {
@@ -56,10 +61,13 @@ export class DesktopDevicePeerAgentLifecycle {
   #nodeDesired: NodeDevicePeerAgentConnection | undefined;
   #nativeRecovery: NativeRecovery | undefined;
   readonly #recoveries = new Set<Promise<void>>();
+  readonly #observeRetirement: DesktopDevicePeerAgentLifecycleOptions["observeRetirement"];
 
   constructor(options: DesktopDevicePeerAgentLifecycleOptions) {
+    this.#observeRetirement = options.observeRetirement;
     const runRoute = options.runRoute ?? runDesktopDevicePeerAgentRoute;
     const lifecycleOptions: NodeDevicePeerAgentLifecycleOptions = {
+      ...(options.observeRetirement === undefined ? {} : { observeRetirement: options.observeRetirement }),
       createExecutor: async () => {
         const desktop = this.#requireDesired(), executor = await options.createExecutor(desktop);
         if (sameConnection(this.#desired, desktop)) {
@@ -80,6 +88,7 @@ export class DesktopDevicePeerAgentLifecycle {
           signal: nodeOptions.signal,
           readAuthKey: nodeOptions.readAuthKey,
           readDefaultDeviceName: nodeOptions.readDefaultDeviceName,
+          ...(options.observeRetirement === undefined ? {} : { observeRetirement: options.observeRetirement }),
           readRouteAuthorization: nodeOptions.readRouteAuthorization
             ?? (() => Promise.resolve(undefined)),
           isAuthorityCurrent: (candidate) => sameConnection(candidate, desktop)
@@ -113,6 +122,7 @@ export class DesktopDevicePeerAgentLifecycle {
       deviceId: connection.deviceId,
       serverId: connection.serverId,
       origin: connection.origin,
+      endpointPublicKey: connection.endpointPublicKey,
       expectedDeviceKind: DeviceKind.DESKTOP
     });
     this.#lifecycle.setConnection(this.#nodeDesired);
@@ -130,8 +140,16 @@ export class DesktopDevicePeerAgentLifecycle {
     this.#cancelNativeRecovery();
     this.#desired = undefined;
     this.#nodeDesired = undefined;
+    this.#retirementProgress("worker_wait_started");
     await this.#lifecycle.dispose();
+    this.#retirementProgress("worker_wait_completed");
+    this.#retirementProgress("native_recovery_wait_started");
     await Promise.all([...this.#recoveries]);
+    this.#retirementProgress("native_recovery_wait_completed");
+  }
+
+  #retirementProgress(stage: Parameters<NonNullable<DesktopDevicePeerAgentLifecycleOptions["observeRetirement"]>>[0]): void {
+    try { this.#observeRetirement?.(stage); } catch { /* Diagnostics never own retirement. */ }
   }
 
   #cancelNativeRecovery(): void { this.#nativeRecovery?.controller.abort(); this.#nativeRecovery = undefined; }
@@ -193,6 +211,7 @@ function sameNodeIdentity(
     && left.deviceId === right.deviceId
     && left.serverId === right.serverId
     && left.origin === right.origin
+    && left.endpointPublicKey === right.endpointPublicKey
     && left.expectedDeviceKind === DeviceKind.DESKTOP;
 }
 
@@ -205,5 +224,6 @@ function sameConnection(
     && left.deviceId === right.deviceId
     && left.serverId === right.serverId
     && left.name === right.name
-    && left.origin === right.origin;
+    && left.origin === right.origin
+    && left.endpointPublicKey === right.endpointPublicKey;
 }

@@ -242,7 +242,7 @@ describe("Extension catalog gateway", () => {
     expect(uploaded).toEqual(["extension-test-secret"]);
     expect(buffers[0]?.every((byte) => byte === 0)).toBe(true);
     expect(vi.mocked(fetch)).toHaveBeenCalledWith(
-      "https://orchestrator.example/v1/credentials/upload/credential-ticket-1",
+      "http://127.0.0.1:4318/v1/credentials/upload/credential-ticket-1",
       expect.objectContaining({
         method: "PUT",
         headers: { authorization: "Bearer auth-key", "content-type": "application/octet-stream" }
@@ -815,7 +815,7 @@ async function mount(handler: (method: string, input: any) => Promise<object>): 
     stream: vi.fn(async (method: any) => response(method, idleStream(), true))
   } as unknown as Transport;
   const gateway = createOrchestratorGateway(
-    { id: "connection", deviceId: "device", name: "Desktop", origin: "https://orchestrator.example", serverId: "server" },
+    { id: "connection", deviceId: "device", name: "Desktop", origin: "http://127.0.0.1:4318", serverId: "server" },
     "auth-key",
     {},
     () => transport

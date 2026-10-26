@@ -8,7 +8,7 @@ export function desktopRemoteDesktopViewerOwner(state: ControllerState): Desktop
   const profile = state.activeProfile;
   return !state.ready || state.connectionState !== "connected" || profile === undefined || state.connectionGeneration === undefined
     ? undefined : { profileId: profile.id, serverId: profile.serverId, deviceId: profile.deviceId,
-      origin: profile.origin, connectionGeneration: state.connectionGeneration };
+      origin: profile.origin, endpointPublicKey: profile.endpointPublicKey, transportKind: profile.transportKind, connectionGeneration: state.connectionGeneration };
 }
 
 export async function openDesktopRemoteDesktopViewer(controller: Pick<AppController, "state">,

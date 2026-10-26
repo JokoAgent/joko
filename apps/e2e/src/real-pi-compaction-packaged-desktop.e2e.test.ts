@@ -406,6 +406,8 @@ describe("packaged Desktop Pi compaction", () => {
 
   managedPackagedIt("connects the current Desktop artifact to its own managed Pi service", { timeout: 240_000 }, async () => {
     const requests: CapturedProviderRequest[] = [];
+    const secondTurnReply = `${REAL_PI_RESPONSE_TEXT}: second managed turn`;
+    let secondTurn = false;
     let failSummary = false;
     let holdNextSummary = false;
     let releaseSummary: (() => void) | undefined;
@@ -418,8 +420,9 @@ describe("packaged Desktop Pi compaction", () => {
           await summaryGate;
         }
         if (failSummary) throw new Error("Controlled managed Desktop compaction Provider failure.");
+        return { kind: "text", text: REAL_PI_RESPONSE_TEXT };
       }
-      return { kind: "text", text: REAL_PI_RESPONSE_TEXT };
+      return { kind: "text", text: secondTurn ? secondTurnReply : REAL_PI_RESPONSE_TEXT };
     });
     const providerAddress = providerServer.address() as AddressInfo;
     const providerUrl = `http://127.0.0.1:${providerAddress.port}/v1`;
@@ -501,16 +504,25 @@ describe("packaged Desktop Pi compaction", () => {
       && operation.state === OperationState.SUCCEEDED)).toHaveLength(2);
 
     const requestCountBeforeSecondTurn = requests.length;
+    secondTurn = true;
     await page.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content")
       .fill("A second managed Desktop Pi turn before route switching.");
     await page.locator(".session-pane").getByRole("button", { name: "Send", exact: true }).click();
     await waitFor(() => Promise.resolve(requests.length), (count) => count > requestCountBeforeSecondTurn,
       "second managed Desktop Pi provider request", 30_000);
-    await waitFor(() => page.getByText(REAL_PI_RESPONSE_TEXT, { exact: true }).count(),
-      (count) => count >= 2, "second managed Desktop Pi reply", 30_000);
     await waitFor(() => managedClients.session.getSession({ sessionId }),
       (response) => response.session?.state === SessionState.IDLE,
       "second managed Desktop Pi turn idle", 30_000);
+    // Earlier turns may be outside the virtualized viewport after compaction.
+    // Check this completed turn in its current task rather than assuming every
+    // streaming paragraph across the whole document is globally unique.
+    const secondReply = page.locator(`[data-timeline-session-id='${sessionId}'] .message-assistant__body`)
+      .getByText(secondTurnReply, { exact: true });
+    const replyDeadline = Date.now() + 30_000;
+    await waitFor(() => secondReply.count(), count => count === 1,
+      "one completed second-turn reply in the current task", 30_000);
+    await secondReply.waitFor({ state: "visible", timeout: Math.max(1, replyDeadline - Date.now()) });
+    secondTurn = false;
 
     await page.evaluate(() => { window.location.hash = "/tasks/new?dialogue=pi"; });
     await newTask.waitFor({ state: "visible", timeout: 30_000 });

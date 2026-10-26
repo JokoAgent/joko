@@ -24,6 +24,7 @@ async function mount() {
   vi.spyOn(LocalState, "open").mockResolvedValue({ readDraft, saveDraft, readDraftSnapshot, saveDraftIfRevision,
     listProfiles: async () => [], listMachineCaches: async () => [], readPreferences: async () => DEFAULT_UI_PREFERENCES,
     readAuthKey: async () => "credential", saveProfile: async () => undefined, saveMachineCache: async () => undefined,
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
     mutatePreferences: async (run: (value: typeof DEFAULT_UI_PREFERENCES) => unknown) => run(DEFAULT_UI_PREFERENCES)
   } as unknown as LocalState);
   vi.mocked(probeOrchestratorOrigin).mockResolvedValue({ serverId: PROFILE.serverId, displayName: "Local", version: "1", apiVersion: "1", pairingEnabled: false });

@@ -37,6 +37,8 @@ export function isInsecureLanOrigin(value: string): boolean {
 
 export function isLocalOrPrivateHostname(value: string): boolean {
   const hostname = canonicalHostname(value);
+  if (hostname === "fd00:ec2::254" || hostname === "metadata" || hostname.startsWith("metadata.")
+    || hostname === "instance-data" || hostname.startsWith("instance-data.")) return false;
   if (hostname === "" || hostname === "0.0.0.0" || hostname === "::") return false;
   if (isLoopbackHostname(hostname)) return true;
   const ipv4 = parseIpv4(hostname);

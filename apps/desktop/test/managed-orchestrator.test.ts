@@ -11,6 +11,8 @@ import { mkdtempSync } from "./test-paths.js";
 import {
   DesktopBootstrapFrameDecoder,
   DesktopBootstrapGrant,
+  createDesktopBootstrapRequest,
+  verifyDesktopBootstrapResponse,
   decodeDesktopBootstrapCommitPayload,
   decodeDesktopBootstrapRequestPayload,
   encodeDesktopBootstrapCommittedFrame,
@@ -50,6 +52,15 @@ afterEach(() => {
 });
 
 describe("managed local Orchestrator", () => {
+  it("authenticates the full endpoint pin on the private bootstrap and rejects pin substitution", () => {
+    const request = createDesktopBootstrapRequest({ deviceId: DEVICE_ID, parentPid: 321, defaultDeviceName: "Desktop", platform: "win32", appVersion: "0.1.0" }, { now: () => 1000 });
+    const grant = DesktopBootstrapGrant.accept(request, { expectedParentPid: 321, now: () => 1001 });
+    const response = grant.exchange({ serverId: "orchestrator-managed", origin: "http://127.0.0.1:45180", endpointPublicKey: `ed25519:${'a'.repeat(64)}`,
+      issueConnection: input => ({ connection: { id: "desktop-connection_pinned", deviceId: input.desktopDeviceId }, authKey: Buffer.alloc(32, 9).toString("base64url") }) });
+    expect(verifyDesktopBootstrapResponse(request, response, { now: () => 1002 }).endpointPublicKey).toBe(response.endpointPublicKey);
+    expect(() => verifyDesktopBootstrapResponse(request, { ...response, endpointPublicKey: `ed25519:${'b'.repeat(64)}` }, { now: () => 1002 })).toThrow();
+    grant.dispose();
+  });
   it("persists one private installation Device identity", async () => {
     const directory = temporaryDirectory();
     const path = resolve(directory, "identity", "device-id");

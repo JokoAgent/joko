@@ -1,4 +1,5 @@
 import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, LocalePreference, MachineCacheView, NewSessionLocalDraft, PendingExtensionSuggestionView, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
+import { normalizeEndpointTransport, rememberEndpointTransport, rememberEndpointTrust, retainIrohRelayRequest, selectEndpointTransport, trustedEndpointTransport, type RetainedIrohRelayRequest } from "@joko/connection-transport/trust";
 import { builtinSkillIntentForText } from "./builtin-skill-intent.js";
 import { normalizeBrowserCommentStyleChanges, normalizeBrowserCommentTarget, sanitizeBrowserCommentPageUrl } from "./browser-comment-draft.js";
 import { normalizeExtensionRecommendation, sameExtensionRecommendation } from "./extension-suggestion-handoff.js";
@@ -316,7 +317,7 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const required = ["deviceId", "id", "name", "origin", "serverId"];
-  const allowed = new Set([...required, "lastConnectedAt", "managedLocal"]);
+  const allowed = new Set([...required, "lastConnectedAt", "managedLocal", "endpointPublicKey", "transportKind"]);
   if (required.some((key) => !Object.hasOwn(record, key)) || Object.keys(record).some((key) => !allowed.has(key))) {
     return undefined;
   }
@@ -324,6 +325,9 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
     !validConnectionIdentity(record["id"], 128)
     || !validConnectionIdentity(record["deviceId"], 256)
     || !validConnectionIdentity(record["serverId"], 256)
+    || (record["endpointPublicKey"] !== undefined && (typeof record["endpointPublicKey"] !== "string" || !/^ed25519:[a-f0-9]{64}$/u.test(record["endpointPublicKey"])))
+    || (record["transportKind"] !== undefined && !['https', 'iroh', 'tailcat', 'webrtc', 'http-connect'].includes(String(record["transportKind"])))
+    || (record["transportKind"] !== undefined && record["transportKind"] !== 'https' && record["endpointPublicKey"] === undefined)
     || typeof record["name"] !== "string"
     || record["name"].length === 0
     || record["name"].length > 256
@@ -356,6 +360,8 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
     serverId: record["serverId"],
     name: record["name"],
     origin: record["origin"],
+    ...(record["endpointPublicKey"] === undefined ? {} : { endpointPublicKey: record["endpointPublicKey"] as string }),
+    ...(record["transportKind"] === undefined ? {} : { transportKind: record["transportKind"] as ConnectionProfile['transportKind'] }),
     ...(Object.hasOwn(record, "managedLocal") ? { managedLocal: record["managedLocal"] as boolean } : {}),
     ...(Object.hasOwn(record, "lastConnectedAt") ? { lastConnectedAt: record["lastConnectedAt"] as number } : {})
   };
@@ -364,6 +370,15 @@ function normalizeConnectionProfile(value: unknown): ConnectionProfile | undefin
 function validConnectionIdentity(value: unknown, maximumLength: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= maximumLength &&
     value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function endpointTransportOwner(profile: ConnectionProfile): string {
+  return JSON.stringify([profile.id, profile.origin, profile.serverId, profile.endpointPublicKey, profile.transportKind]);
+}
+
+async function endpointTransportCredentialId(profileId: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(profileId)));
+  return `transport_${Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
 function persistedUiPreferences(value: UiPreferences): { -readonly [Key in keyof UiPreferences]?: UiPreferences[Key] } {
@@ -442,6 +457,34 @@ export class LocalState {
     return values.map(normalizeConnectionProfile).filter((value): value is ConnectionProfile => value !== undefined);
   }
 
+  async claimIrohRelayRequest(profile: ConnectionProfile, input: RetainedIrohRelayRequest): Promise<RetainedIrohRelayRequest> {
+    const key = this.irohRelayRequestKey(profile, input), transaction = this.#database.transaction(DRAFT_STORE, 'readwrite'), store = transaction.objectStore(DRAFT_STORE);
+    const done = transactionDone(transaction);
+    try {
+      const retained = retainIrohRelayRequest(await requestResult(store.get(key)), input);
+      store.put(retained, key); await done; return retained;
+    } catch (error) { try { transaction.abort(); } catch { /* Already completed or aborted. */ } await done.catch(() => undefined); throw error; }
+  }
+
+  async confirmIrohRelayRequest(profile: ConnectionProfile, input: RetainedIrohRelayRequest, expiresAt: number): Promise<void> {
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0 || expiresAt > Date.now() + 86_400_000) throw new Error('The relay invitation receipt has an invalid expiry.');
+    const key = this.irohRelayRequestKey(profile, input), transaction = this.#database.transaction(DRAFT_STORE, 'readwrite'), store = transaction.objectStore(DRAFT_STORE);
+    const done = transactionDone(transaction);
+    try {
+      const existing: unknown = await requestResult(store.get(key));
+      if (existing === undefined) throw new Error('The original relay invitation request is unavailable.');
+      if (existing === null || typeof existing !== 'object' || (existing as { requestId?: unknown }).requestId !== input.requestId
+        || (existing as { expiresAt?: unknown }).expiresAt !== undefined && (existing as { expiresAt?: unknown }).expiresAt !== expiresAt) throw new Error('The relay invitation receipt conflicts with its retained request.');
+      const retained = retainIrohRelayRequest(existing, input);
+      if (retained.requestId !== input.requestId) throw new Error('The relay invitation receipt belongs to another request.');
+      store.put({ ...retained, expiresAt }, key); await done;
+    } catch (error) { try { transaction.abort(); } catch { /* Already completed or aborted. */ } await done.catch(() => undefined); throw error; }
+  }
+
+  private irohRelayRequestKey(profile: ConnectionProfile, input: RetainedIrohRelayRequest): string {
+    return `iroh-relay-request\u0000${JSON.stringify([profile.id, profile.origin, profile.serverId, profile.endpointPublicKey, profile.transportKind ?? 'https', input.nodeEndpointId, input.recipientEndpointId])}`;
+  }
+
   async taskSharingActions(owner: string): Promise<readonly PendingTaskSharingAction[]> {
     const prefix = `task-sharing-actions\u0000${owner}\u0000`;
     const transaction = this.#database.transaction(DRAFT_STORE, "readonly");
@@ -501,6 +544,7 @@ export class LocalState {
   async saveProfile(profile: ConnectionProfile, authKey: string): Promise<void> {
     const normalized = normalizeConnectionProfile(profile);
     if (normalized === undefined) throw new Error("The connection profile is invalid.");
+    await this.saveEndpointTransport(normalized);
     const desktopCredentials = window.jokoDesktop?.credentials;
     if (desktopCredentials !== undefined) {
       await desktopCredentials.set(normalized.id, authKey);
@@ -534,7 +578,52 @@ export class LocalState {
     await transactionDone(transaction);
   }
 
+  /** Locator secrets may be read before the anonymous proof; the Auth Key may not. */
+  async loadEndpointTransport(profile: ConnectionProfile): Promise<void> {
+    if (profile.transportKind === undefined || profile.transportKind === 'https') {
+      if (profile.endpointPublicKey !== undefined) selectEndpointTransport(profile.origin, profile.endpointPublicKey, 'https');
+      return;
+    }
+    if (profile.endpointPublicKey === undefined) throw new Error('The selected transport requires a trusted node public key.');
+    if (profile.transportKind === 'webrtc') { selectEndpointTransport(profile.origin, profile.endpointPublicKey, 'webrtc'); return; }
+    const recordId = `transport:${profile.id}`;
+    const desktop = window.jokoDesktop?.credentials;
+    let raw = this.#volatileSecrets.get(recordId);
+    if (desktop !== undefined) raw = await desktop.get(await endpointTransportCredentialId(profile.id));
+    else if (raw === undefined && persistentWebSecretEncryptionAvailable()) {
+      const encrypted = await this.get<EncryptedSecret>(SECRET_STORE, recordId);
+      if (encrypted !== undefined) {
+        try {
+          raw = new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: encrypted.iv,
+            additionalData: new TextEncoder().encode(endpointTransportOwner(profile)) }, await this.originKey(), encrypted.ciphertext));
+        } catch { throw new Error('The protected transport locator could not be read. Import the trusted invitation again.'); }
+      }
+    }
+    if (raw === undefined) throw new Error('The protected transport locator is unavailable. Import the trusted invitation again.');
+    let value: unknown;
+    try { value = JSON.parse(raw); } catch { throw new Error('The protected transport locator is invalid.'); }
+    if (value === null || typeof value !== 'object' || Array.isArray(value) || (value as { owner?: unknown }).owner !== endpointTransportOwner(profile)) throw new Error('The protected transport locator does not match this connection owner.');
+    const transport = normalizeEndpointTransport((value as { transport?: unknown }).transport);
+    if (transport.kind !== profile.transportKind) throw new Error('The protected locator belongs to another connection transport.');
+    rememberEndpointTransport(profile.origin, profile.endpointPublicKey, transport);
+  }
+
+  async saveEndpointTransport(profile: ConnectionProfile): Promise<void> {
+    if (profile.transportKind === undefined || profile.transportKind === 'https' || profile.transportKind === 'webrtc') return;
+    if (profile.endpointPublicKey === undefined) throw new Error('The selected transport requires a trusted node public key.');
+    const transport = trustedEndpointTransport(profile.origin, profile.endpointPublicKey, profile.transportKind);
+    if (transport === undefined) throw new Error('The private transport locator is unavailable.');
+    const raw = JSON.stringify({ owner: endpointTransportOwner(profile), transport }), recordId = `transport:${profile.id}`;
+    const desktop = window.jokoDesktop?.credentials;
+    if (desktop !== undefined) { await desktop.set(await endpointTransportCredentialId(profile.id), raw); return; }
+    if (!persistentWebSecretEncryptionAvailable()) { this.#volatileSecrets.set(recordId, raw); return; }
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(endpointTransportOwner(profile)) }, await this.originKey(), new TextEncoder().encode(raw));
+    await this.put(SECRET_STORE, recordId, { profileId: profile.id, iv: iv.buffer.slice(iv.byteOffset, iv.byteOffset + iv.byteLength), ciphertext } satisfies EncryptedSecret);
+  }
+
   async readAuthKey(profile: ConnectionProfile): Promise<string | undefined> {
+    rememberEndpointTrust(profile);
     const desktopCredentials = window.jokoDesktop?.credentials;
     if (desktopCredentials !== undefined) return desktopCredentials.get(profile.id);
     const volatile = this.#volatileSecrets.get(profile.id);
@@ -556,18 +645,24 @@ export class LocalState {
 
   async deleteAuthKey(profileId: string): Promise<void> {
     this.#volatileSecrets.delete(profileId);
+    this.#volatileSecrets.delete(`transport:${profileId}`);
     await window.jokoDesktop?.credentials.delete(profileId);
+    if (window.jokoDesktop?.credentials !== undefined) await window.jokoDesktop.credentials.delete(await endpointTransportCredentialId(profileId));
     const transaction = this.#database.transaction(SECRET_STORE, "readwrite");
     transaction.objectStore(SECRET_STORE).delete(profileId);
+    transaction.objectStore(SECRET_STORE).delete(`transport:${profileId}`);
     await transactionDone(transaction);
   }
 
   async deleteProfile(id: string): Promise<void> {
     this.#volatileSecrets.delete(id);
+    this.#volatileSecrets.delete(`transport:${id}`);
     await window.jokoDesktop?.credentials.delete(id);
+    if (window.jokoDesktop?.credentials !== undefined) await window.jokoDesktop.credentials.delete(await endpointTransportCredentialId(id));
     const transaction = this.#database.transaction([PROFILE_STORE, SECRET_STORE, MACHINE_CACHE_STORE], "readwrite");
     transaction.objectStore(PROFILE_STORE).delete(id);
     transaction.objectStore(SECRET_STORE).delete(id);
+    transaction.objectStore(SECRET_STORE).delete(`transport:${id}`);
     transaction.objectStore(MACHINE_CACHE_STORE).delete(id);
     await transactionDone(transaction);
   }

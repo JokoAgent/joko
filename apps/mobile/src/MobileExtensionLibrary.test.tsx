@@ -297,6 +297,7 @@ function fixtureTransport(snapshot: MobileExtensionLibrarySnapshot): MobileExten
     tasks: vi.fn(() => []),
     useCommand: vi.fn(async () => { throw new Error("unused"); }),
     openMainView: vi.fn(async () => { throw new Error("unused"); }),
+    readMainViewResource: vi.fn(async () => { throw new Error("unused"); }),
     probeMainView: vi.fn(async () => { throw new Error("unused"); }),
     closeMainView: vi.fn(async () => true),
     openLibrary: vi.fn(async () => { throw new Error("unused"); }),

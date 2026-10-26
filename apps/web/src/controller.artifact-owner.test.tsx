@@ -38,7 +38,8 @@ it("retires anonymous discovery when an explicit connection begins and rejects i
   vi.spyOn(LocalState, "open").mockResolvedValue({
     listProfiles: async () => [], listMachineCaches: async () => [],
     readPreferences: async () => ({ ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] }),
-    readAuthKey: async () => "test-key", saveProfile: async () => undefined, saveMachineCache: async () => undefined
+    readAuthKey: async () => "test-key", saveProfile: async () => undefined, saveMachineCache: async () => undefined,
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport
   } as unknown as LocalState);
   const signals: AbortSignal[] = [];
   let releaseDiscovery!: (value: Awaited<ReturnType<typeof discoverOrchestratorNodesAt>>) => void;
@@ -102,6 +103,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
     listProfiles: async () => [], listMachineCaches: async () => [],
     readPreferences: async () => storedPreferences,
     readAuthKey: async () => "test-key", saveProfile: async () => undefined,
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
     saveMachineCache: async () => undefined,
     savePreferences: async (value: UiPreferences) => { storedPreferences = value; },
     mutatePreferences: async (mutation: UiPreferencesMutation) => (storedPreferences = mutation(storedPreferences))
@@ -677,6 +679,7 @@ it("retains a message deep-link target while connecting its saved machine", asyn
     listMachineCaches: async () => [],
     readPreferences: async () => preferences,
     readAuthKey: async () => "test-key",
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
     saveProfile: async () => undefined,
     saveMachineCache: async () => undefined,
     deleteMachineCache: async () => undefined
@@ -761,6 +764,7 @@ it("does not let a stale cross-machine task open replace a newer navigation occu
     listMachineCaches: async () => [],
     readPreferences: async () => ({ ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] }),
     readAuthKey: async () => "test-key",
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
     saveProfile: async () => undefined,
     saveMachineCache: async () => undefined,
     deleteMachineCache: async () => undefined

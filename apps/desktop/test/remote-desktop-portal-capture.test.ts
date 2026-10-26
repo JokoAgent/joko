@@ -32,6 +32,20 @@ class Stream {
 }
 
 describe("lease-owned Wayland portal consent", () => {
+  it("stops tracks immediately but holds its RTC owner until Main acknowledges the original UDP retirement", async () => {
+    let acknowledge!: () => void;
+    const h = await harness(() => new Promise<void>(resolve => { acknowledge = resolve; }));
+    h.command({ op: "preparePortal", leaseId: "lease" }); h.grant(h.original); await drain(); h.offer("original-attempt"); await drain();
+    const rtc = h.peers[0]!; h.original.clones[0]!.tracks[0]!.end(); await drain();
+    expect(h.original.clones[0]!.tracks[0]!.stop).toHaveBeenCalled(); expect(rtc.close).not.toHaveBeenCalled(); expect(h.stopped).toContain("lease");
+    acknowledge(); await drain(); expect(rtc.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("quiesce retains the peer socket and only trusted Main stop can release it after cleanup", async () => {
+    const h = await harness(); h.command({ op: "preparePortal", leaseId: "lease" }); h.grant(h.original); await drain(); h.offer("original-attempt"); await drain();
+    const rtc = h.peers[0]!; h.command({ op: "quiesce" }); expect(rtc.close).not.toHaveBeenCalled(); expect(h.stopped).toEqual([]);
+    h.command({ op: "stop" }); expect(rtc.close).toHaveBeenCalledTimes(1);
+  });
   it("returns first-frame pending throughout local consent and uses only clones across ICE attempts", async () => {
     const h = await harness();
     h.command({ op: "preparePortal", leaseId: "lease" });
@@ -88,7 +102,7 @@ describe("lease-owned Wayland portal consent", () => {
 });
 
 async function drain() { for (let count = 0; count < 24; count += 1) await Promise.resolve(); }
-async function harness() {
+async function harness(beforeStopped?: () => Promise<void>) {
   const original = new Stream();
   let grant!: (stream: Stream) => void; let deny!: (error: Error) => void;
   const getDisplayMedia = vi.fn(() => new Promise<Stream>((resolve, reject) => { grant = resolve; deny = reject; }));
@@ -96,7 +110,9 @@ async function harness() {
   const stopped: unknown[] = [];
   let listener!: (_event: unknown, command: DesktopRemoteDesktopCaptureCommand) => void;
   let unload!: () => void;
+  const peers: Peer[] = [];
   class Peer {
+    constructor() { peers.push(this); }
     localDescription = { sdp: "answer" }; iceGatheringState = "complete";
     close = vi.fn(); getSenders = () => []; addTrack = vi.fn();
     setRemoteDescription = async () => undefined; createAnswer = async () => ({ sdp: "answer", type: "answer" });
@@ -105,7 +121,7 @@ async function harness() {
   const ipc = { on: (_channel: string, callback: typeof listener) => { listener = callback; },
     invoke: async (channel: string, ...args: unknown[]) => {
       if (channel.endsWith(":reply")) receipts.push({ id: args[0] as string, value: args[1] as DesktopRemoteDesktopCaptureReply });
-      if (channel.endsWith(":stopped")) stopped.push(args[0]);
+      if (channel.endsWith(":stopped")) { stopped.push(args[0]); await beforeStopped?.(); }
     } };
   const source = await readFile(new URL("../src/remote-desktop-capture-preload.cts", import.meta.url), "utf8");
   const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2022 } }).outputText;
@@ -118,7 +134,7 @@ async function harness() {
     setTimeout, clearTimeout, setInterval, clearInterval });
   const command = (value: DesktopRemoteDesktopCaptureCommand) => listener({}, value);
   cleanup.push(() => { command({ op: "stop" }); unload(); });
-  return { original, receipts, stopped, getDisplayMedia, command, unload: () => unload(),
+  return { original, receipts, stopped, peers, getDisplayMedia, command, unload: () => unload(),
     grant: (value: Stream) => grant(value), deny: (error: Error) => deny(error),
     offer: (id: string) => command({ op: "offer", id, leaseId: "lease", attemptId: id, offerSdp: "offer", iceServers: [],
       portalCapture: true, nativeCapture: false, nativeVideo: false, chromiumCapture: false,

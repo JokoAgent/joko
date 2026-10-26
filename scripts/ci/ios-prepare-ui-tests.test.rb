@@ -27,7 +27,7 @@ Dir.mktmpdir('joko-ui-project-') do |directory|
   references = REXML::XPath.match(scheme.doc, '//BuildableReference')
   raise 'The scheme must only build or test the XCTest target.' unless !references.empty? && references.all? { |reference| reference.attributes['BlueprintIdentifier'] == target.uuid }
   variables = REXML::XPath.match(scheme.doc, '//EnvironmentVariable').to_h { |element| [element.attributes['key'], element.attributes['value']] }
-  raise 'The owned local servers must reach XCTest.' unless variables == { 'JOKO_CI_METRO_PORT' => '12345', 'JOKO_CI_PROBE_PORT' => '12346' }
+  raise 'The owned local servers and selected runtime must reach XCTest.' unless variables == { 'JOKO_CI_METRO_PORT' => '12345', 'JOKO_CI_PROBE_PORT' => '12346', 'JOKO_CI_SDK_RUNTIME' => 'relay' }
   original = Digest::SHA256.file(File.join(path, 'project.pbxproj')).hexdigest
   _, _, status = Open3.capture3(RbConfig.ruby, generator, *arguments)
   raise 'An existing project must not be overwritten.' if status.success?
@@ -35,5 +35,11 @@ Dir.mktmpdir('joko-ui-project-') do |directory|
   invalid = [File.join(directory, 'Invalid.xcodeproj'), source, '0', '12346', '16.4']
   _, _, status = Open3.capture3(RbConfig.ruby, generator, *invalid)
   raise 'An invalid server must not create a project.' if status.success? || File.exist?(invalid.first)
+  native_path = File.join(directory, 'NativeConnect.xcodeproj')
+  _, error, status = Open3.capture3(RbConfig.ruby, generator, native_path, source, '12345', '12346', '16.4', 'http-connect-native')
+  raise error unless status.success?
+  native_scheme = Xcodeproj::XCScheme.new(File.join(native_path, 'xcshareddata', 'xcschemes', 'JokoCIUITests.xcscheme'))
+  native_variables = REXML::XPath.match(native_scheme.doc, '//EnvironmentVariable').to_h { |element| [element.attributes['key'], element.attributes['value']] }
+  raise 'The actual selected native runtime must reach XCTest.' unless native_variables['JOKO_CI_SDK_RUNTIME'] == 'http-connect-native'
 end
 puts 'Isolated XCTest project, exact Swift source, local servers and non-overwrite checks passed.'

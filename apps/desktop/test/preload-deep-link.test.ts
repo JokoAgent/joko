@@ -71,7 +71,7 @@ describe("private task invitation preload handoff", () => {
   it("delivers once to its captured Document, acknowledges acceptance and retires the listener", async () => {
     const f = loadPreload("main-document");
     const value = buildTaskShareInvitation({ hostOrigin: "https://host.example", hostServerId: "host",
-      shareId: "share", shareGeneration: 1n, inviteSecret: "a".repeat(43) });
+      endpointPublicKey: `ed25519:${"a".repeat(64)}`, shareId: "share", shareGeneration: 1n, inviteSecret: "a".repeat(43) });
     const envelope = { documentOccurrence: "main-document", deliveryOccurrence: 1, invitation: value };
     f.invoke.mockResolvedValueOnce(envelope);
     const api = f.exposed["taskSharingInvitations"] as { subscribe(listener: (invitation: string) => void): () => void };

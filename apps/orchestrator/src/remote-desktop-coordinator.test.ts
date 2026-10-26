@@ -16,14 +16,17 @@ import {
 } from "./device-peer-owner.js";
 import {
   RemoteDesktopCoordinator,
-  type RemoteDesktopCoordinatorOptions
+  type RemoteDesktopCoordinatorOptions,
+  type RemoteDesktopIceConfigurationProvider
 } from "./remote-desktop-coordinator.js";
+import { ConnectionManager } from "./connection-manager.js";
 
 const signal = new AbortController().signal;
 const connection = connectionRecord();
 const identity = selectionIdentity();
 const coordinators: RemoteDesktopCoordinator[] = [];
 const stores: OperationalStore[] = [];
+type IceConfigurationInput = Parameters<RemoteDesktopIceConfigurationProvider["getConfiguration"]>[0];
 
 afterEach(async () => {
   await Promise.allSettled(coordinators.splice(0).map((coordinator) => coordinator.close()));
@@ -33,6 +36,47 @@ afterEach(async () => {
 });
 
 describe("RemoteDesktopCoordinator", () => {
+  it("binds optional UDP offer/trickle to the exact attempt, translates native cursors and retires it on revocation", async () => {
+    const fake = new FakeDevicePeerOwner(), revocations = new RevocationHarness();
+    let context!: Parameters<NonNullable<RemoteDesktopCoordinatorOptions["udpMapping"]>["mapAnswer"]>[0];
+    fake.dispatchHandler = async (_authority, input) => {
+      const command = input.payload as contract.DevicePeerCommand;
+      if (command.action.case === "createRemoteDesktopOffer") return completed(result("remoteDesktopOffer", create(contract.RemoteDesktopOfferResultSchema, { attemptId: command.action.value.attemptId, answerSdp: "v=0\r\n" })));
+      if (command.action.case === "exchangeRemoteDesktopIce") { expect(command.action.value.after).toBe(7); return completed(result("remoteDesktopIce", create(contract.RemoteDesktopIceExchangeResultSchema, { attemptId: command.action.value.attemptId, candidates: [], next: 7, complete: true }))); }
+      return defaultResponse(input);
+    };
+    const udp = { mapAnswer: vi.fn(async (input, answer) => { context = input; input.assertCurrent(); return answer; }),
+      exchangeIce: vi.fn(async (input, _after, dispatch) => { input.assertCurrent(); const native = await dispatch(7); return { ...native, next: 0 }; }),
+      releaseLease: vi.fn(async () => {}), retireLocalCapture: vi.fn(async () => {}), close: vi.fn(async () => {}) } satisfies NonNullable<RemoteDesktopCoordinatorOptions["udpMapping"]>;
+    const coordinator = fakeCoordinator(fake, { onRevoked: revocations.subscribe, udpMapping: udp }).coordinator;
+    const lease = await start(coordinator); const offer = (attemptId: string) => coordinator.createOffer(connection, identity, { leaseId: lease.leaseId, attemptId, offerSdp: "v=0\r\n", cursorOverlay: false }, signal);
+    await offer("first"); const first = context;
+    await coordinator.exchangeIce(connection, identity, { leaseId: lease.leaseId, attemptId: "first", after: 0, candidates: [] }, signal);
+    await offer("second"); expect(first.lifetimeSignal.aborted).toBe(true); expect(() => first.assertCurrent()).toThrow();
+    const before = fake.calls.length; await expect(coordinator.exchangeIce(connection, identity, { leaseId: lease.leaseId, attemptId: "first", after: 0, candidates: [] }, signal)).rejects.toMatchObject({ code: "aborted" }); expect(fake.calls.length).toBe(before);
+    revocations.revoke(connection.id); expect(context.lifetimeSignal.aborted).toBe(true); expect(udp.releaseLease).toHaveBeenCalledWith(lease.leaseId);
+  });
+
+  it("rejects a late UDP answer after the coordinator has selected another media attempt", async () => {
+    const fake = new FakeDevicePeerOwner(); let release!: () => void; let observed = false;
+    fake.dispatchHandler = async (_authority, input) => { const command = input.payload as contract.DevicePeerCommand; return command.action.case === "createRemoteDesktopOffer"
+      ? completed(result("remoteDesktopOffer", create(contract.RemoteDesktopOfferResultSchema, { attemptId: command.action.value.attemptId, answerSdp: "v=0\r\n" }))) : defaultResponse(input); };
+    const udp = { mapAnswer: vi.fn(async (input, sdp) => { if (input.attemptId === "old") { observed = true; await new Promise<void>(resolve => { release = resolve; }); } return sdp; }), exchangeIce: vi.fn(async (_input, after, dispatch) => dispatch(after)), releaseLease: vi.fn(async () => {}), retireLocalCapture: vi.fn(async () => {}), close: vi.fn(async () => {}) } satisfies NonNullable<RemoteDesktopCoordinatorOptions["udpMapping"]>;
+    const coordinator = fakeCoordinator(fake, { udpMapping: udp }).coordinator, lease = await start(coordinator);
+    const offer = (attemptId: string) => coordinator.createOffer(connection, identity, { leaseId: lease.leaseId, attemptId, offerSdp: "v=0\r\n", cursorOverlay: false }, signal);
+    const old = offer("old"); const rejected = expect(old).rejects.toBeDefined(); await vi.waitFor(() => expect(observed).toBe(true)); await offer("new"); release(); await rejected;
+  });
+  it("fences a capture retired by its original Main before a late native offer can publish UDP", async () => {
+    const fake = new FakeDevicePeerOwner(); let complete!: (value: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async (_authority, input) => input.action === "createRemoteDesktopOffer" ? new Promise(resolve => { complete = resolve; }) : defaultResponse(input);
+    const udp = { mapAnswer: vi.fn(async (_input, sdp) => sdp), exchangeIce: vi.fn(async (_input, after, dispatch) => dispatch(after)), releaseLease: vi.fn(async () => {}), retireLocalCapture: vi.fn(async () => {}), close: vi.fn(async () => {}) } satisfies NonNullable<RemoteDesktopCoordinatorOptions["udpMapping"]>;
+    const coordinator = fakeCoordinator(fake, { udpMapping: udp }).coordinator, lease = await start(coordinator);
+    const pending = coordinator.createOffer(connection, identity, { leaseId: lease.leaseId, attemptId: "capture", offerSdp: "v=0\r\n", cursorOverlay: false }, signal);
+    const rejected = expect(pending).rejects.toBeDefined(); await vi.waitFor(() => expect(complete).toBeTypeOf("function"));
+    await coordinator.retireLocalMedia({ ...connection, id: "managed-host-connection", deviceId: identity.targetDeviceId }, lease.leaseId, "capture");
+    complete(completed(result("remoteDesktopOffer", create(contract.RemoteDesktopOfferResultSchema, { attemptId: "capture", answerSdp: "v=0\r\n" }))));
+    await rejected; expect(udp.mapAnswer).not.toHaveBeenCalled(); expect(udp.retireLocalCapture).toHaveBeenCalledWith({ hostConnectionId: "managed-host-connection", targetDeviceId: identity.targetDeviceId, leaseId: lease.leaseId, attemptId: "capture" });
+  });
   it("Linux system audio failure preserves view and heartbeat for the same lease muted offer", async () => {
     const fake = new FakeDevicePeerOwner();
     const coordinator = fakeCoordinator(fake).coordinator;
@@ -1392,6 +1436,92 @@ describe("RemoteDesktopCoordinator", () => {
     expect(fake.actions()).not.toContain("createRemoteDesktopOffer");
   });
 
+  it("aborts hosted ICE after durable Connection revocation and releases only the original real DevicePeer lease", async () => {
+    const store = new OperationalStore(":memory:"); stores.push(store);
+    const controller = store.createConnection({ id: "turn-controller", deviceId: "turn-controller-device",
+      device: { defaultName: "Controller", kind: "mobile", platform: "ios" }, name: "Controller", authKeyDigest: "controller-digest" });
+    const target = store.createConnection({ id: "turn-target", deviceId: "turn-target-device",
+      device: { defaultName: "Host", kind: "desktop", platform: "windows" }, name: "Host", authKeyDigest: "target-digest" });
+    store.setDeviceRemoteControlEnabled(target.deviceId, true);
+    const connections = new ConnectionManager(store);
+    const harness = createInProcessDevicePeerHarness({ targetDeviceId: target.deviceId, capabilities: ["remote_desktop"], agent: {
+      handle: async frame => frame.action === "startRemoteDesktop"
+        ? { outcome: "completed", value: result("remoteDesktopLease", remoteDesktopLease()) }
+        : { outcome: "completed", value: acknowledgementResult() }
+    } });
+    const owner = new DevicePeerOwner({ store }); owner.registerRoute(target, harness.transport);
+    const selected = owner.listForCapabilities(controller, ["remote_desktop"], { kind: "desktop" })[0]!;
+    let request: IceConfigurationInput | undefined;
+    const getConfiguration = vi.fn((input: IceConfigurationInput) => new Promise<readonly contract.RemoteDesktopIceServer[]>((_resolve, reject) => {
+      request = input;
+      input.signal.addEventListener("abort", () => reject(new Error("Hosted ICE was cancelled.")), { once: true });
+    }));
+    const cleanupObservations: { readonly state: string; readonly aborted: boolean }[] = [];
+    const releaseConfiguration = vi.fn(async (_leaseId: string) => {
+      cleanupObservations.push({ state: store.getConnection(controller.id).state, aborted: request?.signal.aborted === true });
+      throw new Error("The provider cleanup is temporarily unavailable.");
+    });
+    const coordinator = track(new RemoteDesktopCoordinator({ owner,
+      onRevoked: (id, listener) => connections.onRevoked(id, listener), iceConfiguration: { getConfiguration, releaseConfiguration } }));
+    const lease = await coordinator.start(controller, selected, { displayId: "display-1", mode: contract.RemoteDesktopStartMode.NEW }, signal);
+    const pending = coordinator.getIceConfiguration(controller, selected, lease.leaseId, signal);
+    const rejected = expect(pending).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.STOPPED } });
+    expect(request).toMatchObject({ leaseId: lease.leaseId, controllerDeviceId: controller.deviceId, targetDeviceId: target.deviceId });
+    request!.assertCurrent!();
+    connections.revoke(controller.id);
+    await rejected;
+    expect(() => request!.assertCurrent!()).toThrow();
+    expect(releaseConfiguration).toHaveBeenCalledExactlyOnceWith(lease.leaseId);
+    expect(cleanupObservations).toEqual([{ state: "revoked", aborted: true }]);
+    await expect(coordinator.getIceConfiguration(controller, selected, lease.leaseId, signal)).rejects.toThrow();
+    expect(getConfiguration).toHaveBeenCalledOnce();
+    expect(store.getConnection(target.id).state).toBe("active");
+  });
+
+  it.each(["route", "viewer", "service"] as const)("aborts in-flight ICE and releases its exact handle when the %s lifetime ends", async lifetime => {
+    const fake = new FakeDevicePeerOwner();
+    let request: IceConfigurationInput | undefined;
+    const cleanupObservations: boolean[] = [];
+    const releaseConfiguration = vi.fn(async (_leaseId: string) => { cleanupObservations.push(request?.signal.aborted === true); });
+    const close = vi.fn(async () => undefined);
+    const coordinator = fakeCoordinator(fake, { iceConfiguration: { releaseConfiguration, close,
+      getConfiguration: input => new Promise<readonly contract.RemoteDesktopIceServer[]>((_resolve, reject) => {
+        request = input;
+        input.signal.addEventListener("abort", () => reject(new Error("Hosted ICE was cancelled.")), { once: true });
+      }) } }).coordinator;
+    const lease = await start(coordinator);
+    const pending = coordinator.createOffer(connection, identity,
+      { leaseId: lease.leaseId, attemptId: "turn-attempt", offerSdp: "v=0\r\n", cursorOverlay: false }, signal);
+    const rejected = expect(pending).rejects.toThrow();
+    expect(request?.signal.aborted).toBe(false);
+    if (lifetime === "route") fake.replaceRoute({ ...identity, routeGeneration: identity.routeGeneration + 1 });
+    else if (lifetime === "viewer") await coordinator.stop(connection, identity,
+      { leaseId: lease.leaseId, lockScreen: false, controlGeneration: 0n }, signal);
+    else await coordinator.close();
+    await rejected;
+    expect(releaseConfiguration).toHaveBeenCalledExactlyOnceWith(lease.leaseId);
+    expect(cleanupObservations).toEqual([true]);
+    expect(fake.actions()).not.toContain("createRemoteDesktopOffer");
+    expect(close).toHaveBeenCalledTimes(lifetime === "service" ? 1 : 0);
+  });
+
+  it("keeps repeated service close pending until the owned ICE provider has actually retired", async () => {
+    const fake = new FakeDevicePeerOwner();
+    let finishCleanup!: () => void;
+    const close = vi.fn(() => new Promise<void>(resolve => { finishCleanup = resolve; }));
+    const coordinator = fakeCoordinator(fake, { iceConfiguration: { getConfiguration: async () => [], close } }).coordinator;
+    await start(coordinator);
+    const first = coordinator.close();
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+    let secondFinished = false;
+    const second = coordinator.close().then(() => { secondFinished = true; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(secondFinished).toBe(false);
+    } finally { finishCleanup(); await Promise.all([first, second]); }
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("loads separate fresh scoped ICE material for viewer and host before dispatching the host offer", async () => {
     const fake = new FakeDevicePeerOwner();
     const getConfiguration = vi.fn(async () => [create(contract.RemoteDesktopIceServerSchema, {
@@ -1408,7 +1538,7 @@ describe("RemoteDesktopCoordinator", () => {
       { leaseId: "lease-1", attemptId: "attempt", offerSdp: "v=0\r\n", cursorOverlay: false }, signal);
     expect(getConfiguration).toHaveBeenCalledTimes(2);
     expect(getConfiguration).toHaveBeenLastCalledWith({ controllerDeviceId: connection.deviceId,
-      targetDeviceId: identity.targetDeviceId, leaseId: "lease-1", signal });
+      targetDeviceId: identity.targetDeviceId, leaseId: "lease-1", signal: expect.any(AbortSignal), assertCurrent: expect.any(Function) });
     const command = fake.calls.find(call => call.input.action === "createRemoteDesktopOffer")?.input.payload as contract.DevicePeerCommand;
     expect(command.action.value).toMatchObject({ iceServers: [{ username: "temporary", credential: "secret" }] });
   });
@@ -1920,6 +2050,7 @@ class FakeDevicePeerOwner {
   asOwner(): DevicePeerOwner {
     return this as unknown as DevicePeerOwner;
   }
+  localDesktopRouteConnectionId(): string { return "managed-host-connection"; }
 
   capture(
     controller: ConnectionRecord,
@@ -2046,6 +2177,7 @@ function fakeCoordinator(
     readonly now?: () => number;
     readonly onRevoked?: RemoteDesktopCoordinatorOptions["onRevoked"];
     readonly iceConfiguration?: RemoteDesktopCoordinatorOptions["iceConfiguration"];
+    readonly udpMapping?: RemoteDesktopCoordinatorOptions["udpMapping"];
   } = {}
 ): { readonly coordinator: RemoteDesktopCoordinator } {
   return {
@@ -2053,7 +2185,8 @@ function fakeCoordinator(
       owner: owner.asOwner(),
       onRevoked: options.onRevoked ?? (() => () => undefined),
       ...(options.now === undefined ? {} : { now: options.now }),
-      ...(options.iceConfiguration === undefined ? {} : { iceConfiguration: options.iceConfiguration })
+      ...(options.iceConfiguration === undefined ? {} : { iceConfiguration: options.iceConfiguration }),
+      ...(options.udpMapping === undefined ? {} : { udpMapping: options.udpMapping })
     }))
   };
 }

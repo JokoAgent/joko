@@ -274,6 +274,8 @@ export interface ConsumePairingInput {
 export interface PrunePairingsOptions {
   /** Delete unused challenges whose expiry is at or before this cutoff. */
   readonly expiredBefore: UnixMillis;
+  /** Keep recently issued challenges for durable issuance rate limiting. */
+  readonly expiredCreatedBefore?: UnixMillis;
   /** Delete consumed challenges consumed at or before this audit-retention cutoff. */
   readonly consumedBefore: UnixMillis;
 }

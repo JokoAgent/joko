@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
   BeginPairingResponseSchema,
+  IssueIrohRelayInvitationResponseSchema,
   BackgroundTaskState,
   CompletePairingResponseSchema,
   DeviceKind,
@@ -28,11 +29,13 @@ import {
   SnapshotSchema
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EndpointTrustError, rememberEndpointTransport, rememberEndpointTrust, reportEndpointTrustFailure } from "@joko/connection-transport/trust";
 import {
   createOrchestratorGateway,
   isUnauthenticatedError,
   mapSnapshot,
   projectSnapshotEvent,
+  probeOrchestratorOrigin,
   reusablePairingDeviceId
 } from "./gateway.js";
 
@@ -41,6 +44,95 @@ afterEach(() => {
 });
 
 describe("connection credential lifecycle", () => {
+  it('allows the selected WebRTC identity handshake to finish after the ordinary discovery budget', async () => {
+    const origin = 'https://webrtc-probe.example', endpointPublicKey = `ed25519:${'3'.repeat(64)}`;
+    rememberEndpointTrust({ origin, endpointPublicKey, transportKind: 'webrtc' });
+    const transport = { unary: async (method: any, signal: AbortSignal | undefined) => {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 2_100);
+        signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+      });
+      return response(method, create(GetServerInfoResponseSchema, { server: { serverId: 'rtc-probe', endpointPublicKey, apiVersion: 'joko.v1' } }));
+    } } as unknown as Transport;
+    await expect(probeOrchestratorOrigin(origin, undefined, () => transport)).resolves.toMatchObject({ serverId: 'rtc-probe' });
+  }, 5_000);
+  it.each(['valid', 'foreign-recipient', 'expired', 'lost-response'] as const)('issues a B-only relay lease before pairing and preserves scope for %s responses', async mode => {
+    const profile = { id: `relay-${mode}`, deviceId: 'owner-device', name: 'Relay node', origin: `https://relay-${mode}.example`, serverId: 'relay-node', endpointPublicKey: `ed25519:${'a'.repeat(64)}`, transportKind: 'iroh' as const };
+    const selected = { kind: 'iroh' as const, endpointId: 'b'.repeat(64), ticket: 'A-iroh-private-ticket', clientKey: 'c'.repeat(64), clientEndpointId: 'd'.repeat(64), relayUrls: ['https://relay.example'], relayToken: 'A-only-lease', relayTokenExpiresAt: Date.now() + 3600000 };
+    rememberEndpointTransport(profile.origin, profile.endpointPublicKey, selected);
+    const request = { requestId: '00000000-0000-4000-8000-000000000001', recipientEndpointId: 'e'.repeat(64) };
+    const calls: string[] = [], checkpoint = vi.fn(async () => undefined);
+    let loseResponse = mode === 'lost-response';
+    const transport = { unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+      calls.push(method.localName);
+      if (method.localName === 'getServerInfo') return response(method, create(GetServerInfoResponseSchema, { server: { serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey } }));
+      if (method.localName === 'issueIrohRelayInvitation') {
+        expect(input).toMatchObject({ ...request, nodeEndpointId: selected.endpointId });
+        if (loseResponse) { loseResponse = false; throw new ConnectError('The relay result was lost.', Code.Unavailable); }
+        return response(method, create(IssueIrohRelayInvitationResponseSchema, { invitation: { ...request, nodeEndpointId: selected.endpointId, ticket: 'B-iroh-private-ticket',
+          origin: profile.origin, serverId: profile.serverId, endpointPublicKey: profile.endpointPublicKey,
+          recipientEndpointId: mode === 'foreign-recipient' ? 'f'.repeat(64) : request.recipientEndpointId,
+          relayUrls: ['https://relay.example'], relayToken: 'B-only-lease', expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + (mode === 'expired' ? -60 : 3600)) } } }));
+      }
+      if (method.localName === 'beginPairing') {
+        expect(checkpoint).toHaveBeenCalledOnce();
+        return response(method, create(BeginPairingResponseSchema, { challenge: { challengeId: 'new-device', humanCode: '1234-5678', verificationUri: `${profile.origin}/pair`, expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + 300) } } }));
+      }
+      return response(method, create(GetSnapshotResponseSchema, { snapshot: { generation: 1n } }));
+    }) } as unknown as Transport;
+    const gateway = createOrchestratorGateway(profile, 'owner-credential', {}, () => transport);
+    try {
+      await gateway.connect({ snapshotOnly: true }); calls.length = 0;
+      const authorize = () => gateway.authorizeNewDevice!({ irohRelay: request, onIrohRelayLease: checkpoint });
+      if (mode === 'foreign-recipient' || mode === 'expired') {
+        await expect(authorize()).rejects.toThrow();
+        expect(calls).not.toContain('beginPairing');
+        expect(checkpoint).toHaveBeenCalledTimes(mode === 'expired' ? 1 : 0);
+      } else {
+        if (mode === 'lost-response') { await expect(authorize()).rejects.toThrow(); expect(calls).not.toContain('beginPairing'); }
+        const invitation = await authorize();
+        expect(invitation.endpointTransport).toMatchObject({ kind: 'iroh', clientEndpointId: request.recipientEndpointId, relayToken: 'B-only-lease' });
+        expect(invitation.endpointTransport).not.toHaveProperty('clientKey');
+        expect(invitation.trustedInvitation).not.toContain(selected.relayToken);
+        expect(calls.slice(-3)).toEqual(['getServerInfo', 'issueIrohRelayInvitation', 'beginPairing']);
+      }
+    } finally { gateway.disconnect(); }
+  });
+
+  it("stops a failed endpoint security check instead of reconnecting the event stream", async () => {
+    const failure = new Error("wrapped", { cause: new EndpointTrustError() });
+    const transport = {
+      unary: vi.fn(async (method: any) => response(method, create(GetSnapshotResponseSchema, {
+        snapshot: create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } })
+      }))),
+      stream: vi.fn(async (method: any) => response(method, failingStream(failure), true))
+    } as unknown as Transport;
+    const invalidated = vi.fn(async () => undefined);
+    const gateway = createOrchestratorGateway({ id: "security-stream", deviceId: "device", name: "Pinned", origin: "https://security-stream.example", serverId: "node" },
+      "credential-kept-by-host", { onAuthenticationInvalidated: invalidated }, () => transport);
+    try {
+      await gateway.connect();
+      await vi.waitFor(() => expect(invalidated).toHaveBeenCalledOnce());
+      expect(invalidated).toHaveBeenCalledWith(expect.objectContaining({ code: "ENDPOINT_TRUST_FAILED", offline: false }));
+      expect(transport.stream).toHaveBeenCalledOnce();
+    } finally { gateway.disconnect(); }
+  });
+
+  it("immediately suspends a current pinned owner when another application request fails its handshake", async () => {
+    const profile = { id: "security-request", deviceId: "device", name: "Pinned", origin: "https://security-request.example", serverId: "node", endpointPublicKey: `ed25519:${"e".repeat(64)}` };
+    const transport = { unary: vi.fn(async (method: any) => response(method, create(GetSnapshotResponseSchema, {
+      snapshot: create(SnapshotSchema, { generation: 1n })
+    }))), stream: vi.fn(async (method: any) => response(method, idleStream(), true)) } as unknown as Transport;
+    const invalidated = vi.fn(async () => undefined);
+    const gateway = createOrchestratorGateway(profile, "credential-kept-by-host", { onAuthenticationInvalidated: invalidated }, () => transport);
+    try {
+      await gateway.connect({ snapshotOnly: true });
+      reportEndpointTrustFailure(profile, new EndpointTrustError());
+      await vi.waitFor(() => expect(invalidated).toHaveBeenCalledOnce());
+      await expect(gateway.refresh()).rejects.toThrow(/before performing this action/u);
+    } finally { gateway.disconnect(); }
+  });
+
   it.each(["caller", "connection"] as const)(
     "rejects a late prediction after %s cancellation even when transport ignores its signal",
     async (cancellation) => {

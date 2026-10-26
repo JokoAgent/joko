@@ -538,6 +538,7 @@ async function groupFixture(f: Awaited<ReturnType<typeof fixture>>) {
   const session = await f.host.createServiceSession({ operationId: "group-lane-create", serviceKind: "partner", targetId: "group-lane-target",
     title: "Group lane", providerId: "test", modelId: "text", effort: "medium", fastMode: false, permissionMode: "ask", planMode: false, assertServiceScope: () => undefined });
   const sessionId = session.value.sessionId, host = new PartnerNetworkHost({ storage: new PartnerNetworkStore(f.store), serverId: "task-home", origin: "http://127.0.0.1",
+    endpointPublicKey: `ed25519:${"a".repeat(64)}`,
     mediaDirectory: join(f.root, "group-media"), partner: id => ({ id, name: f.partner.displayName, description: "Partner" }) });
   const room = host.create(create(contract.CreatePartnerNetworkRequestSchema, { operationId: "task-room-create", name: "Task room", displayName: "Owner", partnerIds: [f.partner.id] }));
   const actor = room.members.find(member => member.kind === "partner")!; let active = true, accessRevision = "1", resultUnavailable = false;

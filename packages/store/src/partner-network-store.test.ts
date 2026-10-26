@@ -19,6 +19,22 @@ function fixture() {
   return { store, database, room, current, ownerId, guestId, manage, invite, accept, send, advance: (ms: number) => { now += ms; } };
 }
 describe("conversation authority and foreign membership", () => {
+  it("revokes foreign owner credentials and all old invitations without changing local history or roles", () => {
+    const f = fixture(); f.invite("guest", true); f.accept("guest");
+    f.send("Keep this original message", f.guestId);
+    f.manage("set-role", f.ownerId, f.guestId, "owner");
+    const localBefore = f.current().members.find(actor => actor.id === f.ownerId)!;
+    const messages = f.store.messages(f.room.id);
+    expect(f.store.authenticate(f.room.id, networkHash("credential")).id).toBe(f.guestId);
+    f.store.revokeForeignAccess("home-a");
+    expect(() => f.store.authenticate(f.room.id, networkHash("credential"))).toThrow();
+    expect(() => f.store.link(networkHash("guest"))).toThrow();
+    expect(() => f.accept("guest", "fresh-operation", "home-c")).toThrow();
+    expect(f.current().members.find(actor => actor.id === f.ownerId)).toEqual(localBefore);
+    expect(f.store.messages(f.room.id)).toEqual(messages);
+    expect(f.store.executions(f.room.id).every(job => !["queued", "running"].includes(job.status))).toBe(true);
+    expect(f.store.revokeForeignAccess("home-a")).toEqual({ members: 0, invitations: 0 });
+  });
   it("keeps one stable companion identity and exactly one durable message/queue effect for a repeated send", () => {
     const f = fixture(), one = f.send("hello", f.ownerId, "same-send"), retry = f.send("hello", f.ownerId, "same-send");
     expect(retry).toEqual(one); expect(f.store.messages(f.room.id)).toHaveLength(1); expect(f.store.executions(f.room.id)).toHaveLength(1);

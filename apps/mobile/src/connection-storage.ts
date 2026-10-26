@@ -1,6 +1,9 @@
 import type { PairedCredential } from "./network";
+import { normalizeEndpointTransport, rememberEndpointTransport, retainIrohRelayRequest, selectEndpointTransport, trustedEndpointTransport, type EndpointTransportKind, type RetainedIrohRelayRequest } from '@joko/connection-transport/trust';
 
 export interface MobileConnectionProfile {
+  readonly endpointPublicKey?: string;
+  readonly transportKind?: EndpointTransportKind;
   readonly profileId: string;
   readonly origin: string;
   readonly serverId: string;
@@ -57,6 +60,11 @@ export interface PendingOperation {
 export interface MobileStorage {
   loadConnectionIndex(): Promise<MobileConnectionIndex>;
   loadCredential(profileId: string): Promise<PairedCredential | undefined>;
+  /** Reads only the SDK locator, before the anonymous endpoint proof. */
+  loadEndpointTransport?(profile: MobileConnectionProfile): Promise<void>;
+  saveEndpointTransport?(profile: MobileConnectionProfile): Promise<void>;
+  claimIrohRelayRequest?(profile: MobileConnectionProfile, input: RetainedIrohRelayRequest): Promise<RetainedIrohRelayRequest>;
+  confirmIrohRelayRequest?(profile: MobileConnectionProfile, input: RetainedIrohRelayRequest, expiresAt: number): Promise<void>;
   saveConnection(credential: PairedCredential): Promise<void>;
   deleteCredential(profileId: string): Promise<void>;
   deleteConnection(profileId: string): Promise<void>;
@@ -90,6 +98,7 @@ const profilesKey = "joko.mobile.connection-profiles.v1";
 const automaticTargetKey = "joko.mobile.automatic-target.v1";
 const connectionMutationIntentKey = "joko.mobile.connection-mutation-intent.v1";
 const credentialPrefix = "joko.mobile.connection-credential.v1.";
+const transportPrefix = "joko.mobile.connection-transport.v1.";
 const pendingKey = "joko.mobile.pending.v1";
 const selectionsKey = "joko.mobile.selections.v1";
 const maximumProfiles = 256;
@@ -148,6 +157,14 @@ export function createMobileStorage(
     }
   };
 
+  const writeEndpointTransport = async (profile: MobileConnectionProfile): Promise<void> => {
+    if (profile.transportKind === undefined || profile.transportKind === 'https' || profile.transportKind === 'webrtc') return;
+    if (profile.endpointPublicKey === undefined) throw new Error('The selected transport requires a trusted node public key.');
+    await secureAvailable();
+    const transport = trustedEndpointTransport(profile.origin, profile.endpointPublicKey, profile.transportKind);
+    await secure.setItem(`${transportPrefix}${profile.profileId}`, JSON.stringify({ owner: transportOwner(profile), transport }));
+  };
+
   const readCredential = async (profileId: string): Promise<PairedCredential | undefined> => {
     assertLocalId(profileId, "connection profile");
     await secureAvailable();
@@ -200,6 +217,8 @@ export function createMobileStorage(
             "The saved credential could not be removed from protected storage."
           );
         }
+        try { await secure.removeItem(`${transportPrefix}${intent.profileId}`); }
+        catch { throw new MobileCredentialStorageError('unavailable', 'The private transport locator could not be removed from protected storage.'); }
         if (intent.kind === "delete-connection") {
           const profiles = await readProfiles();
           await writeProfiles(profiles.filter((profile) => profile.profileId !== intent.profileId));
@@ -248,10 +267,48 @@ export function createMobileStorage(
       await recoverConnectionMutation();
       return readCredential(profileId);
     }),
+    saveEndpointTransport: profile => serialized(() => writeEndpointTransport(profile)),
+
+    claimIrohRelayRequest: (profile, input) => serialized(async () => {
+      const key = irohRelayRequestKey(profile, input), raw = await plain.getItem(key);
+      const retained = retainIrohRelayRequest(raw === null ? undefined : JSON.parse(raw), input);
+      await plain.setItem(key, JSON.stringify(retained)); return retained;
+    }),
+    confirmIrohRelayRequest: (profile, input, expiresAt) => serialized(async () => {
+      if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0 || expiresAt > Date.now() + 86_400_000) throw new Error('The relay invitation receipt has an invalid expiry.');
+      const key = irohRelayRequestKey(profile, input), raw = await plain.getItem(key);
+      if (raw === null) throw new Error('The original relay invitation request is unavailable.');
+      const existing: unknown = JSON.parse(raw);
+      if (existing === null || typeof existing !== 'object' || (existing as { requestId?: unknown }).requestId !== input.requestId
+        || (existing as { expiresAt?: unknown }).expiresAt !== undefined && (existing as { expiresAt?: unknown }).expiresAt !== expiresAt) throw new Error('The relay invitation receipt conflicts with its retained request.');
+      const retained = retainIrohRelayRequest(existing, input);
+      if (retained.requestId !== input.requestId) throw new Error('The relay invitation receipt belongs to another request.');
+      await plain.setItem(key, JSON.stringify({ ...retained, expiresAt }));
+    }),
+
+    loadEndpointTransport: (profile) => serialized(async () => {
+      if (profile.transportKind === undefined || profile.transportKind === 'https') {
+        if (profile.endpointPublicKey !== undefined) selectEndpointTransport(profile.origin, profile.endpointPublicKey, 'https');
+        return;
+      }
+      if (profile.endpointPublicKey === undefined) throw new Error('The selected transport requires a trusted node public key.');
+      if (profile.transportKind === 'webrtc') { selectEndpointTransport(profile.origin, profile.endpointPublicKey, 'webrtc'); return; }
+      await secureAvailable();
+      const raw = await secure.getItem(`${transportPrefix}${profile.profileId}`);
+      if (raw === null) throw new MobileCredentialStorageError('unreadable', 'The private transport locator is unavailable. Import its trusted invitation again.');
+      let parsed: { owner?: unknown; transport?: unknown };
+      try { parsed = JSON.parse(raw) as typeof parsed; }
+      catch { throw new MobileCredentialStorageError('unreadable', 'The protected transport locator is invalid.'); }
+      if (parsed.owner !== transportOwner(profile)) throw new MobileCredentialStorageError('unreadable', 'The protected locator does not match this connection.');
+      const transport = normalizeEndpointTransport(parsed.transport);
+      if (transport.kind !== profile.transportKind) throw new MobileCredentialStorageError('unreadable', 'The protected locator belongs to another transport.');
+      rememberEndpointTransport(profile.origin, profile.endpointPublicKey, transport);
+    }),
 
     saveConnection: (credential) => serialized(async () => {
       const profile = profileFromCredential(credential);
       await secureAvailable();
+      await writeEndpointTransport(profile);
       await plain.setItem(connectionMutationIntentKey, JSON.stringify({ kind: "upsert", profile }));
       try {
         await secure.setItem(credentialKey(profile.profileId), JSON.stringify(credential));
@@ -316,10 +373,17 @@ export function createMobileStorage(
   };
 }
 
+function irohRelayRequestKey(profile: MobileConnectionProfile, input: RetainedIrohRelayRequest): string {
+  return `joko.mobile.iroh-relay-request.v1.${encodeURIComponent(JSON.stringify([profile.profileId, profile.origin, profile.serverId, profile.connectionId, profile.deviceId, profile.endpointPublicKey, profile.transportKind ?? 'https', input.nodeEndpointId, input.recipientEndpointId]))}`;
+}
+
 export function profileFromCredential(credential: PairedCredential): MobileConnectionProfile {
+  if (credential.endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(credential.endpointPublicKey)) throw new Error("The endpoint public key is invalid.");
   return readProfile({
     profileId: credential.profileId,
     origin: credential.origin,
+    ...(credential.endpointPublicKey === undefined ? {} : { endpointPublicKey: credential.endpointPublicKey }),
+    ...(credential.transportKind === undefined ? {} : { transportKind: credential.transportKind }),
     serverId: credential.serverId,
     connectionId: credential.connectionId,
     deviceId: credential.deviceId,
@@ -345,7 +409,8 @@ function upsertProfile(
 function credentialMatchesProfile(credential: PairedCredential, profile: MobileConnectionProfile): boolean {
   return credential.profileId === profile.profileId && credential.origin === profile.origin
     && credential.serverId === profile.serverId && credential.connectionId === profile.connectionId
-    && credential.deviceId === profile.deviceId;
+    && credential.deviceId === profile.deviceId && credential.endpointPublicKey === profile.endpointPublicKey
+    && (credential.transportKind ?? 'https') === (profile.transportKind ?? 'https');
 }
 
 function readConnectionMutationIntent(value: unknown): ConnectionMutationIntent {
@@ -369,8 +434,13 @@ function readProfile(value: unknown): MobileConnectionProfile {
     serverId: text(record.serverId, 128, "server identity"),
     connectionId: text(record.connectionId, 128, "connection identity"),
     deviceId: text(record.deviceId, 128, "device identity"),
-    displayName: text(record.displayName, 256, "connection name")
+    displayName: text(record.displayName, 256, "connection name"),
+    ...(record.endpointPublicKey === undefined ? {} : { endpointPublicKey: text(record.endpointPublicKey, 80, "endpoint public key") }),
+    ...(record.transportKind === undefined ? {} : { transportKind: text(record.transportKind, 16, 'transport kind') as EndpointTransportKind })
   };
+  if (profile.endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(profile.endpointPublicKey)) throw new Error("The saved endpoint public key is invalid.");
+  if (profile.transportKind !== undefined && !['https', 'iroh', 'tailcat', 'webrtc', 'http-connect'].includes(profile.transportKind)) throw new Error('The saved connection transport is invalid.');
+  if (profile.transportKind !== undefined && profile.transportKind !== 'https' && profile.endpointPublicKey === undefined) throw new Error('The selected transport requires a trusted node public key.');
   assertLocalId(profile.profileId, "connection profile");
   assertLocalId(profile.connectionId, "connection identity");
   assertLocalId(profile.deviceId, "device identity");
@@ -379,6 +449,10 @@ function readProfile(value: unknown): MobileConnectionProfile {
     throw new Error("The saved Joko connection origin is invalid.");
   }
   return profile;
+}
+
+function transportOwner(profile: MobileConnectionProfile): string {
+  return JSON.stringify([profile.profileId, profile.origin, profile.serverId, profile.endpointPublicKey, profile.transportKind]);
 }
 
 function readCredentialValue(value: unknown): PairedCredential {

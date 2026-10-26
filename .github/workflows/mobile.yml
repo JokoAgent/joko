@@ -30,12 +30,21 @@ on:
           - all
           - android
           - ios
+      sdk_runtime:
+        description: SDK runtime included in the native test app
+        type: choice
+        default: relay
+        options:
+          - relay
+          - iroh-native
+          - http-connect-native
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: mobile-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && format('{0}-{1}', github.sha, inputs.platform || 'all') || github.ref }}${{ inputs.scope == 'android-signer-diagnostics' && '-android-signer-diagnostics' || inputs.scope == 'ios-startup-diagnostics' && '-ios-startup-diagnostics' || '' }}
+  group: mobile-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && format('{0}-{1}', github.sha, inputs.platform || 'all') || github.ref }}${{ inputs.scope == 'android-signer-diagnostics' && '-android-signer-diagnostics' || inputs.scope == 'ios-startup-diagnostics' && '-ios-startup-diagnostics' || '' }}-${{ inputs.sdk_runtime || 'relay' }}
   # Native builds finish while subsequent pushes replace only the pending run.
   cancel-in-progress: false
 
@@ -63,19 +72,39 @@ jobs:
           node-version: 24.19.0
           cache: pnpm
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
+
+      - name: Prepare Linkspan from remote main
+        run: node scripts/prepare-linkspan.mjs
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
 
       - name: Build shared Mobile inputs
-        run: |
-          pnpm --filter @joko/contracts build
-          pnpm --filter @joko/remote-desktop-sync build
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
+        run: pnpm --filter @joko/mobile prepare:workspace-inputs
 
       - name: Export Android JS/Hermes
-        run: pnpm --filter @joko/mobile exec expo export --platform android --max-workers 2 --output-dir dist/android
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
+        run: pnpm --filter @joko/mobile build:android --source-maps external --max-workers 2
 
       - name: Export iOS JS/Hermes
-        run: pnpm --filter @joko/mobile exec expo export --platform ios --max-workers 2 --output-dir dist/ios
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
+        run: pnpm --filter @joko/mobile build:ios --source-maps external --max-workers 2
+
+      - name: Audit actual Hermes module and selected resource delivery
+        run: node apps/mobile/scripts/check-http-connect-export.mjs
+
+      - name: Check only the selected native CONNECT assets and bindings
+        if: inputs.sdk_runtime == 'http-connect-native'
+        run: |
+          pnpm --filter @joko/mobile typecheck
+          pnpm --filter @joko/mobile exec vitest run src/mobile-http-connect-native.test.ts src/mobile-linkspan-runtime.test.ts src/connection-storage.test.ts src/linkspan-runtime-assets.test.ts
 
       - name: Record JS export scope
         run: printf '%s\n' 'Android and iOS JS/Hermes exports only; these are not APK/IPA, signed releases, or device test results.' >> "$GITHUB_STEP_SUMMARY"
@@ -83,7 +112,7 @@ jobs:
       - name: Upload JS/Hermes exports
         uses: actions/upload-artifact@v4
         with:
-          name: mobile-js-hermes-${{ github.sha }}
+          name: mobile-js-hermes-${{ github.sha }}${{ inputs.sdk_runtime == 'http-connect-native' && '-http-connect-native' || inputs.sdk_runtime == 'iroh-native' && '-iroh-native' || '' }}
           path: |
             apps/mobile/dist/android
             apps/mobile/dist/ios
@@ -118,17 +147,25 @@ jobs:
           node-version: 24.19.0
           cache: pnpm
 
-      - name: Set up JDK 17
+      - name: Set up the selected runtime's JDK
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ inputs.sdk_runtime == 'iroh-native' && '21' || '17' }}
 
       - name: Prepare Android SDK, NDK and CMake
         uses: android-actions/setup-android@v4
         with:
           packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;27.1.12297006 cmake;3.30.5
 
+      - name: Install the fixed server helper build toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
+
+      - name: Prepare Linkspan from remote main
+        run: node scripts/prepare-linkspan.mjs
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
 
@@ -144,7 +181,17 @@ jobs:
       - name: Build a real APK with an ephemeral CI test signer
         id: native-artifact
         timeout-minutes: 30
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
+          JOKO_LINKSPAN_ANDROID_ABIS: x86_64
         run: node scripts/ci/android-native.mjs build
+
+      - name: Verify the selected native SDK is inside the actual APK
+        if: inputs.sdk_runtime == 'iroh-native'
+        env:
+          JOKO_ANDROID_TEST_APK: ${{ steps.native-artifact.outputs.apk-path }}
+        run: |
+          node --input-type=module -e "import {execFileSync} from 'node:child_process'; const entries=execFileSync('unzip',['-Z1',process.env.JOKO_ANDROID_TEST_APK],{encoding:'utf8'}).split(/\r?\n/); for(const name of ['lib/x86_64/libiroh_ffi.so','lib/x86_64/libjnidispatch.so']) if(!entries.includes(name)) throw new Error('The selected native SDK library is missing from the actual APK.');"
 
       - name: Verify the actual APK installer permission
         env:
@@ -162,6 +209,7 @@ jobs:
         uses: ReactiveCircus/android-emulator-runner@v2
         env:
           JOKO_ANDROID_TEST_APK: ${{ steps.native-artifact.outputs.apk-path }}
+          JOKO_ANDROID_CONNECTION_TRANSPORT: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect' || inputs.sdk_runtime == 'iroh-native' && 'https' || 'webrtc' }}
         with:
           api-level: 36
           target: google_apis
@@ -179,7 +227,7 @@ jobs:
         if: always() && steps.native-artifact.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: mobile-android-x86_64-ci-test-${{ github.sha }}
+          name: mobile-android-x86_64-ci-test-${{ github.sha }}${{ inputs.sdk_runtime == 'http-connect-native' && '-http-connect-native' || inputs.sdk_runtime == 'iroh-native' && '-iroh-native' || '' }}
           path: ${{ steps.native-artifact.outputs.artifact-directory }}
           if-no-files-found: error
           compression-level: 0
@@ -290,16 +338,47 @@ jobs:
           xcrun --sdk iphonesimulator --show-sdk-version
           pod --version
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
+
+      - name: Prepare Linkspan from remote main
+        run: node scripts/prepare-linkspan.mjs
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
 
       - name: Build shared Mobile inputs
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
+        run: pnpm --filter @joko/mobile prepare:workspace-inputs
+
+      - name: Install the fixed selected iOS native SDK compiler
+        if: inputs.sdk_runtime == 'iroh-native'
+        shell: bash
         run: |
-          pnpm --filter @joko/contracts build
-          pnpm --filter @joko/remote-desktop-sync build
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+          if [ "$(uname -m)" = arm64 ]; then
+            rustup target add aarch64-apple-ios-sim --toolchain 1.99.0
+            echo 'JOKO_LINKSPAN_IOS_TARGETS=ios-simulator-arm64' >> "$GITHUB_ENV"
+          else
+            rustup target add x86_64-apple-ios --toolchain 1.99.0
+            echo 'JOKO_LINKSPAN_IOS_TARGETS=ios-simulator-x64' >> "$GITHUB_ENV"
+          fi
+
+      - name: Prepare only the selected native iOS Simulator SDK
+        if: inputs.sdk_runtime == 'iroh-native'
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: iroh-native,webrtc
+        run: node apps/mobile/scripts/prepare-linkspan-native.mjs ios
 
       - name: Check the Swift receiver and clipboard state machines
         run: node apps/mobile/scripts/test-remote-desktop-native.mjs
+
+      - name: Check the selected native CONNECT engine
+        if: inputs.sdk_runtime == 'http-connect-native'
+        run: node apps/mobile/scripts/test-http-connect-native.mjs
 
       - name: Check isolated XCTest project generation and build
         run: |
@@ -316,15 +395,25 @@ jobs:
 
       - name: Generate the current iOS project
         working-directory: apps/mobile
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
         run: pnpm exec expo prebuild --platform ios --clean --no-install
 
       - name: Install the generated iOS Pods
         working-directory: apps/mobile
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
         run: pod install --project-directory=ios
 
       - name: Compile the generated iOS Simulator Debug app
         working-directory: apps/mobile
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
         run: |
+          sdk_arch=()
+          if [ '${{ inputs.sdk_runtime || 'relay' }}' = iroh-native ]; then
+            sdk_arch=("ARCHS=$(uname -m)" "ONLY_ACTIVE_ARCH=YES")
+          fi
           xcodebuild \
             -workspace ios/Joko.xcworkspace \
             -scheme Joko \
@@ -336,6 +425,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="-" \
             DEVELOPMENT_TEAM="" \
+            "${sdk_arch[@]}" \
             build
 
       - name: Verify the Simulator application's local signature
@@ -349,7 +439,7 @@ jobs:
         if: ${{ !cancelled() && steps.ios-archive.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: mobile-ios-simulator-debug-${{ github.sha }}
+          name: mobile-ios-simulator-debug-${{ github.sha }}${{ inputs.sdk_runtime == 'http-connect-native' && '-http-connect-native' || inputs.sdk_runtime == 'iroh-native' && '-iroh-native' || '' }}
           path: ${{ runner.temp }}/joko-ios-simulator-debug.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -358,7 +448,7 @@ jobs:
   ios-gui:
     needs: ios-simulator
     name: iOS Simulator startup and native GUI on a fresh runner
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - name: Check out repository
@@ -394,18 +484,25 @@ jobs:
         run: |
           node --input-type=module -e "import {execFileSync} from 'node:child_process'; const started=performance.now(); execFileSync('xcrun',['simctl','list','runtimes','--json'],{timeout:120000,stdio:'ignore'}); console.log(JSON.stringify({simulatorServiceReady:true,elapsedMs:Math.round(performance.now()-started)}));"
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
+
+      - name: Prepare Linkspan from remote main
+        run: node scripts/prepare-linkspan.mjs
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
 
       - name: Build shared Mobile inputs
-        run: |
-          pnpm --filter @joko/contracts build
-          pnpm --filter @joko/remote-desktop-sync build
+        env:
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
+        run: pnpm --filter @joko/mobile prepare:workspace-inputs
 
       - name: Download this run's compiled Simulator app
         uses: actions/download-artifact@v4
         with:
-          name: mobile-ios-simulator-debug-${{ github.sha }}
+          name: mobile-ios-simulator-debug-${{ github.sha }}${{ inputs.sdk_runtime == 'http-connect-native' && '-http-connect-native' || inputs.sdk_runtime == 'iroh-native' && '-iroh-native' || '' }}
           path: ${{ runner.temp }}/joko-ios-artifact
 
       - name: Extract the compiled Simulator app
@@ -417,6 +514,8 @@ jobs:
         timeout-minutes: 33
         run: node scripts/ci/mobile-ios-simulator-runtime.mjs
         env:
+          JOKO_IOS_SDK_RUNTIME: ${{ inputs.sdk_runtime || 'relay' }}
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
           JOKO_IOS_SIMULATOR_APP_PATH: ${{ runner.temp }}/joko-ios-simulator-app/Joko.app
           JOKO_IOS_RUNTIME_EVIDENCE_DIR: ${{ runner.temp }}/joko-ios-runtime-evidence
 
@@ -424,7 +523,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: mobile-ios-simulator-runtime-${{ github.sha }}
+          name: mobile-ios-simulator-runtime-${{ github.sha }}${{ inputs.sdk_runtime == 'http-connect-native' && '-http-connect-native' || inputs.sdk_runtime == 'iroh-native' && '-iroh-native' || '' }}
           path: |
             ${{ runner.temp }}/joko-ios-runtime-evidence/*.png
             ${{ runner.temp }}/joko-ios-runtime-evidence/identity.json

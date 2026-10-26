@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionMainView } from "./MobileExtensionMainView";
 import { decodeMobileLibraryMessage, encodeMobileLibraryMessage } from "./mobile-extension-library-bridge";
 import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
@@ -14,8 +14,26 @@ import type {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const native = vi.hoisted(() => ({
-  web: undefined as undefined | Record<string, unknown>, messages: [] as string[]
+  web: undefined as undefined | Record<string, unknown>, messages: [] as string[], prepare: vi.fn(),
+  documents: [] as Array<{ documentId: string; source: { uri: string }; documentUrl: string; documentUrls: string[]; close: ReturnType<typeof vi.fn> }>
 }));
+
+vi.mock("./mobile-extension-main-view-document", () => ({
+  prepareExtensionMainViewDocument: native.prepare,
+  allowExtensionDocumentNavigation: (document: { documentUrls: string[] }, value: string) => {
+    try { const url = new URL(value); url.hash = ""; return document.documentUrls.includes(url.href); } catch { return false; }
+  }
+}));
+
+beforeEach(() => {
+  native.prepare.mockImplementation(async (_resource, entry: string) => {
+    const origin = `http://127.0.0.1:${4400 + native.documents.length}`;
+    const source = { uri: `${origin}/__joko/isolated-${native.documents.length}` };
+    const documentUrl = `${origin}/${entry}`;
+    const document = { documentId: `native-document-${native.documents.length}`, source, documentUrl, documentUrls: [source.uri, documentUrl], close: vi.fn(async () => undefined) };
+    native.documents.push(document); return document;
+  });
+});
 
 vi.mock("react-native", async () => {
   const React = await import("react");
@@ -39,6 +57,7 @@ vi.mock("react-native", async () => {
       style: undefined
     }, props.children);
   return {
+    Platform: { OS: "android" },
     ActivityIndicator: () => React.createElement("span", { "data-loading": true }),
     Pressable: element("button"),
     StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 },
@@ -91,6 +110,8 @@ afterEach(() => {
   root = undefined as unknown as Root;
   native.web = undefined;
   native.messages = [];
+  native.documents = [];
+  native.prepare.mockReset();
 });
 
 describe("MobileExtensionMainView", () => {
@@ -102,8 +123,8 @@ describe("MobileExtensionMainView", () => {
 
     expect(active.openMainView).toHaveBeenCalledWith(extension, expect.any(AbortSignal));
     expect(native.web).toMatchObject({
-      source: { uri: surface.url },
-      originWhitelist: ["https://node.example"],
+      source: native.documents[0]!.source,
+      originWhitelist: ["*"],
       allowFileAccess: false,
       allowFileAccessFromFileURLs: false,
       allowUniversalAccessFromFileURLs: false,
@@ -112,28 +133,32 @@ describe("MobileExtensionMainView", () => {
       sharedCookiesEnabled: false,
       thirdPartyCookiesEnabled: false,
       domStorageEnabled: false,
-      incognito: true,
+      incognito: false,
       cacheEnabled: false,
       mixedContentMode: "never"
     });
     expect(native.web?.onHttpError).toBeTypeOf("function");
     const allow = native.web!.onShouldStartLoadWithRequest as (request: { readonly url: string }) => boolean;
-    expect(allow({ url: surface.url })).toBe(true);
+    expect(allow({ url: native.documents[0]!.source.uri })).toBe(true);
+    expect(allow({ url: native.documents[0]!.documentUrl })).toBe(true);
     expect(allow({ url: "https://node.example/v1/other" })).toBe(false);
     expect(allow({ url: "https://attacker.example/" })).toBe(false);
 
     await act(async () => (native.web!.onLoadEnd as () => void)());
     expect(container.textContent).not.toContain("Loading Extension content");
     await act(async () => {
-      expect(allow({ url: surface.url.replace("index.html", "asset.js#loaded") })).toBe(false);
+      expect(allow({ url: surface.url.replace("index.html", "nested/page.html#loaded") })).toBe(false);
     });
-    expect(native.web).toMatchObject({ source: { uri: surface.url.replace("index.html", "asset.js#loaded") } });
+    expect(active.readMainViewResource).toHaveBeenCalledWith(surface, surface.url.replace("index.html", "nested/page.html#loaded"), "document", expect.any(AbortSignal));
+    expect(native.web).toMatchObject({ source: { uri: native.documents[1]!.source.uri + "#loaded" } });
+    expect(native.documents[0]!.close).toHaveBeenCalledOnce();
     const reload = container.querySelector('button[aria-label="Reload main view"]') as HTMLButtonElement;
     await act(async () => reload.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(active.probeMainView).toHaveBeenCalledWith(surface, expect.any(AbortSignal));
 
     await act(async () => root.unmount());
     expect(active.closeMainView).toHaveBeenCalledWith(surface);
+    expect(native.documents.at(-1)!.close).toHaveBeenCalledOnce();
     root = undefined as unknown as Root;
   });
 
@@ -154,7 +179,7 @@ describe("MobileExtensionMainView", () => {
 
     const retry = container.querySelector('button[aria-label="Retry"]') as HTMLButtonElement;
     await act(async () => retry.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    expect(native.web).toMatchObject({ source: { uri: second.url } });
+    expect(native.web).toMatchObject({ source: native.documents.at(-1)!.source });
     await act(async () => (native.web!.onRenderProcessGone as () => void)());
     expect(container.textContent).toContain("changed, expired, or lost its owner");
     expect(active.closeMainView).toHaveBeenCalledWith(second);
@@ -176,7 +201,7 @@ describe("MobileExtensionMainView", () => {
     const onMessage = old.onMessage as (event: { nativeEvent: { data: string; url: string } }) => void;
     const request = { nativeEvent: { data: encodeMobileLibraryMessage({ surfaceId: surface.surfaceId,
       frameId: `${surface.surfaceId}:0`, request: { type: "joko:extension-library-request", version: 1,
-        id: "read", operation: { kind: "read", path: "mail" } } }), url: surface.url } };
+        id: "read", operation: { kind: "read", path: "mail" } } }), url: native.documents[0]!.documentUrl } };
     await act(async () => onMessage(request));
     expect(active.callLibrary).toHaveBeenCalledWith(extension, surface, session, { kind: "read", path: "mail" }, expect.any(AbortSignal));
     expect(decodeMobileLibraryMessage(native.messages[0]!)).toMatchObject({ frameId: `${surface.surfaceId}:0`,
@@ -204,6 +229,50 @@ describe("MobileExtensionMainView", () => {
     root = undefined as unknown as Root;
     await act(async () => finish(surface));
     expect(active.closeMainView).toHaveBeenCalledWith(surface);
+  });
+
+  it("retires a native document prepared after its owner was unmounted", async () => {
+    const surface = fixtureSurface(fixtureExtension()), active = fixtureTransport(surface);
+    let complete!: (value: { documentId: string; source: { uri: string }; documentUrl: string; documentUrls: string[]; close: ReturnType<typeof vi.fn> }) => void;
+    native.prepare.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+    await render(active);
+    await act(async () => root.unmount()); root = undefined as unknown as Root;
+    const late = { documentId: "late", source: { uri: "http://127.0.0.1:4409/__joko/late" }, documentUrl: "http://127.0.0.1:4409/index.html", documentUrls: [], close: vi.fn(async () => undefined) };
+    await act(async () => complete(late));
+    expect(late.close).toHaveBeenCalledOnce();
+    expect(active.closeMainView).toHaveBeenCalledWith(surface);
+  });
+
+  it("loads permitted dynamic media over the owner transport and cancels a late resource when navigating", async () => {
+    const surface = fixtureSurface(fixtureExtension()), active = fixtureTransport(surface);
+    await render(active);
+    const old = native.web!, source = native.documents[0]!.documentUrl;
+    const receive = old.onMessage as (event: { nativeEvent: { data: string; url: string } }) => void;
+    const resource = (id: string, url: string, kind = "media", text?: string) => ({ nativeEvent: { url: source,
+      data: JSON.stringify({ type: "joko:extension-resource", version: 1, documentId: native.documents[0]!.documentId, id, kind, url, ...(text === undefined ? {} : { text }) }) } });
+    vi.mocked(active.readMainViewResource).mockResolvedValueOnce({ bytes: Uint8Array.of(137, 80, 78, 71), mimeType: "image/png" });
+    const media = surface.url.replace("index.html", "images/chart.png");
+    await act(async () => receive(resource("image", media)));
+    expect(active.readMainViewResource).toHaveBeenCalledWith(surface, media, "media", expect.any(AbortSignal), undefined);
+    expect(JSON.parse(native.messages[0]!)).toMatchObject({ id: "image", ok: true, dataUrl: "data:image/png;base64,iVBORw==" });
+    vi.mocked(active.readMainViewResource).mockResolvedValueOnce({ bytes: new TextEncoder().encode("export const x=1;"), mimeType: "text/javascript" });
+    const moduleUrl = surface.url.replace("index.html", "chunks/lazy.js");
+    await act(async () => receive(resource("module", moduleUrl, "module")));
+    expect(active.readMainViewResource).toHaveBeenCalledWith(surface, moduleUrl, "module", expect.any(AbortSignal), undefined);
+    expect(JSON.parse(native.messages[1]!)).toMatchObject({ id: "module", ok: true, dataUrl: expect.stringContaining("data:text/javascript;base64,") });
+    vi.mocked(active.readMainViewResource).mockResolvedValueOnce({ bytes: new TextEncoder().encode("body{color:red}"), mimeType: "text/css" });
+    await act(async () => receive(resource("style", surface.url, "style-text", "body{color:red}")));
+    expect(active.readMainViewResource).toHaveBeenCalledWith(surface, surface.url, "style-text", expect.any(AbortSignal), "body{color:red}");
+    await act(async () => receive(resource("external", "https://attacker.example/secret")));
+    expect(active.readMainViewResource).toHaveBeenCalledTimes(4);
+    let finish!: (value: { bytes: Uint8Array; mimeType: string }) => void;
+    vi.mocked(active.readMainViewResource).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => receive(resource("late", media)));
+    const request = vi.mocked(active.readMainViewResource).mock.calls.at(-1)![3];
+    await act(async () => (old.onShouldStartLoadWithRequest as (request: { url: string }) => boolean)({ url: surface.url.replace("index.html", "next.html") }));
+    expect(request.aborted).toBe(true);
+    await act(async () => finish({ bytes: Uint8Array.of(9), mimeType: "image/png" }));
+    expect(native.messages.some(message => JSON.parse(message).id === "late")).toBe(false);
   });
 });
 
@@ -265,6 +334,7 @@ function fixtureTransport(surface: MobileExtensionMainViewSurface): MobileExtens
     tasks: vi.fn(() => []),
     useCommand: vi.fn(async () => { throw new Error("unused"); }),
     openMainView: vi.fn(async () => surface),
+    readMainViewResource: vi.fn(async () => ({ bytes: new TextEncoder().encode("<!doctype html><p>Isolated</p>"), mimeType: "text/html" })),
     probeMainView: vi.fn(async () => surface),
     closeMainView: vi.fn(async () => true),
     openLibrary: vi.fn(async () => { throw new Error("unused"); }),

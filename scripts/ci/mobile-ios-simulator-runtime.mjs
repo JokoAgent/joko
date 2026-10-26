@@ -7,11 +7,13 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure } from "./mobile-ios-runtime-diagnostics.mjs";
+import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, requireSimulatorApplicationContainer } from "./mobile-ios-runtime-diagnostics.mjs";
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const startupDiagnosticsOnly = process.argv.length === 3 && process.argv[2] === "--startup-diagnostics";
+const sdkRuntime = process.env.JOKO_IOS_SDK_RUNTIME ?? 'relay';
+if (!['relay', 'iroh-native', 'http-connect-native'].includes(sdkRuntime)) throw new Error('Unknown selected Mobile UI-test runtime.');
 const abort = new AbortController();
 const observationStartedAt = Date.now();
 // A full run includes up to ten minutes of cold boot and two five-minute
@@ -102,24 +104,12 @@ async function installOwnedApplication(app) {
   return { container: await locateInitiallyInstalledApplication(), installation };
 }
 async function locateInitiallyInstalledApplication() {
-  const ownedUdid = udid, application = bundleId;
-  if (!ownedUdid || !application || !deviceName?.startsWith("joko-ci-")) throw new Error("No owned Simulator application is available for the installation query.");
-  const args = ["simctl", "get_app_container", ownedUdid, application, "app"];
+  const owner = { simulatorUdid: udid, bundleId, deviceName };
   stage = "installed application identity lookup";
-  try {
-    return await command("xcrun", args, { timeout: 30_000, startupLabel: "locate-installed-application" });
-  } catch (error) {
-    const receipt = startupCommandReceipts.at(-1);
-    if (abort.signal.aborted || udid !== ownedUdid || bundleId !== application
-      || receipt?.step !== "locate-installed-application" || receipt.result !== "failed"
-      || receipt.killed !== true || receipt.signal !== "SIGTERM" || receipt.cancelled !== false
-      || receipt.exitCode !== null || receipt.errorCode !== null || receipt.timeoutMs !== 30_000
-      || receipt.elapsedMs < receipt.timeoutMs) throw error;
-    // Preserve the failed receipt; this one fresh read must independently exit
-    // successfully before the original installed-executable hash check runs.
-    stage = "retry installed application identity lookup";
-    return command("xcrun", args, { timeout: 30_000, startupLabel: "retry-locate-installed-application" });
-  }
+  return locateInstalledSimulatorApplication({ owner, command, signal: abort.signal,
+    getReceipt: () => startupCommandReceipts.at(-1),
+    isCurrent: () => udid === owner.simulatorUdid && bundleId === owner.bundleId && deviceName === owner.deviceName,
+    onRetry: () => { stage = "retry installed application identity lookup"; } });
 }
 async function hashFile(path) {
   const hash = createHash("sha256");
@@ -448,7 +438,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   await assertIdentity("pre-ui-build");
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
-  let requests = 0, unexpectedRequests = 0;
+  let requests = 0, unexpectedRequests = 0, screenshotCount = 0;
   const probe = createHttpServer((request, response) => {
     if (request.method === "GET" && request.url === "/ci-probe-status") {
       response.writeHead(200, { "content-type": "application/json" });
@@ -476,7 +466,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   try {
     stage = "Apple UI-test target preparation";
     await command("ruby", [join(root, "scripts/ci/ios-prepare-ui-tests.rb"), project,
-      join(root, "scripts/ci/ios-connection-ui-tests.swift"), String(port), String(probePort), minimumOsVersion]);
+      join(root, "scripts/ci/ios-connection-ui-tests.swift"), String(port), String(probePort), minimumOsVersion, sdkRuntime]);
     stage = "Apple UI-test runner build";
     await guiCommand([...common, "build-for-testing"], "gui-build.log", 5 * 60_000);
     stage = "UI-test runner prepared application identity verification";
@@ -504,13 +494,15 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
       const summary = JSON.parse(await command("xcrun", ["xcresulttool", "get", "test-results", "summary", "--path", xcresult]));
       save("gui-summary.json", summary);
       await command("xcrun", ["xcresulttool", "export", "attachments", "--path", xcresult, "--output-path", screenshots], { timeout: 60_000 });
-      const names = ["01-connection-page", "02-saved-nodes", "03-nearby", "04-invalid-address", "05-local-identity-error",
-        "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme"];
+      const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
+        "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
+        ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : [])];
       const files = readdirSync(screenshots, { recursive: true });
+      screenshotCount = files.filter(name => name.endsWith(".png")).length;
       const manifests = files.filter(name => name.endsWith(".json")).map(name => readFileSync(join(screenshots, name), "utf8")).join("\n");
       const steps = names.map(name => ({ name, screenshotExported: manifests.includes(name) }));
-      save("gui-steps.json", { sourceCommit: expectedSha, executableSha256: expectedHash, simulatorUdid: udid, bundleId,
-        steps, screenshotCount: files.filter(name => name.endsWith(".png")).length, localIdentityRequests: requests, unexpectedRequests,
+      save("gui-steps.json", { sourceCommit: expectedSha, executableSha256: expectedHash, simulatorUdid: udid, bundleId, sdkRuntime,
+        steps, screenshotCount, localIdentityRequests: requests, unexpectedRequests,
         testExitSucceeded: !executionError, passed: !executionError && summary.result === "Passed" && summary.passedTests === 1
           && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported) });
       if (executionError || summary.result !== "Passed") {
@@ -527,9 +519,9 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     // with the same executable bytes still fails this exact process fence.
     stage = "UI-tested application process identity lookup";
     const pid = await assertIdentity("post-ui-test");
-    return { passed: true, test: "JokoConnectionUITests/testConnectionPageInteractions", sourceCommit: expectedSha,
-      executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount: 10,
-      scope: "Real connection-page mode changes, address typing/validation, local transport error, explicit cancellation, retained draft and theme changes." };
+    return { passed: true, test: "JokoConnectionUITests/testConnectionPageInteractions", sourceCommit: expectedSha, sdkRuntime,
+      executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount,
+      scope: "Real connection-page mode availability, address typing/validation, local transport error, explicit cancellation, retained draft and theme changes; selected CONNECT invitation configuration only, no CONNECT pairing or task execution." };
   } finally {
     save("gui-local-probe.json", { loopbackOnly: true, localIdentityRequests: requests, unexpectedRequests });
     probe.closeAllConnections();
@@ -725,7 +717,7 @@ async function main() {
       startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
     stage = "owned application installation";
     const { container, installation } = await installOwnedApplication(app);
-    installedExecutable = realpathSync(join(container, executable));
+    installedExecutable = realpathSync(join(requireSimulatorApplicationContainer(container), executable));
     if (await hashFile(installedExecutable) !== await hashFile(binary)) throw new Error("The installed app bytes do not match the compiled artifact.");
     installation.installedExecutableVerified = true;
     save("installation-state.json", installation);

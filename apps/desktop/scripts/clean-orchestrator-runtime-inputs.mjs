@@ -18,6 +18,7 @@ const runtimePackageRoots = [
   "packages/adapter-transcription-sauc",
   "packages/code-host",
   "packages/contracts",
+  "packages/connection-transport",
   "packages/core",
   "packages/device-peer",
   "packages/git-safety",

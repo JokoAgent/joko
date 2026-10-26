@@ -1,3 +1,4 @@
+import { isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
 import { MobileTaskOutboxStore, mobileTaskOutboxModel, mobileTaskOutboxOwnerMatches,
@@ -513,7 +514,7 @@ export interface MobileState {
   readonly discoveryState: "idle" | "refreshing" | "ready" | "error";
   readonly nearby: readonly NearbyMobileNode[];
   readonly discoveryError?: string;
-  readonly challenge?: { readonly id: string; readonly origin: string; readonly deviceName: string };
+  readonly challenge?: { readonly id: string; readonly origin: string; readonly deviceName: string; readonly endpointPublicKey?: string; readonly transportKind?: import('@joko/connection-transport/trust').EndpointTransportKind };
   readonly owner?: Snapshot;
   readonly selectedId?: string;
   readonly taskSource?: MobileTaskSource;
@@ -843,7 +844,16 @@ export class MobileClient {
     historyBusy: false, historyEnd: false, pending: [], homeSearchQuery: "", homeSearchFilter: "active",
     homeSearchStatus: "idle", homeSearchSessionIds: [], files: emptyMobileFilesState(),
     automations: emptyMobileAutomationsState(), partnerPrivate: emptyMobilePartnerPrivateState() };
-  #credential?: PairedCredential;
+  #credentialValue?: PairedCredential;
+  #stopEndpointTrustWatch = () => {};
+  get #credential(): PairedCredential | undefined { return this.#credentialValue; }
+  set #credential(value: PairedCredential | undefined) {
+    this.#stopEndpointTrustWatch();
+    this.#credentialValue = value;
+    this.#stopEndpointTrustWatch = value === undefined ? () => {} : observeEndpointTrustFailure(value, error => {
+      if (!this.#disposed && this.#credential === value) void this.#identityConflict(this.#epoch, value.profileId, error.message);
+    });
+  }
   #joinedTask?: { readonly source: MobileJoinedTaskSource; readonly credential: PairedCredential;
     readonly api: TaskSharingApi; readonly network: MobileNetwork; readonly lifetime: AbortController };
   private get network(): MobileNetwork { return this.#joinedTask?.network ?? this.ownerNetwork; }
@@ -1224,7 +1234,7 @@ export class MobileClient {
       finally { request.abort(); unsubscribe(); caller.removeEventListener("abort", cancel); signal.removeEventListener("abort", cancel); }
     };
     const invalidate = async (error: unknown): Promise<void> => {
-      if (!isCurrent() || !(error instanceof CredentialIdentityError) && !isRevoked(error)) return;
+      if (!isCurrent() || !(error instanceof CredentialIdentityError) && !isEndpointTrustError(error) && !isRevoked(error)) return;
       if (this.#activeProfileId === profileId && this.#credential) {
         if (isRevoked(error)) await this.#invalidateCredential(this.#epoch, profileId, "The Partner source connection was revoked.");
         else await this.#identityConflict(this.#epoch, profileId, "The saved Partner source identity changed.");
@@ -1241,6 +1251,8 @@ export class MobileClient {
     };
     let credential: PairedCredential, snapshot: Snapshot, generation: bigint;
     const inspect = async (request: AbortSignal): Promise<NodeIdentity> => {
+      await this.storage.loadEndpointTransport?.(profile);
+      rememberEndpointTrust(profile);
       const node = await this.network.inspect(profile.origin, request); assertCurrent();
       if (node.serverId !== profile.serverId) throw new CredentialIdentityError();
       return node;
@@ -1817,6 +1829,7 @@ export class MobileClient {
         }
         // The accepted profile update advances its canonical Session revision. An owner push may
         // arrive before the detail read; reconcile both snapshots before using the ordinary editor.
+        rememberEndpointTrust(context.credential);
         const node = await this.network.inspect(context.credential.origin, signal); requireSaveOwner();
         if (node.serverId !== context.credential.serverId || node.apiVersion !== this.#state.node?.apiVersion) throw new CredentialIdentityError();
         const observed = await this.network.readOwner(context.credential, this.deviceNameSource(), signal); requireSaveOwner();
@@ -3217,6 +3230,14 @@ export class MobileClient {
       useCommand,
       openMainView,
       probeMainView,
+      readMainViewResource: (expected, url, kind, signal, text) => owned(signal, async current => {
+        await probeMainView(expected, current);
+        const resource = await this.network.readExtensionMainViewResource(context.credential, expected, url, kind, current, text);
+        requireCurrent(current);
+        await probeMainView(expected, current);
+        requireCurrent(current);
+        return resource;
+      }),
       closeMainView: (expected) => this.network.closeExtensionMainView(
         context.credential,
         expected.surfaceId
@@ -4199,9 +4220,88 @@ export class MobileClient {
     }
   }
 
+  async trustEndpoint(rawOrigin: string, endpointPublicKey: string, replace = false, serverId?: string, endpointTransport?: import('@joko/connection-transport/trust').EndpointTransport): Promise<void> {
+    const input = { origin: normalizeNodeOrigin(rawOrigin), endpointPublicKey, serverId, endpointTransport, transportKind: endpointTransport?.kind ?? 'https' as const };
+    const challenge = this.#state.challenge;
+    if (challenge?.origin === input.origin && (challenge.endpointPublicKey !== input.endpointPublicKey || (challenge.transportKind ?? 'https') !== input.transportKind)) await this.cancelPairing();
+    if (replace) replaceEndpointTrust(input); else rememberEndpointTrust(input);
+    if (endpointTransport !== undefined) for (const profile of this.#profiles) {
+      if (profile.origin === input.origin && profile.endpointPublicKey === endpointPublicKey && profile.transportKind === endpointTransport.kind) await this.storage.saveEndpointTransport?.(profile);
+    }
+  }
+
+  async createTailcatClient(rawOrigin: string, endpointPublicKey: string, endpointTransport: import('@joko/connection-transport/trust').EndpointTransport): Promise<{ readonly publicKey: string }> {
+    const { createTailcatClientIdentity } = await import('@joko/connection-transport/trust');
+    return createTailcatClientIdentity(normalizeNodeOrigin(rawOrigin), endpointPublicKey, endpointTransport);
+  }
+
+  async createIrohClient(rawOrigin?: string, endpointPublicKey?: string, endpointTransport?: import('@joko/connection-transport/trust').EndpointTransport, mobileMode?: 'native' | 'relay'): Promise<{ readonly publicKey: string }> {
+    const { createIrohClientIdentity } = await import('@joko/connection-transport/trust');
+    return createIrohClientIdentity(rawOrigin === undefined ? undefined : normalizeNodeOrigin(rawOrigin), endpointPublicKey, endpointTransport, mobileMode);
+  }
+
+  async setProfileIrohMode(profileId: string, mode: 'native' | 'relay'): Promise<void> {
+    if (mode !== 'native' && mode !== 'relay') throw new Error('Select a supported local iroh connection mode.');
+    if (this.#mutationOwner || this.#connectionAttemptAbort || this.#state.busy) throw new Error('Finish the current operation before changing this connection path.');
+    const profile = this.#profiles.find(value => value.profileId === profileId);
+    if (profile?.transportKind !== 'iroh' || profile.endpointPublicKey === undefined || this.storage.loadEndpointTransport === undefined || this.storage.saveEndpointTransport === undefined) throw new Error('The original protected iroh connection is unavailable.');
+    const { rememberEndpointTransport, trustedEndpointTransport } = await import('@joko/connection-transport/trust');
+    this.#set({ busy: true });
+    try {
+      await this.storage.loadEndpointTransport(profile);
+      const previous = trustedEndpointTransport(profile.origin, profile.endpointPublicKey, 'iroh');
+      if (previous?.kind !== 'iroh') throw new Error('The original private iroh locator is unavailable.');
+      rememberEndpointTransport(profile.origin, profile.endpointPublicKey, { ...previous, mobileMode: mode });
+      try { await this.storage.saveEndpointTransport(profile); }
+      catch (error) { rememberEndpointTransport(profile.origin, profile.endpointPublicKey, previous); throw error; }
+    } finally { this.#set({ busy: false }); }
+    if (this.#activeProfileId === profileId && this.#credential) await this.refresh();
+  }
+
+  async authorizeNewDevice(options?: import("@joko/connection-transport/trust").NewDeviceAuthorizationOptions): Promise<import("@joko/connection-transport/trust").NodePairingInvitation> {
+    const credential = this.#ready(), ownerAbort = this.#abort;
+    if (!this.network.authorizeNewDevice) throw new Error("New-device authorization is unavailable.");
+    let authorization = options;
+    if (options?.irohRelay !== undefined) {
+      const { requireIrohRelayInvitationRequest, trustedEndpointTransport } = await import('@joko/connection-transport/trust');
+      if (credential.endpointPublicKey === undefined) throw new Error('The original pinned node connection is required.');
+      const transport = trustedEndpointTransport(credential.origin, credential.endpointPublicKey, credential.transportKind ?? 'https');
+      const request = requireIrohRelayInvitationRequest(transport, options);
+      if (transport?.kind !== 'iroh' || request === undefined || this.storage.claimIrohRelayRequest === undefined || this.storage.confirmIrohRelayRequest === undefined) throw new Error('The original relay request journal is unavailable.');
+      const retained = await this.storage.claimIrohRelayRequest(credential, { ...request, requestId: this.newId(), nodeEndpointId: transport.endpointId });
+      if (this.#credential !== credential || this.#abort !== ownerAbort) throw new Error('The original node connection changed.');
+      authorization = { irohRelay: retained, onIrohRelayLease: expiresAt => this.storage.confirmIrohRelayRequest!(credential, retained, expiresAt) };
+    }
+    const result = await this.network.authorizeNewDevice(credential, ownerAbort?.signal, authorization);
+    if (this.#credential !== credential || this.#abort !== ownerAbort) throw new Error("The node connection changed. Check its invitation and connections before retrying.");
+    return result;
+  }
+
+  async cancelDevicePairing(invitation: import("@joko/connection-transport/trust").NodePairingInvitation): Promise<void> {
+    const credential = this.#ready();
+    if (credential.serverId !== invitation.serverId || (credential.endpointPublicKey !== undefined && credential.endpointPublicKey !== invitation.endpointPublicKey)
+      || (credential.transportKind ?? 'https') !== (invitation.endpointTransport?.kind ?? 'https')) throw new Error("Select the original node and connection path before canceling its invitation.");
+    if (!this.network.cancelPairing) throw new Error("Pairing cancellation is unavailable.");
+    rememberEndpointTrust(credential);
+    await this.network.cancelPairing(credential.origin, invitation.challengeId, this.#abort?.signal, invitation.endpointPublicKey, credential.transportKind ?? 'https');
+  }
+
+  async cancelPairing(): Promise<void> {
+    const challenge = this.#state.challenge;
+    if (challenge !== undefined) {
+      if (!this.network.cancelPairing) throw new Error("Pairing cancellation is unavailable.");
+      await this.network.cancelPairing(challenge.origin, challenge.id, undefined, challenge.endpointPublicKey, challenge.transportKind ?? 'https');
+      if (this.#state.challenge !== challenge) return;
+    }
+    this.cancel(false);
+  }
+
   async requestPairing(rawOrigin: string, deviceName: string): Promise<string> {
     if (!deviceName.trim()) throw new Error("Enter a device name.");
+    if (this.#state.challenge !== undefined) await this.cancelPairing();
     const origin = normalizeNodeOrigin(rawOrigin);
+    const endpointPublicKey = trustedEndpointPublicKey(origin);
+    const transportKind = endpointPublicKey === undefined ? 'https' : trustedEndpointTransportKind(origin, endpointPublicKey);
     const { generation, controller } = this.#beginConnectionAttempt();
     this.#set({ challenge: undefined });
     try {
@@ -4212,7 +4312,7 @@ export class MobileClient {
         throw new Error("The Joko node identity changed. Inspect it again.");
       }
       this.#connectionAttemptAbort = undefined;
-      this.#set({ candidate: { origin, node: request.identity }, challenge: { id: request.challengeId, origin, deviceName },
+      this.#set({ candidate: { origin, node: request.identity }, challenge: { id: request.challengeId, origin, deviceName, endpointPublicKey, transportKind },
         busy: false, connectionAttemptError: undefined });
       return request.challengeId;
     } catch (error) {
@@ -4228,6 +4328,8 @@ export class MobileClient {
     if (!challenge || challenge.origin !== origin || challenge.deviceName !== deviceName) {
       throw new Error("Request pairing for this node and device before entering its code.");
     }
+    if (trustedEndpointPublicKey(origin) !== challenge.endpointPublicKey
+      || challenge.endpointPublicKey !== undefined && trustedEndpointTransportKind(origin, challenge.endpointPublicKey) !== (challenge.transportKind ?? 'https')) throw new Error('The pairing connection path changed. Request pairing again on the original trusted node.');
     const { generation, controller } = this.#beginConnectionAttempt();
     try {
       const result = await this.network.completePairing(origin, challenge.id, code, deviceName, this.platform, this.deviceNameSource(), controller.signal);
@@ -4237,6 +4339,7 @@ export class MobileClient {
         throw new Error("The Joko node identity changed during pairing. Inspect it again.");
       }
       // Prove the credential's identity and device before making it durable.
+      rememberEndpointTrust(result.credential);
       const observed = await this.network.inspect(origin, controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
       if (observed.serverId !== result.credential.serverId) throw new Error("The Joko node identity changed during pairing.");
@@ -4262,7 +4365,11 @@ export class MobileClient {
     }
   }
 
-  cancel(): void {
+  cancel(cancelPendingPairing = true): void {
+    const challenge = this.#state.challenge;
+    if (cancelPendingPairing && challenge !== undefined && this.network.cancelPairing) {
+      void this.network.cancelPairing(challenge.origin, challenge.id, undefined, challenge.endpointPublicKey, challenge.transportKind ?? 'https').catch(error => this.#set({ connectionAttemptError: message(error) }));
+    }
     this.#cancelCatalogAttempt();
     this.#connectionAttemptAbort?.abort();
     this.#connectionAttemptAbort = undefined;
@@ -4316,6 +4423,8 @@ export class MobileClient {
         }
       }
       // Public identity proof must precede the protected credential read.
+      await this.storage.loadEndpointTransport?.(profile);
+      rememberEndpointTrust(profile);
       const node = await this.network.inspect(profile.origin, controller.signal);
       if (!this.#connectionAttemptCurrent(generation, controller)) return;
       if (cached) cached = { ...cached, node };
@@ -4395,11 +4504,11 @@ export class MobileClient {
           profileId,
           "This mobile connection was revoked. Forget it or pair this device again."
         );
-      } else if (error instanceof CredentialIdentityError) {
+      } else if (error instanceof CredentialIdentityError || isEndpointTrustError(error)) {
         this.#dropOfflineProjection(profileId);
         const cleanup = await this.#clearOfflineCache(profileId);
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        const detail = [error.message, cleanup].filter(Boolean).join(" ");
+        const detail = [message(error), cleanup].filter(Boolean).join(" ");
         this.#failConnectionAttempt(generation, controller, detail, {
           saved: this.#savedViews(profileId, "identity-conflict", detail)
         });
@@ -4562,6 +4671,8 @@ export class MobileClient {
     )) });
     const saved = await Promise.all(this.#profiles.map(async (profile): Promise<SavedMobileConnection> => {
       try {
+        await this.storage.loadEndpointTransport?.(profile);
+        rememberEndpointTrust(profile);
         const identity = await this.network.inspect(profile.origin, controller.signal);
         if (!this.#catalogCurrent(generation, controller)) {
           return this.#savedConnection(profile, this.#automaticProfileId === profile.profileId, "unknown");
@@ -4609,6 +4720,7 @@ export class MobileClient {
     const candidates = mergeDiscoveryCandidates([...direct, ...expanded.flat()]);
     const verified = (await Promise.all(candidates.slice(0, 128).map(async (candidate): Promise<NearbyMobileNode | undefined> => {
       try {
+        rememberEndpointTrust(candidate);
         const identity = await this.network.inspect(candidate.origin, controller.signal);
         if (identity.serverId !== candidate.serverId) return undefined;
         return {
@@ -4999,6 +5111,7 @@ export class MobileClient {
     this.#set({ status: "connecting", error: undefined });
     try {
       // This request MUST be anonymous and precede every credentialed reconnect.
+      rememberEndpointTrust(credential);
       const node = await this.network.inspect(credential.origin, this.#abort?.signal);
       if (!this.#current(epoch)) return;
       if (node.serverId !== credential.serverId) {
@@ -5037,8 +5150,8 @@ export class MobileClient {
         credential.profileId,
         "This mobile connection was revoked. Forget it or pair this device again."
       );
-      else if (error instanceof CredentialIdentityError) {
-        await this.#identityConflict(epoch, credential.profileId, error.message);
+      else if (error instanceof CredentialIdentityError || isEndpointTrustError(error)) {
+        await this.#identityConflict(epoch, credential.profileId, message(error));
       }
       else {
         this.#set({ status: "offline", liveStatus: "paused", live: [],
@@ -5220,6 +5333,7 @@ export class MobileClient {
         credential.profileId,
         "This mobile connection was revoked. Forget it or pair this device again."
       );
+      else if (isEndpointTrustError(error)) await this.#identityConflict(epoch, credential.profileId, message(error));
       else if ((error as { code?: number })?.code === Code.FailedPrecondition) void this.refresh();
       else this.#fallbackStream();
     }
@@ -5295,7 +5409,7 @@ export class MobileClient {
         credential.profileId,
         "This mobile connection was revoked. Forget it or pair this device again."
       );
-      else if (error instanceof CredentialIdentityError) await this.#identityConflict(epoch, credential.profileId, error.message);
+      else if (error instanceof CredentialIdentityError || isEndpointTrustError(error)) await this.#identityConflict(epoch, credential.profileId, message(error));
       else void this.refresh();
     } finally {
       if (this.#current(epoch)) {
@@ -11232,7 +11346,7 @@ export class MobileClient {
       finally { cancel(); unsubscribe(); signal.removeEventListener("abort", cancel); caller?.removeEventListener("abort", cancel); }
     };
     const invalidate = async (error: unknown): Promise<void> => {
-      if (!isCurrent() || (!isRevoked(error) && !(error instanceof CredentialIdentityError))) return;
+      if (!isCurrent() || (!isRevoked(error) && !(error instanceof CredentialIdentityError) && !isEndpointTrustError(error))) return;
       if (this.#activeProfileId === profileId && this.#credential) {
         if (isRevoked(error)) await this.#invalidateCredential(this.#epoch, profileId, "The dictionary source connection was revoked.");
         else await this.#identityConflict(this.#epoch, profileId, "The saved dictionary source identity changed.");
@@ -11255,6 +11369,8 @@ export class MobileClient {
     let generation: bigint;
     try {
       const proven = await owned(signal, async (request) => {
+        await this.storage.loadEndpointTransport?.(profile);
+        rememberEndpointTrust(profile);
         const observed = await this.network.inspect(profile.origin, request);
         assertCurrent();
         if (observed.serverId !== profile.serverId) throw new CredentialIdentityError();
@@ -11268,9 +11384,7 @@ export class MobileClient {
           || !owner.device.connectionIds.includes(saved.connectionId)
           || !owner.snapshot.devices.find((item) => item.deviceId === saved.deviceId)!.connectionIds.includes(saved.connectionId)
           || owner.snapshot.generation < 1n) throw new CredentialIdentityError();
-        return { node: observed, credential: Object.freeze({ profileId: saved.profileId, origin: saved.origin,
-          serverId: saved.serverId, connectionId: saved.connectionId, deviceId: saved.deviceId,
-          displayName: saved.displayName, authKey: saved.authKey }), generation: owner.snapshot.generation };
+        return { node: observed, credential: Object.freeze({ ...saved }), generation: owner.snapshot.generation };
       });
       ({ node, credential, generation } = proven);
     } catch (error) { await invalidate(error); throw error; }
@@ -11296,15 +11410,29 @@ export class MobileClient {
         if (caller.aborted) cancel(); else caller.addEventListener("abort", cancel, { once: true });
         signal.addEventListener("abort", cancel, { once: true });
         const unsubscribe = subscribe(() => { if (!isCurrent()) { retired = true; cancel(); } });
+        let ownerRechecked = false;
         try {
           for await (const value of network.watchVoiceInputDictionaryReadOnly(credential, request.signal)) {
             request.signal.throwIfAborted(); assertCurrent(); yield value;
           }
           request.signal.throwIfAborted(); assertCurrent();
           // A revoked idle Watch may close normally. Prove its original owner before retaining a cache.
+          ownerRechecked = true;
           await recheck(request.signal);
           throw new Error("The read-only dictionary stream ended.");
-        } catch (error) { await invalidate(error); throw error; }
+        } catch (error) {
+          request.signal.throwIfAborted(); assertCurrent();
+          let failure = error;
+          // Linkspan may retire the carrier before a revoked Watch can send
+          // its EOF. Transport failure alone cannot revoke a saved credential;
+          // ask the same pinned owner while this request still owns its scope.
+          if (!ownerRechecked && !isRevoked(error) && !(error instanceof CredentialIdentityError)) {
+            try { await recheck(request.signal); }
+            catch (recheckError) { failure = recheckError; }
+          }
+          request.signal.throwIfAborted(); assertCurrent();
+          await invalidate(failure); throw failure;
+        }
         finally { cancel(); unsubscribe(); caller.removeEventListener("abort", cancel); signal.removeEventListener("abort", cancel); }
       })()
     };
@@ -15963,6 +16091,7 @@ export class MobileClient {
     if (this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
     if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
     this.#disposed = true;
+    this.#stopEndpointTrustWatch(); this.#stopEndpointTrustWatch = () => {};
     if (this.#discoveryExpiryTimer !== undefined) clearTimeout(this.#discoveryExpiryTimer);
     this.#discoveryExpiryTimer = undefined;
     this.#catalogAbort?.abort();
@@ -16302,7 +16431,8 @@ function upsertProfile(
 function credentialMatchesProfile(credential: PairedCredential, profile: MobileConnectionProfile): boolean {
   return credential.profileId === profile.profileId && credential.origin === profile.origin
     && credential.serverId === profile.serverId && credential.connectionId === profile.connectionId
-    && credential.deviceId === profile.deviceId;
+    && credential.deviceId === profile.deviceId && credential.endpointPublicKey === profile.endpointPublicKey
+    && (credential.transportKind ?? 'https') === (profile.transportKind ?? 'https');
 }
 
 function credentialFailure(error: unknown): Extract<SavedCredentialState, "unavailable" | "unreadable"> {

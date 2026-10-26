@@ -10,7 +10,7 @@ import { TaskSharingHostMedia } from "./task-sharing-host-media.js";
 export type { TaskShareLease, TaskSharingRuntimePort, PreparedTaskShareOperation } from "./task-sharing-host-types.js";
 
 export interface TaskSharingHostOptions {
-  readonly store: OperationalStore; readonly serverId: string; readonly origin: string;
+  readonly store: OperationalStore; readonly serverId: string; readonly origin: string | (() => string); readonly endpointPublicKey: string;
   readonly generation: () => bigint; readonly runtime: TaskSharingRuntimePort;
   readonly artifacts?: ArtifactStore;
   readonly authorizeShare?: (shareId: string, sessionId: string) => void;
@@ -46,8 +46,8 @@ export class TaskSharingHost {
     const result = this.options.store.runOperation({ id: input.operationId, kind: "task_share_invite", body: input }, () => {
       const inviteSecret = randomBytes(32).toString("base64url");
       const share = this.shares.setInvitation(input.shareId, hash(inviteSecret));
-      invitation = contract.buildTaskShareInvitation({ hostOrigin: this.options.origin, hostServerId: this.options.serverId,
-        shareId: share.shareId, shareGeneration: BigInt(share.shareGeneration), inviteSecret });
+      invitation = contract.buildTaskShareInvitation({ hostOrigin: this.origin(), hostServerId: this.options.serverId,
+        endpointPublicKey: this.options.endpointPublicKey, shareId: share.shareId, shareGeneration: BigInt(share.shareGeneration), inviteSecret });
       return share.shareId;
     });
     if (!invitation) throw new ConnectError("Create a new invitation explicitly.", Code.FailedPrecondition);
@@ -247,16 +247,17 @@ export class TaskSharingHost {
   }
   private invitation(value: string): contract.TaskShareInvitation {
     const parsed = contract.parseTaskShareInvitation(value);
-    if (parsed.hostOrigin !== this.options.origin || parsed.hostServerId !== this.options.serverId) throw denied("This invitation belongs to another Host.");
+    if (parsed.hostServerId !== this.options.serverId || parsed.endpointPublicKey !== this.options.endpointPublicKey) throw denied("This invitation belongs to another Host.");
     return parsed;
   }
   private publicShare(share: TaskShareRecord): contract.TaskShare {
     const session = this.options.store.getSession(share.sessionId).descriptor;
     return create(contract.TaskShareSchema, { shareId: share.shareId, sessionId: share.sessionId,
       shareGeneration: BigInt(share.shareGeneration), revision: BigInt(share.revision), title: session.title,
-      hostServerId: this.options.serverId, hostOrigin: this.options.origin, status: share.status,
+      hostServerId: this.options.serverId, hostOrigin: this.origin(), status: share.status,
       members: share.members.map(publicMember), createdAtMs: BigInt(share.createdAt) });
   }
+  private origin(): string { return contract.taskShareOrigin(typeof this.options.origin === "string" ? this.options.origin : this.options.origin()); }
   private assertMutation(lease: TaskShareLease, request: contract.SubmitOperationRequest): void {
     if (request.connectionId !== "" || !request.operationId) throw denied("Task guest operations cannot claim a node Connection.");
     const payload = request.mutation?.payload;

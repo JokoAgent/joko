@@ -4,6 +4,8 @@ import { constants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSy
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { prepareMobileWorkspaceInputs } from "./prepare-workspace-inputs.mjs";
+import { prepareMobileLinkspanNative } from "./prepare-linkspan-native.mjs";
 import {
   apkSignerCertificateDiagnostics,
   apkSignerCertificateSha256,
@@ -146,7 +148,7 @@ function materializeArtifacts(paths, identity, source, runtimeVersion, certifica
   return { outputDirectory, manifestPath, records };
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   assertAllowedArgs(args, ["execute", "artifacts", "out", "skipGitGate"]);
   if (args.execute !== undefined && args.execute !== true) throw new Error("--execute does not accept a value.");
@@ -158,7 +160,7 @@ function main() {
     `target: Android release artifacts (${artifactKinds.join(" + ")})`,
     `identity: ${identity.androidPackage}`,
     `version: ${identity.version} (${identity.versionCode})`,
-    "steps: clean prebuild -> external release signing -> Gradle -> package/version/runtime/signature verification",
+    "steps: shared client inputs -> clean prebuild -> external release signing -> Gradle -> package/version/runtime/signature verification",
     "secrets: keystore and passwords are read only from JOKO_ANDROID_* environment variables",
     ""
   ].join("\n"));
@@ -177,12 +179,16 @@ function main() {
     throw new Error("JOKO_ANDROID_KEYSTORE_PATH does not name a regular file.");
   }
   const environment = { ...process.env, NODE_ENV: "production", ...signing.gradleEnvironment };
+  prepareMobileWorkspaceInputs();
+  const nativeLinkspan = await prepareMobileLinkspanNative({ platform: "android", environment });
+  if (nativeLinkspan.enabled) environment.ORG_GRADLE_PROJECT_reactNativeArchitectures = nativeLinkspan.targets.join(",");
   run(process.execPath, [EXPO_CLI, "prebuild", "--platform", "android", "--clean", "--no-install"], { env: environment });
   const androidDirectory = resolve(MOBILE_DIRECTORY, "android");
   const gradlePath = join(androidDirectory, "app", "build.gradle");
   if (!existsSync(gradlePath)) throw new Error("Expo prebuild did not produce android/app/build.gradle.");
   writeFileSync(gradlePath, patchAndroidReleaseSigning(readFileSync(gradlePath, "utf8")));
   const tasks = artifactKinds.map((kind) => kind === "apk" ? "assembleRelease" : "bundleRelease");
+  if (nativeLinkspan.enabled) tasks.unshift(`-PreactNativeArchitectures=${nativeLinkspan.targets.join(",")}`);
   if (process.platform === "win32") run("cmd.exe", ["/d", "/s", "/c", "gradlew.bat", ...tasks], {
     cwd: androidDirectory, env: environment
   });
@@ -220,7 +226,7 @@ function main() {
   ].join("\n"));
 }
 
-try { main(); }
+try { await main(); }
 catch (error) {
   process.stderr.write(`Android artifact build failed: ${error instanceof Error ? error.message : "unknown failure"}\n`);
   process.exitCode = 1;

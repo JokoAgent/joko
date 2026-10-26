@@ -24,7 +24,8 @@ import {
 } from "./remote-desktop-controller.js";
 import {
   parseRemoteDesktopIceCandidates,
-  parseRemoteDesktopIceReply
+  parseRemoteDesktopIceReply,
+  REMOTE_DESKTOP_NETWORK
 } from "./remote-desktop-ice.js";
 import {
   parseRemoteDesktopIceConfig,
@@ -391,6 +392,10 @@ describe("remote desktop portable protocol", () => {
       next: 1,
       complete: false
     })).toMatchObject({ attemptId: "attempt_1", next: 1, complete: false });
+    expect(REMOTE_DESKTOP_NETWORK.maxLocalCandidates).toBe(128);
+    expect(parseRemoteDesktopIceReply({ attemptId: 'projected', candidates, next: 256, complete: true }).next).toBe(256);
+    expect(() => parseRemoteDesktopIceReply({ attemptId: 'overflow', candidates, next: 257, complete: false })).toThrow();
+    expect(() => parseRemoteDesktopIceCandidates(Array(17).fill(candidates[0]))).toThrow();
     expect(() => parseRemoteDesktopIceCandidates([{
       candidate: "candidate:bad",
       sdpMid: null,

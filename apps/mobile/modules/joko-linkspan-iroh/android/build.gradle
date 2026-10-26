@@ -1,0 +1,51 @@
+import groovy.json.JsonSlurper
+
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+group = 'app.joko.linkspan'
+def hostPackage = new JsonSlurper().parse(new File(projectDir, '../../../package.json'))
+version = hostPackage.version
+
+def backends = (System.getenv('JOKO_LINKSPAN_BUILD_BACKENDS') ?: '').split(',').collect { it.trim() }
+def enabled = backends.contains('iroh-native')
+def generated = new File(projectDir, '../generated').canonicalFile
+def selectionFile = new File(generated, 'android-selection.json')
+def selection = enabled && selectionFile.isFile() ? new JsonSlurper().parse(selectionFile) : null
+def selectedPath = { String name ->
+  def result = new File(generated, name).canonicalFile
+  if (!result.path.startsWith(generated.path + File.separator)) throw new GradleException('The selected native SDK escaped its build-owned directory.')
+  return result
+}
+if (enabled && (selection == null || selection.platform != 'android')) throw new GradleException('Run the Mobile native Linkspan preparation before Gradle.')
+def runtime = enabled ? selectedPath(selection.runtimeDirectory) : null
+def sources = enabled ? selectedPath(selection.sourceDirectory) : null
+def abis = enabled ? selection.targets : []
+if (enabled && (abis.isEmpty() || !abis.every { it in ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86'] })) throw new GradleException('The native SDK target ABIs are invalid.')
+
+android {
+  namespace 'app.joko.linkspan'
+  defaultConfig {
+    minSdkVersion 24
+    versionName hostPackage.version
+    buildConfigField 'String', 'LINKSPAN_IROH_ABIS', '"' + abis.join(',') + '"'
+  }
+  buildFeatures { buildConfig true }
+  sourceSets {
+    main {
+      java.srcDirs = enabled ? [sources] : ['src/stub/java']
+      if (enabled) {
+        jniLibs.srcDirs = [new File(runtime, 'android/jniLibs')]
+        assets.srcDirs = [new File(generated, selection.noticeDirectory)]
+      }
+    }
+  }
+}
+dependencies {
+  if (enabled) {
+    implementation files(new File(runtime, 'android/libs/iroh-api.jar'), new File(runtime, 'android/libs/jna-api.jar'))
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+  }
+}

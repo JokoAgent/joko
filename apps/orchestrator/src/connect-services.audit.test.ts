@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
-import { Code, ConnectError, type ConnectRouter } from "@connectrpc/connect";
+import { Code, ConnectError, createClient, createRouterTransport, type ConnectRouter } from "@connectrpc/connect";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { PiBackendAdapter } from "@joko/adapter-pi";
 import type { CodeHostProvider } from "@joko/code-host";
@@ -18,7 +18,7 @@ import {
   providerRateLimitSettingKey,
   registerConnectServices
 } from "./connect-services.js";
-import { ConnectionAuthenticationError } from "./connection-manager.js";
+import { ConnectionAuthenticationError, ConnectionManager } from "./connection-manager.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
@@ -167,6 +167,8 @@ describe("Connect security and protocol audit", () => {
       "joko.v1.ConnectionService/getServerInfo",
       "joko.v1.ConnectionService/listDiscoveredNodes",
       "joko.v1.ConnectionService/beginPairing",
+      // Its private random challenge ID is the cancellation capability.
+      "joko.v1.ConnectionService/cancelPairing",
       "joko.v1.ConnectionService/completePairing",
       "joko.v1.ConnectionService/getMobilePushCapability",
       "joko.v1.ConnectionService/unregisterMobilePush"
@@ -193,6 +195,26 @@ describe("Connect security and protocol audit", () => {
     }
 
     expect(protectedCount).toBe(registeredCalls.size - publicCalls.size);
+  });
+
+  it("cancels only the exact private pairing capability and rejects an invalid supplied owner before mutation", async () => {
+    const store = new OperationalStore(":memory:"); cleanups.push(() => store.close());
+    const connections = new ConnectionManager(store);
+    const cancelled = connections.issuePairing("Cancelled invitation"), retained = connections.issuePairing("Retained invitation");
+    const client = createClient(contract.ConnectionService, createRouterTransport(router =>
+      registerConnectServices(router, stubApplication({ store, connections: {
+        authenticate: connections.authenticate.bind(connections), cancelPairing: connections.cancelPairing.bind(connections),
+        fence: connections.fence.bind(connections)
+      } }))));
+    await expect(client.cancelPairing({ challengeId: cancelled.id })).resolves.toMatchObject({ cancelled: true });
+    await expect(client.cancelPairing({ challengeId: cancelled.id })).resolves.toMatchObject({ cancelled: false });
+    expect(() => connections.completePairing({ challengeId: cancelled.id, code: cancelled.code, connectionName: "Late" })).toThrow();
+    const before = store.getPairing(retained.id);
+    await expect(client.cancelPairing({ challengeId: retained.id }, { headers: { authorization: "Bearer revoked" } }))
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
+    await expect(client.cancelPairing({ challengeId: "malformed" })).rejects.toMatchObject({ code: Code.PermissionDenied });
+    expect(store.getPairing(retained.id)).toEqual(before);
+    expect(connections.completePairing({ challengeId: retained.id, code: retained.code, connectionName: "Retained" }).connection.state).toBe("active");
   });
 
   it("returns LAN bootstrap nodes without authentication or sensitive fields", async () => {
@@ -2355,6 +2377,7 @@ describe("Connect security and protocol audit", () => {
       expect(next.done).toBe(false);
       received.push(next.value?.event?.cursor?.sequence ?? -1n);
     }
+    expect(await iterator.next()).toMatchObject({ done: false, value: {} });
     const exhausted = iterator.next();
     controller.abort();
 
@@ -2431,7 +2454,9 @@ describe("Connect security and protocol audit", () => {
       request: object,
       handlerContext: unknown
     ) => AsyncIterable<unknown>)({}, context());
-    const streamNext = stream[Symbol.asyncIterator]().next();
+    const streamIterator = stream[Symbol.asyncIterator]();
+    expect(await streamIterator.next()).toMatchObject({ done: false, value: {} });
+    const streamNext = streamIterator.next();
     await Promise.resolve();
     streamConnections.revoke();
     expect(await streamNext).toMatchObject({ done: true });

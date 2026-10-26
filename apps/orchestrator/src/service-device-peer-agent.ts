@@ -23,6 +23,7 @@ import {
 } from "@joko/remote-ssh";
 import { spawnTerminalHost, terminalEnvironment } from "@joko/tool-terminal";
 import { DeviceKind } from "@joko/contracts";
+import { normalizeEndpointTransport, type EndpointTransport } from "@joko/connection-transport/trust";
 
 import type { OrchestratorConfig } from "./config.js";
 
@@ -34,6 +35,8 @@ export interface ServiceDevicePeerAgentOptions {
   readonly createExecutor?: NodeDevicePeerAgentLifecycleOptions["createExecutor"];
   readonly validateCredential?: (credentialPath: string) => Promise<void>;
   readonly readAuthKey?: (credentialPath: string) => Promise<string | undefined>;
+  readonly readTransport?: (transportPath: string) => Promise<EndpointTransport>;
+  readonly prepareTransport?: (kind: "iroh" | "tailcat") => Promise<void>;
   readonly readDefaultDeviceName?: () => string;
   readonly runRoute?: NodeDevicePeerAgentLifecycleOptions["runRoute"];
   readonly wait?: NodeDevicePeerAgentLifecycleOptions["wait"];
@@ -49,7 +52,10 @@ export interface ServiceDevicePeerAgentOptions {
  * it never reuses Desktop profile state or exposes an IPC surface.
  */
 export class ServiceDevicePeerAgent {
-  readonly #connection: NodeDevicePeerAgentConnection;
+  #connection: NodeDevicePeerAgentConnection;
+  readonly #transportPath: string | undefined;
+  readonly #readTransport: (path: string) => Promise<EndpointTransport>;
+  readonly #prepareTransport: (kind: "iroh" | "tailcat") => Promise<void>;
   readonly #credentialPath: string;
   readonly #validateCredential: (credentialPath: string) => Promise<void>;
   readonly #readAuthKey: (credentialPath: string) => Promise<string | undefined>;
@@ -63,9 +69,14 @@ export class ServiceDevicePeerAgent {
       deviceId: options.config.deviceId,
       serverId: options.config.controllerServerId,
       origin: options.config.controllerOrigin,
+      ...(options.config.endpointPublicKey === undefined ? {} : { endpointPublicKey: options.config.endpointPublicKey }),
+      ...(options.config.transportKind === undefined ? {} : { transportKind: options.config.transportKind }),
       expectedDeviceKind: DeviceKind.SERVICE
     });
     this.#credentialPath = options.config.credentialPath;
+    this.#transportPath = options.config.transportPath;
+    this.#readTransport = options.readTransport ?? readServiceDevicePeerTransport;
+    this.#prepareTransport = options.prepareTransport ?? prepareServiceDevicePeerTransport;
     this.#validateCredential = options.validateCredential ?? validateServiceDevicePeerCredentialFile;
     this.#readAuthKey = options.readAuthKey ?? readServiceDevicePeerAuthKey;
     const terminal = serviceTerminalPort(options.environment ?? process.env);
@@ -102,6 +113,18 @@ export class ServiceDevicePeerAgent {
     } catch {
       throw new Error("The Service Device peer credential file is unavailable or unsafe.");
     }
+    try {
+      const kind = this.#connection.transportKind;
+      if (kind !== undefined && this.#connection.endpointPublicKey === undefined) throw new Error();
+      if (kind === "iroh" || kind === "tailcat" || kind === "http-connect") {
+        if (this.#transportPath === undefined) throw new Error();
+        const endpointTransport = normalizeEndpointTransport(await this.#readTransport(this.#transportPath));
+        if (endpointTransport.kind !== kind) throw new Error();
+        this.#connection = Object.freeze({ ...this.#connection, endpointTransport });
+        if (!this.#closed && kind !== "http-connect") await this.#prepareTransport(kind);
+      } else if (this.#transportPath !== undefined) throw new Error();
+      else if (kind === "webrtc") this.#connection = Object.freeze({ ...this.#connection, endpointTransport: { kind: "webrtc" } as const });
+    } catch { throw new Error("The Service Device peer transport is unavailable or unsafe. Restore its original private configuration and trusted endpoint identity."); }
     if (this.#closed) throw new Error("The Service Device peer agent is closed.");
     this.#started = true;
     this.#lifecycle.setConnection(this.#connection);
@@ -270,6 +293,36 @@ export async function readServiceDevicePeerAuthKey(path: string): Promise<string
   }
 }
 
+/** Typed backend locators and their private client keys never enter settings or
+ * diagnostics. Read once for this service occurrence, before any connection. */
+export async function readServiceDevicePeerTransport(path: string): Promise<EndpointTransport> {
+  const directory = dirname(path), signal = AbortSignal.timeout(10_000);
+  await inspectKeyDirectoryPermissions(directory, signal);
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  let permissionLease: Awaited<ReturnType<typeof inspectPrivateKeyPermissions>> | undefined;
+  let bytes: Buffer | undefined;
+  try {
+    permissionLease = await inspectPrivateKeyPermissions(directory, basename(path), handle, signal);
+    const before = await handle.stat();
+    if (!before.isFile() || before.size < 2 || before.size > 32768) throw new Error();
+    bytes = Buffer.alloc(before.size + 1); let offset = 0;
+    while (offset < bytes.length) {
+      signal.throwIfAborted();
+      const part = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (part.bytesRead === 0) break; offset += part.bytesRead;
+    }
+    const after = await handle.stat();
+    if (offset !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error();
+    await permissionLease.verifyFinal(); signal.throwIfAborted();
+    return normalizeEndpointTransport(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset))));
+  } catch { throw new Error("The private Service Device peer transport file is invalid or unavailable."); }
+  finally { bytes?.fill(0); await permissionLease?.close().catch(() => {}); await handle.close().catch(() => {}); }
+}
+async function prepareServiceDevicePeerTransport(kind: "iroh" | "tailcat"): Promise<void> {
+  if (kind === "iroh") (await import("@jokoagent/linkspan-iroh-node")).configureIrohRuntime(fileURLToPath(new URL("../dist/linkspan-runtime/iroh", import.meta.url)));
+  else (await import("@jokoagent/linkspan-tailcat-node")).configureTailcatRuntime(fileURLToPath(new URL("../dist/linkspan-runtime/tailcat", import.meta.url)));
+}
+
 function serviceRecentDirectoriesPath(config: ServiceDevicePeerAgentConfig): string {
   return join(config.stateDirectory, "recent-directories.json");
 }
@@ -282,7 +335,10 @@ function sameConnection(
     && left.deviceId === right.deviceId
     && left.serverId === right.serverId
     && left.expectedDeviceKind === right.expectedDeviceKind
-    && left.origin === right.origin;
+    && left.origin === right.origin
+    && left.endpointPublicKey === right.endpointPublicKey
+    && (left.transportKind ?? "https") === (right.transportKind ?? "https")
+    && JSON.stringify(left.endpointTransport) === JSON.stringify(right.endpointTransport);
 }
 
 async function readRuntimeManifest(root: string): Promise<Record<string, unknown>> {

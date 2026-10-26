@@ -192,6 +192,12 @@ const REMOTE_DESKTOP_KEY_CODES = new Set([
 ]);
 
 type AgentPayload = DevicePeerAgentResult["payload"];
+type RetirementResource = "terminal" | "remote_desktop" | "listener" | "native_agents";
+type RetirementStage = "executor_resources_started" | "executor_resources_completed"
+  | "recent_directories_flush_started" | "recent_directories_flush_completed"
+  | `executor_${RetirementResource}_retirement_${"call_started" | "call_returned" | "completed" | "failed"}`
+  | "executor_resource_deadline_installing" | "executor_resource_deadline_installed"
+  | "executor_resource_deadline_ref" | "executor_resource_deadline_unref" | "executor_resource_deadline_fired";
 
 export interface NodeDevicePeerAgentEmission extends DevicePeerAgentResult {}
 
@@ -208,6 +214,7 @@ export interface NodeDevicePeerAgentExecutorOptions {
   /** Process-local executable identities. Reserved runtime tokens are resolved
    * only here and are never persisted in Target or Session bindings. */
   readonly runtimeExecutables?: NodeDevicePeerRuntimeExecutableMap;
+  readonly observeRetirement?: (stage: RetirementStage) => void;
 }
 
 export const DEVICE_PEER_RUNTIME_EXECUTABLES = Object.freeze({
@@ -247,6 +254,7 @@ export class NodeDevicePeerAgentExecutor {
   readonly #nativeAgents: DevicePeerNativeAgentPort | undefined;
   readonly #stopClipboardAuthority: (() => void) | undefined;
   readonly #runtimeExecutables: NodeDevicePeerRuntimeExecutableMap;
+  readonly #observeRetirement: NodeDevicePeerAgentExecutorOptions["observeRetirement"];
   readonly #activeProcesses = new Map<string, DevicePeerProcessHandle>();
   readonly #activeTerminals = new Map<string, DevicePeerTerminalHandle>();
   readonly #activeForwards = new Map<string, Socket>();
@@ -257,6 +265,7 @@ export class NodeDevicePeerAgentExecutor {
   #retired = false;
 
   constructor(options: NodeDevicePeerAgentExecutorOptions) {
+    this.#observeRetirement = options.observeRetirement;
     this.#recentDirectories = new NodeDevicePeerRecentDirectoryStore(options.recentDirectoriesPath);
     this.#files = options.files ?? new LocalDevicePeerFileTransport();
     this.#processes = options.processes ?? new LocalDevicePeerProcessTransport();
@@ -330,28 +339,65 @@ export class NodeDevicePeerAgentExecutor {
     for (const process of this.#activeProcesses.values()) process.kill("SIGTERM");
     for (const socket of this.#activeForwards.values()) socket.destroy();
     for (const socket of this.#reverseConnections.values()) socket.destroy();
+    this.#retirementProgress("executor_resources_started");
     await Promise.race([
       Promise.allSettled([
-        ...terminals.map((terminal) => terminal.kill()),
+        ...terminals.map((terminal) => this.#retireResource("terminal", () => terminal.kill())),
         ...(this.#remoteDesktop === undefined
           ? []
-          : [Promise.resolve().then(() => this.#remoteDesktop!.retire())]),
-        ...listeners.map(async (listener) => {
+          : [Promise.resolve().then(() => this.#retireResource("remote_desktop", () => this.#remoteDesktop!.retire()))]),
+        ...listeners.map((listener) => this.#retireResource("listener", async () => {
           for (const key of listener.connections) this.#reverseConnections.get(key)?.destroy();
           await closeServer(listener.server);
           await Promise.allSettled([...listener.pumps]);
-        }),
-        ...(this.#nativeAgents === undefined ? [] : [Promise.resolve().then(() => this.#nativeAgents!.retire())])
+        })),
+        ...(this.#nativeAgents === undefined ? []
+          : [Promise.resolve().then(() => this.#retireResource("native_agents", () => this.#nativeAgents!.retire()))])
       ]),
-      new Promise<void>((resolveTimeout) => setTimeout(resolveTimeout, RESOURCE_RETIRE_TIMEOUT_MS))
+      new Promise<void>((resolveTimeout) => {
+        this.#retirementProgress("executor_resource_deadline_installing");
+        const timer = setTimeout(() => {
+          this.#retirementProgress("executor_resource_deadline_fired");
+          resolveTimeout();
+        }, RESOURCE_RETIRE_TIMEOUT_MS);
+        this.#retirementProgress("executor_resource_deadline_installed");
+        this.#retirementProgress(timer.hasRef() ? "executor_resource_deadline_ref" : "executor_resource_deadline_unref");
+      })
     ]);
+    this.#retirementProgress("executor_resources_completed");
     for (const process of this.#activeProcesses.values()) process.kill("SIGKILL");
     this.#activeProcesses.clear();
     this.#activeTerminals.clear();
     this.#activeForwards.clear();
     this.#activeListeners.clear();
     this.#reverseConnections.clear();
+    this.#retirementProgress("recent_directories_flush_started");
     await this.#recentDirectories.flush();
+    this.#retirementProgress("recent_directories_flush_completed");
+  }
+
+  #retirementProgress(stage: Parameters<NonNullable<NodeDevicePeerAgentExecutorOptions["observeRetirement"]>>[0]): void {
+    try { this.#observeRetirement?.(stage); } catch { /* Diagnostics never own resource retirement. */ }
+  }
+
+  #retireResource(resource: RetirementResource, retire: () => void | Promise<void>): void | Promise<void> {
+    this.#retirementProgress(`executor_${resource}_retirement_call_started`);
+    let retirement: void | Promise<void>;
+    try {
+      retirement = retire();
+    } catch (error) {
+      this.#retirementProgress(`executor_${resource}_retirement_failed`);
+      throw error;
+    }
+    this.#retirementProgress(`executor_${resource}_retirement_call_returned`);
+    if (this.#observeRetirement !== undefined) {
+      void Promise.resolve(retirement).then(() => {
+        this.#retirementProgress(`executor_${resource}_retirement_completed`);
+      }, () => {
+        this.#retirementProgress(`executor_${resource}_retirement_failed`);
+      });
+    }
+    return retirement;
   }
 
   async #perform(

@@ -67,6 +67,29 @@ export class PartnerNetworkStore {
   #put<T>(owner: string, key: string, value: T): T { this.store.setSetting("service", `${SCOPE}:${owner}`, key, value); return clone(value); }
   #rows<T>(owner: string, prefix: string): T[] { return this.store.listSettingsByKeyPrefix("service", `${SCOPE}:${owner}`, prefix).map(row => clone(row.value as T)); }
   list(): NetworkRoom[] { return this.#rows<NetworkRoom>("host", "room:").map(room => this.#check(room)); }
+  /** Trusted offline recovery overrides room roles while retaining local owners and messages. */
+  revokeForeignAccess(serverId: string): { readonly members: number; readonly invitations: number } {
+    networkIdentity(serverId);
+    return this.store.transaction(() => {
+      let members = 0, invitations = 0;
+      for (const room of this.list()) {
+        if (room.hostServerId !== serverId) throw new PartnerNetworkStoreError("invalid");
+        const foreign = new Set(room.members.filter(actor => actor.homeServerId !== serverId).map(actor => actor.id));
+        let changed = false;
+        for (const actor of room.members) if (foreign.has(actor.id) && (actor.state === "joined" || actor.credentialDigest)) {
+          actor.state = "removed"; actor.credentialDigest = ""; actor.guestAccess = "none"; actor.accessRevision++;
+          members++; changed = true;
+        }
+        if (room.organizerId && foreign.has(room.organizerId)) { delete room.organizerId; changed = true; }
+        for (const job of this.executions(room.id)) if (foreign.has(job.requesterId) || foreign.has(job.actorId)) this.#end(job, "cancelled");
+        if (changed) this.#save(room);
+      }
+      for (const link of this.#rows<NetworkLink>("host", "link:")) if (link.state === "active") {
+        this.#put("host", `link:${link.digest}`, { ...link, state: "revoked" }); invitations++;
+      }
+      return { members, invitations };
+    });
+  }
   get(id: string): NetworkRoom { const room = this.#get<NetworkRoom>("host", `room:${networkIdentity(id)}`); if (!room) throw new PartnerNetworkStoreError("not_found"); return this.#check(room); }
   #check(room: NetworkRoom): NetworkRoom {
     if (room.format !== 1 || !Number.isSafeInteger(room.revision) || room.revision < 1 || !Array.isArray(room.members)

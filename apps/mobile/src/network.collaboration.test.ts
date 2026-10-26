@@ -3,7 +3,13 @@ import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationWork
   CreateCollaborationWorkerRequestSchema, CreateCollaborationWorkerResponseSchema, GetSettingsResponseSchema } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { mobileNetwork, type PairedCredential } from "./network";
-const credential: PairedCredential = { profileId: "phone", connectionId: "connection", deviceId: "device", serverId: "node",
+import { mobileNetworkFixtureEndpointPublicKey } from "./test/mobile-network-transport";
+
+vi.mock("@joko/connection-transport", async importOriginal => {
+  const { controlledMobileConnectionTransport } = await import("./test/mobile-network-transport");
+  return controlledMobileConnectionTransport(await importOriginal<typeof import("@joko/connection-transport")>());
+});
+const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "phone", connectionId: "connection", deviceId: "device", serverId: "node",
   origin: "http://192.168.1.20:4318", displayName: "Phone", authKey: "private-auth" };
 afterEach(() => vi.restoreAllMocks());
 it("binds optional worker input and actual capacity to the authenticated generated service", async () => {

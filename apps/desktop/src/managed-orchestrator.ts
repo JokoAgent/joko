@@ -1,9 +1,10 @@
+import { createConnectionFetch } from "@joko/connection-transport";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, open, realpath } from "node:fs/promises";
 import { request as createHttpRequest, type IncomingMessage } from "node:http";
-import { createServer, isIP } from "node:net";
-import { isAbsolute, resolve } from "node:path";
+import { createConnection, createServer, isIP } from "node:net";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
@@ -49,6 +50,7 @@ export interface ManagedOrchestratorConnection {
   readonly serverId: string;
   readonly name: string;
   readonly origin: string;
+  readonly endpointPublicKey?: string;
 }
 
 export interface ManagedOrchestratorRuntime {
@@ -108,6 +110,7 @@ interface SpawnedManagedOrchestrator {
 }
 
 export interface StartManagedOrchestratorOptions {
+  readonly expectedEndpointPublicKey?: string;
   readonly orchestratorEntryPath: string;
   readonly dataDirectory: string;
   readonly workspaceRoot: string;
@@ -192,6 +195,7 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
   const publicPort = validPort(options.publicPort ?? MANAGED_ORCHESTRATOR_PUBLIC_PORT);
   const internalPort = validPort(options.internalPort ?? MANAGED_ORCHESTRATOR_INTERNAL_PORT);
   if (publicPort === internalPort) throw startupUnavailable();
+  const executable = options.executablePath ?? await resolveManagedOrchestratorExecutable(entryPath);
   const parentPid = validPid(options.parentPid ?? process.pid);
   const now = options.now ?? Date.now;
   const request = createDesktopBootstrapRequest({
@@ -204,7 +208,6 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
     ...(options.previousConnection === undefined ? {} : { previousConnection: options.previousConnection })
   }, { now });
   const origin = `http://127.0.0.1:${publicPort}`;
-  const executable = options.executablePath ?? process.execPath;
   const environment: NodeJS.ProcessEnv = {
     ...managedOrchestratorEnvironment(options.environment ?? process.env),
     ELECTRON_RUN_AS_NODE: "1",
@@ -244,6 +247,7 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
     const response = await responsePromise;
     verifyDesktopBootstrapResponse(request, response, { now });
     if (response.origin !== origin) throw startupUnavailable();
+    if (options.expectedEndpointPublicKey !== undefined && response.endpointPublicKey !== options.expectedEndpointPublicKey) throw new Error("Managed Orchestrator endpoint identity changed. Verify it through explicit node recovery.");
     let pendingAuthKey: string | undefined = response.authKey;
     let desktopHostAuthKey: string | undefined = deriveDesktopHostAuthorizationKey(request);
     let committed = false;
@@ -257,7 +261,8 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
         deviceId: response.deviceId,
         serverId: response.serverId,
         name: "Local Joko",
-        origin: response.origin
+        origin: response.origin,
+        ...(response.endpointPublicKey === undefined ? {} : { endpointPublicKey: response.endpointPublicKey })
       },
       takeAuthKey: () => {
         const authKey = pendingAuthKey;
@@ -309,7 +314,9 @@ export async function probeManagedOrchestratorConnection(options: {
   readonly readAuthKey: (profileId: string) => Promise<string | undefined>;
   readonly fetch?: typeof fetch;
 }): Promise<ManagedOrchestratorProbeResult> {
-  const fetchImpl = options.fetch;
+  if (options.fetch === undefined && options.connection.endpointPublicKey !== undefined
+    && await managedLoopbackListenerAbsent(options.connection.origin)) return "absent";
+  const fetchImpl = options.fetch ?? (options.connection.endpointPublicKey === undefined ? undefined : createConnectionFetch(options.connection));
   const identity = await connectJson(fetchImpl, options.connection.origin, "joko.v1.ConnectionService/GetServerInfo");
   if (identity.kind === "absent") return "absent";
   if (identity.kind === "indeterminate") return "serviceUnavailable";
@@ -346,7 +353,7 @@ export async function verifyManagedOrchestratorAdoption(options: {
   readonly fetch?: typeof fetch;
 }): Promise<ManagedOrchestratorAdoptionResult> {
   if (options.connection.serverId !== options.expectedServerId) return "identityConflict";
-  const fetchImpl = options.fetch;
+  const fetchImpl = options.fetch ?? (options.connection.endpointPublicKey === undefined ? undefined : createConnectionFetch(options.connection));
   const identity = await connectJson(fetchImpl, options.connection.origin, "joko.v1.ConnectionService/GetServerInfo");
   if (identity.kind !== "response") return "serviceUnavailable";
   if (identity.status !== 200 || !isRecord(identity.body) || !isRecord(identity.body["server"]) ||
@@ -461,7 +468,7 @@ export async function commitVerifiedManagedOrchestratorAdoption(options: {
     runtime = await options.startWithCandidateProof(options.candidate);
     if (runtime.connection.profileId === options.candidate.profileId ||
       runtime.connection.deviceId !== options.candidate.deviceId ||
-      runtime.connection.serverId !== options.candidate.serverId) {
+      runtime.connection.serverId !== options.candidate.serverId || runtime.connection.endpointPublicKey !== options.candidate.endpointPublicKey) {
       throw new Error("Managed Orchestrator recovery bootstrap returned the wrong authority.");
     }
     authKey = runtime.takeAuthKey();
@@ -495,7 +502,7 @@ function sameManagedConnection(left: ManagedOrchestratorConnection, right: Manag
     left.deviceId === right.deviceId &&
     left.serverId === right.serverId &&
     left.name === right.name &&
-    left.origin === right.origin;
+    left.origin === right.origin && left.endpointPublicKey === right.endpointPublicKey;
 }
 
 export function resolveManagedOrchestratorEntry(
@@ -521,6 +528,111 @@ export function resolveManagedOrchestratorEntry(
     return resolve(directory, "..", "..", "orchestrator", "dist", "main.js");
   }
   return resolve(directory, "orchestrator-runtime", "dist", "main.js");
+}
+
+/** The optional SDK needs Node ABI 137, rather than Electron's Node ABI. The
+ * executable is a release-prepared resource, never a PATH or environment input. */
+export async function resolveManagedOrchestratorExecutable(entryPath: string): Promise<string> {
+  try {
+    const entry = resolve(entryPath);
+    if (!isAbsolute(entryPath) || entry !== entryPath) throw startupUnavailable();
+    await assertRegularEntry(entry);
+    const directory = basename(entry) === "main.ts" && basename(dirname(entry)) === "src"
+      ? resolve(dirname(entry), "..", "dist") : dirname(entry);
+    const root = resolve(directory, "linkspan-runtime");
+    const selectedBytes = await readRuntimeBytes(resolve(root, "selected.json"), 65_536, true);
+    if (selectedBytes === undefined || selectedBytes.toString("utf8").trim() === "") return process.execPath;
+    const selected: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(selectedBytes));
+    if (!isRecord(selected)) throw startupUnavailable();
+    if (Object.keys(selected).length === 0) return process.execPath;
+    const backends = selected["backends"];
+    if (!Array.isArray(backends) || backends.length > 32 || backends.some(value => typeof value !== "string" || !/^[a-z][a-z0-9-]{0,63}$/u.test(value))) throw startupUnavailable();
+    if (!backends.includes("pinggy-sdk")) return process.execPath;
+    const target = `${process.platform}-${process.arch}`;
+    const archiveSha256 = PINGGY_NODE_ARCHIVES[target];
+    const prepared = selected["prepared"];
+    if (selected["target"] !== target || archiveSha256 === undefined || !isRecord(prepared) || !isRecord(prepared["pinggy"])) throw startupUnavailable();
+    const sdk = prepared["pinggy"];
+    const node = sdk["nodeRuntime"];
+    const sdkPath = `pinggy/pinggy-0.5.3/${target}/node-137`;
+    const executablePath = `pinggy/node-v24.16.0/${target}/${process.platform === "win32" ? "node.exe" : "node"}`;
+    if (sdk["target"] !== target || sdk["version"] !== "0.5.3" || sdk["nodeAbi"] !== "137" || sdk["sdkDirectory"] !== sdkPath
+      || !isRecord(node) || node["target"] !== target || node["version"] !== "24.16.0" || node["nodeAbi"] !== "137"
+      || node["executable"] !== executablePath || node["archiveSha256"] !== archiveSha256
+      || typeof node["sha256"] !== "string" || !/^[a-f0-9]{64}$/u.test(node["sha256"])) throw startupUnavailable();
+    await runtimeContainedPath(root, sdkPath, true);
+    const receiptPath = await runtimeContainedPath(root, `${sdkPath}/prepared.json`);
+    const sdkReceipt: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode((await readRuntimeBytes(receiptPath, 65_536))!));
+    if (!isRecord(sdkReceipt) || sdkReceipt["version"] !== "0.5.3" || sdkReceipt["target"] !== target || sdkReceipt["nodeAbi"] !== "137") throw startupUnavailable();
+    for (const file of ["dist/index.js", "lib/addon.node", "LICENSE.pinggy-sdk"]) await runtimeContainedPath(root, `${sdkPath}/${file}`);
+    const executable = await runtimeContainedPath(root, executablePath);
+    const license = (await readRuntimeBytes(await runtimeContainedPath(root, `${dirname(executablePath).replaceAll("\\", "/")}/LICENSE`), 2_097_152))!;
+    if (license.length === 0 || await runtimeFileDigest(executable) !== node["sha256"]) throw startupUnavailable();
+    return executable;
+  } catch {
+    throw startupUnavailable();
+  }
+}
+
+// Official Node v24.16.0 archives selected by the release preparation script.
+const PINGGY_NODE_ARCHIVES: Readonly<Record<string, string>> = {
+  "darwin-arm64": "39189dab4eeb15706c424af0ac08a3044c9e48f7db12a7d77f6b7aafc7dd5df6",
+  "darwin-x64": "298b4c7b3cb80765c8703e42b90324a4ece3b6634947b89e769c3c980ab55185",
+  "linux-arm64": "589f5b6dd4fcfee4dfda73013903c966abaa8abd93dbc9d436544e472b4f0e74",
+  "linux-x64": "2faf6a387e9b62b888e21c54f01249fb27537ffecf1842f29f4c919d0a59a0ff",
+  "win32-arm64": "14834611d4c6b3c06054e7007732b90474c16e0b32f395e05b55a571ef71c6d2",
+  "win32-x64": "edaca9bd58ec8e92037dac4e877d52f6b8f430b81c18b57e264b4e2fb111cd56"
+};
+
+async function runtimeContainedPath(root: string, value: string, directory = false): Promise<string> {
+  if (value.length > 4096 || value.split("/").some(part => !/^[a-zA-Z0-9_.-]+$/u.test(part) || part === "." || part === "..")) throw startupUnavailable();
+  const path = resolve(root, ...value.split("/")), suffix = relative(root, path);
+  if (!suffix || suffix === ".." || suffix.startsWith(`..${sep}`) || isAbsolute(suffix)) throw startupUnavailable();
+  const paths = [root]; let current = root;
+  for (const part of value.split("/")) { current = resolve(current, part); paths.push(current); }
+  for (const [index, candidate] of paths.entries()) {
+    const info = await lstat(candidate);
+    if (info.isSymbolicLink() || !samePath(await realpath(candidate), candidate)
+      || (index === paths.length - 1 && !directory ? !info.isFile() || info.size < 1 : !info.isDirectory())) throw startupUnavailable();
+  }
+  return path;
+}
+
+async function readRuntimeBytes(path: string, maximumBytes: number, optional = false): Promise<Buffer | undefined> {
+  try {
+    await assertRegularEntry(path);
+  } catch (error) {
+    if (optional && await lstat(path).then(() => false, reason => reason?.code === "ENOENT")) return undefined;
+    throw error;
+  }
+  const file = await open(path, "r");
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > maximumBytes) throw startupUnavailable();
+    const bytes = Buffer.alloc(maximumBytes + 1); let size = 0;
+    while (size <= maximumBytes) {
+      const part = await file.read(bytes, size, bytes.length - size, size);
+      if (part.bytesRead === 0) return bytes.subarray(0, size);
+      size += part.bytesRead;
+    }
+    throw startupUnavailable();
+  } finally { await file.close(); }
+}
+
+async function runtimeFileDigest(path: string): Promise<string> {
+  const file = await open(path, "r");
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size < 1 || info.size > 268_435_456) throw startupUnavailable();
+    const hash = createHash("sha256"), bytes = Buffer.alloc(65_536); let size = 0;
+    for (;;) {
+      const part = await file.read(bytes, 0, bytes.length, size);
+      if (part.bytesRead === 0) return hash.digest("hex");
+      size += part.bytesRead;
+      if (size > 268_435_456) throw startupUnavailable();
+      hash.update(bytes.subarray(0, part.bytesRead));
+    }
+  } finally { await file.close(); }
 }
 
 /**
@@ -760,8 +872,25 @@ async function connectJson(
     try { body = await response.json(); } catch { body = undefined; }
     return { kind: "response", status: response.status, ...(body === undefined ? {} : { body }) };
   } catch (error) {
+    if (error !== null && typeof error === "object" && "code" in error && (error.code === "identity_mismatch" || error.code === "authentication_failed")) return { kind: "response", status: 495 };
     return connectionRefused(error) ? { kind: "absent" } : { kind: "indeterminate" };
   }
+}
+
+/** Reachability alone never authenticates a node or permits reading a credential. */
+async function managedLoopbackListenerAbsent(origin: string): Promise<boolean> {
+  const url = new URL(origin), host = url.hostname.replace(/^\[|\]$/gu, "");
+  if (url.origin !== origin || url.protocol !== "http:" || !(host === "localhost" || host === "::1" || isIP(host) === 4 && host.startsWith("127."))) {
+    throw new Error("The managed local probe origin is invalid.");
+  }
+  return new Promise(resolve => {
+    const socket = createConnection({ host, port: Number(url.port || "80") });
+    let settled = false;
+    const finish = (absent: boolean) => { if (settled) return; settled = true; socket.destroy(); resolve(absent); };
+    socket.once("connect", () => finish(false));
+    socket.once("error", error => finish((error as NodeJS.ErrnoException).code === "ECONNREFUSED"));
+    socket.setTimeout(2000, () => finish(false));
+  });
 }
 
 /** These two bootstrap probes are local RPCs, independent of the runtime's

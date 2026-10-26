@@ -399,8 +399,18 @@ describe("real Pi managed generation smoke", () => {
     }
   });
 
-  it("clears real Pi continuation queues before aborting the active lifecycle", { timeout: 30_000 }, async () => {
+  it("clears real Pi continuation queues before aborting the active lifecycle", { timeout: 30_000 }, async ({ onTestFailed }) => {
+    const started = performance.now();
+    let phase = "provider-start";
+    let failurePhase: string | undefined;
+    let requestCount = () => 0;
+    let doneCounts = () => [] as number[];
+    onTestFailed(() => {
+      console.info("Pi continuation abort failure:", { phase, failurePhase, elapsedMs: Math.round(performance.now() - started),
+        providerRequests: requestCount(), doneCounts: doneCounts() });
+    });
     const provider = await startGatedContinuationServer();
+    requestCount = () => provider.requests.length;
     const address = provider.server.address() as AddressInfo;
     const agentHome = await mkdtemp(join(tmpdir(), "joko-real-pi-abort-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-real-pi-abort-workspace-"));
@@ -426,8 +436,10 @@ describe("real Pi managed generation smoke", () => {
     const promptSink = new EventSink();
     const steerSink = new EventSink();
     const followUpSink = new EventSink();
+    doneCounts = () => [promptSink.doneCount, steerSink.doneCount, followUpSink.doneCount];
     const creationContext = { ...smokeContext(target, 1, promptSink), sessionId: "real-pi-abort-session" };
     try {
+      phase = "create-session";
       const binding = await adapter.createSession({
         target,
         providerId: "abort-provider",
@@ -440,12 +452,18 @@ describe("real Pi managed generation smoke", () => {
       const steerContext = { ...smokeContext(target, 1, steerSink), sessionId: creationContext.sessionId, binding };
       const followUpContext = { ...smokeContext(target, 1, followUpSink), sessionId: creationContext.sessionId, binding };
 
+      phase = "initial-prompt";
       await adapter.send({ text: "initial prompt", images: [], files: [], mentions: [], disposition: "prompt" }, promptContext);
+      phase = "provider-request";
       await provider.firstRequestReceived;
+      phase = "steer";
       await adapter.send({ text: "queued steering", images: [], files: [], mentions: [], disposition: "steer" }, steerContext);
+      phase = "follow-up";
       await adapter.send({ text: "queued follow-up", images: [], files: [], mentions: [], disposition: "follow_up" }, followUpContext);
+      phase = "abort";
       await adapter.abort(promptContext);
 
+      phase = "settlement";
       await Promise.all([
         promptSink.waitForDone(1),
         steerSink.waitForDone(1),
@@ -456,9 +474,15 @@ describe("real Pi managed generation smoke", () => {
           .toEqual([{ type: "done", outcome: "aborted" }]);
       }
       expect(provider.requests).toHaveLength(1);
+    } catch (error) {
+      failurePhase = phase;
+      throw error;
     } finally {
+      phase = "release-provider";
       provider.releaseFirstResponse();
+      phase = "dispose-adapter";
       await adapter.dispose().catch(() => undefined);
+      phase = "close-provider";
       await closeServer(provider.server);
     }
   });

@@ -5,6 +5,7 @@ import {
   type MobileSecureStorageDriver
 } from "./connection-storage";
 import type { PairedCredential } from "./network";
+import { rememberEndpointTransport, trustedEndpointTransport } from '@joko/connection-transport/trust';
 
 const first: PairedCredential = {
   profileId: "profile-one",
@@ -68,6 +69,66 @@ function drivers() {
 }
 
 describe("current-v1 mobile connection storage", () => {
+  it('restores the selected HTTP CONNECT locator from protected storage without publishing it in the profile', async () => {
+    const memory = drivers(), storage = createMobileStorage(memory.plain, memory.secure);
+    const credential = { ...second, origin: 'https://mobile-connect.example', endpointPublicKey: `ed25519:${'a'.repeat(64)}`, transportKind: 'http-connect' as const };
+    const locator = { kind: 'http-connect' as const, proxyOrigin: 'https://private-proxy.example:8443', authority: 'mobile-connect.example:443' };
+    rememberEndpointTransport(credential.origin, credential.endpointPublicKey, locator);
+    await storage.saveConnection(credential);
+    expect(JSON.stringify([...memory.plainValues])).not.toContain(locator.proxyOrigin);
+    expect(JSON.stringify([...memory.secureValues])).toContain(locator.proxyOrigin);
+    const restarted = createMobileStorage(memory.plain, memory.secure), index = await restarted.loadConnectionIndex();
+    expect(index.profiles[0]?.transportKind).toBe('http-connect');
+    await restarted.loadEndpointTransport!(index.profiles[0]!);
+    expect(trustedEndpointTransport(credential.origin, credential.endpointPublicKey, 'http-connect')).toEqual(locator);
+    await expect(restarted.loadCredential(index.profiles[0]!.profileId)).resolves.toMatchObject({ authKey: credential.authKey, transportKind: 'http-connect' });
+  });
+  it('retains unknown relay requests across restart using only public metadata, then renews a confirmed expired lease', async () => {
+    const memory = drivers(), storage = createMobileStorage(memory.plain, memory.secure);
+    const input = { requestId: '00000000-0000-4000-8000-000000000001', nodeEndpointId: 'a'.repeat(64), recipientEndpointId: 'b'.repeat(64) };
+    const replacement = { ...input, requestId: '00000000-0000-4000-8000-000000000002' };
+    await expect(storage.claimIrohRelayRequest!(second, input)).resolves.toEqual(input);
+    const restarted = createMobileStorage(memory.plain, memory.secure);
+    await expect(restarted.claimIrohRelayRequest!(second, replacement)).resolves.toEqual(input);
+    expect(memory.secureValues.size).toBe(0);
+    expect(JSON.stringify([...memory.plainValues])).not.toContain(second.authKey);
+    await restarted.confirmIrohRelayRequest!(second, input, Date.now() - 1);
+    await expect(restarted.claimIrohRelayRequest!(second, replacement)).resolves.toEqual(replacement);
+    await expect(restarted.claimIrohRelayRequest!(first, input)).resolves.toEqual(input);
+  });
+
+  it('keeps a private SDK locator separate from public profiles and the business credential', async () => {
+    const memory = drivers(), reads: string[] = [];
+    const get = memory.secure.getItem;
+    memory.secure.getItem = async key => { reads.push(key); return get(key); };
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const credential = { ...second, origin: 'https://mobile-sdk-storage.example', endpointPublicKey: `ed25519:${'e'.repeat(64)}`, transportKind: 'tailcat' as const };
+    const locator = { kind: 'tailcat', endpointId: `nodekey:${'f'.repeat(64)}`, address: 'tcPrivate-tailcat-psk', port: 4318 } as const;
+    rememberEndpointTransport(credential.origin, credential.endpointPublicKey, locator);
+    await storage.saveConnection(credential);
+    const profile = (await storage.loadConnectionIndex()).profiles[0]!;
+    expect(profile.transportKind).toBe('tailcat');
+    expect(JSON.stringify([...memory.plainValues])).not.toContain(locator.address);
+    expect(JSON.stringify([...memory.plainValues])).not.toContain(credential.authKey);
+    reads.length = 0;
+    await storage.loadEndpointTransport!(profile);
+    expect(reads).toEqual([`joko.mobile.connection-transport.v1.${credential.profileId}`]);
+    expect(trustedEndpointTransport(profile.origin, profile.endpointPublicKey!, 'tailcat')).toEqual(locator);
+    await expect(storage.loadCredential(profile.profileId)).resolves.toEqual(credential);
+    await storage.deleteConnection(profile.profileId);
+    expect([...memory.secureValues.keys()]).not.toContain(`joko.mobile.connection-transport.v1.${profile.profileId}`);
+    await expect(storage.loadEndpointTransport!(profile)).rejects.toThrow(/unavailable/u);
+  });
+  it("persists the full endpoint pin with the exact protected credential and public connection profile", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const pinned = { ...first, endpointPublicKey: `ed25519:${'a'.repeat(64)}` };
+    await storage.saveConnection(pinned);
+    await expect(storage.loadCredential(pinned.profileId)).resolves.toEqual(pinned);
+    await expect(storage.loadConnectionIndex()).resolves.toMatchObject({ profiles: [{ endpointPublicKey: pinned.endpointPublicKey, serverId: pinned.serverId, connectionId: pinned.connectionId }] });
+    await expect(storage.saveConnection({ ...pinned, endpointPublicKey: 'ed25519:truncated' })).rejects.toThrow(/public key/u);
+    await expect(storage.loadCredential(pinned.profileId)).resolves.toEqual(pinned);
+  });
   it("does not read the retired single-credential or boolean automatic-entry shapes", async () => {
     const memory = drivers();
     memory.secureValues.set("joko.mobile.credential.v1", JSON.stringify(first));

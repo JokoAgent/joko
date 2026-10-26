@@ -35,6 +35,7 @@ import {
   terminalElectronSmokeSource
 } from "../dist/runtime-staging.js";
 import { buildDevelopmentCommandHost } from "../../../packages/personal-development/scripts/build-command-host.mjs";
+import { pnpmInvocation } from "../../../scripts/pnpm-invocation.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const desktopRoot = resolve(scriptDirectory, "..");
@@ -131,6 +132,7 @@ try {
     normalizedCommandShims,
     optionalDependency,
     criticalImportsResolvedWithinCandidate: importSmoke.criticalImports,
+    isolatedExtensionDocument: importSmoke.isolatedExtensionDocument,
     piCliResolvedWithinCandidate: importSmoke.piCli,
     npmRuntime: importSmoke.npmRuntime,
     sqliteVec: sqliteVecSmoke,
@@ -162,6 +164,8 @@ async function copyWorkspaceInputs() {
   // The frozen workspace manifest names local dependency patches even when
   // the filtered production closure does not install the patched package.
   await copyRegularTree(join(repositoryRoot, "dependency-patches"), join(workspaceRoot, "dependency-patches"));
+  await mkdir(join(workspaceRoot, ".runtime"), { recursive: false, mode: 0o755 });
+  await copyRegularTree(join(repositoryRoot, ".runtime", "linkspan-packages"), join(workspaceRoot, ".runtime", "linkspan-packages"));
   for (const descriptor of ORCHESTRATOR_RUNTIME_PACKAGES) {
     const sourcePackageRoot = join(repositoryRoot, descriptor.workspacePath);
     const workspacePackageRoot = join(workspaceRoot, descriptor.workspacePath);
@@ -238,6 +242,10 @@ async function runCandidateImportSmoke(root) {
     '  assertContained(path);',
     '  await import(specification);',
     '}',
+    'const { isolatedExtensionDocument } = await import("./dist/extension-main-view-document.js");',
+    'const extensionDocument = await isolatedExtensionDocument({ html: Buffer.from(\'<script src="./entry.js"></script>\'), entry: "index.html",',
+    '  assertCurrent: async () => {}, read: async path => { if (path !== "entry.js") throw new Error("Unexpected isolated resource."); return { body: Buffer.from("window.jokoPackagingProbe = 1;"), mimeType: "text/javascript" }; } });',
+    'if (!Buffer.isBuffer(extensionDocument) || !extensionDocument.includes(Buffer.from("data:text/javascript;base64,"))) throw new Error("The isolated MainView compiler did not run in the staged runtime.");',
     'const piEntry = await realpath(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));',
     'const piCli = await realpath(resolve(dirname(piEntry), "cli.js"));',
     'assertContained(piCli);',
@@ -249,7 +257,7 @@ async function runCandidateImportSmoke(root) {
     'if (npmManifest.name !== npmRuntime.name || npmManifest.version !== npmRuntime.version || npmManifest.bin?.npm !== npmRuntime.packageBinTarget) {',
     '  throw new Error("The bundled npm runtime identity is invalid.");',
     '}',
-    'process.stdout.write(JSON.stringify({ ok: true, root, piCli, npmCli, npmVersion: npmManifest.version }));'
+    'process.stdout.write(JSON.stringify({ ok: true, root, piCli, npmCli, npmVersion: npmManifest.version, isolatedExtensionDocument: true }));'
   ].join("\n");
   await writeFile(smokePath, `${source}\n`, { flag: "wx", mode: 0o600 });
   try {
@@ -266,6 +274,7 @@ async function runCandidateImportSmoke(root) {
     if (typeof parsed.npmCli !== "string" || parsed.npmVersion !== ORCHESTRATOR_BUNDLED_NPM_RUNTIME.version) {
       throw new Error("The isolated Electron-Node import smoke returned an invalid npm runtime identity.");
     }
+    if (parsed.isolatedExtensionDocument !== true) throw new Error("The staged MainView compiler was not exercised.");
     const npmResult = await runCommand(electronExecutable(), [parsed.npmCli, "--version"], {
       cwd: root,
       environment: electronNodeEnvironment(),
@@ -277,6 +286,7 @@ async function runCandidateImportSmoke(root) {
     }
     return {
       criticalImports: ORCHESTRATOR_RUNTIME_CRITICAL_IMPORTS.length,
+      isolatedExtensionDocument: true,
       piCli: parsed.piCli,
       npmRuntime: { cli: parsed.npmCli, version: parsed.npmVersion }
     };
@@ -480,45 +490,6 @@ function electronExecutable() {
   const executable = createRequire(import.meta.url)("electron");
   if (typeof executable !== "string" || executable === "") throw new Error("Electron executable is unavailable.");
   return executable;
-}
-
-async function pnpmInvocation() {
-  if (process.platform !== "win32") return { executable: "pnpm", arguments: [] };
-  const activeEntry = process.env.npm_execpath;
-  if (
-    typeof activeEntry === "string" &&
-    isAbsolute(activeEntry) &&
-    resolve(activeEntry) === activeEntry &&
-    basename(activeEntry).toLowerCase() === "pnpm.cjs" &&
-    await regularFileExists(activeEntry)
-  ) {
-    return { executable: process.execPath, arguments: [activeEntry] };
-  }
-  const diagnostics = [];
-  for (const directory of (process.env.PATH ?? process.env.Path ?? "").split(delimiter).filter(Boolean)) {
-    const direct = resolve(directory, "pnpm.exe");
-    if (await regularFileExists(direct)) return { executable: direct, arguments: [] };
-    const wrapper = resolve(directory, "pnpm.cmd");
-    if (!await regularFileExists(wrapper)) continue;
-    const packageEntry = resolve(directory, "..", "pnpm", "bin", "pnpm.cjs");
-    if (await regularFileExists(packageEntry)) {
-      return { executable: process.execPath, arguments: [packageEntry] };
-    }
-    const source = await readFile(wrapper, "utf8");
-    const normalizedSource = source.toLowerCase();
-    const prefix = normalizedSource.indexOf('"%~dp0');
-    const suffix = normalizedSource.indexOf('pnpm.exe"', prefix + 6);
-    if (prefix < 0 || suffix < 0) {
-      diagnostics.push(`${wrapper}:not-direct`);
-      continue;
-    }
-    const relativeExecutable = source.slice(prefix + 6, suffix + "pnpm.exe".length);
-    if (relativeExecutable.includes("\r") || relativeExecutable.includes("\n") || relativeExecutable.includes('"')) continue;
-    const executable = resolve(`${directory}${relativeExecutable.replaceAll("\\", "/")}`);
-    if (await regularFileExists(executable)) return { executable, arguments: [] };
-    diagnostics.push(`${wrapper}:missing-${executable}`);
-  }
-  throw new Error(`A directly executable pnpm binary could not be resolved without a command shell (${diagnostics.join("; ")}).`);
 }
 
 async function regularFileExists(path) {

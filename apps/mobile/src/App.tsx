@@ -23,6 +23,7 @@ import {
 import type { PartnerLearningSettingsDestination } from "@joko/contracts";
 import { MobilePartnerLearningFooter } from "./MobilePartnerLearningFooter";
 import { MobileSharedConnectionScreen } from "./MobileSharedConnectionScreen";
+import { MobileLinkspanHost } from './MobileLinkspanHost';
 import { MobileFileTextPreview } from "./MobileFileTextPreview";
 import { useMobileFileTextActions } from "./use-mobile-file-text-actions";
 import { MobileFilesPreviewPager } from "./MobileFilesPreviewPager";
@@ -948,6 +949,7 @@ export function App() {
   const handleComposerFocused = useCallback(() => setFocusTaskComposer(false), []);
   return (
     <SafeAreaProvider>
+      <MobileLinkspanHost />
       <MobileAdaptiveWindowProvider>
       <MobileNavigationFrame dark={dark} onBack={() => {
         if (!foreground || updates.forced || updates.prompt) return false;

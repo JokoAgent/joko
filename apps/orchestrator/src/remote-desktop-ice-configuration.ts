@@ -98,7 +98,7 @@ async function readConfigurationBody(response: Response, signal: AbortSignal): P
   }
 }
 
-async function readIceToken(path: string, signal: AbortSignal): Promise<string> {
+export async function readIceToken(path: string, signal: AbortSignal): Promise<string> {
   const directory = dirname(path);
   await inspectKeyDirectoryPermissions(directory, signal);
   signal.throwIfAborted();

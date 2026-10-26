@@ -1,8 +1,10 @@
+import { normalizeEndpointTransport } from '@joko/connection-transport/trust';
+
 export type MobileConnectionActionName =
   | "connect" | "pair" | "disconnect" | "forgetProfile" | "refreshDiscoveredNodes"
   | "retryManagedOrchestrator" | "cancelAutomaticConnectionAttempt"
   | "setAutomaticConnectionEnabled" | "setTheme" | "inspect" | "requestPairing"
-  | "cancelPairing" | "recheckSavedProfiles" | "goBack" | "selectMode";
+  | "cancelPairing" | "recheckSavedProfiles" | "goBack" | "selectMode" | "trustEndpoint" | 'createTailcatClient' | 'createIrohClient' | 'setProfileIrohMode';
 
 export type MobileConnectionMessage =
   | { readonly type: "ready"; readonly instanceId: string }
@@ -11,7 +13,7 @@ export type MobileConnectionMessage =
 
 /** Only the local connection surface may request these host capabilities. */
 export function parseMobileConnectionMessage(raw: string, instanceId: string): MobileConnectionMessage | undefined {
-  if (raw.length > 16_384) return undefined;
+  if (raw.length > 32_768) return undefined;
   let value: unknown;
   try { value = JSON.parse(raw); } catch { return undefined; }
   if (!record(value) || value.instanceId !== instanceId) return undefined;
@@ -33,6 +35,20 @@ export function parseMobileConnectionMessage(raw: string, instanceId: string): M
     case "forgetProfile": valid = args.length === 1 && text(0, 256); break;
     case "inspect": valid = args.length === 1 && text(0, 2_048); break;
     case "requestPairing": valid = args.length === 2 && text(0, 2_048) && text(1, 256); break;
+    case 'setProfileIrohMode': valid = args.length === 2 && text(0, 192) && (args[1] === 'native' || args[1] === 'relay'); break;
+    case "trustEndpoint": {
+      valid = (args.length >= 2 && args.length <= 5) && text(0, 2_048) && text(1, 80) && /^ed25519:[a-f0-9]{64}$/u.test(args[1] as string) && (args[2] === undefined || typeof args[2] === "boolean")
+        && (args[3] === undefined || args.length === 5 && args[3] === null || text(3, 256) && /^[a-z0-9][a-z0-9._:-]{0,255}$/iu.test(args[3] as string));
+      if (valid && args.length === 5) { try { normalizeEndpointTransport(args[4]); } catch { valid = false; } }
+      break;
+    }
+    case 'createTailcatClient': case 'createIrohClient': {
+      if (value.name === 'createIrohClient' && args.length === 0) { valid = true; break; }
+      if (value.name === 'createIrohClient' && args.length === 1) { valid = args[0] === 'native' || args[0] === 'relay'; break; }
+      valid = (args.length === 3 || value.name === 'createIrohClient' && args.length === 4 && (args[3] === 'native' || args[3] === 'relay')) && text(0, 2048) && text(1, 80) && /^ed25519:[a-f0-9]{64}$/u.test(args[1] as string);
+      if (valid) { try { valid = normalizeEndpointTransport(args[2]).kind === (value.name === 'createIrohClient' ? 'iroh' : 'tailcat'); } catch { valid = false; } }
+      break;
+    }
     case "setTheme": valid = args.length === 1 && (args[0] === "light" || args[0] === "dark" || args[0] === "system"); break;
     case "setAutomaticConnectionEnabled": valid = args.length === 1 && typeof args[0] === "boolean"; break;
     case "selectMode": valid = args.length === 1 && (args[0] === "nearby" || args[0] === "saved" || args[0] === "pair"); break;

@@ -42,7 +42,7 @@ describe("Remote Host gateway", () => {
     const requests: any[] = [];
     let wrongRevision = false;
     const gateway = createOrchestratorGateway(
-      { id: "remote-directory", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "remote-directory", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", {}, () => remoteTransport((method, input) => {
         if (method !== "listRemoteHostDirectories") throw new Error(`Unexpected method: ${method}`);
         requests.push(input);
@@ -67,7 +67,7 @@ describe("Remote Host gateway", () => {
   it("maps remote project inspection and creation to the exact source Target and Host revisions", async () => {
     const requests: Array<{ readonly method: string; readonly input: any }> = [];
     const gateway = createOrchestratorGateway(
-      { id: "remote-project", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "remote-project", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", {}, () => remoteTransport((method, input) => {
         requests.push({ method, input });
         if (method === "inspectRemoteHostDirectory") {
@@ -184,7 +184,7 @@ describe("Remote Host gateway", () => {
       throw new Error(`Unexpected method: ${method}`);
     });
     const gateway = createOrchestratorGateway(
-      { id: "remote-connection", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
+      { id: "remote-connection", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
       "auth-key",
       { onSnapshot: (value) => { snapshot = value; } },
       () => transport
@@ -320,7 +320,7 @@ describe("Remote Host gateway", () => {
       })(), true);
     });
     const gateway = createOrchestratorGateway(
-      { id: "runtime", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "runtime", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", {}, () => transport
     );
     await gateway.connect();
@@ -370,7 +370,7 @@ describe("Remote Host gateway", () => {
       })(), true);
     });
     const gateway = createOrchestratorGateway(
-      { id: "runtime-invalid", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "runtime-invalid", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", {}, () => transport
     );
     await gateway.connect();
@@ -395,7 +395,7 @@ describe("Remote Host gateway", () => {
         });
       })() : idleStream(), true));
     const gateway = createOrchestratorGateway(
-      { id: "remote-watch", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "remote-watch", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", {}, () => transport
     );
     await gateway.connect();
@@ -428,7 +428,7 @@ describe("Remote Host gateway", () => {
       throw new Error(`Unexpected method: ${method}`);
     });
     const gateway = createOrchestratorGateway(
-      { id: "remote-credential", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "remote-credential", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", {}, () => transport
     );
     await gateway.connect();
@@ -459,7 +459,7 @@ describe("Remote Host gateway", () => {
       return create(SubmitOperationResponseSchema, { operation: { operationId: input.operationId, state: OperationState.SUCCEEDED } });
     });
     const gateway = createOrchestratorGateway(
-      { id: "remote-caller", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "remote-caller", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", {}, () => transport
     );
     await gateway.connect();
@@ -483,7 +483,7 @@ describe("Remote Host gateway", () => {
       return create(SubmitOperationResponseSchema, { operation: { operationId: input.operationId, state: OperationState.SUCCEEDED } });
     });
     const gateway = createOrchestratorGateway(
-      { id: "credential-consumer", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "credential-consumer", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", {}, () => transport
     );
     await gateway.connect();
@@ -527,7 +527,7 @@ describe("Remote Host gateway", () => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     const gateway = createOrchestratorGateway(
-      { id: "question-answer", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "question-answer", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key", { onSnapshot: (value) => { snapshot = value; } }, () => transport
     );
     await gateway.connect();
@@ -557,7 +557,7 @@ describe("Remote Host gateway", () => {
       throw new Error(`Unexpected method: ${method}`);
     });
     const gateway = createOrchestratorGateway(
-      { id: "remote-malformed", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
+      { id: "remote-malformed", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
       "auth-key",
       {},
       () => transport
@@ -569,7 +569,7 @@ describe("Remote Host gateway", () => {
 
   it.each([undefined, { value: 0n }])("fails closed without a current auto-connect revision (%s)", async (autoConnectRevision) => {
     const gateway = createOrchestratorGateway(
-      { id: "remote-auto-connect-malformed", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "remote-auto-connect-malformed", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key",
       {},
       () => remoteTransport((method) => {
@@ -587,7 +587,7 @@ describe("Remote Host gateway", () => {
 
   it("fails closed without an explicit auto-connect value", async () => {
     const gateway = createOrchestratorGateway(
-      { id: "remote-auto-connect-value-malformed", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "remote-auto-connect-value-malformed", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "auth-key",
       {},
       () => remoteTransport((method) => {
@@ -619,7 +619,7 @@ describe("Remote Host gateway", () => {
           });
     });
     const gateway = createOrchestratorGateway(
-      { id: "remote-pages", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
+      { id: "remote-pages", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
       "auth-key",
       {},
       () => transport
@@ -635,7 +635,7 @@ describe("Remote Host gateway", () => {
 
     let calls = 0;
     const cyclicGateway = createOrchestratorGateway(
-      { id: "remote-cycle", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
+      { id: "remote-cycle", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
       "auth-key",
       {},
       () => remoteTransport((method) => {

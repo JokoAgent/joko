@@ -2,6 +2,7 @@ import {
   DEFAULT_NODE_DEVICE_PEER_AGENT_ROUTE_PORT,
   runNodeDevicePeerAgentRoute,
   type NodeDevicePeerAgentConnection,
+  type NodeDevicePeerAgentRetirementStage,
   type NodeDevicePeerAgentRoutePort
 } from "@joko/device-peer";
 import { DeviceKind } from "@joko/contracts";
@@ -23,6 +24,7 @@ export interface DesktopDevicePeerAgentRouteOptions {
   ) => boolean | Promise<boolean>;
   readonly heartbeatIntervalMs?: number;
   readonly port?: DesktopDevicePeerAgentRoutePort;
+  readonly observeRetirement?: (stage: NodeDevicePeerAgentRetirementStage) => void;
 }
 
 /** Maps Desktop's protected profile identity into the neutral Node route owner. */
@@ -34,6 +36,7 @@ export function runDesktopDevicePeerAgentRoute(
     deviceId: options.connection.deviceId,
     serverId: options.connection.serverId,
     origin: options.connection.origin,
+    endpointPublicKey: options.connection.endpointPublicKey,
     expectedDeviceKind: DeviceKind.DESKTOP
   };
   return runNodeDevicePeerAgentRoute({
@@ -43,6 +46,7 @@ export function runDesktopDevicePeerAgentRoute(
     readAuthKey: options.readAuthKey,
     readDefaultDeviceName: options.readDefaultDeviceName,
     readRouteAuthorization: options.readRouteAuthorization,
+    ...(options.observeRetirement === undefined ? {} : { observeRetirement: options.observeRetirement }),
     isAuthorityCurrent: async (candidate) => sameNodeConnection(candidate, connection)
       && await options.isAuthorityCurrent(options.connection),
     ...(options.heartbeatIntervalMs === undefined
@@ -62,5 +66,5 @@ function sameNodeConnection(
     && left.deviceId === right.deviceId
     && left.serverId === right.serverId
     && left.expectedDeviceKind === right.expectedDeviceKind
-    && left.origin === right.origin;
+    && left.origin === right.origin && left.endpointPublicKey === right.endpointPublicKey;
 }

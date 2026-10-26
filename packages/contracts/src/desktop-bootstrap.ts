@@ -39,6 +39,7 @@ export interface DesktopBootstrapResponse {
   readonly parentPid: number;
   readonly serverId: string;
   readonly origin: string;
+  readonly endpointPublicKey?: string;
   readonly connectionId: string;
   readonly authKey: string;
   readonly issuedAt: number;
@@ -194,6 +195,7 @@ export class DesktopBootstrapGrant {
   exchange(input: {
     readonly serverId: string;
     readonly origin: string;
+    readonly endpointPublicKey?: string;
     readonly issueConnection: (input: TrustedDesktopConnectionInput) => TrustedDesktopConnectionResult;
   }): DesktopBootstrapResponse {
     const now = this.#now();
@@ -204,6 +206,7 @@ export class DesktopBootstrapGrant {
     }
     const serverId = validatedServerId(input.serverId);
     const origin = validatedLoopbackOrigin(input.origin);
+    if (input.endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(input.endpointPublicKey)) throw invalidResponse();
 
     // Burn before issuing durable authority. A failure cannot make this
     // capability reusable and accidentally mint a second credential.
@@ -239,6 +242,7 @@ export class DesktopBootstrapGrant {
         parentPid: this.request.parentPid,
         serverId,
         origin,
+        ...(input.endpointPublicKey === undefined ? {} : { endpointPublicKey: input.endpointPublicKey }),
         connectionId: validatedOpaqueId(result.connection.id),
         authKey: validatedAuthKey(result.authKey),
         issuedAt: now
@@ -437,6 +441,7 @@ export function encodeDesktopBootstrapResponseFrame(value: DesktopBootstrapRespo
     parentPid: response.parentPid,
     serverId: response.serverId,
     origin: response.origin,
+    ...(response.endpointPublicKey === undefined ? {} : { endpointPublicKey: response.endpointPublicKey }),
     connectionId: response.connectionId,
     authKey: response.authKey,
     issuedAt: response.issuedAt,
@@ -534,7 +539,7 @@ export function parseDesktopBootstrapRequest(value: unknown): DesktopBootstrapRe
 export function parseDesktopBootstrapResponse(value: unknown): DesktopBootstrapResponse {
   if (!isExactRecord(value, [
     "kind", "protocolVersion", "instanceId", "deviceId", "parentPid", "serverId", "origin", "connectionId",
-    "authKey", "issuedAt", "proof"
+    "authKey", "issuedAt", "proof", ...(value !== null && typeof value === "object" && Object.hasOwn(value, "endpointPublicKey") ? ["endpointPublicKey"] : [])
   ])) throw invalidResponse();
   if (
     value["kind"] !== RESPONSE_KIND ||
@@ -544,6 +549,7 @@ export function parseDesktopBootstrapResponse(value: unknown): DesktopBootstrapR
     !validPid(value["parentPid"]) ||
     typeof value["serverId"] !== "string" || validatedServerId(value["serverId"]) !== value["serverId"] ||
     typeof value["origin"] !== "string" || validatedLoopbackOrigin(value["origin"]) !== value["origin"] ||
+    (value["endpointPublicKey"] !== undefined && (typeof value["endpointPublicKey"] !== "string" || !/^ed25519:[a-f0-9]{64}$/u.test(value["endpointPublicKey"]))) ||
     typeof value["connectionId"] !== "string" || validatedOpaqueId(value["connectionId"]) !== value["connectionId"] ||
     typeof value["authKey"] !== "string" || validatedAuthKey(value["authKey"]) !== value["authKey"] ||
     !validTimestamp(value["issuedAt"]) ||
@@ -625,6 +631,7 @@ function unsignedResponse(response: DesktopBootstrapResponse): Omit<DesktopBoots
     parentPid: response.parentPid,
     serverId: response.serverId,
     origin: response.origin,
+    ...(response.endpointPublicKey === undefined ? {} : { endpointPublicKey: response.endpointPublicKey }),
     connectionId: response.connectionId,
     authKey: response.authKey,
     issuedAt: response.issuedAt

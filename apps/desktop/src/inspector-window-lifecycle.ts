@@ -56,22 +56,22 @@ export class InspectorWindowLifecycle<
   }
 
   owns(owner: Owner, child: Child): boolean {
-    return owner === this.#owner && child === this.#child && this.#currentOccurrence();
+    return owner === this.#owner && child === this.#child && this.#closeKind === "open" && this.#currentOccurrence();
   }
 
   markReady(child: Child): boolean {
-    if (child !== this.#child || !this.#current()) return false;
+    if (child !== this.#child || this.#closeKind !== "open" || !this.#current()) return false;
     this.#ready = true;
     return true;
   }
 
   ownerHidden(owner: Owner): void {
-    if (owner !== this.#owner || !this.#current() || this.#child.isDestroyed()) return;
+    if (owner !== this.#owner || this.#closeKind !== "open" || !this.#current() || this.#child.isDestroyed()) return;
     this.#child.hide();
   }
 
   ownerShown(owner: Owner): void {
-    if (owner !== this.#owner || !this.#ready || !this.#current() || this.#child.isDestroyed()) return;
+    if (owner !== this.#owner || this.#closeKind !== "open" || !this.#ready || !this.#current() || this.#child.isDestroyed()) return;
     if (owner.isDestroyed() || !owner.isVisible() || owner.isMinimized()) return;
     this.#child.showInactive();
   }
@@ -129,7 +129,7 @@ export class InspectorWindowLifecycle<
   }
 
   canReveal(child: Child): boolean {
-    return child === this.#child && this.#ready && this.#current() &&
+    return child === this.#child && this.#closeKind === "open" && this.#ready && this.#current() &&
       this.#ownerCanReceiveFocus();
   }
 

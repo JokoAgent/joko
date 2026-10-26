@@ -194,6 +194,7 @@ async function mount(connectFirst = true, showPrice = false, showEditor = false)
   const auth = vi.fn(async (_owner: ConnectionProfile) => "private-test-bearer");
   vi.spyOn(LocalState, "open").mockResolvedValue({ listProfiles: async () => [a, b, c], listMachineCaches: async () => [],
     readPreferences: async () => DEFAULT_UI_PREFERENCES, readAuthKey: auth, saveProfile: async () => undefined, deleteProfile,
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
     saveMachineCache: async () => undefined, deleteMachineCache: async () => undefined,
     mutatePreferences: async (update: (value: typeof DEFAULT_UI_PREFERENCES) => typeof DEFAULT_UI_PREFERENCES) => update(DEFAULT_UI_PREFERENCES)
   } as unknown as LocalState);

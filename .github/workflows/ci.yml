@@ -28,6 +28,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'browser-regressions' && format('-browser-regressions-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
@@ -60,6 +61,12 @@ jobs:
         with:
           node-version: 24.19.0
           cache: pnpm
+
+      - name: Install the fixed helper build toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
 
       - name: Use the canonical temporary directory
         id: temporary
@@ -102,6 +109,8 @@ jobs:
         timeout-minutes: 1
         run: node scripts/ci/macos-loopback-multicast.mjs configure
 
+      - name: Prepare Linkspan from remote main
+        run: node scripts/prepare-linkspan.mjs
       - name: Install dependencies from lockfile
         id: dependencies
         shell: bash
@@ -418,12 +427,59 @@ jobs:
           JOKO_E2E_SOAK_DURATION_MS: "3000"
           JOKO_E2E_FAULTS: clean,crash,dispatch_unknown,hang
 
+      - name: Read the installed macOS target-only stack tool capabilities
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'desktop-product' && runner.os == 'macOS' }}
+        timeout-minutes: 1
+        continue-on-error: true
+        shell: bash
+        run: node apps/desktop/scripts/mac-native-stack.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/mac-native-stack-capabilities.jsonl"
+
+      - name: Observe the fixed macOS engine after owned renderer retirement
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'desktop-product' && runner.os == 'macOS' }}
+        timeout-minutes: 1
+        continue-on-error: true
+        shell: bash
+        run: node apps/desktop/scripts/probe-mac-native-scheduler.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/mac-native-scheduler-observation.log"
+
+      - name: Upload the immediate macOS stack-tool and scheduler observations
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'desktop-product' && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-native-stack-preparation-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/mac-native-stack-capabilities.jsonl
+            ${{ runner.temp }}/joko-ci-logs/mac-native-scheduler-observation.log
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Build and verify isolated Desktop Orchestrator runtime
         id: desktop_runtime
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
         timeout-minutes: 45
         shell: bash
         run: pnpm stage:desktop:orchestrator-runtime 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-runtime.log"
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+          JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.scope == 'desktop-product' && 'cloudflare,iroh,tailcat,pinggy-sdk' || 'cloudflare,iroh,tailcat' }}
+
+      - name: Verify the selected Pinggy SDK and managed child in the isolated runtime
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && inputs.scope == 'desktop-product' }}
+        timeout-minutes: 5
+        shell: bash
+        env:
+          JOKO_DESKTOP_PINGGY_PREPARED_ENTRY: ${{ github.workspace }}/apps/desktop/dist/orchestrator-runtime/dist/main.js
+        run: pnpm --filter @joko/desktop exec vitest run test/managed-orchestrator-pinggy.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/pinggy-managed-runtime.log"
+
+      - name: Verify connection, media ownership and selected SDK product paths
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          pnpm --filter @joko/connection-transport test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/connection-transports.log"
+          pnpm --filter @joko/orchestrator exec vitest run linkspan src/config.test.ts src/connection-manager.test.ts device-peer src/remote-desktop-coordinator.test.ts src/hosted-agent-desktop-service.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/connection-media-lifecycles.log"
+          pnpm --filter @joko/desktop exec vitest run linkspan src/connection-transport.test.ts test/remote-desktop-media.test.ts test/remote-desktop-native.test.ts test/secure-files.test.ts test/mcp-app-host.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-sdk-connections.log"
+          pnpm --filter @joko/web exec vitest run linkspan src/gateway.auth-context.test.ts src/local-state-credentials.test.ts DevicePairingInvitation ConnectionScreen 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/web-sdk-connections.log"
+          pnpm --filter @joko/mobile exec vitest run linkspan network mobile-client mobile-iroh-native mobile-http-connect-native connection-storage mobile-connection-protocol mobile-workspace-inputs MobileDevicePairingInvitation MobileSharedConnectionScreen MobileSettingsScreen mobile-file-share.secure-transfer mobile-release-artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/mobile-sdk-connections.log"
 
       - name: Check smoke evidence preservation before profile cleanup
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'desktop-product' }}
@@ -561,6 +617,20 @@ jobs:
         env:
           JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
           JOKO_DESKTOP_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/joko-packaged-evidence
+
+      - name: Upload the immediate macOS native retirement stack and progress
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-native-stack-result-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-packaged-evidence/**/result.json
+            ${{ runner.temp }}/joko-packaged-evidence/**/result.txt.progress
+            ${{ runner.temp }}/joko-packaged-evidence/**/result.txt.native-retirement-sample.json
+            ${{ runner.temp }}/joko-packaged-evidence/**/result.txt.uncaught-exception.json
+            ${{ runner.temp }}/joko-ci-logs/desktop-smoke.log
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Run the independent Desktop viewer GUI chain (Linux)
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
@@ -711,6 +781,12 @@ jobs:
       - name: Use the canonical temporary directory for parser owners
         run: |
           node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync.native(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV,['TMPDIR='+canonical,'TMP='+canonical,'TEMP='+canonical,''].join('\n'));"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
+      - name: Prepare Linkspan from remote main
+        run: node scripts/prepare-linkspan.mjs
       - name: Install dependencies from lockfile
         id: dependencies
         shell: bash

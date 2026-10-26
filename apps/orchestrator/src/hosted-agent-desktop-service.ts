@@ -34,6 +34,7 @@ export interface HostedAgentDesktopServiceOptions {
   /** The managed service's own identity, never accepted from an RPC message. */
   readonly serverId: string;
   readonly groupOptions?: Omit<ProviderGroupConnectOptions, "authenticate">;
+  readonly media?: { readonly localUdpRetirementRequired: boolean; retireLocalMedia(connection: ConnectionRecord, leaseId: string, attemptId: string): Promise<void> };
 }
 
 /** Each committed Main-process route owns a distinct native authority. The
@@ -64,6 +65,19 @@ export class HostedAgentDesktopDelegates {
       }
     };
     return {
+      getDesktopMediaUdpPolicy: (request, context) => invoke(request.format, context, () => create(contract.GetDesktopMediaUdpPolicyResponseSchema, {
+        format: FORMAT, retirementRequired: this.options.media?.localUdpRetirementRequired === true
+      })),
+      retireDesktopMediaUdp: async (request, context) => {
+        if (request.format !== FORMAT || this.#closed) throw new ConnectError("Desktop media cleanup is unavailable.", Code.FailedPrecondition);
+        let connection: ConnectionRecord;
+        try { connection = this.options.connections.authenticateDesktopMediaRetirement(request.connectionId,
+          context.requestHeader.get("authorization") ?? undefined, context.requestHeader.get(DESKTOP_HOST_AUTHORIZATION_HEADER) ?? undefined); }
+        catch { throw new ConnectError("Original Desktop Main cleanup authentication is required.", Code.Unauthenticated); }
+        try { await this.options.media?.retireLocalMedia(connection, request.leaseId, request.attemptId); }
+        catch { throw new ConnectError("The original Desktop media UDP cleanup is unconfirmed.", Code.Unavailable); }
+        return create(contract.RetireDesktopMediaUdpResponseSchema, { format: FORMAT });
+      },
       openDesktopHostedAgentDelegate: (request, context) => invoke(request.format, context, authority => {
         if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(request.routeInstanceId)) {
           throw new ConnectError("The native route identity is invalid.", Code.InvalidArgument);

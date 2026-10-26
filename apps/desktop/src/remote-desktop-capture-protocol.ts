@@ -80,7 +80,8 @@ export type DesktopRemoteDesktopCaptureCommand =
       readonly leaseId: string;
       readonly enabled: boolean;
     }
-  | { readonly op: "stop" };
+  | { readonly op: "stop" }
+  | { readonly op: "quiesce" };
 
 export type DesktopRemoteDesktopCaptureReply =
   | { readonly kind: "frame"; readonly frame: RemoteDesktopJpegFrame | null }

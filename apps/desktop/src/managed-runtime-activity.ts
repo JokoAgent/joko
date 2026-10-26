@@ -1,5 +1,5 @@
 import { createClient, type Interceptor, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, normalizeEndpointPublicKey, requireEndpointTrust } from "@joko/connection-transport/node";
 import { ConnectionService, EventService } from "@joko/contracts";
 
 import type { DesktopManagedOrchestratorConnection } from "./channels.js";
@@ -30,7 +30,8 @@ export async function probeManagedRuntimeActivity(
   }
   const canonicalOrigin = new URL(options.connection.origin).origin;
   if (canonicalOrigin !== options.connection.origin) throw new Error("Managed runtime activity authority is invalid.");
-  const transportFactory = options.transportFactory ?? createManagedRuntimeTransport;
+  const endpointPublicKey = options.connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin: canonicalOrigin }) : normalizeEndpointPublicKey(options.connection.endpointPublicKey);
+  const transportFactory = options.transportFactory ?? ((target: string, auth: string | undefined, timeout: number) => createManagedRuntimeTransport(target, auth, timeout, endpointPublicKey));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref();
@@ -82,7 +83,7 @@ function timestampMilliseconds(
   return milliseconds;
 }
 
-function createManagedRuntimeTransport(origin: string, authKey: string | undefined, timeoutMs: number): Transport {
+function createManagedRuntimeTransport(origin: string, authKey: string | undefined, timeoutMs: number, endpointPublicKey?: string): Transport {
   const interceptors: Interceptor[] = [];
   if (authKey !== undefined) interceptors.push((next) => (request) => {
     request.header.set("authorization", `Bearer ${authKey}`);
@@ -90,6 +91,7 @@ function createManagedRuntimeTransport(origin: string, authKey: string | undefin
   });
   return createConnectTransport({
     baseUrl: origin,
+    endpointPublicKey,
     httpVersion: "1.1",
     useBinaryFormat: true,
     interceptors,

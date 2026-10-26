@@ -1,4 +1,5 @@
 import { createClient, type Client, type Interceptor } from "@connectrpc/connect";
+import { createConnectTransport as createPinnedTransport } from "@joko/connection-transport/node";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import {
   ArtifactService,
@@ -81,20 +82,22 @@ export interface PairedClient {
   readonly clients: E2eClients;
 }
 
-export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = rpcTimeoutMs): E2eClients {
+export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = rpcTimeoutMs, endpointPublicKey?: string): E2eClients {
   const interceptors: Interceptor[] = authKey === undefined ? [] : [
     (next) => (request) => {
       request.header.set("authorization", `Bearer ${authKey}`);
       return next(request);
     }
   ];
-  const transport = createConnectTransport({
+  const transportOptions = {
     baseUrl,
-    httpVersion: "1.1",
+    httpVersion: "1.1" as const,
     useBinaryFormat: true,
     interceptors,
     defaultTimeoutMs: timeoutMs
-  });
+  };
+  const transport = endpointPublicKey === undefined ? createConnectTransport(transportOptions)
+    : createPinnedTransport({ ...transportOptions, endpointPublicKey });
   return {
     connection: createClient(ConnectionService, transport),
     collaboration: createClient(CollaborationService, transport),

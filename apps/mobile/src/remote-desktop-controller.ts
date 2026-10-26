@@ -4052,7 +4052,7 @@ function parseViewerMessage(raw: unknown): ViewerMessage | undefined {
     return { type: "offer", epoch: value.epoch, attemptId: value.attemptId as string, sdp: value.sdp };
   }
   if (value.type === "ice" && Number.isSafeInteger(value.after) && (value.after as number) >= 0
-    && (value.after as number) <= 128 && Number.isSafeInteger(value.exchangeId)
+    && (value.after as number) <= RTC_NETWORK.maxCandidates && Number.isSafeInteger(value.exchangeId)
     && (value.exchangeId as number) >= 0 && Array.isArray(value.candidates) && value.candidates.length <= 16) {
     const candidates = value.candidates.map(parseIceCandidate);
     if (candidates.every((candidate) => candidate !== undefined)) return {

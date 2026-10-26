@@ -1,5 +1,6 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
+import { readMobileExtensionMainViewResource } from "./mobile-extension-main-view-resource";
 import type { MobileConnectionProfile } from "./connection-storage";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
@@ -21,7 +22,8 @@ import { mobileTaskHeaderRole, type MobileTaskHeaderRole } from "./mobile-task-h
 import { protoMobilePartnerAvatar, type MobilePartnerAvatarIdentity } from "./mobile-partner-avatar";
 import { MobilePartnerCreationRejected, projectMobilePartnerCreationOptions, projectMobilePartnerCreationResult,
   type MobilePartnerCreationOptions, type MobilePartnerCreationDraft, type MobilePartnerCreationResult } from "./mobile-partner-creation";
-import { createConnectTransport } from "@connectrpc/connect-web";
+import { createConnectTransport, createConnectionFetch, rememberEndpointTrust, trustedEndpointPublicKey } from "@joko/connection-transport";
+import { assertTrustedEndpointServerId, endpointTransportForNewDevice, formatTrustedNodeInvitation, irohTransportForRecipient, isLoopbackEndpoint, normalizeEndpointPublicKey, pairingVerificationOrigin, requireIrohRelayInvitationRequest, trustedEndpointTransport, trustedEndpointTransportKind, type NewDeviceAuthorizationOptions, type NodePairingInvitation, type EndpointTransportKind } from "@joko/connection-transport/trust";
 import { createPartnerRoutineApi, PartnerRoutineService, type PartnerRoutineApi, createPartnerImportApi, PartnerImportService, type PartnerImportApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService, type PartnerHomeApi } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService, type PartnerGroupApi } from "@joko/contracts";
@@ -143,6 +145,8 @@ import {
 } from "./mobile-extension-library-runtime";
 
 export interface PairedCredential {
+  readonly endpointPublicKey?: string;
+  readonly transportKind?: EndpointTransportKind;
   readonly profileId: string;
   readonly origin: string;
   readonly serverId: string;
@@ -214,6 +218,8 @@ export interface MobileNetwork {
   inspect(origin: string, signal?: AbortSignal): Promise<NodeIdentity>;
   discover(origin: string, signal?: AbortSignal): Promise<readonly DiscoveredNodeRecord[]>;
   requestPairing(origin: string, deviceName: string, platform: string, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
+  cancelPairing?(origin: string, challengeId: string, signal?: AbortSignal, endpointPublicKey?: string, transportKind?: EndpointTransportKind): Promise<void>;
+  authorizeNewDevice?(credential: PairedCredential, signal?: AbortSignal, options?: NewDeviceAuthorizationOptions): Promise<NodePairingInvitation>;
   completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
   readOwner(credential: PairedCredential, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
   listRemoteDesktopHosts?(credential: PairedCredential, signal?: AbortSignal): Promise<readonly DevicePeerDescriptor[]>;
@@ -344,6 +350,8 @@ export interface MobileNetwork {
     surfaceId: string,
     signal?: AbortSignal
   ): Promise<MobileExtensionMainViewSurface>;
+  readExtensionMainViewResource(credential: PairedCredential, surface: MobileExtensionMainViewSurface, url: string,
+    kind: import("./mobile-extensions").MobileExtensionResourceKind, signal?: AbortSignal, text?: string): Promise<import("./mobile-extensions").MobileExtensionMainViewResource>;
   closeExtensionMainView(
     credential: PairedCredential,
     surfaceId: string,
@@ -583,6 +591,8 @@ export interface MaterializedWorkspaceBlob {
 }
 
 export interface AuthorizedBlobDownload {
+  readonly endpointPublicKey?: string;
+  readonly transportKind?: EndpointTransportKind;
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly blobId: string;
@@ -1033,11 +1043,11 @@ function acceptedWorkspacePreviewRevision(expected: FileRevision, actual: FileRe
 }
 
 export async function downloadVerifiedBlob(
-  credential: Pick<PairedCredential, "origin" | "authKey">,
+  credential: Pick<PairedCredential, "origin" | "authKey" | "endpointPublicKey" | "transportKind">,
   blob: BlobRef,
   ticket: BlobTransferTicket | undefined,
   signal?: AbortSignal,
-  fetcher: typeof fetch = fetch,
+  fetcher?: typeof fetch,
   digestBytes: (bytes: Uint8Array) => Promise<string> = sha256Hex
 ): Promise<VerifiedBlobDownload> {
   signal?.throwIfAborted();
@@ -1052,23 +1062,48 @@ export async function downloadVerifiedBlob(
     throw new Error("The Joko node returned an expired Blob download ticket.");
   }
   const endpoint = authorizedBlobEndpoint(credential.origin, ticket.relativeEndpoint);
-  const response = await fetcher(endpoint, {
+  const response = await (fetcher ?? createConnectionFetch(credential))(endpoint, {
     headers: { authorization: `Bearer ${credential.authKey}` },
     cache: "no-store",
+    redirect: "error",
     signal
   });
   signal?.throwIfAborted();
-  if (!response.ok) throw new Error(`Blob download failed (${response.status}).`);
+  if (!response.ok) { await response.body?.cancel().catch(() => undefined); throw new Error(`Blob download failed (${response.status}).`); }
   const declaredLength = response.headers.get("content-length")?.trim();
   if (!declaredLength || !/^(0|[1-9][0-9]*)$/u.test(declaredLength) || BigInt(declaredLength) !== blob.byteSize) {
+    await response.body?.cancel().catch(() => undefined);
     throw new Error("The Blob response length did not match its authenticated metadata.");
   }
   if (normalizeMediaType(response.headers.get("content-type") ?? "") !== normalizeMediaType(blob.mediaType)) {
+    await response.body?.cancel().catch(() => undefined);
     throw new Error("The Blob response media type did not match its authenticated metadata.");
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
+  const reader = response.body?.getReader();
+  if (!reader && blob.byteSize !== 0n) throw new Error("A streaming Blob response is required on this device.");
+  const bytes = new Uint8Array(Number(blob.byteSize));
+  let byteSize = 0;
+  const onAbort = (): void => { void reader?.cancel().catch(() => undefined); };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    while (reader) {
+      signal?.throwIfAborted();
+      const next = await reader.read();
+      signal?.throwIfAborted();
+      if (next.done) break;
+      if (!(next.value instanceof Uint8Array) || byteSize + next.value.byteLength > bytes.byteLength) {
+        throw new Error("The Blob response exceeded its authenticated size.");
+      }
+      bytes.set(next.value, byteSize);
+      byteSize += next.value.byteLength;
+    }
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    await reader?.cancel().catch(() => undefined);
+    reader?.releaseLock();
+  }
   signal?.throwIfAborted();
-  if (BigInt(bytes.byteLength) !== blob.byteSize || BigInt(bytes.byteLength) > ticket.maximumBytes) {
+  if (BigInt(byteSize) !== blob.byteSize || BigInt(byteSize) > ticket.maximumBytes) {
     throw new Error("The Blob response size did not match its authenticated metadata.");
   }
   if (await digestBytes(bytes) !== blob.sha256Hex) {
@@ -1079,7 +1114,7 @@ export async function downloadVerifiedBlob(
 }
 
 export function authorizeVerifiedBlobDownload(
-  credential: Pick<PairedCredential, "origin" | "authKey">,
+  credential: Pick<PairedCredential, "origin" | "authKey" | "endpointPublicKey" | "transportKind">,
   blob: BlobRef,
   ticket: BlobTransferTicket | undefined
 ): AuthorizedBlobDownload {
@@ -1096,6 +1131,8 @@ export function authorizeVerifiedBlobDownload(
   }
   return {
     url: authorizedBlobEndpoint(credential.origin, ticket.relativeEndpoint),
+    ...(credential.endpointPublicKey === undefined ? {} : { endpointPublicKey: credential.endpointPublicKey }),
+    ...(credential.transportKind === undefined ? {} : { transportKind: credential.transportKind }),
     headers: { authorization: `Bearer ${credential.authKey}` },
     blobId: blob.blobId,
     fileName: blob.fileName,
@@ -1106,12 +1143,12 @@ export function authorizeVerifiedBlobDownload(
 }
 
 export async function uploadVerifiedBlob(
-  credential: Pick<PairedCredential, "origin" | "authKey">,
+  credential: Pick<PairedCredential, "origin" | "authKey" | "endpointPublicKey" | "transportKind">,
   source: MobileBlobUploadSource,
   pending: PendingBlobUpload | undefined,
   complete: (uploadId: string, signal?: AbortSignal) => Promise<BlobRef | undefined>,
   signal?: AbortSignal,
-  uploader: MobileNativeBlobUploader = uploadNativeBlobFile
+  uploader?: MobileNativeBlobUploader
 ): Promise<BlobRef> {
   signal?.throwIfAborted();
   const exact = assertBlobUploadSource(source);
@@ -1129,10 +1166,13 @@ export async function uploadVerifiedBlob(
     throw new Error("The Joko node returned an expired Blob upload ticket.");
   }
   const endpoint = authorizedBlobEndpoint(credential.origin, ticket.relativeEndpoint);
-  const response = await uploader(endpoint, exact.uri, {
+  const headers = {
     authorization: `Bearer ${credential.authKey}`,
     "content-type": "application/octet-stream"
-  }, signal);
+  };
+  const response = uploader
+    ? await uploader(endpoint, exact.uri, headers, signal)
+    : await uploadNativeBlobFile(endpoint, exact, headers, signal, createConnectionFetch(credential));
   signal?.throwIfAborted();
   if (!Number.isSafeInteger(response.status) || response.status < 200 || response.status >= 300) {
     throw new Error(`Attachment upload failed (${response.status || "unknown"}).`);
@@ -1215,7 +1255,7 @@ function assertBlobUploadSource(source: MobileBlobUploadSource): MobileBlobUploa
   if (!source || typeof source !== "object" || typeof source.uri !== "string" || !source.uri
     || typeof source.fileName !== "string" || !source.fileName.trim() || source.fileName.length > 512
     || /[\u0000-\u001f\u007f]/u.test(source.fileName) || !mediaType
-    || !Number.isSafeInteger(source.byteSize) || source.byteSize <= 0
+    || !Number.isSafeInteger(source.byteSize) || source.byteSize <= 0 || source.byteSize > MOBILE_FILE_SHARE_MAXIMUM_BYTES
     || !/^[0-9a-f]{64}$/u.test(source.sha256Hex)) {
     throw new Error("The staged attachment upload metadata is invalid.");
   }
@@ -1229,20 +1269,75 @@ function validBlobTransferIdentity(value: string | undefined): value is string {
 
 async function uploadNativeBlobFile(
   endpoint: string,
-  sourceUri: string,
+  source: MobileBlobUploadSource,
   headers: Readonly<Record<string, string>>,
-  signal?: AbortSignal
+  signal: AbortSignal | undefined,
+  fetcher: typeof fetch
 ): Promise<{ readonly status: number; readonly body?: string }> {
-  const { File, UploadType } = await import("expo-file-system");
+  const { File, FileMode } = await import("expo-file-system");
+  const { sha256 } = await import("@noble/hashes/sha2.js");
   signal?.throwIfAborted();
-  const result = await new File(sourceUri).upload(endpoint, {
-    httpMethod: "PUT",
-    uploadType: UploadType.BINARY_CONTENT,
-    headers: { ...headers },
-    sessionType: "foreground",
-    signal
-  });
-  return { status: result.status, body: result.body };
+  const file = new File(source.uri);
+  if (!file.exists || file.size !== source.byteSize) throw new Error("The staged attachment changed before upload.");
+  const handle = file.open(FileMode.ReadOnly);
+  const digest = sha256.create();
+  const lifetime = new AbortController();
+  const transferSignal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(10 * 60_000), ...(signal === undefined ? [] : [signal])]);
+  let consumed = 0;
+  let closed = false;
+  let finished = false;
+  let resolveConsumed!: () => void;
+  let rejectConsumed!: (error: unknown) => void;
+  const consumption = new Promise<void>((resolve, reject) => { resolveConsumed = resolve; rejectConsumed = reject; });
+  void consumption.catch(() => undefined);
+  const close = (): void => { if (!closed) { closed = true; handle.close(); } };
+  let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const onAbort = (): void => {
+    const error = transferSignal.reason ?? new Error("The attachment upload was cancelled.");
+    rejectConsumed(error);
+    try { close(); } catch (closeError) { rejectConsumed(closeError); }
+    if (!finished) bodyController?.error(error);
+  };
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { bodyController = controller; },
+    pull(controller) {
+      try {
+        transferSignal.throwIfAborted();
+        if (consumed === source.byteSize) {
+          const hash = [...digest.digest()].map(byte => byte.toString(16).padStart(2, "0")).join("");
+          if (!file.exists || file.size !== source.byteSize || hash !== source.sha256Hex) {
+            throw new Error("The staged attachment changed while it was uploaded.");
+          }
+          finished = true; close(); controller.close(); resolveConsumed(); return;
+        }
+        const maximum = Math.min(64 * 1024, source.byteSize - consumed);
+        const chunk = handle.readBytes(maximum);
+        if (chunk.byteLength < 1 || chunk.byteLength > maximum) throw new Error("The staged attachment ended unexpectedly during upload.");
+        consumed += chunk.byteLength;
+        digest.update(chunk);
+        controller.enqueue(chunk);
+      } catch (error) {
+        close(); rejectConsumed(error); controller.error(error);
+      }
+    },
+    cancel(reason) { close(); if (!finished) rejectConsumed(reason ?? new Error("The attachment upload was cancelled.")); }
+  }, { highWaterMark: 0 });
+  transferSignal.addEventListener("abort", onAbort, { once: true });
+  if (transferSignal.aborted) onAbort();
+  try {
+    const result = await fetcher(endpoint, {
+      method: "PUT", headers: { ...headers }, body, signal: transferSignal,
+      redirect: "error", cache: "no-store", duplex: "half"
+    } as RequestInit);
+    transferSignal.throwIfAborted();
+    if (result.ok) await consumption;
+    await result.body?.cancel();
+    return { status: result.status };
+  } finally {
+    transferSignal.removeEventListener("abort", onAbort);
+    lifetime.abort();
+    close();
+  }
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -1368,7 +1463,12 @@ function normalizedMobilePushToken(value: string): string {
   return token;
 }
 
-function transport(origin: string, authKey?: string): Transport {
+function credentialTransport(credential: PairedCredential): Transport {
+  rememberEndpointTrust(credential);
+  return transport(credential.origin, credential.authKey, credential.endpointPublicKey, credential.transportKind ?? 'https');
+}
+
+function transport(origin: string, authKey?: string, endpointPublicKey?: string, transportKind?: EndpointTransportKind): Transport {
   const interceptors: Interceptor[] = authKey === undefined ? [] : [
     (next) => async (request) => {
       request.header.set("authorization", `Bearer ${authKey}`);
@@ -1376,7 +1476,7 @@ function transport(origin: string, authKey?: string): Transport {
       return next(request);
     }
   ];
-  return createConnectTransport({ baseUrl: origin, useBinaryFormat: true, interceptors });
+  return createConnectTransport({ baseUrl: origin, endpointPublicKey, transportKind, useBinaryFormat: true, interceptors });
 }
 
 export function parseNodeIdentity(server: {
@@ -1457,11 +1557,13 @@ function validRemoteDesktopDisplayModes(modes: readonly RemoteDesktopDisplayMode
 }
 
 export const mobileNetwork: MobileNetwork = {
-  inputHandoffApi: (credential, scope) => createMobileInputHandoffApi({ credential, scope, transport: transport(credential.origin, credential.authKey) }),
-  listInputHandoffTasks: (credential, signal) => readMobileInputHandoffTasks(transport(credential.origin, credential.authKey), signal),
+  inputHandoffApi: (credential, scope) => createMobileInputHandoffApi({ credential, scope, transport: credentialTransport(credential) }),
+  listInputHandoffTasks: (credential, signal) => readMobileInputHandoffTasks(credentialTransport(credential), signal),
   async inspect(origin, signal) {
     const response = await createClient(ConnectionService, transport(normalizeNodeOrigin(origin))).getServerInfo({}, options(signal));
-    return parseNodeIdentity(response.server);
+    const identity = parseNodeIdentity(response.server);
+    assertTrustedEndpointServerId(normalizeNodeOrigin(origin), identity.serverId);
+    return identity;
   },
   async discover(rawOrigin, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
@@ -1485,16 +1587,52 @@ export const mobileNetwork: MobileNetwork = {
     const origin = normalizeNodeOrigin(rawOrigin);
     const client = createClient(ConnectionService, transport(origin));
     const node = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
+    assertTrustedEndpointServerId(origin, node.serverId);
     if (!node.pairingEnabled) throw new Error("Pairing is closed on this Joko node. Ask the node owner to open pairing.");
     const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0", deviceNameSource };
     const challenge = (await client.beginPairing(args, options(signal))).challenge;
     if (!challenge?.challengeId) throw new Error("The Joko node did not return a pairing challenge.");
     return { identity: node, challengeId: challenge.challengeId };
   },
+  async cancelPairing(origin, challengeId, signal, endpointPublicKey, transportKind) {
+    await createClient(ConnectionService, transport(normalizeNodeOrigin(origin), undefined, endpointPublicKey, transportKind)).cancelPairing({ challengeId }, options(signal));
+  },
+  async authorizeNewDevice(credential, signal, authorization) {
+    rememberEndpointTrust(credential);
+    const selectedTransport = credential.endpointPublicKey === undefined ? undefined : trustedEndpointTransport(credential.origin, credential.endpointPublicKey, credential.transportKind ?? 'https');
+    const relayRequest = requireIrohRelayInvitationRequest(selectedTransport, authorization);
+    const request = relayRequest === undefined ? undefined : { ...relayRequest }, confirmLease = authorization?.onIrohRelayLease;
+    const client = createClient(ConnectionService, credentialTransport(credential));
+    const info = (await client.getServerInfo({}, options(signal))).server;
+    signal?.throwIfAborted();
+    if (info?.serverId !== credential.serverId) throw new Error("The Joko node identity changed.");
+    const endpointPublicKey = normalizeEndpointPublicKey(credential.endpointPublicKey ?? (isLoopbackEndpoint(credential.origin) ? info.endpointPublicKey : ""));
+    let endpointTransport = endpointTransportForNewDevice(selectedTransport);
+    if (request !== undefined && selectedTransport?.kind === 'iroh') {
+      const reply = await client.issueIrohRelayInvitation({ ...request, nodeEndpointId: selectedTransport.endpointId }, options(signal));
+      signal?.throwIfAborted();
+      endpointTransport = irohTransportForRecipient({ transport: selectedTransport, origin: credential.origin, serverId: credential.serverId, endpointPublicKey, request, invitation: reply.invitation, allowExpiredReceipt: true });
+      await confirmLease?.(endpointTransport.relayTokenExpiresAt!); signal?.throwIfAborted();
+      if (endpointTransport.relayTokenExpiresAt! <= Date.now()) throw new Error('The original relay lease expired. Authorize the new device again to explicitly renew that confirmed request.');
+    }
+    const challenge = (await client.beginPairing({ deviceDisplayName: "New device", deviceKind: DeviceKind.UNSPECIFIED, appVersion: "0.1.0" }, options(signal))).challenge;
+    signal?.throwIfAborted();
+    if (!challenge?.challengeId || !challenge.humanCode || !challenge.expiresAt) throw new Error("The new-device invitation could not be confirmed. Check node connections before retrying.");
+    const challengeExpiresAt = Number(challenge.expiresAt.seconds) * 1000 + Math.floor(challenge.expiresAt.nanos / 1_000_000);
+    const expiresAt = endpointTransport?.kind === 'iroh' && endpointTransport.relayTokenExpiresAt !== undefined ? Math.min(challengeExpiresAt, endpointTransport.relayTokenExpiresAt) : challengeExpiresAt;
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) throw new Error("The new-device invitation expired.");
+    const origin = endpointTransport === undefined ? pairingVerificationOrigin(challenge.verificationUri) : credential.origin;
+    return { challengeId: challenge.challengeId, humanCode: challenge.humanCode, expiresAt, origin, serverId: credential.serverId, endpointPublicKey,
+      ...(endpointTransport === undefined ? {} : { endpointTransport }),
+      trustedInvitation: formatTrustedNodeInvitation({ origin, serverId: credential.serverId, endpointPublicKey, endpointTransport }) };
+  },
   async completePairing(rawOrigin, challengeId, code, deviceName, platform, deviceNameSource, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
-    const client = createClient(ConnectionService, transport(origin));
+    const endpointPublicKey = trustedEndpointPublicKey(origin);
+    const transportKind = endpointPublicKey === undefined ? undefined : trustedEndpointTransportKind(origin, endpointPublicKey);
+    const client = createClient(ConnectionService, transport(origin, undefined, endpointPublicKey, transportKind));
     const node = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
+    assertTrustedEndpointServerId(origin, node.serverId);
     const args = { deviceDisplayName: deviceName.trim(), deviceKind: DeviceKind.MOBILE, platform, appVersion: "0.1.0", deviceNameSource };
     const result = (await client.completePairing({ ...args, challengeId, humanCode: code.trim() }, options(signal))).result;
     if (!result?.connection?.connectionId || !result.connection.connectionProfileId || !result.device?.deviceId
@@ -1505,13 +1643,14 @@ export const mobileNetwork: MobileNetwork = {
       identity: node,
       credential: {
         profileId: result.connection.connectionProfileId,
-        origin, serverId: node.serverId, connectionId: result.connection.connectionId,
+        origin, serverId: node.serverId, connectionId: result.connection.connectionId, endpointPublicKey,
+        ...(transportKind === undefined || transportKind === 'https' ? {} : { transportKind }),
         deviceId: result.device.deviceId, displayName: result.connection.displayName || deviceName.trim(), authKey: result.authKey
       }
     };
   },
   async readOwner(credential, currentDeviceNameSource, signal) {
-    const response = await createClient(EventService, transport(credential.origin, credential.authKey)).getSnapshot({
+    const response = await createClient(EventService, credentialTransport(credential)).getSnapshot({
       scope: { kind: { case: "owner", value: {} } }, currentDeviceNameSource
     }, options(signal));
     const snapshot = response.snapshot;
@@ -1523,7 +1662,7 @@ export const mobileNetwork: MobileNetwork = {
     return { connection: connections[0]!, device: devices[0]!, snapshot };
   },
   async listModelSourceRemoteHosts(credential, targetId, signal) {
-    const client = createClient(RemoteHostService, transport(credential.origin, credential.authKey));
+    const client = createClient(RemoteHostService, credentialTransport(credential));
     const rows: RemoteHost[] = [], tokens = new Set<string>();
     let pageToken = "";
     for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
@@ -1543,7 +1682,7 @@ export const mobileNetwork: MobileNetwork = {
     throw new Error("The model source SSH Host catalog exceeded its page limit.");
   },
   async listModelSourceDevicePeers(credential, signal) {
-    const client = createClient(DevicePeerService, transport(credential.origin, credential.authKey));
+    const client = createClient(DevicePeerService, credentialTransport(credential));
     const rows: DevicePeerDescriptor[] = [], tokens = new Set<string>();
     let pageToken = "";
     for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
@@ -1566,14 +1705,14 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted();
     if (!backendId || !providerId || backendId.length > 256 || providerId.length > 256
       || /[\x00-\x1f\x7f]/u.test(backendId + providerId)) throw new Error("The account usage route is invalid.");
-    const result = await createClient(BackendService, transport(credential.origin, credential.authKey))
+    const result = await createClient(BackendService, credentialTransport(credential))
       .getProviderUsage({ backendId, providerId }, options(signal));
     signal?.throwIfAborted();
     if (result.accountUsage && result.accountUsage.providerId !== providerId) throw new Error("The account usage Provider changed.");
     return result.accountUsage;
   },
   async listRemoteDesktopHosts(credential, signal) {
-    const client = createClient(RemoteDesktopService, transport(credential.origin, credential.authKey));
+    const client = createClient(RemoteDesktopService, credentialTransport(credential));
     const hosts: DevicePeerDescriptor[] = [];
     const seen = new Set<string>();
     let pageToken = "";
@@ -1596,28 +1735,28 @@ export const mobileNetwork: MobileNetwork = {
     throw new Error("The Remote Desktop host catalog exceeded its bounded page count.");
   },
   async getRemoteDesktopCapabilities(credential, peer, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .getRemoteDesktopCapabilities({ peer }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.capabilities) throw new Error("The Joko node returned no Remote Desktop capabilities.");
     return response.capabilities;
   },
   async getRemoteDesktopPermissions(credential, peer, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .getRemoteDesktopPermissions({ peer }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.permissions) throw new Error("The Joko node returned no Remote Desktop permissions.");
     return response.permissions;
   },
   async showRemoteDesktopPermissionGuide(credential, peer, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .showRemoteDesktopPermissionGuide({ peer }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.permissions) throw new Error("The Joko node returned no Remote Desktop permissions.");
     return response.permissions;
   },
   async startRemoteDesktop(credential, peer, displayId, mode, signal, control) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .startRemoteDesktop({ peer, displayId, mode, control: control === true }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.lease?.leaseId || response.lease.display?.displayId !== displayId) {
@@ -1626,7 +1765,7 @@ export const mobileNetwork: MobileNetwork = {
     return response.lease;
   },
   async heartbeatRemoteDesktop(credential, peer, leaseId, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .heartbeatRemoteDesktop({ peer, leaseId }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.state) throw new Error("The Joko node returned no Remote Desktop control state.");
@@ -1638,19 +1777,19 @@ export const mobileNetwork: MobileNetwork = {
       || (exit.lockScreen ? exit.controlGeneration < 1n : exit.controlGeneration !== 0n)) {
       throw new Error("Invalid Remote Desktop exit authority.");
     }
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .stopRemoteDesktop({ peer, leaseId, ...exit }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
   },
   async setRemoteDesktopControl(credential, peer, leaseId, enabled, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .setRemoteDesktopControl({ peer, leaseId, enabled }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.state) throw new Error("The Joko node returned no Remote Desktop control state.");
     return response.state;
   },
   async setRemoteDesktopPresentation(credential, peer, leaseId, enabled, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .setRemoteDesktopPresentation({ peer, leaseId, enabled }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.state) throw new Error("The Joko node returned no Remote Desktop presentation state.");
@@ -1659,7 +1798,7 @@ export const mobileNetwork: MobileNetwork = {
   async setRemoteDesktopHostMute(credential, peer, request, signal) {
     if (!request.leaseId || request.leaseId.length > 256 || request.controlGeneration < 1n
       || typeof request.enabled !== "boolean") throw new Error("Invalid Remote Desktop host mute request.");
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .setRemoteDesktopHostMute({ peer, request }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop host mute result.");
@@ -1668,14 +1807,14 @@ export const mobileNetwork: MobileNetwork = {
   async setRemoteDesktopPrivacyScreen(credential, peer, request, signal) {
     if (!request.leaseId || request.leaseId.length > 256 || request.controlGeneration < 1n
       || typeof request.enabled !== "boolean" || typeof request.lockOnExit !== "boolean") throw new Error("Invalid Remote Desktop privacy request.");
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .setRemoteDesktopPrivacyScreen({ peer, request }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop privacy result.");
     return response.result;
   },
   async getRemoteDesktopLockState(credential, peer, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .getRemoteDesktopLockState({ peer }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("CREDENTIAL_INVALID_MESSAGE");
@@ -1690,7 +1829,7 @@ export const mobileNetwork: MobileNetwork = {
         !action.value.ciphertext || action.value.ciphertext.length > 2 * 1024 * 1024 || !/^[\x20-\x7e]+$/u.test(action.value.ciphertext)))) {
       throw new Error("CREDENTIAL_INVALID_MESSAGE");
     }
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .requestRemoteDesktopCredentials({ peer, request }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("CREDENTIAL_INVALID_MESSAGE");
@@ -1700,7 +1839,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!request.leaseId || request.leaseId.length > 256 || typeof request.controlGeneration !== "bigint"
       || request.controlGeneration < 1n || request.controlGeneration > 0xffffffffffffffffn
       || typeof request.enabled !== "boolean") throw new Error("Invalid Remote Desktop clipboard sync request.");
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .setRemoteDesktopClipboardSync({ peer, request }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result || response.result.syncGeneration < 1n || response.result.enabled !== request.enabled) {
@@ -1713,7 +1852,7 @@ export const mobileNetwork: MobileNetwork = {
       || request.controlGeneration < 1n || request.controlGeneration > 0xffffffffffffffffn
       || typeof request.syncGeneration !== "bigint" || request.syncGeneration < 1n
       || request.syncGeneration > 0xffffffffffffffffn) throw new Error("Invalid Remote Desktop clipboard version request.");
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .getRemoteDesktopClipboardVersion({ peer, request }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result || !isRemoteDesktopClipboardVersion(response.result.version)) {
@@ -1722,18 +1861,18 @@ export const mobileNetwork: MobileNetwork = {
     return response.result;
   },
   async sendRemoteDesktopInput(credential, peer, leaseId, sequence, events, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .sendRemoteDesktopInput({ peer, leaseId, sequence, events: [...events] }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
   },
   async getRemoteDesktopIceConfiguration(credential, peer, leaseId, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .getRemoteDesktopIceConfiguration({ peer, leaseId }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     return Object.freeze([...response.iceServers]);
   },
   async createRemoteDesktopOffer(credential, peer, leaseId, attemptId, offerSdp, settings, cursorOverlay, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .createRemoteDesktopOffer({ peer, leaseId, attemptId, offerSdp, settings, cursorOverlay }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.offer || response.offer.attemptId !== attemptId || !response.offer.answerSdp) {
@@ -1742,7 +1881,7 @@ export const mobileNetwork: MobileNetwork = {
     return response.offer;
   },
   async exchangeRemoteDesktopIce(credential, peer, leaseId, attemptId, candidates, after, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .exchangeRemoteDesktopIce({ peer, leaseId, attemptId, candidates: [...candidates], after }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.exchange || response.exchange.attemptId !== attemptId) {
@@ -1751,7 +1890,7 @@ export const mobileNetwork: MobileNetwork = {
     return response.exchange;
   },
   async getRemoteDesktopFrame(credential, peer, leaseId, cursorOverlay, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .getRemoteDesktopFrame({ peer, leaseId, cursorOverlay }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop frame result.");
@@ -1767,7 +1906,7 @@ export const mobileNetwork: MobileNetwork = {
     return response.result;
   },
   async listRemoteDesktopDisplayModes(credential, peer, leaseId, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .listRemoteDesktopDisplayModes({ peer, leaseId }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!validRemoteDesktopDisplayModes(response.modes)) {
@@ -1779,7 +1918,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!REMOTE_DESKTOP_MODE_ID.test(modeId) || controlGeneration < 1n) {
       throw new Error("A current Remote Desktop display mode authority is required.");
     }
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .setRemoteDesktopDisplayMode({ peer, leaseId, controlGeneration, modeId, temporary, control: control === true }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop mode result.");
@@ -1790,7 +1929,7 @@ export const mobileNetwork: MobileNetwork = {
       || !Number.isSafeInteger(height) || height < 320 || height > 2_560) {
       throw new Error("A current Remote Desktop viewer display authority and valid dimensions are required.");
     }
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .setRemoteDesktopViewerDisplay({ peer, leaseId, controlGeneration, width, height, control: control === true }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result?.lease) throw new Error("The Joko node returned no Remote Desktop viewer display result.");
@@ -1798,7 +1937,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async restoreRemoteDesktopViewerDisplay(credential, peer, leaseId, controlGeneration, signal, control) {
     if (controlGeneration < 1n) throw new Error("A current Remote Desktop viewer display authority is required.");
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .restoreRemoteDesktopViewerDisplay({ peer, leaseId, controlGeneration, control: control === true }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result?.lease) throw new Error("The Joko node returned no Remote Desktop viewer display restore result.");
@@ -1810,38 +1949,38 @@ export const mobileNetwork: MobileNetwork = {
       : action === "workspaceRight" ? RemoteDesktopSystemActionKind.WORKSPACE_RIGHT
         : action === "systemMenu" ? RemoteDesktopSystemActionKind.SYSTEM_MENU : undefined;
     if (kind === undefined) throw new Error("The Remote Desktop system action is invalid.");
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .performRemoteDesktopSystemAction({ peer, request: { leaseId, controlGeneration, action: kind } }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result || response.result.action !== kind) throw new Error("The Joko node returned an invalid Remote Desktop system action result.");
     return action;
   },
   async transferRemoteDesktopClipboardText(credential, peer, transferValue, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .transferRemoteDesktopClipboardText({ peer, transfer: transferValue }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop clipboard text result.");
     return response.result;
   },
   async transferRemoteDesktopClipboardContent(credential, peer, transferValue, signal) {
-    const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
+    const response = await createClient(RemoteDesktopService, credentialTransport(credential))
       .transferRemoteDesktopClipboardContent({ peer, transfer: transferValue }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop clipboard content result.");
     return response.result;
   },
   partnerRoutineApi(credential, partnerId, ownerKey, newRequestId, assertCurrent) {
-    return createPartnerRoutineApi({ rpc: createClient(PartnerRoutineService, transport(credential.origin, credential.authKey)),
+    return createPartnerRoutineApi({ rpc: createClient(PartnerRoutineService, credentialTransport(credential)),
       partnerId, ownerKey, newRequestId, assertCurrent });
   },
   mcpAppApi(credential, ownerKey) {
-    const current = transport(credential.origin, credential.authKey);
+    const current = credentialTransport(credential);
     const metadata = createClient(McpAppService, current), native = createClient(McpAppNativeService, current);
     return { ownerKey, metadata: (request, signal) => metadata.operate(request, { ...options(signal), timeoutMs: 120_000 }),
       native: (request, signal) => native.operate(request, { ...options(signal), timeoutMs: 120_000 }) };
   },
   extensionCardApi(credential) {
-    const connection = transport(credential.origin, credential.authKey), client = createClient(ExtensionCardService, connection), artifacts = createClient(ArtifactService, connection);
+    const connection = credentialTransport(credential), client = createClient(ExtensionCardService, connection), artifacts = createClient(ArtifactService, connection);
     return { ...client, formScope: sessionId => extensionCardFormDeliveryScope(credential, sessionId),
       uploadAttachment: async (sessionId, cardId, source, inline, signal) => {
         const exact = assertBlobUploadSource(source); signal.throwIfAborted();
@@ -1852,7 +1991,7 @@ export const mobileNetwork: MobileNetwork = {
       } };
   },
   partnerGroupApi(credential, ownerKey, newRequestId, assertCurrent) {
-    return createPartnerGroupApi({ rpc: createClient(PartnerGroupService, transport(credential.origin, credential.authKey)), ownerKey, newRequestId, assertCurrent,
+    return createPartnerGroupApi({ rpc: createClient(PartnerGroupService, credentialTransport(credential)), ownerKey, newRequestId, assertCurrent,
       respond: async (interaction, decision, signal) => {
         const result = await this.submit(credential, newRequestId(), create(OperationMutationSchema, { payload: { case: "resolveInteraction", value: {
           interactionId: interaction.interactionId, interactionGeneration: interaction.generation, resolution: { connectionId: credential.connectionId, decision }
@@ -1861,25 +2000,25 @@ export const mobileNetwork: MobileNetwork = {
       } });
   },
   partnerIdentityApi(credential, ownerKey, assertCurrent) {
-    return createMobilePartnerIdentityApi(transport(credential.origin, credential.authKey), ownerKey, assertCurrent);
+    return createMobilePartnerIdentityApi(credentialTransport(credential), ownerKey, assertCurrent);
   },
   partnerNetworkApi(credential, ownerKey, assertCurrent) {
-    return createMobilePartnerNetworkApi(transport(credential.origin, credential.authKey), ownerKey, assertCurrent);
+    return createMobilePartnerNetworkApi(credentialTransport(credential), ownerKey, assertCurrent);
   },
   partnerMemoryApi(credential, partnerId, ownerKey, assertCurrent) {
-    return createPartnerMemoryApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
+    return createPartnerMemoryApi({ rpc: createClient(PartnerService, credentialTransport(credential)),
       partnerId, ownerKey, assertCurrent });
   },
   objectiveRpc(credential, sessionId, generation, assertCurrent) {
-    return createMobileObjectiveRpc(createClient(ObjectiveService, transport(credential.origin, credential.authKey)),
+    return createMobileObjectiveRpc(createClient(ObjectiveService, credentialTransport(credential)),
       sessionId, generation, assertCurrent);
   },
   collaborationRpc(credential, sessionId, generation, assertCurrent) {
-    return createMobileCollaborationRpc(createClient(CollaborationService, transport(credential.origin, credential.authKey)),
+    return createMobileCollaborationRpc(createClient(CollaborationService, credentialTransport(credential)),
       sessionId, generation, assertCurrent);
   },
   async getCollaborationSettings(credential, signal) {
-    const value = (await createClient(SettingsService, transport(credential.origin, credential.authKey)).getSettings({}, options(signal))).settings?.collaboration;
+    const value = (await createClient(SettingsService, credentialTransport(credential)).getSettings({}, options(signal))).settings?.collaboration;
     signal?.throwIfAborted();
     if (!value || !value.version?.revision || value.version.revision.value < 1n || !Number.isInteger(value.workerSoftLimit)
       || !Number.isInteger(value.workerHardLimit) || value.workerSoftLimit < 1 || value.workerHardLimit < value.workerSoftLimit
@@ -1892,7 +2031,7 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted();
     let response;
     try {
-      response = await createClient(OperationService, transport(credential.origin, credential.authKey)).getOperation({ operationId }, options(signal));
+      response = await createClient(OperationService, credentialTransport(credential)).getOperation({ operationId }, options(signal));
     } catch (error) {
       if (error instanceof ConnectError && error.code === Code.NotFound) return undefined;
       throw error;
@@ -1906,28 +2045,28 @@ export const mobileNetwork: MobileNetwork = {
     return operation;
   },
   partnerConnectionsApi(credential, partnerId, ownerKey, assertCurrent) {
-    return createPartnerConnectionsApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
+    return createPartnerConnectionsApi({ rpc: createClient(PartnerService, credentialTransport(credential)),
       partnerId, ownerKey, assertCurrent });
   },
   partnerSkillsApi(credential, partnerId, ownerKey, assertCurrent) {
-    return createPartnerSkillsApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
+    return createPartnerSkillsApi({ rpc: createClient(PartnerService, credentialTransport(credential)),
       partnerId, ownerKey, assertCurrent });
   },
   partnerImportApi(credential, ownerKey, newRequestId, assertCurrent) {
-    return createPartnerImportApi({ rpc: createClient(PartnerImportService, transport(credential.origin, credential.authKey)), ownerKey,
+    return createPartnerImportApi({ rpc: createClient(PartnerImportService, credentialTransport(credential)), ownerKey,
       controllerId: newRequestId(), newRequestId, assertCurrent: () => assertCurrent(new AbortController().signal) });
   },
   partnerHomeApi(credential, ownerKey, assertCurrent) {
-    return createPartnerHomeApi({ rpc: createClient(PartnerHomeService, transport(credential.origin, credential.authKey)), ownerKey,
+    return createPartnerHomeApi({ rpc: createClient(PartnerHomeService, credentialTransport(credential)), ownerKey,
       assertCurrent: () => assertCurrent(new AbortController().signal) });
   },
   async listPartners(credential, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .listPartners({}, options(signal));
     return projectMobilePartners(response);
   },
   async getPartnerCreationOptions(credential, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerDirectory({}, options(signal));
+    const response = await createClient(PartnerService, credentialTransport(credential)).getPartnerDirectory({}, options(signal));
     signal?.throwIfAborted();
     return projectMobilePartnerCreationOptions(response.directory);
   },
@@ -1936,7 +2075,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId) || expectedDirectoryRevision < 1n) throw new Error("A current Partner creation identity is required.");
     try {
       const capabilities = draft.capabilities;
-      const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).createPartner({ requestId,
+      const response = await createClient(PartnerService, credentialTransport(credential)).createPartner({ requestId,
         expectedDirectoryRevision: { value: expectedDirectoryRevision }, draft: { displayName: draft.displayName,
           description: draft.description,
           avatar: protoMobilePartnerAvatar(draft.avatar), identitySource: draft.identitySource, templateId: draft.templateId,
@@ -1954,57 +2093,57 @@ export const mobileNetwork: MobileNetwork = {
     }
   },
   async deletePartner(credential, requestId, partnerId, revision, confirmName, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).deletePartner({ requestId,
+    const response = await createClient(PartnerService, credentialTransport(credential)).deletePartner({ requestId,
       partnerId, expectedRevision: { value: revision }, confirmName }, { signal }); signal?.throwIfAborted();
     const deletion = projectPartnerDeletion(response.deletion);
     if (deletion.requestId !== requestId || deletion.partnerId !== partnerId) throw new Error("The Partner deletion owner changed.");
     return deletion;
   },
   async getPartnerDeletion(credential, requestId, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerDeletion({ requestId }, { signal });
+    const response = await createClient(PartnerService, credentialTransport(credential)).getPartnerDeletion({ requestId }, { signal });
     signal?.throwIfAborted(); const deletion = response.deletion ? projectPartnerDeletion(response.deletion) : undefined;
     if (deletion && (deletion.requestId !== requestId || response.retired)) throw new Error("The Partner deletion result changed.");
     return { ...(deletion ? { deletion } : {}), retired: response.retired };
   },
   async retirePartnerDeletion(credential, requestId, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retirePartnerDeletion({ requestId }, { signal });
+    const response = await createClient(PartnerService, credentialTransport(credential)).retirePartnerDeletion({ requestId }, { signal });
     signal?.throwIfAborted(); const deletion = response.deletion ? projectPartnerDeletion(response.deletion) : undefined;
     if (deletion ? deletion.requestId !== requestId || response.retired : !response.retired) throw new Error("The Partner deletion result is invalid.");
     return { ...(deletion ? { deletion } : {}), retired: response.retired };
   },
   async retryPartnerDeletion(credential, requestId, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retryPartnerDeletion({ requestId }, { signal });
+    const response = await createClient(PartnerService, credentialTransport(credential)).retryPartnerDeletion({ requestId }, { signal });
     signal?.throwIfAborted(); const deletion = projectPartnerDeletion(response.deletion);
     if (deletion.requestId !== requestId) throw new Error("The Partner deletion owner changed.");
     return deletion;
   },
   async getPartnerRestartControls(credential, partnerId, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerRestartControls({ partnerId }, { signal });
+    const response = await createClient(PartnerService, credentialTransport(credential)).getPartnerRestartControls({ partnerId }, { signal });
     signal?.throwIfAborted();
     if (!response.revision || response.revision.value < 1n) throw new Error("The Partner restart controls are invalid.");
     return { revision: response.revision.value, available: response.available };
   },
   async restartPartner(credential, requestId, partnerId, revision, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).restartPartner({ requestId,
+    const response = await createClient(PartnerService, credentialTransport(credential)).restartPartner({ requestId,
       partnerId, expectedRevision: { value: revision } }, { signal }); signal?.throwIfAborted();
     const restart = projectPartnerRestart(response.restart);
     if (restart.requestId !== requestId || restart.partnerId !== partnerId) throw new Error("The Partner restart owner changed.");
     return restart;
   },
   async getPartnerRestart(credential, requestId, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerRestart({ requestId }, { signal });
+    const response = await createClient(PartnerService, credentialTransport(credential)).getPartnerRestart({ requestId }, { signal });
     signal?.throwIfAborted(); const restart = response.restart ? projectPartnerRestart(response.restart) : undefined;
     if (restart && (restart.requestId !== requestId || response.retired)) throw new Error("The Partner restart result changed.");
     return { ...(restart ? { restart } : {}), retired: response.retired };
   },
   async retirePartnerRestart(credential, requestId, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retirePartnerRestart({ requestId }, { signal });
+    const response = await createClient(PartnerService, credentialTransport(credential)).retirePartnerRestart({ requestId }, { signal });
     signal?.throwIfAborted(); const restart = response.restart ? projectPartnerRestart(response.restart) : undefined;
     if (restart ? restart.requestId !== requestId || response.retired : !response.retired) throw new Error("The Partner restart result is invalid.");
     return { ...(restart ? { restart } : {}), retired: response.retired };
   },
   async retryPartnerRestart(credential, requestId, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retryPartnerRestart({ requestId }, { signal });
+    const response = await createClient(PartnerService, credentialTransport(credential)).retryPartnerRestart({ requestId }, { signal });
     signal?.throwIfAborted(); const restart = projectPartnerRestart(response.restart);
     if (restart.requestId !== requestId) throw new Error("The Partner restart owner changed.");
     return restart;
@@ -2013,7 +2152,7 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted();
     if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId)) throw new Error("A retained Partner creation identity is required.");
     try {
-      const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerCreation({ requestId }, options(signal));
+      const response = await createClient(PartnerService, credentialTransport(credential)).getPartnerCreation({ requestId }, options(signal));
       signal?.throwIfAborted();
       return projectMobilePartnerCreationResult(response.partner);
     } catch (error) {
@@ -2024,14 +2163,14 @@ export const mobileNetwork: MobileNetwork = {
   async retirePartnerCreation(credential, requestId, signal) {
     signal?.throwIfAborted();
     if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId)) throw new Error("A retained Partner creation identity is required.");
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retirePartnerCreation({ requestId }, options(signal));
+    const response = await createClient(PartnerService, credentialTransport(credential)).retirePartnerCreation({ requestId }, options(signal));
     signal?.throwIfAborted();
     if (response.retired && !response.partner) return { kind: "retired" };
     if (!response.retired && response.partner) return projectMobilePartnerCreationResult(response.partner);
     throw new Error("The Joko node returned an ambiguous Partner creation retirement.");
   },
   async listPartnerCatalog(credential, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .listPartners({}, options(signal));
     return projectMobilePartnerCatalog(response);
   },
@@ -2039,18 +2178,18 @@ export const mobileNetwork: MobileNetwork = {
     if (!validMobilePartnerId(partnerId) || throughCursor < 0n) {
       throw new Error("A valid Partner and read cursor are required.");
     }
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .markPartnerRead({ partnerId, throughCursor: { value: throughCursor } }, options(signal));
     return projectMobilePartnerReadResponse(partnerId, throughCursor, response);
   },
   async getPartnerProfileOptions(credential, signal) {
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .getPartnerDirectory({}, options(signal));
     return projectMobilePartnerProfileOptions(response.directory);
   },
   async updatePartnerProfile(credential, partnerId, expectedRevision, draft, signal) {
     if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current Partner profile.");
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .updatePartner({ partnerId, expectedRevision: { value: expectedRevision }, patch: {
         displayName: draft.displayName, description: draft.description, identitySource: draft.identitySource,
         taskModelPreference: draft.taskModelOverride === undefined ? { case: "inheritTaskModel", value: true }
@@ -2072,7 +2211,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async resumePartner(credential, partnerId, expectedRevision, signal) {
     if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current paused Partner.");
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .setPartnerLifecycle({ partnerId, expectedRevision: { value: expectedRevision }, lifecycle: PartnerLifecycle.ACTIVE }, options(signal));
     signal?.throwIfAborted();
     if (!response.partner) throw new Error("The Partner resume returned no profile.");
@@ -2086,7 +2225,7 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted();
     const image = partner.avatar;
     if (typeof image === "string" || !validMobilePartnerId(partner.partnerId) || partner.revision < 1n) throw new Error("Select a current Partner image.");
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .readPartnerAvatar({ partnerId: partner.partnerId, expectedRevision: { value: partner.revision }, sha256: image.sha256 }, options(signal));
     signal?.throwIfAborted();
     if (!response.image || response.image.sha256 !== image.sha256 || response.image.mimeType !== image.mimeType
@@ -2098,7 +2237,7 @@ export const mobileNetwork: MobileNetwork = {
   async readPartnerWorkingStatus(credential, partnerId, status, locale, signal) {
     signal?.throwIfAborted();
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).readPartnerWorkingStatus({
+    const response = await createClient(PartnerService, credentialTransport(credential)).readPartnerWorkingStatus({
       partnerId, sessionId: status.sessionId, generation: status.generation, runId: status.runId,
       attemptId: status.attemptId, phase: toPartnerWorkingPhase(status.phase), locale
     }, options(signal));
@@ -2112,32 +2251,32 @@ export const mobileNetwork: MobileNetwork = {
   },
   async listPartnerSessions(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
-    return createClient(PartnerService, transport(credential.origin, credential.authKey))
+    return createClient(PartnerService, credentialTransport(credential))
       .listPartnerSessions({ partnerId }, options(signal));
   },
   async listPartnerTaskOutputs(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
     signal?.throwIfAborted();
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .listPartnerTaskOutputs({ partnerId }, options(signal));
     signal?.throwIfAborted();
     return projectMobilePartnerTaskOutputs(response, partnerId);
   },
   async controlPartnerSessionTask(credential, requestId, partnerId, partnerRevision, task, action, signal) {
     if (task.partnerId !== partnerId) throw new Error("The independent task belongs to another Partner.");
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).controlPartnerSessionTask({ requestId,
+    const response = await createClient(PartnerService, credentialTransport(credential)).controlPartnerSessionTask({ requestId,
       partnerId, taskId: task.id, expectedPartnerRevision: { value: partnerRevision }, expectedTaskRevision: { value: task.revision }, action: partnerSessionTaskAction(action) }, options(signal));
     if (!response.task || response.task.id !== task.id) throw new Error("The task control response is inconsistent.");
     return projectPartnerSessionTask(response.task, partnerId);
   },
   async retryPartnerInitialization(credential, partnerId, expectedRevision, signal) {
     if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current Partner initialization.");
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .retryPartnerInitialization({ partnerId, expectedRevision: { value: expectedRevision } }, options(signal));
     return projectMobilePartnerInitializationRetry(partnerId, expectedRevision, response);
   },
   async listExtensions(credential, signal) {
-    const client = createClient(ExtensionService, transport(credential.origin, credential.authKey));
+    const client = createClient(ExtensionService, credentialTransport(credential));
     const requestSignal = signal ?? new AbortController().signal;
     return collectMobileExtensionCatalog(async (pageToken, catalogSignal) => {
       const response = await client.listExtensions({
@@ -2160,10 +2299,10 @@ export const mobileNetwork: MobileNetwork = {
       };
     }, requestSignal);
   },
-  extensionTaskApi(credential) { return createClient(ExtensionTaskService, transport(credential.origin, credential.authKey)); },
+  extensionTaskApi(credential) { return createClient(ExtensionTaskService, credentialTransport(credential)); },
   async getExtension(credential, extensionId, signal) {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .getExtension({ extensionId }, options(signal));
     signal?.throwIfAborted();
     if (response.catalogRevision?.value === undefined || response.catalogRevision.value < 0n
@@ -2177,7 +2316,7 @@ export const mobileNetwork: MobileNetwork = {
   async getExtensionForRuntime(credential, extensionId, sessionId, signal) {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
     if (!/^[a-zA-Z0-9_-]{1,128}$/u.test(sessionId)) throw new Error("A current task runtime is required.");
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .getExtension({ extensionId, sessionId }, options(signal));
     signal?.throwIfAborted();
     if (response.catalogRevision?.value === undefined || response.catalogRevision.value < 0n
@@ -2192,7 +2331,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId) || expectedRevision < 1n) {
       throw new Error("A current Extension main view is required.");
     }
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .openExtensionMainView({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
     signal?.throwIfAborted();
     if (response.surface === undefined) throw new Error("The Joko node returned an empty Extension main-view surface.");
@@ -2200,11 +2339,12 @@ export const mobileNetwork: MobileNetwork = {
     if (surface.extensionId !== extensionId) throw new Error("The Joko node returned a mismatched Extension main-view surface.");
     return surface;
   },
+  readExtensionMainViewResource: readMobileExtensionMainViewResource,
   async getExtensionMainViewSurface(credential, surfaceId, signal) {
     if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) {
       throw new Error("A current Extension main-view surface is required.");
     }
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .getExtensionMainViewSurface({ surfaceId }, options(signal));
     signal?.throwIfAborted();
     if (response.surface === undefined) throw new Error("The Joko node returned an empty Extension main-view probe.");
@@ -2216,14 +2356,14 @@ export const mobileNetwork: MobileNetwork = {
     if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) {
       throw new Error("A current Extension main-view surface is required.");
     }
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .closeExtensionMainView({ surfaceId }, options(signal));
     signal?.throwIfAborted();
     return response.closed;
   },
   async getExtensionLibraryOverview(credential, extensionId, expectedRevision, signal) {
     assertExtensionLibraryAuthority(extensionId, expectedRevision);
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .getExtensionLibraryOverview({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
     signal?.throwIfAborted();
     if (response.library === undefined) throw new Error("The Joko node returned an empty Extension Library overview.");
@@ -2232,7 +2372,7 @@ export const mobileNetwork: MobileNetwork = {
   async openExtensionLibrary(credential, extensionId, expectedRevision, surfaceId, signal) {
     assertExtensionLibraryAuthority(extensionId, expectedRevision);
     if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) throw new Error("A current Extension Library surface is required.");
-    const client = createClient(ExtensionService, transport(credential.origin, credential.authKey));
+    const client = createClient(ExtensionService, credentialTransport(credential));
     const response = await client.openExtensionLibrary({ extensionId, expectedRevision: { value: expectedRevision }, surfaceId }, options(signal));
     try {
       signal?.throwIfAborted();
@@ -2247,7 +2387,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async callExtensionLibrary(credential, sessionId, call, signal) {
     if (!/^library_session_[a-f0-9]{32}$/u.test(sessionId)) throw new Error("A current Extension Library session is required.");
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .callExtensionLibrary({ sessionId, call: mapMobileExtensionLibraryCall(call) }, options(signal));
     signal?.throwIfAborted();
     if (response.result === undefined) throw new Error("The Joko node returned an empty Extension Library call result.");
@@ -2257,7 +2397,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async closeExtensionLibrary(credential, sessionId, signal) {
     if (!/^library_session_[a-f0-9]{32}$/u.test(sessionId)) throw new Error("A current Extension Library session is required.");
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .closeExtensionLibrary({ sessionId }, { ...options(signal), timeoutMs: 5_000 });
     signal?.throwIfAborted();
     return response.closed;
@@ -2265,7 +2405,7 @@ export const mobileNetwork: MobileNetwork = {
   async validateExtensionLibraryLocation(credential, extensionId, expectedRevision, candidate, signal) {
     assertExtensionLibraryAuthority(extensionId, expectedRevision);
     const exactCandidate = normalizeMobileExtensionLibraryCandidate(candidate);
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .validateExtensionLibraryLocation({
         extensionId,
         expectedRevision: { value: expectedRevision },
@@ -2282,7 +2422,7 @@ export const mobileNetwork: MobileNetwork = {
     const candidate = destination.kind === "custom"
       ? normalizeMobileExtensionLibraryCandidate(destination.candidate)
       : undefined;
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .relocateExtensionLibrary({
         extensionId,
         expectedRevision: { value: expectedRevision },
@@ -2304,7 +2444,7 @@ export const mobileNetwork: MobileNetwork = {
   async rebindExtensionLibrary(credential, extensionId, expectedRevision, candidate, signal) {
     assertExtensionLibraryAuthority(extensionId, expectedRevision);
     const exactCandidate = normalizeMobileExtensionLibraryCandidate(candidate);
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .rebindExtensionLibrary({
         extensionId,
         expectedRevision: { value: expectedRevision },
@@ -2317,7 +2457,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async unbindExtensionLibrary(credential, extensionId, expectedRevision, signal) {
     assertExtensionLibraryAuthority(extensionId, expectedRevision);
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .unbindExtensionLibrary({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
     signal?.throwIfAborted();
     if (response.detachedPath !== undefined && (response.detachedPath.trim().length === 0
@@ -2327,7 +2467,7 @@ export const mobileNetwork: MobileNetwork = {
     }
   },
   async repairExtensionLibraryState(credential, signal) {
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .repairExtensionLibraryState({}, options(signal));
     signal?.throwIfAborted();
     if (!Number.isSafeInteger(response.bindings) || response.bindings < 0
@@ -2337,7 +2477,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async repairExtensionLibraryMetadata(credential, extensionId, expectedRevision, signal) {
     assertExtensionLibraryAuthority(extensionId, expectedRevision);
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .repairExtensionLibraryMetadata({ extensionId, expectedRevision: { value: expectedRevision } }, options(signal));
     signal?.throwIfAborted();
     if (response.library === undefined) throw new Error("The Joko node returned an empty repaired Extension Library.");
@@ -2346,7 +2486,7 @@ export const mobileNetwork: MobileNetwork = {
   async trashExtensionLibrary(credential, extensionId, expectedRevision, confirmation, signal) {
     assertExtensionLibraryAuthority(extensionId, expectedRevision);
     assertExtensionLibraryConfirmation(confirmation);
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .trashExtensionLibrary({
         extensionId,
         expectedRevision: { value: expectedRevision },
@@ -2358,7 +2498,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async listExtensionLibraryTrash(credential, extensionId, signal) {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension Library is required.");
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .listExtensionLibraryTrash({ extensionId }, options(signal));
     signal?.throwIfAborted();
     return projectMobileExtensionLibraryTrashList(response.trash, extensionId);
@@ -2368,7 +2508,7 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("A current Extension Library trash record is required.");
     }
     assertExtensionLibraryConfirmation(confirmation);
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .restoreExtensionLibraryTrash({
         trashId,
         confirmation,
@@ -2387,14 +2527,14 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("A current Extension Library trash record is required.");
     }
     assertExtensionLibraryConfirmation(confirmation);
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .purgeExtensionLibraryTrash({ trashId, confirmation }, options(signal));
     signal?.throwIfAborted();
     if (!response.purged) throw new Error("The Extension Library trash record was not purged.");
   },
   async listExtensionLibraryGrace(credential, extensionId, signal) {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension Library is required.");
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .listExtensionLibraryGrace({ extensionId }, options(signal));
     signal?.throwIfAborted();
     return projectMobileExtensionLibraryGraceList(response.grace, extensionId);
@@ -2404,7 +2544,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!/^library_grace_[a-f0-9]{32}$/u.test(graceId)) {
       throw new Error("A current Extension Library grace record is required.");
     }
-    const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ExtensionService, credentialTransport(credential))
       .rollbackExtensionLibrary({
         extensionId,
         expectedRevision: { value: expectedRevision },
@@ -2432,7 +2572,7 @@ export const mobileNetwork: MobileNetwork = {
       if (bytes.byteLength === 0 || bytes.byteLength > 64 * 1024 || secret.includes("\0")) {
         throw new Error("The Extension credential input is invalid.");
       }
-      const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))
+      const response = await createClient(ExtensionService, credentialTransport(credential))
         .beginExtensionSetupCredentialUpload({ extensionId, attemptId, fieldId, kind: credentialKind }, options(signal));
       signal?.throwIfAborted();
       const ticket = response.ticket;
@@ -2451,7 +2591,7 @@ export const mobileNetwork: MobileNetwork = {
         throw new Error("The Extension credential channel has expired.");
       }
       const endpoint = authorizedExtensionCredentialEndpoint(credential.origin, ticket.relativeEndpoint);
-      const upload = await fetch(endpoint, {
+      const upload = await createConnectionFetch(credential)(endpoint, {
         method: "PUT",
         headers: {
           authorization: `Bearer ${credential.authKey}`,
@@ -2470,7 +2610,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async listPartnerPrivateThreads(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .listPartnerPrivateThreads({ partnerId }, options(signal));
     return projectMobilePrivateThreads(partnerId, response);
   },
@@ -2478,7 +2618,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!validMobilePartnerId(partnerId) || !validMobilePartnerId(threadId)) {
       throw new Error("A valid Partner and private thread are required.");
     }
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .getPartnerPrivateThread({ partnerId, threadId }, options(signal));
     return projectMobilePrivateDetail(partnerId, threadId, response);
   },
@@ -2488,7 +2628,7 @@ export const mobileNetwork: MobileNetwork = {
       || !Number.isSafeInteger(maximumSequence) || throughSequence > maximumSequence) {
       throw new Error("A visible private message is required before marking it read.");
     }
-    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(PartnerService, credentialTransport(credential))
       .markPartnerPrivateThreadRead({ partnerId, threadId, throughSequence: BigInt(throughSequence) }, options(signal));
     return projectMobilePrivateReadResponse(partnerId, threadId, response, throughSequence, maximumSequence);
   },
@@ -2514,7 +2654,7 @@ export const mobileNetwork: MobileNetwork = {
     if (ticket.serverId !== credential.serverId) throw new Error("The mobile push ticket belongs to another Joko node.");
     const environment = wireMobilePushEnvironment(input.environment);
     const locale = wireMobilePushLocale(input.locale);
-    const response = await createClient(ConnectionService, transport(credential.origin, credential.authKey)).registerMobilePush({
+    const response = await createClient(ConnectionService, credentialTransport(credential)).registerMobilePush({
       connectionId: credential.connectionId,
       deviceId: credential.deviceId,
       expectedDeviceRevision: input.expectedDeviceRevision,
@@ -2558,7 +2698,7 @@ export const mobileNetwork: MobileNetwork = {
     }, options(signal));
   },
   async readSession(credential, sessionId, signal) {
-    const response = await createClient(EventService, transport(credential.origin, credential.authKey)).getSnapshot({
+    const response = await createClient(EventService, credentialTransport(credential)).getSnapshot({
       scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 120 } } }
     }, options(signal));
     if (!response.snapshot || !response.snapshot.sessions.some((session) => session.sessionId === sessionId)) {
@@ -2568,14 +2708,14 @@ export const mobileNetwork: MobileNetwork = {
   },
   async readNativeSessionTree(credential, sessionId, signal) {
     if (!sessionId) throw new Error("A current task is required for native branches.");
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SessionService, credentialTransport(credential))
       .getNativeSessionTree({ sessionId }, options(signal));
     if (!response.tree) throw new Error("The Joko node returned no native branch tree.");
     return response.tree;
   },
   async previewTaskTagDeletion(credential, taskTagId, signal) {
     if (!taskTagId) throw new Error("An exact task tag is required.");
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SessionService, credentialTransport(credential))
       .previewTaskTagDeletion({ taskTagId }, options(signal));
     if (!response.preview || response.preview.taskTagId !== taskTagId) {
       throw new Error("The Joko node returned a mismatched task-tag delete preview.");
@@ -2585,7 +2725,7 @@ export const mobileNetwork: MobileNetwork = {
   async readTaskHeaderRole(credential, sessionId, signal) {
     signal?.throwIfAborted();
     if (!sessionId) throw new Error("A current task is required for its header.");
-    const response = await createClient(CollaborationService, transport(credential.origin, credential.authKey))
+    const response = await createClient(CollaborationService, credentialTransport(credential))
       .listCollaborationGoals({ sessionId, includeArchived: true }, options(signal));
     signal?.throwIfAborted();
     return mobileTaskHeaderRole(sessionId, response.access);
@@ -2593,7 +2733,7 @@ export const mobileNetwork: MobileNetwork = {
   async suggestSessionTitle(credential, sessionId, signal) {
     signal?.throwIfAborted();
     if (!sessionId) throw new Error("A current task is required to suggest its title.");
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SessionService, credentialTransport(credential))
       .suggestSessionTitle({ sessionId }, options(signal));
     signal?.throwIfAborted();
     return response;
@@ -2601,7 +2741,7 @@ export const mobileNetwork: MobileNetwork = {
   async listBackgroundTasks(credential, sessionId, pageToken = "", signal) {
     signal?.throwIfAborted();
     if (!sessionId) throw new Error("A current task is required for background activity.");
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SessionService, credentialTransport(credential))
       .listBackgroundTasks({ sessionId, page: { pageToken, pageSize: 100 } }, options(signal));
     if (response.backgroundTasks.some((task) => !task.backgroundTaskId || task.sessionId !== sessionId)) {
       throw new Error("The background activity response belongs to another task.");
@@ -2609,7 +2749,7 @@ export const mobileNetwork: MobileNetwork = {
     return { tasks: response.backgroundTasks, nextPageToken: response.page?.nextPageToken ?? "" };
   },
   async readBackgroundTaskOutput(credential, sessionId, backgroundTaskId, signal) {
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SessionService, credentialTransport(credential))
       .getBackgroundTaskOutput({ sessionId, backgroundTaskId, maximumBytes: 16_384 }, options(signal));
     if (!response.output || response.output.sessionId !== sessionId || response.output.backgroundTaskId !== backgroundTaskId) throw new Error("The background output belongs to another task.");
     return response.output;
@@ -2617,7 +2757,7 @@ export const mobileNetwork: MobileNetwork = {
   async listSubagentRuns(credential, sessionId, pageToken = "", signal) {
     signal?.throwIfAborted();
     if (!sessionId) throw new Error("A current task is required for delegated activity.");
-    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SubagentService, credentialTransport(credential))
       .listSubagentRuns({ sessionId, page: { pageToken, pageSize: 100 } }, options(signal));
     if (response.runs.some((run) => !run.subagentRunId || run.sessionId !== sessionId)) {
       throw new Error("The delegated activity response belongs to another task.");
@@ -2627,7 +2767,7 @@ export const mobileNetwork: MobileNetwork = {
   async getSubagentRun(credential, sessionId, runId, signal) {
     signal?.throwIfAborted();
     if (!sessionId || !runId) throw new Error("An exact delegated run is required.");
-    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SubagentService, credentialTransport(credential))
       .getSubagentRun({ sessionId, subagentRunId: runId }, options(signal));
     if (!response.run?.run || response.run.run.sessionId !== sessionId || response.run.run.subagentRunId !== runId) {
       throw new Error("The delegated detail response belongs to another run.");
@@ -2637,25 +2777,25 @@ export const mobileNetwork: MobileNetwork = {
   async listSubagentTranscript(credential, sessionId, runId, childId = "", pageToken = "", signal) {
     signal?.throwIfAborted();
     if (!sessionId || !runId) throw new Error("An exact delegated run is required.");
-    const response = await createClient(SubagentService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SubagentService, credentialTransport(credential))
       .listSubagentTranscript({ sessionId, subagentRunId: runId, childId, page: { pageToken, pageSize: 200 } }, options(signal));
     if (response.entries.some((entry) => !entry.entryId || entry.sequence < 0n)) throw new Error("The delegated transcript contains an invalid entry.");
     return { entries: response.entries, nextPageToken: response.page?.nextPageToken ?? "", tailPageToken: response.tailPageToken };
   },
   async readHistory(credential, sessionId, before, signal) {
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey)).listSessionTimeline({
+    const response = await createClient(SessionService, credentialTransport(credential)).listSessionTimeline({
       sessionId, limit: 120, ...(before === undefined ? {} : { beforeCursor: before })
     }, options(signal));
     return { events: response.events, ...(response.nextBeforeCursor === undefined ? {} : { before: response.nextBeforeCursor }) };
   },
   async readAround(credential, sessionId, eventId, signal) {
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey)).listSessionTimeline({
+    const response = await createClient(SessionService, credentialTransport(credential)).listSessionTimeline({
       sessionId, aroundEventId: eventId, limit: 120
     }, options(signal));
     return response.events;
   },
   async searchSessionMessages(credential, query, status, signal) {
-    const client = createClient(SessionService, transport(credential.origin, credential.authKey));
+    const client = createClient(SessionService, credentialTransport(credential));
     return collectSessionMessageSearchPages(async (pageToken) => {
       const response = await client.searchSessionMessages({
         scope: { case: "owner", value: {} },
@@ -2675,7 +2815,7 @@ export const mobileNetwork: MobileNetwork = {
   async listWorkspaceDirectory(credential, workspaceId, parentPath, signal) {
     if (!workspaceId) throw new Error("A current Workspace is required.");
     const parent = canonicalWorkspacePath(parentPath, true);
-    const client = createClient(WorkspaceService, transport(credential.origin, credential.authKey));
+    const client = createClient(WorkspaceService, credentialTransport(credential));
     return collectWorkspaceDirectoryPages(workspaceId, parent, async (pageToken) => {
       const response = await client.listWorkspaceEntries({
         workspaceId,
@@ -2696,7 +2836,7 @@ export const mobileNetwork: MobileNetwork = {
   async listWorkspaceChangeSets(credential, workspaceId, sessionId, signal) {
     signal?.throwIfAborted();
     if (!workspaceId || !sessionId) throw new Error("A current Workspace and task are required.");
-    const client = createClient(WorkspaceService, transport(credential.origin, credential.authKey));
+    const client = createClient(WorkspaceService, credentialTransport(credential));
     return collectWorkspaceChangeSetPages(workspaceId, sessionId, async (pageToken) => {
       signal?.throwIfAborted();
       const response = await client.listWorkspaceChangeSets({ workspaceId, sessionId,
@@ -2708,14 +2848,14 @@ export const mobileNetwork: MobileNetwork = {
   async previewWorkspaceRewind(credential, workspaceId, changeSetId, signal) {
     signal?.throwIfAborted();
     if (!workspaceId || !changeSetId) throw new Error("A current Workspace checkpoint is required.");
-    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey))
+    const response = await createClient(WorkspaceService, credentialTransport(credential))
       .previewWorkspaceRewind({ workspaceId, changeSetId }, options(signal));
     if (!response.preview) throw new Error("The Joko node did not return a Workspace rewind preview.");
     return response.preview;
   },
   async listWorkspaceFileIndex(credential, workspaceId, signal) {
     if (!workspaceId) throw new Error("A current Workspace is required.");
-    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey))
+    const response = await createClient(WorkspaceService, credentialTransport(credential))
       .listWorkspaceFiles({ workspaceId }, options(signal));
     if (response.relativePaths.length > 30_000) throw new Error("The Joko node returned an oversized workspace file index.");
     const paths = response.relativePaths.map((path) => canonicalWorkspacePath(path));
@@ -2724,7 +2864,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async searchWorkspace(credential, workspaceId, query, caseSensitive, signal) {
     if (!workspaceId || !query) throw new Error("A current Workspace and literal search query are required.");
-    const client = createClient(WorkspaceService, transport(credential.origin, credential.authKey));
+    const client = createClient(WorkspaceService, credentialTransport(credential));
     return collectWorkspaceSearchPages(workspaceId, async (pageToken) => {
       const response = await client.searchWorkspace({
         workspaceId,
@@ -2747,7 +2887,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async *watchWorkspace(credential, workspaceId, signal) {
     if (!workspaceId) throw new Error("A current Workspace is required.");
-    const client = createClient(WorkspaceService, transport(credential.origin, credential.authKey));
+    const client = createClient(WorkspaceService, credentialTransport(credential));
     let previousSequence = 0n;
     for await (const response of client.watchWorkspaceFileChanges({
       scope: { kind: { case: "workspace", value: { workspaceId } } }
@@ -2767,7 +2907,7 @@ export const mobileNetwork: MobileNetwork = {
   async readWorkspaceFile(credential, workspaceId, relativePath, revision, signal) {
     const path = canonicalWorkspacePath(relativePath);
     if (!workspaceId || !revision.opaqueRevision) throw new Error("A current Workspace file revision is required.");
-    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey)).readWorkspaceFile({
+    const response = await createClient(WorkspaceService, credentialTransport(credential)).readWorkspaceFile({
       workspaceId,
       relativePath: path,
       startByte: 0n,
@@ -2782,7 +2922,7 @@ export const mobileNetwork: MobileNetwork = {
     if (revision.byteSize < 0n || revision.byteSize > BigInt(MOBILE_FILE_SHARE_MAXIMUM_BYTES)) {
       throw new Error("The Workspace file exceeds the mobile sharing limit.");
     }
-    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey)).readWorkspaceFile({
+    const response = await createClient(WorkspaceService, credentialTransport(credential)).readWorkspaceFile({
       workspaceId,
       relativePath: path,
       startByte: 0n,
@@ -2797,7 +2937,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!sessionId || !file.workspaceId || file.expectedRevision !== "" && !/^workspace-html:[0-9a-f]{64}$/u.test(file.expectedRevision)) {
       throw new Error("A current task and canonical HTML snapshot reference are required.");
     }
-    const response = await createClient(WorkspaceService, transport(credential.origin, credential.authKey))
+    const response = await createClient(WorkspaceService, credentialTransport(credential))
       .readWorkspaceHtmlSnapshot({ sessionId, file: { ...file, relativePath } }, options(signal));
     signal?.throwIfAborted();
     if (!response.file || response.file.workspaceId !== file.workspaceId || response.file.relativePath !== relativePath
@@ -2810,7 +2950,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async listSessionArtifacts(credential, sessionId, signal) {
     if (!sessionId) throw new Error("A current task is required for Generated files.");
-    const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
+    const client = createClient(ArtifactService, credentialTransport(credential));
     return collectArtifactPages(sessionId, async (pageToken) => {
       const response = await client.listArtifacts({
         sessionId,
@@ -2826,20 +2966,20 @@ export const mobileNetwork: MobileNetwork = {
     });
   },
   async getSessionRuntimeControl(credential, sessionId, signal) {
-    const result = await createClient(SessionService, transport(credential.origin, credential.authKey))
+    const result = await createClient(SessionService, credentialTransport(credential))
       .getSessionRuntimeControl({ sessionId }, options(signal));
     if (!result.control) throw new Error("The task runtime selection is unavailable.");
     return result.control;
   },
   async listRuntimeCommands(credential, sessionId, signal) {
     if (!validCatalogIdentity(sessionId, 1_024)) throw new Error("A current task is required for its runtime command catalog.");
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SessionService, credentialTransport(credential))
       .listRuntimeCommands({ sessionId }, options(signal));
     return response.commands;
   },
   async listSessionResources(credential, sessionId, signal) {
     if (!validCatalogIdentity(sessionId, 1_024)) throw new Error("A current task is required for its Resource catalog.");
-    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SessionService, credentialTransport(credential))
       .listSessionResources({ sessionId }, options(signal));
     return assertSessionResourceCatalog(sessionId, response.resources);
   },
@@ -2847,7 +2987,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!validCatalogIdentity(sessionId, 1_024) || generation < 1n || generation > 0xffff_ffff_ffff_ffffn) {
       throw new Error("A current task generation is required for its Artifact reference catalog.");
     }
-    const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
+    const client = createClient(ArtifactService, credentialTransport(credential));
     return collectArtifactReferencePages(async (pageToken) => {
       const response = await client.listArtifacts({
         referenceTargetSessionId: sessionId,
@@ -2864,7 +3004,7 @@ export const mobileNetwork: MobileNetwork = {
     });
   },
   async listSchedules(credential, signal) {
-    const client = createClient(SchedulerService, transport(credential.origin, credential.authKey));
+    const client = createClient(SchedulerService, credentialTransport(credential));
     return collectSchedulePages(async (pageToken) => {
       const response = await client.listSchedules({
         page: { pageSize: SCHEDULE_PAGE_SIZE, pageToken }
@@ -2879,7 +3019,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async readSchedule(credential, scheduleId, signal) {
     if (!validCatalogIdentity(scheduleId, 512)) throw new Error("A current Automation Schedule is required.");
-    const response = await createClient(SchedulerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SchedulerService, credentialTransport(credential))
       .getSchedule({ scheduleId }, options(signal));
     if (!response.schedule || response.schedule.scheduleId !== scheduleId) {
       throw new Error("The Joko node returned a different Automation Schedule.");
@@ -2890,7 +3030,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!validCatalogIdentity(scheduleId, 512) || !validSchedulePageToken(pageToken)) {
       throw new Error("A current Automation Schedule and valid history cursor are required.");
     }
-    const response = await createClient(SchedulerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SchedulerService, credentialTransport(credential))
       .listScheduleRunHistory({
         scheduleId,
         page: { pageSize: SCHEDULE_HISTORY_PAGE_SIZE, pageToken }
@@ -2903,14 +3043,14 @@ export const mobileNetwork: MobileNetwork = {
     });
   },
   async readSchedulerRuntime(credential, signal) {
-    const response = await createClient(SchedulerService, transport(credential.origin, credential.authKey))
+    const response = await createClient(SchedulerService, credentialTransport(credential))
       .getSchedulerRuntime({}, options(signal));
     if (!response.runtime) throw new Error("The Joko node returned no Scheduler runtime.");
     return response.runtime;
   },
   async probeTargetWorktree(credential, targetId, signal) {
     if (!validCatalogIdentity(targetId, 512)) throw new Error("A current Target is required for Worktree discovery.");
-    const response = await createClient(WorktreeService, transport(credential.origin, credential.authKey))
+    const response = await createClient(WorktreeService, credentialTransport(credential))
       .probeTargetWorktree({ targetId }, options(signal));
     if (response.targetId !== targetId) throw new Error("The Joko node returned a Worktree probe for another Target.");
     return {
@@ -2921,7 +3061,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async listTargetWorktreeSources(credential, targetId, signal) {
     if (!validCatalogIdentity(targetId, 512)) throw new Error("A current Target is required for Worktree discovery.");
-    const client = createClient(WorktreeService, transport(credential.origin, credential.authKey));
+    const client = createClient(WorktreeService, credentialTransport(credential));
     return collectTargetWorktreeSourcePages(async (pageToken) => {
       const response = await client.listTargetWorktreeSources({
         targetId,
@@ -2945,7 +3085,7 @@ export const mobileNetwork: MobileNetwork = {
     assertDownloadBlob(blob);
     const current = mobileMediaByteCache.captureOwner(credential.profileId, () => signal?.throwIfAborted());
     current();
-    const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ArtifactService, credentialTransport(credential))
       .getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
     current();
     authorizeVerifiedBlobDownload(credential, blob, response.ticket);
@@ -2968,7 +3108,7 @@ export const mobileNetwork: MobileNetwork = {
   async readImageThumbnail(credential, blob, edge, signal) {
     assertDownloadBlob(blob);
     const current = mobileMediaByteCache.captureOwner(credential.profileId, () => signal?.throwIfAborted());
-    const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
+    const client = createClient(ArtifactService, credentialTransport(credential));
     const cached = await mobileMediaByteCache.getThumbnail(credential, blob, edge, current).catch(() => undefined);
     current();
     if (cached) {
@@ -2997,7 +3137,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async authorizeBlobDownload(credential, blob, signal) {
     assertShareBlob(blob);
-    const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
+    const response = await createClient(ArtifactService, credentialTransport(credential))
       .getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
     signal?.throwIfAborted();
     return authorizeVerifiedBlobDownload(credential, blob, response.ticket);
@@ -3005,7 +3145,7 @@ export const mobileNetwork: MobileNetwork = {
   async uploadBlob(credential, source, signal) {
     const exact = assertBlobUploadSource(source);
     const current = mobileMediaByteCache.captureOwner(credential.profileId, () => signal?.throwIfAborted());
-    const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
+    const client = createClient(ArtifactService, credentialTransport(credential));
     const response = await client.beginBlobUpload({
       fileName: exact.fileName,
       mediaType: exact.mediaType,
@@ -3033,12 +3173,12 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted(); return result;
   },
   async getVoiceInputCapabilities(credential, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .getVoiceInputCapabilities({}, options(signal));
     return projectMobileVoiceCapability(response.profile);
   },
   async getVoiceInputServiceSettings(credential, signal) {
-    const response = await createClient(SettingsService, transport(credential.origin, credential.authKey)).getSettings({}, options(signal));
+    const response = await createClient(SettingsService, credentialTransport(credential)).getSettings({}, options(signal));
     signal?.throwIfAborted();
     return assertMobileVoiceServiceSettings(response.settings?.voiceInput);
   },
@@ -3047,14 +3187,14 @@ export const mobileNetwork: MobileNetwork = {
     const bytes = new TextEncoder().encode(secret);
     try {
       if (bytes.length === 0 || bytes.length > 64 * 1024) throw new Error("The voice credential input is invalid.");
-      const response = await createClient(CredentialService, transport(credential.origin, credential.authKey))
+      const response = await createClient(CredentialService, credentialTransport(credential))
         .beginCredentialUpload({ kind: CredentialKind.API_KEY, providerId: "" }, options(signal));
       signal?.throwIfAborted();
       const ticket = response.ticket;
       if (!ticket?.ticketId || ticket.maximumBytes < BigInt(bytes.length) || !ticket.relativeEndpoint.startsWith("/")) throw new Error("The voice credential channel is unavailable.");
       const endpoint = new URL(ticket.relativeEndpoint, credential.origin);
       if (endpoint.origin !== new URL(credential.origin).origin || endpoint.username || endpoint.password || endpoint.hash) throw new Error("The voice credential channel is invalid.");
-      const upload = await fetch(endpoint.toString(), { method: "PUT", headers: {
+      const upload = await createConnectionFetch(credential)(endpoint.toString(), { method: "PUT", headers: {
         authorization: `Bearer ${credential.authKey}`, "content-type": "application/octet-stream"
       }, body: bytes, signal });
       signal?.throwIfAborted();
@@ -3063,21 +3203,21 @@ export const mobileNetwork: MobileNetwork = {
     } finally { bytes.fill(0); }
   },
   async testVoiceInputConnection(credential, signal) {
-    const result = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).testVoiceInputConnection({}, options(signal));
+    const result = await createClient(VoiceInputService, credentialTransport(credential)).testVoiceInputConnection({}, options(signal));
     signal?.throwIfAborted();
     return result;
   },
   async getVoiceInputDictionary(credential, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .getVoiceInputDictionary({}, options(signal));
     return projectMobileVoiceDictionarySnapshot(response.dictionary);
   },
   async getVoiceInputDictionaryPeerStatus(credential, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).getVoiceInputDictionaryPeerStatus({}, options(signal));
+    const response = await createClient(VoiceInputService, credentialTransport(credential)).getVoiceInputDictionaryPeerStatus({}, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   },
   async getVoiceInputDictionaryReadOnly(credential, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .getVoiceInputDictionaryReadOnly({}, options(signal));
     return projectVoiceDictionaryReadOnly(response.dictionary);
   },
@@ -3087,7 +3227,7 @@ export const mobileNetwork: MobileNetwork = {
     const cancel = (): void => request.abort();
     if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
     try {
-      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionaryReadOnly({}, options(request.signal));
+      const stream = createClient(VoiceInputService, credentialTransport(credential)).watchVoiceInputDictionaryReadOnly({}, options(request.signal));
       for await (const response of stream) {
         request.signal.throwIfAborted();
         sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
@@ -3096,7 +3236,7 @@ export const mobileNetwork: MobileNetwork = {
     } finally { cancel(); signal.removeEventListener("abort", cancel); }
   },
   async grantVoiceInputDictionaryPeer(credential, expectedConfigurationRevision, peerId, expectedFingerprint, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).grantVoiceInputDictionaryPeer({ expectedConfigurationRevision, peerId, expectedFingerprint }, options(signal));
+    const response = await createClient(VoiceInputService, credentialTransport(credential)).grantVoiceInputDictionaryPeer({ expectedConfigurationRevision, peerId, expectedFingerprint }, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   },
   async *watchVoiceInputDictionary(credential, signal) {
@@ -3105,7 +3245,7 @@ export const mobileNetwork: MobileNetwork = {
     const cancel = (): void => request.abort();
     if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
     try {
-      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionary({}, options(request.signal));
+      const stream = createClient(VoiceInputService, credentialTransport(credential)).watchVoiceInputDictionary({}, options(request.signal));
       for await (const response of stream) {
         request.signal.throwIfAborted();
         sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
@@ -3119,7 +3259,7 @@ export const mobileNetwork: MobileNetwork = {
     const cancel = (): void => request.abort();
     if (signal.aborted) cancel(); else signal.addEventListener("abort", cancel, { once: true });
     try {
-      const stream = createClient(VoiceInputService, transport(credential.origin, credential.authKey)).watchVoiceInputDictionaryPeerStatus({}, options(request.signal));
+      const stream = createClient(VoiceInputService, credentialTransport(credential)).watchVoiceInputDictionaryPeerStatus({}, options(request.signal));
       for await (const response of stream) {
         request.signal.throwIfAborted();
         sequence = nextVoiceDictionaryWatchSequence(response.sequence, sequence);
@@ -3128,87 +3268,87 @@ export const mobileNetwork: MobileNetwork = {
     } finally { cancel(); signal.removeEventListener("abort", cancel); }
   },
   async revokeVoiceInputDictionaryPeer(credential, peerId, expectedGrantRevision, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).revokeVoiceInputDictionaryPeer({ peerId, expectedGrantRevision }, options(signal));
+    const response = await createClient(VoiceInputService, credentialTransport(credential)).revokeVoiceInputDictionaryPeer({ peerId, expectedGrantRevision }, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   },
   async syncVoiceInputDictionaryNow(credential, expectedConfigurationRevision, peerId, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).syncVoiceInputDictionaryNow({ expectedConfigurationRevision, ...(peerId === undefined ? {} : { peerId }) }, options(signal));
+    const response = await createClient(VoiceInputService, credentialTransport(credential)).syncVoiceInputDictionaryNow({ expectedConfigurationRevision, ...(peerId === undefined ? {} : { peerId }) }, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   },
   async configureVoiceInputDictionaryListener(credential, expectedConfigurationRevision, listener, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).configureVoiceInputDictionaryListener({ expectedConfigurationRevision, listener }, options(signal));
+    const response = await createClient(VoiceInputService, credentialTransport(credential)).configureVoiceInputDictionaryListener({ expectedConfigurationRevision, listener }, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   },
   async getVoiceInputDictionaryPeerInvitation(credential, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).getVoiceInputDictionaryPeerInvitation({}, options(signal));
+    const response = await createClient(VoiceInputService, credentialTransport(credential)).getVoiceInputDictionaryPeerInvitation({}, options(signal));
     readVoiceDictionaryPeerInvitation(response.invitation);
     return response.invitation;
   },
   async grantVoiceInputDictionaryDirectPeer(credential, expectedConfigurationRevision, invitation, expectedFingerprint, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).grantVoiceInputDictionaryDirectPeer({ expectedConfigurationRevision, invitation, expectedFingerprint }, options(signal));
+    const response = await createClient(VoiceInputService, credentialTransport(credential)).grantVoiceInputDictionaryDirectPeer({ expectedConfigurationRevision, invitation, expectedFingerprint }, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   },
   async clearVoiceInputDictionaryPeerRoute(credential, expectedConfigurationRevision, peerId, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey)).clearVoiceInputDictionaryPeerRoute({ expectedConfigurationRevision, peerId }, options(signal));
+    const response = await createClient(VoiceInputService, credentialTransport(credential)).clearVoiceInputDictionaryPeerRoute({ expectedConfigurationRevision, peerId }, options(signal));
     return projectVoiceDictionaryPeerStatus(response.status);
   },
   async setVoiceInputDictionarySyncEnabled(credential, expectedRevision, enabled, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .setVoiceInputDictionarySyncEnabled({ expectedRevision, enabled }, options(signal));
     return projectMobileVoiceDictionarySnapshot(response.dictionary);
   },
   async addVoiceInputDictionaryTerms(credential, expectedRevision, terms, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .addVoiceInputDictionaryTerms({ expectedRevision, terms: [...terms] }, options(signal));
     return projectMobileVoiceDictionarySnapshot(response.dictionary);
   },
   async editVoiceInputDictionaryEntry(credential, expectedRevision, entryId, text, aliases, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .editVoiceInputDictionaryEntry({ expectedRevision, entryId, text, aliases: [...aliases] }, options(signal));
     return projectMobileVoiceDictionarySnapshot(response.dictionary);
   },
   async deleteVoiceInputDictionaryEntry(credential, expectedRevision, entryId, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .deleteVoiceInputDictionaryEntry({ expectedRevision, entryId }, options(signal));
     return projectMobileVoiceDictionarySnapshot(response.dictionary);
   },
   async applyVoiceInputDictionaryLearning(credential, expectedRevision, actions, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .applyVoiceInputDictionaryLearning({ expectedRevision, actions: mobileVoiceDictionaryLearningRequest(actions) }, options(signal));
     return projectMobileVoiceDictionarySnapshot(response.dictionary);
   },
   async adviseVoiceInputDictionaryEdit(credential, draft, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .adviseVoiceInputDictionaryEdit(mobileVoiceDictionaryAdviceRequest(draft), options(signal));
     return Object.freeze({ actions: projectMobileVoiceDictionaryAdvice(response.actions, draft) });
   },
   async startVoiceInput(credential, requestId, mimeType, locale, refinement, signal, recognitionContext) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .startVoiceInput(mobileVoiceStartRequest(requestId, mimeType, locale, refinement, recognitionContext), options(signal));
     return projectMobileVoiceSession(response.session);
   },
   async appendVoiceAudio(credential, voiceInputId, chunkSequence, audio, durationMs, voiced, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .appendVoiceAudio({ voiceInputId, chunkSequence, audio: Uint8Array.from(audio), durationMs, voiced }, options(signal));
     return projectMobileVoiceSession(response.session);
   },
   async stopVoiceInput(credential, voiceInputId, expectedNextChunkSequence, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .stopVoiceInput({ voiceInputId, expectedNextChunkSequence }, options(signal));
     return projectMobileVoiceSession(response.session);
   },
   async cancelVoiceInput(credential, voiceInputId, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .cancelVoiceInput({ voiceInputId }, options(signal));
     return projectMobileVoiceSession(response.session);
   },
   async getVoiceInputSession(credential, voiceInputId, signal) {
-    const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
+    const response = await createClient(VoiceInputService, credentialTransport(credential))
       .getVoiceInputSession({ voiceInputId }, options(signal));
     return projectMobileVoiceSession(response.session);
   },
   async *streamOwner(credential, after, signal) {
-    const client = createClient(EventService, transport(credential.origin, credential.authKey));
+    const client = createClient(EventService, credentialTransport(credential));
     for await (const response of client.streamEvents({
       scope: { kind: { case: "owner", value: {} } }, afterCursor: after
     }, { signal })) {
@@ -3218,7 +3358,7 @@ export const mobileNetwork: MobileNetwork = {
   async prepareTarget(credential, target, signal) {
     const revision = target.version?.revision;
     if (!target.targetId || !revision || revision.value < 1n) throw new Error("A current target revision is required.");
-    const response = await createClient(TargetService, transport(credential.origin, credential.authKey)).prepareTargetWorkspace({
+    const response = await createClient(TargetService, credentialTransport(credential)).prepareTargetWorkspace({
       targetId: target.targetId, expectedTargetRevision: revision
     }, options(signal));
     if (!response.workspace || response.workspace.targetId !== target.targetId
@@ -3227,7 +3367,7 @@ export const mobileNetwork: MobileNetwork = {
     }
   },
   async submit(credential, operationId, mutation, signal) {
-    const response = await createClient(OperationService, transport(credential.origin, credential.authKey)).submitOperation({
+    const response = await createClient(OperationService, credentialTransport(credential)).submitOperation({
       operationId, connectionId: credential.connectionId, mutation
     }, options(signal));
     if (!response.operation || response.operation.operationId !== operationId || response.operation.connectionId !== credential.connectionId) {
@@ -3236,7 +3376,7 @@ export const mobileNetwork: MobileNetwork = {
     return response.operation;
   },
   async waitOperation(credential, operationId, signal) {
-    const client = createClient(OperationService, transport(credential.origin, credential.authKey));
+    const client = createClient(OperationService, credentialTransport(credential));
     let revision = 0n;
     for await (const response of client.watchOperation({ operationId }, options(signal))) {
       const operation = response.operation;
@@ -3257,7 +3397,7 @@ export const mobileNetwork: MobileNetwork = {
   async getOperation(credential, operationId, signal) {
     let response;
     try {
-      response = await createClient(OperationService, transport(credential.origin, credential.authKey)).getOperation({ operationId }, options(signal));
+      response = await createClient(OperationService, credentialTransport(credential)).getOperation({ operationId }, options(signal));
     } catch (error) {
       if (error instanceof ConnectError && error.code === Code.NotFound) return undefined;
       throw error;

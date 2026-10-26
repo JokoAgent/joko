@@ -5,6 +5,7 @@ import { create } from "@bufbuild/protobuf";
 import { McpAppCardSchema, McpAppOperation, McpAppServiceOperateResponseSchema } from "@joko/contracts";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
+import type { McpAppApi } from "../model.js";
 import { translate } from "../i18n.js";
 import { McpAppCard, McpAppTimelineProvider } from "./McpAppCard.js";
 
@@ -17,10 +18,10 @@ afterEach(async () => { for (const { root, element } of roots.splice(0)) { await
 const t = (key: Parameters<typeof translate>[1]) => translate("en", key);
 const card = create(McpAppCardSchema, { cardId: "mcp-app:00000000-0000-0000-0000-000000000001", sessionId: "task", title: "Example form", text: "Public answer" });
 function mount() { const element = document.body.appendChild(document.createElement("div")), root = createRoot(element); roots.push({ root, element }); return { root, element }; }
-function controller(operate: ReturnType<typeof vi.fn>, serverId = "one", guest = false): AppController {
+function controller(operate: ReturnType<typeof vi.fn>, serverId = "one", guest = false, openSurface?: McpAppApi["openSurface"]): AppController {
   return { state: { connectionState: "connected", activeProfile: { id: "connection", serverId, origin: "https://node.example.test" },
     snapshot: { generation: 1n }, ...(guest ? { sessionAccess: { role: "guest" } } : {}) },
-    mcpAppApi: () => ({ operate }), openHttpLink: vi.fn(async () => {}) } as unknown as AppController;
+    mcpAppApi: () => ({ operate, openSurface }), openHttpLink: vi.fn(async () => {}) } as unknown as AppController;
 }
 
 it("keeps shared-task cards read-only without opening an interactive View", async () => {
@@ -65,4 +66,27 @@ it("reclaims a late open through its original connection when the visible node c
   expect(first.mock.calls.some(([request]) => request.operation === McpAppOperation.TEARDOWN && (request as { viewId?: string }).viewId === "first")).toBe(true);
   expect(second.mock.calls.some(([request]) => (request as { viewId?: string })?.viewId === "first")).toBe(false);
   expect(f.element.querySelector("iframe")?.getAttribute("src")).toContain("/second");
+});
+
+it("keeps the private browser bridge alive for the original bounded teardown", async () => {
+  const f = mount();
+  let finish!: (value: ReturnType<typeof create<typeof McpAppServiceOperateResponseSchema>>) => void;
+  let browserSignal!: AbortSignal;
+  const invoke = vi.fn(async () => new Promise<unknown>(() => {}));
+  const openSurface = vi.fn(async (_url: string, signal: AbortSignal) => {
+    browserSignal = signal;
+    return { html: "<p>private App</p>", policy: "default-src 'none'", invoke };
+  });
+  const operate = vi.fn(({ operation }: { operation: McpAppOperation }) => operation === McpAppOperation.OPEN
+    ? Promise.resolve(create(McpAppServiceOperateResponseSchema, { viewId: "private-view", proxyUrl: `https://node.example.test/mcp-apps/proxy/${"a".repeat(64)}` }))
+    : operation === McpAppOperation.TEARDOWN ? new Promise(resolve => { finish = resolve; })
+      : Promise.resolve(create(McpAppServiceOperateResponseSchema)));
+  await act(async () => f.root.render(<McpAppTimelineProvider controller={controller(operate, "one", false, openSurface)}><McpAppCard card={card} locale="en" t={t} /></McpAppTimelineProvider>));
+  expect(openSurface).toHaveBeenCalledOnce();
+  expect(f.element.querySelector("iframe")?.getAttribute("sandbox")).toBe("allow-scripts");
+  await act(async () => f.root.render(null));
+  expect(operate.mock.calls.some(([request]) => request.operation === McpAppOperation.TEARDOWN)).toBe(true);
+  expect(browserSignal.aborted).toBe(false);
+  await act(async () => finish(create(McpAppServiceOperateResponseSchema)));
+  expect(browserSignal.aborted).toBe(true);
 });

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { createClient, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, endpointOrigin, normalizeEndpointPublicKey } from "@joko/connection-transport/node";
 import {
   BrowserService,
   ConnectionService,
@@ -77,6 +77,36 @@ export interface BrowserAutomationNodeExecutionRequest {
 
 export function browserAutomationNodeCredentialProviderId(nodeId: string): string {
   return `${CREDENTIAL_PROVIDER_PREFIX}${validNodeId(nodeId)}`;
+}
+
+/** Private header_secret payload for this existing credential purpose. */
+export interface BrowserAutomationNodeCredential {
+  readonly format: 1;
+  readonly serverId: string;
+  readonly origin: string;
+  readonly endpointPublicKey: string;
+  readonly authKey: string;
+}
+
+export function parseBrowserAutomationNodeCredential(value: string): BrowserAutomationNodeCredential {
+  try {
+    if (value.length > 8_192) throw new Error();
+    const parsed: unknown = JSON.parse(value);
+    if (!isRecord(parsed) || Object.keys(parsed).sort().join(",") !== "authKey,endpointPublicKey,format,origin,serverId"
+      || parsed["format"] !== 1 || typeof parsed["serverId"] !== "string" || typeof parsed["origin"] !== "string"
+      || typeof parsed["endpointPublicKey"] !== "string" || typeof parsed["authKey"] !== "string"
+      || !/^[A-Za-z0-9._~-]{1,4096}$/u.test(parsed["authKey"])) throw new Error();
+    const origin = endpointOrigin(parsed["origin"]);
+    if (origin !== parsed["origin"]) throw new Error();
+    return { format: 1, serverId: validNodeId(parsed["serverId"]), origin,
+      endpointPublicKey: normalizeEndpointPublicKey(parsed["endpointPublicKey"]), authKey: parsed["authKey"] };
+  } catch {
+    throw new Error("Reconfigure the Browser node with its complete trusted connection credential, including the endpoint public key and origin.");
+  }
+}
+
+export function formatBrowserAutomationNodeCredential(value: Omit<BrowserAutomationNodeCredential, "format">): string {
+  return JSON.stringify(parseBrowserAutomationNodeCredential(JSON.stringify({ format: 1, ...value })));
 }
 
 /** Local authenticated dispatch target used by BrowserService and the self route. */
@@ -224,12 +254,12 @@ export interface BrowserAutomationNodeRpcClient {
   ): Promise<ExecuteBrowserAutomationActionResponse>;
 }
 
-export type BrowserAutomationNodeRpcClientFactory = (origin: string) => BrowserAutomationNodeRpcClient;
+export type BrowserAutomationNodeRpcClientFactory = (origin: string, endpointPublicKey: string) => BrowserAutomationNodeRpcClient;
 
 /**
  * Resolves only live discovery records with an encrypted service credential.
- * The discovery origin is never persisted and is identity-probed before a
- * bearer is decrypted or sent.
+ * Discovery must match the sealed credential's trusted route. It supplies
+ * neither endpoint trust nor an alternative destination for the bearer.
  */
 export class AuthenticatedBrowserRemoteNodeRouter implements BrowserRemoteNodeRouter {
   readonly #localNodeId: string;
@@ -239,6 +269,7 @@ export class AuthenticatedBrowserRemoteNodeRouter implements BrowserRemoteNodeRo
   readonly #artifacts: ArtifactStore;
   readonly #rpcFactory: BrowserAutomationNodeRpcClientFactory;
   readonly #remote = new Map<string, BrowserAutomationNodeProjection>();
+  readonly #remoteCredentials = new Map<string, string>();
   #localExecutor: BrowserAutomationNodeExecutor | undefined;
 
   constructor(input: {
@@ -307,23 +338,27 @@ export class AuthenticatedBrowserRemoteNodeRouter implements BrowserRemoteNodeRo
       async (request, signal) => {
         const discovered = this.#discoveredRemote(id);
         if (discovered === undefined) throw new Error("Remote Browser node is no longer discoverable.");
-        const rpc = this.#rpcFactory(discovered.origin);
+        const credential = this.#credentialConnection(id);
+        if (credential === undefined || credential.origin !== discovered.origin) throw new Error("Remote Browser discovery does not match its trusted connection.");
+        if (this.#remoteCredentials.get(id) !== credential.generation) throw new Error("Remote Browser credential changed. Refresh the node before calling it.");
+        const rpc = this.#rpcFactory(credential.origin, credential.endpointPublicKey);
         if (await rpc.serverId(signal) !== id) throw new Error("Remote Browser node identity changed.");
-        const credential = this.#credentialReference(id);
-        if (credential === undefined) throw new Error("Remote Browser node has no authenticated service connection.");
+        credential.assertCurrent();
         const expected = this.#remote.get(id);
         if (expected === undefined) throw new Error("Remote Browser node capability projection is unavailable.");
         assertActionCapabilities(request.action, request.arguments, expected.capabilities);
         const inputArtifacts = request.action === "upload"
           ? await this.#readInputArtifacts(request.arguments)
           : [];
-        const response = await rpc.execute(this.#credentials.resolve(credential), {
+        credential.assertCurrent();
+        const response = await rpc.execute(credential.authKey, {
           nodeId: id,
           expectedGeneration: expected.generation,
           action: request.action,
           arguments: request.arguments,
           inputArtifacts
         }, signal);
+        credential.assertCurrent();
         const currentDiscovery = this.#discoveredRemote(id);
         if (currentDiscovery === undefined || currentDiscovery.origin !== discovered.origin) {
           throw new Error("Remote Browser node discovery authority changed during execution.");
@@ -340,17 +375,22 @@ export class AuthenticatedBrowserRemoteNodeRouter implements BrowserRemoteNodeRo
 
   async #readRemoteNode(id: string): Promise<BrowserAutomationNodeProjection | undefined> {
     const discovered = this.#discoveredRemote(id);
-    const credential = this.#credentialReference(id);
-    if (discovered === undefined || credential === undefined) return undefined;
-    const rpc = this.#rpcFactory(discovered.origin);
-    // Bind the credential-free discovery origin to the stable server identity
-    // before decrypting the service bearer.
+    if (discovered === undefined) return undefined;
+    const credential = this.#credentialConnection(id);
+    if (credential === undefined) return undefined;
+    if (discovered.origin !== credential.origin) throw new Error("Remote Browser discovery does not match its trusted connection.");
+    const rpc = this.#rpcFactory(credential.origin, credential.endpointPublicKey);
+    // The endpoint key is verified by Linkspan before either this identity RPC
+    // or the business bearer can reach the selected destination.
     if (await rpc.serverId() !== id) return undefined;
-    const nodes = await rpc.list(this.#credentials.resolve(credential));
+    credential.assertCurrent();
+    const nodes = await rpc.list(credential.authKey);
+    credential.assertCurrent();
     const current = this.#discoveredRemote(id);
     if (current === undefined || current.origin !== discovered.origin) return undefined;
     const matches = nodes.filter((node) => node.nodeId === id);
     if (matches.length !== 1) return undefined;
+    this.#remoteCredentials.set(id, credential.generation);
     return projectionFromProto(matches[0], id);
   }
 
@@ -367,12 +407,22 @@ export class AuthenticatedBrowserRemoteNodeRouter implements BrowserRemoteNodeRo
     return node;
   }
 
-  #credentialReference(id: string): string | undefined {
+  #credentialConnection(id: string): (BrowserAutomationNodeCredential & { readonly generation: string; assertCurrent(): void }) | undefined {
     const credentials = this.#credentials.list({
       providerId: browserAutomationNodeCredentialProviderId(id),
       kind: "header_secret"
     }).filter((credential) => credential.configured);
-    return credentials.length === 1 ? credentials[0]!.credentialReferenceId : undefined;
+    if (credentials.length !== 1) return undefined;
+    const captured = credentials[0]!;
+    if (!captured.generation) throw new Error("Remote Browser credential has no current generation.");
+    const connection = parseBrowserAutomationNodeCredential(this.#credentials.resolve(captured.credentialReferenceId));
+    if (connection.serverId !== id) throw new Error("Remote Browser credential belongs to another node.");
+    return { ...connection, generation: captured.generation, assertCurrent: () => {
+      const current = this.#credentials.list({ providerId: browserAutomationNodeCredentialProviderId(id), kind: "header_secret" }).filter((entry) => entry.configured);
+      if (current.length !== 1 || current[0]!.credentialReferenceId !== captured.credentialReferenceId || current[0]!.generation !== captured.generation) {
+        throw new Error("Remote Browser credential was revoked or replaced.");
+      }
+    } };
   }
 
   async #readInputArtifacts(arguments_: Readonly<Record<string, unknown>>): Promise<readonly BrowserAutomationInputArtifact[]> {
@@ -397,19 +447,19 @@ export class AuthenticatedBrowserRemoteNodeRouter implements BrowserRemoteNodeRo
   }
 }
 
-function defaultRpcClient(origin: string): BrowserAutomationNodeRpcClient {
+function defaultRpcClient(origin: string, endpointPublicKey: string): BrowserAutomationNodeRpcClient {
   const normalizedOrigin = new URL(origin).origin;
   if (normalizedOrigin !== origin) throw new Error("Remote Browser node origin is invalid.");
   return {
     async serverId(signal) {
-      const response = await createClient(ConnectionService, transport(normalizedOrigin)).getServerInfo({}, { signal });
+      const response = await createClient(ConnectionService, transport(normalizedOrigin, endpointPublicKey)).getServerInfo({}, { signal });
       return response.server?.serverId ?? "";
     },
     async list(authKey, signal) {
-      const response = await browserClient(normalizedOrigin, authKey).listBrowserAutomationNodes({}, { signal });
+      const response = await browserClient(normalizedOrigin, endpointPublicKey, authKey).listBrowserAutomationNodes({}, { signal });
       return response.nodes;
     },
-    execute: async (authKey, request, signal) => browserClient(normalizedOrigin, authKey).executeBrowserAutomationAction({
+    execute: async (authKey, request, signal) => browserClient(normalizedOrigin, endpointPublicKey, authKey).executeBrowserAutomationAction({
       nodeId: request.nodeId,
       expectedGeneration: BigInt(request.expectedGeneration),
       action: request.action,
@@ -419,11 +469,11 @@ function defaultRpcClient(origin: string): BrowserAutomationNodeRpcClient {
   };
 }
 
-function browserClient(origin: string, authKey: string): Client<typeof BrowserService> {
-  return createClient(BrowserService, transport(origin, authKey));
+function browserClient(origin: string, endpointPublicKey: string, authKey: string): Client<typeof BrowserService> {
+  return createClient(BrowserService, transport(origin, endpointPublicKey, authKey));
 }
 
-function transport(origin: string, authKey?: string): Transport {
+function transport(origin: string, endpointPublicKey: string, authKey?: string): Transport {
   const interceptors: Interceptor[] = [];
   if (authKey !== undefined) interceptors.push((next) => (request) => {
     request.header.set("authorization", `Bearer ${authKey}`);
@@ -431,6 +481,7 @@ function transport(origin: string, authKey?: string): Transport {
   });
   return createConnectTransport({
     baseUrl: origin,
+    endpointPublicKey,
     httpVersion: "1.1",
     useBinaryFormat: true,
     interceptors,

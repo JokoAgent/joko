@@ -35,6 +35,8 @@ export class OrchestratorServiceLifecycle {
   #closePromise: Promise<void> | undefined;
   #publicServer: OrchestratorLifecycleServer | undefined;
   #internalServer: OrchestratorLifecycleServer | undefined;
+  readonly #transports = new Set<OrchestratorLifecycleServer>();
+  readonly #shutdownAbort = new AbortController();
   #stopPairingAnnouncements: (() => void) | undefined;
   #bootstrapDisposed = false;
 
@@ -47,6 +49,7 @@ export class OrchestratorServiceLifecycle {
   get shutdownRequested(): boolean {
     return this.#shutdownSignal !== undefined;
   }
+  get signal(): AbortSignal { return this.#shutdownAbort.signal; }
 
   registerPublicServer<T extends OrchestratorLifecycleServer>(server: T): T {
     this.#publicServer = server;
@@ -58,6 +61,12 @@ export class OrchestratorServiceLifecycle {
     this.#internalServer = server;
     if (this.shutdownRequested) this.#closeResource(server, () => server.close());
     return server;
+  }
+
+  registerTransport<T extends OrchestratorLifecycleServer>(transport: T): T {
+    this.#transports.add(transport);
+    if (this.shutdownRequested) this.#closeResource(transport, () => transport.close());
+    return transport;
   }
 
   registerPairingAnnouncements(stop: () => void): void {
@@ -81,10 +90,12 @@ export class OrchestratorServiceLifecycle {
   requestShutdown(signal: string): Promise<void> {
     if (this.#shutdownSignal === undefined) {
       this.#shutdownSignal = signal;
+      this.#shutdownAbort.abort(new OrchestratorStartupInterruptedError());
       this.#publicServer?.log?.info({ signal }, "Orchestrator is shutting down");
       this.#disposeBootstrapOnce();
       this.#stopPairingAnnouncements?.();
       this.#stopPairingAnnouncements = undefined;
+      for (const transport of this.#transports) this.#closeResource(transport, () => transport.close());
       this.#closeResource(this.#application.lanDiscovery, () => this.#application.lanDiscovery.stop());
       if (this.#internalServer !== undefined) {
         this.#closeResource(this.#internalServer, () => this.#internalServer!.close());

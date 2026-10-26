@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
-import { EventSchema, GetSnapshotResponseSchema, SnapshotSchema, RunState } from "@joko/contracts";
+import { EventSchema, GetSnapshotResponseSchema, SnapshotSchema, StreamEventsResponseSchema, RunState } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 import type { AppSnapshot } from "./model.js";
@@ -14,7 +14,6 @@ const ownerSnapshot = (cursor: bigint) => create(GetSnapshotResponseSchema, { sn
 function response(method: any, message: any, stream = false): any {
   return { stream, service: method.parent, method, header: new Headers(), trailer: new Headers(), message };
 }
-async function* idle(): AsyncIterable<never> { await new Promise<never>(() => undefined); }
 
 it("never promotes a snapshot-only probe to a live task-status source", async () => {
   const live = vi.fn(), snapshot = vi.fn();
@@ -30,6 +29,7 @@ it("withdraws an interrupted source and requires a fresh authenticated owner sna
   const observed: Array<AppSnapshot | undefined> = [];
   let reads = 0, streams = 0;
   let finishRefresh!: (value: ReturnType<typeof ownerSnapshot>) => void;
+  let acceptStream!: () => void;
   const transport = {
     unary: async (method: any) => {
       if (method.localName !== "getSnapshot") throw new Error("Unsupported fixture method");
@@ -38,7 +38,12 @@ it("withdraws an interrupted source and requires a fresh authenticated owner sna
     },
     stream: async (method: any) => {
       streams += 1;
-      return response(method, streams === 1 ? { async *[Symbol.asyncIterator]() { throw new ConnectError("offline", Code.Unavailable); } } : idle(), true);
+      return response(method, streams === 1 ? { async *[Symbol.asyncIterator]() { throw new ConnectError("offline", Code.Unavailable); } }
+        : { async *[Symbol.asyncIterator]() {
+          await new Promise<void>(resolve => { acceptStream = resolve; });
+          yield create(StreamEventsResponseSchema);
+          await new Promise<never>(() => undefined);
+        } }, true);
     }
   } as unknown as Transport;
   const gateway = createOrchestratorGateway(profile, "fixture-auth", { onLiveSnapshot: value => observed.push(value) }, () => transport);
@@ -48,7 +53,10 @@ it("withdraws an interrupted source and requires a fresh authenticated owner sna
     await vi.advanceTimersByTimeAsync(350);
     expect(reads).toBe(2); expect(streams).toBe(1); expect(observed.at(-1)).toBeUndefined();
     finishRefresh(ownerSnapshot(2n)); await vi.advanceTimersByTimeAsync(0);
-    expect(observed.filter(Boolean).map(value => value!.cursor)).toEqual([1n, 2n]); expect(streams).toBe(2);
+    expect(streams).toBe(2); expect(observed.at(-1)).toBeUndefined();
+    expect(observed.filter(Boolean).map(value => value!.cursor)).toEqual([1n]);
+    acceptStream(); await vi.advanceTimersByTimeAsync(0);
+    expect(observed.filter(Boolean).map(value => value!.cursor)).toEqual([1n, 2n]);
   } finally { gateway.disconnect(); }
 });
 

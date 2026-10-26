@@ -5,8 +5,14 @@ import { EntityVersionSchema, GetOperationResponseSchema, ObjectiveSchema, Objec
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mobileNetwork, type PairedCredential } from "./network";
 import { projectMobileObjective } from "./mobile-objective";
+import { mobileNetworkFixtureEndpointPublicKey } from "./test/mobile-network-transport";
 
-const credential: PairedCredential = { profileId: "phone", connectionId: "connection", deviceId: "device", serverId: "node",
+vi.mock("@joko/connection-transport", async importOriginal => {
+  const { controlledMobileConnectionTransport } = await import("./test/mobile-network-transport");
+  return controlledMobileConnectionTransport(await importOriginal<typeof import("@joko/connection-transport")>());
+});
+
+const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "phone", connectionId: "connection", deviceId: "device", serverId: "node",
   origin: "http://192.168.1.20:4318", displayName: "Phone", authKey: "private-auth" };
 const objective = () => create(ObjectiveSchema, { sessionId: "task", text: "Finish the result", status: ObjectiveStatus.ACTIVE,
   sessionGeneration: 7n, ownerGeneration: 2n, noProgressTurnLimit: 3, startedAt: { seconds: 10n }, version: { revision: { value: 9n }, generation: 2n } });

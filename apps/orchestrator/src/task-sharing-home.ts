@@ -3,7 +3,7 @@ import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { create, fromBinary, fromJsonString, toBinary, toJsonString } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient, type Client } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport } from "@joko/connection-transport/node";
 import * as contract from "@joko/contracts";
 import type { CredentialVault, EncryptedCredential } from "./credential-vault.js";
 
@@ -21,6 +21,7 @@ interface StoredIntent {
   readonly requestSha256Hex: string;
   readonly joinId: string;
   readonly hostOrigin: string;
+  readonly endpointPublicKey: string;
   readonly hostServerId: string;
   readonly shareId: string;
   readonly shareGeneration: string;
@@ -33,6 +34,7 @@ interface StoredIntent {
 }
 interface StoredJoin {
   value: string;
+  readonly endpointPublicKey: string;
   readonly credentialReference: string;
   readonly sealed: EncryptedCredential;
 }
@@ -63,7 +65,7 @@ export class TaskSharingHome {
   #closed = false;
   #directoryOffset = 0;
   constructor(readonly options: { readonly directory: string; readonly vault: CredentialVault; readonly serverId: string;
-    readonly connect?: (origin: string) => TaskSharingHomeRemote; readonly now?: () => number }) {}
+    readonly connect?: (origin: string, endpointPublicKey: string) => TaskSharingHomeRemote; readonly now?: () => number }) {}
 
   async initialize(): Promise<void> {
     await mkdir(this.options.directory, { recursive: true, mode: 0o700 });
@@ -76,13 +78,16 @@ export class TaskSharingHome {
       || !Array.isArray(value.joined) || !Array.isArray(value.writes) || !Array.isArray(value.actions)) throw new Error("The private shared task directory is invalid.");
     for (const item of value.intents) {
       contract.taskShareIdentity(item.operationId); contract.taskShareIdentity(item.joinId); contract.taskShareOrigin(item.hostOrigin);
+      contract.taskShareEndpointPublicKey(item.endpointPublicKey);
       if (!/^[a-f0-9]{64}$/u.test(item.requestSha256Hex) || !/^[a-f0-9]{64}$/u.test(item.credentialSha256Hex)
         || !["prepared", "sent", "joined", "unknown", "failed"].includes(item.status) || this.#intents.has(item.operationId)) throw new Error("The shared task intent is invalid.");
       this.#intents.set(item.operationId, { ...item, status: item.status === "sent" || item.status === "prepared" ? "unknown" : item.status });
     }
     for (const item of value.joined) {
       const joined = fromJsonString(contract.JoinedTaskShareSchema, item.value);
+      contract.taskShareEndpointPublicKey(item.endpointPublicKey);
       this.#validateJoined(joined);
+      if (item.credentialReference !== this.#joinedReference(joined, item.endpointPublicKey)) throw unavailable();
       if (this.#joined.has(joined.joinId)) throw new Error("The joined task identity is duplicated.");
       this.#joined.set(joined.joinId, item); this.#lifetimes.set(joined.joinId, new AbortController());
     }
@@ -100,7 +105,7 @@ export class TaskSharingHome {
       intents: [...this.#intents.values()].map(item => this.#intent(item)) };
   }
   async preview(invitation: string, auth: TaskSharingHomeAuthority): Promise<contract.TaskShare> {
-    const parsed = contract.parseTaskShareInvitation(invitation); const remote = this.#remote(parsed.hostOrigin);
+    const parsed = contract.parseTaskShareInvitation(invitation); const remote = this.#remote(parsed.hostOrigin, parsed.endpointPublicKey);
     auth.assertCurrent(); await remote.verify(parsed.hostServerId, auth.signal); auth.assertCurrent();
     const response = await remote.guest.inspectTaskShareInvitation({ invitation }, { signal: auth.signal }); auth.assertCurrent();
     return this.#checkInvitationShare(parsed, response.share);
@@ -121,14 +126,15 @@ export class TaskSharingHome {
       await this.preview(invitation, auth); auth.assertCurrent();
       const secret = randomBytes(32).toString("base64url"), joinId = randomUUID();
       const intent: StoredIntent = { operationId, requestSha256Hex: fingerprint, joinId, hostOrigin: parsed.hostOrigin,
+        endpointPublicKey: parsed.endpointPublicKey,
         hostServerId: parsed.hostServerId, shareId: parsed.shareId, shareGeneration: String(parsed.shareGeneration), displayName: name,
         homeDeviceId: auth.deviceId, credentialSha256Hex: digest(secret),
-        sealed: this.options.vault.seal(JSON.stringify({ secret }), this.#intentReference(operationId, joinId, parsed.hostServerId, parsed.shareId)),
+        sealed: this.options.vault.seal(JSON.stringify({ secret }), this.#intentReference(operationId, joinId, parsed.hostServerId, parsed.shareId, parsed.hostOrigin, parsed.endpointPublicKey)),
         status: "prepared", errorCode: "" };
       this.#intents.set(operationId, intent); await this.#save(); auth.assertCurrent();
       intent.status = "sent"; await this.#save(); auth.assertCurrent();
       try {
-        const remote = this.#remote(parsed.hostOrigin); await remote.verify(parsed.hostServerId, auth.signal); auth.assertCurrent();
+        const remote = this.#remote(parsed.hostOrigin, parsed.endpointPublicKey); await remote.verify(parsed.hostServerId, auth.signal); auth.assertCurrent();
         const response = await remote.guest.acceptTaskShareJoin({ intentId: operationId, invitation, credentialSha256Hex: intent.credentialSha256Hex,
           displayName: name, homeServerId: this.options.serverId, homeDeviceId: auth.deviceId }, { signal: auth.signal });
         auth.assertCurrent(); await this.#accept(intent, response.share, response.member, secret); auth.assertCurrent();
@@ -186,7 +192,8 @@ export class TaskSharingHome {
       contract.assertTaskShareScope(scope, response.state.share, response.state.member.memberId, response.state.member.memberGeneration);
       const snapshot = response.state.snapshot;
       if (snapshot.sessions.length !== 1 || snapshot.sessions[0]?.sessionId !== scope.sessionId) throw unavailable();
-      return response.state;
+      const captured = fromJsonString(contract.JoinedTaskShareSchema, this.#joined.get(joinId)!.value);
+      return create(contract.TaskShareSnapshotSchema, { ...response.state, share: { ...response.state.share, hostOrigin: captured.share!.hostOrigin } });
     });
   }
   events(joinId: string, after: contract.EventCursor | undefined, limit: number, auth: TaskSharingHomeAuthority): Promise<contract.TaskShareEventBatch> {
@@ -271,7 +278,7 @@ export class TaskSharingHome {
       if (stored) {
         const joined = fromJsonString(contract.JoinedTaskShareSchema, stored.value);
         auth.assertCurrent();
-        const remote = this.#remote(joined.share!.hostOrigin);
+        const remote = this.#remote(joined.share!.hostOrigin, stored.endpointPublicKey);
         await remote.verify(joined.share!.hostServerId, auth.signal); auth.assertCurrent();
         const secret = this.options.vault.open(stored.sealed, stored.credentialReference);
         const response = await remote.guest.getSharedTaskLeaveReceipt({ operationId,
@@ -313,7 +320,7 @@ export class TaskSharingHome {
     const lifetime = this.#lifetimes.get(joinId)!;
     const signal = leaving ? auth.signal : AbortSignal.any([auth.signal, lifetime.signal]);
     const current = () => { auth.assertCurrent(); signal.throwIfAborted(); if (this.#closed || this.#joined.get(joinId) !== stored) throw unavailable(); };
-    const remote = this.#remote(joined.share!.hostOrigin); current(); await remote.verify(joined.share!.hostServerId, signal); current();
+    const remote = this.#remote(joined.share!.hostOrigin, stored.endpointPublicKey); current(); await remote.verify(joined.share!.hostServerId, signal); current();
     const secret = this.options.vault.open(stored.sealed, stored.credentialReference);
     const scope = create(contract.TaskShareScopeSchema, contract.scopeForJoinedTask(joined));
     try {
@@ -340,7 +347,7 @@ export class TaskSharingHome {
     }
   }
   async #recover(intent: StoredIntent, auth: TaskSharingHomeAuthority): Promise<contract.TaskShareJoinIntent> {
-    const remote = this.#remote(intent.hostOrigin); auth.assertCurrent();
+    const remote = this.#remote(intent.hostOrigin, intent.endpointPublicKey); auth.assertCurrent();
     await remote.verify(intent.hostServerId, auth.signal); auth.assertCurrent();
     const sealed = JSON.parse(this.options.vault.open(intent.sealed,
       this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId))) as { secret: string };
@@ -352,12 +359,12 @@ export class TaskSharingHome {
     return this.#intent(intent);
   }
   async #accept(intent: StoredIntent, share: contract.TaskShare | undefined, member: contract.TaskShareMember | undefined, secret: string): Promise<void> {
-    this.#checkInvitationShare({ hostOrigin: intent.hostOrigin, hostServerId: intent.hostServerId, shareId: intent.shareId,
-      shareGeneration: BigInt(intent.shareGeneration), inviteSecret: "" }, share);
+    const pinnedShare = this.#checkInvitationShare({ hostOrigin: intent.hostOrigin, hostServerId: intent.hostServerId, shareId: intent.shareId,
+      endpointPublicKey: intent.endpointPublicKey, shareGeneration: BigInt(intent.shareGeneration), inviteSecret: "" }, share);
     if (!member?.memberId || member.memberGeneration < 1n || member.status !== "active") throw unavailable();
-    const joined = create(contract.JoinedTaskShareSchema, { joinId: intent.joinId, share, member, status: "active", joinedAtMs: BigInt((this.options.now ?? Date.now)()) });
-    const reference = `task-sharing-guest:${this.options.serverId}:${intent.joinId}:${share!.hostServerId}:${share!.shareId}:${share!.shareGeneration}:${share!.sessionId}:${member.memberId}:${member.memberGeneration}`;
-    this.#joined.set(intent.joinId, { value: toJsonString(contract.JoinedTaskShareSchema, joined), credentialReference: reference, sealed: this.options.vault.seal(secret, reference) });
+    const joined = create(contract.JoinedTaskShareSchema, { joinId: intent.joinId, share: pinnedShare, member, status: "active", joinedAtMs: BigInt((this.options.now ?? Date.now)()) });
+    const reference = this.#joinedReference(joined, intent.endpointPublicKey);
+    this.#joined.set(intent.joinId, { value: toJsonString(contract.JoinedTaskShareSchema, joined), endpointPublicKey: intent.endpointPublicKey, credentialReference: reference, sealed: this.options.vault.seal(secret, reference) });
     this.#lifetimes.set(intent.joinId, new AbortController()); intent.status = "joined"; intent.errorCode = "";
     intent.sealed = this.options.vault.seal("{}", this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId));
     await this.#save();
@@ -368,16 +375,27 @@ export class TaskSharingHome {
       ...(stored ? { joined: fromJsonString(contract.JoinedTaskShareSchema, stored.value) } : {}) });
   }
   #checkInvitationShare(invitation: contract.TaskShareInvitation, share: contract.TaskShare | undefined): contract.TaskShare {
-    if (!share || share.shareId !== invitation.shareId || share.hostServerId !== invitation.hostServerId || share.hostOrigin !== invitation.hostOrigin
-      || share.shareGeneration !== invitation.shareGeneration || !share.sessionId || share.status !== "active") throw unavailable(); return share;
+    if (!share || share.shareId !== invitation.shareId || share.hostServerId !== invitation.hostServerId
+      || share.shareGeneration !== invitation.shareGeneration || !share.sessionId || share.status !== "active") throw unavailable();
+    contract.taskShareOrigin(share.hostOrigin);
+    return create(contract.TaskShareSchema, { ...share, hostOrigin: invitation.hostOrigin });
   }
   #validateJoined(joined: contract.JoinedTaskShare): void {
     contract.taskShareIdentity(joined.joinId);
     if (!joined.share || !joined.member || joined.share.shareGeneration < 1n || joined.member.memberGeneration < 1n) throw unavailable();
     contract.taskShareOrigin(joined.share.hostOrigin); contract.taskShareIdentity(joined.share.hostServerId); contract.taskShareIdentity(joined.share.shareId);
   }
-  #remote(origin: string): TaskSharingHomeRemote { return (this.options.connect ?? createTaskSharingHomeRemote)(contract.taskShareOrigin(origin)); }
-  #intentReference(operationId: string, joinId: string, serverId: string, shareId: string): string { return `task-sharing-intent:${this.options.serverId}:${operationId}:${joinId}:${serverId}:${shareId}`; }
+  #remote(origin: string, endpointPublicKey: string): TaskSharingHomeRemote {
+    return (this.options.connect ?? createTaskSharingHomeRemote)(contract.taskShareOrigin(origin), contract.taskShareEndpointPublicKey(endpointPublicKey));
+  }
+  #intentReference(operationId: string, joinId: string, serverId: string, shareId: string, origin?: string, endpointPublicKey?: string): string {
+    const intent = this.#intents.get(operationId), pinnedOrigin = contract.taskShareOrigin(origin ?? intent?.hostOrigin ?? ""), pin = contract.taskShareEndpointPublicKey(endpointPublicKey ?? intent?.endpointPublicKey ?? "");
+    return `task-sharing-intent:${this.options.serverId}:${operationId}:${joinId}:${serverId}:${shareId}:${pinnedOrigin}:${pin}`;
+  }
+  #joinedReference(joined: contract.JoinedTaskShare, endpointPublicKey: string): string {
+    const share = joined.share!, member = joined.member!;
+    return `task-sharing-guest:${this.options.serverId}:${joined.joinId}:${share.hostServerId}:${share.shareId}:${share.shareGeneration}:${share.sessionId}:${member.memberId}:${member.memberGeneration}:${share.hostOrigin}:${contract.taskShareEndpointPublicKey(endpointPublicKey)}`;
+  }
   #single<T>(key: string, work: () => Promise<T>): Promise<T> {
     const old = this.#flights.get(key); if (old) return old as Promise<T>;
     const pending = work().finally(() => { if (this.#flights.get(key) === pending) this.#flights.delete(key); }); this.#flights.set(key, pending); return pending;
@@ -398,8 +416,8 @@ export class TaskSharingHome {
   }
 }
 /** Node HTTP transport does not follow redirects; identity is read without auth. */
-export function createTaskSharingHomeRemote(origin: string): TaskSharingHomeRemote {
-  const transport = createConnectTransport({ baseUrl: contract.taskShareOrigin(origin), httpVersion: "1.1", useBinaryFormat: true,
+export function createTaskSharingHomeRemote(origin: string, endpointPublicKey: string): TaskSharingHomeRemote {
+  const transport = createConnectTransport({ baseUrl: contract.taskShareOrigin(origin), endpointPublicKey: contract.taskShareEndpointPublicKey(endpointPublicKey), httpVersion: "1.1", useBinaryFormat: true,
     readMaxBytes: 16 * 1024 * 1024, writeMaxBytes: 4 * 1024 * 1024, defaultTimeoutMs: 15_000 });
   const identity = createClient(contract.ConnectionService, transport);
   return { guest: createClient(contract.TaskSharingGuestService, transport), verify: async (serverId, signal) => {

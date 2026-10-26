@@ -1,3 +1,5 @@
+import { Code, ConnectError } from "@connectrpc/connect";
+import { isEndpointTrustError } from "@joko/connection-transport/node";
 import type { NodeDevicePeerAgentExecutor } from "./node-agent-executor.js";
 import {
   runNodeDevicePeerAgentRoute,
@@ -17,6 +19,10 @@ type DevicePeerAgentRouteRunner = (
   options: NodeDevicePeerAgentRouteOptions
 ) => Promise<void>;
 
+export type NodeDevicePeerAgentWorkerRetirementStage =
+  | "worker_executor_retirement_started" | "worker_executor_retirement_completed"
+  | "worker_retry_started" | "worker_retry_completed";
+
 export interface NodeDevicePeerAgentLifecycleOptions {
   readonly createExecutor: (
     connection: NodeDevicePeerAgentConnection
@@ -32,6 +38,7 @@ export interface NodeDevicePeerAgentLifecycleOptions {
   readonly wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly retryBaseDelayMs?: number;
   readonly retryMaximumDelayMs?: number;
+  readonly observeRetirement?: (stage: NodeDevicePeerAgentWorkerRetirementStage) => void;
 }
 
 interface ActiveAttempt {
@@ -66,12 +73,14 @@ export class NodeDevicePeerAgentLifecycle {
     readonly wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
     readonly retryBaseDelayMs: number;
     readonly retryMaximumDelayMs: number;
+    readonly observeRetirement?: (stage: NodeDevicePeerAgentWorkerRetirementStage) => void;
   };
   #desired: NodeDevicePeerAgentConnection | undefined;
   #revision = 0;
   #active: ActiveAttempt | undefined;
   #backoff: RetryBackoff | undefined;
   #worker: Promise<void> | undefined;
+  #blockedRevision: number | undefined;
   #disposed = false;
 
   constructor(options: NodeDevicePeerAgentLifecycleOptions) {
@@ -92,7 +101,8 @@ export class NodeDevicePeerAgentLifecycle {
       runRoute: options.runRoute ?? runNodeDevicePeerAgentRoute,
       wait: options.wait ?? abortableDelay,
       retryBaseDelayMs,
-      retryMaximumDelayMs
+      retryMaximumDelayMs,
+      ...(options.observeRetirement === undefined ? {} : { observeRetirement: options.observeRetirement })
     };
   }
 
@@ -131,7 +141,7 @@ export class NodeDevicePeerAgentLifecycle {
   }
 
   #ensureWorker(): void {
-    if (this.#worker !== undefined || this.#desired === undefined || this.#disposed) return;
+    if (this.#worker !== undefined || this.#desired === undefined || this.#disposed || this.#blockedRevision === this.#revision) return;
     const worker = this.#run().catch(() => {
       // Route, identity, credential, and native executor failures stay inside
       // the trusted Node host owner and never include untrusted detail in logs.
@@ -172,11 +182,14 @@ export class NodeDevicePeerAgentLifecycle {
 
       const attempt: ActiveAttempt = { connection, revision, controller, executor };
       if (!await this.#authorityCurrent(connection, revision)) {
+        this.#retirementProgress("worker_executor_retirement_started");
         await retireAttempt(attempt);
+        this.#retirementProgress("worker_executor_retirement_completed");
         if (revision !== this.#revision) continue;
         return;
       }
       this.#active = attempt;
+      let terminalFailure = false;
       try {
         await this.#options.runRoute({
           connection,
@@ -189,15 +202,27 @@ export class NodeDevicePeerAgentLifecycle {
             : { readRouteAuthorization: this.#options.readRouteAuthorization }),
           isAuthorityCurrent: (candidate) => this.#authorityCurrent(candidate, revision)
         });
-      } catch {
-        // A generic route failure contains no payload or credential. Retry is
-        // decided solely by the exact local authority below.
+      } catch (error) {
+        terminalFailure = isEndpointTrustError(error) || error instanceof ConnectError
+          && (error.code === Code.Unauthenticated || error.code === Code.PermissionDenied);
       } finally {
         if (this.#active === attempt) this.#active = undefined;
+        this.#retirementProgress("worker_executor_retirement_started");
         await retireAttempt(attempt);
+        this.#retirementProgress("worker_executor_retirement_completed");
+      }
+      if (terminalFailure) {
+        if (revision !== this.#revision) continue;
+        // Reconciliation of the same saved authority cannot silently restart a
+        // failed identity or revoked credential. Explicit recovery changes it.
+        this.#blockedRevision = revision;
+        return;
       }
 
-      if (!await this.#retry(connection, revision, controller, retryIndex++)) {
+      this.#retirementProgress("worker_retry_started");
+      const retry = await this.#retry(connection, revision, controller, retryIndex++);
+      this.#retirementProgress("worker_retry_completed");
+      if (!retry) {
         if (revision !== this.#revision) continue;
         return;
       }
@@ -226,6 +251,10 @@ export class NodeDevicePeerAgentLifecycle {
       if (this.#backoff === backoff) this.#backoff = undefined;
     }
     return !controller.signal.aborted && await this.#authorityCurrent(connection, revision);
+  }
+
+  #retirementProgress(stage: NodeDevicePeerAgentWorkerRetirementStage): void {
+    try { this.#options.observeRetirement?.(stage); } catch { /* Diagnostics never own worker retirement. */ }
   }
 
   async #authorityCurrent(
@@ -281,6 +310,9 @@ function sameConnection(
     && left.deviceId === right.deviceId
     && left.serverId === right.serverId
     && left.expectedDeviceKind === right.expectedDeviceKind
+    && left.endpointPublicKey === right.endpointPublicKey
+    && (left.transportKind ?? "https") === (right.transportKind ?? "https")
+    && JSON.stringify(left.endpointTransport) === JSON.stringify(right.endpointTransport)
     && left.origin === right.origin;
 }
 

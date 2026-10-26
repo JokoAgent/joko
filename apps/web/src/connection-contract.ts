@@ -8,6 +8,8 @@ export interface ConnectionScreenProfile {
   readonly serverId: string;
   readonly name: string;
   readonly origin: string;
+  readonly endpointPublicKey?: string;
+  readonly transportKind?: import('@joko/connection-transport/trust').EndpointTransportKind;
   readonly managedLocal?: boolean;
   readonly lastConnectedAt?: number;
   readonly automatic?: boolean;
@@ -79,6 +81,11 @@ export interface ConnectionScreenState {
     readonly challengePairing?: boolean;
     readonly recheckSaved?: boolean;
     readonly back?: boolean;
+    readonly irohNativeAvailable?: boolean;
+    readonly irohRelayAvailable?: boolean;
+    readonly tailcatRelayAvailable?: boolean;
+    readonly webRtcAvailable?: boolean;
+    readonly httpConnectNativeAvailable?: boolean;
   };
   readonly candidate?: { readonly origin: string; readonly node: ConnectionScreenNode };
   /** Only the challenge's form scope is public; its identifier is retained by the host. */
@@ -90,6 +97,10 @@ export interface ConnectionScreenController {
   readonly state: ConnectionScreenState;
   connect(profile: ConnectionScreenProfile, options?: { readonly automatic?: boolean }): Promise<void>;
   pair(origin: string, code: string, deviceName: string, options?: { readonly automatic?: boolean }): Promise<void>;
+  trustEndpoint?(origin: string, endpointPublicKey: string, replace?: boolean, serverId?: string, endpointTransport?: import('@joko/connection-transport/trust').EndpointTransport): Promise<void>;
+  createTailcatClient?(origin: string, endpointPublicKey: string, endpointTransport: import('@joko/connection-transport/trust').EndpointTransport): Promise<{ readonly publicKey: string }>;
+  createIrohClient?(origin?: string, endpointPublicKey?: string, endpointTransport?: import('@joko/connection-transport/trust').EndpointTransport, mobileMode?: 'native' | 'relay'): Promise<{ readonly publicKey: string }>;
+  setProfileIrohMode?(profileId: string, mode: 'native' | 'relay'): Promise<void>;
   disconnect(): Promise<void>;
   forgetProfile(profileId: string): Promise<void>;
   refreshDiscoveredNodes(): Promise<void>;
@@ -99,7 +110,7 @@ export interface ConnectionScreenController {
   setTheme(theme: ConnectionScreenTheme): Promise<void>;
   inspect?(origin: string): Promise<void>;
   requestPairing?(origin: string, deviceName: string): Promise<void>;
-  cancelPairing?(): void;
+  cancelPairing?(): void | Promise<void>;
   recheckSavedProfiles?(): Promise<void>;
   goBack?(): Promise<void>;
   selectMode?(mode: ConnectionScreenMode): void;
@@ -118,6 +129,10 @@ export interface ConnectionScreenActionArguments {
   readonly setTheme: readonly [theme: ConnectionScreenTheme];
   readonly inspect: readonly [origin: string];
   readonly requestPairing: readonly [origin: string, deviceName: string];
+  readonly trustEndpoint: readonly [origin: string, endpointPublicKey: string, replace?: boolean, serverId?: string, endpointTransport?: import('@joko/connection-transport/trust').EndpointTransport];
+  readonly createTailcatClient: readonly [origin: string, endpointPublicKey: string, endpointTransport: import('@joko/connection-transport/trust').EndpointTransport];
+  readonly createIrohClient: readonly [] | readonly [mobileMode: 'native' | 'relay'] | readonly [origin: string, endpointPublicKey: string, endpointTransport: import('@joko/connection-transport/trust').EndpointTransport, mobileMode?: 'native' | 'relay'];
+  readonly setProfileIrohMode: readonly [profileId: string, mode: 'native' | 'relay'];
   readonly cancelPairing: readonly [];
   readonly recheckSavedProfiles: readonly [];
   readonly goBack: readonly [];

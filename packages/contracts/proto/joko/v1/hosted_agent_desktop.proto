@@ -8,10 +8,23 @@ import "joko/v1/hosted_agent.proto";
 // Every method requires both the revocable owner bearer and the separate
 // committed Desktop-host proof. A renderer credential alone confers no access.
 service DesktopHostedAgentService {
+  // Main-only, same-node media lifetime fencing; no media or provider secret.
+  rpc GetDesktopMediaUdpPolicy(GetDesktopMediaUdpPolicyRequest) returns (GetDesktopMediaUdpPolicyResponse);
+  rpc RetireDesktopMediaUdp(RetireDesktopMediaUdpRequest) returns (RetireDesktopMediaUdpResponse);
   rpc OpenDesktopHostedAgentDelegate(OpenDesktopHostedAgentDelegateRequest) returns (OpenDesktopHostedAgentDelegateResponse);
   rpc InvokeDesktopHostedAgentDelegate(InvokeDesktopHostedAgentDelegateRequest) returns (InvokeDesktopHostedAgentDelegateResponse);
   rpc CloseDesktopHostedAgentDelegate(CloseDesktopHostedAgentDelegateRequest) returns (CloseDesktopHostedAgentDelegateResponse);
 }
+
+message GetDesktopMediaUdpPolicyRequest { uint32 format = 1; }
+message GetDesktopMediaUdpPolicyResponse { uint32 format = 1; bool retirement_required = 2; }
+message RetireDesktopMediaUdpRequest {
+  uint32 format = 1;
+  string connection_id = 2;
+  string lease_id = 3;
+  string attempt_id = 4;
+}
+message RetireDesktopMediaUdpResponse { uint32 format = 1; }
 
 message OpenDesktopHostedAgentDelegateRequest {
   uint32 format = 1;

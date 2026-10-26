@@ -3,7 +3,7 @@ import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { create, fromJsonString, toJsonString } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient, type Client, type Interceptor } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport } from "@joko/connection-transport/node";
 import * as contract from "@joko/contracts";
 import type { ProviderModel } from "@joko/core";
 import type { CredentialVault, EncryptedCredential } from "./credential-vault.js";
@@ -19,15 +19,17 @@ export interface ProviderSharingRemote {
 }
 export interface ProviderSharingRemoteOptions {
   readonly origin: string; readonly serverId?: string; readonly authorization?: () => string; readonly sourceDeviceId?: string;
+  readonly endpointPublicKey: string;
   readonly recipientKey?: string; readonly assertCurrent: () => void;
 }
 interface StoredIntent {
   readonly id: string; readonly joinId: string; readonly requestId: string; readonly bodyHash: string; readonly deviceId: string;
+  readonly endpointPublicKey: string;
   readonly preview: string; readonly person: { readonly name: string; readonly avatarUrl?: string };
   readonly requestCredential: EncryptedCredential; memberCredential?: EncryptedCredential;
   request?: string; status: string; errorCode: string;
 }
-interface StoredJoin { value: string; credential?: EncryptedCredential; }
+interface StoredJoin { value: string; readonly endpointPublicKey: string; credential?: EncryptedCredential; }
 interface HomeDisk { readonly format: 1; readonly serverId: string; readonly intents: readonly StoredIntent[]; readonly joined: readonly [string, StoredJoin][];
   readonly actions: readonly { readonly id: string; readonly kind: string; readonly bodyHash: string; readonly joinId: string; readonly status: string }[]; }
 export class ProviderSharingHome implements ProviderSharingDirectoryPort {
@@ -44,9 +46,11 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
     if (Buffer.byteLength(text) > 16 * 1024 * 1024) throw invalid(); const value = JSON.parse(text) as HomeDisk;
     if (!value || value.format !== 1 || value.serverId !== this.options.serverId || !Array.isArray(value.intents) || !Array.isArray(value.joined) || !Array.isArray(value.actions)) throw invalid();
     for (const intent of value.intents) { id(intent.id); id(intent.joinId); id(intent.requestId); if (!/^[a-f0-9]{64}$/u.test(intent.bodyHash) || this.#intents.has(intent.id)) throw invalid();
+      contract.taskShareEndpointPublicKey(intent.endpointPublicKey);
       this.checkPreview(fromJsonString(contract.ProviderSharingPreviewSchema, intent.preview));
       this.#intents.set(intent.id, { ...intent, status: ["prepared", "sent"].includes(intent.status) ? "unknown" : intent.status }); }
     for (const [joinId, stored] of value.joined) { const received = this.parseReceived(stored.value); if (received.joinId !== joinId || this.#joins.has(joinId)) throw invalid();
+      contract.taskShareEndpointPublicKey(stored.endpointPublicKey);
       if (received.state === "active") stored.value = toJsonString(contract.ProviderSharingReceivedSchema, { ...received, state: "unavailable" });
       this.#joins.set(joinId, stored); }
     for (const action of value.actions) { id(action.id); id(action.joinId); if (!["leave", "withdraw"].includes(action.kind) || !["prepared", "unknown", "complete"].includes(action.status)
@@ -62,27 +66,29 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
       state: row.state as ProviderSharingReceivedEntry["state"] }));
   }
   async preview(link: string, auth: ProviderSharingHomeAuthority): Promise<contract.ProviderSharingPreview> {
-    this.check(auth); const parsed = contract.parseProviderSharingLink(link), remote = this.remote({ origin: parsed.origin, assertCurrent: () => this.check(auth) });
+    this.check(auth); const parsed = contract.parseProviderSharingLink(link), remote = this.remote({ origin: parsed.origin, endpointPublicKey: parsed.endpointPublicKey, assertCurrent: () => this.check(auth) });
     const serverId = await remote.verify(undefined, auth.signal); this.check(auth);
     const result = await remote.guest.inspectProviderShare({ invitation: parsed.secret }, { signal: auth.signal }); this.check(auth);
-    const preview = this.checkPreview(result.preview); if (preview.hostOrigin !== parsed.origin || preview.hostServerId !== serverId) throw denied();
-    if (serverId === this.options.serverId) throw new ConnectError("This Provider already belongs to your Home.", Code.FailedPrecondition); return preview;
+    const preview = this.checkPreview(result.preview); if (preview.hostServerId !== serverId) throw denied();
+    if (serverId === this.options.serverId) throw new ConnectError("This Provider already belongs to your Home.", Code.FailedPrecondition);
+    return create(contract.ProviderSharingPreviewSchema, { ...preview, hostOrigin: parsed.origin });
   }
   apply(input: contract.ApplyProviderShareRequest, auth: ProviderSharingHomeAuthority): Promise<contract.ProviderSharingIntent> {
     return this.single(`apply:${id(input.operationId)}`, async () => {
       this.check(auth); const parsed = contract.parseProviderSharingLink(input.link), person = safePerson(input.person);
-      const bodyHash = hash(JSON.stringify([parsed.origin, hash(parsed.secret), person])); let intent = this.#intents.get(input.operationId);
+      const bodyHash = hash(JSON.stringify([parsed.origin, parsed.endpointPublicKey, hash(parsed.secret), person])); let intent = this.#intents.get(input.operationId);
       if (intent) { if (intent.bodyHash !== bodyHash) throw denied(); return this.recover(intent, auth); }
       const preview = await this.preview(input.link, auth); this.check(auth);
       if (preview.state !== "unused" || Number(preview.expiresAtMs) <= Date.now()) throw new ConnectError("This invitation is used or expired.", Code.FailedPrecondition);
       const joinId = `received-${randomUUID()}`, requestId = `request-${randomUUID()}`, requestSecret = randomBytes(32).toString("base64url"), memberSecret = randomBytes(32).toString("base64url");
-      const reference = this.reference(joinId, preview);
+      const reference = this.reference(joinId, preview, parsed.endpointPublicKey);
       intent = { id: input.operationId, joinId, requestId, bodyHash, deviceId: auth.deviceId, preview: toJsonString(contract.ProviderSharingPreviewSchema, preview), person,
+        endpointPublicKey: parsed.endpointPublicKey,
         requestCredential: this.options.vault.seal(requestSecret, reference + ":request"), memberCredential: this.options.vault.seal(memberSecret, reference + ":member"), status: "prepared", errorCode: "" };
       this.#intents.set(input.operationId, intent); await this.save(); this.check(auth);
       try {
         intent.status = "sent"; await this.save(); this.check(auth);
-        const remote = this.remote({ origin: parsed.origin, serverId: preview.hostServerId, assertCurrent: () => this.check(auth) });
+        const remote = this.remote({ origin: parsed.origin, endpointPublicKey: intent.endpointPublicKey, serverId: preview.hostServerId, assertCurrent: () => this.check(auth) });
         const response = await remote.guest.submitProviderShareRequest({ requestId, invitation: parsed.secret, homeServerId: this.options.serverId, deviceId: auth.deviceId,
           person, requestSha256Hex: hash(requestSecret), credentialSha256Hex: hash(memberSecret) }, { signal: auth.signal });
         this.check(auth); await this.accept(intent, response); this.check(auth);
@@ -102,7 +108,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
       this.check(auth); const intent = this.#intents.get(id(applicationId)); if (!intent) throw invalid(); const preview = this.intentPreview(intent);
       const secret = this.options.vault.open(intent.requestCredential, this.reference(intent.joinId, preview) + ":request");
       const bodyHash = hash(JSON.stringify([applicationId])); this.action(operationId, "withdraw", bodyHash, intent.joinId); await this.save(); this.check(auth);
-      try { const remote = this.remote({ origin: preview.hostOrigin, serverId: preview.hostServerId, authorization: () => `ProviderShareRequest ${secret}`, assertCurrent: () => this.check(auth) });
+      try { const remote = this.remote({ origin: preview.hostOrigin, endpointPublicKey: intent.endpointPublicKey, serverId: preview.hostServerId, authorization: () => `ProviderShareRequest ${secret}`, assertCurrent: () => this.check(auth) });
         const response = await remote.guest.withdrawProviderShareRequest({ operationId, requestId: intent.requestId }, { signal: auth.signal }); this.check(auth); await this.accept(intent, response);
         this.#actions.set(operationId, { ...this.#actions.get(operationId)!, status: "complete" });
       } catch (error) { intent.errorCode = safeCode(error); this.#actions.set(operationId, { ...this.#actions.get(operationId)!, status: "unknown" }); }
@@ -118,7 +124,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
     if (original.state === "removed") { this.#actions.set(operationId, { ...this.#actions.get(operationId)!, status: "complete" }); await this.save(); return original; }
     if (!stored.credential) throw denied(); const secret = this.options.vault.open(stored.credential, this.reference(joinId, original));
     await this.save(); this.check(auth);
-    const remote = this.remote({ origin: original.hostOrigin, serverId: original.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, assertCurrent: () => this.check(auth) });
+    const remote = this.remote({ origin: original.hostOrigin, endpointPublicKey: stored.endpointPublicKey, serverId: original.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, assertCurrent: () => this.check(auth) });
     try {
       if (previous?.status === "unknown") {
         try { const receipt = await remote.guest.getProviderShareLeaveReceipt({ operationId, shareId: original.shareId }, { signal: auth.signal }); this.check(auth); if (receipt.member?.status !== "left") throw denied(); }
@@ -146,7 +152,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
     signal.throwIfAborted(); this.assertReceived(identity); const row = this.get(identity.joinId), stored = this.#joins.get(identity.joinId)!;
     if (!stored.credential) throw denied(); const secret = this.options.vault.open(stored.credential, this.reference(row.joinId, row));
     const assertCurrent = () => { signal.throwIfAborted(); this.assertReceived(identity); };
-    const remote = this.remote({ origin: row.hostOrigin, serverId: row.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, sourceDeviceId: this.localSourceDeviceId, assertCurrent });
+    const remote = this.remote({ origin: row.hostOrigin, endpointPublicKey: stored.endpointPublicKey, serverId: row.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, sourceDeviceId: this.localSourceDeviceId, assertCurrent });
     const entries = recipients.map(recipient => ({ key: providerSharingReshareKey(recipient), person: { name: recipient.name, ...(recipient.avatarUrl ? { avatarUrl: recipient.avatarUrl } : {}) } }));
     const states = new Map<string, string>(), count = Math.max(1, Math.ceil(entries.length / 256)), batchId = randomBytes(16).toString("base64url");
     for (let index = 0; index < count; index++) {
@@ -165,9 +171,9 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
     const consent = recipient ? this.canRelayToRecipient(identity, recipient) : undefined;
     const assertCurrent = () => { this.assertReceived(identity); consent?.assertCurrent(); };
     assertCurrent();
-    const remote = this.remote({ origin: row.hostOrigin, serverId: row.hostServerId, authorization: () => `ProviderShareGuest ${secret}`,
+    const remote = this.remote({ origin: row.hostOrigin, endpointPublicKey: stored.endpointPublicKey, serverId: row.hostServerId, authorization: () => `ProviderShareGuest ${secret}`,
       sourceDeviceId: id(sourceDeviceId), ...(consent ? { recipientKey: consent.opaqueReshareKey } : {}), assertCurrent });
-    const terminal = this.remote({ origin: row.hostOrigin, serverId: row.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, assertCurrent: () => { if (this.#closed) throw unavailable(); } });
+    const terminal = this.remote({ origin: row.hostOrigin, endpointPublicKey: stored.endpointPublicKey, serverId: row.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, assertCurrent: () => { if (this.#closed) throw unavailable(); } });
     return { client: new HostedAgentConnectClient(remote.native, assertCurrent), assertCurrent,
       close: async (runId: string, signal: AbortSignal) => { await terminal.guest.closeProviderShareRun({ runId }, { signal }); } };
   }
@@ -175,7 +181,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
   private async recover(intent: StoredIntent, auth: ProviderSharingHomeAuthority): Promise<contract.ProviderSharingIntent> {
     this.check(auth); if (!["pending", "unknown", "prepared", "sent"].includes(intent.status)) return this.publicIntent(intent);
     const preview = this.intentPreview(intent), secret = this.options.vault.open(intent.requestCredential, this.reference(intent.joinId, preview) + ":request");
-    try { const remote = this.remote({ origin: preview.hostOrigin, serverId: preview.hostServerId, authorization: () => `ProviderShareRequest ${secret}`, assertCurrent: () => this.check(auth) });
+    try { const remote = this.remote({ origin: preview.hostOrigin, endpointPublicKey: intent.endpointPublicKey, serverId: preview.hostServerId, authorization: () => `ProviderShareRequest ${secret}`, assertCurrent: () => this.check(auth) });
       const response = await remote.guest.getProviderShareRequest({ requestId: intent.requestId }, { signal: auth.signal }); this.check(auth); await this.accept(intent, response); this.check(auth);
     } catch (error) { intent.errorCode = safeCode(error); intent.status = "unknown"; await this.save(); this.check(auth); }
     this.changed(); return this.publicIntent(intent);
@@ -191,7 +197,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
       const received = create(contract.ProviderSharingReceivedSchema, { joinId: intent.joinId, hostOrigin: preview.hostOrigin, hostServerId: preview.hostServerId, shareId: preview.shareId,
         memberId: member.memberId, generation: member.generation, nativeBackendId: preview.backendId, backendId: providerSharingBackendId(intent.joinId, preview.backendId),
         providerId: preview.providerId, providerName: preview.providerName, owner: preview.owner, state: "unavailable", models: [] });
-      this.#joins.set(intent.joinId, { value: toJsonString(contract.ProviderSharingReceivedSchema, received), credential: this.options.vault.seal(secret, this.reference(intent.joinId, received)) });
+      this.#joins.set(intent.joinId, { value: toJsonString(contract.ProviderSharingReceivedSchema, received), endpointPublicKey: intent.endpointPublicKey, credential: this.options.vault.seal(secret, this.reference(intent.joinId, received)) });
     } else if (["rejected", "withdrawn", "expired"].includes(request.status)) delete intent.memberCredential;
     await this.save();
   }
@@ -201,7 +207,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
     const current = () => this.#joins.get(joinId) === stored && stored.value === valueBefore && stored.credential === credentialBefore;
     const secret = this.options.vault.open(stored.credential, this.reference(joinId, before));
     try {
-      const remote = this.remote({ origin: before.hostOrigin, serverId: before.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, assertCurrent: () => this.check(auth) });
+      const remote = this.remote({ origin: before.hostOrigin, endpointPublicKey: stored.endpointPublicKey, serverId: before.hostServerId, authorization: () => `ProviderShareGuest ${secret}`, assertCurrent: () => this.check(auth) });
       const result = await remote.guest.readProviderShare({ shareId: before.shareId }, { signal: auth.signal }); this.check(auth);
       if (!current()) return;
       const share = this.checkPreview(result.share), member = result.member;
@@ -239,7 +245,10 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
   }
   private publicIntent(intent: StoredIntent): contract.ProviderSharingIntent { return create(contract.ProviderSharingIntentSchema, { operationId: intent.id, joinId: intent.joinId,
     status: intent.status, errorCode: intent.errorCode, preview: this.intentPreview(intent), ...(intent.request ? { request: fromJsonString(contract.ProviderSharingRequestSchema, intent.request) } : {}) }); }
-  private reference(joinId: string, row: Pick<contract.ProviderSharingPreview, "hostServerId" | "shareId">): string { return `provider-sharing:${this.options.serverId}:${joinId}:${row.hostServerId}:${row.shareId}`; }
+  private reference(joinId: string, row: Pick<contract.ProviderSharingPreview, "hostServerId" | "hostOrigin" | "shareId">, endpointPublicKey?: string): string {
+    const pin = contract.taskShareEndpointPublicKey(endpointPublicKey ?? this.#joins.get(joinId)?.endpointPublicKey ?? [...this.#intents.values()].find(intent => intent.joinId === joinId)?.endpointPublicKey ?? "");
+    return `provider-sharing:${this.options.serverId}:${joinId}:${row.hostServerId}:${row.shareId}:${row.hostOrigin}:${pin}`;
+  }
   private action(id: string, kind: string, bodyHash: string, joinId: string): void { const previous = this.#actions.get(id);
     if (previous && (previous.kind !== kind || previous.bodyHash !== bodyHash || previous.joinId !== joinId)) throw denied();
     if (!previous) this.#actions.set(id, { id, kind, bodyHash, joinId, status: "prepared" }); }
@@ -259,7 +268,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
 }
 /** No redirect following and no credentials in server-identity discovery. */
 export function createProviderSharingRemote(options: ProviderSharingRemoteOptions): ProviderSharingRemote {
-  const baseUrl = contract.taskShareOrigin(options.origin), plain = createConnectTransport({ baseUrl, httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 15_000 });
+  const baseUrl = contract.taskShareOrigin(options.origin), endpointPublicKey = contract.taskShareEndpointPublicKey(options.endpointPublicKey), plain = createConnectTransport({ baseUrl, endpointPublicKey, httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 15_000 });
   const identity = createClient(contract.ConnectionService, plain);
   const verify = async (expected: string | undefined, signal: AbortSignal) => { options.assertCurrent(); signal.throwIfAborted();
     const result = await identity.getServerInfo({}, { signal }); options.assertCurrent(); signal.throwIfAborted(); const actual = id(result.server?.serverId ?? "");
@@ -271,7 +280,7 @@ export function createProviderSharingRemote(options: ProviderSharingRemoteOption
     if (options.recipientKey) request.header.set(PROVIDER_SHARING_RECIPIENT_HEADER, options.recipientKey);
     const result = await next(request); options.assertCurrent(); return result;
   };
-  const transport = createConnectTransport({ baseUrl, httpVersion: "1.1", useBinaryFormat: true, readMaxBytes: 16 * 1024 * 1024, writeMaxBytes: 8 * 1024 * 1024,
+  const transport = createConnectTransport({ baseUrl, endpointPublicKey, httpVersion: "1.1", useBinaryFormat: true, readMaxBytes: 16 * 1024 * 1024, writeMaxBytes: 8 * 1024 * 1024,
     defaultTimeoutMs: 35_000, interceptors: [authorization] });
   return { verify, guest: createClient(contract.ProviderSharingGuestService, transport), native: createClient(contract.HostedAgentService, transport) };
 }

@@ -3,8 +3,14 @@ import { CollaborationGoalStatus, CollaborationSessionRole, ListCollaborationGoa
 import { SuggestSessionTitleRequestSchema, SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { mobileNetwork, type PairedCredential } from "./network";
+import { mobileNetworkFixtureEndpointPublicKey } from "./test/mobile-network-transport";
 
-const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server", connectionId: "connection",
+vi.mock("@joko/connection-transport", async importOriginal => {
+  const { controlledMobileConnectionTransport } = await import("./test/mobile-network-transport");
+  return controlledMobileConnectionTransport(await importOriginal<typeof import("@joko/connection-transport")>());
+});
+
+const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server", connectionId: "connection",
   deviceId: "phone", displayName: "Phone", authKey: "header-fixture-key" };
 afterEach(() => vi.restoreAllMocks());
 it("suggests only through the authenticated generated session contract and preserves non-success statuses", async () => {

@@ -3,6 +3,9 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPrivateLanDiscoveryHost } from "@joko/contracts";
+import { CLOUDFLARED_VERSION } from "@jokoagent/linkspan-cloudflare";
+import { validateTurnUrl } from "@jokoagent/linkspan-turn";
+import type { EndpointTransportKind } from "@joko/connection-transport/trust";
 import { discoverBrowserExecutable } from "./browser-executable.js";
 import { discoverCodexExecutable } from "./codex-executable.js";
 
@@ -50,10 +53,31 @@ export interface OrchestratorConfig {
   };
   /** Deployment-owned HTTPS endpoint and private bearer file, never public settings. */
   readonly remoteDesktopIce?: { readonly url: string; readonly tokenPath: string };
+  /** Explicit, server-only hosted TURN key. Mutually exclusive with the external ICE broker. */
+  readonly remoteDesktopTurn?: {
+    readonly provider?: "cloudflare" | "twilio" | "coturn";
+    readonly keyId: string;
+    readonly tokenPath: string;
+    readonly ttlSeconds: number;
+    readonly urls?: readonly string[];
+  };
+  /** Select one private deployment entry's same-host UDP media mapping. */
+  readonly remoteDesktopUdp?: { readonly entryId: string };
+  readonly linkspan?: {
+    readonly port: number;
+    readonly cloudflaredExecutable?: string;
+    readonly originCaPool?: string;
+    readonly originServerName?: string;
+    /** Private deployment selection; provider secrets never enter public settings. */
+    readonly deploymentPath?: string;
+  };
   /** Optional standalone Service-device outbound agent authority. */
   readonly devicePeerAgent?: {
     readonly controllerOrigin: string;
     readonly controllerServerId: string;
+    readonly endpointPublicKey?: string;
+    readonly transportKind?: EndpointTransportKind;
+    readonly transportPath?: string;
     readonly connectionId: string;
     readonly deviceId: string;
     readonly credentialPath: string;
@@ -124,7 +148,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
   }
   const mobilePush = readMobilePushConfig(environment);
   const remoteDesktopIce = readRemoteDesktopIceConfig(environment, workspaceRoot);
-  const devicePeerAgent = readDevicePeerAgentConfig(environment, dataDirectory, allowInsecureLan);
+  const remoteDesktopTurn = readRemoteDesktopTurnConfig(environment, workspaceRoot);
+  if (remoteDesktopIce !== undefined && remoteDesktopTurn !== undefined) {
+    throw new Error("Choose either the external ICE broker or hosted TURN; automatic provider switching is not supported.");
+  }
+  const devicePeerAgent = readDevicePeerAgentConfig(environment, dataDirectory, allowInsecureLan, workspaceRoot);
+  const udpEntry = environment.JOKO_REMOTE_DESKTOP_UDP_ENTRY_ID;
+  if (udpEntry !== undefined && (!/^[a-z][a-z0-9-]{0,63}$/u.test(udpEntry) || environment.JOKO_LINKSPAN_CONNECTORS_FILE === undefined)) throw new Error("JOKO_REMOTE_DESKTOP_UDP_ENTRY_ID requires a valid entry in the private Linkspan deployment file.");
   return {
     host,
     port,
@@ -171,15 +201,47 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
     } }),
     ...(mobilePush === undefined ? {} : { mobilePush }),
     ...(remoteDesktopIce === undefined ? {} : { remoteDesktopIce }),
+    ...(remoteDesktopTurn === undefined ? {} : { remoteDesktopTurn }),
+    ...(udpEntry === undefined ? {} : { remoteDesktopUdp: { entryId: udpEntry } }),
     ...(devicePeerAgent === undefined ? {} : { devicePeerAgent }),
+    ...readLinkspanConfig(environment, tls, publicOrigin, workspaceRoot),
     corsOrigins
   };
+}
+
+function readLinkspanConfig(environment: NodeJS.ProcessEnv, tls: OrchestratorConfig["tls"], publicOrigin: string, workspaceRoot: string): { readonly linkspan?: OrchestratorConfig["linkspan"] } {
+  const port = environment.JOKO_LINKSPAN_PORT;
+  const mode = environment.JOKO_LINKSPAN_CLOUDFLARE;
+  const deployment = environment.JOKO_LINKSPAN_CONNECTORS_FILE;
+  let deploymentPath: string | undefined;
+  if (deployment !== undefined) {
+    if (!isAbsolute(deployment)) throw new Error("JOKO_LINKSPAN_CONNECTORS_FILE must be an absolute private file outside source/workspace roots.");
+    deploymentPath = canonicalizePotentialPath(deployment);
+    if ([workspaceRoot, ...jokoSourceRoots()].some(root => isWithin(canonicalizePotentialPath(root), deploymentPath!))) {
+      throw new Error("JOKO_LINKSPAN_CONNECTORS_FILE must be outside source/workspace roots.");
+    }
+  }
+  if (mode !== undefined && mode !== "quick") throw new Error("JOKO_LINKSPAN_CLOUDFLARE must be quick when enabled.");
+  const bundled = fileURLToPath(new URL(`../dist/linkspan-helper/${CLOUDFLARED_VERSION}/${process.platform}-${process.arch}/${process.platform === "win32" ? "cloudflared.exe" : "cloudflared"}`, import.meta.url));
+  const helper = environment.JOKO_LINKSPAN_CLOUDFLARED ?? (mode === "quick" ? bundled : undefined);
+  if (port === undefined && helper === undefined && deploymentPath === undefined) return {};
+  if (helper !== undefined && tls === undefined) throw new Error("Cloudflare requires the configured JOKO_TLS_CERT and JOKO_TLS_KEY for its verified HTTPS origin.");
+  if (helper !== undefined && (!isAbsolute(helper) || !existsSync(helper) || !lstatSync(helper).isFile() || lstatSync(helper).isSymbolicLink())) {
+    throw new Error("JOKO_LINKSPAN_CLOUDFLARED must identify a prepared, absolute helper file.");
+  }
+  return { linkspan: { port: port === undefined ? 0 : readPort(port, "JOKO_LINKSPAN_PORT"),
+    ...(deploymentPath === undefined ? {} : { deploymentPath }),
+    ...(tls === undefined ? {} : { originCaPool: tls.certificatePath,
+      originServerName: new URL(publicOrigin).hostname.replace(/^\[|\]$/gu, "") }),
+    ...(helper === undefined ? {} : { cloudflaredExecutable: helper, originCaPool: tls!.certificatePath,
+      originServerName: new URL(publicOrigin).hostname.replace(/^\[|\]$/gu, "") }) } };
 }
 
 function readDevicePeerAgentConfig(
   environment: NodeJS.ProcessEnv,
   dataDirectory: string,
-  allowInsecureLan: boolean
+  allowInsecureLan: boolean,
+  workspaceRoot: string
 ): OrchestratorConfig["devicePeerAgent"] {
   const values = {
     controllerOrigin: environment.JOKO_DEVICE_PEER_CONTROLLER_ORIGIN?.trim(),
@@ -189,7 +251,9 @@ function readDevicePeerAgentConfig(
   };
   const configured = Object.values(values).filter((value) => value !== undefined && value !== "");
   const credentialSetting = environment.JOKO_DEVICE_PEER_AUTH_KEY_FILE?.trim();
-  if (configured.length === 0 && (credentialSetting === undefined || credentialSetting === "")) return undefined;
+  const transportKind = environment.JOKO_DEVICE_PEER_TRANSPORT_KIND?.trim() || undefined;
+  const transportFile = environment.JOKO_DEVICE_PEER_TRANSPORT_FILE?.trim() || undefined;
+  if (configured.length === 0 && !credentialSetting && transportKind === undefined && transportFile === undefined) return undefined;
   if (configured.length !== Object.keys(values).length) {
     throw new Error(
       "JOKO_DEVICE_PEER_CONTROLLER_ORIGIN, JOKO_DEVICE_PEER_CONTROLLER_SERVER_ID, " +
@@ -216,8 +280,31 @@ function readDevicePeerAgentConfig(
     // repeats the check through an open handle, including the Windows ACL.
     throw new Error("JOKO_DEVICE_PEER_AUTH_KEY_FILE is unavailable or unsafe.");
   }
+  const controllerOrigin = validatePeerControllerOrigin(values.controllerOrigin!, allowInsecureLan);
+  if (transportKind !== undefined && !["https", "webrtc", "iroh", "tailcat", "http-connect"].includes(transportKind)
+    || (transportKind === "iroh" || transportKind === "tailcat" || transportKind === "http-connect") !== (transportFile !== undefined)) {
+    throw new Error("Select a supported Service Device peer transport; iroh/tailcat/HTTP CONNECT require their own private transport file and HTTPS/WebRTC do not use that file.");
+  }
+  let transportPath: string | undefined;
+  if (transportFile !== undefined) {
+    if (!isAbsolute(transportFile)) throw new Error("JOKO_DEVICE_PEER_TRANSPORT_FILE must be an absolute private file outside source/workspace roots.");
+    transportPath = canonicalizePotentialPath(transportFile);
+    if ([workspaceRoot, ...jokoSourceRoots()].some(root => isWithin(canonicalizePotentialPath(root), transportPath!))) {
+      throw new Error("JOKO_DEVICE_PEER_TRANSPORT_FILE must remain outside source/workspace roots.");
+    }
+  }
+  const endpointPublicKey = environment.JOKO_DEVICE_PEER_ENDPOINT_PUBLIC_KEY?.trim();
+  const controller = new URL(controllerOrigin);
+  const restrictedLanHttp = allowInsecureLan && controller.protocol === "http:" && isPrivateLanHost(controller.hostname);
+  if ((endpointPublicKey !== undefined && !/^ed25519:[a-f0-9]{64}$/u.test(endpointPublicKey))
+    || (endpointPublicKey === undefined && (transportKind !== undefined || !isLoopbackHost(controller.hostname) && !restrictedLanHttp))) {
+    throw new Error("JOKO_DEVICE_PEER_ENDPOINT_PUBLIC_KEY must be supplied through a trusted deployment channel.");
+  }
   return {
-    controllerOrigin: validatePeerControllerOrigin(values.controllerOrigin!, allowInsecureLan),
+    controllerOrigin,
+    ...(endpointPublicKey === undefined ? {} : { endpointPublicKey }),
+    ...(transportKind === undefined ? {} : { transportKind: transportKind as EndpointTransportKind }),
+    ...(transportPath === undefined ? {} : { transportPath }),
     controllerServerId: devicePeerIdentifier(values.controllerServerId!, "controller server"),
     connectionId: devicePeerIdentifier(values.connectionId!, "Connection"),
     deviceId: devicePeerIdentifier(values.deviceId!, "Device"),
@@ -238,6 +325,29 @@ function readRemoteDesktopIceConfig(environment: NodeJS.ProcessEnv, workspaceRoo
   const tokenPath = canonicalizePotentialPath(tokenSetting);
   if ([workspaceRoot, ...jokoSourceRoots()].some(root => isWithin(canonicalizePotentialPath(root), tokenPath))) return fail();
   return { url: url.toString(), tokenPath };
+}
+
+function readRemoteDesktopTurnConfig(environment: NodeJS.ProcessEnv, workspaceRoot: string): OrchestratorConfig["remoteDesktopTurn"] {
+  const provider = environment.JOKO_REMOTE_DESKTOP_TURN_PROVIDER?.trim() ?? "cloudflare";
+  const keyId = environment.JOKO_REMOTE_DESKTOP_TURN_KEY_ID?.trim();
+  const tokenSetting = environment.JOKO_REMOTE_DESKTOP_TURN_TOKEN_FILE?.trim();
+  const ttlSetting = environment.JOKO_REMOTE_DESKTOP_TURN_TTL_SECONDS?.trim();
+  const urlsSetting = environment.JOKO_REMOTE_DESKTOP_TURN_URLS;
+  if (!keyId && !tokenSetting && !ttlSetting && environment.JOKO_REMOTE_DESKTOP_TURN_PROVIDER === undefined && urlsSetting === undefined) return undefined;
+  const fail = (): never => { throw new Error("Hosted TURN requires an explicitly selected provider/key, a private token file outside workspace/source roots, and a TTL from 180 to 86400 seconds."); };
+  if (!["cloudflare", "twilio", "coturn"].includes(provider)) return fail();
+  if (!keyId || !/^[A-Za-z0-9_-]{1,128}$/u.test(keyId) || !tokenSetting || !isAbsolute(tokenSetting)) return fail();
+  if (provider === "twilio" && !/^AC[a-f0-9]{32}$/iu.test(keyId)) return fail();
+  const tokenPath = canonicalizePotentialPath(tokenSetting);
+  if ([workspaceRoot, ...jokoSourceRoots()].some(root => isWithin(canonicalizePotentialPath(root), tokenPath))) return fail();
+  const ttlSeconds = ttlSetting === undefined ? 600 : Number(ttlSetting);
+  if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 180 || ttlSeconds > 86_400) return fail();
+  const urls = urlsSetting === undefined ? undefined : splitList(urlsSetting);
+  if (provider === "coturn" && (urls === undefined || urls.length < 1 || urls.length > 4
+    || !urls.every(validateTurnUrl))) return fail();
+  if (provider !== "coturn" && urls !== undefined) return fail();
+  return { keyId, tokenPath, ttlSeconds, ...(provider === "cloudflare" ? {} : { provider: provider as "twilio" | "coturn" }),
+    ...(urls === undefined ? {} : { urls }) };
 }
 
 function readMobilePushConfig(environment: NodeJS.ProcessEnv): OrchestratorConfig["mobilePush"] {

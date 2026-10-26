@@ -9,7 +9,7 @@ import { fromBinary } from "@bufbuild/protobuf";
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type Page, type Request, type Route } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createSessionMutation, pauseQueueMutation, sessionIdFrom, submit } from "./operations.js";
@@ -53,7 +53,7 @@ describe("mounted Collaboration Goal product chain", () => {
     fixture = undefined;
   });
 
-  mountedIt("drives Queue editing, responsive focus, locale, lifecycle confirmation, and restart recovery through production Web", { timeout: 180_000 }, async () => {
+  mountedIt("drives Queue editing, responsive focus, locale, lifecycle confirmation, and restart recovery through production Web", { timeout: 180_000 }, async (context) => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
     const webDirectory = requiredEnvironment("JOKO_MOUNTED_WEB_DIR");
     fixture = await RealPiSystemFixture.start({
@@ -92,14 +92,27 @@ describe("mounted Collaboration Goal product chain", () => {
     browser = await chromium.launch({ executablePath, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     let generationBeforeRestart: bigint | undefined;
+    let usagePhase = "initial", usageWindowStart = 0;
     const permittedUsageErrors: string[] = [];
-    const { errors: browserErrors, settle: settleBrowserErrors } = observeBrowserErrors(page, stale => {
-      if (generationBeforeRestart === undefined || stale.sessionId !== leadSessionId
-        || stale.generation <= 0n || stale.generation !== generationBeforeRestart || fixture === undefined) return;
-      const current = BigInt(fixture.application.store.getSession(leadSessionId).descriptor.binding.generation);
-      if (stale.generation >= current) return;
-      permittedUsageErrors.push(stale.responseError, stale.consoleError);
-    });
+    const { errors: browserErrors, settle: settleBrowserErrors, pauseUsageCapture, resumeUsageCapture, usageDiagnostics } = await observeBrowserErrors(
+      page, new URL("/joko.v1.ProviderGroupService/GetTaskProviderGroupUsage", fixture.baseUrl).href, stale => {
+        if (generationBeforeRestart === undefined || stale.sessionId !== leadSessionId
+          || stale.generation <= 0n || stale.generation !== generationBeforeRestart || fixture === undefined) return false;
+        const current = BigInt(fixture.application.store.getSession(leadSessionId).descriptor.binding.generation);
+        if (stale.generation >= current) return false;
+        permittedUsageErrors.push(stale.responseError, stale.consoleError);
+        return true;
+      }, usage => ({
+        sessionMatchesOriginal: usage.sessionId === leadSessionId,
+        generationPositive: usage.generation > 0n,
+        vsOriginal: generationRelation(usage.generation, generationBeforeRestart),
+        vsCurrent: generationRelation(usage.generation, fixture === undefined ? undefined
+          : BigInt(fixture.application.store.getSession(leadSessionId).descriptor.binding.generation))
+      }), () => usagePhase);
+    context.onTestFailed(() => console.error("[collaboration-usage-classification]", JSON.stringify({
+      phase: usagePhase, windowStartResponseCount: usageWindowStart, browserErrorCount: browserErrors.length,
+      permittedErrorCount: permittedUsageErrors.length, ...usageDiagnostics()
+    })));
     await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -109,7 +122,12 @@ describe("mounted Collaboration Goal product chain", () => {
 
     const collaborationTrigger = page.getByRole("button", { name: "Open collaboration", exact: true });
     await collaborationTrigger.waitFor({ state: "visible", timeout: 30_000 });
+    usagePhase = "initial-drain";
+    await pauseUsageCapture();
+    await settleBrowserErrors();
     browserErrors.splice(0);
+    usagePhase = "active";
+    await resumeUsageCapture();
     await collaborationTrigger.click();
     let panel = page.locator(".collaboration-panel");
     await panel.waitFor({ state: "visible" });
@@ -284,6 +302,10 @@ describe("mounted Collaboration Goal product chain", () => {
 
     const authKey = paired.authKey;
     generationBeforeRestart = BigInt(fixture.application.store.getSession(leadSessionId).descriptor.binding.generation);
+    usagePhase = "before-restart-drain";
+    await pauseUsageCapture();
+    await settleBrowserErrors();
+    usagePhase = "service-stop";
     await fixture.close({ removeRoot: false });
     fixture = undefined;
     fixture = await RealPiSystemFixture.start({
@@ -310,18 +332,27 @@ describe("mounted Collaboration Goal product chain", () => {
       expect.objectContaining({ dispatch: expect.objectContaining({ message: `${EDITED_FIRST_MESSAGE}\n\n${SECOND_MESSAGE}` }) })
     ]));
 
+    usagePhase = "reconnect-document";
+    // Neither retiring document should acquire a new capture before reload.
     await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
     const restartedDocument = await page.reload({ waitUntil: "domcontentloaded" });
     expect(restartedDocument?.ok()).toBe(true);
+    usagePhase = "reconnect-ready";
+    await resumeUsageCapture();
     // Automatic entry was not enabled. Reopen the exact saved node from a
     // fresh document before verifying the archived Goal and durable queue.
     await page.locator(".connection-tabs > button").nth(1).click();
     await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
       .getByRole("button", { name: /^(?:Connect|连接)$/u }).click();
     await page.getByRole("button", { name: "打开协作面板", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    usagePhase = "reconnect-drain";
+    await pauseUsageCapture();
     await settleBrowserErrors();
     browserErrors.splice(0);
     permittedUsageErrors.splice(0);
+    usageWindowStart = usageDiagnostics().responses400;
+    usagePhase = "restarted-goal";
+    await resumeUsageCapture();
     await page.getByRole("button", { name: "打开协作面板", exact: true }).click();
     panel = page.locator(".collaboration-panel");
     await panel.getByText(GOAL_TITLE, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
@@ -330,6 +361,8 @@ describe("mounted Collaboration Goal product chain", () => {
       expect.stringContaining("已归档")
     ]);
     expect(await overflow(page)).toBeLessThanOrEqual(1);
+    usagePhase = "final-drain";
+    await pauseUsageCapture();
     await settleBrowserErrors();
     expect(permittedUsageErrors.length).toBeLessThanOrEqual(2);
     expect(browserErrors.toSorted()).toEqual(permittedUsageErrors.toSorted());
@@ -353,11 +386,104 @@ async function captureCollaboration(page: Page, name: string, state: Record<stri
     ...state, screenshotSha256: createHash("sha256").update(screenshot).digest("hex") }, null, 2) + "\n");
 }
 
-function observeBrowserErrors(page: Page, onStaleUsage: (stale: {
+type GenerationRelation = "unavailable" | "before" | "same" | "after";
+type UsageRelations = { readonly sessionMatchesOriginal: boolean; readonly generationPositive: boolean;
+  readonly vsOriginal: GenerationRelation; readonly vsCurrent: GenerationRelation };
+type UsageFailure = { readonly capturePhase: string; readonly bodyState: string; readonly bodyBytes?: number;
+  readonly codeMatches: boolean; readonly messageMatches: boolean };
+type UsageReceipt = { readonly sequence: number; readonly capturePhase: string; readonly responsePhase: string;
+  readonly bodyState: string; readonly bodyBytes?: number; readonly codeMatches: boolean; readonly messageMatches: boolean;
+  requestProto: boolean; requestDecoded: boolean; relations?: UsageRelations; admitted: boolean; classification: string };
+type UsageTransportFailure = { readonly capturePhase: string; readonly failurePhase: string;
+  readonly stage: "fetch" | "fulfill"; readonly status?: number; readonly pageClosed: boolean;
+  readonly requestAborted: boolean; readonly documentLoadRelation: "later-load-observed" | "same-observed-load";
+  readonly interceptionUnavailable: boolean; readonly routeAlreadyHandled: boolean; readonly targetClosed: boolean;
+  readonly connectionRefused: boolean; readonly connectionReset: boolean };
+
+function generationRelation(value: bigint, expected: bigint | undefined): GenerationRelation {
+  return expected === undefined ? "unavailable" : value < expected ? "before" : value === expected ? "same" : "after";
+}
+
+async function observeBrowserErrors(page: Page, usageUrl: string, onStaleUsage: (stale: {
   readonly sessionId: string; readonly generation: bigint; readonly responseError: string; readonly consoleError: string;
-}) => void): { readonly errors: string[]; readonly settle: () => Promise<void> } {
+}) => boolean, describeUsage: (usage: { readonly sessionId: string; readonly generation: bigint }) => UsageRelations,
+  phase: () => string
+): Promise<{ readonly errors: string[]; readonly settle: () => Promise<void>;
+  readonly pauseUsageCapture: () => Promise<void>; readonly resumeUsageCapture: () => Promise<void>;
+  readonly usageDiagnostics: () => { captures: number; activeCaptures: number; responses400: number;
+    receipts: readonly UsageReceipt[]; transportFailures: readonly UsageTransportFailure[] } }> {
   const errors: string[] = [];
   const pending = new Set<Promise<void>>();
+  const capturePending = new Set<Promise<void>>();
+  const usageFailures = new WeakMap<Request, UsageFailure>();
+  const receipts: UsageReceipt[] = [];
+  const transportFailures: UsageTransportFailure[] = [];
+  let capturing = false, captures = 0, responses400 = 0, documentLoads = 0;
+  page.on("domcontentloaded", () => { documentLoads++; });
+  const captureUsage = async (route: Route): Promise<void> => {
+    if (!capturing) { await route.continue(); return; }
+    const capturePhase = phase(), captureDocumentLoad = documentLoads;
+    let stage: "fetch" | "fulfill" = "fetch", status: number | undefined;
+    const capture = (async () => {
+      captures++;
+      try {
+        // Own this exact read-only response before document retirement can
+        // evict Chromium's body. Unknown bodies remain classification failures.
+        const response = await route.fetch({ maxRetries: 0, maxRedirects: 0, timeout: 30_000 });
+        status = response.status();
+        if (response.status() === 400) {
+          let bodyState = "unavailable", bodyBytes: number | undefined, codeMatches = false, messageMatches = false;
+          try {
+            const bytes = await response.body();
+            bodyBytes = bytes.length;
+            bodyState = "oversized";
+            if (bytes.length <= 64 * 1024) {
+              bodyState = "invalid-json";
+              const failure = JSON.parse(bytes.toString("utf8")) as { code?: unknown; message?: unknown } | null;
+              bodyState = "retained";
+              codeMatches = failure?.code === "failed_precondition";
+              messageMatches = failure?.message === "The original task generation is no longer current.";
+            }
+          } catch { /* Preserve the real response; no unknown refusal is admitted. */ }
+          usageFailures.set(route.request(), { capturePhase, bodyState, bodyBytes, codeMatches, messageMatches });
+        }
+        stage = "fulfill";
+        await route.fulfill({ response });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        const pageClosed = page.isClosed(), requestAborted = route.request().failure()?.errorText === "net::ERR_ABORTED";
+        if (transportFailures.length === 16) transportFailures.shift();
+        transportFailures.push({ capturePhase, failurePhase: phase(), stage, status, pageClosed, requestAborted,
+          // Report only the observed load relationship, never infer ownership
+          // from a URL, a shared Frame, or the absence of a completed load.
+          documentLoadRelation: documentLoads > captureDocumentLoad ? "later-load-observed" : "same-observed-load",
+          interceptionUnavailable: /invalid interception\s*id/iu.test(message),
+          routeAlreadyHandled: message.includes("Route is already handled"),
+          targetClosed: message.includes("Target page, context or browser has been closed"),
+          connectionRefused: message.includes("ECONNREFUSED"), connectionReset: message.includes("ECONNRESET") });
+        if (!pageClosed && !requestAborted) {
+          errors.push("requestfailed:GetTaskProviderGroupUsage:capture_transport_unavailable");
+        }
+        await route.abort("failed").catch(() => undefined);
+      }
+    })();
+    capturePending.add(capture);
+    try { await capture; } finally { capturePending.delete(capture); }
+  };
+  const pauseUsageCapture = async (): Promise<void> => {
+    const wasCapturing = capturing;
+    capturing = false;
+    // Removing the interceptor forwards its in-flight routes in Playwright
+    // 1.60. Complete each owned fulfill before releasing that interceptor.
+    await Promise.all([...capturePending]);
+    if (wasCapturing) await page.unroute(usageUrl, captureUsage);
+  };
+  const resumeUsageCapture = async (): Promise<void> => {
+    if (!capturing) {
+      capturing = true;
+      await page.route(usageUrl, captureUsage);
+    }
+  };
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
   page.on("console", (message) => {
     if (message.type() === "error") {
@@ -371,23 +497,36 @@ function observeBrowserErrors(page: Page, onStaleUsage: (stale: {
     errors.push(responseError);
     const url = new URL(response.url());
     if (response.status() !== 400 || url.pathname !== "/joko.v1.ProviderGroupService/GetTaskProviderGroupUsage") return;
-    // Resume may advance the binding between the page snapshot and its quota read.
-    // The caller also proves the exact submitted generation is now retired.
+    const request = response.request(), failure = usageFailures.get(request);
+    const receipt: UsageReceipt = { sequence: ++responses400, capturePhase: failure?.capturePhase ?? "uncaptured",
+      responsePhase: phase(), bodyState: failure?.bodyState ?? "unretained", bodyBytes: failure?.bodyBytes,
+      codeMatches: failure?.codeMatches === true, messageMatches: failure?.messageMatches === true,
+      requestProto: false, requestDecoded: false, admitted: false, classification: "unclassified" };
+    // Only the unchanged literal refusal and original submitted generation may
+    // be admitted. Diagnostics expose relationships, never identities or bytes.
     const observation = (async () => {
       try {
-        const request = response.request(), bytes = request.postDataBuffer();
-        if (!request.headers()["content-type"]?.startsWith("application/proto") || bytes === null || bytes.length > 64 * 1024) return;
+        const bytes = request.postDataBuffer();
+        receipt.requestProto = request.headers()["content-type"]?.startsWith("application/proto") === true;
+        if (!receipt.requestProto || bytes === null || bytes.length > 64 * 1024) { receipt.classification = "invalid-request"; return; }
         const usage = fromBinary(GetTaskProviderGroupUsageRequestSchema, bytes);
-        const failure = await response.json() as { code?: string; message?: string };
-        if (failure.code !== "failed_precondition" || failure.message !== "The original task generation is no longer current.") return;
-        onStaleUsage({ sessionId: usage.sessionId, generation: usage.generation, responseError,
+        receipt.requestDecoded = true;
+        receipt.relations = describeUsage(usage);
+        if (!receipt.codeMatches || !receipt.messageMatches) { receipt.classification = "failure-unmatched"; return; }
+        receipt.admitted = onStaleUsage({ sessionId: usage.sessionId, generation: usage.generation, responseError,
           consoleError: `console:Failed to load resource: the server responded with a status of 400 (Bad Request):${response.url()}:0` });
-      } catch { /* Unknown responses remain failures; never log request bytes. */ }
+        receipt.classification = receipt.admitted ? "admitted" : "owner-unmatched";
+      } catch { receipt.classification = receipt.requestDecoded ? "owner-unavailable" : "invalid-request"; }
+      finally { if (receipts.length === 16) receipts.shift(); receipts.push(receipt); }
     })();
     pending.add(observation);
     void observation.finally(() => pending.delete(observation));
   });
-  return { errors, settle: async () => { await Promise.all([...pending]); } };
+  await resumeUsageCapture();
+  return { errors, pauseUsageCapture, resumeUsageCapture,
+    settle: async () => { await Promise.all([...pending]); },
+    usageDiagnostics: () => ({ captures, activeCaptures: capturePending.size, responses400,
+      receipts: receipts.map(receipt => ({ ...receipt })), transportFailures: transportFailures.map(failure => ({ ...failure })) }) };
 }
 
 async function overflow(page: Page): Promise<number> {

@@ -1,4 +1,4 @@
-android/
+/android/
 !modules/joko-app-installer/android/
 !modules/joko-app-installer/android/**
 modules/joko-app-installer/android/build/

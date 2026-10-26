@@ -33,6 +33,66 @@ afterAll(() => {
 });
 
 describe("the single connection page and host capabilities", () => {
+  it.each([false, true])('requires an embedded CONNECT binding before inspection or pairing (delivered=%s)', async available => {
+    const host = fixture({ initialMode: 'pair', profiles: [], capabilities: { challengePairing: true, httpConnectNativeAvailable: available } });
+    const trust = vi.fn(async () => undefined);
+    host.controller.trustEndpoint = trust;
+    host.controller.createIrohClient = vi.fn();
+    const invitation = { version: 1, origin: 'https://connect-ui.example', serverId: 'connect-ui-node', endpointPublicKey: `ed25519:${'c'.repeat(64)}`,
+      endpointTransport: { kind: 'http-connect', proxyOrigin: 'https://private-proxy.example:8443', authority: 'connect-ui.example:443' } };
+    await host.render();
+    await input(element<HTMLTextAreaElement>(host.container, 'textarea[aria-label="connection.trustedIdentity"]'), JSON.stringify(invitation));
+    expect(element<HTMLInputElement>(host.container, 'input[type="url"]').value).toBe(invitation.origin);
+    expect(host.container.textContent).toContain('connection.transportHttpConnectHelp');
+    expect(host.container.textContent).not.toContain('connection.createIrohClient');
+    expect(host.container.querySelector('.connection-transport-choice')).toBeNull();
+    await click(button(host.container, 'Inspect identity'));
+    if (available) {
+      expect(trust).toHaveBeenCalledExactlyOnceWith(invitation.origin, invitation.endpointPublicKey, false, invitation.serverId, invitation.endpointTransport);
+      expect(host.controller.inspect).toHaveBeenCalledExactlyOnceWith(invitation.origin);
+      expect(host.container.textContent).not.toContain('connection.httpConnectNativeRequired');
+    } else {
+      expect(host.container.textContent).toContain('connection.httpConnectNativeRequired');
+      expect(host.container.textContent).toContain('connection.sdkNotDelivered');
+      expect(trust).not.toHaveBeenCalled();
+      expect(host.controller.inspect).not.toHaveBeenCalled();
+    }
+    expect(host.controller.requestPairing).not.toHaveBeenCalled();
+    expect(host.controller.pair).not.toHaveBeenCalled();
+  });
+
+  it("generates a local device public key before an invitation and uses only a delivered Mobile mode", async () => {
+    const host = fixture({ initialMode: "pair", profiles: [], capabilities: { challengePairing: true, irohNativeAvailable: false, irohRelayAvailable: true } });
+    const create = vi.fn(async () => ({ publicKey: 'b'.repeat(64) }));
+    host.controller.createIrohClient = create;
+    await host.render();
+    const mode = element<HTMLSelectElement>(host.container, 'select[aria-label="connection.irohMobileMode"]');
+    expect(mode.value).toBe('relay');
+    expect(mode.querySelector<HTMLOptionElement>('option[value="native"]')?.disabled).toBe(true);
+    expect(host.container.textContent).toContain('connection.irohBeforeInvitationHelp');
+    await click(button(host.container, 'connection.createIrohClient'));
+    expect(create).toHaveBeenCalledExactlyOnceWith(undefined, undefined, undefined, 'relay');
+    expect(element<HTMLInputElement>(host.container, 'input[aria-label="connection.irohPublicKey"]').value).toBe('b'.repeat(64));
+    expect(host.controller.inspect).not.toHaveBeenCalled();
+    expect(host.controller.requestPairing).not.toHaveBeenCalled();
+    expect(host.controller.pair).not.toHaveBeenCalled();
+  });
+
+  it("keeps restricted LAN HTTP behind its explicit warning without requiring a secure-path pin", async () => {
+    const host = fixture({ initialMode: "pair", defaultDeviceName: "LAN phone", profiles: [] });
+    await host.render();
+    await input(element<HTMLInputElement>(host.container, 'input[type="url"]'), "http://192.168.14.20:4318");
+    await input(element<HTMLInputElement>(host.container, 'input[autocomplete="one-time-code"]'), "123456");
+    expect(host.container.textContent).toContain("connection.insecureLanBody");
+    const submit = element<HTMLButtonElement>(host.container, ".pair-form__submit");
+    expect(submit.disabled).toBe(true);
+    expect(host.controller.pair).not.toHaveBeenCalled();
+    await click(element<HTMLInputElement>(host.container, '.lan-http-confirm input'));
+    await click(submit);
+    expect(host.controller.pair).toHaveBeenCalledExactlyOnceWith("http://192.168.14.20:4318", "123456", "LAN phone", expect.any(Object));
+    expect(host.container.textContent).not.toContain("connection.trustedKeyRequired");
+  });
+
   it("keeps the Web artwork interactions and explicitly recovers a failed theme action without duplicate dispatch", async () => {
     const host = fixture();
     const theme = deferred();
@@ -115,6 +175,7 @@ describe("the single connection page and host capabilities", () => {
     expect(origin.getAttribute("aria-label")).toBe("connection.origin");
     expect(document.getElementById(origin.getAttribute("aria-describedby")!)?.textContent).toBe("connection.secureHint");
     await input(origin, node.origin);
+    await input(element<HTMLTextAreaElement>(host.container, 'textarea[aria-label="connection.trustedIdentity"]'), `ed25519:${'a'.repeat(64)}`);
     await click(button(host.container, "Inspect identity"));
     expect(origin.disabled).toBe(true);
     await click(button(host.container, "common.cancel"));
@@ -236,9 +297,9 @@ function button(container: ParentNode, label: string): HTMLButtonElement {
   return result;
 }
 async function click(element: HTMLElement): Promise<void> { await act(async () => element.click()); }
-async function input(element: HTMLInputElement, value: string): Promise<void> {
+async function input(element: HTMLInputElement | HTMLTextAreaElement, value: string): Promise<void> {
   await act(async () => {
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(element, value);
+    Object.getOwnPropertyDescriptor(element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, "value")!.set!.call(element, value);
     element.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }

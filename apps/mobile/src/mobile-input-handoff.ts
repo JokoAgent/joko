@@ -1,5 +1,6 @@
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import { createClient, type Transport } from "@connectrpc/connect";
+import { createConnectionFetch } from "@joko/connection-transport";
 import {
   InputHandoffDecisionKind, InputHandoffService, InputHandoffStatePhase, inputHandoffPresentation,
   parseInputHandoffPicture, parseInputHandoffSubmission, validateInputHandoffSubmissionForStep,
@@ -78,7 +79,7 @@ export function createMobileInputHandoffApi(options: {
         const presentationSha256 = await mobileInputHandoffPresentationDigest(snapshot); current();
         const response = await client.beginInputHandoffSubmission({ requestId: snapshot.requestId,
           expectedRevision: BigInt(snapshot.revision), presentationSha256 }, { signal: active }); current();
-        const credentialUploadTicketId = await uploadPrivateInput(options.credential, exact, response.ticket, active, current, options.fetch ?? fetch); current();
+        const credentialUploadTicketId = await uploadPrivateInput(options.credential, exact, response.ticket, active, current, options.fetch ?? createConnectionFetch(options.credential)); current();
         return (await client.submitInputHandoff({ requestId: snapshot.requestId, expectedRevision: BigInt(snapshot.revision), credentialUploadTicketId }, { signal: active })).accepted;
       } finally { for (const id of Object.keys(exact.values)) delete exact.values[id]; }
     }),

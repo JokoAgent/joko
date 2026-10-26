@@ -1,4 +1,4 @@
-import { lstat, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -57,6 +57,48 @@ describe("Desktop secure files", () => {
     }
     await deletePrivateFile(target);
     await expect(readPrivateFile(target)).resolves.toBeUndefined();
+  });
+
+  it("keeps concurrent private credential reads and replacements complete without sharing violations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-desktop-private-concurrent-"));
+    const target = join(root, "profile.bin");
+    await atomicWritePrivateFile(target, new Uint8Array(1024).fill(255));
+    const operations: Promise<unknown>[] = [];
+    for (let index = 0; index < 32; index++) {
+      operations.push(atomicWritePrivateFile(target, new Uint8Array(1024).fill(index)));
+      operations.push(readPrivateFile(target).then(bytes => {
+        expect(bytes).toHaveLength(1024);
+        expect(bytes?.every(byte => byte === bytes[0])).toBe(true);
+      }));
+    }
+    await Promise.all(operations);
+    await expect(readPrivateFile(target)).resolves.toEqual(new Uint8Array(1024).fill(31));
+    expect(await readdir(root)).toEqual(["profile.bin"]);
+  });
+
+  it("releases a rejected private-file operation before a later valid write", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-desktop-private-rejected-"));
+    const target = join(root, "profile.bin");
+    await mkdir(target);
+    await expect(readPrivateFile(target)).rejects.toThrow(/regular non-symlink/u);
+    await rmdir(target);
+    await atomicWritePrivateFile(target, new Uint8Array([4, 5, 6]));
+    await expect(readPrivateFile(target)).resolves.toEqual(new Uint8Array([4, 5, 6]));
+    expect(await readdir(root)).toEqual(["profile.bin"]);
+  });
+
+  it("orders deletion after earlier writes without reviving deleted private data", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-desktop-private-delete-order-"));
+    const target = join(root, "profile.bin");
+    await atomicWritePrivateFile(target, new Uint8Array([1]));
+    const earlierWrite = atomicWritePrivateFile(target, new Uint8Array([2]));
+    const deletion = deletePrivateFile(target);
+    const deletedValue = readPrivateFile(target);
+    const replacement = atomicWritePrivateFile(target, new Uint8Array([3]));
+    await Promise.all([earlierWrite, deletion, replacement]);
+    await expect(deletedValue).resolves.toBeUndefined();
+    await expect(readPrivateFile(target)).resolves.toEqual(new Uint8Array([3]));
+    expect(await readdir(root)).toEqual(["profile.bin"]);
   });
 
   it("atomically saves an explicitly selected export and rejects unsafe leaves and oversized payloads", async () => {

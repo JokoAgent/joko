@@ -39,17 +39,17 @@ export function networkPlan(plan: NetworkPlan): contract.PartnerNetworkPlan { re
   steps: plan.steps.map(step => ({ ...step, startedAtMs: BigInt(step.startedAt), finishedAtMs: BigInt(step.finishedAt) })) }); }
 function networkLink(link: NetworkLink): contract.PartnerNetworkLink { return create(contract.PartnerNetworkLinkSchema, { ...link, expiresAtMs: BigInt(link.expiresAt ?? 0) }); }
 
-export function buildPartnerNetworkInvitation(input: { origin: string; serverId: string; secret: string }): string {
+export function buildPartnerNetworkInvitation(input: { origin: string; serverId: string; secret: string; endpointPublicKey: string }): string {
   const origin = contract.taskShareOrigin(input.origin); networkIdentity(input.serverId);
   if (!/^[A-Za-z0-9_-]{43}$/u.test(input.secret)) throw new PartnerNetworkStoreError("invalid");
-  return `joko://conversation/join#${Buffer.from(JSON.stringify([origin, input.serverId, input.secret])).toString("base64url")}`;
+  return `joko://conversation/join#${Buffer.from(JSON.stringify([origin, input.serverId, input.secret, contract.taskShareEndpointPublicKey(input.endpointPublicKey)])).toString("base64url")}`;
 }
-export function parsePartnerNetworkInvitation(input: string): { origin: string; serverId: string; secret: string } {
+export function parsePartnerNetworkInvitation(input: string): { origin: string; serverId: string; secret: string; endpointPublicKey: string } {
   try {
     if (input.length > 2048 || !/^joko:\/\/conversation\/join#[A-Za-z0-9_-]+$/u.test(input)) throw new Error();
     const parsed = JSON.parse(Buffer.from(input.slice(input.indexOf("#") + 1), "base64url").toString("utf8")) as unknown;
-    if (!Array.isArray(parsed) || parsed.length !== 3 || !parsed.every(value => typeof value === "string") || !/^[A-Za-z0-9_-]{43}$/u.test(parsed[2]!)) throw new Error();
-    return { origin: contract.taskShareOrigin(parsed[0]!), serverId: networkIdentity(parsed[1]!), secret: parsed[2]! };
+    if (!Array.isArray(parsed) || parsed.length !== 4 || !parsed.every(value => typeof value === "string") || !/^[A-Za-z0-9_-]{43}$/u.test(parsed[2]!)) throw new Error();
+    return { origin: contract.taskShareOrigin(parsed[0]!), serverId: networkIdentity(parsed[1]!), secret: parsed[2]!, endpointPublicKey: contract.taskShareEndpointPublicKey(parsed[3]!) };
   } catch { throw new ConnectError("The invitation is incomplete or invalid.", Code.InvalidArgument); }
 }
 
@@ -57,8 +57,12 @@ export function parsePartnerNetworkInvitation(input: string): { origin: string; 
 export class PartnerNetworkHost {
   readonly #invites = new Map<string, { fingerprint: string; value: contract.InvitePartnerNetworkResponse }>();
   readonly #mediaFlights = new Map<string, Promise<unknown>>();
-  constructor(readonly options: { storage: PartnerNetworkStore; serverId: string; origin: string; mediaDirectory: string;
+  constructor(readonly options: { storage: PartnerNetworkStore; serverId: string; origin: string | (() => string); endpointPublicKey: string; mediaDirectory: string;
     partner: (id: string) => { id: string; name: string; description: string }; artifacts?: ArtifactStore }) {}
+  #origin(): string { return contract.taskShareOrigin(typeof this.options.origin === "string" ? this.options.origin : this.options.origin()); }
+  #room(room: NetworkRoom, selfId: string, joinId = ""): contract.PartnerNetworkRoom {
+    return networkRoom({ ...room, hostOrigin: this.#origin() }, selfId, joinId);
+  }
   get storage(): PartnerNetworkStore { return this.options.storage; }
   get selfId(): string { return networkHumanId(this.options.serverId); }
   actor(roomId: string, authorization?: string): string {
@@ -68,11 +72,11 @@ export class PartnerNetworkHost {
     return this.storage.authenticate(roomId, networkDigest(match[1]!)).id;
   }
   assertActor(roomId: string, actorId: string): void { this.storage.assertJoined(roomId, actorId); }
-  list(): contract.PartnerNetworkRoom[] { return this.storage.list().map(room => networkRoom(room, this.selfId)); }
+  list(): contract.PartnerNetworkRoom[] { return this.storage.list().map(room => this.#room(room, this.selfId)); }
   create(request: contract.CreatePartnerNetworkRequest): contract.PartnerNetworkRoom {
     if (request.partnerIds.length > 6 || new Set(request.partnerIds).size !== request.partnerIds.length) throw new PartnerNetworkStoreError("invalid");
-    return networkRoom(this.storage.create({ operationId: request.operationId, name: request.name, displayName: request.displayName,
-      serverId: this.options.serverId, origin: this.options.origin, partners: request.partnerIds.map(id => this.options.partner(id)) }), this.selfId);
+    return this.#room(this.storage.create({ operationId: request.operationId, name: request.name, displayName: request.displayName,
+      serverId: this.options.serverId, origin: this.#origin(), partners: request.partnerIds.map(id => this.options.partner(id)) }), this.selfId);
   }
   invite(request: contract.InvitePartnerNetworkRequest, actorId: string): contract.InvitePartnerNetworkResponse {
     const authority = this.storage.assertJoined(request.roomId, actorId).actor;
@@ -82,23 +86,23 @@ export class PartnerNetworkHost {
     const secret = randomBytes(32).toString("base64url"), link = this.storage.invite({ operationId: request.operationId, roomId: request.roomId, actorId,
       expectedRevision: networkInteger(request.expectedRevision), digest: networkDigest(secret), reusable: request.reusable, lifetimeMs: networkInteger(request.lifetimeMs) || (request.reusable ? 0 : 86400_000) });
     if (link.digest !== networkDigest(secret)) throw new ConnectError("The original invitation reply is no longer available. Create a new invitation explicitly.", Code.FailedPrecondition);
-    const value = create(contract.InvitePartnerNetworkResponseSchema, { link: networkLink(link), invitation: buildPartnerNetworkInvitation({ origin: this.options.origin, serverId: this.options.serverId, secret }) });
+    const value = create(contract.InvitePartnerNetworkResponseSchema, { link: networkLink(link), invitation: buildPartnerNetworkInvitation({ origin: this.#origin(), serverId: this.options.serverId, secret, endpointPublicKey: this.options.endpointPublicKey }) });
     this.#invites.set(key, { fingerprint, value }); setTimeout(() => this.#invites.delete(key), 60_000).unref(); return value;
   }
   inspect(invitation: string): contract.PreviewPartnerNetworkResponse {
     const parsed = parsePartnerNetworkInvitation(invitation);
-    if (parsed.serverId !== this.options.serverId || parsed.origin !== this.options.origin) throw new PartnerNetworkStoreError("denied");
+    if (parsed.serverId !== this.options.serverId || parsed.endpointPublicKey !== this.options.endpointPublicKey) throw new PartnerNetworkStoreError("denied");
     const link = this.storage.link(networkDigest(parsed.secret)), room = this.storage.get(link.roomId);
     // Preview reveals the group name and inviter only; no history or other members.
-    const preview = networkRoom({ ...room, members: room.members.filter(member => member.kind === "human" && member.role === "owner") }, "");
+    const preview = this.#room({ ...room, members: room.members.filter(member => member.kind === "human" && member.role === "owner") }, "");
     return create(contract.PreviewPartnerNetworkResponseSchema, { room: preview, link: networkLink(link) });
   }
   accept(request: contract.AcceptPartnerNetworkRequest): contract.AcceptPartnerNetworkResponse {
     const parsed = parsePartnerNetworkInvitation(request.invitation);
-    if (parsed.serverId !== this.options.serverId || parsed.origin !== this.options.origin) throw new PartnerNetworkStoreError("denied");
+    if (parsed.serverId !== this.options.serverId || parsed.endpointPublicKey !== this.options.endpointPublicKey) throw new PartnerNetworkStoreError("denied");
     const result = this.storage.accept({ operationId: request.operationId, linkDigest: networkDigest(parsed.secret), homeServerId: request.homeServerId,
       displayName: request.displayName, credentialDigest: request.credentialSha256 });
-    return create(contract.AcceptPartnerNetworkResponseSchema, { room: networkRoom(result.room, result.memberId), memberId: result.memberId });
+    return create(contract.AcceptPartnerNetworkResponseSchema, { room: this.#room(result.room, result.memberId), memberId: result.memberId });
   }
   snapshot(request: contract.GetPartnerNetworkRequest, actorId: string): contract.PartnerNetworkSnapshot {
     const { room } = this.storage.assertJoined(request.roomId, actorId), before = networkInteger(request.beforeSequence);
@@ -107,7 +111,7 @@ export class PartnerNetworkHost {
       const root = this.storage.message(room.id, request.threadRootId); if (root.deleted || root.threadRootId) throw new PartnerNetworkStoreError("not_found");
       messages = messages.filter(message => message.id === root.id || message.threadRootId === root.id);
     } else messages = messages.filter(message => !message.threadRootId);
-    return create(contract.PartnerNetworkSnapshotSchema, { room: networkRoom(room, actorId), messages: this.#projectMessages(room.id, messages.slice(-100), actorId), hasMore: messages.length > 100, canContinue: this.storage.canContinue(room.id, request.threadRootId),
+    return create(contract.PartnerNetworkSnapshotSchema, { room: this.#room(room, actorId), messages: this.#projectMessages(room.id, messages.slice(-100), actorId), hasMore: messages.length > 100, canContinue: this.storage.canContinue(room.id, request.threadRootId),
       executions: this.storage.executions(room.id).filter(job => ["queued", "running", "failed", "unknown"].includes(job.status)).slice(-100).map(networkExecution),
       plans: this.storage.plans.list(room.id).filter(plan => messages.slice(-100).some(message => message.planId === plan.id) || ["proposed", "running", "waiting"].includes(plan.status)).map(networkPlan) });
   }
@@ -134,13 +138,13 @@ export class PartnerNetworkHost {
       attachments: request.attachments.map(attachment => ({ id: attachment.id, name: attachment.name, mediaType: attachment.mediaType, sizeBytes: networkInteger(attachment.sizeBytes) })) }));
   }
   manage(request: contract.ManagePartnerNetworkRequest, actorId: string, local: boolean): contract.PartnerNetworkRoom {
-    if (request.action === "share-thread") return networkRoom(this.storage.shareThread({ roomId: request.roomId, ownerId: actorId, operationId: request.operationId, sourceId: request.value }), actorId);
+    if (request.action === "share-thread") return this.#room(this.storage.shareThread({ roomId: request.roomId, ownerId: actorId, operationId: request.operationId, sourceId: request.value }), actorId);
     let partner: { id: string; name: string; description: string } | undefined;
     if (request.action === "add-partner") {
       if (local) partner = this.options.partner(request.actorId);
       else { if (!request.partner) throw new PartnerNetworkStoreError("invalid"); partner = { id: request.partner.partnerId, name: request.partner.name, description: request.partner.description }; }
     }
-    return networkRoom(this.storage.manage({ operationId: request.operationId, roomId: request.roomId, actorId, expectedRevision: networkInteger(request.expectedRevision),
+    return this.#room(this.storage.manage({ operationId: request.operationId, roomId: request.roomId, actorId, expectedRevision: networkInteger(request.expectedRevision),
       action: request.action, targetId: request.actorId, value: request.value, throughSequence: networkInteger(request.throughSequence), ...(partner ? { partner } : {}) }), actorId);
   }
   react(request: contract.ReactPartnerNetworkRequest, actorId: string): contract.PartnerNetworkMessage {
@@ -161,7 +165,7 @@ export class PartnerNetworkHost {
     if (plan) for (const id of [plan.sourceMessageId, ...plan.requestMessageIds, ...plan.noteMessageIds, ...plan.steps.flatMap(step => step.resultMessageId ? [step.resultMessageId] : [])]) {
       if (!messages.some(message => message.id === id)) messages.push(this.storage.message(roomId, id));
     }
-    return create(contract.PartnerNetworkSnapshotSchema, { room: networkRoom(room, actorId), messages: [...new Map(messages.map(message => [message.id, message])).values()].map(message => networkMessage(message, actorId)),
+    return create(contract.PartnerNetworkSnapshotSchema, { room: this.#room(room, actorId), messages: [...new Map(messages.map(message => [message.id, message])).values()].map(message => networkMessage(message, actorId)),
       executions: [networkExecution(job)], plans: plan ? [networkPlan(plan)] : [] });
   }
   readExecution(request: contract.GetPartnerNetworkExecutionRequest, actorId: string): contract.GetPartnerNetworkExecutionResponse {
@@ -228,7 +232,7 @@ export class PartnerNetworkHost {
           mimeType: saved.attachment.mediaType, signal: authority.signal, beforeFinalize: async () => check() }); check();
         const ticket = await this.options.artifacts.createDownloadTicket(artifact.id); check();
         return create(contract.MediaPartnerNetworkResponseSchema, { attachment: networkAttachment(saved.attachment), complete: true,
-          downloadUrl: `${this.options.origin}/v1/blobs/download/${encodeURIComponent(ticket.ticketId)}/${encodeURIComponent(ticket.secret)}` });
+          downloadUrl: `${this.#origin()}/v1/blobs/download/${encodeURIComponent(ticket.ticketId)}/${encodeURIComponent(ticket.secret)}` });
       } finally { await handle.close(); }
     }
     if (request.action === "read") {

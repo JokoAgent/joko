@@ -13,6 +13,7 @@ import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { DevicePeerAuthorityError, DevicePeerOwner } from "./device-peer-owner.js";
+import { ConnectionManager } from "./connection-manager.js";
 
 const stores: OperationalStore[] = [];
 
@@ -21,6 +22,19 @@ afterEach(() => {
 });
 
 describe("DevicePeerOwner", () => {
+  it("binds local Desktop proof to private bootstrap, exact live route generation and revocable connection", () => {
+    const fixture = setup(), connections = new ConnectionManager(fixture.store);
+    const owner = new DevicePeerOwner({ store: fixture.store, localDesktopHostConnection: connection => connections.isLocalDesktopHostConnection(connection) });
+    const transport = (deviceId: string) => createInProcessDevicePeerHarness({ targetDeviceId: deviceId, capabilities: ["remote_desktop"], agent: { handle: async () => ({ outcome: "completed", value: undefined }) } }).transport;
+    const ordinary = owner.registerRoute(fixture.target, transport(fixture.target.deviceId)); expect(owner.isLocalDesktopRoute(ordinary)).toBe(false);
+    const hostKey = "h".repeat(43);
+    const managed = connections.issueTrustedDesktopConnection({ desktopInstanceId: "4e56f4d8-c6ee-4a17-9a89-56e059b7e592", desktopDeviceId: "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75", defaultDeviceName: "Local Main", platform: "win32", appVersion: "development", desktopHostAuthKey: hostKey });
+    connections.confirmTrustedDesktopConnection(managed.connection.id, managed.authKey);
+    const authenticated = connections.authenticateDevicePeerAgent(`Bearer ${hostKey}`);
+    const first = owner.registerRoute(authenticated, transport(authenticated.deviceId)); expect(owner.isLocalDesktopRoute(first)).toBe(true);
+    const second = owner.registerRoute(authenticated, transport(authenticated.deviceId)); expect(owner.isLocalDesktopRoute(first)).toBe(false); expect(owner.isLocalDesktopRoute(second)).toBe(true);
+    connections.revoke(authenticated.id); expect(owner.isLocalDesktopRoute(second)).toBe(false); owner.shutdown();
+  });
   it("keeps Remote Desktop-only routes out of the existing catalog and exposes the exact Desktop capability catalog", () => {
     const fixture = setup();
     const harness = createInProcessDevicePeerHarness({

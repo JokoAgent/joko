@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createIrohClientIdentity, createTailcatClientIdentity, isEndpointTrustError, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
 import type { NativeTaskStatusLiveSource } from "./native-task-status-sources.js";
 import { nativeTaskStatusAvatar } from "./native-task-status-avatar.js";
 import { readDesktopMenuBarUsage, type DesktopMenuBarSource, type DesktopMenuBarUsage } from "./desktop-menu-bar.js";
@@ -23,6 +24,7 @@ import {
   probeOrchestratorRuntimeActivityAt,
   type ExtensionNotificationKind,
   type ExtensionUiEffect,
+  type GatewayError,
   type GatewayConnectionState,
   type OrchestratorGateway
 } from "./gateway.js";
@@ -41,7 +43,7 @@ import {
   withPersonalizationPrompt
 } from "./local-state.js";
 import { isLoopbackHostname, normalizeOrchestratorOrigin } from "./connection-origin.js";
-import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
+import { persistentWebSecretEncryptionAvailable, randomUuid } from "./web-crypto.js";
 import { normalizeNavigationWidth, type NavigationLayout } from "./navigation-layout.js";
 import type { RecentProject } from "./recent-projects.js";
 import { parseWorkspaceFilesHash, workspaceFilesHash } from "./workspace-files-navigation.js";
@@ -237,6 +239,9 @@ export interface AppController extends OperationApi {
   probeRuntimeActivity(): Promise<boolean>;
   connect(profile: ConnectionProfile, options?: ConnectionSelectionOptions): Promise<void>;
   pair(origin: string, code: string, deviceName: string, options?: ConnectionSelectionOptions): Promise<void>;
+  trustEndpoint?(origin: string, endpointPublicKey: string, replace?: boolean, serverId?: string, endpointTransport?: import('@joko/connection-transport/trust').EndpointTransport): Promise<void>;
+  createTailcatClient?(origin: string, endpointPublicKey: string, endpointTransport: import('@joko/connection-transport/trust').EndpointTransport): Promise<{ readonly publicKey: string }>;
+  createIrohClient?(origin?: string, endpointPublicKey?: string, endpointTransport?: import('@joko/connection-transport/trust').EndpointTransport, mobileMode?: 'native' | 'relay'): Promise<{ readonly publicKey: string }>;
   disconnect(): Promise<void>;
   forgetProfile(profileId: string): Promise<void>;
   logoutProfile(profileId: string): Promise<void>;
@@ -403,7 +408,7 @@ export function useAppController(): AppController {
   const managedRetryRef = useRef(false);
   const machineRefreshGenerationRef = useRef(0);
   const machineRefreshPromiseRef = useRef<Promise<void> | undefined>(undefined);
-  const machineFailureBackoffRef = useRef(new Map<string, { readonly failures: number; readonly retryAt: number }>());
+  const machineFailureBackoffRef = useRef(new Map<string, { readonly failures: number; readonly retryAt: number; readonly profileKey?: string }>());
   const machineSwitchIntentRef = useRef(0);
   const remoteMachineGatewayEpochRef = useRef(0);
   const partnerDirectoryRef = useRef<PartnerSourceDirectory | undefined>(undefined);
@@ -1037,15 +1042,11 @@ export function useAppController(): AppController {
       },
       onSnapshot: (snapshot) => {
         if (gatewayGenerationRef.current !== generation) return;
-        connectionStateRef.current = "connected";
         snapshotRef.current = snapshot;
         const cache = machineCacheFromSnapshot(profile, snapshot);
         setState((current) => ({
           ...current,
           snapshot,
-          connectionState: "connected",
-          statusMessage: undefined,
-          error: undefined,
           machineCaches: upsertMachineCache(current.machineCaches, cache),
           machinePresenceByProfile: { ...current.machinePresenceByProfile, [profile.id]: "current" }
         }));
@@ -1064,10 +1065,15 @@ export function useAppController(): AppController {
         if (gatewayGenerationRef.current !== generation) return;
         partnerDirectoryRef.current?.invalidate(profile.id);
         const managedLocal = profile.managedLocal === true;
+        const trustFailed = isEndpointTrustError(error);
+        if (trustFailed) {
+          explicitDisconnectRef.current = true;
+          machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
+        }
         // Desktop owns managed-local bearer diagnosis and retirement. Keep it
         // available so the main process can prove an explicit server logout;
         // generic saved connections remain renderer-owned and are forgotten.
-        if (shouldDeleteInvalidatedConnectionCredential(profile)) {
+        if (!trustFailed && shouldDeleteInvalidatedConnectionCredential(profile)) {
           await requireLocal(localRef.current).deleteAuthKey(profile.id);
           if (gatewayGenerationRef.current !== generation) return;
         }
@@ -1085,7 +1091,7 @@ export function useAppController(): AppController {
           ...(managedLocal
             ? {
               activeProfile: profile,
-              managedOrchestratorStatus: managedRecoveryStatus("credentialRejected")
+              managedOrchestratorStatus: managedRecoveryStatus(trustFailed ? "identityConflict" : "credentialRejected")
             }
             : { activeProfile: undefined }),
           connectionState: "disconnected",
@@ -1164,6 +1170,8 @@ export function useAppController(): AppController {
         throw error;
       }
       activeProfileRef.current = safeProfile;
+      await requireLocal(localRef.current).loadEndpointTransport(safeProfile);
+      rememberEndpointTrust(safeProfile);
       setState((current) => ({ ...current, activeProfile: safeProfile }));
       // Validate the transport boundary before decrypting a persisted bearer
       // credential. A tampered profile must never redirect an Auth Key to
@@ -1189,6 +1197,7 @@ export function useAppController(): AppController {
       if (gatewayGenerationRef.current !== generation) bound.disconnect();
       else {
         const connectedProfile = { ...verifiedProfile, lastConnectedAt: Date.now() };
+        machineFailureBackoffRef.current.delete(profile.id);
         await requireLocal(localRef.current).saveProfile(connectedProfile, authKey);
         if (gatewayGenerationRef.current !== generation) {
           bound.disconnect();
@@ -1386,12 +1395,14 @@ export function useAppController(): AppController {
     setState((current) => ({ ...current, activeProfile: undefined, connectionState: "connecting", error: undefined }));
     try {
       const normalizedOrigin = normalizeOrchestratorOrigin(origin);
+      const pairingPublicKey = trustedEndpointPublicKey(normalizedOrigin);
+      const pairingTransportKind = pairingPublicKey === undefined ? undefined : trustedEndpointTransportKind(normalizedOrigin, pairingPublicKey);
       const local = requireLocal(localRef.current);
       // Probe anonymously before decrypting any reusable credential. Reuse is
       // allowed only for the exact persisted node identity at this origin.
       const identity = await probeOrchestratorOrigin(normalizedOrigin);
       if (gatewayGenerationRef.current !== generation) return;
-      const reusableProfiles = trustedReusablePairingProfiles(state.profiles, normalizedOrigin, identity.serverId);
+      const reusableProfiles = trustedReusablePairingProfiles(state.profiles, normalizedOrigin, identity.serverId, trustedEndpointPublicKey(normalizedOrigin));
       let reusableProfile: ConnectionProfile | undefined;
       let reusableAuthKey: string | undefined;
       for (const profile of reusableProfiles) {
@@ -1403,7 +1414,9 @@ export function useAppController(): AppController {
         }
       }
       if (gatewayGenerationRef.current !== generation) return;
-      const result = await createOrchestratorGateway(reusableProfile, reusableAuthKey, {}).pair(normalizedOrigin, code, deviceName);
+      if (pairingPublicKey !== undefined) rememberEndpointTrust({ origin: normalizedOrigin, endpointPublicKey: pairingPublicKey, serverId: identity.serverId, transportKind: pairingTransportKind });
+      const pairingProfile = reusableProfile === undefined ? undefined : { ...reusableProfile, transportKind: pairingTransportKind };
+      const result = await createOrchestratorGateway(pairingProfile, reusableAuthKey, {}).pair(normalizedOrigin, code, deviceName);
       if (gatewayGenerationRef.current !== generation) return;
       await local.saveProfile(result.profile, result.authKey);
       if (gatewayGenerationRef.current !== generation) return;
@@ -1758,6 +1771,8 @@ export function useAppController(): AppController {
 
   const loadMachineSnapshot = useCallback(async (profile: ConnectionProfile): Promise<AppSnapshot> => {
     if (profile.id === activeProfileRef.current?.id && connectionStateRef.current === "connected") return snapshotRef.current;
+    await requireLocal(localRef.current).loadEndpointTransport(profile);
+    rememberEndpointTrust(profile);
     const identity = await probeOrchestratorOrigin(profile.origin);
     if (identity.serverId !== profile.serverId) {
       await requireLocal(localRef.current).deleteMachineCache(profile.id);
@@ -1772,15 +1787,20 @@ export function useAppController(): AppController {
     const authKey = await local.readAuthKey(profile);
     if (authKey === undefined) throw new Error("The saved connection secret is unavailable. Pair this device again.");
     let captured: AppSnapshot | undefined;
-    let accessDenied = false;
+    let invalidated: GatewayError | undefined;
     const transient = createOrchestratorGateway(profile, authKey, {
       onSnapshot: (snapshot) => { captured = snapshot; },
-      onAuthenticationInvalidated: () => { accessDenied = true; }
+      onAuthenticationInvalidated: (error) => { invalidated = error; }
     });
     try {
       await transient.connect();
+      if (invalidated) throw invalidated;
     } catch (error) {
-      if (accessDenied) {
+      if (isEndpointTrustError(error)) {
+        machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
+        throw error;
+      }
+      if (invalidated) {
         await local.deleteMachineCache(profile.id);
         setState((current) => ({
           ...current,
@@ -1827,9 +1847,14 @@ export function useAppController(): AppController {
       const local = requireLocal(localRef.current);
       const results = await Promise.all(profiles.map(async (profile): Promise<readonly [string, MachinePresenceView] | undefined> => {
         if (profile.id === active?.id && connectionStateRef.current === "connected") return [profile.id, "current"];
-        const backoff = machineFailureBackoffRef.current.get(profile.id);
+        let backoff = machineFailureBackoffRef.current.get(profile.id);
+        if (backoff?.profileKey !== undefined && backoff.profileKey !== remoteMachineProfileKey(profile)) {
+          machineFailureBackoffRef.current.delete(profile.id); backoff = undefined;
+        }
         if (!manual && backoff !== undefined && backoff.retryAt > Date.now()) return undefined;
         try {
+          await local.loadEndpointTransport(profile);
+          rememberEndpointTrust(profile);
           const identity = await probeOrchestratorOrigin(profile.origin);
           machineFailureBackoffRef.current.delete(profile.id);
           if (identity.serverId !== profile.serverId) {
@@ -1845,10 +1870,14 @@ export function useAppController(): AppController {
             return [profile.id, "online"];
           } catch (error) {
             if (error instanceof MachineAccessDeniedError) return [profile.id, "accessDenied"];
-            if (error instanceof MachineIdentityError) return [profile.id, "identityMismatch"];
+            if (error instanceof MachineIdentityError || isEndpointTrustError(error)) return [profile.id, "identityMismatch"];
             return [profile.id, "online"];
           }
-        } catch {
+        } catch (error) {
+          if (isEndpointTrustError(error)) {
+            machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
+            return [profile.id, "identityMismatch"];
+          }
           const previous = machineFailureBackoffRef.current.get(profile.id)?.failures ?? 0;
           const failures = previous + 1;
           machineFailureBackoffRef.current.set(profile.id, {
@@ -2096,6 +2125,8 @@ export function useAppController(): AppController {
     }
     for (const profile of desired.values()) {
       if (remoteMachineGatewaysRef.current.has(profile.id)) continue;
+      const blocked = machineFailureBackoffRef.current.get(profile.id);
+      if (blocked?.retryAt === Infinity && blocked.profileKey === remoteMachineProfileKey(profile)) continue;
       const epoch = ++remoteMachineGatewayEpochRef.current;
       const binding = {
         epoch,
@@ -2185,6 +2216,8 @@ export function useAppController(): AppController {
       const connectGateway = async (): Promise<void> => {
         const local = requireLocal(localRef.current);
         try {
+          await local.loadEndpointTransport(profile);
+          rememberEndpointTrust(profile);
           const identity = await probeOrchestratorOrigin(profile.origin);
           if (!current()) return;
           if (identity.serverId !== profile.serverId) {
@@ -2250,11 +2283,13 @@ export function useAppController(): AppController {
               publishActivity();
               setState((value) => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "offline" } }));
             },
-            onAuthenticationInvalidated: async () => {
+            onAuthenticationInvalidated: async (error) => {
               if (!current() || binding.gateway !== gateway) return;
               binding.connected = false;
               publishActivity();
-              if (shouldDeleteInvalidatedConnectionCredential(profile)) await local.deleteAuthKey(profile.id);
+              const trustFailed = isEndpointTrustError(error);
+              if (trustFailed) machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
+              if (!trustFailed && shouldDeleteInvalidatedConnectionCredential(profile)) await local.deleteAuthKey(profile.id);
               await local.deleteMachineCache(profile.id);
               if (!current()) return;
               gateway.disconnect();
@@ -2262,7 +2297,7 @@ export function useAppController(): AppController {
               setState((value) => ({
                 ...value,
                 machineCaches: value.machineCaches.filter((cache) => cache.profileId !== profile.id),
-                machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "accessDenied" }
+                machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: trustFailed ? "identityMismatch" : "accessDenied" }
               }));
             }
           });
@@ -2273,12 +2308,17 @@ export function useAppController(): AppController {
             return;
           }
           binding.failures = 0;
-        } catch {
+        } catch (error) {
           if (!current()) return;
           binding.connected = false;
           publishActivity();
           binding.gateway?.disconnect();
           binding.gateway = undefined;
+          if (isEndpointTrustError(error)) {
+            machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
+            setState(value => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "identityMismatch" } }));
+            return;
+          }
           setState((value) => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "offline" } }));
           scheduleRetry();
         }
@@ -3023,6 +3063,35 @@ export function useAppController(): AppController {
     probeRuntimeActivity,
     connect,
     pair,
+    authorizeNewDevice: async options => {
+      const active = gateway();
+      if (!active.authorizeNewDevice) throw new Error("New-device authorization is unavailable.");
+      if (options?.irohRelay === undefined) return active.authorizeNewDevice(options);
+      const profile = activeProfileRef.current;
+      if (profile === undefined || profile.endpointPublicKey === undefined) throw new Error('The original pinned node connection is required.');
+      const { requireIrohRelayInvitationRequest, trustedEndpointTransport } = await import('@joko/connection-transport/trust');
+      const transport = trustedEndpointTransport(profile.origin, profile.endpointPublicKey, profile.transportKind ?? 'https');
+      const request = requireIrohRelayInvitationRequest(transport, options);
+      if (transport?.kind !== 'iroh' || request === undefined) throw new Error('Select the original iroh node entrance.');
+      const local = requireLocal(localRef.current), input = { ...request, requestId: randomUuid(), nodeEndpointId: transport.endpointId };
+      const retained = await local.claimIrohRelayRequest(profile, input);
+      if (gateway() !== active || activeProfileRef.current !== profile) throw new Error('The original node connection changed.');
+      return active.authorizeNewDevice({ irohRelay: retained, onIrohRelayLease: expiresAt => local.confirmIrohRelayRequest(profile, retained, expiresAt) });
+    },
+    cancelDevicePairing: invitation => {
+      const active = gateway();
+      if (!active.cancelDevicePairing) throw new Error("Pairing cancellation is unavailable.");
+      return active.cancelDevicePairing(invitation);
+    },
+    trustEndpoint: async (origin, endpointPublicKey, replace, serverId, endpointTransport) => {
+      const input = { origin: normalizeOrchestratorOrigin(origin), endpointPublicKey, serverId, endpointTransport, transportKind: endpointTransport?.kind ?? 'https' as const };
+      if (replace === true) replaceEndpointTrust(input); else rememberEndpointTrust(input);
+      if (endpointTransport !== undefined) for (const profile of profilesRef.current) {
+        if (profile.origin === input.origin && profile.endpointPublicKey === endpointPublicKey && profile.transportKind === endpointTransport.kind) await requireLocal(localRef.current).saveEndpointTransport(profile);
+      }
+    },
+    createTailcatClient: (origin, endpointPublicKey, endpointTransport) => createTailcatClientIdentity(normalizeOrchestratorOrigin(origin), endpointPublicKey, endpointTransport),
+    createIrohClient: (origin, endpointPublicKey, endpointTransport, mobileMode) => createIrohClientIdentity(origin === undefined ? undefined : normalizeOrchestratorOrigin(origin), endpointPublicKey, endpointTransport, mobileMode),
     disconnect,
     forgetProfile,
     logoutProfile,
@@ -3805,7 +3874,7 @@ function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineC
 }
 
 function remoteMachineProfileKey(profile: ConnectionProfile): string {
-  return `${profile.id}\u0000${profile.origin}\u0000${profile.serverId}`;
+  return `${profile.id}\u0000${profile.origin}\u0000${profile.serverId}\u0000${profile.endpointPublicKey ?? ''}\u0000${profile.transportKind ?? 'https'}`;
 }
 
 const REMOTE_SEARCH_ID_SEPARATOR = "\u0000";
@@ -4067,7 +4136,7 @@ function sameManagedOrchestratorConnection(
     && left.deviceId === right.deviceId
     && left.serverId === right.serverId
     && left.name === right.name
-    && left.origin === right.origin;
+    && left.origin === right.origin && left.endpointPublicKey === right.endpointPublicKey;
 }
 
 export function managedConnectionProfile(
@@ -4088,6 +4157,7 @@ export function managedConnectionProfile(
     name: value.name.trim().slice(0, 256) || "Local Joko",
     origin,
     managedLocal: true,
+    ...(value.endpointPublicKey === undefined ? {} : { endpointPublicKey: value.endpointPublicKey }),
     ...(previous?.lastConnectedAt === undefined ? {} : { lastConnectedAt: previous.lastConnectedAt })
   };
 }
@@ -4234,7 +4304,8 @@ async function tryAdoptRecoveredManagedConnection(
       deviceId: profile.deviceId,
       serverId: profile.serverId,
       name: "Local Joko",
-      origin: profile.origin
+      origin: profile.origin,
+      endpointPublicKey: profile.endpointPublicKey
     });
   } catch {
     // Pairing itself remains a valid normal Connection. A failed adoption must
@@ -4595,10 +4666,12 @@ function applyWindowZoom(value: number): void {
 export function trustedReusablePairingProfiles(
   profiles: readonly ConnectionProfile[],
   origin: string,
-  serverId: string
+  serverId: string,
+  expectedEndpointPublicKey?: string
 ): readonly ConnectionProfile[] {
   return profiles
     .filter((profile) => profile.managedLocal !== true
+      && (expectedEndpointPublicKey === undefined || profile.endpointPublicKey === expectedEndpointPublicKey)
       && profile.serverId === serverId
       && sameOrchestratorOrigin(profile.origin, origin))
     .sort((left, right) => (right.lastConnectedAt ?? 0) - (left.lastConnectedAt ?? 0));

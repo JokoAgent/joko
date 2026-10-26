@@ -1,5 +1,6 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { EndpointTrustError } from "@joko/connection-transport/trust";
 import { EventSchema, StreamEventsResponseSchema, type EventCursor, type StreamEventsResponse } from "@joko/contracts";
 import type { SharedOwnerEventsOwner } from "./shared-owner-events-broker.js";
 
@@ -11,8 +12,9 @@ export type SharedOwnerEventsRequest =
 
 export type SharedOwnerEventsReply =
   | { readonly type: "ready" }
+  | { readonly type: "accepted" }
   | { readonly type: "event"; readonly bytes: ArrayBuffer; readonly serial: number }
-  | { readonly type: "error"; readonly code: number; readonly message: string }
+  | { readonly type: "error"; readonly code: number; readonly message: string; readonly endpointTrustFailed?: true }
   | { readonly type: "ping" };
 
 /** One private port per connection occurrence; no credential is part of the worker address. */
@@ -21,7 +23,8 @@ export async function* streamSharedOwnerEvents(
   authKey: string,
   cursor: EventCursor,
   signal: AbortSignal,
-  onDocumentRetired: () => void
+  onDocumentRetired: () => void,
+  onAccepted?: () => void
 ): AsyncGenerator<StreamEventsResponse> {
   signal.throwIfAborted();
   const worker = new SharedWorker(new URL("./shared-owner-events.worker.ts", import.meta.url), {
@@ -34,18 +37,23 @@ export async function* streamSharedOwnerEvents(
   let failure: ConnectError | undefined;
   let closed = false;
   let ready = false;
+  let accepted = false;
   let liveness: ReturnType<typeof setTimeout> | undefined;
   const fail = (error: ConnectError): void => { failure ??= error; wake?.(); };
   const abort = (): void => { closed = true; wake?.(); };
   const retire = (): void => { onDocumentRetired(); abort(); };
   const startup = setTimeout(() => fail(new ConnectError("The event worker did not start.", Code.Unavailable)), 15_000);
   port.onmessage = ({ data }: MessageEvent<SharedOwnerEventsReply>): void => {
-    if (closed || signal.aborted) return;
+    if (closed || signal.aborted || failure !== undefined) return;
     clearTimeout(liveness);
     liveness = setTimeout(() => fail(new ConnectError("The event worker stopped responding.", Code.Unavailable)), 90_000);
     if (data.type === "ping") { port.postMessage({ type: "pong" } satisfies SharedOwnerEventsRequest); return; }
     if (data.type === "ready") { ready = true; clearTimeout(startup); return; }
-    if (data.type === "error") { fail(new ConnectError(data.message, data.code)); return; }
+    if (data.type === "error") { fail(new ConnectError(data.message, data.code, undefined, undefined, data.endpointTrustFailed ? new EndpointTrustError() : undefined)); return; }
+    if (data.type === "accepted" && ready) {
+      if (!accepted) { accepted = true; onAccepted?.(); }
+      return;
+    }
     if (data.type !== "event" || !ready || !(data.bytes instanceof ArrayBuffer) || !Number.isSafeInteger(data.serial)) {
       fail(new ConnectError("The event worker returned an invalid response.", Code.DataLoss)); return;
     }

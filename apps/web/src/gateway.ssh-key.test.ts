@@ -21,7 +21,7 @@ it("sends SSH passphrases only over the ticket upload channel and preserves key 
   await expect(fixture.gateway.getSshKeyInstallCommand({ keyId: "opaque-key", expectedFingerprint: "SHA256:observed", destination: { kind: "savedHost", targetId: "project", hostId: "host", expectedRevision: 9n }, shell: "powershell" }, signal)).resolves.toBe("fixture-command");
   expect(uploads).toEqual(["generation-test-secret", "agent-test-secret"]);
   expect(buffers.every((bytes) => bytes.every((byte) => byte === 0))).toBe(true);
-  expect(fetch).toHaveBeenCalledWith("https://service.example/v1/credential-uploads/ssh-ticket", expect.objectContaining({ method: "PUT", signal: expect.any(AbortSignal), headers: { authorization: "Bearer fixture-auth", "content-type": "application/octet-stream" } }));
+  expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4318/v1/credential-uploads/ssh-ticket", expect.objectContaining({ method: "PUT", signal: expect.any(AbortSignal), headers: { authorization: "Bearer fixture-auth", "content-type": "application/octet-stream" } }));
   expect(fixture.requests.filter((entry) => entry.method === "beginSshKeyPassphraseUpload").map((entry) => entry.input)).toEqual([
     expect.objectContaining({ purpose: SshKeyPassphrasePurpose.GENERATE }),
     expect.objectContaining({ purpose: SshKeyPassphrasePurpose.AGENT_ADD, keyId: "opaque-key", expectedFingerprint: "SHA256:observed" })
@@ -94,7 +94,7 @@ async function mount() {
     }),
     stream: vi.fn(async (method: any) => response(method, idleStream(), true))
   } as unknown as Transport;
-  const gateway = createOrchestratorGateway({ id: "profile", deviceId: "device", name: "Node", origin: "https://service.example", serverId: "node" }, "fixture-auth", {}, () => transport);
+  const gateway = createOrchestratorGateway({ id: "profile", deviceId: "device", name: "Node", origin: "http://127.0.0.1:4318", serverId: "node" }, "fixture-auth", {}, () => transport);
   const fixture = { gateway, requests, pause: undefined as undefined | ((step: string) => Promise<void>), failure: undefined as ConnectError | undefined, agentHostPlatform: SshAgentHostPlatform.WINDOWS };
   await gateway.connect(); return fixture;
 }

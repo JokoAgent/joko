@@ -51,6 +51,11 @@ describe("native Remote Desktop private commands", () => {
   it("separates current ICE success and error receipts and preserves nullable candidate fields", () => {
     const receipt = { type: "ice", epoch, attemptId, exchangeId: 2, error: false, candidates: [candidate], next: 1, complete: false };
     expect(parseMobileRemoteDesktopNativeCommand(receipt)).toEqual(receipt);
+    expect(RTC_NETWORK.maxLocalCandidates).toBe(128);
+    expect(parseMobileRemoteDesktopNativeCommand({ ...receipt, next: 256 })).toBeDefined();
+    expect(parseMobileRemoteDesktopNativeCommand({ ...receipt, next: 257 })).toBeUndefined();
+    expect(parseMobileRemoteDesktopNativeEvent(event({ type: 'ice', candidates: [], after: 256, exchangeId: 2 }))).toBeDefined();
+    expect(parseMobileRemoteDesktopNativeEvent(event({ type: 'ice', candidates: [], after: 257, exchangeId: 2 }))).toBeUndefined();
     expect(parseMobileRemoteDesktopNativeCommand({ ...receipt, error: true })).toBeUndefined();
     expect(parseMobileRemoteDesktopNativeCommand({ type: "ice", epoch, attemptId, exchangeId: 2, error: true })).toBeDefined();
     expect(parseMobileRemoteDesktopNativeCommand({ ...receipt, candidates: [{ ...candidate, sdpMLineIndex: null }] })).toBeDefined();

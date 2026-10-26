@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useReducer, useRef, useState } from "react";
+import { allowsUnpinnedEndpoint, normalizeEndpointPublicKey, parseTrustedNodeInvitation, rememberEndpointTrust, replaceEndpointTrust, type EndpointTrust } from "@joko/connection-transport/trust";
 import type { JSX } from "react";
 import { AlertTriangle, ArrowRight, KeyRound, Laptop, Moon, RefreshCcw, Server, Sun, Trash2, Wifi } from "lucide-react";
 import { connectionArtworkGroupAt, nextConnectionArtworkGroupIndex } from "../connection-artwork.js";
@@ -34,6 +35,39 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
   };
   const [origin, setOrigin] = useState(state.candidate?.origin ?? (state.capabilities?.challengePairing === true ? "" : "http://127.0.0.1:4318"));
   const [code, setCode] = useState("");
+  const [trustedIdentity, setTrustedIdentity] = useState("");
+  const [clientPublicKey, setClientPublicKey] = useState('');
+  const [httpTransportMode, setHttpTransportMode] = useState<'https' | 'webrtc'>();
+  const selectedTransport = useMemo(() => {
+    try {
+      const kind = trustedIdentity.trim().startsWith('{') ? parseTrustedNodeInvitation(trustedIdentity).endpointTransport?.kind : undefined;
+      return kind === 'iroh' || kind === 'tailcat' || kind === 'http-connect' ? kind : httpTransportMode === 'https' ? undefined : httpTransportMode ?? kind;
+    } catch { return httpTransportMode === 'webrtc' ? 'webrtc' : undefined; }
+  }, [trustedIdentity, httpTransportMode]);
+  const mobileIroh = state.capabilities?.irohNativeAvailable !== undefined;
+  const [irohMobileMode, setIrohMobileMode] = useState<'native' | 'relay'>(state.capabilities?.irohNativeAvailable === true ? 'native' : 'relay');
+  const clientBindingAvailable = selectedTransport === 'http-connect' ? state.capabilities?.httpConnectNativeAvailable === true || window.jokoDesktop?.linkspan !== undefined
+    : selectedTransport === 'webrtc' ? state.capabilities?.webRtcAvailable !== false : selectedTransport === 'tailcat' ? state.capabilities?.tailcatRelayAvailable !== false
+    : !mobileIroh || (irohMobileMode === 'native' ? state.capabilities?.irohNativeAvailable === true : state.capabilities?.irohRelayAvailable === true);
+  const [replaceIdentity, setReplaceIdentity] = useState(false);
+  const prepareTrust = async (): Promise<void> => {
+    if (trustedIdentity.trim() === "") {
+      if (selectedTransport === 'webrtc' || !allowsUnpinnedEndpoint(origin)) throw new Error(t("connection.trustedKeyRequired"));
+      return;
+    }
+    const pin: EndpointTrust & { readonly endpointPublicKey: string } = trustedIdentity.trim().startsWith("{")
+      ? parseTrustedNodeInvitation(trustedIdentity) : { origin: normalizeOrchestratorOrigin(origin), endpointPublicKey: normalizeEndpointPublicKey(trustedIdentity) };
+    if (pin.origin !== normalizeOrchestratorOrigin(origin)) throw new Error(t("connection.invitationOriginMismatch"));
+    const endpointTransport = pin.endpointTransport?.kind === 'iroh' && mobileIroh ? { ...pin.endpointTransport, mobileMode: irohMobileMode }
+      : selectedTransport === 'webrtc' ? { kind: 'webrtc' as const } : pin.endpointTransport?.kind === 'webrtc' ? undefined : pin.endpointTransport;
+    if (endpointTransport?.kind === 'iroh' && endpointTransport.relayUrls?.length === 0 && window.jokoDesktop?.linkspan === undefined && (!mobileIroh || irohMobileMode !== 'native')) throw new Error(t('connection.irohDirectOnly'));
+    if (endpointTransport !== undefined && !clientBindingAvailable) throw new Error(t('connection.sdkNotDelivered'));
+    if (endpointTransport?.kind === 'iroh' && mobileIroh && endpointTransport.mobileMode === 'native' && state.capabilities?.irohNativeAvailable !== true) throw new Error(t('connection.irohNativeUnavailable'));
+    if (clientPublicKey !== '' && pin.endpointTransport?.kind === 'iroh' && pin.endpointTransport.relayToken !== undefined && pin.endpointTransport.clientEndpointId !== clientPublicKey) throw new Error(t('connection.irohClientLeaseRequired'));
+    if (controller.trustEndpoint) await controller.trustEndpoint(pin.origin, pin.endpointPublicKey, replaceIdentity, pin.serverId, endpointTransport);
+    else if (replaceIdentity) replaceEndpointTrust({ ...pin, endpointTransport, transportKind: endpointTransport?.kind ?? 'https' });
+    else rememberEndpointTrust({ ...pin, endpointTransport, transportKind: endpointTransport?.kind ?? 'https' });
+  };
   const [deviceName, setDeviceName] = useState(() => state.defaultDeviceName ?? defaultDeviceName());
   const [insecureConfirmed, setInsecureConfirmed] = useState(false);
   const [localError, setLocalError] = useState<string>();
@@ -53,7 +87,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
   const isConnecting = state.connectionState === "connecting";
   const actionsDisabled = busy !== undefined || state.busy === true || state.interactive === false;
   const challengePairing = state.capabilities?.challengePairing === true;
-  const insecureLan = isInsecureLanOrigin(origin);
+  const insecureLan = isInsecureLanOrigin(origin) && trustedIdentity.trim() === "";
   const sessionOnlySecret = insecureLan && (state.sessionOnlyCredential ?? (window.jokoDesktop === undefined && !persistentWebSecretEncryptionAvailable()));
   const automaticEntryAvailable = state.automaticConnectionAvailable;
   const darkThemeActive = state.preferences.theme === "dark" || (state.preferences.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
@@ -124,7 +158,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
   const pair = (): void => {
     if (!code.trim() || !deviceName.trim() || !origin.trim() || (insecureLan && !insecureConfirmed)
       || (challengePairing && !challengeMatches)) return;
-    runAction("pair", () => controller.pair(origin, code, deviceName, { automatic: automaticEntryAvailable ? rememberAutomatically : undefined }),
+    runAction("pair", async () => { await prepareTrust(); await controller.pair(origin, code, deviceName, { automatic: automaticEntryAvailable ? rememberAutomatically : undefined }); },
       undefined, () => setCode(""));
   };
 
@@ -148,7 +182,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
   const invalidatePairing = (): void => {
     if (!challengePairing) return;
     setCode("");
-    try { controller.cancelPairing?.(); }
+    try { void Promise.resolve(controller.cancelPairing?.()).catch(error => setLocalError(messageOf(error, t("error.unexpected")))); }
     catch (error) { setLocalError(messageOf(error, t("error.unexpected"))); }
   };
   const cancelConnection = (): void => {
@@ -158,7 +192,7 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
   const cancelPairing = (): void => {
     actionRef.current = undefined;
     setCode("");
-    runAction("cancel", async () => { controller.cancelPairing?.(); });
+    runAction("cancel", async () => { await controller.cancelPairing?.(); });
   };
   const connectingProfile = state.activeProfile ?? state.profiles.find((profile) => profile.id === busy);
 
@@ -306,6 +340,10 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
                   {busy === profile.id ? <Spinner label={t("connection.connecting")} /> : <ArrowRight aria-hidden="true" />}
                   {t("connection.connect")}
                 </Button>
+                {profile.transportKind === 'iroh' && mobileIroh && controller.setProfileIrohMode !== undefined && <>
+                  <Button disabled={actionsDisabled || state.capabilities?.irohNativeAvailable !== true} onClick={() => runAction('iroh-native', () => controller.setProfileIrohMode!(profile.id, 'native'))}>{t('connection.irohNativeMode')}</Button>
+                  <Button disabled={actionsDisabled || state.capabilities?.irohRelayAvailable !== true} onClick={() => runAction('iroh-relay', () => controller.setProfileIrohMode!(profile.id, 'relay'))}>{t('connection.irohRelayMode')}</Button>
+                </>}
                 {profile.managedLocal !== true && <IconButton className="profile-card__forget" label={t("connection.forget", { name: profile.name })} disabled={actionsDisabled}
                   onClick={() => runAction("forget", () => controller.forgetProfile(profile.id))}>
                   <Trash2 aria-hidden="true" />
@@ -324,6 +362,49 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
               <input type="url" inputMode="url" aria-label={t("connection.origin")} aria-describedby={originHintId} required disabled={actionsDisabled} value={origin} onChange={(event) => { setOrigin(event.target.value); setInsecureConfirmed(false); invalidatePairing(); }} placeholder="http://192.168.1.20:4318" autoComplete="url" />
               <small id={originHintId}>{t("connection.secureHint")}</small>
             </label>
+            <label>
+              <span>{t("connection.trustedIdentity")}</span>
+              <textarea aria-label={t("connection.trustedIdentity")} disabled={actionsDisabled} value={trustedIdentity} maxLength={32768}
+                onChange={event => { const value = event.target.value; setTrustedIdentity(value); setClientPublicKey(''); setReplaceIdentity(false); invalidatePairing();
+                  if (value.trim().startsWith("{")) { setHttpTransportMode(undefined); try { setOrigin(parseTrustedNodeInvitation(value).origin); } catch { /* Keep incomplete invitation drafts editable. */ } }
+                  else if (selectedTransport === 'webrtc') setHttpTransportMode('webrtc'); }}
+                placeholder="ed25519:…" autoComplete="off" spellCheck={false} />
+              <small>{t("connection.trustedIdentityHelp")}</small>
+              {selectedTransport !== undefined && <small role="note">{t(selectedTransport === 'http-connect' ? 'connection.transportHttpConnectHelp' : selectedTransport === 'webrtc' ? 'connection.transportWebRtcHelp' : selectedTransport === 'iroh' ? 'connection.transportIrohHelp' : 'connection.transportTailcatHelp')}</small>}
+              {selectedTransport === 'http-connect' && !clientBindingAvailable && <small role="note">{t('connection.httpConnectNativeRequired')}</small>}
+            </label>
+            {(selectedTransport === undefined || selectedTransport === 'webrtc') && <div className="connection-transport-choice" role="group" aria-label={t('connection.transport')}>
+              <button type="button" aria-pressed={selectedTransport === undefined} className={selectedTransport === undefined ? 'is-active' : ''} disabled={actionsDisabled}
+                onClick={() => { setHttpTransportMode('https'); invalidatePairing(); }}>HTTPS / WSS</button>
+              <button type="button" aria-pressed={selectedTransport === 'webrtc'} className={selectedTransport === 'webrtc' ? 'is-active' : ''}
+                disabled={actionsDisabled || state.capabilities?.webRtcAvailable === false}
+                onClick={() => { setHttpTransportMode('webrtc'); invalidatePairing(); }}>WebRTC</button>
+            </div>}
+            {mobileIroh && (selectedTransport === undefined || selectedTransport === 'iroh') && <label><span>{t('connection.irohMobileMode')}</span>
+              <select aria-label={t('connection.irohMobileMode')} value={irohMobileMode} disabled={actionsDisabled} onChange={event => { setIrohMobileMode(event.target.value === 'native' ? 'native' : 'relay'); invalidatePairing(); }}>
+                <option value="native" disabled={state.capabilities?.irohNativeAvailable !== true}>{t('connection.irohNativeMode')}</option>
+                <option value="relay" disabled={state.capabilities?.irohRelayAvailable !== true}>{t('connection.irohRelayMode')}</option>
+              </select><small>{t(state.capabilities?.irohNativeAvailable === true ? 'connection.irohMobileModeHelp' : 'connection.irohNativeUnavailable')}</small>
+            </label>}
+            {selectedTransport !== 'webrtc' && selectedTransport !== 'http-connect' && (selectedTransport === 'tailcat' ? controller.createTailcatClient : controller.createIrohClient) !== undefined && <>
+              {selectedTransport === undefined && <small>{t('connection.irohBeforeInvitationHelp')}</small>}
+              <Button disabled={actionsDisabled || !clientBindingAvailable} onClick={() => runAction('client-identity', async () => {
+                let result: { readonly publicKey: string };
+                if (selectedTransport === undefined) result = await controller.createIrohClient!(undefined, undefined, undefined, mobileIroh ? irohMobileMode : undefined);
+                else {
+                  const invitation = parseTrustedNodeInvitation(trustedIdentity);
+                  if (invitation.endpointTransport === undefined) throw new Error(t('connection.trustedKeyRequired'));
+                  result = invitation.endpointTransport.kind === 'tailcat'
+                    ? await controller.createTailcatClient!(invitation.origin, invitation.endpointPublicKey, invitation.endpointTransport)
+                    : await controller.createIrohClient!(invitation.origin, invitation.endpointPublicKey, invitation.endpointTransport, mobileIroh ? irohMobileMode : undefined);
+                }
+                if (mountedRef.current) setClientPublicKey(result.publicKey);
+              })}>{t(selectedTransport === 'tailcat' ? 'connection.createTailcatClient' : 'connection.createIrohClient')}</Button>
+              {!clientBindingAvailable && <small>{t('connection.sdkNotDelivered')}</small>}
+              {clientPublicKey !== '' && <label><span>{t(selectedTransport === 'tailcat' ? 'connection.tailcatPublicKey' : 'connection.irohPublicKey')}</span><input readOnly value={clientPublicKey} aria-label={t(selectedTransport === 'tailcat' ? 'connection.tailcatPublicKey' : 'connection.irohPublicKey')} /><small>{t(selectedTransport === 'tailcat' ? 'connection.tailcatAllowlistHelp' : 'connection.irohLeaseHelp')}</small></label>}
+            </>}
+            <label className="connection-checkbox"><CheckboxControl checked={replaceIdentity} disabled={actionsDisabled}
+              onChange={event => setReplaceIdentity(event.target.checked)} /><span>{t("connection.replaceIdentity")}</span></label>
             {insecureLan && <div className="lan-http-warning" role="note">
               <AlertTriangle aria-hidden="true" />
               <div><strong>{t("connection.insecureLanTitle")}</strong><p>{t("connection.insecureLanBody")}</p>{sessionOnlySecret && <p>{t("connection.sessionOnlySecret")}</p>}</div>
@@ -333,8 +414,8 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
               <span>{t("connection.insecureLanConfirm")}</span>
             </label>}
             {challengePairing && <>
-              <Button disabled={actionsDisabled || normalizedOrigin === undefined || controller.inspect === undefined}
-                onClick={() => runAction("inspect", () => controller.inspect!(origin))}>{busy === "inspect" && <Spinner label={state.labels?.checking ?? t("connection.connecting")} />}{state.labels?.inspect ?? t("connection.properties")}</Button>
+              <Button disabled={actionsDisabled || normalizedOrigin === undefined || controller.inspect === undefined || (insecureLan && !insecureConfirmed)}
+                onClick={() => runAction("inspect", async () => { await prepareTrust(); await controller.inspect!(origin); })}>{busy === "inspect" && <Spinner label={state.labels?.checking ?? t("connection.connecting")} />}{state.labels?.inspect ?? t("connection.properties")}</Button>
               {candidate !== undefined && <div className="profile-card__body" role="status">
                 <strong>{candidate.name}</strong><span>{candidate.identityLabel ?? candidate.serverId}</span>
                 <small>{candidate.summaryLabel ?? `${candidate.version} · ${t(candidate.pairingEnabled ? "connection.pairingOpen" : "connection.pairingClosed")}`}</small>
@@ -351,8 +432,8 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
               </label>
             </div>
             {challengePairing && <>
-              <Button disabled={actionsDisabled || candidate?.pairingEnabled !== true || !deviceName.trim() || controller.requestPairing === undefined}
-                onClick={() => { setCode(""); runAction("challenge", () => controller.requestPairing!(origin, deviceName)); }}>
+              <Button disabled={actionsDisabled || candidate?.pairingEnabled !== true || !deviceName.trim() || controller.requestPairing === undefined || (insecureLan && !insecureConfirmed)}
+                onClick={() => { setCode(""); runAction("challenge", async () => { await prepareTrust(); await controller.requestPairing!(origin, deviceName); }); }}>
                 {busy === "challenge" && <Spinner label={t("connection.connecting")} />}{state.labels?.requestPairing ?? t("connection.pair")}
               </Button>
               {challengeMatches && <p role="status">{state.labels?.challengeHint ?? t("connection.pairHelp")}</p>}

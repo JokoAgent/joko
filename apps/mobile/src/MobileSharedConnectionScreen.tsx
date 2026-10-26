@@ -10,6 +10,9 @@ import { mobileConnectionMessages, projectMobileConnection } from "./mobile-conn
 import { mobileConnectionJson, parseMobileConnectionMessage, type MobileConnectionMessage } from "./mobile-connection-protocol";
 import connectionRuntime from "./connection-runtime.connjs";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
+import { mobileIrohNativeAvailable } from './mobile-iroh-native';
+import { mobileHttpConnectNativeAvailable } from './mobile-http-connect-native';
+import { linkspanRuntimeAssets, linkspanWebRtcRuntimeAssets } from './linkspan-runtime-assets';
 
 interface ConnectionWebViewHandle { injectJavaScript(script: string): void }
 const ConnectionWebView = WebView as unknown as ForwardRefExoticComponent<WebViewProps & RefAttributes<ConnectionWebViewHandle>>;
@@ -40,9 +43,12 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
   const lastRequestId = useRef(0);
   const current = useRef(props);
   current.current = props;
+  const projectedState = projectMobileConnection(props.state, props.locale, props.dark, props.defaultDeviceName, props.onBack !== undefined, foreground);
   const publicView = {
     instanceId: surface, locale: props.locale, dark: props.dark,
-    state: projectMobileConnection(props.state, props.locale, props.dark, props.defaultDeviceName, props.onBack !== undefined, foreground),
+    state: { ...projectedState, capabilities: { ...projectedState.capabilities, irohNativeAvailable: mobileIrohNativeAvailable(),
+      irohRelayAvailable: linkspanRuntimeAssets.iroh !== undefined, tailcatRelayAvailable: linkspanRuntimeAssets.tailcat !== undefined,
+      webRtcAvailable: linkspanWebRtcRuntimeAssets !== undefined, httpConnectNativeAvailable: mobileHttpConnectNativeAvailable() } },
     messages: mobileConnectionMessages(props.locale)
   };
   const latestPublicView = useRef(publicView);
@@ -95,12 +101,12 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
     }
     if (!ready.current || message.id <= lastRequestId.current) return;
     lastRequestId.current = message.id;
-    const settle = (success: boolean, error?: string) => {
+    const settle = (success: boolean, error?: string, result?: unknown) => {
       if (activeSurface.current !== surface || !ready.current) return;
-      webView.current?.injectJavaScript(`window.jokoConnection?.settle(${message.id},${success},${mobileConnectionJson(error)});true;`);
+      webView.current?.injectJavaScript(`window.jokoConnection?.settle(${message.id},${success},${mobileConnectionJson(error)},${mobileConnectionJson(result)});true;`);
     };
     if (!foreground) { settle(false, mobileMessage(current.current.locale, "connection.repair")); return; }
-    void executeConnectionAction(message, current.current).then(() => settle(true), (error: unknown) => {
+    void executeConnectionAction(message, current.current).then(result => settle(true, undefined, result), (error: unknown) => {
       settle(false, error instanceof Error ? error.message : mobileMessage(current.current.locale, "connection.repair"));
     });
   };
@@ -130,7 +136,7 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
 }
 
 async function executeConnectionAction(message: Extract<MobileConnectionMessage, { type: "action" }>,
-  props: MobileSharedConnectionScreenProps): Promise<void> {
+  props: MobileSharedConnectionScreenProps): Promise<void | { readonly publicKey: string }> {
   const { client, locale } = props;
   const args = message.args;
   const automatic = (index: number): boolean | undefined => (args[index] as { automatic?: boolean } | undefined)?.automatic;
@@ -148,8 +154,18 @@ async function executeConnectionAction(message: Extract<MobileConnectionMessage,
       return;
     case "inspect": await client.inspect(args[0] as string); return;
     case "requestPairing": await client.requestPairing(args[0] as string, args[1] as string); return;
+    case "trustEndpoint": await client.trustEndpoint(args[0] as string, args[1] as string, args[2] === true, args[3] == null ? undefined : args[3] as string, args[4] as import('@joko/connection-transport/trust').EndpointTransport | undefined); return;
+    case 'createTailcatClient': return client.createTailcatClient(args[0] as string, args[1] as string, args[2] as import('@joko/connection-transport/trust').EndpointTransport);
+    case 'createIrohClient': return args.length === 0 ? client.createIrohClient() : args.length === 1 ? client.createIrohClient(undefined, undefined, undefined, args[0] as 'native' | 'relay')
+      : client.createIrohClient(args[0] as string, args[1] as string, args[2] as import('@joko/connection-transport/trust').EndpointTransport, args[3] as 'native' | 'relay' | undefined);
+    case 'setProfileIrohMode': {
+      if (args[1] === 'native' && !mobileIrohNativeAvailable()) throw new Error('Native iroh is unavailable in this app build or OS. Select relay mode explicitly.');
+      if (args[1] === 'relay' && linkspanRuntimeAssets.iroh === undefined) throw new Error('The iroh relay runtime was not selected for this app build.');
+      await client.setProfileIrohMode(args[0] as string, args[1] as 'native' | 'relay'); return;
+    }
     case "setTheme": await props.onThemeChange(args[0] as MobileThemePreference); return;
-    case "disconnect": case "cancelPairing": client.cancel(); return;
+    case "disconnect": client.cancel(); return;
+    case "cancelPairing": await client.cancelPairing(); return;
     case "selectMode": client.setConnectionMode(args[0] === "pair" ? "add" : args[0] as "nearby" | "saved"); return;
     case "refreshDiscoveredNodes": await client.refreshNearby(); return;
     case "recheckSavedProfiles": await client.refreshSaved(); return;

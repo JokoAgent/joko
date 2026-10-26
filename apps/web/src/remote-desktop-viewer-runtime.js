@@ -1892,7 +1892,7 @@ export function mountRemoteDesktopViewer(root, postMessage, config) {
       rtc.addTransceiver("audio", { direction: "recvonly" });
       rtc.onicecandidate = ({ candidate }) => {
         if (g !== generation || !candidate?.candidate || !trickleIce) return;
-        if (localCandidates.length >= net.maxCandidates) {
+        if (localCandidates.length >= (net.maxLocalCandidates ?? Math.min(net.maxCandidates, 128))) {
           failRtc("candidate-limit", false);
           return;
         }

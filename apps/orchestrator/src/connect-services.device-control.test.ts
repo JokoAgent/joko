@@ -33,28 +33,28 @@ describe("Device control Connect surface", () => {
     const stream = (services.event.streamEvents as (request: contract.StreamEventsRequest, context: unknown) =>
       AsyncGenerator<contract.StreamEventsResponse>)(request, { requestHeader: new Headers(), signal: controller.signal });
     try {
-      const receiving = stream.next();
+      const receiving = nextStreamEvent(stream);
       const changed = manager.refreshDeviceNameSource(phone, "Native B");
-      const first = (await receiving).value!.event!;
+      const first = await receiving;
       expect(first.payload?.kind.case).toBe("deviceChanged");
       if (first.payload?.kind.case !== "deviceChanged") throw new Error("Device event is missing.");
       expect(first.payload.kind.value.device).toMatchObject({ deviceId: phone.deviceId, displayName: "Native B",
         defaultDisplayName: "Native B", connectionIds: [phone.id], version: { revision: { value: changed.revision } } });
       expect(first.identity).toMatchObject({ backendId: "", targetId: "", sessionId: "" });
-      const naming = stream.next();
+      const naming = nextStreamEvent(stream);
       await submit(services, "rename-stream-phone", { case: "renameDevice", value: { deviceId: phone.deviceId, displayName: "My phone" } });
-      expect((await naming).value!.event!.payload?.kind.value).toMatchObject({ device: { displayName: "My phone",
+      expect((await naming).payload?.kind.value).toMatchObject({ device: { displayName: "My phone",
         manualDisplayName: "My phone", defaultDisplayName: "Native B" } });
-      const resetting = stream.next();
+      const resetting = nextStreamEvent(stream);
       await submit(services, "reset-stream-phone", { case: "resetDeviceName", value: { deviceId: phone.deviceId } });
-      const reset = (await resetting).value!.event!;
+      const reset = await resetting;
       if (reset.payload?.kind.case !== "deviceChanged") throw new Error("Device reset event is missing.");
       expect(reset.payload.kind.value.device?.manualDisplayName).toBeUndefined();
       expect(reset.payload.kind.value.device?.displayName).toBe("Native B");
       const replay = (services.event.streamEvents as (request: contract.StreamEventsRequest, context: unknown) =>
         AsyncGenerator<contract.StreamEventsResponse>)(request, { requestHeader: new Headers(), signal: controller.signal });
       try {
-        expect((await replay.next()).value!.event).toEqual(first);
+        expect(await nextStreamEvent(replay)).toEqual(first);
       } finally { await replay.return(undefined as never); }
     } finally { controller.abort(); await stream.return(undefined as never); }
   });
@@ -207,6 +207,14 @@ describe("Device control Connect surface", () => {
     expect(store.getDevice(web.deviceId).remoteControlEnabled).toBe(false);
   });
 });
+
+async function nextStreamEvent(stream: AsyncGenerator<contract.StreamEventsResponse>): Promise<contract.Event> {
+  for (;;) {
+    const next = await stream.next();
+    if (next.done) throw new Error("The stream ended before the Device event.");
+    if (next.value.event !== undefined) return next.value.event;
+  }
+}
 
 function stubApplication(store: OperationalStore, connections: object): OrchestratorApplication {
   return {

@@ -13,7 +13,7 @@ function fixture() {
     requests: [{ requestId: "request", pairingCode: "0123", person: { name: "Applicant" }, status: "pending" }],
     reshares: [{ id: "consent", memberId: "member", person: { name: "Third person" }, state: "pending" }] }] });
   const list = vi.fn(async (_signal: AbortSignal) => value), refresh = vi.fn(async (_signal: AbortSignal) => value);
-  const createLink = vi.fn(async () => create(contract.CreateProviderShareLinkResponseSchema, { link: "http://127.0.0.1:4000/provider-share/join#" + "a".repeat(43), expiresAtMs: BigInt(Date.now() + 300_000) }));
+  const createLink = vi.fn(async () => create(contract.CreateProviderShareLinkResponseSchema, { link: contract.buildProviderSharingLink("http://127.0.0.1:4000", "a".repeat(43), `ed25519:${"a".repeat(64)}`), expiresAtMs: BigInt(Date.now() + 300_000) }));
   const decide = vi.fn(async () => { value = create(contract.ListProviderSharesResponseSchema, { owned: value.owned.map(row => ({ ...row, requests: [] })) }); return create(contract.DecideProviderShareRequestResponseSchema); });
   const member = vi.fn(async () => create(contract.SetProviderShareMemberResponseSchema)), reshare = vi.fn(async () => create(contract.DecideProviderReshareResponseSchema));
   const preview = vi.fn(async () => create(contract.PreviewProviderShareResponseSchema, { preview: { providerName: "Foreign Provider", owner: { name: "Issuer" }, hostServerId: "foreign-home", state: "unused", expiresAtMs: BigInt(Date.now() + 300_000) } }));
@@ -39,7 +39,7 @@ it("requires the human comparison before approval and keeps member and original 
 it("previews an invitation without submitting and only submits once after the explicit application", async () => {
   const f = fixture(), { container } = await mount(f); await act(async () => button(container, "Received").click());
   const textarea = container.querySelector("textarea")!;
-  await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "http://127.0.0.1:4000/provider-share/join#" + "a".repeat(43)); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
+  await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, contract.buildProviderSharingLink("http://127.0.0.1:4000", "a".repeat(43), `ed25519:${"a".repeat(64)}`)); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
   await act(async () => button(container, "Preview invitation").click()); expect(f.preview).toHaveBeenCalledTimes(1); expect(f.apply).not.toHaveBeenCalled(); expect(container.textContent).toContain("Issuer");
   await act(async () => button(container, "Submit application").click()); expect(f.apply).toHaveBeenCalledTimes(1); expect(textarea.value).toBe(""); expect(f.refresh).toHaveBeenCalled();
 });

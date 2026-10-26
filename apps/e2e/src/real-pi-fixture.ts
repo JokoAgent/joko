@@ -8,6 +8,7 @@ import type { PiManagedProvider, PiManagedSettings } from "@joko/adapter-pi";
 import {
   createOrchestratorApplication,
   createInternalServer,
+  createLinkspanIngress,
   createPublicServer,
   type OrchestratorApplication,
   type OrchestratorApplicationDependencies,
@@ -94,6 +95,7 @@ export class RealPiSystemFixture {
   readonly anonymous: E2eClients;
   readonly providerRequests: CapturedProviderRequest[];
   readonly #publicServer: Awaited<ReturnType<typeof createPublicServer>>;
+  readonly #linkspan: ReturnType<typeof createLinkspanIngress>;
   readonly #internalServer: Awaited<ReturnType<typeof createInternalServer>> | undefined;
   readonly #providerServer: Server;
   readonly #pairingCodes: ReadonlyMap<string, string>;
@@ -108,6 +110,7 @@ export class RealPiSystemFixture {
     readonly baseUrl: string;
     readonly application: OrchestratorApplication;
     readonly publicServer: Awaited<ReturnType<typeof createPublicServer>>;
+    readonly linkspan: ReturnType<typeof createLinkspanIngress>;
     readonly internalServer: Awaited<ReturnType<typeof createInternalServer>> | undefined;
     readonly providerServer: Server;
     readonly providerRequests: CapturedProviderRequest[];
@@ -121,6 +124,7 @@ export class RealPiSystemFixture {
     this.baseUrl = input.baseUrl;
     this.application = input.application;
     this.#publicServer = input.publicServer;
+    this.#linkspan = input.linkspan;
     this.#internalServer = input.internalServer;
     this.#providerServer = input.providerServer;
     this.providerRequests = input.providerRequests;
@@ -144,6 +148,7 @@ export class RealPiSystemFixture {
     let providerServer: Server | undefined;
     let application: OrchestratorApplication | undefined;
     let publicServer: Awaited<ReturnType<typeof createPublicServer>> | undefined;
+    let linkspan: ReturnType<typeof createLinkspanIngress> | undefined;
     let internalServer: Awaited<ReturnType<typeof createInternalServer>> | undefined;
     let removePairingListener: (() => void) | undefined;
     const providerResponseGate = options.holdProviderResponses === true
@@ -281,12 +286,15 @@ export class RealPiSystemFixture {
       if (orchestratorAddress === null || typeof orchestratorAddress === "string") {
         throw new Error("Orchestrator did not expose an ephemeral TCP port.");
       }
+      const baseUrl = `http://127.0.0.1:${orchestratorAddress.port}`;
+      linkspan = createLinkspanIngress(application, { backendOrigin: baseUrl, server: publicServer.server });
       return new RealPiSystemFixture({
         rootDirectory,
         workspaceDirectory,
-        baseUrl: `http://127.0.0.1:${orchestratorAddress.port}`,
+        baseUrl,
         application,
         publicServer,
+        linkspan,
         internalServer,
         providerServer,
         providerRequests,
@@ -297,6 +305,7 @@ export class RealPiSystemFixture {
       });
     } catch (error) {
       removePairingListener?.();
+      await linkspan?.close().catch(() => undefined);
       await publicServer?.close().catch(() => undefined);
       await internalServer?.close().catch(() => undefined);
       await application?.close().catch(() => undefined);
@@ -350,6 +359,7 @@ export class RealPiSystemFixture {
     this.#closed = true;
     this.#providerResponseGate?.release();
     this.#removePairingListener();
+    await this.#linkspan.close();
     await this.#publicServer.close();
     await this.#internalServer?.close();
     await this.application.close();

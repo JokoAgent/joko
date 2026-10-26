@@ -191,6 +191,7 @@ export function isAllowedExtensionWindowNavigation(
 
 function isAllowedPackagedAppResourceHash(url: URL): boolean {
   if (url.hash === "") return true;
+  if (url.pathname === "/isolated-surface.html") return /^#v1-[a-f0-9]{32}$/u.test(url.hash);
   if (url.pathname !== "/index.html") return false;
   // The primary window owns renderer routing in its fragment. Auxiliary
   // entries carry an identity query and remain bound to one exact route below.
@@ -260,8 +261,14 @@ export function isExtensionMainViewSubframeUrl(value: string): boolean {
   }
 }
 
-export function shouldMergeDesktopFrameContentSecurityPolicy(resourceType: string, value: string): boolean {
-  return resourceType === "mainFrame" || (resourceType === "subFrame" && !isExtensionMainViewSubframeUrl(value));
+export function shouldMergeDesktopFrameContentSecurityPolicy(resourceType: string, value: string, trustedUiOrigin?: string): boolean {
+  let isolated = false;
+  if (trustedUiOrigin !== undefined) try {
+    const url = new URL(value), ui = new URL(trustedUiOrigin);
+    isolated = url.protocol === ui.protocol && url.host === ui.host && url.username === "" && url.password === ""
+      && url.pathname === "/isolated-surface.html" && url.search === "" && /^#v1-[a-f0-9]{32}$/u.test(url.hash);
+  } catch { /* Invalid or unrelated subframes receive the application policy. */ }
+  return resourceType === "mainFrame" || (resourceType === "subFrame" && !isolated && !isExtensionMainViewSubframeUrl(value));
 }
 
 /**

@@ -312,8 +312,12 @@ describe("RemoteHostToolBridgeProvider", () => {
           .toThrow("An active Remote Host cannot change routing or credential metadata.");
         const disconnected = await fixture.registry.disconnect(host.targetId, host.id, host.revision);
         expect(disconnected.status.state).toBe("disconnected");
-        fixture.registry.update({ targetId: host.targetId, id: host.id,
-          expectedRevision: disconnected.revision, hostname: "replacement.example.test" });
+        const cleared = fixture.registry.clearTrust({ targetId: host.targetId, id: host.id,
+          expectedRevision: disconnected.revision });
+        expect(cleared.trust).toBeUndefined();
+        const replacement = fixture.registry.update({ targetId: host.targetId, id: host.id,
+          expectedRevision: cleared.revision, hostname: "replacement.example.test", credentialReferenceId: null });
+        expect(replacement.credentialReferenceId).toBeUndefined();
       }
     } finally { release(); }
     expect((await pending).isError).toBe(true);

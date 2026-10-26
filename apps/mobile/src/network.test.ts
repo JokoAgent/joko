@@ -37,6 +37,7 @@ import {
   BlobRefSchema,
   BlobTransferTicketSchema,
   BeginPairingRequestSchema, BeginPairingResponseSchema,
+  IssueIrohRelayInvitationRequestSchema, IssueIrohRelayInvitationResponseSchema,
   CompletePairingRequestSchema, CompletePairingResponseSchema,
   ListPartnersRequestSchema, ListPartnersResponseSchema, MarkPartnerReadRequestSchema, MarkPartnerReadResponseSchema,
   GetPartnerDirectoryResponseSchema, UpdatePartnerRequestSchema, UpdatePartnerResponseSchema,
@@ -123,7 +124,7 @@ import {
   VoiceInputServiceSettingsSchema, VoiceInputTranscriptionProtocol, VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
   GetSettingsResponseSchema, BeginCredentialUploadResponseSchema, BeginCredentialUploadRequestSchema, TestVoiceInputConnectionResponseSchema
 } from "@joko/contracts";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { RemoteDesktopSystemAction } from "@joko/contracts";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
@@ -152,10 +153,24 @@ import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
 import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
 import { creationSnapshot } from "./test/mobile-partner-creation";
 import { mobilePartnerCreationDraft, MobilePartnerCreationRejected } from "./mobile-partner-creation";
+import { rememberEndpointTrust, replaceEndpointTrust } from "@joko/connection-transport";
+import { rememberEndpointTransport } from '@joko/connection-transport/trust';
+import { mobileNetworkFixtureEndpointPublicKey } from "./test/mobile-network-transport";
+
+vi.mock("@joko/connection-transport", async importOriginal => {
+  const { controlledMobileConnectionTransport } = await import("./test/mobile-network-transport");
+  return controlledMobileConnectionTransport(await importOriginal<typeof import("@joko/connection-transport")>());
+});
+
+beforeEach(() => {
+  // Independent wire fixtures reuse this origin with different node IDs. Each
+  // starts with its own trusted key; identity conflicts inside a case stay real.
+  replaceEndpointTrust({ origin: "https://node.example", endpointPublicKey: mobileNetworkFixtureEndpointPublicKey });
+});
 
 describe("Mobile account usage network", () => {
   it("reads the exact generated Backend Provider route and rejects foreign account snapshots", async () => {
-    const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone", connectionId: "connection",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", serverId: "server", deviceId: "phone", connectionId: "connection",
       origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
     const response = create(GetProviderUsageResponseSchema, { accountUsage: { providerId: "provider", primaryWindow: { usedPercent: 80 },
       modelWindows: [{ modelId: "model", displayName: "Model", window: { usedPercent: 90 } }] } });
@@ -177,9 +192,49 @@ describe("Mobile account usage network", () => {
   });
 });
 
+describe('mobile recipient relay pairing', () => {
+  it.each(['valid', 'wrong-node', 'expired'] as const)('checks the B-only relay receipt before issuing a pairing code for %s', async mode => {
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: 'relay-profile', serverId: 'server', deviceId: 'phone', connectionId: 'connection', origin: 'https://node.example', displayName: 'Node', authKey: 'owner-key', transportKind: 'iroh' };
+    const selected = { kind: 'iroh' as const, endpointId: 'b'.repeat(64), ticket: 'A-iroh-private-ticket', clientKey: 'c'.repeat(64), clientEndpointId: 'd'.repeat(64), relayUrls: ['https://relay.example'], relayToken: 'A-only-lease', relayTokenExpiresAt: Date.now() + 3600000 };
+    rememberEndpointTransport(credential.origin, credential.endpointPublicKey!, selected);
+    const request = { requestId: '00000000-0000-4000-8000-000000000001', recipientEndpointId: 'e'.repeat(64) };
+    const checkpoint = vi.fn(async () => undefined), paths: string[] = [];
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname; paths.push(path);
+      const headers = { 'content-type': 'application/proto' };
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer owner-key');
+      if (path.endsWith('/GetServerInfo')) return new Response(toBinary(GetServerInfoResponseSchema, create(GetServerInfoResponseSchema, { server: { serverId: credential.serverId, endpointPublicKey: credential.endpointPublicKey } })), { headers });
+      if (path.endsWith('/IssueIrohRelayInvitation')) {
+        expect(fromBinary(IssueIrohRelayInvitationRequestSchema, new Uint8Array(init?.body as Uint8Array))).toMatchObject({ ...request, nodeEndpointId: selected.endpointId });
+        return new Response(toBinary(IssueIrohRelayInvitationResponseSchema, create(IssueIrohRelayInvitationResponseSchema, { invitation: {
+          ...request, nodeEndpointId: mode === 'wrong-node' ? 'f'.repeat(64) : selected.endpointId,
+          origin: credential.origin, serverId: credential.serverId, endpointPublicKey: credential.endpointPublicKey,
+          ticket: 'B-iroh-private-ticket', relayUrls: ['https://relay.example'], relayToken: 'B-only-lease', expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + (mode === 'expired' ? -60 : 3600)) }
+        } })), { headers });
+      }
+      expect(path).toBe('/joko.v1.ConnectionService/BeginPairing'); expect(checkpoint).toHaveBeenCalledOnce();
+      return new Response(toBinary(BeginPairingResponseSchema, create(BeginPairingResponseSchema, { challenge: { challengeId: 'pairing', humanCode: '1234-5678', verificationUri: `${credential.origin}/pair`, expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + 300) } } })), { headers });
+    });
+    try {
+      const authorize = () => mobileNetwork.authorizeNewDevice!(credential, undefined, { irohRelay: request, onIrohRelayLease: checkpoint });
+      if (mode === 'valid') {
+        const invitation = await authorize();
+        expect(invitation.endpointTransport).toMatchObject({ kind: 'iroh', clientEndpointId: request.recipientEndpointId, relayToken: 'B-only-lease' });
+        expect(invitation.endpointTransport).not.toHaveProperty('clientKey');
+        expect(invitation.trustedInvitation).not.toContain('A-only-lease');
+        expect(paths.at(-1)).toContain('/BeginPairing');
+      } else {
+        await expect(authorize()).rejects.toThrow();
+        expect(paths.some(path => path.endsWith('/BeginPairing'))).toBe(false);
+        expect(checkpoint).toHaveBeenCalledTimes(mode === 'expired' ? 1 : 0);
+      }
+    } finally { fetcher.mockRestore(); }
+  });
+});
+
 describe("Partner task output network", () => {
   it("uses the authenticated generated metadata RPC and rejects wrong owner, malformed paths and aborted reads", async () => {
-    const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", serverId: "server", deviceId: "phone",
       connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
     const value = create(ListPartnerTaskOutputsResponseSchema, { partnerId: "partner-a", outputs: [{
       sourceKind: PartnerTaskOutputSourceKind.DELEGATION, sourceId: "delegation-a", parentSessionId: "parent",
@@ -213,7 +268,7 @@ describe("Partner task output network", () => {
 
 describe("Mobile Remote Desktop system action network", () => {
   it("maps exactly three actions through generated RPC and validates control, route and matching receipts", async () => {
-    const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", serverId: "server", deviceId: "phone",
       connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
     const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop", relationId: "relation",
       targetDeviceRevision: { value: 1n }, relationRevision: { value: 0n }, routeGeneration: 2n });
@@ -247,7 +302,7 @@ describe("Mobile Remote Desktop system action network", () => {
 });
 
 describe("Mobile Remote Desktop viewer display network", () => {
-  const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+  const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", serverId: "server", deviceId: "phone",
     connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
   const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop", relationId: "relation",
     targetDeviceRevision: { value: 1n }, relationRevision: { value: 0n }, routeGeneration: 2n });
@@ -313,7 +368,7 @@ describe("Mobile Remote Desktop viewer display network", () => {
 });
 
 describe("Mobile Remote Desktop clipboard sync network", () => {
-  const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+  const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", serverId: "server", deviceId: "phone",
     connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
   const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop", relationId: "relation",
     targetDeviceRevision: { value: 1n }, relationRevision: { value: 0n }, routeGeneration: 2n });
@@ -380,7 +435,7 @@ describe("Mobile Remote Desktop clipboard sync network", () => {
 });
 
 describe("Mobile Remote Desktop host mute network", () => {
-  const credential: PairedCredential = { profileId: "profile-1", serverId: "server-1", deviceId: "phone-1",
+  const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile-1", serverId: "server-1", deviceId: "phone-1",
     connectionId: "connection-1", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
   const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop-1", relationId: "relation-1",
     targetDeviceRevision: { value: 1n, etag: "target" }, relationRevision: { value: 0n, etag: "relation" }, routeGeneration: 2n });
@@ -420,7 +475,7 @@ describe("Mobile Remote Desktop host mute network", () => {
 });
 
 describe("Mobile Remote Desktop exit authority network", () => {
-  const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+  const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", serverId: "server", deviceId: "phone",
     connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
   const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop", relationId: "relation",
     targetDeviceRevision: { value: 1n }, relationRevision: { value: 0n }, routeGeneration: 1n });
@@ -450,7 +505,7 @@ describe("Mobile Remote Desktop exit authority network", () => {
 
 describe("mobile Partner creation network", () => {
   it("roundtrips exact full-access profile and creation fields through generated enum three", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
     const fullPartner = { ...profilePartner, capabilities: { ...profilePartner.capabilities, permissionMode: "bypassPermissions" as const } };
     const wire = profilePartnerWire(fullPartner); wire.capabilities!.permissionMode = PermissionMode.BYPASS_PERMISSIONS;
@@ -475,7 +530,7 @@ describe("mobile Partner creation network", () => {
         .resolves.toMatchObject({ kind: "found", partner: { capabilities: { permissionMode: "bypassPermissions" } } });
     } finally { fetcher.mockRestore(); }
   });
-  const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+  const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
     connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
   const requestId = "creation-request-native-network";
   it("maps all typed creation fields and never dual-writes inherited capabilities", async () => {
@@ -539,7 +594,7 @@ describe("mobile Partner creation network", () => {
 
 describe("mobile Partner catalog network", () => {
   it("uses authenticated deletion and recovery RPCs with exact typed receipt identity", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
     const requestId = "deletion-native-network-intent";
     const deletion = { requestId, partnerId: "partner-a", phase: PartnerDeletionPhase.CLOSING, failure: PartnerDeletionFailure.RUNTIME_CLOSE_PENDING,
@@ -580,7 +635,7 @@ describe("mobile Partner catalog network", () => {
     } finally { fetcher.mockRestore(); }
   });
   it("binds working caption responses to the exact generated turn, phase and language", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
     const status = { sessionId: "session", targetId: "target", backendId: "backend", generation: 2n,
       runId: "run", attemptId: "attempt", phase: "testing" as const };
@@ -607,7 +662,7 @@ describe("mobile Partner catalog network", () => {
     } finally { fetcher.mockRestore(); }
   });
   it("sends typed photo patches, omits unchanged image bodies and verifies exact image responses", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
     const content = new Uint8Array(Buffer.from("/9j/2w==", "base64"));
     const avatar = { sha256: createHash("sha256").update(content).digest("hex"), mimeType: "image/jpeg" as const, byteLength: content.length };
@@ -645,7 +700,7 @@ describe("mobile Partner catalog network", () => {
   });
 
   it("uses the generated initialization CAS and rejects missing, mismatched or non-advancing results", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
     let returned = profilePartnerWire({ ...profilePartner, revision: 3n });
     const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -669,7 +724,7 @@ describe("mobile Partner catalog network", () => {
     } finally { fetcher.mockRestore(); }
   });
   it("uses generated profile options and CAS patches without dual-writing inherited capabilities", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
     const directory = { revision: { value: 4n }, avatarPresets: ["orbit", "spark"] };
     const patches: UpdatePartnerRequest[] = [];
@@ -708,7 +763,7 @@ describe("mobile Partner catalog network", () => {
   });
 
   it("uses generated node-local directory and monotonic read RPCs and rejects a mismatched acknowledgement", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
     let wrongOwner = false;
     const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -740,7 +795,7 @@ describe("mobile Partner catalog network", () => {
 });
 
 describe("mobile device name handshake", () => {
-  const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+  const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
     connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "device-name-fixture-key" };
   const server = { serverId: "server", displayName: "Joko node", apiVersion: "joko.v1", version: "0.1.0", pairingEnabled: true };
   const connection = create(ConnectionSchema, { connectionId: "connection", connectionProfileId: "profile", deviceId: "phone",
@@ -749,6 +804,7 @@ describe("mobile device name handshake", () => {
     manualDisplayName: "Manual phone", kind: DeviceKind.MOBILE, connectionIds: ["connection"], version: { revision: { value: 3n } } });
 
   it("reports each explicit native source and returns the current Device from the same authenticated owner Snapshot", async () => {
+    rememberEndpointTrust({ origin: credential.origin, endpointPublicKey: credential.endpointPublicKey });
     const calls: string[] = [];
     const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = new URL(String(input)).pathname;
@@ -811,7 +867,7 @@ describe("mobile device name handshake", () => {
 
 describe("mobile Extension network", () => {
   it("requests the complete installed catalog, restarts revision drift, and gets exact current detail", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "extension-fixture-key" };
     const first = extensionWire(1, "Mail");
     const second = extensionWire(2, "Calendar");
@@ -867,7 +923,7 @@ describe("mobile Extension network", () => {
   });
 
   it("uploads setup credentials through an exact same-origin short-lived ticket and zeroes encoded bytes", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "extension-fixture-key" };
     const extensionId = "extension_0123456789abcdef0123456789abcdef";
     let ticket = {
@@ -942,7 +998,7 @@ describe("mobile Extension network", () => {
   });
 
   it("opens, probes, and closes an exact opaque main-view surface through generated RPCs", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "extension-fixture-key" };
     const extensionId = "extension_0123456789abcdef0123456789abcdef";
     const surfaceId = "extension_surface_11111111111111111111111111111111";
@@ -997,7 +1053,7 @@ describe("mobile Extension network", () => {
   });
 
   it("opens a connection-owned Library and carries binary and SQLite values through generated RPCs", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "library-fixture-key" };
     const extensionId = `extension_${"1".repeat(32)}`, sessionId = `library_session_${"2".repeat(32)}`;
     let resultCase: "write" | "sqlResult" = "write";
@@ -1058,7 +1114,7 @@ describe("mobile Extension network", () => {
   });
 
   it("uses every generated Extension Library management RPC and rejects mismatched authority", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "library-fixture-key" };
     const extensionId = `extension_${"7".repeat(32)}`;
     const trashId = `library_trash_${"8".repeat(32)}`;
@@ -1275,7 +1331,7 @@ function extensionWire(index: number, name: string) {
 
 describe("canonical image thumbnail network", () => {
   it("uses the authenticated generated source request and accepts only explicit bounded thumbnail or original-file outcomes", async () => {
-    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server", connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "thumbnail-fixture-key" };
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile", origin: "https://node.example", serverId: "server", connectionId: "connection", deviceId: "phone", displayName: "Phone", authKey: "thumbnail-fixture-key" };
     const blob = create(BlobRefSchema, { blobId: "canonical", fileName: "image.png", mediaType: "image/png", byteSize: 100n, sha256Hex: "a".repeat(64) });
     const thumbnail = { data: Uint8Array.from([1, 2, 3]), mediaType: "image/webp", sha256Hex: "b".repeat(64), widthPixels: 512, heightPixels: 256, sourceWidthPixels: 2048, sourceHeightPixels: 1024 };
     let response = create(GetImageThumbnailResponseSchema, { sourceBlob: blob, result: { case: "thumbnail", value: thumbnail } });
@@ -1302,7 +1358,7 @@ describe("canonical image thumbnail network", () => {
 });
 describe("complete Workspace HTML snapshot network", () => {
   it("binds the generated authenticated snapshot to its task, path and exact opaque revision", async () => {
-    const credential: PairedCredential = { profileId: "html-profile", origin: "https://node.example", serverId: "server", connectionId: "connection",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "html-profile", origin: "https://node.example", serverId: "server", connectionId: "connection",
       deviceId: "phone", displayName: "Phone", authKey: "html-fixture-key" };
     const file = { workspaceId: "workspace", relativePath: "docs/index.html", expectedRevision: "workspace-html:" + "a".repeat(64) };
     let response = create(ReadWorkspaceHtmlSnapshotResponseSchema, { file, utf8Html: "<!doctype html><p>HTML</p>" });
@@ -1340,7 +1396,7 @@ vi.mock("expo-crypto", () => ({
 
 describe("mobile Workspace rewind reads", () => {
   it("collects complete generated checkpoint pages and reads an exact preview with the original credential and abort signal", async () => {
-    const credential: PairedCredential = { profileId: "rewind-profile", origin: "https://node.example", serverId: "node", connectionId: "connection",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "rewind-profile", origin: "https://node.example", serverId: "node", connectionId: "connection",
       deviceId: "device", displayName: "Phone", authKey: "private-test-key" };
     const controller = new AbortController(); const tokens: string[] = [];
     const preview = create(WorkspaceRewindPreviewSchema, { previewId: "preview", workspaceId: "workspace", changeSetId: "second",
@@ -1385,7 +1441,7 @@ describe("mobile Workspace rewind reads", () => {
 
 describe("mobile voice ephemeral requests", () => {
   it("loads voice service settings, uploads credentials only through a same-origin ticket, and keeps context separate", async () => {
-    const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Phone", authKey: "voice-test-key" };
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Phone", authKey: "voice-test-key" };
     const settings = create(VoiceInputServiceSettingsSchema, { protocol: VoiceInputTranscriptionProtocol.VOLCENGINE_SAUC,
       fallbackProtocol: VoiceInputTranscriptionProtocol.OPENAI_COMPATIBLE_BATCH, version: { revision: { value: 4n } },
       sauc: create(VoiceInputSaucSettingsSchema, { mode: VoiceInputSaucMode.STREAM_INPUT, authentication: VoiceInputSaucAuthentication.ACCESS_TOKEN, appId: "public-app" }) });
@@ -1426,7 +1482,7 @@ describe("mobile voice ephemeral requests", () => {
     let invitation = JSON.stringify({ version: 1, nodeId: "node-a", displayName: "Node", publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=",
       fingerprint: "a".repeat(64), host: listener.host, port: listener.port });
     const calls: Array<{ method: string; body: Uint8Array }> = [];
-    const credential: PairedCredential = { profileId: "direct-profile", origin: "https://node.example", serverId: "node-a", connectionId: "direct-connection",
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "direct-profile", origin: "https://node.example", serverId: "node-a", connectionId: "direct-connection",
       deviceId: "direct-phone", displayName: "Phone", authKey: "direct-test-key" };
     const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const request = new Request(input, init);
@@ -1459,7 +1515,7 @@ describe("mobile voice ephemeral requests", () => {
   });
   it.each(["content", "sharing", "readonly"] as const)("decodes the generated %s stream and cancels its HTTP owner after a duplicate sequence or consumer return", async (kind) => {
     const signals: AbortSignal[] = [];
-    const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Voice phone", authKey: "voice-test-key" };
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Voice phone", authKey: "voice-test-key" };
     const content = create(WatchVoiceInputDictionaryResponseSchema, { sequence: 1n, dictionary: dictionaryWireSnapshot() });
     const sharing = create(WatchVoiceInputDictionaryPeerStatusResponseSchema, { sequence: 1n, status: { available: true,
       configurationRevision: 3n, nodeId: "voice-server", fingerprint: "a".repeat(64), enabled: true, phase: VoiceInputDictionaryPeerPhase.WAITING } });
@@ -1508,7 +1564,7 @@ describe("mobile voice ephemeral requests", () => {
       ["ApplyVoiceInputDictionaryLearning", toBinary(ApplyVoiceInputDictionaryLearningResponseSchema, create(ApplyVoiceInputDictionaryLearningResponseSchema, { dictionary }))]
     ] as const;
     const requests: Array<{ method: string; body: Uint8Array }> = [];
-    const credential: PairedCredential = { profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Voice phone", authKey: "voice-test-key" };
+    const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "voice-profile", origin: "https://node.example", serverId: "voice-server", connectionId: "voice-connection", deviceId: "voice-device", displayName: "Voice phone", authKey: "voice-test-key" };
     const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const request = new Request(input, init);
       expect(request.headers.get("authorization")).toBe("Bearer voice-test-key");

@@ -4,7 +4,7 @@ import { DesktopTaskSharingInvitationBuffer } from "../src/task-sharing-invitati
 import { DesktopInboundOpenIntentFence, desktopInboundOpenIntentFromArgv, parseDesktopDeepLink } from "../src/deep-link.js";
 
 const invitation = (shareId = "share") => buildTaskShareInvitation({ hostOrigin: "https://host.example",
-  hostServerId: "host", shareId, shareGeneration: 1n, inviteSecret: "a".repeat(43) });
+  hostServerId: "host", endpointPublicKey: `ed25519:${"a".repeat(64)}`, shareId, shareGeneration: 1n, inviteSecret: "a".repeat(43) });
 
 it("accepts the canonical private handoff from cold argv and retires an earlier asynchronous navigation", () => {
   const value = invitation(), parsed = parseDesktopDeepLink(value);

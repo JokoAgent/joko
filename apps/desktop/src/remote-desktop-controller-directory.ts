@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createClient, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, normalizeEndpointPublicKey, requireEndpointTrust } from "@joko/connection-transport/node";
 import { ConnectionService, ConnectionState, OperationService, OperationState } from "@joko/contracts";
 
 export interface DesktopRemoteDesktopControllerDirectory {
@@ -10,7 +10,7 @@ export interface DesktopRemoteDesktopControllerDirectory {
 
 /** Uses the host's original authenticated node; never follows renderer navigation. */
 export function createDesktopRemoteDesktopControllerDirectory(options: {
-  readonly profileId: string; readonly serverId: string; readonly deviceId: string; readonly origin: string;
+  readonly profileId: string; readonly serverId: string; readonly deviceId: string; readonly origin: string; readonly endpointPublicKey?: string;
   readonly current: () => boolean;
   readonly readAuthKey: () => Promise<string | undefined>;
   readonly transport?: (origin: string, key?: string) => Transport;
@@ -18,7 +18,8 @@ export function createDesktopRemoteDesktopControllerDirectory(options: {
   const check = (): void => { if (!options.current()) throw new Error("REMOTE_DESKTOP_ACCESS_REVOKED"); };
   const authenticated = async (signal: AbortSignal): Promise<Transport> => {
     check();
-    const factory = options.transport ?? directoryTransport;
+    const endpointPublicKey = options.endpointPublicKey === undefined ? requireEndpointTrust({ origin: options.origin }) : normalizeEndpointPublicKey(options.endpointPublicKey);
+    const factory = options.transport ?? ((origin: string, key?: string) => directoryTransport(origin, key, endpointPublicKey));
     const info = await createClient(ConnectionService, factory(options.origin)).getServerInfo({}, { signal });
     check();
     if (info.server?.serverId !== options.serverId) throw new Error("REMOTE_DESKTOP_ACCESS_REVOKED");
@@ -63,8 +64,8 @@ export function createDesktopRemoteDesktopControllerDirectory(options: {
     }
   };
 }
-function directoryTransport(origin: string, key?: string): Transport {
-  return createConnectTransport({ baseUrl: origin, httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 15_000,
+function directoryTransport(origin: string, key?: string, endpointPublicKey?: string): Transport {
+  return createConnectTransport({ baseUrl: origin, endpointPublicKey, httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 15_000,
     interceptors: key === undefined ? [] : [next => request => {
       request.header.set("authorization", `Bearer ${key}`); return next(request);
     }] });

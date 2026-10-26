@@ -55,7 +55,7 @@ const owners: DesktopRemoteDesktopViewerWindows[] = [];
 afterEach(() => { for (const owner of owners.splice(0)) owner.dispose(); state.handlers.clear(); state.windows.length = 0; state.connections.length = 0; state.writeClipboard.mockClear(); vi.useRealTimers(); });
 
 function fixture(syncClipboard?: DesktopViewerSyncClipboard, credentialNative?: DesktopViewerCredentialNative,
-  windowPlatform?: NodeJS.Platform) {
+  windowPlatform?: NodeJS.Platform, observeNativeCleanup?: (stage: string) => void) {
   const source = { isDestroyed: () => false } as WebContents;
   let quitting = false;
   const readAuthKey = vi.fn(async () => "A".repeat(43));
@@ -88,6 +88,7 @@ function fixture(syncClipboard?: DesktopViewerSyncClipboard, credentialNative?: 
       saved.set(key, value); return value;
     }) };
   const manager = new DesktopRemoteDesktopViewerWindows({ sourceDirectory: resolve("dist"), entryUrl: "joko://app/index.html",
+    ...(observeNativeCleanup === undefined ? {} : { observeNativeCleanup }),
     navigation: createNavigationPolicy(resolve("dist/web/index.html")), readAuthKey, preferences, syncClipboard: syncClipboardFactory,
     ...(credentialNative ? { credentialNative: credentialNativeFactory, credentialPlatform: "darwin" } : {}),
     ...(windowPlatform ? { windowPlatform } : {}),
@@ -242,13 +243,28 @@ describe("Desktop viewer native windows", () => {
   });
 
   it.each(["crash", "load", "reload", "closed"] as const)("retires a spare on %s without recovery, remote cleanup or foreground effects", async failure => {
-    vi.useFakeTimers(); const f = fixture(); f.manager.prewarm();
+    vi.useFakeTimers();
+    const cleanupStages: string[] = [];
+    const f = fixture(undefined, undefined, undefined, stage => {
+      cleanupStages.push(stage); throw new Error("A diagnostic observer cannot prevent native retirement.");
+    });
+    f.manager.prewarm();
     const window = state.windows[0], event = f.viewerEvent(window); f.invoke(C.ready, event, 0);
     if (failure === "crash") window.webContents.emit("render-process-gone");
     else if (failure === "load") window.webContents.emit("did-fail-load", {}, -2, "failed", "", true);
     else if (failure === "reload") window.webContents.emit("did-start-navigation", {}, window.webContents.mainFrame.url, false, true);
     else window.destroy();
+    if (failure === "crash") {
+      expect(window.destroyed).toBe(false);
+      expect(() => f.invoke(C.ready, event, 0)).toThrow("retired");
+      await vi.advanceTimersByTimeAsync(0);
+    }
     expect(window.destroyed).toBe(true); await vi.advanceTimersByTimeAsync(35000);
+    expect(cleanupStages).toContain("viewer_native_closed");
+    if (failure === "crash" || failure === "load") {
+      expect(cleanupStages).toContain("viewer_failed_native_destroy_started");
+      expect(cleanupStages).toContain("viewer_failed_native_destroy_returned");
+    }
     expect(state.windows).toHaveLength(1); expect(() => f.invoke(C.ready, event, 0)).toThrow("retired");
     expect(state.connections).toHaveLength(0); expect(f.syncClipboardFactory).not.toHaveBeenCalled();
     f.manager.prewarm(); expect(state.windows).toHaveLength(2);
@@ -276,6 +292,31 @@ describe("Desktop viewer native windows", () => {
     f.setQuitting(false); f.manager.prewarm(); const spare = state.windows[0];
     f.manager.retireSource(f.source); expect(spare.destroyed).toBe(true); expect(f.onOwnerRetired).not.toHaveBeenCalled();
     expect(state.connections).toHaveLength(0); expect(f.syncClipboardFactory).not.toHaveBeenCalled();
+  });
+
+  it("retires source authority during gone dispatch and defers native cleanup to only its original windows", async () => {
+    vi.useFakeTimers();
+    const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    const originals = [...state.windows], oldEvent = f.viewerEvent(originals[0]);
+    const generation = f.invoke(C.state, oldEvent).generation;
+    let dispatchingGone = false;
+    for (const window of originals) {
+      window.webContents.setIgnoreMenuShortcuts.mockImplementation(() => { expect(dispatchingGone).toBe(false); });
+      const nativeDestroy = window.destroy.bind(window);
+      vi.spyOn(window, "destroy").mockImplementation(() => { expect(dispatchingGone).toBe(false); nativeDestroy(); });
+    }
+    dispatchingGone = true;
+    f.manager.retireSource(f.source, true);
+    expect(() => f.invoke(C.ready, oldEvent, generation)).toThrow("retired");
+    expect(originals.every(window => !window.destroyed)).toBe(true);
+    expect(state.connections[0].current).toBe(false);
+    dispatchingGone = false;
+    f.manager.prewarm();
+    const fresh = state.windows.at(-1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(originals.every(window => window.destroyed)).toBe(true);
+    expect(fresh.destroyed).toBe(false);
+    expect(fresh.webContents.setIgnoreMenuShortcuts).not.toHaveBeenCalled();
   });
 
   it.each(["win32", "darwin", "linux"] as const)("presents the ready local shell without waiting for remote work on %s", async platform => {
@@ -389,12 +430,18 @@ describe("Desktop viewer native windows", () => {
     const original = targetWindows()[0], oldEvent = f.viewerEvent(original), oldContents = original.webContents;
     const generation = f.invoke(C.state, oldEvent).generation;
     if (visible) f.invoke(C.ready, oldEvent, generation);
+    const oldMessages = oldContents.sent.length;
     oldContents.emit("render-process-gone", {}, { reason: "crashed" });
-    expect(original.destroyed).toBe(true); expect(targetWindows()).toHaveLength(2);
+    expect(original.destroyed).toBe(false); expect(targetWindows()).toHaveLength(2);
+    expect(oldContents.sent).toHaveLength(oldMessages);
     const replacement = targetWindows()[1], event = f.viewerEvent(replacement), fresh = f.invoke(C.state, event).generation;
     expect(fresh).toBeGreaterThan(generation); expect(replacement.visible).toBe(false);
     expect(() => f.invoke(C.ready, oldEvent, generation)).toThrow("retired");
     f.invoke(C.ready, event, fresh); expect(f.invoke(C.state, event).active).toBe(true);
+    expect(replacement.webContents.sent).toContainEqual([C.state, expect.objectContaining({ generation: fresh, active: true })]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(original.destroyed).toBe(true); expect(replacement.destroyed).toBe(false);
+    expect(oldContents.sent).toHaveLength(oldMessages);
     oldContents.emit("render-process-gone"); oldContents.emit("did-fail-load", {}, -2, "failed", "", true);
     expect(targetWindows()).toHaveLength(2); expect(f.invoke(C.state, event).generation).toBe(fresh);
     replacement.webContents.emit("render-process-gone"); await vi.advanceTimersByTimeAsync(5000);
@@ -402,6 +449,7 @@ describe("Desktop viewer native windows", () => {
     expect(await f.invoke(C.open, f.event, "document", OWNER, TARGET)).toEqual({ focusedExisting: false });
     expect(targetWindows()).toHaveLength(3);
     targetWindows()[2].webContents.emit("render-process-gone"); expect(targetWindows()).toHaveLength(4);
+    await vi.advanceTimersByTimeAsync(0);
   });
 
   it("restores one automatic recovery only after thirty seconds of current ready stability", async () => {
@@ -412,7 +460,8 @@ describe("Desktop viewer native windows", () => {
     f.invoke(C.ready, event, generation); await vi.advanceTimersByTimeAsync(29999);
     expect(targetWindows()).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(1); replacement.webContents.emit("render-process-gone");
-    expect(targetWindows()).toHaveLength(3); expect(replacement.destroyed).toBe(true);
+    expect(targetWindows()).toHaveLength(3); expect(replacement.destroyed).toBe(false);
+    await vi.advanceTimersByTimeAsync(0); expect(replacement.destroyed).toBe(true);
   });
 
   it.each(["crash", "load"] as const)("keeps a hidden %s failure closed and allows other live targets and an explicit reopen", async failure => {
@@ -422,6 +471,11 @@ describe("Desktop viewer native windows", () => {
     f.invoke(C.ready, event, generation); await f.invoke(C.close, event, generation);
     const contents = original.webContents;
     if (failure === "crash") contents.emit("render-process-gone"); else contents.emit("did-fail-load", {}, -2, "failed", "", true);
+    if (failure === "crash") {
+      expect(original.destroyed).toBe(false);
+      expect(() => f.invoke(C.ready, event, generation + 1)).toThrow("retired");
+      await vi.advanceTimersByTimeAsync(0);
+    }
     expect(original.destroyed).toBe(true); await vi.advanceTimersByTimeAsync(35000); expect(targetWindows()).toHaveLength(1);
     Object.defineProperty(original, "webContents", { get: () => { throw new Error("Object has been destroyed"); } });
     await f.invoke(C.open, f.event, "document", OWNER, { ...TARGET, deviceId: "other" });

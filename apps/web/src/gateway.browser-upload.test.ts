@@ -76,7 +76,7 @@ describe("browser file upload gateway", () => {
       stream: vi.fn(async (method: any) => response(method, idleStream(), true))
     } as unknown as Transport;
     const gateway = createOrchestratorGateway(
-      { id: "connection-1", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
+      { id: "connection-1", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318" , serverId: "server-test" },
       "secret",
       {},
       () => transport
@@ -86,7 +86,7 @@ describe("browser file upload gateway", () => {
     await gateway.uploadBrowserFile("browser-1", "page-1", new File(["hello"], "proof.txt", { type: "text/plain" }));
 
     expect(calls).toEqual(["begin", "put", "complete", "submit"]);
-    expect(fetch).toHaveBeenCalledWith("https://orchestrator.example/v1/blob-uploads/ticket-1", expect.objectContaining({
+    expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4318/v1/blob-uploads/ticket-1", expect.objectContaining({
       method: "PUT",
       headers: expect.objectContaining({ authorization: "Bearer secret", "content-type": "application/octet-stream" })
     }));
@@ -145,7 +145,7 @@ describe("browser file upload gateway", () => {
       stream: vi.fn(async (method: any) => response(method, idleStream(), true))
     } as unknown as Transport;
     const gateway = createOrchestratorGateway(
-      { id: "original-connection", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      { id: "original-connection", deviceId: "device-test", name: "Browser", origin: "http://127.0.0.1:4318", serverId: "server-test" },
       "test-only-auth", {}, () => transport
     );
     await gateway.connect();

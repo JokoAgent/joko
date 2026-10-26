@@ -10,7 +10,7 @@ import {
   SnapshotScopeSchema,
   SubmitOperationRequestSchema
 } from "@joko/contracts";
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type Page, type Request, type Route } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { waitFor } from "./fixture.js";
@@ -56,7 +56,7 @@ describe("mounted Pi compaction product chain", () => {
     fixture = undefined;
   });
 
-  mountedIt("keeps typed manual outcomes, route ownership, live feedback and restart recovery aligned", { timeout: 180_000 }, async () => {
+  mountedIt("keeps typed manual outcomes, route ownership, live feedback and restart recovery aligned", { timeout: 180_000 }, async (context) => {
     let releaseSummary: (() => void) | undefined;
     let holdNextSummary = false;
     let failSummary = false;
@@ -131,8 +131,10 @@ describe("mounted Pi compaction product chain", () => {
     let attentionBeforeResume: bigint | undefined;
     const permittedAttentionErrors: string[] = [];
     const permittedUsageErrors: string[] = [];
+    const observedUsageGenerations: { sessionId: string; requested: string; current: string; afterResume: boolean }[] = [];
     const permittedAttentionCursors: { submitted: string; current: string; generation: string }[] = [];
-    const { errors, settle: settleBrowserErrors } = observeBrowserErrors(page, conflict => {
+    let usagePhase = "initial";
+    const { errors, settle: settleBrowserErrors, pauseUsageCapture, resumeUsageCapture, usageDiagnostics } = await observeBrowserErrors(page, conflict => {
       if (attentionBeforeResume === undefined || conflict.sessionId !== compactSessionId
         || conflict.intent !== SessionAttentionAcknowledgementIntent.VIEWED) return;
       const current = fixture!.application.store.getSessionAttention(compactSessionId);
@@ -142,11 +144,17 @@ describe("mounted Pi compaction product chain", () => {
       permittedAttentionCursors.push({ submitted: conflict.sequence.toString(), current: current.attentionCursor.toString(),
         generation: conflict.generation.toString() });
     }, stale => {
+      const generation = BigInt(fixture!.application.store.getSession(stale.sessionId).descriptor.binding.generation);
+      observedUsageGenerations.push({ sessionId: stale.sessionId, requested: stale.generation.toString(),
+        current: generation.toString(), afterResume: attentionBeforeResume !== undefined });
       if (attentionBeforeResume === undefined || stale.sessionId !== compactSessionId) return;
-      const generation = BigInt(fixture!.application.store.getSession(compactSessionId).descriptor.binding.generation);
       if (stale.generation <= 0n || stale.generation >= generation) return;
       permittedUsageErrors.push(stale.responseError, stale.consoleError);
-    });
+    }, () => usagePhase);
+    context.onTestFailed(() => console.error("[compaction-usage-capture]", JSON.stringify({
+      phase: usagePhase, browserErrorCount: errors.length, permittedAttentionErrorCount: permittedAttentionErrors.length,
+      permittedUsageErrorCount: permittedUsageErrors.length, ...usageDiagnostics()
+    })));
     await page.goto(taskUrl(compactSessionId), { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -163,7 +171,12 @@ describe("mounted Pi compaction product chain", () => {
         rings: await page.locator(".context-capacity-ring").allTextContents()
       })}`, { cause: error });
     }
+    usagePhase = "initial-drain";
+    await pauseUsageCapture();
+    await settleBrowserErrors();
     errors.splice(0);
+    usagePhase = "active";
+    await resumeUsageCapture();
     await trigger.click();
     const confirmation = page.getByRole("dialog", { name: "Compact context?" });
     await confirmation.waitFor({ state: "visible" });
@@ -233,10 +246,13 @@ describe("mounted Pi compaction product chain", () => {
     expect(failureStates).not.toContain(CompactionState.NO_OP);
     expect(errors.filter((error) => error.startsWith("pageerror:"))).toEqual([]);
     // The controlled Provider refusal is intentionally surfaced as HTTP 503.
+    usagePhase = "provider-failure-drain";
+    await pauseUsageCapture();
     await settleBrowserErrors();
     errors.splice(0);
 
     const authKey = manager.authKey;
+    usagePhase = "service-stop";
     await fixture.close({ removeRoot: false });
     fixture = undefined;
     fixture = await RealPiSystemFixture.start({
@@ -251,12 +267,20 @@ describe("mounted Pi compaction product chain", () => {
     }) });
     expect(restartedTimeline.snapshot?.timeline.some((item) => item.payload?.kind.case === "compactionChanged"
       && item.payload.kind.value.state === CompactionState.COMPLETED)).toBe(true);
+    usagePhase = "reconnect-document";
+    // Keep the drained route detached while the retiring document navigates.
     await page.goto(taskUrl(compactSessionId), { waitUntil: "domcontentloaded" });
+    usagePhase = "reconnect-ready";
+    await resumeUsageCapture();
     await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
     expect(await page.locator(".compact-action-feedback").count()).toBe(0);
     // Background Connect polls may fail while the service is deliberately stopped.
+    usagePhase = "reconnect-drain";
+    await pauseUsageCapture();
     await settleBrowserErrors();
     errors.splice(0);
+    usagePhase = "restarted-continuation";
+    await resumeUsageCapture();
     attentionBeforeResume = fixture.application.store.getSessionAttention(compactSessionId).attentionCursor;
     const continuationRunId = await send(compactSessionId, "The same native Pi context continues after service restart.");
     const completion = await waitFor(async () => fixture!.application.store.listEvents({ sessionId: compactSessionId })
@@ -269,6 +293,8 @@ describe("mounted Pi compaction product chain", () => {
         && attention.readThroughCursor?.sequence === attention.attentionCursor?.sequence
         && attention.readThroughCursor?.generation === attention.attentionCursor?.generation;
     }, "the mounted page to acknowledge the latest resumed projection", 30_000);
+    usagePhase = "final-drain";
+    await pauseUsageCapture();
     await settleBrowserErrors();
     if (process.env.RUNNER_TEMP !== undefined) {
       const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "compaction");
@@ -278,6 +304,7 @@ describe("mounted Pi compaction product chain", () => {
         sourceCommit: process.env.GITHUB_SHA ?? "working-tree",
         staleViewedAcknowledgements: permittedAttentionErrors.length / 2,
         staleViewedCursors: permittedAttentionCursors,
+        observedUsageGenerations,
         preResumeCursor: attentionBeforeResume.toString(),
         nativeCompletionCursor: completion.globalCursor.toString(),
         readThroughCursor: attention.readThroughCursor?.sequence.toString(),
@@ -342,7 +369,7 @@ describe("mounted Pi compaction product chain", () => {
     const pairingCode = fixture.pairingCode(challenge.challenge.challengeId);
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
-    const { errors } = observeBrowserErrors(page);
+    const { errors } = await observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -399,11 +426,81 @@ async function navigateMountedTask(page: Page, sessionId: string, name: string):
     .waitFor({ state: "visible" });
 }
 
-function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: StaleViewedAcknowledgement) => void,
-  onStaleUsage?: (stale: { sessionId: string; generation: bigint; responseError: string; consoleError: string }) => void
-): { readonly errors: string[]; readonly settle: () => Promise<void> } {
+async function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: StaleViewedAcknowledgement) => void,
+  onStaleUsage?: (stale: { sessionId: string; generation: bigint; responseError: string; consoleError: string }) => void,
+  phase: () => string = () => "active"
+): Promise<{ readonly errors: string[]; readonly settle: () => Promise<void>;
+  readonly pauseUsageCapture: () => Promise<void>; readonly resumeUsageCapture: () => Promise<void>;
+  readonly usageDiagnostics: () => { captures: number; activeCaptures: number; transportFailures: readonly UsageTransportFailure[] } }> {
   const errors: string[] = [];
   const pending = new Set<Promise<void>>();
+  const capturePending = new Set<Promise<void>>();
+  const usagePattern = "**/joko.v1.ProviderGroupService/GetTaskProviderGroupUsage";
+  let capturing = false;
+  let captures = 0, documentLoads = 0;
+  const transportFailures: UsageTransportFailure[] = [];
+  page.on("domcontentloaded", () => { documentLoads++; });
+  const usageFailures = new WeakMap<Request, { readonly code: string; readonly message: string }>();
+  const captureUsage = async (route: Route): Promise<void> => {
+    if (!capturing) { await route.continue(); return; }
+    const capturePhase = phase(), captureDocumentLoad = documentLoads;
+    let stage: "fetch" | "fulfill" = "fetch", status: number | undefined;
+    // Keep the exact read-only server refusal before navigation or request
+    // cancellation retires Chromium's response body. Forward it unchanged.
+    const capture = (async () => {
+      captures++;
+      try {
+        const response = await route.fetch({ maxRetries: 0, maxRedirects: 0 });
+        status = response.status();
+        try {
+          if (response.status() === 400) {
+            const bytes = await response.body();
+            if (bytes.length <= 64 * 1024) {
+              const failure = JSON.parse(bytes.toString("utf8")) as { code?: string; message?: string };
+              if (typeof failure.code === "string" && typeof failure.message === "string") {
+                usageFailures.set(route.request(), { code: failure.code, message: failure.message });
+              }
+            }
+          }
+        } catch { /* An unavailable or invalid refusal must still fail classification. */ }
+        stage = "fulfill";
+        await route.fulfill({ response });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        const pageClosed = page.isClosed(), requestAborted = route.request().failure()?.errorText === "net::ERR_ABORTED";
+        if (transportFailures.length === 16) transportFailures.shift();
+        transportFailures.push({ capturePhase, failurePhase: phase(), stage, status, pageClosed, requestAborted,
+          // A later DOMContentLoaded is evidence of a load boundary. Its absence
+          // does not prove the request still belongs to the current document.
+          documentLoadRelation: documentLoads > captureDocumentLoad ? "later-load-observed" : "same-observed-load",
+          interceptionUnavailable: /invalid interception\s*id/iu.test(message),
+          routeAlreadyHandled: message.includes("Route is already handled"),
+          targetClosed: message.includes("Target page, context or browser has been closed"),
+          connectionRefused: message.includes("ECONNREFUSED"), connectionReset: message.includes("ECONNRESET") });
+        if (!pageClosed && !requestAborted) {
+          errors.push("requestfailed:GetTaskProviderGroupUsage:capture_transport_unavailable");
+        }
+        await route.abort("failed").catch(() => undefined);
+      }
+    })();
+    capturePending.add(capture);
+    try { await capture; } finally { capturePending.delete(capture); }
+  };
+  const pauseUsageCapture = async (): Promise<void> => {
+    const wasCapturing = capturing;
+    capturing = false;
+    // Removing the interceptor forwards its in-flight routes in Playwright
+    // 1.60. Complete each owned fulfill before releasing that interceptor.
+    await Promise.all([...capturePending]);
+    if (wasCapturing) await page.unroute(usagePattern, captureUsage);
+  };
+  const resumeUsageCapture = async (): Promise<void> => {
+    if (onStaleUsage !== undefined && !capturing) {
+      capturing = true;
+      await page.route(usagePattern, captureUsage);
+    }
+  };
+  await resumeUsageCapture();
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
   const observeResponse = async (response: import("playwright-core").Response) => {
     if (response.status() < 400) return;
@@ -428,22 +525,30 @@ function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: Stale
         } catch { /* Never include request bytes or free-form decode failures. */ }
       }
     }
-    const responseError = `response:${response.status()}:${response.request().method()}:${url.origin}${url.pathname}${operation}`;
-    errors.push(responseError);
+    let responseError = `response:${response.status()}:${response.request().method()}:${url.origin}${url.pathname}${operation}`;
     // A resume can retire the observed generation between rendering and its read-only quota request.
     // Admit only the exact old-generation request; the caller checks it against durable server state.
     if (response.status() === 400 && url.pathname === "/joko.v1.ProviderGroupService/GetTaskProviderGroupUsage") {
       const request = response.request(), bytes = request.postDataBuffer();
-      if (request.headers()["content-type"]?.startsWith("application/proto") && bytes !== null && bytes.length <= 64 * 1024) {
+      const contentType = request.headers()["content-type"];
+      responseError += `:request=${contentType?.startsWith("application/proto") ? "proto" : contentType === undefined ? "missing_type" : "other_type"}:bytes=${bytes?.length ?? "unavailable"}`;
+      if (contentType?.startsWith("application/proto") && bytes !== null && bytes.length <= 64 * 1024) {
+        let decoded = false;
         try {
           const usage = fromBinary(GetTaskProviderGroupUsageRequestSchema, bytes);
-          const failure = await response.json() as { code?: string; message?: string };
-          if (failure.code !== "failed_precondition" || failure.message !== "The original task generation is no longer current.") return;
-          onStaleUsage?.({ sessionId: usage.sessionId, generation: usage.generation, responseError,
+          decoded = true;
+          responseError += `:generation=${usage.generation}`;
+          const failure = usageFailures.get(request)
+            ?? await response.json() as { code?: string; message?: string };
+          const retired = failure.code === "failed_precondition"
+            && failure.message === "The original task generation is no longer current.";
+          responseError += `:reason=${retired ? "retired_generation" : "unclassified"}`;
+          if (retired) onStaleUsage?.({ sessionId: usage.sessionId, generation: usage.generation, responseError,
             consoleError: `console:Failed to load resource: the server responded with a status of 400 (Bad Request):${url.origin}${url.pathname}` });
-        } catch { /* Keep unknown responses as failures. */ }
+        } catch { responseError += `:decode=${decoded ? "response_unavailable" : "invalid_request"}`; }
       }
     }
+    errors.push(responseError);
     if (response.status() === 409 && acknowledgement !== undefined) onAttentionConflict?.({
       ...acknowledgement, responseError,
       consoleError: `console:Failed to load resource: the server responded with a status of 409 (Conflict):${url.origin}${url.pathname}`
@@ -464,5 +569,14 @@ function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: Stale
     } catch { /* Some browser errors have no source location. */ }
     errors.push(`console:${message.text()}:${location}`);
   });
-  return { errors, settle: async () => { await Promise.all([...pending]); } };
+  return { errors, pauseUsageCapture, resumeUsageCapture,
+    settle: async () => { await Promise.all([...pending]); },
+    usageDiagnostics: () => ({ captures, activeCaptures: capturePending.size,
+      transportFailures: transportFailures.map(failure => ({ ...failure })) }) };
 }
+
+type UsageTransportFailure = { readonly capturePhase: string; readonly failurePhase: string;
+  readonly stage: "fetch" | "fulfill"; readonly status?: number; readonly pageClosed: boolean;
+  readonly requestAborted: boolean; readonly documentLoadRelation: "later-load-observed" | "same-observed-load";
+  readonly interceptionUnavailable: boolean; readonly routeAlreadyHandled: boolean; readonly targetClosed: boolean;
+  readonly connectionRefused: boolean; readonly connectionReset: boolean };

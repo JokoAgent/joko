@@ -1409,12 +1409,13 @@ describe("SessionHost", () => {
   });
 
   it.each(["catalog", "attempt", "provider"] as const)("C109 retains the original resource admission until native dispatch after %s retirement", async (retirement) => {
+    let drainsSettled = 0;
     const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, capabilities: [
       ...PI_LIKE_PROFILE.capabilities.filter(value => value.key !== "input.mention" && value.key !== "runtime.resources"),
       { key: "runtime.resources", supported: true, options: ["skill"] },
       { key: "input.mention", supported: true, options: ["resource"] }
     ] });
-    const f = await createFixture(adapter);
+    const f = await createFixture(adapter, { onBackendMayBeIdle: () => { drainsSettled += 1; } });
     vi.spyOn(adapter, "getResources").mockImplementation(async context => [{
       id: "approved-report", kind: "skill", name: "Report", source: "managed", state: "loaded",
       revision: "sha256:approved", resourceVersion: 5n, runtimeGeneration: context.generation
@@ -1425,29 +1426,49 @@ describe("SessionHost", () => {
     const mention = { kind: "resource" as const, reference: "approved-report", label: "Report", discoveredRevision: "sha256:approved",
       resourceVersion: "5", runtimeGeneration: catalog.runtimeGeneration };
     let dispatchedContext: AdapterContext | undefined;
+    let finished = false;
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const consume = vi.fn(adapter.send.bind(adapter));
-    vi.spyOn(adapter, "send").mockImplementation(async (input, context) => {
+    const dispatch = vi.spyOn(adapter, "send").mockImplementation(async (input, context) => {
       dispatchedContext = context;
-      context.assertResourceMentionCurrent!(mention);
-      await gate;
-      context.assertResourceMentionCurrent!(mention);
-      await consume(input, context);
+      try {
+        context.assertResourceMentionCurrent!(mention);
+        await gate;
+        context.assertResourceMentionCurrent!(mention);
+        await consume(input, context);
+      } finally { finished = true; }
     });
     const admitted = f.host.enqueueInput({ operationId: `c109-send-${retirement}`, connection: f.connection, sessionId,
       prompt: { text: "Use @Report", images: [], files: [], mentions: [mention], disposition: "prompt",
         mentionRanges: [{ start: 4, end: 11, mentionIndex: 0 }] } }).value;
+    let retired: { queue: ReturnType<OperationalStore["getQueueItem"]>; run: ReturnType<OperationalStore["getRun"]>;
+      attempt: ReturnType<OperationalStore["getAttempt"]> } | undefined;
+    let settledBeforeRelease = 0;
     try {
       await eventually(() => dispatchedContext !== undefined);
       expect(f.store.getQueueItem(admitted.queueItemId).state).toBe("dispatching");
       expect(() => dispatchedContext!.assertResourceMentionCurrent!({ ...mention, resourceVersion: "6" })).toThrow(/admission/u);
       if (retirement === "catalog") f.host.fenceBackendResourceCatalogs(adapter.id);
-      else if (retirement === "attempt") f.store.finishAttempt(f.store.getQueueItem(admitted.queueItemId).attemptId!);
-      else f.store.upsertBackend({ ...f.store.getBackend(adapter.id).descriptor, authenticationState: "signed_out" });
+      else if (retirement === "attempt") {
+        const attemptId = f.store.getQueueItem(admitted.queueItemId).attemptId!;
+        f.store.finishAttempt(attemptId);
+        retired = { queue: f.store.getQueueItem(admitted.queueItemId), run: f.store.getRun(admitted.runId),
+          attempt: f.store.getAttempt(attemptId) };
+      } else f.store.upsertBackend({ ...f.store.getBackend(adapter.id).descriptor, authenticationState: "signed_out" });
       expect(() => dispatchedContext!.assertResourceMentionCurrent!(mention)).toThrow();
+      settledBeforeRelease = drainsSettled;
     } finally { release(); }
-    await eventually(() => f.store.getQueueItem(admitted.queueItemId).state === "failed");
+    await eventually(() => finished && drainsSettled > settledBeforeRelease);
+    if (retired !== undefined) {
+      expect(f.store.getQueueItem(admitted.queueItemId)).toEqual(retired.queue);
+      expect(f.store.getRun(admitted.runId)).toEqual(retired.run);
+      expect(f.store.getAttempt(retired.attempt.descriptor.id)).toEqual(retired.attempt);
+    } else {
+      expect(f.store.getQueueItem(admitted.queueItemId).state).toBe("failed");
+      expect(f.store.getRun(admitted.runId).descriptor.state).toBe("failed");
+    }
+    expect(dispatch).toHaveBeenCalledOnce();
     expect(consume).not.toHaveBeenCalled();
   });
 
@@ -4655,7 +4676,11 @@ describe("SessionHost", () => {
     }
     if (boundary === "backend") {
       const backend = fixture.store.getBackend(adapter.id).descriptor;
-      fixture.store.upsertBackend({ ...backend, instanceGeneration: backend.instanceGeneration + 1 });
+      const successor = fixture.store.reserveBackendInstanceGeneration({ backendId: adapter.id, adapterKind: backend.adapterKind });
+      expect(successor.expectedCurrentGeneration).toBe(backend.instanceGeneration);
+      expect(fixture.store.publishBackendInstanceDescriptor({
+        descriptor: { ...backend, instanceGeneration: successor.generation }, expectedCurrentGeneration: backend.instanceGeneration
+      }).status).toBe("published");
     }
     if (boundary === "permission") revoked = true;
     expect(() => background!.snapshot!()).toThrow();

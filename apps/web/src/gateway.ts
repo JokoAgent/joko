@@ -36,7 +36,8 @@ import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } fro
 import { mapPartnerWorkingStatus } from "./partner-working-status.js";
 import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
 import { createClient, ConnectError, Code, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-web";
+import { createConnectTransport, createConnectionFetch, endpointTransportForNewDevice, rememberEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransport, trustedEndpointTransportKind, type EndpointTrust } from "@joko/connection-transport";
+import { assertTrustedEndpointServerId, EndpointTrustError, formatTrustedNodeInvitation, irohTransportForRecipient, isEndpointTrustError, isLoopbackEndpoint, normalizeEndpointPublicKey, observeEndpointTrustFailure, pairingVerificationOrigin, requireIrohRelayInvitationRequest, type NewDeviceAuthorizationOptions, type NodePairingInvitation } from "@joko/connection-transport/trust";
 import { createWebTaskSharingApi } from "./task-sharing-api.js";
 import type { TaskSharingApi } from "@joko/contracts";
 import { TaskShareRuntimeService, BackgroundTaskOutputState, type BackgroundTaskOutput, type TaskShareRuntimeControl } from "@joko/contracts";
@@ -973,6 +974,7 @@ export type GatewayConnectionState = "disconnected" | "connecting" | "connected"
 
 export interface GatewayCallbacks {
   readonly onState?: (state: GatewayConnectionState, statusMessage?: string) => void;
+  /** Projection updates do not establish or restore an Event connection. */
   readonly onSnapshot?: (snapshot: AppSnapshot) => void;
   /** Authenticated owner snapshot attached to this live stream incarnation; never a snapshot-only probe. */
   readonly onLiveSnapshot?: (snapshot: AppSnapshot | undefined) => void;
@@ -1150,6 +1152,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   readonly #portableImportDrafts = new Map<string, { readonly expiresAt: number; readonly cancel: () => Promise<void>; readonly release: () => void }>();
   #inputHandoffs: NonNullable<AppSnapshot["inputHandoffs"]> = [];
   #stopInputHandoffWatch = () => {};
+  #stopEndpointTrustWatch = () => {};
 
   inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi {
     if (this.#taskSharing) throw new GatewayError("The computer owner must authorize input handoff.", { code: "ACCESS_DENIED" });
@@ -1205,24 +1208,34 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     taskSharing?: TaskSharingGatewayPort
   ) {
     this.#profile = profile;
+    if (profile !== undefined) rememberEndpointTrust({ ...profile, transportKind: profile.transportKind ?? 'https' });
     this.#authKey = authKey;
     this.#callbacks = callbacks;
-    this.#transportFactory = transportFactory;
+    if (transportFactory === transportFor && profile?.transportKind !== undefined && profile.transportKind !== 'https') {
+      const endpointTransport = trustedEndpointTransport(profile.origin, profile.endpointPublicKey!, profile.transportKind);
+      this.#transportFactory = (origin, key) => transportFor(origin, key, { ...profile, endpointTransport });
+    } else this.#transportFactory = transportFactory;
     this.#taskSharing = taskSharing;
   }
 
   async pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome> {
+    const endpointPublicKey = trustedEndpointPublicKey(origin);
+    const transportKind = endpointPublicKey === undefined ? undefined : trustedEndpointTransportKind(origin, endpointPublicKey);
+    const endpointTransport = endpointPublicKey === undefined ? undefined : trustedEndpointTransport(origin, endpointPublicKey, transportKind);
+    const pairingTransport = this.#transportFactory === transportFor
+      ? (target: string, key?: string) => transportFor(target, key, { origin, endpointPublicKey, transportKind, endpointTransport }) : this.#transportFactory;
     const desktop = desktopAvailable();
     const deviceNameSource = desktop ? await readDesktopDeviceNameSource() : undefined;
     // Identity discovery must never carry a saved bearer. Only after the
     // anonymous response matches the profile's durable node identity may a
     // credentialed transport be created for same-device pairing.
-    const anonymousClient = createClient(ConnectionService, this.#transportFactory(origin));
+    const anonymousClient = createClient(ConnectionService, pairingTransport(origin));
     const identity = mapServerIdentity((await anonymousClient.getServerInfo({})).server);
+    assertTrustedEndpointServerId(origin, identity.serverId);
     const reusableDeviceId = reusablePairingDeviceId(this.#profile, this.#authKey, origin, identity.serverId);
     const client = reusableDeviceId === undefined
       ? anonymousClient
-      : createClient(ConnectionService, this.#transportFactory(origin, this.#authKey));
+      : createClient(ConnectionService, pairingTransport(origin, this.#authKey));
     let challengeId = "";
     try {
       const challengeResponse = await client.beginPairing({
@@ -1269,10 +1282,58 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         serverId: identity.serverId,
         name: result.connection.displayName || new URL(origin).hostname,
         origin,
+        ...(endpointPublicKey === undefined ? {} : { endpointPublicKey }),
+        ...(transportKind === undefined || transportKind === 'https' ? {} : { transportKind }),
         lastConnectedAt: Date.now()
       },
       authKey: result.authKey
     };
+  }
+
+  async authorizeNewDevice(options?: NewDeviceAuthorizationOptions): Promise<NodePairingInvitation> {
+    if (this.#taskSharing !== undefined || this.#profile === undefined) throw new GatewayError("A node owner connection is required.");
+    const profile = this.#profile, scope = this.captureActionScope();
+    const selectedTransport = profile.endpointPublicKey === undefined ? undefined : trustedEndpointTransport(profile.origin, profile.endpointPublicKey, profile.transportKind ?? 'https');
+    const relayRequest = requireIrohRelayInvitationRequest(selectedTransport, options);
+    const request = relayRequest === undefined ? undefined : { ...relayRequest }, confirmLease = options?.onIrohRelayLease;
+    const assertCurrent = () => { scope.signal.throwIfAborted(); if (this.#profile !== profile || this.#transport !== scope.transport) throw new GatewayError('The original node connection changed. Recover its invitation before retrying.'); };
+    const client = createClient(ConnectionService, scope.transport);
+    const info = (await client.getServerInfo({}, { signal: scope.signal })).server;
+    scope.signal.throwIfAborted();
+    if (info?.serverId !== profile.serverId) throw new GatewayError("The Joko node identity changed.");
+    const endpointPublicKey = normalizeEndpointPublicKey(profile.endpointPublicKey ?? (isLoopbackEndpoint(profile.origin) ? info.endpointPublicKey : ""));
+    let endpointTransport = endpointTransportForNewDevice(selectedTransport);
+    if (request !== undefined && selectedTransport?.kind === 'iroh') {
+      assertCurrent();
+      const reply = await client.issueIrohRelayInvitation({ ...request, nodeEndpointId: selectedTransport.endpointId }, { signal: scope.signal });
+      assertCurrent();
+      endpointTransport = irohTransportForRecipient({ transport: selectedTransport, origin: profile.origin, serverId: profile.serverId, endpointPublicKey, request, invitation: reply.invitation, allowExpiredReceipt: true });
+      await confirmLease?.(endpointTransport.relayTokenExpiresAt!); assertCurrent();
+      if (endpointTransport.relayTokenExpiresAt! <= Date.now()) throw new GatewayError('The original relay lease expired. Authorize the new device again to explicitly renew that confirmed request.');
+    }
+    assertCurrent();
+    const challenge = (await client.beginPairing({ deviceDisplayName: "New device", deviceKind: DeviceKind.UNSPECIFIED, appVersion: APP_VERSION }, { signal: scope.signal })).challenge;
+    scope.signal.throwIfAborted();
+    if (this.#profile !== profile || this.#transport !== scope.transport || !challenge?.challengeId || !challenge.humanCode || !challenge.expiresAt) throw new GatewayError("The new-device invitation could not be confirmed. Check node connections before retrying.");
+    const challengeExpiresAt = Number(challenge.expiresAt.seconds) * 1000 + Math.floor(challenge.expiresAt.nanos / 1_000_000);
+    const expiresAt = endpointTransport?.kind === 'iroh' && endpointTransport.relayTokenExpiresAt !== undefined ? Math.min(challengeExpiresAt, endpointTransport.relayTokenExpiresAt) : challengeExpiresAt;
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) throw new GatewayError("The new-device invitation expired.");
+    const origin = endpointTransport === undefined ? pairingVerificationOrigin(challenge.verificationUri) : profile.origin;
+    return { challengeId: challenge.challengeId, humanCode: challenge.humanCode, expiresAt, origin, serverId: profile.serverId, endpointPublicKey,
+      ...(endpointTransport === undefined ? {} : { endpointTransport }),
+      trustedInvitation: formatTrustedNodeInvitation({ origin, serverId: profile.serverId, endpointPublicKey, endpointTransport }) };
+  }
+
+  async cancelDevicePairing(invitation: NodePairingInvitation): Promise<void> {
+    const profile = this.#profile;
+    if (profile?.serverId !== invitation.serverId || (profile.endpointPublicKey !== undefined && profile.endpointPublicKey !== invitation.endpointPublicKey)
+      || (profile.transportKind ?? 'https') !== (invitation.endpointTransport?.kind ?? 'https')) throw new GatewayError("Select the original node and connection path before canceling its invitation.");
+    const scope = this.captureActionScope();
+    // The unguessable challenge identifier is a cancellation capability. Keep
+    // it on the original pinned endpoint even if trust was explicitly replaced.
+    const transport = createConnectTransport({ baseUrl: profile.origin, endpointPublicKey: invitation.endpointPublicKey, transportKind: profile.transportKind ?? 'https', useBinaryFormat: true });
+    await createClient(ConnectionService, transport).cancelPairing({ challengeId: invitation.challengeId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
   }
 
   async connect(options?: { readonly snapshotOnly?: boolean }): Promise<void> {
@@ -1285,6 +1346,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const abort = new AbortController();
     this.#transport = transport;
     this.#abort = abort;
+    this.#stopEndpointTrustWatch = observeEndpointTrustFailure(this.#profile, error => {
+      if (this.#abort !== abort) return;
+      void this.terminateAuthentication(normalizeError(error));
+    });
     try {
       await this.refresh();
       if (abort.signal.aborted || this.#abort !== abort || this.#transport !== transport) return;
@@ -1315,7 +1380,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     } catch (error) {
       if (abort.signal.aborted || this.#abort !== abort || this.#transport !== transport) return;
       const gatewayError = normalizeError(error);
-      if (isUnauthenticatedError(error)) await this.terminateAuthentication(gatewayError);
+      if (isUnauthenticatedError(error) || isEndpointTrustError(error)) await this.terminateAuthentication(gatewayError);
       else this.#callbacks.onError?.(gatewayError);
       throw gatewayError;
     }
@@ -1347,6 +1412,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   disconnect(): void {
+    this.#stopEndpointTrustWatch(); this.#stopEndpointTrustWatch = () => {};
     this.#stopInputHandoffWatch(); this.#stopInputHandoffWatch = () => {}; this.#inputHandoffs = [];
     if (this.#snapshot?.inputHandoffs?.length) { this.#snapshot = { ...this.#snapshot, inputHandoffs: [] }; this.#callbacks.onSnapshot?.(this.#snapshot); }
     this.publishLiveSnapshot(false);
@@ -5255,12 +5321,40 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (transport === undefined) return;
     const native = typeof window === "undefined" ? undefined : window.jokoDesktop?.mcpApps, profile = this.#profile;
     if (native && profile) {
-      const owner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin };
+      const owner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin, endpointPublicKey: profile.endpointPublicKey, transportKind: profile.transportKind };
       return { operate: async request => fromBinary(McpAppServiceOperateResponseSchema,
         await native.operate(owner, toBinary(McpAppServiceOperateRequestSchema, create(McpAppServiceOperateRequestSchema, request)))) };
     }
+    if (profile === undefined) return;
     const client = createClient(McpAppService, transport);
-    return { operate: (request, signal) => client.operate(request, { signal, timeoutMs: 120_000 }) };
+    const scope = this.captureActionScope(), owner = this.#abort;
+    const current = () => { scope.signal.throwIfAborted();
+      if (this.#transport !== transport || this.#abort !== owner) throw new GatewayError("Application surface connection changed."); };
+    return { operate: (request, signal) => client.operate(request, { signal, timeoutMs: 120_000 }),
+      openSurface: async (proxyUrl, abort) => {
+        current();
+        const signal = AbortSignal.any([scope.signal, abort]);
+        const url = new URL(proxyUrl);
+        if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash
+          || !/^\/mcp-apps\/proxy\/[a-f0-9]{64}$/u.test(url.pathname)) throw new GatewayError("Invalid application surface.");
+        const fetcher = createConnectionFetch(profile);
+        // The same node may advertise a direct address while this client chose a
+        // public ingress. Capability bytes always follow the already pinned path.
+        const response = await fetcher(new URL(url.pathname, profile.origin).href, { signal, headers: { "x-joko-isolated-document": "1" } });
+        if (!response.ok) throw new GatewayError("Application surface is unavailable.");
+        const body = await response.json() as { html?: unknown; csp?: unknown; bridgeEndpoint?: unknown };
+        current(); signal.throwIfAborted();
+        if (typeof body.html !== "string" || body.html.length > 8 * 1024 * 1024 || typeof body.csp !== "string" || body.csp.length > 16384
+          || typeof body.bridgeEndpoint !== "string" || !/^\/mcp-apps\/bridge\/[a-f0-9]{64}$/u.test(body.bridgeEndpoint)) throw new GatewayError("Invalid application surface document.");
+        const endpoint = new URL(body.bridgeEndpoint, profile.origin).href;
+        return { html: body.html, policy: body.csp, invoke: async input => {
+          current(); signal.throwIfAborted();
+          const result = await fetcher(endpoint, { method: "POST", headers: { "content-type": "application/json", "x-joko-isolated-document": "1" }, body: JSON.stringify(input), signal });
+          if (!result.ok) throw new GatewayError("Application surface was revoked.");
+          const value: unknown = await result.json(); current(); signal.throwIfAborted(); return value;
+        } };
+      }
+    };
   }
   extensionNetworkApi(): import("./model.js").ExtensionNetworkApi | undefined {
     if (!this.#transport || !this.#abort) return;
@@ -5307,7 +5401,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (!this.#transport || !this.#abort || !this.#profile) return;
     const scope = this.captureActionScope(), transport = this.#transport, lifetime = this.#abort, profile = this.#profile;
     const client = createClient(ExtensionOAuthService, scope.transport), native = typeof window === "undefined" ? undefined : window.jokoDesktop?.extensionOAuth;
-    const owner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin };
+    const owner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin, endpointPublicKey: profile.endpointPublicKey, transportKind: profile.transportKind };
     const assertCurrent = () => {
       scope.signal.throwIfAborted();
       if (this.#transport !== transport || this.#abort !== lifetime || this.#profile !== profile) throw new GatewayError("Plugin authorization connection changed.");
@@ -5393,7 +5487,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         const upload = response.upload, endpoint = upload?.ticket?.relativeEndpoint;
         if (!upload || !endpoint || upload.expectedSha256Hex !== digest || upload.expectedByteSize !== BigInt(file.size)
           || !endpoint.startsWith("/v1/blobs/upload/") || endpoint.includes("\\") || endpoint.includes("?") || endpoint.includes("#")) throw new GatewayError("Invalid mail attachment upload ticket.");
-        const uploaded = await fetch(this.authorizedEndpoint(endpoint), { method: "PUT", body: file, signal: combined,
+        const uploaded = await this.fetchEndpoint(this.authorizedEndpoint(endpoint), { method: "PUT", body: file, signal: combined,
           headers: { authorization: `Bearer ${uploadScope.authKey}`, "content-type": "application/octet-stream" } });
         assertCurrent(); combined.throwIfAborted(); if (!uploaded.ok) throw new GatewayError("Mail attachment upload failed.");
         return upload.uploadId;
@@ -5408,7 +5502,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         if (result.authorizationFlowId) {
           const flowId = result.authorizationFlowId, oauth = createClient(ExtensionOAuthService, transport);
           if (!native || !profile) { await oauth.cancelFlow({ flowId }).catch(() => undefined); throw new GatewayError("Open Joko Desktop to connect an account."); }
-          const controllerOwner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin };
+          const controllerOwner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin, endpointPublicKey: profile.endpointPublicKey, transportKind: profile.transportKind };
           let cancelled = false, completed = false;
           const cancel = () => { if (cancelled) return; cancelled = true; void native.cancel(controllerOwner, flowId).catch(() => undefined); void oauth.cancelFlow({ flowId }, { timeoutMs: 5_000 }).catch(() => undefined); };
           signal.addEventListener("abort", cancel, { once: true });
@@ -7510,7 +7604,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         if (ticket.maximumBytes > 0n && BigInt(bytes.byteLength) > ticket.maximumBytes) {
           throw new GatewayError("The provider login input exceeds the credential channel limit.");
         }
-        const upload = await fetch(this.authorizedEndpoint(ticket.relativeEndpoint), {
+        const upload = await this.fetchEndpoint(this.authorizedEndpoint(ticket.relativeEndpoint), {
           method: "PUT",
           headers: { authorization: `Bearer ${this.#authKey ?? ""}`, "content-type": "application/octet-stream" },
           body: bytes,
@@ -10443,13 +10537,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     let delay = 350;
     let refreshLiveSnapshot = false;
     while (!signal.aborted) {
+      let accepting = true;
+      let accepted = false;
+      const onAccepted = (): void => {
+        if (!accepting || accepted || signal.aborted || this.#abort?.signal !== signal) return;
+        accepted = true;
+        if (!this.#liveSnapshotConnected) this.publishLiveSnapshot(true);
+        this.#callbacks.onState?.("connected");
+      };
       try {
-        // A retry's optimistic connection state is not authority for the prior
-        // snapshot. Renew the owner snapshot before restoring native activity.
+        // Renew the owner snapshot before a newly accepted stream restores
+        // native activity. Refreshing the projection alone is not acceptance.
         if (refreshLiveSnapshot && this.#callbacks.onLiveSnapshot) {
           await this.refresh();
           if (signal.aborted || this.#abort?.signal !== signal) return;
-          this.publishLiveSnapshot(true);
           refreshLiveSnapshot = false;
         }
         const transport = this.requireTransport();
@@ -10457,16 +10558,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         const cursor = this.#rawSnapshot?.resumeCursor;
         let lastGeneration = this.#snapshot?.generation;
         let lastSequence = this.#snapshot?.cursor;
-        this.#callbacks.onState?.("connected");
         const profile = this.#profile;
-        const stream = this.#taskSharing !== undefined ? this.finiteTaskEvents(signal)
+        const stream = this.#taskSharing !== undefined ? this.finiteTaskEvents(signal, onAccepted)
           : this.#transportFactory === transportFor && profile !== undefined && this.#authKey !== undefined
           && cursor !== undefined && typeof SharedWorker === "function"
-          ? streamSharedOwnerEvents({ profileId: profile.id, serverId: profile.serverId, deviceId: profile.deviceId, origin: profile.origin },
-            this.#authKey, cursor, signal, () => { if (this.#abort?.signal === signal) this.disconnect(); })
+          ? streamSharedOwnerEvents({ profileId: profile.id, serverId: profile.serverId, deviceId: profile.deviceId, origin: profile.origin, endpointPublicKey: profile.endpointPublicKey },
+            this.#authKey, cursor, signal, () => { if (this.#abort?.signal === signal) this.disconnect(); }, onAccepted)
           : client.streamEvents({ scope: OWNER_SCOPE, afterCursor: cursor }, { signal });
         for await (const response of stream) {
-          if (signal.aborted) return;
+          if (signal.aborted || this.#abort?.signal !== signal) return;
+          // Connect can return HTTP 200 headers before an initial error
+          // envelope. Only a decoded response proves the stream was accepted;
+          // an empty response is the idle stream's in-band ready confirmation.
+          onAccepted();
           const event = response.event;
           if (event === undefined) continue;
           const invalidated = payloadCase(event) === "projectionInvalidated";
@@ -10526,7 +10630,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         }
         if (!signal.aborted) throw new GatewayError("The Orchestrator event stream closed.", { offline: true });
       } catch (error) {
-        if (signal.aborted) return;
+        accepting = false;
+        if (signal.aborted || this.#abort?.signal !== signal) return;
         this.publishLiveSnapshot(false);
         refreshLiveSnapshot = true;
         let retryError = error;
@@ -10535,17 +10640,15 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           try {
             await this.refresh();
             if (signal.aborted || this.#abort?.signal !== signal) return;
-            this.publishLiveSnapshot(true);
             refreshLiveSnapshot = false;
             delay = 350;
-            this.#callbacks.onState?.("connected");
             continue;
           } catch (refreshError) {
             retryError = refreshError;
           }
         }
         const gatewayError = normalizeError(retryError);
-        if (isUnauthenticatedError(retryError)) {
+        if (isUnauthenticatedError(retryError) || isEndpointTrustError(retryError)) {
           await this.terminateAuthentication(gatewayError);
           return;
         }
@@ -10553,11 +10656,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         this.#callbacks.onState?.(gatewayError.offline ? "offline" : "reconnecting", "Connection interrupted; retrying…");
         await abortableDelay(delay, signal);
         delay = Math.min(delay * 2, 10_000);
+      } finally {
+        accepting = false;
       }
     }
   }
 
-  private async *finiteTaskEvents(signal: AbortSignal): AsyncGenerator<{ readonly event: Event }> {
+  private async *finiteTaskEvents(signal: AbortSignal, onAccepted: () => void): AsyncGenerator<{ readonly event: Event }> {
     const port = this.#taskSharing;
     if (port === undefined) return;
     let after = this.#rawSnapshot?.resumeCursor;
@@ -10568,6 +10673,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       }
       const batch = await port.events(after, signal);
       signal.throwIfAborted();
+      onAccepted();
       if (batch.resyncRequired || batch.generation !== this.#rawSnapshot?.generation) {
         await this.refresh();
         after = this.#rawSnapshot?.resumeCursor;
@@ -10767,7 +10873,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const upload = response.upload;
     const endpoint = upload?.ticket?.relativeEndpoint;
     if (upload === undefined || endpoint === undefined || endpoint.length === 0) throw new GatewayError("Orchestrator returned no upload ticket.");
-    const uploadResponse = await fetch(this.authorizedEndpoint(endpoint), {
+    const uploadResponse = await this.fetchEndpoint(this.authorizedEndpoint(endpoint), {
       method: "PUT",
       headers: {
         authorization: `Bearer ${scope.authKey}`,
@@ -10795,7 +10901,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     signal?.throwIfAborted();
     const endpoint = response.ticket?.relativeEndpoint;
     if (endpoint === undefined || endpoint.length === 0) throw new GatewayError("Orchestrator returned no download ticket.");
-    const download = await fetch(this.authorizedEndpoint(endpoint), {
+    const download = await this.fetchEndpoint(this.authorizedEndpoint(endpoint), {
       headers: { authorization: `Bearer ${authKey ?? ""}` },
       cache: "no-store",
       signal
@@ -10849,7 +10955,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         throw new GatewayError("The credential input exceeds the credential channel limit.");
       }
       scope.signal.throwIfAborted();
-      const upload = await fetch(this.authorizedEndpoint(ticket.relativeEndpoint), {
+      const upload = await this.fetchEndpoint(this.authorizedEndpoint(ticket.relativeEndpoint), {
         method: "PUT",
         headers: {
           authorization: `Bearer ${scope.authKey}`,
@@ -10930,6 +11036,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator returned an unsafe authenticated transfer endpoint.");
     }
     return endpoint.href;
+  }
+
+  private fetchEndpoint(input: string, init?: RequestInit): Promise<Response> {
+    if (this.#profile === undefined) throw new GatewayError("The authenticated connection is unavailable.");
+    return createConnectionFetch(this.#profile)(input, init);
   }
 }
 
@@ -12606,22 +12717,29 @@ export function probeOrchestratorRuntimeActivityAt(
   return probeRuntimeActivityWithTransport(transportFactory(origin, authKey), signal);
 }
 
+function endpointProbeSignal(origin: string): AbortSignal {
+  const key = trustedEndpointPublicKey(origin);
+  return AbortSignal.timeout(key !== undefined && trustedEndpointTransportKind(origin, key) === 'webrtc' ? 20_000 : 2_000);
+}
+
 /** Probes node identity without an Authorization header. This must run before
  * a saved bearer is decrypted and attached to a reconnect request. */
 export async function probeOrchestratorOrigin(
   origin: string,
-  signal: AbortSignal = AbortSignal.timeout(2_000),
+  signal: AbortSignal = endpointProbeSignal(origin),
   transportFactory: GatewayTransportFactory = transportFor
 ): Promise<OrchestratorIdentity> {
   const client = createClient(ConnectionService, transportFactory(origin));
-  return mapServerIdentity((await client.getServerInfo({}, { signal })).server);
+  const identity = mapServerIdentity((await client.getServerInfo({}, { signal })).server);
+  assertTrustedEndpointServerId(origin, identity.serverId);
+  return identity;
 }
 
 /** Lists public bootstrap candidates without ever constructing an auth
  * interceptor. The contacted node may contribute its short-lived LAN cache. */
 export async function discoverOrchestratorNodesAt(
   origin: string,
-  signal: AbortSignal = AbortSignal.timeout(2_000),
+  signal: AbortSignal = endpointProbeSignal(origin),
   transportFactory: GatewayTransportFactory = transportFor
 ): Promise<readonly DiscoveredOrchestratorView[]> {
   const normalizedOrigin = normalizeOrchestratorOrigin(origin);
@@ -12718,7 +12836,7 @@ function mapServerIdentity(server: { readonly serverId: string; readonly display
   };
 }
 
-function transportFor(origin: string, authKey?: string): Transport {
+function transportFor(origin: string, authKey?: string, endpoint?: EndpointTrust): Transport {
   const interceptors: Interceptor[] = [];
   if (authKey !== undefined) {
     interceptors.push((next) => async (request) => {
@@ -12727,7 +12845,8 @@ function transportFor(origin: string, authKey?: string): Transport {
       return next(request);
     });
   }
-  return createConnectTransport({ baseUrl: origin, interceptors, useBinaryFormat: true });
+  return createConnectTransport({ baseUrl: origin, interceptors, useBinaryFormat: true, ...(endpoint === undefined ? {} : {
+    endpointPublicKey: endpoint.endpointPublicKey, transportKind: endpoint.transportKind ?? 'https', endpointTransport: endpoint.endpointTransport }) });
 }
 
 async function loadWorkspaceEntries(
@@ -20270,6 +20389,7 @@ function declaredQuestionChoiceIds(choices: readonly QuestionChoice[]): Readonly
 
 function normalizeError(error: unknown): GatewayError {
   if (error instanceof GatewayError) return error;
+  if (isEndpointTrustError(error)) return new GatewayError(new EndpointTrustError().message, { cause: error, code: "ENDPOINT_TRUST_FAILED" });
   if (error instanceof ConnectError) {
     const offline = [Code.Unavailable, Code.DeadlineExceeded, Code.Aborted].includes(error.code);
   if (error.code === Code.Unauthenticated) return new GatewayError("This Joko connection was revoked or logged out.", { cause: error });

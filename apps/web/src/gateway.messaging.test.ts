@@ -237,7 +237,7 @@ describe("Messaging gateway", () => {
     expect(buffers).toHaveLength(1);
     expect(buffers[0]!.every((byte) => byte === 0)).toBe(true);
     expect(fetch).toHaveBeenCalledWith(
-      "https://service.example/v1/credential-uploads/messaging-ticket",
+      "http://127.0.0.1:4318/v1/credential-uploads/messaging-ticket",
       expect.objectContaining({
         method: "PUT",
         signal: expect.any(AbortSignal),
@@ -661,7 +661,7 @@ async function mount() {
     stream: vi.fn(async (method: any) => response(method, idleStream(), true))
   } as unknown as Transport;
   fixture.gateway = createOrchestratorGateway(
-    { id: "profile", deviceId: "device", name: "Node", origin: "https://service.example", serverId: "node" },
+    { id: "profile", deviceId: "device", name: "Node", origin: "http://127.0.0.1:4318", serverId: "node" },
     "fixture-auth",
     {},
     () => transport

@@ -1,0 +1,46 @@
+{
+  "name": "@joko/connection-transport",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "react-native": "./dist/index.js", "browser": "./dist/index.js", "node": "./dist/node-index.js", "import": "./dist/index.js" },
+    "./node": { "types": "./dist/node.d.ts", "import": "./dist/node.js" },
+    "./trust": { "types": "./dist/trust.d.ts", "react-native": "./dist/trust.js", "import": "./dist/trust.js" },
+    "./webrtc": { "types": "./dist/webrtc.d.ts", "react-native": "./dist/webrtc.js", "import": "./dist/webrtc.js" }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@joko/contracts": "workspace:*",
+    "@connectrpc/connect": "2.1.2",
+    "@connectrpc/connect-node": "2.1.2",
+    "@connectrpc/connect-web": "2.1.2",
+    "@jokoagent/linkspan-core": "*",
+    "@jokoagent/linkspan-noise": "*",
+    "@jokoagent/linkspan-http": "*",
+    "@jokoagent/linkspan-http-connect": "*",
+    "@jokoagent/linkspan-iroh": "*",
+    "@jokoagent/linkspan-tailcat": "*",
+    "@jokoagent/linkspan-webrtc": "*"
+  },
+  "peerDependencies": {
+    "@jokoagent/linkspan-iroh-node": "*",
+    "@jokoagent/linkspan-iroh-wasm": "*",
+    "@jokoagent/linkspan-tailcat-node": "*",
+    "@jokoagent/linkspan-tailcat-wasm": "*",
+    "@jokoagent/linkspan-webrtc-node": "*"
+  },
+  "peerDependenciesMeta": {
+    "@jokoagent/linkspan-iroh-node": { "optional": true },
+    "@jokoagent/linkspan-iroh-wasm": { "optional": true },
+    "@jokoagent/linkspan-tailcat-node": { "optional": true },
+    "@jokoagent/linkspan-tailcat-wasm": { "optional": true },
+    "@jokoagent/linkspan-webrtc-node": { "optional": true }
+  },
+  "devDependencies": { "@jokoagent/linkspan-webrtc-node": "*", "@types/node": "24.12.4", "typescript": "5.9.3", "vitest": "4.1.9" }
+}

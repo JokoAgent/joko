@@ -1,0 +1,7 @@
+{
+  "name": "@joko/mobile-linkspan-http-connect",
+  "version": "0.1.0",
+  "description": "Joko host adapter for an explicitly selected native proxy byte stream.",
+  "private": true,
+  "peerDependencies": { "expo": "*" }
+}

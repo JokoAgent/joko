@@ -1,5 +1,5 @@
 import { createClient, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
+import { createConnectTransport, normalizeEndpointPublicKey, requireEndpointTrust } from "@joko/connection-transport/node";
 import { randomUUID } from "node:crypto";
 import {
   AuthenticationState,
@@ -286,10 +286,12 @@ async function withPackagedSmokeAuthority<T>(
     || origin.origin !== options.connection.origin || origin.username !== "" || origin.password !== "") {
     throw new Error("Packaged smoke managed authority is invalid.");
   }
+  const endpointPublicKey = options.connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin: options.connection.origin }) : normalizeEndpointPublicKey(options.connection.endpointPublicKey);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref();
-  const factory = options.transportFactory ?? createPackagedSmokeTransport;
+  const factory = options.transportFactory ?? ((origin: string, authKey: string | undefined, timeoutMs: number) =>
+    createPackagedSmokeTransport(origin, authKey, timeoutMs, endpointPublicKey));
   try {
     const identity = await createClient(
       ConnectionService,
@@ -498,7 +500,7 @@ function assertTaskInSnapshot(snapshot: Snapshot, task: PackagedSmokeTask): void
   }
 }
 
-function createPackagedSmokeTransport(origin: string, authKey: string | undefined, timeoutMs: number): Transport {
+function createPackagedSmokeTransport(origin: string, authKey: string | undefined, timeoutMs: number, endpointPublicKey?: string): Transport {
   const interceptors: Interceptor[] = [];
   if (authKey !== undefined) interceptors.push((next) => (request) => {
     request.header.set("authorization", `Bearer ${authKey}`);
@@ -506,6 +508,7 @@ function createPackagedSmokeTransport(origin: string, authKey: string | undefine
   });
   return createConnectTransport({
     baseUrl: origin,
+    endpointPublicKey,
     httpVersion: "1.1",
     useBinaryFormat: true,
     interceptors,

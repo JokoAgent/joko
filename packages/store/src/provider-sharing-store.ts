@@ -42,6 +42,25 @@ export class ProviderSharingStoreError extends StoreError {
 /** Independent current-v1 Provider grants. No record here is a Connection or a task guest. */
 export class ProviderSharingStore {
   constructor(readonly store: OperationalStore, readonly now: () => number = Date.now) {}
+  /** Trusted offline node recovery: retire inbound access without deleting its history. */
+  revokeAllAccess(): { readonly members: number; readonly requests: number; readonly invitations: number } {
+    return this.store.transaction(() => {
+      let members = 0, requests = 0, invitations = 0;
+      for (const share of this.list()) for (const member of share.members) {
+        if (!["active", "paused"].includes(member.status)) continue;
+        this.setMember(share.id, member.id, member.generation, "removed"); members++;
+      }
+      for (const request of this.requests()) if (request.status === "pending") {
+        this.setRequest(request, "rejected"); requests++;
+      }
+      for (const row of this.store.listSettingsByKeyPrefix("service", SCOPE, "link:")) {
+        const link = this.link(row.key.slice("link:".length));
+        if (!["unused", "pending"].includes(link.state)) continue;
+        this.put(row.key, { ...link, state: "expired" }); invitations++;
+      }
+      return { members, requests, invitations };
+    });
+  }
   list(): readonly ProviderSharingShareRecord[] { return this.store.listSettingsByKeyPrefix("service", SCOPE, "share:").map(row => parseShare(row.value)); }
   get(shareId: string): ProviderSharingShareRecord {
     const found = this.store.findSetting("service", SCOPE, `share:${identity(shareId)}`); if (!found) throw new ProviderSharingStoreError("NOT_FOUND"); return parseShare(found.value);

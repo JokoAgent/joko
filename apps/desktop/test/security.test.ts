@@ -228,6 +228,18 @@ describe("Desktop security policy", () => {
     expect(shouldMergeDesktopFrameContentSecurityPolicy("subFrame", "https://example.test/ordinary.html")).toBe(true);
   });
 
+  it("keeps the independent policy only on the trusted isolated bootstrap", () => {
+    const path = `/isolated-surface.html#v1-${"a".repeat(32)}`;
+    for (const origin of ["joko://app", "http://127.0.0.1:4319"]) {
+      expect(shouldMergeDesktopFrameContentSecurityPolicy("subFrame", origin + path, origin)).toBe(false);
+      expect(shouldMergeDesktopFrameContentSecurityPolicy("mainFrame", origin + path, origin)).toBe(true);
+      expect(shouldMergeDesktopFrameContentSecurityPolicy("subFrame", origin + path)).toBe(true);
+      expect(shouldMergeDesktopFrameContentSecurityPolicy("subFrame", `https://untrusted.example${path}`, origin)).toBe(true);
+      expect(shouldMergeDesktopFrameContentSecurityPolicy("subFrame", `${origin}/isolated-surface.html?secret=1#v1-${"a".repeat(32)}`, origin)).toBe(true);
+      expect(shouldMergeDesktopFrameContentSecurityPolicy("subFrame", `${origin}/isolated-surface.html#wrong`, origin)).toBe(true);
+    }
+  });
+
   it("rejects Linux safeStorage plaintext fallback and validates renderer-controlled values", () => {
     expect(isSecureStorageBackend("linux", true, "basic_text")).toBe(false);
     expect(isSecureStorageBackend("linux", true, "unknown")).toBe(false);

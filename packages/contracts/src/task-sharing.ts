@@ -5,6 +5,7 @@ import { TaskShareMethod, type TaskShare, type TaskShareScope, type JoinedTaskSh
 
 export interface TaskShareInvitation {
   readonly hostOrigin: string;
+  readonly endpointPublicKey: string;
   readonly hostServerId: string;
   readonly shareId: string;
   readonly shareGeneration: bigint;
@@ -12,6 +13,10 @@ export interface TaskShareInvitation {
 }
 const identifier = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 export const TASK_SHARE_ATTACHMENT_CHUNK_BYTES = 256 * 1024;
+export function taskShareEndpointPublicKey(value: string): string {
+  if (typeof value !== "string" || !/^ed25519:[a-f0-9]{64}$/u.test(value)) throw new Error("The trusted endpoint public key is invalid or missing.");
+  return value;
+}
 export function taskShareIdentity(value: string): string {
   if (!identifier.test(value)) throw new Error("The shared task identity is invalid.");
   return value;
@@ -25,9 +30,10 @@ export function taskShareOrigin(value: string): string {
 /** Explicit clipboard/deep-link value only; never a navigation or draft key. */
 export function buildTaskShareInvitation(input: TaskShareInvitation): string {
   taskShareOrigin(input.hostOrigin); taskShareIdentity(input.hostServerId); taskShareIdentity(input.shareId);
+  taskShareEndpointPublicKey(input.endpointPublicKey);
   if (input.shareGeneration < 1n || !/^[A-Za-z0-9_-]{32,256}$/u.test(input.inviteSecret)) throw new Error("The shared task invitation is invalid.");
   return `joko://shared-task/join#${encodeURIComponent(JSON.stringify({ format: 1, hostOrigin: input.hostOrigin,
-    hostServerId: input.hostServerId, shareId: input.shareId, shareGeneration: String(input.shareGeneration), inviteSecret: input.inviteSecret }))}`;
+    hostServerId: input.hostServerId, endpointPublicKey: input.endpointPublicKey, shareId: input.shareId, shareGeneration: String(input.shareGeneration), inviteSecret: input.inviteSecret }))}`;
 }
 export function parseTaskShareInvitation(value: string): TaskShareInvitation {
   if (value.length > 8192 || value.trim() !== value) throw new Error("The shared task invitation is invalid.");
@@ -35,13 +41,13 @@ export function parseTaskShareInvitation(value: string): TaskShareInvitation {
   if (url.protocol !== "joko:" || url.hostname !== "shared-task" || url.pathname !== "/join" || url.username || url.password || url.port || url.search) throw new Error("The shared task invitation is invalid.");
   const row: unknown = JSON.parse(decodeURIComponent(url.hash.slice(1)));
   if (!row || typeof row !== "object" || Array.isArray(row)
-    || Object.keys(row).sort().join(",") !== "format,hostOrigin,hostServerId,inviteSecret,shareGeneration,shareId") throw new Error("The shared task invitation is invalid.");
+    || Object.keys(row).sort().join(",") !== "endpointPublicKey,format,hostOrigin,hostServerId,inviteSecret,shareGeneration,shareId") throw new Error("The shared task invitation is invalid.");
   const item = row as Record<string, unknown>;
   if (item["format"] !== 1 || typeof item["hostOrigin"] !== "string" || typeof item["hostServerId"] !== "string"
     || typeof item["shareId"] !== "string" || typeof item["shareGeneration"] !== "string" || !/^[1-9]\d{0,19}$/u.test(item["shareGeneration"])
-    || typeof item["inviteSecret"] !== "string") throw new Error("The shared task invitation is invalid.");
+    || typeof item["inviteSecret"] !== "string" || typeof item["endpointPublicKey"] !== "string") throw new Error("The shared task invitation is invalid.");
   const result = { hostOrigin: taskShareOrigin(item["hostOrigin"]), hostServerId: taskShareIdentity(item["hostServerId"]),
-    shareId: taskShareIdentity(item["shareId"]), shareGeneration: BigInt(item["shareGeneration"]), inviteSecret: item["inviteSecret"] };
+    endpointPublicKey: taskShareEndpointPublicKey(item["endpointPublicKey"]), shareId: taskShareIdentity(item["shareId"]), shareGeneration: BigInt(item["shareGeneration"]), inviteSecret: item["inviteSecret"] };
   if (result.shareGeneration > 18446744073709551615n || !/^[A-Za-z0-9_-]{32,256}$/u.test(result.inviteSecret)) throw new Error("The shared task invitation is invalid.");
   return result;
 }

@@ -1,11 +1,12 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
+import { isEndpointTrustError } from "@joko/connection-transport/trust";
 import { EventCursorSchema, EventSchema, ExtensionNotificationKind, ExtensionUiEffectKind, GetSnapshotResponseSchema } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { streamSharedOwnerEvents, type SharedOwnerEventsReply, type SharedOwnerEventsRequest } from "./shared-owner-events.js";
 import { createOrchestratorGateway } from "./gateway.js";
 
-const owner = { profileId: "profile-one", serverId: "node-one", deviceId: "device-one", origin: "https://node.example" };
+const owner = { profileId: "profile-one", serverId: "node-one", deviceId: "device-one", origin: "http://127.0.0.1:4318" };
 const cursor = create(EventCursorSchema, { generation: 3n, sequence: 9n, opaqueToken: "cursor-nine" });
 const workers: FakeWorker[] = [];
 class FakePort {
@@ -28,10 +29,11 @@ function harness() {
   vi.stubGlobal("window", host);
   const abort = new AbortController();
   const retired = vi.fn(() => abort.abort());
-  const iterator = streamSharedOwnerEvents(owner, "private-credential", cursor, abort.signal, retired);
+  const accepted = vi.fn();
+  const iterator = streamSharedOwnerEvents(owner, "private-credential", cursor, abort.signal, retired, accepted);
   const reading = iterator.next();
   const worker = workers.at(-1)!;
-  return { host, abort, retired, iterator, reading, worker, port: worker.port };
+  return { host, abort, retired, accepted, iterator, reading, worker, port: worker.port };
 }
 function bytes(sequence: bigint): ArrayBuffer {
   return toBinary(EventSchema, create(EventSchema, { eventId: `event-${sequence}`, cursor: { generation: 3n, sequence } })).slice().buffer;
@@ -39,6 +41,56 @@ function bytes(sequence: bigint): ArrayBuffer {
 afterEach(() => { workers.length = 0; vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("shared Event connection occurrence", () => {
+  it("keeps retry errors through port readiness and restores connection only after upstream acceptance", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("SharedWorker", FakeWorker);
+    vi.stubGlobal("window", Object.assign(new EventTarget(), { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout }));
+    vi.stubGlobal("fetch", vi.fn(async (request: RequestInfo | URL) => {
+      const path = new URL(request instanceof Request ? request.url : String(request)).pathname;
+      if (path === "/joko.v1.ManagedModelRuntimeService/ListManagedModelRuntimes") return new Response(new Uint8Array(), { headers: { "content-type": "application/proto" } });
+      expect(path).toBe("/joko.v1.EventService/GetSnapshot");
+      return new Response(toBinary(GetSnapshotResponseSchema, create(GetSnapshotResponseSchema, {
+        snapshot: { generation: 3n, resumeCursor: cursor }
+      })), { headers: { "content-type": "application/proto" } });
+    }));
+    const states: string[] = [], errors: string[] = [];
+    const gateway = createOrchestratorGateway({ id: owner.profileId, serverId: owner.serverId, deviceId: owner.deviceId,
+      origin: owner.origin, name: "Node" }, "private-credential", {
+      onState: state => states.push(state), onError: error => errors.push(error.message)
+    });
+    try {
+      await gateway.connect();
+      workers[0]!.port.emit({ type: "ready" }); workers[0]!.port.emit({ type: "accepted" });
+      workers[0]!.port.emit({ type: "error", code: Code.Unavailable, message: "Upstream offline" });
+      await vi.advanceTimersByTimeAsync(0);
+      const established = states.filter(state => state === "connected").length;
+      expect(states.at(-1)).toBe("offline");
+      await vi.advanceTimersByTimeAsync(350);
+      expect(workers).toHaveLength(2); workers[1]!.port.emit({ type: "ready" });
+      expect(states.at(-1)).toBe("offline"); expect(errors.at(-1)).toBe("Upstream offline");
+      expect(states.filter(state => state === "connected")).toHaveLength(established);
+      workers[1]!.port.emit({ type: "error", code: Code.Unavailable, message: "Still offline" });
+      await vi.advanceTimersByTimeAsync(700);
+      expect(workers).toHaveLength(3); workers[2]!.port.emit({ type: "ready" });
+      expect(states.at(-1)).toBe("offline"); expect(errors.at(-1)).toBe("Still offline");
+      workers[0]!.port.emit({ type: "accepted" }); workers[1]!.port.emit({ type: "accepted" });
+      expect(states.filter(state => state === "connected")).toHaveLength(established);
+      workers[2]!.port.emit({ type: "accepted" });
+      expect(states.at(-1)).toBe("connected");
+      expect(states.filter(state => state === "connected")).toHaveLength(established + 1);
+    } finally { gateway.disconnect(); await vi.advanceTimersByTimeAsync(0); }
+  });
+
+  it("distinguishes a private port ready signal from upstream acceptance and ignores late acceptance after failure", async () => {
+    const h = harness();
+    h.port.emit({ type: "ready" }); expect(h.accepted).not.toHaveBeenCalled();
+    h.port.emit({ type: "accepted" }); h.port.emit({ type: "accepted" }); expect(h.accepted).toHaveBeenCalledOnce();
+    h.port.emit({ type: "error", code: Code.Unavailable, message: "Offline" });
+    h.port.emit({ type: "accepted" });
+    await expect(h.reading).rejects.toMatchObject({ code: Code.Unavailable });
+    expect(h.accepted).toHaveBeenCalledOnce();
+  });
+
   it("refreshes an expired shared replay cursor before subscribing again and ignores the retired port", async () => {
     vi.stubGlobal("SharedWorker", FakeWorker);
     vi.stubGlobal("window", new EventTarget());
@@ -125,6 +177,16 @@ describe("shared Event connection occurrence", () => {
     expect(h.port.sent.at(-1)).toEqual({ type: "close" });
     expect(h.port.close).toHaveBeenCalledOnce();
     expect(h.port.onmessage).toBeNull();
+  });
+
+  it("retains a worker security failure as terminal without turning it into credential revocation", async () => {
+    const h = harness();
+    h.port.emit({ type: "ready" });
+    h.port.emit({ type: "error", code: Code.Unknown, message: "The node security check failed.", endpointTrustFailed: true });
+    const failure = await h.reading.catch(error => error);
+    expect(isEndpointTrustError(failure)).toBe(true);
+    expect(failure.code).toBe(Code.Unknown);
+    expect(h.port.close).toHaveBeenCalledOnce();
   });
 
   it.each([Code.OutOfRange, Code.FailedPrecondition, Code.Unauthenticated])("preserves generated recovery/authentication code %s", async code => {

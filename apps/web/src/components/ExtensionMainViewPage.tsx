@@ -1,6 +1,9 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide-react";
+import { createConnectionFetch } from "@joko/connection-transport";
+import { mountIsolatedSurface } from "../isolated-surface.js";
+import { bindExtensionSurfaceResources } from "../extension-main-view-resource-bridge.js";
 
 import type { AppController } from "../controller.js";
 import type {
@@ -42,6 +45,7 @@ export function ExtensionMainViewPage({
   const [state, setState] = useState<MainViewState>({ phase: "loading" });
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [frameRevision, setFrameRevision] = useState(0);
+  const [frameEndpoint, setFrameEndpoint] = useState<string>();
   const [retryRevision, setRetryRevision] = useState(0);
   const requestRevision = useRef(0);
   const surfaceRef = useRef<ExtensionMainViewSurfaceView | undefined>(undefined);
@@ -87,6 +91,7 @@ export function ExtensionMainViewPage({
         return;
       }
       surfaceRef.current = surface;
+      setFrameEndpoint(surface.endpoint);
       setState({ phase: "ready", extension, surface });
     }).catch(() => {
       if (!disposed && !abort.signal.aborted && request === requestRevision.current) setState({ phase: "error" });
@@ -128,12 +133,12 @@ export function ExtensionMainViewPage({
     if (state.phase !== "ready") return undefined;
     const origin = controller.state.activeProfile?.origin ?? window.location.origin;
     try {
-      const url = new URL(state.surface.endpoint, origin);
+      const url = new URL(frameEndpoint ?? state.surface.endpoint, origin);
       return url.protocol === "http:" || url.protocol === "https:" ? url.href : undefined;
     } catch {
       return undefined;
     }
-  }, [controller.state.activeProfile?.origin, state]);
+  }, [controller.state.activeProfile?.origin, frameEndpoint, state]);
 
   useEffect(() => {
     if (state.phase === "ready" && surfaceUrl === undefined) {
@@ -141,6 +146,35 @@ export function ExtensionMainViewPage({
       setState({ phase: "error", extension: state.extension });
     }
   }, [releaseSurface, state, surfaceUrl]);
+
+  useEffect(() => {
+    if (state.phase !== "ready" || surfaceUrl === undefined || frameRef.current === null) return;
+    const frame = frameRef.current, profile = controller.state.activeProfile;
+    const abort = new AbortController();
+    const failed = () => {
+      if (abort.signal.aborted || surfaceRef.current?.id !== state.surface.id) return;
+      releaseSurface(state.surface); setFrameLoaded(false); setState({ phase: "error", extension: state.extension });
+    };
+    const current = () => surfaceRef.current?.id === state.surface.id && controller.state.activeProfile?.id === profile?.id
+      && controller.state.activeProfile?.serverId === profile?.serverId && controller.state.activeProfile?.endpointPublicKey === profile?.endpointPublicKey
+      && controller.state.activeProfile?.origin === profile?.origin;
+    let fetcher: typeof globalThis.fetch | undefined;
+    try { fetcher = profile === undefined ? undefined : createConnectionFetch(profile); } catch { failed(); return () => abort.abort(); }
+    const resourceRoot = new URL(state.surface.endpoint.slice(0, state.surface.endpoint.lastIndexOf("/") + 1), profile?.origin ?? window.location.origin).href;
+    const disposeResources = fetcher === undefined ? () => {} : bindExtensionSurfaceResources(frame, { resourceRoot, fetch: fetcher,
+      signal: abort.signal, current, navigate: url => { if (current()) { closeLibrary(); setFrameLoaded(false); setFrameEndpoint(new URL(url).pathname + new URL(url).hash); setFrameRevision(value => value + 1); } } });
+    const document = (async () => {
+      if (profile === undefined || new URL(surfaceUrl).origin !== new URL(profile.origin).origin) throw new Error("Extension surface endpoint changed.");
+      const response = await fetcher!(surfaceUrl, { headers: { "x-joko-isolated-document": "1" }, signal: abort.signal });
+      if (!response.ok) throw new Error("Extension surface is unavailable.");
+      const html = await response.text(), policy = response.headers.get("content-security-policy");
+      abort.signal.throwIfAborted();
+      if (!current() || !policy) throw new Error("Extension surface authority changed.");
+      return { html, policy, baseUrl: surfaceUrl };
+    })();
+    const dispose = mountIsolatedSurface(frame, document, { signal: abort.signal, failed });
+    return () => { abort.abort(); disposeResources(); dispose(); };
+  }, [closeLibrary, controller, frameRevision, releaseSurface, state, surfaceUrl]);
 
   useEffect(() => {
     if (state.phase !== "ready" || state.extension.library === undefined || surfaceUrl === undefined) return undefined;
@@ -345,7 +379,6 @@ export function ExtensionMainViewPage({
           ref={frameRef}
           key={`${state.surface.id}:${frameRevision}`}
           className="extension-main-view-page__frame"
-          src={surfaceUrl}
           title={title}
           sandbox="allow-scripts"
           referrerPolicy="no-referrer"

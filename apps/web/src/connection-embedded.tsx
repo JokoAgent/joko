@@ -17,7 +17,7 @@ export interface ConnectionEmbeddedSnapshot {
 
 export interface ConnectionEmbeddedRuntime {
   update(snapshot: ConnectionEmbeddedSnapshot): void;
-  settle(id: number, success: boolean, error?: string): void;
+  settle(id: number, success: boolean, error?: string, result?: unknown): void;
   close(): void;
 }
 
@@ -33,7 +33,7 @@ declare global {
 const requestTimeoutMs = 60_000;
 
 interface PendingAction {
-  readonly resolve: () => void;
+  readonly resolve: (value?: unknown) => void;
   readonly reject: (error: Error) => void;
   readonly timer: number;
 }
@@ -63,10 +63,10 @@ export function mountConnectionEmbedded(initial: ConnectionEmbeddedSnapshot): Co
     if (closed || window.ReactNativeWebView === undefined) throw unexpectedError();
     window.ReactNativeWebView.postMessage(JSON.stringify(message));
   };
-  const request = <Name extends keyof ConnectionScreenActionArguments>(name: Name, args: ConnectionScreenActionArguments[Name]): Promise<void> => {
+  const requestResult = <Name extends keyof ConnectionScreenActionArguments>(name: Name, args: ConnectionScreenActionArguments[Name]): Promise<unknown> => {
     if (closed) return Promise.reject(unexpectedError());
     const id = ++sequence;
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const timer = window.setTimeout(() => {
         if (!pending.delete(id)) return;
         reject(unexpectedError());
@@ -81,6 +81,7 @@ export function mountConnectionEmbedded(initial: ConnectionEmbeddedSnapshot): Co
       }
     });
   };
+  const request = <Name extends keyof ConnectionScreenActionArguments>(name: Name, args: ConnectionScreenActionArguments[Name]): Promise<void> => requestResult(name, args).then(() => undefined);
   const notify = <Name extends keyof ConnectionScreenActionArguments>(name: Name, args: ConnectionScreenActionArguments[Name]): void => {
     void request(name, args).catch(() => undefined);
   };
@@ -97,7 +98,20 @@ export function mountConnectionEmbedded(initial: ConnectionEmbeddedSnapshot): Co
     setTheme: (theme) => request("setTheme", [theme]),
     inspect: (origin) => request("inspect", [origin]),
     requestPairing: (origin, deviceName) => request("requestPairing", [origin, deviceName]),
-    cancelPairing: () => notify("cancelPairing", []),
+    trustEndpoint: (origin, endpointPublicKey, replace, serverId, endpointTransport) => request("trustEndpoint", endpointTransport !== undefined ? [origin, endpointPublicKey, replace ?? false, serverId, endpointTransport] : serverId !== undefined ? [origin, endpointPublicKey, replace ?? false, serverId] : replace === undefined ? [origin, endpointPublicKey] : [origin, endpointPublicKey, replace]),
+    createTailcatClient: async (origin, endpointPublicKey, endpointTransport) => {
+      const value = await requestResult('createTailcatClient', [origin, endpointPublicKey, endpointTransport]);
+      if (value === null || typeof value !== 'object' || !('publicKey' in value) || typeof value.publicKey !== 'string' || !/^nodekey:[a-f0-9]{64}$/u.test(value.publicKey) || Object.keys(value).length !== 1) throw unexpectedError();
+      return { publicKey: value.publicKey };
+    },
+    createIrohClient: async (origin, endpointPublicKey, endpointTransport, mobileMode) => {
+      const value = await requestResult('createIrohClient', origin === undefined ? mobileMode === undefined ? [] : [mobileMode]
+        : mobileMode === undefined ? [origin, endpointPublicKey!, endpointTransport!] : [origin, endpointPublicKey!, endpointTransport!, mobileMode]);
+      if (value === null || typeof value !== 'object' || !('publicKey' in value) || typeof value.publicKey !== 'string' || !/^[a-f0-9]{64}$/u.test(value.publicKey) || Object.keys(value).length !== 1) throw unexpectedError();
+      return { publicKey: value.publicKey };
+    },
+    cancelPairing: () => request("cancelPairing", []),
+    setProfileIrohMode: (profileId, mode) => request('setProfileIrohMode', [profileId, mode]),
     recheckSavedProfiles: () => request("recheckSavedProfiles", []),
     goBack: () => request("goBack", []),
     selectMode: (mode) => notify("selectMode", [mode])
@@ -123,13 +137,13 @@ export function mountConnectionEmbedded(initial: ConnectionEmbeddedSnapshot): Co
       snapshot = next;
       render();
     },
-    settle(id, success, error) {
+    settle(id, success, error, result) {
       if (closed || !Number.isSafeInteger(id) || id < 1 || typeof success !== "boolean") return;
       const action = pending.get(id);
       if (action === undefined) return;
       pending.delete(id);
       window.clearTimeout(action.timer);
-      if (success) action.resolve();
+      if (success) action.resolve(result);
       else action.reject(typeof error === "string" && error.length > 0 ? new Error(error) : unexpectedError());
     },
     close() {

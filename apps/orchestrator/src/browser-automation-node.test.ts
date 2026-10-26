@@ -12,12 +12,19 @@ import {
   BROWSER_AUTOMATION_NODE_CAPABILITIES,
   BrowserAutomationNodeExecutor,
   browserAutomationNodeCredentialProviderId,
+  formatBrowserAutomationNodeCredential,
+  parseBrowserAutomationNodeCredential,
   type BrowserAutomationNodeRpcClient
 } from "./browser-automation-node.js";
 import type { ArtifactStore } from "./artifact-store.js";
 import type { BrowserToolBridgeProvider } from "./browser-tool-bridge.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { LanDiscoveryService } from "./lan-discovery.js";
+
+const endpointPublicKey = `ed25519:${"a".repeat(64)}`;
+const nodeCredential = (origin = "http://192.168.1.20:4318") => formatBrowserAutomationNodeCredential({
+  serverId: "node-peer", origin, endpointPublicKey, authKey: "service-auth-key"
+});
 
 describe("BrowserAutomationNodeExecutor", () => {
   it("enforces node generation and dispatches the capability-fenced unified action", async () => {
@@ -96,7 +103,7 @@ describe("BrowserAutomationNodeExecutor", () => {
 });
 
 describe("AuthenticatedBrowserRemoteNodeRouter", () => {
-  it("identity-probes discovery before using the encrypted service credential", async () => {
+  it("pins the private credential route before identity-probing or sending its service bearer", async () => {
     const order: string[] = [];
     const rpc: BrowserAutomationNodeRpcClient = {
       serverId: vi.fn(async () => { order.push("identity"); return "node-peer"; }),
@@ -116,11 +123,12 @@ describe("AuthenticatedBrowserRemoteNodeRouter", () => {
     const credentials = {
       list: vi.fn(() => [{
         credentialReferenceId: "credential-ref",
+        generation: "credential-generation-one",
         providerId: browserAutomationNodeCredentialProviderId("node-peer"),
         kind: "header_secret",
         configured: true
       }]),
-      resolve: vi.fn(() => { order.push("resolve"); return "service-auth-key"; })
+      resolve: vi.fn(() => { order.push("resolve"); return nodeCredential(); })
     };
     const router = new AuthenticatedBrowserRemoteNodeRouter({
       localNodeId: "node-local",
@@ -128,12 +136,12 @@ describe("AuthenticatedBrowserRemoteNodeRouter", () => {
       discovery: discovery() as unknown as LanDiscoveryService,
       credentials: credentials as unknown as CredentialManager,
       artifacts: artifactStore() as unknown as ArtifactStore,
-      rpcFactory: () => rpc
+      rpcFactory: (origin, pin) => { expect(origin).toBe("http://192.168.1.20:4318"); expect(pin).toBe(endpointPublicKey); return rpc; }
     });
 
     const route = await router.resolve("node-peer");
     expect(route?.generation).toBe(11);
-    expect(order.slice(0, 2)).toEqual(["identity", "resolve"]);
+    expect(order.slice(0, 3)).toEqual(["resolve", "identity", "list:service-auth-key"]);
     await expect(route?.call({ action: "status", arguments: { action: "status" } }))
       .resolves.toEqual({ ok: true, data: { running: true } });
     expect(order).toContain("execute:service-auth-key:11");
@@ -154,14 +162,41 @@ describe("AuthenticatedBrowserRemoteNodeRouter", () => {
       localGeneration: 5,
       discovery: discovery() as unknown as LanDiscoveryService,
       credentials: {
-        list: () => [{ credentialReferenceId: "ref", configured: true }],
-        resolve: () => "service-auth-key"
+        list: () => [{ credentialReferenceId: "ref", generation: "one", configured: true }],
+        resolve: () => nodeCredential()
       } as unknown as CredentialManager,
       artifacts: artifactStore() as unknown as ArtifactStore,
       rpcFactory: () => rpc
     });
     const route = await router.resolve("node-peer");
     await expect(route?.call({ action: "status", arguments: { action: "status" } })).rejects.toThrow("generation changed");
+  });
+
+  it("rejects missing pins and bare legacy keys instead of deriving trust from discovery", () => {
+    expect(() => parseBrowserAutomationNodeCredential("service-auth-key")).toThrow("complete trusted connection credential");
+    expect(() => parseBrowserAutomationNodeCredential(JSON.stringify({ format: 1, serverId: "node-peer", origin: "http://192.168.1.20:4318", authKey: "service-auth-key" }))).toThrow("complete trusted connection credential");
+  });
+
+  it("refuses a discovery-origin substitution before invoking any RPC", async () => {
+    const rpcFactory = vi.fn();
+    const router = new AuthenticatedBrowserRemoteNodeRouter({ localNodeId: "node-local", localGeneration: 1,
+      discovery: discovery() as unknown as LanDiscoveryService, artifacts: artifactStore() as unknown as ArtifactStore,
+      credentials: { list: () => [{ credentialReferenceId: "ref", generation: "one", configured: true }], resolve: () => nodeCredential("https://trusted.example") } as unknown as CredentialManager,
+      rpcFactory });
+    await expect(router.resolve("node-peer")).rejects.toThrow("does not match its trusted connection");
+    expect(rpcFactory).not.toHaveBeenCalled();
+  });
+
+  it("fences a credential replacement while an identity check is awaiting its result", async () => {
+    let generation = "one";
+    const list = vi.fn(async () => [node("node-peer", 11)]);
+    const rpc: BrowserAutomationNodeRpcClient = { serverId: async () => { generation = "two"; return "node-peer"; }, list, execute: vi.fn() };
+    const router = new AuthenticatedBrowserRemoteNodeRouter({ localNodeId: "node-local", localGeneration: 1,
+      discovery: discovery() as unknown as LanDiscoveryService, artifacts: artifactStore() as unknown as ArtifactStore,
+      credentials: { list: () => [{ credentialReferenceId: "ref", generation, configured: true }], resolve: () => nodeCredential() } as unknown as CredentialManager,
+      rpcFactory: () => rpc });
+    await expect(router.resolve("node-peer")).rejects.toThrow("revoked or replaced");
+    expect(list).not.toHaveBeenCalled();
   });
 });
 

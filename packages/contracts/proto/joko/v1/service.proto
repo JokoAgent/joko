@@ -39,7 +39,12 @@ service ConnectionService {
   // Public, credential-free bootstrap metadata used by the connection screen.
   rpc ListDiscoveredNodes(ListDiscoveredNodesRequest) returns (ListDiscoveredNodesResponse);
   rpc BeginPairing(BeginPairingRequest) returns (BeginPairingResponse);
+  // Authenticated owner bootstrap for a recipient-owned paid relay identity.
+  rpc IssueIrohRelayInvitation(IssueIrohRelayInvitationRequest) returns (IssueIrohRelayInvitationResponse);
   rpc CompletePairing(CompletePairingRequest) returns (CompletePairingResponse);
+  // Possession of the private, random challenge ID permits cancelling only
+  // that challenge. No code or Connection credential is returned.
+  rpc CancelPairing(CancelPairingRequest) returns (CancelPairingResponse);
   rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
   rpc GetConnection(GetConnectionRequest) returns (GetConnectionResponse);
   rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
@@ -878,6 +883,33 @@ message BeginPairingResponse {
   PairingChallenge challenge = 1;
 }
 
+message IssueIrohRelayInvitationRequest {
+  // Caller-generated UUID, retained for a lost response; never mint a new lease
+  // by silently replacing this identifier.
+  string request_id = 1;
+  string node_endpoint_id = 2;
+  string recipient_endpoint_id = 3;
+}
+
+// Private bootstrap material. Never place it in events, discovery, public
+// settings, logs or a URL. It contains no recipient private key or issuer secret.
+message IrohRelayInvitation {
+  string request_id = 1;
+  string node_endpoint_id = 2;
+  string recipient_endpoint_id = 3;
+  string ticket = 4;
+  repeated string relay_urls = 5;
+  string relay_token = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  string origin = 8;
+  string server_id = 9;
+  string endpoint_public_key = 10;
+}
+
+message IssueIrohRelayInvitationResponse {
+  IrohRelayInvitation invitation = 1;
+}
+
 message CompletePairingRequest {
   string challenge_id = 1;
   string human_code = 2;
@@ -895,6 +927,14 @@ message CompletePairingRequest {
 
 message CompletePairingResponse {
   PairingResult result = 1;
+}
+
+message CancelPairingRequest {
+  string challenge_id = 1;
+}
+
+message CancelPairingResponse {
+  bool cancelled = 1;
 }
 
 message ListConnectionsRequest {

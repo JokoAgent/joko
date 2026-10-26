@@ -18,7 +18,7 @@ export class ProviderSharingHost {
   readonly #completed = new Map<string, { id: string; count: number; digests: readonly string[]; touchedAt: number }>();
   readonly #listeners = new Set<() => void>();
   #closed = false;
-  constructor(readonly options: { readonly store: OperationalStore; readonly serverId: string; readonly origin: string | (() => string);
+  constructor(readonly options: { readonly store: OperationalStore; readonly serverId: string; readonly origin: string | (() => string); readonly endpointPublicKey: string;
     readonly native: HostedAgentRuntime; readonly now?: () => number; readonly closeNative?: (credentialDigest: string, runId: string) => Promise<void> }) {
     this.records = new ProviderSharingStore(options.store, options.now);
   }
@@ -33,7 +33,7 @@ export class ProviderSharingHost {
     const result = this.options.store.runOperation({ id: id(input.operationId), kind: "provider_share_link", body }, () => {
       const secret = randomBytes(32).toString("base64url"), digest = hash(secret);
       const { share, link } = this.records.issue({ shareId: `provider-share-${randomUUID()}`, ...body, linkDigest: digest });
-      this.#issued.set(input.operationId, { link: contract.buildProviderSharingLink(this.origin(), secret), linkId: digest, expiresAt: link.expiresAt, shareId: share.id }); return share.id;
+      this.#issued.set(input.operationId, { link: contract.buildProviderSharingLink(this.origin(), secret, this.options.endpointPublicKey), linkId: digest, expiresAt: link.expiresAt, shareId: share.id }); return share.id;
     });
     const issued = this.#issued.get(input.operationId);
     if (!issued || issued.expiresAt <= this.now()) { this.#issued.delete(input.operationId); throw new ConnectError("The private link reply expired. Generate a new link explicitly.", Code.FailedPrecondition); }

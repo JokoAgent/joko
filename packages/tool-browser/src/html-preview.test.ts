@@ -1,12 +1,11 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { Duplex } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { chromium } from "playwright-core";
+import { WebSocketServer } from "ws";
 import { BrowserProvider } from "./provider.js";
 import { HTML_PREVIEW_CSP, installHtmlSnapshot, isWorkspaceHtmlPreviewUrl, validateHtmlSnapshot, workspaceHtmlPreviewUrl } from "./html-preview.js";
 
@@ -210,13 +209,18 @@ describe("isolated HTML snapshots", () => {
     } finally { await browser.close(); }
   }, 20_000);
 
-  it.skipIf(process.env.JOKO_BROWSER_EXECUTABLE === undefined)("loads isolated HTTP and WebSocket resources without allowing an external document navigation", async () => {
+  it.skipIf(process.env.JOKO_BROWSER_EXECUTABLE === undefined)("loads isolated HTTP and WebSocket resources without allowing an external document navigation", async (context) => {
     const requests: { readonly path: string; readonly referer: string | undefined }[] = [];
     const failures: { readonly url: string; readonly error: string | undefined }[] = [];
     const consoleMessages: string[] = [];
     const webSocketMessages: string[] = [];
     const webSocketOrigins: (string | undefined)[] = [];
-    const sockets = new Set<Duplex>();
+    const webSockets = new WebSocketServer({ noServer: true, maxPayload: 125 });
+    let phase = "server-setup", failurePhase: string | undefined;
+    context.onTestFailed(() => console.error("[isolated-html-network-phase]", JSON.stringify({
+      phase, failurePhase, requests: requests.length, requestFailures: failures.length, consoleMessages: consoleMessages.length,
+      webSocketMessages: webSocketMessages.length, webSocketOrigins: webSocketOrigins.length, openSockets: webSockets.clients.size
+    })));
     const server = createServer((request, response) => {
       requests.push({ path: request.url ?? "", referer: request.headers.referer });
       response.setHeader("Access-Control-Allow-Origin", "*");
@@ -226,41 +230,27 @@ describe("isolated HTML snapshots", () => {
       if (request.url === "/data.json") { response.setHeader("Content-Type", "application/json"); response.end('{"answer":42}'); return; }
       response.setHeader("Content-Type", "text/html"); response.end("<p>External document</p>");
     });
-    server.on("upgrade", (request, socket) => {
+    webSockets.on("connection", (socket, request) => {
       webSocketOrigins.push(request.headers.origin);
-      sockets.add(socket);
-      socket.once("close", () => sockets.delete(socket));
-      socket.once("end", () => socket.end());
-      const key = request.headers["sec-websocket-key"];
-      if (typeof key !== "string") { socket.destroy(); return; }
-      const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
-      socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-      const message = Buffer.from("server");
-      socket.write(Buffer.concat([Buffer.from([0x81, message.byteLength]), message]));
-      socket.on("data", (chunk) => {
-        if (chunk.byteLength < 6 || (chunk[1]! & 0x80) === 0) return;
-        const opcode = chunk[0]! & 0x0f;
-        const length = chunk[1]! & 0x7f;
-        if (length >= 126 || chunk.byteLength < 6 + length) return;
-        const mask = chunk.subarray(2, 6);
-        const payload = Buffer.alloc(length);
-        for (let index = 0; index < length; index += 1) payload[index] = chunk[6 + index]! ^ mask[index % 4]!;
-        if (opcode === 1) webSocketMessages.push(payload.toString("utf8"));
-        else if (opcode === 8) {
-          socket.write(Buffer.concat([Buffer.from([0x88, payload.byteLength]), payload]));
-          socket.end();
-        }
-      });
+      socket.on("message", (message, binary) => { if (!binary) webSocketMessages.push(message.toString()); });
+      socket.send("server");
     });
+    server.on("upgrade", (request, socket, head) => {
+      webSockets.handleUpgrade(request, socket, head, (connection) => webSockets.emit("connection", connection, request));
+    });
+    phase = "server-listen";
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as AddressInfo).port;
     const origin = `http://127.0.0.1:${port}`;
+    phase = "browser-launch";
     const browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     try {
+      phase = "page-create";
       const page = await browser.newPage({ serviceWorkers: "block", acceptDownloads: false });
       page.on("requestfailed", (request) => failures.push({ url: request.url(), error: request.failure()?.errorText }));
       page.on("console", (message) => consoleMessages.push(message.text()));
       const url = workspaceHtmlPreviewUrl("network-resources");
+      phase = "snapshot-install";
       await installHtmlSnapshot(page, url, { assertCurrent: () => undefined, html: `<!doctype html>
         <link rel="stylesheet" href="${origin}/style.css"><p id="network">Network</p>
         <img id="network-image" src="${origin}/pixel.svg"><script src="${origin}/script.js"></script>
@@ -283,8 +273,11 @@ describe("isolated HTML snapshots", () => {
         </script>`,
         readDocument: async (path) => ({ html: `<!doctype html><h1 id="network-details">${path}</h1>`, mediaType: "text/html" })
       });
+      phase = "initial-navigation";
       await page.goto(url);
+      phase = "network-ready";
       await page.waitForFunction(() => document.body.dataset.networkReady === "yes");
+      phase = "resource-assertions";
       expect({
         color: await page.locator("#network").evaluate((node) => getComputedStyle(node).color),
         imageWidth: await page.locator("#network-image").evaluate((node) => (node as HTMLImageElement).naturalWidth),
@@ -301,18 +294,32 @@ describe("isolated HTML snapshots", () => {
           expect.objectContaining({ path: "/pixel.svg" }), expect.objectContaining({ path: "/data.json" })]), failures: [], consoleMessages: [] });
       expect(requests.map((request) => request.path)).toEqual(expect.arrayContaining(["/style.css", "/script.js", "/pixel.svg", "/data.json"]));
       expect(requests.every((request) => request.referer === undefined)).toBe(true);
+      phase = "websocket-client-receipt";
       await expect.poll(() => webSocketMessages).toContain("client");
       expect(webSocketOrigins).toEqual(["null"]);
+      phase = "external-navigation";
       await page.locator("#external-navigation").click().catch(() => undefined);
       expect(page.url()).toBe(url);
+      phase = "local-navigation";
       await page.locator("#local-navigation").click();
+      phase = "local-document";
       await page.waitForURL("**/details.html");
       expect(await page.locator("#network-details").textContent()).toBe("details.html");
-      await expect.poll(() => sockets.size).toBe(0);
+      phase = "socket-retirement";
+      await expect.poll(() => webSockets.clients.size).toBe(0);
+    } catch (error) {
+      failurePhase = phase;
+      throw error;
     } finally {
+      phase = "browser-close";
       await browser.close();
-      for (const socket of sockets) socket.destroy();
+      phase = "fixture-socket-destroy";
+      for (const socket of webSockets.clients) socket.terminate();
+      phase = "websocket-server-close";
+      await new Promise<void>((resolve, reject) => webSockets.close((error) => error === undefined ? resolve() : reject(error)));
+      phase = "server-close";
       await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)));
+      phase = "complete";
     }
   }, 20_000);
 

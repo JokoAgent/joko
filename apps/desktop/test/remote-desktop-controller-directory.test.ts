@@ -20,6 +20,7 @@ function fixture() {
   };
   const readAuthKey = vi.fn(async () => "A".repeat(43)), factory = vi.fn(() => transport);
   const directory = createDesktopRemoteDesktopControllerDirectory({ profileId: "profile", serverId: "node", deviceId: "host", origin: "https://node.example",
+    endpointPublicKey: `ed25519:${"e".repeat(64)}`,
     current: () => current, readAuthKey, transport: factory });
   return { directory, calls, readAuthKey, factory, retire: () => { current = false; }, replace: () => { serverId = "other"; }, disconnect: () => { connected = false; }, loseReceipt: () => { unknown = true; } };
 }

@@ -20,6 +20,8 @@ message ServerInfo {
   google.protobuf.Timestamp server_time = 5;
   ServerHealth health = 6;
   bool pairing_enabled = 7;
+  // Public identity information; remote clients must obtain trust independently.
+  string endpoint_public_key = 8;
 }
 
 // Deliberately public bootstrap metadata. This message must never grow fields

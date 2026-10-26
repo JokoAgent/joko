@@ -149,11 +149,13 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   #sessionRevision = 0;
   readonly #audioStops = new Set<Promise<void>>();
   #retirement: Promise<void> | undefined;
+  readonly #heldCaptures = new Map<string, { readonly leaseId: string; readonly attemptId: string; readonly actions: Set<() => void>; pending?: Promise<void> }>();
 
   constructor(preloadPath: string, nativeCapture = new DesktopRemoteDesktopNativeCapture(),
     readonly captureStopped?: (leaseId: string) => void,
     nativeAudio: DesktopRemoteDesktopNativeAudioPort = new DesktopRemoteDesktopLinuxAudio(),
-    readonly audioSession: (signal: AbortSignal) => Promise<DesktopRemoteDesktopSessionState> = readDesktopRemoteDesktopLinuxSessionState) {
+    readonly audioSession: (signal: AbortSignal) => Promise<DesktopRemoteDesktopSessionState> = readDesktopRemoteDesktopLinuxSessionState,
+    readonly beforeCaptureClose?: (leaseId: string, attemptId: string) => Promise<void>) {
     this.#preloadPath = preloadPath;
     this.#nativeCapture = nativeCapture;
     this.#nativeAudio = nativeAudio;
@@ -180,13 +182,15 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         this.#receivePresentationPong(event, leaseId, attemptId);
       }
     );
-    ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.stopped, (event, leaseId: unknown) => {
+    ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.stopped, (event, leaseId: unknown, attemptId: unknown) => {
       this.#assertSender(event);
+      if (attemptId !== undefined && (typeof attemptId !== "string" || attemptId !== this.#attempt?.attemptId || leaseId !== this.#attempt.leaseId)) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
       const portal = this.#portal;
       if (portal !== undefined && (leaseId === undefined || leaseId === portal.leaseId)) {
         this.captureStopped?.(portal.leaseId);
       }
       this.stop();
+      return this.#drainHeldCaptures();
     });
   }
 
@@ -387,8 +391,8 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       await this.#ensurePortal(request);
       const first = await this.frame(request);
       if (first === null) throw new Error("REMOTE_DESKTOP_CAPTURE_PENDING");
-      this.#resetAttempt();
-    } else this.stop();
+      await this.#resetPortalAttempt();
+    } else { this.stop(); await this.#drainHeldCaptures(); }
     this.#nativeCapture.setWindow(request.window?.windowId ?? null);
     this.#windowCheck = request.window ? request.validateWindow : undefined;
     const generation = this.#generation;
@@ -472,7 +476,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       return reply.answerSdp;
     } catch (error) {
       if (generation === this.#generation) {
-        if (portalCapture) this.#resetAttempt(); else this.stop();
+        if (portalCapture) await this.#resetPortalAttempt(); else this.stop();
       }
       throw error;
     }
@@ -526,7 +530,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   stop(): void {
     this.#generation += 1;
     this.#portal = undefined;
-    this.#resetAttempt();
+    const previous = this.#resetAttempt();
     const ready = this.#ready;
     this.#ready = undefined;
     if (ready !== undefined) {
@@ -535,10 +539,16 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     }
     const owner = this.#window;
     this.#window = undefined;
-    if (owner !== undefined && !owner.isDestroyed()) owner.destroy();
+    if (owner !== undefined) {
+      if (previous.attempt && this.beforeCaptureClose) {
+        try { owner.webContents.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command, { op: "quiesce" } satisfies DesktopRemoteDesktopCaptureCommand); } catch { /* Retirement still runs if the isolated renderer failed. */ }
+        void this.#holdCapture(previous.attempt, () => { if (!owner.isDestroyed()) owner.destroy(); }).catch(() => {});
+      } else if (!owner.isDestroyed()) { try { owner.webContents.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command, { op: "stop" } satisfies DesktopRemoteDesktopCaptureCommand); } catch {} owner.destroy(); }
+    }
   }
 
-  #resetAttempt(): void {
+  #resetAttempt(): { readonly attempt: { readonly leaseId: string; readonly attemptId: string } | undefined; readonly owner: BrowserWindow | undefined } {
+    const previous = { attempt: this.#attempt, owner: this.#window };
     this.#windowCheck = undefined;
     this.#retireAudio();
     this.#nativeCapture.stop();
@@ -551,10 +561,29 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       clearTimeout(pending.timer);
       pending.reject(new Error("REMOTE_DESKTOP_VIDEO_STOPPED"));
     }
-    const owner = this.#window?.webContents;
-    if (owner !== undefined && !owner.isDestroyed()) owner.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command,
-      { op: "stop" } satisfies DesktopRemoteDesktopCaptureCommand);
+    return previous;
   }
+
+  async #resetPortalAttempt(): Promise<void> {
+    const previous = this.#resetAttempt(); if (!previous.owner) return;
+    const stop = (): void => { if (!previous.owner!.isDestroyed()) previous.owner!.webContents.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command, { op: "stop" } satisfies DesktopRemoteDesktopCaptureCommand); };
+    if (previous.attempt && this.beforeCaptureClose) {
+      try { previous.owner.webContents.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command, { op: "quiesce" } satisfies DesktopRemoteDesktopCaptureCommand); } catch {}
+      await this.#holdCapture(previous.attempt, stop);
+    } else stop();
+  }
+
+  #holdCapture(attempt: { readonly leaseId: string; readonly attemptId: string }, action?: () => void): Promise<void> {
+    const key = `${attempt.leaseId}:${attempt.attemptId}`;
+    let held = this.#heldCaptures.get(key);
+    if (!held) { held = { leaseId: attempt.leaseId, attemptId: attempt.attemptId, actions: new Set() }; this.#heldCaptures.set(key, held); }
+    if (action) held.actions.add(action); const original = held;
+    original.pending ??= Promise.resolve().then(() => this.beforeCaptureClose!(original.leaseId, original.attemptId)).then(() => {
+      for (const close of original.actions) close(); this.#heldCaptures.delete(key);
+    }).catch(error => { delete original.pending; throw error; });
+    return original.pending;
+  }
+  async #drainHeldCaptures(): Promise<void> { await Promise.all([...this.#heldCaptures.values()].map(held => this.#holdCapture(held))); }
 
   async #ensurePortal(request: { readonly leaseId: string; readonly current: () => boolean;
     readonly signal: AbortSignal }): Promise<PortalCaptureOwner> {
@@ -568,6 +597,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       return portal;
     }
     this.stop();
+    await this.#drainHeldCaptures();
     const generation = this.#generation;
     const portal = { leaseId: request.leaseId, current: request.current, generation,
       grant: true, selecting: false, ready: Promise.resolve() };
@@ -583,12 +613,8 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
 
   async retire(): Promise<void> {
     if (this.#retirement !== undefined) return this.#retirement;
-    if (this.#retired) {
-      await Promise.all([...this.#audioStops, this.#nativeAudio.stop(), this.#nativeCapture.release()]);
-      return;
-    }
-    this.#retired = true;
-    this.stop();
+    if (!this.#retired) { this.#retired = true; this.stop(); }
+    await this.#drainHeldCaptures();
     this.#inputHandler = undefined;
     this.#controlHandler = undefined;
     this.#presentationPongHandler = undefined;
@@ -613,6 +639,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
 
   async release(): Promise<void> {
     this.stop();
+    await this.#drainHeldCaptures();
     await this.#nativeCapture.release();
   }
 
@@ -1085,7 +1112,7 @@ function parseCaptureReply(
     const candidates = parseRemoteDesktopIceCandidates(record["candidates"]);
     if (typeof record["attemptId"] === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(record["attemptId"])
       && Number.isSafeInteger(record["next"]) && (record["next"] as number) >= 0
-      && (record["next"] as number) <= REMOTE_DESKTOP_NETWORK.maxCandidates
+      && (record["next"] as number) <= REMOTE_DESKTOP_NETWORK.maxLocalCandidates
       && typeof record["complete"] === "boolean") {
       return {
         kind: "ice",

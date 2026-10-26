@@ -749,7 +749,7 @@ describe("Orchestrator application composition", () => {
     expect(desktopConnectPreflight.headers["access-control-allow-origin"]).toBe("joko://app");
     expect(desktopConnectPreflight.headers["access-control-allow-methods"]).toContain("POST");
     expect(desktopConnectPreflight.headers["access-control-allow-headers"]).toBe(
-      "authorization, content-type, connect-protocol-version, connect-timeout-ms, x-joko-client-version"
+      "authorization, content-type, connect-protocol-version, connect-timeout-ms, x-joko-client-version, x-joko-isolated-document"
     );
     const disabledLanCors = await server.inject({
       method: "OPTIONS",

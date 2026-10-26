@@ -19,7 +19,7 @@ afterEach(async () => { for (const work of cleanup.splice(0).reverse()) await wo
 const auth = (): TaskSharingHomeAuthority => {
   const life = new AbortController(); return { deviceId: "home-device", signal: life.signal, assertCurrent: () => life.signal.throwIfAborted() };
 };
-async function fixture() {
+async function fixture(origin: string | (() => string) = "http://127.0.0.1:4327") {
   const root = mkdtempSync(join(tmpdir(), "joko-partner-identity-"));
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
   const sourceStore = new OperationalStore(join(root, "source.sqlite")), homeStore = new OperationalStore(join(root, "home.sqlite"));
@@ -32,25 +32,25 @@ async function fixture() {
   let profile: PartnerIdentityProfile = { id: "partner-one", name: "Partner", description: "Shared public description", canonicalSessionId: "canonical-one", revision: 1n }, available = true;
   const vault = await CredentialVault.open(join(root, "source.key")), homeVault = await CredentialVault.open(join(root, "home.key"));
   const sourceHome = new TaskSharingHome({ directory: join(root, "source-home"), vault, serverId: "source" }); await sourceHome.initialize();
-  const directory = new PartnerIdentityDirectory({ store: sourceStore, serverId: "source", origin: "http://127.0.0.1:4327", vault, home: sourceHome,
+  const directory = new PartnerIdentityDirectory({ store: sourceStore, serverId: "source", origin, endpointPublicKey: `ed25519:${"a".repeat(64)}`, vault, home: sourceHome,
     partner: id => { if (!available || id !== profile.id) throw new Error("Not current"); return profile; } });
   const executed: string[] = [];
   const runtime: TaskSharingRuntimePort = { canShare: id => ["canonical-one", "canonical-two"].includes(id),
     snapshot: async lease => create(contract.SnapshotSchema, { scope: { kind: { case: "session", value: { sessionId: lease.scope.sessionId } } }, sessions: [{ sessionId: lease.scope.sessionId }] }),
     read: async () => new Uint8Array(), projectEvent: () => undefined,
     prepareOperation: lease => ({ kind: "transactional", commit: () => { executed.push(lease.scope.sessionId); return Uint8Array.of(1); } }) };
-  const host = new TaskSharingHost({ store: sourceStore, serverId: "source", origin: "http://127.0.0.1:4327", generation: () => 1n, runtime,
+  const host = new TaskSharingHost({ store: sourceStore, serverId: "source", origin, endpointPublicKey: `ed25519:${"a".repeat(64)}`, generation: () => 1n, runtime,
     authorizeShare: (shareId, sessionId) => directory.authorizeScope(shareId, sessionId) }); directory.attachHost(host);
   cleanup.push(() => { host.close(); });
   const guest = createTaskSharingGuestConnectService(host), accept = vi.fn(guest.acceptTaskShareJoin!);
   const sharingTransport = createRouterTransport(router => router.service(contract.TaskSharingGuestService, { ...guest, acceptTaskShareJoin: accept }));
   const sharingRemote = { guest: createClient(contract.TaskSharingGuestService, sharingTransport), verify: vi.fn(async (id: string) => { expect(id).toBe("source"); }) };
-  const home = new TaskSharingHome({ directory: join(root, "home"), vault: homeVault, serverId: "home", connect: () => sharingRemote }); await home.initialize();
+  const home = new TaskSharingHome({ directory: join(root, "home"), vault: homeVault, serverId: "home", connect: (_origin, pin) => { expect(pin).toBe(`ed25519:${"a".repeat(64)}`); return sharingRemote; } }); await home.initialize();
   cleanup.push(() => home.dispose()); cleanup.push(() => sourceHome.dispose());
   const remote = { client: createClient(contract.PartnerIdentityGuestService, createRouterTransport(router => router.service(contract.PartnerIdentityGuestService, createPartnerIdentityGuestService(directory)))),
     verify: vi.fn(async (id: string) => { expect(id).toBe("source"); }) };
-  const createHome = () => new PartnerIdentityDirectory({ store: homeStore, serverId: "home", origin: "http://127.0.0.1:4328", vault: homeVault, home,
-    partner: () => { throw new Error("No duplicate Partner profile"); }, connect: () => remote });
+  const createHome = () => new PartnerIdentityDirectory({ store: homeStore, serverId: "home", origin: "http://127.0.0.1:4328", endpointPublicKey: `ed25519:${"b".repeat(64)}`, vault: homeVault, home,
+    partner: () => { throw new Error("No duplicate Partner profile"); }, connect: (_origin, pin) => { expect(pin).toBe(`ed25519:${"a".repeat(64)}`); return remote; } });
   const links = createHome(); let revoked = false;
   const connections = { authenticate: vi.fn((header?: string) => { if (revoked || header !== "Bearer local-owner") throw new ConnectError("Owner required", Code.Unauthenticated); return { id: "owner", deviceId: "home-device" }; }),
     fence: vi.fn(() => { if (revoked) throw new ConnectError("Revoked", Code.PermissionDenied); }), onRevoked: () => () => undefined } as unknown as ConnectionManager;
@@ -60,6 +60,25 @@ async function fixture() {
   return { root, directory, links, createHome, home, homeStore, sourceStore, homeVault, host, remote, guest: remote.client, issue, executed, accept, rpc, call,
     move: () => { profile = { ...profile, canonicalSessionId: "canonical-two", revision: profile.revision + 1n }; }, offline: () => { available = false; }, revokeOwner: () => { revoked = true; } };
 }
+
+it("uses the live invitation entrance but keeps imported aliases and sealed task routes on their captured locator", async () => {
+  let origin = "http://127.0.0.1:4327";
+  const f = await fixture(() => origin);
+  origin = "https://current.trycloudflare.com";
+  const issued = f.issue("public-identity");
+  expect(contract.parsePartnerIdentityInvitation(issued.invitation).origin).toBe(origin);
+  const link = await f.links.import(issued.invitation, "Public Partner", auth());
+  origin = "http://127.0.0.1:4327";
+  const retained = f.issue("public-identity");
+  expect(retained.invitation).toBe(issued.invitation);
+  expect(contract.parsePartnerIdentityInvitation(f.issue("fallback-identity").invitation).origin).toBe(origin);
+  const opened = await f.links.open(create(contract.OpenPartnerIdentityRequestSchema, { operationId: "open-published", linkId: link.linkId, displayName: "Guest" }), auth());
+  expect(opened.joined?.share?.hostOrigin).toBe("https://current.trycloudflare.com");
+  await f.home.refreshDirectory(auth());
+  expect(f.home.list().joined[0]?.share?.hostOrigin).toBe("https://current.trycloudflare.com");
+  await expect(f.home.snapshot(opened.joined!.joinId, auth())).resolves.toMatchObject({ share: { hostOrigin: "https://current.trycloudflare.com" } });
+  expect((await f.createHome().open(create(contract.OpenPartnerIdentityRequestSchema, { operationId: "open-after-withdrawal", linkId: link.linkId, displayName: "Guest" }), auth())).joined?.joinId).toBe(opened.joined!.joinId);
+});
 
 it("opens the current canonical over generated services, seals aliases, and re-resolves one identity after a primary move", async () => {
   const f = await fixture(), issued = f.issue(), secret = contract.parsePartnerIdentityInvitation(issued.invitation).secret;

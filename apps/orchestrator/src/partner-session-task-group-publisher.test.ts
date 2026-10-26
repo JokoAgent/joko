@@ -17,7 +17,7 @@ const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "joko-task-group-publish-")), store = new OperationalStore(":memory:");
-  const host = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId: "task-home", origin: "http://127.0.0.1", mediaDirectory: join(root, "media"),
+  const host = new PartnerNetworkHost({ storage: new PartnerNetworkStore(store), serverId: "task-home", origin: "http://127.0.0.1", endpointPublicKey: `ed25519:${"a".repeat(64)}`, mediaDirectory: join(root, "media"),
     partner: id => ({ id, name: "Aster", description: "Partner" }) });
   const room = host.create(create(contract.CreatePartnerNetworkRequestSchema, { operationId: "group-create", name: "Project", displayName: "Owner", partnerIds: ["aster"] }));
   const actor = room.members.find(member => member.kind === "partner")!;

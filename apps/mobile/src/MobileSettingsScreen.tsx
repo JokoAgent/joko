@@ -25,6 +25,7 @@ import {
 } from "./mobile-locale-preference";
 import { mobileMessage, type MobileMessageKey } from "./mobile-messages";
 import { validMobileDeviceName } from "./mobile-device-name";
+import { MobileDevicePairingInvitation } from "./MobileDevicePairingInvitation";
 import { MobileVoiceDictionaryScreen } from "./MobileVoiceDictionaryScreen";
 import { MobileVoiceDictionaryReadOnlyScreen } from "./MobileVoiceDictionaryReadOnlyScreen";
 import type { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
@@ -52,7 +53,7 @@ export interface MobileSettingsColors {
 }
 
 export type MobileSettingsClient = Pick<MobileClient,
-  "renameCurrentDevice" | "resetCurrentDevice" | "reconcile" | "dismissUnconfirmed">;
+  "renameCurrentDevice" | "resetCurrentDevice" | "reconcile" | "dismissUnconfirmed"> & Partial<Pick<MobileClient, "authorizeNewDevice" | "cancelDevicePairing">>;
 
 export interface MobileSettingsScreenProps {
   readonly colors: MobileSettingsColors;
@@ -119,7 +120,7 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
   return {
     profile,
     device,
-    ownerKey: `${profile.profileId}\u001f${profile.serverId}\u001f${profile.connectionId}\u001f${profile.deviceId}`
+    ownerKey: `${profile.profileId}\u001f${profile.serverId}\u001f${profile.connectionId}\u001f${profile.deviceId}\u001f${profile.origin}\u001f${profile.endpointPublicKey ?? ''}\u001f${profile.transportKind ?? 'https'}`
   };
 }
 
@@ -433,6 +434,9 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     {!online && current && <Notice colors={colors} text={foreground
       ? t("settings.identityReconnect")
       : t("settings.identityBackground")} />}
+    {current && client.authorizeNewDevice && client.cancelDevicePairing && <MobileDevicePairingInvitation
+      client={{ authorizeNewDevice: client.authorizeNewDevice.bind(client), cancelDevicePairing: client.cancelDevicePairing.bind(client) }}
+      owner={current.ownerKey} colors={colors} locale={locale.effectiveLocale} iroh={current.profile.transportKind === 'iroh'} />}
     <NavigationRow label={t("settings.allDevices")} description={t("settings.allDevicesDescription")}
       colors={colors} onPress={onDevices} />
 

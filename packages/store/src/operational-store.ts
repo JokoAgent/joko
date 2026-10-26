@@ -2508,15 +2508,28 @@ export class OperationalStore {
     return (rows as Row[]).map(pairingFromRow);
   }
 
+  /** Retain the issue for rate limiting while making its code unusable across restarts. */
+  cancelPairing(id: string, cancelledAt = this.now()): boolean {
+    if (!Number.isSafeInteger(cancelledAt)) throw new RangeError("Pairing cancellation requires an integer timestamp.");
+    return this.write(() => {
+      const result = this.database.prepare(`
+        UPDATE pairings SET expires_at = ?, revision = ?
+        WHERE id = ? AND consumed_at IS NULL AND expires_at > ?
+      `).run(cancelledAt, asSqlInteger(this.requireActiveRevision()), id, cancelledAt);
+      return result.changes === 1;
+    });
+  }
+
   prunePairings(options: PrunePairingsOptions): number {
-    if (!Number.isSafeInteger(options.expiredBefore) || !Number.isSafeInteger(options.consumedBefore)) {
+    const expiredCreatedBefore = options.expiredCreatedBefore ?? options.expiredBefore;
+    if (!Number.isSafeInteger(options.expiredBefore) || !Number.isSafeInteger(options.consumedBefore) || !Number.isSafeInteger(expiredCreatedBefore)) {
       throw new RangeError("Pairing prune cutoffs must be integer timestamps.");
     }
     return this.write(() => {
       const expired = this.database.prepare(`
         DELETE FROM pairings
-        WHERE consumed_at IS NULL AND expires_at <= ?
-      `).run(options.expiredBefore);
+        WHERE consumed_at IS NULL AND expires_at <= ? AND created_at <= ?
+      `).run(options.expiredBefore, expiredCreatedBefore);
       const consumed = this.database.prepare(`
         DELETE FROM pairings
         WHERE consumed_at IS NOT NULL

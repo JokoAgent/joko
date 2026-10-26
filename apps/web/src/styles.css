@@ -459,6 +459,9 @@ time { color: var(--text-faint); font-size: var(--text-11); white-space: nowrap;
 .connection-tabs button { min-height: 32px; display: flex; align-items: center; justify-content: center; gap: 7px; border-radius: 9px; background: transparent; color: var(--text-soft); font-size: var(--text-14); font-weight: 650; }
 .connection-tabs button svg { width: 18px; height: 18px; }
 .connection-tabs button.is-active { background: var(--surface-raised); box-shadow: 0 3px 10px rgb(0 0 0 / .1); color: var(--text); }
+.connection-transport-choice { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 4px; border-radius: 13px; background: var(--surface-sunken); }
+.connection-transport-choice button { min-height: 36px; border-radius: 9px; background: transparent; color: var(--text-soft); font-size: var(--text-14); font-weight: 650; }
+.connection-transport-choice button.is-active { background: var(--surface-raised); color: var(--text); }
 .connection-card .error-banner { margin: 10px 4px 0; border: 1px solid color-mix(in srgb, var(--red) 30%, var(--line)); border-radius: 9px; }
 .profile-list { display: grid; align-content: start; gap: 12px; padding: 20px 6px 6px; }
 .connection-card > .profile-list { flex: 1; }
@@ -4329,7 +4332,7 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 }
 
 @media (pointer: coarse) {
-  .connection-card .button, .connection-tabs button { min-height: 44px; }
+  .connection-card .button, .connection-tabs button, .connection-transport-choice button { min-height: 44px; }
   .connection-auto-choice, .pair-form .lan-http-confirm { min-height: 44px; }
   .pair-form input { font-size: var(--text-16); }
 }

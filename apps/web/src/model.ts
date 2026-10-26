@@ -22,6 +22,10 @@ export interface ConnectionProfile {
   readonly serverId: string;
   readonly name: string;
   readonly origin: string;
+  /** Full endpoint key received through a trusted local/bootstrap/invitation channel. */
+  readonly endpointPublicKey?: string;
+  /** Backend selection only; private SDK locators stay in protected storage. */
+  readonly transportKind?: import('@joko/connection-transport/trust').EndpointTransportKind;
   readonly lastConnectedAt?: number;
 }
 
@@ -5971,6 +5975,15 @@ export type ArtifactDownloadOutcome = "saved" | "dispatched" | "cancelled";
 
 export interface McpAppApi {
   operate(request: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").McpAppServiceOperateRequestSchema>, signal?: AbortSignal): Promise<import("@joko/contracts").McpAppServiceOperateResponse>;
+  openSurface?(proxyUrl: string, signal: AbortSignal): Promise<McpAppBrowserSurface>;
+}
+
+export interface McpAppBrowserSurface {
+  readonly html: string;
+  readonly policy: string;
+  invoke(input: { readonly op: "message"; readonly message: unknown } | { readonly op: "poll"; readonly after: number }
+    | { readonly op: "open-link"; readonly linkId: string; readonly url: string }
+    | { readonly op: "link-result"; readonly linkId: string; readonly success: boolean }): Promise<unknown>;
 }
 
 export type ExtensionNetworkApi = Pick<import("@connectrpc/connect").Client<typeof import("@joko/contracts").ExtensionNetworkService>, "get" | "change"> & {
@@ -6411,6 +6424,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   setDeviceControllerAllowed(controllerDeviceId: string, allowed: boolean): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
   logoutConnection(connectionId: string): Promise<void>;
+  authorizeNewDevice?(options?: import("@joko/connection-transport/trust").NewDeviceAuthorizationOptions): Promise<import("@joko/connection-transport/trust").NodePairingInvitation>;
+  cancelDevicePairing?(invitation: import("@joko/connection-transport/trust").NodePairingInvitation): Promise<void>;
   saveProvider(draft: ProviderDraft, signal?: AbortSignal): Promise<void>;
   deleteProvider(providerId: string): Promise<void>;
   refreshProviderModels(backendId: string, providerId?: string, automatic?: boolean): Promise<void>;

@@ -36,6 +36,7 @@ import type { ExtensionProjectPolicies, ExtensionProject } from "./extension-pro
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
+import { issueAuthorizedIrohRelayInvitation } from "./linkspan-iroh-lease.js";
 import {
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM,
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM,
@@ -606,8 +607,9 @@ export interface ConnectServiceDependencies {
     readonly displayName?: string;
     readonly version?: string;
     readonly apiVersion?: string;
-    readonly publicOrigin?: string;
+    readonly publicOrigin?: string | (() => string);
     readonly pairingEnabled?: boolean;
+    readonly endpointPublicKey?: string;
   };
   /** Changes whenever the in-memory Orchestrator runtime is replaced. Durable event cursors are fenced by it. */
   readonly generation?: bigint;
@@ -1393,7 +1395,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
       displayName: "Joko",
       version: "0.1.0",
       apiVersion: "joko.v1",
-      publicOrigin: application.config.publicOrigin
+      endpointPublicKey: application.linkspanIdentity?.publicKey ?? "",
+      publicOrigin: application.advertisedOrigin ?? application.config.publicOrigin
     }
   };
   scheduleDeletionRetryDisposed.delete(application.store);
@@ -1405,7 +1408,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const now = dependencies.now ?? Date.now;
   const generation = dependencies.generation ?? 1n;
   const sharingHost = application.taskSharingHome === undefined ? undefined : new TaskSharingHost({
-    store: dependencies.store, serverId: application.serverId, origin: application.config.publicOrigin,
+    store: dependencies.store, serverId: application.serverId, origin: application.advertisedOrigin ?? application.config.publicOrigin,
+    endpointPublicKey: application.linkspanIdentity!.publicKey,
     generation: () => generation, artifacts: application.artifacts,
     ...(application.partnerIdentity === undefined ? {} : { authorizeShare: (shareId: string, sessionId: string) => application.partnerIdentity!.authorizeScope(shareId, sessionId) }),
     runtime: createTaskSharingRuntime(dependencies, new TaskSharingReads(dependencies, () => generation))
@@ -1591,10 +1595,35 @@ export function createConnectServices(application: OrchestratorApplication, proj
           challengeId: challenge.id,
           // Anonymous clients never receive the secret; an authenticated owner may explicitly reopen pairing.
           humanCode: owner ? challenge.code : "",
-          verificationUri: `${dependencies.server?.publicOrigin ?? ""}/pair`,
+          verificationUri: `${serverPublicOrigin(dependencies)}/pair`,
           expiresAt: toProtoTimestamp(challenge.expiresAt)
         })
       };
+    },
+    issueIrohRelayInvitation: async (request, context) => {
+      const owner = authenticate(context);
+      const revoked = new AbortController();
+      const stop = dependencies.connections.onRevoked(owner.id, () => revoked.abort());
+      const signal = AbortSignal.any([context.signal, revoked.signal]);
+      const assertCurrent = (): void => {
+        signal.throwIfAborted();
+        const current = authenticate(context);
+        if (current.id !== owner.id || current.authKeyDigest !== owner.authKeyDigest) throw new ConnectError("The original connection was revoked.", Code.PermissionDenied);
+      };
+      try {
+        assertCurrent();
+        const invitation = await issueAuthorizedIrohRelayInvitation(application, { requestId: request.requestId,
+          nodeEndpointId: request.nodeEndpointId, recipientEndpointId: request.recipientEndpointId,
+          ownerConnectionId: owner.id, signal, assertCurrent });
+        assertCurrent();
+        return { invitation: create(contract.IrohRelayInvitationSchema, { ...invitation,
+          relayUrls: [...invitation.relayUrls], expiresAt: toProtoTimestamp(invitation.expiresAt) }) };
+      } finally { stop(); }
+    },
+    cancelPairing: (request, context) => {
+      const authorization = context.requestHeader.get("authorization");
+      if (authorization !== null) dependencies.connections.authenticate(authorization);
+      return { cancelled: dependencies.connections.cancelPairing(request.challengeId) };
     },
     completePairing: (request, context) => {
       let existingDevice: DeviceRecord | undefined;
@@ -1874,6 +1903,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
             throw new ConnectError("The durable event history no longer contains the requested cursor; fetch a new snapshot.", Code.FailedPrecondition);
           }
         }
+        // A successful empty v1 response confirms that authentication, cursor
+        // validation and durable replay completed. It flushes an idle stream
+        // without inventing an Event or advancing the consumer's cursor.
+        if (context.signal.aborted) return;
+        dependencies.connections.fence(authenticated);
+        yield {};
         let observed = highWater;
         while (!context.signal.aborted) {
           const item = await queue.next();
@@ -7010,6 +7045,11 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
   return { accepted: record.status === "completed", resultCase: "acknowledgement" };
 }
 
+function serverPublicOrigin(dependencies: ConnectServiceDependencies): string {
+  const origin = dependencies.server?.publicOrigin;
+  return typeof origin === "function" ? origin() : origin ?? "";
+}
+
 export function serverInfo(dependencies: ConnectServiceDependencies, at: number): contract.ServerInfo {
   return create(contract.ServerInfoSchema, {
     serverId: dependencies.server?.id ?? "orchestrator",
@@ -7018,7 +7058,8 @@ export function serverInfo(dependencies: ConnectServiceDependencies, at: number)
     apiVersion: dependencies.server?.apiVersion ?? "joko.v1",
     serverTime: toProtoTimestamp(at),
     health: contract.ServerHealth.HEALTHY,
-    pairingEnabled: dependencies.server?.pairingEnabled ?? dependencies.connections.pairingEnabled
+    pairingEnabled: dependencies.server?.pairingEnabled ?? dependencies.connections.pairingEnabled,
+    endpointPublicKey: dependencies.server?.endpointPublicKey ?? ""
   });
 }
 
@@ -7026,7 +7067,7 @@ function fallbackDiscoveredNode(dependencies: ConnectServiceDependencies, at: nu
   return {
     serverId: dependencies.server?.id ?? "orchestrator",
     displayName: dependencies.server?.displayName ?? "Joko",
-    origin: dependencies.server?.publicOrigin ?? "",
+    origin: serverPublicOrigin(dependencies),
     version: dependencies.server?.version ?? "0.1.0",
     apiVersion: dependencies.server?.apiVersion ?? "joko.v1",
     pairingEnabled: dependencies.server?.pairingEnabled ?? dependencies.connections.pairingEnabled,
@@ -13524,7 +13565,7 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
     connectionProfiles: dependencies.store.listConnections().map((item) => create(contract.ConnectionProfileSettingsSchema, {
       connectionProfileId: item.id,
       displayName: item.name,
-      serverOrigin: dependencies.server?.publicOrigin ?? "",
+      serverOrigin: serverPublicOrigin(dependencies),
       reconnectAutomatically: true,
       desktopNotifications: false,
       lastConnectedAt: item.lastSeenAt === undefined ? undefined : toProtoTimestamp(item.lastSeenAt)

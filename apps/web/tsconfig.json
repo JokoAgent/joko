@@ -10,5 +10,5 @@
     "types": ["vite/client"]
   },
   "references": [{ "path": "../../packages/contracts" }],
-  "include": ["src/**/*.ts", "src/**/*.tsx", "model-viewer-assets.ts", "pdfjs-assets.ts", "vite.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "model-viewer-assets.ts", "pdfjs-assets.ts", "linkspan-assets.ts", "vite.config.ts"]
 }

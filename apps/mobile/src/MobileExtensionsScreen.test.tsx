@@ -146,6 +146,7 @@ function transport(ownerKey = "owner-a", value = catalog()): MobileExtensionTran
       ? { kind: "newTask" as const }
       : { kind: "task" as const, sessionId: destination.sessionId }),
     openMainView: vi.fn(async () => { throw new Error("No main-view fixture was configured."); }),
+    readMainViewResource: vi.fn(async () => { throw new Error("No main-view resource fixture was configured."); }),
     probeMainView: vi.fn(async () => { throw new Error("No main-view fixture was configured."); }),
     closeMainView: vi.fn(async () => true),
     openLibrary: vi.fn(async () => { throw new Error("unused"); }),
