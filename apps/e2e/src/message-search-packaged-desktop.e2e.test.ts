@@ -286,14 +286,18 @@ packagedIt("searches completed and paged older messages through packaged Desktop
 
   const earlyPage = await manager.clients.session.listSessionTimeline({ sessionId: alphaSessionId, limit: 240 });
   const earlyEventIds = new Set(earlyPage.events.map((event) => event.eventId));
-  for (let turn = 0; turn < 230; turn += 1) {
+  // Fill through the actual paging boundary rather than running extra turns
+  // after every original event has already left the newest page.
+  let latestPage = earlyPage;
+  for (let turn = 0; turn < 230 && (latestPage.nextBeforeCursor === undefined
+    || latestPage.events.some((event) => earlyEventIds.has(event.eventId))); turn += 1) {
     const generation = BigInt(fixture.application.store.getSession(alphaSessionId).descriptor.binding.generation);
     const sent = await submit(manager.clients.operation, manager.connectionId,
       sendInputMutation(alphaSessionId, generation, `timeline filler ${turn}`));
     await waitFor(() => manager.clients.run.getRun({ runId: queueRunIdFrom(sent) }),
       (run) => run.run?.state === RunState.SUCCEEDED, `completed Timeline filler ${turn}`);
+    latestPage = await manager.clients.session.listSessionTimeline({ sessionId: alphaSessionId, limit: 240 });
   }
-  const latestPage = await manager.clients.session.listSessionTimeline({ sessionId: alphaSessionId, limit: 240 });
   expect(latestPage.nextBeforeCursor).toBeDefined();
   expect(latestPage.events.some((event) => earlyEventIds.has(event.eventId))).toBe(false);
 

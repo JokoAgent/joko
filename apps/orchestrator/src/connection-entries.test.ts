@@ -9,9 +9,10 @@ describe('live node entrance directory', () => {
     try {
       store.setSetting('service', 'orchestrator', 'runtime.linkspan.quick', { state: 'active', publicOrigin: 'https://stale.example' });
       expect(connectionEntryDirectory(app).entries).toHaveLength(1);
-      const retire = publishConnectionEntry(store, { id: 'linkspan:relay', provider: 'tailcat', origin: 'https://home.example',
+      const retire = publishConnectionEntry(store, { id: 'linkspan:relay', provider: 'tailcat', displayName: 'Home relay', origin: 'https://home.example',
         allowPrivateAddressPairing: true, transport: { kind: 'tailcat', endpointId: `nodekey:${'c'.repeat(64)}`, address: 'tcPRIVATE', port: 443 } });
       expect(JSON.stringify(connectionEntryDirectory(app))).not.toContain('tcPRIVATE');
+      expect(connectionEntryDirectory(app).entries[1]?.displayName).toBe('Home relay');
       const result = await prepareConnectionEntry(app, { entryId: 'linkspan:relay', requestId: crypto.randomUUID(),
         clientPublicKey: `nodekey:${'b'.repeat(64)}`, connectionId: 'device-connection', signal: new AbortController().signal, assertCurrent() {} });
       expect(result.locator.case).toBe('tailcat');

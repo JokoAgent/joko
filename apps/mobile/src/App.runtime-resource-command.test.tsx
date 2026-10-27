@@ -109,6 +109,7 @@ beforeAll(async () => {
   vi.doMock("expo-constants", () => ({ default: {} }));
   vi.doMock("expo-crypto", () => ({ randomUUID: () => "selected-occurrence", getRandomBytes: (count: number) => new Uint8Array(count).fill(1) }));
   vi.doMock("expo-clipboard", () => ({}));
+  vi.doMock("expo-camera", () => ({ CameraView: () => null, useCameraPermissions: () => [undefined, vi.fn()] }));
   for (const name of ["expo-image-picker", "expo-image-manipulator", "expo-image", "expo-sharing", "expo-file-system", "expo-media-library", "expo-audio", "expo-network", "expo-secure-store", "expo-notifications", "expo-application"]) vi.doMock(name, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => undefined }));
   vi.doMock("expo-modules-core", () => ({ requireNativeModule: () => ({}), requireOptionalNativeModule: () => ({}), NativeModule: class {}, EventEmitter: class {} }));
   vi.doMock("expo", () => ({ requireOptionalNativeModule: () => null }));

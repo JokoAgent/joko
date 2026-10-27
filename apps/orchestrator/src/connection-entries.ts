@@ -11,6 +11,7 @@ import { issueAuthorizedIrohRelayInvitation } from './linkspan-iroh-lease.js';
 export interface PublishedConnectionEntry {
   readonly id: string;
   readonly provider: string;
+  readonly displayName?: string;
   readonly origin: string;
   readonly transport?: EndpointTransport;
   readonly managedIrohLease?: boolean;
@@ -41,7 +42,7 @@ function entriesForStore(store: OperationalStore, origin: string): PublishedConn
     ...published.get(store)?.values() ?? []];
 }
 function summary(entry: PublishedConnectionEntry) {
-  return create(NodeConnectionEntrySchema, { entryId: entry.id, displayName: entry.id === 'direct' ? 'Direct' : `${entry.provider} · ${entry.id.replace(/^linkspan:/u, '')}`,
+  return create(NodeConnectionEntrySchema, { entryId: entry.id, displayName: entry.displayName ?? (entry.id === 'direct' ? 'Direct' : `${entry.provider} · ${entry.id.replace(/^linkspan:/u, '')}`),
     provider: entry.provider, origin: entry.origin, transportKind: entry.transport?.kind ?? 'https',
     requiresClientIdentity: entry.transport?.kind === 'iroh' || entry.transport?.kind === 'tailcat',
     requiresServerSetup: entry.transport?.kind === 'tailcat' && !entry.allowPrivateAddressPairing });

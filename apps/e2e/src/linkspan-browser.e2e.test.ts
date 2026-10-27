@@ -185,6 +185,17 @@ mountedIt('pairs the production Web through selected WebRTC and restores the pin
     expect(connections).toHaveLength(1);
     fixture.application.connections.revoke(connections[0]!.id);
     await page.reload(); await page.locator('.connection-screen').waitFor({ timeout: 60_000 });
+    await expect.poll(() => automatic.getAttribute('aria-checked')).toBe('false');
+    expect(await page.evaluate(() => new Promise<number>((resolve, reject) => {
+      const open = indexedDB.open('joko-ui'); open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const database = open.result, count = database.transaction('secrets', 'readonly').objectStore('secrets').count();
+        count.onsuccess = () => { database.close(); resolve(count.result); };
+        count.onerror = () => { database.close(); reject(count.error); };
+      };
+    }))).toBe(0);
+    await page.reload(); await page.locator('.connection-screen').waitFor({ timeout: 30_000 });
+    expect(await automatic.getAttribute('aria-checked')).toBe('false');
     await screenshot('webrtc-revoked-connection');
     if (evidence !== undefined) await writeFile(join(evidence, 'receipt.json'), JSON.stringify({ transport: 'webrtc', actualSignalingRequests: fixture.webRtcSignalingRequests,
       selectedAssets, selectedRequested: selectedAssets.filter(asset => requested.has(asset)), unselectedRequested: [], nodeAssets, wasmRequested: false,

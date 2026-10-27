@@ -61,41 +61,63 @@ jobs:
           sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev ripgrep
       - name: Prepare Linkspan from remote main
         run: node scripts/prepare-linkspan.mjs
+      - name: Preserve the actual Linkspan source build receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-linkspan-source-${{ runner.os }}-${{ github.sha }}
+          path: |
+            .runtime/linkspan-packages/manifest.json
+            .runtime/linkspan-packages/*/dist/source-build.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
       - run: pnpm install --frozen-lockfile
       - name: Check contracts, boundaries, source inputs, production builds and types
+        id: source_check
         run: pnpm check
         env:
           NODE_OPTIONS: --max-old-space-size=4096
+      - name: Collect affected type diagnostics after a source check failure
+        if: ${{ failure() && steps.source_check.outcome == 'failure' }}
+        run: pnpm --filter @joko/orchestrator --filter @joko/web --filter @joko/mobile --filter @joko/e2e -r --workspace-concurrency=2 --no-bail typecheck
       - name: Verify transport and peer authority lifecycles
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         run: pnpm --filter @joko/connection-transport --filter @joko/device-peer test
       - name: Verify service security, pairing, recovery and hosted TURN
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         working-directory: apps/orchestrator
-        run: pnpm exec vitest run linkspan src/config.test.ts src/server-security.test.ts src/connection-manager.test.ts src/service-device-peer-agent.test.ts src/remote-desktop-ice-configuration.test.ts src/remote-desktop-coordinator.test.ts
+        run: pnpm exec vitest run linkspan server-access src/connection-entries.test.ts src/config.test.ts src/server-security.test.ts src/connection-manager.test.ts src/service-device-peer-agent.test.ts src/remote-desktop-ice-configuration.test.ts src/remote-desktop-coordinator.test.ts
       - name: Verify current product pairing, files, receipts and Mobile authorization
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         working-directory: apps/e2e
         run: pnpm exec vitest run --config vitest.config.ts src/linkspan.e2e.test.ts src/linkspan-mobile-bridge.e2e.test.ts
       - name: Verify client trust, cancellation and private storage
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         working-directory: apps/web
-        run: pnpm exec vitest run src/desktop-linkspan-binding.test.ts src/components/ConnectionScreen.test.tsx src/components/ConnectionScreen.connection-choice.test.tsx src/connection-origin.test.ts src/local-state-credentials.test.ts src/gateway.auth-context.test.ts src/controller.event-connection.test.tsx src/controller.native-task-status-source.test.tsx src/controller.partner-source.test.tsx src/controller.catalog-node.test.tsx src/shared-owner-events.test.ts src/shared-owner-events-broker.test.ts
+        run: pnpm exec vitest run src/components/ServerAccessSettings.test.tsx src/components/DeviceAuthorization.test.tsx src/desktop-linkspan-binding.test.ts src/components/ConnectionScreen.test.tsx src/components/ConnectionScreen.connection-choice.test.tsx src/connection-origin.test.ts src/local-state-credentials.test.ts src/gateway.auth-context.test.ts src/controller.event-connection.test.tsx src/controller.native-task-status-source.test.tsx src/controller.partner-source.test.tsx src/controller.catalog-node.test.tsx src/shared-owner-events.test.ts src/shared-owner-events-broker.test.ts
       - name: Verify Mobile storage and runtime primitives
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         working-directory: apps/mobile
-        run: pnpm exec vitest run src/connection-storage.test.ts src/mobile-client.test.ts src/network.test.ts src/network.native-upload.test.ts src/MobileSharedConnectionScreen.test.tsx src/mobile-abort-runtime.test.ts src/mobile-iroh-native.test.ts src/mobile-http-connect-native.test.ts linkspan
+        run: pnpm exec vitest run src/MobileSettingsScreen.test.tsx src/connection-storage.test.ts src/mobile-client.test.ts src/network.test.ts src/network.native-upload.test.ts src/MobileSharedConnectionScreen.test.tsx src/mobile-abort-runtime.test.ts src/mobile-iroh-native.test.ts src/mobile-http-connect-native.test.ts linkspan
       - name: Verify native host connection retirement
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         working-directory: apps/desktop
         run: pnpm exec vitest run test/native-host-security.test.ts test/remote-desktop-viewer-connection.test.ts test/input-handoff-native-host.test.ts test/secure-files.test.ts
       - name: Install Chromium for actual production module loading
-        if: runner.os == 'Linux'
+        id: browser_install
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && runner.os == 'Linux' }}
         working-directory: apps/e2e
         run: pnpm exec playwright-core install --with-deps chromium
       - name: Verify actual production browser requests
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() && steps.browser_install.outcome == 'success' && runner.os == 'Linux' }}
         shell: bash
         env:
           JOKO_LINKSPAN_BROWSER_EVIDENCE_DIR: ${{ runner.temp }}/joko-network-browser
         run: |
           export JOKO_BROWSER_EXECUTABLE="$(pnpm --filter @joko/e2e exec node --input-type=module -e 'import {chromium} from "playwright-core"; process.stdout.write(chromium.executablePath())')"
           export JOKO_MOUNTED_WEB_DIR="$GITHUB_WORKSPACE/apps/web/dist"
-          pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/linkspan-browser.e2e.test.ts
+          pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/linkspan-browser.e2e.test.ts src/server-access-browser.e2e.test.ts
       - name: Preserve production browser transport and appearance evidence
         if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4

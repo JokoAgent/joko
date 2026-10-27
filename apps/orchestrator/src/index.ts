@@ -23,6 +23,8 @@ export * from "./connection-entries.js";
 export * from "./linkspan-identity.js";
 export * from "./linkspan-server.js";
 export * from "./linkspan-tcp-server.js";
+export * from "./server-access-manager.js";
+export * from "./server-access-runtime.js";
 export * from "./collaboration-manager.js";
 export { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 export * from "./objective-manager.js";

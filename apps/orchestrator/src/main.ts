@@ -6,10 +6,10 @@ import {
   createManagedOutboundProxyResolver
 } from "@joko/contracts/managed-outbound-proxy";
 import type { FastifyInstance } from "fastify";
-import { formatTrustedNodeInvitation } from "@joko/connection-transport/trust";
+import { formatTrustedNodeInvitation } from '@joko/connection-transport/trust';
 
 import { createOrchestratorApplication } from "./application.js";
-import { loadConfig, readTls } from "./config.js";
+import { loadConfig } from "./config.js";
 import {
   DESKTOP_BOOTSTRAP_REQUEST_FD,
   DESKTOP_BOOTSTRAP_RESPONSE_FD,
@@ -21,11 +21,9 @@ import {
 import { needsLocalPairingRecovery } from "./local-pairing-recovery.js";
 import { createInternalServer, createPublicServer } from "./server.js";
 import { createLinkspanIngress } from "./linkspan-server.js";
-import { startManagedLinkspanConnector } from "./linkspan-connector.js";
-import { linkspanHttpConnectTransport, linkspanMediaUdpEntryId, readLinkspanDeployment } from "./linkspan-deployment.js";
-import { startManagedProviderConnector } from "./linkspan-provider-connector.js";
-import { startLinkspanSdkIngress } from "./linkspan-sdk-server.js";
-import { manageLinkspanResource, resolveManagedLinkspanConnector } from "./linkspan-resource-manager.js";
+import { createServerAccessRuntime } from './server-access-runtime.js';
+import { linkspanMediaUdpEntryId, readLinkspanDeployment } from "./linkspan-deployment.js";
+import { manageLinkspanResource } from "./linkspan-resource-manager.js";
 import { withOfflineLinkspanContext } from "./linkspan-offline-context.js";
 import { issuePrivateIrohRelayInvitation } from "./linkspan-iroh-lease.js";
 import { recoverOfflineEndpointIdentity } from "./linkspan-recovery.js";
@@ -155,57 +153,18 @@ async function main(): Promise<void> {
     const bridgeOrigin = await bridge.listen({ host: "127.0.0.1", port: 0 });
     lifecycle.assertStartupActive();
     lifecycle.registerTransport(createLinkspanIngress(application, { backendOrigin: bridgeOrigin, server: server.server }));
-    if (config.linkspan !== undefined) {
-      const ingress = lifecycle.registerTransport(createLinkspanIngress(application, { backendOrigin: bridgeOrigin,
-        ...(config.tls === undefined ? {} : { tls: readTls(config)! }) }));
-      const localOrigin = await ingress.listen({ host: "127.0.0.1", port: config.linkspan.port });
-      lifecycle.assertStartupActive();
-      if (config.linkspan.cloudflaredExecutable !== undefined) {
-        const connector = lifecycle.registerTransport(await startManagedLinkspanConnector(application, {
-          executable: config.linkspan.cloudflaredExecutable, localOrigin, signal: lifecycle.signal,
-          originCaPool: config.linkspan.originCaPool!, originServerName: config.linkspan.originServerName!
-        }));
-        lifecycle.assertStartupActive();
-        process.stdout.write(`Joko public encrypted endpoint: ${JSON.stringify({ origin: connector.publicOrigin,
-          serverId: application.serverId, endpointPublicKey: application.linkspanIdentity?.publicKey,
-          provider: "cloudflare", mode: "quick", helperTarget: `${process.platform}-${process.arch}`, limits: connector.limits,
-          carrierVerification: { trafficQuota: "not_verified", singleConnectionDuration: "not_verified",
-            maximumMessageBytes: "not_verified", idleTimeout: "not_verified" } })}\n`);
-      }
-      if (config.linkspan.deploymentPath !== undefined) {
-        const entries = await readLinkspanDeployment(config.linkspan.deploymentPath, lifecycle.signal);
-        lifecycle.assertStartupActive();
-        for (const entry of entries) {
-          if (entry.connector === undefined) continue;
-          if (entry.connector.provider === "iroh" || entry.connector.provider === "tailcat") {
-            const sdk = lifecycle.registerTransport(await startLinkspanSdkIngress(application, { id: entry.id, connector: entry.connector }, { backendOrigin: bridgeOrigin, signal: lifecycle.signal }));
-            lifecycle.assertStartupActive();
-            process.stdout.write(`Joko private SDK invitation: ${JSON.stringify({ entryId: entry.id, provider: sdk.provider, invitationPath: sdk.invitationPath, limits: sdk.limits })}\n`);
-            continue;
-          }
-          const endpointTransport = linkspanHttpConnectTransport(entry.connector);
-          if (endpointTransport === undefined && config.tls === undefined) throw new Error("Public HTTP/TCP connectors require the configured JOKO_TLS_CERT and JOKO_TLS_KEY.");
-          const selectedConnector = await resolveManagedLinkspanConnector(application, { entryId: entry.id, connector: entry.connector });
-          lifecycle.assertStartupActive();
-          const encryptedStreamTarget = endpointTransport === undefined ? undefined
-            : await lifecycle.registerTransport((await import("./linkspan-tcp-server.js")).createLinkspanTcpIngress(application,
-              { backendOrigin: bridgeOrigin, signal: lifecycle.signal })).listen();
-          lifecycle.assertStartupActive();
-          const connector = lifecycle.registerTransport(await startManagedProviderConnector(application, { id: entry.id, connector: selectedConnector }, {
-            ...(encryptedStreamTarget === undefined
-              ? { localOrigin, originCaPool: config.linkspan.originCaPool!, originServerName: config.linkspan.originServerName! }
-              : { encryptedStreamTarget }), signal: lifecycle.signal
-          }));
-          lifecycle.assertStartupActive();
-          process.stdout.write(`Joko public encrypted endpoint: ${JSON.stringify({ entryId: entry.id, provider: entry.connector.provider,
-            origin: connector.publicOrigin, serverId: application.serverId, endpointPublicKey: application.linkspanIdentity?.publicKey,
-            ...(connector.endpointTransport === undefined ? {} : { endpointTransport: connector.endpointTransport }), limits: connector.limits })}\n`);
-          if (connector.endpointTransport !== undefined) {
-            process.stdout.write(`Joko trusted node invitation: ${formatTrustedNodeInvitation({ origin: connector.publicOrigin,
-              serverId: application.serverId, endpointPublicKey: application.linkspanIdentity!.publicKey, endpointTransport: connector.endpointTransport })}\n`);
-          }
+    if (application.serverAccess) {
+      lifecycle.registerTransport(application.serverAccess);
+      await application.serverAccess.attach(createServerAccessRuntime(application, bridgeOrigin, (record, publication) => {
+        if (publication.invitationPath) process.stdout.write(`Joko private SDK invitation: ${JSON.stringify({ entryId: record.entryId, provider: record.provider, invitationPath: publication.invitationPath, limits: publication.limits })}\n`);
+        else if (publication.publicOrigin) {
+          const identity = { origin: publication.publicOrigin, serverId: application.serverId, endpointPublicKey: application.linkspanIdentity!.publicKey };
+          process.stdout.write(`Joko public encrypted endpoint: ${JSON.stringify({ ...identity, entryId: record.entryId, provider: record.provider, mode: record.mode, limits: publication.limits,
+            ...(publication.endpointTransport ? { endpointTransport: publication.endpointTransport } : {}) })}\n`);
+          if (publication.endpointTransport) process.stdout.write(`Joko trusted node invitation: ${formatTrustedNodeInvitation({ ...identity, endpointTransport: publication.endpointTransport })}\n`);
         }
-      }
+      }));
+      lifecycle.assertStartupActive();
     }
     await internalServer.listen({ host: "127.0.0.1", port: config.internalPort });
     lifecycle.assertStartupActive();

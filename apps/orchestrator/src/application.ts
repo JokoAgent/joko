@@ -286,8 +286,9 @@ import {
   type RemoteDesktopIceConfigurationProvider
 } from "./remote-desktop-coordinator.js";
 import { ConfiguredRemoteDesktopIceConfiguration, REMOTE_DESKTOP_ICE_RESPONSE_BYTES } from "./remote-desktop-ice-configuration.js";
-import { LinkspanRemoteDesktopTurnConfiguration } from "./linkspan-turn-configuration.js";
-import { LinkspanRemoteDesktopUdpMapping } from "./linkspan-media-udp.js";
+import { ServerAccessManager } from './server-access-manager.js';
+import { ServerAccessMedia } from './server-access-runtime.js';
+import { reserveLinkspanTurnCredentials } from './linkspan-turn-configuration.js';
 import { reserveManagedLinkspanResourceCredentials } from "./linkspan-resource-manager.js";
 import { reserveIrohRelayLeaseCredentials } from "./linkspan-iroh-lease.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
@@ -430,6 +431,8 @@ export interface OrchestratorApplication {
   /** Stable, public node identity used by ServerInfo and LAN discovery deduplication. */
   readonly serverId: string;
   readonly linkspanIdentity?: LinkspanIdentity;
+  readonly serverAccess?: ServerAccessManager;
+  readonly serverAccessMedia?: ServerAccessMedia;
   /** Current published locator; deployment TLS and private bridge configuration stay separate. */
   readonly advertisedOrigin?: () => string;
   readonly lanDiscovery: LanDiscoveryService;
@@ -877,6 +880,8 @@ export async function createOrchestratorApplication(
     storagePath: join(config.dataDirectory, "credentials", "records.json")
   });
   await credentials.initialize();
+  const serverAccess = new ServerAccessManager({ config, serverId, store, credentials, connections });
+  reserveLinkspanTurnCredentials(store, credentials);
   reserveManagedLinkspanResourceCredentials({ config, store, credentials });
   reserveIrohRelayLeaseCredentials({ store, credentials });
   const providerCredentialSurfaces = new ProviderCredentialSurfaceResolver({
@@ -897,24 +902,16 @@ export async function createOrchestratorApplication(
     connector: dependencies.remoteSshConnector ?? new Ssh2ResolvedAgentAuthConnector()
   });
   const devicePeers = new DevicePeerOwner({ store, localDesktopHostConnection: connection => connections.isLocalDesktopHostConnection(connection) });
-  const mediaUdp = config.remoteDesktopUdp === undefined ? undefined : new LinkspanRemoteDesktopUdpMapping({ config, store, serverId, credentials,
-    isLocalDesktopRoute: identity => devicePeers.isLocalDesktopRoute(identity) });
-  await mediaUdp?.initialize();
-  const hostedTurn = config.remoteDesktopTurn === undefined ? undefined : new LinkspanRemoteDesktopTurnConfiguration({
-    configuration: config.remoteDesktopTurn, store, credentials,
-    fetch: createOutboundFetch(dependencies.resolveOutboundProxy, REMOTE_DESKTOP_ICE_RESPONSE_BYTES)
-  });
-  // Reconcile saved resources before accepting a new media lease. Unknown
-  // generations are retained; this does not replay their issuance.
-  if (dependencies.remoteDesktopIceConfiguration === undefined) await hostedTurn?.initialize();
+  const serverAccessMedia = new ServerAccessMedia({ config, store, serverId, credentials,
+    isLocalDesktopRoute: identity => devicePeers.isLocalDesktopRoute(identity),
+    fetch: createOutboundFetch(dependencies.resolveOutboundProxy, REMOTE_DESKTOP_ICE_RESPONSE_BYTES),
+    fallbackIce: dependencies.remoteDesktopIceConfiguration ?? new ConfiguredRemoteDesktopIceConfiguration({
+      configuration: config.remoteDesktopIce, fetch: createOutboundFetch(dependencies.resolveOutboundProxy, REMOTE_DESKTOP_ICE_RESPONSE_BYTES) }) });
   const remoteDesktop = new RemoteDesktopCoordinator({
     owner: devicePeers,
-    ...(mediaUdp === undefined ? {} : { udpMapping: mediaUdp }),
+    udpMapping: serverAccessMedia.udp,
     onRevoked: (connectionId, listener) => connections.onRevoked(connectionId, listener),
-    iceConfiguration: dependencies.remoteDesktopIceConfiguration ?? hostedTurn ?? new ConfiguredRemoteDesktopIceConfiguration({
-      configuration: config.remoteDesktopIce,
-      fetch: createOutboundFetch(dependencies.resolveOutboundProxy, REMOTE_DESKTOP_ICE_RESPONSE_BYTES)
-    })
+    iceConfiguration: serverAccessMedia.ice
   });
   const remoteExecution = new RemoteExecutionRouter({ hosts: remoteHosts, peers: devicePeers });
   const partnerHomeProjects = new PartnerHomeProjects({ execution: remoteExecution, home: targetId => partnerHomeRuntime?.executionHome(targetId), codeHost: new CodeHostProjectProvider() });
@@ -3382,6 +3379,8 @@ export async function createOrchestratorApplication(
     connections,
     serverId,
     linkspanIdentity,
+    serverAccess,
+    serverAccessMedia,
     advertisedOrigin,
     lanDiscovery,
     artifacts,
@@ -3532,6 +3531,7 @@ export async function createOrchestratorApplication(
         serviceCleanups.clear();
         deferredBackendRestarts?.dispose();
         for (const cleanup of cleanups) await attempt(cleanup);
+        await attempt(() => serverAccess.close());
         await attempt(() => hostedAgentSources?.stopDiscovery());
         await attempt(() => inputHandoff?.close());
         await attempt(() => inputHandoffNotifications?.close());

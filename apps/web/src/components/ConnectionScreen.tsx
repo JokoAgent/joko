@@ -100,6 +100,15 @@ export function ConnectionScreen({ controller, t, initialInvitation }: { readonl
     state.capabilities?.challengePairing === true ? false : state.preferences.automaticConnectionTarget !== undefined
       || (state.automaticConnectionAvailable && state.managedOrchestratorStatus !== undefined && state.managedOrchestratorStatus.state !== "disabled")
   );
+  const automaticChoiceKey = state.preferences.automaticConnectionTarget?.kind === 'profile'
+    ? `profile:${state.preferences.automaticConnectionTarget.profileId}` : state.preferences.automaticConnectionTarget?.kind;
+  const lastAutomaticChoice = useRef(automaticChoiceKey);
+  useEffect(() => {
+    if (lastAutomaticChoice.current === automaticChoiceKey) return;
+    lastAutomaticChoice.current = automaticChoiceKey;
+    setRememberAutomatically(automaticChoiceKey !== undefined);
+    setSavedAutomaticChoices({});
+  }, [automaticChoiceKey]);
   const isConnecting = state.connectionState === "connecting";
   const actionsDisabled = busy !== undefined || state.busy === true || state.interactive === false;
   const challengePairing = state.capabilities?.challengePairing === true;

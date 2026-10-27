@@ -17,12 +17,12 @@ import { publishConnectionEntry } from './connection-entries.js';
 interface SdkRecord { readonly requestId: string; readonly processId: number; readonly processIdentity: string; readonly state: "starting" | "active" | "closed" }
 
 /** Backend-specific addresses stay in private invitations, never public discovery. */
-export async function startLinkspanSdkIngress(application: OrchestratorApplication, entry: { readonly id: string; readonly connector: SdkDeployment }, input: {
+export async function startLinkspanSdkIngress(application: OrchestratorApplication, entry: { readonly id: string; readonly displayName?: string; readonly connector: SdkDeployment }, input: {
   readonly backendOrigin: string; readonly signal: AbortSignal;
 }) {
   const { connector: config } = entry, identity = application.linkspanIdentity;
   if (identity === undefined) throw new Error("The node's trusted identity is unavailable.");
-  if (config.provider === "iroh" && config.servicesApiSecretPath !== undefined && (!config.relayUrls || config.relayUrls.length === 0)) {
+  if (config.provider === "iroh" && (config.servicesApiSecretPath !== undefined || config.servicesApiSecret !== undefined) && (!config.relayUrls || config.relayUrls.length === 0)) {
     throw new Error("An iroh issuer requires explicitly configured relay URLs before starting a paid relay endpoint.");
   }
   if (!isAbsolute(config.invitationDirectory)) throw new Error("SDK invitations require an absolute private directory outside source/workspace roots.");
@@ -55,12 +55,18 @@ export async function startLinkspanSdkIngress(application: OrchestratorApplicati
   let retireIssuer: (() => void) | undefined;
   let retireEntry: (() => void) | undefined;
   const markClosed = (): void => { store.setSetting("service", "orchestrator", journal, { requestId, processId: process.pid, processIdentity, state: "closed" }); };
-  const close = (): Promise<void> => closing ??= (async () => {
-    retireEntry?.(); retireEntry = undefined;
-    retireIssuer?.(); retireIssuer = undefined;
-    shutdown.abort(); for (const channel of active) channel.abort();
-    await listener?.close(); await acceptLoop; await Promise.all(serving); markClosed();
-  })();
+  const close = (): Promise<void> => {
+    if (closing) return closing;
+    const pending = (async () => {
+      retireEntry?.(); retireEntry = undefined;
+      retireIssuer?.(); retireIssuer = undefined;
+      shutdown.abort(); for (const channel of active) channel.abort();
+      await listener?.close(); await acceptLoop; await Promise.all(serving); markClosed();
+    })();
+    closing = pending;
+    void pending.catch(() => { if (closing === pending) closing = undefined; });
+    return pending;
+  };
   try {
     if (config.provider === "iroh") {
       if (!/^[a-f0-9]{64}$/u.test(config.secretKeyHex)) throw new Error("The iroh server requires a private 32-byte identity key in its deployment configuration.");
@@ -68,7 +74,7 @@ export async function startLinkspanSdkIngress(application: OrchestratorApplicati
         import("@jokoagent/linkspan-iroh/node"), import("@jokoagent/linkspan-iroh-node")
       ]);
       configureIrohRuntime(fileURLToPath(new URL("../dist/linkspan-runtime/iroh", import.meta.url)));
-      let servicesApiSecret: string | undefined;
+      let servicesApiSecret: string | undefined = config.servicesApiSecret;
       if (config.servicesApiSecretPath !== undefined) {
         if (!isAbsolute(config.servicesApiSecretPath)) throw new Error("The iroh issuer-secret file must be absolute and outside source/workspace roots.");
         const path = await realpath(config.servicesApiSecretPath);
@@ -117,8 +123,9 @@ export async function startLinkspanSdkIngress(application: OrchestratorApplicati
       return { state: "active", provider: config.provider, endpointId: endpointTransport.endpointId };
     });
     retireEntry = publishConnectionEntry(store, { id: `linkspan:${entry.id}`, provider: config.provider,
+      ...(entry.displayName ? { displayName: entry.displayName } : {}),
       origin: application.config.publicOrigin, transport: endpointTransport,
-      ...(config.provider === 'iroh' ? { managedIrohLease: config.servicesApiSecretPath !== undefined }
+      ...(config.provider === 'iroh' ? { managedIrohLease: config.servicesApiSecretPath !== undefined || config.servicesApiSecret !== undefined }
         : { allowedClients: config.allowedClients, allowPrivateAddressPairing: config.allowPrivateAddressPairing === true }) });
     return destination;
   }

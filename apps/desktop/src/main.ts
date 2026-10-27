@@ -2927,7 +2927,8 @@ async function verifyPackagedSmokeTimelineSystemClipboard(window: BrowserWindow)
       window,
       ".timeline-copy-block--table",
       ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)",
-      systemClipboardFixture.tableText
+      systemClipboardFixture.tableText,
+      [mermaidFingerprint.imageSha256]
     );
     recordPackagedSmokeProgress("timeline_table_system_clipboard_verified");
 
@@ -2941,7 +2942,8 @@ async function verifyPackagedSmokeTimelineSystemClipboard(window: BrowserWindow)
       window,
       ".timeline-copy-block--math",
       ":scope > button.timeline-copy-block__button:not(.timeline-copy-block__annotate)",
-      systemClipboardFixture.mathText
+      systemClipboardFixture.mathText,
+      [mermaidFingerprint.imageSha256, tableFingerprint.imageSha256]
     );
     copyActionsSettled = true;
     if (new Set([
@@ -3117,7 +3119,8 @@ async function waitForPackagedSmokeTimelineClipboard(
   window: BrowserWindow,
   blockSelector: string,
   buttonSelector: string,
-  expectedText: string
+  expectedText: string,
+  previousImageHashes: readonly string[] = []
 ): Promise<PackagedSmokeClipboardFingerprint> {
   const deadline = Date.now() + 20_000;
   let lastObservation = "unavailable";
@@ -3128,6 +3131,10 @@ async function waitForPackagedSmokeTimelineClipboard(
     const text = clipboard.readText("clipboard");
     const size = image.getSize();
     const png = image.isEmpty() ? Buffer.alloc(0) : image.toPNG();
+    // New text alone must not accept the preceding PNG. Keep the distinct-image
+    // requirement inside this Copy action's existing observation deadline.
+    const imageSha256 = createHash("sha256").update(png).digest("hex");
+    const distinctImage = !previousImageHashes.includes(imageSha256);
     const validPng = !image.isEmpty() && size.width >= 1 && size.height >= 1 && png.byteLength > 8
       && png.subarray(0, 8).toString("hex") === PACKAGED_SMOKE_PNG_SIGNATURE
       && !nativeImage.createFromBuffer(png).isEmpty();
@@ -3140,16 +3147,18 @@ async function waitForPackagedSmokeTimelineClipboard(
       imageEmpty: image.isEmpty(),
       imageSize: size,
       pngBytes: png.byteLength,
+      imageSha256,
+      distinctImage,
       validPng,
       formats: clipboard.availableFormats("clipboard")
     });
-    if (state === "settled" && text === expectedText && !image.isEmpty()) {
+    if (state === "settled" && text === expectedText && !image.isEmpty() && distinctImage) {
       if (!validPng) {
         throw new Error(`Packaged smoke ${blockSelector} system clipboard PNG was invalid.`);
       }
       return Object.freeze({
         text: expectedText,
-        imageSha256: createHash("sha256").update(png).digest("hex")
+        imageSha256
       });
     }
     await waitForPackagedSmokePoll();

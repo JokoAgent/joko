@@ -257,6 +257,18 @@ describe("ConnectionScreen connection choice", () => {
     container.remove();
   });
 
+  it('updates the visible automatic choice after revocation clears the persisted target', async () => {
+    const controller = controllerFixture({ automaticConnectionTarget: { kind: 'profile', profileId: remoteProfile.id } });
+    const container = document.body.appendChild(document.createElement('div')), root = createRoot(container);
+    try {
+      await act(async () => root.render(<ConnectionScreen controller={controller} t={translator} />));
+      expect(container.querySelector<HTMLInputElement>('.connection-auto-choice input')?.checked).toBe(true);
+      const revoked = { ...controller, state: { ...controller.state, preferences: { ...controller.state.preferences, automaticConnectionTarget: undefined } } };
+      await act(async () => root.render(<ConnectionScreen controller={revoked} t={translator} />));
+      expect(container.querySelector<HTMLInputElement>('.connection-auto-choice input')?.checked).toBe(false);
+    } finally { await act(async () => root.unmount()); container.remove(); }
+  });
+
   it("disables automatic entry when the browser cannot persist encrypted credentials", async () => {
     Object.defineProperty(window, "isSecureContext", { configurable: true, value: false });
     const controller = controllerFixture({ managedOrchestratorStatus: { state: "starting" }, automaticConnectionAvailable: false });

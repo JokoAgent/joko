@@ -973,6 +973,8 @@ import { createSessionRuntimeGateway, type SessionRuntimeModelSelection } from "
 export type GatewayConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting" | "offline";
 
 import { deviceAuthorizationOwner } from '@joko/connection-transport/device-authorization';
+import { serverAccessClient } from '@joko/connection-transport/server-access';
+import { ServerAccessService } from '@joko/contracts';
 export interface GatewayCallbacks {
   readonly onState?: (state: GatewayConnectionState, statusMessage?: string) => void;
   /** Projection updates do not establish or restore an Event connection. */
@@ -1030,6 +1032,7 @@ export interface PairingOutcome {
 
 export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage">, AppDefaultModelUiPort {
   deviceAuthorizationOwner?(): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
+  serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
   inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi;
   providerSharingApi(): ProviderSharingApi;
   partnerNetworkApi(): PartnerNetworkApi;
@@ -1130,6 +1133,14 @@ const localUserInputOperations = new Map<string, LocalUserInputOperation>();
 const deviceNameOperationIds = new Map<string, string>();
 
 class ConnectOrchestratorGateway implements OrchestratorGateway {
+  serverAccess(): import('@joko/connection-transport/server-access').ServerAccessClient {
+    if (this.#taskSharing) throw new GatewayError('A normal node connection is required.');
+    const scope = this.captureActionScope();
+    return serverAccessClient(createClient(ServerAccessService, scope.transport), () => {
+      scope.signal.throwIfAborted();
+      if (this.#transport !== scope.transport) throw new GatewayError('The original node connection changed.');
+    }, `${this.#profile?.serverId}:${this.#profile?.id}`);
+  }
   deviceAuthorizationOwner(): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner {
     if (this.#taskSharing) throw new GatewayError('A normal node connection is required.');
     const scope = this.captureActionScope();

@@ -11,6 +11,8 @@ import {
   DeviceSchema,
   SnapshotSchema
 } from "@joko/contracts";
+import { GetServerAccessSettingsResponseSchema, ServerAccessEntrySchema } from '@joko/contracts';
+import { MobileServerAccessSettings } from './MobileServerAccessSettings';
 import { emptyMobileAutomationsState } from "./mobile-automation";
 import type { MobileState, SavedMobileConnection } from "./mobile-client";
 import { emptyMobileFilesState } from "./workspace-files";
@@ -416,6 +418,43 @@ function deferred<T>() {
 }
 
 describe("MobileSettingsScreen", () => {
+  it('manages server access natively and requires confirmation before stopping', async () => {
+    const container = document.createElement('div'); root = createRoot(container);
+    const entry = create(ServerAccessEntrySchema, { entryId: 'home', name: 'Home relay', provider: 'iroh', mode: 'relay', revision: 'r1', source: 'gui', state: 'active', enabled: true, configuredSecrets: ['servicesApiSecret'] });
+    const change = vi.fn(async () => {}), api = { change, save: vi.fn(), read: async (requestId?: string) => create(GetServerAccessSettingsResponseSchema, { entries: [entry], operationState: requestId ? 'completed' : '' }) };
+    await act(async () => root!.render(<MobileServerAccessSettings getApi={() => api} colors={colors} locale="en" />));
+    await act(async () => button(container, 'Edit').click());
+    const secret = container.querySelector<HTMLInputElement>('input[aria-label="Restricted relay issuer secret"]');
+    expect(secret).toBeNull();
+    await act(async () => button(container, 'More options').click());
+    expect(container.querySelector<HTMLInputElement>('input[aria-label="Restricted relay issuer secret"]')!.value).toBe('');
+    await act(async () => button(container, 'Cancel').click());
+    await act(async () => button(container, 'Stop').click());
+    expect(button(container, 'Confirm').disabled).toBe(true); expect(change).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+    await act(async () => button(container, 'Confirm').click());
+    expect(change).toHaveBeenCalledWith(expect.objectContaining({ action: 'stop', expectedRevision: 'r1', confirmDisconnection: true }));
+  });
+  it('accepts a server enable while polling and keeps the newer result when the poll returns', async () => {
+    vi.useFakeTimers();
+    try {
+      const container = document.createElement('div'); root = createRoot(container);
+      let entry = create(ServerAccessEntrySchema, { entryId: 'media', name: 'coturn', provider: 'coturn', mode: 'turn', revision: 'r1', source: 'gui', state: 'saved' });
+      const read = vi.fn(async (id?: string) => create(GetServerAccessSettingsResponseSchema, { entries: [entry], operationState: id ? 'completed' : '' }));
+      const change = vi.fn(async () => { entry = create(ServerAccessEntrySchema, { ...entry, state: 'active', enabled: true }); });
+      const api = { read, change, save: vi.fn() };
+      await act(async () => root!.render(<MobileServerAccessSettings getApi={() => api} colors={colors} locale="en" />));
+      const stale = create(GetServerAccessSettingsResponseSchema, { entries: [entry] });
+      let finish!: (value: typeof stale) => void;
+      read.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+      await act(async () => { vi.advanceTimersByTime(3000); });
+      await act(async () => button(container, 'Check and enable').click());
+      expect(change).toHaveBeenCalledOnce(); expect(container.textContent).toContain('Enabled');
+      await act(async () => { finish(stale); });
+      expect(container.textContent).toContain('Enabled'); expect(container.textContent).not.toContain('Saved · not enabled');
+    } finally { await act(async () => root?.unmount()); root = undefined; vi.useRealTimers(); }
+  });
+
   it('opens a matching review without approving, and refuses a stale request ID', async () => {
     const container = document.createElement('div'); root = createRoot(container);
     const review = { serverId: 'node', endpointPublicKey: `ed25519:${'a'.repeat(64)}`, invitationId: '11111111-1111-4111-8111-111111111111', requestId: '22222222-2222-4222-8222-222222222222' };

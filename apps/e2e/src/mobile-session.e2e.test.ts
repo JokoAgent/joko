@@ -632,14 +632,20 @@ describe("native mobile device through the durable product chain", () => {
     const logoutOwner = (await logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;
     const connectionRevision = logoutOwner.connections.find((item) => item.connectionId === logoutConnectionId)?.version?.revision;
     expect(connectionRevision?.value).toBeGreaterThan(0n);
+    const logoutId = randomUUID();
     const loggedOut = await submit(logoutClients.operation, logoutConnectionId, create(OperationMutationSchema, {
       preconditions: [create(OperationPreconditionSchema, {
         entity: create(EntityRefSchema, { kind: EntityKind.CONNECTION, id: logoutConnectionId }),
         expectedRevision: connectionRevision
       })],
       payload: { case: "logoutConnection", value: create(LogoutConnectionMutationSchema, { connectionId: logoutConnectionId }) }
-    }));
-    expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
+    }), logoutId).catch((error: unknown) => {
+      expect(error).toMatchObject({ code: Code.Aborted });
+      return undefined;
+    });
+    if (loggedOut) expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
+    expect(fixture.application.store.getOperation(logoutId).status).toBe("completed");
+    expect((await ownerClient.clients.connection.getConnection({ connectionId: logoutConnectionId })).connection?.state).toBe(ConnectionState.REVOKED);
     await expect(logoutClients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).rejects.toBeDefined();
   });
 

@@ -24,7 +24,7 @@ export interface PrivateIrohRelayInvitation {
 
 /** Only a live, explicitly configured publishing instance may grant relay use. */
 export function registerIrohRelayIssuer(application: Pick<OrchestratorApplication, "store">, input: ActiveIssuer): () => void {
-  if (input.configuration.servicesApiSecretPath === undefined) return () => undefined;
+  if (input.configuration.servicesApiSecretPath === undefined && input.configuration.servicesApiSecret === undefined) return () => undefined;
   if (!input.configuration.relayUrls?.length) throw new Error("A managed relay issuer requires its explicitly selected relay URLs.");
   let entries = issuers.get(application.store);
   if (entries === undefined) { entries = new Map(); issuers.set(application.store, entries); }
@@ -73,7 +73,7 @@ export async function issueAuthorizedIrohRelayInvitation(application: Pick<Orche
     return invitation;
   }
   const issuer = issuers.get(application.store)?.get(input.nodeEndpointId);
-  if (issuer === undefined || !issuer.configuration.servicesApiSecretPath || !issuer.configuration.relayUrls?.length) throw new Error("The selected node entrance has no live managed relay issuer.");
+  if (issuer === undefined || !(issuer.configuration.servicesApiSecretPath || issuer.configuration.servicesApiSecret) || !issuer.configuration.relayUrls?.length) throw new Error("The selected node entrance has no live managed relay issuer.");
   const activeIssuer: ActiveIssuer = issuer;
   const ttlSeconds = issuer.configuration.relayLeaseTtlSeconds ?? 3600;
   if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 60 || ttlSeconds > 86400) throw new Error("The relay-use lease TTL must be from 60 to 86400 seconds.");
@@ -119,11 +119,15 @@ export async function issueAuthorizedIrohRelayInvitation(application: Pick<Orche
     operation = application.store.claimDeferredEffectOperation({ id: requestId, kind: "connection.iroh.relay-lease", body }, current => {
       current.setSetting("service", "orchestrator", PREFIX + requestId, record);
     }).operation;
-    const secretPath = activeIssuer.configuration.servicesApiSecretPath!;
-    if (!isAbsolute(secretPath)) throw new Error("The issuer secret requires an absolute private file.");
-    const [secret, workspace, source] = await Promise.all([realpath(secretPath), realpath(application.config.workspace.root), realpath(fileURLToPath(new URL("../../../", import.meta.url)))]);
-    if ([workspace, source].some(root => within(root, secret))) throw new Error("The issuer secret must remain outside source/workspace roots.");
-    assertCurrent(); const apiSecret = await readIceToken(secret, input.signal); assertCurrent();
+    let apiSecret = activeIssuer.configuration.servicesApiSecret;
+    if (apiSecret === undefined) {
+      const secretPath = activeIssuer.configuration.servicesApiSecretPath!;
+      if (!isAbsolute(secretPath)) throw new Error("The issuer secret requires an absolute private file.");
+      const [secret, workspace, source] = await Promise.all([realpath(secretPath), realpath(application.config.workspace.root), realpath(fileURLToPath(new URL("../../../", import.meta.url)))]);
+      if ([workspace, source].some(root => within(root, secret))) throw new Error("The issuer secret must remain outside source/workspace roots.");
+      assertCurrent(); apiSecret = await readIceToken(secret, input.signal);
+    }
+    assertCurrent();
     const { issueIrohRelayLease } = await import("@jokoagent/linkspan-iroh-services");
     const lease = await issueIrohRelayLease({ apiSecret, endpointId: input.recipientEndpointId, ttlSeconds, signal: input.signal });
     assertCurrent();

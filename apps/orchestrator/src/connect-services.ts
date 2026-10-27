@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createServerAccessConnectService } from './server-access-connect-service.js';
 import { TaskShareStore } from "@joko/store";
 import { taskShareEventAuthor } from "./task-sharing-author.js";
 import { TaskSharingHost } from "./task-sharing-host.js";
@@ -1170,6 +1171,7 @@ const RUNTIME_GENERATION = BigInt(Date.now());
 
 /** Register all public v1 services. Every descriptor method receives a concrete handler. */
 export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
+  router.service(contract.ServerAccessService, withConnectErrors(createServerAccessConnectService(application)), { readMaxBytes: 65536 });
   const services = createConnectServices(application, projectionShutdownSignal);
   if (application.hostedAgents) router.service(contract.HostedAgentService, createHostedAgentConnectService(application.hostedAgents.connectOptions()),
     { readMaxBytes: HOSTED_AGENT_WIRE_ENVELOPE_BYTES, writeMaxBytes: HOSTED_AGENT_WIRE_ENVELOPE_BYTES });

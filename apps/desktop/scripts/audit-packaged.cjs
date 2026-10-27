@@ -1266,7 +1266,9 @@ async function auditDesktopLinkspanRuntime(applicationRoot) {
   for (const manifest of manifests.values()) {
     for (const [name, version] of Object.entries(manifest.dependencies ?? {})) {
       const dependency = manifests.get(name);
-      if (dependency === undefined || dependency.version !== version) {
+      // Source consumers deliberately use "*" for internal dependencies. Their
+      // generation is the common source receipt checked above, not a release.
+      if (dependency === undefined || (version !== "*" && dependency.version !== version)) {
         throw new Error("The packaged Desktop carrier dependency closure is incomplete or has a conflicting generation.");
       }
     }

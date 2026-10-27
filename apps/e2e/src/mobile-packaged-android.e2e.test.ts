@@ -267,6 +267,9 @@ async function runNativeScenario(): Promise<void> {
     await launch();
     try {
       await tap("Add Joko node");
+      // The tab click can return while accessibility still exposes Nearby.
+      // Wait for the actual add page before searching its scrollable viewport.
+      await waitNode(node => node.enabled && (node.text === "Connect to Joko" || node.contentDescription === "Connect to Joko"), "the connection method choices");
       await tap("Manual configuration", true);
       await scrollToNode(node => node.enabled && (node.text === "Joko node address"
         || node.contentDescription === "Joko node address"), "the expanded manual node address");

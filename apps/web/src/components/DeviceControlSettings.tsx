@@ -3,6 +3,7 @@ import type { AppController } from "../controller.js";
 import type { AppSnapshot, DeviceControlRelationView, DeviceView } from "../model.js";
 import { DevicePairingInvitation } from "./DevicePairingInvitation.js";
 import { ConnectionEntries } from './ConnectionEntries.js';
+import { ServerAccessSettings } from './ServerAccessSettings.js';
 import type { RunAction, Translator } from "./types.js";
 import { Button, Pill, StatusDot, cx, formatRelativeTime, SwitchControl } from "./ui.js";
 import { desktopRemoteDesktopViewerOwner, openDesktopRemoteDesktopViewer } from "../remote-desktop-viewer-bridge.js";
@@ -66,6 +67,7 @@ export function DeviceControlSettings({ controller, snapshot, locale, runAction,
     {activeProfile.endpointPublicKey && controller.refreshConnectionEntries && <div className="settings-card connection-settings-entries"><ConnectionEntries profile={activeProfile} controller={controller} t={t} disabled={entriesBusy} run={(name, action) => runAction(name, async () => {
       setEntriesBusy(true); try { await action(); } finally { setEntriesBusy(false); }
     })} /></div>}
+    <ServerAccessSettings controller={controller} t={t} />
     <DevicePairingInvitation controller={controller} t={t} />
     <div className="device-control-settings__heading">
       <div>

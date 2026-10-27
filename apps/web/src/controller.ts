@@ -26,6 +26,7 @@ import { isWorkspaceHtmlPreviewVisible, WorkspaceHtmlAutoReload } from "./worksp
 import {
   createOrchestratorGateway,
   discoverOrchestratorNodesAt,
+  isUnauthenticatedError,
   probeOrchestratorOrigin,
   probeOrchestratorRuntimeActivityAt,
   type ExtensionNotificationKind,
@@ -234,6 +235,7 @@ export interface ControllerState {
 export interface AppController extends OperationApi {
   readonly deviceAuthorization?: DeviceAuthorizationPort;
   deviceAuthorizationOwner?(): DeviceAuthorizationOwner;
+  serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
   readonly readDesktopMenuBarUsage?: (source: DesktopMenuBarSource, signal: AbortSignal, refreshAccounts?: boolean) => Promise<DesktopMenuBarUsage>;
   readonly taskSharing?: TaskSharingApi;
   readonly inputHandoff?: InputHandoffApi;
@@ -1328,12 +1330,34 @@ export function useAppController(): AppController {
       : adoptConnectionUnlocked(profile, options, attempt)); }
     catch (error) {
       if (attempt.signal.aborted) return false;
+      let failure = error;
+      if (entryAttemptRef.current === attempt && !gatewayRef.current && isUnauthenticatedError(error)) {
+        partnerDirectoryRef.current?.invalidate(profile.id);
+        if (shouldDeleteInvalidatedConnectionCredential(profile)) {
+          try { await local.deleteAuthKey(profile.id); }
+          catch (cleanup) { failure = new Error(`${messageOf(error)} ${messageOf(cleanup)}`); }
+        }
+        if (entryAttemptRef.current === attempt && !attempt.signal.aborted
+          && automaticConnectionTargetMatchesProfile(preferencesRef.current.automaticConnectionTarget, profile.id, [profile])) {
+          automaticPreferenceIntentRef.current += 1;
+          await updatePreferences({ automaticConnectionTarget: undefined }).catch(() => undefined);
+        }
+      }
+      // Startup projects a connecting screen before entrance/authorization
+      // preflight. Failure there precedes the gateway transition's own catch.
+      // Retain a healthy gateway when a manually selected candidate fails.
+      if (entryAttemptRef.current === attempt && !gatewayRef.current) {
+        activeProfileRef.current = undefined;
+        connectionStateRef.current = 'disconnected';
+        setState(current => ({ ...current, activeProfile: undefined, connectionState: 'disconnected',
+          snapshot: emptySnapshot(), statusMessage: undefined, error: messageOf(failure) }));
+      }
       const saved = await local.readConnectionEntries?.(profile);
       if (saved && entryAttemptRef.current === attempt && !forgottenProfilesRef.current.has(profile.id)) projectEntries(activeProfileRef.current?.id === profile.id ? activeProfileRef.current : profile, saved);
-      throw error;
+      throw failure;
     }
     finally { if (entryAttemptRef.current === attempt) entryAttemptRef.current = undefined; }
-  }, [adoptConnectionUnlocked, projectEntries]);
+  }, [adoptConnectionUnlocked, projectEntries, updatePreferences]);
   const connectProfile = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions, callerIsCurrent: () => boolean = () => true): Promise<boolean> => {
     const leave = beginConnectionLeave();
     try {
@@ -3324,6 +3348,11 @@ export function useAppController(): AppController {
   }, [connectProfile]);
   return useMemo<AppController>(() => ({
     deviceAuthorization,
+    serverAccess: () => {
+      const api = gateway().serverAccess?.();
+      if (!api) throw new Error('Server access management is unavailable on this node.');
+      return api;
+    },
     deviceAuthorizationOwner: () => {
       const api = gateway().deviceAuthorizationOwner?.();
       if (!api) throw new Error('Device approval is unavailable on this node.');

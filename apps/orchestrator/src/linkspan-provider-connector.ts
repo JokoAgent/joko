@@ -21,6 +21,7 @@ interface Record {
 
 /** Each selected entrance has its own durable effect and exact owned handle. */
 export async function startManagedProviderConnector(application: OrchestratorApplication, entry: Omit<LinkspanDeploymentEntry, "connector"> & {
+  readonly displayName?: string;
   readonly connector: Exclude<NonNullable<LinkspanDeploymentEntry["connector"]>, SdkDeployment>;
 }, input: Omit<Parameters<typeof startConnector>[1], "requestId" | "onResource">) {
   const store = application.store;
@@ -117,7 +118,7 @@ export async function startManagedProviderConnector(application: OrchestratorApp
     throw error;
   }
   unpublish = registerManagedLinkspanOrigin(store, journalKey, requestId, connector.publicOrigin,
-    { id: `linkspan:${entry.id}`, provider: config.provider, ...(endpointTransport ? { transport: endpointTransport } : {}) });
+    { id: `linkspan:${entry.id}`, provider: config.provider, ...(entry.displayName ? { displayName: entry.displayName } : {}), ...(endpointTransport ? { transport: endpointTransport } : {}) });
   void connector.closed.then(markClosed).catch(() => {
     unpublish();
     process.stderr.write("A public entrance cleanup is unconfirmed; its original operation is retained.\n");

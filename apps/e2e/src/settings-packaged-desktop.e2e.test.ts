@@ -152,6 +152,7 @@ packagedIt("converges conversation settings across real application windows and 
   if (pairingTabBounds === null) throw new Error("Settings Desktop pairing tab has no visible bounds.");
   await main.mouse.click(pairingTabBounds.x + pairingTabBounds.width / 2,
     pairingTabBounds.y + pairingTabBounds.height / 2);
+  await main.locator('details.device-authorization__manual > summary').click();
   await main.locator("form.pair-form").waitFor({ state: "visible", timeout: 30_000 });
   await main.locator('form.pair-form input[type="url"]').fill(activeFixture.baseUrl);
   await main.locator('form.pair-form input[autocomplete="one-time-code"]')

@@ -1,4 +1,5 @@
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { serverAccessEnglish, serverAccessChinese } from '@joko/contracts/server-access';
 import { mobileObjectiveMessages } from "./mobile-objective-messages";
 import { mobileAutomationMessages } from "./mobile-automation-messages";
 import { mobilePushMessages } from "./mobile-push-messages";
@@ -14,6 +15,7 @@ import { mobileTaskTagMessages } from "./mobile-task-tag-messages";
 import { mobileExtensionMessages } from "./mobile-extension-messages";
 
 const en = {
+  ...serverAccessEnglish,
   ...mobileObjectiveMessages.en,
   ...mobileConversationSearchMessages.en,
   "common.about": "About",
@@ -345,6 +347,7 @@ export type MobileMessageKey = keyof typeof en;
 type MobileMessageCatalog = { readonly [K in MobileMessageKey]: string };
 
 const zhCN: MobileMessageCatalog = {
+  ...serverAccessChinese,
   ...mobileObjectiveMessages["zh-CN"],
   ...mobileConversationSearchMessages["zh-CN"],
   "common.about": "关于",
@@ -673,6 +676,7 @@ const zhCN: MobileMessageCatalog = {
 };
 
 const zhTW: MobileMessageCatalog = {
+  ...serverAccessChinese,
   ...mobileObjectiveMessages["zh-TW"],
   ...mobileConversationSearchMessages.en,
   "common.about": "關於",
@@ -1001,6 +1005,7 @@ const zhTW: MobileMessageCatalog = {
 };
 
 const ja: MobileMessageCatalog = {
+  ...serverAccessEnglish,
   ...mobileObjectiveMessages.ja,
   ...mobileConversationSearchMessages.en,
   "common.about": "情報",
@@ -1329,6 +1334,7 @@ const ja: MobileMessageCatalog = {
 };
 
 const ko: MobileMessageCatalog = {
+  ...serverAccessEnglish,
   ...mobileObjectiveMessages.ko,
   ...mobileConversationSearchMessages.en,
   "common.about": "정보",

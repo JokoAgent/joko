@@ -224,7 +224,7 @@ final class JokoConnectionUITests: XCTestCase {
 
     private func replace(_ field: XCUIElement, with text: String, knownPublicInvitation: Bool = false) {
         tap(field)
-        // The two exact QuickPath checks and final value receipt share the
+        // The exact QuickPath checks and final value receipt share the
         // existing 10s value-gate budget; do not replay keyboard input.
         let initialGuideCheck = Date()
         dismissQuickPathIfPresent(until: initialGuideCheck.addingTimeInterval(10))
@@ -246,10 +246,20 @@ final class JokoConnectionUITests: XCTestCase {
         field.typeText(text)
         let valueDeadline = Date().addingTimeInterval(max(0, 10 - initialGuideElapsed))
         dismissQuickPathIfPresent(until: valueDeadline)
-        let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", text), object: field)
-        let result = XCTWaiter.wait(for: [changed], timeout: max(0, valueDeadline.timeIntervalSinceNow))
-        if result != .completed { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation) }
-        XCTAssertEqual(result, .completed)
+        // The native guide can appear after typing has returned. Observe it
+        // between value checks inside the original deadline, without sending
+        // the input again or accepting the stale placeholder as a typed value.
+        // Read the actual field between waits: a short wait's timeout must not
+        // override a value that already matches the exact requested input.
+        var valueMatches = (field.value as? String) == text
+        while !valueMatches && valueDeadline.timeIntervalSinceNow > 0 {
+            dismissQuickPathIfPresent(until: valueDeadline)
+            let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", text), object: field)
+            _ = XCTWaiter.wait(for: [changed], timeout: min(1, max(0, valueDeadline.timeIntervalSinceNow)))
+            valueMatches = (field.value as? String) == text
+        }
+        if !valueMatches { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation) }
+        XCTAssertTrue(valueMatches, "The native field must contain the exact requested value.")
         // The URL keyboard's real Done accessory dismisses it. On a layout
         // without that accessory, tapping the form heading blurs the field.
         let done = app.buttons["Done"].firstMatch

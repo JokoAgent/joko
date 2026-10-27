@@ -430,8 +430,9 @@ describe("workspace, artifact, and capability boundaries", () => {
     } finally { releaseRead(); }
     const lateResult = await late;
     heldRead.mockRestore();
-    expect(lateResult).toBe(OperationState.FAILED);
-    expect(fixture.application.store.getOperation(lateId).status).toBe("failed");
+    if (lateResult instanceof ConnectError) expect(lateResult.code).toBe(Code.Aborted);
+    else expect(lateResult).toBe(OperationState.FAILED);
+    await waitFor(async () => fixture!.application.store.getOperation(lateId).status, (status) => status === "failed", "retired HTML operation failure");
     expect(controlled.accepted).toHaveLength(1);
     expect(controlled.accepted.some((value) => value.owner === manager.connectionId)).toBe(false);
     expect(JSON.stringify(fixture.application.store.getOperation(lateId).body)).not.toContain("Private");

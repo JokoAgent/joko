@@ -13,10 +13,10 @@ import type { CredentialManager } from './credential-manager.js';
 import { readIceToken } from './remote-desktop-ice-configuration.js';
 import { linkspanMediaUdpEntryId } from './linkspan-deployment.js';
 
-export type LinkspanResourceManagement =
-  | { readonly provider: 'cloudflare'; readonly accountId: string; readonly tokenPath: string }
-  | { readonly provider: 'netbird'; readonly managementUrl: string; readonly tokenPath: string; readonly mode: 'http' | 'tls' | 'tcp' | 'udp'; readonly domain: string; readonly peerId: string; readonly targetPort: number; readonly listenPort?: number }
-  | { readonly provider: 'dev-tunnels'; readonly tokenPath: string; readonly tokenScheme?: 'Bearer' | 'github'; readonly clusterId: string; readonly port: number };
+export type LinkspanResourceManagement = ({ readonly tokenPath?: string; readonly credentialReferenceId?: string } & (
+  | { readonly provider: 'cloudflare'; readonly accountId: string }
+  | { readonly provider: 'netbird'; readonly managementUrl: string; readonly mode: 'http' | 'tls' | 'tcp' | 'udp'; readonly domain: string; readonly peerId: string; readonly targetPort: number; readonly listenPort?: number }
+  | { readonly provider: 'dev-tunnels'; readonly tokenScheme?: 'Bearer' | 'github'; readonly clusterId: string; readonly port: number }));
 
 export interface LinkspanResourceAction {
   readonly action: 'create' | 'status' | 'delete' | 'adopt';
@@ -198,10 +198,12 @@ function assertDevMaterial(record: RecordState, value: PrivateMaterial, original
 }
 
 async function validateConfiguration(app: Application, value: LinkspanResourceManagement, requireTokenFile = true): Promise<void> {
-  if (!value || typeof value !== 'object' || !['cloudflare', 'netbird', 'dev-tunnels'].includes(value.provider) || !isAbsolute(value.tokenPath)) fail('Select a supported resource provider and an absolute private token file.');
+  if (!value || typeof value !== 'object' || !['cloudflare', 'netbird', 'dev-tunnels'].includes(value.provider)
+    || (value.tokenPath === undefined) === (value.credentialReferenceId === undefined)
+    || value.tokenPath !== undefined && !isAbsolute(value.tokenPath)) fail('Select a supported resource provider and protected publisher credentials.');
   const fields = value.provider === 'cloudflare' ? ['provider', 'accountId', 'tokenPath'] : value.provider === 'netbird'
     ? ['provider', 'managementUrl', 'tokenPath', 'mode', 'domain', 'peerId', 'targetPort', 'listenPort'] : ['provider', 'tokenPath', 'tokenScheme', 'clusterId', 'port'];
-  if (Object.keys(value).some(key => !fields.includes(key))) fail('The resource management configuration contains unsupported fields.');
+  if (Object.keys(value).some(key => key !== 'credentialReferenceId' && !fields.includes(key))) fail('The resource management configuration contains unsupported fields.');
   const port = (number: unknown) => Number.isSafeInteger(number) && Number(number) > 0 && Number(number) <= 65535;
   if (value.provider === 'cloudflare') {
     if (!/^[a-f0-9]{32}$/u.test(value.accountId)) fail('The publisher account is invalid.');
@@ -211,8 +213,13 @@ async function validateConfiguration(app: Application, value: LinkspanResourceMa
       || !/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/u.test(value.domain) || !/^[A-Za-z0-9._:-]{1,128}$/u.test(value.peerId)
       || !port(value.targetPort) || value.listenPort !== undefined && value.listenPort !== 0 && !port(value.listenPort)) fail('The public proxy configuration is invalid.');
   } else if (!/^[A-Za-z0-9-]{1,64}$/u.test(value.clusterId) || !port(value.port) || value.tokenScheme !== undefined && !['Bearer', 'github'].includes(value.tokenScheme)) fail('The Dev Tunnel configuration is invalid.');
+  if (value.credentialReferenceId !== undefined) {
+    if (!/^server\.access:[a-f0-9-]{36}$/u.test(value.credentialReferenceId)
+      || app.credentials?.find(value.credentialReferenceId)?.providerId !== 'server.access') fail('The original server access credential is unavailable.');
+    return;
+  }
   if (!requireTokenFile) return;
-  const token = await realpath(value.tokenPath);
+  const token = await realpath(value.tokenPath!);
   const roots = await Promise.all([app.config.workspace.root, fileURLToPath(new URL('../../../', import.meta.url))].map(root => realpath(root)));
   for (const start of [process.cwd(), dirname(fileURLToPath(import.meta.url))]) {
     let current = resolve(start);
@@ -224,9 +231,10 @@ async function validateConfiguration(app: Application, value: LinkspanResourceMa
   if (roots.some(root => { const child = relative(root, token); return child === '' || child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child); })) fail('Resource tokens must stay outside Joko source and workspace roots.');
 }
 
-async function provider(record: RecordState, value: PrivateMaterial, signal: AbortSignal, dependencies: LinkspanResourceManagerDependencies) {
+async function provider(app: Application, record: RecordState, value: PrivateMaterial, signal: AbortSignal, dependencies: LinkspanResourceManagerDependencies) {
   const configuration = value.configuration;
-  const token = await (dependencies.readToken ?? readIceToken)(configuration.tokenPath, signal);
+  const token = configuration.credentialReferenceId === undefined ? await (dependencies.readToken ?? readIceToken)(configuration.tokenPath!, signal)
+    : (JSON.parse(app.credentials!.resolve(configuration.credentialReferenceId)) as { fields: { apiToken: string } }).fields.apiToken;
   const common = { requestId: record.requestId, signal, deadline: Date.now() + 15_000 };
   if (configuration.provider === 'cloudflare') {
     const sdk = dependencies.cloudflare ?? await import('@jokoagent/linkspan-cloudflare');
@@ -239,7 +247,7 @@ async function provider(record: RecordState, value: PrivateMaterial, signal: Abo
   }
   if (configuration.provider === 'netbird') {
     const sdk = dependencies.netbird ?? await import('@jokoagent/linkspan-connectors/netbird');
-    const { tokenPath: _tokenPath, provider: _provider, ...selected } = configuration;
+    const { tokenPath: _tokenPath, credentialReferenceId: _reference, provider: _provider, ...selected } = configuration;
     const options = { ...common, ...selected, apiToken: token, ...(value.resource === undefined ? {} : { expectedResource: value.resource as NetbirdPublicResource }) };
     return { find: () => sdk.findNetbirdPublicResource(options), create: async (): Promise<PrivateMaterial> => ({ ...value, resource: await sdk.createNetbirdPublicResource(options) }),
       remove: () => sdk.deleteNetbirdPublicResource({ ...options, resource: value.resource as NetbirdPublicResource }), open: async (): Promise<PrivateMaterial> => value };
@@ -261,13 +269,14 @@ export async function manageLinkspanResource(app: Application, input: LinkspanRe
     if (record !== undefined) validateJournalRecord(app, record);
     await validateConfiguration(app, input.configuration, input.action === 'create' || record !== undefined && ['creating', 'active', 'outcome_unknown', 'deleting'].includes(record.state));
     const configurationHash = hash(identity(input.configuration));
-    if (record !== undefined && (record.entryId !== input.entryId || record.provider !== input.configuration.provider || record.configurationHash !== configurationHash)) fail('Restore the original resource configuration before reconciling this entry.');
-    if (record === undefined || input.action === 'create' && ['deleted', 'rejected'].includes(record.state)) {
+    const recreate = record !== undefined && input.action === 'create' && ['deleted', 'rejected'].includes(record.state);
+    if (record !== undefined && !recreate && (record.entryId !== input.entryId || record.provider !== input.configuration.provider || record.configurationHash !== configurationHash)) fail('Restore the original resource configuration before reconciling this entry.');
+    if (record === undefined || recreate) {
       if (input.action !== 'create') {
         if (input.action === 'adopt') fail('Adoption requires this host\'s original uncertain creation operation.');
         return { entryId: input.entryId, provider: input.configuration.provider, state: 'not_created' as const };
       }
-      if (record !== undefined) await credentialManager(app, record).deleteManagedSecret(record.reference);
+      if (record !== undefined) { finishRetiredCreate(app, record); await credentialManager(app, record).deleteManagedSecret(record.reference); }
       const requestId = `linkspan-resource:${randomUUID()}`;
       record = { entryId: input.entryId, provider: input.configuration.provider, requestId, configurationHash, reference: `linkspan.resource:${requestId}`, state: 'preparing' };
       const created = record;
@@ -298,7 +307,7 @@ export async function manageLinkspanResource(app: Application, input: LinkspanRe
     if (value.resource !== undefined) assertOwned(record, input.configuration, value.resource);
     if (record.state === 'preparing') {
       if (input.action !== 'create') return view(record, value);
-      const api = await provider(record, value, signal, dependencies);
+      const api = await provider(app, record, value, signal, dependencies);
       record = recordState(app, record, 'creating');
       try {
         value = await api.create();
@@ -315,7 +324,7 @@ export async function manageLinkspanResource(app: Application, input: LinkspanRe
       }
     }
     if (record.state === 'rejected') return view(record, value);
-    const api = await provider(record, value, signal, dependencies);
+    const api = await provider(app, record, value, signal, dependencies);
     let observed: Resource | Candidate | null;
     try { observed = await api.find() as Resource | Candidate | null; }
     catch (error) { return view(record, value, error instanceof LinkspanError ? error.code : 'transport_error'); }
@@ -331,7 +340,7 @@ export async function manageLinkspanResource(app: Application, input: LinkspanRe
         app.store.completeDeferredEffectOperation(adoption.id, adoption.bodyHash, () => ({ state: 'adopted', reference: record!.reference }));
         finishCreate(app, record); record = { ...record, state: 'active' };
         if (record.provider === 'dev-tunnels') {
-          try { value = await (await provider(record, value, signal, dependencies)).open(); assertDevMaterial(record, value, resourceId(resource)); await saveMaterial(app, record, value); }
+          try { value = await (await provider(app, record, value, signal, dependencies)).open(); assertDevMaterial(record, value, resourceId(resource)); await saveMaterial(app, record, value); }
           catch { return view(record, value, 'material_unavailable'); }
         }
         return view(record, value);
@@ -366,20 +375,31 @@ export async function manageLinkspanResource(app: Application, input: LinkspanRe
 }
 
 /** Supply only missing connector material from this host's exact known receipt. */
-export async function resolveManagedLinkspanConnector<T extends { readonly provider: string }>(app: Application, input: { readonly entryId: string; readonly connector: T }, dependencies: LinkspanResourceManagerDependencies = {}): Promise<T> {
+export async function resolveManagedLinkspanConnector<T extends { readonly provider: string }>(app: Application, input: {
+  readonly entryId: string; readonly connector: T; readonly configuration?: LinkspanResourceManagement; readonly signal?: AbortSignal;
+}, dependencies: LinkspanResourceManagerDependencies = {}): Promise<T> {
   if (!/^[a-z][a-z0-9-]{0,63}$/u.test(input.entryId)) fail('Select a valid managed connection entry.');
   const connector = input.connector as T & Record<string, unknown>;
   const missing = connector.provider === 'cloudflare' ? !connector['tunnelId'] || !connector['tunnelSecret'] : connector.provider === 'netbird' ? !connector['resourceId'] || !connector['listenPort'] || !connector['publicOrigin']
     : connector.provider === 'dev-tunnels' ? !connector['tunnelId'] || !connector['hostAccessToken'] || !connector['publicOrigin'] : false;
   if (!missing) return input.connector;
   return serial(app, input.entryId, async () => {
+    const signal = input.signal ?? AbortSignal.timeout(30_000); signal.throwIfAborted();
     const record = app.store.findSetting<RecordState>('service', 'orchestrator', PREFIX + input.entryId)?.value;
     if (record === undefined || record.provider !== connector.provider || record.state !== 'active') fail('Create or reconcile the exact managed resource before enabling this connector.');
     validateJournalRecord(app, record);
     let value = material(app, record);
     if (value?.resource === undefined) fail('Restore the protected owned-resource receipt before enabling this connector.');
-    assertOwned(record, value.configuration, value.resource);
-    const id = resourceId(value.resource);
+    const owned = value.resource;
+    if (input.configuration !== undefined) {
+      await validateConfiguration(app, input.configuration);
+      if (input.configuration.provider !== record.provider || hash(identity(input.configuration)) !== record.configurationHash) fail('Restore the original resource configuration before enabling this connector.');
+      // This operation's saved/applied revision supplies credentials; it cannot
+      // change the identity or ownership of the already-created resource.
+      value = { ...value, configuration: input.configuration };
+    }
+    assertOwned(record, value.configuration, owned);
+    const id = resourceId(owned);
     if (connector.provider === 'cloudflare') {
       const resource = value.resource as CloudflareNamedResource;
       if (connector['tunnelId'] && connector['tunnelId'] !== id || connector['accountId'] && connector['accountId'] !== resource.accountId || !value.tunnelSecret) fail('The connector does not match the exact managed named tunnel.');
@@ -403,7 +423,9 @@ export async function resolveManagedLinkspanConnector<T extends { readonly provi
     const resource = value.resource as DevTunnelResource;
     if (connector['tunnelId'] && connector['tunnelId'] !== id || connector['clusterId'] && connector['clusterId'] !== resource.clusterId || connector['port'] && connector['port'] !== resource.port) fail('The connector does not match the exact managed Dev Tunnel.');
     await validateConfiguration(app, value.configuration);
-    value = await (await provider(record, value, AbortSignal.timeout(30_000), dependencies)).open();
+    signal.throwIfAborted();
+    value = await (await provider(app, record, value, signal, dependencies)).open();
+    signal.throwIfAborted();
     assertDevMaterial(record, value, id);
     if (connector['publicOrigin'] && connector['publicOrigin'] !== value.publicOrigin) fail('The connector address does not match the exact managed Dev Tunnel.');
     await saveMaterial(app, record, value);

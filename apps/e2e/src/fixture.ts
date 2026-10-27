@@ -43,6 +43,10 @@ import {
   VoiceDictionarySyncRepository,
   VoiceDictionaryPeerManager,
   CredentialVault,
+  CredentialManager,
+  ServerAccessManager,
+  ServerAccessMedia,
+  createServerAccessRuntime,
   TaskSharingHome,
   createPublicServer,
   createLinkspanIngress,
@@ -71,6 +75,7 @@ type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
   | "browserSettings" | "browserState" | "voiceInput" | "diagnosticsBundles">;
 
 export interface FixtureOptions {
+  readonly serverAccess?: boolean;
   readonly tls?: OrchestratorConfig['tls'];
   readonly taskSharing?: boolean;
   readonly collaborationGoals?: boolean;
@@ -488,6 +493,12 @@ export class OrchestratorE2eFixture {
     const serviceCleanups = new Set<() => void>();
     const linkspanIdentity = await openLinkspanIdentity({ dataDirectory, serverId, store,
       vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key")) });
+    const accessCredentials = options.serverAccess ? auxiliaryServices?.credentials ?? new CredentialManager({
+      vault: await CredentialVault.open(join(dataDirectory, 'credentials', 'master.key')), storagePath: join(dataDirectory, 'credentials', 'records.json') }) : undefined;
+    if (accessCredentials && !auxiliaryServices?.credentials) await accessCredentials.initialize();
+    const serverAccess = accessCredentials && new ServerAccessManager({ config, serverId, store, credentials: accessCredentials, connections });
+    const serverAccessMedia = accessCredentials && new ServerAccessMedia({ config, serverId, store, credentials: accessCredentials,
+      fallbackIce: { getConfiguration: async () => [] }, fetch, isLocalDesktopRoute: identity => devicePeers.isLocalDesktopRoute(identity) });
     const application: OrchestratorApplication = {
       config,
       store,
@@ -527,6 +538,7 @@ export class OrchestratorE2eFixture {
       registerServiceCleanup(cleanup) { serviceCleanups.add(cleanup); return () => serviceCleanups.delete(cleanup); },
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
+      ...(serverAccess ? { serverAccess, serverAccessMedia, credentials: accessCredentials } : {}),
       voiceDictionary,
       ...(voiceDictionaryPeers === undefined ? {} : { voiceDictionaryPeers }),
       async close() {
@@ -535,6 +547,7 @@ export class OrchestratorE2eFixture {
           try { await cleanup(); } catch (error) { failures.push(error); }
         };
         for (const cleanup of serviceCleanups) await attempt(cleanup);
+        await attempt(() => serverAccess?.close());
         await attempt(() => taskSharingHome?.dispose());
         await attempt(() => collaborationGoals?.close());
         await attempt(() => scheduler.stop());
@@ -584,6 +597,7 @@ export class OrchestratorE2eFixture {
     });
     if (secureServer !== undefined) secureServer.log.level = 'silent';
     const backendOrigin = secureServer === undefined ? baseUrl : await secureServer.listen({ host: '127.0.0.1', port: 0 });
+    if (serverAccess) await serverAccess.attach(createServerAccessRuntime(application, backendOrigin));
     const linkspan = createLinkspanIngress(application, { backendOrigin, server: server.server });
     const httpConnect = options.httpConnect ? await createHttpConnectFixture(application, backendOrigin, new URL(baseUrl).host) : undefined;
     // This fixture owns the node key, like a trusted local bootstrap. Reused

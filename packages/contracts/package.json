@@ -8,6 +8,11 @@
     "proto"
   ],
   "exports": {
+    "./server-access": {
+      "types": "./dist/server-access.d.ts",
+      "react-native": "./dist/server-access.js",
+      "import": "./dist/server-access.js"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "react-native": "./dist/index.js",

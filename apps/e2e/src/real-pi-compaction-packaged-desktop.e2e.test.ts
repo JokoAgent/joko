@@ -845,6 +845,13 @@ describe("packaged Desktop Pi compaction", () => {
         summary: JSON.stringify(request.body).includes("You are a context summarization assistant")
       })),
       sessionState: (await clients.session.getSession({ sessionId })).session?.state,
+      compacting: (await clients.session.getSession({ sessionId })).session?.contextState?.compacting,
+      compactions: (await clients.event.getSnapshot({ scope: create(SnapshotScopeSchema, {
+        kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId, recentTimelineItems: 50 }) }
+      }) })).snapshot?.timeline.flatMap((item) => item.payload?.kind.case === "compactionChanged"
+        ? [{ sequence: String(item.cursor?.sequence), state: item.payload.kind.value.state,
+            reason: item.payload.kind.value.reason, automatic: item.payload.kind.value.automatic }]
+        : []),
       runs: (await clients.run.listRuns({ sessionId })).runs.map((run) => run.state),
       operations: (await clients.operation.listOperations({ sessionId })).operations.map((operation) => ({
         kind: operation.mutation?.payload.case,
@@ -880,7 +887,11 @@ describe("packaged Desktop Pi compaction", () => {
     }
     recordLifecycle("automatic-summary-requested");
     const status = page.locator(".compaction-status-indicator");
-    await status.waitFor({ state: "visible", timeout: 30_000 });
+    try {
+      await status.waitFor({ state: "visible", timeout: 30_000 });
+    } catch (cause) {
+      throw new Error(`Managed Pi ${reason} status was not visible: ${JSON.stringify(await automaticDiagnostic())}`, { cause });
+    }
     expect(await status.getAttribute("role")).toBe("status");
     expect(await status.getAttribute("aria-live")).toBe("polite");
     expect(await status.innerText()).toContain(expectedStatus);

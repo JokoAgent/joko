@@ -1847,7 +1847,43 @@ describe("mobile current task delegated reads", () => {
 });
 
 const clients: MobileClient[] = [];
+vi.mock('@joko/connection-transport/entries', async original => {
+  const entries = await original<typeof import('@joko/connection-transport/entries')>();
+  return { ...entries, resolvePreparedConnection: vi.fn(entries.resolvePreparedConnection) };
+});
 describe('prepared connection entrance cancellation', () => {
+  it.each([Code.Unavailable, Code.Unauthenticated])('ends automatic startup after entrance preflight rejects (%s)', async code => {
+    const entries = await import('@joko/connection-transport/entries');
+    const pinned = { ...credential, origin: 'https://preflight.example', endpointPublicKey: `ed25519:${'9'.repeat(64)}` };
+    const owner = { profileId: pinned.profileId, serverId: pinned.serverId, deviceId: pinned.deviceId, endpointPublicKey: pinned.endpointPublicKey };
+    const memory = memoryStorage(pinned), network = fakeNetwork();
+    memory.storage.readConnectionEntries = vi.fn(async () => entries.initialConnectionEntries(owner, pinned));
+    const resolve = vi.mocked(entries.resolvePreparedConnection).mockRejectedValueOnce(new ConnectError('Entrance preflight rejected', code));
+    try {
+      const app = client(network, memory.storage); await app.start();
+      expect(app.state.status).toBe(code === Code.Unauthenticated ? 'revoked' : 'unpaired');
+      expect(app.state.busy).toBe(false); expect(app.state.connectionAttemptError).toContain('Entrance preflight rejected');
+      expect(memory.automatic()).toBe(code !== Code.Unauthenticated);
+      expect(memory.key()).toBe(code === Code.Unauthenticated ? undefined : pinned);
+      expect(network.readOwner).not.toHaveBeenCalled();
+    } finally { resolve.mockRestore(); }
+  });
+
+  it('retains a healthy connection when another saved entrance fails preflight', async () => {
+    const entries = await import('@joko/connection-transport/entries');
+    const pinned = { ...credential, profileId: 'other-profile', connectionId: 'other-connection', origin: 'https://other-preflight.example', endpointPublicKey: `ed25519:${'6'.repeat(64)}` };
+    const owner = { profileId: pinned.profileId, serverId: pinned.serverId, deviceId: pinned.deviceId, endpointPublicKey: pinned.endpointPublicKey };
+    const memory = memoryStorage([credential, pinned], credential.profileId), network = fakeNetwork();
+    memory.storage.readConnectionEntries = vi.fn(async () => entries.initialConnectionEntries(owner, pinned));
+    const app = client(network, memory.storage); await app.start(); expect(app.state.status).toBe('connected');
+    const resolve = vi.mocked(entries.resolvePreparedConnection).mockRejectedValueOnce(new ConnectError('Candidate offline', Code.Unavailable));
+    try {
+      await expect(app.connectSaved(pinned.profileId)).rejects.toThrow('Candidate offline');
+      expect(app.state.status).toBe('connected'); expect(app.state.activeProfileId).toBe(credential.profileId);
+      expect(memory.key()).toBe(credential); expect(memory.automaticProfile()).toBe(credential.profileId);
+    } finally { resolve.mockRestore(); }
+  });
+
   it('persists the selected iroh mode in the protected entry directory and keeps the prior mode on write failure', async () => {
     const entries = await import('@joko/connection-transport/entries');
     const trust = await import('@joko/connection-transport/trust');

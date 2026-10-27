@@ -869,6 +869,14 @@ export class MobileClient {
       abort?.signal.throwIfAborted();
     });
   }
+  serverAccess(): import('@joko/connection-transport/server-access').ServerAccessClient {
+    const credential = this.#ready(), abort = this.#abort;
+    if (!this.network.serverAccess) throw new Error('Server access management is unavailable in this build.');
+    return this.network.serverAccess(credential, () => {
+      if (this.#credential !== credential || this.#abort !== abort || this.#disposed) throw new Error('The original node connection changed.');
+      abort?.signal.throwIfAborted();
+    });
+  }
   get deviceAuthorization(): DeviceAuthorizationPort {
     return {
       transportRequest: (kind, signal) => this.#authorizationReceiver().transportRequest(kind, signal, this.connectionEntryIrohMode),
@@ -4668,167 +4676,190 @@ export class MobileClient {
       return;
     }
     const originalProfile = profile, originalEpoch = this.#epoch;
-    const entryApi = await import('@joko/connection-transport/entries');
-    let savedEntries = profile.endpointPublicKey ? await this.storage.readConnectionEntries?.(profile) : undefined;
-    const entryOwner = profile.endpointPublicKey ? { profileId, serverId: profile.serverId, deviceId: profile.deviceId, endpointPublicKey: profile.endpointPublicKey } : undefined;
-    let savedCredential: PairedCredential | undefined;
-    const resolved = savedEntries && entryOwner ? await entryApi.resolvePreparedConnection(entryOwner, savedEntries, async () => {
-      savedCredential = await this.storage.loadCredential(profileId);
-      if (savedCredential && !credentialMatchesProfile(savedCredential, originalProfile)) throw new CredentialIdentityError();
-      return savedCredential?.authKey;
-    }, this.connectionEntrySupported, entryAttempt.signal, entryId, async next => {
-      entryAttempt.signal.throwIfAborted(); if (!this.#current(originalEpoch)) throw new Error('The node connection changed.');
-      await this.storage.writeConnectionEntries!(originalProfile, next); savedEntries = next;
-    }) : undefined;
-    if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || this.#epoch !== originalEpoch || !this.#foreground || this.#disposed) return;
-    if (resolved && entryOwner) {
-      entryApi.activateConnectionEntry(entryOwner, resolved.entry);
-      profile = { ...profile, entryId: resolved.entry.id, origin: resolved.entry.origin, transportKind: resolved.entry.kind };
-    }
-    await this.#releaseQueueEditBeforeTransition();
-    if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || this.#epoch !== originalEpoch || !this.#foreground || this.#disposed) return;
-    const preserveActiveConnection = this.#hasActiveConnection();
-    const { generation, controller } = this.#beginConnectionAttempt();
-    this.#set({
-      ...(!this.#hasActiveConnection() ? { status: "connecting" as const } : {}),
-      candidate: undefined,
-      challenge: undefined,
-      saved: this.#savedViews(profileId, "checking")
-    });
-    const cancelEntryAttempt = () => controller.abort();
-    entryAttempt.signal.addEventListener('abort', cancelEntryAttempt, { once: true });
-    let selection: string | undefined;
-    let cached: MobileOfflineCacheSnapshot | undefined;
-    let cacheLoadWarning: string | undefined;
-    let credential: PairedCredential | undefined;
-    let offlineEligible = true;
+    let preflight = true;
     try {
-      selection = await this.storage.loadSelection(profileId);
-      if (!this.#connectionAttemptCurrent(generation, controller)) return;
-      if (!preserveActiveConnection && this.offlineCache) {
-        try {
-          cached = await this.offlineCache.load(profile, selection);
-          if (!this.#connectionAttemptCurrent(generation, controller)) return;
-          if (cached) this.#showOfflineProjection(profile, cached, selection, "connecting");
-        } catch (error) {
-          cacheLoadWarning = message(error);
-          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+      const entryApi = await import('@joko/connection-transport/entries');
+      let savedEntries = profile.endpointPublicKey ? await this.storage.readConnectionEntries?.(profile) : undefined;
+      const entryOwner = profile.endpointPublicKey ? { profileId, serverId: profile.serverId, deviceId: profile.deviceId, endpointPublicKey: profile.endpointPublicKey } : undefined;
+      let savedCredential: PairedCredential | undefined;
+      const resolved = savedEntries && entryOwner ? await entryApi.resolvePreparedConnection(entryOwner, savedEntries, async () => {
+        savedCredential = await this.storage.loadCredential(profileId);
+        if (savedCredential && !credentialMatchesProfile(savedCredential, originalProfile)) throw new CredentialIdentityError();
+        return savedCredential?.authKey;
+      }, this.connectionEntrySupported, entryAttempt.signal, entryId, async next => {
+        entryAttempt.signal.throwIfAborted(); if (!this.#current(originalEpoch)) throw new Error('The node connection changed.');
+        await this.storage.writeConnectionEntries!(originalProfile, next); savedEntries = next;
+      }) : undefined;
+      if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || this.#epoch !== originalEpoch || !this.#foreground || this.#disposed) return;
+      if (resolved && entryOwner) {
+        entryApi.activateConnectionEntry(entryOwner, resolved.entry);
+        profile = { ...profile, entryId: resolved.entry.id, origin: resolved.entry.origin, transportKind: resolved.entry.kind };
+      }
+      await this.#releaseQueueEditBeforeTransition();
+      if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || this.#epoch !== originalEpoch || !this.#foreground || this.#disposed) return;
+      preflight = false;
+      const preserveActiveConnection = this.#hasActiveConnection();
+      const { generation, controller } = this.#beginConnectionAttempt();
+      this.#set({
+        ...(!this.#hasActiveConnection() ? { status: "connecting" as const } : {}),
+        candidate: undefined,
+        challenge: undefined,
+        saved: this.#savedViews(profileId, "checking")
+      });
+      const cancelEntryAttempt = () => controller.abort();
+      entryAttempt.signal.addEventListener('abort', cancelEntryAttempt, { once: true });
+      let selection: string | undefined;
+      let cached: MobileOfflineCacheSnapshot | undefined;
+      let cacheLoadWarning: string | undefined;
+      let credential: PairedCredential | undefined;
+      let offlineEligible = true;
+      try {
+        selection = await this.storage.loadSelection(profileId);
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        if (!preserveActiveConnection && this.offlineCache) {
+          try {
+            cached = await this.offlineCache.load(profile, selection);
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            if (cached) this.#showOfflineProjection(profile, cached, selection, "connecting");
+          } catch (error) {
+            cacheLoadWarning = message(error);
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          }
         }
-      }
-      // Public identity proof must precede the protected credential read.
-      if (!resolved) await this.storage.loadEndpointTransport?.(profile);
-      rememberEndpointTrust(profile);
-      const node = await this.network.inspect(profile.origin, controller.signal);
-      if (!this.#connectionAttemptCurrent(generation, controller)) return;
-      if (cached) cached = { ...cached, node };
-      this.#set({ candidate: { origin: profile.origin, node } });
-      if (node.serverId !== profile.serverId) {
-        offlineEligible = false;
-        this.#dropOfflineProjection(profileId);
-        const cleanup = await this.#clearOfflineCache(profileId);
+        // Public identity proof must precede the protected credential read.
+        if (!resolved) await this.storage.loadEndpointTransport?.(profile);
+        rememberEndpointTrust(profile);
+        const node = await this.network.inspect(profile.origin, controller.signal);
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        const detail = [
-          "The saved Joko node identity changed. Its credential was not read; forget it or inspect and pair this node again.",
-          cleanup
-        ].filter(Boolean).join(" ");
-        this.#failConnectionAttempt(generation, controller, detail, {
-          saved: this.#savedViews(profileId, "identity-conflict", detail)
-        });
-        throw new Error(detail);
-      }
-      try { credential = savedCredential ?? await this.storage.loadCredential(profileId); }
-      catch (error) {
+        if (cached) cached = { ...cached, node };
+        this.#set({ candidate: { origin: profile.origin, node } });
+        if (node.serverId !== profile.serverId) {
+          offlineEligible = false;
+          this.#dropOfflineProjection(profileId);
+          const cleanup = await this.#clearOfflineCache(profileId);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          const detail = [
+            "The saved Joko node identity changed. Its credential was not read; forget it or inspect and pair this node again.",
+            cleanup
+          ].filter(Boolean).join(" ");
+          this.#failConnectionAttempt(generation, controller, detail, {
+            saved: this.#savedViews(profileId, "identity-conflict", detail)
+          });
+          throw new Error(detail);
+        }
+        try { credential = savedCredential ?? await this.storage.loadCredential(profileId); }
+        catch (error) {
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          const failure = credentialFailure(error);
+          offlineEligible = failure === "unavailable";
+          if (!offlineEligible || !cached) {
+            if (!offlineEligible) this.#dropOfflineProjection(profileId);
+            const cleanup = offlineEligible ? undefined : await this.#clearOfflineCache(profileId);
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            const detail = [message(error), cleanup].filter(Boolean).join(" ");
+            this.#failConnectionAttempt(generation, controller, detail, {
+              saved: this.#savedViews(profileId, failure, detail)
+            });
+          }
+          throw error;
+        }
+        if (!credential || !credentialMatchesProfile(credential, originalProfile)) {
+          offlineEligible = false;
+          this.#dropOfflineProjection(profileId);
+          const cleanup = await this.#clearOfflineCache(profileId);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          const detail = [credential
+            ? "The protected credential does not match this saved Joko connection. Forget it and pair again."
+            : "The protected credential for this saved Joko connection is missing. Forget it and pair again.", cleanup]
+            .filter(Boolean).join(" ");
+          this.#failConnectionAttempt(generation, controller, detail, {
+            saved: this.#savedViews(profileId, credential ? "unreadable" : "missing", detail)
+          });
+          throw new Error(detail);
+        }
+        if (resolved) credential = { ...credential, entryId: profile.entryId, origin: profile.origin, transportKind: profile.transportKind };
+        const owner = await this.network.readOwner(credential, this.deviceNameSource(), controller.signal);
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        const failure = credentialFailure(error);
-        offlineEligible = failure === "unavailable";
-        if (!offlineEligible || !cached) {
-          if (!offlineEligible) this.#dropOfflineProjection(profileId);
-          const cleanup = offlineEligible ? undefined : await this.#clearOfflineCache(profileId);
+        this.#assertOwner(credential, owner, node);
+        const selected = selection !== undefined && owner.snapshot.sessions.some((session) => session.sessionId === selection)
+          ? selection : undefined;
+        const detail = selected ? await this.network.readSession(credential, selected, controller.signal) : undefined;
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        if (selected !== selection) await this.storage.saveSelection(profileId, selected);
+        let preferenceError: string | undefined;
+        if (automatic !== undefined) {
+          try {
+            await this.storage.saveAutomaticProfile(automatic ? profileId : undefined);
+            this.#automaticProfileId = automatic ? profileId : undefined;
+          } catch (error) {
+            preferenceError = `Connected, but the automatic-entry preference could not be saved: ${message(error)}`;
+          }
+        }
+        preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
+        if (savedEntries && entryOwner) {
+          const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
+          await this.storage.writeConnectionEntries?.(profile, next);
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          await this.storage.saveConnection(credential);
+          this.#profiles = [...(await this.storage.loadConnectionIndex()).profiles];
+          if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          this.#set({ connectionEntries: { profileId, entries: entryApi.connectionEntryViews(next, profile, this.connectionEntrySupported), returnToPreferred: next.returnToPreferred,
+            ...(resolved?.entry.id !== next.preferredId ? { notice: 'Using a prepared backup. Your preferred entrance has not changed.' } : {}) } });
+        }
+        entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt);
+        await this.#adoptConnection(generation, controller, credential, node, owner, selected, detail, preferenceError);
+      } catch (error) {
+        if (!this.#connectionAttemptCurrent(generation, controller)) {
+          if (controller.signal.aborted) return;
+          throw error;
+        }
+        if (isRevoked(error)) {
+          await this.#invalidateConnectionAttemptProfile(
+            generation,
+            controller,
+            profileId,
+            "This mobile connection was revoked. Forget it or pair this device again."
+          );
+        } else if (error instanceof CredentialIdentityError || isEndpointTrustError(error)) {
+          this.#dropOfflineProjection(profileId);
+          const cleanup = await this.#clearOfflineCache(profileId);
           if (!this.#connectionAttemptCurrent(generation, controller)) return;
           const detail = [message(error), cleanup].filter(Boolean).join(" ");
           this.#failConnectionAttempt(generation, controller, detail, {
-            saved: this.#savedViews(profileId, failure, detail)
+            saved: this.#savedViews(profileId, "identity-conflict", detail)
+          });
+        } else if (cached && offlineEligible
+          && this.#adoptOfflineFallback(generation, controller, profile, cached, selection, message(error), credential)) {
+          return;
+        } else if (this.#state.saved.find((item) => item.profileId === profileId)?.credentialState === "checking") {
+          this.#dropOfflineProjection(profileId);
+          const detail = [message(error), cacheLoadWarning].filter(Boolean).join(" ");
+          this.#failConnectionAttempt(generation, controller, detail, {
+            saved: this.#savedViews(profileId, "offline", detail)
           });
         }
         throw error;
-      }
-      if (!credential || !credentialMatchesProfile(credential, originalProfile)) {
-        offlineEligible = false;
-        this.#dropOfflineProjection(profileId);
-        const cleanup = await this.#clearOfflineCache(profileId);
-        if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        const detail = [credential
-          ? "The protected credential does not match this saved Joko connection. Forget it and pair again."
-          : "The protected credential for this saved Joko connection is missing. Forget it and pair again.", cleanup]
-          .filter(Boolean).join(" ");
-        this.#failConnectionAttempt(generation, controller, detail, {
-          saved: this.#savedViews(profileId, credential ? "unreadable" : "missing", detail)
-        });
-        throw new Error(detail);
-      }
-      if (resolved) credential = { ...credential, entryId: profile.entryId, origin: profile.origin, transportKind: profile.transportKind };
-      const owner = await this.network.readOwner(credential, this.deviceNameSource(), controller.signal);
-      if (!this.#connectionAttemptCurrent(generation, controller)) return;
-      this.#assertOwner(credential, owner, node);
-      const selected = selection !== undefined && owner.snapshot.sessions.some((session) => session.sessionId === selection)
-        ? selection : undefined;
-      const detail = selected ? await this.network.readSession(credential, selected, controller.signal) : undefined;
-      if (!this.#connectionAttemptCurrent(generation, controller)) return;
-      if (selected !== selection) await this.storage.saveSelection(profileId, selected);
-      let preferenceError: string | undefined;
-      if (automatic !== undefined) {
-        try {
-          await this.storage.saveAutomaticProfile(automatic ? profileId : undefined);
-          this.#automaticProfileId = automatic ? profileId : undefined;
-        } catch (error) {
-          preferenceError = `Connected, but the automatic-entry preference could not be saved: ${message(error)}`;
-        }
-      }
-      preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
-      if (savedEntries && entryOwner) {
-        const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
-        await this.storage.writeConnectionEntries?.(profile, next);
-        if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        await this.storage.saveConnection(credential);
-        this.#profiles = [...(await this.storage.loadConnectionIndex()).profiles];
-        if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        this.#set({ connectionEntries: { profileId, entries: entryApi.connectionEntryViews(next, profile, this.connectionEntrySupported), returnToPreferred: next.returnToPreferred,
-          ...(resolved?.entry.id !== next.preferredId ? { notice: 'Using a prepared backup. Your preferred entrance has not changed.' } : {}) } });
-      }
-      entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt);
-      await this.#adoptConnection(generation, controller, credential, node, owner, selected, detail, preferenceError);
+      } finally { entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt); }
     } catch (error) {
-      if (!this.#connectionAttemptCurrent(generation, controller)) {
-        if (controller.signal.aborted) return;
-        throw error;
-      }
-      if (isRevoked(error)) {
-        await this.#invalidateConnectionAttemptProfile(
-          generation,
-          controller,
-          profileId,
-          "This mobile connection was revoked. Forget it or pair this device again."
-        );
-      } else if (error instanceof CredentialIdentityError || isEndpointTrustError(error)) {
-        this.#dropOfflineProjection(profileId);
-        const cleanup = await this.#clearOfflineCache(profileId);
-        if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        const detail = [message(error), cleanup].filter(Boolean).join(" ");
-        this.#failConnectionAttempt(generation, controller, detail, {
-          saved: this.#savedViews(profileId, "identity-conflict", detail)
-        });
-      } else if (cached && offlineEligible
-        && this.#adoptOfflineFallback(generation, controller, profile, cached, selection, message(error), credential)) {
-        return;
-      } else if (this.#state.saved.find((item) => item.profileId === profileId)?.credentialState === "checking") {
-        this.#dropOfflineProjection(profileId);
-        const detail = [message(error), cacheLoadWarning].filter(Boolean).join(" ");
-        this.#failConnectionAttempt(generation, controller, detail, {
-          saved: this.#savedViews(profileId, "offline", detail)
-        });
+      if (!preflight) throw error;
+      if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || !this.#current(originalEpoch)) return;
+      // Startup already shows connecting while the saved entrance is checked.
+      // Reuse the existing failure/retirement path even before gateway creation.
+      const detail = message(error);
+      if (isRevoked(error) && this.#activeProfileId === profileId) {
+        await this.#invalidateCredential(originalEpoch, profileId, detail);
+      } else {
+        const { generation, controller } = this.#beginConnectionAttempt();
+        if (isRevoked(error)) await this.#invalidateConnectionAttemptProfile(generation, controller, profileId, detail);
+        else if (error instanceof CredentialIdentityError || isEndpointTrustError(error)) {
+          this.#dropOfflineProjection(profileId);
+          const cleanup = await this.#clearOfflineCache(profileId);
+          const failure = [detail, cleanup].filter(Boolean).join(' ');
+          this.#failConnectionAttempt(generation, controller, failure, { saved: this.#savedViews(profileId, 'identity-conflict', failure) });
+        } else this.#failConnectionAttempt(generation, controller, detail, { saved: this.#savedViews(profileId, 'offline', detail) });
       }
       throw error;
-    } finally { entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt); }
+    }
   }
 
   async #adoptConnection(

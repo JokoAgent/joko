@@ -1,0 +1,27 @@
+.server-access { display: grid; gap: 24px; min-width: 0; overflow-wrap: anywhere; line-height: 1.55; }
+.server-access h3, .server-access h4, .server-access p { margin: 0; }
+.server-access h3 { font-size: var(--text-16); }
+.server-access h4 { font-size: var(--text-15); }
+.server-access__header { display: flex; flex-wrap: wrap; align-items: start; gap: 12px; }
+.server-access__header > div { flex: 1; min-width: 160px; display: grid; gap: 6px; }
+.server-access__header p, .server-access__note, .server-access small { color: var(--text-soft); font-size: var(--text-13); }
+.server-access__group, .server-access__form, .server-access__advanced > div { display: grid; gap: 16px; min-width: 0; }
+.server-access__entry, .server-access__resource { display: grid; gap: 12px; min-width: 0; }
+.server-access__entry { padding: var(--settings-card-padding); border: 1px solid var(--line); border-radius: var(--radius); }
+.server-access__entry > div:first-child { display: grid; gap: 4px; }
+.server-access__actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.server-access .button { min-height: 44px; white-space: normal; }
+.server-access__form > label, .server-access__advanced label { display: grid; gap: 7px; min-width: 0; }
+.server-access input:not([type=checkbox]), .server-access textarea { width: 100%; min-width: 0; box-sizing: border-box; min-height: 44px; padding: 10px 12px; color: var(--text); background: var(--surface-raised); border: 1px solid var(--line); border-radius: 10px; }
+.server-access input:focus-visible, .server-access textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.server-access textarea { resize: vertical; font-family: inherit; }
+.server-access label.server-access__toggle, .server-access__secret-clear { display: flex; align-items: center; gap: 12px; min-height: 44px; }
+.server-access__secret-clear { font-size: var(--text-13); color: var(--text-soft); }
+.server-access__advanced > summary { cursor: pointer; min-height: 44px; padding: 10px 0; }
+.server-access__address { overflow-wrap: anywhere; font-size: var(--text-13); }
+.server-access__group > .button { justify-self: start; }
+.server-access .connection-method { grid-template-columns: 24px minmax(0, 1fr) 18px; }
+.connection-provider-guide { display: grid; gap: 16px; }
+.connection-provider-guide > summary { min-height: 44px; padding: 10px 0; cursor: pointer; }
+.connection-provider-guide__body { display: grid; gap: 12px; padding-top: 8px; }
+@media (max-width: 420px) { .server-access__actions > .button { width: 100%; } .server-access__header > .button { padding-inline: 0; } }

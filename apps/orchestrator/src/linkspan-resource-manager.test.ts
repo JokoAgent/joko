@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -46,6 +46,21 @@ async function fixture() {
   const dependencies = { cloudflare, readToken: vi.fn(async () => 'publisher-private-token') };
   return { root, workspace, app, configuration, dependencies, cloudflare, get remote() { return remote; }, set remote(value: CloudflareNamedResource | undefined) { remote = value; } };
 }
+
+it('uses a reserved GUI Vault revision for the original managed resource without creating a plaintext token file', async () => {
+  const f = await fixture(), reference = `server.access:${randomUUID()}`;
+  f.app.credentials.reserveManagedSecret({ credentialReferenceId: reference, kind: 'header_secret', providerId: 'server.access' });
+  await f.app.credentials.compareAndSetManagedSecret({ credentialReferenceId: reference, expectedSecret: undefined,
+    secret: JSON.stringify({ fields: { apiToken: 'gui-private-token' } }), displayName: 'Server access', kind: 'header_secret', providerId: 'server.access' });
+  const configuration = { provider: 'cloudflare' as const, accountId: 'a'.repeat(32), credentialReferenceId: reference };
+  const created = await manageLinkspanResource(f.app, { action: 'create', entryId: 'from-gui', configuration }, f.dependencies);
+  expect(created.state).toBe('active'); expect(f.dependencies.readToken).not.toHaveBeenCalled();
+  expect(f.cloudflare.createNamedTunnel).toHaveBeenCalledWith(expect.objectContaining({ apiToken: 'gui-private-token' }));
+  await manageLinkspanResource(f.app, { action: 'status', entryId: 'from-gui', configuration }, f.dependencies);
+  await manageLinkspanResource(f.app, { action: 'delete', entryId: 'from-gui', configuration, confirmResourceId: created.resourceId! }, f.dependencies);
+  expect(f.cloudflare.createNamedTunnel).toHaveBeenCalledOnce(); expect(f.cloudflare.deleteNamedTunnel).toHaveBeenCalledOnce();
+  expect(f.app.credentials.list()).toEqual([]);
+});
 
 it('journals a stable operation and saves the named-tunnel secret before creating, then opens only private owned material', async () => {
   const f = await fixture();
@@ -102,6 +117,24 @@ it('rejects changed resource inputs, unowned adoption and token paths inside a w
   expect(f.cloudflare.deleteNamedTunnel).not.toHaveBeenCalled();
 });
 
+it.each(['deleted', 'rejected'] as const)('creates a new exact operation for changed resource ownership only after %s', async phase => {
+  const f = await fixture();
+  if (phase === 'rejected') vi.mocked(f.cloudflare.createNamedTunnel).mockRejectedValueOnce(new LinkspanError('authentication_failed', 'private provider response'));
+  const original = await manageLinkspanResource(f.app, { action: 'create', entryId: 'replace', configuration: f.configuration }, f.dependencies);
+  const oldJournal = f.app.store.listSettingsByKeyPrefix('service', 'orchestrator', 'runtime.linkspan.resource.')[0]!.value as { reference: string };
+  if (phase === 'deleted') await manageLinkspanResource(f.app, { action: 'delete', entryId: 'replace', configuration: f.configuration }, f.dependencies);
+  const changed = { ...f.configuration, accountId: 'b'.repeat(32) };
+  await expect(manageLinkspanResource(f.app, { action: 'status', entryId: 'replace', configuration: changed }, f.dependencies)).rejects.toThrow(/original/u);
+  const created = await manageLinkspanResource(f.app, { action: 'create', entryId: 'replace', configuration: changed }, f.dependencies);
+  expect(created.state).toBe('active'); expect(created.requestId).not.toBe(original.requestId);
+  expect(f.app.store.getOperation(original.requestId!).status).toBe('completed');
+  expect(f.app.credentials.find(oldJournal.reference)).toBeUndefined();
+  expect(f.cloudflare.createNamedTunnel).toHaveBeenLastCalledWith(expect.objectContaining({ accountId: changed.accountId, requestId: created.requestId }));
+  expect(f.cloudflare.createNamedTunnel).toHaveBeenCalledTimes(2);
+  await expect(manageLinkspanResource(f.app, { action: 'create', entryId: 'replace', configuration: f.configuration }, f.dependencies)).rejects.toThrow(/original/u);
+  expect(f.cloudflare.createNamedTunnel).toHaveBeenCalledTimes(2);
+});
+
 it('opens the known Dev Tunnel material through an exact-ID read and never copies its host token to public facts', async () => {
   const f = await fixture();
   const configuration: LinkspanResourceManagement = { provider: 'dev-tunnels', clusterId: 'use', port: 4318, tokenPath: join(f.root, 'token'), tokenScheme: 'github' };
@@ -122,6 +155,10 @@ it('opens the known Dev Tunnel material through an exact-ID read and never copie
   const connector = await resolveManagedLinkspanConnector(f.app, { entryId: 'dev', connector: { provider: 'dev-tunnels' } }, dependencies);
   expect(connector).toMatchObject({ tunnelId: 'owned-dev-tunnel', clusterId: 'use', port: 4318, hostAccessToken: 'rotated-private-host-token' });
   expect(devTunnels.createDevTunnel).toHaveBeenCalledOnce(); expect(devTunnels.getDevTunnelMaterial).toHaveBeenCalledOnce();
+  for (const changed of [{ ...configuration, port: 4320 }, { ...configuration, clusterId: 'euw' }]) {
+    await expect(resolveManagedLinkspanConnector(f.app, { entryId: 'dev', connector: { provider: 'dev-tunnels' }, configuration: changed }, dependencies)).rejects.toThrow('original resource configuration');
+  }
+  expect(devTunnels.getDevTunnelMaterial).toHaveBeenCalledOnce();
   expect(JSON.stringify(f.app.store.listSettings(), (_key, value) => typeof value === 'bigint' ? value.toString() : value)).not.toContain('host-token');
   await expect(resolveManagedLinkspanConnector(f.app, { entryId: 'dev', connector: { provider: 'dev-tunnels', publicOrigin: 'https://other-tunnel.example' } }, dependencies)).rejects.toThrow(/does not match/u);
 });

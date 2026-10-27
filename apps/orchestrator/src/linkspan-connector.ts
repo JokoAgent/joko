@@ -43,6 +43,7 @@ export async function startManagedLinkspanConnector(application: OrchestratorApp
   readonly localOrigin: string;
   readonly originCaPool: string;
   readonly originServerName: string;
+  readonly displayName?: string;
   readonly signal?: AbortSignal;
 }) {
   const store = application.store;
@@ -123,7 +124,8 @@ export async function startManagedLinkspanConnector(application: OrchestratorApp
     throw receiptError;
   }
   ownedPublicOrigins.set(store, { requestId, origin: tunnel.publicOrigin });
-  retireEntry = publishConnectionEntry(store, { id: 'quick:cloudflare', provider: 'cloudflare', origin: tunnel.publicOrigin });
+  retireEntry = publishConnectionEntry(store, { id: 'quick:cloudflare', provider: 'cloudflare', origin: tunnel.publicOrigin,
+    ...(input.displayName ? { displayName: input.displayName } : {}) });
   void tunnel.closed.then(markClosed).catch(() => {
     unpublish();
     process.stderr.write("The public connector cleanup is unconfirmed or its receipt could not be saved.\n");

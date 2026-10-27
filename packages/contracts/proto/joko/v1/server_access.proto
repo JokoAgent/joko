@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package joko.v1;
+
+// Authenticated server management. Publisher secrets are never returned.
+service ServerAccessService {
+  rpc GetServerAccessSettings(GetServerAccessSettingsRequest) returns (GetServerAccessSettingsResponse);
+  rpc SaveServerAccessEntry(SaveServerAccessEntryRequest) returns (SaveServerAccessEntryResponse);
+  rpc ChangeServerAccessEntry(ChangeServerAccessEntryRequest) returns (ChangeServerAccessEntryResponse);
+}
+
+message ServerAccessCapability {
+  string provider = 1;
+  string mode = 2;
+  // ready, missing_runtime, missing_tls, unavailable
+  string state = 3;
+  string issue = 4;
+}
+message ServerAccessEntry {
+  string entry_id = 1;
+  string name = 2;
+  string provider = 3;
+  string mode = 4;
+  string revision = 5;
+  // gui or deployment; deployment entries require explicit adoption.
+  string source = 6;
+  bool enabled = 7;
+  // saved, starting, active, stopping, stopped, failed, outcome_unknown, source_conflict
+  string state = 8;
+  string public_origin = 9;
+  string published_entry_id = 10;
+  map<string, string> fields = 11;
+  repeated string configured_secrets = 12;
+  string request_id = 13;
+  string issue = 14;
+  bool pending_changes = 15;
+  string resource_state = 16;
+  string resource_id = 17;
+  bool resource_needs_adoption = 18;
+  bool resource_requires_dns = 19;
+}
+message GetServerAccessSettingsRequest {
+  // Optional original request. Read-only recovery, including deleted entries.
+  string request_id = 1;
+}
+message GetServerAccessSettingsResponse {
+  string server_id = 1;
+  repeated ServerAccessCapability capabilities = 2;
+  repeated ServerAccessEntry entries = 3;
+  // missing, pending, completed, failed, outcome_unknown
+  string operation_state = 4;
+  ServerAccessEntry operation_entry = 5;
+  bool operation_deleted = 6;
+  string operation_issue = 7;
+}
+message SaveServerAccessEntryRequest {
+  string request_id = 1;
+  string entry_id = 2;
+  string expected_revision = 3;
+  string name = 4;
+  string provider = 5;
+  string mode = 6;
+  // Keys are restricted by the selected provider/mode. An omitted secret is retained.
+  map<string, string> fields = 7;
+}
+message SaveServerAccessEntryResponse {
+  ServerAccessEntry entry = 1;
+}
+message ChangeServerAccessEntryRequest {
+  string request_id = 1;
+  string entry_id = 2;
+  string expected_revision = 3;
+  // start, stop, delete, adopt, accept_source, resource_create,
+  // resource_status, resource_delete, resource_adopt.
+  string action = 4;
+  bool confirm_disconnection = 5;
+  string confirm_resource_id = 6;
+}
+message ChangeServerAccessEntryResponse {
+  ServerAccessEntry entry = 1;
+  bool deleted = 2;
+}

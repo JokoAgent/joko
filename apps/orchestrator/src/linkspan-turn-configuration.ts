@@ -26,6 +26,16 @@ interface TurnRecord {
 }
 type IceInput = Parameters<RemoteDesktopIceConfigurationProvider["getConfiguration"]>[0];
 
+/** Reserve cleanup handles even when no TURN configuration is currently enabled. */
+export function reserveLinkspanTurnCredentials(store: OperationalStore, credentials: CredentialManager): void {
+  for (const { key, value } of store.listSettingsByKeyPrefix('service', 'orchestrator', PREFIX)) {
+    const record = value as TurnRecord, provider = record.provider ?? 'cloudflare';
+    if (!/^turn:[a-f0-9-]{36}$/u.test(record.requestId) || record.reference !== `linkspan.turn:${record.requestId}`
+      || key !== PREFIX + record.requestId || !['cloudflare', 'twilio', 'coturn'].includes(provider)) throw new Error('Invalid TURN cleanup ownership.');
+    credentials.reserveManagedSecret({ credentialReferenceId: record.reference, kind: 'header_secret', providerId: `${provider}.turn` });
+  }
+}
+
 /** Host authorization and receipts stay here; Linkspan only handles provider material. */
 export class LinkspanRemoteDesktopTurnConfiguration implements RemoteDesktopIceConfigurationProvider {
   readonly #leases = new Map<string, { readonly promise: Promise<TurnMaterial>; retired: boolean }>();

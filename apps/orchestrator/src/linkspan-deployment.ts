@@ -49,6 +49,8 @@ export type SdkDeployment = {
   readonly relayToken?: string;
   readonly relayTokenExpiresAt?: number;
   readonly servicesApiSecretPath?: string;
+  /** GUI configuration resolves this only from the server Vault. */
+  readonly servicesApiSecret?: string;
   readonly relayLeaseTtlSeconds?: number;
 } | {
   readonly provider: "tailcat";
@@ -116,66 +118,70 @@ export async function readLinkspanDeployment(path: string, signal: AbortSignal, 
     await permissions.verifyFinal(); signal.throwIfAborted();
     let value: unknown;
     try { value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset))); } catch { throw invalid(); }
-    if (!Array.isArray(value) || value.length < 1 || value.length > 16) throw invalid();
-    const ids = new Set<string>();
-    let prepared: PreparedRuntimes | undefined;
-    const runtimeRoot = fileURLToPath(new URL("../dist/linkspan-runtime/", import.meta.url));
-    const pinggyDirectory = async (): Promise<string> => {
-      try { prepared ??= JSON.parse(await readFile(resolve(runtimeRoot, "selected.json"), "utf8")) as PreparedRuntimes; }
-      catch { throw new Error("Build the selected Pinggy SDK before enabling it."); }
-      return resolvePreparedPinggySdkDirectory(runtimeRoot, prepared);
-    };
-    const providers = new Set(["cloudflare", "funnel", "frp", "rathole", "bore", "ssh", "netbird", "ngrok", "zrok", "pangolin", "pinggy", "dev-tunnels", "localtunnel", "iroh", "tailcat"]);
-    for (const entry of value) {
-      if (entry === null || typeof entry !== "object" || Object.keys(entry).some(key => !["id", "connector", "management", "mediaUdp", "mediaUdpManagement"].includes(key))
-        || typeof entry.id !== "string" || !/^[a-z][a-z0-9-]{0,63}$/u.test(entry.id) || ids.has(entry.id)
-        || (entry.connector === undefined ? entry.mediaUdp === undefined : entry.connector === null || typeof entry.connector !== "object" || !providers.has(entry.connector.provider))) throw invalid();
-      if (entry.connector?.provider === "cloudflare" && entry.connector.mode !== "named") throw invalid();
-      if (entry.connector !== undefined) linkspanHttpConnectTransport(entry.connector);
-      if (entry.connector?.provider === "iroh") {
-        const urls = entry.connector.relayUrls;
-        if (urls !== undefined && (!Array.isArray(urls) || urls.length > 8 || urls.some((value: unknown) => typeof value !== "string"))) throw invalid();
-        if (entry.connector.servicesApiSecretPath !== undefined && (!Array.isArray(urls) || urls.length === 0)) throw new Error("A restricted iroh relay requires explicit nonempty owned relay URLs before lease issuance.");
-      }
-      if (entry.mediaUdp !== undefined) {
-        if (entry.mediaUdp === null || typeof entry.mediaUdp !== "object" || !["netbird", "pangolin", "frp", "rathole", "pinggy"].includes(entry.mediaUdp.provider)
-          || entry.mediaUdp.provider === "pinggy" && entry.mediaUdp.runtime !== "sdk") throw invalid();
-        if (options.resolveRuntime !== false && entry.mediaUdp.provider === "pinggy" && entry.mediaUdp.sdkDirectory === undefined) {
-          entry.mediaUdp.sdkDirectory = await pinggyDirectory();
-        }
-        if (options.resolveRuntime !== false && entry.mediaUdp.provider !== "pinggy" && entry.mediaUdp.helper === undefined) {
-          try { prepared ??= JSON.parse(await readFile(resolve(runtimeRoot, "selected.json"), "utf8")) as NonNullable<typeof prepared>; } catch { throw new Error("Build the selected UDP media helper before enabling it."); }
-          const helper = prepared.helpers[entry.mediaUdp.provider];
-          if (prepared.target !== `${process.platform}-${process.arch}` || helper === undefined || isAbsolute(helper.executable)) throw invalid();
-          const executable = resolve(runtimeRoot, helper.executable), suffix = relative(runtimeRoot, executable);
-          if (!suffix || suffix === ".." || suffix.startsWith(`..${sep}`) || isAbsolute(suffix)) throw invalid();
-          entry.mediaUdp.helper = { ...helper, executable };
-        }
-      }
-      if (entry.mediaUdpManagement !== undefined && (entry.mediaUdp?.provider !== "netbird" || entry.mediaUdpManagement === null
-        || typeof entry.mediaUdpManagement !== "object" || entry.mediaUdpManagement.provider !== "netbird" || entry.mediaUdpManagement.mode !== "udp")) throw invalid();
-      if (entry.connector === undefined) { if (entry.management !== undefined) throw invalid(); ids.add(entry.id); continue; }
-      if (options.resolveRuntime !== false && entry.connector.provider === "cloudflare" && entry.connector.executable === undefined) {
-        entry.connector.executable = fileURLToPath(new URL(`../dist/linkspan-helper/${CLOUDFLARED_VERSION}/${process.platform}-${process.arch}/${process.platform === "win32" ? "cloudflared.exe" : "cloudflared"}`, import.meta.url));
-      }
-      if (entry.management !== undefined && (entry.management === null || typeof entry.management !== "object"
-        || entry.management.provider !== entry.connector.provider || !["cloudflare", "netbird", "dev-tunnels"].includes(entry.management.provider))) throw invalid();
-      if (options.resolveRuntime !== false && ["funnel", "frp", "rathole", "bore", "netbird", "zrok", "pangolin"].includes(entry.connector.provider) && entry.connector.helper === undefined) {
-        try { prepared ??= JSON.parse(await readFile(resolve(runtimeRoot, "selected.json"), "utf8")) as NonNullable<typeof prepared>; } catch { throw new Error("Build the explicitly selected connector helper before enabling this entrance."); }
-        const helper = prepared.helpers[entry.connector.provider];
-        if (prepared.target !== `${process.platform}-${process.arch}` || helper === undefined || isAbsolute(helper.executable)) throw new Error("The selected helper was not prepared for this server target.");
-        const executable = resolve(runtimeRoot, helper.executable), suffix = relative(runtimeRoot, executable);
-        if (!suffix || suffix === ".." || suffix.startsWith(`..${sep}`) || isAbsolute(suffix)) throw invalid();
-        entry.connector.helper = { ...helper, executable };
-      }
-      if (options.resolveRuntime !== false && entry.connector.provider === "pinggy" && entry.connector.runtime === "sdk" && entry.connector.sdkDirectory === undefined) {
-        entry.connector.sdkDirectory = await pinggyDirectory();
-      }
-      ids.add(entry.id);
-    }
-    return Object.freeze(value as LinkspanDeploymentEntry[]);
+    return await prepareLinkspanDeployment(value, options);
   } finally {
     bytes?.fill(0); await permissions?.close().catch(() => undefined); await handle.close().catch(() => undefined);
   }
+}
+/** Resolve only fixed build receipts; GUI input never supplies helper paths. */
+export async function prepareLinkspanDeployment(value: unknown, options: { readonly resolveRuntime?: boolean } = {}): Promise<readonly LinkspanDeploymentEntry[]> {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 16) throw invalid();
+  const ids = new Set<string>();
+  let prepared: PreparedRuntimes | undefined;
+  const runtimeRoot = fileURLToPath(new URL("../dist/linkspan-runtime/", import.meta.url));
+  const pinggyDirectory = async (): Promise<string> => {
+    try { prepared ??= JSON.parse(await readFile(resolve(runtimeRoot, "selected.json"), "utf8")) as PreparedRuntimes; }
+    catch { throw new Error("Build the selected Pinggy SDK before enabling it."); }
+    return resolvePreparedPinggySdkDirectory(runtimeRoot, prepared);
+  };
+  const providers = new Set(["cloudflare", "funnel", "frp", "rathole", "bore", "ssh", "netbird", "ngrok", "zrok", "pangolin", "pinggy", "dev-tunnels", "localtunnel", "iroh", "tailcat"]);
+  for (const entry of value) {
+    if (entry === null || typeof entry !== "object" || Object.keys(entry).some(key => !["id", "connector", "management", "mediaUdp", "mediaUdpManagement"].includes(key))
+      || typeof entry.id !== "string" || !/^[a-z][a-z0-9-]{0,63}$/u.test(entry.id) || ids.has(entry.id)
+      || (entry.connector === undefined ? entry.mediaUdp === undefined : entry.connector === null || typeof entry.connector !== "object" || !providers.has(entry.connector.provider))) throw invalid();
+    if (entry.connector?.provider === "cloudflare" && entry.connector.mode !== "named") throw invalid();
+    if (entry.connector !== undefined) linkspanHttpConnectTransport(entry.connector);
+    if (entry.connector?.provider === "iroh") {
+      const urls = entry.connector.relayUrls;
+      if (urls !== undefined && (!Array.isArray(urls) || urls.length > 8 || urls.some((value: unknown) => typeof value !== "string"))) throw invalid();
+      if (entry.connector.servicesApiSecretPath !== undefined && (!Array.isArray(urls) || urls.length === 0)) throw new Error("A restricted iroh relay requires explicit nonempty owned relay URLs before lease issuance.");
+    }
+    if (entry.mediaUdp !== undefined) {
+      if (entry.mediaUdp === null || typeof entry.mediaUdp !== "object" || !["netbird", "pangolin", "frp", "rathole", "pinggy"].includes(entry.mediaUdp.provider)
+        || entry.mediaUdp.provider === "pinggy" && entry.mediaUdp.runtime !== "sdk") throw invalid();
+      if (options.resolveRuntime !== false && entry.mediaUdp.provider === "pinggy" && entry.mediaUdp.sdkDirectory === undefined) {
+        entry.mediaUdp.sdkDirectory = await pinggyDirectory();
+      }
+      if (options.resolveRuntime !== false && entry.mediaUdp.provider !== "pinggy" && entry.mediaUdp.helper === undefined) {
+        try { prepared ??= JSON.parse(await readFile(resolve(runtimeRoot, "selected.json"), "utf8")) as NonNullable<typeof prepared>; } catch { throw new Error("Build the selected UDP media helper before enabling it."); }
+        const helper = prepared.helpers[entry.mediaUdp.provider];
+        if (prepared.target !== `${process.platform}-${process.arch}` || helper === undefined || isAbsolute(helper.executable)) throw invalid();
+        const executable = resolve(runtimeRoot, helper.executable), suffix = relative(runtimeRoot, executable);
+        if (!suffix || suffix === ".." || suffix.startsWith(`..${sep}`) || isAbsolute(suffix)) throw invalid();
+        entry.mediaUdp.helper = { ...helper, executable };
+      }
+    }
+    if (entry.mediaUdpManagement !== undefined && (entry.mediaUdp?.provider !== "netbird" || entry.mediaUdpManagement === null
+      || typeof entry.mediaUdpManagement !== "object" || entry.mediaUdpManagement.provider !== "netbird" || entry.mediaUdpManagement.mode !== "udp")) throw invalid();
+    if (entry.connector === undefined) { if (entry.management !== undefined) throw invalid(); ids.add(entry.id); continue; }
+    if (options.resolveRuntime !== false && entry.connector.provider === "cloudflare" && entry.connector.executable === undefined) {
+      entry.connector.executable = fileURLToPath(new URL(`../dist/linkspan-helper/${CLOUDFLARED_VERSION}/${process.platform}-${process.arch}/${process.platform === "win32" ? "cloudflared.exe" : "cloudflared"}`, import.meta.url));
+    }
+    if (entry.management !== undefined && (entry.management === null || typeof entry.management !== "object"
+      || entry.management.provider !== entry.connector.provider || !["cloudflare", "netbird", "dev-tunnels"].includes(entry.management.provider))) throw invalid();
+    if (options.resolveRuntime !== false && ["funnel", "frp", "rathole", "bore", "netbird", "zrok", "pangolin"].includes(entry.connector.provider) && entry.connector.helper === undefined) {
+      try { prepared ??= JSON.parse(await readFile(resolve(runtimeRoot, "selected.json"), "utf8")) as NonNullable<typeof prepared>; } catch { throw new Error("Build the explicitly selected connector helper before enabling this entrance."); }
+      const helper = prepared.helpers[entry.connector.provider];
+      if (prepared.target !== `${process.platform}-${process.arch}` || helper === undefined || isAbsolute(helper.executable)) throw new Error("The selected helper was not prepared for this server target.");
+      const executable = resolve(runtimeRoot, helper.executable), suffix = relative(runtimeRoot, executable);
+      if (!suffix || suffix === ".." || suffix.startsWith(`..${sep}`) || isAbsolute(suffix)) throw invalid();
+      entry.connector.helper = { ...helper, executable };
+    }
+    if (options.resolveRuntime !== false && entry.connector.provider === "pinggy" && entry.connector.runtime === "sdk" && entry.connector.sdkDirectory === undefined) {
+      entry.connector.sdkDirectory = await pinggyDirectory();
+    }
+    ids.add(entry.id);
+  }
+  return Object.freeze(value as LinkspanDeploymentEntry[]);
 }
 function invalid(): Error { return new Error("The private Linkspan deployment file is invalid. Check its bounded entries and selected provider configuration locally."); }

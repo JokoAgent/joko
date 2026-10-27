@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
+  ConnectionState,
   CreateTargetMutationSchema,
   LogoutConnectionMutationSchema,
   EntityKind,
@@ -308,8 +309,15 @@ describe("remote connection auth and durable operations", () => {
         value: create(LogoutConnectionMutationSchema, { connectionId: owner.connectionId })
       }
     });
-    const loggedOut = await submit(owner.clients.operation, owner.connectionId, logout);
-    expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
+    const logoutId = randomUUID();
+    // Self-revocation can retire the HTTP response after the durable commit.
+    const loggedOut = await submit(owner.clients.operation, owner.connectionId, logout, logoutId).catch((error: unknown) => {
+      expect(error).toMatchObject({ code: Code.Aborted });
+      return undefined;
+    });
+    if (loggedOut) expect(loggedOut.state).toBe(OperationState.SUCCEEDED);
+    expect(fixture.application.store.getOperation(logoutId).status).toBe("completed");
+    expect((await peer.clients.connection.getConnection({ connectionId: owner.connectionId })).connection?.state).toBe(ConnectionState.REVOKED);
     await expect(owner.clients.connection.listConnections({})).rejects.toMatchObject({ code: Code.Unauthenticated });
   });
 

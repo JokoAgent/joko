@@ -986,7 +986,8 @@ test("Collaboration exposes exact Goal, worker, lifecycle, and Queue CAS authori
 
 test("discovery metadata is a closed public allowlist", () => {
   assert.deepEqual(fields(contract.DiscoveredNodeSchema).map((candidate) => candidate.name), [
-    "server_id", "display_name", "origin", "version", "api_version", "pairing_enabled", "last_seen"
+    "server_id", "display_name", "origin", "version", "api_version", "pairing_enabled", "last_seen",
+    "endpoint_public_key", "connection_kinds", "connection_directory_revision"
   ]);
   assert.deepEqual(fields(contract.LanDiscoveryDatagramSchema).map((candidate) => candidate.name), [
     "magic", "protocol_version", "nonce", "kind", "node"
@@ -1532,17 +1533,25 @@ test("public enum wire numbers remain stable", () => {
   }
 });
 
-test("public messages use typed fields instead of maps, Struct, or Any", () => {
-  const descriptions = field(contract.ManagedModelRuntimeCatalogModelSchema, "descriptions");
-  assert.equal(descriptions.fieldKind, "map");
-  assert.equal(descriptions.mapKey, ScalarType.STRING);
-  assert.equal(descriptions.mapKind, "scalar");
-  assert.equal(descriptions.scalar, ScalarType.STRING);
+test("public messages allow only explicit string maps and reject Struct or Any", () => {
+  const stringMaps = new Set([
+    "joko.v1.ManagedModelRuntimeCatalogModel.descriptions",
+    "joko.v1.ServerAccessEntry.fields",
+    "joko.v1.SaveServerAccessEntryRequest.fields"
+  ]);
+  const observedStringMaps = new Set();
   for (const [exportName, descriptor] of Object.entries(contract)) {
     if (!exportName.endsWith("Schema") || descriptor?.kind !== "message") continue;
     for (const candidate of descriptor.fields) {
-      if (descriptor.typeName !== "joko.v1.ManagedModelRuntimeCatalogModel" || candidate.name !== "descriptions") {
-        assert.notEqual(candidate.fieldKind, "map", `${descriptor.typeName}.${candidate.name} uses a map`);
+      const identity = `${descriptor.typeName}.${candidate.name}`;
+      if (stringMaps.has(identity)) {
+        assert.equal(candidate.fieldKind, "map", identity);
+        assert.equal(candidate.mapKey, ScalarType.STRING, identity);
+        assert.equal(candidate.mapKind, "scalar", identity);
+        assert.equal(candidate.scalar, ScalarType.STRING, identity);
+        observedStringMaps.add(identity);
+      } else {
+        assert.notEqual(candidate.fieldKind, "map", `${identity} uses a map`);
       }
       if (candidate.message !== undefined) {
         assert.notEqual(candidate.message.typeName, "google.protobuf.Struct");
@@ -1550,4 +1559,5 @@ test("public messages use typed fields instead of maps, Struct, or Any", () => {
       }
     }
   }
+  assert.deepEqual(observedStringMaps, stringMaps);
 });

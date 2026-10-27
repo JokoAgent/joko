@@ -36,6 +36,8 @@ import type { ConnectionScreenController } from '../connection-contract.js';
 import type { Translator } from './types.js';
 import { Button, ErrorBanner, Spinner } from './ui.js';
 import { DeviceInvitationQr } from './DeviceInvitationQr.js';
+import { SERVER_ACCESS_PROVIDERS } from '@joko/contracts/server-access';
+import './server-access.css';
 
 export function DeviceAuthorizationEntry({ controller, t, defaultName, initialInvitation, automatic, onStageChange, discoveredNode, onClearDiscovered }: {
   readonly controller: ConnectionScreenController; readonly t: Translator; readonly defaultName: string; readonly initialInvitation?: string; readonly automatic?: boolean;
@@ -55,6 +57,7 @@ export function DeviceAuthorizationEntry({ controller, t, defaultName, initialIn
   const [confirmForget, setConfirmForget] = useState(false);
   const [reviewCopied, setReviewCopied] = useState(false), [copyError, setCopyError] = useState('');
   const [privateMode, setPrivateMode] = useState(false), [transportRequest, setTransportRequest] = useState('');
+  const [providerGuide, setProviderGuide] = useState('');
   const [now, setNow] = useState(Date.now()), [entriesRevision, setEntriesRevision] = useState(0);
   const heading = useRef<HTMLHeadingElement>(null), paste = useRef<HTMLTextAreaElement>(null);
   const invitationHint = useId();
@@ -163,6 +166,14 @@ export function DeviceAuthorizationEntry({ controller, t, defaultName, initialIn
           <span><strong>{t('authorization.useLink')}</strong><small>{t('authorization.linkHelp')}</small></span><ArrowRight aria-hidden="true" /></button>
       </div>
       {controller.deviceAuthorization?.transportRequest && <Button tone="ghost" disabled={busy || unconfirmed} onClick={() => { setPrivateMode(true); setError(''); void perform('restoreTransport'); }}>{t('entries.privateRequest')}</Button>}
+      <details className="connection-provider-guide"><summary>{t('access.browse')}</summary><div className="connection-provider-guide__body">
+        {providerGuide ? <><strong>{t('access.receiverTitle', { provider: SERVER_ACCESS_PROVIDERS.find(provider => provider.id === providerGuide)?.name ?? providerGuide })}</strong>
+          <p>{t('access.receiverHelp')}</p><Button tone="primary" disabled={busy || unconfirmed} onClick={() => { setStage('invite'); setError(''); }}>{t('access.getInvitation')}</Button>
+          {['iroh', 'tailcat'].includes(providerGuide) && controller.deviceAuthorization?.transportRequest && <Button disabled={busy || unconfirmed} onClick={() => { setPrivateMode(true); setError(''); void perform('restoreTransport'); }}>{t('entries.privateRequest')}</Button>}
+          <Button tone="ghost" disabled={busy} onClick={() => setProviderGuide('')}>{t('access.back')}</Button>
+        </> : SERVER_ACCESS_PROVIDERS.filter(provider => provider.modes.some(mode => mode.purpose !== 'media')).map(provider => <button key={provider.id} type="button" className="connection-method" disabled={busy || unconfirmed} onClick={() => setProviderGuide(provider.id)}>
+          <span className="connection-method__icon"><Cloud aria-hidden="true" /></span><span><strong>{provider.name}</strong><small>{t(['iroh', 'tailcat'].includes(provider.id) ? 'entries.privateHelp' : 'entries.publicHelp')}</small></span><ArrowRight aria-hidden="true" /></button>)}
+      </div></details>
       <details className="connection-onboarding__help"><summary>{t('authorization.needInvitation')}</summary><p>{t('authorization.help')}</p></details>
     </> : !progress ? <>
       <button type="button" className="connection-onboarding__back" disabled={busy || unconfirmed} onClick={() => { setStage('choice'); setError(''); }}><ArrowLeft aria-hidden="true" />{t('authorization.chooseAnother')}</button>

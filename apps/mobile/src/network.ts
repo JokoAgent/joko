@@ -202,6 +202,7 @@ export interface MobilePushCapabilityResult {
 export interface MobileNetwork {
   deviceAuthorizationTransport?(invitation: import('@joko/connection-transport/device-authorization').DeviceTarget): Transport;
   deviceAuthorizationOwner?(credential: PairedCredential, assertCurrent: () => void): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
+  serverAccess?(credential: PairedCredential, assertCurrent: () => void): import('@joko/connection-transport/server-access').ServerAccessClient;
   listModelSourceRemoteHosts?(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<readonly RemoteHost[]>;
   listModelSourceDevicePeers?(credential: PairedCredential, signal?: AbortSignal): Promise<readonly DevicePeerDescriptor[]>;
   getSessionRuntimeControl?(credential: PairedCredential, sessionId: string,
@@ -1467,6 +1468,8 @@ function normalizedMobilePushToken(value: string): string {
 }
 
 import { deviceAuthorizationOwner } from '@joko/connection-transport/device-authorization';
+import { serverAccessClient } from '@joko/connection-transport/server-access';
+import { ServerAccessService } from '@joko/contracts';
 function credentialTransport(credential: PairedCredential): Transport {
   rememberEndpointTrust(credential);
   return transport(credential.origin, credential.authKey, credential.endpointPublicKey, credential.transportKind ?? 'https');
@@ -1563,6 +1566,7 @@ function validRemoteDesktopDisplayModes(modes: readonly RemoteDesktopDisplayMode
 export const mobileNetwork: MobileNetwork = {
   deviceAuthorizationTransport: invitation => transport(invitation.origin, undefined, invitation.endpointPublicKey, invitation.endpointTransport?.kind ?? 'https'),
   deviceAuthorizationOwner: (credential, assertCurrent) => deviceAuthorizationOwner(createClient(ConnectionService, credentialTransport(credential)), assertCurrent),
+  serverAccess: (credential, assertCurrent) => serverAccessClient(createClient(ServerAccessService, credentialTransport(credential)), assertCurrent, `${credential.serverId}:${credential.connectionId}`),
   inputHandoffApi: (credential, scope) => createMobileInputHandoffApi({ credential, scope, transport: credentialTransport(credential) }),
   listInputHandoffTasks: (credential, signal) => readMobileInputHandoffTasks(credentialTransport(credential), signal),
   async inspect(origin, signal) {

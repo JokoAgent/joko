@@ -75,6 +75,7 @@ describe("Desktop distribution", () => {
   it("pins an inert builder toolchain and keeps build-only packages out of production dependencies", () => {
     expect(manifest.dependencies).toEqual({
       "@jokoagent/linkspan-core": "*",
+      "@jokoagent/linkspan-http-connect": "*",
       "@jokoagent/linkspan-iroh": "*",
       "@jokoagent/linkspan-tailcat": "*",
       "@jokoagent/linkspan-iroh-node": "*",

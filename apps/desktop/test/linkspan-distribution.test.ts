@@ -79,6 +79,14 @@ it('delivers and resolves the exact Desktop carrier closure even when the builde
     }
     expect(await auditDesktopLinkspanRuntime(app)).toEqual({ packages: 11 });
     const noiseRoot = join(app, 'node_modules/@jokoagent/linkspan-noise');
+    const noiseManifestPath = join(noiseRoot, 'package.json');
+    const noiseManifest = JSON.parse(await readFile(noiseManifestPath, 'utf8'));
+    expect(noiseManifest.dependencies['@jokoagent/linkspan-core']).toBe('*');
+    await writeFile(noiseManifestPath, JSON.stringify({ ...noiseManifest, dependencies: { '@jokoagent/linkspan-core': '999.0.0' } }));
+    await expect(auditDesktopLinkspanRuntime(app)).rejects.toThrow(/dependency closure/u);
+    await writeFile(noiseManifestPath, JSON.stringify({ ...noiseManifest, dependencies: { ...noiseManifest.dependencies, '@jokoagent/linkspan-absent': '*' } }));
+    await expect(auditDesktopLinkspanRuntime(app)).rejects.toThrow(/dependency closure/u);
+    await writeFile(noiseManifestPath, JSON.stringify(noiseManifest));
     expect((await readFile(join(noiseRoot, 'dist/THIRD_PARTY_LICENSES.txt'))).length).toBeGreaterThan(0);
     expect(JSON.parse(await readFile(join(noiseRoot, 'dist/dependency-inventory.json'), 'utf8')).length).toBeGreaterThan(0);
     const entries = [['linkspan-noise/dist/index.js', 'connectWebSocket'], ['linkspan-http/dist/index.js', 'createHttpClient'],
@@ -94,10 +102,19 @@ it('delivers and resolves the exact Desktop carrier closure even when the builde
     await writeFile(patchReceiptPath, '{}');
     await expect(auditDesktopLinkspanRuntime(app)).rejects.toThrow(/patch receipt is invalid/u);
     await writeFile(patchReceiptPath, patchReceipt);
+    const entryPath = join(noiseRoot, 'dist/index.js');
+    const entry = await readFile(entryPath);
+    await rm(entryPath);
+    await expect(auditDesktopLinkspanRuntime(app)).rejects.toThrow(/entry is missing/u);
+    await writeFile(entryPath, entry);
     const sourceReceiptPath = join(noiseRoot, 'dist/source-build.json');
     const sourceReceipt = JSON.parse(await readFile(sourceReceiptPath, 'utf8'));
-    await writeFile(sourceReceiptPath, JSON.stringify({ ...sourceReceipt, sourceCommit: '0'.repeat(40) }));
-    await expect(auditDesktopLinkspanRuntime(app)).rejects.toThrow(/conflicting source receipts/u);
+    for (const field of ['sourceCommit', 'sourceTree']) {
+      await writeFile(sourceReceiptPath, JSON.stringify({ ...sourceReceipt, [field]: '0'.repeat(40) }));
+      await expect(auditDesktopLinkspanRuntime(app)).rejects.toThrow(/conflicting source receipts/u);
+    }
+    await writeFile(sourceReceiptPath, JSON.stringify(sourceReceipt));
+    expect(await auditDesktopLinkspanRuntime(app)).toEqual({ packages: 11 });
     await rm(join(app, 'node_modules/@jokoagent/linkspan-noise'), { recursive: true });
     await expect(auditDesktopLinkspanRuntime(app)).rejects.toThrow(/missing.*linkspan-noise/u);
   } finally {
