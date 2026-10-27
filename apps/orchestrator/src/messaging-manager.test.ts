@@ -38,7 +38,7 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
-import type { AdapterContext, InteractionDecision, MessageBlock, PromptInput } from "@joko/core";
+import type { AdapterContext, BlobRef, EventPayload, InteractionDecision, MessageBlock, PromptInput } from "@joko/core";
 import { OperationalStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -796,6 +796,155 @@ describe("MessagingManager", () => {
     expect(durableText).not.toContain("private-document-body");
   });
 
+  it.each([false, true])("retains generated tool images across pagination and restart with final-image echo %s", async (echoImage) => {
+    const transports: FakeTelegramTransport[] = [];
+    const adapter = new AttachmentFakeAdapter();
+    const fixture = await createFixture(() => {
+      const transport = new FakeTelegramTransport(directMessageBatch()); transports.push(transport); return transport;
+    }, () => adapter);
+    const first = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "generated-one.png", mimeType: "image/png" });
+    const second = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "generated-two.png", mimeType: "image/png" });
+    const withheld = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "observation.png", mimeType: "image/png" });
+    adapter.events = [
+      generatedImageResult(first),
+      { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Earlier commentary." }] },
+      { ...generatedImageResult(second), callId: "second-image", parts: [
+        { kind: "image", blob: first }, { kind: "image", blob: second }, { kind: "image", blob: second }
+      ] },
+      { ...generatedImageResult(withheld), name: "mcp__browser__screenshot" },
+      { ...generatedImageResult(withheld), name: "read" },
+      { ...generatedImageResult(withheld), isError: true },
+      { ...generatedImageResult(withheld), type: "tool_update" },
+      { ...generatedImageResult(withheld), parts: [{ kind: "artifact", blob: withheld, label: "Private file" }] }
+    ];
+    adapter.blocks = [{ kind: "text", text: "Your images are ready." },
+      ...(echoImage ? [{ kind: "image" as const, blob: first }] : [])];
+    adapter.beforeReply = async (context) => {
+      const request = fixture.store.listMessagingInboundRequests()[0]!;
+      fixture.store.transaction((store) => {
+        for (let index = 0; index < 1_001; index += 1) store.appendEvent({
+          backendId: context.target.backendId, targetId: context.target.id, sessionId: context.sessionId,
+          runId: request.runId!, generation: context.generation, traceId: `progress-${index}`,
+          payload: { type: "status", key: "progress", text: "Working" }
+        });
+      });
+    };
+    // Pause only the sender: admission, run events and delivery creation remain durable.
+    const claim = vi.spyOn(fixture.store, "claimNextMessagingDelivery").mockReturnValue(undefined);
+    await enableTelegramReply(fixture, "generated-images");
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]?.status).toBe("completed"), { timeout: 5_000 });
+    const request = fixture.store.listMessagingInboundRequests()[0]!;
+    const deliveries = fixture.store.listMessagingDeliveries();
+    expect(deliveries.filter((delivery) => delivery.kind === "file")).toEqual([
+      expect.objectContaining({ status: "pending", dedupeKey: `run:${request.runId}:answer`, payload: expect.objectContaining({
+        files: [expect.objectContaining({ blob: expect.objectContaining({ id: first.id }) }),
+          expect.objectContaining({ blob: expect.objectContaining({ id: second.id }) })]
+      }) })
+    ]);
+    fixture.store.expireArtifacts(Date.now() + 60 * 60_000);
+    for (const blob of [first, second]) expect(fixture.store.findArtifact(blob.id)).toMatchObject({ metadata: {} });
+    await fixture.manager.onRunSettled({ sessionId: fixture.store.getMessagingConversation(request.conversationId!).sessionId!,
+      runId: request.runId!, outcome: "completed" });
+    expect(fixture.store.listMessagingDeliveries().map((delivery) => delivery.id)).toEqual(deliveries.map((delivery) => delivery.id));
+    await fixture.manager.close();
+    claim.mockRestore();
+    await fixture.restartManager();
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries().every((delivery) => delivery.status === "sent")).toBe(true));
+    expect(transports.flatMap((transport) => transport.sentAttachments)).toEqual([
+      { address: expect.objectContaining({ providerConversationId: "42" }), fileNames: ["generated-one.png", "generated-two.png"] }
+    ]);
+    expect(transports.flatMap((transport) => transport.sentText).map((part) => part.text)).toEqual(["Your images are ready."]);
+    expect(fixture.store.listMessagingDeliveries().map((delivery) => delivery.id)).toEqual(deliveries.map((delivery) => delivery.id));
+  });
+
+  it("excludes other runs, Sessions, foreign-owned blobs and expiring tool images", async () => {
+    const transport = new FakeTelegramTransport(directMessageBatch());
+    const adapter = new AttachmentFakeAdapter();
+    const fixture = await createFixture(() => transport, () => adapter);
+    const image = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "own.png", mimeType: "image/png" });
+    const unrelated = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "unrelated.png", mimeType: "image/png" });
+    const foreign = await fixture.artifacts.ingestBytes(pngBytes(), {
+      fileName: "foreign.png", mimeType: "image/png", expiresAt: Date.now() + 60_000
+    });
+    const expiring = await fixture.artifacts.ingestBytes(pngBytes(), {
+      fileName: "staging.png", mimeType: "image/png", expiresAt: Date.now() + 60_000
+    });
+    adapter.events = [generatedImageResult(image), generatedImageResult(expiring)];
+    adapter.beforeReply = async (context) => {
+      const request = fixture.store.listMessagingInboundRequests()[0]!;
+      const session = fixture.store.getSession(context.sessionId).descriptor;
+      fixture.store.createSession({ ...session, id: "other-session", binding: {
+        ...session.binding, opaqueRef: "fake://other-session", nativeSessionId: "fake-native-other"
+      } });
+      fixture.store.createRun({ id: "other-run", sessionId: context.sessionId, source: "user", state: "completed", createdAt: Date.now() });
+      fixture.store.createRun({ id: "foreign-run", sessionId: "other-session", source: "user", state: "completed", createdAt: Date.now() });
+      fixture.store.transaction((store) => {
+        store.adoptSessionArtifact({ blob: store.getArtifact(foreign.id).blob, sessionId: "other-session", runId: "foreign-run" });
+        for (const [sessionId, runId, blob] of [
+          [context.sessionId, "other-run", unrelated], ["other-session", "foreign-run", unrelated],
+          [context.sessionId, request.runId!, foreign]
+        ] as const) store.appendEvent({
+          backendId: context.target.backendId, targetId: context.target.id, sessionId, runId,
+          generation: context.generation, traceId: `foreign-image-${runId}`, payload: generatedImageResult(blob)
+        });
+      });
+      await fixture.manager.onRunSettled({ sessionId: "other-session", runId: request.runId!, outcome: "completed" });
+      expect(fixture.store.getMessagingInboundRequest(request.id).status).toBe("queued");
+    };
+    await enableTelegramReply(fixture, "scoped-images");
+    await vi.waitFor(() => expect(transport.sentAttachments).toEqual([
+      { address: expect.objectContaining({ providerConversationId: "42" }), fileNames: ["own.png"] }
+    ]));
+  });
+
+  it("rechecks channel revocation after reading a generated image and does not send it on restart", async () => {
+    const transports: FakeTelegramTransport[] = [];
+    const adapter = new AttachmentFakeAdapter();
+    const fixture = await createFixture(() => {
+      const transport = new FakeTelegramTransport(directMessageBatch()); transports.push(transport); return transport;
+    }, () => adapter);
+    const image = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "revoked.png", mimeType: "image/png" });
+    adapter.events = [generatedImageResult(image)];
+    adapter.blocks = [];
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const readBlob = fixture.artifacts.readBlob.bind(fixture.artifacts);
+    const read = vi.spyOn(fixture.artifacts, "readBlob").mockImplementation(async (blob) => { await pending; return readBlob(blob); });
+    try {
+      const connection = await enableTelegramReply(fixture, "revoked-image");
+      await vi.waitFor(() => expect(read).toHaveBeenCalled());
+      const current = fixture.store.getMessagingConnection(connection.id);
+      await fixture.manager.clearCredential({ connectionId: current.id, expectedRevision: current.revision,
+        expectedGeneration: current.generation });
+    } finally {
+      release();
+    }
+    await fixture.restartManager();
+    expect(transports.flatMap((transport) => transport.sentAttachments)).toEqual([]);
+    expect(fixture.store.listMessagingDeliveries().filter((delivery) => delivery.kind === "file"))
+      .not.toContainEqual(expect.objectContaining({ status: "sent" }));
+  });
+
+  it("keeps an unknown generated-image delivery under its original ID without resending after restart", async () => {
+    const transports: FakeTelegramTransport[] = [];
+    const adapter = new AttachmentFakeAdapter();
+    const fixture = await createFixture(() => {
+      const transport = new FakeTelegramTransport(directMessageBatch(), { failFirstAttachmentUnknown: true });
+      transports.push(transport); return transport;
+    }, () => adapter);
+    const image = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "uncertain.png", mimeType: "image/png" });
+    adapter.events = [generatedImageResult(image)];
+    adapter.blocks = [];
+    await enableTelegramReply(fixture, "unknown-image");
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] }))
+      .toContainEqual(expect.objectContaining({ kind: "file" })));
+    const unknown = fixture.store.listMessagingDeliveries({ statuses: ["unknown"] })[0]!;
+    await fixture.restartManager();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fixture.store.getMessagingDelivery(unknown.id)).toMatchObject({ status: "unknown", attempts: 1 });
+    expect(transports.reduce((sum, transport) => sum + transport.attachmentAttempts, 0)).toBe(1);
+  });
+
   it("projects an open permission to a durable Telegram card and resolves its owner callback once", async () => {
     const transport = new InteractiveTelegramTransport();
     const adapter = new PermissionFakeAdapter();
@@ -1353,12 +1502,13 @@ class FakeTelegramTransport {
   readonly typing: MessagingAddress[] = [];
   readonly reactions: Array<{ readonly messageId: string; readonly emoji: string | null }> = [];
   textAttempts = 0;
+  attachmentAttempts = 0;
   #boundConnectionId = "";
   #boundGeneration = 0;
 
   constructor(
     readonly batch: TelegramNormalizationResult,
-    readonly options: { readonly failFirstTextUnknown?: boolean } = {}
+    readonly options: { readonly failFirstTextUnknown?: boolean; readonly failFirstAttachmentUnknown?: boolean } = {}
   ) {}
 
   bind(options: TelegramTransportOptions): this {
@@ -1429,6 +1579,10 @@ class FakeTelegramTransport {
     readonly address: MessagingAddress;
     readonly attachments: readonly { readonly fileName: string }[];
   }) {
+    this.attachmentAttempts += 1;
+    if (this.options.failFirstAttachmentUnknown === true && this.attachmentAttempts === 1) {
+      throw new MessagingTransportError("network", "uncertain image effect", { retryable: true, effect: "unknown" });
+    }
     this.sentAttachments.push({ address: input.address, fileNames: input.attachments.map((value) => value.fileName) });
     return { providerMessageId: `file-${this.sentAttachments.length}`, address: input.address };
   }
@@ -2881,6 +3035,8 @@ class BoundedAlbumPagesTransport extends FakeTelegramTransport {
 
 class AttachmentFakeAdapter extends FakeBackendAdapter {
   blocks: readonly MessageBlock[] = [{ kind: "text", text: "Files are ready." }];
+  events: readonly EventPayload[] = [];
+  beforeReply: ((context: AdapterContext) => Promise<void>) | undefined;
 
   constructor(inputFile = false) {
     super(inputFile ? {
@@ -2896,10 +3052,25 @@ class AttachmentFakeAdapter extends FakeBackendAdapter {
 
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
     queueMicrotask(() => void (async () => {
+      for (const event of this.events) await context.emit(event);
+      await this.beforeReply?.(context);
       await context.emit({ type: "message_complete", role: "assistant", blocks: this.blocks });
       await context.emit({ type: "done", outcome: "completed" });
     })());
   }
+}
+
+function generatedImageResult(blob: BlobRef): Extract<EventPayload, { readonly type: "tool_result" }> {
+  return { type: "tool_result", callId: "generated-image", name: "image_generate", output: "Image generated successfully.",
+    parts: [{ kind: "image", blob }], isError: false };
+}
+
+async function enableTelegramReply(fixture: Awaited<ReturnType<typeof createFixture>>, suffix: string) {
+  fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+  const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42", configuration: {
+    ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off", lifecycleAnnouncements: false
+  } });
+  return replaceCredential(fixture, created, suffix, true);
 }
 
 class CaptureFakeAdapter extends FakeBackendAdapter {

@@ -53,7 +53,7 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
-import type { BlobRef, InteractionQuestionField, PromptInput, TurnExecutionOverrides } from "@joko/core";
+import type { BlobRef, InteractionQuestionField, MessageBlock, PromptInput, TurnExecutionOverrides } from "@joko/core";
 import {
   messagingConversationContextAad,
   operationBodyHash,
@@ -1159,7 +1159,7 @@ export class MessagingManager {
       let current = store.getMessagingInboundRequest(request.id);
       if (current.status !== "queued") return;
       if (input.outcome === "completed") {
-        const output = this.#latestAssistantOutput(input.sessionId, input.runId);
+        const output = this.#completedRunOutput(input.sessionId, input.runId);
         const text = boundedOutboundText(output.text, channel);
         const deliveryText = text.trim() === "" && (channel === "wecom" || channel === "wechat")
           ? channel === "wecom"
@@ -3323,10 +3323,13 @@ export class MessagingManager {
     });
   }
 
-  #latestAssistantOutput(sessionId: string, runId: string): {
+  #completedRunOutput(sessionId: string, runId: string): {
     readonly text: string;
     readonly attachments: readonly MessagingOutboundFile[];
   } {
+    let finalBlocks: readonly MessageBlock[] | undefined;
+    const generatedImages: Extract<MessageBlock, { readonly kind: "image" }>[] = [];
+    const seenImages = new Set<string>();
     let beforeCursor: bigint | undefined;
     for (;;) {
       const page = this.#store.listEvents({
@@ -3335,34 +3338,56 @@ export class MessagingManager {
         order: "desc",
         limit: 1_000
       });
-      const message = page.find((event) =>
-        event.runId === runId && event.payload.type === "message_complete" && event.payload.role === "assistant");
-      if (message?.payload.type === "message_complete") {
-        const text = message.payload.blocks
-          .filter((block): block is Extract<(typeof message.payload.blocks)[number], { readonly kind: "text" }> => block.kind === "text")
-          .map((block) => block.text.trim())
-          .filter(Boolean)
-          .join("\n\n");
-        const seen = new Set<string>();
-        const attachments: MessagingOutboundFile[] = [];
-        for (const block of message.payload.blocks) {
-          if (block.kind !== "image" && block.kind !== "artifact") continue;
-          if (seen.has(block.blob.id) || attachments.length >= MAXIMUM_OUTBOUND_ATTACHMENTS) continue;
-          seen.add(block.blob.id);
-          attachments.push({
-            kind: block.kind === "image" ? "image" : "file",
-            blob: block.blob,
-            fileName: outboundFileName(
-              block.blob.fileName ?? (block.kind === "artifact" ? block.label : block.alt),
-              attachments.length
-            )
-          });
+      for (const event of page) {
+        if (event.runId !== runId) continue;
+        const payload = event.payload;
+        if (finalBlocks === undefined && payload.type === "message_complete" && payload.role === "assistant") {
+          finalBlocks = payload.blocks;
         }
-        return { text, attachments };
+        // Only the service's image-generation tool produces implicit outbound
+        // images. Ordinary tool images (screenshots, reads, private results) are
+        // observations, not permission to forward them to an external channel.
+        if (payload.type !== "tool_result" || payload.name !== "image_generate" || payload.isError) continue;
+        for (const part of [...(payload.parts ?? [])].reverse()) {
+          if (part.kind !== "image" || seenImages.has(part.blob.id)
+            || generatedImages.length >= MAXIMUM_OUTBOUND_ATTACHMENTS
+            || !/^image\/(?:png|jpeg|gif|webp)$/u.test(part.blob.mimeType)) continue;
+          const artifact = this.#store.findArtifact(part.blob.id);
+          if (artifact === undefined
+            || artifact.sessionId !== undefined && artifact.sessionId !== sessionId
+            || artifact.runId !== undefined && artifact.runId !== runId
+            || isRecord(artifact.metadata) && artifact.metadata["expiresAt"] !== undefined
+            || artifact.blob.sha256 !== part.blob.sha256
+            || artifact.blob.byteLength !== part.blob.byteLength
+            || artifact.blob.mimeType !== part.blob.mimeType) continue;
+          seenImages.add(part.blob.id);
+          generatedImages.push({ ...part, blob: artifact.blob });
+        }
       }
-      if (page.length < 1_000) return { text: "", attachments: [] };
+      if (page.length < 1_000) break;
       beforeCursor = page.at(-1)!.globalCursor;
     }
+    const text = (finalBlocks ?? [])
+      .filter((block): block is Extract<MessageBlock, { readonly kind: "text" }> => block.kind === "text")
+      .map((block) => block.text.trim())
+      .filter(Boolean)
+      .join("\n\n");
+    const seen = new Set<string>();
+    const attachments: MessagingOutboundFile[] = [];
+    for (const block of [...(finalBlocks ?? []), ...generatedImages.reverse()]) {
+      if (block.kind !== "image" && block.kind !== "artifact") continue;
+      if (seen.has(block.blob.id) || attachments.length >= MAXIMUM_OUTBOUND_ATTACHMENTS) continue;
+      seen.add(block.blob.id);
+      attachments.push({
+        kind: block.kind === "image" ? "image" : "file",
+        blob: block.blob,
+        fileName: outboundFileName(
+          block.blob.fileName ?? (block.kind === "artifact" ? block.label : block.alt),
+          attachments.length
+        )
+      });
+    }
+    return { text, attachments };
   }
 
   #managedCredentialReferences(): ReadonlySet<string> {
@@ -3537,6 +3562,11 @@ async function dispatchMessagingDelivery(
         bytes: resolved.data,
         fileName: file.fileName,
         mimeType: resolved.mimeType
+      });
+    }
+    if (signal.aborted) {
+      throw new MessagingTransportError("cancelled", "Messaging delivery was cancelled before sending attachments.", {
+        retryable: false, effect: "none"
       });
     }
     const receipt = await transport.sendAttachments({

@@ -1160,6 +1160,44 @@ describe("PiEventTranslator", () => {
     expect(storeArtifact).not.toHaveBeenCalled();
   });
 
+  it("keeps a managed generated image in the tool result when the final assistant reply is text only", async () => {
+    const events: EventPayload[] = [];
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-generated-image-workspace-"));
+    const artifacts = await mkdtemp(join(tmpdir(), "joko-pi-generated-image-artifacts-"));
+    const storeArtifact = vi.fn();
+    const translator = new PiEventTranslator({
+      context: { ...context(workspace, events, []), storeArtifact },
+      artifactDirectory: artifacts, wasAbortRequested: () => false
+    });
+    const blob: BlobRef = { id: "generated-image", sha256: "e".repeat(64), byteLength: 16,
+      mimeType: "image/png", fileName: "generated-image.png" };
+    const result = { content: [{ type: "text", text: "Image generated successfully." }],
+      details: { jokoMcpBridge: { format: 1, imageOutputs: [{ blob }] } } };
+    await translator.translate({ type: "tool_execution_end", toolCallId: "image-call",
+      toolName: "image_generate", isError: false, result } as unknown as PiRpcEvent);
+    await translator.translate({ type: "message_end", message: {
+      role: "assistant", content: [{ type: "text", text: "Your image is ready." }]
+    } } as unknown as PiRpcEvent);
+    expect(events.filter(event => event.type === "tool_result" || event.type === "message_complete")).toEqual([
+      expect.objectContaining({ type: "tool_result", name: "image_generate", isError: false, parts: [
+        { kind: "text", text: "Image generated successfully." }, { kind: "image", blob }
+      ] }),
+      expect.objectContaining({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Your image is ready." }] })
+    ]);
+    const nativeEntry = await translator.materializeNativeHistoryEntry({
+      id: "image-result", type: "message", timestamp: 1,
+      data: { message: { role: "toolResult", toolCallId: "image-call", toolName: "image_generate",
+        content: result.content, details: result.details, isError: false, timestamp: 1 } }
+    });
+    const projected = projectPiNativeHistory(undefined, { entries: [nativeEntry], leafId: nativeEntry.id });
+    expect(projected.events.find(event => event.payload.type === "tool_result")?.payload).toMatchObject({
+      name: "image_generate", isError: false, parts: [
+        { kind: "text", text: "Image generated successfully." }, { kind: "image", blob }
+      ]
+    });
+    expect(storeArtifact).not.toHaveBeenCalled();
+  });
+
   it("projects a managed MCP recording as a durable Artifact part online and after history replay", async () => {
     const events: EventPayload[] = [];
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-recording-workspace-"));
