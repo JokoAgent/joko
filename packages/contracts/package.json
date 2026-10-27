@@ -38,7 +38,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "pnpm build && node --test test/contract-surface.test.mjs test/managed-outbound-proxy.test.mjs test/protobuf-tree-wire.test.mjs test/partner-routine-editor.test.mjs test/partner-resume.test.mjs test/partner-memory.test.mjs test/partner-connections.test.mjs test/partner-group-view.test.mjs"
+    "test": "pnpm build && node --test test/contract-surface.test.mjs test/managed-outbound-proxy.test.mjs test/protobuf-tree-wire.test.mjs test/partner-routine-editor.test.mjs test/partner-resume.test.mjs test/partner-memory.test.mjs test/partner-connections.test.mjs test/partner-group-view.test.mjs test/question-references.test.mjs"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.14.0",

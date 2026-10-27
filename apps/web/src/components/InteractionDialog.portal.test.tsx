@@ -601,9 +601,11 @@ async function mountPortal(
   const controller = {
     state: {
       connectionState: "connected",
+      snapshot: { generation: 1n },
       preferences: { locale: "en" },
       activeProfile: { id: "profile", serverId: "server", deviceId: "device", name: "Node", origin: "https://joko.test" }
     },
+    getVoiceInputCapabilities: vi.fn(async () => ({ support: "unsupported" })),
     ...actions
   } as unknown as AppController;
   const render = async (nextInteraction: InteractionView): Promise<void> => {

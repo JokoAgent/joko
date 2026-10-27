@@ -5,6 +5,7 @@ export * from "./remote-desktop-system-action.js";
 export * from "./remote-desktop-clipboard-version.js";
 export * from "./partner-session-tasks.js";
 export * from "./session-handoff-messages.js";
+export * from "./question-references.js";
 
 export * from "./gen/joko/v1/capability_pb.js";
 export * from "./gen/joko/v1/code_host_pb.js";

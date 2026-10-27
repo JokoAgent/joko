@@ -3221,6 +3221,11 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .voice-input-history-list article p { max-height: 92px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-12); }
 .voice-input-history-list article time { display: block; margin-top: 5px; color: var(--text-soft); font-size: var(--text-10); }
 .voice-input-history-actions { display: flex; gap: 5px; }
+.question-dictation { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; min-width: 0; width: 100%; }
+.question-dictation > input, .question-dictation > textarea { flex: 1 1 160px; min-width: 0; }
+.question-dictation__actions { display: inline-flex; align-items: center; gap: 4px; }
+.question-dictation > small { flex-basis: 100%; overflow-wrap: anywhere; }
+.question-reference-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .voice-input-history-actions button { border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--text-soft); padding: 4px 8px; font-size: var(--text-10); cursor: pointer; }
 @media (max-width: 620px) {
   .voice-input-settings .setting-row > .select-control,

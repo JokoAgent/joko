@@ -1,5 +1,7 @@
 import { isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
+import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
+import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
 import { MobileTaskOutboxStore, mobileTaskOutboxModel, mobileTaskOutboxOwnerMatches,
   type MobileTaskOutboxRecord } from "./mobile-task-outbox";
@@ -8129,6 +8131,52 @@ export class MobileClient {
 
   async prepareMarkdownResources(messageId: string, text: string, signal: AbortSignal): Promise<MobileMarkdownResourceDescriptor> {
     return this.#markdownResources.prepare(this.newId(), text, this.#markdownResourceContext(messageId, text), signal);
+  }
+
+  async openQuestionReference(interactionId: string, href: string, signal: AbortSignal): Promise<
+    { readonly kind: "external"; readonly url: string } | { readonly kind: "workspace"; readonly source?: MobileFilesComposerSource }
+  > {
+    signal.throwIfAborted();
+    const question = clone(InteractionSchema, this.#interactionContext(interactionId));
+    if (question.request.case !== "question") throw new Error("The question is no longer current.");
+    const request = question.request.value;
+    const texts = [request.prompt, ...request.fields.flatMap(field => [field.label, field.description,
+      ...(field.input.case === "singleChoice" || field.input.case === "multipleChoice"
+        ? field.input.value.choices.flatMap(choice => [choice.label, choice.description]) : [])])];
+    if (!texts.some(text => splitQuestionReferences(text, (raw, prefix) => clipBareHttpAutolinkText(raw, { prefix })).some(part => part.href === href))) {
+      throw new Error("The reference does not belong to the current question.");
+    }
+    if (/^https?:\/\//iu.test(href)) return { kind: "external", url: href };
+    const files = this.#filesContext(), credential = this.#ready(), ownerKey = this.markdownResourceOwnerKey();
+    if (!ownerKey) throw new Error("The question has no current Workspace authority.");
+    const assertCurrent = (currentSignal?: AbortSignal): void => {
+      currentSignal?.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.markdownResourceOwnerKey() !== ownerKey
+        || !equals(InteractionSchema, this.#interactionContext(interactionId), question)) throw new Error("The question or its Workspace changed.");
+    };
+    const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
+      assertCurrent(currentSignal);
+      const snapshot = await this.network.readSession(credential, question.sessionId, currentSignal);
+      assertCurrent(currentSignal);
+      const fresh = pendingMobileInteractions(snapshot, question.sessionId).filter(item => item.interactionId === interactionId);
+      const session = snapshot.sessions.find(item => item.sessionId === question.sessionId);
+      if (snapshot.server?.serverId !== credential.serverId || snapshot.generation !== this.#taskGeneration()
+        || session?.nativeBinding?.runtimeGeneration !== this.#selectedSession()?.nativeBinding?.runtimeGeneration
+        || !session || session.backendId !== question.backendId || session.targetId !== question.targetId
+        || fresh.length !== 1 || !equals(InteractionSchema, fresh[0]!, question)) throw new Error("The question changed before its reference opened.");
+    };
+    const context: MobileMarkdownResourceContext = {
+      workspaceId: files.authority.workspace.workspaceId, workdir: files.authority.workspace.serverPathDisplay,
+      assertCurrent, revalidateSource,
+      listDirectory: (parent, currentSignal) => this.network.listWorkspaceDirectory(credential, files.authority.workspace.workspaceId, parent, currentSignal),
+      readFile: async (entry, currentSignal) => this.#canonicalWorkspaceImagePreview(credential, files.authority.workspace.workspaceId,
+        await this.network.readWorkspaceFile(credential, files.authority.workspace.workspaceId, entry.relativePath, entry.revision!, currentSignal), currentSignal),
+      download: (blob, currentSignal) => this.network.downloadBlob(credential, blob, currentSignal)
+    };
+    assertCurrent(signal);
+    const prepared = await this.#markdownResources.prepare(this.newId(), `[reference](<${href}>)`, context, signal);
+    try { return { kind: "workspace", source: await this.openMarkdownPath(prepared.leaseId, JSON.stringify(["link", href]), signal) }; }
+    finally { this.#markdownResources.release(prepared.leaseId); }
   }
 
   filesMarkdownResourceOwnerKey(preview: Extract<MobileFilePreview, { kind: "text" }>): string | undefined {

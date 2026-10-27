@@ -294,8 +294,8 @@ import {
 import { buildMobileMessageActions, buildMobileMessageCopyText, captureMobileMessageReference, commitMobileMessageReference,
   queueItemText, type MobileMessageActionId, type MobileMessageReferenceLease } from "./task-actions";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
+import { useMobileVoicePermissionSettings } from "./use-mobile-voice-permission-settings";
 import { MobileVoiceDictionaryController } from "./mobile-voice-dictionary-controller";
-import type { MobileVoiceRunError } from "./mobile-voice-input";
 import { MobileImageLightbox } from "./MobileImageLightbox";
 import { MobileMediaPlayer } from "./MobileMediaPlayer";
 import type { MobileMediaPlayerStatus } from "./mobile-media-player";
@@ -4902,6 +4902,26 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       if (taskMountedRef.current) setGalleryOpening(false);
     });
   };
+  const questionReferenceAbortRef = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => { questionReferenceAbortRef.current?.abort(); questionReferenceAbortRef.current = undefined; },
+    [interactionVisible, activeInteractionId, taskDraftProfileId, state.status]);
+  const openQuestionReference = (interactionId: string, href: string): void => {
+    if (!interactionVisible || interactionId !== activeInteractionId || state.status !== "connected" || questionReferenceAbortRef.current) return;
+    const request = new AbortController(); questionReferenceAbortRef.current = request;
+    let timedOut = false;
+    const deadline = setTimeout(() => { timedOut = true; request.abort(); }, 15_000);
+    void client.openQuestionReference(interactionId, href, request.signal).then(async result => {
+      if (request.signal.aborted || !taskMountedRef.current) return;
+      if (result.kind === "external") await Linking.openURL(result.url);
+      else { setInteractionVisible(false); onFiles(result.source); }
+    }).catch(error => {
+      if (questionReferenceAbortRef.current === request && taskMountedRef.current && (!request.signal.aborted || timedOut)) {
+        setLocalError(timedOut ? locale === "zh-CN" ? "打开引用超时，请重试。" : "Opening the reference timed out. Try again." : errorText(error));
+      }
+    }).finally(() => {
+      clearTimeout(deadline); if (questionReferenceAbortRef.current === request) questionReferenceAbortRef.current = undefined;
+    });
+  };
   const openTimelineArtifact = (artifact: MobileTimelineArtifact): void => {
     if (!artifact.previewKind) return;
     if (state.timelinePreview || galleryOpening || imageGallery.view || state.status !== "connected"
@@ -6957,6 +6977,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       colors={colors} locale={locale} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}
       onClose={() => setComposerAtomId(undefined)} onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
     <MobileInteractionSheet visible={!workerReadOnly && interactionVisible && interactions.length > 0} locale={locale}
+      voiceTransport={voiceTransport} onOpenReference={openQuestionReference}
       profileId={taskDraftProfileId} interactions={interactions} selectedId={activeInteractionId}
       busy={state.busy || interactionMutationPending} colors={colors}
       onSelect={setSelectedInteractionId} onMinimize={() => setInteractionVisible(false)}
@@ -7897,24 +7918,6 @@ function MobileAttachmentTray({ attachments, colors, locale, disabled, busy, pen
       </Pressable>
     </View>)}
   </View>;
-}
-
-function useMobileVoicePermissionSettings(error: MobileVoiceRunError | undefined, locale: MobileSupportedLocale): void {
-  useEffect(() => {
-    if (error?.code !== "permissionBlocked") return;
-    Alert.alert(
-      mobileMessage(locale, "voice.permissionTitle"),
-      mobileMessage(locale, "voice.permissionBody"),
-      [
-        { text: mobileMessage(locale, "voice.notNow"), style: "cancel" },
-        { text: mobileMessage(locale, "voice.openSettings"), onPress: () => {
-          void Linking.openSettings().catch(() => {
-            Alert.alert(mobileMessage(locale, "voice.settingsUnavailableTitle"), mobileMessage(locale, "voice.settingsUnavailableBody"));
-          });
-        } }
-      ]
-    );
-  }, [error, locale]);
 }
 
 function MobileVoiceAction({ voice, colors, locale, disabled }: {

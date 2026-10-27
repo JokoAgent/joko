@@ -11971,6 +11971,37 @@ describe("native current-task Files ownership", () => {
     expect(network.uploadBlob).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
   });
 
+  it("opens only references authored in the current question and preserves the original Workspace authority", async () => {
+    const question = create(InteractionSchema, { ...questionInteraction, request: { case: "question", value: {
+      title: "Choose", prompt: "Read `README.md:1` and https://example.com/evidence（说明）",
+      fields: [{ fieldId: "answer", label: "Answer", input: { case: "text", value: {} } }]
+    } } });
+    const projected = create(SnapshotSchema, { ...filesSnapshot, interactions: [question],
+      workspaces: [create(WorkspaceDescriptorSchema, { ...filesSnapshot.workspaces[0]!, serverPathDisplay: "D:\\repo" })] });
+    const network = fakeNetwork(); configureFiles(network, projected);
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    await expect(app.openQuestionReference(question.interactionId, "private.md", new AbortController().signal)).rejects.toThrow(/belong/u);
+    expect(network.listWorkspaceDirectory).not.toHaveBeenCalled();
+    expect(await app.openQuestionReference(question.interactionId, "https://example.com/evidence", new AbortController().signal))
+      .toEqual({ kind: "external", url: "https://example.com/evidence" });
+    expect(await app.openQuestionReference(question.interactionId, "README.md:1", new AbortController().signal))
+      .toMatchObject({ kind: "workspace", source: { kind: "workspace-entry", entry: readme } });
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects server-retired question references before reading their files", async () => {
+    const question = create(InteractionSchema, { ...questionInteraction, request: { case: "question", value: {
+      title: "Choose", prompt: "Read `README.md:1`", fields: questionInteraction.request.case === "question" ? questionInteraction.request.value.fields : []
+    } } });
+    const projected = create(SnapshotSchema, { ...filesSnapshot, interactions: [question],
+      workspaces: [create(WorkspaceDescriptorSchema, { ...filesSnapshot.workspaces[0]!, serverPathDisplay: "D:\\repo" })] });
+    const network = fakeNetwork(); configureFiles(network, projected);
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    vi.mocked(network.readSession).mockResolvedValue(create(SnapshotSchema, { ...projected, interactions: [] }));
+    await expect(app.openQuestionReference(question.interactionId, "README.md:1", new AbortController().signal)).rejects.toThrow(/question changed/u);
+    expect(network.readWorkspaceFile).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("rejects spoofed Markdown text and server-deleted messages before any path opens", async () => {
     const event = create(EventSchema, { eventId: messageEvent.eventId, identity: messageEvent.identity, cursor: messageEvent.cursor,
       payload: { kind: { case: "messageCompleted", value: {

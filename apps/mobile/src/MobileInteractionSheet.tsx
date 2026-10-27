@@ -48,6 +48,10 @@ import {
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import type { MobileVoiceTransport } from "./mobile-voice-input";
+import { MobileQuestionTextInput } from "./MobileQuestionTextInput";
+import { splitQuestionReferences } from "@joko/contracts";
+import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 
 export interface MobileInteractionSheetColors {
   readonly background: string;
@@ -72,7 +76,9 @@ export function MobileInteractionSheet({
   onMinimize,
   onResolve,
   onDismiss,
-  onError
+  onError,
+  voiceTransport,
+  onOpenReference
 }: {
   readonly visible: boolean;
   readonly profileId?: string;
@@ -86,6 +92,8 @@ export function MobileInteractionSheet({
   readonly onResolve: (interaction: Interaction, submission: MobileInteractionSubmission) => Promise<boolean>;
   readonly onDismiss: (interaction: Interaction) => Promise<boolean>;
   readonly onError: (message: string) => void;
+  readonly voiceTransport?: MobileVoiceTransport;
+  readonly onOpenReference?: (interactionId: string, href: string) => void;
 }) {
   const interaction = interactions.find((candidate) => candidate.interactionId === selectedId) ?? interactions[0];
   const interactionIndex = interaction === undefined ? -1 : interactions.indexOf(interaction);
@@ -260,7 +268,8 @@ export function MobileInteractionSheet({
                   );
                 }} />
                 : interaction.request.case === "question" && draft?.kind === "question"
-                  ? <QuestionRequest interaction={interaction} draft={draft} disabled={disabled} colors={colors} locale={locale}
+                  ? <QuestionRequest interaction={interaction} draft={draft} disabled={disabled || !visible} colors={colors} locale={locale}
+                    ownerKey={identityKey ?? authorityKey ?? interaction.interactionId} voiceTransport={voiceTransport} onError={onError} onOpenReference={onOpenReference}
                     onDraft={updateDraft} onResolve={(answers) => void settle({ kind: "question", answers })} />
                   : interaction.request.case === "planReview" && draft?.kind === "plan"
                     ? <PlanRequest interaction={interaction} draft={draft} disabled={disabled} colors={colors} locale={locale}
@@ -309,7 +318,7 @@ function PermissionRequest({ interaction, disabled, colors, locale, onResolve }:
   </View>;
 }
 
-function QuestionRequest({ interaction, draft, disabled, colors, locale, onDraft, onResolve }: {
+function QuestionRequest({ interaction, draft, disabled, colors, locale, ownerKey, voiceTransport, onError, onOpenReference, onDraft, onResolve }: {
   readonly interaction: Interaction;
   readonly draft: Extract<MobileInteractionDraft, { readonly kind: "question" }>;
   readonly disabled: boolean;
@@ -317,6 +326,10 @@ function QuestionRequest({ interaction, draft, disabled, colors, locale, onDraft
   readonly locale: MobileSupportedLocale;
   readonly onDraft: (draft: MobileInteractionDraft) => void;
   readonly onResolve: (answers: MobileQuestionAnswers) => void;
+  readonly ownerKey: string;
+  readonly voiceTransport?: MobileVoiceTransport;
+  readonly onError: (message: string) => void;
+  readonly onOpenReference?: (interactionId: string, href: string) => void;
 }) {
   if (interaction.request.case !== "question") return null;
   const request = interaction.request.value;
@@ -333,15 +346,16 @@ function QuestionRequest({ interaction, draft, disabled, colors, locale, onDraft
   };
   const go = (fieldIndex: number): void => onDraft({ ...draft, fieldIndex: clampMobileQuestionIndex(fieldIndex, request.fields.length) });
   return <View style={sheetStyles.sectionStack}>
-    {request.prompt.trim() !== "" && <Text selectable style={[sheetStyles.body, { color: colors.ink }]}>{request.prompt}</Text>}
+    {request.prompt.trim() !== "" && <QuestionReferenceText text={request.prompt} color={colors.ink} accent={colors.accent} onOpen={onOpenReference && (href => onOpenReference(interaction.interactionId, href))} />}
     <Text style={[sheetStyles.eyebrow, { color: colors.muted }]}>{mobileMessage(locale, "interaction.questionPosition", {
       index: index + 1,
       count: request.fields.length
     })}</Text>
     <View style={[sheetStyles.questionCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
-      <Text style={[sheetStyles.questionLabel, { color: colors.ink }]}>{field.label || field.fieldId}{field.required ? " *" : ""}</Text>
-      {field.description.trim() !== "" && <Text style={[sheetStyles.caption, { color: colors.muted }]}>{field.description}</Text>}
-      <QuestionFieldInput field={field} answer={answer} disabled={disabled} colors={colors} locale={locale} onChange={updateAnswer} />
+      <QuestionReferenceText text={`${field.label || field.fieldId}${field.required ? " *" : ""}`} color={colors.ink} accent={colors.accent} onOpen={onOpenReference && (href => onOpenReference(interaction.interactionId, href))} />
+      {field.description.trim() !== "" && <QuestionReferenceText text={field.description} color={colors.muted} accent={colors.accent} onOpen={onOpenReference && (href => onOpenReference(interaction.interactionId, href))} />}
+      <QuestionFieldInput key={field.fieldId} field={field} answer={answer} disabled={disabled} colors={colors} locale={locale} onChange={updateAnswer}
+        ownerKey={`${ownerKey}:${field.fieldId}`} voiceTransport={voiceTransport} onError={onError} onOpenReference={onOpenReference && (href => onOpenReference(interaction.interactionId, href))} />
       {fieldError !== undefined && <Text accessibilityRole="alert" style={[sheetStyles.fieldError, { color: colors.negative }]}>{fieldError}</Text>}
     </View>
     <View style={sheetStyles.requestNavigation}>
@@ -359,19 +373,23 @@ function QuestionRequest({ interaction, draft, disabled, colors, locale, onDraft
   </View>;
 }
 
-function QuestionFieldInput({ field, answer, disabled, colors, locale, onChange }: {
+function QuestionFieldInput({ field, answer, disabled, colors, locale, ownerKey, voiceTransport, onError, onOpenReference, onChange }: {
   readonly field: QuestionField;
   readonly answer: MobileQuestionAnswerDraft | undefined;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
   readonly locale: MobileSupportedLocale;
   readonly onChange: (answer: MobileQuestionAnswerDraft | undefined) => void;
+  readonly ownerKey: string;
+  readonly voiceTransport?: MobileVoiceTransport;
+  readonly onError: (message: string) => void;
+  readonly onOpenReference?: (href: string) => void;
 }) {
   const input = field.input;
-  if (input.case === "text") return <TextInput accessibilityLabel={field.label || field.fieldId}
-    multiline={input.value.multiline} editable={!disabled} value={answer?.kind === "text" ? answer.value : ""}
-    placeholder={input.value.placeholder || mobileMessage(locale, "interaction.answerPlaceholder")} placeholderTextColor={colors.muted}
-    onChangeText={(value) => onChange({ kind: "text", value })}
+  if (input.case === "text") return <MobileQuestionTextInput ownerKey={ownerKey} transport={voiceTransport} colors={colors} locale={locale} onError={onError} label={field.label || field.fieldId}
+    multiline={input.value.multiline} enabled={!disabled} value={answer?.kind === "text" ? answer.value : ""}
+    placeholder={input.value.placeholder || mobileMessage(locale, "interaction.answerPlaceholder")}
+    onChange={(value) => onChange({ kind: "text", value })}
     style={[sheetStyles.textInput, input.value.multiline && sheetStyles.multilineInput,
       { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />;
   if (input.case === "boolean") return <View style={sheetStyles.choiceStack}>
@@ -384,17 +402,18 @@ function QuestionFieldInput({ field, answer, disabled, colors, locale, onChange 
     const other = answer?.kind === "single" && answer.selection.kind === "other" ? answer.selection.text : "";
     return <View style={sheetStyles.choiceStack}>
       {input.value.choices.map((choice) => <ChoiceRow key={choice.choiceId} label={choice.label || choice.choiceId}
-        description={choice.description} role="radio" disabled={disabled}
+        description={choice.description} role="radio" disabled={disabled} onOpenReference={onOpenReference}
         selected={answer?.kind === "single" && answer.selection.kind === "choice" && answer.selection.choiceId === choice.choiceId}
         colors={colors} onPress={() => onChange(toggleMobileQuestionChoice(field, answer, choice.choiceId))} />)}
       {input.value.allowOther && <View style={sheetStyles.otherStack}>
         <ChoiceRow label={mobileMessage(locale, "common.other")} role="radio" disabled={disabled}
           selected={answer?.kind === "single" && answer.selection.kind === "other"}
           colors={colors} onPress={() => onChange(setMobileQuestionOther(field, answer, other))} />
-        <TextInput accessibilityLabel={mobileMessage(locale, "interaction.otherLabel", { field: field.label || field.fieldId })} editable={!disabled}
-          value={other} placeholder={mobileMessage(locale, "interaction.otherPlaceholder")} placeholderTextColor={colors.muted}
+        <MobileQuestionTextInput ownerKey={`${ownerKey}:other`} transport={voiceTransport} colors={colors} locale={locale} onError={onError}
+          label={mobileMessage(locale, "interaction.otherLabel", { field: field.label || field.fieldId })} enabled={!disabled}
+          value={other} placeholder={mobileMessage(locale, "interaction.otherPlaceholder")}
           onFocus={() => onChange(setMobileQuestionOther(field, answer, other))}
-          onChangeText={(value) => onChange(setMobileQuestionOther(field, answer, value))}
+          onChange={(value) => onChange(setMobileQuestionOther(field, answer, value))}
           style={[sheetStyles.textInput, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
       </View>}
     </View>;
@@ -408,14 +427,15 @@ function QuestionFieldInput({ field, answer, disabled, colors, locale, onChange 
     return <View style={sheetStyles.choiceStack}>
       {input.value.choices.map((choice) => {
         const checked = selected.includes(choice.choiceId);
-        return <ChoiceRow key={choice.choiceId} label={choice.label || choice.choiceId} description={choice.description}
+        return <ChoiceRow key={choice.choiceId} label={choice.label || choice.choiceId} description={choice.description} onOpenReference={onOpenReference}
           role="checkbox" selected={checked} disabled={disabled || atMaximum && !checked} colors={colors}
           onPress={() => onChange(toggleMobileQuestionChoice(field, answer, choice.choiceId))} />;
       })}
       {input.value.allowOther && <View style={sheetStyles.otherStack}>
-        <TextInput accessibilityLabel={mobileMessage(locale, "interaction.otherLabel", { field: field.label || field.fieldId })} editable={!disabled && (!atMaximum || other !== "")}
-          value={other} placeholder={mobileMessage(locale, "interaction.addOtherPlaceholder")} placeholderTextColor={colors.muted}
-          onChangeText={(value) => onChange(setMobileQuestionOther(field, answer, value))}
+        <MobileQuestionTextInput ownerKey={`${ownerKey}:other`} transport={voiceTransport} colors={colors} locale={locale} onError={onError}
+          label={mobileMessage(locale, "interaction.otherLabel", { field: field.label || field.fieldId })} enabled={!disabled && (!atMaximum || other !== "")}
+          value={other} placeholder={mobileMessage(locale, "interaction.addOtherPlaceholder")}
+          onChange={(value) => onChange(setMobileQuestionOther(field, answer, value))}
           style={[sheetStyles.textInput, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
       </View>}
       <Text style={[sheetStyles.caption, { color: colors.muted }]}>
@@ -468,7 +488,7 @@ function PlanRequest({ interaction, draft, disabled, colors, locale, onDraft, on
   </View>;
 }
 
-function ChoiceRow({ label, description, selected, disabled, role, colors, onPress }: {
+function ChoiceRow({ label, description, selected, disabled, role, colors, onOpenReference, onPress }: {
   readonly label: string;
   readonly description?: string;
   readonly selected: boolean;
@@ -476,6 +496,7 @@ function ChoiceRow({ label, description, selected, disabled, role, colors, onPre
   readonly role: "radio" | "checkbox";
   readonly colors: MobileInteractionSheetColors;
   readonly onPress: () => void;
+  readonly onOpenReference?: (href: string) => void;
 }) {
   return <Pressable accessibilityRole={role} accessibilityState={{ checked: selected, disabled }} disabled={disabled}
     onPress={onPress} style={[sheetStyles.choiceRow, disabled && sheetStyles.disabled, { borderColor: selected ? colors.accent : colors.border }]}>
@@ -483,10 +504,16 @@ function ChoiceRow({ label, description, selected, disabled, role, colors, onPre
       {selected && <Text style={sheetStyles.choiceCheck}>✓</Text>}
     </View>
     <View style={sheetStyles.flex}>
-      <Text style={[sheetStyles.choiceLabel, { color: colors.ink }]}>{label}</Text>
-      {description !== undefined && description.trim() !== "" && <Text style={[sheetStyles.caption, { color: colors.muted }]}>{description}</Text>}
+      <QuestionReferenceText text={label} color={colors.ink} accent={colors.accent} onOpen={onOpenReference} />
+      {description !== undefined && description.trim() !== "" && <QuestionReferenceText text={description} color={colors.muted} accent={colors.accent} onOpen={onOpenReference} />}
     </View>
   </Pressable>;
+}
+
+function QuestionReferenceText({ text, color, accent, onOpen }: { readonly text: string; readonly color: string; readonly accent: string; readonly onOpen?: (href: string) => void }) {
+  return <Text selectable style={[sheetStyles.body, { color }]}>{splitQuestionReferences(text, (raw, prefix) => clipBareHttpAutolinkText(raw, { prefix })).map((part, index) =>
+    part.href && onOpen ? <Text key={index} accessibilityRole="link" style={{ color: accent, textDecorationLine: "underline" }}
+      onPress={event => { event.stopPropagation(); onOpen(part.href!); }}>{part.text}</Text> : <Text key={index}>{part.text}</Text>)}</Text>;
 }
 
 function SheetButton({ label, colors, onPress, disabled, quiet, danger }: {

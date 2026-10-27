@@ -11,17 +11,21 @@ import type { RunAction, Translator } from "./types.js";
 import { useGamepadActions } from "../gamepad-actions.js";
 import { createCurrentV1InteractionOwnershipCoordinator, questionWizardDraftCodec, type InteractionOwnershipCoordinator, type InteractionOwnershipSnapshot } from "../interaction-ownership-coordinator.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, formatRelativeTime, CheckboxControl, RadioControl } from "./ui.js";
+import { QuestionTextInput } from "./QuestionTextInput.js";
+import { QuestionReferenceText } from "./QuestionReferenceText.js";
+import type { TimelineReferenceActions } from "./TimelineReferenceContent.js";
 
 type AnswerMap = Record<string, QuestionAnswerDraft>;
 type InteractionOwnershipState = { readonly scope: string; readonly snapshot: InteractionOwnershipSnapshot<QuestionWizardDraft> };
 
 const questionDrafts = new QuestionWizardDraftStore();
 
-export function InteractionDialog({ controller, interaction, remaining, inline = false, t, runAction, onResolve, onDismiss }: {
+export function InteractionDialog({ controller, interaction, remaining, inline = false, workspaceRoot, t, runAction, onResolve, onDismiss }: {
   readonly controller: AppController;
   readonly interaction?: InteractionView;
   readonly remaining: number;
   readonly inline?: boolean;
+  readonly workspaceRoot?: string;
   readonly t: Translator;
   readonly runAction: RunAction;
   readonly onResolve?: (resolution: InteractionResolutionDraft) => Promise<void>;
@@ -288,12 +292,14 @@ export function InteractionDialog({ controller, interaction, remaining, inline =
           <span aria-hidden="true">{icon}</span>
           <div><strong>{interactionTitle(interaction.kind, t)}</strong>{interaction.risk !== undefined && <Pill tone={interaction.risk === "high" || interaction.risk === "critical" ? "danger" : interaction.risk === "medium" ? "warning" : "neutral"}>{t("interaction.risk", { risk: interaction.risk })}</Pill>}</div>
         </div>
-        {inline && interaction.message.trim() !== "" && interaction.kind !== "plan" && <p className="interaction-takeover__message">{interaction.message}</p>}
+        {(inline || interaction.kind === "question") && interaction.message.trim() !== "" && interaction.kind !== "plan" && <p className="interaction-takeover__message">{interaction.kind === "question"
+          ? <QuestionReferenceText text={interaction.message} workspaceRoot={workspaceRoot} actions={{ ownerKey: actionScope ?? "", sessionId: interaction.sessionId, t,
+            onOpenHttpLink: (url, options) => controller.openHttpLink(url, { ...options, sessionId: interaction.sessionId }) }} /> : interaction.message}</p>}
         {interaction.expiresAt !== undefined && <p className="interaction-expiry"><Clock3 aria-hidden="true" />{t("interaction.expires", { time: formatRelativeTime(interaction.expiresAt, controller.state.effectiveLocale) })}</p>}
         {interaction.kind === "permission" && interaction.permissionSubject !== undefined && <PermissionSubject subject={interaction.permissionSubject} t={t} />}
         {(interaction.kind === "question" || interaction.kind === "permission") && !ownsInteraction && <div className="interaction-ownership" role="status"><p>{ownershipStatus === "unavailable" ? t("interaction.ownershipUnavailable") : ownershipStatus === "observer" ? t("interaction.ownershipElsewhere") : ownershipStatus === "handoff" ? t("interaction.ownershipHandoff") : ownershipStatus === "settled" ? t("interaction.ownershipSettled") : t("interaction.ownershipClaiming")}</p>{ownershipStatus === "observer" && <Button onClick={continueHere}>{t("interaction.ownershipContinueHere")}</Button>}</div>}
         {interaction.kind === "permission" && <PermissionDecision disabled={!ownsInteraction || settling} interaction={interaction} onResolve={(decisionId) => resolve({ kind: "permission", decisionId })} t={t} />}
-        {interaction.kind === "question" && <QuestionDecision disabled={!ownsQuestionDraft || settling} fields={interaction.fields} answers={visibleAnswers} otherText={visibleOtherText} currentIndex={visibleQuestionIndex} onCurrentIndexChange={(currentIndex) => updateQuestionDraft((draft) => ({ ...draft, currentIndex }))} onChange={(answers) => updateQuestionDraft((draft) => ({ ...draft, answers }))} onOtherTextChange={(otherText) => updateQuestionDraft((draft) => ({ ...draft, otherText }))} onMinimize={() => updateQuestionDraft((draft) => ({ ...draft, minimized: true }))} onResolve={(submittedAnswers) => resolve({ kind: "question", answers: submittedAnswers })} t={t} />}
+        {interaction.kind === "question" && <QuestionDecision controller={controller} ownerKey={`${actionScope}:${renderedOwnerToken}`} workspaceRoot={workspaceRoot} sessionId={interaction.sessionId} disabled={!ownsQuestionDraft || settling} fields={interaction.fields} answers={visibleAnswers} otherText={visibleOtherText} currentIndex={visibleQuestionIndex} onCurrentIndexChange={(currentIndex) => updateQuestionDraft((draft) => ({ ...draft, currentIndex }))} onChange={(answers) => updateQuestionDraft((draft) => ({ ...draft, answers }))} onOtherTextChange={(otherText) => updateQuestionDraft((draft) => ({ ...draft, otherText }))} onMinimize={() => updateQuestionDraft((draft) => ({ ...draft, minimized: true }))} onResolve={(submittedAnswers) => resolve({ kind: "question", answers: submittedAnswers })} t={t} />}
         {interaction.kind === "select" && <OptionDecision interaction={interaction} onResolve={(value) => resolve({ kind: "extension", value })} />}
         {(interaction.kind === "input" || interaction.kind === "editor") && <TextDecision interaction={interaction} value={extensionValue} onChange={setExtensionValue} onResolve={() => resolve({ kind: "extension", value: extensionValue })} onDismiss={dismiss} t={t} />}
         {interaction.kind === "confirm" && <ConfirmDecision onResolve={(value) => resolve({ kind: "extension", value })} t={t} />}
@@ -311,7 +317,7 @@ export function InteractionDialog({ controller, interaction, remaining, inline =
     );
   }
   return (
-    <><span ref={ownerSentinelRef} hidden /><Modal open showClose closeLabel={t("interaction.minimize")} title={interaction.title || interactionTitle(interaction.kind, t)} description={interaction.message} size={interaction.kind === "editor" || interaction.kind === "plan" || interaction.fields.length > 1 ? "large" : "medium"} onClose={() => { if (interaction.kind === "question" && ownsInteraction) updateQuestionDraft((draft) => ({ ...draft, minimized: true })); else setMinimized(true); }}>
+    <><span ref={ownerSentinelRef} hidden /><Modal open showClose closeLabel={t("interaction.minimize")} title={interaction.title || interactionTitle(interaction.kind, t)} description={interaction.kind === "question" ? undefined : interaction.message} size={interaction.kind === "editor" || interaction.kind === "plan" || interaction.fields.length > 1 ? "large" : "medium"} onClose={() => { if (interaction.kind === "question" && ownsInteraction) updateQuestionDraft((draft) => ({ ...draft, minimized: true })); else setMinimized(true); }}>
       {content}
     </Modal></>
   );
@@ -470,7 +476,11 @@ function permissionDecision(id: string, fallbackLabel: string, fallbackDescripti
   return { label: fallbackLabel, description: fallbackDescription ?? t("interaction.chooseHelp") };
 }
 
-function QuestionDecision({ disabled, fields, answers, otherText, currentIndex, onCurrentIndexChange, onChange, onOtherTextChange, onMinimize, onResolve, t }: {
+function QuestionDecision({ controller, ownerKey, sessionId, workspaceRoot, disabled, fields, answers, otherText, currentIndex, onCurrentIndexChange, onChange, onOtherTextChange, onMinimize, onResolve, t }: {
+  readonly controller: AppController;
+  readonly ownerKey: string;
+  readonly sessionId: string;
+  readonly workspaceRoot?: string;
   readonly disabled: boolean;
   readonly fields: readonly QuestionFieldView[];
   readonly answers: AnswerMap;
@@ -525,6 +535,7 @@ function QuestionDecision({ disabled, fields, answers, otherText, currentIndex, 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLFormElement>): void => {
     if (disabled) return;
     if (field === undefined) return;
+    if (interactionHTMLElement(event.target)?.closest("a, button")) return;
     if (slideDirection !== undefined) {
       if (event.key === "Enter" || event.key === "Escape" || /^[1-9]$/.test(event.key)) {
         event.preventDefault();
@@ -581,7 +592,7 @@ function QuestionDecision({ disabled, fields, answers, otherText, currentIndex, 
     <form ref={formRef} className="question-form question-wizard" aria-disabled={disabled} onKeyDown={handleKeyDown} onSubmit={(event) => { event.preventDefault(); if (!disabled) advance(); }}>
       <fieldset className="question-wizard__lease" disabled={disabled}>
         {fields.length === 0 && <p className="muted">{t("interaction.noFields")}</p>}
-        {field !== undefined && <><div className="question-wizard__progress" aria-live="polite"><span>{t("interaction.step", { current: step + 1, total: fields.length })}</span><progress value={step + 1} max={fields.length} /></div><div className="question-wizard__scroll"><div className={cx("question-wizard__step", slideDirection === "left" && "is-leaving-left", slideDirection === "right" && "is-leaving-right")}><QuestionField key={field.id} ownerRoot={formRef} field={field} value={answers[field.id]} otherText={otherText[field.id] ?? questionOtherAnswer(field, answers[field.id])} autoFocus={!disabled} lastQuestion={last} t={t} onAdvance={advance} onSkip={skip} onMinimize={onMinimize} onSingleChoice={(choiceId) => { const nextAnswers = { ...answers, [field.id]: { kind: "single", selection: { kind: "choice", choiceId } } as const }; onChange(nextAnswers); advance(nextAnswers); }} onOtherTextChange={(value) => onOtherTextChange({ ...otherText, [field.id]: value })} onChange={(value) => onChange({ ...answers, [field.id]: value })} /></div></div></>}
+        {field !== undefined && <><div className="question-wizard__progress" aria-live="polite"><span>{t("interaction.step", { current: step + 1, total: fields.length })}</span><progress value={step + 1} max={fields.length} /></div><div className="question-wizard__scroll"><div className={cx("question-wizard__step", slideDirection === "left" && "is-leaving-left", slideDirection === "right" && "is-leaving-right")}><QuestionField key={field.id} controller={controller} ownerKey={ownerKey} sessionId={sessionId} workspaceRoot={workspaceRoot} disabled={disabled || slideDirection !== undefined} ownerRoot={formRef} field={field} value={answers[field.id]} otherText={otherText[field.id] ?? questionOtherAnswer(field, answers[field.id])} autoFocus={!disabled} lastQuestion={last} t={t} onAdvance={advance} onSkip={skip} onMinimize={onMinimize} onSingleChoice={(choiceId) => { const nextAnswers = { ...answers, [field.id]: { kind: "single", selection: { kind: "choice", choiceId } } as const }; onChange(nextAnswers); advance(nextAnswers); }} onOtherTextChange={(value) => onOtherTextChange({ ...otherText, [field.id]: value })} onChange={(value) => onChange({ ...answers, [field.id]: value })} /></div></div></>}
         <div className="modal__actions question-wizard__actions">
           {step > 0 && <Button disabled={slideDirection !== undefined} onClick={() => navigateQuestion(step - 1, "right")}>{t("common.back")}</Button>}
           {field !== undefined && !field.required && <Button disabled={slideDirection !== undefined} onClick={skip}>{t("interaction.skip")}</Button>}
@@ -592,7 +603,10 @@ function QuestionDecision({ disabled, fields, answers, otherText, currentIndex, 
   );
 }
 
-function QuestionField({ ownerRoot, field, value, otherText, autoFocus, lastQuestion, t, onChange, onOtherTextChange, onSingleChoice, onAdvance, onSkip, onMinimize }: { readonly ownerRoot: { readonly current: HTMLFormElement | null }; readonly field: QuestionFieldView; readonly value?: QuestionAnswerDraft; readonly otherText: string; readonly autoFocus: boolean; readonly lastQuestion: boolean; readonly t: Translator; readonly onChange: (value: QuestionAnswerDraft) => void; readonly onOtherTextChange: (value: string) => void; readonly onSingleChoice: (value: string) => void; readonly onAdvance: () => void; readonly onSkip: () => void; readonly onMinimize: () => void }): JSX.Element {
+function QuestionField({ controller, ownerKey, sessionId, workspaceRoot, disabled, ownerRoot, field, value, otherText, autoFocus, lastQuestion, t, onChange, onOtherTextChange, onSingleChoice, onAdvance, onSkip, onMinimize }: { readonly controller: AppController; readonly ownerKey: string; readonly sessionId: string; readonly workspaceRoot?: string; readonly disabled: boolean; readonly ownerRoot: { readonly current: HTMLFormElement | null }; readonly field: QuestionFieldView; readonly value?: QuestionAnswerDraft; readonly otherText: string; readonly autoFocus: boolean; readonly lastQuestion: boolean; readonly t: Translator; readonly onChange: (value: QuestionAnswerDraft) => void; readonly onOtherTextChange: (value: string) => void; readonly onSingleChoice: (value: string) => void; readonly onAdvance: () => void; readonly onSkip: () => void; readonly onMinimize: () => void }): JSX.Element {
+  const references: TimelineReferenceActions = { ownerKey, sessionId, t,
+    onOpenHttpLink: (url, options) => controller.openHttpLink(url, { ...options, sessionId }) };
+  const referenceText = (text: string) => <QuestionReferenceText text={text} workspaceRoot={workspaceRoot} actions={references} />;
   const hasOtherAnswer = field.allowOther && (field.kind === "single" || field.kind === "multiple") && (otherText.trim() !== "" || questionOtherAnswer(field, value) !== "");
   const [otherExpanded, setOtherExpanded] = useState(hasOtherAnswer);
   useEffect(() => {
@@ -632,7 +646,7 @@ function QuestionField({ ownerRoot, field, value, otherText, autoFocus, lastQues
       onAdvance();
     }
   };
-  const handleOtherKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>): void => {
+  const handleOtherKeyDown = (event: ReactKeyboardEvent<HTMLInputElement | HTMLTextAreaElement>): void => {
     if (event.nativeEvent.isComposing) return;
     if (event.key === "Escape") {
       event.preventDefault();
@@ -646,10 +660,10 @@ function QuestionField({ ownerRoot, field, value, otherText, autoFocus, lastQues
       if (otherText.trim() !== "") onAdvance();
     }
   };
-  const legend = <><strong>{field.label}</strong>{field.required && <span aria-label={t("interaction.required")}> *</span>}{field.description !== undefined && <small>{field.description}</small>}</>;
+  const legend = <><strong>{referenceText(field.label)}</strong>{field.required && <span aria-label={t("interaction.required")}> *</span>}{field.description !== undefined && <small>{referenceText(field.description)}</small>}</>;
   if (field.kind === "text") {
     const text = value?.kind === "text" ? value.value : "";
-    return <label className="interaction-input question-field"><span>{legend}</span>{field.multiline ? <textarea autoFocus={autoFocus} rows={1} value={text} placeholder={field.placeholder} onKeyDown={handleTextKeyDown} onChange={(event) => onChange({ kind: "text", value: event.target.value })} /> : <input autoFocus={autoFocus} type="text" value={text} placeholder={field.placeholder} onKeyDown={handleTextKeyDown} onChange={(event) => onChange({ kind: "text", value: event.target.value })} />}</label>;
+    return <div className="interaction-input question-field"><span>{legend}</span><QuestionTextInput controller={controller} ownerKey={`${ownerKey}:${field.id}`} enabled={!disabled} label={field.label} value={text} multiline={field.multiline} autoFocus={autoFocus} placeholder={field.placeholder} onKeyDown={handleTextKeyDown} onChange={next => onChange({ kind: "text", value: next })} t={t} /></div>;
   }
   if (field.kind === "boolean") {
     const selected = value?.kind === "boolean" ? value.value : undefined;
@@ -658,14 +672,44 @@ function QuestionField({ ownerRoot, field, value, otherText, autoFocus, lastQues
   if (field.kind === "single") {
     const selected = value?.kind === "single" && value.selection.kind === "choice" ? value.selection.choiceId : "";
     const custom = questionOtherAnswer(field, value);
-    return <fieldset className="question-field"><legend>{legend}</legend><div className="question-choice-grid">{field.options.map((option, index) => <label key={option.id}><RadioControl autoFocus={autoFocus && index === 0} name={field.id} checked={selected === option.id} onChange={() => onSingleChoice(option.id)} /><span><strong>{option.label}</strong>{option.description !== undefined && <small>{option.description}</small>}</span><kbd aria-hidden="true">{index + 1}</kbd></label>)}{field.allowOther && <div className={cx("question-choice-other", custom !== "" && "is-selected", otherExpanded && "is-expanded")}>{otherExpanded ? <div className="question-choice-other__editor"><textarea data-question-other-input={field.id} rows={1} value={otherText} placeholder={t("interaction.otherPlaceholder")} onKeyDown={handleOtherKeyDown} onFocus={() => { if (otherText.trim() !== "" && custom === "") onChange(replaceQuestionOtherAnswer(field, value, otherText)); }} onChange={(event) => { onOtherTextChange(event.target.value); onChange(replaceQuestionOtherAnswer(field, value, event.target.value)); }} /><button type="button" disabled={otherText.trim() === ""} aria-label={lastQuestion ? t("interaction.submit") : t("common.continue")} onClick={() => onAdvance()}>{lastQuestion ? t("interaction.submit") : <ArrowRight aria-hidden="true" />}</button></div> : <label><RadioControl data-question-other-toggle={field.id} name={field.id} checked={false} onChange={openOther} /><span><strong>{t("interaction.other")}</strong></span><kbd aria-hidden="true">{field.options.length + 1}</kbd></label>}</div>}</div></fieldset>;
+    return <fieldset className="question-field"><legend>{legend}</legend><div className="question-choice-grid">
+      {field.options.map((option, index) => <label key={option.id}>
+        <RadioControl autoFocus={autoFocus && index === 0} name={field.id} checked={selected === option.id} onChange={() => onSingleChoice(option.id)} />
+        <span><strong>{referenceText(option.label)}</strong>{option.description !== undefined && <small>{referenceText(option.description)}</small>}</span><kbd aria-hidden="true">{index + 1}</kbd>
+      </label>)}
+      {field.allowOther && <div className={cx("question-choice-other", custom !== "" && "is-selected", otherExpanded && "is-expanded")}>
+        {otherExpanded ? <div className="question-choice-other__editor">
+          <QuestionTextInput controller={controller} ownerKey={`${ownerKey}:${field.id}:other`} enabled={!disabled} label={t("interaction.other")} otherFieldId={field.id}
+            value={otherText} placeholder={t("interaction.otherPlaceholder")} onKeyDown={handleOtherKeyDown}
+            onFocus={() => { if (otherText.trim() !== "" && custom === "") onChange(replaceQuestionOtherAnswer(field, value, otherText)); }}
+            onChange={next => { onOtherTextChange(next); onChange(replaceQuestionOtherAnswer(field, value, next)); }} t={t}>
+            <button type="button" disabled={otherText.trim() === ""} aria-label={lastQuestion ? t("interaction.submit") : t("common.continue")} onClick={() => onAdvance()}>
+              {lastQuestion ? t("interaction.submit") : <ArrowRight aria-hidden="true" />}
+            </button>
+          </QuestionTextInput>
+        </div> : <label><RadioControl data-question-other-toggle={field.id} name={field.id} checked={false} onChange={openOther} /><span><strong>{t("interaction.other")}</strong></span><kbd aria-hidden="true">{field.options.length + 1}</kbd></label>}
+      </div>}
+    </div></fieldset>;
   }
   const selected = value?.kind === "multiple" ? value.choiceIds : [];
   const custom = questionOtherAnswer(field, value);
   const minimum = Math.max(field.required ? 1 : 0, field.minimumSelections);
   const atMaximum = field.maximumSelections !== undefined && selected.length + (custom === "" ? 0 : 1) >= field.maximumSelections;
   const otherDisabled = custom === "" && atMaximum;
-  return <fieldset className="question-field"><legend>{legend}</legend><div className="question-choice-grid">{field.options.map((option, index) => <label key={option.id}><CheckboxControl autoFocus={autoFocus && index === 0} checked={selected.includes(option.id)} disabled={!selected.includes(option.id) && atMaximum} onChange={() => onChange(toggleQuestionOptionAnswer(field, value, option.id))} /><span><strong>{option.label}</strong>{option.description !== undefined && <small>{option.description}</small>}</span><kbd aria-hidden="true">{index + 1}</kbd></label>)}{field.allowOther && <div className={cx("question-choice-other", custom !== "" && "is-selected", otherExpanded && "is-expanded")}>{otherExpanded ? <div className="question-choice-other__editor"><CheckboxControl className="question-choice-other__check" checked={custom !== ""} readOnly tabIndex={-1} aria-hidden="true" /><textarea data-question-other-input={field.id} rows={1} value={otherText} placeholder={t("interaction.otherPlaceholder")} onKeyDown={handleOtherKeyDown} onChange={(event) => { onOtherTextChange(event.target.value); onChange(replaceQuestionOtherAnswer(field, value, event.target.value)); }} /></div> : <label><CheckboxControl data-question-other-toggle={field.id} checked={false} disabled={otherDisabled} onChange={openOther} /><span><strong>{t("interaction.other")}</strong></span><kbd aria-hidden="true">{field.options.length + 1}</kbd></label>}</div>}</div><small>{field.maximumSelections === undefined ? t("interaction.selectionMinimum", { min: minimum }) : t("interaction.selectionRange", { min: minimum, max: field.maximumSelections })}</small></fieldset>;
+  return <fieldset className="question-field"><legend>{legend}</legend><div className="question-choice-grid">
+    {field.options.map((option, index) => <label key={option.id}>
+      <CheckboxControl autoFocus={autoFocus && index === 0} checked={selected.includes(option.id)} disabled={!selected.includes(option.id) && atMaximum} onChange={() => onChange(toggleQuestionOptionAnswer(field, value, option.id))} />
+      <span><strong>{referenceText(option.label)}</strong>{option.description !== undefined && <small>{referenceText(option.description)}</small>}</span><kbd aria-hidden="true">{index + 1}</kbd>
+    </label>)}
+    {field.allowOther && <div className={cx("question-choice-other", custom !== "" && "is-selected", otherExpanded && "is-expanded")}>
+      {otherExpanded ? <div className="question-choice-other__editor">
+        <CheckboxControl className="question-choice-other__check" checked={custom !== ""} readOnly tabIndex={-1} aria-hidden="true" />
+        <QuestionTextInput controller={controller} ownerKey={`${ownerKey}:${field.id}:other`} enabled={!disabled && !otherDisabled} otherFieldId={field.id}
+          label={t("interaction.other")} value={otherText} placeholder={t("interaction.otherPlaceholder")} onKeyDown={handleOtherKeyDown}
+          onChange={next => { onOtherTextChange(next); onChange(replaceQuestionOtherAnswer(field, value, next)); }} t={t} />
+      </div> : <label><CheckboxControl data-question-other-toggle={field.id} checked={false} disabled={otherDisabled} onChange={openOther} /><span><strong>{t("interaction.other")}</strong></span><kbd aria-hidden="true">{field.options.length + 1}</kbd></label>}
+    </div>}
+  </div><small>{field.maximumSelections === undefined ? t("interaction.selectionMinimum", { min: minimum }) : t("interaction.selectionRange", { min: minimum, max: field.maximumSelections })}</small></fieldset>;
 }
 
 function focusQuestionOtherInput(ownerRoot: HTMLElement | null, fieldId: string): void {

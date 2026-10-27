@@ -81,6 +81,7 @@ async function main() {
   await appendFile(process.env.GITHUB_ENV, [
     `JOKO_BROWSER_EXECUTABLE=${selected.executable}`, `JOKO_MOUNTED_WEB_DIR=${web}`,
     `JOKO_GROUP_EVIDENCE_DIR=${join(process.env.RUNNER_TEMP, "joko-web-evidence/groups")}`,
+    `JOKO_QUESTION_EVIDENCE_DIR=${join(process.env.RUNNER_TEMP, "joko-web-evidence/questions")}`,
     `JOKO_DOCUMENT_MOUNTED_CAPTURE_DIR=${join(process.env.RUNNER_TEMP, "joko-web-evidence/documents")}`, ""
   ].join("\n"));
   if (process.platform === "linux") {
