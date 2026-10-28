@@ -1,4 +1,4 @@
-import type { BrowserLease, BrowserProvider, BrowserRemoteNodeRouter } from "@joko/tool-browser";
+import { BrowserPageGuardError, type BrowserLease, type BrowserProvider, type BrowserRemoteNodeRouter } from "@joko/tool-browser";
 import { runInNewContext } from "node:vm";
 import { OperationalStore } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
@@ -82,6 +82,7 @@ function fixture(
     handleDialog: vi.fn(async () => undefined),
     evaluatePage: vi.fn(async () => ({ value: "safe" })),
     evaluateBundledRecipe: vi.fn(async () => ({ value: "bundled" })),
+    checkPageGuard: vi.fn(async () => true),
     extract: vi.fn(async () => ({ ok: true as const, count: 1, records: [{ title: "Example" }] })),
     readResponseBody: vi.fn(async () => ({
       url: "https://example.test/api/items", status: 200, mediaType: "application/json", body: "{\"ok\":true}", truncated: false
@@ -566,15 +567,62 @@ describe("BrowserToolBridgeProvider", () => {
 
   it.each([false, true])("stops after a failed recipe result unless the step is optional (%s)", async optional => {
     const { bridge, browser, actions } = fixture();
-    vi.mocked(browser.evaluatePage).mockResolvedValue({ ok: false, message: "The page returned a failed result." });
+    vi.mocked(browser.extract).mockRejectedValue(new Error("The page extraction failed."));
     await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
-      id: "failed-result", steps: [{ action: "evaluate", fn: "() => ({ ok: false })", optional },
+      id: "failed-result", steps: [{ action: "extract", extract: { fields: { title: "h1" } }, optional },
         { action: "navigate", url: "https://example.test/after" }]
     } });
     const result = await bridge.callTool("browser", { action: "recipe", recipeId: "failed-result", targetId: "page-1" });
     expect(result.isError).toBe(!optional);
     expect(actions.some(action => (action as { type?: string }).type === "navigate")).toBe(optional);
     expect(result.structuredContent).toMatchObject(optional ? { ok: true } : { ok: false, failedStep: 0 });
+  });
+
+  it("preserves an evaluate result containing ok:false as data", async () => {
+    const { bridge, browser } = fixture();
+    vi.mocked(browser.evaluatePage).mockResolvedValue({ ok: false, title: "An ordinary record" });
+    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
+      id: "record", steps: [{ action: "evaluate", fn: "() => ({ ok: false })", as: "record" }], output: "{{record}}"
+    } });
+    expect((await bridge.callTool("browser", { action: "recipe", recipeId: "record", targetId: "page-1" })).structuredContent)
+      .toMatchObject({ ok: true, data: { output: { ok: false, title: "An ordinary record" } } });
+  });
+
+  it("does not perform an action when the page guard fails, and never makes validation optional", async () => {
+    const { bridge, browser, actions } = fixture();
+    const step = { action: "click", selector: "#send", guard: { url: "https://example.test/", selector: "h1", text: "Inbox" } };
+    await expect(bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
+      id: "unsafe-guard", steps: [{ ...step, optional: true }]
+    } })).rejects.toThrow(/cannot be optional/u);
+    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: { id: "guarded-click", steps: [step] } });
+    vi.mocked(browser.checkPageGuard).mockResolvedValue(false);
+    const result = await bridge.callTool("browser", { action: "recipe", recipeId: "guarded-click", targetId: "page-1" });
+    expect(result.structuredContent).toMatchObject({ ok: false, failureKind: "guard", failedStep: 0, steps: [] });
+    expect(actions).toEqual([]);
+  });
+
+  it("checks guarded extraction in the same read and validates actual records before continuing", async () => {
+    const { bridge, browser, actions } = fixture();
+    const guard = { url: "https://example.test/", text: "Results" };
+    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
+      id: "validated-results", inputs: { expected: { required: true } }, steps: [
+        { action: "extract", extract: { fields: { title: "h1" } }, guard, expect: {
+          minCount: 1, requiredFields: ["title"], equals: { title: "{{expected}}" }
+        }, as: "rows" }, { action: "navigate", url: "https://example.test/after" }
+      ], output: "{{rows}}"
+    } });
+    const run = () => bridge.callTool("browser", { action: "recipe", recipeId: "validated-results", targetId: "page-1", inputs: { expected: "Example" } });
+    vi.mocked(browser.extract).mockRejectedValueOnce(new BrowserPageGuardError());
+    expect((await run()).structuredContent).toMatchObject({ ok: false, failureKind: "guard", steps: [] });
+    expect(browser.checkPageGuard).not.toHaveBeenCalled();
+    expect(browser.extract).toHaveBeenCalledWith("page-1", expect.anything(), { fields: { title: "h1" } }, undefined, undefined, guard);
+    for (const records of [[], [{ title: " " }], [{ title: "Other" }]]) {
+      vi.mocked(browser.extract).mockResolvedValueOnce({ ok: true, count: 100, records });
+      expect((await run()).structuredContent).toMatchObject({ ok: false, failureKind: "expect", failedStep: 0 });
+    }
+    expect(actions).toEqual([]);
+    expect((await run()).isError).toBe(false);
+    expect(actions).toEqual([{ type: "navigate", url: "https://example.test/after" }]);
   });
 
   it("validates and exposes the built-in recipe and site-guide catalog", async () => {

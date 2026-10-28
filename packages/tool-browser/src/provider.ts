@@ -317,6 +317,16 @@ export interface BrowserExtractResult {
   readonly records: readonly Readonly<Record<string, string | null>>[];
 }
 
+export interface BrowserPageGuard {
+  readonly url: string;
+  readonly selector?: string;
+  readonly text?: string;
+}
+
+export class BrowserPageGuardError extends Error {
+  constructor() { super("The page identity or locator changed. Observe the page again before continuing."); }
+}
+
 export interface BrowserResponseBodySnapshot {
   readonly url: string;
   readonly status: number;
@@ -1867,18 +1877,34 @@ export class BrowserProvider {
     lease: BrowserLeaseFence,
     spec: BrowserExtractSpec,
     timeoutMs = 10_000,
-    frame?: string
+    frame?: string,
+    guard?: BrowserPageGuard
   ): Promise<BrowserExtractResult> {
     const fence = copyAgentFence(lease);
     const safePageId = validatePublicPageId(pageId);
     const safeSpec = validateExtractSpec(spec);
     const safeTimeout = validateIntegerInRange(timeoutMs, "Browser extract timeout", 1, MAXIMUM_WAIT_MILLISECONDS);
     const safeFrame = frame === undefined ? undefined : validateSelector(frame);
+    const safeGuard = guard === undefined ? undefined : validatePageGuard(guard);
     return this.withAgentControl(fence, async () => {
       const page = this.requirePageNow(safePageId);
       assertBrowserPageContentReadable(page);
       const scope = safeFrame === undefined ? page.locator("html") : page.frameLocator(safeFrame).locator("html");
       const result = await withTimeout(scope.evaluate((documentRoot, input) => {
+        if (input.guard !== undefined) {
+          const doc = documentRoot.ownerDocument;
+          const view = doc.defaultView!;
+          const g = input.guard;
+          const nodes = g.selector ? Array.from(doc.querySelectorAll(g.selector)).filter(element => {
+            const rect = element.getBoundingClientRect();
+            const style = view.getComputedStyle(element);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.visibility !== "collapse";
+          }) : [doc.body];
+          if (doc.location.href !== g.url || nodes.length !== 1 || !nodes[0]
+            || g.text !== undefined && (nodes[0].textContent ?? "").trim() !== g.text) {
+            return { ok: false as const };
+          }
+        }
         const roots = input.from
           ? input.multiple
             ? [...documentRoot.querySelectorAll(input.from)]
@@ -1904,8 +1930,31 @@ export class BrowserProvider {
           return record;
         });
         return { ok: true as const, count: records.length, records };
-      }, safeSpec), safeTimeout, "Browser extract timed out.");
+      }, { ...safeSpec, guard: safeGuard }), safeTimeout, "Browser extract timed out.");
+      if (!result.ok) throw new BrowserPageGuardError();
       return boundedModelValue(result) as BrowserExtractResult;
+    });
+  }
+
+  checkPageGuard(pageId: string, lease: BrowserLeaseFence, guard: BrowserPageGuard, timeoutMs = 10_000): Promise<boolean> {
+    const fence = copyAgentFence(lease);
+    const safePageId = validatePublicPageId(pageId);
+    const safeGuard = validatePageGuard(guard);
+    const safeTimeout = validateIntegerInRange(timeoutMs, "Browser guard timeout", 1, MAXIMUM_WAIT_MILLISECONDS);
+    return this.withAgentControl(fence, async () => {
+      const page = this.requirePageNow(safePageId);
+      assertBrowserPageContentReadable(page);
+      return withTimeout(page.locator("html").evaluate((root, g) => {
+        const doc = root.ownerDocument;
+        const view = doc.defaultView!;
+        if (doc.location.href !== g.url) return false;
+        const nodes = g.selector ? Array.from(doc.querySelectorAll(g.selector)).filter(element => {
+          const rect = element.getBoundingClientRect();
+          const style = view.getComputedStyle(element);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.visibility !== "collapse";
+        }) : [doc.body];
+        return nodes.length === 1 && !!nodes[0] && (g.text === undefined || (nodes[0].textContent ?? "").trim() === g.text);
+      }, safeGuard), safeTimeout, "Browser page guard timed out.");
     });
   }
 
@@ -3426,6 +3475,15 @@ function validateBundledRecipeEvaluateSource(value: string): string {
 
 export function validateBrowserEvaluateSource(value: string): string {
   return validateEvaluateSource(value);
+}
+
+function validatePageGuard(value: BrowserPageGuard): BrowserPageGuard {
+  validateWebUrl(value.url);
+  return {
+    url: value.url,
+    ...(!value.selector ? {} : { selector: validateSelector(value.selector) }),
+    ...(value.text === undefined ? {} : { text: validateBoundedString(value.text, "Browser guard text", 64 * 1024, true) })
+  };
 }
 
 function validateExtractSpec(value: BrowserExtractSpec): {

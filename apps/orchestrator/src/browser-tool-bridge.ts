@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import {
+  BrowserPageGuardError,
   sanitizeBrowserFileName,
   sanitizeBrowserUrlForDisplay,
   validateBrowserEvaluateSource,
@@ -17,6 +18,7 @@ import {
   type BrowserKeyModifier,
   type BrowserLease,
   type BrowserPageState,
+  type BrowserPageGuard,
   type BrowserProvider,
   type BrowserRemoteAutomationResult,
   type BrowserRemoteNodeRoute,
@@ -212,6 +214,14 @@ interface BrowserRecipeStep {
   readonly extract?: BrowserExtractSpec;
   readonly as?: string;
   readonly optional?: boolean;
+  readonly guard?: BrowserPageGuard;
+  readonly expect?: BrowserRecipeExpectation;
+}
+
+interface BrowserRecipeExpectation {
+  readonly minCount?: number;
+  readonly requiredFields?: readonly string[];
+  readonly equals?: Readonly<Record<string, string | number | boolean>>;
 }
 
 interface BrowserRecipe {
@@ -1375,13 +1385,47 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         throw new Error(`Browser recipe is missing required input '${name}'.`);
       }
     }
+    for (const [name, value] of Object.entries(vars)) {
+      if (value === undefined || value === null || typeof value === "string") continue;
+      if (typeof value !== "number" && typeof value !== "boolean"
+        || typeof value === "number" && (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER)) {
+        return browserError("recipe", { recipe: id, steps: [], failureKind: "input",
+          message: `Browser recipe input '${name}' must be a scalar with safe numeric precision; pass long identifiers as strings.` });
+      }
+      vars[name] = String(value);
+    }
     const completed: Array<{ action: string; ok: boolean }> = [];
     for (let index = 0; index < recipe.steps.length; index += 1) {
       signal?.throwIfAborted();
       const step = recipe.steps[index]!;
+      let failureKind: "input" | "guard" | "expect" | "action" = "input";
       try {
+        const call = recipeStepInput(step, vars, input);
+        const guard = step.guard === undefined ? undefined : {
+          url: interpolateRecipe(step.guard.url, vars),
+          ...(step.guard.selector === undefined ? {} : { selector: interpolateRecipe(step.guard.selector, vars) }),
+          ...(step.guard.text === undefined ? {} : { text: interpolateRecipe(step.guard.text, vars) })
+        };
+        if (guard !== undefined) agentUrl(guard.url);
+        const expectation = step.expect === undefined ? undefined : {
+          ...step.expect,
+          ...(step.expect.equals === undefined ? {} : { equals: Object.fromEntries(Object.entries(step.expect.equals)
+            .map(([field, expected]) => [field, typeof expected === "string" ? interpolateRecipe(expected, vars) : expected])) })
+        };
+        if (guard !== undefined && step.action !== "extract") {
+          failureKind = "guard";
+          const pageId = this.#unifiedPageId(input);
+          const matched = await this.#withPageReadLease(pageId, lease => this.#browser.checkPageGuard(pageId, lease, guard, step.timeoutMs));
+          if (!matched) throw new BrowserPageGuardError();
+        }
+        failureKind = "action";
         let result: McpCallResult;
-        if (step.action === "evaluate" && this.#recipeProvenance(id) === "builtin") {
+        if (step.action === "extract" && guard !== undefined) {
+          const pageId = this.#unifiedPageId(input);
+          result = await this.#withPageReadLease(pageId, async lease => browserResult("extract", await this.#browser.extract(
+            pageId, lease, step.extract!, step.timeoutMs, undefined, guard
+          )));
+        } else if (step.action === "evaluate" && this.#recipeProvenance(id) === "builtin") {
           if (step.fn === undefined) throw new Error("Browser recipe evaluate step requires fn.");
           const pageId = this.#unifiedPageId(input);
           const source = interpolateRecipe(step.fn, vars);
@@ -1393,24 +1437,27 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           ));
           result = browserResult("act", { kind: "evaluate", result: value });
         } else {
-          const call = recipeStepInput(step, vars, input);
           result = await this.#executeUnified(call, signal);
         }
         const value = recipeStepValue(step, result);
         if (result.isError || result.structuredContent?.["ok"] === false
-          || typeof value === "object" && value !== null && "ok" in value && value.ok === false) {
+          || step.action === "extract" && typeof value === "object" && value !== null && "ok" in value && value.ok === false) {
           throw new Error(`Browser recipe step '${step.action}' returned an error.`);
         }
+        failureKind = "expect";
+        assertRecipeExpectation(expectation, value);
         completed.push({ action: step.action, ok: true });
-        if (step.as !== undefined) vars[step.as] = recipeStepValue(step, result);
+        if (step.as !== undefined) vars[step.as] = value;
       } catch (error) {
-        completed.push({ action: step.action, ok: false });
-        if (step.optional === true) continue;
+        if (error instanceof BrowserPageGuardError) failureKind = "guard";
+        if (failureKind !== "guard" && failureKind !== "input") completed.push({ action: step.action, ok: false });
+        if (step.optional === true && failureKind === "action") continue;
         return browserError("recipe", {
           recipe: id,
           steps: completed,
           failedStep: index,
           failedAction: step.action,
+          failureKind,
           message: error instanceof Error ? error.message : String(error)
         });
       }
@@ -2151,6 +2198,20 @@ function validateRecipe(value: Readonly<Record<string, unknown>>): BrowserRecipe
     const step = raw as Readonly<Record<string, unknown>>;
     const action = requiredEnum(step, "action", accepted);
     const fn = optionalString(step, "fn", 64 * 1024);
+    const guardValue = optionalRecord(step, "guard");
+    const guard = guardValue === undefined ? undefined : {
+      url: requiredString(guardValue, "url", 8_192),
+      ...(guardValue["selector"] === undefined ? {} : { selector: requiredString(guardValue, "selector", 4_096, true) }),
+      ...(guardValue["text"] === undefined ? {} : { text: requiredString(guardValue, "text", 64 * 1024, true) })
+    };
+    const expectValue = optionalRecord(step, "expect");
+    const expectation = expectValue === undefined ? undefined : validateRecipeExpectation(expectValue);
+    if (expectation !== undefined && action !== "extract" && action !== "evaluate") {
+      throw new Error("Browser recipe expect is only supported for extract/evaluate.");
+    }
+    if ((guard !== undefined || expectation !== undefined) && step["optional"] === true) {
+      throw new Error("Browser recipe validation steps cannot be optional.");
+    }
     if ((action === "evaluate" || action === "wait") && fn !== undefined) {
       for (const match of fn.matchAll(/\{\{\s*[\w-]+\s*(?:\|\s*([a-z]+)\s*)?\}\}/gu)) {
         if (match[1] !== "js") throw new Error(`Browser recipe step ${index} has unsafe function interpolation.`);
@@ -2158,6 +2219,8 @@ function validateRecipe(value: Readonly<Record<string, unknown>>): BrowserRecipe
     }
     return {
       action,
+      ...(guard === undefined ? {} : { guard }),
+      ...(expectation === undefined ? {} : { expect: expectation }),
       ...(step["url"] === undefined ? {} : { url: requiredString(step, "url", 8_192) }),
       ...(step["selector"] === undefined ? {} : { selector: requiredString(step, "selector", 4_096) }),
       ...(fn === undefined ? {} : { fn }),
@@ -2193,6 +2256,52 @@ function validateRecipe(value: Readonly<Record<string, unknown>>): BrowserRecipe
     steps,
     ...(value["output"] === undefined ? {} : { output: requiredString(value, "output", 4_096, true) })
   };
+}
+
+function validateRecipeExpectation(value: Readonly<Record<string, unknown>>): BrowserRecipeExpectation {
+  const minCount = value["minCount"] === undefined ? undefined : requiredInteger(value, "minCount", 1, Number.MAX_SAFE_INTEGER);
+  const requiredFields = value["requiredFields"] === undefined ? undefined : requiredStringArray(value, "requiredFields", 128, 256);
+  const rawEquals = optionalRecord(value, "equals");
+  const equals: Record<string, string | number | boolean> = {};
+  const entries = Object.entries(rawEquals ?? {});
+  if (entries.length > 128) throw new Error("Browser recipe expect has too many fields.");
+  for (const [field, expected] of entries) {
+    requiredString({ field }, "field", 256);
+    if (typeof expected !== "string" && typeof expected !== "boolean" && typeof expected !== "number"
+      || typeof expected === "number" && !Number.isFinite(expected)
+      || typeof expected === "string" && expected.length > 64 * 1024) {
+      throw new Error("Browser recipe expect equals values must be bounded scalars.");
+    }
+    equals[field] = expected;
+  }
+  if (minCount === undefined && !requiredFields?.length && entries.length === 0) throw new Error("Browser recipe expect requires a result check.");
+  return { ...(minCount === undefined ? {} : { minCount }), ...(requiredFields === undefined ? {} : { requiredFields }),
+    ...(rawEquals === undefined ? {} : { equals }) };
+}
+
+function assertRecipeExpectation(expectation: BrowserRecipeExpectation | undefined, value: unknown): void {
+  if (expectation === undefined) return;
+  const record = typeof value === "object" && value !== null ? value as Readonly<Record<string, unknown>> : undefined;
+  const rows: readonly unknown[] = Array.isArray(value) ? value : Array.isArray(record?.["records"]) ? record["records"] : record === undefined ? [] : [record];
+  if (expectation.minCount !== undefined && rows.length < expectation.minCount) {
+    throw new Error(`Browser recipe expect requires at least ${expectation.minCount} records; received ${rows.length}.`);
+  }
+  if ((expectation.requiredFields?.length || Object.keys(expectation.equals ?? {}).length) && rows.length === 0) {
+    throw new Error("Browser recipe expect received an empty result.");
+  }
+  for (const row of rows) {
+    if (row === null || typeof row !== "object" || Array.isArray(row)) throw new Error("Browser recipe expect requires object records.");
+    const fields = row as Readonly<Record<string, unknown>>;
+    for (const field of expectation.requiredFields ?? []) {
+      const item = fields[field];
+      if (item === null || item === undefined || typeof item === "string" && !item.trim()) {
+        throw new Error(`Browser recipe expect required field '${field}' is empty.`);
+      }
+    }
+    for (const [field, expected] of Object.entries(expectation.equals ?? {})) {
+      if (fields[field] !== expected) throw new Error(`Browser recipe expect field '${field}' did not match.`);
+    }
+  }
 }
 
 function validateUserRecipeSafety(recipe: BrowserRecipe): void {
