@@ -27,8 +27,8 @@ export function splitDiscordText(text: string, limit = DISCORD_TEXT_LIMIT): read
     current = inFence ? reopenFence() : '';
   };
 
-  for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
-    let token = tokens[tokenIndex];
+  for (const line of tokens) {
+    let token = line;
 
     while (token.length > 0) {
       const nextState = stateAfterToken(token, inFence, fenceLang);
