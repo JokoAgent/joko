@@ -564,6 +564,19 @@ describe("BrowserToolBridgeProvider", () => {
     })).rejects.toThrow(/unsafe/u);
   });
 
+  it.each([false, true])("stops after a failed recipe result unless the step is optional (%s)", async optional => {
+    const { bridge, browser, actions } = fixture();
+    vi.mocked(browser.evaluatePage).mockResolvedValue({ ok: false, message: "The page returned a failed result." });
+    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
+      id: "failed-result", steps: [{ action: "evaluate", fn: "() => ({ ok: false })", optional },
+        { action: "navigate", url: "https://example.test/after" }]
+    } });
+    const result = await bridge.callTool("browser", { action: "recipe", recipeId: "failed-result", targetId: "page-1" });
+    expect(result.isError).toBe(!optional);
+    expect(actions.some(action => (action as { type?: string }).type === "navigate")).toBe(optional);
+    expect(result.structuredContent).toMatchObject(optional ? { ok: true } : { ok: false, failedStep: 0 });
+  });
+
   it("validates and exposes the built-in recipe and site-guide catalog", async () => {
     expect(BUILTIN_BROWSER_RECIPES).toHaveLength(56);
     expect(BUILTIN_BROWSER_SITE_GUIDES).toHaveLength(56);

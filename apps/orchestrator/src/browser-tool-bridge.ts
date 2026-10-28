@@ -1396,7 +1396,12 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           const call = recipeStepInput(step, vars, input);
           result = await this.#executeUnified(call, signal);
         }
-        completed.push({ action: step.action, ok: !result.isError });
+        const value = recipeStepValue(step, result);
+        if (result.isError || result.structuredContent?.["ok"] === false
+          || typeof value === "object" && value !== null && "ok" in value && value.ok === false) {
+          throw new Error(`Browser recipe step '${step.action}' returned an error.`);
+        }
+        completed.push({ action: step.action, ok: true });
         if (step.as !== undefined) vars[step.as] = recipeStepValue(step, result);
       } catch (error) {
         completed.push({ action: step.action, ok: false });
