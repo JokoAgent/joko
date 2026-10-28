@@ -1,6 +1,16 @@
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
-import type { ModelReferenceTariff, ModelTokenPrices } from "@joko/core";
+import type { ModelPriceOverrideValues, ModelReferenceTariff, ModelTokenPrices } from "@joko/core";
+
+export function toProtoModelPriceOverrideValues(values: ModelPriceOverrideValues): contract.ModelPriceOverrideValues {
+  return create(contract.ModelPriceOverrideValuesSchema, {
+    currency: values.currencyCode === undefined ? undefined : values.currencyCode === "CNY" ? contract.ModelPriceCurrency.CNY : contract.ModelPriceCurrency.USD,
+    inputCostMicrosPerMillion: protoModelPrice(values.input), outputCostMicrosPerMillion: protoModelPrice(values.output),
+    cacheReadCostMicrosPerMillion: protoModelPrice(values.cacheRead ?? undefined),
+    cacheWriteCostMicrosPerMillion: protoModelPrice(values.cacheWrite ?? undefined),
+    clearCacheRead: values.cacheRead === null, clearCacheWrite: values.cacheWrite === null
+  });
+}
 
 export function priceMicros(value: number | undefined): number | undefined {
   if (value === undefined) return undefined;

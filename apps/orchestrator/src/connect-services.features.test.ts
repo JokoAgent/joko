@@ -2058,7 +2058,7 @@ describe("Connect typed feature boundaries", () => {
       updatedAt: 1
     };
     const services = createConnectServices(stubApplication({
-      store: { listBackends: () => [backend], getBackend: () => backend },
+      store: { listBackends: () => [backend], getBackend: () => backend, findModelPriceOverride: () => undefined },
       providers: {
         list: () => [
           { backendId: "pi", provider: { id: "signed-out" }, authenticationState: "signed_out" },
@@ -5097,6 +5097,7 @@ describe("Connect typed feature boundaries", () => {
       findOperation: () => undefined,
       listBackends: () => [record],
       getBackend: () => record,
+      findModelPriceOverride: () => undefined,
       findSetting: () => ({
         value: create(contract.BackendModelAccessSettingsSchema, {
           disabledModels: [create(contract.ModelKeySchema, { providerId: "managed", modelId: "catalog-model" })]

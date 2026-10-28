@@ -5088,16 +5088,16 @@ describe("SessionHost", () => {
     { name: "fast above the threshold", requestInput: 272_001, fastMode: true, costMicros: 14_900_080 },
     { name: "unobserved fast mode", requestInput: 272_000, fastMode: undefined, costMicros: 3_750_000 },
     { name: "unobserved request size", requestInput: 272_001, fastMode: true, omitPricingContext: true, costMicros: 3_750_020 },
-    { name: "owner price override", requestInput: 272_001, fastMode: true, override: true, costMicros: 546_002 },
+    { name: "owner Standard price override with context bands", requestInput: 272_001, fastMode: false, override: true, costMicros: 1_091_004 },
+    { name: "independent Fast price with a Standard override", requestInput: 272_001, fastMode: true, override: true, costMicros: 14_900_080 },
     { name: "reported cost", requestInput: 272_001, fastMode: true, reportedCost: true, costMicros: 500_000 }
   ])("prices $name from request observations without multiplying cumulative usage or duplicate events", async (testCase) => {
     const fixture = await createFixture(new TieredUsageFakeAdapter(testCase), {
       usageMoneyKind: () => "reference-value"
     });
     if (testCase.override) fixture.store.upsertModelPriceOverride({
-      ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text", currencyCode: "USD",
-      inputCostMicrosPerMillion: 1_000_000, outputCostMicrosPerMillion: 1_000_000,
-      cacheReadCostMicrosPerMillion: 1_000_000, cacheWriteCostMicrosPerMillion: 1_000_000
+      ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text",
+      values: { currencyCode: "USD", input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }
     });
     const sessionId = (await fixture.host.createSession({
       operationId: "create-tiered-usage", connection: fixture.connection, targetId: "target-one", title: "Tiered usage",
@@ -5122,14 +5122,20 @@ describe("SessionHost", () => {
 
   it.each([
     { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, costMicros: 890_000, complete: true },
+    { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, overrideCacheWrite: 10, costMicros: 916_000, complete: true },
     { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: true, cacheWrite1hTokens: 1_000, costMicros: 1_780_000, complete: true },
     { model: "google/gemini-3.8-flash", at: Date.UTC(2026, 11, 31, 23, 59, 59), fastMode: false, costMicros: 169_500, complete: false },
     { model: "google/gemini-3.8-flash", at: Date.UTC(2027, 0, 1), fastMode: false, costMicros: 339_000, complete: false }
   ])("records $model tariffs using request time $at and observed cache duration", async testCase => {
-    const { catalogModelReferencePricing } = await import("@joko/core");
+    const { catalogModelReferencePricing, captureModelPriceReference } = await import("@joko/core");
     const fixture = await createFixture(new TieredUsageFakeAdapter({ requestInput: 200_000, fastMode: testCase.fastMode,
       requestedAt: testCase.at, cacheWrite1hTokens: testCase.cacheWrite1hTokens, pricing: catalogModelReferencePricing(testCase.model) }),
     { usageMoneyKind: () => "reference-value" });
+    if (testCase.overrideCacheWrite !== undefined) fixture.store.upsertModelPriceOverride({
+      ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text",
+      values: { cacheWrite: testCase.overrideCacheWrite },
+      baseReference: captureModelPriceReference(fixture.store.getBackend(fixture.adapter.id).descriptor.models[0]!, testCase.at)
+    });
     const sessionId = (await fixture.host.createSession({ operationId: "create-tariff-usage", connection: fixture.connection,
       targetId: "target-one", title: "Tariff usage", providerId: "test", modelId: "text", fastMode: testCase.fastMode,
       permissionMode: "ask", planMode: false })).value.sessionId;
@@ -5265,9 +5271,7 @@ describe("SessionHost", () => {
       backendId: primary.id,
       providerId: "test",
       modelId: "text",
-      currencyCode: "CNY",
-      inputCostMicrosPerMillion: 10_000_000,
-      outputCostMicrosPerMillion: 20_000_000
+      values: { currencyCode: "CNY", input: 10, output: 20, cacheRead: null, cacheWrite: null }
     });
 
     const createAndRun = async (operation: string, targetId: string) => {

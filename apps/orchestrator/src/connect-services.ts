@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { modelTokenPricesAt } from "@joko/core";
-import { priceMicros } from "./model-pricing-projection.js";
+import { captureModelPriceReference, createModelPriceOverrideValues, modelPriceOverrideConflict, modelPricesWithOverride, modelTokenPricesAt, type ModelPriceReferenceSnapshot } from "@joko/core";
+import { priceMicros, toProtoModelPriceOverrideValues } from "./model-pricing-projection.js";
 import type { ExtensionSettingsManager } from "./extension-settings.js";
 import type { ExtensionDirectoryPicker, ExtensionDirectoryPage, PickedExtensionDirectory } from "./extension-directory-picker.js";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
@@ -2410,7 +2410,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
         })
       };
       const ownerId = usageOwnerId(dependencies);
-      if (reference.available && sameModelPrice(reference.quote, quote)) {
+      const values = createModelPriceOverrideValues({ currencyCode, cost: {
+        input: quote.inputCostMicrosPerMillion / 1_000_000, output: quote.outputCostMicrosPerMillion / 1_000_000,
+        cacheRead: quote.cacheReadCostMicrosPerMillion === undefined ? undefined : quote.cacheReadCostMicrosPerMillion / 1_000_000,
+        cacheWrite: quote.cacheWriteCostMicrosPerMillion === undefined ? undefined : quote.cacheWriteCostMicrosPerMillion / 1_000_000
+      } }, reference.snapshot);
+      if (Object.keys(values).length === 0) {
         dependencies.store.deleteModelPriceOverride(
           ownerId,
           reference.backendId,
@@ -2423,7 +2428,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
           backendId: reference.backendId,
           providerId: reference.providerId,
           modelId: reference.modelId,
-          ...quote,
+          values,
+          baseReference: reference.snapshot,
           updatedAt: (dependencies.now ?? Date.now)()
         });
       }
@@ -2467,7 +2473,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const values = records.flatMap((record) => backendCatalogModels(dependencies, record.descriptor)
         .filter((model) => request.providerId === "" || model.providerId === request.providerId)
         .map((model) => {
-          const descriptor = toProtoModelDescriptor(record.descriptor.id, model);
+          const descriptor = ownerModelDescriptor(dependencies, record.descriptor.id, model);
           const authenticationState = managedProviderCatalogApplies(dependencies, record.descriptor.id)
             ? providerAuthentication.get(providerDescriptorKey(record.descriptor.id, model.providerId))
             : undefined;
@@ -9721,6 +9727,9 @@ interface ModelPriceReference {
   readonly backendId: string;
   readonly providerId: string;
   readonly modelId: string;
+  readonly model: ProviderModel;
+  readonly at: number;
+  readonly snapshot?: ModelPriceReferenceSnapshot;
   readonly quote: {
     readonly currencyCode: "USD" | "CNY";
     readonly inputCostMicrosPerMillion?: number;
@@ -9755,13 +9764,17 @@ function modelPriceReference(
     candidate.providerId === providerId && candidate.modelId === modelId
   );
   if (model === undefined) throw new NotFoundError("Model", `${backendId}/${providerId}/${modelId}`);
-  const selected = modelTokenPricesAt(model, { at: Date.now() });
+  const at = (dependencies.now ?? Date.now)();
+  const selected = modelTokenPricesAt(model, { at });
   const cost = selected?.cost ?? {};
   const available = Object.values(cost).some(value => value !== undefined);
   return {
     backendId,
     providerId,
     modelId,
+    model,
+    at,
+    snapshot: captureModelPriceReference(model, at),
     quote: {
       currencyCode: model.pricing?.currencyCode === "CNY" ? "CNY" : "USD",
       inputCostMicrosPerMillion: priceMicros(cost.input),
@@ -9790,18 +9803,36 @@ function modelPriceOverrideView(
     modelId
   );
   const updatedAt = override?.updatedAt ?? reference.updatedAt;
+  const effective = modelPricesWithOverride(reference.model, override, { at: reference.at });
   return create(contract.ModelPriceOverrideViewSchema, {
     backendId,
     model: create(contract.ModelKeySchema, { providerId, modelId }),
     reference: protoModelPriceQuote(reference.quote),
-    effective: protoModelPriceQuote(override ?? reference.quote),
-    override: override === undefined ? undefined : protoModelPriceQuote(override),
+    effective: protoModelPriceQuote(effective === undefined ? reference.quote : {
+      currencyCode: effective.currencyCode === "CNY" ? "CNY" : "USD",
+      inputCostMicrosPerMillion: priceMicros(effective.cost.input), outputCostMicrosPerMillion: priceMicros(effective.cost.output),
+      cacheReadCostMicrosPerMillion: priceMicros(effective.cost.cacheRead), cacheWriteCostMicrosPerMillion: priceMicros(effective.cost.cacheWrite)
+    }),
+    override: override === undefined ? undefined : toProtoModelPriceOverrideValues(override.values),
+    conflict: override !== undefined && modelPriceOverrideConflict(reference.model, override, reference.at),
     allowedCurrencies: [contract.ModelPriceCurrency.USD, contract.ModelPriceCurrency.CNY],
     referenceAvailable: reference.available,
     registryUpdatedAt: reference.registryUpdatedAt === undefined ? undefined : toProtoTimestamp(reference.registryUpdatedAt),
     updatedAt: toProtoTimestamp(updatedAt),
     version: toProtoEntityVersion(override?.revision ?? reference.revision, 0, updatedAt)
   });
+}
+
+function ownerModelDescriptor(dependencies: ConnectServiceDependencies, backendId: string, model: ProviderModel): contract.ModelDescriptor {
+  const descriptor = toProtoModelDescriptor(backendId, model);
+  const override = dependencies.store.findModelPriceOverride(usageOwnerId(dependencies), backendId, model.providerId, model.modelId);
+  const effective = override === undefined ? undefined : modelPricesWithOverride(model, override, { at: (dependencies.now ?? Date.now)() });
+  if (effective !== undefined) descriptor.ownerPriceOverride = protoModelPriceQuote({
+    currencyCode: effective.currencyCode === "CNY" ? "CNY" : "USD",
+    inputCostMicrosPerMillion: priceMicros(effective.cost.input), outputCostMicrosPerMillion: priceMicros(effective.cost.output),
+    cacheReadCostMicrosPerMillion: priceMicros(effective.cost.cacheRead), cacheWriteCostMicrosPerMillion: priceMicros(effective.cost.cacheWrite)
+  });
+  return descriptor;
 }
 
 function protoModelPriceQuote(value: {
@@ -9828,17 +9859,6 @@ function modelPriceCurrencyCode(value: contract.ModelPriceCurrency): "USD" | "CN
   if (value === contract.ModelPriceCurrency.USD) return "USD";
   if (value === contract.ModelPriceCurrency.CNY) return "CNY";
   throw invalidArgument("Model price currency must be USD or CNY.");
-}
-
-function sameModelPrice(
-  left: ModelPriceReference["quote"],
-  right: ModelPriceReference["quote"]
-): boolean {
-  return left.currencyCode === right.currencyCode
-    && left.inputCostMicrosPerMillion === right.inputCostMicrosPerMillion
-    && left.outputCostMicrosPerMillion === right.outputCostMicrosPerMillion
-    && left.cacheReadCostMicrosPerMillion === right.cacheReadCostMicrosPerMillion
-    && left.cacheWriteCostMicrosPerMillion === right.cacheWriteCostMicrosPerMillion;
 }
 
 export { providerRateLimitSettingKey } from "./provider-rate-limit.js";
@@ -14117,7 +14137,7 @@ async function enrichSnapshot(
       for (const model of backendCatalogModels(dependencies, record.descriptor)) {
         projectedModelMap.set(
           modelDescriptorKey(backend.backendId, model.providerId, model.modelId),
-          toProtoModelDescriptor(backend.backendId, model)
+          ownerModelDescriptor(dependencies, backend.backendId, model)
         );
       }
     }

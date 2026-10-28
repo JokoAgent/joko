@@ -173,6 +173,8 @@ message ModelDescriptor {
   bool supports_ultrafast_mode = 34;
   optional bool declared_supports_ultrafast_mode = 35;
   ModelReferenceTariffs reference_tariffs = 36;
+  // Owner-only presentation. Never replace shared reference prices or route metadata.
+  ModelPriceQuote owner_price_override = 37;
 }
 
 // Absence means no tariff metadata; a present empty list withdraws all tariffs.
@@ -371,17 +373,29 @@ message ModelPriceQuote {
   optional int64 cache_write_cost_micros_per_million = 5;
 }
 
+// Missing values inherit the current reference. Cleared cache fields stay unknown.
+message ModelPriceOverrideValues {
+  optional ModelPriceCurrency currency = 1;
+  optional int64 input_cost_micros_per_million = 2;
+  optional int64 output_cost_micros_per_million = 3;
+  optional int64 cache_read_cost_micros_per_million = 4;
+  optional int64 cache_write_cost_micros_per_million = 5;
+  bool clear_cache_read = 6;
+  bool clear_cache_write = 7;
+}
+
 message ModelPriceOverrideView {
   string backend_id = 1;
   ModelKey model = 2;
   ModelPriceQuote reference = 3;
   ModelPriceQuote effective = 4;
-  ModelPriceQuote override = 5;
+  ModelPriceOverrideValues override = 5;
   repeated ModelPriceCurrency allowed_currencies = 6;
   google.protobuf.Timestamp updated_at = 7;
   EntityVersion version = 8;
   bool reference_available = 9;
   google.protobuf.Timestamp registry_updated_at = 10;
+  bool conflict = 11;
 }
 
 message UsageCurrencyTotal {

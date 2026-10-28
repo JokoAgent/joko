@@ -166,6 +166,7 @@ export function ModelPriceOverrideDialog({ controller, model, variants, t, onClo
       } } : {})}
     />}
     {price !== undefined && draft !== undefined && <form className="settings-form model-price-dialog__form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+      {price.conflict === true && <p role="status">{t("settings.modelPrice.conflict")}</p>}
       <div className="model-price-dialog__grid">
         <label className="field model-price-dialog__currency"><span>{t("settings.modelPrice.currency")}</span><SelectControl value={draft.currency} disabled={busy} onChange={(event) => updateDraft({ currency: event.target.value as ModelPriceQuoteView["currency"] })}>{price.allowedCurrencies.map((currency) => <option key={currency} value={currency}>{currency}</option>)}</SelectControl></label>
         <PriceInput inputRef={inputRef} label={t("settings.modelPrice.input")} value={draft.input} disabled={busy} onChange={(input) => updateDraft({ input })} />
@@ -198,7 +199,7 @@ function PriceInput({ inputRef, label, value, disabled, optional = false, onChan
 }
 
 function modelPriceInitialQuote(price: ModelPriceOverrideView): ModelPriceQuoteView | undefined {
-  return price.override ?? (price.referenceAvailable ? price.reference : undefined);
+  return price.override === undefined ? (price.referenceAvailable ? price.reference : undefined) : price.effective;
 }
 
 function modelPriceDraft(quote: ModelPriceQuoteView | undefined, fallbackCurrency: ModelPriceQuoteView["currency"] = "USD"): ModelPriceDraft {

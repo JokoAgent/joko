@@ -13,6 +13,21 @@ beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); window.local
 afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); resetModelPickerPreferencesForTests(); });
 
 describe("ProviderSettings model advanced journey", () => {
+  it("shows a saved override and its conflict after reference prices disappear", async () => {
+    const get = vi.fn(async (): Promise<ModelPriceOverrideView> => ({
+      backendId: "a", providerId: "provider", modelId: "model-primary",
+      reference: { currency: "USD" }, effective: { currency: "USD", inputPerMillion: 3, outputPerMillion: 6 },
+      override: { inputPerMillion: 3 }, conflict: true, referenceAvailable: false, allowedCurrencies: ["USD"]
+    }));
+    await mount({ getModelPriceOverride: get }, undefined, { pricingKnown: false });
+    await open();
+    expect(get).toHaveBeenCalledWith("a", "provider", "model-primary", expect.any(AbortSignal));
+    const drawer = required(document.querySelector(".model-advanced-drawer"));
+    expect(drawer.textContent).toContain("3 USD / 1M");
+    expect(drawer.textContent).toContain("6 USD / 1M");
+    expect(drawer.textContent).toContain("reference price has changed");
+  });
+
   it("opens published tariffs with date/token boundaries and distinct one-hour cache prices", async () => {
     await mount({}, undefined, { referenceTariffs: [{ currencyCode: "USD", variant: "fast", inputPerMillion: 8,
       outputPerMillion: 40, cacheWritePerMillion: 10, cacheWrite1hPerMillion: 16, minInputTokens: 272001,
@@ -198,7 +213,10 @@ async function mount(overrides: Record<string, unknown> = {}, managed?: ManagedM
   const api = { state: { activeProfile: { id: "profile", serverId: "node", name: "Node", origin: "https://node.invalid" }, connectionState: "connected", connectionGeneration: 1, effectiveLocale: "en", preferences: { locale: "en" }, snapshot },
     refreshProviderModels: vi.fn(async () => undefined), refreshManagedModelRuntimes: vi.fn(async () => undefined), saveProvider: vi.fn(async () => undefined), updateBackendSettings: vi.fn(async () => undefined),
     getModelWorkingContext: vi.fn(async () => context()), setModelWorkingContext: vi.fn(async (_target: unknown, _observed: unknown, tokens?: number) => context({ limitTokens: tokens, effectiveContextWindowTokens: tokens, revision: 8n })), resetModelWorkingContext: vi.fn(async () => context({ limitTokens: undefined, customized: false, mixed: false })),
-    getManagedModelContext: vi.fn(async () => ({ defaultContextWindowTokens: 32_000, effectiveContextWindowTokens: 32_000, maximumContextWindowTokens: 262_144, presets: [262_144], customized: false, canConfigure: false, pendingApply: false })), ...overrides
+    getManagedModelContext: vi.fn(async () => ({ defaultContextWindowTokens: 32_000, effectiveContextWindowTokens: 32_000, maximumContextWindowTokens: 262_144, presets: [262_144], customized: false, canConfigure: false, pendingApply: false })),
+    getModelPriceOverride: vi.fn(async (backendId: string, providerId: string, modelId: string): Promise<ModelPriceOverrideView> => ({
+      backendId, providerId, modelId, reference: { currency: "USD" }, effective: { currency: "USD" }, referenceAvailable: false, allowedCurrencies: ["USD", "CNY"]
+    })), ...overrides
   };
   const controller = api as unknown as AppController;
   const container = document.body.appendChild(document.createElement("div")); const root = createRoot(container); roots.push(root);

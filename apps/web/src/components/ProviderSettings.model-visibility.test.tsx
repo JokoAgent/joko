@@ -1046,6 +1046,10 @@ describe("ProviderSettings model visibility", () => {
     const controller = {
       refreshProviderModels: vi.fn(async () => undefined),
       getModelWorkingContext: vi.fn(async () => ({ target: { backendId: "backend-a", providerId: "shared-provider", modelId: "shared-model" }, revision: 0n, sourceRevision: "source", canConfigure: false, customized: false, mixed: false })),
+      getModelPriceOverride: vi.fn(async (backendId: string, providerId: string, modelId: string) => ({
+        backendId, providerId, modelId, reference: { currency: "USD" }, effective: { currency: "USD" },
+        allowedCurrencies: ["USD", "CNY"], referenceAvailable: false, revision: 0n
+      })),
       updateBackendSettings,
       state: {
         connectionState: "connected",

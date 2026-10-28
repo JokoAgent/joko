@@ -46,7 +46,7 @@ export function selectModelReferenceTariff(
 }
 
 /** Returns one complete tariff selection. Never blend bands, currencies or variants. */
-export function modelTokenPricesAt(model: ProviderModel, input: {
+export function modelTokenPricesAt(model: Pick<ProviderModel, "cost" | "pricing">, input: {
   readonly at: number;
   readonly inputTokens?: number;
   readonly fastMode?: boolean | "ultrafast";

@@ -347,6 +347,7 @@ export interface ModelView {
   readonly providerAccessKind?: ProviderConfigurationView["kind"];
   readonly pricingKnown?: boolean;
   readonly pricingSource?: "providerReference" | "upstream";
+  readonly priceOverride?: ModelPriceQuoteView;
   readonly pricingUpdatedAt?: number;
   readonly modelId: string;
   readonly logicalId?: string;
@@ -1410,7 +1411,14 @@ export interface ModelPriceOverrideView {
   readonly modelId: string;
   readonly reference: ModelPriceQuoteView;
   readonly effective: ModelPriceQuoteView;
-  readonly override?: ModelPriceQuoteView;
+  readonly override?: {
+    readonly currency?: ModelPriceCurrencyView;
+    readonly inputPerMillion?: number;
+    readonly outputPerMillion?: number;
+    readonly cacheReadPerMillion?: number | null;
+    readonly cacheWritePerMillion?: number | null;
+  };
+  readonly conflict?: boolean;
   readonly allowedCurrencies: readonly ModelPriceCurrencyView[];
   readonly referenceAvailable: boolean;
   readonly registryUpdatedAt?: number;

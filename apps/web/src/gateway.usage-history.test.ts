@@ -7,15 +7,67 @@ import {
   GetUsageReportResponseSchema,
   UsageReportGroup,
   ModelPriceCurrency,
+  ModelPriceQuoteSchema,
+  ModelDescriptorSchema,
   ResetModelPriceOverrideResponseSchema,
   SetModelPriceOverrideResponseSchema,
-  SnapshotSchema
+  SnapshotSchema,
+  type ModelPriceQuote,
+  type Snapshot
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("usage history gateway", () => {
+  it("refreshes the displayed catalog after saving and resetting an owner price", async () => {
+    let ownerPrice: ModelPriceQuote | undefined;
+    const model = create(ModelDescriptorSchema, { backendId: "backend-one", key: { providerId: "provider-one", modelId: "model-one" },
+      displayName: "Model", inputCostMicrosPerMillion: 2_000_000n, outputCostMicrosPerMillion: 6_000_000n, currencyCode: "USD" });
+    const transport = usageTransport((method, input) => {
+      if (method.localName === "setModelPriceOverride") {
+        ownerPrice = create(ModelPriceQuoteSchema, input.desired);
+        return create(SetModelPriceOverrideResponseSchema, { price: { ...protoPrice(input.backendId, input.providerId, input.modelId),
+          effective: ownerPrice, override: { currency: ownerPrice.currency, inputCostMicrosPerMillion: ownerPrice.inputCostMicrosPerMillion,
+            outputCostMicrosPerMillion: ownerPrice.outputCostMicrosPerMillion, clearCacheRead: true, clearCacheWrite: true } } });
+      }
+      if (method.localName === "resetModelPriceOverride") {
+        ownerPrice = undefined;
+        return create(ResetModelPriceOverrideResponseSchema, { price: { ...protoPrice(input.backendId, input.providerId, input.modelId), override: undefined } });
+      }
+      throw new Error(`Unexpected method ${method.localName}`);
+    }, () => create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n },
+      models: [{ ...model, ownerPriceOverride: ownerPrice }] }));
+    const onSnapshot = vi.fn();
+    const gateway = createOrchestratorGateway({ id: "price-catalog", deviceId: "device-test", name: "Desktop",
+      origin: "https://orchestrator.example", serverId: "server-test" }, "secret", { onSnapshot }, () => transport);
+    await gateway.connect();
+    await gateway.setModelPriceOverride("backend-one", "provider-one", "model-one", { currency: "CNY", inputPerMillion: 3, outputPerMillion: 12 });
+    expect(onSnapshot.mock.lastCall?.[0].models[0]).toMatchObject({ inputCostMicrosPerMillion: 2_000_000, currencyCode: "USD",
+      priceOverride: { currency: "CNY", inputPerMillion: 3, outputPerMillion: 12 } });
+    await gateway.resetModelPriceOverride("backend-one", "provider-one", "model-one");
+    expect(onSnapshot.mock.lastCall?.[0].models[0].priceOverride).toBeUndefined();
+    gateway.disconnect();
+  });
+
+  it("keeps sparse price fields and explicit cache removal distinct", async () => {
+    const transport = usageTransport((method, input) => {
+      if (method.localName === "getSnapshot") return create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, {}) });
+      if (method.localName === "getModelPriceOverride") return create(GetModelPriceOverrideResponseSchema, { price: {
+        ...protoPrice(input.backendId, input.providerId, input.modelId), conflict: true,
+        override: { inputCostMicrosPerMillion: 0n, clearCacheRead: true }
+      } });
+      throw new Error(`Unexpected method ${method.localName}`);
+    });
+    const gateway = createOrchestratorGateway({ id: "sparse-price", deviceId: "device-test", name: "Desktop",
+      origin: "https://orchestrator.example", serverId: "server-test" }, "secret", {}, () => transport);
+    await gateway.connect();
+    const result = await gateway.getModelPriceOverride("backend-one", "provider-one", "model-one");
+    expect(result.override).toEqual({ inputPerMillion: 0, cacheReadPerMillion: null });
+    expect(result.conflict).toBe(true);
+    gateway.disconnect();
+  });
+
   it("maps durable history and exact price targets without combining currencies", async () => {
     const calls: Array<{ readonly method: string; readonly input: any }> = [];
     const transport = usageTransport((method, input) => {
@@ -152,11 +204,12 @@ function utcDay(offset: number): string {
   return date.toISOString().slice(0, 10);
 }
 
-function usageTransport(resolve: (method: any, input: any) => unknown): Transport {
+function usageTransport(resolve: (method: any, input: any) => unknown,
+  snapshot: () => Snapshot = () => create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } })): Transport {
   return {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
       const message = method.localName === "getSnapshot"
-        ? create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } }) })
+        ? create(GetSnapshotResponseSchema, { snapshot: snapshot() })
         : resolve(method, input);
       return response(method, message);
     }),

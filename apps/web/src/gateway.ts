@@ -5849,13 +5849,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     signal?: AbortSignal
   ): Promise<ModelPriceOverrideView> {
     const model = checkedModelPriceTarget(backendId, providerId, modelId);
-    const client = createClient(BackendService, this.requireTransport());
+    const scope = this.captureActionScope(signal);
+    const client = createClient(BackendService, scope.transport);
     const response = await client.setModelPriceOverride(
       { ...model, desired: protoModelPriceQuote(desired) },
-      signal === undefined ? undefined : { signal }
+      { signal: scope.signal }
     );
     if (response.price === undefined) throw new GatewayError("Orchestrator returned an empty model price.");
-    return mapModelPriceOverride(response.price, model);
+    const price = mapModelPriceOverride(response.price, model);
+    await this.#refreshPromise?.catch(() => undefined);
+    scope.signal.throwIfAborted();
+    await this.refresh();
+    scope.signal.throwIfAborted();
+    return price;
   }
 
   async resetModelPriceOverride(
@@ -5865,13 +5871,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     signal?: AbortSignal
   ): Promise<ModelPriceOverrideView> {
     const model = checkedModelPriceTarget(backendId, providerId, modelId);
-    const client = createClient(BackendService, this.requireTransport());
+    const scope = this.captureActionScope(signal);
+    const client = createClient(BackendService, scope.transport);
     const response = await client.resetModelPriceOverride(
       model,
-      signal === undefined ? undefined : { signal }
+      { signal: scope.signal }
     );
     if (response.price === undefined) throw new GatewayError("Orchestrator returned an empty model price.");
-    return mapModelPriceOverride(response.price, model);
+    const price = mapModelPriceOverride(response.price, model);
+    await this.#refreshPromise?.catch(() => undefined);
+    scope.signal.throwIfAborted();
+    await this.refresh();
+    scope.signal.throwIfAborted();
+    return price;
   }
 
   async terminateRuntimeProcess(process: RuntimeProcessUsageView): Promise<void> {
@@ -14577,6 +14589,7 @@ function mapModel(
         ? { pricingSource: "upstream" as const }
         : {}),
     ...(model.priceUpdatedAt === undefined ? {} : { pricingUpdatedAt: timestampMs(model.priceUpdatedAt) }),
+    ...(model.ownerPriceOverride === undefined ? {} : { priceOverride: mapModelPriceQuote(model.ownerPriceOverride) }),
     modelId: model.key?.modelId ?? "",
     logicalId: model.logicalId || model.key?.modelId || "",
     name: model.displayName,
@@ -14895,12 +14908,26 @@ function mapModelPriceOverride(
     ...expected,
     reference: mapModelPriceQuote(price.reference),
     effective: mapModelPriceQuote(price.effective),
-    ...(price.override === undefined ? {} : { override: mapModelPriceQuote(price.override) }),
+    ...(price.override === undefined ? {} : { override: mapModelPriceOverrideValues(price.override) }),
+    conflict: price.conflict,
     allowedCurrencies,
     referenceAvailable: price.referenceAvailable,
     ...(price.registryUpdatedAt === undefined ? {} : { registryUpdatedAt: timestampMs(price.registryUpdatedAt) }),
     ...(updatedAt === undefined ? {} : { updatedAt }),
     ...(price.version?.revision?.value === undefined ? {} : { revision: price.version.revision.value })
+  };
+}
+
+function mapModelPriceOverrideValues(values: import("@joko/contracts").ModelPriceOverrideValues): NonNullable<ModelPriceOverrideView["override"]> {
+  const units = (value: bigint | undefined): number | undefined => value === undefined ? undefined : numberValue(value) / 1_000_000;
+  if (values.clearCacheRead && values.cacheReadCostMicrosPerMillion !== undefined
+    || values.clearCacheWrite && values.cacheWriteCostMicrosPerMillion !== undefined) throw new GatewayError("Orchestrator returned conflicting cache price overrides.");
+  return {
+    ...(values.currency === undefined ? {} : { currency: modelPriceCurrency(values.currency) }),
+    ...(values.inputCostMicrosPerMillion === undefined ? {} : { inputPerMillion: units(values.inputCostMicrosPerMillion) }),
+    ...(values.outputCostMicrosPerMillion === undefined ? {} : { outputPerMillion: units(values.outputCostMicrosPerMillion) }),
+    ...(values.clearCacheRead ? { cacheReadPerMillion: null } : values.cacheReadCostMicrosPerMillion === undefined ? {} : { cacheReadPerMillion: units(values.cacheReadCostMicrosPerMillion) }),
+    ...(values.clearCacheWrite ? { cacheWritePerMillion: null } : values.cacheWriteCostMicrosPerMillion === undefined ? {} : { cacheWritePerMillion: units(values.cacheWriteCostMicrosPerMillion) })
   };
 }
 
