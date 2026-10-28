@@ -37,6 +37,9 @@ export type RoutineTrigger =
 
 /** A single standing instruction, with OR-combined time and event triggers. */
 export interface Routine {
+  /** Host template; the owner may pause/resume it without editing its definition. */
+  builtin?: "follow-up";
+  builtinVersion?: number;
   /** Derived by the engine, never accepted as configuration. */
   activity?: "queued" | "running";
   id: string;

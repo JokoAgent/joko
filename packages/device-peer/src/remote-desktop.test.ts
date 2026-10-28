@@ -1048,7 +1048,7 @@ describe("remote desktop finite authority controller", () => {
     expect(vi.mocked(fixture.dependencies.stopHostMute!).mock.calls.map(([token]) => token)).toEqual([owner, owner]);
   });
 
-  it.each(["presentation", "expired", "revoked"])("restores host mute on %s retirement", async (cause) => {
+  it.each(["expired", "revoked"])("restores host mute on %s retirement", async (cause) => {
     const fixture = controllerFixture();
     const lease = await start(fixture);
     const control = await fixture.controller.request(AUTHORITY, {
@@ -1057,16 +1057,11 @@ describe("remote desktop finite authority controller", () => {
     await fixture.controller.request(AUTHORITY, {
       op: "hostMute", lease: lease.lease, controlGeneration: control.controlGeneration, enabled: true
     });
-    if (cause === "presentation") {
-      await fixture.controller.request(AUTHORITY, { op: "presentation", lease: lease.lease, enabled: true });
-      expect(fixture.controller.state?.lease).toBe(lease.lease);
-    } else {
-      if (cause === "expired") fixture.now += REMOTE_DESKTOP_LEASE_MS + 1;
-      else fixture.currentAuthorities.delete(authorityKey(AUTHORITY));
-      fixture.controller.tick();
-      await vi.waitFor(() => expect(fixture.dependencies.stopHostMute).toHaveBeenCalledOnce());
-      expect(fixture.controller.state).toBeUndefined();
-    }
+    if (cause === "expired") fixture.now += REMOTE_DESKTOP_LEASE_MS + 1;
+    else fixture.currentAuthorities.delete(authorityKey(AUTHORITY));
+    fixture.controller.tick();
+    await vi.waitFor(() => expect(fixture.dependencies.stopHostMute).toHaveBeenCalledOnce());
+    expect(fixture.controller.state).toBeUndefined();
     expect(fixture.dependencies.stopHostMute).toHaveBeenCalledOnce();
   });
 
@@ -1188,15 +1183,66 @@ describe("remote desktop finite authority controller", () => {
     await fixture.controller.stopAndRestore();
   });
 
-  it.each(["control", "presentation", "revoked"])("privacy %s retirement restores without acquiring terminal lock authority", async (cause) => {
+  it.each(["control", "revoked"])("privacy %s retirement restores without acquiring terminal lock authority", async (cause) => {
     const fixture = controllerFixture(); const lease = await start(fixture);
     const control = await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true }) as { controlGeneration: number };
     await fixture.controller.request(AUTHORITY, { op: "privacyScreen", lease: lease.lease, controlGeneration: control.controlGeneration, enabled: true, lockOnExit: true });
     const owner = vi.mocked(fixture.dependencies.privacyScreen!).mock.calls[0]![0];
     if (cause === "revoked") { fixture.currentAuthorities.delete(authorityKey(AUTHORITY)); fixture.controller.tick(); }
-    else await fixture.controller.request(AUTHORITY, { op: cause, lease: lease.lease, enabled: cause === "presentation" });
+    else await fixture.controller.request(AUTHORITY, { op: cause, lease: lease.lease, enabled: false });
     await vi.waitFor(() => expect(fixture.dependencies.stopPrivacyScreen).toHaveBeenCalledExactlyOnceWith(owner));
     expect(fixture.dependencies.lockScreen).not.toHaveBeenCalled();
+  });
+
+  it.each(["resumed", "failed"])("keeps exact privacy and mute owners across picture-in-picture until control is %s", async result => {
+    const fixture = controllerFixture(), lease = await start(fixture);
+    const control = await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true }) as { controlGeneration: number };
+    await fixture.controller.request(AUTHORITY, { op: "hostMute", lease: lease.lease, controlGeneration: control.controlGeneration, enabled: true });
+    await fixture.controller.request(AUTHORITY, { op: "privacyScreen", lease: lease.lease, controlGeneration: control.controlGeneration, enabled: true, lockOnExit: false });
+    const [owner, , current] = vi.mocked(fixture.dependencies.privacyScreen!).mock.calls[0]!;
+    const muteOwner = vi.mocked(fixture.dependencies.hostMute!).mock.calls[0]![0];
+    await fixture.controller.request(AUTHORITY, { op: "presentation", lease: lease.lease, enabled: true });
+    expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: false });
+    expect(current()).toBe(true);
+    expect(fixture.dependencies.stopPrivacyScreen).not.toHaveBeenCalled();
+    expect(fixture.dependencies.stopHostMute).not.toHaveBeenCalled();
+    expect(fixture.dependencies.stopClipboardVersion).toHaveBeenCalled();
+    await fixture.controller.request(AUTHORITY, { op: "presentation", lease: lease.lease, enabled: false });
+    if (result === "failed") vi.mocked(fixture.dependencies.startInput).mockRejectedValueOnce(new Error("input unavailable"));
+    const resume = fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true });
+    if (result === "resumed") {
+      await resume;
+      expect(current()).toBe(true);
+      expect(fixture.dependencies.stopPrivacyScreen).not.toHaveBeenCalled();
+      expect(fixture.dependencies.stopHostMute).not.toHaveBeenCalled();
+    } else {
+      await expect(resume).rejects.toThrow("input unavailable");
+      expect(current()).toBe(false);
+      expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: false });
+      expect(fixture.dependencies.stopPrivacyScreen).toHaveBeenCalledExactlyOnceWith(owner);
+      expect(fixture.dependencies.stopHostMute).toHaveBeenCalledExactlyOnceWith(muteOwner);
+    }
+    await fixture.controller.stopAndRestore();
+    expect(fixture.dependencies.stopPrivacyScreen).toHaveBeenCalledExactlyOnceWith(owner);
+    expect(fixture.dependencies.stopHostMute).toHaveBeenCalledExactlyOnceWith(muteOwner);
+  });
+
+  it("finishes an exact mask initialization in picture-in-picture and accepts its local exit", async () => {
+    const fixture = controllerFixture(), lease = await start(fixture);
+    const control = await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true }) as { controlGeneration: number };
+    let ready!: () => void;
+    vi.mocked(fixture.dependencies.privacyScreen!).mockImplementationOnce(() => new Promise(resolve => { ready = resolve; }));
+    const enabling = fixture.controller.request(AUTHORITY, { op: "privacyScreen", lease: lease.lease, controlGeneration: control.controlGeneration, enabled: true, lockOnExit: true });
+    await vi.waitFor(() => expect(fixture.dependencies.privacyScreen).toHaveBeenCalledOnce());
+    const [owner, , current] = vi.mocked(fixture.dependencies.privacyScreen!).mock.calls[0]!;
+    await fixture.controller.request(AUTHORITY, { op: "presentation", lease: lease.lease, enabled: true });
+    expect(current()).toBe(true);
+    ready(); await expect(enabling).resolves.toEqual({ enabled: true });
+    await fixture.controller.stopPrivacyByUser(owner);
+    expect(current()).toBe(false);
+    expect(fixture.dependencies.lockScreen).toHaveBeenCalledOnce();
+    expect(fixture.dependencies.stopPrivacyScreen).toHaveBeenCalledExactlyOnceWith(owner);
+    expect(fixture.controller.state).toBeUndefined();
   });
 
   it("privacy restoration failure stays occupied and explicit retirement retries the exact owner", async () => {

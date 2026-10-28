@@ -10,6 +10,7 @@ import { VoiceCallContext, type VoiceCallRecord } from './call-context.js';
 import { SpeechModelCatalog, type SpeechSelection } from './models.js';
 import { SpeechSynthesisSession } from './speech.js';
 import { loadSpeechVoices } from './voices.js';
+import { classifyVoiceExit } from './semantic-exit.js';
 
 const SCOPE = 'desktop.voice-conversation.v1';
 const CALL_SCOPE = 'runtime.desktop-voice-call:';
@@ -25,6 +26,8 @@ interface Call {
   readonly reads: Map<string, { pcm: Uint8Array; done: boolean }>;
   readonly readIds: Set<string>;
   readonly inputs: Map<string, string>;
+  readonly exitJudgments: Map<string, { readonly text: string; readonly result: Promise<string> }>;
+  readonly inferExit: (text: string) => Promise<string>;
   speechId?: string; speechReadId?: string; touchedAt: number;
 }
 /** One local Desktop call lease. Model context has no tools. Transcripts are
@@ -41,8 +44,9 @@ export class DesktopVoiceConversationManager {
     // accepted task work retains its independent Queue ownership.
     for (const value of options.store.listSettings().filter(value => value.scopeType === 'session' && value.key.startsWith(CALL_SCOPE))) {
       const saved = value.value as SavedCall;
-      if (saved?.format !== 1 || !saved.record?.callId) throw unavailable();
-      if (saved.record.endedAt === undefined) this.#save({ ...saved, record: { ...saved.record, endedAt: this.#now() } });
+      if (saved?.format !== 1 || !saved.record?.callId || saved.sessionId !== value.scopeId || value.key !== `${CALL_SCOPE}${saved.record.callId}`) throw unavailable();
+      if (saved.record.endedAt === undefined) options.store.setSetting('session', saved.sessionId, value.key,
+        { ...saved, record: { ...saved.record, endedAt: this.#now() } });
     }
     this.#timer = setInterval(() => {
       const call = this.#call;
@@ -68,7 +72,7 @@ export class DesktopVoiceConversationManager {
       const own = this.#call?.owner === owner && this.#call.sessionId === request.sessionId && (!request.callId || request.callId === this.#call.id) ? this.#call : undefined;
       if (own) { own.assertCurrent(); own.touchedAt = this.#now(); this.#collectResults(own); }
       const saved = !own && request.callId ? this.options.store.findSetting<SavedCall>('session', request.sessionId, `${CALL_SCOPE}${identity(request.callId, 64)}`)?.value : undefined;
-      return this.#snapshot(request.sessionId, generation, own, saved?.generation === generation && saved.record.endedAt !== undefined ? saved : undefined);
+      return this.#snapshot(request.sessionId, generation, own, saved?.format === 1 && saved.record.endedAt !== undefined ? saved : undefined);
     }
     if (action === contract.DesktopVoiceConversationAction.SAVE_PREFERENCE) {
       const incoming = request.preference; if (!incoming) throw invalid();
@@ -116,7 +120,7 @@ export class DesktopVoiceConversationManager {
             || this.options.store.getBackend(session.backendId).descriptor.instanceGeneration !== backend.instanceGeneration)) throw unavailable();
         binding.assertCurrent();
       };
-      const context = new VoiceCallContext({ callId, identity: `${companion.identity}\n${session.appendSystemPrompt ?? ''}`.slice(0, 32_000), reference: this.#reference(session.id),
+      const context: VoiceCallContext = new VoiceCallContext({ callId, identity: `${companion.identity}\n${session.appendSystemPrompt ?? ''}`.slice(0, 32_000), reference: this.#reference(session.id),
         generate: async (user, system, signal) => {
           assertCurrent(); call.speech.cancel(); call.speechId = undefined;
           const result = await this.options.infer(session.backendId, { providerId: providerId!, modelId: modelId!, backendInstanceGeneration: backend.instanceGeneration,
@@ -130,6 +134,8 @@ export class DesktopVoiceConversationManager {
           // supplement is not a new user instruction or permission grant.
           const receipt = this.options.host.enqueueInput({ operationId: id, sessionId: session.id, connection: authority.connection,
             prompt: { text: original, images: [], files: [], mentions: [], disposition: 'prompt' } });
+          const handoff = context.record.handoffs.find(handoff => handoff.id === id);
+          if (handoff) { handoff.runId = receipt.value.runId; handoff.queueItemId = receipt.value.queueItemId; }
           call.dispatches.set(id, { runId: receipt.value.runId, queueItemId: receipt.value.queueItemId,
             cursor: this.options.store.listEvents({ sessionId: session.id, order: 'desc', limit: 1 })[0]?.globalCursor ?? 0n, text: '' }); return true;
         },
@@ -141,7 +147,17 @@ export class DesktopVoiceConversationManager {
         } });
       call = { id: callId, operationId: request.operationId, owner, sessionId: session.id, generation, kind: request.playbackOnly ? 'playback' : 'conversation', context, selection: chosen,
         authority, assertCurrent, touchedAt: this.#now(), speech: new SpeechSynthesisSession({ connection: () => binding.connection,
-          fetch: this.options.fetch, assertCurrent }), speechIds: new Map(), dispatches: new Map(), reads: new Map(), readIds: new Set(), inputs: new Map() };
+          fetch: this.options.fetch, assertCurrent }), speechIds: new Map(), dispatches: new Map(), reads: new Map(), readIds: new Set(), inputs: new Map(), exitJudgments: new Map(),
+        inferExit: text => {
+          // No fallback to a native Agent, another model, or an auxiliary chain.
+          const route = providerId && modelId ? this.options.models.routes.resolve({ backendId: session.backendId, providerId, modelId }) : undefined;
+          if (!route) return Promise.resolve('continue');
+          return classifyVoiceExit({ text, current: () => { try { assertCurrent(); return true; } catch { return false; } },
+            infer: (system, user, signal) => this.options.infer(session.backendId, { providerId: providerId!, modelId: modelId!,
+              backendInstanceGeneration: backend.instanceGeneration, system, user, signal, maxTokens: 96, timeoutMs: 2000,
+              assertCurrent: () => { assertCurrent(); if (this.options.models.routes.resolve(route)?.generationId !== route.generationId) throw unavailable(); },
+              assertModelAllowed: (provider, model) => { assertCurrent(); if (provider !== providerId || model !== modelId) throw unavailable(); } }) });
+        } };
       this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
         { id: identity(request.operationId), kind: 'desktop_voice_start', body: { callId, sessionId: session.id, generation, chosen, kind: call.kind } }, () => {
           authority.assertCurrent(); this.#save({ format: 1, sessionId: session.id, generation, kind: call.kind, record: context.record }); return true;
@@ -152,9 +168,24 @@ export class DesktopVoiceConversationManager {
     if (!call || call.owner !== owner || call.id !== request.callId || call.sessionId !== session.id || call.generation !== generation) throw unavailable();
     call.assertCurrent(); call.touchedAt = this.#now();
     switch (action) {
+      case contract.DesktopVoiceConversationAction.CLASSIFY_EXIT: {
+        if (call.kind !== 'conversation') throw invalid();
+        const inputId = identity(request.inputId, 128), text = bounded(request.text, 32_000);
+        const previous = call.exitJudgments.get(inputId);
+        if (previous && previous.text !== text) throw invalid();
+        if (call.inputs.has(inputId) && call.inputs.get(inputId) !== text) throw invalid();
+        if (call.exitJudgments.size >= 2000) throw unavailable();
+        this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
+          { id: `voice-exit:${call.id}:${inputId}`, kind: 'desktop_voice_exit', body: { callId: call.id, sessionId: call.sessionId, generation, textDigest: createHash('sha256').update(text).digest('hex') } }, () => true);
+        const result = previous?.result ?? call.inferExit(text);
+        call.exitJudgments.set(inputId, { text, result });
+        const decision = await result; call.assertCurrent();
+        return create(contract.ControlDesktopVoiceConversationResponseSchema, { exitDecision: decision });
+      }
       case contract.DesktopVoiceConversationAction.SUBMIT:
         if (call.kind !== 'conversation') throw invalid();
         bounded(request.text, 32_000); identity(request.inputId, 128);
+        if (call.exitJudgments.has(request.inputId) && call.exitJudgments.get(request.inputId)!.text !== request.text) throw invalid();
         if (call.inputs.has(request.inputId) && call.inputs.get(request.inputId) !== request.text) throw new ConnectError('The original call input changed.', Code.AlreadyExists);
         if (call.context.record.turns.reduce((total, turn) => total + turn.text.length, 0) + request.text.length > 1_000_000) throw new ConnectError('This call reached its transcript limit. End it and start another call.', Code.ResourceExhausted);
         this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
@@ -215,7 +246,7 @@ export class DesktopVoiceConversationManager {
   #snapshot(sessionId: string, generation: number, call?: Call, selected?: SavedCall): contract.ControlDesktopVoiceConversationResponse {
     const preference = this.#preference(sessionId);
     const history = this.options.store.listSettingsByKeyPrefix('session', sessionId, CALL_SCOPE).map(value => value.value as SavedCall)
-      .filter(value => value.format === 1 && value.generation === generation).sort((a, b) => b.record.startedAt - a.record.startedAt).slice(0, 20);
+      .filter(value => value.format === 1 && value.sessionId === sessionId).sort((a, b) => b.record.startedAt - a.record.startedAt).slice(0, 20);
     return create(contract.ControlDesktopVoiceConversationResponseSchema, { preference: { ...preference, revision: BigInt(preference.revision) },
       models: this.options.models.list(), ...(call ? { call: publicRecord({ format: 1, sessionId, generation, kind: call.kind, record: call.context.record }) }
         : selected ? { call: publicRecord(selected) } : {}),

@@ -13,11 +13,30 @@ export interface HostedNativeInferenceRequest {
   readonly maxTokens?: number;
   readonly images?: readonly { readonly data: string; readonly mimeType: string }[];
 }
+export interface HostedNativeDerivationLifecycle {
+  readonly kind: "derivation_lifecycle";
+  readonly action: "adopt" | "cleanup";
+  readonly derivationKind: "fork" | "clone";
+  readonly operationId: string;
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly sourceSessionId: string;
+  readonly sourceTargetId: string;
+  readonly sourceNativeSessionId: string;
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly nativeSessionId: string;
+}
 
 /** Closed private values shared by the native Provider actor and its Source
  * Adapter. Public clients use the generated protobuf service envelopes. */
 export type HostedNativeCommand =
+  | HostedNativeDerivationLifecycle
+  | { readonly kind: "derive"; readonly derivationKind: "fork" | "clone"; readonly sessionId: string; readonly targetId: string; readonly nativeSessionId: string; readonly entryId?: string;
+      readonly completedSnapshot?: { readonly kind: "completed_assistant"; readonly nativeBoundaryId: string } }
   | { readonly kind: "state" }
+  | { readonly kind: "idle_release"; readonly idleMinutes: number }
+  | { readonly kind: "idle_release_status"; readonly releaseCallId: string }
   | { readonly kind: "send"; readonly input: PromptInput; readonly durableFence: boolean; readonly newGroupRound?: boolean }
   | { readonly kind: "abort" }
   | { readonly kind: "delete" }

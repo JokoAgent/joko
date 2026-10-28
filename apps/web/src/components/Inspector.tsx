@@ -3,6 +3,9 @@ import { workspacePreviewConnectionFailure } from "../workspace-text-preview-cac
 import { usePartnerConversation } from "./PartnerConversation.js";
 import { PartnerWorkbench, type PartnerWorkbenchDrafts } from "./PartnerWorkbench.js";
 import { readTerminalAppearance } from "../terminal-appearance.js";
+import { requestWorkspaceDocumentLeave } from "../workspace-document-lifecycle.js";
+import { InspectorTabContribution, type InspectorDock } from "./inspector-layout-context.js";
+import { inspectorSessionTabKey } from "./inspector-layout.js";
 import type { TerminalPaletteView } from "../model.js";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
@@ -145,7 +148,10 @@ interface DetachedInspectorFocusScope {
 }
 const InteractiveTerminalPanel = lazy(() => import("./InteractiveTerminalPanel.js").then((module) => ({ default: module.InteractiveTerminalPanel })));
 
-export function Inspector({ controller, snapshot, session, workspace, timeline, open, subagentFocusRequest, turnReviewFocusRequest, browserFocusRequest, gamepadRequest, onGamepadRequestConsumed, t, runAction, onClose, onDetachedChange, onSelectionQuote }: {
+export function Inspector({ controller, snapshot, session, workspace, timeline, open, subagentFocusRequest, turnReviewFocusRequest, browserFocusRequest, gamepadRequest, onGamepadRequestConsumed, t, runAction, onClose, onDetachedChange, onSelectionQuote, dock }: InspectorProps): JSX.Element {
+  return <InspectorImplementation {...{ controller, snapshot, session, workspace, timeline, open, subagentFocusRequest, turnReviewFocusRequest, browserFocusRequest, gamepadRequest, onGamepadRequestConsumed, t, runAction, onClose, onDetachedChange, onSelectionQuote, dock }} />;
+}
+export interface InspectorProps {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly session: SessionView;
@@ -162,7 +168,9 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   readonly onClose: () => void;
   readonly onDetachedChange?: (detached: boolean) => void;
   readonly onSelectionQuote: (sessionId: string, quote: ComposerFileSelectionQuoteDraft) => void;
-}): JSX.Element {
+  readonly dock?: InspectorDock;
+}
+function InspectorImplementation({ controller, snapshot, session, workspace, timeline, open, subagentFocusRequest, turnReviewFocusRequest, browserFocusRequest, gamepadRequest, onGamepadRequestConsumed, t, runAction, onClose, onDetachedChange, onSelectionQuote, dock }: InspectorProps): JSX.Element {
   const reducedMotion = useReducedMotionPreference();
   const partnerConversation = usePartnerConversation();
   const canWorkbench = partnerConversation?.sessionId === session.id && partnerConversation.workbenchAvailable;
@@ -470,7 +478,10 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   }, [browserFocusRequest?.requestId, canBrowser, session.id]);
 
   useEffect(() => {
-    try { window.localStorage.setItem(INSPECTOR_TABS_KEY, serializeInspectorTabBuckets(tabBuckets)); } catch { /* Client storage can be unavailable. */ }
+    try {
+      const next = dock === undefined ? tabBuckets : { ...readInspectorTabBuckets(), [session.id]: tabBuckets[session.id] ?? createInitialInspectorTabBucket() };
+      window.localStorage.setItem(INSPECTOR_TABS_KEY, serializeInspectorTabBuckets(next));
+    } catch { /* Client storage can be unavailable. */ }
   }, [tabBuckets]);
 
   const clearDetachedHost = useCallback((): void => {
@@ -743,10 +754,14 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     setMenu(undefined);
   };
 
-  const closeTabs = (tabIds: readonly string[]): void => {
+  const closeTabs = async (tabIds: readonly string[]): Promise<void> => {
     if (terminalPendingRef.current) return;
     const owner = terminalOwner;
     const tabs = storedBucket.tabs.filter((tab) => tabIds.includes(tab.id));
+    if (tabs.some(tab => tab.kind === "files") && !await requestWorkspaceDocumentLeave({
+      reason: "route-change", matches: identity => identity.sessionId === session.id
+    })) return;
+    if (terminalOwnerRef.current !== owner) return;
     const finish = (closed: readonly string[]): void => {
       if (terminalOwnerRef.current !== owner) return;
       const next = closed.reduce(closeInspectorTab, storedBucketRef.current);
@@ -759,7 +774,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     terminalPendingRef.current = true;
     setTerminalPending(true);
     setTerminalError(undefined);
-    void (async () => {
+    await (async () => {
       const closed: string[] = [];
       for (const tab of tabs) {
         if (terminalOwnerRef.current !== owner) return;
@@ -790,6 +805,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
   };
 
   const cycleTabsFromShortcut = (direction: -1 | 1): boolean => {
+    if (dock !== undefined) return false;
     if (document.body.classList.contains("modal-open")) return false;
     // Consume these application shortcuts while the right-side shell
     // exists even when it is collapsed or has only one tab.
@@ -804,6 +820,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     lastInteractionRef: { readonly current: boolean },
     event: KeyboardEvent
   ): boolean => {
+    if (dock !== undefined) return false;
     const ownerDocument = ownerWindow.document;
     if (ownerDocument.body.classList.contains("modal-open")) return false;
     const target = eventElementInWindow(ownerWindow, event.target);
@@ -837,6 +854,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     return () => window.removeEventListener(GAMEPAD_PANEL_EVENT, cycle);
   });
   const openTerminalFromShortcut = (): boolean => {
+    if (dock !== undefined) return false;
     if ((!canTerminal && !bucket.tabs.some((tab) => tab.kind === "terminal")) || document.body.classList.contains("modal-open")) return false;
     openTerminal(true);
     return true;
@@ -1037,6 +1055,62 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
     onClose();
   };
 
+  const renderInspectorPanel = (tab: InspectorTabState, tabActive: boolean, ownerDocument: Document): JSX.Element => <div id={`inspector-panel-${tab.id}`} key={`${session.id}:${tab.id}`} className={cx("inspector-tab-panel", tabActive && "is-active")} data-tab-kind={tab.kind} role="tabpanel" aria-labelledby={`inspector-tab-${tab.id}`} aria-hidden={!tabActive} hidden={!tabActive} tabIndex={0}><InspectorTabErrorBoundary resetKey={`${session.id}:${tab.id}:${tab.kind}`} t={t}>
+          {tab.kind === "context" && <ContextPanel controller={controller} backend={backend} session={session} queue={sessionQueue} tasks={tasks} t={t} runAction={runAction} />}
+          {tab.kind === "workbench" && canWorkbench && <PartnerWorkbench controller={controller} session={session} conversation={partnerConversation}
+            active={open && tabActive} ownerDocument={ownerDocument} t={t}
+            selectedTaskId={storedBucket.workbenchOwner === workbenchOwner ? storedBucket.workbenchTaskId : undefined}
+            selectedProject={storedBucket.workbenchOwner === workbenchOwner ? storedBucket.workbenchProject : undefined}
+            onSelectTask={(taskId) => setSessionBucket({ ...storedBucketRef.current, workbenchTaskId: taskId })}
+            onSelectProject={(project) => setSessionBucket({ ...storedBucketRef.current, workbenchProject: project })}
+            drafts={workbenchDrafts.current.get(partnerConversation.ownerKey) ?? (() => {
+              const drafts: PartnerWorkbenchDrafts = { messages: new Map() }; workbenchDrafts.current.set(partnerConversation.ownerKey, drafts); return drafts;
+            })()} />}
+          {tab.kind === "branches" && canTree && <BranchesPanel controller={controller} backend={backend} session={session} t={t} runAction={runAction} />}
+          {tab.kind === "files" && canFiles && <FilesPanel controller={controller} workspace={workspace} sessionId={session.id} canWrite={canWriteFiles} t={t} onSelectionQuote={onSelectionQuote} />}
+          {tab.kind === "changes" && (canDiff || canRewind) && <ChangesPanel controller={controller} session={session} workspace={workspace} {...(turnReviewFocusRequest === undefined ? {} : { focusRequest: turnReviewFocusRequest })} canDiff={canDiff} canDiffImagePreview={canDiffImagePreview} canStageDiff={canStageDiff} canUnstageDiff={canUnstageDiff} canRevertDiff={canRevertDiff} canCommitDiff={canCommitDiff} canPushDiff={canPushDiff} canRewind={canRewind} gitWriteDisabledReason={gitWriteDisabledReason} t={t} runAction={runAction} />}
+          {tab.kind === "background" && canBackgroundTasks && <BackgroundTasksPanel
+            timeline={timeline}
+            history={backgroundHistory}
+            historyState={backgroundHistoryState}
+            historyError={backgroundHistoryError}
+            onRefresh={() => setBackgroundHistoryRefresh((value) => value + 1)}
+            canCancel={canCancelBackgroundTasks}
+            onCancel={(backgroundTaskId) => controller.cancelBackgroundTask(session.id, backgroundTaskId)}
+            onReadOutput={(backgroundTaskId, signal) => controller.getBackgroundTaskOutput(session.id, backgroundTaskId, signal)}
+            outputOwner={JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, controller.state.connectionGeneration, session.id, String(session.generation)])}
+            locale={controller.state.effectiveLocale}
+            t={t}
+          />}
+          {tab.kind === "subagents" && canSubagents && <SubagentsPanel controller={controller} sessionId={session.id} focusRunId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.runId : undefined} focusRequestId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.requestId : undefined} locale={controller.state.effectiveLocale} t={t} runAction={runAction} />}
+          {tab.kind === "shell" && canUserShell && <InspectorShellPanel controller={controller} session={session} timeline={timeline} t={t} runAction={runAction} />}
+          {tab.kind === "terminal" && terminalCapabilities !== undefined && <Suspense fallback={<p role="status">{t("terminal.connecting")}</p>}><InteractiveTerminalPanel controller={controller} sessionId={session.id} terminalId={tab.id} active={open && tabActive} capabilities={terminalCapabilities} t={t} onState={(value) => setTerminalRecords((current) => current[value.id]?.generation === value.generation && current[value.id]?.status === value.status && current[value.id]?.shellLabel === value.shellLabel ? current : { ...current, [value.id]: value })} /></Suspense>}
+          {tab.kind === "tools" && <ToolPanel
+            toolItems={toolItems}
+            resources={snapshot.resources}
+            runtimeSupported={canRuntimeTools}
+            runtimeCatalog={runtimeToolCatalog}
+            runtimeState={runtimeToolState}
+            runtimeError={runtimeToolError}
+            onRefreshRuntime={() => setRuntimeToolRefresh((value) => value + 1)}
+            locale={controller.state.effectiveLocale}
+            t={t}
+          />}
+          {tab.kind === "browser" && canBrowser && <BrowserPanel controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} session={session} commentSessions={browserCommentSessions} locale={controller.state.effectiveLocale} focusRequest={gamepadBrowserFocusRequest?.sessionId === session.id ? gamepadBrowserFocusRequest : browserFocusRequest?.sessionId === session.id ? browserFocusRequest : undefined} t={t} runAction={runAction} />}
+        </InspectorTabErrorBoundary></div>;
+
+  if (dock !== undefined) return <InspectorTabContribution dock={dock} owner={inspectorOwner} sessionId={session.id}
+    tabs={bucket.tabs.map(tab => ({ key: inspectorSessionTabKey(session.id, session.generation, tab.id), sessionId: session.id,
+      kind: tab.kind, label: tab.kind === "terminal" ? terminalRecords[tab.id]?.shellLabel ?? t("terminal.title") : inspectorTabLabel(tab.kind, t),
+      onActivate: () => activateTab(tab.id), onClose: () => closeTabs([tab.id]) }))}
+    actions={addableKinds.map(kind => ({ id: kind, label: kind === "terminal" ? t("terminal.new") : inspectorTabLabel(kind, t),
+      disabled: kind === "terminal" && (!canTerminal || terminalPending || controller.state.connectionState !== "connected"),
+      run: () => { if (kind === "terminal") openTerminal(false); else setSessionBucket(addInspectorTab(storedBucketRef.current, kind)); } }))}
+    render={(key, active, ownerDocument) => {
+      const tab = bucket.tabs.find(candidate => inspectorSessionTabKey(session.id, session.generation, candidate.id) === key);
+      return tab === undefined ? null : renderInspectorPanel(tab, active, ownerDocument);
+    }} />;
+
   const inspector = (
     <aside ref={inspectorRef} className={cx("inspector", open && "is-open", panelSide === "left" && "is-left", maximized && "is-maximized", detached && "is-detached")} aria-label={t("a11y.openInspector")} aria-hidden={!open} inert={!open}>
       {!detached && <div
@@ -1106,49 +1180,7 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
         {terminalError !== undefined && <div role="alert" className="inline-error"><p>{terminalError}</p><Button disabled={terminalPending || terminalCatalogPending || controller.state.connectionState !== "connected"} onClick={() => { if (canTerminal && terminalCreationRef.current?.owner === terminalOwner) openTerminal(false); else setTerminalRefresh((value) => value + 1); }}>{t("common.retry")}</Button></div>}
         {terminalCapabilities !== undefined && !canTerminal && <div className="inline-error" role="status"><p>{terminalCapabilities.reason ?? t("terminal.unavailable")}</p><Button disabled={terminalCatalogPending || controller.state.connectionState !== "connected"} onClick={() => setTerminalRefresh((value) => value + 1)}>{t("common.retry")}</Button></div>}
         {bucket.tabs.length === 0 && <div className="inspector-empty"><Gauge aria-hidden="true" /><h2>{t("inspector.emptyTitle")}</h2><p>{t("inspector.emptyBody")}</p>{addableKinds.length > 0 && <Button onClick={() => setMenu("add")}><Plus aria-hidden="true" />{t("inspector.addTab")}</Button>}</div>}
-        {bucket.tabs.map((tab) => <div id={`inspector-panel-${tab.id}`} key={`${session.id}:${tab.id}`} className={cx("inspector-tab-panel", tab.id === bucket.activeTabId && "is-active")} data-tab-kind={tab.kind} role="tabpanel" aria-labelledby={`inspector-tab-${tab.id}`} aria-hidden={tab.id !== bucket.activeTabId} hidden={tab.id !== bucket.activeTabId} tabIndex={0}><InspectorTabErrorBoundary resetKey={`${session.id}:${tab.id}:${tab.kind}`} t={t}>
-          {tab.kind === "context" && <ContextPanel controller={controller} backend={backend} session={session} queue={sessionQueue} tasks={tasks} t={t} runAction={runAction} />}
-          {tab.kind === "workbench" && canWorkbench && <PartnerWorkbench controller={controller} session={session} conversation={partnerConversation}
-            active={open && tab.id === bucket.activeTabId} ownerDocument={activeDetachedHost?.window.document ?? document} t={t}
-            selectedTaskId={storedBucket.workbenchOwner === workbenchOwner ? storedBucket.workbenchTaskId : undefined}
-            selectedProject={storedBucket.workbenchOwner === workbenchOwner ? storedBucket.workbenchProject : undefined}
-            onSelectTask={(taskId) => setSessionBucket({ ...storedBucketRef.current, workbenchTaskId: taskId })}
-            onSelectProject={(project) => setSessionBucket({ ...storedBucketRef.current, workbenchProject: project })}
-            drafts={workbenchDrafts.current.get(partnerConversation.ownerKey) ?? (() => {
-              const drafts: PartnerWorkbenchDrafts = { messages: new Map() }; workbenchDrafts.current.set(partnerConversation.ownerKey, drafts); return drafts;
-            })()} />}
-          {tab.kind === "branches" && canTree && <BranchesPanel controller={controller} backend={backend} session={session} t={t} runAction={runAction} />}
-          {tab.kind === "files" && canFiles && <FilesPanel controller={controller} workspace={workspace} sessionId={session.id} canWrite={canWriteFiles} t={t} onSelectionQuote={onSelectionQuote} />}
-          {tab.kind === "changes" && (canDiff || canRewind) && <ChangesPanel controller={controller} session={session} workspace={workspace} {...(turnReviewFocusRequest === undefined ? {} : { focusRequest: turnReviewFocusRequest })} canDiff={canDiff} canDiffImagePreview={canDiffImagePreview} canStageDiff={canStageDiff} canUnstageDiff={canUnstageDiff} canRevertDiff={canRevertDiff} canCommitDiff={canCommitDiff} canPushDiff={canPushDiff} canRewind={canRewind} gitWriteDisabledReason={gitWriteDisabledReason} t={t} runAction={runAction} />}
-          {tab.kind === "background" && canBackgroundTasks && <BackgroundTasksPanel
-            timeline={timeline}
-            history={backgroundHistory}
-            historyState={backgroundHistoryState}
-            historyError={backgroundHistoryError}
-            onRefresh={() => setBackgroundHistoryRefresh((value) => value + 1)}
-            canCancel={canCancelBackgroundTasks}
-            onCancel={(backgroundTaskId) => controller.cancelBackgroundTask(session.id, backgroundTaskId)}
-            onReadOutput={(backgroundTaskId, signal) => controller.getBackgroundTaskOutput(session.id, backgroundTaskId, signal)}
-            outputOwner={JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, controller.state.connectionGeneration, session.id, String(session.generation)])}
-            locale={controller.state.effectiveLocale}
-            t={t}
-          />}
-          {tab.kind === "subagents" && canSubagents && <SubagentsPanel controller={controller} sessionId={session.id} focusRunId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.runId : undefined} focusRequestId={subagentFocusRequest?.sessionId === session.id ? subagentFocusRequest.requestId : undefined} locale={controller.state.effectiveLocale} t={t} runAction={runAction} />}
-          {tab.kind === "shell" && canUserShell && <InspectorShellPanel controller={controller} session={session} timeline={timeline} t={t} runAction={runAction} />}
-          {tab.kind === "terminal" && terminalCapabilities !== undefined && <Suspense fallback={<p role="status">{t("terminal.connecting")}</p>}><InteractiveTerminalPanel controller={controller} sessionId={session.id} terminalId={tab.id} active={open && tab.id === bucket.activeTabId} capabilities={terminalCapabilities} t={t} onState={(value) => setTerminalRecords((current) => current[value.id]?.generation === value.generation && current[value.id]?.status === value.status && current[value.id]?.shellLabel === value.shellLabel ? current : { ...current, [value.id]: value })} /></Suspense>}
-          {tab.kind === "tools" && <ToolPanel
-            toolItems={toolItems}
-            resources={snapshot.resources}
-            runtimeSupported={canRuntimeTools}
-            runtimeCatalog={runtimeToolCatalog}
-            runtimeState={runtimeToolState}
-            runtimeError={runtimeToolError}
-            onRefreshRuntime={() => setRuntimeToolRefresh((value) => value + 1)}
-            locale={controller.state.effectiveLocale}
-            t={t}
-          />}
-          {tab.kind === "browser" && canBrowser && <BrowserPanel controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} session={session} commentSessions={browserCommentSessions} locale={controller.state.effectiveLocale} focusRequest={gamepadBrowserFocusRequest?.sessionId === session.id ? gamepadBrowserFocusRequest : browserFocusRequest?.sessionId === session.id ? browserFocusRequest : undefined} t={t} runAction={runAction} />}
-        </InspectorTabErrorBoundary></div>)}
+{bucket.tabs.map(tab => renderInspectorPanel(tab, tab.id === bucket.activeTabId, activeDetachedHost?.window.document ?? document))}
       </div>
     </aside>
   );

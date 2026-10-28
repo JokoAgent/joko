@@ -14,6 +14,10 @@ export interface PolicyDecisionRequest {
 }
 
 export type PolicyDecisionResult = PolicyRuleEffect | "default" | "stale" | "delegated_allow";
+export interface PolicyDecisionReply {
+  readonly decision: PolicyDecisionResult;
+  readonly ownerUserInstructions: readonly string[];
+}
 
 type PolicyDecisionTransport = {
   readonly closed: boolean;
@@ -26,7 +30,7 @@ type PolicyDecisionTransport = {
 export async function handlePolicyDecisionExtensionRequest(
   event: Readonly<Record<string, unknown>>,
   options: {
-    readonly decide: (request: PolicyDecisionRequest) => Promise<PolicyDecisionResult>;
+    readonly decide: (request: PolicyDecisionRequest) => Promise<PolicyDecisionResult | PolicyDecisionReply>;
     readonly transport: PolicyDecisionTransport;
     readonly isCurrent: () => boolean;
   }
@@ -39,14 +43,20 @@ export async function handlePolicyDecisionExtensionRequest(
     await respond(options, requestId, { cancelled: true });
     return true;
   }
-  let result: PolicyDecisionResult;
+  let result: PolicyDecisionResult | PolicyDecisionReply;
   try {
     result = await options.decide(request);
   } catch {
     await respond(options, requestId, { cancelled: true });
     return true;
   }
-  await respond(options, requestId, { value: result });
+  if (typeof result !== "string" && (!Array.isArray(result.ownerUserInstructions) || result.ownerUserInstructions.length > 64
+    || result.ownerUserInstructions.some(value => typeof value !== "string")
+    || result.ownerUserInstructions.reduce((size, value) => size + value.length, 0) > 16_000)) {
+    await respond(options, requestId, { cancelled: true });
+    return true;
+  }
+  await respond(options, requestId, { value: typeof result === "string" ? result : JSON.stringify(result) });
   return true;
 }
 

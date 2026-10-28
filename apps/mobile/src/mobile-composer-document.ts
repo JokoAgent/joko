@@ -171,11 +171,25 @@ export interface MobileComposerSlashCommandMark {
 }
 
 export interface MobileComposerDraft {
+  readonly replyQuote?: MobilePartnerReplyQuote;
   readonly text: string;
   readonly mentions: readonly MobileComposerMention[];
   readonly atoms: readonly MobileComposerAtom[];
   readonly slashCommands: readonly MobileComposerSlashCommandMark[];
   readonly attachments: readonly MobileComposerAttachment[];
+}
+
+export interface MobilePartnerReplyQuote {
+  readonly generation: string; readonly eventId: string; readonly messageId: string; readonly role: 'user' | 'assistant'; readonly excerpt: string;
+}
+export function normalizeMobileReplyQuote(value: unknown): MobilePartnerReplyQuote {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The private reply quote is invalid.');
+  const row = value as Record<string, unknown>;
+  if (typeof row['generation'] !== 'string' || !/^[1-9]\d{0,15}$/u.test(row['generation']) || BigInt(row['generation']) > BigInt(Number.MAX_SAFE_INTEGER)
+    || typeof row['eventId'] !== 'string' || typeof row['messageId'] !== 'string'
+    || !['user', 'assistant'].includes(String(row['role'])) || typeof row['excerpt'] !== 'string' || row['excerpt'].length > 280) throw new Error('The private reply quote is invalid.');
+  return { generation: row['generation'], eventId: normalizeExactIdentity(String(row['eventId'] ?? ''), 'reply Event', 256),
+    messageId: normalizeExactIdentity(String(row['messageId'] ?? ''), 'reply message', 256), role: row['role'] as 'user' | 'assistant', excerpt: row['excerpt'] };
 }
 
 export interface MobileComposerSelection {
@@ -350,7 +364,8 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
     return { text: candidate.text, start: candidate.start, end: candidate.end };
   });
   const attachments = normalizeMobileComposerAttachmentSet(value.attachments);
-  const draft = { text: value.text, mentions, atoms, slashCommands, attachments };
+  const draft = { text: value.text, mentions, atoms, slashCommands, attachments,
+    ...(value.replyQuote ? { replyQuote: normalizeMobileReplyQuote(value.replyQuote) } : {}) };
   serializeMobileComposerText(draft);
   return draft;
 }
@@ -359,6 +374,7 @@ export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComp
   const exact = normalizeMobileComposerDraft(draft);
   return {
     text: exact.text,
+    ...(exact.replyQuote ? { replyQuote: { ...exact.replyQuote } } : {}),
     mentions: exact.mentions.map((mention) => mention.kind === "workspace" && mention.lineRange !== undefined
       ? { ...mention, lineRange: { ...mention.lineRange } }
       : { ...mention }),
@@ -371,7 +387,7 @@ export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComp
 export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: MobileComposerDraft): boolean {
   const first = normalizeMobileComposerDraft(left);
   const second = normalizeMobileComposerDraft(right);
-  return first.text === second.text && first.mentions.length === second.mentions.length
+  return JSON.stringify(first.replyQuote) === JSON.stringify(second.replyQuote) && first.text === second.text && first.mentions.length === second.mentions.length
     && first.atoms.length === second.atoms.length
     && first.slashCommands.length === second.slashCommands.length
     && first.attachments.length === second.attachments.length
@@ -846,6 +862,7 @@ export function appendPlainTextToMobileComposer(draft: MobileComposerDraft, addi
   const separator = current.text.length > 0 ? "\n\n" : "";
   return normalizeMobileComposerDraft({
     text: `${current.text}${separator}${addition}`,
+    ...(current.replyQuote ? { replyQuote: current.replyQuote } : {}),
     mentions: current.mentions,
     atoms: current.atoms,
     slashCommands: current.slashCommands,
@@ -859,9 +876,11 @@ export function prependMobileComposerDraft(
 ): MobileComposerDraft {
   const source = normalizeMobileComposerDraft(prefix);
   const existing = normalizeMobileComposerDraft(current);
+  if (source.replyQuote && existing.replyQuote && JSON.stringify(source.replyQuote) !== JSON.stringify(existing.replyQuote)) throw new Error('Keep the original reply draft separate from the new reply root.');
+  const replyQuote = existing.replyQuote ?? source.replyQuote;
   const attachments = mergeRecoveredAttachments(source.attachments, existing.attachments);
-  if (!source.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(existing), attachments });
-  if (!existing.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(source), attachments });
+  if (!source.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(existing), ...(replyQuote ? { replyQuote } : {}), attachments });
+  if (!existing.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(source), ...(replyQuote ? { replyQuote } : {}), attachments });
   const separator = "\n\n";
   const offset = source.text.length + separator.length;
   const usedMentionIds = new Set(source.mentions.map((mention) => mention.mentionId));
@@ -894,6 +913,7 @@ export function prependMobileComposerDraft(
   ];
   return normalizeMobileComposerDraft({
     text: `${source.text}${separator}${existing.text}`,
+    ...((existing.replyQuote ?? source.replyQuote) ? { replyQuote: existing.replyQuote ?? source.replyQuote } : {}),
     mentions,
     atoms,
     slashCommands,
@@ -913,10 +933,12 @@ export function mobileComposerDraftWithoutPrefix(
       existing.attachments[index]!
     ))) return undefined;
   const remainingAttachments = existing.attachments.slice(source.attachments.length).map(cloneMobileComposerAttachment);
-  if (!source.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(existing), attachments: remainingAttachments });
+  if (!source.text) { const { replyQuote: _quote, ...rest } = cloneMobileComposerDraft(existing);
+    return normalizeMobileComposerDraft({ ...rest, ...(JSON.stringify(source.replyQuote) !== JSON.stringify(existing.replyQuote) && existing.replyQuote ? { replyQuote: existing.replyQuote } : {}), attachments: remainingAttachments }); }
   if (existing.text === source.text) {
     if (!mobileComposerDraftsEqual(source, {
       text: existing.text,
+      ...(existing.replyQuote ? { replyQuote: existing.replyQuote } : {}),
       mentions: existing.mentions,
       atoms: existing.atoms,
       slashCommands: existing.slashCommands,
@@ -938,6 +960,7 @@ export function mobileComposerDraftWithoutPrefix(
   const sourceSlashCommands = existing.slashCommands.filter((mark) => mark.end <= source.text.length);
   if (!mobileComposerDraftsEqual(source, {
     text: source.text,
+    ...(existing.replyQuote ? { replyQuote: existing.replyQuote } : {}),
     mentions: sourceMentions,
     atoms: sourceAtoms,
     slashCommands: sourceSlashCommands,
@@ -1002,6 +1025,7 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
   }
   return create(InputContentSchema, {
     parts: mobileComposerInputParts(exact, serialized),
+    ...(exact.replyQuote ? { replyQuote: { ...exact.replyQuote, generation: BigInt(exact.replyQuote.generation) } } : {}),
     quotesEncoded: exact.atoms.some(isMobileComposerQuoteAtom),
     pastedTextRanges: serialized.pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
     mentionRanges: exact.mentions.map((mention, mentionIndex) => create(InputMentionRangeSchema, {
@@ -1107,7 +1131,8 @@ export function restoreMobileComposerInput(input: InputContent, source: {
     text += mobileComposerMentionToken(seed);
     mentions.push({ ...seed, mentionId: `restored-mention-${index}`, start, end: text.length } as MobileComposerMention);
   });
-  return normalizeMobileComposerDraft({ text, mentions, atoms, attachments: [], slashCommands: [] });
+  return normalizeMobileComposerDraft({ text, mentions, atoms, attachments: [], slashCommands: [],
+    ...(input.replyQuote ? { replyQuote: normalizeMobileReplyQuote({ ...input.replyQuote, generation: input.replyQuote.generation.toString() }) } : {}) });
 }
 
 export function mobileInputSummary(input: InputContent | undefined, typedMetadataTrusted = true): string {
@@ -1119,7 +1144,7 @@ export function mobileInputSummary(input: InputContent | undefined, typedMetadat
     const untrustedStructuredMetadata = input.parts.some((part) => part.content.case === "sessionMention"
       || part.content.case === "workspaceMention" || part.content.case === "resourceMention"
       || part.content.case === "artifactMention")
-      || input.mentionRanges.length > 0 || input.pastedTextRanges.length > 0 || input.quotesEncoded;
+      || input.mentionRanges.length > 0 || input.pastedTextRanges.length > 0 || input.quotesEncoded || input.replyQuote !== undefined;
     return [wireText, ...media, ...(untrustedStructuredMetadata ? ["[Untrusted structured metadata ignored]"] : [])]
       .filter((value) => value.length > 0).join("\n");
   }
@@ -1178,6 +1203,7 @@ export function replaceMobileComposerRange(
   const slashCommands = remapSlashCommandMarks(exact.slashCommands, range, replacement.length);
   const next = normalizeMobileComposerDraft({
     text,
+    ...(exact.replyQuote ? { replyQuote: exact.replyQuote } : {}),
     mentions,
     atoms,
     slashCommands,
@@ -1225,6 +1251,7 @@ function insertMobileComposerMention(
     .sort((left, right) => left.start - right.start || left.end - right.end);
   const next = normalizeMobileComposerDraft({
     text: result.draft.text,
+    ...(result.draft.replyQuote ? { replyQuote: result.draft.replyQuote } : {}),
     mentions,
     atoms: result.draft.atoms,
     slashCommands: result.draft.slashCommands,
@@ -1254,6 +1281,7 @@ function insertMobileComposerAtom(
     .sort((left, right) => left.start - right.start || left.end - right.end);
   const next = normalizeMobileComposerDraft({
     text: result.draft.text,
+    ...(result.draft.replyQuote ? { replyQuote: result.draft.replyQuote } : {}),
     mentions: result.draft.mentions,
     atoms,
     slashCommands: result.draft.slashCommands,

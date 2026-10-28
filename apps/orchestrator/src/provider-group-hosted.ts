@@ -12,6 +12,8 @@ import type { ProviderGroupAssignment } from "./provider-group-router.js";
 import { decideProviderGroupFailure, providerGroupFailureSignals, ProviderGroupUnavailableError } from "./provider-group-failure-policy.js";
 import type { HostedAgentRunPort } from "./hosted-agent-controller.js";
 import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
+import { Code, ConnectError } from "@connectrpc/connect";
+import { HostedAgentLimitError } from "./hosted-agent-limits.js";
 
 interface NativeClient extends HostedAgentTransport {
   open(input: HostedAgentOpen, signal: AbortSignal): Promise<{ readonly virtualRoot: string }>;
@@ -130,7 +132,7 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     this.#assert(principal);
     const group = this.options.runtime.store.snapshot({ backendId: input.backendId, providerId: input.providerId });
     const scope = hash([principal.id, principal.deviceId, input.backendId, input.providerId, input.sessionId, input.targetId, input.nativeSessionId]);
-    const retained = this.options.runtime.store.hostedBinding(scope);
+    const priorBinding = this.options.runtime.store.hostedBinding(scope), retained = priorBinding?.phase === "admission_rejected" ? undefined : priorBinding;
     if (principal.providerGrant?.groupMember || principal.trust === "owner" && input.groupMember || !group.config && !retained) return this.options.base.begin(principal, input);
     const key = this.#key(principal, input.runId), digest = hash(input), previous = this.#entries.get(key);
     if (previous) { this.#entry(principal, input.runId); if (digest !== previous.digest) throw new HostedAgentHostError("CONFLICT"); return { workspaceRoot: previous.virtualRoot }; }
@@ -150,6 +152,7 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     return { workspaceRoot: virtualRoot };
   }
   async call(principal: HostedAgentPrincipal, runId: string, callId: string, command: HostedAgentCall): Promise<unknown> {
+    if (command.kind === "derivation_lifecycle") return this.#derivationLifecycle(principal, runId, callId, command);
     const entry = this.#entries.get(this.#key(principal, runId)); if (!entry) return this.options.base.call(principal, runId, callId, command);
     this.#assertEntry(entry, principal); const digest = hash(command), previous = entry.calls.get(callId);
     if (!callId || callId.length > 512 || /[\0\r\n]/u.test(callId)) throw new HostedAgentHostError("INVALID_REQUEST");
@@ -171,6 +174,14 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
         this.options.runtime.leases.started({ sessionId: this.#session(entry), memberKey: member.key, backendId: member.backendId, providerId: member.providerId });
       }
       let forwarded = this.#down(entry, command) as HostedAgentCall;
+      let childScope: string | undefined;
+      if (command.kind === "derive") {
+        if (command.targetId !== entry.input.targetId || command.sessionId === entry.input.sessionId) throw new HostedAgentHostError("INVALID_REQUEST");
+        childScope = hash([principal.id, principal.deviceId, entry.input.backendId, entry.input.providerId, command.sessionId, command.targetId, command.nativeSessionId]);
+        if (this.options.runtime.store.hostedBinding(childScope)) throw new HostedAgentHostError("CONFLICT");
+        this.options.runtime.store.stageHostedBinding({ ...entry.binding!, id: childScope });
+        forwarded = { ...command, nativeSessionId: hash([command.nativeSessionId, entry.binding!.member.key]) };
+      }
       if (command.kind === "set_model") {
         this.options.assertSelection(principal, { backendId: entry.input.backendId, providerId: command.providerId, modelId: command.modelId });
         if (command.providerId !== entry.input.providerId) throw new HostedAgentHostError("ACCESS_DENIED");
@@ -182,13 +193,46 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
       try {
         const result = await entry.capture!.client.call(runId, callId, forwarded, entry.lifetime.signal); this.#assertEntry(entry);
         if (command.kind === "set_model") entry.binding = { ...entry.binding!, modelId: (forwarded as Extract<HostedAgentCall, { kind: "set_model" }>).modelId, outerModelId: command.modelId };
+        if (childScope) this.options.runtime.store.settleHostedBinding(childScope, "ready");
         return this.#result(entry, result);
       } catch (error) {
+        if (childScope) this.options.runtime.store.settleHostedBinding(childScope, "unknown");
         if (command.kind === "send" && providerGroupFailureSignals(error).stateMayHaveChanged !== true) { await this.#finishTurn(entry); this.#offer(entry, error); }
         throw error;
       }
     });
     entry.calls.set(callId, { digest, value }); void value.catch(() => {}); return value;
+  }
+  async #derivationLifecycle(principal: HostedAgentPrincipal, runId: string, callId: string,
+    command: Extract<HostedAgentCall, { kind: "derivation_lifecycle" }>): Promise<unknown> {
+    this.#assert(principal);
+    if (principal.providerGrant?.groupMember) return this.options.base.call(principal, runId, callId, command);
+    const store = this.options.runtime.store;
+    const sourceScope = hash([principal.id, principal.deviceId, command.backendId, command.providerId,
+      command.sourceSessionId, command.sourceTargetId, command.sourceNativeSessionId]);
+    const childScope = hash([principal.id, principal.deviceId, command.backendId, command.providerId, command.sessionId, command.targetId, command.nativeSessionId]);
+    const source = store.hostedBinding(sourceScope), child = store.hostedBinding(childScope), binding = child ?? source;
+    if (!binding) return this.options.base.call(principal, runId, callId, command);
+    if (binding.group.backendId !== command.backendId || binding.group.providerId !== command.providerId
+      || command.sourceTargetId !== command.targetId) throw new HostedAgentHostError("ACCESS_DENIED");
+    const selection = this.options.assertSelection(principal, { backendId: command.backendId, providerId: command.providerId, modelId: binding.outerModelId });
+    const assertCurrent = () => { this.#assert(principal); if (typeof selection === "function") selection(); };
+    assertCurrent();
+    if (!child) store.stageHostedBinding({ ...binding, id: childScope });
+    const member = binding.member;
+    const forwarded: typeof command = { ...command, backendId: member.nativeBackendId, providerId: member.providerId,
+      sourceNativeSessionId: hash([command.sourceNativeSessionId, member.key]), nativeSessionId: hash([command.nativeSessionId, member.key]) };
+    let result: unknown;
+    if (member.kind === "local") {
+      const localPrincipal: HostedAgentPrincipal = { ...principal, id: "group-native:" + hash([principal.id, member.key]), assertCurrent,
+        ...(principal.providerGrant ? { providerGrant: { ...principal.providerGrant, groupMember: true, backendId: member.nativeBackendId,
+          providerId: member.providerId, modelIds: [binding.modelId], assertCurrent } } : {}) };
+      result = await this.options.base.call(localPrincipal, runId, callId, forwarded);
+    } else {
+      const capture = this.options.capture(member, principal, [binding.modelId], assertCurrent); capture.assertCurrent();
+      result = await capture.client.call(runId, callId, forwarded, AbortSignal.timeout(30_000)); capture.assertCurrent();
+    }
+    assertCurrent(); store.settleHostedBinding(childScope, command.action === "cleanup" ? "closed" : "ready"); return result;
   }
   async poll(principal: HostedAgentPrincipal, cursors: readonly HostedAgentPollCursor[], signal: AbortSignal, waitMs = 30_000): Promise<readonly HostedAgentPollRun[]> {
     this.#assert(principal); signal.throwIfAborted();
@@ -225,7 +269,12 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     this.#assertEntry(entry, principal); const result = await entry.capture!.client.readArtifact(runId, id, offset, maximum, entry.lifetime.signal); this.#assertEntry(entry); return result;
   }
   async close(principal: HostedAgentPrincipal, runId: string): Promise<void> {
-    const entry = this.#entries.get(this.#key(principal, runId)); if (!entry) return this.options.base.close(principal, runId); this.#assertEntry(entry, principal); await this.#close(entry);
+    const entry = this.#entries.get(this.#key(principal, runId)); if (!entry) return this.options.base.close(principal, runId);
+    this.#assert(principal);
+    if (principal.id !== entry.principal.id || principal.deviceId !== entry.principal.deviceId || principal.trust !== entry.principal.trust) throw new HostedAgentHostError("ACCESS_DENIED");
+    // Closing already retired the execution lifetime. The same authenticated
+    // owner may still confirm or retry this exact run's cleanup.
+    await this.#close(entry);
   }
   async closePrincipal(principal: HostedAgentPrincipal): Promise<void> {
     await allClosed([...this.#entries.values()].filter(entry => entry.principal === principal).map(entry => this.#close(entry))); await this.options.base.closePrincipal(principal);
@@ -276,16 +325,27 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     if (!retained || offer) this.options.assertSelection(entry.principal, entry.input);
     if (retained && entry.input.start !== "resume") throw new HostedAgentHostError("CONFLICT");
     const failures = new Set(runtime.router.tried(sessionId));
+    let capacityFailure: unknown;
     for (;;) {
       this.#assertEntry(entry); let assignment: ProviderGroupAssignment | undefined;
       if (retained) entry.binding = retained;
       else {
         const source = runtime.directory.sources().find(source => source.backendId === entry.input.backendId && source.providerId === entry.input.providerId);
         if (!source) throw new ProviderGroupUnavailableError();
-        assignment = (entry.principal.trust === "owner" ? runtime.router.takeRemoteSelection(entry.principal.deviceId, entry.input.sessionId, group) : undefined)
-          ?? await runtime.router.pick({ sessionId, group, profile: { backendId: group.backendId, providerId: group.providerId, modelId: entry.input.modelId, fastMode: entry.input.fastMode,
-          ...(entry.input.effort === undefined ? {} : { effort: entry.input.effort }) }, agentKind: source.agentKind, modelId: entry.input.modelId, logicalModelId: entry.input.modelId,
-          ownTask: false, ...(entry.principal.providerGrant?.recipient ? { recipient: entry.principal.providerGrant.recipient } : {}), exclude: failures, fresh: failures.size > 0 }, entry.lifetime.signal);
+        try {
+          const prepared = entry.principal.trust === "owner" ? runtime.router.takeRemoteSelection(entry.principal.deviceId, entry.input.sessionId, group) : undefined;
+          assignment = prepared
+            ?? await runtime.router.pick({ sessionId, group, profile: { backendId: group.backendId, providerId: group.providerId, modelId: entry.input.modelId, fastMode: entry.input.fastMode,
+            ...(entry.input.effort === undefined ? {} : { effort: entry.input.effort }) }, agentKind: source.agentKind, modelId: entry.input.modelId, logicalModelId: entry.input.modelId,
+            ownTask: false, ...(entry.principal.providerGrant?.recipient ? { recipient: entry.principal.providerGrant.recipient } : {}), exclude: failures, fresh: failures.size > 0 }, entry.lifetime.signal);
+        } catch (error) {
+          if (capacityFailure && error instanceof ProviderGroupUnavailableError) {
+            // Every attempted native owner positively rejected admission/closed.
+            // Only now let the original controller pool reclaim idle capacity.
+            runtime.router.clearTurn(sessionId); throw capacityFailure;
+          }
+          throw error;
+        }
         entry.binding = { format: 1, id: entry.scope, group, groupRevision: assignment.snapshot.revision.toString(), member: assignment.member, modelId: assignment.profile.modelId,
           outerModelId: entry.input.modelId, phase: "opening" };
       }
@@ -308,7 +368,19 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
       } catch (error) {
         assignment?.release();
         try { await this.#closeNative(entry); } catch { runtime.store.settleHostedBinding(entry.scope, "unknown"); throw unknown(); }
-        runtime.store.settleHostedBinding(entry.scope, "closed");
+        const capacity = error instanceof HostedAgentLimitError || error instanceof ConnectError && error.code === Code.ResourceExhausted && ["device", "total"].includes(error.metadata.get("x-joko-native-capacity") ?? "");
+        runtime.store.settleHostedBinding(entry.scope, capacity ? "admission_rejected" : "closed");
+        if (capacity) {
+          // Owner tasks retain the controller's exact original pick/creation
+          // receipt. Its Router selects the next member after this closed
+          // rejection; a guest has no owner RPC and stays within this relay.
+          if (retained || entry.principal.trust === "owner" || !runtime.store.snapshot(group).config?.autoSwitch) throw error;
+          capacityFailure = error;
+          for (const candidate of runtime.store.snapshot(group).config?.members ?? []) {
+            if (candidate.nodeId === member.nodeId) { failures.add(candidate.key); runtime.router.markTried(sessionId, candidate.key); }
+          }
+          entry.capture = undefined; entry.port = undefined; entry.actualRoot = undefined; continue;
+        }
         if (retained || !runtime.store.snapshot(group).config?.autoSwitch) throw error;
         const decision = decideProviderGroupFailure(providerGroupFailureSignals(error), "start"); if (decision.action !== "switch") throw error;
         failures.add(member.key); runtime.router.markTried(sessionId, member.key); runtime.router.cool(group, member, binding.modelId, providerGroupFailureSignals(error), decision);
@@ -352,9 +424,20 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
         if (batch.cursor !== cursor) throw new HostedAgentHostError("CONFLICT");
         if (batch.finished) { if (entry.startupComplete) entry.exchange.finish(); return; }
       }
-    })().catch(error => { if (!signal.aborted && entry.closed === undefined && entry.startupComplete) { this.#offer(entry, { code: "HOSTED_SOURCE_DISCONNECTED" });
+    })().catch(error => { if (!signal.aborted && entry.closed === undefined && entry.startupComplete) {
+      try { this.#assertEntry(entry); } catch {
+        // Revocation retires delivery before cleanup. Reporting another frame
+        // through that same stale exchange would reject the cleanup's pump.
+        entry.lifetime.abort(); entry.port?.detach(); entry.exchange.close();
+        void this.#close(entry).catch(() => {});
+        return;
+      }
+      this.#offer(entry, { code: "HOSTED_SOURCE_DISCONNECTED" });
       entry.exchange.emit({ type: "error", terminal: true, error: { code: "HOSTED_SOURCE_DISCONNECTED", message: "The group member connection ended.", phase: "transport", retryable: true, stateMayHaveChanged: false, recovery: "Wait for the original task to reconnect or hand off." } }); entry.exchange.emit({ type: "done", outcome: "failed" }); }
       void error; if (!signal.aborted && entry.startupComplete) entry.exchange.finish(); });
+    // Cleanup still awaits this original promise. Observe a failure immediately
+    // without changing its rejection or releasing any native ownership.
+    void entry.pump.catch(() => {});
   }
   async #beforeSend(entry: Entry): Promise<void> {
     const binding = entry.binding!, group = this.options.runtime.store.snapshot(binding.group);
@@ -396,9 +479,10 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
   #up(entry: Entry, value: unknown): unknown { return mapPaths(value, entry.actualRoot, entry.virtualRoot); }
   #down(entry: Entry, value: unknown): unknown { return mapPaths(value, entry.virtualRoot, entry.actualRoot); }
   #close(entry: Entry): Promise<void> {
+    if (entry.closed !== undefined) return Promise.resolve();
     return entry.closing ??= (async () => {
       entry.lifetime.abort(); entry.port?.detach(); entry.exchange.finish(); await this.#closeNative(entry); await entry.opening.catch(() => {}); await this.#closeNative(entry);
-      await entry.pump; if (entry.binding) this.options.runtime.store.settleHostedBinding(entry.scope, "closed");
+      await entry.pump; if (entry.binding && this.options.runtime.store.hostedBinding(entry.scope)?.phase !== "admission_rejected") this.options.runtime.store.settleHostedBinding(entry.scope, "closed");
       if (entry.turn) { this.options.runtime.usage.usage.finishNative(entry.turn, entry.lastUsage, this.#now()); entry.turn = undefined; }
       this.options.runtime.leases.ended(this.#session(entry)); entry.closed = this.#now(); this.#notify();
     })().finally(() => { entry.closing = undefined; });

@@ -174,6 +174,7 @@ const DESKTOP_CHANNELS = {
   nativeTaskStatusSetVisibleSessions: "joko:native-task-status:visible-sessions:set",
   nativeTaskStatusAction: "joko:native-task-status:action",
   nativeTaskStatusAcknowledgeFocus: "joko:native-task-status:focus:acknowledge",
+  nativeTaskStatusCompletionResult: "joko:native-task-status:completion:result",
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
   keepAwakeChanged: "joko:power:keep-awake:changed",
@@ -650,7 +651,11 @@ const desktopApi = Object.freeze({
     }
   }),
   inspectorWindow: Object.freeze({
-    activate: (): Promise<boolean> => ipcRenderer.invoke(DESKTOP_CHANNELS.inspectorWindowActivate),
+    activate: (occurrence?: string): Promise<boolean> => {
+      if (occurrence !== undefined && (typeof occurrence !== "string" || !/^[0-9a-f-]{36}$/u.test(occurrence))) throw new TypeError("Inspector occurrence is invalid.");
+      return occurrence === undefined ? ipcRenderer.invoke(DESKTOP_CHANNELS.inspectorWindowActivate)
+        : ipcRenderer.invoke(DESKTOP_CHANNELS.inspectorWindowActivate, occurrence);
+    },
     onClosed: (listener: (event: { readonly occurrence: string; readonly reason: "user" | "child-failure" }) => void): (() => void) => {
       if (typeof listener !== "function") throw new TypeError("Inspector window listener must be a function.");
       const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
@@ -693,6 +698,12 @@ const desktopApi = Object.freeze({
     acknowledgeFocus: (sessionId: string, token: string): Promise<void> => {
       if (!mainDocumentOccurrence || !nativeIdentity(sessionId, 1024) || !nativeIdentity(token, 2048)) return Promise.reject(new TypeError("Invalid native task focus receipt."));
       return ipcRenderer.invoke(DESKTOP_CHANNELS.nativeTaskStatusAcknowledgeFocus, mainDocumentOccurrence, sessionId, token);
+    },
+    finishCompletion: (sessionId: string, token: string, accepted: boolean): Promise<void> => {
+      if (!mainDocumentOccurrence || !nativeIdentity(sessionId, 1024) || !nativeIdentity(token, 2048) || typeof accepted !== "boolean") {
+        return Promise.reject(new TypeError("Invalid native task completion receipt."));
+      }
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.nativeTaskStatusCompletionResult, mainDocumentOccurrence, sessionId, token, accepted);
     },
     getSettings: (): Promise<DesktopNativeTaskStatusSettings> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.nativeTaskStatusGetSettings).then(parseDesktopNativeTaskStatusSettings),
@@ -1266,6 +1277,9 @@ function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktop
     : ["enabled", "active", "controlling", "permissions"];
   const hasWindowsSupport = Object.hasOwn(candidate, "windowsSupport");
   if (hasWindowsSupport) keys.push("windowsSupport");
+  const hasDiagnostic = Object.hasOwn(candidate, "windowsSupportDiagnostic");
+  if (hasDiagnostic) keys.push("windowsSupportDiagnostic");
+  const diagnostic = hasDiagnostic ? parseWindowsSupportDiagnostic(candidate["windowsSupportDiagnostic"]) : undefined;
   const hasOverlay = Object.hasOwn(candidate, "overlayVisible");
   if (hasOverlay) keys.push("overlayVisible");
   if (!exactRemoteDesktopRecord(candidate, keys)
@@ -1274,6 +1288,7 @@ function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktop
     || typeof candidate["controlling"] !== "boolean"
     || (hasOverlay && typeof candidate["overlayVisible"] !== "boolean")
     || (hasWindowsSupport && !isRemoteDesktopWindowsSupport(candidate["windowsSupport"]))
+    || (hasDiagnostic && !hasWindowsSupport)
     || (!candidate["active"] && candidate["controlling"])
     || (candidate["active"] && (!boundedRemoteDesktopIdentity(candidate["controllerDeviceId"])
       || !boundedRemoteDesktopIdentity(candidate["displayId"])))) {
@@ -1281,7 +1296,7 @@ function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktop
   }
   const permissions = parseDesktopRemoteDesktopPermissions(candidate["permissions"]);
   const windowsSupport = isRemoteDesktopWindowsSupport(candidate["windowsSupport"])
-    ? { windowsSupport: candidate["windowsSupport"] } : {};
+    ? { windowsSupport: candidate["windowsSupport"], ...(diagnostic === undefined ? {} : { windowsSupportDiagnostic: diagnostic }) } : {};
   return candidate["active"]
     ? Object.freeze({
         enabled: candidate["enabled"],
@@ -1304,6 +1319,18 @@ function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktop
 
 function isRemoteDesktopWindowsSupport(value: unknown): value is NonNullable<DesktopRemoteDesktopSnapshot["windowsSupport"]> {
   return value === "ready" || value === "missing" || value === "installRequired" || value === "unavailable";
+}
+
+function parseWindowsSupportDiagnostic(value: unknown): NonNullable<DesktopRemoteDesktopSnapshot["windowsSupportDiagnostic"]> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Invalid Windows setup diagnostic.");
+  const record = value as Record<string, unknown>;
+  const child = Object.hasOwn(record, "childStep");
+  const step = (candidate: unknown): candidate is string => typeof candidate === "string" && /^[a-z][a-z-]{0,31}$/u.test(candidate);
+  if (!exactRemoteDesktopRecord(record, child ? ["step", "childStep", "osError"] : ["step", "osError"])
+    || !step(record["step"]) || (child && !step(record["childStep"]))
+    || typeof record["osError"] !== "number" || !Number.isSafeInteger(record["osError"])
+    || record["osError"] < 0 || record["osError"] > 0x00ff_ffff) throw new TypeError("Invalid Windows setup diagnostic.");
+  return Object.freeze({ step: record["step"], osError: record["osError"], ...(child ? { childStep: record["childStep"] as string } : {}) });
 }
 
 function exactRemoteDesktopRecord(
@@ -1685,6 +1712,10 @@ function parseNativeTaskStatusVisibleSessionIds(value: unknown): readonly string
 
 function parseDesktopNativeTaskStatusAction(value: unknown): DesktopNativeTaskStatusAction | undefined {
   if (!nativeRecord(value) || !nativeIdentity(value["sessionId"], 1024)) return undefined;
+  if (value["kind"] === "completion" && nativeKeys(value) === "action,entryToken,kind,sessionId"
+    && (value["action"] === "archive" || value["action"] === "markRead") && nativeIdentity(value["entryToken"], 2048)) {
+    return Object.freeze({ kind: "completion", action: value["action"], sessionId: value["sessionId"], entryToken: value["entryToken"] });
+  }
   if (value["kind"] === "focus" && ["kind,sessionId", "entryToken,kind,sessionId"].includes(nativeKeys(value))
     && (value["entryToken"] === undefined || nativeIdentity(value["entryToken"], 2048))) {
     return Object.freeze({ kind: "focus", sessionId: value["sessionId"], ...(value["entryToken"] === undefined ? {} : { entryToken: value["entryToken"] }) });

@@ -37,7 +37,8 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
         INVALID_REQUEST: Code.InvalidArgument, ACCESS_DENIED: Code.PermissionDenied, CONFLICT: Code.Aborted,
         UNAVAILABLE: Code.Unavailable, RESOURCE_EXHAUSTED: Code.ResourceExhausted
       }[error.code] : Code.FailedPrecondition;
-      throw new ConnectError("Hosted Agent request is unavailable.", code);
+      const metadata = error instanceof HostedAgentLimitError ? { "x-joko-native-capacity": error.scope } : undefined;
+      throw new ConnectError("Hosted Agent request is unavailable.", code, metadata);
     }
   };
   const identity = (value: string) => { if (!value || value.length > 512 || /[\0\r\n]/u.test(value)) throw new HostedAgentWireError(); return value; };
@@ -52,7 +53,7 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
     return create(contract.HostedAgentSettingsSchema, { revision: snapshot.revision, remoteControlEnabled: snapshot.value.remoteControlEnabled,
       providers: snapshot.value.providers.map(provider => ({ backendId: provider.backendId, providerId: provider.providerId, enabled: provider.enabled,
         modelAccess: contract.toRemoteModelAccess(provider.modelIds) })),
-      limits: owner.settings.limits(), limitsOverridden: snapshot.value.limits !== undefined, usage: owner.slots.summary() });
+      limits: owner.settings.limits(), limitsOverridden: snapshot.value.limits !== undefined, usage: owner.slots.summary(), idleReleaseMinutes: owner.settings.idleReleaseMinutes() });
   };
   return {
     getHostedAgentCatalog: (request, context) => invoke(request.format, context, async principal => {
@@ -70,6 +71,7 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
           update = { kind: "provider", backendId: provider.backendId, providerId: provider.providerId, enabled: provider.enabled }; break;
         }
         case "limits": update = { kind: "limits", value: request.update.value }; break;
+        case "idleReleaseMinutes": update = { kind: "idle_release", minutes: request.update.value }; break;
         case "modelAccess": {
           const provider = request.update.value; identity(provider.backendId); identity(provider.providerId);
           if (!provider.access) throw new HostedAgentWireError();
@@ -84,16 +86,27 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
       return create(contract.UpdateHostedAgentSettingsResponseSchema, { settings: settings(principal) });
     }),
     openHostedAgent: (request, context) => invoke(request.format, context, async principal => {
-      const input = decodeHostedAgentOpen(request.openJson), run = await options.host.begin(principal, input);
-      return create(contract.OpenHostedAgentResponseSchema, { format, runId: input.runId, virtualRoot: run.workspaceRoot });
+      const input = decodeHostedAgentOpen(request.openJson);
+      try {
+        const run = await options.host.begin(principal, input);
+        return create(contract.OpenHostedAgentResponseSchema, { format, runId: input.runId, virtualRoot: run.workspaceRoot });
+      } catch (error) {
+        const capacityRejection = nativeCapacity(error); if (capacityRejection === undefined) throw error;
+        return create(contract.OpenHostedAgentResponseSchema, { format, runId: input.runId, capacityRejection });
+      }
     }),
     callHostedAgent: (request, context) => invoke(request.format, context, async principal => {
       const command = decodeHostedAgentInvocation(request.commandJson);
       if (command.kind === "infer" && (request.runId !== command.request.requestId || request.callId !== command.request.requestId)) throw new HostedAgentWireError();
       if (command.kind === "infer" && !options.host.infer) throw new ConnectError("Isolated native inference is unavailable.", Code.Unimplemented);
-      const result = command.kind === "infer" ? await options.host.infer!(principal, command.request, context.signal)
-        : await options.host.call(principal, identity(request.runId), identity(request.callId), command);
-      return create(contract.CallHostedAgentResponseSchema, { format, resultJson: encodeHostedAgentValue(result) });
+      try {
+        const result = command.kind === "infer" ? await options.host.infer!(principal, command.request, context.signal)
+          : await options.host.call(principal, identity(request.runId), identity(request.callId), command);
+        return create(contract.CallHostedAgentResponseSchema, { format, resultJson: encodeHostedAgentValue(result) });
+      } catch (error) {
+        const capacityRejection = nativeCapacity(error); if (capacityRejection === undefined) throw error;
+        return create(contract.CallHostedAgentResponseSchema, { format, capacityRejection });
+      }
     }),
     pollHostedAgents: (request, context) => invoke(request.format, context, async principal => {
       const runs = await options.host.poll(principal, request.cursors.map(cursor => ({ runId: identity(cursor.runId), after: integer(cursor.after) })), context.signal);
@@ -112,4 +125,9 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
       await options.host.close(principal, identity(request.runId)); return create(contract.CloseHostedAgentResponseSchema, { format });
     })
   };
+}
+function nativeCapacity(error: unknown): contract.HostedAgentCapacityRejection | undefined {
+  const scope = error instanceof HostedAgentLimitError ? error.scope : error instanceof ConnectError && error.code === Code.ResourceExhausted
+    ? error.metadata.get("x-joko-native-capacity") : undefined;
+  return scope === "device" ? contract.HostedAgentCapacityRejection.DEVICE_LIMIT : scope === "total" ? contract.HostedAgentCapacityRejection.TOTAL_LIMIT : undefined;
 }

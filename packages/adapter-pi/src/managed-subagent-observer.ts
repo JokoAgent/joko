@@ -340,9 +340,12 @@ export class ManagedSubagentObserver {
           decide: async (request) => {
             if (request.policyGeneration !== this.#policyGeneration) return "stale";
             const snapshot = this.#context.policySnapshot;
-            return snapshot === undefined
+            const decision = snapshot === undefined
               ? "default"
               : evaluateOrderedPolicyRules(snapshot, request.observation)?.action ?? "default";
+            if (decision !== "default") return decision;
+            return { decision, ownerUserInstructions: (this.#context.nativeToolAuthorization?.readOwnerUserInstructions?.() ?? [])
+              .map(text => redactManagedSecrets(text, this.#redactValues)) };
           },
           transport: extensionTransport,
           isCurrent: () => !this.#stopped

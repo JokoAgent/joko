@@ -120,6 +120,7 @@ export interface UiPreferences extends AppearancePreferences {
   readonly localLinkOpenPreference: LinkOpenPreference;
   /** Enables a word-level opacity reveal while assistant text streams. */
   readonly streamFadeEnabled: boolean;
+  readonly showPartnerReplyQuotes?: boolean;
   /** Enables local OS notifications for new durable task-attention edges. */
   readonly sessionNotificationsEnabled: boolean;
   /** Default for fresh project tasks; eligibility still fails closed per Target. */
@@ -169,6 +170,7 @@ export const DEFAULT_UI_PREFERENCES: UiPreferences = {
   webLinkOpenPreference: LINK_OPEN_DEFAULTS.web,
   localLinkOpenPreference: LINK_OPEN_DEFAULTS.local,
   streamFadeEnabled: true,
+  showPartnerReplyQuotes: true,
   sessionNotificationsEnabled: true,
   newSessionWorktreeEnabled: false,
   sidebarDisplayPreferences: DEFAULT_SIDEBAR_DISPLAY_PREFERENCES,
@@ -198,6 +200,7 @@ const UI_PREFERENCE_KEYS = [
   "sidebarDisplayPreferences",
   "sidebarOwnerLayouts",
   "streamFadeEnabled",
+  "showPartnerReplyQuotes",
   "theme",
   "uiFamily",
   "uiSize",
@@ -247,6 +250,7 @@ export function normalizeUiPreferences(value: unknown): UiPreferences {
     || (record["webLinkOpenPreference"] !== "sidebar" && record["webLinkOpenPreference"] !== "external")
     || (record["localLinkOpenPreference"] !== "sidebar" && record["localLinkOpenPreference"] !== "external")
     || typeof record["streamFadeEnabled"] !== "boolean"
+    || typeof record['showPartnerReplyQuotes'] !== 'boolean'
     || typeof record["sessionNotificationsEnabled"] !== "boolean"
     || typeof record["newSessionWorktreeEnabled"] !== "boolean"
     || !samePersistedValue(sidebarDisplayPreferences, record["sidebarDisplayPreferences"])
@@ -271,6 +275,7 @@ export function normalizeUiPreferences(value: unknown): UiPreferences {
     webLinkOpenPreference: record["webLinkOpenPreference"],
     localLinkOpenPreference: record["localLinkOpenPreference"],
     streamFadeEnabled: record["streamFadeEnabled"],
+    showPartnerReplyQuotes: record['showPartnerReplyQuotes'],
     sessionNotificationsEnabled: record["sessionNotificationsEnabled"],
     newSessionWorktreeEnabled: record["newSessionWorktreeEnabled"],
     sidebarDisplayPreferences,
@@ -407,6 +412,7 @@ function persistedUiPreferences(value: UiPreferences): { -readonly [Key in keyof
   if (value.webLinkOpenPreference === LINK_OPEN_DEFAULTS.web) delete persisted.webLinkOpenPreference;
   if (value.localLinkOpenPreference === LINK_OPEN_DEFAULTS.local) delete persisted.localLinkOpenPreference;
   if (value.streamFadeEnabled) delete persisted.streamFadeEnabled;
+  if (value.showPartnerReplyQuotes !== false) delete persisted.showPartnerReplyQuotes;
   if (value.sessionNotificationsEnabled) delete persisted.sessionNotificationsEnabled;
   if (!value.newSessionWorktreeEnabled) delete persisted.newSessionWorktreeEnabled;
   if (Object.keys(value.personalizationPrompts).length === 0) delete persisted.personalizationPrompts;

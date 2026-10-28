@@ -11,6 +11,7 @@ const INSPECTOR_WINDOW_CHANNELS = {
   minimize: "joko:inspector-window:minimize",
   toggleMaximize: "joko:inspector-window:toggle-maximize",
   close: "joko:inspector-window:close",
+  closeRequested: "joko:inspector-window:close-requested",
   selectionContextMenuAddToChat: "joko:selection-context-menu:add-to-chat"
 } as const;
 
@@ -18,6 +19,12 @@ contextBridge.exposeInMainWorld("jokoInspectorDesktop", Object.freeze({
   platform: process.platform,
   window: Object.freeze({
     identity: (): Promise<string> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.identity),
+    onCloseRequested: (listener: () => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Inspector close listener must be a function.");
+      const wrapped = (): void => listener();
+      ipcRenderer.on(INSPECTOR_WINDOW_CHANNELS.closeRequested, wrapped);
+      return () => ipcRenderer.removeListener(INSPECTOR_WINDOW_CHANNELS.closeRequested, wrapped);
+    },
     ready: (): Promise<void> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.ready),
     minimize: (): Promise<void> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.minimize),
     toggleMaximize: (): Promise<boolean> => ipcRenderer.invoke(INSPECTOR_WINDOW_CHANNELS.toggleMaximize),

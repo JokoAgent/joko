@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import type { Client } from "@connectrpc/connect";
+import { Code, ConnectError, type Client } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import type { HostedAgentFrame } from "./hosted-agent-exchange.js";
 import type { HostedAgentOpen } from "./hosted-agent-host.js";
@@ -23,13 +23,14 @@ export class HostedAgentConnectClient implements HostedAgentTransport {
     this.#check(signal);
     const result = await this.#client.openHostedAgent(create(contract.OpenHostedAgentRequestSchema, { format: HOSTED_AGENT_WIRE_FORMAT, openJson: encodeHostedAgentValue(input) }), { signal });
     this.#check(signal); assertHostedAgentWireFormat(result.format);
+    assertNativeCapacity(result.capacityRejection);
     if (result.runId !== input.runId || !result.virtualRoot || result.virtualRoot.length > 16_384 || result.virtualRoot.includes("\0")) throw new HostedAgentWireError();
     return { runId: result.runId, virtualRoot: result.virtualRoot };
   }
   async call(runId: string, callId: string, command: HostedAgentCall, signal: AbortSignal): Promise<unknown> {
     this.#check(signal);
     const result = await this.#client.callHostedAgent(create(contract.CallHostedAgentRequestSchema, { format: HOSTED_AGENT_WIRE_FORMAT, runId, callId, commandJson: encodeHostedAgentValue(command) }), { signal });
-    this.#check(signal); assertHostedAgentWireFormat(result.format); return decodeHostedAgentValue(result.resultJson);
+    this.#check(signal); assertHostedAgentWireFormat(result.format); assertNativeCapacity(result.capacityRejection); return decodeHostedAgentValue(result.resultJson);
   }
   async infer(request: HostedNativeInferenceRequest, signal: AbortSignal): Promise<string> {
     this.#check(signal);
@@ -69,4 +70,10 @@ export class HostedAgentConnectClient implements HostedAgentTransport {
     this.#check(signal); assertHostedAgentWireFormat(result.format);
   }
   #check(signal: AbortSignal): void { signal.throwIfAborted(); this.#assertCurrent(); }
+}
+function assertNativeCapacity(value: contract.HostedAgentCapacityRejection): void {
+  if (value === contract.HostedAgentCapacityRejection.UNSPECIFIED) return;
+  if (value !== contract.HostedAgentCapacityRejection.DEVICE_LIMIT && value !== contract.HostedAgentCapacityRejection.TOTAL_LIMIT) throw new HostedAgentWireError();
+  throw new ConnectError("Native Agent process admission reached its limit.", Code.ResourceExhausted,
+    { "x-joko-native-capacity": value === contract.HostedAgentCapacityRejection.DEVICE_LIMIT ? "device" : "total" });
 }

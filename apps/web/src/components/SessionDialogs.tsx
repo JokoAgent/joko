@@ -114,21 +114,27 @@ export function RenameSessionDialog({ session, t, onClose, onRename, onSuggest }
   </Modal>;
 }
 
-export function ArchiveSessionDialog({ sessions, preflight, t, onClose, onArchive }: {
+export function ArchiveSessionDialog({ sessions, preflight, t, onClose, onArchive, onRetry }: {
   readonly sessions: readonly SessionView[];
   readonly preflight?: WorktreeRemovalPreflightSummary;
   readonly t: Translator;
   readonly onClose: () => void;
   readonly onArchive: () => void;
+  readonly onRetry?: () => void;
 }): JSX.Element {
   return <Modal open={sessions.length > 0} title={t("session.archive")} description={sessions.length === 1 ? sessions[0]?.name : undefined} closeLabel={t("common.close")} size="small" onClose={onClose}>
     <div className="delete-dialog">
       <div className="delete-dialog__warning"><Archive aria-hidden="true" /><div>
         <p>{t("session.archiveWarning")}</p>
         <WorktreeRemovalWarnings disposition="archive" preflight={preflight} t={t} />
+        {(preflight?.activeBoundScheduleCount ?? 0) > 0 && <div role="alert">
+          <p>{t("session.archiveSchedulesWarning", { count: preflight?.activeBoundScheduleCount ?? 0 })}</p>
+          <ul>{preflight?.activeBoundScheduleNames?.map((name, index) => <li key={index}>{name}</li>)}</ul>
+        </div>}
+        {preflight?.archiveUnavailable === true && <p role="alert">{t("session.archiveSchedulesUnavailable")}</p>}
       </div></div>
       {sessions.length > 1 && <ul className="delete-dialog__sessions">{sessions.map((session) => <li key={session.id}>{session.name}</li>)}</ul>}
-      <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" onClick={onArchive}><Archive aria-hidden="true" />{t("session.archive")}</Button></div>
+      <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button>{preflight?.archiveUnavailable === true && onRetry !== undefined && <Button onClick={onRetry}>{t("common.retry")}</Button>}<Button tone="primary" disabled={preflight?.archiveUnavailable === true} onClick={onArchive}><Archive aria-hidden="true" />{t("session.archive")}</Button></div>
     </div>
   </Modal>;
 }

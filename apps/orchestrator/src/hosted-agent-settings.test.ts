@@ -71,3 +71,16 @@ it("rejects incompatible persisted remote settings without interpreting partial 
     expect(() => new HostedAgentSettings(store)).toThrow("current v1");
   } finally { store.close(); }
 });
+
+it("persists the controller's explicit idle release opt-in without revoking native permissions", () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    const settings = new HostedAgentSettings(store); expect(settings.idleReleaseMinutes()).toBe(0);
+    let value = settings.update({ kind: "remote_control", enabled: true }, 0n);
+    const computer = settings.captureComputer();
+    value = settings.update({ kind: "idle_release", minutes: 120 }, value.revision);
+    expect(new HostedAgentSettings(store).idleReleaseMinutes()).toBe(120); expect(computer).not.toThrow();
+    for (const minutes of [-1, 121, 1.5, Number.NaN]) expect(() => settings.update({ kind: "idle_release", minutes }, value.revision)).toThrow("whole minutes");
+    settings.update({ kind: "idle_release", minutes: 0 }, value.revision); expect(settings.idleReleaseMinutes()).toBe(0);
+  } finally { store.close(); }
+});

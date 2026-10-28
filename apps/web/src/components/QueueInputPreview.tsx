@@ -19,6 +19,7 @@ export function QueueInputPreview({
   inputMentions = [],
   mentionRanges = [],
   attachments = [],
+  replyQuote,
   t
 }: QueueItemView & { readonly t: Translator }): JSX.Element {
   const parsed = parseSelectionQuoteMessage(text, quotesEncoded);
@@ -29,6 +30,7 @@ export function QueueInputPreview({
   let textSegmentIndex = 0;
 
   return <span className="queue-strip__text queue-input-preview">
+    {replyQuote && <span className="queue-input-preview__chip" title={replyQuote.excerpt}><MessageSquare aria-hidden="true" /><span>{replyQuote.excerpt || t('timeline.inputReferences')}</span></span>}
     <span className="queue-input-preview__content">
       {parsed.segments.map((segment, segmentIndex) => {
         if (segment.kind === "quote") {

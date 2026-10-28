@@ -123,7 +123,9 @@ export function SelectionQuoteButton({
   getQuoteText,
   getQuoteMetadata,
   label,
-  onCommit
+  onCommit,
+  onAskSideChat,
+  sideChatLabel
 }: {
   readonly sessionId: string;
   readonly containerRef: RefObject<HTMLElement | null>;
@@ -132,6 +134,8 @@ export function SelectionQuoteButton({
   readonly getQuoteMetadata?: () => SelectionQuoteFileMetadata | null;
   readonly label: string;
   readonly onCommit: (quote: ComposerSelectionQuoteDraft) => void;
+  readonly onAskSideChat?: (quote: ComposerSelectionQuoteDraft) => void;
+  readonly sideChatLabel?: string;
 }): JSX.Element | null {
   const [anchor, setAnchor] = useState<SelectionAnchor>();
   const visibleAnchor = anchor?.quote.sessionId === sessionId ? anchor : undefined;
@@ -195,9 +199,7 @@ export function SelectionQuoteButton({
   const ownerWindow = ownerDocument?.defaultView;
   if (visibleAnchor === undefined || ownerDocument === undefined || ownerWindow === null || ownerWindow === undefined) return null;
   return createPortal(
-    <button
-      type="button"
-      className="selection-quote-button"
+    <div className="selection-quote-actions"
       style={{
         left: `${clamp(visibleAnchor.x, BUTTON_MIN_X_PX, ownerWindow.innerWidth - BUTTON_RIGHT_MARGIN_PX)}px`,
         top: visibleAnchor.placement === "above"
@@ -208,12 +210,17 @@ export function SelectionQuoteButton({
           )}px`,
         transform: visibleAnchor.placement === "above" ? "translate(-50%, -100%)" : "translate(-50%, 0)"
       }}
-      onMouseDown={(event) => event.preventDefault()}
-      onClick={() => commit(visibleAnchor)}
     >
-      <MessageSquarePlus aria-hidden="true" />
-      <span>{label}</span>
-    </button>,
+      <button type="button" className="selection-quote-button" onMouseDown={(event) => event.preventDefault()} onClick={() => commit(visibleAnchor)}>
+        <MessageSquarePlus aria-hidden="true" /><span>{label}</span>
+      </button>
+      {onAskSideChat !== undefined && <button type="button" className="selection-quote-button"
+        onMouseDown={(event) => event.preventDefault()} onClick={() => {
+          onAskSideChat(visibleAnchor.quote);
+          ownerWindow.getSelection()?.removeAllRanges();
+          setAnchor(undefined);
+        }}><MessageSquarePlus aria-hidden="true" /><span>{sideChatLabel}</span></button>}
+    </div>,
     ownerDocument.body
   );
 }

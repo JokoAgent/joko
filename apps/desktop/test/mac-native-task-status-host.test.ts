@@ -98,6 +98,35 @@ class FakeClock {
 }
 
 describe("macOS native task-status host", () => {
+  it("switches completed cards and restores an optimistic archive until its original entry is confirmed", () => {
+    const windows: FakeWindow[] = [], actions: DesktopNativeTaskStatusAction[] = [];
+    const host = createMacNativeTaskStatusHost({ supported: true,
+      getDisplays: () => [{ id: 1, name: "Primary", primary: true, bounds: { x: 0, y: 0, width: 1600, height: 900 } }],
+      createWindow: bounds => { const window = new FakeWindow(bounds); windows.push(window); return window; },
+      onAction: action => actions.push(action), onNewTask: () => undefined, onOpenSettings: () => undefined,
+      onToggleSounds: () => undefined, playSound: () => undefined });
+    host.setSettings({ enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS });
+    const entries = ["one", "two"].map(sessionId => ({ sessionId, title: sessionId, detail: "", phase: "running", activityLines: [], updatedAt: 1 }));
+    const publish = (revision: number, sessions: readonly Record<string, unknown>[]) => host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "renderer", revision: String(revision), locale: "en", sessions }));
+    publish(1, entries); publish(2, entries.map(entry => ({ ...entry, phase: "completed", updatedAt: 2 })));
+    const first = host.surface()!.current!, token = remoteEntryToken(first);
+    const url = (command: string, session = first, entryToken = remoteEntryToken(session)) =>
+      `joko-task-status://${command}?${new URLSearchParams({ sessionId: session.sessionId, token: entryToken, action: "archive" })}`;
+    windows[0]!.navigate!(url("completion-next"));
+    expect(host.surface()!.current!.sessionId).not.toBe(first.sessionId);
+    windows[0]!.navigate!(url("completion"));
+    expect(actions).toEqual([{ kind: "completion", action: "archive", sessionId: first.sessionId, entryToken: token }]);
+    expect(host.surface()!.sessions.some(entry => entry.sessionId === first.sessionId)).toBe(false);
+    host.finishCompletion(first.sessionId, token, false);
+    expect(host.surface()!.sessions.some(entry => entry.sessionId === first.sessionId)).toBe(true);
+    windows[0]!.navigate!(url("completion")); host.finishCompletion(first.sessionId, "stale", true);
+    expect(host.surface()!.sessions.some(entry => entry.sessionId === first.sessionId)).toBe(false);
+    host.finishCompletion(first.sessionId, token, true);
+    publish(3, entries.map(entry => ({ ...entry, phase: "completed", updatedAt: 2 })));
+    expect(host.surface()!.sessions.some(entry => entry.sessionId === first.sessionId)).toBe(false);
+    host.dispose();
+  });
+
   it("keeps first remote attention passive, alerts on a real transition and clears only an unchanged committed entry", () => {
     const sounds = vi.fn(), actions: DesktopNativeTaskStatusAction[] = [];
     const host = createMacNativeTaskStatusHost({ supported: true,

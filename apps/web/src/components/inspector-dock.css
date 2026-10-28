@@ -1,0 +1,49 @@
+.inspector-dock-layout { display: contents; }
+.app:has(.inspector-dock-layout) {
+  --dock-navigation: 0px;
+  --dock-left: 0px; --dock-right: 0px; --dock-top: 0px; --dock-bottom: 0px;
+  grid-template-columns: var(--dock-navigation) var(--dock-left) minmax(0, 1fr) var(--dock-right);
+  grid-template-rows: var(--dock-top) minmax(0, 1fr) var(--dock-bottom);
+}
+.app.has-navigation:has(.inspector-dock-layout) { --dock-navigation: var(--sidebar-width); }
+.app:has(.inspector-dock-group[data-edge="left"]) { --dock-left: var(--joko-dock-left-size, min(360px, 28vw)); }
+.app:has(.inspector-dock-group[data-edge="right"]) { --dock-right: var(--joko-dock-right-size, min(420px, 35vw)); }
+.app:has(.inspector-dock-group[data-edge="top"]) { --dock-top: var(--joko-dock-top-size, min(280px, 35vh)); }
+.app:has(.inspector-dock-group[data-edge="bottom"]) { --dock-bottom: var(--joko-dock-bottom-size, min(280px, 35vh)); }
+.app:has(.inspector-dock-layout) > .app__main { grid-column: 3; grid-row: 2; }
+.app:has(.inspector-dock-layout) > .sidebar { grid-column: 1; grid-row: 1 / -1; }
+.app:has(.inspector-dock-layout) > .panel-scrim--inspector { display: none; }
+.inspector-dock-group { min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; background: var(--surface); border: 1px solid var(--line); overflow: hidden; }
+.inspector-dock-group[data-edge="left"] { grid-column: 2; grid-row: 2; }
+.inspector-dock-group[data-edge="right"] { grid-column: 4; grid-row: 2; }
+.inspector-dock-group[data-edge="top"] { grid-column: 2 / -1; grid-row: 1; }
+.inspector-dock-group[data-edge="bottom"] { grid-column: 2 / -1; grid-row: 3; }
+.inspector-dock-group.is-maximized { position: fixed; z-index: 700; inset: 0 0 0 var(--dock-navigation, 0px); }
+.inspector-dock-group__header { min-height: 38px; display: flex; align-items: center; gap: 2px; padding: 0 5px; border-bottom: 1px solid var(--line); flex: none; }
+.inspector-dock-group__header > .inspector-tabs { flex: 1; min-width: 0; display: flex; overflow-x: auto; scrollbar-width: thin; }
+.inspector-dock-group__header .inspector-tab { flex: none; }
+.inspector-dock-group__header > .inspector-menu > .icon-button { width: 28px; height: 28px; }
+.inspector-dock-group__body, .inspector-dock-mount { min-width: 0; min-height: 0; height: 100%; flex: 1; overflow: hidden; }
+.inspector-dock-mount[hidden] { display: none; }
+.inspector-dock-mount > .inspector-tab-panel { height: 100%; overflow: auto; }
+.inspector-dock-mount > .extension-main-view-page { height: 100%; }
+.inspector-dock-window > .inspector-dock-group { height: calc(100% - 46px); }
+.inspector-dock-window .inspector-dock-group.is-maximized { inset: 46px 0 0; }
+.inspector-dock-drop-preview { position: fixed; z-index: 800; pointer-events: none; border: 2px solid var(--accent-edge); background: var(--accent-soft); inset: 15% 15% 15% 15%; }
+.inspector-dock-drop-preview.is-left { right: 65%; }
+.inspector-dock-drop-preview.is-right { left: 65%; }
+.inspector-dock-drop-preview.is-top { bottom: 65%; }
+.inspector-dock-drop-preview.is-bottom { top: 65%; }
+.inspector-dock-resize { position: absolute; z-index: 5; touch-action: none; }
+.inspector-dock-group[data-edge="left"] > .inspector-dock-resize { right: 0; top: 38px; bottom: 0; width: 5px; cursor: col-resize; }
+.inspector-dock-group[data-edge="right"] > .inspector-dock-resize { left: 0; top: 38px; bottom: 0; width: 5px; cursor: col-resize; }
+.inspector-dock-group[data-edge="top"] > .inspector-dock-resize { left: 0; right: 0; bottom: 0; height: 5px; cursor: row-resize; }
+.inspector-dock-group[data-edge="bottom"] > .inspector-dock-resize { left: 0; right: 0; top: 0; height: 5px; cursor: row-resize; }
+.inspector-dock-resize:focus-visible { background: var(--accent-edge); outline: none; }
+.inspector-extension-menu { position: fixed; z-index: 1200; min-width: 200px; padding: 5px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); box-shadow: var(--shadow-lg); display: flex; flex-direction: column; }
+.inspector-extension-menu > button { padding: 7px 9px; text-align: start; background: transparent; color: var(--text); border-radius: 5px; }
+.inspector-extension-menu > button:hover, .inspector-extension-menu > button:focus-visible { background: var(--surface-hover); }
+@media (max-width: 720px) {
+  .app:has(.inspector-dock-layout) { --dock-navigation: 0px; --dock-left: 0px; --dock-right: 0px; --dock-top: 0px; --dock-bottom: 0px; }
+  .inspector-dock-group[data-edge] { position: fixed; z-index: 650; inset: 48px 0 0 15%; }
+}

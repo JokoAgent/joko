@@ -1,5 +1,6 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { encodeModelSpeed } from "@joko/contracts";
+import { readSessionArchivePreview, type SessionArchivePreview } from "@joko/contracts";
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
 import { readMobileExtensionMainViewResource } from "./mobile-extension-main-view-resource";
 import type { MobileConnectionProfile } from "./connection-storage";
@@ -498,6 +499,7 @@ export interface MobileNetwork {
   listScheduleHistory(credential: PairedCredential, scheduleId: string, pageToken?: string, signal?: AbortSignal): Promise<ScheduleHistoryPage>;
   readSchedulerRuntime(credential: PairedCredential, signal?: AbortSignal): Promise<SchedulerRuntimeSnapshot>;
   probeTargetWorktree(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<MobileTargetWorktreeProbe>;
+  readSessionArchivePreview(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<SessionArchivePreview>;
   listTargetWorktreeSources(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<readonly MobileTargetWorktreeSource[]>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
   readCachedBlob?(profile: MobileConnectionProfile, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload | undefined>;
@@ -3058,6 +3060,12 @@ export const mobileNetwork: MobileNetwork = {
       .getSchedulerRuntime({}, options(signal));
     if (!response.runtime) throw new Error("The Joko node returned no Scheduler runtime.");
     return response.runtime;
+  },
+  async readSessionArchivePreview(credential, sessionId, signal) {
+    const response = await createClient(WorktreeService, credentialTransport(credential))
+      .getSessionWorktreeRemovalPreview({ sessionId }, options(signal));
+    if (response.sessionId !== sessionId) throw new Error("The archive preview belongs to another task.");
+    return readSessionArchivePreview(response);
   },
   async probeTargetWorktree(credential, targetId, signal) {
     if (!validCatalogIdentity(targetId, 512)) throw new Error("A current Target is required for Worktree discovery.");

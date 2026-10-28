@@ -32,7 +32,7 @@ export function projectMobileSessionOrigin(session: Session, sessions: readonly 
 }
 
 export function mobileSessionOriginKey(origin: SessionDerivationOrigin | undefined): string {
-  return origin ? JSON.stringify([origin.kind, origin.sourceSessionId, origin.sourceMessageId ?? null, origin.sourceEventId ?? null]) : "";
+  return origin ? JSON.stringify([origin.kind, origin.sourceSessionId, origin.sourceMessageId ?? null, origin.sourceEventId ?? null, origin.sideChat]) : "";
 }
 
 export function mobileSessionOriginSourceAvailable(session: Session): boolean {

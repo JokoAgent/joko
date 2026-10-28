@@ -596,7 +596,9 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       }
       let pending = 0;
       let pendingRequests = 0;
+      let releasing = false;
       channel.onmessage = ({ data }) => {
+        if (channel.readyState !== "open") return;
         if (current !== generation || typeof data !== "string" || data.length > 32_768) {
           channel.close();
           return;
@@ -635,17 +637,20 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
             return;
           }
         } catch { /* Ordinary input validation owns malformed batches. */ }
-        if (pending >= 8) {
-          channel.close();
-          return;
-        }
         try {
           const value: unknown = JSON.parse(data);
           if (!record(value) || !exactKeys(value, ["sequence", "events"])
             || !Number.isSafeInteger(value["sequence"]) || (value["sequence"] as number) < 1
             || !Array.isArray(value["events"]) || value["events"].length < 1
-            || value["events"].length > 64) {
+            || value["events"].length > 64 || !value["events"].every(validInput)) {
             throw new Error("invalid");
+          }
+          if (releasing) return;
+          if (pending >= 8) {
+            releasing = true;
+            void ipcRenderer.invoke(CHANNELS.input, command.leaseId, value["sequence"], [{ kind: "release" }])
+              .catch(() => { channel.close(); }).finally(() => { releasing = false; });
+            return;
           }
           pending += 1;
           void ipcRenderer.invoke(
@@ -1104,6 +1109,35 @@ function validCursorPng(value: string): boolean {
 
 function finiteRange(value: unknown, minimum: number, maximum: number): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum;
+}
+
+// This preload is self-contained under Electron's sandbox. Main independently
+// validates the same v1 input contract before native dispatch.
+const INPUT_KEYS = new Set([
+  ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map(key => `Key${key}`),
+  ..."0123456789".split("").map(key => `Digit${key}`),
+  ...Array.from({ length: 12 }, (_value, index) => `F${index + 1}`),
+  "Enter", "Escape", "Tab", "Space", "Backspace", "Delete", "Insert", "Home", "End", "PageUp", "PageDown",
+  "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "ShiftLeft", "ControlLeft", "AltLeft", "MetaLeft",
+  "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Slash"
+]);
+function validInput(value: unknown): boolean {
+  if (!record(value)) return false;
+  switch (value["kind"]) {
+    case "release": return exactKeys(value, ["kind"]);
+    case "move": return exactKeys(value, ["kind", "x", "y"])
+      && finiteRange(value["x"], 0, 1) && finiteRange(value["y"], 0, 1);
+    case "button": return exactKeys(value, ["kind", "button", "down", "x", "y"])
+      && finiteRange(value["x"], 0, 1) && finiteRange(value["y"], 0, 1)
+      && [0, 1, 2].includes(value["button"] as number) && typeof value["down"] === "boolean";
+    case "scroll": return exactKeys(value, ["kind", "dx", "dy"])
+      && finiteRange(value["dx"], -2_000, 2_000) && finiteRange(value["dy"], -2_000, 2_000);
+    case "key": return exactKeys(value, ["kind", "code", "down"])
+      && typeof value["code"] === "string" && INPUT_KEYS.has(value["code"]) && typeof value["down"] === "boolean";
+    case "text": return exactKeys(value, ["kind", "text"])
+      && typeof value["text"] === "string" && value["text"].length <= 4_096;
+    default: return false;
+  }
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;

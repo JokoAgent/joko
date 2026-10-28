@@ -47,7 +47,7 @@ interface StoredGroup extends ProviderGroupKey {
 export interface ProviderGroupHostedBinding {
   readonly format: 1; readonly id: string; readonly group: ProviderGroupKey; readonly groupRevision: string;
   readonly member: ProviderGroupMember; readonly modelId: string; readonly outerModelId: string;
-  readonly phase: "opening" | "ready" | "closed" | "unknown";
+  readonly phase: "opening" | "ready" | "closed" | "unknown" | "admission_rejected";
 }
 const SCOPE = "provider-groups.v1";
 const STRATEGIES = ["least_busy", "round_robin", "ordered", "weighted"];
@@ -128,7 +128,7 @@ export class ProviderGroupStore {
     return value === undefined ? undefined : structuredClone(parseHostedBinding(value));
   }
   stageHostedBinding(input: Omit<ProviderGroupHostedBinding, "format" | "phase">): void {
-    const previous = this.hostedBinding(input.id); if (previous && !["ready", "closed"].includes(previous.phase)) throw new StoreError("The original Provider group native effect is unknown.");
+    const previous = this.hostedBinding(input.id); if (previous && !["ready", "closed", "admission_rejected"].includes(previous.phase)) throw new StoreError("The original Provider group native effect is unknown.");
     this.#saveHosted({ format: 1, ...input, phase: "opening" });
   }
   settleHostedBinding(id: string, phase: ProviderGroupHostedBinding["phase"]): void {
@@ -229,7 +229,7 @@ function assertBinding(value: unknown): asserts value is ProviderGroupBinding {
 function parseHostedBinding(value: unknown): ProviderGroupHostedBinding {
   if (!object(value) || !keys(value, ["format", "id", "group", "groupRevision", "member", "modelId", "outerModelId", "phase"]) || value["format"] !== 1
     || !["id", "modelId", "outerModelId"].every(key => bounded(value[key])) || !decimal(value["groupRevision"])
-    || !["opening", "ready", "closed", "unknown"].includes(String(value["phase"])) || !object(value["group"])
+    || !["opening", "ready", "closed", "unknown", "admission_rejected"].includes(String(value["phase"])) || !object(value["group"])
     || !keys(value["group"], ["backendId", "providerId"]) || !bounded(value["group"]["backendId"]) || !bounded(value["group"]["providerId"])) throw invalid();
   assertProviderGroupConfig({ strategy: "ordered", autoSwitch: true, members: [value["member"]] }); return value as unknown as ProviderGroupHostedBinding;
 }

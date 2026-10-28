@@ -4,6 +4,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import { mobileSideChatCopy } from "./mobile-side-chat";
 import { mobileSelectionQuoteMaximumCharacters, type MobileComposerSelection } from "./mobile-composer-document";
 import type { MobileQuoteSelectionLease } from "./mobile-composer-quote";
 
@@ -13,7 +14,8 @@ export function MobileQuoteSelectionSheet({
   locale,
   busy,
   onClose,
-  onAdd
+  onAdd,
+  onAskSideChat
 }: {
   readonly lease?: MobileQuoteSelectionLease;
   readonly colors: MobileInteractionSheetColors;
@@ -21,6 +23,7 @@ export function MobileQuoteSelectionSheet({
   readonly busy: boolean;
   readonly onClose: () => void;
   readonly onAdd: (selection: MobileComposerSelection) => void;
+  readonly onAskSideChat?: (selection: MobileComposerSelection) => void;
 }) {
   const [selection, setSelection] = useState<MobileComposerSelection>({ start: 0, end: 0 });
   const inputRef = useRef<TextInput>(null);
@@ -65,6 +68,10 @@ export function MobileQuoteSelectionSheet({
           color: selectedCharacters > mobileSelectionQuoteMaximumCharacters ? colors.negative : colors.muted
         }]}>{mobileMessage(locale, "quote.selected", { count: selectedCharacters.toLocaleString(locale) })}</Text>
         <View style={styles.actions}>
+          {onAskSideChat !== undefined && <Pressable accessibilityRole="button" disabled={!canAdd}
+            onPress={() => onAskSideChat(selection)} style={[styles.button, { borderColor: colors.border }, !canAdd && styles.disabled]}>
+            <Text style={[styles.buttonText, { color: colors.ink }]}>{mobileSideChatCopy(locale).create}</Text>
+          </Pressable>}
           <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "quote.selectAllLabel")}
             disabled={busy} onPress={() => setSelection({ start: 0, end: lease.text.length })}
             style={[styles.button, { borderColor: colors.border }, busy && styles.disabled]}>

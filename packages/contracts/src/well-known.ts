@@ -8,6 +8,7 @@ export const capabilityNames = {
   sessionResume: "session.resume",
   sessionDetach: "session.detach",
   sessionFork: "session.fork",
+  sessionSideChat: "session.side_chat",
   sessionClone: "session.clone",
   sessionRewind: "session.rewind",
   sessionTree: "session.tree",

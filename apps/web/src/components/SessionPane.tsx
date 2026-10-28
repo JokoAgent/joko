@@ -25,7 +25,7 @@ import type { AppController, AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
 import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
-import { composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
+import { appendQuoteToComposerDocument, composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
 import { Composer, type ComposerHistoryEntry } from "./Composer.js";
@@ -163,7 +163,7 @@ export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JS
   </PartnerConversationProvider>;
 }
 
-function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
+function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -212,6 +212,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly onCopyTaskLink?: () => void;
   readonly onExportPortableSession?: () => void;
   readonly onSplitSession?: (side: "right" | "bottom") => void;
+  readonly onSideChatOpened?: (sourceSessionId: string, sessionId: string) => void;
   readonly onOpenSessionWindow?: () => void;
 }): JSX.Element {
   const guest = controller.state.sessionAccess?.role === "guest";
@@ -508,6 +509,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const canAddMessageReference = !reviewReadOnly && backend?.capabilities.get("input.text")?.supported === true;
   const canForkMessage = !reviewReadOnly && canDeriveWorkspace
     && backend?.capabilities.get("session.fork")?.supported === true;
+  const canOpenSideChat = !guest && !reviewReadOnly && !session.archived && session.derivationOrigin?.sideChat !== true
+    && (partnerConversation === undefined || partnerConversation.kind === "task")
+    && backend?.capabilities.get("session.side_chat")?.supported === true;
   const visionBridgeRouted = controller.state.snapshot.settings.visionBridge.enabled && session.model !== undefined
     && controller.state.snapshot.settings.visionBridge.targetModels.some((candidate) => candidate.backendId === session.backendId && candidate.providerId === session.model?.providerId && candidate.modelId === session.model.modelId);
   const canAddWorkspaceImage = !reviewReadOnly && resolveComposerAttachmentPolicy(backend, session.model?.supportsImages === true || visionBridgeRouted).images;
@@ -1387,6 +1391,25 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     runAction(`fork-message-blocked:${itemId}`, async () => { throw new Error(message); });
   };
 
+  const openSideChat = (quote?: ComposerSelectionQuoteDraft): void => {
+    if (!canOpenSideChat) return;
+    const owner = beginDerivedTaskAction();
+    const sourceSessionId = session.id, sourceGeneration = session.generation;
+    const open = controller.openSideChat, save = controller.saveDraft;
+    runAction(`side-chat:${sourceSessionId}`, async () => {
+      const child = await open(sourceSessionId, sourceGeneration);
+      if (!owner.isCurrent()) return;
+      if (quote !== undefined) {
+        const editorDocument = appendQuoteToComposerDocument(undefined, quote);
+        await save(child, { text: composerDocumentPlainText(editorDocument), editorDocument,
+          attachments: [], mentions: [], deliveryMode: "prompt" });
+        if (!owner.isCurrent()) return;
+      }
+      if (onSideChatOpened !== undefined) onSideChatOpened(sourceSessionId, child);
+      else controller.navigate({ kind: "session", sessionId: child });
+    });
+  };
+
   const forkFromMessage = (item: TimelineItemView): void => {
     const target = resolveMessageForkTarget(item);
     if (!canForkMessage || target === undefined || forkingMessageId !== undefined) return;
@@ -2037,6 +2060,11 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
               }
             }) : undefined}
             onSplitSession={onSplitSession}
+            onStartSideChat={canOpenSideChat ? () => openSideChat() : undefined}
+            sideChats={controller.state.snapshot.sessions.filter((child) => child.derivationOrigin?.sideChat
+              && child.derivationOrigin.sourceSessionId === session.id).slice(0, 20)}
+            onSelectSideChat={(childId) => onSideChatOpened === undefined
+              ? controller.navigate({ kind: "session", sessionId: childId }) : onSideChatOpened(session.id, childId)}
             onOpenSessionWindow={onOpenSessionWindow}
             onOpenCodeHostPullRequest={(url) => runAction(
               `open-code-host-pull-request:${session.id}`,
@@ -2067,6 +2095,11 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
 
       <ExtensionStatuses statuses={extensionStatuses} />
 
+      {derivationOrigin?.sideChat === true && <div className="session-schedule-notice" role="note">
+        <span>{t("session.sideChatContext")}</span>
+        {session.worktree === undefined && <span>{t("session.sideChatReadOnly")}</span>}
+        {derivationOrigin.sourceSessionAvailable && <Button onClick={() => controller.navigate({ kind: "session", sessionId: derivationOrigin.sourceSessionId })}>{t("session.sideChatReturn")}</Button>}
+      </div>}
       {exportDownload.failed && <p className="danger-text" role="alert">{t("portable.exportFailed")}</p>}
       <NativeFileActionsContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? {
         copyFile: controller.copyArtifactFile,
@@ -2123,6 +2156,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         onReobserveReview={(reviewRunId) => controller.reobserveReview(reviewRunId)}
         onAddMessageToComposer={canAddMessageReference ? addMessageToComposer : undefined}
         onAddSelectionToComposer={canAddMessageReference ? addSelectionToComposer : undefined}
+        onAskSideChat={canOpenSideChat ? openSideChat : undefined}
         onForkMessage={canForkMessage ? forkFromMessage : undefined}
         forkingMessageId={forkingMessageId}
         shareSelection={currentShareSelection === undefined ? undefined : { selectedIds: currentShareSelection.selectedIds }}

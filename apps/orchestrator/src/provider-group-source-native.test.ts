@@ -6,7 +6,7 @@ import { createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { createPiAdapter, type PiMcpBridgeOptions } from "@joko/adapter-pi";
 import { createInProcessDevicePeerHarness, NodeDevicePeerAgentExecutor } from "@joko/device-peer";
-import { OperationalStore, type ConnectionRecord } from "@joko/store";
+import { HostedAgentStore, OperationalStore, type ConnectionRecord } from "@joko/store";
 import { expect, it, vi } from "vitest";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import { ArtifactStore } from "./artifact-store.js";
@@ -216,6 +216,20 @@ it("relays guest C through B to isolated A, offers one native handoff and contin
     expect(c.store.listEvents({ sessionId }).filter(event => event.payload.type === "error" && event.payload.terminal)).toEqual([]);
     expect(f.nativeTrust.filter(entry => entry.node === "A" || entry.node === "B").every(entry => entry.trust === "guest" && entry.guestHome)).toBe(true);
     expect(b.groups.usage.usage.rows({ group: key }).some(row => row.partyId === "member-C" && row.nodeId === "B")).toBe(true);
+    const callsBeforeClone = f.calls.length;
+    const childId = (await c.host.deriveSession({ operationId: "guest-native-clone", sourceSessionId: sessionId, connection: c.connection,
+      title: "Native guest history clone", kind: "clone" })).value.sessionId;
+    expect(f.calls.length).toBe(callsBeforeClone);
+    const child = c.store.getSession(childId).descriptor;
+    expect(child.binding.nativeSessionId).not.toBe(c.store.getSession(sessionId).descriptor.binding.nativeSessionId);
+    const nativeChildren = new HostedAgentStore(b.store).list().filter(record => record.owner.sessionId === childId);
+    expect(nativeChildren).toHaveLength(1); expect(nativeChildren[0]!.derivation).toMatchObject({ kind: "clone", state: "settled", adopted: true });
+    expect(nativeChildren[0]!.storageKey).toBe(nativeChildren[0]!.derivation!.sourceKey);
+    const continued = c.host.enqueueInput({ operationId: "guest-clone-continue", connection: c.connection, sessionId: childId,
+      prompt: { text: "Continue the cloned native history", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await vi.waitFor(() => expect(c.store.getQueueItem(continued.queueItemId).state).toBe("completed"), { timeout: 30_000 });
+    expect(f.calls.slice(callsBeforeClone).every(call => call.node === "B")).toBe(true);
+    expect(f.calls.at(-1)!.body).toContain("Read original files once");
     live = false; await b.native.endpoint.sweep(); expect(a.native.slots.summary().total).toBe(0); expect(b.native.slots.summary().total).toBe(0);
   } finally { await f.close(); }
 });

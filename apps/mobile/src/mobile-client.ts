@@ -1,6 +1,7 @@
 import { isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
+import type { SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
@@ -39,7 +40,7 @@ import {
   PartnerRoutineEditor, RoutineCreationReceipts, PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor,
   PartnerGroupAttachmentSchema, PartnerGroupAttachmentCategory,
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
-  ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, SessionDerivationKind,
+  ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, OpenSideChatMutationSchema, SessionDerivationKind,
   CreateTargetMutationSchema, TargetWorkspaceInputSchema,
   CreateTaskTagMutationSchema, UpdateTaskTagMutationSchema, ReorderTaskTagsMutationSchema, SetSessionTaskTagsMutationSchema, DeleteTaskTagMutationSchema,
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
@@ -10131,6 +10132,7 @@ export class MobileClient {
     const session = this.#state.detail?.sessions.find((item) => item.sessionId === sessionId);
     const backend = this.#selectedBackend(session);
     const generation = session?.nativeBinding?.runtimeGeneration;
+    if (exactDraft.replyQuote && exactDraft.replyQuote.generation !== generation?.toString()) throw new Error('The reply belongs to the original task generation.');
     if ((!exactDraft.text.trim() && exactDraft.attachments.length === 0)
       || !sessionId || !session || !backend || !supportsText(backend) || !generation || generation < 1n) {
       throw new Error("A current task generation and a message or attachment are required.");
@@ -13030,7 +13032,7 @@ export class MobileClient {
       return matches.length === 1 && matches[0]!.support === CapabilitySupport.SUPPORTED;
     };
     const canDerive = supported(capability)
-      && (!runtime.session.worktree || supported("workspace.derive"))
+      && (capability === capabilityNames.sessionSideChat || !runtime.session.worktree || supported("workspace.derive"))
       && !this.#state.detail?.reviewRuns.some((review) => review.reviewerSessionId === runtime.session.sessionId)
       && !this.#state.pending.some((pending) => pending.sessionId === runtime.session.sessionId
         && (pending.kind.startsWith("session-") || pending.kind === "workspace-rewind"));
@@ -13043,6 +13045,70 @@ export class MobileClient {
       sourceSessionId: runtime.session.sessionId, sourceName: runtime.session.displayName
     };
     return { controls, canDerive, runtime };
+  }
+
+  taskSideChatControls() {
+    if (this.#joinedTask) return undefined;
+    const context = this.#taskDerivationContext(capabilityNames.sessionSideChat);
+    if (!context || context.runtime.session.derivationOrigin?.sideChat) return undefined;
+    return { ...context.controls, canOpen: context.canDerive && !context.runtime.session.archived,
+      children: (this.#state.owner?.sessions ?? []).filter((child) => child.derivationOrigin?.sideChat
+        && child.derivationOrigin.sourceSessionId === context.runtime.session.sessionId).slice(0, 50) };
+  }
+
+  async openSideChat(authorityKey: string, draft?: MobileComposerDraft): Promise<
+    { readonly kind: "opened"; readonly sessionId: string } | { readonly kind: "unknown" | "retired" | "rejected" }
+  > {
+    const controls = this.taskSideChatControls(), session = this.taskRuntimeControls()?.session;
+    if (!controls?.canOpen || controls.authorityKey !== authorityKey || !session) throw new Error("The side chat source changed.");
+    const credential = this.#ready(), epoch = this.#epoch, operationId = this.newId();
+    const identity = { profileId: credential.profileId, sessionId: session.sessionId };
+    const current = (): boolean => this.#current(epoch) && this.#foreground && this.#credential === credential
+      && this.taskSideChatControls()?.surfaceOwnerKey === controls.surfaceOwnerKey;
+    this.#assertNoPendingRuntimeControl(session.sessionId);
+    const action = this.#claimMutation();
+    try {
+      if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable.");
+      await this.composerDrafts.retainOperationInput(identity, operationId, draft ?? emptyMobileComposerDraft());
+      if (!current()) { await this.composerDrafts.clearOperationInput(identity, operationId); return { kind: "retired" }; }
+      const receipt = { kind: "session-side-chat" as const, sessionId: session.sessionId,
+        backendId: session.backendId, targetId: session.targetId, sourceGeneration: session.nativeBinding!.runtimeGeneration.toString() };
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [create(OperationPreconditionSchema, { entity: { kind: EntityKind.SESSION, id: session.sessionId },
+          expectedGeneration: session.nativeBinding!.runtimeGeneration })],
+        payload: { case: "openSideChat", value: create(OpenSideChatMutationSchema, { sourceSessionId: session.sessionId }) }
+      }), receipt, operationId, true, false, { signal: this.#abort!.signal, isCurrent: current,
+        beforeTerminalReceipt: async (operation) => {
+          if (operation.state === OperationState.SUCCEEDED) await this.#recoverSideChatReceipt({ ...receipt, operationId,
+            connectionId: credential.connectionId, state: "unknown" }, operation, epoch);
+        } });
+      if (!current()) return { kind: "retired" };
+      if (!result.definitive) return { kind: "unknown" };
+      await this.composerDrafts.clearOperationInput(identity, operationId);
+      if (!result.accepted) return { kind: "rejected" };
+      const child = this.#derivedTaskResult(result.operation, session, SessionDerivationKind.FORK);
+      if (!child.derivationOrigin?.sideChat) throw new Error("The result is not the original side chat.");
+      return await this.#refreshDerivedTaskList(child, current) ? { kind: "opened", sessionId: child.sessionId } : { kind: "retired" };
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async #recoverSideChatReceipt(pending: PendingOperation, operation: Operation, epoch: number): Promise<void> {
+    const credential = this.#ready(), profileId = credential.profileId;
+    const source = this.#state.owner?.sessions.find((candidate) => candidate.sessionId === pending.sessionId);
+    const payload = operation.mutation?.payload;
+    if (!source || source.backendId !== pending.backendId || source.targetId !== pending.targetId
+      || source.nativeBinding?.runtimeGeneration.toString() !== pending.sourceGeneration
+      || payload?.case !== "openSideChat" || payload.value.sourceSessionId !== source.sessionId || !this.composerDrafts) {
+      throw new Error("The retained side chat source is unavailable. Its operation was not resent.");
+    }
+    const child = this.#derivedTaskResult(operation, source, SessionDerivationKind.FORK);
+    if (!child.derivationOrigin?.sideChat) throw new Error("The original side chat receipt is invalid.");
+    const current = () => this.#current(epoch) && this.#credential === credential;
+    const draft = await this.composerDrafts.readOperationInput({ profileId, sessionId: source.sessionId }, pending.operationId);
+    if (!current()) return;
+    if (!draft || !await this.#restoreForkDraft(draft, profileId, child.sessionId, current)) {
+      throw new Error("The side chat was created, but its retained draft could not be restored. The newer draft was kept.");
+    }
   }
 
   async cloneTask(authorityKey: string, name: string, signal?: AbortSignal): Promise<MobileTaskCloneResult> {
@@ -13696,10 +13762,41 @@ export class MobileClient {
     });
   }
 
-  async setSessionArchived(sessionId: string, archived: boolean): Promise<boolean> {
+  async prepareSessionArchive(sessionId: string): Promise<{
+    readonly preview: SessionArchivePreview;
+    readonly archive: () => Promise<boolean>;
+  }> {
+    const credential = this.#ready(), abort = this.#abort;
+    const session = this.#state.owner?.sessions.find((candidate) => candidate.sessionId === sessionId);
+    const revision = session?.version?.revision?.value;
+    if (!session || session.archived || revision === undefined) throw new Error("A current active task is required.");
+    const current = (): void => {
+      if (this.#credential !== credential || this.#abort !== abort || this.#disposed
+        || !this.#foreground
+        || this.#state.owner?.sessions.find((candidate) => candidate.sessionId === sessionId)?.version?.revision?.value !== revision) {
+        throw new Error("The archive source changed. Review this task again.");
+      }
+      abort?.signal.throwIfAborted();
+    };
+    const controller = new AbortController();
+    const signal = abort === undefined ? controller.signal : AbortSignal.any([abort.signal, controller.signal]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const preview = await Promise.race([
+        this.network.readSessionArchivePreview(credential, sessionId, signal),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => { controller.abort(); reject(new Error("The archive preview timed out. Retry before archiving.")); }, 3_000);
+        })
+      ]);
+      current();
+      return { preview, archive: async () => { current(); return this.setSessionArchived(sessionId, true, preview.archiveConfirmation); } };
+    } finally { if (timer !== undefined) clearTimeout(timer); }
+  }
+
+  async setSessionArchived(sessionId: string, archived: boolean, archiveConfirmation = ""): Promise<boolean> {
     return this.#mutateSession(sessionId, "archive", {
       case: "archiveSession",
-      value: create(ArchiveSessionMutationSchema, { sessionId, archived })
+      value: create(ArchiveSessionMutationSchema, { sessionId, archived, archiveConfirmation })
     });
   }
 
@@ -14105,7 +14202,7 @@ export class MobileClient {
   #assertNoPendingRuntimeControl(sessionId: string): void {
     if (this.#state.pending.some((item) => item.kind === "model-favorite" || item.sessionId === sessionId
       && ["session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-        "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind"].includes(item.kind))) {
+        "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind"].includes(item.kind))) {
       throw new Error("A previous task control change is still pending. Check its operation before changing another setting.");
     }
   }
@@ -16225,6 +16322,11 @@ export class MobileClient {
         }
         if (!this.#current(epoch)) return;
         if (operation) {
+          if (pending.kind === "session-side-chat" && operation.state === OperationState.SUCCEEDED
+            && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId) {
+            await this.#recoverSideChatReceipt(pending, operation, epoch);
+            if (!this.#current(epoch)) return;
+          }
           if (pending.kind === "session-fork" && operation.state === OperationState.SUCCEEDED
             && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId) {
             await this.#recoverForkReceipt(pending, operation, epoch);
@@ -16241,7 +16343,7 @@ export class MobileClient {
             if (!this.#current(epoch)) return;
           }
           await this.#receipt(operation, pending, epoch);
-          if (pending.kind === "session-rewind" && exactOperation && isTerminal(operation.state) && this.#current(epoch)
+          if ((pending.kind === "session-rewind" || pending.kind === "session-side-chat") && exactOperation && isTerminal(operation.state) && this.#current(epoch)
             && !this.#state.pending.some((value) => value.operationId === pending.operationId)) {
             await this.composerDrafts?.clearOperationInput({ profileId: pending.taskJoinId
               ? mobileSharedTaskDraftProfileId(credential.profileId, credential.serverId, credential.origin, pending.taskJoinId)
@@ -16265,7 +16367,7 @@ export class MobileClient {
             && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-              "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
+              "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
             if ((pending.kind === "message-delete" || messageRewind) && this.#foreground

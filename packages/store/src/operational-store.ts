@@ -3565,7 +3565,7 @@ export class OperationalStore {
         automationOrigin?.scheduleId ?? null,
         automationOrigin?.scheduleName ?? null,
         automationOrigin?.runId ?? null,
-        derivationOrigin?.kind ?? null,
+        derivationOrigin?.sideChat === true ? "side_chat" : derivationOrigin?.kind ?? null,
         derivationOrigin?.sourceSessionId ?? null,
         derivationOrigin?.sourceMessageId ?? null,
         derivationOrigin?.sourceEventId ?? null,
@@ -7506,7 +7506,8 @@ export class OperationalStore {
       assertNativeSessionDerivationOperation(operation, normalized.sourceSessionId, normalized.sessionId, normalized.sourceBinding);
       const source = this.getSession(normalized.sourceSessionId);
       const target = this.getTarget(normalized.targetId);
-      if (source.revision !== normalized.sourceSessionRevision) {
+      const completedSnapshot = operation.kind === "fork_session" && isRecord(operation.body) && operation.body["sideChat"] === true;
+      if (completedSnapshot ? !sameNativeBinding(source.descriptor.binding, normalized.sourceBinding) : source.revision !== normalized.sourceSessionRevision) {
         throw new RevisionConflictError("Session", source.descriptor.id,
           normalized.sourceSessionRevision, source.revision);
       }
@@ -7603,7 +7604,8 @@ export class OperationalStore {
       }
       const source = this.getSession(record.sourceSessionId);
       const target = this.getTarget(record.targetId);
-      if (source.revision !== record.sourceSessionRevision || target.revision !== record.targetRevision
+      const completedSnapshot = operation.kind === "fork_session" && isRecord(operation.body) && operation.body["sideChat"] === true;
+      if ((completedSnapshot ? !sameNativeBinding(source.descriptor.binding, record.sourceBinding) : source.revision !== record.sourceSessionRevision) || target.revision !== record.targetRevision
         || !sameRemoteWorkspace(source.descriptor.remoteWorkspace, record.remoteWorkspace)
         || !sameRemoteWorkspace(target.descriptor.remoteWorkspace, record.remoteWorkspace)) {
         throw new StoreError("The remote derivation checkout source authority changed.");
@@ -8088,12 +8090,23 @@ export class OperationalStore {
       if (receipt.externalLifecycle) {
         const source = this.getSession(receipt.sourceSessionId);
         const target = this.getTarget(receipt.targetId);
+        const sideChatWorkspace = descriptor.derivationOrigin?.sideChat === true
+          ? this.findSetting<{ readonly format: number; readonly owner: string; readonly targetId: string;
+              readonly inheritedSessionId: string; readonly inheritedWorktreeLeaseId?: string; readonly path: string;
+              readonly targetRoot: string }>("service", descriptor.id, "collaboration.worker-workspace")?.value : undefined;
+        const referenceRoot = sideChatWorkspace?.format === 1 && sideChatWorkspace.owner === "side_chat"
+          && sideChatWorkspace.targetId === descriptor.targetId && sideChatWorkspace.inheritedSessionId === source.descriptor.id
+          && sideChatWorkspace.targetRoot === target.descriptor.workspaceRoot && target.descriptor.trusted
+          && sideChatWorkspace.inheritedWorktreeLeaseId === source.descriptor.worktree?.leaseId
+          && sideChatWorkspace.path === source.descriptor.worktree?.path ? sideChatWorkspace.path : undefined;
         const effectiveWorkspaceRoot = receipt.worktree?.path
           ?? descriptor.worktree?.path
+          ?? referenceRoot
           ?? receipt.remoteWorkspace?.workspaceRoot
           ?? target.descriptor.workspaceRoot;
         if (receipt.sourceSessionRevision === undefined || receipt.targetRevision === undefined
-          || source.revision !== receipt.sourceSessionRevision || target.revision !== receipt.targetRevision
+          || (descriptor.derivationOrigin?.sideChat === true ? !sameNativeBinding(source.descriptor.binding, receipt.sourceBinding)
+            : source.revision !== receipt.sourceSessionRevision) || target.revision !== receipt.targetRevision
           || this.getBackend(receipt.backendId).descriptor.instanceGeneration !== receipt.backendInstanceGeneration
           || (receipt.remoteWorktreePlan !== undefined
             && (receipt.worktree === undefined || descriptor.worktree === undefined
@@ -10822,6 +10835,7 @@ export class OperationalStore {
     readonly sessionId: string;
     readonly eventId?: string;
     readonly nativeBoundaryId?: string;
+    readonly completedAssistantOnly?: boolean;
   }): { readonly messageId: string; readonly eventId: string } | undefined {
     this.assertOpen();
     const sessionId = nonBlank(input.sessionId, "Session message origin Session ID");
@@ -10840,6 +10854,13 @@ export class OperationalStore {
       "(json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)"
     ];
     const params: Array<string | number | bigint | null> = [...(nativeVisibility?.params ?? []), sessionId];
+    if (input.completedAssistantOnly === true) {
+      clauses.push("json_extract(event.payload_json, '$.payload.role') = 'assistant'");
+      clauses.push("event.generation = ?");
+      params.push(this.getSession(sessionId).descriptor.binding.generation);
+      clauses.push("(event.run_id IS NULL OR EXISTS (SELECT 1 FROM runs AS completed_run WHERE completed_run.id = event.run_id AND completed_run.session_id = event.session_id AND completed_run.state = 'completed' AND completed_run.ended_at IS NOT NULL))");
+      clauses.push("length(json_extract(event.payload_json, '$.payload.nativeHistory.identity.entryId')) > 0");
+    }
     if (input.eventId !== undefined) {
       clauses.push("event.id = ?");
       params.push(nonBlank(input.eventId, "Session message origin Event ID"));
@@ -10869,6 +10890,20 @@ export class OperationalStore {
     if (row === undefined) return undefined;
     const event = eventFromRow(row);
     return { messageId: sessionTimelineMessageId(event), eventId: event.id };
+  }
+
+  /** A settled, currently visible anchor. Adapters must independently verify the native cutoff. */
+  findCompletedSessionAssistantOrigin(sessionId: string): {
+    readonly messageId: string; readonly eventId: string; readonly nativeEntryId: string;
+    readonly generation: number; readonly runId?: string;
+  } | undefined {
+    const origin = this.findVisibleSessionMessageOrigin({ sessionId, completedAssistantOnly: true });
+    if (origin === undefined) return undefined;
+    const event = this.findEvent(origin.eventId);
+    if (event?.payload.type !== "message_complete" || event.payload.role !== "assistant"
+      || !event.payload.nativeHistory?.identity?.entryId) return undefined;
+    return { ...origin, nativeEntryId: event.payload.nativeHistory.identity.entryId, generation: event.generation,
+      ...(event.runId === undefined ? {} : { runId: event.runId }) };
   }
 
   /**
@@ -14836,6 +14871,30 @@ export class OperationalStore {
     this.assertOpen();
     const row = this.database.prepare("SELECT * FROM schedules WHERE id = ?").get(id) as Row | undefined;
     return row === undefined ? undefined : scheduleFromRow(row);
+  }
+
+  /** Bounded user-facing projection. Hash the exact binding set without loading prompts. */
+  readSessionArchiveSchedules(sessionId: string): {
+    readonly count: number;
+    readonly names: readonly string[];
+    readonly confirmation: string;
+  } {
+    this.assertOpen();
+    this.getSession(sessionId);
+    const hash = createHash("sha256").update(JSON.stringify(["session-archive.v1", sessionId]));
+    const names: string[] = [];
+    let count = 0;
+    const rows = this.database.prepare(`
+      SELECT id, name, revision FROM schedules
+      WHERE session_id = ? AND session_mode = 'bound' AND enabled = 1 ORDER BY id
+    `).iterate(sessionId);
+    for (const row of rows) {
+      count++;
+      const name = String(row["name"]);
+      hash.update(JSON.stringify([String(row["id"]), String(row["revision"]), name]));
+      if (names.length < 20) names.push(name.slice(0, 160));
+    }
+    return { count, names, confirmation: hash.digest("hex") };
   }
 
   listSchedules(options: {
@@ -19685,8 +19744,8 @@ function sessionFromRow(row: Row): StoredSession {
   if (
     (derivationKind === undefined) !== (derivationSourceSessionId === undefined) ||
     (derivationSourceMessageId === undefined) !== (derivationSourceEventId === undefined) ||
-    (derivationKind === "fork" && derivationSourceMessageId === undefined) ||
-    (derivationKind !== undefined && derivationKind !== "fork" && derivationKind !== "clone")
+    ((derivationKind === "fork" || derivationKind === "side_chat") && derivationSourceMessageId === undefined) ||
+    (derivationKind !== undefined && derivationKind !== "fork" && derivationKind !== "clone" && derivationKind !== "side_chat")
   ) {
     throw new StoreError("Stored Session derivation origin is incomplete.");
   }
@@ -19710,7 +19769,8 @@ function sessionFromRow(row: Row): StoredSession {
         ? {}
         : {
             derivationOrigin: {
-              kind: derivationKind as "fork" | "clone",
+              kind: derivationKind === "side_chat" ? "fork" : derivationKind as "fork" | "clone",
+              ...(derivationKind === "side_chat" ? { sideChat: true as const } : {}),
               sourceSessionId: derivationSourceSessionId,
               ...(derivationSourceMessageId === undefined || derivationSourceEventId === undefined
                 ? {}
@@ -22634,6 +22694,9 @@ function normalizeSessionDerivationOrigin(
   if (value.kind !== "fork" && value.kind !== "clone") {
     throw new StoreError("Session derivation kind is invalid.");
   }
+  if (value.sideChat !== undefined && (value.sideChat !== true || value.kind !== "fork")) {
+    throw new StoreError("A side chat must be an independent native fork.");
+  }
   const sourceSessionId = boundedSessionDerivationIdentity(
     value.sourceSessionId,
     "Session derivation source Session ID"
@@ -22648,6 +22711,7 @@ function normalizeSessionDerivationOrigin(
   return {
     kind: value.kind,
     sourceSessionId,
+    ...(value.sideChat === true ? { sideChat: true as const } : {}),
     sourceMessageId: boundedSessionDerivationIdentity(
       value.sourceMessageId,
       "Session derivation source message ID"

@@ -4,6 +4,7 @@ import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor, ExtensionRoutineEventsDescriptor, ExtensionRuntimeDescriptor } from "./extension-surface-manifest.js";
+import { EXTENSION_VIEW_LIFECYCLE_ASSET, EXTENSION_VIEW_LIFECYCLE_SCRIPT } from "./extension-view-lifecycle.js";
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
 import { isolatedExtensionDocument } from "./extension-main-view-document.js";
 import type { PiInstalledPackageLease, PiResourceManager } from "./resource-manager.js";
@@ -228,7 +229,10 @@ export class ExtensionMainViewManager {
     if (!SAFE_CONNECTION_ID.test(input.connectionId)) throw new Error("Extension main-view connection ID is invalid.");
     return this.#mutate(async () => {
       await this.#destroyExpired(this.#now());
-      if (this.#surfaces.size >= this.#maximumSurfaces) {
+      const isMainView = input.authority.runtime === undefined && input.authority.routineEvents === undefined;
+      const previousViews = isMainView && input.authority.mainView.multiple !== true ? [...this.#surfaces.values()].filter(surface =>
+        surface.authority.extensionId === input.authority.extensionId && surface.authority.runtime === undefined && surface.authority.routineEvents === undefined) : [];
+      if (this.#surfaces.size - previousViews.length >= this.#maximumSurfaces) {
         throw new ExtensionMainViewError(429, "Extension main-view surface limit reached.");
       }
       await input.assertAuthorityCurrent();
@@ -269,6 +273,7 @@ export class ExtensionMainViewManager {
         await assertContainedCanonicalDirectory(packageRoot, viewRoot, "Extension main-view directory");
         const expiresAt = this.#now() + this.#ttlMs;
         const endpoint = `/v1/extensions/main-views/${id}/${token}/${encodeURIComponent(basename(input.authority.mainView.html))}`;
+        for (const previous of previousViews) await this.#destroy(previous);
         this.#surfaces.set(id, {
           id,
           tokenDigest: tokenDigest(token),
@@ -353,6 +358,11 @@ export class ExtensionMainViewManager {
         throw new ExtensionMainViewError(404, "Extension main view not found.");
       }
       if (surface.lifetime.signal.aborted) throw new ExtensionMainViewError(410, "Extension main view was revoked.");
+      if (input.assetPath === EXTENSION_VIEW_LIFECYCLE_ASSET && surface.authority.runtime === undefined && surface.authority.routineEvents === undefined) {
+        if (input.isolatedDocument === true || input.materializeAsset === "style" || input.inlineStyle !== undefined) throw new ExtensionMainViewError(404, "Extension transform type does not match its asset.");
+        return { status: 200, mimeType: MIME_TYPES[".js"]!, contentLength: EXTENSION_VIEW_LIFECYCLE_SCRIPT.byteLength,
+          ...(input.method === "HEAD" ? {} : { body: Buffer.from(EXTENSION_VIEW_LIFECYCLE_SCRIPT) }), headers: surfaceHeaders(), lifetime: surface.lifetime.signal };
+      }
       const inlineStyle = input.method === "POST" && input.materializeAsset === "style" && input.inlineStyle !== undefined;
       if (input.method !== "GET" && input.method !== "HEAD" && !inlineStyle) throw new ExtensionMainViewError(405, "Extension main views allow only read requests.");
       if (input.inlineStyle !== undefined && !inlineStyle) throw new ExtensionMainViewError(405, "Inline stylesheet transforms require POST.");
@@ -386,8 +396,10 @@ export class ExtensionMainViewManager {
       const entrypoint = resolve(surface.viewRoot, basename(surface.authority.mainView.html));
       const injectLibrary = samePath(candidate, entrypoint) && mimeType.startsWith("text/html")
         && surface.authority.library !== undefined;
+      const injectLifecycle = samePath(candidate, entrypoint) && mimeType.startsWith("text/html")
+        && surface.authority.runtime === undefined && surface.authority.routineEvents === undefined;
       const materialize = input.isolatedDocument === true || input.materializeAsset !== undefined;
-      const file = await readStableAsset(surface.viewRoot, candidate, this.#maximumAssetBytes, inlineStyle || input.method === "HEAD" && !injectLibrary && !materialize);
+      const file = await readStableAsset(surface.viewRoot, candidate, this.#maximumAssetBytes, inlineStyle || input.method === "HEAD" && !injectLibrary && !injectLifecycle && !materialize);
       input.signal?.throwIfAborted();
       try {
         await surface.lease.assertCurrent(); await surface.assertAuthorityCurrent();
@@ -398,6 +410,7 @@ export class ExtensionMainViewManager {
       }
       input.signal?.throwIfAborted();
       let transformed = inlineStyle ? Buffer.from(input.inlineStyle!) : injectLibrary && file.body !== undefined ? injectLibraryBridge(file.body) : file.body;
+      if (injectLifecycle && transformed !== undefined && !inlineStyle) transformed = injectLibraryBridge(transformed, EXTENSION_VIEW_LIFECYCLE_ASSET);
       if (materialize) {
         if (input.isolatedDocument === true && !mimeType.startsWith("text/html") || transformed === undefined) {
           throw new ExtensionMainViewError(404, "Only an allowed HTML asset can be materialized.");
@@ -415,6 +428,7 @@ export class ExtensionMainViewManager {
           ...(input.materializeAsset === undefined ? {} : { output: input.materializeAsset }),
           assertCurrent, ...(input.signal === undefined ? {} : { signal: input.signal }), read: async path => {
             if (path === LIBRARY_BRIDGE_ASSET && surface.authority.library !== undefined) return { body: LIBRARY_BRIDGE_SCRIPT, mimeType: MIME_TYPES[".js"]! };
+            if (path === EXTENSION_VIEW_LIFECYCLE_ASSET && injectLifecycle) return { body: EXTENSION_VIEW_LIFECYCLE_SCRIPT, mimeType: MIME_TYPES[".js"]! };
             let pending = read.get(path);
             if (pending === undefined) {
               if (read.size >= 1024) throw new ExtensionMainViewError(413, "Extension asset graph is too large.");
@@ -544,19 +558,20 @@ function copyAuthority(authority: ExtensionMainViewAuthority): ExtensionMainView
 }
 
 function sameMainView(left: ExtensionMainViewDescriptor | undefined, right: ExtensionMainViewDescriptor): boolean {
-  return left?.html === right.html && left.title === right.title && left.icon === right.icon;
+  return left?.html === right.html && left.title === right.title && left.icon === right.icon
+    && left.open === right.open && left.side === right.side && left.multiple === right.multiple;
 }
 
 function sameLibrary(left: ExtensionLibraryDescriptor | undefined, right: ExtensionLibraryDescriptor | undefined): boolean {
   return left?.schemaVersion === right?.schemaVersion && (left === undefined) === (right === undefined);
 }
 
-function injectLibraryBridge(html: Buffer): Buffer {
+function injectLibraryBridge(html: Buffer, asset = LIBRARY_BRIDGE_ASSET): Buffer {
   const source = html.toString("utf8");
   if (!Buffer.from(source, "utf8").equals(html)) {
     throw new ExtensionMainViewError(410, "Extension main-view entry HTML is not valid UTF-8.");
   }
-  const tag = `<script src="./${LIBRARY_BRIDGE_ASSET}"></script>`;
+  const tag = `<script src="./${asset}"></script>`;
   const head = /<head(?:\s[^>]*)?>/iu.exec(source);
   if (head !== null && head.index !== undefined) {
     const offset = head.index + head[0].length;

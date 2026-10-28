@@ -176,6 +176,7 @@ import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory
 import { PartnerMemoryPreferences } from "./partner-memory-preferences.js";
 import { PartnerConnectionPreferences, PartnerConnectionsManager } from "./partner-connections.js";
 import { PartnerRuntimePromptResolver } from "./partner-runtime-prompt.js";
+import { partnerReplyQuoteContext } from './partner-topic-context.js';
 import { PartnerGroupStore, PartnerNetworkStore } from "@joko/store";
 import { PartnerGroupSessionRuntime } from "./partner-group-runtime.js";
 import { PartnerNetworkHost } from "./partner-network-host.js";
@@ -264,6 +265,7 @@ import { PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-p
 import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { PartnerRoutineStore } from "@joko/store";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
+import { PartnerAutonomyManager } from "./partner-autonomy.js";
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
 import { partnerPackageOpening } from "./partner-package-opening.js";
@@ -533,6 +535,7 @@ export interface OrchestratorApplication {
   readonly partnerNetwork?: PartnerNetworkRuntime;
   readonly appDefaultModels?: AppDefaultModelCoordinator;
   readonly partnerRoutines?: PartnerRoutineManager;
+  readonly partnerAutonomy?: PartnerAutonomyManager;
   readonly partnerImports?: PartnerImportManager;
   readonly partnerHomes?: PartnerHomeOwner;
   readonly partnerHomeRuntime?: PartnerHomeRuntimeAdapter;
@@ -1674,6 +1677,7 @@ export async function createOrchestratorApplication(
   let startupHistoryMaintenance: HistoryMaintenance | undefined;
   let startupCleanupHandled = false;
   let startupRoutineRuntime: ExtensionRoutineRuntime | undefined;
+  let startupPartnerAutonomy: PartnerAutonomyManager | undefined;
   let startupCardRuntime: ExtensionCardRuntime | undefined;
   let startupHostedAgents: HostedAgentRuntime | undefined;
   let startupExtensionCards: ExtensionCardsManager | undefined;
@@ -1934,6 +1938,14 @@ export async function createOrchestratorApplication(
       const resolved = await partnerRuntimePrompt.resolve(session, assertCurrent);
       assertCurrent();
       return resolved ?? session.appendSystemPrompt;
+    },
+    resolvePartnerReplyQuote: (sessionId, quote) => {
+      const session = store.getSession(sessionId).descriptor, link = partnerStore.getSessionLink(sessionId);
+      if (!link || !['canonical', 'topic'].includes(link.role)) throw new Error('This task has no private Partner reply authority.');
+      const profile = partnerStore.getPartner(link.partnerId);
+      if (profile.lifecycle !== 'active' || profile.initializationState !== 'ready' || profile.homeTargetId !== session.targetId
+        || session.archived || session.deletedAt !== undefined || quote.generation !== session.binding.generation) throw new Error('The original private conversation changed.');
+      return partnerReplyQuoteContext(store, sessionId, quote);
     },
     resolveServiceRuntimeConfiguration: session => {
       const connections = partnerConnections?.runtimeIdentity(session), skills = partnerSkills?.runtimeIdentity(session);
@@ -2502,6 +2514,9 @@ export async function createOrchestratorApplication(
   schedulerForBridgeTools = scheduler;
   partnerRoutines = new PartnerRoutineManager({ partners, store, scheduler,
     storage: new PartnerRoutineStore(join(config.dataDirectory, "partner-routines")) });
+  const partnerAutonomy = new PartnerAutonomyManager({ store, profiles: partnerStore, partners, routines: partnerRoutines, tasks: partnerSessionTasks });
+  startupPartnerAutonomy = partnerAutonomy;
+  partnerRoutines.setFollowUpRuntime(partnerAutonomy);
   const extensionRoutineRuntime = new ExtensionRoutineRuntime({ catalog: extensionCatalog, resources: piResources, store,
     surfaces: extensionMainViews, engine: partnerRoutines.engine, ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
   startupRoutineRuntime = extensionRoutineRuntime;
@@ -3269,6 +3284,7 @@ export async function createOrchestratorApplication(
     mobilePush.start();
     scheduler.start();
     await partnerRoutines.start();
+    await partnerAutonomy.start();
     await partnerHomes.recover();
     await partnerImports.recover();
     await extensionRoutineRuntime.start();
@@ -3311,6 +3327,7 @@ export async function createOrchestratorApplication(
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());
     await attempt(() => extensionPackagePublisher.close());
+    await attempt(() => partnerAutonomy.stop());
     await attempt(() => partnerRoutines?.stop());
     await attempt(() => scheduler.stop());
     await attempt(() => mobilePush.close());
@@ -3485,6 +3502,7 @@ export async function createOrchestratorApplication(
     partnerIdentity,
     appDefaultModels,
     partnerRoutines,
+    partnerAutonomy,
     partnerImports,
     partnerHomes,
     partnerHomeRuntime,
@@ -3602,6 +3620,7 @@ export async function createOrchestratorApplication(
         await attempt(() => extensionMainViews.close());
         await attempt(() => extensionPackagePublisher.close());
         if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer);
+        await attempt(() => partnerAutonomy.stop());
         await attempt(() => partnerRoutines?.stop());
         await attempt(() => scheduler.stop());
         await attempt(() => mobilePush.close());
@@ -3732,6 +3751,7 @@ export async function createOrchestratorApplication(
     await attempt(() => extensionOAuth.dispose());
     await attempt(() => extensionOAuthAccounts.dispose());
     await attempt(() => startupRoutineRuntime?.stop());
+    await attempt(() => startupPartnerAutonomy?.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());
     await attempt(() => extensionPackagePublisher.close());

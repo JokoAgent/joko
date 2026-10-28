@@ -30,6 +30,7 @@ export interface HostedAgentPollCursor { readonly runId: string; readonly after:
 export interface HostedAgentPollRun { readonly runId: string; readonly cursor: number; readonly finished: boolean; readonly frames: readonly HostedAgentFrame[] }
 type AuthorizedRun = Omit<HostedAgentRunOptions, "runId" | "nativeSessionId" | "start" | "source" | "trust" | "backendId" | "providerId" | "modelId" | "name" | "permissionMode" | "fastMode" | "effort" | "workspace" | "onCreated">;
 export interface HostedAgentHostOptions {
+  readonly manageDerivation?: (principal: HostedAgentPrincipal, command: Extract<HostedAgentCall, { kind: "derivation_lifecycle" }>) => Promise<void>;
   readonly authorizeInference?: (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest) => () => void;
   readonly infer?: (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest, signal: AbortSignal) => Promise<string>;
   readonly authorize: (principal: HostedAgentPrincipal, input: HostedAgentOpen) => AuthorizedRun | Promise<AuthorizedRun>;
@@ -65,6 +66,7 @@ export class HostedAgentHost {
     readonly owner: AbortController; readonly promise: Promise<string>; readonly assertAccess: () => void }>();
   readonly #entries = new Map<string, Entry>();
   readonly #expired = new Set<string>();
+  readonly #expiredOwners = new Map<string, { readonly deviceId: string; readonly trust: "owner" | "guest" }>();
   readonly #nativeOwners = new Map<string, Entry>();
   readonly #polling = new Set<string>();
   readonly #wake = new Set<() => void>();
@@ -152,6 +154,12 @@ export class HostedAgentHost {
     return this.#entry(principal, input.runId).prepared;
   }
   async call(principal: HostedAgentPrincipal, runId: string, callId: string, command: HostedAgentCall): Promise<unknown> {
+    this.#assertPrincipal(principal);
+    if (command.kind === "derivation_lifecycle") {
+      if (!this.#options.manageDerivation) throw new HostedAgentHostError("UNAVAILABLE");
+      await this.#options.manageDerivation(principal, command); this.#assertPrincipal(principal); return null;
+    }
+    if (command.kind === "idle_release_status" && this.#confirmedClosed(principal, runId)) return "released";
     const entry = this.#entry(principal, runId), run = await entry.opening; this.#assertEntry(principal, entry);
     entry.touchedAt = this.#now(); return run.call(callId, command);
   }
@@ -164,10 +172,14 @@ export class HostedAgentHost {
     entry.touchedAt = this.#now(); return run.readArtifact(id, offset, maximum);
   }
   async close(principal: HostedAgentPrincipal, runId: string): Promise<void> {
+    this.#assertPrincipal(principal); if (this.#confirmedClosed(principal, runId)) return;
     const entry = this.#entry(principal, runId); await this.#closeEntry(entry);
   }
   activeProviderTurns(backendId: string, providerId: string): number {
     return [...this.#entries.values()].reduce((sum, entry) => sum + (entry.run?.activeProviderTurns(backendId, providerId) ?? 0), 0);
+  }
+  hasNativeDerivation(sourceKey: string, operationId: string): boolean {
+    return [...this.#entries.values()].some(entry => entry.run?.id === sourceKey && entry.run.hasNativeDerivation(operationId));
   }
   /** Internal route owner, usable after that route's captured authority ends. */
   async closePrincipal(principal: HostedAgentPrincipal): Promise<void> {
@@ -234,6 +246,7 @@ export class HostedAgentHost {
       if (revoked || entry.closedAt === undefined && (entry.run && !entry.run.ready && !entry.run.initializing || now - entry.touchedAt >= 180_000)) await this.#closeEntry(entry).catch(() => {});
       if (entry.closedAt !== undefined && now - entry.closedAt >= 60_000) {
         entry.detach?.(); entry.run?.disposeExchange(); this.#entries.delete(key); this.#expired.add(key);
+        this.#expiredOwners.set(key, { deviceId: entry.principal.deviceId, trust: entry.principal.trust });
       }
     }));
   }
@@ -243,7 +256,7 @@ export class HostedAgentHost {
     const results = await Promise.allSettled([...this.#entries.values()].map(entry => this.#closeEntry(entry)));
     for (const result of results) if (result.status === "rejected") throw new HostedAgentHostError("UNAVAILABLE");
     for (const entry of this.#entries.values()) { entry.detach?.(); entry.run?.disposeExchange(); }
-    this.#entries.clear(); this.#expired.clear(); this.#nativeOwners.clear();
+    this.#entries.clear(); this.#expired.clear(); this.#expiredOwners.clear(); this.#nativeOwners.clear();
     this.#inferences.clear();
   }
   #closeEntry(entry: Entry): Promise<void> {
@@ -272,6 +285,12 @@ export class HostedAgentHost {
   }
   #key(principal: HostedAgentPrincipal, runId: string): string {
     if (!validId(runId)) throw new HostedAgentHostError("INVALID_REQUEST"); return JSON.stringify([principal.id, runId]);
+  }
+  #confirmedClosed(principal: HostedAgentPrincipal, runId: string): boolean {
+    const owner = this.#expiredOwners.get(this.#key(principal, runId));
+    if (!owner) return false;
+    if (owner.deviceId !== principal.deviceId || owner.trust !== principal.trust) throw new HostedAgentHostError("ACCESS_DENIED");
+    return true;
   }
   #now(): number { return (this.#options.now ?? Date.now)(); }
   #notify(): void { for (const wake of [...this.#wake]) wake(); }

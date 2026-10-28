@@ -8,7 +8,8 @@ const epoch = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const schema = z.strictObject({ format: z.literal(1), remoteControlEnabled: z.boolean(), generation: epoch,
   providers: z.array(z.strictObject({ backendId: id, providerId: id, enabled: z.boolean(), generation: epoch,
     modelIds: z.array(id).max(4096).refine(ids => new Set(ids).size === ids.length).optional() })).max(10_000),
-  limits: z.strictObject({ perDevice: z.number(), total: z.number() }).optional() });
+  limits: z.strictObject({ perDevice: z.number(), total: z.number() }).optional(),
+  idleReleaseMinutes: z.number().int().min(0).max(120).optional() });
 type Value = z.infer<typeof schema>;
 export interface HostedAgentSettingsSnapshot { readonly revision: bigint; readonly value: Value }
 export type HostedAgentSettingsUpdate =
@@ -16,6 +17,7 @@ export type HostedAgentSettingsUpdate =
   | { readonly kind: "provider"; readonly backendId: string; readonly providerId: string; readonly enabled: boolean }
   | { readonly kind: "model_access"; readonly backendId: string; readonly providerId: string; readonly modelIds: readonly string[] | undefined }
   | { readonly kind: "limits"; readonly value: HostedAgentLimits }
+  | { readonly kind: "idle_release"; readonly minutes: number }
   | { readonly kind: "reset_limits" };
 
 /** Node-owned opt-in. Sharing and per-Provider settings survive a temporary
@@ -33,6 +35,7 @@ export class HostedAgentSettings {
     return { revision: row.revision, value };
   }
   limits(): HostedAgentLimits { return this.snapshot().value.limits ?? DEFAULT_HOSTED_AGENT_LIMITS; }
+  idleReleaseMinutes(): number { return this.snapshot().value.idleReleaseMinutes ?? 0; }
   providerEnabled(backendId: string, providerId: string): boolean {
     const value = this.snapshot().value;
     return value.remoteControlEnabled && value.providers.some(provider => provider.backendId === backendId && provider.providerId === providerId && provider.enabled);
@@ -85,6 +88,10 @@ export class HostedAgentSettings {
           value = { ...value, providers }; break;
         }
         case "limits": value = { ...value, limits: validateHostedAgentLimits(update.value) }; break;
+        case "idle_release": {
+          if (!Number.isSafeInteger(update.minutes) || update.minutes < 0 || update.minutes > 120) throw new Error("Idle release must be whole minutes from 0 to 120.");
+          value = { ...value, idleReleaseMinutes: update.minutes }; break;
+        }
         case "reset_limits": { const { limits: _limits, ...rest } = value; value = rest; break; }
         default: throw new Error("Hosted Agent settings operation is invalid.");
       }

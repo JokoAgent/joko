@@ -50,7 +50,7 @@ export function MobilePartnerRoutineSheet({ editor, colors, locale, onClose }: {
             <View style={styles.choices}><Switch accessibilityLabel={`${routine.definition?.name}: ${m.enabled}`} value={!!routine.definition?.enabled} disabled={locked || editor.dirty} onValueChange={() => void editor.toggle(routine)} />
               <Text style={{ color: colors.ink }}>{m.enabled}{routine.activity !== undefined ? ` · ${m.states[routine.activity] ?? m.states[0]}` : ""}</Text></View>
           </View>)}
-          {draft && <View style={styles.field}>
+          {draft && !state.selected?.builtin && <View style={styles.field}>
             {field(m.name, draft.name, name => editor.edit({ name }), false, false, 200)}
             {field(m.prompt, draft.prompt, prompt => editor.edit({ prompt }), true)}
             <View style={styles.choices}><Switch accessibilityLabel={m.enabled} value={!!draft.enabled} disabled={locked || !!state.pendingId} onValueChange={enabled => editor.edit({ enabled })} /><Text style={{ color: colors.ink }}>{m.enabled}</Text></View>
@@ -65,8 +65,9 @@ export function MobilePartnerRoutineSheet({ editor, colors, locale, onClose }: {
             {action(m.save, () => void editor.save(), locked || !!state.pendingId || !editor.dirty || !validRoutineDraft(draft))}
             {editor.dirty && action(m.discard, () => confirm(m.discardBody, () => editor.discard()), state.busy)}
           </View>}
-          {state.selected && <View style={styles.field}>{action(m.run, () => void editor.run(), locked || editor.dirty)}
-            {action(m.remove, () => confirm(m.deleteBody, () => void editor.remove()), locked || editor.dirty)}
+          {state.selected?.builtin && <Text style={{ color: colors.muted }}>{state.selected.definition?.prompt}</Text>}
+          {state.selected && <View style={styles.field}>{!state.selected.builtin && action(m.run, () => void editor.run(), locked || editor.dirty)}
+            {!state.selected.builtin && action(m.remove, () => confirm(m.deleteBody, () => void editor.remove()), locked || editor.dirty)}
             {action(m.history, () => void editor.history(), state.busy || state.requiresRefresh || !foreground)}
             {state.runs.length === 0 && <Text style={{ color: colors.muted }}>{m.noHistory}</Text>}
             {state.runs.map(run => <View key={run.id} style={styles.field}><Text style={{ color: colors.ink }}>{m.states[run.status] ?? m.states[0]} · {new Date(routineTime(run.createdAt)).toLocaleString(locale)}</Text>

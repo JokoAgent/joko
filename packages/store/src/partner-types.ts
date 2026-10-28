@@ -59,7 +59,7 @@ export interface PartnerAvatarImageRecord {
 }
 export type PartnerAvatarRecord = string | PartnerAvatarImageRecord;
 export type PartnerAvatarInput = string | { readonly base64: string };
-export type PartnerSessionRole = "canonical" | "history" | "delegation" | "group";
+export type PartnerSessionRole = "canonical" | "history" | "delegation" | "group" | "topic";
 export type PartnerPrivateThreadStatus = "active" | "closed";
 export type PartnerPrivateThreadCloseReason = "message_limit" | "idle_timeout";
 export type PartnerPrivateMessageDeliveryStatus = "pending" | "delivered" | "failed";
@@ -138,6 +138,8 @@ export interface PartnerSessionLinkRecord {
   readonly profileVersion: number;
   readonly parentSessionId?: string;
   readonly delegationId?: string;
+  readonly topicRoot?: { readonly sessionId: string; readonly generation: number; readonly eventId: string; readonly messageId: string };
+  readonly topicOperationId?: string;
   readonly createdAt: number;
 }
 

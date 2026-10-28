@@ -33,8 +33,14 @@ const prompt = z.strictObject({ text, images: z.array(z.strictObject({ blob, alt
 });
 const noArgs = ["state", "abort", "delete", "abort_retry", "commands", "resources", "tools", "tree", "history", "abort_shell"] as const;
 const callSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("derive"), derivationKind: z.enum(["fork", "clone"]), sessionId: id, targetId: id, nativeSessionId: id, entryId: id.optional(),
+    completedSnapshot: z.strictObject({ kind: z.literal("completed_assistant"), nativeBoundaryId: id }).optional() }),
+  z.strictObject({ kind: z.literal("derivation_lifecycle"), action: z.enum(["adopt", "cleanup"]), derivationKind: z.enum(["fork", "clone"]), operationId: id,
+    backendId: id, providerId: id, sourceSessionId: id, sourceTargetId: id, sourceNativeSessionId: id, sessionId: id, targetId: id, nativeSessionId: id }),
   z.strictObject({ kind: z.literal("send"), input: prompt, durableFence: z.boolean(), newGroupRound: z.boolean().optional() }),
   ...noArgs.map(kind => z.strictObject({ kind: z.literal(kind) })),
+  z.strictObject({ kind: z.literal("idle_release"), idleMinutes: z.number().int().min(1).max(120) }),
+  z.strictObject({ kind: z.literal("idle_release_status"), releaseCallId: id }),
   z.strictObject({ kind: z.literal("set_model"), providerId: id, modelId: id }),
   z.strictObject({ kind: z.literal("set_effort"), effort: id }),
   z.strictObject({ kind: z.literal("set_fast"), enabled: z.union([z.boolean(), z.literal("ultrafast")]) }),

@@ -487,7 +487,9 @@ export class FakeCodexAppServer {
           isObject(record["config"]) ? record["config"] : source.config
         );
         thread.historyMode = source.historyMode;
-        thread.turns.push(...source.turns.map((turn) => structuredClone(turn)));
+        const boundary = typeof record["lastTurnId"] === "string" ? source.turns.findIndex(turn => turn["id"] === record["lastTurnId"]) : source.turns.length - 1;
+        if (record["lastTurnId"] !== undefined && boundary < 0) throw new RpcRemoteFault(-32602);
+        thread.turns.push(...source.turns.slice(0, boundary + 1).map((turn) => structuredClone(turn)));
         await transport.emitNotification("thread/started", { thread: nativeThread(thread) });
         return sessionResponse(thread, record);
       }

@@ -50,7 +50,10 @@ export class ProviderGroupRouter {
     const cooling = this.store.cooling(input.group, this.now()), tried = this.tried(input.sessionId);
     const candidates = snapshot.config.members.map(member => {
       const status = members.find(status => status.member.key === member.key);
-      return { id: member.key, available: status?.available === true && !cooling.some(row => row.memberKey === member.key && (row.modelId === undefined || row.modelId === status?.model?.modelId)),
+      const speedSupported = input.profile.fastMode === false || (input.profile.fastMode === "ultrafast"
+        ? status?.model?.supportsUltrafastMode === true : status?.model?.supportsFastMode === true);
+      const effortSupported = input.profile.effort === undefined || status?.model?.thinkingLevels.includes(input.profile.effort) === true;
+      return { id: member.key, available: status?.available === true && speedSupported && effortSupported && !cooling.some(row => row.memberKey === member.key && (row.modelId === undefined || row.modelId === status?.model?.modelId)),
         paused: member.paused && !(member.kind === "local" && input.ownTask), running: this.leases.count(member.key, status?.running), capacity: member.capacity, weight: member.weight,
         ...(status?.quota.usagePercent === undefined ? {} : { usagePercent: status.quota.usagePercent }),
         ...(status?.quota.weeklyResetAt === undefined ? {} : { weeklyResetAt: status.quota.weeklyResetAt }),

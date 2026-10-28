@@ -52,6 +52,9 @@ export interface SessionHeaderActionsMenuProps {
   readonly onExportHtml?: (ownerDocument: Document) => void;
   readonly exportHtmlPending?: boolean;
   readonly onClone?: () => void;
+  readonly onStartSideChat?: () => void;
+  readonly sideChats?: readonly SessionView[];
+  readonly onSelectSideChat?: (sessionId: string) => void;
   readonly onLearnFromSession?: () => void;
   readonly onSplitSession?: (side: "right" | "bottom") => void;
   readonly onOpenSessionWindow?: () => void;
@@ -81,6 +84,9 @@ export function SessionHeaderActionsMenu({
   onExportHtml,
   exportHtmlPending,
   onClone,
+  onStartSideChat,
+  sideChats,
+  onSelectSideChat,
   onLearnFromSession,
   onSplitSession,
   onOpenSessionWindow,
@@ -286,6 +292,12 @@ export function SessionHeaderActionsMenu({
           <GitBranch aria-hidden="true" />
           {t("session.clone")}
         </button>}
+        {onStartSideChat !== undefined && <button type="button" role="menuitem" onClick={() => run(onStartSideChat)}>
+          <MessageSquare aria-hidden="true" />{t("session.sideChat")}
+        </button>}
+        {sideChats?.map((child) => <button key={child.id} type="button" role="menuitem" onClick={() => run(() => onSelectSideChat?.(child.id))}>
+          <MessageSquare aria-hidden="true" />{child.name}
+        </button>)}
         {onLearnFromSession !== undefined && <button type="button" role="menuitem" onClick={() => run(onLearnFromSession)}>
           <Sparkles aria-hidden="true" />
           {t("skills.learning.fromSession")}

@@ -3512,6 +3512,36 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.transport!.requests.filter((entry) => entry.method === "thread/start" || entry.method === "thread/resume")).toEqual(nativeStarts);
   });
 
+  it("snapshots only a completed assistant prefix while the parent keeps streaming and rejects an in-progress boundary", async () => {
+    const setup = await createSetup(), events: EventPayload[] = [];
+    const initial = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    const parent = setup.fake.threads.get(binding.nativeSessionId!)!;
+    parent.turns.push(historyTurn(0, "Completed assistant context"));
+    const active = { ...initial, binding, operationId: "active-parent-turn" };
+    await setup.adapter.send(prompt("Still running parent work"), active);
+    const activeTurn = parent.turns.at(-1)!, before = setup.fake.transport!.requests.length;
+    const recordBinding = vi.fn();
+    const derived = await setup.adapter.fork("history-turn-0", { ...active, operationId: "completed-side-chat" }, { sessionId: "side-chat",
+      target: setup.target, completedSnapshot: { kind: "completed_assistant", nativeBoundaryId: "history-turn-0" }, recordBinding });
+    expect(recordBinding).toHaveBeenCalledExactlyOnceWith(derived.binding);
+    expect(setup.fake.threads.get(derived.binding.nativeSessionId!)!.turns).toEqual([parent.turns[0]]);
+    expect(parent.status["type"]).toBe("active"); expect(parent.turns.at(-1)).toBe(activeTurn);
+    expect(setup.fake.transport!.requests.slice(before).some(request => request.method === "turn/interrupt")).toBe(false);
+    const starts = setup.fake.transport!.requests.filter(request => request.method === "thread/fork").length;
+    await expect(setup.adapter.fork(String(activeTurn["id"]), { ...active, operationId: "unfinished-side-chat" }, { sessionId: "invalid-side-chat",
+      target: setup.target, completedSnapshot: { kind: "completed_assistant", nativeBoundaryId: String(activeTurn["id"]) }, recordBinding: vi.fn() }))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_COMPLETED_SNAPSHOT_BOUNDARY_INVALID", stateMayHaveChanged: false } });
+    expect(setup.fake.transport!.requests.filter(request => request.method === "thread/fork")).toHaveLength(starts);
+    const persistent = { ...initial, sessionId: "side-chat", binding: derived.binding, generation: derived.binding.generation,
+      runtimePolicy: "review_read_only" as const, persistentReadOnly: "side_chat" as const };
+    await expect(setup.adapter.resumeSession(derived.binding, persistent)).resolves.toMatchObject({ permissionMode: "ask", fastMode: false });
+    await expect(setup.adapter.getNativeHistoryProjection(persistent)).resolves.toMatchObject({ events: expect.any(Array) });
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params).toMatchObject({ ephemeral: false,
+      approvalPolicy: "never", permissions: "joko-review-readonly", environments: [] });
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+  });
+
   it("rewinds paginated history to an exact retained turn and treats the retained tail as a no-op", async () => {
     const setup = await createRewindSetup();
     expect(setup.transport.requests.find((entry) => entry.method === "thread/start")?.params).toMatchObject({ historyMode: "paginated" });

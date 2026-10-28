@@ -7,12 +7,13 @@ export interface IsolatedDocument { readonly html: string; readonly policy: stri
 export function mountIsolatedSurface(frame: HTMLIFrameElement, document: Promise<IsolatedDocument>, options: {
   readonly signal: AbortSignal;
   readonly failed: () => void;
+  readonly bootstrapBaseUrl?: string;
 }): () => void {
   frame.setAttribute("sandbox", "allow-scripts");
   frame.setAttribute("referrerpolicy", "no-referrer");
   const owner = frame.ownerDocument.defaultView!;
   const nonce = `v1-${randomUuid().replaceAll("-", "")}`;
-  const url = new URL("./isolated-surface.html", owner.location.href);
+  const url = new URL("./isolated-surface.html", options.bootstrapBaseUrl ?? owner.location.href);
   url.search = ""; url.hash = nonce;
   let ready = false, sent = false, stopped = false;
   let value: IsolatedDocument | undefined;

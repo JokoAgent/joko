@@ -7,6 +7,8 @@ import { createConnectTransport } from '@joko/connection-transport';
 import { DeviceAuthorizationReceiver, parseDeviceInvitation, bindDeviceInvitationTransport, type DeviceAuthorizationPort, type DeviceAuthorizationOwner } from '@joko/connection-transport/device-authorization';
 import { createIrohClientIdentity, createTailcatClientIdentity, isEndpointTrustError, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind, trustedEndpointTransport } from "@joko/connection-transport";
 import type { NativeTaskStatusLiveSource } from "./native-task-status-sources.js";
+import { nativeTaskStatusProfileKey, type NativeTaskStatusRoute } from "./native-task-status-projection.js";
+import type { NativeTaskStatusCompletionSource } from "./native-task-status-completion.js";
 import { nativeTaskStatusAvatar } from "./native-task-status-avatar.js";
 import { readDesktopMenuBarUsage, type DesktopMenuBarSource, type DesktopMenuBarUsage } from "./desktop-menu-bar.js";
 import { bindPortableSessionImportApi } from "./portable-session-import-connection.js";
@@ -233,6 +235,7 @@ export interface ControllerState {
 }
 
 export interface AppController extends OperationApi {
+  nativeTaskStatusCompletionSource?(route: NativeTaskStatusRoute): NativeTaskStatusCompletionSource | undefined;
   readonly deviceAuthorization?: DeviceAuthorizationPort;
   deviceAuthorizationOwner?(): DeviceAuthorizationOwner;
   serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
@@ -298,6 +301,7 @@ export interface AppController extends OperationApi {
   setLinkOpenPreference(kind: LinkOpenKind, preference: LinkOpenPreference): Promise<void>;
   resetLinkOpenPreference(kind: LinkOpenKind): Promise<void>;
   setStreamFadeEnabled(enabled: boolean): Promise<void>;
+  setPartnerReplyQuotesVisible?(enabled: boolean): Promise<void>;
   resetStreamFadeEnabled(): Promise<void>;
   setSessionNotificationsEnabled(enabled: boolean): Promise<void>;
   setNewSessionWorktreeEnabled(enabled: boolean): Promise<void>;
@@ -3380,6 +3384,59 @@ export function useAppController(): AppController {
       return readDesktopMenuBarUsage(original, signal, current, refreshAccounts ? source.snapshot.providers : []);
     },
     state,
+    nativeTaskStatusCompletionSource: (route) => {
+      const profile = profilesRef.current.find(value => value.id === route.profileId && value.serverId === route.serverId);
+      if (!profile || route.profileKey !== nativeTaskStatusProfileKey(profile)) return undefined;
+      const expectedKey = remoteMachineProfileKey(profile), generation = gatewayGenerationRef.current;
+      const binding = route.epoch === undefined ? undefined : remoteMachineGatewaysRef.current.get(route.profileId);
+      const original = route.epoch === undefined ? gatewayRef.current : binding?.gateway;
+      const partner = route.partnerId === undefined ? undefined : binding?.partners?.find(value => value.id === route.partnerId
+        && value.canonicalSessionId === route.sessionId && (value.lifecycle === "active" || value.lifecycle === "paused"));
+      if (route.partnerId !== undefined && partner === undefined) return undefined;
+      const readSnapshot = (): AppSnapshot | undefined => {
+        const saved = profilesRef.current.find(value => value.id === route.profileId);
+        if (!original || !saved || remoteMachineProfileKey(saved) !== expectedKey) return undefined;
+        if (route.profileKey !== nativeTaskStatusProfileKey(saved)) return undefined;
+        if (route.epoch === undefined) return gatewayRef.current === original && gatewayGenerationRef.current === generation
+          && route.connectionGeneration === generation
+          && connectionStateRef.current === "connected" && activeProfileRef.current
+          && remoteMachineProfileKey(activeProfileRef.current) === expectedKey ? snapshotRef.current : undefined;
+        const live = remoteMachineGatewaysRef.current.get(route.profileId);
+        return live === binding && live?.gateway === original && live.connected && live.profileKey === expectedKey
+          && live.liveEpoch === route.epoch ? live.snapshot : undefined;
+      };
+      const snapshot = readSnapshot();
+      const session = snapshot?.sessions.find(value => value.id === route.sessionId && value.generation === route.generation);
+      if (!session || !original || snapshot?.generation !== route.sourceGeneration || session.hidden || session.archived
+        || session.state === "running" || session.state === "waiting" || session.state === "retrying" || session.activeRunId !== undefined) return undefined;
+      const attention = session.attention;
+      const current = (): boolean => {
+        const now = readSnapshot();
+        const value = now?.sessions.find(candidate => candidate.id === session.id);
+        const currentPartner = partner === undefined ? undefined : binding?.partners?.find(candidate => candidate.id === partner.id);
+        return now?.generation === route.sourceGeneration && value?.generation === session.generation
+          && !value.archived && !value.hidden && value.activeRunId === undefined && value.state === session.state
+          && value.attention?.attentionCursor.opaqueToken === attention?.attentionCursor.opaqueToken
+          && value.taskActivity?.runId === session.taskActivity?.runId
+          && (partner === undefined || currentPartner?.canonicalSessionId === session.id
+            && currentPartner.activity.latestReplyCursor === partner.activity.latestReplyCursor
+            && currentPartner.lifecycle === partner.lifecycle);
+      };
+      const assertCurrent = () => { if (!current()) throw new Error("The native completion owner changed."); };
+      return { session, canArchive: partner === undefined, isCurrent: current,
+        readArchivePreview: async (signal) => { assertCurrent(); const value = await original.getSessionWorktreeRemovalPreview(session.id, signal); assertCurrent(); return value; },
+        archive: async (confirmation) => { assertCurrent(); if (partner !== undefined) throw new Error("A Partner conversation cannot be archived here."); await original.archiveSession(session.id, true, confirmation); },
+        markRead: async () => {
+          assertCurrent();
+          if (partner !== undefined) {
+            if (partner.activity.latestReplyCursor === undefined) throw new Error("The Partner completion has no current read cursor.");
+            await original.markPartnerRead(partner.id, partner.activity.latestReplyCursor); return;
+          }
+          if (!attention) throw new Error("The completion has no current read receipt.");
+          if (attention.kind === "error") await original.acknowledgeSessionError(session.id, attention.attentionCursor);
+          else await original.acknowledgeSessionAttention(session.id, attention.attentionCursor);
+        } };
+    },
     ...ownerServices,
     ...(artifactGateway === undefined || state.connectionState !== "connected" ? {} : { taskSharing: artifactGateway.taskSharingApi() }),
     appDefaultModelUi: {
@@ -3476,6 +3533,7 @@ export function useAppController(): AppController {
     resetLinkOpenPreference: (kind) => updatePreferences(kind === "web"
       ? { webLinkOpenPreference: LINK_OPEN_DEFAULTS.web } : { localLinkOpenPreference: LINK_OPEN_DEFAULTS.local }),
     setStreamFadeEnabled: (streamFadeEnabled) => updatePreferences({ streamFadeEnabled }),
+    setPartnerReplyQuotesVisible: showPartnerReplyQuotes => updatePreferences({ showPartnerReplyQuotes }),
     resetStreamFadeEnabled: () => updatePreferences({ streamFadeEnabled: true }),
     setSessionNotificationsEnabled,
     setNewSessionWorktreeEnabled: (newSessionWorktreeEnabled) => updatePreferences({ newSessionWorktreeEnabled }),
@@ -3580,7 +3638,8 @@ export function useAppController(): AppController {
     deleteTaskTag: (originSessionId, preview) => gateway().deleteTaskTag(originSessionId, preview),
     suggestSessionTitle: (sessionId, signal) => gateway().suggestSessionTitle(sessionId, signal),
     pinSession: (sessionId, pinned) => gateway().pinSession(sessionId, pinned),
-    archiveSession: (sessionId, archived) => gateway().archiveSession(sessionId, archived),
+    archiveSession: (sessionId, archived, confirmation) => gateway().archiveSession(sessionId, archived, confirmation),
+    openSideChat: (sessionId, generation) => gateway().openSideChat(sessionId, generation),
     getSessionWorktreeRemovalPreview: (sessionId, signal) => gateway().getSessionWorktreeRemovalPreview(sessionId, signal),
     moveSessionProject: (sessionId, projectId, catalogImport) => gateway().moveSessionProject(sessionId, projectId, catalogImport),
     acknowledgeSessionAttention: (sessionId, throughCursor) => gateway().acknowledgeSessionAttention(sessionId, throughCursor),
@@ -3886,6 +3945,7 @@ export function useAppController(): AppController {
     getPartnerDirectory: (signal) => gateway().getPartnerDirectory(signal),
     listPartners: (lifecycle, signal) => gateway().listPartners(lifecycle, signal),
     partnerRoutineApi: (partnerId, ownerKey) => gateway().partnerRoutineApi(partnerId, ownerKey),
+    partnerAutonomyApi: ownerKey => gateway().partnerAutonomyApi(ownerKey),
     partnerGroupApi: ownerKey => gateway().partnerGroupApi(ownerKey),
     mcpAppApi: () => gateway().mcpAppApi(),
     extensionCardApi: () => gateway().extensionCardApi(),
@@ -3923,6 +3983,8 @@ export function useAppController(): AppController {
     updatePartnerDefaults: (expectedDirectoryRevision, capabilities, signal) =>
       gateway().updatePartnerDefaults(expectedDirectoryRevision, capabilities, signal),
     listPartnerSessions: (partnerId, signal) => gateway().listPartnerSessions(partnerId, signal),
+    getPartnerTopic: (sessionId, signal) => gateway().getPartnerTopic(sessionId, signal),
+    ensurePartnerTopic: (operationId, partnerId, revision, root, signal) => gateway().ensurePartnerTopic(operationId, partnerId, revision, root, signal),
     listPartnerSessionTasks: (partnerId, signal) => gateway().listPartnerSessionTasks(partnerId, signal),
     controlPartnerSessionTask: (partnerId, revision, task, action, signal) => gateway().controlPartnerSessionTask(partnerId, revision, task, action, signal),
     markPartnerRead: (partnerId, throughCursor, signal) => gateway().markPartnerRead(partnerId, throughCursor, signal),

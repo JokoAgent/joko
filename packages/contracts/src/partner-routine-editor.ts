@@ -48,7 +48,7 @@ export class PartnerRoutineEditor {
   }
   select(routine?: PartnerRoutine): void { if (!this.state.busy && !this.state.requiresRefresh && !this.dirty) this.#select(routine); }
   discard(): void { if (!this.state.busy) this.#select(this.state.selected); }
-  edit(patch: Partial<RoutineDefinition>): void { if (this.writable && this.state.draft) this.#set({ draft: create(RoutineDefinitionSchema, { ...this.state.draft, ...patch }) }); }
+  edit(patch: Partial<RoutineDefinition>): void { if (this.writable && !this.state.selected?.builtin && this.state.draft) this.#set({ draft: create(RoutineDefinitionSchema, { ...this.state.draft, ...patch }) }); }
   async refresh(): Promise<void> {
     if (this.dirty) return;
     await this.#perform(async signal => {
@@ -119,7 +119,7 @@ export class PartnerRoutineEditor {
   }
   async run(): Promise<void> {
     const { catalog, selected } = this.state;
-    if (!this.writable || this.dirty || !catalog?.partnerRevision || !selected) return;
+    if (!this.writable || this.dirty || !catalog?.partnerRevision || !selected || selected.builtin) return;
     await this.#perform(async signal => {
       let requestId = await this.receipts.readRun(this.partnerId, selected.id);
       if (!requestId) { requestId = this.api.newRequestId(); await this.receipts.claimRun(this.partnerId, selected.id, requestId); }
@@ -131,7 +131,7 @@ export class PartnerRoutineEditor {
   }
   async remove(): Promise<void> {
     const { catalog, selected } = this.state;
-    if (!this.writable || !catalog?.partnerRevision || !selected || this.dirty) return;
+    if (!this.writable || !catalog?.partnerRevision || !selected || selected.builtin || this.dirty) return;
     await this.#perform(async signal => {
       await this.api.remove(catalog.partnerRevision!.value, selected, signal); this.#current(signal);
       this.#set({ catalog: { ...catalog, routines: catalog.routines.filter(item => item.id !== selected.id) } }); this.#select();

@@ -10,6 +10,8 @@ import { MobileNavigationFrame } from "./MobileNavigationFrame";
 import { MobileTaskHeaderButtons } from "./MobileTaskHeaderChrome";
 import { useMobileTaskHeaderRole } from "./use-mobile-task-header-role";
 import { mobileTaskHeaderNotice } from "./mobile-task-header-notice";
+import { archiveMobileSession } from "./mobile-session-archive";
+import { mobileSideChatCopy } from "./mobile-side-chat";
 import { mobileTaskControlsRegion } from "./mobile-task-controls-region";
 import { SvgXml } from "react-native-svg";
 import { StatusBar } from "expo-status-bar";
@@ -32,6 +34,7 @@ import { mobileFilesPreviewCanSwipe, type MobileFilesPreviewPager as FilesPrevie
 import { MobileTimelineImage } from "./MobileTimelineImage";
 import { MobileUploadLeaveDecision } from "./mobile-upload-leave-decision";
 import { MobileUserMessageContent } from "./MobileUserMessageContent";
+import { normalizeMobileReplyQuote } from './mobile-composer-document';
 import { MobilePendingNewTaskConversation } from "./MobilePendingNewTaskConversation";
 import { MobileMessageRunFacts } from "./MobileMessageRunFacts";
 import { MobileMcpAppCard } from "./MobileMcpAppCard";
@@ -90,6 +93,7 @@ import {
   mobilePartnerDeletionReceipts,
   mobilePartnerRestartReceipts,
   mobileThemePreferences,
+  mobileReplyQuotePreferences,
   mobileFilesPreferences,
   mobileVoicePreferences,
   mobileUpdates
@@ -1410,7 +1414,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     }
   };
   const togglePin = (session: Session): void => runMutation(() => client.setSessionPinned(session.sessionId, !session.pinned));
-  const toggleArchive = (session: Session): void => runMutation(() => client.setSessionArchived(session.sessionId, !session.archived));
+  const toggleArchive = (session: Session): void => runMutation(() => session.archived
+    ? client.setSessionArchived(session.sessionId, false)
+    : archiveMobileSession(client, session.sessionId, locale, () => foreground && mountedRef.current && AppState.currentState === "active"));
   const openOptions = (session: Session): void => {
     if (!foreground || !mountedRef.current || AppState.currentState !== "active") return;
     if (state.status !== "connected" && state.status !== "offline") return;
@@ -3609,6 +3615,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
   const [timelinePreviewSource, setTimelinePreviewSource] = useState<MobileTimelineArtifact>();
   const [messageFocusHighlight, setMessageFocusHighlight] = useState<string>();
+  const [replyQuoteFocus, setReplyQuoteFocus] = useState<{ readonly ownerKey: string; readonly generation: string; readonly focus: MobileNativeIntentMessageFocus }>();
+  const quoteDisplay = useSyncExternalStore(listener => mobileReplyQuotePreferences.subscribe(listener), () => mobileReplyQuotePreferences.snapshot);
+  useEffect(() => { void mobileReplyQuotePreferences.hydrate(); }, []);
   const [searchOwner, setSearchOwner] = useState<string>();
   const [searchFocus, setSearchFocus] = useState<MobileConversationSearchHit & { readonly scope: string }>();
   const searchFocusRef = useRef(searchFocus); searchFocusRef.current = searchFocus;
@@ -3938,13 +3947,15 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ));
   }, [activeOptimisticOperationIds, latestObservedRows, optimisticOwnerKey, optimisticUserRows,
     state.selectedId, state.status]);
-  const activeMessageFocus = messageFocus?.sessionId === state.selectedId ? messageFocus : undefined;
+  const quoteFocus = replyQuoteFocus && replyQuoteFocus.ownerKey === client.taskHeaderSourceKey() && replyQuoteFocus.generation === session?.nativeBinding?.runtimeGeneration.toString()
+    ? replyQuoteFocus.focus : undefined;
+  const activeMessageFocus = (quoteFocus ?? messageFocus)?.sessionId === state.selectedId ? quoteFocus ?? messageFocus : undefined;
   const messageFocusIndex = activeMessageFocus === undefined
     ? -1
     : displayRows.findIndex((item) => mobileWorkContains(item,
       (row) => mobileNativeIntentMessageMatches(activeMessageFocus, row)));
-  const messageFocusKey = messageFocus && messageFocusIndex >= 0
-    ? `${messageFocus.requestId}\u001f${messageFocus.messageId}\u001f${messageFocus.messageEventId ?? ""}`
+  const messageFocusKey = activeMessageFocus && messageFocusIndex >= 0
+    ? `${activeMessageFocus.requestId}\u001f${activeMessageFocus.messageId}\u001f${activeMessageFocus.messageEventId ?? ""}`
     : undefined;
   const focusedWorkKey = JSON.stringify(activeMessageFocus === undefined ? [] : mobileWorkExpansionKeys(displayRows,
     (row) => mobileNativeIntentMessageMatches(activeMessageFocus, row)));
@@ -4024,6 +4035,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   }, [objectiveApi?.ownerKey]);
   const nativeTreeControls = state.status === "connected" ? client.taskNativeTreeControls() : undefined;
   const cloneControls = state.status === "connected" ? client.taskCloneControls() : undefined;
+  const sideChatControls = state.status === "connected" && !partnerIdentity.partner && !workerReadOnly
+    ? client.taskSideChatControls() : undefined;
+  const [sideChatsVisible, setSideChatsVisible] = useState(false);
   const [cloneVisible, setCloneVisible] = useState(false);
   const [forkEventId, setForkEventId] = useState<string>();
   const forkControls = state.status === "connected" && forkEventId ? client.taskMessageForkControls(forkEventId) : undefined;
@@ -4595,12 +4609,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ? buildMobileMessageActions(messageAction.row, {
       canDelete: !workerReadOnly && client.canDeleteMessage(messageAction.row.eventId), locale, copyDisabled: copyBusy,
       canAddToComposer: composerOwnerReady && messageAction.reference !== undefined,
+      canReplyQuote: composerOwnerReady && partnerIdentity.partner !== undefined && messageAction.reference !== undefined,
       canFork: !workerReadOnly && !state.busy && !attachmentBusy && !voice.busy && client.taskMessageForkControls(messageAction.row.eventId)?.canFork === true,
       canRewind: !workerReadOnly && !state.busy && !attachmentBusy && !voice.busy && queueEdit === undefined
         && client.taskMessageRewindControls(messageAction.row.eventId)?.canRewind === true,
       shareDisabled: conversationShareDisabled
     }).filter((item) => state.status === "connected" || item.id === "copy-link" || item.id === "copy-text"
-      || state.status === "offline" && item.id === "add-to-composer")
+      || state.status === "offline" && (item.id === "add-to-composer" || item.id === 'reply'))
     : [];
   useMobileScreenshotSelection({ owner: client.conversationShareOwnerKey(), selectionActive: conversationShare.active,
     blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || taskActionsVisible || interactionVisible || contextVisible
@@ -5612,6 +5627,32 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       setLocalError(errorText(failure));
     }
   };
+  const askInSideChat = (selection?: MobileComposerSelection): void => {
+    const controls = client.taskSideChatControls();
+    if (!controls?.canOpen || state.busy || voice.busy || attachmentBusy) return;
+    let sideDraft: MobileComposerDraft | undefined;
+    try {
+      if (selection !== undefined) {
+        const captured = quoteSelection;
+        const identity = draftIdentityRef.current;
+        if (!captured || !identity || captured.draftIdentityKey !== mobileComposerDraftIdentityKey(identity)
+          || captured.draft !== (queueEditRef.current?.stashedDraft ?? composerDraftRef.current)
+          || AppState.currentState !== "active") throw new Error(mobileMessage(locale, "task.error.quoteComposerChanged"));
+        const latest = timelineRows(client.state.window
+          ?? [...client.state.older, ...(client.state.detail?.timeline ?? []), ...client.state.live])
+          .find((row) => row.eventId === captured.lease.sourceEventId && row.id === captured.lease.sourceMessageId);
+        sideDraft = commitMobileQuoteSelection({ lease: captured.lease, currentSessionId: client.state.selectedId,
+          latestRow: latest, selection, draft: emptyMobileComposerDraft(), atomId: randomUUID() }).draft;
+      }
+      setQuoteSelection(undefined);
+      void client.openSideChat(controls.authorityKey, sideDraft).then(async (result) => {
+        if (!taskMountedRef.current) return;
+        if (result.kind === "opened") await client.select(result.sessionId);
+        else if (result.kind === "unknown") setLocalError(mobileSideChatCopy(locale).unknown);
+      }).catch((failure) => { if (taskMountedRef.current) setLocalError(errorText(failure)); });
+    } catch (failure) { setLocalError(errorText(failure)); }
+  };
+
   const addSelectedQuote = (selection: MobileComposerSelection): void => {
     const captured = quoteSelection;
     const identity = draftIdentityRef.current;
@@ -5748,6 +5789,18 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     }
     if (action === "copy-link") {
       void copyPublicTaskLink(latest);
+      return;
+    }
+    if (action === 'reply') {
+      const identity = draftIdentityRef.current, active = queueEditRef.current, generation = session?.nativeBinding?.runtimeGeneration;
+      if (!identity || !generation || !partnerIdentity.partner || !composerOwnerReady || voice.busy || latest.partnerPrivateOrigin
+        || identity.profileId !== client.taskDraftProfileId() || identity.sessionId !== selected.sessionId) return;
+      const text = buildMobileMessageCopyText(latest, locale).replace(/\s+/gu, ' ').trim();
+      const replyQuote = normalizeMobileReplyQuote({ generation: generation.toString(), eventId: latest.eventId, messageId: latest.id,
+        role: latest.kind, excerpt: text.length > 280 ? text.slice(0, 279) + '…' : text });
+      const next = { ...(active?.stashedDraft ?? composerDraftRef.current), replyQuote };
+      if (active) { const updated = { ...active, stashedDraft: next }; queueEditRef.current = updated; setQueueEdit(updated); mobileComposerDrafts.save(identity, next); }
+      else { saveNormalDraft(next, identity); composerInputRef.current?.focus(); }
       return;
     }
     if (action === "add-to-composer") {
@@ -6181,8 +6234,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const sourceLabel = taskSource && (sourceName ? mobileMessage(locale, taskSource.senderPartnerName?.trim()
           ? "task.messageSourcePartner" : "task.messageSourceNamed", { name: sourceName }) : mobileMessage(locale, "task.messageSource"));
         const delegatedOnly = delegatedCards.length > 0 && item.tool === undefined;
-        const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && messageFocus !== undefined
-          && mobileNativeIntentMessageMatches(messageFocus, item);
+        const quoteSource = item.replyQuote ? latestObservedRows.find(row => row.id === item.replyQuote!.messageId && ['user', 'assistant'].includes(row.kind)) : undefined;
+        const quoteSourceText = quoteSource ? buildMobileMessageCopyText(quoteSource, locale).replace(/\s+/gu, ' ').trim() : item.replyQuote?.excerpt;
+        const replyQuoteText = quoteSourceText && quoteSourceText.length > 280 ? quoteSourceText.slice(0, 279) + '…' : quoteSourceText;
+        const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && activeMessageFocus !== undefined
+          && mobileNativeIntentMessageMatches(activeMessageFocus, item);
         const markdownOwnerKey = `${taskDraftProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
         return <View accessibilityLiveRegion={linked ? "polite" : undefined}
           collapsable={false} ref={(view) => {
@@ -6226,6 +6282,16 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         {partnerIdentity.partner && item.partnerPrivateOrigin && item.kind === "assistant" && <Text style={[styles.caption, { color: colors.muted }]}>
           {mobileMessage(locale, "partnerConversation.privateReply")}
         </Text>}
+        {partnerIdentity.partner && quoteDisplay.visible && item.replyQuote && <Pressable accessibilityRole="button" onPress={() => {
+          const quote = item.replyQuote!, ownerKey = client.taskHeaderSourceKey(), sessionId = state.selectedId;
+          if (!ownerKey || !sessionId || quote.generation !== session?.nativeBinding?.runtimeGeneration.toString()) return;
+          void client.around(quote.eventId).then(() => { if (taskMountedRef.current && client.taskHeaderSourceKey() === ownerKey && client.state.selectedId === sessionId)
+            setReplyQuoteFocus({ ownerKey, generation: quote.generation, focus: { requestId: Date.now(), sessionId, messageId: quote.messageId, messageEventId: quote.eventId } });
+          }).catch(failure => { if (taskMountedRef.current && client.taskHeaderSourceKey() === ownerKey) setLocalError(errorText(failure)); });
+        }} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <Text style={[styles.caption, { color: colors.muted }]}>{item.replyQuote.role === 'assistant' ? partnerIdentity.partner.displayName : locale === 'zh-CN' ? '你' : 'You'}</Text>
+          <Text style={[styles.body, { color: colors.ink }]}>{replyQuoteText || (locale === 'zh-CN' ? '仅附件消息' : 'Attachment-only message')}</Text>
+        </Pressable>}
         {item.collaboration ? <MobileCollaborationMessageCard message={item.collaboration} blockKey={item.id} ownerKey={blockOwnerKey}
           colors={colors} locale={locale} enabled={state.status === "connected" || state.status === "offline"}
           canOpen={state.status === "connected" && !!collaborationApi && !state.busy && !voice.busy && !attachmentBusy && !navigationBusy}
@@ -6350,6 +6416,15 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         modelId={session?.model?.model?.modelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
         failed={taskAccountUsage.failed} now={taskAccountUsage.now} colors={colors} locale={locale} />}
       actions={([
+        ...(partnerIdentity.partner ? [{ id: 'reply-quotes', label: locale === 'zh-CN' ? `${quoteDisplay.visible ? '隐藏' : '显示'}引用` : `${quoteDisplay.visible ? 'Hide' : 'Show'} reply quotes`,
+          onPress: () => { void mobileReplyQuotePreferences.save(!quoteDisplay.visible).catch(failure => setLocalError(errorText(failure))); }, disabled: !quoteDisplay.ready || quoteDisplay.saving }] : []),
+        ...(sideChatControls?.canOpen ? [{ id: "side-chat" as const, label: mobileSideChatCopy(locale).create,
+          onPress: () => askInSideChat(), disabled: state.busy || voice.busy || attachmentBusy }] : []),
+        ...(sideChatControls && sideChatControls.children.length > 0 ? [{ id: "side-chats" as const, label: mobileSideChatCopy(locale).list,
+          onPress: () => setSideChatsVisible(true), disabled: state.busy || voice.busy || attachmentBusy }] : []),
+        ...(session?.derivationOrigin?.sideChat && session.derivationOrigin.sourceSessionAvailable ? [{ id: "side-chat-parent" as const,
+          label: mobileSideChatCopy(locale).back, onPress: () => { void client.select(session.derivationOrigin!.sourceSessionId)
+            .catch((failure) => setLocalError(errorText(failure))); }, disabled: state.busy || voice.busy || attachmentBusy }] : []),
         ...(!partnerIdentity.partner && state.taskSource?.kind !== "joined" && headerRole.role !== "worker" ? [
           { id: "rename" as const, label: mobileMessage(locale, "common.rename"),
             onPress: () => {
@@ -6361,7 +6436,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             onPress: () => { if (headerSourceKey && session) mutateTaskMetadata(headerSourceKey, () => client.setSessionPinned(session.sessionId, !session.pinned)); },
             disabled: !headerSourceKey || headerRole.role === undefined || state.status !== "connected" || state.busy || attachmentBusy || voice.busy },
           { id: "archive" as const, label: mobileMessage(locale, session?.archived ? "common.restore" : "common.archive"),
-            onPress: () => { if (headerSourceKey && session) mutateTaskMetadata(headerSourceKey, () => client.setSessionArchived(session.sessionId, !session.archived)); },
+            onPress: () => { if (headerSourceKey && session) mutateTaskMetadata(headerSourceKey, () => session.archived
+              ? client.setSessionArchived(session.sessionId, false)
+              : archiveMobileSession(client, session.sessionId, locale, () => taskMetadataCurrent(headerSourceKey))); },
             disabled: !headerSourceKey || headerRole.role === undefined || state.status !== "connected" || state.busy || attachmentBusy || voice.busy },
           { id: "delete" as const, label: mobileMessage(locale, "common.deleteTask"), destructive: true,
             onPress: deleteCurrentTask,
@@ -6767,6 +6844,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         colors={colors} onClose={dismissRuntimeCommandPalette}
         onRefresh={loadRuntimeCommandCatalog} onRetry={loadRuntimeCommandCatalog}
         onSelect={(candidate) => { void commitRuntimeCommand(candidate); }} />
+      {draft.replyQuote && !queueEdit && <View style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+        <Text style={[styles.caption, { color: colors.ink }]} numberOfLines={3}>{draft.replyQuote.excerpt || (locale === 'zh-CN' ? '仅附件消息' : 'Attachment-only message')}</Text>
+        <Action label={mobileMessage(locale, 'common.close')} colors={colors} compact disabled={!composerOwnerReady || state.busy || voice.busy}
+          onPress={() => { const { replyQuote: _quote, ...next } = composerDraftRef.current; if (draftIdentityRef.current) saveNormalDraft(next, draftIdentityRef.current); }} />
+      </View>}
       <View style={styles.composerRow}>
         {queueEdit ? <TextInput ref={queueInputRef} accessibilityLabel={mobileMessage(locale, "composer.queuedInput")} multiline
           value={composerOwnerReady ? draft.text : ""} selection={composerSelection}
@@ -6940,7 +7022,15 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       colors={colors} onClose={() => setCommandHelpItems(undefined)} />
     <MobileQuoteSelectionSheet lease={state.status === "connected" ? quoteSelection?.lease : undefined} locale={locale}
       colors={colors} busy={state.busy || voice.busy}
-      onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote} />
+      onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote}
+      onAskSideChat={sideChatControls?.canOpen ? askInSideChat : undefined} />
+    <MobileActionSheet visible={sideChatsVisible && sideChatControls !== undefined && state.status === "connected"}
+      items={(sideChatControls?.children ?? []).map((child) => ({ id: child.sessionId, label: child.displayName, disabled: state.busy }))}
+      colors={colors} locale={locale} onClose={() => setSideChatsVisible(false)} onAction={(id) => {
+        const current = client.taskSideChatControls();
+        if (current?.authorityKey !== sideChatControls?.authorityKey || !current?.children.some((child) => child.sessionId === id)) return;
+        void client.select(id).catch((failure) => { if (taskMountedRef.current) setLocalError(errorText(failure)); });
+      }} />
     <MobileTaskRenameSheet visible={renameTask !== undefined && renameTask.ownerKey === headerSourceKey
       && state.status === "connected" && headerRole.role !== undefined && !workerReadOnly && !partnerIdentity.partner}
       ownerKey={renameTask?.ownerKey} name={renameTask?.name ?? ""} busy={state.busy || attachmentBusy || voice.busy}

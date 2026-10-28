@@ -7,6 +7,7 @@ import type { AppController } from "../controller.js";
 import { emptySnapshot, type PartnerActivityView, type PartnerPrivateThreadView, type PartnerProfileView, type SessionView, type TimelineItemView } from "../model.js";
 import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
 import { Timeline } from "./Timeline.js";
+import { setPendingPartnerReplyQuote } from '../partner-reply-quote.js';
 import { ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
   GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema,
   type PartnerHomeApi, type PartnerMemoryApi, type PartnerConnectionsApi, type ConnectionsDetail, type PartnerLearningFeedbackView } from "@joko/contracts";
@@ -46,6 +47,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
+  setPendingPartnerReplyQuote(JSON.stringify(['node', 'profile', 'session', '1']), undefined);
   document.body.replaceChildren(); document.body.className = "";
   vi.restoreAllMocks(); vi.unstubAllGlobals();
   if (originalScrollTo === undefined) Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
@@ -53,6 +55,22 @@ afterEach(async () => {
 });
 
 describe("mounted Partner conversation", () => {
+  it('retries opening the exact original topic operation and navigates only after its receipt', async () => {
+    const root = { sessionId: 'session', generation: 1n, eventId: 'event-answer', messageId: 'answer' };
+    const ensurePartnerTopic = vi.fn().mockRejectedValueOnce(new Error('Reply lost')).mockResolvedValueOnce({
+      partnerId: 'partner', sessionId: 'separate-topic', role: 'topic', topicRoot: root, available: true, deleted: false, profileVersion: 1n
+    });
+    const navigate = vi.fn(), view = await mount(controller({ ensurePartnerTopic, navigate }));
+    const button = () => [...view.host.querySelectorAll<HTMLButtonElement>("button[aria-label='Discuss in a separate topic']")].at(-1)!;
+    await act(async () => { button().click(); await settle(); });
+    expect(navigate).not.toHaveBeenCalled();
+    await act(async () => { button().click(); await settle(); });
+    expect(ensurePartnerTopic).toHaveBeenCalledTimes(2);
+    expect(ensurePartnerTopic.mock.calls[0]![0]).toBe(ensurePartnerTopic.mock.calls[1]![0]);
+    expect(ensurePartnerTopic.mock.calls[1]!.slice(1)).toEqual(['partner', 1n, root]);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: 'session', sessionId: 'separate-topic' });
+  });
+
   it.each(["memory", "skills"] as const)("opens the original %s settings from a completed assistant learning receipt", async destination => {
     const selected = { ...partner(), capabilities: { ...partner().capabilities,
       modelChain: [{ backendId: "backend", providerId: "provider", modelId: "model", fastMode: false }] } }, owner = { partnerId: selected.id, homeTargetId: selected.homeTargetId,
@@ -116,7 +134,8 @@ describe("mounted Partner conversation", () => {
     expect(view.host.querySelector(".message-usage")).toBeNull();
     expect(view.host.querySelector("[aria-label='timeline.copy']")).not.toBeNull();
     await act(async () => view.host.querySelector<HTMLButtonElement>(".message-assistant [aria-label='timeline.reply']")!.click());
-    expect(view.reply).toHaveBeenCalledWith(expect.objectContaining({ id: "answer", text: "A useful answer." }));
+    expect(view.reply).not.toHaveBeenCalled();
+    expect(view.host.querySelector('[data-pending-reply-quote]')?.textContent).toBe('A useful answer.');
     await flushFrames();
     expect(view.app.markPartnerRead).toHaveBeenCalledExactlyOnceWith("partner", 91n, expect.any(AbortSignal));
     expect(view.host.querySelector(".partner-unread-divider")).not.toBeNull();
@@ -228,7 +247,7 @@ async function mount(app = controller(), active = true, streaming = false, items
     pinned: false, archived: false, fastMode: false, planMode: false, permissionMode: "ask", updatedAt: 1 };
   const ownerKey = `mounted-partner-${frameId}`;
   const render = async (currentItems: readonly TimelineItemView[] = items) => act(async () => {
-    root.render(<PartnerConversationProvider controller={app} session={session} active={active} t={(key) => key}><Timeline
+    root.render(<PartnerConversationProvider controller={app} session={session} active={active} t={(key) => key}><PendingQuoteProbe /><Timeline
       ownerKey={ownerKey} viewportOwnerKey={ownerKey} sessionId={session.id} sessionName={session.name}
       sessionActive={streaming} items={currentItems} hasEarlier={false} historyLoading={false} locale="en" streamFadeEnabled={false} messageNavRailEnabled={false}
       t={(key) => key} onLoadEarlier={async () => undefined} onArtifactUrl={async () => ""} onArtifactUrlRelease={vi.fn()} onArtifactDownload={vi.fn()}
@@ -238,6 +257,7 @@ async function mount(app = controller(), active = true, streaming = false, items
   await render();
   return { host, app, reply, render };
 }
+function PendingQuoteProbe() { const value = usePartnerConversation(); return <output data-pending-reply-quote="">{value?.replyQuote?.excerpt}</output>; }
 function controller(overrides: Partial<AppController> = {}): AppController {
   return { state: { ready: true, connectionState: "connected", activeProfile: { id: "profile", serverId: "node", origin: "https://node.invalid" }, snapshot: emptySnapshot() },
     partnerHomeApi: (ownerKey: string): PartnerHomeApi => ({ ownerKey,

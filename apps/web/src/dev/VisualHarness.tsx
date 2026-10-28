@@ -2107,7 +2107,8 @@ export function VisualHarness(): JSX.Element {
       getSessionWorktreeRemovalPreview: async (sessionId: string) => {
         record(`worktree-removal-preview:${sessionId}:${scenario.worktreeRemoval}`);
         if (scenario.worktreeRemoval === "unknown") throw new Error("The visual workspace state is unavailable.");
-        return { hasWorktree: true, dirty: scenario.worktreeRemoval === "dirty" };
+        return { hasWorktree: true, dirty: scenario.worktreeRemoval === "dirty",
+          activeBoundScheduleCount: 0, activeBoundScheduleNames: [], archiveConfirmation: "a".repeat(64) };
       },
       deleteSession: async (sessionId: string): Promise<void> => {
         record(`delete:${sessionId}`);

@@ -108,7 +108,7 @@ describe("DesktopRemoteDesktopSettings", () => {
   });
 
   it.each([
-    ["installRequired", "Install Joko for all users in Program Files"],
+    ["installRequired", "Lock-screen setup is unavailable for this installation"],
     ["unavailable", "The system service is unavailable"]
   ] as const)("shows %s recovery without offering authorization", async (windowsSupport, message) => {
     const fixture = remoteDesktopFixture(snapshot({ enabled: true, windowsSupport }));
@@ -117,6 +117,15 @@ describe("DesktopRemoteDesktopSettings", () => {
     expect(host.textContent).toContain(message);
     expect(button(host, "Authorize").disabled).toBe(true);
     expect(fixture.api.configureWindowsSupport).not.toHaveBeenCalled();
+  });
+
+  it("shows safe setup step and OS diagnostics for administrator recovery", async () => {
+    const fixture = remoteDesktopFixture(snapshot({ enabled: true, windowsSupport: "missing",
+      windowsSupportDiagnostic: { step: "elevate-child", childStep: "protected-reparse", osError: 5 } }));
+    installDesktop(fixture.api);
+    const { host } = await render(<DesktopRemoteDesktopSettings t={t} />);
+    expect(host.textContent).toContain("Setup step: elevate-child/protected-reparse. Windows error: 5.");
+    expect(button(host, "Authorize").disabled).toBe(false);
   });
 });
 

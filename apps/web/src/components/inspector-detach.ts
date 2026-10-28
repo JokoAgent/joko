@@ -21,9 +21,11 @@ export async function activateDetachedInspectorWindow(desktop: JokoDesktopApi | 
 }
 
 export function openDetachedInspectorWindow(
-  openWindow: (url?: string | URL, target?: string, features?: string) => Window | null = window.open.bind(window)
+  openWindow: (url?: string | URL, target?: string, features?: string) => Window | null = window.open.bind(window),
+  windowId?: string
 ): Window | null {
-  return openWindow(INSPECTOR_WINDOW_URL, INSPECTOR_WINDOW_FRAME_NAME, INSPECTOR_WINDOW_FEATURES);
+  if (windowId !== undefined && !/^[0-9a-f]{32}$/u.test(windowId)) throw new TypeError("Inspector window identity is invalid.");
+  return openWindow(INSPECTOR_WINDOW_URL, windowId === undefined ? INSPECTOR_WINDOW_FRAME_NAME : `${INSPECTOR_WINDOW_FRAME_NAME}-${windowId}`, INSPECTOR_WINDOW_FEATURES);
 }
 
 export function initializeDetachedInspectorHost(

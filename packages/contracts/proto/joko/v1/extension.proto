@@ -303,9 +303,27 @@ message ExtensionPackageExportPreview {
   optional ExtensionPackageExportJob active_export = 7;
 }
 
+enum ExtensionMainViewOpenMode {
+  EXTENSION_MAIN_VIEW_OPEN_MODE_UNSPECIFIED = 0;
+  EXTENSION_MAIN_VIEW_OPEN_MODE_PAGE = 1;
+  EXTENSION_MAIN_VIEW_OPEN_MODE_SIDEBAR = 2;
+  EXTENSION_MAIN_VIEW_OPEN_MODE_WINDOW = 3;
+}
+
+enum ExtensionTabSide {
+  EXTENSION_TAB_SIDE_UNSPECIFIED = 0;
+  EXTENSION_TAB_SIDE_LEFT = 1;
+  EXTENSION_TAB_SIDE_RIGHT = 2;
+  EXTENSION_TAB_SIDE_TOP = 3;
+  EXTENSION_TAB_SIDE_BOTTOM = 4;
+}
+
 message ExtensionMainViewDescriptor {
   optional string title = 1;
   ExtensionMainViewIcon icon = 2;
+  ExtensionMainViewOpenMode open = 3;
+  ExtensionTabSide side = 4;
+  bool multiple = 5;
 }
 
 message ExtensionLibraryDescriptor {

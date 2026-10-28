@@ -28,7 +28,7 @@ export interface PendingOperation {
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
-    | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-rewind" | "workspace-rewind"
+    | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-side-chat" | "session-rewind" | "workspace-rewind"
     | "task-tag"
     | "objective-set" | "objective-pause" | "objective-resume" | "objective-clear"
     | "collaboration-enable" | "collaboration-create" | "collaboration-release" | "collaboration-archive" | "collaboration-end"
@@ -524,7 +524,7 @@ function isPending(value: unknown): value is PendingOperation {
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact",
       "objective-set", "objective-pause", "objective-resume", "objective-clear",
       "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end",
-      "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
+      "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
       "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite", "model-source-target",
@@ -572,10 +572,12 @@ function isPending(value: unknown): value is PendingOperation {
     && (typeof record.sessionId !== "string" || typeof record.interactionId !== "string"
       || typeof record.interactionGeneration !== "string" || typeof record.interactionRevision !== "string")) return false;
   if (["session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-    "session-shell", "session-reset", "session-review", "session-clone", "session-fork",
+    "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat",
     "objective-set", "objective-pause", "objective-resume", "objective-clear"].includes(String(record.kind))
     && typeof record.sessionId !== "string") return false;
   if (record.kind === "session-fork" && !validReceiptIdentity(record.eventId)) return false;
+  if (record.kind === "session-side-chat" && (!validReceiptIdentity(record.backendId) || !validReceiptIdentity(record.targetId)
+    || record.sourceGeneration === undefined || record.taskJoinId !== undefined)) return false;
   if (String(record.kind).startsWith("objective-") && (!validReceiptIdentity(record.sessionId) || record.sourceGeneration === undefined)) return false;
   if (String(record.kind).startsWith("collaboration-") && (!validReceiptIdentity(record.sessionId) || record.sourceGeneration === undefined
     || record.backendId !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;

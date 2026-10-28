@@ -59,10 +59,16 @@ export function createWorktreeConnectService(
       authenticate(context);
       const sessionId = publicSessionId(request.sessionId);
       const preview = await requireCoordinator(coordinator).previewRemoval(sessionId, { signal: context.signal });
+      authenticate(context);
+      context.signal.throwIfAborted();
+      const schedules = store.readSessionArchiveSchedules(sessionId);
       return create(contract.GetSessionWorktreeRemovalPreviewResponseSchema, {
         sessionId,
         hasWorktree: preview.hasWorktree,
-        dirty: preview.dirty
+        dirty: preview.dirty,
+        activeBoundScheduleCount: schedules.count,
+        activeBoundScheduleNames: [...schedules.names],
+        archiveConfirmation: schedules.confirmation
       });
     }),
 

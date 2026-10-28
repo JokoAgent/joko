@@ -114,7 +114,8 @@ import {
   desktopDeepLinkNavigationMatchesRoute,
   desktopDeepLinkRouteHash
 } from "./desktop-deep-link-navigation.js";
-import { isExtensionApplicationWindow, openExtensionWindowFallback } from "./extension-window-navigation.js";
+import { isExtensionApplicationWindow } from "./extension-window-navigation.js";
+import { openInspectorExtension } from "./components/inspector-layout.js";
 import { CLIENT_LAYOUT_RESET_EVENT, subscribeClientLayoutResetOccurrence } from "./client-layout-reset.js";
 import {
   applySessionProjectOverrides,
@@ -141,6 +142,7 @@ import { useDedicatedHardwareCollaborationCatalog,
 import {
   prefetchWorktreeRemovalPreflight,
   summarizeWorktreeRemovalPreflights,
+  summarizeSessionArchivePreflights,
   type WorktreeRemovalPreflightSummary
 } from "./worktree-removal-preflight.js";
 import { PartnerConversationScope } from "./components/PartnerConversation.js";
@@ -163,7 +165,7 @@ type PendingDesktopDeepLinkDelivery =
     readonly requestId: number;
     readonly rendererOccurrence: object;
   };
-const Inspector = lazy(async () => ({ default: (await import("./components/Inspector.js")).Inspector }));
+const Inspector = lazy(async () => ({ default: (await import("./components/InspectorWorkspace.js")).InspectorWorkspace }));
 const SchedulesPage = lazy(async () => ({ default: (await import("./components/SchedulesPage.js")).SchedulesPage }));
 const ProjectsPage = lazy(async () => ({ default: (await import("./components/ProjectsPage.js")).ProjectsPage }));
 const PartnersPage = lazy(async () => ({ default: (await import("./components/PartnersPage.js")).PartnersPage }));
@@ -1996,6 +1998,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         addSessionToSplit(activeSession.id, anchor, side);
       }}
       onOpenSessionWindow={() => openTaskWindow(activeSession)}
+      onSideChatOpened={(sourceSessionId, childId) => addSessionToSplit(childId, sourceSessionId, "right")}
     />
   );
   const focusSplitSession = (sessionId: string): void => {
@@ -2043,12 +2046,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     controller.navigate(replacement === undefined ? { kind: "session" } : { kind: "session", sessionId: replacement });
   };
   const prepareWorktreeRemoval = async (
-    sessions: readonly SessionView[]
+    sessions: readonly SessionView[],
+    archive = false
   ): Promise<WorktreeRemovalPreflightSummary | undefined> => {
     const ownerId = removalOwnerId;
     if (ownerId === undefined) return undefined;
     const requestGeneration = ++removalRequestGenerationRef.current;
-    const preflight = await summarizeWorktreeRemovalPreflights(
+    const preflight = archive ? await summarizeSessionArchivePreflights(
+      sessions.map((session) => session.id),
+      (sessionId, signal) => controllerRef.current.getSessionWorktreeRemovalPreview(sessionId, signal)
+    ) : await summarizeWorktreeRemovalPreflights(
       ownerId,
       sessions.map((session) => session.id),
       (sessionId) => controllerRef.current.getSessionWorktreeRemovalPreview(sessionId)
@@ -2071,9 +2078,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
   const archiveSessionsNow = async (
     sessions: readonly SessionView[],
-    onArchived?: () => void
+    onArchived?: () => void,
+    preflight?: WorktreeRemovalPreflightSummary
   ): Promise<void> => {
-    for (const session of sessions) await controller.archiveSession(session.id, true);
+    if (preflight?.archiveUnavailable === true) return;
+    for (const session of sessions) await controller.archiveSession(session.id, true, preflight?.archiveConfirmations?.[session.id]);
     removeSessionsFromNavigation(sessions, onArchived === undefined);
     onArchived?.();
   };
@@ -2092,9 +2101,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         });
         if (!allowed) return;
       }
-      const preflight = await prepareWorktreeRemoval(batch);
+      const preflight = await prepareWorktreeRemoval(batch, true);
       if (preflight === undefined) return;
-      if (preflight.dirty > 0 || preflight.unknown > 0) {
+      if (preflight.dirty > 0 || preflight.unknown > 0 || (preflight.activeBoundScheduleCount ?? 0) > 0) {
         setArchiveRemoval({
           sessions: batch,
           preflight,
@@ -2102,7 +2111,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         });
         return;
       }
-      await archiveSessionsNow(batch, onArchived);
+      await archiveSessionsNow(batch, onArchived, preflight);
     });
   };
   const requestArchiveSession = (session: SessionView, onArchived?: () => void): void => {
@@ -2275,7 +2284,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
 
   return (
-    <PartnerConversationScope controller={controller} session={activeSession} active={state.route.kind === "session"} t={t}>
+    <PartnerConversationScope controller={controller} session={activeSession} active={state.route.kind === "session"} t={t}
+      onOpenTopic={(topicSessionId) => addSessionToSplit(topicSessionId, activeSession?.id ?? topicSessionId, "right")}>
     <PartnerAvatarProvider controller={controller} ownerKey={state.connectionState === "connected" && state.activeProfile
       ? JSON.stringify([state.activeProfile.id, state.activeProfile.deviceId, state.activeProfile.serverId, state.activeProfile.origin, state.snapshot.generation.toString()]) : undefined}>
     <div
@@ -2359,6 +2369,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           }
         }}
         onNavigate={(route) => {
+          if (route.kind === "extensionMainView") { openInspectorExtension(route.extensionId); return; }
           messageJumpGenerationRef.current += 1;
           setTimelineFocusRequest(undefined);
           setSearchTimelineWindow(undefined);
@@ -2581,17 +2592,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             navigationOpen={navigationOpen}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
             onOpenIndependent={(extensionId) => {
-              const profile = controller.state.activeProfile;
-              if (!profile) return;
-              const source = { profileId: profile.id, serverId: profile.serverId };
-              if (window.jokoDesktop?.capabilities.includes("extension.windows") === true) {
-                void window.jokoDesktop.extensionWindows.open({ extensionId, ...source })
-                  .catch(() => setActionError(t("extensions.mainView.windowFailed")));
-                return;
-              }
-              if (openExtensionWindowFallback(window.location, extensionId, source) === null) {
-                setActionError(t("extensions.mainView.windowFailed"));
-              }
+              openInspectorExtension(extensionId, "window");
             }}
           />)}
           {state.route.kind === "settings" && <SettingsPage controller={controller} snapshot={state.snapshot} activeTargetId={settingsTargetIdRef.current} locale={state.effectiveLocale} t={t} runAction={runAction} onImportPortableSession={portableImportTargets.length === 0 ? undefined : () => { void choosePortableSessionImport(); }} />}
@@ -2600,7 +2601,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         </AppErrorBoundary>
       </div>}
 
-      <Suspense fallback={null}>{activeSession !== undefined && state.route.kind === "session" && <Inspector controller={controller} snapshot={state.snapshot} session={activeSession} workspace={activeWorkspace} timeline={activeTimeline} open={inspectorOpen} subagentFocusRequest={inspectorSubagentFocusRequest?.sessionId === activeSession.id ? inspectorSubagentFocusRequest : undefined} turnReviewFocusRequest={inspectorTurnReviewFocusRequest?.sessionId === activeSession.id ? inspectorTurnReviewFocusRequest : undefined} browserFocusRequest={state.browserInspectorFocusRequest?.sessionId === activeSession.id ? state.browserInspectorFocusRequest : undefined} gamepadRequest={inspectorGamepadRequest?.sessionId === activeSession.id ? inspectorGamepadRequest : undefined} onGamepadRequestConsumed={(requestId) => setInspectorGamepadRequest((current) => current?.requestId === requestId ? undefined : current)} t={t} runAction={runAction} onClose={() => void controller.setInspectorOpen(false)} onDetachedChange={setInspectorDetached} onSelectionQuote={insertFileSelectionQuote} />}</Suspense>
+      <Suspense fallback={null}>{<Inspector controller={controller} snapshot={state.snapshot} session={state.route.kind === "session" ? activeSession : undefined} workspace={activeWorkspace} timeline={activeTimeline} open={inspectorOpen} subagentFocusRequest={inspectorSubagentFocusRequest?.sessionId === activeSession?.id ? inspectorSubagentFocusRequest : undefined} turnReviewFocusRequest={inspectorTurnReviewFocusRequest?.sessionId === activeSession?.id ? inspectorTurnReviewFocusRequest : undefined} browserFocusRequest={state.browserInspectorFocusRequest?.sessionId === activeSession?.id ? state.browserInspectorFocusRequest : undefined} gamepadRequest={inspectorGamepadRequest?.sessionId === activeSession?.id ? inspectorGamepadRequest : undefined} onGamepadRequestConsumed={(requestId) => setInspectorGamepadRequest((current) => current?.requestId === requestId ? undefined : current)} t={t} runAction={runAction} onClose={() => void controller.setInspectorOpen(false)} onDetachedChange={setInspectorDetached} onSelectionQuote={insertFileSelectionQuote} />}</Suspense>
       {inspectorAttached && <button className="panel-scrim panel-scrim--inspector" type="button" aria-label={t("a11y.closeInspector")} onClick={() => void controller.setInspectorOpen(false)} />}
 
       <RenameSessionDialog
@@ -2629,6 +2630,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <ArchiveSessionDialog
         sessions={archiveRemoval?.sessions ?? []}
         preflight={archiveRemoval?.preflight}
+        onRetry={() => {
+          const request = archiveRemoval;
+          setArchiveRemoval(undefined);
+          if (request !== undefined) requestArchiveSessions(request.sessions, request.onArchived);
+        }}
         t={t}
         onClose={() => {
           removalRequestGenerationRef.current += 1;
@@ -2640,7 +2646,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           setArchiveRemoval(undefined);
           if (request !== undefined) runAction(
             `archive:${request.sessions.map((session) => session.id).join(",")}`,
-            () => archiveSessionsNow(request.sessions, request.onArchived)
+            () => archiveSessionsNow(request.sessions, request.onArchived, request.preflight)
           );
         }}
       />

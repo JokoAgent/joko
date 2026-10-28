@@ -503,6 +503,7 @@ function QuestionDecision({ controller, ownerKey, runId, sessionId, workspaceRoo
   const [slideDirection, setSlideDirection] = useState<"left" | "right">();
   const transitionTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [voiceFeedback, setVoiceFeedback] = useState<"hint" | "confirm" | "unknown" | "cancelled">("hint");
+  useEffect(() => setVoiceFeedback("hint"), [ownerKey, field?.id]);
   const voiceHandler = useRef<(text: string) => void>(() => {});
   const voiceStep = JSON.stringify([ownerKey, field, field ? answers[field.id] : undefined, field ? otherText[field.id] : undefined, voiceFeedback]);
   const voiceServer = controller.state.activeProfile?.serverId;

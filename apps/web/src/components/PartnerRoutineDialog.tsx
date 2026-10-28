@@ -56,7 +56,7 @@ function RoutineContent({ editor, connected, m, onClose, ownerDocument }: { read
         <label className="check-row"><CheckboxControl checked={!!routine.definition?.enabled} disabled={locked || editor.dirty} onChange={() => void editor.toggle(routine)} /><span>{m.enabled}</span></label>
         {routine.activity !== undefined && <small>{m.states[routine.activity] ?? m.states[0]}</small>}
       </li>)}</ul>
-      {draft && <fieldset disabled={locked || !!state.pendingId} style={{ border: 0, padding: 0, minWidth: 0 }}>
+      {draft && !state.selected?.builtin && <fieldset disabled={locked || !!state.pendingId} style={{ border: 0, padding: 0, minWidth: 0 }}>
         <label className="field"><span>{m.name}</span><input value={draft.name} maxLength={200} required onChange={e => editor.edit({ name: e.target.value })} /></label>
         <label className="field"><span>{m.prompt}</span><textarea rows={7} value={draft.prompt} maxLength={100000} required onChange={e => editor.edit({ prompt: e.target.value })} /></label>
         <label className="check-row"><CheckboxControl checked={!!draft.enabled} onChange={e => editor.edit({ enabled: e.target.checked })} /><span>{m.enabled}</span></label>
@@ -70,8 +70,9 @@ function RoutineContent({ editor, connected, m, onClose, ownerDocument }: { read
         <Button disabled={!editor.dirty || !validRoutineDraft(draft)} onClick={() => void editor.save()}>{m.save}</Button>
         {editor.dirty && <Button onClick={() => setConfirm({ body: m.discardBody, action: () => editor.discard() })}>{m.discard}</Button>}
       </fieldset>}
-      {state.selected && <><div className="toolbar-actions"><Button disabled={locked || editor.dirty} onClick={() => void editor.run()}>{m.run}</Button>
-        <Button disabled={locked || editor.dirty} onClick={() => setConfirm({ body: m.deleteBody, action: () => void editor.remove() })}>{m.remove}</Button>
+      {state.selected?.builtin && <p>{state.selected.definition?.prompt}</p>}
+      {state.selected && <><div className="toolbar-actions">{!state.selected.builtin && <><Button disabled={locked || editor.dirty} onClick={() => void editor.run()}>{m.run}</Button>
+        <Button disabled={locked || editor.dirty} onClick={() => setConfirm({ body: m.deleteBody, action: () => void editor.remove() })}>{m.remove}</Button></>}
         <Button disabled={state.busy || state.requiresRefresh || !foreground || !connected} onClick={() => void editor.history()}>{m.history}</Button></div>
         <ul aria-label={m.history}>{state.runs.map(run => <li key={run.id}><strong>{m.states[run.status] ?? m.states[0]}</strong> · {new Date(routineTime(run.createdAt)).toLocaleString()}<p>{run.error ?? run.resultText}</p></li>)}</ul>
         {state.runs.length === 0 && <p>{m.noHistory}</p>}{state.nextOffset !== undefined && <Button disabled={state.busy || state.requiresRefresh} onClick={() => void editor.history(true)}>{m.more}</Button>}</>}

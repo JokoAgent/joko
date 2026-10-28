@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { readWorkerWorkspaceBinding, workerWorkspaceTarget, WORKER_WORKSPACE_PLAN_KEY,
+import { readWorkerWorkspaceBinding, workerWorkspaceTarget, WORKER_WORKSPACE_PLAN_KEY, WORKER_WORKSPACE_BINDING_KEY,
   type WorkerWorkspaceBinding, type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -498,6 +498,12 @@ export class SessionWorktreeCoordinator {
 
   #workerReferencesLease(leaseId: string): boolean {
     return this.#store.listSettings("service").some(setting => {
+      if (setting.key === WORKER_WORKSPACE_BINDING_KEY) {
+        const session = this.#store.findSession(setting.scopeId)?.descriptor;
+        if (session?.derivationOrigin?.sideChat !== true || session.deletedAt !== undefined) return false;
+        const binding = readWorkerWorkspaceBinding(this.#store, session.id);
+        return binding?.owner === "side_chat" && binding.inheritedWorktreeLeaseId === leaseId;
+      }
       if (setting.key !== WORKER_WORKSPACE_PLAN_KEY) return false;
       const plan = setting.value as WorkerWorkspacePlan;
       if (plan.format !== 1 || plan.createWorktree || plan.inherited?.worktreeLeaseId !== leaseId) return false;
@@ -720,8 +726,13 @@ export class SessionWorktreeCoordinator {
     const binding = expectedBinding ?? persistedBinding ?? this.#activeBindings.get(sessionId);
     if (binding?.remote === undefined && binding && this.#workerReferencesLease(binding.leaseId)) {
       if (expectedBinding) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
-      const retained = await this.#service.release(sessionId, { retainForRestore: true });
+      const retained = await this.#service.release(sessionId, { retainForRestore: true }, async lease =>
+        lease.id === binding.leaseId && !this.#workerReferencesLease(lease.id));
       if (!retained.ok) throw new SessionWorktreeCoordinatorError(retained.error.code);
+      if (retained.value.status !== "preserved"
+        || retained.value.pathRemoved === true && this.#workerReferencesLease(binding.leaseId)) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
       this.#activeBindings.delete(sessionId);
       this.#workspaces.unregister(binding.workspaceId);
       if (persistedBinding && persistedBinding.state !== "preserved") this.#store.updateSessionWorktreeState(sessionId, "preserved");

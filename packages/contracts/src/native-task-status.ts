@@ -27,6 +27,7 @@ export interface NativeTaskStatusSession {
   readonly activityLines: readonly NativeTaskStatusActivityLine[];
   readonly startedAt?: number;
   readonly updatedAt: number;
+  readonly completionIdentity?: string;
   readonly permission?: NativeTaskStatusPermission;
   readonly remote?: {
     readonly sourceId: string;
@@ -50,6 +51,7 @@ export interface NativeRemoteTaskObservation {
   readonly sessionId: string;
   readonly phase: "running" | "interaction" | "completed" | "error";
   readonly updatedAt?: number;
+  readonly completionIdentity?: string;
   readonly remote?: { readonly sourceId: string; readonly runId: string; readonly silent: boolean; readonly completionNotification: "none" | "pending" | "teammate"; readonly observedCompletionOnly?: boolean };
 }
 interface ObservedTask { phase: NativeRemoteTaskObservation["phase"]; sourceId: string; runId: string; active: boolean; observedActivity: boolean; pending: boolean; passive: boolean; dismissed?: string; }
@@ -100,7 +102,9 @@ export class NativeRemoteTaskTracker {
   reset(): void { this.#seen.clear(); }
 }
 export function remoteEntryToken(session: NativeRemoteTaskObservation): string {
-  return JSON.stringify([session.remote?.sourceId ?? "", session.remote?.runId ?? "", session.phase, session.updatedAt ?? 0]);
+  const fields = [session.remote?.sourceId ?? "", session.remote?.runId ?? "", session.phase, session.updatedAt ?? 0];
+  if (session.completionIdentity !== undefined) fields.push(session.completionIdentity);
+  return JSON.stringify(fields);
 }
 function remoteObservationToken(session: NativeRemoteTaskObservation): string {
   return JSON.stringify([session.remote?.sourceId ?? "", session.remote?.runId ?? "", session.phase]);

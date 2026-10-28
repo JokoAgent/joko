@@ -114,6 +114,7 @@ enum PartnerSessionRole {
   PARTNER_SESSION_ROLE_CANONICAL = 1;
   PARTNER_SESSION_ROLE_HISTORY = 2;
   PARTNER_SESSION_ROLE_DELEGATION = 3;
+  PARTNER_SESSION_ROLE_TOPIC = 4;
 }
 
 enum PartnerWorkingPhase {
@@ -301,7 +302,25 @@ message PartnerSession {
   bool deleted = 11;
   google.protobuf.Timestamp created_at = 12;
   optional google.protobuf.Timestamp last_activity_at = 13;
+  PartnerTopicRoot topic_root = 14;
 }
+
+message PartnerTopicRoot {
+  string session_id = 1;
+  uint64 generation = 2;
+  string event_id = 3;
+  string message_id = 4;
+}
+
+message EnsurePartnerTopicRequest {
+  string operation_id = 1;
+  string partner_id = 2;
+  PartnerTopicRoot root = 3;
+  Revision expected_partner_revision = 4;
+}
+message EnsurePartnerTopicResponse { PartnerSession topic = 1; }
+message GetPartnerTopicRequest { string session_id = 1; }
+message GetPartnerTopicResponse { PartnerSession topic = 1; }
 
 message PartnerPrivateThread {
   string thread_id = 1;

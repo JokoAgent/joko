@@ -11,6 +11,7 @@ import {
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   snapshotNativeSkills,
   nativeTextInferenceImages,
+  assertHostedExecution,
   type ApprovedSkillResolver,
   type ApprovedSkillSeed,
   type NativeSkillPolicy,
@@ -1373,7 +1374,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   ): Promise<NativeSessionState> {
     this.#assertOpen();
     const nativeAuthenticationEpoch = this.#nativeAuthenticationEpoch;
-    assertStandardReviewContext(context, "resume native Session history");
+    const persistentReadOnly = context.runtimePolicy === "review_read_only" && context.persistentReadOnly === "side_chat";
+    if (!persistentReadOnly) assertStandardReviewContext(context, "resume native Session history");
     this.#assertContextTarget(context, context.target);
     await this.validateTarget(context.target);
     const resumedBinding = this.#resumeBindingForContext(binding, context);
@@ -1400,7 +1402,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (!runtimeHasProductWork(current)) current.context = context;
       return stateFromRuntime(current);
     }
-    await this.#prepareNativeMemory(inspection.scope, "standard", context.signal);
+    await this.#prepareNativeMemory(inspection.scope, persistentReadOnly ? "review_read_only" : "standard", context.signal);
+    const readOnlyProfile: JsonObject | undefined = persistentReadOnly ? { ...await this.#buildReviewThreadProfile(inspection.workspaceRoot, inspection.workspaceRoot, context.signal, inspection.scope.assertCurrent), ephemeral: false } : undefined;
     const smartRoute = inspection.scope.remote
       ? undefined
       : await this.#prepareSmartRoute(context.modelSelection?.providerId, context.modelSelection?.modelId, context);
@@ -1441,6 +1444,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       managedRoute?.dispose(); smartRoute?.dispose(); await mcp?.release().catch(() => undefined); throw error;
     });
     const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration, ...this.#taskShellConfiguration(context),
+      ...(isJsonObject(readOnlyProfile?.["config"]) ? readOnlyProfile["config"] : {}),
       ...nativeWebPolicyConfiguration(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot) }, context,
       context.modelSelection?.providerId, context.modelSelection?.modelId);
     const nativeSkills = preparedSkills.nativeSkills;
@@ -1472,7 +1476,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       context.appendSystemPrompt,
       nativeAuthenticationAdmission,
       undefined,
-      this.#executionEnvironments(context)
+      this.#executionEnvironments(context),
+      readOnlyProfile
     ).catch(async (error) => {
       managedRoute?.dispose();
       smartRoute?.dispose();
@@ -1485,6 +1490,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
     try {
       let thread = parseThreadResult(response.value);
+      if (persistentReadOnly) assertPersistentReadOnlyThread(objectValue(response.value, "read-only resume"), thread, inspection.workspaceRoot);
       if (thread.status?.["type"] === "active" && thread.turns.length === 0) {
         const latest = await inspection.scope.host.request("thread/turns/list", {
           threadId,
@@ -1520,7 +1526,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         binding: normalized,
         context,
         hostGeneration: response.hostGeneration,
-        permissionMode: permissionModeFromResponse(record),
+        permissionMode: persistentReadOnly ? "ask" : permissionModeFromResponse(record),
         managedRoute,
         smartRoute,
         mcp,
@@ -1532,7 +1538,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           : context.modelSelection?.providerId ?? this.#providerId,
         modelId: observedModelId,
         effort: optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
-        fastMode: isFastServiceTier(record["serviceTier"]),
+        fastMode: persistentReadOnly ? false : isFastServiceTier(record["serviceTier"]),
         observedFastMode: observedFastServiceTier(record),
         name: thread.name ?? undefined,
         nativeAuthenticationAdmission
@@ -2379,7 +2385,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (context.target.remoteWorkspace !== undefined) throw remoteMutationUnsupported("fork the native thread");
     const runtime = await this.#requireRuntime(context, "bound");
     this.#assertStandardRuntime(runtime, "fork the native thread");
-    assertRuntimeProductIdle(runtime);
+    if (!derivation.completedSnapshot) assertRuntimeProductIdle(runtime);
     return {
       binding: await this.#forkThread(runtime, context, derivation, entryId)
     };
@@ -2660,7 +2666,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   supportsDetachedSessionDeletion(context: AdapterContext): boolean {
-    return context.runtimePolicy !== "review_read_only"
+    return (context.runtimePolicy !== "review_read_only" || context.persistentReadOnly === "side_chat")
       && context.target.remoteWorkspace === undefined
       && context.target.backendId === this.id
       && context.backendInstanceGeneration === this.#instanceGeneration;
@@ -3128,7 +3134,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     developerInstructions?: string,
     nativeAuthenticationAdmission?: number,
     permissionMode?: PermissionMode,
-    executionEnvironments?: JsonObject
+    executionEnvironments?: JsonObject,
+    readOnlyProfile?: JsonObject
   ) {
     const assertCurrent = () => {
       scope.assertCurrent();
@@ -3155,7 +3162,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ...(this.#hosted === undefined
         ? developerInstructions === undefined ? {} : { developerInstructions }
         : { developerInstructions: this.#hosted.instructions(developerInstructions) }),
-      config: configuration
+      ...(readOnlyProfile ?? {}),
+      config: { ...configuration, ...(isJsonObject(readOnlyProfile?.["config"]) ? readOnlyProfile["config"] : {}) }
     };
     const resume = () => scope.host.request("thread/resume", params, { mutation: false, beforeDispatch: assertCurrent });
     const response = await resume().catch(async (error: unknown) => {
@@ -5427,8 +5435,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     await this.validateTarget(derivation.target);
     const hostGeneration = runtime.hostGeneration;
     const dispatchSignal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
-    const boundary = nativeBoundaryId === undefined
-      ? undefined
+    const boundary = nativeBoundaryId === undefined ? undefined : derivation.completedSnapshot
+      ? await this.#completedSnapshotBoundary(runtime, context, nativeBoundaryId)
       : await this.#resolveForkTurnId(runtime, context, nativeBoundaryId);
     const profileKey = await this.#activeProfileKey;
     const assertForkDispatch = () => {
@@ -5505,12 +5513,61 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         });
       }
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
+      if (boundary && "expectedPrefix" in boundary) {
+        const copied = await this.#readCompleteHistoryFromHost({ host: runtime.host, hostGeneration: response.hostGeneration,
+          threadId, workspaceRoot: derivation.target.workspaceRoot, remote: runtime.remote, signal: dispatchSignal, assertOwner: assertForkDispatch });
+        if (copied.thread.turns.length !== boundary.expectedPrefix.length
+          || copied.thread.turns.some((turn, index) => fullTurnSignature(turn) !== fullTurnSignature(boundary.expectedPrefix[index]))) {
+          throw adapterError({ code: "CODEX_COMPLETED_SNAPSHOT_MISMATCH", message: "The native child did not preserve the exact completed history prefix.",
+            phase: "dispatch", stateMayHaveChanged: true, recovery: "Reconcile the original native derivation before creating another Side Chat." });
+        }
+      }
       return binding;
     } finally {
       await this.#host.releaseUnboundThread(threadId, response.hostGeneration).catch((error) => {
         throw this.#requestFailure(error, "shutdown", "CODEX_SESSION_FORK_DETACH_FAILED", true);
       });
     }
+  }
+
+  async #completedSnapshotBoundary(runtime: SessionRuntime, context: AdapterContext, entryId: string): Promise<{
+    readonly turnId: string; readonly expectedPrefix: readonly NativeTurn[]; readonly assertCurrent: () => void;
+  }> {
+    if (!entryId || entryId.length > 512 || /[\u0000-\u001f]/u.test(entryId)) throw adapterError({ code: "CODEX_COMPLETED_SNAPSHOT_BOUNDARY_INVALID",
+      message: "The completed native boundary is invalid.", phase: "probe", recovery: "Choose a completed assistant reply from the current native history." });
+    const generation = runtime.hostGeneration, source = runtime.binding;
+    const assertCurrent = () => {
+      context.signal.throwIfAborted();
+      if (!this.#matchesCoreFence(runtime, context) || runtime.binding.opaqueRef !== source.opaqueRef
+        || runtime.hostGeneration !== generation || !runtime.host.isActiveGeneration(generation)) throw nativeHistoryReadFailure("STALE");
+    };
+    const readPrefix = async (): Promise<NativeTurn[]> => {
+      const turns: NativeTurn[] = [], cursors = new Set<string>(); let cursor: string | undefined, bytes = 0;
+      for (let pages = 0; pages < this.#maximumHistoryPages; pages++) {
+        assertCurrent();
+        const response = await runtime.host.request("thread/turns/list", { threadId: runtime.threadId, sortDirection: "asc", itemsView: "full", limit: 100,
+          ...(cursor === undefined ? {} : { cursor }) }, { signal: context.signal, timeoutMs: this.#historyReadTimeoutMs, beforeDispatch: assertCurrent });
+        assertCurrent(); bytes += serializedByteLength(response.value);
+        if (response.hostGeneration !== generation || bytes > this.#maximumHistoryBytes) throw nativeHistoryReadFailure("SIZE_LIMIT");
+        const page = parseFullTurnPage(response.value, { maximumTurns: 100, maximumItems: this.#maximumHistoryItems });
+        for (const turn of page.turns) {
+          if (turns.some(previous => previous.id === turn.id) || turns.length >= this.#maximumHistoryTurns) throw nativeHistoryReadFailure("SIZE_LIMIT");
+          turns.push(turn);
+          if (turn.id === entryId || turn.items.some(item => item.id === entryId)) {
+            if (turn.status !== "completed" || !turn.items.some(item => item.type === "agentMessage")) throw adapterError({ code: "CODEX_COMPLETED_SNAPSHOT_BOUNDARY_INVALID",
+              message: "The native boundary is not a completed assistant turn.", phase: "dispatch", recovery: "Choose a completed assistant reply from the current native history." });
+            return turns;
+          }
+        }
+        cursor = page.nextCursor;
+        if (!cursor || cursors.has(cursor) || page.turns.length === 0) break; cursors.add(cursor);
+      }
+      throw adapterError({ code: "CODEX_COMPLETED_SNAPSHOT_BOUNDARY_MISSING", message: "The completed native boundary is unavailable.", phase: "probe",
+        recovery: "Refresh the source's completed native history before opening a Side Chat." });
+    };
+    const expectedPrefix = await readPrefix(), confirmed = await readPrefix(); assertCurrent();
+    if (expectedPrefix.length !== confirmed.length || expectedPrefix.some((turn, index) => fullTurnSignature(turn) !== fullTurnSignature(confirmed[index]))) throw nativeHistoryReadFailure("STALE");
+    return { turnId: expectedPrefix.at(-1)!.id, expectedPrefix, assertCurrent };
   }
 
   async #resolveForkTurnId(runtime: SessionRuntime, context: AdapterContext, nativeBoundaryId: string): Promise<{ readonly turnId: string; readonly assertCurrent: () => void }> {
@@ -5880,6 +5937,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "session.resume",
       "session.detach",
       "session.fork",
+      "session.side_chat",
       "session.clone",
       "workspace.derive",
       "session.rewind",
@@ -6135,6 +6193,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   #assertStandardRuntime(runtime: SessionRuntime, operation: string): void {
+    if (runtime.context.persistentReadOnly === "side_chat" && operation === "read native history") return;
     if (runtime.runtimePolicy === "standard") return;
     throw adapterError({
       code: "CODEX_REVIEW_OPERATION_DENIED",
@@ -6510,7 +6569,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #withPreparedNativeMutation<T>(context: AdapterContext, action: () => Promise<T>): Promise<T> {
     if (this.#hosted) {
-      if (context.runtimePolicy === "review_read_only" || context.target.remoteWorkspace) throw new TypeError("This hosted native execution does not accept another runtime domain.");
+      if (context.runtimePolicy === "review_read_only" && context.persistentReadOnly !== "side_chat" || context.target.remoteWorkspace) throw new TypeError("This hosted native execution does not accept another runtime domain.");
       this.#hosted.assertModel(context.modelSelection?.providerId, context.modelSelection?.modelId);
       await this.#ensureLocalHostStarted();
       if (versionFromUserAgent(this.#host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
@@ -6733,6 +6792,7 @@ function reviewRuntimePolicy(
 }
 
 function assertStandardReviewContext(context: AdapterContext, operation: string): void {
+  if (context.persistentReadOnly === "side_chat" && ["delete native Session state", "inspect native Session deletion"].includes(operation)) return;
   if (context.runtimePolicy !== "review_read_only") return;
   throw adapterError({
     code: "CODEX_REVIEW_OPERATION_DENIED",
@@ -6909,6 +6969,14 @@ function assertReviewThreadStarted(
 
 }
 
+function assertPersistentReadOnlyThread(response: JsonObject, thread: NativeThread, root: string): void {
+  const profile = response["activePermissionProfile"], roots = response["runtimeWorkspaceRoots"];
+  if (!isJsonObject(profile) || profile["id"] !== REVIEW_PERMISSION_PROFILE || response["approvalPolicy"] !== "never"
+    || response["serviceTier"] !== null || thread.ephemeral === true || typeof response["cwd"] !== "string"
+    || !equalNativePaths(response["cwd"], root) || thread.cwd === undefined || !equalNativePaths(thread.cwd, root)
+    || !Array.isArray(roots) || roots.length !== 1 || typeof roots[0] !== "string" || !equalNativePaths(roots[0], root)) throw invalidReviewProfile();
+}
+
 function rewindBusy() {
   return adapterError({ code: "CODEX_REWIND_BUSY", message: "Native history cannot be rewound while this Session has pending work.", phase: "dispatch", recovery: "Wait for input, controls, compaction and background tasks to settle before rewinding." });
 }
@@ -7063,13 +7131,9 @@ async function executeReviewDynamicTool(workspaceRoot: string, params: JsonValue
     const decision = await authority?.review({ toolName: params["tool"].slice("joko_".length), input: args, signal: context!.signal });
     authority?.assertCurrent(revision);
     if (decision?.verdict === "block" || decision?.verdict === "ask" || decision?.unavailable) throw new ReviewToolInputError("The current policy does not authorize this read-only operation.");
-    const output = params["tool"] === "joko_read"
-      ? await executeReviewRead(workspaceRoot, args)
-      : params["tool"] === "joko_grep"
-        ? await executeReviewGrep(workspaceRoot, args)
-        : params["tool"] === "joko_find"
-          ? await executeReviewFind(workspaceRoot, args)
-          : await executeReviewList(workspaceRoot, args);
+    const output = context?.persistentReadOnly === "side_chat" && context.hostedExecution
+      ? await executeHostedReviewTool(context, params["tool"], args)
+      : await executeCodexReadOnlyWorkspaceTool(workspaceRoot, params["tool"], args);
     authority?.assertCurrent(revision);
     return reviewToolResponse(true, output);
   } catch (error) {
@@ -7080,6 +7144,45 @@ async function executeReviewDynamicTool(workspaceRoot: string, params: JsonValue
         : "The bounded read-only workspace operation failed."
     );
   }
+}
+
+/** Shared only with the Source's closed read-only executor. No Backend native
+ * references or filesystem authority are inferred from the tool arguments. */
+export async function executeCodexReadOnlyWorkspaceTool(workspaceRoot: string, tool: string, args: unknown): Promise<string> {
+  if (!REVIEW_DYNAMIC_TOOL_NAMES.has(tool) || !isJsonObject(args)) throw new ReviewToolInputError("The read-only workspace tool is invalid.");
+  const output = tool === "joko_read" ? await executeReviewRead(workspaceRoot, args)
+    : tool === "joko_grep" ? await executeReviewGrep(workspaceRoot, args)
+      : tool === "joko_find" ? await executeReviewFind(workspaceRoot, args) : await executeReviewList(workspaceRoot, args);
+  return boundedReviewOutput(output);
+}
+
+async function executeHostedReviewTool(context: AdapterContext, tool: string, args: JsonObject): Promise<string> {
+  const hosted = context.hostedExecution!;
+  assertHostedExecution(hosted);
+  const rawPath = args["path"] ?? ".";
+  if (typeof rawPath !== "string" || !rawPath || rawPath.length > 4096 || isAbsolute(rawPath) || rawPath.includes("\0")
+    || rawPath.replace(/\\/gu, "/").split("/").includes("..") || reviewPathSegmentsAreSensitive(rawPath.split(/[\\/]/gu))) throw new ReviewToolInputError("The read-only Source path is invalid.");
+  const callId = "side-chat-read-" + randomUUID(); let sequence = 0;
+  const call = async (operation: string, payload: JsonObject): Promise<JsonObject> => {
+    assertHostedExecution(hosted); context.signal.throwIfAborted();
+    const response = await fetch(hosted.channel.endpoint.replace(/\/$/u, "") + "/execute", { method: "POST", redirect: "error", signal: context.signal,
+      headers: { authorization: "Bearer " + hosted.channel.bearer, "content-type": "application/json" },
+      body: JSON.stringify({ format: 1, callId, requestId: `${callId}:${++sequence}`, origin: "agent", operation, payload }) });
+    if (!response.ok || !response.body) throw new ReviewToolInputError("The original Source rejected the read-only operation.");
+    const reader = response.body.getReader(), parts: Uint8Array[] = []; let bytes = 0;
+    try { for (;;) { const next = await reader.read(); if (next.done) break; bytes += next.value.byteLength;
+      if (bytes > 1024 * 1024) throw new ReviewToolInputError("The read-only Source response exceeded its bound."); parts.push(next.value); } }
+    finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    assertHostedExecution(hosted); context.signal.throwIfAborted();
+    const value: unknown = JSON.parse(Buffer.concat(parts).toString("utf8"));
+    if (!isJsonObject(value) || value["format"] !== 1 || value["ok"] !== true || !isJsonObject(value["value"])) throw new ReviewToolInputError("The original Source read-only response is invalid.");
+    return value["value"];
+  };
+  await call("tool.begin", { name: "read", input: { path: resolve(hosted.workspace.root, rawPath) } });
+  try {
+    const value = await call("review.call", { tool, arguments: args });
+    if (typeof value["text"] !== "string") throw new ReviewToolInputError("The Source did not return a bounded read-only result."); return boundedReviewOutput(value["text"]);
+  } finally { await call("tool.end", {}).catch(() => {}); }
 }
 
 function reviewToolResponse(success: boolean, text: string): JsonObject {
@@ -8401,12 +8504,13 @@ function isFastServiceTier(value: JsonValue | undefined): boolean | "ultrafast" 
   if (value === "fast" || value === "priority") return true;
   if (value === undefined || value === null || value === "default" || value === "standard" || value === "auto") return false;
   throw adapterError({ code: "CODEX_SERVICE_TIER_UNSUPPORTED", message: "The native model returned an unsupported service tier.",
-    phase: "session", recovery: "Refresh the current model and runtime capabilities before retrying." });
+    phase: "probe", recovery: "Refresh the current model and runtime capabilities before retrying." });
 }
 
 function fastServiceTier(value: boolean | "ultrafast"): "fast" | "ultrafast" | null {
   if (value === "ultrafast") return "ultrafast";
-  if (typeof value !== "boolean") throw adapterError({ code: "CODEX_SERVICE_TIER_INVALID", message: "The requested model speed is invalid.", phase: "provision" });
+  if (typeof value !== "boolean") throw adapterError({ code: "CODEX_SERVICE_TIER_INVALID", message: "The requested model speed is invalid.", phase: "provision",
+    recovery: "Choose Standard, Fast, or Ultrafast from the model's declared capabilities." });
   return value ? "fast" : null;
 }
 

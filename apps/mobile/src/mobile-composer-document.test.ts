@@ -44,6 +44,20 @@ import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
 import { mobileIncomingShareStorageId } from "./mobile-incoming-share-order";
 
 describe("mobile structured composer document", () => {
+  it('preserves a private reply root through native typing, accepted input restore and retry recovery without inserting snapshot text', () => {
+    const replyQuote = { generation: '7', eventId: 'root-event', messageId: 'root-message', role: 'assistant' as const, excerpt: 'Visible snapshot only' };
+    const draft = normalizeMobileComposerDraft({ ...plainTextMobileComposerDraft('Explain'), replyQuote });
+    const edited = reconcileMobileComposerText(draft, 'Explain the original code.').draft;
+    expect(edited.replyQuote).toEqual(replyQuote);
+    const input = mobileComposerInput(edited);
+    expect(input.replyQuote).toMatchObject({ ...replyQuote, generation: 7n });
+    expect(input.parts[0]?.content.value).toBe('Explain the original code.');
+    const restored = restoreMobileComposerInput(input, { sessionId: 'task', messageId: 'sent-reply', eventId: 'sent-event' });
+    expect(restored.replyQuote).toEqual(replyQuote);
+    expect(recoverMobileComposerDraft(restored, plainTextMobileComposerDraft('New text')).replyQuote).toEqual(replyQuote);
+    expect(() => normalizeMobileComposerDraft({ ...draft, replyQuote: { ...replyQuote, generation: '0' } })).toThrow();
+  });
+
   it("keeps file excerpts as separate quote atoms across editing, wire offsets and accepted-input recovery", () => {
     const selected = appendMobileFileSelectionQuote(plainTextMobileComposerDraft("Before"), {
       sourceSessionId: "task", sourcePath: "docs/README.md", text: "\n  selected 😀\r\nsecond\n"

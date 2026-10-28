@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import type { AdapterContext, AdapterEventMetadata, BackendAdapter, BlobRef, CreateNativeSessionInput, EventPayload, HostedExecution, NativeSessionBinding, PermissionMode, PromptInput, SubagentControlInput, UsageSnapshot, UserShellInput } from "@joko/core";
+import type { AdapterContext, AdapterEventMetadata, BackendAdapter, BlobRef, CreateNativeSessionInput, EventPayload, HostedExecution, NativeSessionBinding, NativeSessionDerivationLifecycle, PermissionMode, PromptInput, SubagentControlInput, UsageSnapshot, UserShellInput } from "@joko/core";
 import { JokoError } from "@joko/core";
 import { assertManagedSubagentHostedToolScope, managedSubagentRunRoot, type PiHostedBackgroundScope } from "@joko/adapter-pi";
 import type { HostedAgentStore, HostedNativeSessionOwner, HostedNativeProviderGrantOwner } from "@joko/store";
@@ -74,6 +74,9 @@ export class HostedAgentRun {
   readonly #slot: HostedAgentSlot;
   readonly #owner: HostedNativeSessionOwner;
   readonly #leaseId = randomUUID();
+  readonly #storageKey: string;
+  readonly #persistentReadOnly: boolean;
+  readonly #derivations = new Set<string>();
   #claimed = false;
   #nativeCleaned = false;
   readonly #receipts = new Map<string, CallReceipt>();
@@ -96,6 +99,7 @@ export class HostedAgentRun {
   #activeProvider?: string;
   #usageTurn?: string;
   #lastUsage?: UsageSnapshot;
+  readonly #usageFollowUps = new Map<string, string>();
   #usageObserved = false;
   readonly #toolOwners = new Map<string, { readonly operationId: string; readonly origin: string; readonly backgroundScope?: string }>();
   readonly #backgroundOwners = new Map<string, { readonly operationId: string; readonly scope: PiHostedBackgroundScope; readonly generation: number }>();
@@ -107,6 +111,10 @@ export class HostedAgentRun {
   #mcp?: HostedAgentNativeMcp;
   readonly #navigation: HostedAgentNavigation;
   #navigating = false;
+  #idleReleaseId?: string;
+  readonly #activeBackground = new Set<string>();
+  readonly #observedBackground = new Set<string>();
+  #lastActivity = Date.now();
 
   private constructor(options: HostedAgentRunOptions) {
     if (!options.runId || options.runId.length > 512 || !isAbsolute(options.root) || resolve(options.root) !== options.root
@@ -121,6 +129,8 @@ export class HostedAgentRun {
       targetId: options.source.targetId, nativeSessionId: options.nativeSessionId, backendId: options.backendId, trust: options.trust,
       ...(options.providerCleanup ? { providerGrant: options.providerCleanup } : {}) };
     this.id = options.store.key(this.#owner);
+    this.#storageKey = options.store.find(this.id)?.storageKey ?? this.id;
+    this.#persistentReadOnly = options.store.find(this.id)?.derivation?.completedSnapshot !== undefined;
     this.#navigation = new HostedAgentNavigation(options.store, this.id, this.#leaseId);
     this.#slot = options.slots.reserve(options.source.deviceId);
     try { this.exchange = new HostedAgentExchange({ assertCurrent: () => options.assertCurrent(), onOverflow: () => { void this.close().catch(() => {}); } }); }
@@ -137,7 +147,8 @@ export class HostedAgentRun {
   get ready(): boolean { return this.#ready && !this.#lifetime.signal.aborted; }
   get initializing(): boolean { return !this.#startupSettled && !this.#lifetime.signal.aborted; }
   checkAuthority(): void { this.#assertAuthority(); }
-  get workspaceRoot(): string { return join(this.#options.root, this.id, "workspace"); }
+  get workspaceRoot(): string { return join(this.#options.root, this.#storageKey, "workspace"); }
+  hasNativeDerivation(operationId: string): boolean { return this.#derivations.has(operationId); }
   activeProviderTurns(backendId: string, providerId: string): number {
     return this.#options.backendId === backendId && this.#activeProvider === providerId && !this.#nativeCleaned ? 1 : 0;
   }
@@ -146,7 +157,7 @@ export class HostedAgentRun {
   }
 
   call(id: string, command: HostedAgentCall): Promise<unknown> {
-    this.#assertCurrent();
+    if (command.kind !== "idle_release_status") this.#assertCurrent(); else this.#options.assertCurrent();
     if (!id || id.length > 512 || /[\0\r\n]/u.test(id)) throw new Error("Hosted Agent call identity is invalid.");
     const serialized = JSON.stringify(command);
     if (Buffer.byteLength(serialized) > 64 * 1024 * 1024) throw new Error("Hosted Agent call exceeds its limit.");
@@ -186,7 +197,7 @@ export class HostedAgentRun {
 
   async #start(): Promise<void> {
     try {
-      const root = join(this.#options.root, this.id), home = join(root, "native"), workspace = join(root, "workspace");
+      const root = join(this.#options.root, this.#storageKey), home = join(root, "native"), workspace = join(root, "workspace");
       await mkdir(root, { recursive: true, mode: 0o700 }); await chmod(root, 0o700);
       const info = await lstat(root);
       if (!info.isDirectory() || info.isSymbolicLink() || await realpath(root) !== root) throw new Error("Hosted Agent storage is unsafe.");
@@ -209,8 +220,8 @@ export class HostedAgentRun {
       };
       const pendingNavigation = this.#navigation.read();
       const retainedBinding = pendingNavigation?.sourceRetired ? pendingNavigation.binding : prior.binding;
-      const nativeOwner = { sessionId: `hosted-session:${this.id}`, targetId: `hosted-target:${this.id}`, generation: retainedBinding?.generation ?? 1, backendInstanceGeneration: 1 };
-      if (hosted.workspace.mcpEnabled) this.#mcp = await HostedAgentNativeMcp.create({ owner: nativeOwner, signal: this.#lifetime.signal,
+      const nativeOwner = { sessionId: `hosted-session:${this.id}`, targetId: `hosted-target:${this.#storageKey}`, generation: retainedBinding?.generation ?? 1, backendInstanceGeneration: 1 };
+      if (hosted.workspace.mcpEnabled && !this.#persistentReadOnly) this.#mcp = await HostedAgentNativeMcp.create({ owner: nativeOwner, signal: this.#lifetime.signal,
         assertCurrent: () => this.#assertAuthority(), execute: (request, signal) => this.exchange.tool({ operation: "mcp.request", request }, signal,
           request.kind === "catalog" || request.kind === "model_open" || request.kind === "model_poll" || request.kind === "model_close" ? this.#options.runId : this.#inputOperationId ?? this.#options.runId) });
       this.#adapter = await this.#options.createAdapter({ home, trust: this.#options.trust, providerId: this.#options.providerId,
@@ -220,8 +231,9 @@ export class HostedAgentRun {
         nativeOwner }); this.#assertAuthority();
       if (this.#adapter.id !== this.#options.backendId || this.#adapter.hostedExecutionCapabilities?.toolsOnSource !== true
         || this.#options.trust === "guest" && this.#adapter.hostedExecutionCapabilities.isolatedGuests !== true) throw new Error("This native Adapter does not support isolated hosted execution.");
-      const target = { id: `hosted-target:${this.id}`, backendId: this.#adapter.id, displayName: "Hosted Agent", workspaceRoot: workspace, trusted: false, managed: true };
+      const target = { id: `hosted-target:${this.#storageKey}`, backendId: this.#adapter.id, displayName: "Hosted Agent", workspaceRoot: workspace, trusted: false, managed: true };
       this.#context = { sessionId: `hosted-session:${this.id}`, generation: retainedBinding?.generation ?? 1, backendInstanceGeneration: 1, target, hostedExecution: hosted,
+        ...(this.#persistentReadOnly ? { runtimePolicy: "review_read_only" as const, persistentReadOnly: "side_chat" as const } : {}),
         signal: this.#lifetime.signal, operationId: this.#options.runId, modelSelection: { providerId: this.#options.providerId, modelId: this.#options.modelId },
         emit: (event, metadata) => this.#emit(event, metadata, this.#options.runId),
         requestInteraction: (interaction, options) => this.exchange.interaction(interaction,
@@ -254,13 +266,15 @@ export class HostedAgentRun {
         const resumed = await this.#adapter.resumeSession(retainedBinding, this.#context); this.#assertAuthority(); this.#binding = resumed.binding;
         if (resumed.streaming) this.#activeProvider = resumed.providerId ?? this.#options.providerId;
         this.#context = { ...this.#context, binding: resumed.binding, generation: resumed.binding.generation };
-        if (resumed.providerId !== this.#options.providerId || resumed.modelId !== this.#options.modelId) {
+        if (!this.#persistentReadOnly && (resumed.providerId !== this.#options.providerId || resumed.modelId !== this.#options.modelId)) {
           this.#options.assertModelAllowed(this.#options.providerId, this.#options.modelId);
           await this.#adapter.setModel(this.#options.providerId, this.#options.modelId, this.#context);
         }
-        if (this.#options.effort !== undefined && resumed.effort !== this.#options.effort) await this.#adapter.setEffort(this.#options.effort, this.#context);
-        if (resumed.fastMode !== this.#options.fastMode) await this.#adapter.setFastMode(this.#options.fastMode, this.#context);
-        if (resumed.permissionMode !== this.#options.permissionMode) await this.#adapter.setPermissionMode(this.#options.permissionMode, this.#context);
+        if (!this.#persistentReadOnly) {
+          if (this.#options.effort !== undefined && resumed.effort !== this.#options.effort) await this.#adapter.setEffort(this.#options.effort, this.#context);
+          if (resumed.fastMode !== this.#options.fastMode) await this.#adapter.setFastMode(this.#options.fastMode, this.#context);
+          if (resumed.permissionMode !== this.#options.permissionMode) await this.#adapter.setPermissionMode(this.#options.permissionMode, this.#context);
+        } else if (resumed.permissionMode !== "ask" || resumed.fastMode !== false) throw new Error("The native Side Chat did not confirm its immutable read-only launch profile.");
       } else this.#binding = await this.#adapter.createSession(creation, this.#context);
       this.#assertAuthority(); this.#options.store.bind(this.id, this.#leaseId, this.#binding);
       this.#context = { ...this.#context, binding: this.#binding }; this.#ready = true;
@@ -278,6 +292,16 @@ export class HostedAgentRun {
   }
   async #emit(event: EventPayload, metadata?: AdapterEventMetadata, operationId?: string): Promise<void> {
     this.#assertAuthority();
+    const usageOwner = operationId === this.#options.runId ? this.#inputOperationId ?? operationId : operationId;
+    if (this.#options.usage && !this.#usageTurn && event.type === "run_state" && event.state === "running" && usageOwner) {
+      const modelId = this.#usageFollowUps.get(usageOwner);
+      if (modelId) {
+        this.#options.usage.begin(usageOwner, modelId, this.#lastUsage); this.#usageTurn = usageOwner;
+        this.#usageObserved = false; this.#usageFollowUps.delete(usageOwner);
+      }
+    }
+    if (["done", "run_state", "tool_start", "tool_result", "background_task", "subagent_run", "subagent_transcript"].includes(event.type)) this.#lastActivity = Date.now();
+    this.#observeBackground(event);
     if (event.type === "usage") { this.#lastUsage = event.usage; this.#usageObserved = true; }
     if (this.#usageTurn && (event.type === "done" || event.type === "run_state" && ["completed", "aborted", "failed"].includes(event.state))) {
       this.#options.usage?.finish(this.#usageTurn, this.#usageObserved ? this.#lastUsage : undefined); this.#usageTurn = undefined;
@@ -447,6 +471,7 @@ export class HostedAgentRun {
     })().catch(error => { this.#cleanup = undefined; throw error; });
   }
   async #invokeOnce(id: string, digest: string, command: HostedAgentCall): Promise<unknown> {
+    if (command.kind === "idle_release_status") return this.#idleReleaseStatus(command.releaseCallId);
     this.#assertCurrent();
     if (["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind)) return this.#invoke(id, command);
     const prior = this.#options.store.call(this.id, id);
@@ -456,6 +481,7 @@ export class HostedAgentRun {
       throw new Error(prior.state === "pending" ? "The prior native outcome is unknown; the operation was not repeated." : "The prior native operation failed and was not repeated.");
     }
     this.#options.store.claimCall(this.id, this.#leaseId, id, digest);
+    if (command.kind !== "idle_release") this.#lastActivity = Date.now();
     let result: unknown;
     try { result = await this.#invoke(id, command); }
     catch (error) {
@@ -464,7 +490,9 @@ export class HostedAgentRun {
     }
     // A commit failure leaves the durable pending receipt intact. Retrying that
     // ID must not repeat a native effect whose response could have been lost.
-    this.#options.store.finishCall(this.id, this.#leaseId, id, digest, { ok: true, value: result }); return result;
+    this.#options.store.finishCall(this.id, this.#leaseId, id, digest, { ok: true, value: result });
+    if (command.kind === "idle_release" && result === true) this.exchange.finish();
+    return result;
   }
   async #invoke(id: string, command: HostedAgentCall): Promise<unknown> {
     this.#assertCurrent();
@@ -472,13 +500,22 @@ export class HostedAgentRun {
     const adapter = this.#adapter!, observation = ["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind);
     const context = this.#operationContext(observation ? this.#options.runId : id);
     switch (command.kind) {
+      case "derive": return this.#derive(id, command, context);
+      case "derivation_lifecycle": throw new Error("Native derivation lifecycle requires the authenticated service owner.");
+      case "idle_release": return this.#releaseIdle(id, command.idleMinutes, context);
+      case "idle_release_status": return this.#idleReleaseStatus(command.releaseCallId);
       case "state": return adapter.inspectSession(this.#binding!, context);
       case "send":
-        if (this.#options.usage) {
+        if (this.#options.usage && !this.#usageTurn && !this.#activeProvider && command.input.disposition !== "steer") {
           const state = await adapter.inspectSession(this.#binding!, context); this.#assertCurrent();
-          this.#lastUsage = state.usage;
-          this.#usageObserved = false;
-          this.#options.usage.begin(id, context.modelSelection!.modelId, state.usage); this.#usageTurn = id;
+          if (!state.streaming && !state.compacting && state.pendingMessages === 0) {
+            this.#lastUsage = state.usage; this.#usageObserved = false;
+            this.#options.usage.begin(id, context.modelSelection!.modelId, state.usage); this.#usageTurn = id;
+          }
+        }
+        if (this.#options.usage && this.#usageTurn !== id && command.input.disposition === "follow_up") {
+          if (this.#usageFollowUps.size >= 256) throw new Error("Hosted queued usage attribution capacity is exhausted.");
+          this.#usageFollowUps.set(id, context.modelSelection!.modelId);
         }
         this.#activeProvider = context.modelSelection?.providerId ?? this.#options.providerId;
         this.#inputOperationId = id;
@@ -531,6 +568,84 @@ export class HostedAgentRun {
       case "background_output": if (!adapter.getBackgroundTaskOutput) throw new Error("Hosted background task output is unsupported."); return adapter.getBackgroundTaskOutput(context, command.taskId, command.maximumBytes);
     }
   }
+  async #derive(id: string, command: Extract<HostedAgentCall, { kind: "derive" }>, context: AdapterContext): Promise<{ readonly editorText?: string }> {
+    if (command.sessionId === this.#owner.sessionId || command.targetId !== this.#owner.targetId
+      || command.nativeSessionId === this.#owner.nativeSessionId || command.derivationKind === "fork" && !command.entryId
+      || command.derivationKind === "clone" && command.entryId !== undefined
+      || command.completedSnapshot && (command.derivationKind !== "fork" || command.completedSnapshot.nativeBoundaryId !== command.entryId)) throw new Error("The native derivation child authority is invalid.");
+    const adapter = this.#adapter!, descriptor = await adapter.describe(); this.#assertCurrent();
+    if (descriptor.capabilities.get(command.completedSnapshot ? "session.side_chat" : `session.${command.derivationKind}`)?.supported !== true) {
+      throw new Error("The native source does not support this derivation.");
+    }
+    if (!command.completedSnapshot && this.#idleBusy(id)) throw new Error("The native source is busy and cannot derive its history.");
+    const sourceBinding = this.#binding!, owner: HostedNativeSessionOwner = { ...this.#owner, sessionId: command.sessionId,
+      targetId: command.targetId, nativeSessionId: command.nativeSessionId };
+    const record = this.#options.store.prepareDerivation(this.id, this.#leaseId, owner, { operationId: id, kind: command.derivationKind,
+      providerId: context.modelSelection!.providerId, modelId: context.modelSelection!.modelId,
+      ...(command.completedSnapshot ? { completedSnapshot: command.completedSnapshot } : {}) });
+    const lifecycle: NativeSessionDerivationLifecycle = { operationId: id, kind: command.derivationKind,
+      sourceSessionId: context.sessionId, sourceBinding, sessionId: `hosted-session:${record.key}`, sourceTarget: context.target, target: context.target };
+    this.#derivations.add(id);
+    try {
+      const derivation = { sessionId: lifecycle.sessionId, target: context.target,
+        ...(command.completedSnapshot ? { completedSnapshot: command.completedSnapshot } : {}),
+        recordBinding: (binding: NativeSessionBinding) => { this.#options.store.updateDerivation(record.key, record.leaseId, {}, binding); } };
+      const result = command.derivationKind === "fork" ? await adapter.fork(command.entryId!, context, derivation)
+        : { binding: await adapter.clone(context, derivation) };
+      this.#assertCurrent();
+      const recorded = this.#options.store.assertLease(record.key, record.leaseId);
+      if (!recorded.binding || recorded.binding.opaqueRef !== result.binding.opaqueRef
+        || recorded.binding.nativeSessionId !== result.binding.nativeSessionId
+        || recorded.binding.generation !== result.binding.generation) throw new Error("The native derivation did not register its exact child binding.");
+      if (await adapter.ownsNativeSessionDerivationLifecycle?.(lifecycle) === true) {
+        if (!adapter.adoptNativeSessionDerivation) throw new Error("The native derivation adopter is unavailable.");
+        await adapter.adoptNativeSessionDerivation({ ...lifecycle, binding: result.binding }, this.#lifetime.signal); this.#assertCurrent();
+      }
+      const settled = this.#options.store.updateDerivation(record.key, record.leaseId, { state: "settled", nativeAdopted: true });
+      if (settled.derivation!.cleanupRequested) throw new Error("The original native derivation was cancelled before adoption.");
+      return "editorText" in result && typeof result.editorText === "string" ? { editorText: result.editorText } : {};
+    } catch (error) {
+      this.#options.store.updateDerivation(record.key, record.leaseId, { state: "unknown" }); throw error;
+    } finally { this.#derivations.delete(id); }
+  }
+  #observeBackground(event: EventPayload, historical = false): void {
+    const id = event.type === "background_task" ? `task:${event.taskId}` : event.type === "subagent_run" ? `child:${event.run.id}` : undefined;
+    const state = event.type === "background_task" ? event.state : event.type === "subagent_run" ? event.run.state : undefined;
+    if (id === undefined || state === undefined) return;
+    if (historical && this.#observedBackground.has(id)) return;
+    if (!historical) this.#observedBackground.add(id);
+    if (["completed", "failed", "stopped", "cancelled", "aborted"].includes(state)) this.#activeBackground.delete(id);
+    else this.#activeBackground.add(id);
+  }
+  #idleBusy(id: string): boolean {
+    return !!this.#activeProvider || !!this.#shellOperationId || this.#navigating || this.#toolOwners.size > 0
+      || this.#backgroundRegistrations.size > 0 || this.#backgroundResumes.size > 0 || this.#activeBackground.size > 0
+      || this.exchange.pendingRequests > 0 || [...this.#receipts].some(([call, receipt]) => call !== id && !receipt.settled);
+  }
+  async #releaseIdle(id: string, idleMinutes: number, context: AdapterContext): Promise<boolean> {
+    if (!Number.isSafeInteger(idleMinutes) || idleMinutes < 1 || idleMinutes > 120) throw new Error("Native idle release threshold is invalid.");
+    if (this.#idleBusy(id)) return false;
+    if (this.#adapter!.getNativeHistoryProjection && !this.#persistentReadOnly) {
+      const history = await this.#adapter!.getNativeHistoryProjection(context);
+      for (const event of history.events) this.#observeBackground(event.payload, true);
+      this.#assertCurrent();
+    }
+    const state = await this.#adapter!.inspectSession(this.#binding!, context); this.#assertCurrent();
+    if (state.streaming || state.compacting || state.pendingMessages > 0 || this.#idleBusy(id) || Date.now() - this.#lastActivity < idleMinutes * 60_000) return false;
+    // Fence dispatch synchronously before any process cleanup awaits. A lost
+    // response is reconciled through this exact release identity, never a new run.
+    this.#idleReleaseId = id; this.#ready = false;
+    await this.#channel?.close(); await this.#disposeNative(); return true;
+  }
+  async #idleReleaseStatus(id: string): Promise<"busy" | "released" | "unknown"> {
+    this.#options.assertCurrent();
+    if (this.#idleReleaseId === id) {
+      await this.#channel?.close(); await this.#disposeNative(); this.exchange.finish(); return "released";
+    }
+    const receipt = this.#options.store.call(this.id, id);
+    if (receipt?.state === "completed" && receipt.resultJson === "false") return "busy";
+    return "unknown";
+  }
   async #navigate(id: string, command: Extract<HostedAgentCall, { kind: "navigate" }>, context: AdapterContext): Promise<null> {
     const adapter = this.#adapter!, sourceBinding = this.#binding!;
     let nativeConfirmed = false;
@@ -577,14 +692,26 @@ export class HostedAgentRun {
  * while filesystem deletion awaits the operating system. */
 export async function purgeHostedAgentStorage(options: { readonly root: string; readonly store: HostedAgentStore; readonly key: string; readonly leaseId: string }): Promise<void> {
   if (!isAbsolute(options.root) || resolve(options.root) !== options.root || !/^[a-f0-9]{64}$/u.test(options.key)) throw new Error("Hosted Agent cleanup path is invalid.");
-  const target = resolve(options.root, options.key);
+  const record = options.store.assertLease(options.key, options.leaseId), storageKey = record.storageKey ?? record.key;
+  const references = options.store.list().filter(row => row.key !== record.key && (row.storageKey ?? row.key) === storageKey && row.derivation?.state !== "cleaned");
+  const targetKey = record.key === storageKey && references.length ? undefined : record.key;
+  const target = resolve(options.root, targetKey ?? options.key);
   if (target !== join(options.root, options.key) || target === options.root || await realpath(options.root) !== options.root) throw new Error("Hosted Agent cleanup path is unsafe.");
   options.store.beginPurge(options.key, options.leaseId);
   try {
-    const info = await lstat(target);
+    const info = targetKey === undefined ? undefined : await lstat(target);
+    if (info === undefined) { options.store.finishPurge(options.key, options.leaseId); return; }
     if (!info.isDirectory() || info.isSymbolicLink() || await realpath(target) !== target) throw new Error("Hosted Agent cleanup directory is unsafe.");
     options.store.assertLease(options.key, options.leaseId);
     await rm(target, { recursive: true, force: false });
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (storageKey !== record.key && references.length === 0) {
+    const lineage = resolve(options.root, storageKey);
+    try {
+      const info = await lstat(lineage);
+      if (lineage !== join(options.root, storageKey) || !info.isDirectory() || info.isSymbolicLink() || await realpath(lineage) !== lineage) throw new Error("Hosted native lineage cleanup is unsafe.");
+      options.store.assertLease(options.key, options.leaseId); await rm(lineage, { recursive: true, force: false });
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
   options.store.finishPurge(options.key, options.leaseId);
 }

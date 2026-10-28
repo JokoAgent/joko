@@ -100,7 +100,10 @@ describe("isolated-workspace gateway", () => {
     let preview = create(GetSessionWorktreeRemovalPreviewResponseSchema, {
       sessionId: "session-1",
       hasWorktree: true,
-      dirty: true
+      dirty: true,
+      activeBoundScheduleCount: 1,
+      activeBoundScheduleNames: ["Nightly"],
+      archiveConfirmation: "a".repeat(64)
     });
     const requests: unknown[] = [];
     const transport = transportWithSnapshot(async (method, input) => {
@@ -115,7 +118,10 @@ describe("isolated-workspace gateway", () => {
 
     await expect(gateway.getSessionWorktreeRemovalPreview("session-1")).resolves.toEqual({
       hasWorktree: true,
-      dirty: true
+      dirty: true,
+      activeBoundScheduleCount: 1,
+      activeBoundScheduleNames: ["Nightly"],
+      archiveConfirmation: "a".repeat(64)
     });
     expect(requests).toEqual([{ sessionId: "session-1" }]);
 

@@ -184,7 +184,7 @@ export function deliverDesktopNativeTaskStatusAction<TWindow>(
     readonly dispatch: (window: TWindow, action: DesktopNativeTaskStatusAction) => void;
   }
 ): boolean {
-  if (action.kind === "focus" && !target.revealMainWindow()) return false;
+  if ((action.kind === "focus" || action.kind === "completion" && action.action === "archive") && !target.revealMainWindow()) return false;
   const window = target.currentMainWindow();
   if (window === undefined || !target.isWindowAvailable(window)) return false;
   target.dispatch(window, action);

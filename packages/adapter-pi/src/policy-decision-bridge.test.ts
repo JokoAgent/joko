@@ -7,6 +7,14 @@ import {
 } from "./policy-decision-bridge.js";
 
 describe("managed policy decision bridge", () => {
+  it("carries host-projected owner text separately from native approval decisions", async () => {
+    const notify = vi.fn(async () => undefined);
+    const reply = { decision: "default" as const, ownerUserInstructions: ["Inspect the branch; keep credentials private."] };
+    await handlePolicyDecisionExtensionRequest({ id: "owner-text", method: "input", title: encodePolicyDecisionRequest({ policyGeneration: 1,
+      observation: { subjectKind: "command", risk: "medium", toolName: "bash" } }) }, {
+      decide: async () => reply, transport: { closed: false, notify }, isCurrent: () => true });
+    expect(notify).toHaveBeenCalledWith({ type: "extension_ui_response", id: "owner-text", value: JSON.stringify(reply) });
+  });
   it("carries bounded actual native action evidence and distinguishes delegated approval", async () => {
     const notify = vi.fn(async () => undefined), decide = vi.fn(async () => "delegated_allow" as const);
     const request = { policyGeneration: 1, observation: { subjectKind: "file_read" as const, risk: "read_only" as const, toolName: "read" },

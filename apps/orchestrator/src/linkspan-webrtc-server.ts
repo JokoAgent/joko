@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type { ByteChannel } from "@jokoagent/linkspan-core";
 import type { openWebRtcChannel } from "@jokoagent/linkspan-webrtc";
+import { boundWebRtcRecordWrites } from "@joko/connection-transport/webrtc";
 import type { OrchestratorApplication } from "./application.js";
 import { serveLinkspanChannel } from "./linkspan-server.js";
 import { publishWebRtcConnectionEntry } from './connection-entries.js';
@@ -76,8 +77,8 @@ export class LinkspanWebRtcSignaling {
           || data.maxPacketLifeTime !== null || data.maxRetransmits !== null) { data.close(); retire(); return; }
         accepted = true;
         void (async () => {
-          const channel = await open({ peerConnection: peer, dataChannel: data, expectedFingerprint: fingerprint,
-            signal: session.abort.signal, ownsPeerConnection: true });
+          const channel = boundWebRtcRecordWrites(await open({ peerConnection: peer, dataChannel: data, expectedFingerprint: fingerprint,
+            signal: session.abort.signal, ownsPeerConnection: true }));
           session.channel = channel;
           session.abort.signal.throwIfAborted();
           clearTimeout(session.timer); session.timer = undefined;

@@ -14,6 +14,7 @@ import { ExecutorWorkspace, realPathOrAncestor, type ExecutorPathAlias } from ".
 import { isShareCredentialCommand, isShareCredentialPath, shareCredentialGitReads } from "./hosted-agent-credentials.js";
 import { GitCredentialHistory } from "./hosted-agent-git-credentials.js";
 import { reviewNativeToolPolicy } from "./native-tool-policy.js";
+import { executeCodexReadOnlyWorkspaceTool } from "@joko/adapter-codex";
 import { tightenNativeCodexFileSystemPolicy } from "./native-codex-filesystem-policy.js";
 import { hostedDirectoryId, hostedDirectoryPath } from "./hosted-agent-directories.js";
 import type { SourceInputMount } from "./hosted-agent-source-attachments.js";
@@ -183,6 +184,15 @@ export class HostedAgentExecutor {
           return {};
         }
         case "tool.end": keys(payload, []); this.#tools.delete(request.callId); return {};
+        case "review.call": {
+          keys(payload, ["tool", "arguments"]);
+          if (this.#options.context.persistentReadOnly !== "side_chat" || this.#options.context.runtimePolicy !== "review_read_only"
+            || this.#options.remote) throw new HostedAgentExecutorError("INVALID_REQUEST");
+          const args = record(payload.arguments), tool = text(payload.tool, 64), rawPath = args.path ?? ".";
+          const target = await this.#canonical(this.#workspace.resolve(text(rawPath, 4096)), activeSignal);
+          const assert = await this.#authorize(request, { name: "read", args: { path: target } }, activeSignal); assert();
+          const result = await executeCodexReadOnlyWorkspaceTool(this.#options.context.target.workspaceRoot, tool, args); assert(); return { text: result };
+        }
         case "fs.read": {
           keys(payload, ["path"]);
           const maximum = effects?.readMaximumBytes ?? RAW_FILE_LIMIT, range = effects?.readLines;
@@ -445,7 +455,7 @@ export class HostedAgentExecutor {
   #toolOperation(request: ExecutorRequest, call: ToolCall, signal: AbortSignal): () => void {
     const lease = this.#tools.get(request.callId);
     const operations: Readonly<Record<string, readonly string[]>> = {
-      read: ["fs.read", "fs.access", "fs.mime", "fs.stat"], write: ["fs.mkdir", "fs.write"], edit: ["fs.mkdir", "fs.access", "fs.read", "fs.write"],
+      read: ["fs.read", "fs.access", "fs.mime", "fs.stat", "review.call"], write: ["fs.mkdir", "fs.write"], edit: ["fs.mkdir", "fs.access", "fs.read", "fs.write"],
       ls: ["fs.stat", "fs.readdir"], find: ["fs.stat", "fs.glob"], grep: ["pi.grep"], bash: ["exec.run"]
     };
     if (!lease || lease.expiresAt <= Date.now() || !operations[lease.name]?.includes(request.operation)) throw new HostedAgentExecutorError("ACCESS_DENIED");

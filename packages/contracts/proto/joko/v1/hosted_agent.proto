@@ -149,9 +149,16 @@ message UpdateHostedAgentSettingsResponse { HostedAgentSettings settings = 1; }
 // They are private transport values, never persisted as product Events, Sessions
 // or Workspaces. The service rejects unknown fields and unsupported operations.
 message OpenHostedAgentRequest { uint32 format = 1; bytes open_json = 2; }
-message OpenHostedAgentResponse { uint32 format = 1; string run_id = 2; string virtual_root = 3; }
+// Only native process admission may produce this value. Payload/artifact
+// ResourceExhausted errors must never authorize a new native open attempt.
+enum HostedAgentCapacityRejection {
+  HOSTED_AGENT_CAPACITY_REJECTION_UNSPECIFIED = 0;
+  HOSTED_AGENT_CAPACITY_REJECTION_DEVICE_LIMIT = 1;
+  HOSTED_AGENT_CAPACITY_REJECTION_TOTAL_LIMIT = 2;
+}
+message OpenHostedAgentResponse { uint32 format = 1; string run_id = 2; string virtual_root = 3; HostedAgentCapacityRejection capacity_rejection = 4; }
 message CallHostedAgentRequest { uint32 format = 1; string run_id = 2; string call_id = 3; bytes command_json = 4; }
-message CallHostedAgentResponse { uint32 format = 1; bytes result_json = 2; }
+message CallHostedAgentResponse { uint32 format = 1; bytes result_json = 2; HostedAgentCapacityRejection capacity_rejection = 3; }
 message HostedAgentPollCursor { string run_id = 1; uint64 after = 2; }
 message HostedAgentPollRun { string run_id = 1; uint64 cursor = 2; bool finished = 3; bytes frames_json = 4; }
 message PollHostedAgentsRequest { uint32 format = 1; repeated HostedAgentPollCursor cursors = 2; }

@@ -13,8 +13,44 @@ import { HostedAgentPoller } from "./hosted-agent-poller.js";
 import type { HostedAgentRun } from "./hosted-agent-run.js";
 import { decodeHostedAgentCall, decodeHostedAgentOpen, encodeHostedAgentValue } from "./hosted-agent-wire.js";
 import { HostedAgentRun as NativeRun } from "./hosted-agent-run.js";
+import { createClient, createRouterTransport, Code } from "@connectrpc/connect";
+import * as contract from "@joko/contracts";
+import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
+import { HostedAgentConnectClient } from "./hosted-agent-connect-client.js";
 const databases: OperationalStore[] = [];
 afterEach(() => { for (const store of databases.splice(0)) store.close(); });
+
+it("protects background work from idle release and retries only the approved native close when its outcome is uncertain", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-hosted-idle-")), database = new OperationalStore(":memory:"), store = new HostedAgentStore(database);
+  let now = 0, context!: AdapterContext, disposals = 0; const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+  const slots = new HostedAgentSessionSlots(), binding = { opaqueRef: "native-history", nativeSessionId: "history", generation: 1 };
+  const adapter = { id: "native", hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },
+    createSession: async (_input, input) => { context = input; return binding; },
+    inspectSession: async () => ({ binding, streaming: false, compacting: false, pendingMessages: 0, fastMode: false, permissionMode: "ask" }),
+    getNativeHistoryProjection: async () => ({ events: [] }),
+    dispose: async () => { if (++disposals === 1) throw new Error("Native closure is uncertain."); }
+  } satisfies Partial<BackendAdapter>;
+  let run: NativeRun | undefined;
+  try {
+    run = await NativeRun.create({ root, runId: "idle-run", nativeSessionId: "retained", start: "create", store, slots,
+      source: { authorityId: "owner", deviceId: "source", sessionId: "task", targetId: "workspace", generation: 1 },
+      trust: "owner", backendId: "native", providerId: "provider", modelId: "model", modelIds: ["model"], permissionMode: "ask", fastMode: false,
+      workspace: { platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false }, artifactCapacityBytes: 1024,
+      assertCurrent: () => {}, assertModelAllowed: () => {}, createAdapter: () => adapter as unknown as BackendAdapter });
+    await context.emit({ type: "background_task", taskId: "background", title: "Active background work", state: "running" });
+    now = 120_000; expect(await run.call("busy-idle", { kind: "idle_release", idleMinutes: 1 })).toBe(false); expect(disposals).toBe(0);
+    await context.emit({ type: "background_task", taskId: "background", title: "Finished background work", state: "completed" });
+    expect(await run.call("recent-idle", { kind: "idle_release", idleMinutes: 1 })).toBe(false);
+    now = 240_000; await expect(run.call("release-idle", { kind: "idle_release", idleMinutes: 1 })).rejects.toThrow("uncertain");
+    expect(slots.summary().total).toBe(1);
+    expect(await run.call("recover-idle", { kind: "idle_release_status", releaseCallId: "release-idle" })).toBe("released");
+    expect(disposals).toBe(2); expect(slots.summary().total).toBe(0); expect(store.find(run.id)?.state).toBe("closed");
+    expect(() => run!.call("new-input", { kind: "abort" })).toThrow();
+  } finally {
+    await run?.close(); run?.disposeExchange(); database.close(); clock.mockRestore();
+    if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
+  }
+});
 
 function fixture(options: { readonly beforeAuthorize?: () => Promise<void>; readonly beforeClose?: () => Promise<void> } = {}) {
   let now = 1, enabled = true, connected = true;
@@ -56,6 +92,19 @@ it("reserves one open across async authorization and rejects conflicting identit
       .rejects.toMatchObject({ code: "ACCESS_DENIED" });
     expect(f.slots.usage("source-device").device).toBe(1);
   } finally { release(); await f.host.dispose(); }
+});
+
+it("carries native admission rejection through the generated service while keeping payload failures outside that retry authority", async () => {
+  const f = fixture(), occupied = Array.from({ length: 16 }, () => f.slots.reserve(f.principal.deviceId));
+  const generated = createClient(contract.HostedAgentService, createRouterTransport(router => router.service(contract.HostedAgentService,
+    createHostedAgentConnectService({ host: f.host, authenticate: () => f.principal }))));
+  const client = new HostedAgentConnectClient(generated, f.principal.assertCurrent);
+  try {
+    const response = await generated.openHostedAgent({ format: 1, openJson: encodeHostedAgentValue(f.input) });
+    expect(response.capacityRejection).toBe(contract.HostedAgentCapacityRejection.DEVICE_LIMIT); expect(response.virtualRoot).toBe("");
+    await expect(client.open({ ...f.input, runId: "another-rejected-open" }, new AbortController().signal)).rejects.toMatchObject({ code: Code.ResourceExhausted });
+    expect(f.slots.summary().total).toBe(16); expect(f.exchanges.size).toBe(0);
+  } finally { occupied.forEach(slot => slot.release()); await f.host.dispose(); }
 });
 
 it("multiplexes two task cursors over one pending poll and cancels only the departing task", async () => {

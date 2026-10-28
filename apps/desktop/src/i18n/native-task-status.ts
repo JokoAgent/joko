@@ -20,6 +20,10 @@ export interface NativeStrings {
   readonly newTask: string;
   readonly untitled: string;
   readonly recentActivity: string;
+  readonly archive: string;
+  readonly markRead: string;
+  readonly previous: string;
+  readonly next: string;
   readonly awaitingPermission: string;
   readonly awaitingQuestion: string;
   readonly awaitingPlan: string;
@@ -50,6 +54,10 @@ export const EN_STRINGS: NativeStrings = Object.freeze({
   newTask: "New task",
   untitled: "Untitled task",
   recentActivity: "Recent activity",
+  archive: "Archive task",
+  markRead: "Mark as read",
+  previous: "Previous completion",
+  next: "Next completion",
   awaitingPermission: "Awaiting permission",
   awaitingQuestion: "Awaiting your reply",
   awaitingPlan: "Awaiting plan review",
@@ -80,6 +88,10 @@ export const ZH_STRINGS: NativeStrings = Object.freeze({
   newTask: "新建任务",
   untitled: "未命名任务",
   recentActivity: "最近活动",
+  archive: "归档任务",
+  markRead: "标为已读",
+  previous: "上一条完成消息",
+  next: "下一条完成消息",
   awaitingPermission: "等待权限确认",
   awaitingQuestion: "等待你的回复",
   awaitingPlan: "等待计划审核",

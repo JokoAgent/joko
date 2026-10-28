@@ -7,6 +7,13 @@ export interface DesktopRemoteDesktopPermissions {
 
 export type DesktopRemoteDesktopWindowsSupport = "ready" | "missing" | "installRequired" | "unavailable";
 
+/** Setup diagnostics contain only a bounded step code and Win32 error number. */
+export interface DesktopRemoteDesktopWindowsDiagnostic {
+  readonly step: string;
+  readonly childStep?: string;
+  readonly osError: number;
+}
+
 /** Process-local state owned by the current primary Desktop document. */
 export interface DesktopRemoteDesktopSnapshot {
   readonly enabled: boolean;
@@ -17,6 +24,7 @@ export interface DesktopRemoteDesktopSnapshot {
   readonly displayId?: string;
   readonly permissions: DesktopRemoteDesktopPermissions;
   readonly windowsSupport?: DesktopRemoteDesktopWindowsSupport;
+  readonly windowsSupportDiagnostic?: DesktopRemoteDesktopWindowsDiagnostic;
 }
 
 export interface DesktopRemoteDesktopApi {

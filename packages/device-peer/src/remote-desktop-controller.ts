@@ -466,9 +466,7 @@ export class RemoteDesktopController {
   #clearHostMute(active: ActiveRemoteDesktopLease, retainPrivacy = false): void {
     this.#retireSystemActions();
     if (!retainPrivacy) this.#clearPrivacy(active);
-    active.clipboardSync = false;
-    active.syncGeneration = ++this.#syncGeneration;
-    this.#dependencies.stopClipboardVersion?.();
+    this.#stopClipboardSync(active);
     const owner = active.muteOwner;
     active.muteOwner = undefined;
     if (owner !== undefined && this.#dependencies.stopHostMute !== undefined) {
@@ -477,6 +475,12 @@ export class RemoteDesktopController {
     } else {
       for (const pending of this.#pendingMuteRestores) this.#queueMuteRestore(pending);
     }
+  }
+
+  #stopClipboardSync(active: ActiveRemoteDesktopLease): void {
+    active.clipboardSync = false;
+    active.syncGeneration = ++this.#syncGeneration;
+    this.#dependencies.stopClipboardVersion?.();
   }
 
   #queueMuteRestore(owner: object): void {
@@ -517,8 +521,9 @@ export class RemoteDesktopController {
 
   /** Called only by the exact mask's native physical-input confirmation. */
   async stopPrivacyByUser(owner: object): Promise<void> {
+    this.tick();
     const active = this.#active;
-    if (active === undefined || active.privacyOwner !== owner || !active.controlling
+    if (active === undefined || active.privacyOwner !== owner
       || !this.#authorityCurrent(active.authority)) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
     this.#locallyStopped.set(peerKey(active.authority), active.lease);
     if (active.privacyLockOnExit && active.lockOnExit) {
@@ -891,7 +896,8 @@ export class RemoteDesktopController {
     if (enabled) {
       active.controlling = false;
       active.controlGeneration = ++this.#controlGeneration;
-      this.#clearHostMute(active);
+      this.#retireSystemActions();
+      this.#stopClipboardSync(active);
       this.#dependencies.stopInput();
     }
     this.#dependencies.changed();
@@ -916,7 +922,10 @@ export class RemoteDesktopController {
     if (enabled) active.backgroundViewing = false;
     const generation = ++this.#controlGeneration;
     active.controlGeneration = generation;
-    if (!recovering) this.#clearHostMute(active);
+    if (!recovering) {
+      if (enabled) { this.#retireSystemActions(); this.#stopClipboardSync(active); }
+      else this.#clearHostMute(active);
+    }
     if (enabled) {
       await this.#awaitSafety();
       this.#revalidateAsyncCompletion(authority, active);
@@ -947,6 +956,10 @@ export class RemoteDesktopController {
         if (this.#active === active && generation === this.#controlGeneration) {
           this.#dependencies.stopInput();
           active.controlling = false;
+          if (!recovering) {
+            this.#clearHostMute(active);
+            await this.#awaitSafety();
+          }
           this.#dependencies.changed();
         }
         throw error;
@@ -1084,7 +1097,11 @@ export class RemoteDesktopController {
       owner = Object.freeze({});
       active.privacyOwner = owner;
       const captured = owner;
-      const current = (): boolean => controlCurrent() && active.privacyOwner === captured;
+      const current = (): boolean => {
+        this.tick();
+        return this.#active === active && this.#authorityCurrent(authority)
+          && this.#authenticationCurrent(active) && active.privacyOwner === captured;
+      };
       const promise = (async () => {
         await this.#awaitSafety();
         if (!current()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
@@ -1098,15 +1115,19 @@ export class RemoteDesktopController {
       void pending.then(() => { if (this.#privacyPending === pending) this.#privacyPending = undefined; });
     }
     const captured = owner;
+    const leaseCurrent = (): boolean => {
+      this.tick();
+      return this.#active === active && this.#authorityCurrent(authority) && this.#authenticationCurrent(active);
+    };
     try {
       await operation.promise;
-      if (!controlCurrent() || active.privacyOwner !== captured) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+      if (!leaseCurrent() || active.privacyOwner !== captured) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
       if (active.privacyRevision === revision) active.privacyLockOnExit = lockOnExit && active.lockOnExit;
       return Object.freeze({ enabled: true });
     } catch (error) {
       if (active.privacyOwner === captured) this.#clearPrivacy(active);
       await this.#awaitSafety();
-      if (!controlCurrent()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+      if (!leaseCurrent()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
       throw error;
     }
   }

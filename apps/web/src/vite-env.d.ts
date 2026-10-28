@@ -222,6 +222,7 @@ type JokoDesktopNativeTaskStatusSnapshot = import("@joko/contracts").NativeTaskS
 
 type JokoDesktopNativeTaskStatusAction =
   | { readonly kind: "focus"; readonly sessionId: string; readonly entryToken?: string }
+  | { readonly kind: "completion"; readonly action: "archive" | "markRead"; readonly sessionId: string; readonly entryToken: string }
   | {
       readonly kind: "permission";
       readonly sessionId: string;
@@ -584,7 +585,7 @@ interface JokoDesktopApi {
     onCommand(listener: (command: "open-about" | "open-help" | "new-session" | "open-settings" | "open-task-status-settings" | "check-for-updates" | "toggle-sidebar" | "zoom-reset" | "zoom-in" | "zoom-out") => void): () => void;
   };
   readonly inspectorWindow: {
-    activate(): Promise<boolean>;
+    activate(occurrence?: string): Promise<boolean>;
     onClosed(listener: (event: { readonly occurrence: string; readonly reason: "user" | "child-failure" }) => void): () => void;
   };
   readonly selectionContextMenu: {
@@ -611,6 +612,7 @@ interface JokoDesktopApi {
     publish(snapshot: JokoDesktopNativeTaskStatusSnapshot): Promise<void>;
     setVisibleSessions(sessionIds: readonly string[]): Promise<void>;
     acknowledgeFocus?(sessionId: string, entryToken: string): Promise<void>;
+    finishCompletion?(sessionId: string, entryToken: string, accepted: boolean): Promise<void>;
     onAction(listener: (action: JokoDesktopNativeTaskStatusAction) => void): () => void;
     onSettingsChanged(listener: (settings: JokoDesktopNativeTaskStatusSettings) => void): () => void;
   };
@@ -724,6 +726,7 @@ interface JokoInspectorDesktopApi {
   readonly platform: string;
   readonly window: {
     identity(): Promise<string>;
+    onCloseRequested?(listener: () => void): () => void;
     ready(): Promise<void>;
     minimize(): Promise<void>;
     toggleMaximize(): Promise<boolean>;

@@ -680,6 +680,7 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
             ? SessionDerivationKind.FORK
             : SessionDerivationKind.CLONE,
           sourceSessionId: session.derivationOrigin.sourceSessionId,
+          sideChat: session.derivationOrigin.sideChat === true,
           ...(session.derivationOrigin.sourceMessageId === undefined
             ? {}
             : { sourceMessageId: session.derivationOrigin.sourceMessageId }),
@@ -1290,6 +1291,7 @@ export function toProtoInputContent(input: PromptInput): InputContent {
   }
   return message<InputContent>("joko.v1.InputContent", {
     parts,
+    ...(input.replyQuote ? { replyQuote: message<contract.PartnerReplyQuote>('joko.v1.PartnerReplyQuote', { ...input.replyQuote, generation: BigInt(input.replyQuote.generation) }) } : {}),
     quotesEncoded: input.quotesEncoded === true,
     pastedTextRanges: pastedTextRanges.map((range) => message<ProtoInlineTextRange>("joko.v1.InlineTextRange", {
       start: range.start,
@@ -1399,10 +1401,19 @@ export function fromProtoInputContent(
     files,
     mentions,
     disposition,
+    ...(content?.replyQuote ? { replyQuote: fromProtoPartnerReplyQuote(content.replyQuote) } : {}),
     ...(content?.quotesEncoded === true ? { quotesEncoded: true } : {}),
     ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges }),
     ...(mentionRanges.length === 0 ? {} : { mentionRanges })
   };
+}
+
+function fromProtoPartnerReplyQuote(value: contract.PartnerReplyQuote): NonNullable<PromptInput['replyQuote']> {
+  if (value.generation < 1n || value.generation > BigInt(Number.MAX_SAFE_INTEGER) || !value.eventId || value.eventId.length > 256
+    || !value.messageId || value.messageId.length > 256 || !['user', 'assistant'].includes(value.role) || value.excerpt.length > 280) {
+    throw new ProtoMappingError('invalid_argument', 'input.reply_quote', 'The private reply quote is invalid.');
+  }
+  return { generation: Number(value.generation), eventId: value.eventId, messageId: value.messageId, role: value.role as 'user' | 'assistant', excerpt: value.excerpt };
 }
 
 function fromProtoSessionDerivationOrigin(

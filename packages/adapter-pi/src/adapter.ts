@@ -87,7 +87,8 @@ import { PiNativeRootTools } from "./native-root-tools.js";
 import {
   handlePolicyDecisionExtensionRequest,
   type PolicyDecisionRequest,
-  type PolicyDecisionResult
+  type PolicyDecisionResult,
+  type PolicyDecisionReply
 } from "./policy-decision-bridge.js";
 import { isPiCompactionNoopRejection } from "./compaction.js";
 import { readPiWorkingContext, writePiWorkingContext } from "./working-context.js";
@@ -2816,8 +2817,9 @@ export class PiBackendAdapter implements
   }
 
   async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
-    this.#assertReviewOperationAllowed(context, "fork native history");
     assertPiDerivationTarget(context, derivation);
+    if (derivation.completedSnapshot) return this.#forkCompletedSnapshot(entryId, context, derivation);
+    this.#assertReviewOperationAllowed(context, "fork native history");
     if (!entryId) throw piError("PI_FORK_ENTRY_REQUIRED", "Native fork entry id is required", "dispatch");
     const runtime = this.#runtime(context);
     return this.#runExclusiveSessionMutation(runtime, context, async () => {
@@ -2935,6 +2937,57 @@ export class PiBackendAdapter implements
         await this.#disposeDerivationShadow("fork", shadowKey, shadow, shadowContext);
       }
     });
+  }
+
+  async #forkCompletedSnapshot(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
+    if (derivation.completedSnapshot?.kind !== "completed_assistant" || derivation.completedSnapshot.nativeBoundaryId !== entryId
+      || context.target.remoteWorkspace !== undefined) throw piError("PI_COMPLETED_SNAPSHOT_UNAVAILABLE", "The completed-history snapshot requires its original native workspace authority", "session");
+    const runtime = this.#runtimes.get(context.sessionId);
+    if (!runtime || runtime.transport.closed || !runtime.ready || runtime.control.runtimePolicy !== "standard") throw piError("PI_COMPLETED_SNAPSHOT_UNAVAILABLE", "The original native source runtime is unavailable", "session");
+    const sourceBinding = runtime.binding;
+    const assertSource = () => {
+      context.signal.throwIfAborted(); this.#assertNotDisposed();
+      const hosted = runtime.context.hostedExecution;
+      if (hosted) {
+        assertHostedExecution(hosted);
+        if (!context.hostedExecution || context.hostedExecution.channel.endpoint !== hosted.channel.endpoint
+          || context.hostedExecution.channel.bearer !== hosted.channel.bearer || context.hostedExecution.source.sessionId !== hosted.source.sessionId
+          || context.hostedExecution.source.targetId !== hosted.source.targetId || context.hostedExecution.source.generation !== hosted.source.generation) throw piError("PI_COMPLETED_SNAPSHOT_STALE", "The native source channel changed", "session");
+      } else if (context.hostedExecution) throw piError("PI_COMPLETED_SNAPSHOT_STALE", "The native source authority changed", "session");
+      if (this.#runtimes.get(runtime.key) !== runtime || runtime.transport.closed || runtime.binding.opaqueRef !== sourceBinding.opaqueRef
+        || runtime.binding.nativeSessionId !== sourceBinding.nativeSessionId || runtime.binding.generation !== sourceBinding.generation
+        || runtime.transport.generation !== context.generation || context.binding?.opaqueRef !== sourceBinding.opaqueRef
+        || runtime.context.target.id !== context.target.id || runtime.context.target.backendId !== context.target.backendId
+        || !samePath(runtime.context.target.workspaceRoot, context.target.workspaceRoot)
+        || runtime.context.backendInstanceGeneration !== context.backendInstanceGeneration) throw piError("PI_COMPLETED_SNAPSHOT_STALE", "The native snapshot source changed", "session");
+    };
+    assertSource();
+    const history = await this.#getEntriesRaw(undefined, runtime, context.signal); assertSource();
+    const entries = new Map(history.entries.map(entry => [entry.id, entry]));
+    const boundary = entries.get(entryId);
+    if (boundary?.type !== "message" || !isRecord(boundary.message) || boundary.message.role !== "assistant"
+      || typeof boundary.message.stopReason !== "string" || ["aborted", "error"].includes(boundary.message.stopReason)) throw piError("PI_COMPLETED_SNAPSHOT_BOUNDARY_INVALID", "The native boundary is not a completed assistant reply", "session");
+    const prefix: PiRpcEntry[] = [], visited = new Set<string>();
+    let entry: PiRpcEntry | undefined = boundary;
+    while (entry) {
+      if (visited.has(entry.id) || visited.size > 1_000_000) throw piError("PI_COMPLETED_SNAPSHOT_HISTORY_INVALID", "The native snapshot parent chain is invalid", "session");
+      visited.add(entry.id); prefix.push(entry);
+      if (entry.parentId === null) break;
+      const parent = entries.get(entry.parentId);
+      if (!parent) throw piError("PI_COMPLETED_SNAPSHOT_HISTORY_INVALID", "The native snapshot has a missing parent entry", "session");
+      entry = parent;
+    }
+    prefix.reverse();
+    await this.#sessionStore.assertManagedSession(sourceBinding.opaqueRef); assertSource();
+    const confirmation = await this.#getEntriesRaw(undefined, runtime, context.signal); assertSource();
+    const confirmed = new Map(confirmation.entries.map(candidate => [candidate.id, candidate]));
+    if (prefix.some(candidate => JSON.stringify(confirmed.get(candidate.id)) !== JSON.stringify(candidate))) throw piError("PI_COMPLETED_SNAPSHOT_CHANGED", "The completed native prefix changed before its copy", "session", { retryable: true });
+    // The published native manager reserves a real Session identity. Copy only
+    // its immutable ancestor chain; the parent's active runtime is untouched.
+    const binding = this.#sessionStore.reserveFreshSession(runtimeWorkspaceRoot(context.target), 1);
+    derivation.recordBinding(binding);
+    await this.#sessionStore.materializeDetachedFork({ binding, parentSession: sourceBinding.opaqueRef, entries: prefix }); assertSource();
+    return { binding };
   }
 
   async #disposeDerivationShadow(
@@ -5648,25 +5701,27 @@ export class PiBackendAdapter implements
   async #decideOrderedPolicy(
     runtime: PiRuntime,
     request: PolicyDecisionRequest
-  ): Promise<PolicyDecisionResult> {
+  ): Promise<PolicyDecisionResult | PolicyDecisionReply> {
     const context = runtime.context;
+    const reply = (decision: PolicyDecisionResult): PolicyDecisionResult | PolicyDecisionReply => decision !== "default" ? decision : ({ decision,
+      ownerUserInstructions: (context.nativeToolAuthorization?.readOwnerUserInstructions?.() ?? []).map(text => redactManagedSecrets(text, runtime.redactValues)) });
       const control = await readControl(runtime.controlPath, runtime.transport.generation);
-      if (control.policyGeneration !== request.policyGeneration) return "stale";
+      if (control.policyGeneration !== request.policyGeneration) return reply("stale");
       const snapshot = context.policySnapshot;
       const policy = snapshot === undefined ? "default" : evaluateOrderedPolicyRules(snapshot, request.observation)?.action ?? "default";
-      if (policy === "deny") return policy;
+      if (policy === "deny") return reply(policy);
       if (request.toolCall && context.nativeToolAuthorization) {
         const authorization = context.nativeToolAuthorization;
         const decision = await authorization.review({ ...request.toolCall, signal: context.signal });
         authorization.assertCurrent(decision.authorizationRevision);
         const current = await readControl(runtime.controlPath, runtime.transport.generation);
-        if (current.policyGeneration !== request.policyGeneration || runtime.context !== context) return "stale";
+        if (current.policyGeneration !== request.policyGeneration || runtime.context !== context) return reply("stale");
         authorization.assertCurrent(decision.authorizationRevision);
-        if (decision.verdict === "block") return "deny";
-        if (decision.verdict === "ask") return "ask";
-        if (decision.verdict === "allow" && policy !== "ask") return "delegated_allow";
+        if (decision.verdict === "block") return reply("deny");
+        if (decision.verdict === "ask") return reply("ask");
+        if (decision.verdict === "allow" && policy !== "ask") return reply("delegated_allow");
       }
-      return policy;
+      return reply(policy);
   }
 
   async #confirmNativeSessionSwitch(
@@ -6580,6 +6635,7 @@ export class PiBackendAdapter implements
       "session.resume",
       "session.detach",
       "session.fork",
+      "session.side_chat",
       "session.rewind",
       "session.rewind_to_start",
       "session.message_delete",
@@ -6731,6 +6787,7 @@ export class PiBackendAdapter implements
 
   #assertReviewOperationAllowed(context: AdapterContext, operation: string): void {
     const runtime = this.#runtime(context);
+    if (context.persistentReadOnly === "side_chat" && ["read native history", "read native history tree"].includes(operation)) return;
     if (runtime.control.runtimePolicy === "review_read_only") {
       throw piError("PI_REVIEW_OPERATION_DENIED", `Reviewer runtime cannot ${operation}`, "dispatch", {
         recovery: "Use only bounded read, grep, find, or ls tools inside the dedicated Reviewer Session."

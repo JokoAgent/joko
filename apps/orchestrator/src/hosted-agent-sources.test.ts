@@ -71,7 +71,7 @@ it("publishes actual paired native sources, retains paused and offline choices, 
     for (const key of ["runtime.commands", "subagents.list", "subagents.detail", "subagents.transcript", "subagents.resume", "session.rewind", "session.rewind_to_start"]) {
       expect(descriptor.capabilities.get(key)?.supported).toBe(true);
     }
-    for (const key of ["session.fork", "session.clone"]) expect(descriptor.capabilities.get(key)).toMatchObject({ supported: false, reason: "upstream_missing" });
+    for (const key of ["session.fork", "session.clone"]) expect(descriptor.capabilities.get(key)).toMatchObject({ supported: true });
     expect(descriptor.capabilities.get("permission.modes")?.options).toEqual(["ask", "acceptEdits", "auto", "bypassPermissions"]);
     expect(descriptor.capabilities.get("runtime.resources")).toMatchObject({ supported: true, options: ["skill", "prompt"] });
     expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["resource"] });

@@ -65,7 +65,7 @@ import { ExtensionLibrarySection } from "./ExtensionLibrarySection.js";
 import { ExtensionNetworkSection } from "./ExtensionNetworkSection.js";
 import { ExtensionOAuthSection } from "./ExtensionOAuthSection.js";
 import { ExtensionTasksSection } from "./ExtensionTasksSection.js";
-import { openExtensionWindowFallback } from "../extension-window-navigation.js";
+import { openInspectorExtension } from "./inspector-layout.js";
 import { SkillTools } from "./SkillTools.js";
 import { useExtensionSuggestionContinuation, type ExtensionSuggestionContinuationState } from "./use-extension-suggestion-continuation.js";
 import { CatalogNodePicker, CatalogNodeUnavailable, useCatalogNodeSelection, type CatalogNodeSelection } from "./CatalogNodePicker.js";
@@ -1275,21 +1275,9 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
         onExport={() => setPackageExport(selectedDetail)}
         onRemove={() => setPackageRemoval(selectedDetail)}
         onOpenMainView={() => {
-          const profile = controller.state.activeProfile;
-          if (profile) controller.navigate({ kind: "extensionMainView", extensionId: selectedDetail.id, profileId: profile.id, serverId: profile.serverId });
+          openInspectorExtension(selectedDetail.id);
         }}
-        onOpenWindow={() => runAction(`extension-window:${selectedDetail.id}`, async () => {
-          const profile = controller.state.activeProfile;
-          if (!profile) throw new Error(t("catalog.unavailable"));
-          const source = { profileId: profile.id, serverId: profile.serverId };
-          if (window.jokoDesktop?.capabilities.includes("extension.windows") === true) {
-            await window.jokoDesktop.extensionWindows.open({ extensionId: selectedDetail.id, ...source });
-            return;
-          }
-          if (openExtensionWindowFallback(window.location, selectedDetail.id, source) === null) {
-            throw new Error(t("extensions.mainView.windowFailed"));
-          }
-        })}
+        onOpenWindow={() => openInspectorExtension(selectedDetail.id, "window")}
       />}
     </section>
     <ExtensionSetupDialog

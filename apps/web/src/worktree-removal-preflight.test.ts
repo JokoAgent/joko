@@ -4,12 +4,39 @@ import {
   prefetchWorktreeRemovalPreflight,
   resetWorktreeRemovalPreflightCache,
   resolveWorktreeRemovalPreflight,
-  summarizeWorktreeRemovalPreflights
+  summarizeWorktreeRemovalPreflights,
+  summarizeSessionArchivePreflights
 } from "./worktree-removal-preflight.js";
 
 afterEach(() => resetWorktreeRemovalPreflightCache());
 
 describe("worktree removal preflight", () => {
+  test("always refreshes exact automation bindings and never reuses a cached dirty result", async () => {
+    const read = vi.fn(async () => ({ hasWorktree: true, dirty: true,
+      activeBoundScheduleCount: 1, activeBoundScheduleNames: ["Nightly"], archiveConfirmation: "a".repeat(64) }));
+    await resolveWorktreeRemovalPreflight("owner", "task", read);
+    const summary = await summarizeSessionArchivePreflights(["task", "task"], read);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(summary).toMatchObject({ dirty: 1, activeBoundScheduleCount: 1,
+      activeBoundScheduleNames: ["Nightly"], archiveConfirmations: { task: "a".repeat(64) }, archiveUnavailable: false });
+    read.mockRejectedValueOnce(new Error("offline"));
+    expect(await summarizeSessionArchivePreflights(["task"], read)).toMatchObject({ archiveUnavailable: true, unknown: 1 });
+  });
+
+  test("bounds stalled archive queries and aborts their original reader", async () => {
+    vi.useFakeTimers();
+    try {
+      let signal: AbortSignal | undefined;
+      const result = summarizeSessionArchivePreflights(["task"], async (_id, active) => {
+        signal = active;
+        return new Promise<never>(() => undefined);
+      });
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(await result).toMatchObject({ archiveUnavailable: true, unknown: 1 });
+      expect(signal?.aborted).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
   test("reuses only a settled dirty preview and scopes it to the connected owner", async () => {
     const read = vi.fn(async () => ({ hasWorktree: true, dirty: true }));
 

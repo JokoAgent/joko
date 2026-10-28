@@ -341,9 +341,10 @@ export class PartnerNetworkStore {
       jobs = this.executions(room.id);
       for (const ended of jobs.filter(job => ["completed", "failed", "cancelled", "unknown"].includes(job.status) && !["plan-decision", "plan-step"].includes(job.kind ?? ""))) this.#settleRound(room, ended, false);
       jobs = this.executions(room.id);
-      if (jobs.some(job => job.actorId === actorId && job.status === "running" && job.leaseExpiresAt > this.now())) return undefined;
+      const scope = (job: NetworkExecution) => this.message(room.id, job.sourceMessageId).threadRootId;
+      const busy = new Set(jobs.filter(job => job.actorId === actorId && job.status === 'running' && job.leaseExpiresAt > this.now()).map(scope));
       const job = jobs.find(item => item.actorId === actorId && item.status === "queued" && item.accessRevision === actor.accessRevision
-        && this.rounds.canClaim(item, jobs));
+        && !busy.has(scope(item)) && this.rounds.canClaim(item, jobs));
       if (!job) return undefined;
       const next = { ...job, status: "running" as const, lease: job.lease + 1, leaseExpiresAt: this.now() + 30_000,
         ...(["plan-decision", "plan-step"].includes(job.kind ?? "") ? {} : { contextThroughSequence: this.rounds.contextThrough(room, job) }) };

@@ -1,6 +1,7 @@
 import { QueueDispatchState, type QueueControl, type Session } from "@joko/contracts";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import { mobileSideChatCopy } from "./mobile-side-chat";
 import type { MobileTaskHeaderRole } from "./mobile-task-header-role";
 
 export function mobileTaskHeaderNotice(input: {
@@ -23,5 +24,7 @@ export function mobileTaskHeaderNotice(input: {
   if (input.role === "worker" || input.role === "lead") return mobileMessage(locale, input.role === "worker" ? "task.headerWorker" : "task.headerLead");
   if (session.archived) return mobileMessage(locale, "common.archived");
   if (control?.dispatchState === QueueDispatchState.PAUSED) return mobileMessage(locale, "task.headerQueuePaused");
+  if (session.derivationOrigin?.sideChat) return [mobileSideChatCopy(locale).context,
+    session.worktree === undefined ? mobileSideChatCopy(locale).readOnly : ""].filter(Boolean).join(" ");
   return undefined;
 }

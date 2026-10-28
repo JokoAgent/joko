@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 
 import { createClient, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport, endpointOrigin, normalizeEndpointPublicKey } from "@joko/connection-transport/node";
@@ -519,6 +520,9 @@ function binaryFromProto(value: ProtoBrowserAutomationBinary): NonNullable<Brows
   if (createHash("sha256").update(bytes).digest("hex") !== value.sha256Hex.toLowerCase()) {
     throw new Error("Remote Browser binary digest is invalid.");
   }
+  if ((value.mediaType === "image/png" || value.mediaType === "image/jpeg") && sniffMediaMime(bytes) !== value.mediaType) {
+    throw new Error("Remote Browser image MIME does not match its bytes.");
+  }
   return {
     bytes,
     mediaType: remoteMediaType(value.mediaType),
@@ -611,8 +615,13 @@ function firstImageContent(content: readonly unknown[]): NonNullable<BrowserRemo
     if (!isRecord(candidate) || candidate["type"] !== "image" || typeof candidate["data"] !== "string") continue;
     const mimeType = candidate["mimeType"];
     if (mimeType !== "image/png" && mimeType !== "image/jpeg") throw new Error("Browser image result has an invalid media type.");
-    if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(candidate["data"])) throw new Error("Browser image result is not valid base64.");
+    if (candidate["data"].length === 0 || candidate["data"].length % 4 !== 0
+      || candidate["data"].length > Math.ceil(MAXIMUM_BINARY_BYTES / 3) * 4
+      || !/^[A-Za-z0-9+/]*={0,2}$/u.test(candidate["data"])) throw new Error("Browser image result is not valid base64.");
     const bytes = boundedBytes(Buffer.from(candidate["data"], "base64"), "Browser image result");
+    if (Buffer.from(bytes).toString("base64") !== candidate["data"] || sniffMediaMime(bytes) !== mimeType) {
+      throw new Error("Browser image MIME does not match its bytes.");
+    }
     return { bytes, mediaType: mimeType };
   }
   return undefined;

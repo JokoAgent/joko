@@ -12,6 +12,7 @@ import {
   partnerHomeDirectoryName,
   type CreatePartnerInput,
   type OperationalStore,
+  type ConnectionRecord,
   type PersistedEvent,
   type PartnerCapabilitiesRecord,
   type PartnerModelRouteRecord,
@@ -39,6 +40,7 @@ import { modelRoutingEnabled } from "./backend-model-access.js";
 import type { SessionHost } from "./session-host.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import type { WorkspaceService } from "./workspace-service.js";
+import { partnerTopicRootMessage } from './partner-topic-context.js';
 
 export interface PartnerTemplateDefinition {
   readonly templateId: string;
@@ -146,6 +148,7 @@ export interface PartnerManagerOptions {
     | "restartPartnerSession" | "canRestartPartnerSession"
     | "preparePartnerPauseQueue" | "pausePartnerSession" | "restorePartnerQueue" | "wakePartnerSession"
     | "retirePartnerPolicyRuntime" | "retryPartnerPolicyRetirement"
+    | "isPrivateSessionCreationClosed" | "releasePrivateSessionCreationReceipt"
   >;
   readonly workspaceService: Pick<WorkspaceService, "register" | "unregister">;
   readonly homesRoot: string;
@@ -444,9 +447,65 @@ export class PartnerManager {
         link,
         ...(session === undefined ? {} : { session }),
         available: session !== undefined && session.deletedAt === undefined,
-        readOnly: link.role !== "canonical" || session?.archived === true || session?.deletedAt !== undefined
+        readOnly: !['canonical', 'topic'].includes(link.role) || partner.lifecycle !== 'active' || session?.archived === true || session?.deletedAt !== undefined
       };
     });
+  }
+
+  getTopic(sessionId: string): PartnerSessionView | undefined {
+    const link = this.#store.getSessionLink(sessionId);
+    if (link?.role !== 'topic') return undefined;
+    return this.listSessions(link.partnerId).find(row => row.link.sessionId === sessionId);
+  }
+
+  async ensureTopic(input: { readonly operationId: string; readonly connection: ConnectionRecord; readonly partnerId: string;
+    readonly expectedRevision: bigint; readonly root: NonNullable<PartnerSessionLinkRecord['topicRoot']>; readonly assertCurrent: () => void }): Promise<PartnerSessionView> {
+    const { root } = input;
+    input.assertCurrent();
+    this.#operationalStore.runAuthorizedOperation(input.connection.id, input.connection.authKeyDigest, { id: input.operationId,
+      kind: 'partner_topic', body: { partnerId: input.partnerId, expectedRevision: input.expectedRevision.toString(), root } }, () => true);
+    const profile = this.#store.getPartner(input.partnerId);
+    const existing = this.#store.listSessionLinks(profile.id, 'topic').find(link => JSON.stringify(link.topicRoot) === JSON.stringify(root));
+    let replaces: { readonly sessionId: string; readonly operationId: string } | undefined;
+    if (existing) {
+      const topic = this.getTopic(existing.sessionId)!;
+      if (topic.available && !topic.readOnly) return topic;
+      if (topic.available || !existing.topicOperationId || !this.#sessionHost.isPrivateSessionCreationClosed(existing.topicOperationId, existing.sessionId)) {
+        throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The original topic creation is unavailable or unknown. Its native effect is not replayed.');
+      }
+      replaces = { sessionId: existing.sessionId, operationId: existing.topicOperationId };
+    }
+    const assertOwner = () => {
+      input.assertCurrent(); this.#operationalStore.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+      const current = this.canonicalCaller(root.sessionId), session = this.#operationalStore.getSession(root.sessionId).descriptor;
+      if (current.id !== profile.id || current.revision !== input.expectedRevision || current.profileVersion !== profile.profileVersion
+        || session.binding.generation !== root.generation || !partnerTopicRootMessage(this.#operationalStore, root)) {
+        throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The original topic root or Partner changed.');
+      }
+    };
+    assertOwner();
+    const primary = profile.capabilities.modelChain[0]!;
+    let operationId = `partner-topic:${createHash('sha256').update(JSON.stringify([profile.id, root, replaces?.operationId ?? null])).digest('hex')}`;
+    // A failed operation without a reserved link never reached native
+    // creation. A reserved link can be replaced only with Host close proof.
+    for (let retry = 0; this.#operationalStore.findOperation(operationId)?.status === 'failed'; retry++) {
+      if (retry >= 20) throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The topic creation needs attention before retrying.');
+      operationId = `partner-topic:${createHash('sha256').update(operationId).digest('hex')}`;
+    }
+    const message = partnerTopicRootMessage(this.#operationalStore, root)!;
+    const title = message.blocks.flatMap(block => block.kind === 'text' ? [block.text] : []).join(' ').replace(/\s+/gu, ' ').trim().slice(0, 60);
+    const result = await this.#sessionHost.createServiceSession({ operationId, serviceKind: 'partner', targetId: profile.homeTargetId,
+      runtimeBackendId: primary.backendId, title: `${profile.displayName}: ${title || 'Topic'}`, providerId: primary.providerId, modelId: primary.modelId,
+      ...(primary.effort === undefined ? {} : { effort: primary.effort }), fastMode: primary.fastMode,
+      permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode, appendSystemPrompt: profile.identitySource,
+      assertServiceScope: assertOwner, preparePrivateSession: async sessionId => {
+        assertOwner(); this.#store.bindTopicSession({ partnerId: profile.id, expectedRevision: profile.revision, profileVersion: profile.profileVersion, sessionId, root, operationId, ...(replaces ? { replaces } : {}) });
+        if (replaces) this.#sessionHost.releasePrivateSessionCreationReceipt(replaces.operationId, replaces.sessionId);
+      } });
+    assertOwner();
+    const topic = this.getTopic(result.value.sessionId);
+    if (!topic?.available) throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The topic task is unavailable.');
+    return topic;
   }
 
   listPrivateThreads(partnerId: string): readonly PartnerPrivateThreadRecord[] {

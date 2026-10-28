@@ -53,6 +53,8 @@ message PartnerRoutine {
   optional RoutineRunStatus activity = 5;
   google.protobuf.Timestamp created_at = 6;
   google.protobuf.Timestamp updated_at = 7;
+  optional string builtin = 8;
+  optional uint32 builtin_version = 9;
 }
 message RoutineSourceEvent { string type = 1; string name = 2; repeated string fields = 3; }
 message RoutineSource {

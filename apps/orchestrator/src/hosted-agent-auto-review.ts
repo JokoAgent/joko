@@ -6,6 +6,7 @@ import type { OperationalStore } from "@joko/store";
 import type { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 import type { HostedAgentExecutorPolicy } from "./hosted-agent-executor.js";
 import { realPathOrAncestor } from "./hosted-agent-workspace.js";
+import { readNativeOwnerInstructions } from "./native-owner-intent.js";
 
 /** Reuses the native deterministic/contextual reviewer on the task node. The
  * auxiliary owner retains model credentials, deadlines and route revocation. */
@@ -37,41 +38,8 @@ export function createHostedAgentAutoReviewer(options: {
     };
     const branch = () => {
       guard();
-      const active = new Set<string>(); let afterCursor: bigint | undefined, complete = false;
-      // Never drop an earlier restriction to fit the evidence budget.
-      for (let page = 0; page < 20; page++) {
-        const events = options.store.listEvents({ sessionId: context.sessionId, activeNativeTimeline: true, limit: 500,
-          ...(afterCursor === undefined ? {} : { afterCursor }) });
-        for (const event of events) {
-          const value = event.payload;
-          if (value.type !== "message_complete" || value.role !== "user" || value.automaticContinuation || value.objectiveContinuation
-            || value.inputHandoffContinuation || value.partnerPrivateOrigin) continue;
-          if (event.operationId) active.add(event.operationId);
-        }
-        if (events.length < 500) { complete = true; break; }
-        afterCursor = events.at(-1)!.globalCursor;
-      }
-      if (!complete) return [];
-      const instructions: { at: number; text: string }[] = [];
-      for (let offset = 0; ; offset += 500) {
-        const page = options.store.listQueueItems({ sessionId: context.sessionId, offset, limit: 500 });
-        for (const item of page) if (options.store.getRun(item.runId).descriptor.source === "user"
-          && (active.has(item.operationId) && ["backend_accepted", "completed"].includes(item.state)
-            || item.operationId === context.operationId && ["dispatching", "backend_accepted", "completed"].includes(item.state))) {
-          // Provider-native user-shaped messages cannot author owner consent.
-          instructions.push({ at: item.createdAt, text: item.body.text });
-        }
-        if (page.length < 500) break;
-        if (offset >= 10_000) return [];
-      }
-      const answers = options.store.listInteractions({ sessionId: context.sessionId, kinds: ["question", "plan_review"], status: "resolved", limit: 65 });
-      if (answers.length >= 65) return [];
-      for (const answer of answers) if (answer.generation === context.generation && answer.decision
-        && ["question", "plan_review"].includes(answer.decision.kind)) instructions.push({ at: answer.resolvedAt ?? answer.createdAt,
-          text: JSON.stringify({ interactionContext: answer.payload, ownerAnswer: answer.decision }) });
-      const values = instructions.sort((a, b) => a.at - b.at).map(value => options.redact(value.text));
-      if (values.length > 64 || values.reduce((size, value) => size + value.length, 0) > 16_000) return [];
-      return values.map(content => ({ type: "message", message: { role: "user", content } }));
+      return readNativeOwnerInstructions(options.store, context, options.redact)
+        .map(content => ({ type: "message", message: { role: "user", content } }));
     };
     const captured = control();
     const digest = createHash("sha256").update(JSON.stringify([plan.models, plan.revision.toString(), plan.runtimeRevision])).digest("hex");

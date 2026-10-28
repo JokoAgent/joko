@@ -22,6 +22,9 @@ export interface ExtensionMainViewDescriptor {
   readonly html: string;
   readonly title?: string;
   readonly icon?: ExtensionMainViewIcon;
+  readonly open?: "page" | "sidebar" | "window";
+  readonly side?: "left" | "right" | "top" | "bottom";
+  readonly multiple?: true;
 }
 
 export interface ExtensionLibraryDescriptor {
@@ -121,7 +124,8 @@ export function parseExtensionSurfaceManifest(
     let mainView: ExtensionMainViewDescriptor | undefined;
     if (binding.mainView !== undefined) {
       const rawMainView = requirePlainObject(binding.mainView, "Extension main view");
-      requireExactKeys(rawMainView, ["html", "title", "icon"], ["html"], "Extension main view");
+      requireExactKeys(rawMainView, ["html", "title", "icon", "open", "side", "multiple"], ["html"], "Extension main view");
+      const placement = parseMainViewPlacement(rawMainView);
       const html = requirePortablePath(rawMainView.html, "Extension main-view HTML");
       if (extname(html) !== ".html" || posix.dirname(html) === ".") {
         throw new Error("Extension main-view HTML must be a lowercase .html file in a self-contained directory.");
@@ -131,6 +135,7 @@ export function parseExtensionSurfaceManifest(
       const icon = rawMainView.icon === undefined ? undefined : requireIcon(rawMainView.icon);
       mainView = {
         html,
+        ...placement,
         ...(title === undefined ? {} : { title }),
         ...(icon === undefined ? {} : { icon })
       };
@@ -295,7 +300,8 @@ export function validateExtensionRecommendations(value: unknown):
 export function isExtensionMainViewDescriptor(value: unknown): value is ExtensionMainViewDescriptor {
   if (!isPlainObject(value)) return false;
   try {
-    requireExactKeys(value, ["html", "title", "icon"], ["html"], "Extension main view");
+    requireExactKeys(value, ["html", "title", "icon", "open", "side", "multiple"], ["html"], "Extension main view");
+    parseMainViewPlacement(value);
     const html = requirePortablePath(value.html, "Extension main-view HTML");
     if (extname(html) !== ".html" || posix.dirname(html) === ".") return false;
     if (value.title !== undefined) requireTitle(value.title);
@@ -304,6 +310,15 @@ export function isExtensionMainViewDescriptor(value: unknown): value is Extensio
   } catch {
     return false;
   }
+}
+
+function parseMainViewPlacement(value: Record<string, unknown>): Pick<ExtensionMainViewDescriptor, "open" | "side" | "multiple"> {
+  if (value.open !== undefined && !["page", "sidebar", "window"].includes(value.open as string)) throw new Error("Extension main-view open must be page, sidebar or window.");
+  if (value.side !== undefined && (value.open !== "sidebar" || !["left", "right", "top", "bottom"].includes(value.side as string))) throw new Error("Extension main-view side requires sidebar mode and a supported edge.");
+  if (value.multiple !== undefined && value.multiple !== true) throw new Error("Extension main-view multiple must be true when declared.");
+  return { ...(value.open === undefined ? {} : { open: value.open as NonNullable<ExtensionMainViewDescriptor["open"]> }),
+    ...(value.side === undefined ? {} : { side: value.side as NonNullable<ExtensionMainViewDescriptor["side"]> }),
+    ...(value.multiple === true ? { multiple: true } : {}) };
 }
 
 export function isExtensionLibraryDescriptor(value: unknown): value is ExtensionLibraryDescriptor {

@@ -3,16 +3,17 @@ import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { AdapterContext, BackendAdapter, BackendDescriptor, BlobRef, CreateNativeSessionInput, DurableNativeDispatchPreparation,
-  BackgroundTaskOutputResult, NativeHistoryProjection, NativeNavigationTarget, NativeSessionBinding, NativeSessionDerivation, NativeSessionForkResult,
+  BackgroundTaskOutputResult, NativeHistoryProjection, NativeNavigationTarget, NativeSessionBinding, NativeSessionDerivation, NativeSessionDerivationLifecycle, NativeSessionForkResult,
   NativeSessionNavigation, NativeSessionNavigationResult, NativeSessionState, PromptInput, ProviderModel, RuntimeCommand, RuntimeResource,
   RuntimeToolCatalog, SessionTree, SubagentControlInput, TargetDescriptor, UserShellInput, UserShellResult, NativeTextInferenceInput } from "@joko/core";
-import type { HostedNativeCommand, HostedNativeOpen } from "./protocol.js";
+import type { HostedNativeCommand, HostedNativeOpen, HostedNativeDerivationLifecycle } from "./protocol.js";
 import { JokoError, toPublicError } from "@joko/core";
+import type { HostedAgentConnectionPool } from "./connection-pool.js";
 
 const identity = z.string().min(1).max(512).refine(value => !/[\0\r\n]/u.test(value));
 const sourceSchema = z.strictObject({ controllerDeviceId: identity, targetDeviceId: identity, backendId: identity });
 const bindingSchema = z.strictObject({ format: z.literal(1), backendId: identity, source: sourceSchema,
-  sessionId: identity, targetId: identity, nativeSessionId: identity });
+  sessionId: identity, targetId: identity, nativeSessionId: identity, providerId: identity });
 type SourceBinding = z.infer<typeof bindingSchema>;
 export type HostedAgentDeviceSource = z.infer<typeof sourceSchema>;
 export interface HostedAgentSourceController {
@@ -55,6 +56,10 @@ export interface HostedAgentSourceAdapterOptions {
   readonly takeGroupSwitch?: (context: AdapterContext) => string | undefined;
   readonly takeNewGroupRound?: (context: AdapterContext) => boolean;
   readonly isGroupMember?: (context: AdapterContext) => boolean;
+  readonly connectionPool?: HostedAgentConnectionPool;
+  /** A typed native admission rejection, distinct from upload/payload limits. */
+  readonly isCapacityError?: (error: unknown) => boolean;
+  readonly manageDerivation?: (command: HostedNativeDerivationLifecycle, signal: AbortSignal) => Promise<void>;
 }
 interface ActiveSourceSession {
   readonly binding: NativeSessionBinding;
@@ -65,6 +70,11 @@ interface ActiveSourceSession {
   readonly shadow: string;
   failure?: unknown;
   closing?: Promise<void>;
+  busy: number;
+  lastActivity: number;
+  idleClosed?: boolean;
+  unregisterPool?: () => void;
+  idleRelease?: { readonly id: string; readonly idleMinutes: number; attempted: boolean; confirmed?: boolean; flight?: Promise<boolean> };
 }
 
 /** Native Adapter on the original task node. Its durable binding identifies an
@@ -107,7 +117,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     if (!input.providerId || !input.modelId) throw new Error("Hosted native creation requires an explicit model and source.");
     const nativeSessionId = createHash("sha256").update(JSON.stringify([this.id, context.sessionId, context.target.id,
       context.generation, context.operationId ?? "create"])).digest("hex");
-    const binding = this.#binding(context, nativeSessionId);
+    const binding = this.#binding({ ...context, modelSelection: { providerId: input.providerId, modelId: input.modelId } }, nativeSessionId);
     await this.#activate(binding, { ...context, modelSelection: { providerId: input.providerId, modelId: input.modelId } }, "create",
       { permissionMode: input.permissionMode, fastMode: input.fastMode, ...(input.name === undefined ? {} : { name: input.name }),
         ...(input.effort === undefined ? {} : { effort: input.effort }) });
@@ -117,7 +127,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     const active = await this.#activate(binding, context, "resume"); return this.#state(active, context);
   }
   async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
-    const active = this.#active(context, binding); return this.#state(active, context);
+    const active = await this.#ready(context, binding); return this.#state(active, context);
   }
   async detachSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> { await this.closeSession(binding, context); }
   async closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
@@ -162,7 +172,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     return value === "prompt" || value === "steer" || value === "follow_up" ? value : undefined;
   }
   async getResources(context: AdapterContext): Promise<readonly RuntimeResource[]> {
-    this.#active(context);
+    await this.#ready(context);
     return this.#options.resources?.(context) ?? await this.#call(this.#active(context), { kind: "resources" }, context) as readonly RuntimeResource[];
   }
   async getRuntimeTools(context: AdapterContext): Promise<RuntimeToolCatalog> { return await this.#call(this.#active(context), { kind: "tools" }, context) as RuntimeToolCatalog; }
@@ -188,13 +198,57 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     // bindings stay in its private journal; the Source reloads the confirmed tree.
     return { kind: "in_place" };
   }
-  async fork(_entryId: string, _context: AdapterContext, _derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
-    throw new JokoError({ code: "HOSTED_AGENT_FORK_UNSUPPORTED", message: "This native source does not support task forks.", phase: "session_fork", retryable: false, stateMayHaveChanged: false,
-      recovery: "Continue in the current task or create a new task with an explicitly chosen source." });
+  async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
+    const result = await this.#derive("fork", context, derivation, entryId); return result;
   }
-  async clone(_context: AdapterContext, _derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
-    throw new JokoError({ code: "HOSTED_AGENT_CLONE_UNSUPPORTED", message: "This native source does not support task clones.", phase: "session_clone", retryable: false, stateMayHaveChanged: false,
-      recovery: "Continue in the current task or create a new task with an explicitly chosen source." });
+  async clone(context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionBinding> {
+    return (await this.#derive("clone", context, derivation)).binding;
+  }
+  async ownsNativeSessionDerivationLifecycle(lifecycle: NativeSessionDerivationLifecycle): Promise<boolean> {
+    this.#assertOpen();
+    if (lifecycle.kind === "navigate" || !this.#options.manageDerivation) return false;
+    this.#parse(lifecycle.sourceBinding, { sessionId: lifecycle.sourceSessionId, target: lifecycle.sourceTarget });
+    this.#assertDerivedTarget(lifecycle.sourceTarget, lifecycle.target); return true;
+  }
+  async adoptNativeSessionDerivation(lifecycle: NativeSessionDerivationLifecycle & { readonly binding: NativeSessionBinding }, signal: AbortSignal): Promise<void> {
+    await this.#manageDerivation(lifecycle, "adopt", signal);
+  }
+  async cleanupNativeSessionDerivation(lifecycle: NativeSessionDerivationLifecycle, signal: AbortSignal): Promise<void> {
+    await this.#manageDerivation(lifecycle, "cleanup", signal);
+  }
+  async #derive(kind: "fork" | "clone", context: AdapterContext, derivation: NativeSessionDerivation, entryId?: string): Promise<NativeSessionForkResult> {
+    if (!context.operationId || !this.#options.manageDerivation) throw new Error("Native derivation requires its durable Source operation owner.");
+    this.#assertDerivedTarget(context.target, derivation.target); await this.validateTarget(derivation.target);
+    const descriptor = await this.describe(); if (descriptor.capabilities.get(derivation.completedSnapshot ? "session.side_chat" : `session.${kind}`)?.supported !== true) throw new Error("This native source does not support the selected derivation.");
+    const active = await this.#ready(context), source = this.#parse(active.binding, context);
+    const binding = this.#derivedBinding(source, context.operationId, kind, derivation.sessionId, derivation.target.id);
+    // Register the deterministic Source alias before sending the only native
+    // effect. Lost responses therefore keep a recoverable Product placeholder.
+    derivation.recordBinding(binding);
+    const result = await this.#call(active, { kind: "derive", derivationKind: kind, sessionId: derivation.sessionId, targetId: derivation.target.id,
+      nativeSessionId: binding.nativeSessionId!, ...(entryId === undefined ? {} : { entryId }),
+      ...(derivation.completedSnapshot ? { completedSnapshot: derivation.completedSnapshot } : {}) }, context) as { readonly editorText?: string };
+    return { binding, ...(typeof result?.editorText === "string" ? { editorText: result.editorText } : {}) };
+  }
+  async #manageDerivation(lifecycle: NativeSessionDerivationLifecycle, action: "adopt" | "cleanup", signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    if (!await this.ownsNativeSessionDerivationLifecycle(lifecycle) || lifecycle.kind === "navigate") throw new Error("The original native derivation authority is unavailable.");
+    const source = this.#parse(lifecycle.sourceBinding, { sessionId: lifecycle.sourceSessionId, target: lifecycle.sourceTarget });
+    const expected = this.#derivedBinding(source, lifecycle.operationId, lifecycle.kind, lifecycle.sessionId, lifecycle.target.id);
+    if (lifecycle.binding && (expected.opaqueRef !== lifecycle.binding.opaqueRef || expected.generation !== lifecycle.binding.generation)) throw new Error("The native derivation child identity conflicts.");
+    await this.#options.manageDerivation!({ kind: "derivation_lifecycle", action, derivationKind: lifecycle.kind,
+      operationId: createHash("sha256").update(JSON.stringify([lifecycle.operationId, "derive"])).digest("hex"), backendId: source.source.backendId, providerId: source.providerId,
+      sourceSessionId: source.sessionId, sourceTargetId: source.targetId, sourceNativeSessionId: source.nativeSessionId,
+      sessionId: lifecycle.sessionId, targetId: lifecycle.target.id, nativeSessionId: expected.nativeSessionId! }, signal);
+    signal.throwIfAborted();
+  }
+  #derivedBinding(source: SourceBinding, operationId: string, kind: "fork" | "clone", sessionId: string, targetId: string): NativeSessionBinding {
+    const nativeSessionId = createHash("sha256").update(JSON.stringify([this.id, source.nativeSessionId, operationId, kind, sessionId, targetId])).digest("hex");
+    return { opaqueRef: JSON.stringify({ ...source, sessionId, targetId, nativeSessionId }), nativeSessionId, generation: 1 };
+  }
+  #assertDerivedTarget(source: TargetDescriptor, target: TargetDescriptor): void {
+    if (source.id !== target.id || source.backendId !== this.id || target.backendId !== this.id || source.managed !== target.managed
+      || source.trusted !== target.trusted || source.workspaceRoot !== target.workspaceRoot || JSON.stringify(source.remoteWorkspace) !== JSON.stringify(target.remoteWorkspace)) throw new Error("The native derivation requires the original Source workspace authority.");
   }
   async dispose(): Promise<void> {
     this.#closed = true; await Promise.allSettled([...this.#opening.values()]);
@@ -207,7 +261,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   async #send(input: PromptInput, context: AdapterContext, fence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>): Promise<void> {
     if ((input.files.length || input.mentions.length) && !this.#options.prepareInput) throw new Error("Hosted native input requires its Source resolver.");
     if (!context.operationId) throw new Error("Hosted native dispatch requires its original operation identity.");
-    const active = this.#active(context);
+    const active = await this.#ready(context);
     const prepared = await this.#options.prepareInput?.(input, context, active.shadow);
     this.#check(context); prepared?.assertCurrent();
     if (prepared?.commit && !fence) throw new Error("File input requires its original durable native dispatch confirmation.");
@@ -220,10 +274,11 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
       ...(newGroupRound ? { newGroupRound: true } : {}) }, context, preparedFence);
   }
   #binding(context: AdapterContext, nativeSessionId: string): NativeSessionBinding {
-    const value: SourceBinding = { format: 1, backendId: this.id, source: this.#options.source, sessionId: context.sessionId, targetId: context.target.id, nativeSessionId };
+    if (!context.modelSelection?.providerId) throw new Error("The native Source binding requires its Provider identity.");
+    const value: SourceBinding = { format: 1, backendId: this.id, source: this.#options.source, sessionId: context.sessionId, targetId: context.target.id, nativeSessionId, providerId: context.modelSelection.providerId };
     return { opaqueRef: JSON.stringify(value), nativeSessionId, generation: context.generation };
   }
-  #parse(binding: NativeSessionBinding, context: AdapterContext): SourceBinding {
+  #parse(binding: NativeSessionBinding, context: Pick<AdapterContext, "sessionId" | "target">): SourceBinding {
     let value: SourceBinding;
     try { if (binding.opaqueRef.length > 8192) throw new Error(); value = bindingSchema.parse(JSON.parse(binding.opaqueRef)); }
     catch { throw new Error("Hosted native binding is invalid."); }
@@ -236,7 +291,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     creation?: Pick<CreateNativeSessionInput, "permissionMode" | "fastMode" | "effort" | "name">): Promise<ActiveSourceSession> {
     this.#check(context); this.#parse(binding, context);
     const current = this.#sessions.get(context.sessionId);
-    if (current && !current.failure && !(start === "resume" && current.binding.opaqueRef === binding.opaqueRef
+    if (current && !current.failure && !current.idleClosed && !current.idleRelease && !(start === "resume" && current.binding.opaqueRef === binding.opaqueRef
       && current.binding.nativeSessionId === binding.nativeSessionId && context.generation === current.binding.generation + 1)) {
       this.#active(context, binding); return Promise.resolve(current);
     }
@@ -251,6 +306,15 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     this.#opening.set(context.sessionId, opening); return opening;
   }
   async #open(binding: NativeSessionBinding, context: AdapterContext, start: "create" | "resume",
+    creation?: Pick<CreateNativeSessionInput, "permissionMode" | "fastMode" | "effort" | "name">): Promise<ActiveSourceSession> {
+    await this.#options.connectionPool?.beforeOpen();
+    try { return await this.#openOnce(binding, context, start, creation); }
+    catch (error) {
+      if (!(error instanceof HostedNativeCapacityError) && !this.#options.isCapacityError?.(error) || !await this.#options.connectionPool?.releaseForRetry()) throw error;
+      this.#check(context); return this.#openOnce(binding, context, start, creation);
+    }
+  }
+  async #openOnce(binding: NativeSessionBinding, context: AdapterContext, start: "create" | "resume",
     creation?: Pick<CreateNativeSessionInput, "permissionMode" | "fastMode" | "effort" | "name">): Promise<ActiveSourceSession> {
     const saved = this.#parse(binding, context), runId = randomUUID();
     let connection: HostedAgentSourceConnection;
@@ -272,20 +336,27 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
       this.#check(context); connection.assertCurrent();
       const controller = connection.createController({ runId, shadow: opened.virtualRoot, context, binding: () => binding });
       controller.registerOperation(runId, context);
-      active = { binding, context, runId, connection, controller, shadow: opened.virtualRoot }; this.#sessions.set(context.sessionId, active);
+      active = { binding, context, runId, connection, controller, shadow: opened.virtualRoot, busy: 0, lastActivity: Date.now() }; this.#sessions.set(context.sessionId, active);
       const running = active;
       const unavailable = (error: unknown) => {
-        if (running.closing || this.#closed || this.#sessions.get(context.sessionId) !== running) return;
+        if (running.closing || running.idleRelease || running.idleClosed || this.#closed || this.#sessions.get(context.sessionId) !== running) return;
         running.failure = error; this.#options.onRuntimeUnavailable?.(context);
       };
       void controller.start().then(() => unavailable(new Error("The original native runtime ended.")), unavailable).catch(() => {});
       await connection.client.call(runId, randomUUID(), { kind: "state" }, context.signal);
       this.#check(context); connection.assertCurrent(); if (active.failure) throw active.failure;
+      active.unregisterPool = this.#options.connectionPool?.register({ occupiesSlot: () => !running.idleClosed,
+        isIdle: () => !running.failure && !running.closing && running.busy === 0, lastActivityAt: () => running.lastActivity,
+        release: minutes => this.#releaseIdle(running, minutes) });
       return active;
     } catch (error) {
       // Cleanup remains owned even when authority changes after native open.
-      try { await connection.close(); this.#unclosed.delete(runId); } catch (cleanup) { throw new AggregateError([error, cleanup], "Hosted native startup cleanup could not be confirmed."); }
-      if (active) await this.#close(active); else await this.#options.releaseWorkspace?.(context); throw closedStartup(error);
+      try {
+        if (active) await this.#close(active);
+        else { await connection.close(); this.#unclosed.delete(runId); await this.#options.releaseWorkspace?.(context); }
+      } catch (cleanup) { throw new AggregateError([error, cleanup], "Hosted native startup cleanup could not be confirmed."); }
+      if (this.#options.isCapacityError?.(error)) throw new HostedNativeCapacityError(error);
+      throw closedStartup(error);
     }
   }
   async #state(active: ActiveSourceSession, context: AdapterContext): Promise<NativeSessionState> {
@@ -293,14 +364,45 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   }
   async #call(active: ActiveSourceSession, command: HostedNativeCommand, context: AdapterContext,
     fence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>): Promise<unknown> {
+    active = await this.#ready(context, active.binding);
+    while (active.idleRelease || active.idleClosed) active = await this.#ready(context, active.binding);
     this.#active(context); active.connection.assertCurrent();
     const observation = ["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind);
     const id = command.kind === "send" ? context.operationId! : context.operationId && !observation
       ? createHash("sha256").update(JSON.stringify([context.operationId, command.kind])).digest("hex") : randomUUID();
     if (!observation) active.controller.registerOperation(id, context, fence, command.kind === "send" ? command.input : undefined,
       command.kind === "control_subagent" && command.input.action === "resume" ? command.input : undefined);
-    const value = await active.connection.client.call(active.runId, id, command, context.signal);
-    this.#check(context); active.connection.assertCurrent(); return active.controller.projectResult(value);
+    active.busy++;
+    try {
+      const value = await active.connection.client.call(active.runId, id, command, context.signal);
+      this.#check(context); active.connection.assertCurrent(); return active.controller.projectResult(value);
+    } finally { active.busy--; if (!observation) active.lastActivity = Date.now(); }
+  }
+  async #ready(context: AdapterContext, binding = context.binding): Promise<ActiveSourceSession> {
+    const active = this.#active(context, binding);
+    if (active.idleRelease) await this.#releaseIdle(active);
+    return active.idleClosed ? this.#activate(active.binding, context, "resume") : this.#active(context, binding);
+  }
+  #releaseIdle(active: ActiveSourceSession, idleMinutes = 1): Promise<boolean> {
+    if (active.idleClosed) return Promise.resolve(true);
+    if (!active.idleRelease && (active.busy || active.failure || active.closing)) return Promise.resolve(false);
+    const release = active.idleRelease ??= { id: randomUUID(), idleMinutes, attempted: false };
+    return release.flight ??= (async () => {
+      active.connection.assertCurrent();
+      const signal = AbortSignal.timeout(15_000);
+      if (!release.confirmed) {
+        const command: HostedNativeCommand = release.attempted ? { kind: "idle_release_status", releaseCallId: release.id } : { kind: "idle_release", idleMinutes: release.idleMinutes };
+        release.attempted = true;
+        const value = await active.connection.client.call(active.runId, command.kind === "idle_release" ? release.id : randomUUID(), command, signal);
+        if (value === false || value === "busy") { active.idleRelease = undefined; active.lastActivity = Date.now(); return false; }
+        if (value !== true && value !== "released") throw new Error("The original idle release outcome is unconfirmed.");
+        release.confirmed = true;
+      }
+      await active.connection.close(); await active.controller.stop();
+      this.#unclosed.delete(active.runId); active.unregisterPool?.(); active.unregisterPool = undefined;
+      await this.#options.releaseWorkspace?.(active.context); active.idleClosed = true; active.idleRelease = undefined;
+      return true;
+    })().finally(() => { release.flight = undefined; });
   }
   #active(context: AdapterContext, binding = context.binding): ActiveSourceSession {
     this.#check(context); if (binding) this.#parse(binding, context);
@@ -313,8 +415,9 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   #close(active: ActiveSourceSession): Promise<void> {
     active.controller.abortPending();
     return active.closing ??= (async () => {
-      await active.connection.close(); this.#unclosed.delete(active.runId); await active.controller.stop();
-      await this.#options.releaseWorkspace?.(active.context);
+      if (!active.idleClosed) { await active.connection.close(); this.#unclosed.delete(active.runId); await active.controller.stop(); }
+      active.unregisterPool?.(); active.unregisterPool = undefined;
+      if (!active.idleClosed) await this.#options.releaseWorkspace?.(active.context);
       if (this.#sessions.get(active.context.sessionId) === active) this.#sessions.delete(active.context.sessionId);
     })().catch(error => { active.closing = undefined; throw error; });
   }
@@ -324,6 +427,14 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   }
   #assertOpen(): void { if (this.#closed) throw new Error("Hosted native Adapter is closed."); }
 }
+/** Positive native admission rejection after the original startup was closed. */
+export class HostedNativeCapacityError extends JokoError {
+  constructor(cause: unknown) {
+    super({ code: "HOSTED_AGENT_CAPACITY_REJECTED", message: "The selected computer rejected native Agent admission because its session capacity is full.",
+      phase: "session_start", retryable: true, stateMayHaveChanged: false, recovery: "Use another authorized group computer or release an eligible idle Agent." }, { cause });
+  }
+}
+
 function closedStartup(error: unknown): JokoError {
   const failure = toPublicError(error, { code: "HOSTED_AGENT_START_FAILED", phase: "session_start", retryable: true, stateMayHaveChanged: false,
     recovery: "The exact failed native startup was closed. Select an available authorized Source or retry." });

@@ -27,6 +27,21 @@ const nodeCredential = (origin = "http://192.168.1.20:4318") => formatBrowserAut
 });
 
 describe("BrowserAutomationNodeExecutor", () => {
+  it("checks screenshot bytes and canonical base64 before relaying image blocks", async () => {
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    let image = { type: "image", mimeType: "image/png", data: png.toString("base64") };
+    const executor = new BrowserAutomationNodeExecutor({ nodeId: "local", displayName: "Local", generation: 1,
+      bridge: { available: true, callTool: vi.fn(async () => ({ content: [image],
+        structuredContent: { ok: true, action: "screenshot", data: {} }, isError: false })) } as unknown as BrowserToolBridgeProvider,
+      artifacts: artifactStore() as unknown as ArtifactStore });
+    const capture = () => executor.execute({ nodeId: "local", expectedGeneration: 1, action: "screenshot", arguments: { action: "screenshot" } });
+    await expect(capture()).resolves.toMatchObject({ ok: true, binary: { bytes: new Uint8Array(png), mediaType: "image/png" } });
+    for (const invalid of [{ ...image, mimeType: "image/jpeg" }, { ...image, data: "iVBORw0KGgp=" },
+      { ...image, data: "iVBORw0KGgo" }, { ...image, data: Buffer.from("not an image").toString("base64") }]) {
+      image = invalid;
+      await expect(capture()).rejects.toThrow(/image/u);
+    }
+  });
   it("enforces node generation and dispatches the capability-fenced unified action", async () => {
     const callTool = vi.fn(async () => ({
       content: [{ type: "text", text: "ok" }],
@@ -103,6 +118,18 @@ describe("BrowserAutomationNodeExecutor", () => {
 });
 
 describe("AuthenticatedBrowserRemoteNodeRouter", () => {
+  it("rejects a screenshot MIME substitution even when the authenticated byte digest is valid", async () => {
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const rpc: BrowserAutomationNodeRpcClient = { serverId: async () => "node-peer", list: async () => [node("node-peer", 11)],
+      execute: async () => create(ExecuteBrowserAutomationActionResponseSchema, { node: node("node-peer", 11), ok: true,
+        binary: { data: png, byteSize: BigInt(png.length), sha256Hex: createHash("sha256").update(png).digest("hex"), mediaType: "image/jpeg" } }) };
+    const router = new AuthenticatedBrowserRemoteNodeRouter({ localNodeId: "node-local", localGeneration: 1,
+      discovery: discovery() as unknown as LanDiscoveryService, artifacts: artifactStore() as unknown as ArtifactStore,
+      credentials: { list: () => [{ credentialReferenceId: "ref", generation: "one", configured: true }], resolve: () => nodeCredential() } as unknown as CredentialManager,
+      rpcFactory: () => rpc });
+    const route = await router.resolve("node-peer");
+    await expect(route?.call({ action: "screenshot", arguments: { action: "screenshot" } })).rejects.toThrow("MIME does not match");
+  });
   it("pins the private credential route before identity-probing or sending its service bearer", async () => {
     const order: string[] = [];
     const rpc: BrowserAutomationNodeRpcClient = {

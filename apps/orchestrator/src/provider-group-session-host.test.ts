@@ -36,6 +36,22 @@ async function fixture() {
 const prompt = (text: string): PromptInput => ({ text, images: [], files: [], mentions: [], disposition: "prompt" });
 async function until(predicate: () => boolean): Promise<void> { await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 8000, interval: 10 }); }
 
+it("selects members by the exact requested speed without substituting ordinary Fast for Ultrafast", async () => {
+  const f = await fixture(); f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
+  const model = f.registry.get(f.first.id).descriptor.models.find(model => model.modelId === "text")!;
+  const statuses = f.members.map((member, index) => ({ member, available: true, reachable: true, running: 0, quota: { limited: false },
+    model: { ...model, supportsFastMode: index === 0, supportsUltrafastMode: index === 1 }, assertCurrent: () => {} }));
+  vi.spyOn(f.groups.directory, "members").mockResolvedValue(statuses);
+  const input = { sessionId: "exact-speed", group: f.key, agentKind: "pi", modelId: "text", ownTask: true,
+    profile: { backendId: f.first.id, providerId: "test", modelId: "text", fastMode: "ultrafast" as const } };
+  const ultra = await f.groups.router.pick(input, new AbortController().signal);
+  expect(ultra.member.key).toBe(f.members[1]!.key); expect(ultra.profile.fastMode).toBe("ultrafast"); ultra.release();
+  const fast = await f.groups.router.pick({ ...input, profile: { ...input.profile, fastMode: true } }, new AbortController().signal);
+  expect(fast.member.key).toBe(f.members[0]!.key); expect(fast.profile.fastMode).toBe(true); fast.release();
+  statuses[1]!.model.supportsUltrafastMode = false;
+  await expect(f.groups.router.pick(input, new AbortController().signal)).rejects.toThrow();
+});
+
 it("selects the actual initial native Backend while preserving the original Target and durable operation", async () => {
   const f = await fixture(), createFirst = vi.spyOn(f.first, "createSession"), createSecond = vi.spyOn(f.second, "createSession");
   f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: [f.members[1]!, f.members[0]!] }, 0n);

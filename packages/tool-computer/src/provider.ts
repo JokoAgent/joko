@@ -1414,6 +1414,11 @@ function prepareDriverArguments(entry: SessionEntry, name: ComputerPublicToolNam
     prepared["include_screenshot"] ??= true;
     if (Object.hasOwn(properties, "max_elements")) prepared["max_elements"] ??= 200;
     if (Object.hasOwn(properties, "max_depth")) prepared["max_depth"] ??= 15;
+    // Current drivers default to Markdown; registration needs the structured
+    // rows as well as the model-facing tree from this exact observation.
+    if (Object.hasOwn(properties, "tree_format")) prepared["tree_format"] = "both";
+    else delete prepared["tree_format"];
+    if (!Object.hasOwn(properties, "since")) delete prepared["since"];
   }
   const element = typeof input["element_token"] === "string" ? entry.snapshots.element(input["element_token"]) : undefined;
   const id = typeof input["snapshot_id"] === "string" ? input["snapshot_id"] : element?.snapshotId;
@@ -1423,11 +1428,23 @@ function prepareDriverArguments(entry: SessionEntry, name: ComputerPublicToolNam
     prepared["window_id"] ??= reference.windowId;
     if (Object.hasOwn(properties, "snapshot_id") && reference.driverSnapshotId !== undefined) prepared["snapshot_id"] = reference.driverSnapshotId;
   }
+  if (prepared["element_index"] !== undefined && !Object.hasOwn(properties, "element_index")
+    && Object.hasOwn(properties, "element_token")) {
+    if (prepared["element_token"] === undefined) {
+      if (reference?.driverSnapshotId === undefined) throw new ComputerToolProviderError("driver_incompatible", name);
+      prepared["element_token"] = `${reference.driverSnapshotId}:${prepared["element_index"]}`;
+    }
+    delete prepared["element_index"];
+  }
   if (prepared["element_index"] !== undefined && Object.hasOwn(properties, "snapshot_id") && prepared["snapshot_id"] === undefined && prepared["element_token"] === undefined) {
     throw new ComputerToolProviderError("driver_incompatible", name);
   }
   for (const [key, value] of Object.entries(prepared)) {
     const property = properties[key];
+    if (key === "delivery_mode" && property === undefined && schema["additionalProperties"] === false) {
+      delete prepared[key];
+      continue;
+    }
     if (schema["additionalProperties"] === false && property === undefined) throw new ComputerToolProviderError("driver_incompatible", name);
     if (isRecord(property) && Array.isArray(property["enum"]) && !property["enum"].includes(value)) throw new ComputerToolProviderError("driver_incompatible", name);
   }

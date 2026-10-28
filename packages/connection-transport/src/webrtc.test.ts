@@ -5,11 +5,12 @@ vi.mock('@jokoagent/linkspan-http', () => ({ createHttpFetch: (options: { connec
   await options.connect({}); return state.fetch(...args);
 } }));
 vi.mock('@jokoagent/linkspan-webrtc', () => ({ openWebRtcChannel: state.open }));
-import { connectWebRtcEndpoint, webRtcFingerprint } from './webrtc.js';
+import { boundWebRtcRecordWrites, connectWebRtcEndpoint, webRtcFingerprint, WEBRTC_RECORD_WRITE_TIMEOUT_MS } from './webrtc.js';
+import type { ByteChannel, OperationOptions } from '@jokoagent/linkspan-core';
 const fingerprint = Array(32).fill('AB').join(':'), other = Array(32).fill('CD').join(':');
 const sdp = (value: string) => `v=0\r\na=fingerprint:sha-256 ${value}\r\n`;
 const origin = 'https://trusted-signaling.example', pin = `ed25519:${'a'.repeat(64)}`;
-afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
 function fixture() {
   const peer = { localDescription: { type: 'offer', sdp: sdp(fingerprint) }, iceGatheringState: 'complete',
@@ -32,7 +33,8 @@ it('requires a complete, consistent SHA-256 identity from trusted signaling', ()
 it('pins Noise signaling before accepting the DTLS peer and sends no business credential in signaling', async () => {
   const { peer, channel } = fixture();
   const direct = vi.fn(); vi.stubGlobal('fetch', direct);
-  await expect(connectWebRtcEndpoint({ origin, expectedPublicKey: pin })).resolves.toBe(channel);
+  const connected = await connectWebRtcEndpoint({ origin, expectedPublicKey: pin });
+  expect(connected.closed).toBe(channel.closed);
   expect(peer.createDataChannel).toHaveBeenCalledWith('linkspan-http', { ordered: true });
   expect(state.noise).toHaveBeenCalledWith(expect.objectContaining({ expectedPublicKey: pin, url: `${origin.replace('https:', 'wss:')}/_linkspan` }));
   const request = state.fetch.mock.calls[0]!;
@@ -41,6 +43,48 @@ it('pins Noise signaling before accepting the DTLS peer and sends no business cr
   expect(request[1].headers).toEqual({ 'content-type': 'application/json' });
   expect(state.open).toHaveBeenCalledWith(expect.objectContaining({ peerConnection: peer, expectedFingerprint: other, ownsPeerConnection: true }));
   expect(direct).not.toHaveBeenCalled();
+});
+
+it('retires a blocked complete record without replay and gives each large-result record its own write budget', async () => {
+  vi.useFakeTimers();
+  const sent: Uint8Array[] = [];
+  const abort = vi.fn();
+  let stalled = false;
+  const channel: ByteChannel = { closed: new Promise(() => {}), abort, close: vi.fn(async () => {}), receive: vi.fn(async () => null),
+    send: vi.fn(async (bytes: Uint8Array, options: OperationOptions = {}) => {
+      sent.push(bytes);
+      if (stalled) return new Promise<void>((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true }));
+      await new Promise<void>(resolve => setTimeout(resolve, WEBRTC_RECORD_WRITE_TIMEOUT_MS - 1));
+    }) };
+  const bound = boundWebRtcRecordWrites(channel);
+  // Total transfer time exceeds a write deadline; bounded progress remains valid.
+  for (let i = 0; i < 3; i++) {
+    const record = bound.send(new Uint8Array(65_000).fill(i));
+    await vi.advanceTimersByTimeAsync(WEBRTC_RECORD_WRITE_TIMEOUT_MS - 1);
+    await record;
+  }
+  expect(abort).not.toHaveBeenCalled();
+  stalled = true;
+  const blocked = bound.send(new Uint8Array([9]));
+  const failure = expect(blocked).rejects.toMatchObject({ code: 'deadline_exceeded' });
+  await vi.advanceTimersByTimeAsync(WEBRTC_RECORD_WRITE_TIMEOUT_MS);
+  await failure;
+  expect(sent).toHaveLength(4); expect(abort).toHaveBeenCalledOnce();
+});
+
+it('honors a shorter caller deadline and cancellation while a record is blocked', async () => {
+  vi.useFakeTimers();
+  const abort = vi.fn();
+  const channel = { closed: new Promise(() => {}), abort, close: vi.fn(), receive: vi.fn(), send: vi.fn(() => new Promise<void>(() => {})) } as ByteChannel;
+  const bound = boundWebRtcRecordWrites(channel);
+  const pending = bound.send(new Uint8Array([1]), { deadline: Date.now() + 25 });
+  const failed = expect(pending).rejects.toMatchObject({ code: 'deadline_exceeded' });
+  await vi.advanceTimersByTimeAsync(25); await failed;
+  const cancelled = new AbortController();
+  const next = bound.send(new Uint8Array([2]), { signal: cancelled.signal });
+  const stopped = expect(next).rejects.toMatchObject({ code: 'cancelled' });
+  cancelled.abort(); await stopped;
+  expect(channel.send).toHaveBeenCalledTimes(2); expect(abort).toHaveBeenCalledTimes(2);
 });
 
 it('closes the peer on a failed pin and never opens a business channel', async () => {

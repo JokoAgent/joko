@@ -43,6 +43,16 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it('round trips a typed private reply quote without treating its display snapshot as input text', () => {
+    const prompt: PromptInput = { text: 'Explain', disposition: 'prompt', images: [], files: [], mentions: [],
+      replyQuote: { generation: 7, eventId: 'original-event', messageId: 'original-message', role: 'assistant', excerpt: 'Display snapshot' } };
+    const wire = toProtoInputContent(prompt);
+    expect(wire.replyQuote?.generation).toBe(7n);
+    expect(fromProtoInputContent(wire, 'prompt')).toEqual(prompt);
+    if (wire.replyQuote) wire.replyQuote.role = 'system';
+    expect(() => fromProtoInputContent(wire, 'prompt')).toThrow('private reply quote');
+  });
+
   it("preserves unknown Run money and exact completion ownership through current-v1 wire data", () => {
     const summary: RunUsageSummary = { tokensComplete: true, inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0,
       totalTokens: 15, costMicros: 0, estimated: true, costComplete: false, completionEventId: "reply", messageId: "native-reply" };

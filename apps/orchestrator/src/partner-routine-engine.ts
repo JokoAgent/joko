@@ -193,6 +193,13 @@ export class RoutineEngine {
     return this.writeRoutine(partnerId, raw, { creationId, assertCurrent });
   }
 
+  /** Host realignment preserves a pause already committed by the owner. */
+  async ensureBuiltin(partnerId: string, raw: RoutineInput, id: string, builtinVersion: number): Promise<Routine | null> {
+    if (!/^[a-zA-Z0-9_-]{16,128}$/.test(id) || !Number.isSafeInteger(builtinVersion) || builtinVersion < 1) throw new Error("Invalid built-in routine identity");
+    if (this.blockedPartners.has(partnerId)) return null;
+    return this.writeRoutine(partnerId, raw, { id, builtin: "follow-up", builtinVersion });
+  }
+
   isRetired(id: string): boolean { return this.state.retiredRoutineIds.includes(id); }
 
   async retireCreation(partnerId: string, id: string): Promise<Routine | undefined> {
@@ -207,7 +214,7 @@ export class RoutineEngine {
     });
   }
 
-  private async writeRoutine(partnerId: string, raw: RoutineInput, options: { id?: string; expectedRevision?: number; creationId?: string; authority?: object; assertCurrent?: () => void }): Promise<Routine> {
+  private async writeRoutine(partnerId: string, raw: RoutineInput, options: { id?: string; expectedRevision?: number; creationId?: string; authority?: object; assertCurrent?: () => void; builtin?: "follow-up"; builtinVersion?: number }): Promise<Routine> {
     const { expectedRevision, creationId } = options;
     const id = options.id ?? creationId;
     const parsed = parseRoutineInput(raw);
@@ -222,13 +229,18 @@ export class RoutineEngine {
             (routine) => routine.id === id && routine.partnerId === partnerId,
           )
         : undefined;
-      const input = parsed;
-      if (id && !existing && !creationId) throw new Error("Routine not found");
-      if (creationId && state.routines.some(row => row.id === creationId && row.partnerId !== partnerId)) throw new Error("Routine creation ID already used");
+      const input = options.builtin && existing ? { ...parsed, enabled: existing.enabled } : parsed;
+      if (id && !existing && !creationId && !options.builtin) throw new Error("Routine not found");
+      if ((creationId || options.builtin) && state.routines.some(row => row.id === id && row.partnerId !== partnerId)) throw new Error("Routine creation ID already used");
+      if (existing?.builtin && !options.builtin
+        && JSON.stringify(parseRoutineInput({ ...existing, enabled: input.enabled })) !== JSON.stringify(input)) {
+        throw new Error("Built-in routines can only be paused or resumed.");
+      }
+      const builtin = options.builtin ?? existing?.builtin, builtinVersion = options.builtinVersion ?? existing?.builtinVersion;
       if (creationId && existing && JSON.stringify(parseRoutineInput(existing)) !== JSON.stringify(input)) throw new Error("Routine already created; refresh before editing");
       if (expectedRevision !== undefined && existing?.revision !== expectedRevision) throw new Error("Routine changed; refresh before saving");
       if (
-        existing &&
+        existing && existing.builtin === builtin && existing.builtinVersion === builtinVersion &&
         JSON.stringify(parseRoutineInput(existing)) === JSON.stringify(input)
       )
         return structuredClone(existing);
@@ -236,7 +248,8 @@ export class RoutineEngine {
       const now = this.deps.now();
       const routine: Routine = {
         ...input,
-        id: existing?.id ?? creationId ?? this.deps.id(),
+        ...(builtin ? { builtin, builtinVersion } : {}),
+        id: existing?.id ?? creationId ?? id ?? this.deps.id(),
         partnerId,
         revision: (existing?.revision ?? 0) + 1,
         createdAt: existing?.createdAt ?? now,
@@ -275,6 +288,7 @@ export class RoutineEngine {
   /** Quiesce execution before host cleanup; failed cleanup leaves a disabled, retryable rule. */
   async remove(partnerId: string, id: string, cleanup?: () => Promise<void>, expectedRevision?: number, assertCurrent?: () => void): Promise<void> {
     assertCurrent?.();
+    if (this.state.routines.some(routine => routine.id === id && routine.partnerId === partnerId && routine.builtin)) throw new Error("Built-in routines cannot be deleted. Pause it instead.");
     if (!this.state.routines.some((routine) => routine.id === id && routine.partnerId === partnerId))
       throw new Error("Routine not found");
     if (this.removing.has(id)) throw new Error("Routine is being removed");
@@ -431,6 +445,7 @@ export class RoutineEngine {
         (row) => row.id === id && row.partnerId === partnerId,
       );
       if (!routine) throw new Error("Routine not found");
+      if (routine.builtin) throw new Error("Built-in observation runs only on current host events.");
       if (requestId !== undefined) {
         const previous = state.runs.find(run => run.id === requestId);
         if (previous) {

@@ -19,6 +19,9 @@ export interface NativeToolAuthorization {
   /** Current ordered policy, read only by owner-private execution boundaries.
    * The caller must retain the matching capture/assertCurrent revision fence. */
   readonly snapshot?: () => import("./policy.js").PolicySnapshot;
+  /** Current authored Queue/answer projection, excluding native inherited
+   * history, service messages, pasted/quoted data and reference bodies. */
+  readonly readOwnerUserInstructions?: () => readonly string[];
   /** A service-registered background task retains this exact original dispatch.
    * The caller must separately fence its private native runner occurrence. */
   readonly forBackgroundTask?: (taskId: string) => NativeToolAuthorization;

@@ -37,6 +37,23 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("projects only enabled bound automations and changes the confirmation on replacement", () => {
+    const { store, prompt } = createFixture();
+    const initial = store.readSessionArchiveSchedules("session-1");
+    const input = { id: "bound-archive", backendId: "pi", targetId: "target-1", sessionMode: "bound" as const,
+      sessionId: "session-1", name: "Nightly", kind: "manual" as const, timezone: "UTC", enabled: true,
+      prompt, executionSnapshot: { permissionMode: "ask" as const }, overlapPolicy: "queue" as const, misfirePolicy: "run_once" as const };
+    store.upsertSchedule({ ...input, id: "persistent", sessionMode: "persistent" });
+    store.upsertSchedule({ ...input, id: "disabled", enabled: false });
+    expect(store.readSessionArchiveSchedules("session-1")).toEqual(initial);
+    const schedule = store.upsertSchedule(input);
+    const first = store.readSessionArchiveSchedules("session-1");
+    expect(first).toMatchObject({ count: 1, names: ["Nightly"] });
+    expect(first.confirmation).not.toBe(initial.confirmation);
+    store.upsertSchedule({ ...input, name: "Renamed", expectedRevision: schedule.revision });
+    expect(store.readSessionArchiveSchedules("session-1").confirmation).not.toBe(first.confirmation);
+  });
+
   it("persists each exact model speed without turning Ultrafast into ordinary Fast", () => {
     const f = createFixture();
     for (const fastMode of ["ultrafast", true, false] as const) {

@@ -3,6 +3,7 @@ import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@conn
 import * as contract from "@joko/contracts";
 import {
   PartnerStoreError,
+  type ConnectionRecord,
   type PartnerCapabilitiesRecord,
   type PartnerAvatarInput,
   type PartnerAvatarRecord,
@@ -40,6 +41,8 @@ import { createPartnerSkillMethods, type PartnerSkillsManager } from "./partner-
 import type { PartnerSessionTaskManager } from "./partner-session-tasks.js";
 import { createPartnerSessionTaskControl, toProtoSessionTask } from "./partner-session-task-connect.js";
 import { PartnerTaskOutputChangedError, type PartnerTaskOutputProjection, type PartnerTaskOutputRow } from "./partner-task-outputs.js";
+import { createPartnerAutonomyConnectMethods } from "./partner-autonomy-connect-service.js";
+import type { PartnerAutonomyManager } from "./partner-autonomy.js";
 
 type PublicActivity = PartnerActivitySummary & { readonly workingStatus?: contract.SessionWorkingStatus };
 
@@ -52,7 +55,8 @@ export function createPartnerConnectService(
   connections?: PartnerConnectionsManager,
   skills?: PartnerSkillsManager,
   tasks?: PartnerSessionTaskManager,
-  outputs?: PartnerTaskOutputProjection
+  outputs?: PartnerTaskOutputProjection,
+  autonomy?: PartnerAutonomyManager
 ): ServiceImpl<typeof contract.PartnerService> {
   const owner = (): PartnerManager => {
     if (manager === undefined) throw new ConnectError("Partners are unavailable.", Code.Unimplemented);
@@ -67,6 +71,7 @@ export function createPartnerConnectService(
     if (context.signal.aborted) throw new ConnectError("The Partner permission request was canceled.", Code.Canceled);
   };
   return {
+    ...createPartnerAutonomyConnectMethods(autonomy, authenticate),
     ...createPartnerWorkbenchConnectMethods(workbench, authenticate),
     ...createPartnerMemoryConnectMethods(memory, authenticate),
     ...createPartnerConnectionMethods(connections, authenticate),
@@ -381,6 +386,23 @@ export function createPartnerConnectService(
         tasks: tasks?.list(request.partnerId).map(task => toProtoSessionTask(tasks, task)) ?? []
       }));
     },
+    ensurePartnerTopic: (request, context) => partnerRpc(async () => {
+      const connection = authenticate(context) as ConnectionRecord | undefined;
+      if (!connection?.id || !connection.authKeyDigest) throw new ConnectError('The authenticated topic owner is unavailable.', Code.Unauthenticated);
+      const root = required(request.root, 'root');
+      if (root.generation < 1n || root.generation > BigInt(Number.MAX_SAFE_INTEGER)) throw new ConnectError('The topic root generation is invalid.', Code.InvalidArgument);
+      const topic = await owner().ensureTopic({ operationId: request.operationId, connection, partnerId: request.partnerId,
+        expectedRevision: fromProtoRevision(request.expectedPartnerRevision, 'expected_partner_revision'),
+        root: { sessionId: root.sessionId, generation: Number(root.generation), eventId: root.eventId, messageId: root.messageId },
+        assertCurrent: () => assertPermissionOwner(context) });
+      assertPermissionOwner(context);
+      return create(contract.EnsurePartnerTopicResponseSchema, { topic: toProtoPartnerSession(topic) });
+    }),
+    getPartnerTopic: (request, context) => {
+      authenticate(context);
+      return partnerRpc(() => { const topic = owner().getTopic(request.sessionId);
+        return create(contract.GetPartnerTopicResponseSchema, { ...(topic ? { topic: toProtoPartnerSession(topic) } : {}) }); });
+    },
     markPartnerRead: (request, context) => {
       authenticate(context);
       return partnerRpc(() => {
@@ -547,12 +569,13 @@ function toProtoPartnerSession(view: PartnerSessionView): contract.PartnerSessio
     partnerId: view.link.partnerId,
     role: view.link.role === "canonical"
       ? contract.PartnerSessionRole.CANONICAL
-      : view.link.role === "history"
+      : view.link.role === 'topic' ? contract.PartnerSessionRole.TOPIC : view.link.role === "history"
         ? contract.PartnerSessionRole.HISTORY
         : contract.PartnerSessionRole.DELEGATION,
     profileVersion: BigInt(view.link.profileVersion),
     ...(view.link.parentSessionId === undefined ? {} : { parentSessionId: view.link.parentSessionId }),
     ...(view.link.delegationId === undefined ? {} : { delegationId: view.link.delegationId }),
+    ...(view.link.topicRoot ? { topicRoot: { ...view.link.topicRoot, generation: BigInt(view.link.topicRoot.generation) } } : {}),
     displayName: view.session?.title ?? "Unavailable partner task",
     available: view.available,
     readOnly: view.readOnly,

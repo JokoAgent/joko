@@ -4,6 +4,7 @@ import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide
 import { createConnectionFetch } from "@joko/connection-transport";
 import { mountIsolatedSurface } from "../isolated-surface.js";
 import { bindExtensionSurfaceResources } from "../extension-main-view-resource-bridge.js";
+import { bindExtensionViewClose } from "../extension-view-lifecycle.js";
 
 import type { AppController } from "../controller.js";
 import type {
@@ -33,7 +34,10 @@ export function ExtensionMainViewPage({
   t,
   navigationOpen,
   onOpenNavigation,
-  onOpenIndependent
+  onOpenIndependent,
+  embedded = false,
+  ownerDocument = document,
+  registerCloseGuard
 }: {
   readonly controller: AppController;
   readonly extensionId: string;
@@ -41,6 +45,9 @@ export function ExtensionMainViewPage({
   readonly navigationOpen: boolean;
   readonly onOpenNavigation: () => void;
   readonly onOpenIndependent: (extensionId: string) => void;
+  readonly embedded?: boolean;
+  readonly ownerDocument?: Document;
+  readonly registerCloseGuard?: (guard: () => Promise<boolean>) => () => void;
 }) {
   const [state, setState] = useState<MainViewState>({ phase: "loading" });
   const [frameLoaded, setFrameLoaded] = useState(false);
@@ -53,6 +60,7 @@ export function ExtensionMainViewPage({
   const libraryRef = useRef<{ readonly surfaceId: string; readonly extensionRevision: bigint; readonly session: ExtensionLibrarySessionView } | undefined>(undefined);
   const libraryOpeningRef = useRef<{ readonly surfaceId: string; readonly extensionRevision: bigint; readonly promise: Promise<ExtensionLibrarySessionView> } | undefined>(undefined);
   const bridgeEpoch = useRef(0);
+  const closeGuard = useRef<() => Promise<boolean>>(async () => true);
 
   const closeLibrary = useCallback((): void => {
     const current = libraryRef.current;
@@ -172,9 +180,19 @@ export function ExtensionMainViewPage({
       if (!current() || !policy) throw new Error("Extension surface authority changed.");
       return { html, policy, baseUrl: surfaceUrl };
     })();
-    const dispose = mountIsolatedSurface(frame, document, { signal: abort.signal, failed });
+    const dispose = mountIsolatedSurface(frame, document, { signal: abort.signal, failed, bootstrapBaseUrl: window.location.href });
     return () => { abort.abort(); disposeResources(); dispose(); };
-  }, [closeLibrary, controller, frameRevision, releaseSurface, state, surfaceUrl]);
+  }, [closeLibrary, controller, frameRevision, releaseSurface, state, surfaceUrl, ownerDocument]);
+
+  useEffect(() => {
+    const frame = frameRef.current;
+    if (state.phase !== "ready" || frame === null) return;
+    const expected = state.surface.id;
+    const bridge = bindExtensionViewClose(frame, () => surfaceRef.current?.id === expected && frameRef.current === frame && frame.isConnected);
+    closeGuard.current = bridge.close;
+    const unregister = registerCloseGuard?.(bridge.close);
+    return () => { if (closeGuard.current === bridge.close) closeGuard.current = async () => true; unregister?.(); bridge.dispose(); };
+  }, [state, frameRevision, ownerDocument, registerCloseGuard]);
 
   useEffect(() => {
     if (state.phase !== "ready" || state.extension.library === undefined || surfaceUrl === undefined) return undefined;
@@ -326,21 +344,22 @@ export function ExtensionMainViewPage({
         respond(request.id, { ok: false, error: libraryBridgeFailure(cause) });
       }).finally(() => pending.delete(request.id));
     };
-    window.addEventListener("message", onMessage);
+    const bridgeWindow = ownerDocument.defaultView!;
+    bridgeWindow.addEventListener("message", onMessage);
     return () => {
       bridgeEpoch.current += 1;
       abort.abort();
       pending.clear();
-      window.removeEventListener("message", onMessage);
+      bridgeWindow.removeEventListener("message", onMessage);
       closeLibrary();
     };
-  }, [closeLibrary, controller, frameRevision, state, surfaceUrl]);
+  }, [closeLibrary, controller, frameRevision, state, surfaceUrl, ownerDocument]);
 
   const extension = "extension" in state ? state.extension : undefined;
   const title = state.phase === "ready"
     ? state.surface.title ?? state.extension.mainView?.title ?? state.extension.name
     : extension?.mainView?.title ?? extension?.name ?? t("extensions.mainView.title");
-  const back = (): void => controller.navigate({ kind: "tools", extensionId });
+  const back = (): void => { void closeGuard.current().then(allowed => { if (allowed) controller.navigate({ kind: "tools", extensionId }); }); };
   const retry = (): void => setRetryRevision((value) => value + 1);
   const reload = (): void => {
     if (state.phase !== "ready") return;
@@ -359,7 +378,7 @@ export function ExtensionMainViewPage({
   };
 
   return <main className="extension-main-view-page">
-    <header className="extension-main-view-page__header">
+    {!embedded && <header className="extension-main-view-page__header">
       <div className="extension-main-view-page__leading">
         {!navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
         <IconButton label={t("extensions.mainView.back")} onClick={back}><ArrowLeft aria-hidden="true" /></IconButton>
@@ -369,7 +388,7 @@ export function ExtensionMainViewPage({
         {state.phase === "ready" && <IconButton label={t("extensions.mainView.reload")} onClick={reload}><RefreshCcw aria-hidden="true" /></IconButton>}
         {extensionMainViewReady(extension) && <Button tone="ghost" onClick={() => onOpenIndependent(extension.id)}><ExternalLink aria-hidden="true" />{t("extensions.mainView.openWindow")}</Button>}
       </div>
-    </header>
+    </header>}
     <section className="extension-main-view-page__surface" aria-busy={state.phase === "loading" || state.phase === "opening" || !frameLoaded}>
       {(state.phase === "loading" || state.phase === "opening") && <div className="extension-main-view-page__status"><Spinner /><p>{state.phase === "loading" ? t("extensions.mainView.loading") : t("extensions.mainView.opening")}</p></div>}
       {(state.phase === "error" || state.phase === "revoked") && <div className="extension-main-view-page__status extension-main-view-page__status--error"><AlertTriangle aria-hidden="true" /><h2>{state.phase === "revoked" ? t("extensions.mainView.revoked") : t("extensions.mainView.unavailable")}</h2><p>{state.phase === "revoked" ? t("extensions.mainView.revokedBody") : t("extensions.mainView.unavailableBody")}</p><div><Button tone="primary" onClick={retry}>{t("common.retry")}</Button><Button tone="ghost" onClick={back}>{t("extensions.mainView.back")}</Button></div></div>}

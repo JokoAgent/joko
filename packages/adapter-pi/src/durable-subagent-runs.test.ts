@@ -6,16 +6,19 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const native = vi.hoisted(() => ({ lstat: vi.fn() }));
+const recovery = vi.hoisted(() => ({ inventory: vi.fn() }));
+vi.mock("./managed-subagent-process-inventory.js", () => ({ readManagedSubagentRecoveryInventory: recovery.inventory }));
 vi.mock("node:fs/promises", async importOriginal => ({
   ...await importOriginal<typeof files>(), lstat: native.lstat
 }));
-import { managedSubagentSessionKey, stopAndRemoveManagedSubagentRuns } from "./durable-subagent-runs.js";
+import { managedSubagentSessionKey, stopAndRemoveManagedSubagentRuns, stopManagedSubagentRunsByProvider } from "./durable-subagent-runs.js";
 
 let original: typeof files;
 const roots: string[] = [];
 beforeEach(async () => {
   original = await vi.importActual<typeof files>("node:fs/promises");
   native.lstat.mockImplementation(original.lstat);
+  recovery.inventory.mockReset().mockResolvedValue(["node test-runner"]);
 });
 afterEach(async () => {
   native.lstat.mockImplementation(original.lstat);
@@ -42,6 +45,51 @@ async function terminalRun() {
 }
 
 describe("private background run status snapshots", () => {
+  async function receiptedRun() {
+    const run = await terminalRun();
+    const config = JSON.parse(await original.readFile(join(run.directory, "config.json"), "utf8"));
+    Object.assign(config, { runDir: run.directory, nativeSessionId: randomUUID(), route: { provider: "provider", model: "model", effort: "high" } });
+    const runnerPid = 2_147_483_646;
+    const receipt = { ...config, runnerPid, state: "completed", completedAt: Date.now(), result: "verified output" };
+    await Promise.all([
+      original.writeFile(join(run.directory, "config.json"), JSON.stringify(config)),
+      original.writeFile(join(run.directory, "owner.json"), JSON.stringify({ ...config, state: "running", runnerPid })),
+      original.writeFile(join(run.directory, "runner.claim.json"), JSON.stringify({ ...config, runnerPid })),
+      original.writeFile(join(run.directory, "result.json"), JSON.stringify(receipt)),
+      original.writeFile(run.statusPath, "{ damaged status")
+    ]);
+    return { ...run, config, receipt };
+  }
+
+  it.each(["corrupt", "missing"])("reconciles %s status only from an exact terminal receipt and fresh complete process inventory", async kind => {
+    const run = await receiptedRun();
+    if (kind === "missing") await original.rm(run.statusPath);
+    await stopManagedSubagentRunsByProvider(run.root, "provider", 1000);
+    expect(recovery.inventory).toHaveBeenCalledTimes(2);
+    // Provider retirement keeps the damaged original as diagnostic evidence.
+    if (kind === "corrupt") expect(await original.readFile(run.statusPath, "utf8")).toBe("{ damaged status");
+    else await expect(original.lstat(run.statusPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(JSON.parse(await original.readFile(join(run.directory, "result.json"), "utf8"))).toEqual(run.receipt);
+    await expect(original.lstat(join(run.directory, "control.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["runner", "child", "unreadable"])("retains a terminal receipt while the %s process inventory is unresolved", async kind => {
+    const run = await receiptedRun();
+    recovery.inventory.mockResolvedValue(kind === "unreadable" ? undefined
+      : [`node ${kind === "runner" ? run.receipt.runId : run.config.nativeSessionId}`]);
+    await expect(stopManagedSubagentRunsByProvider(run.root, "provider", 1000)).rejects.toMatchObject({ publicError: { code: "PI_SUBAGENT_STATUS_INVALID" } });
+    expect(await original.readFile(run.statusPath, "utf8")).toBe("{ damaged status");
+    expect((await original.lstat(run.directory)).isDirectory()).toBe(true);
+  });
+
+  it.each(["runId", "launchToken", "taskId", "nativeSessionId", "runnerInstanceId"])("rejects a terminal receipt with a substituted %s", async field => {
+    const run = await receiptedRun();
+    await original.writeFile(join(run.directory, "result.json"), JSON.stringify({ ...run.receipt, [field]: randomUUID() }));
+    await expect(stopManagedSubagentRunsByProvider(run.root, "provider", 1000)).rejects.toMatchObject({ publicError: { code: "PI_SUBAGENT_STATUS_INVALID" } });
+    expect(recovery.inventory).not.toHaveBeenCalled();
+    expect(await original.readFile(run.statusPath, "utf8")).toBe("{ damaged status");
+  });
+
   it.each([1, 2, 3])("retries an unlinked regular-file snapshot at observation %i before deleting a retired run", async observation => {
     const run = await terminalRun();
     let reads = 0;

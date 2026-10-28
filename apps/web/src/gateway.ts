@@ -1,5 +1,6 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
+import { readSessionArchivePreview } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
 import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
@@ -26,7 +27,7 @@ import type { HelpMessageView, HelpAnswerView, HelpFeedbackDraftView, WorktreeRe
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
-import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService } from "@joko/contracts";
+import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
 import { createPartnerMemoryApi } from "@joko/contracts";
@@ -164,6 +165,8 @@ import {
   ExtensionLibraryState as ProtoExtensionLibraryState,
   ExtensionLibraryUnavailableReason as ProtoExtensionLibraryUnavailableReason,
   ExtensionMainViewIcon as ProtoExtensionMainViewIcon,
+  ExtensionMainViewOpenMode as ProtoExtensionMainViewOpenMode,
+  ExtensionTabSide as ProtoExtensionTabSide,
   ExtensionPackageAction as ProtoExtensionPackageAction,
   ExtensionPackageExportState as ProtoExtensionPackageExportState,
   ExtensionSourceKind as ProtoExtensionSourceKind,
@@ -2260,6 +2263,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         sessionId,
         input: {
           parts,
+          ...(draft.replyQuote ? { replyQuote: draft.replyQuote } : {}),
           quotesEncoded: serialized.quotesEncoded,
           pastedTextRanges: serialized.pastedTextRanges?.map((range) => ({
             start: bodyStart + range.start,
@@ -2468,8 +2472,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "pinSession", value: { sessionId, pinned } });
   }
 
-  async archiveSession(sessionId: string, archived: boolean): Promise<void> {
-    await this.submit({ case: "archiveSession", value: { sessionId, archived } });
+  async archiveSession(sessionId: string, archived: boolean, archiveConfirmation = ""): Promise<void> {
+    await this.submit({ case: "archiveSession", value: { sessionId, archived, archiveConfirmation } });
   }
 
   async moveSessionProject(
@@ -3109,7 +3113,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (response.sessionId !== sessionId || (!response.hasWorktree && response.dirty)) {
       throw new GatewayError("Orchestrator returned an invalid Worktree removal preview.");
     }
-    return { hasWorktree: response.hasWorktree, dirty: response.dirty };
+    return readSessionArchivePreview(response);
   }
 
   async exportSession(sessionId: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome> {
@@ -3452,6 +3456,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         customInstructions: options.summarize === true ? customInstructions : ""
       }
     }, true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: options.expectedGeneration }]);
+  }
+
+  async openSideChat(sessionId: string, expectedGeneration: bigint): Promise<string> {
+    if (this.#taskSharing !== undefined) throw new GatewayError("Side chats require the task's original node connection.");
+    const operation = await this.submit({ case: "openSideChat", value: { sourceSessionId: sessionId, newDisplayName: "" } },
+      true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }]);
+    return operationSessionId(operation);
   }
 
   async forkSession(
@@ -5333,6 +5344,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       newRequestId: () => crypto.randomUUID(), assertCurrent: () => {
         if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Routine connection owner changed.");
       } });
+  }
+  partnerAutonomyApi(ownerKey: string) {
+    const transport = this.requireTransport(), owner = this.#abort;
+    return createPartnerAutonomyApi({ rpc: createClient(PartnerService, transport), ownerKey, newOperationId: () => crypto.randomUUID(), assertCurrent: signal => {
+      signal.throwIfAborted(); if (this.#transport !== transport || this.#abort !== owner || owner?.signal.aborted) throw new GatewayError("Task observation connection changed.");
+    } });
   }
   partnerGroupApi(ownerKey: string) {
     const transport = this.requireTransport();
@@ -8412,6 +8429,27 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator returned a Partner task owned by another profile.");
     }
     return sessions;
+  }
+
+  async getPartnerTopic(sessionId: string, signal?: AbortSignal): Promise<PartnerSessionView | undefined> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerTopic({ sessionId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const topic = response.topic ? mapPartnerSession(response.topic) : undefined;
+    if (topic && (topic.role !== 'topic' || topic.sessionId !== sessionId)) throw new GatewayError('The topic task owner changed.');
+    return topic;
+  }
+
+  async ensurePartnerTopic(operationId: string, partnerId: string, expectedRevision: bigint, root: NonNullable<PartnerSessionView['topicRoot']>, signal?: AbortSignal): Promise<PartnerSessionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).ensurePartnerTopic({ operationId, partnerId, root,
+      expectedPartnerRevision: { value: expectedRevision } }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.topic) throw new GatewayError('The topic task is unavailable.');
+    const topic = mapPartnerSession(response.topic);
+    if (topic.role !== 'topic' || topic.partnerId !== partnerId || JSON.stringify(topic.topicRoot, (_key, value) => typeof value === 'bigint' ? value.toString() : value)
+      !== JSON.stringify(root, (_key, value) => typeof value === 'bigint' ? value.toString() : value)) throw new GatewayError('The topic root changed.');
+    await this.refresh(); scope.signal.throwIfAborted(); return topic;
   }
 
   async markPartnerRead(
@@ -11841,7 +11879,7 @@ function projectTimelineEvent(
       const userText = kind.value.role === 1 ? messageInputText(userInput) : undefined;
       const userInputAccepted = kind.value.role === 1 && kind.value.userInputAccepted === true;
       const inputMentions = messageInputMentions(userInput);
-      if (!userInputAccepted && (inputMentions.length > 0 || userInput?.mentionRanges.length || userInput?.pastedTextRanges.length || userInput?.quotesEncoded)) {
+      if (!userInputAccepted && (inputMentions.length > 0 || userInput?.mentionRanges.length || userInput?.pastedTextRanges.length || userInput?.quotesEncoded || userInput?.replyQuote)) {
         throw new GatewayError("Orchestrator returned structured user input without an accepted receipt.");
       }
       const pastedTextRanges = userText === undefined
@@ -11890,6 +11928,7 @@ function projectTimelineEvent(
         ...(userInputAccepted && inputMentions.length > 0 ? { inputMentions } : {}),
         ...(userInputAccepted && mentionRanges.length > 0 ? { mentionRanges } : {}),
         ...(userInputAccepted && userInput?.quotesEncoded === true ? { quotesEncoded: true } : {}),
+        ...(userInputAccepted && userInput?.replyQuote ? { replyQuote: mapPrivateReplyQuote(userInput.replyQuote) } : {}),
         ...(kind.value.role === 1 && pastedTextRanges.length > 0 ? { pastedTextRanges } : {}),
         ...(kind.value.role === 1 && automationOrigin !== undefined ? { automationOrigin } : {}),
         ...(kind.value.role === 1 && inputDelivery !== undefined ? { inputDelivery } : {}),
@@ -14101,6 +14140,7 @@ function mapSessionDerivationOrigin(
   return {
     kind,
     sourceSessionId: origin.sourceSessionId,
+    ...(origin.sideChat ? { sideChat: true } : {}),
     ...(origin.sourceMessageId === undefined || origin.sourceEventId === undefined
       ? {}
       : {
@@ -14747,6 +14787,7 @@ function mapQueueItem(item: QueueItem): QueueItemView {
     mode: uiDeliveryMode(item.deliveryMode),
     text,
     ...(item.input?.quotesEncoded === true ? { quotesEncoded: true } : {}),
+    ...(item.input?.replyQuote ? { replyQuote: mapPrivateReplyQuote(item.input.replyQuote) } : {}),
     ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges }),
     ...(inputMentions.length === 0 ? {} : { inputMentions }),
     ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
@@ -17552,13 +17593,17 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
   const mainViewIcon = extension.mainView === undefined ? undefined : extensionMainViewIcon(extension.mainView.icon);
   const mainView = extension.mainView === undefined ? undefined : {
     ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
-    ...(mainViewIcon === undefined ? {} : { icon: mainViewIcon })
+    ...(mainViewIcon === undefined ? {} : { icon: mainViewIcon }),
+    ...(extensionMainViewOpen(extension.mainView.open) === undefined ? {} : { open: extensionMainViewOpen(extension.mainView.open)! }),
+    ...(extensionTabSide(extension.mainView.side) === undefined ? {} : { side: extensionTabSide(extension.mainView.side)! }),
+    ...(extension.mainView.multiple ? { multiple: true as const } : {})
   };
   if (extension.mainView?.title !== undefined && (
     extension.mainView.title.trim() !== extension.mainView.title
     || extension.mainView.title.length === 0
     || extension.mainView.title.length > 80
-  ) || extension.sidebarSupported !== (mainView !== undefined) || extension.sidebarVisible && mainView === undefined) {
+  ) || mainView?.side !== undefined && mainView.open !== "sidebar"
+    || extension.sidebarSupported !== (mainView !== undefined) || extension.sidebarVisible && mainView === undefined) {
     throw new GatewayError("Orchestrator returned an invalid Extension main-view capability.");
   }
   const library = extension.library === undefined
@@ -18028,6 +18073,26 @@ function validLibraryRelativePath(value: string): boolean {
   if (value.length === 0 || value.length > 512 || value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:/u.test(value)) return false;
   const segments = value.split("/");
   return segments.length <= 32 && segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+function extensionMainViewOpen(value: ProtoExtensionMainViewOpenMode): "page" | "sidebar" | "window" | undefined {
+  switch (value) {
+    case ProtoExtensionMainViewOpenMode.UNSPECIFIED: return undefined;
+    case ProtoExtensionMainViewOpenMode.PAGE: return "page";
+    case ProtoExtensionMainViewOpenMode.SIDEBAR: return "sidebar";
+    case ProtoExtensionMainViewOpenMode.WINDOW: return "window";
+    default: throw new GatewayError("Orchestrator returned an invalid Extension main-view open mode.");
+  }
+}
+function extensionTabSide(value: ProtoExtensionTabSide): "left" | "right" | "top" | "bottom" | undefined {
+  switch (value) {
+    case ProtoExtensionTabSide.UNSPECIFIED: return undefined;
+    case ProtoExtensionTabSide.LEFT: return "left";
+    case ProtoExtensionTabSide.RIGHT: return "right";
+    case ProtoExtensionTabSide.TOP: return "top";
+    case ProtoExtensionTabSide.BOTTOM: return "bottom";
+    default: throw new GatewayError("Orchestrator returned an invalid Extension tab side.");
+  }
 }
 
 function extensionMainViewIcon(value: ProtoExtensionMainViewIcon): ExtensionMainViewIconView | undefined {
@@ -20587,6 +20652,7 @@ function editedQueueInput(original: InputContent, edit: QueueItemTextEditView): 
   }
   return create(InputContentSchema, {
     parts,
+    ...(original.replyQuote ? { replyQuote: original.replyQuote } : {}),
     quotesEncoded: false,
     pastedTextRanges: pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
     mentionRanges: mentionRanges.map((range) => create(InputMentionRangeSchema, {
@@ -20647,6 +20713,12 @@ function messageInputAttachments(input: any): NonNullable<QueueItemView["attachm
     if (content?.case === "file") return [{ kind: "file", label: content.value.fileName || "" }];
     return [];
   });
+}
+
+function mapPrivateReplyQuote(value: { readonly generation: bigint; readonly eventId: string; readonly messageId: string; readonly role: string; readonly excerpt: string }): import('./model.js').PartnerReplyQuoteView {
+  if (value.generation < 1n || !validResourceIdentityText(value.eventId) || !validResourceIdentityText(value.messageId)
+    || !['user', 'assistant'].includes(value.role) || value.excerpt.length > 280) throw new GatewayError('The private reply quote is invalid.');
+  return { generation: value.generation, eventId: value.eventId, messageId: value.messageId, role: value.role as 'user' | 'assistant', excerpt: value.excerpt };
 }
 
 function messageInputMentionRanges(input: any, text: string, mentionCount: number, pastedRanges: NonNullable<TimelineItemView["pastedTextRanges"]>): NonNullable<TimelineItemView["mentionRanges"]> {
@@ -21682,11 +21754,13 @@ function mapPartnerSession(value: ProtoPartnerSession): PartnerSessionView {
   }
   const role: PartnerSessionRoleView = value.role === PartnerSessionRole.CANONICAL ? "canonical"
     : value.role === PartnerSessionRole.HISTORY ? "history"
-      : value.role === PartnerSessionRole.DELEGATION ? "delegation"
+      : value.role === PartnerSessionRole.DELEGATION ? "delegation" : value.role === PartnerSessionRole.TOPIC ? 'topic'
         : (() => { throw new GatewayError("Orchestrator returned an unknown Partner task role."); })();
-  if ((role === "delegation") !== (value.parentSessionId !== undefined)
+  if ((role === "delegation" || role === 'topic') !== (value.parentSessionId !== undefined)
     || (role === "delegation") !== (value.delegationId !== undefined)
-    || (role !== "canonical" && !value.readOnly)) {
+    || (role === 'topic') !== Boolean(value.topicRoot)
+    || (value.topicRoot && (value.topicRoot.sessionId !== value.parentSessionId || value.topicRoot.generation < 1n || !value.topicRoot.eventId || !value.topicRoot.messageId))
+    || (!['canonical', 'topic'].includes(role) && !value.readOnly)) {
     throw new GatewayError("Orchestrator returned an inconsistent Partner task link.");
   }
   return {
@@ -21696,6 +21770,7 @@ function mapPartnerSession(value: ProtoPartnerSession): PartnerSessionView {
     profileVersion: value.profileVersion,
     ...(value.parentSessionId === undefined ? {} : { parentSessionId: value.parentSessionId }),
     ...(value.delegationId === undefined ? {} : { delegationId: value.delegationId }),
+    ...(value.topicRoot ? { topicRoot: { sessionId: value.topicRoot.sessionId, generation: value.topicRoot.generation, eventId: value.topicRoot.eventId, messageId: value.topicRoot.messageId } } : {}),
     displayName: value.displayName,
     available: value.available,
     readOnly: value.readOnly,

@@ -18,6 +18,18 @@ defaults:
     shell: bash
 
 jobs:
+  windows-host-security:
+    name: Windows staged host identity and bootstrap parser
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check staged identity, bounded source reads, reparse refusal and bootstrap quoting
+        run: cargo test --locked --manifest-path apps/desktop/native/remote-desktop/windows-host/Cargo.toml --bin joko-windows-remote-desktop-host
+
   linux-native:
     name: Linux protocol, display rollback, and sanitized C++ fragments
     runs-on: ubuntu-24.04

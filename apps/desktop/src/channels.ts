@@ -56,6 +56,7 @@ export const DESKTOP_CHANNELS = {
   inspectorWindowMinimize: "joko:inspector-window:minimize",
   inspectorWindowToggleMaximize: "joko:inspector-window:toggle-maximize",
   inspectorWindowClose: "joko:inspector-window:close",
+  inspectorWindowCloseRequested: "joko:inspector-window:close-requested",
   inspectorWindowClosed: "joko:inspector-window:closed",
   traySetIcon: "joko:tray:set-icon",
   notify: "joko:notify",
@@ -73,6 +74,7 @@ export const DESKTOP_CHANNELS = {
   nativeTaskStatusSetVisibleSessions: "joko:native-task-status:visible-sessions:set",
   nativeTaskStatusAction: "joko:native-task-status:action",
   nativeTaskStatusAcknowledgeFocus: "joko:native-task-status:focus:acknowledge",
+  nativeTaskStatusCompletionResult: "joko:native-task-status:completion:result",
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
   keepAwakeChanged: "joko:power:keep-awake:changed",
@@ -184,7 +186,8 @@ export const INSPECTOR_WINDOW_URL = "about:blank";
 export const INSPECTOR_WINDOW_FEATURES = "popup,width=520,height=860";
 
 export function isInspectorWindowOpenRequest(url: unknown, frameName: unknown): boolean {
-  return url === INSPECTOR_WINDOW_URL && frameName === INSPECTOR_WINDOW_FRAME_NAME;
+  return url === INSPECTOR_WINDOW_URL && (frameName === INSPECTOR_WINDOW_FRAME_NAME
+    || typeof frameName === "string" && /^joko-inspector-window-[0-9a-f]{32}$/u.test(frameName));
 }
 
 export type DesktopLocale = "en" | "zh-CN" | "en-XA";
@@ -701,6 +704,7 @@ export interface DesktopNativeTaskStatusDisplay {
 
 export type DesktopNativeTaskStatusAction =
   | { readonly kind: "focus"; readonly sessionId: string; readonly entryToken?: string }
+  | { readonly kind: "completion"; readonly action: "archive" | "markRead"; readonly sessionId: string; readonly entryToken: string }
   | {
       readonly kind: "permission";
       readonly sessionId: string;

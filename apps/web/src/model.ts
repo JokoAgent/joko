@@ -552,7 +552,7 @@ export type PartnerInitializationErrorCodeView =
   | "stateChanged";
 export type PartnerInvitationStageView = "home" | "avatar" | "session" | "ready" | "failed";
 export type PartnerPermissionModeView = PermissionMode;
-export type PartnerSessionRoleView = "canonical" | "history" | "delegation";
+export type PartnerSessionRoleView = "canonical" | "history" | "delegation" | "topic";
 export type PartnerPrivateThreadStatusView = "active" | "closed";
 export type PartnerPrivateThreadCloseReasonView = "messageLimit" | "idleTimeout";
 export type PartnerPrivateMessageDeliveryStatusView = "pending" | "delivered" | "failed";
@@ -643,6 +643,7 @@ export interface PartnerSessionView {
   readonly profileVersion: bigint;
   readonly parentSessionId?: string;
   readonly delegationId?: string;
+  readonly topicRoot?: { readonly sessionId: string; readonly generation: bigint; readonly eventId: string; readonly messageId: string };
   readonly displayName: string;
   readonly available: boolean;
   readonly readOnly: boolean;
@@ -1478,6 +1479,7 @@ export interface SessionView {
   /** Immutable task lineage projected by Orchestrator; availability is authoritative for this snapshot. */
   readonly derivationOrigin?: {
     readonly kind: "fork" | "clone";
+    readonly sideChat?: boolean;
     readonly sourceSessionId: string;
     readonly sourceMessageId?: string;
     readonly sourceEventId?: string;
@@ -1566,6 +1568,7 @@ export interface ContextView {
 }
 
 export interface TimelineItemView {
+  readonly replyQuote?: PartnerReplyQuoteView;
   readonly extensionCard?: import("@joko/contracts").ExtensionCard;
   readonly mcpApp?: import("@joko/contracts").McpAppCard;
   readonly personalDevelopmentReport?: PersonalDevelopmentDoctorRun;
@@ -1957,6 +1960,7 @@ export interface ErrorRecoveryActionView {
 }
 
 export interface QueueItemView {
+  readonly replyQuote?: PartnerReplyQuoteView;
   readonly sharedTaskAuthor?: import("@joko/contracts").SharedTaskAuthor;
   readonly id: string;
   readonly sessionId: string;
@@ -4230,6 +4234,9 @@ export interface ExtensionCatalogEntryView {
   readonly mainView?: {
     readonly title?: string;
     readonly icon?: ExtensionMainViewIconView;
+    readonly open?: "page" | "sidebar" | "window";
+    readonly side?: "left" | "right" | "top" | "bottom";
+    readonly multiple?: true;
   };
   readonly library?: { readonly schemaVersion: 1 };
   readonly sidebarSupported: boolean;
@@ -5473,6 +5480,9 @@ export interface TargetWorktreeProbeView {
 export interface SessionWorktreeRemovalPreviewView {
   readonly hasWorktree: boolean;
   readonly dirty: boolean;
+  readonly activeBoundScheduleCount?: number;
+  readonly activeBoundScheduleNames?: readonly string[];
+  readonly archiveConfirmation?: string;
 }
 
 export interface WorktreeSourceView {
@@ -5617,6 +5627,7 @@ export type ComposerSelectionQuoteDraft =
   | ComposerFileSelectionQuoteDraft;
 
 export interface ComposerDraft {
+  readonly replyQuote?: PartnerReplyQuoteView;
   readonly builtinSkillIntent?: "plugin_creator";
   readonly text: string;
   /** Ordered rich-text source of truth for inline selected-text quote atoms. */
@@ -5628,6 +5639,10 @@ export interface ComposerDraft {
   readonly deliveryMode: DeliveryMode;
   /** Explicit per-turn directory selection. Undefined follows Session defaults; [] grants none. */
   readonly extraDirectoryIds?: readonly string[];
+}
+
+export interface PartnerReplyQuoteView {
+  readonly generation: bigint; readonly eventId: string; readonly messageId: string; readonly role: 'user' | 'assistant'; readonly excerpt: string;
 }
 
 export type VoiceInputCapabilitySupportView =
@@ -6083,7 +6098,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   deleteTaskTag(originSessionId: string, preview: TaskTagDeletePreviewView): Promise<void>;
   suggestSessionTitle(sessionId: string, signal?: AbortSignal): Promise<SessionTitleSuggestionView>;
   pinSession(sessionId: string, pinned: boolean): Promise<void>;
-  archiveSession(sessionId: string, archived: boolean): Promise<void>;
+  archiveSession(sessionId: string, archived: boolean, archiveConfirmation?: string): Promise<void>;
+  openSideChat(sessionId: string, expectedGeneration: bigint): Promise<string>;
   getSessionWorktreeRemovalPreview(sessionId: string, signal?: AbortSignal): Promise<SessionWorktreeRemovalPreviewView>;
   moveSessionProject(
     sessionId: string,
@@ -6588,6 +6604,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView>;
   listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView>;
   partnerRoutineApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerRoutineApi;
+  partnerAutonomyApi?(ownerKey: string): import("@joko/contracts").PartnerAutonomyApi;
   partnerGroupApi(ownerKey: string): import("@joko/contracts").PartnerGroupApi;
   uploadPartnerGroupFile(file: File, signal: AbortSignal): Promise<import("@joko/contracts").BlobRef>;
   partnerMemoryApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerMemoryApi;
@@ -6614,6 +6631,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   retryPartnerInitialization(partnerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerMutationView>;
   updatePartnerDefaults(expectedDirectoryRevision: bigint, capabilities: PartnerCapabilitiesView, signal?: AbortSignal): Promise<PartnerDefaultsMutationView>;
   listPartnerSessions(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerSessionView[]>;
+  getPartnerTopic?(sessionId: string, signal?: AbortSignal): Promise<PartnerSessionView | undefined>;
+  ensurePartnerTopic?(operationId: string, partnerId: string, expectedRevision: bigint, root: NonNullable<PartnerSessionView['topicRoot']>, signal?: AbortSignal): Promise<PartnerSessionView>;
   listPartnerSessionTasks(partnerId: string, signal?: AbortSignal): Promise<readonly import("@joko/contracts").PartnerSessionTaskView[]>;
   controlPartnerSessionTask(partnerId: string, partnerRevision: bigint, task: import("@joko/contracts").PartnerSessionTaskView,
     action: "pause" | "resume" | "cancel", signal?: AbortSignal): Promise<import("@joko/contracts").PartnerSessionTaskView>;

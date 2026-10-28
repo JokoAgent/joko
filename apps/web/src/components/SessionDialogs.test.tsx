@@ -68,6 +68,18 @@ describe("RenameSessionDialog", () => {
 });
 
 describe("Session removal dialogs", () => {
+  it("shows enabled bound automations and blocks an unavailable binding query", async () => {
+    const onArchive = vi.fn(), onRetry = vi.fn();
+    await mount(<ArchiveSessionDialog sessions={[session()]} preflight={{ clean: 1, dirty: 0, unknown: 0,
+      activeBoundScheduleCount: 1, activeBoundScheduleNames: ["Nightly"], archiveUnavailable: true }}
+      t={(key, values) => translate("en", key, values)} onClose={vi.fn()} onArchive={onArchive} onRetry={onRetry} />);
+    expect(document.body.textContent).toContain("Nightly");
+    expect(document.body.textContent).toContain("stay enabled");
+    expect(buttonNamed("Archive task").disabled).toBe(true);
+    await act(async () => buttonNamed("Retry").click());
+    expect(onRetry).toHaveBeenCalledOnce(); expect(onArchive).not.toHaveBeenCalled();
+  });
+
   it("shows aggregated dirty and unknown workspace state before archiving a batch", async () => {
     const onArchive = vi.fn();
     await mount(<ArchiveSessionDialog

@@ -84,7 +84,7 @@ describe("WorktreeService removal preview", () => {
     const previewRemoval = vi.fn(async () => ({ hasWorktree: true, dirty: true }));
     const service = createWorktreeConnectService(
       { previewRemoval } as unknown as SessionWorktreeCoordinator,
-      {} as OperationalStore,
+      { readSessionArchiveSchedules: () => ({ count: 1, names: ["Nightly"], confirmation: "a".repeat(64) }) } as unknown as OperationalStore,
       authenticate
     );
     const context = { signal } as HandlerContext;
@@ -92,8 +92,9 @@ describe("WorktreeService removal preview", () => {
     await expect(service.getSessionWorktreeRemovalPreview(
       create(contract.GetSessionWorktreeRemovalPreviewRequestSchema, { sessionId: "task-one" }),
       context
-    )).resolves.toMatchObject({ sessionId: "task-one", hasWorktree: true, dirty: true });
-    expect(authenticate).toHaveBeenCalledExactlyOnceWith(context);
+    )).resolves.toMatchObject({ sessionId: "task-one", hasWorktree: true, dirty: true,
+      activeBoundScheduleCount: 1, activeBoundScheduleNames: ["Nightly"], archiveConfirmation: "a".repeat(64) });
+    expect(authenticate).toHaveBeenCalledTimes(2);
     expect(previewRemoval).toHaveBeenCalledExactlyOnceWith("task-one", { signal });
   });
 

@@ -64,3 +64,40 @@ it("fences only the exact cleanup lease and removes its native receipts with the
     store.finishPurge(session.key, "replacement"); expect(store.find(session.key)).toBeUndefined(); expect(store.call(session.key, "send")).toBeUndefined();
   } finally { database.close(); }
 });
+
+it("retains exact native lineage and derivation ownership through restart, and permits resumption only after Product adoption", () => {
+  const root = mkdtempSync(join(tmpdir(), "joko-hosted-derive-")), path = join(root, "operations.sqlite"); let database = new OperationalStore(path);
+  try {
+    let store = new HostedAgentStore(database); const source = store.claim(owner, "source-process", "create"); store.bind(source.key, source.leaseId, binding);
+    const childOwner = { ...owner, sessionId: "child-task", nativeSessionId: "child-alias" };
+    const child = store.prepareDerivation(source.key, source.leaseId, childOwner, { operationId: "native-fork-call", kind: "fork", providerId: "provider", modelId: "model" });
+    const childBinding = { ...binding, opaqueRef: "actual-native-child", nativeSessionId: "actual-child" };
+    store.updateDerivation(child.key, child.leaseId, {}, childBinding);
+    const reordered = { generation: childBinding.generation, opaqueRef: childBinding.opaqueRef, nativeSessionId: childBinding.nativeSessionId };
+    expect(store.updateDerivation(child.key, child.leaseId, {}, reordered).binding).toEqual(childBinding);
+    for (const change of [{ opaqueRef: "another-reference" }, { nativeSessionId: "another-child" }, { generation: childBinding.generation + 1 }]) {
+      expect(() => store.updateDerivation(child.key, child.leaseId, {}, { ...childBinding, ...change })).toThrow("binding conflicts");
+      expect(store.find(child.key)?.binding).toEqual(childBinding);
+    }
+    store.updateDerivation(child.key, child.leaseId, { state: "settled", nativeAdopted: true });
+    expect(() => store.claim(childOwner, "premature-process", "resume")).toThrow("cannot");
+    database.close(); database = new OperationalStore(path); store = new HostedAgentStore(database);
+    const recovered = store.find(child.key)!; expect(recovered).toMatchObject({ storageKey: source.key, binding: childBinding,
+      derivation: { sourceKey: source.key, sourceBinding: binding, operationId: "native-fork-call", state: "settled", adopted: false } });
+    expect(store.updateDerivation(child.key, recovered.leaseId, {}, reordered).binding).toEqual(childBinding);
+    store.updateDerivation(child.key, recovered.leaseId, { adopted: true });
+    const resumed = store.claim(childOwner, "child-process", "resume"); expect(resumed.storageKey).toBe(source.key); expect(resumed.binding).toEqual(childBinding);
+    expect(() => store.updateDerivation(child.key, recovered.leaseId, { cleanupRequested: true })).toThrow("changed");
+  } finally { database.close(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); rmSync(root, { recursive: true, force: true }); }
+});
+
+it("fences late derivation delivery after a confirmed unstarted cleanup and never recreates that child alias", () => {
+  const database = new OperationalStore(":memory:");
+  try {
+    const store = new HostedAgentStore(database), source = store.claim(owner, "source-process", "create"); store.bind(source.key, source.leaseId, binding);
+    const childOwner = { ...owner, sessionId: "cancelled-child", nativeSessionId: "cancelled-alias" };
+    store.cancelUnstartedDerivation(childOwner, store.find(source.key)!, "cancelled-native-call", "clone");
+    expect(() => store.prepareDerivation(source.key, source.leaseId, childOwner, { operationId: "cancelled-native-call", kind: "clone", providerId: "provider", modelId: "model" })).toThrow("conflicts");
+    expect(() => store.claim(childOwner, "late-process", "create")).toThrow("cannot"); expect(store.find(store.key(childOwner))?.derivation?.state).toBe("cleaned");
+  } finally { database.close(); }
+});

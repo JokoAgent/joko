@@ -24,6 +24,22 @@ export interface HostedNativeSessionRecord {
   readonly leaseId: string;
   readonly state: "creating" | "ready" | "closed" | "purging";
   readonly binding?: NativeSessionBinding;
+  /** Server-chosen native history/workspace lineage, never an inbound path. */
+  readonly storageKey?: string;
+  readonly derivation?: HostedNativeDerivationRecord;
+}
+export interface HostedNativeDerivationRecord {
+  readonly operationId: string;
+  readonly kind: "fork" | "clone";
+  readonly sourceKey: string;
+  readonly sourceBinding: NativeSessionBinding;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly state: "running" | "settled" | "unknown" | "cleaned";
+  readonly nativeAdopted: boolean;
+  readonly adopted: boolean;
+  readonly cleanupRequested: boolean;
+  readonly completedSnapshot?: { readonly kind: "completed_assistant"; readonly nativeBoundaryId: string };
 }
 export interface HostedNativeCallReceipt {
   readonly format: 1;
@@ -48,11 +64,14 @@ export class HostedAgentStore {
     if (start !== "create" && start !== "resume") throw new StoreError("The hosted native start is invalid.");
     return this.store.transaction(() => {
       const prior = this.find(key);
-      if (start === "create" && prior || start === "resume" && (!prior?.binding || prior.state === "creating" || prior.state === "purging")) {
+      if (start === "create" && (prior || this.list().some(row => row.storageKey === key && row.derivation?.state !== "cleaned"))
+        || start === "resume" && (!prior?.binding || prior.state === "creating" || prior.state === "purging"
+          || prior.derivation && (!prior.derivation.adopted || prior.derivation.cleanupRequested || prior.derivation.state !== "settled"))) {
         throw new StoreError("The hosted native identity cannot be created or resumed with this request.");
       }
       const value: HostedNativeSessionRecord = { format: 1, key, owner: { ...owner }, leaseId,
-        state: prior?.binding ? "ready" : "creating", ...(prior?.binding ? { binding: prior.binding } : {}) };
+        state: prior?.binding ? "ready" : "creating", ...(prior?.binding ? { binding: prior.binding } : {}),
+        ...(prior?.storageKey ? { storageKey: prior.storageKey } : {}), ...(prior?.derivation ? { derivation: prior.derivation } : {}) };
       this.store.setSetting("service", SCOPE, `session:${key}`, value); return value;
     });
   }
@@ -64,8 +83,10 @@ export class HostedAgentStore {
     validateOwner(value.owner as HostedNativeSessionOwner); identity(value.leaseId);
     if (this.key(value.owner as HostedNativeSessionOwner) !== key) throw new StoreError("The hosted native owner conflicts.");
     if (value.binding !== undefined) validateBinding(value.binding as NativeSessionBinding);
+    if (value.storageKey !== undefined) assertDigest(value.storageKey);
+    if (value.derivation !== undefined) validateDerivation(value.derivation);
     if (value.state !== "creating" && value.state !== "purging" && value.binding === undefined) throw new StoreError("The hosted native binding is missing.");
-    if (Object.keys(value).some(name => !["format", "key", "owner", "leaseId", "state", "binding"].includes(name))) throw new StoreError("The hosted native record has unknown fields.");
+    if (Object.keys(value).some(name => !["format", "key", "owner", "leaseId", "state", "binding", "storageKey", "derivation"].includes(name))) throw new StoreError("The hosted native record has unknown fields.");
     return value as unknown as HostedNativeSessionRecord;
   }
   assertLease(key: string, leaseId: string): HostedNativeSessionRecord {
@@ -90,6 +111,48 @@ export class HostedAgentStore {
   }
   list(): readonly HostedNativeSessionRecord[] {
     return this.store.listSettingsByKeyPrefix("service", SCOPE, "session:").map(row => this.find(row.key.slice("session:".length))!);
+  }
+  prepareDerivation(sourceKey: string, sourceLease: string, owner: HostedNativeSessionOwner,
+    input: Pick<HostedNativeDerivationRecord, "operationId" | "kind" | "providerId" | "modelId" | "completedSnapshot">): HostedNativeSessionRecord {
+    return this.store.transaction(() => {
+      const source = this.assertLease(sourceKey, sourceLease), key = this.key(owner);
+      if (!source.binding || source.state !== "ready" || this.find(key) || key === sourceKey
+        || source.owner.authorityId !== owner.authorityId || source.owner.deviceId !== owner.deviceId || source.owner.trust !== owner.trust
+        || source.owner.targetId !== owner.targetId || source.owner.backendId !== owner.backendId
+        || JSON.stringify(source.owner.providerGrant) !== JSON.stringify(owner.providerGrant)) throw new StoreError("The native derivation source or child owner conflicts.");
+      const derivation: HostedNativeDerivationRecord = { ...input, sourceKey, sourceBinding: source.binding, state: "running", nativeAdopted: false, adopted: false, cleanupRequested: false };
+      validateDerivation(derivation);
+      const value: HostedNativeSessionRecord = { format: 1, key, owner, leaseId: `derive:${input.operationId}`, state: "creating",
+        storageKey: source.storageKey ?? source.key, derivation };
+      this.store.setSetting("service", SCOPE, `session:${key}`, value); return value;
+    });
+  }
+  updateDerivation(key: string, leaseId: string, update: Partial<Pick<HostedNativeDerivationRecord, "state" | "nativeAdopted" | "adopted" | "cleanupRequested">>,
+    binding?: NativeSessionBinding): HostedNativeSessionRecord {
+    return this.store.transaction(() => {
+      const prior = this.assertLease(key, leaseId); if (!prior.derivation) throw new StoreError("The native child has no derivation owner.");
+      if (binding) validateBinding(binding);
+      if (binding && prior.binding && (binding.opaqueRef !== prior.binding.opaqueRef
+        || binding.nativeSessionId !== prior.binding.nativeSessionId
+        || binding.generation !== prior.binding.generation)) throw new StoreError("The native child binding conflicts.");
+      const derivation = { ...prior.derivation, ...update }; validateDerivation(derivation);
+      if (derivation.adopted && (!prior.binding && !binding || derivation.cleanupRequested || derivation.state !== "settled" || !derivation.nativeAdopted)) throw new StoreError("The native child cannot be adopted.");
+      const value: HostedNativeSessionRecord = { ...prior, derivation, ...(binding ? { binding } : {}),
+        state: derivation.state === "cleaned" ? "purging" : derivation.state === "settled" && (binding ?? prior.binding) ? "ready" : prior.state };
+      this.store.setSetting("service", SCOPE, `session:${key}`, value); return value;
+    });
+  }
+  cancelUnstartedDerivation(owner: HostedNativeSessionOwner, source: HostedNativeSessionRecord, operationId: string, kind: "fork" | "clone"): void {
+    this.store.transaction(() => {
+      const key = this.key(owner); if (this.find(key)) throw new StoreError("The native derivation cleanup owner changed.");
+      if (!source.binding || source.owner.authorityId !== owner.authorityId || source.owner.deviceId !== owner.deviceId
+        || source.owner.trust !== owner.trust || source.owner.targetId !== owner.targetId || source.owner.backendId !== owner.backendId) throw new StoreError("The native derivation source owner conflicts.");
+      const derivation: HostedNativeDerivationRecord = { operationId, kind, sourceKey: source.key, sourceBinding: source.binding,
+        providerId: "cleanup-only", modelId: "cleanup-only", state: "cleaned", nativeAdopted: false, adopted: false, cleanupRequested: true };
+      validateDerivation(derivation);
+      this.store.setSetting("service", SCOPE, `session:${key}`, { format: 1, key, owner, leaseId: `derive:${operationId}`, state: "purging",
+        storageKey: source.storageKey ?? source.key, derivation });
+    });
   }
   /** A confirmed process owner fences resumption before deleting its files. */
   beginPurge(key: string, leaseId: string): void {
@@ -151,4 +214,16 @@ function validateBinding(binding: NativeSessionBinding): void {
   const value = record(binding); identity(value.opaqueRef);
   if (!Number.isSafeInteger(binding.generation) || binding.generation < 0 || value.nativeSessionId !== undefined && typeof value.nativeSessionId !== "string"
     || Object.keys(value).some(name => !["opaqueRef", "nativeSessionId", "generation"].includes(name))) throw new StoreError("The hosted native binding is invalid.");
+}
+function validateDerivation(input: unknown): asserts input is HostedNativeDerivationRecord {
+  const value = record(input);
+  for (const key of ["operationId", "providerId", "modelId"]) identity(value[key]);
+  assertDigest(value.sourceKey); validateBinding(value.sourceBinding as NativeSessionBinding);
+  if (value.completedSnapshot !== undefined) {
+    const snapshot = record(value.completedSnapshot); identity(snapshot.nativeBoundaryId);
+    if (value.kind !== "fork" || snapshot.kind !== "completed_assistant" || Object.keys(snapshot).some(key => !["kind", "nativeBoundaryId"].includes(key))) throw new StoreError("The native completed snapshot is invalid.");
+  }
+  if (!["fork", "clone"].includes(value.kind as string) || !["running", "settled", "unknown", "cleaned"].includes(value.state as string)
+    || ["nativeAdopted", "adopted", "cleanupRequested"].some(key => typeof value[key] !== "boolean")
+    || Object.keys(value).some(key => !["operationId", "kind", "sourceKey", "sourceBinding", "providerId", "modelId", "state", "nativeAdopted", "adopted", "cleanupRequested", "completedSnapshot"].includes(key))) throw new StoreError("The native derivation receipt is invalid.");
 }

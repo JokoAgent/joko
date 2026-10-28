@@ -333,13 +333,17 @@ CREATE INDEX partner_delegations_recovery_idx
 CREATE TABLE partner_session_links (
   session_id TEXT PRIMARY KEY,
   partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK (role IN ('canonical', 'history', 'delegation', 'group')),
+  role TEXT NOT NULL CHECK (role IN ('canonical', 'history', 'delegation', 'group', 'topic')),
   profile_version INTEGER NOT NULL CHECK (profile_version BETWEEN 1 AND 9007199254740991),
   parent_session_id TEXT,
   delegation_id TEXT REFERENCES partner_delegations(id) ON DELETE CASCADE,
+  topic_root_json TEXT,
+  topic_operation_id TEXT,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   CHECK ((role = 'delegation') = (delegation_id IS NOT NULL)),
-  CHECK ((role = 'delegation') = (parent_session_id IS NOT NULL))
+  CHECK ((role IN ('delegation', 'topic')) = (parent_session_id IS NOT NULL)),
+  CHECK ((role = 'topic') = (topic_root_json IS NOT NULL)),
+  CHECK ((role = 'topic') = (topic_operation_id IS NOT NULL))
 ) STRICT;
 CREATE UNIQUE INDEX partner_session_links_canonical_partner_unique
   ON partner_session_links(partner_id)
@@ -349,6 +353,9 @@ CREATE INDEX partner_session_links_partner_created_idx
 CREATE UNIQUE INDEX partner_session_links_delegation_unique
   ON partner_session_links(delegation_id)
   WHERE role = 'delegation';
+CREATE UNIQUE INDEX partner_session_links_topic_root_unique
+  ON partner_session_links(partner_id, parent_session_id, json_extract(topic_root_json, '$.generation'), json_extract(topic_root_json, '$.eventId'))
+  WHERE role = 'topic';
 `;
 
 export const PARTNER_SCHEMA_BASELINE_ID = createHash("sha256")
@@ -956,6 +963,30 @@ export class PartnerStore {
           ORDER BY created_at DESC, session_id
         `).all(partnerId, role) as Row[];
     return rows.map(partnerSessionLink);
+  }
+
+  /** The native creation Host supplies close proof before replacing an unstored topic. */
+  bindTopicSession(input: { readonly partnerId: string; readonly expectedRevision: bigint; readonly profileVersion: number;
+    readonly sessionId: string; readonly operationId: string; readonly replaces?: { readonly sessionId: string; readonly operationId: string };
+    readonly root: NonNullable<PartnerSessionLinkRecord['topicRoot']> }): PartnerSessionLinkRecord {
+    return this.#write(() => {
+      const profile = this.getPartner(input.partnerId); assertMutable(profile); assertRevision(profile, input.expectedRevision);
+      if (profile.initializationState !== 'ready' || profile.profileVersion !== input.profileVersion || profile.canonicalSessionId !== input.root.sessionId) throw changed(profile.id);
+      const root = topicRoot(input.root), sessionId = entityId(input.sessionId, 'Topic Session ID'), existing = this.getSessionLink(sessionId);
+      if (existing) {
+        if (existing.partnerId !== profile.id || existing.role !== 'topic' || JSON.stringify(existing.topicRoot) !== JSON.stringify(root)) throw changed(profile.id);
+        return existing;
+      }
+      if (input.replaces) {
+        const old = this.getSessionLink(input.replaces.sessionId);
+        if (old?.role !== 'topic' || old.partnerId !== profile.id || old.topicOperationId !== input.replaces.operationId
+          || JSON.stringify(old.topicRoot) !== JSON.stringify(root)) throw changed(profile.id);
+        this.#database.prepare("DELETE FROM partner_session_links WHERE session_id = ? AND role = 'topic'").run(old.sessionId);
+      }
+      this.#database.prepare(`INSERT INTO partner_session_links(session_id,partner_id,role,profile_version,parent_session_id,delegation_id,topic_root_json,topic_operation_id,created_at)
+        VALUES (?,?,'topic',?,?,NULL,?,?,?)`).run(sessionId, profile.id, input.profileVersion, root.sessionId, JSON.stringify(root), entityId(input.operationId, 'Topic operation ID'), this.#now());
+      return this.getSessionLink(sessionId)!;
+    });
   }
 
   /** Group route ownership remains in the group Store; this link owns only the private Profile. */
@@ -2015,7 +2046,9 @@ function partnerSessionLink(row: Row): PartnerSessionLinkRecord {
   const parentSessionId = nullableEntityId(row["parent_session_id"], "Partner parent Session ID");
   const delegationId = nullableEntityId(row["delegation_id"], "Partner delegation ID");
   if ((role === "delegation") !== (delegationId !== undefined)
-    || (role === "delegation") !== (parentSessionId !== undefined)) {
+    || (role === "delegation" || role === "topic") !== (parentSessionId !== undefined)
+    || (role === "topic") !== (row['topic_root_json'] !== null)
+    || (role === "topic") !== (row['topic_operation_id'] !== null)) {
     throw unavailable("The partner Session link role is inconsistent.");
   }
   return {
@@ -2025,13 +2058,22 @@ function partnerSessionLink(row: Row): PartnerSessionLinkRecord {
     profileVersion: positiveInteger(row["profile_version"], "Partner Session profile version"),
     ...(parentSessionId === undefined ? {} : { parentSessionId }),
     ...(delegationId === undefined ? {} : { delegationId }),
+    ...(role === 'topic' ? { topicRoot: topicRoot(JSON.parse(String(row['topic_root_json']))) } : {}),
+    ...(role === 'topic' ? { topicOperationId: entityId(row['topic_operation_id'], 'Topic operation ID') } : {}),
     createdAt: timestamp(row["created_at"], "Partner Session link created time")
   };
 }
 
 function partnerSessionRole(value: unknown): PartnerSessionRole {
-  if (value === "canonical" || value === "history" || value === "delegation" || value === "group") return value;
+  if (value === "canonical" || value === "history" || value === "delegation" || value === "group" || value === "topic") return value;
   throw unavailable("The partner Session role is invalid.");
+}
+
+function topicRoot(value: unknown): NonNullable<PartnerSessionLinkRecord['topicRoot']> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw unavailable('The topic root is invalid.');
+  const row = value as Record<string, unknown>;
+  return { sessionId: entityId(row['sessionId'], 'Topic root Session ID'), generation: positiveInteger(row['generation'], 'Topic root generation'),
+    eventId: entityId(row['eventId'], 'Topic root Event ID'), messageId: entityId(row['messageId'], 'Topic root message ID') };
 }
 
 function partnerReadState(row: Row): PartnerReadStateRecord {

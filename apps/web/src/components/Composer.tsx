@@ -1895,6 +1895,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     }
     promptRecommendationStore.dismiss(sourceSessionId);
     const sourceText = draftText.trim();
+    const sourceReplyQuote = partnerConversation?.replyQuote;
+    const clearSentReplyQuote = partnerConversation?.clearSentReplyQuote;
     const sourceEditorDocument = draftDocument;
     const sourceAttachments = [...attachments];
     const sourceBrowserComments = [...browserComments];
@@ -1999,6 +2001,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         if (sourceEpoch === undefined || sendEpochRef.current !== sourceEpoch || current.owner !== sourceSendOwner || current.readOnly || !current.connected || current.route !== sourceRoute || !current.supportedModes.includes(sourceDeliveryMode) || !attachmentsAllowed(draftMedia, current.attachmentPolicy) || !composerMentionsAllowed(sourceMentions, current.mentionPolicy, current.resources)) throw new Error(t("composer.inputUnavailable"));
         await sourceSend(sourceSessionId, {
           text: sourceText,
+          ...(sourceReplyQuote ? { replyQuote: sourceReplyQuote } : {}),
           builtinSkillIntent: sourceBuiltinSkillIntent,
           editorDocument: sourceEditorDocument,
           attachments: sourceAttachments,
@@ -2008,6 +2011,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           deliveryMode: sourceDeliveryMode,
           ...(sourceExtraDirectoryIds === undefined ? {} : { extraDirectoryIds: sourceExtraDirectoryIds })
         }, { expectedGeneration: sourceGeneration });
+        if (sourceReplyQuote) clearSentReplyQuote?.(sourceReplyQuote);
+        partnerConversation?.userSent?.();
         revokeAttachments(sourceAttachments);
         revokeBrowserCommentPreviews(sourceBrowserComments);
       } catch (error) {
@@ -2697,6 +2702,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           if (!effectiveBashMode && !composerLocked) addFiles(event.dataTransfer.files);
         }}
       >
+        {partnerConversation?.replyQuote && <div className="composer-reference-list"><div className="composer-reference-chip">
+          <button type="button" onClick={() => partnerConversation.locateReplyQuote?.(partnerConversation.replyQuote!)}>{partnerConversation.replyQuote.excerpt || t('timeline.inputReferences')}</button>
+          <IconButton label={t('common.close')} disabled={composerLocked} onClick={partnerConversation.clearReplyQuote}><X aria-hidden="true" /></IconButton>
+        </div></div>}
         {dragging && !effectiveBashMode && <div className="composer__drop"><Paperclip aria-hidden="true" /><span>{t("composer.drop")}</span></div>}
         {effectiveBashMode && <div className="composer__bash-notice" role="status"><Terminal aria-hidden="true" /><div><strong>{t("composer.shell")}</strong><span>{t("composer.shellHelp")}</span>{!bashPermitted && <em>{t("composer.shellUnavailable")}</em>}{attachments.length > 0 && <em>{t("composer.shellAttachments")}</em>}</div></div>}
         {mentions.some((mention) => mention.kind === "message") && (

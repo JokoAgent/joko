@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { create } from '@bufbuild/protobuf';
+import { create, type MessageInitShape } from '@bufbuild/protobuf';
 import { Code, createClient, createRouterTransport } from '@connectrpc/connect';
 import * as contract from '@joko/contracts';
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from '@joko/contracts/desktop-bootstrap';
@@ -44,7 +44,7 @@ async function fixture() {
     createDesktopVoiceConversationService(manager, connections))));
   const base = { windowId: 'desktop-window-one', sessionId, sessionGeneration: BigInt(store.getSession(sessionId).descriptor.binding.generation) };
   const speech = create(contract.DesktopSpeechSelectionSchema, { ...reference, protocol: 'openai', voice: 'alloy' });
-  const control = (action: contract.DesktopVoiceConversationAction, input: Partial<contract.ControlDesktopVoiceConversationRequest> = {}) =>
+  const control = (action: contract.DesktopVoiceConversationAction, input: MessageInitShape<typeof contract.ControlDesktopVoiceConversationRequestSchema> = {}) =>
     rpc().controlDesktopVoiceConversation({ ...base, action, ...input }, { headers });
   const start = (callId = 'call-one', playbackOnly = false) => control(contract.DesktopVoiceConversationAction.START,
     { callId, operationId: `start-${callId}`, selection: speech, playbackOnly });
@@ -96,7 +96,11 @@ it('retains independent conversation/playback preferences and original save rece
     expect(replay.preference).toMatchObject({ conversation: { voice: 'alloy' }, playback: { voice: 'nova' }, sentencePlayback: false, revision: 1n });
     await expect(f.control(contract.DesktopVoiceConversationAction.SAVE_PREFERENCE, { ...input, preference: { ...preference, sentencePlayback: true } })).rejects.toBeDefined();
     await f.control(contract.DesktopVoiceConversationAction.SAVE_PREFERENCE, { operationId: 'reset-voices', preference: create(contract.DesktopVoiceConversationPreferenceSchema, { revision: 1n, sentencePlayback: true }) });
-    expect((await f.control(contract.DesktopVoiceConversationAction.SNAPSHOT)).preference).toMatchObject({ conversation: undefined, playback: undefined, sentencePlayback: true });
+    const reset = (await f.control(contract.DesktopVoiceConversationAction.SNAPSHOT)).preference;
+    expect(reset).toMatchObject({ sentencePlayback: true, revision: 2n });
+    expect(reset?.conversation).toBeUndefined(); expect(reset?.playback).toBeUndefined();
+    expect((await f.control(contract.DesktopVoiceConversationAction.SAVE_PREFERENCE, input)).preference).toEqual(reset);
+    await expect(f.control(contract.DesktopVoiceConversationAction.SAVE_PREFERENCE, { ...input, operationId: 'stale-voices' })).rejects.toMatchObject({ code: Code.Aborted });
   } finally { await f.close(); }
 });
 
@@ -124,5 +128,19 @@ it('rejects original-generation call activity after a task reset', async () => {
     f.store.updateSession(session.id, { binding: { ...session.binding, generation: session.binding.generation + 1 } });
     await expect(f.control(contract.DesktopVoiceConversationAction.SUBMIT, { callId: 'call-one', inputId: 'late-input', text: 'Late' })).rejects.toBeDefined();
     expect(f.infer).not.toHaveBeenCalled();
+  } finally { await f.close(); }
+});
+it('keeps exit classification stateless, exact-route-bound and idempotent without dispatching task work', async () => {
+  const f = await fixture();
+  try {
+    await f.start(); f.infer.mockResolvedValue('SUBMIT_THEN_EXIT');
+    const input = { callId: 'call-one', inputId: 'exit-input', text: 'Research this, then exit voice chat.' };
+    const first = await f.control(contract.DesktopVoiceConversationAction.CLASSIFY_EXIT, input);
+    expect(first.exitDecision).toBe('submit_then_exit');
+    expect((await f.control(contract.DesktopVoiceConversationAction.CLASSIFY_EXIT, input)).exitDecision).toBe('submit_then_exit');
+    expect(f.infer).toHaveBeenCalledOnce(); expect(f.infer.mock.calls[0]?.[1].user).toBe(JSON.stringify(input.text));
+    expect((await f.control(contract.DesktopVoiceConversationAction.SNAPSHOT)).call?.turns).toHaveLength(0);
+    expect(f.store.listQueueItems({ sessionId: f.base.sessionId })).toHaveLength(0);
+    expect(JSON.stringify(f.store.listSettings().map(row => row.value))).not.toContain(input.text);
   } finally { await f.close(); }
 });

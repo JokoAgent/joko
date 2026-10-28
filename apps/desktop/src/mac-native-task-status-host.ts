@@ -81,7 +81,7 @@ export interface MacNativeTaskStatusHostOptions {
   readonly supported: boolean;
   readonly getDisplays: () => readonly DesktopNativeTaskStatusDisplay[];
   readonly createWindow: (bounds: NativeTaskStatusWindowBounds) => NativeTaskStatusWindow;
-  readonly onAction: (action: DesktopNativeTaskStatusAction) => void;
+  readonly onAction: (action: DesktopNativeTaskStatusAction) => unknown;
   readonly onNewTask: () => void;
   readonly onOpenSettings: () => void;
   readonly onToggleSounds: () => void | Promise<void>;
@@ -97,6 +97,7 @@ export interface MacNativeTaskStatusHostOptions {
 
 export interface MacNativeTaskStatusHost {
   readonly acknowledgeFocus: (sessionId: string, token: string) => void;
+  readonly finishCompletion: (sessionId: string, token: string, accepted: boolean) => void;
   readonly focusSession: (sessionId: string, token: string) => void;
   readonly setSettings: (settings: DesktopNativeTaskStatusSettings) => void;
   readonly setApplicationFocused: (focused: boolean) => void;
@@ -131,6 +132,8 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
   let snapshot: DesktopNativeTaskStatusSnapshot | undefined;
   let lastIncomingSnapshot: DesktopNativeTaskStatusSnapshot | undefined;
   const localDismissedSessions = new Map<string, string>();
+  const pendingCompletions = new Map<string, string>();
+  let selectedCompletion: { readonly sessionId: string; readonly token: string } | undefined;
   const handoffFocusTokens = new Map<string, { readonly previous: string; readonly current: string }>();
   const remoteTracker = new NativeRemoteTaskTracker();
   let passiveRemoteSessions: ReadonlySet<string> = new Set();
@@ -250,6 +253,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     const at = now();
     const manualExpanded = manualExpandedDisplayId !== undefined;
     const unexpiredSessions = snapshot.sessions.filter((session) => {
+      if (pendingCompletions.get(session.sessionId) === remoteEntryToken(session)) return false;
       if (session.remote || !isTerminalPhase(session.phase)) return true;
       const observedAt = terminalObservedAt.get(transientKey(session.sessionId, session.phase));
       return observedAt === undefined || observedAt + NATIVE_TASK_STATUS_UNREAD_TERMINAL_TTL_MS > at;
@@ -328,6 +332,13 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       surface = Object.freeze({ ...surface, mode: "compact" });
     }
     let terminalDeadline: number | undefined;
+    if (selectedCompletion !== undefined) {
+      const choice = selectedCompletion;
+      const selected = surface.sessions.find(session => session.sessionId === choice.sessionId
+        && isTerminalPhase(session.phase) && remoteEntryToken(session) === choice.token);
+      if (selected === undefined) selectedCompletion = undefined;
+      else surface = Object.freeze({ ...surface, current: selected });
+    }
     if (surface.policy === "transient" && surface.current !== undefined) {
       const key = transientKey(surface.current.sessionId, surface.current.phase);
       let revealDeadline = terminalRevealUntil.get(key);
@@ -573,6 +584,24 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     if (sessionId === null) return;
     const session = snapshot.sessions.find((candidate) => candidate.sessionId === sessionId);
     if (session === undefined) return;
+    if (url.hostname === "completion" || url.hostname === "completion-prev" || url.hostname === "completion-next") {
+      const token = url.searchParams.get("token");
+      if (!isTerminalPhase(session.phase) || token !== remoteEntryToken(session)) return;
+      if (url.hostname !== "completion") {
+        const entries = currentSurface().surface?.sessions.filter(value => isTerminalPhase(value.phase)) ?? [];
+        const index = entries.findIndex(value => value.sessionId === sessionId);
+        if (index < 0 || entries.length < 2) return;
+        const next = entries[(index + (url.hostname === "completion-next" ? 1 : entries.length - 1)) % entries.length]!;
+        selectedCompletion = { sessionId: next.sessionId, token: remoteEntryToken(next) }; render(); return;
+      }
+      const action = url.searchParams.get("action");
+      if (action !== "archive" && action !== "markRead" || action === "archive" && session.remote?.companion) return;
+      if (pendingCompletions.has(sessionId)) return;
+      pendingCompletions.set(sessionId, token);
+      selectedCompletion = undefined;
+      if (options.onAction({ kind: "completion", action, sessionId, entryToken: token }) === false) pendingCompletions.delete(sessionId);
+      render(); return;
+    }
     if (url.hostname === "focus") {
       playConfiguredSound("select");
       options.onAction({ kind: "focus", sessionId, ...(session.remote || isTerminalPhase(session.phase) ? { entryToken: remoteEntryToken(session) } : {}) });
@@ -765,6 +794,8 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       const displayedIds = new Set(snapshot?.sessions.map(session => session.sessionId));
       lastIncomingSnapshot = next;
       if (previous?.ownerId !== next.ownerId) {
+        pendingCompletions.clear();
+        selectedCompletion = undefined;
         remoteTracker.reset();
         handoffPassiveSessions.clear();
         localDismissedSessions.clear();
@@ -809,6 +840,21 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
         if (event !== undefined) playConfiguredSound(event);
       }
       observedSnapshot = true;
+      for (const [id, token] of pendingCompletions) {
+        const current = next.sessions.find(session => session.sessionId === id);
+        if (current === undefined || remoteEntryToken(current) !== token) pendingCompletions.delete(id);
+      }
+      render();
+    },
+    finishCompletion: (sessionId: string, token: string, accepted: boolean) => {
+      if (pendingCompletions.get(sessionId) !== token) return;
+      pendingCompletions.delete(sessionId);
+      const current = snapshot?.sessions.find(session => session.sessionId === sessionId);
+      if (accepted && current && remoteEntryToken(current) === token && snapshot) {
+        if (current.remote) remoteTracker.dismiss(current, token);
+        else localDismissedSessions.set(sessionId, token);
+        snapshot = { ...snapshot, sessions: snapshot.sessions.filter(session => session.sessionId !== sessionId) };
+      }
       render();
     },
     acknowledgeFocus: (sessionId: string, token: string) => {
@@ -859,9 +905,10 @@ export function renderNativeTaskStatusDocument(
   const rowCandidates = surface.policy === "manual"
     ? surface.sessions
     : surface.policy === "transient"
-      ? surface.sessions.filter((session) => isTerminalPhase(session.phase))
+      ? current === undefined ? [] : [current]
       : current === undefined ? [] : [current];
   const rows = rowCandidates.slice(0, MAXIMUM_VISIBLE_TASK_ROWS);
+  const multipleCompletions = surface.sessions.filter(session => isTerminalPhase(session.phase)).length > 1;
   const compactBody = current === undefined
     ? `<div class="compact-row compact-row--idle">
         <span class="phase-mark phase-mark--idle" aria-hidden="true"></span>
@@ -872,6 +919,7 @@ export function renderNativeTaskStatusDocument(
     : `<div class="compact-row">
         ${phaseMark(current.phase)}
         <a class="task-main" href="${focusUrl(current.sessionId)}"><strong>${escapeHtml(current.title || strings.untitled)}</strong><span>${escapeHtml(phaseLabel(current.phase, strings, current.interactionKind, current.inputHandoff))}</span></a>
+        ${isTerminalPhase(current.phase) && multipleCompletions ? completionNavigation(current, strings) : ""}
         ${countBadge(surface.counts, strings)}
         <a class="icon-action" href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(strings.expand)}" title="${escapeAttribute(strings.expand)}">${nativeIcon("chevron-down")}</a>
       </div>`;
@@ -888,7 +936,7 @@ export function renderNativeTaskStatusDocument(
     : nativeIcon("chevron-up");
   const expandedBody = `<div class="expanded-shell">
       <header><div><strong>${escapeHtml(strings.heading)}</strong><span>${escapeHtml(strings.taskCount(surface.counts.total))}</span></div><nav><a href="${ACTION_SCHEME}//toggle-sounds" aria-label="${escapeAttribute(soundLabel)}" title="${escapeAttribute(soundLabel)}">${soundIcon}</a><a href="${ACTION_SCHEME}//settings" aria-label="${escapeAttribute(strings.settings)}" title="${escapeAttribute(strings.settings)}">${nativeIcon("settings")}</a><a href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(toggleLabel)}" title="${escapeAttribute(toggleLabel)}">${toggleIcon}</a></nav></header>
-      ${emptyState || `<div class="task-list">${rows.map((session) => renderSessionRow(session, strings)).join("")}</div>`}
+      ${emptyState || `<div class="task-list">${rows.map((session) => renderSessionRow(session, strings, multipleCompletions && surface.policy !== "manual")).join("")}</div>`}
       ${rowCandidates.length > rows.length ? `<div class="more">${escapeHtml(strings.more(rowCandidates.length - rows.length))}</div>` : ""}
     </div>`;
   const body = surface.mode === "compact" ? compactBody : expandedBody;
@@ -916,7 +964,7 @@ function nativeIcon(icon: NativeTaskStatusIcon): string {
   return `<svg class="native-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${NATIVE_TASK_STATUS_ICON_PATHS[icon]}</svg>`;
 }
 
-function renderSessionRow(session: DesktopNativeTaskStatusSurface["sessions"][number], strings: NativeStrings): string {
+function renderSessionRow(session: DesktopNativeTaskStatusSurface["sessions"][number], strings: NativeStrings, multipleCompletions = false): string {
   const permission = session.permission;
   const actions = permission === undefined ? "" : `<div class="permission-actions">
     ${permission.deny ? actionLink(session, "deny", strings.deny, "danger") : ""}
@@ -934,7 +982,22 @@ function renderSessionRow(session: DesktopNativeTaskStatusSurface["sessions"][nu
     <a class="focus-action" href="${focusUrl(session.sessionId)}">${escapeHtml(strings.focus)}</a>
     ${activity}
     ${actions}
+    ${isTerminalPhase(session.phase) ? `<div class="permission-actions">
+      ${multipleCompletions ? completionNavigation(session, strings) : ""}
+      ${session.remote?.companion ? "" : completionActionLink(session, "archive", strings.archive)}
+      ${completionActionLink(session, "markRead", strings.markRead)}
+    </div>` : ""}
   </article>`;
+}
+
+function completionNavigation(session: DesktopNativeTaskStatusSurface["sessions"][number], strings: NativeStrings): string {
+  const parameters = new URLSearchParams({ sessionId: session.sessionId, token: remoteEntryToken(session) });
+  return `<a class="icon-action" href="${ACTION_SCHEME}//completion-prev?${parameters}" aria-label="${escapeAttribute(strings.previous)}">‹</a><a class="icon-action" href="${ACTION_SCHEME}//completion-next?${parameters}" aria-label="${escapeAttribute(strings.next)}">›</a>`;
+}
+
+function completionActionLink(session: DesktopNativeTaskStatusSurface["sessions"][number], action: "archive" | "markRead", label: string): string {
+  const parameters = new URLSearchParams({ sessionId: session.sessionId, token: remoteEntryToken(session), action });
+  return `<a class="decision decision--secondary" href="${ACTION_SCHEME}//completion?${parameters}">${escapeHtml(label)}</a>`;
 }
 
 function actionLink(

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import type { InteractionView } from "../model.js";
 import { dispatchGamepadOwnedAction } from "../gamepad-actions.js";
+import { currentVoiceQuestionTarget } from "../voice-question-bridge.js";
 import type { RunAction } from "./types.js";
 import type { InteractionLock, InteractionLockManager } from "../interaction-ownership-coordinator.js";
 import { InteractionDialog } from "./InteractionDialog.js";
@@ -92,6 +93,61 @@ const twoStepQuestion: InteractionView = {
 };
 
 describe("InteractionDialog portal ownership", () => {
+  it("routes an explicit spoken choice through the original owned Question action and retires that target", async () => {
+    const resolveInteraction = vi.fn(async () => undefined);
+    const owned = { ...question, runId: "call-handoff-run" };
+    const view = await mountPortal(owned, { resolveInteraction, dismissInteraction: vi.fn(async () => undefined) });
+    Object.defineProperty(view.document, "visibilityState", { configurable: true, value: "visible" });
+    const target = currentVoiceQuestionTarget("server", "task", "call-handoff-run")!;
+    expect(target).toBeDefined();
+    expect(currentVoiceQuestionTarget("server", "task", "another-run")).toBeUndefined();
+    await act(async () => target.receive("Guided"));
+    await Promise.all(view.pending);
+    expect(resolveInteraction).toHaveBeenCalledExactlyOnceWith(owned, { kind: "question", answers: {
+      approach: { kind: "single", selection: { kind: "choice", choiceId: "guided" } }
+    } });
+    expect(target.isCurrent()).toBe(false);
+    target.receive("Guided");
+    expect(resolveInteraction).toHaveBeenCalledOnce();
+  });
+
+  it("keeps spoken free text visible until a separate explicit confirmation on the same owned step", async () => {
+    const resolveInteraction = vi.fn(async () => undefined);
+    const owned = { ...question, runId: "call-text-run", fields: [twoStepQuestion.fields[1]!] };
+    const view = await mountPortal(owned, { resolveInteraction, dismissInteraction: vi.fn(async () => undefined) });
+    Object.defineProperty(view.document, "visibilityState", { configurable: true, value: "visible" });
+    const first = currentVoiceQuestionTarget("server", "task", "call-text-run")!;
+    await act(async () => first.receive("Keep the original answer exactly."));
+    expect(resolveInteraction).not.toHaveBeenCalled();
+    expect(view.document.querySelector<HTMLInputElement>(".question-field input")?.value).toBe("Keep the original answer exactly.");
+    expect(first.isCurrent()).toBe(false);
+    first.receive("confirm");
+    expect(resolveInteraction).not.toHaveBeenCalled();
+    const confirmation = currentVoiceQuestionTarget("server", "task", "call-text-run")!;
+    await act(async () => confirmation.receive("confirm"));
+    await Promise.all(view.pending);
+    expect(resolveInteraction).toHaveBeenCalledExactlyOnceWith(owned, { kind: "question", answers: {
+      details: { kind: "text", value: "Keep the original answer exactly." }
+    } });
+  });
+
+  it("does not infer Other or install voice approval targets for permission and plan interactions", async () => {
+    const resolveInteraction = vi.fn(async () => undefined);
+    const owned = { ...question, runId: "call-question-run" };
+    const view = await mountPortal(owned, { resolveInteraction, dismissInteraction: vi.fn(async () => undefined) });
+    Object.defineProperty(view.document, "visibilityState", { configurable: true, value: "visible" });
+    const target = currentVoiceQuestionTarget("server", "task", "call-question-run")!;
+    await act(async () => target.receive("Use some unlisted alternative"));
+    expect(resolveInteraction).not.toHaveBeenCalled();
+    expect(view.document.querySelector("[data-question-other-input]")).toBeNull();
+    await view.render({ ...permission, runId: "call-question-run" });
+    expect(target.isCurrent()).toBe(false);
+    expect(currentVoiceQuestionTarget("server", "task", "call-question-run")).toBeUndefined();
+    await view.render({ ...plan, runId: "call-question-run" });
+    expect(currentVoiceQuestionTarget("server", "task", "call-question-run")).toBeUndefined();
+    expect(resolveInteraction).not.toHaveBeenCalled();
+  });
+
   it("does not treat an iframe-realm editor as a permission shortcut target", async () => {
     const resolveInteraction = vi.fn(async () => undefined);
     const dismissInteraction = vi.fn(async () => undefined);

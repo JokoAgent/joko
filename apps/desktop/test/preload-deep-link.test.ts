@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { DESKTOP_CHANNELS, isDesktopSessionWindowContext, type DesktopSessionWindowContext } from "../src/channels.js";
 import { buildTaskShareInvitation, type DesktopRemoteDesktopApi } from "@joko/contracts";
 import { compiledPreloadSource } from "./support/preload-source.js";
-import { parseDesktopNativeTaskStatusSnapshot } from "../src/native-task-status.js";
+import { parseDesktopNativeTaskStatusSnapshot, parseDesktopNativeTaskStatusVisibleSessionIds } from "../src/native-task-status.js";
 
 describe("native task-status contract across the actual preload and Main parser", () => {
   const session = { sessionId: "task-one", title: "Task", detail: "", phase: "running", activityLines: [], updatedAt: 1 };
@@ -48,6 +48,31 @@ describe("native task-status contract across the actual preload and Main parser"
     ]) {
       expect(() => parseDesktopNativeTaskStatusSnapshot(value)).toThrow();
       await expect(api.publish(value)).rejects.toThrow();
+    }
+    expect(f.invoke).not.toHaveBeenCalled();
+  });
+
+  it("forwards a complete pinned Task route through the actual preload within the Main visibility budget", async () => {
+    const f = loadPreload("task-document");
+    const api = f.exposed["nativeTaskStatus"] as { setVisibleSessions(value: unknown): Promise<void> };
+    const profile = ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002",
+      "00000000-0000-4000-8000-000000000003", "http://127.0.0.1:4318", `ed25519:${"a".repeat(64)}`, "https", ""];
+    const key = JSON.stringify([profile[0], profile[1], "1", "1", "00000000-0000-4000-8000-000000000004", JSON.stringify(profile), 2]);
+    expect(key.length).toBeGreaterThan(256);
+    expect(key.length).toBeLessThanOrEqual(1024);
+    f.invoke.mockImplementation(async (channel: string, value: unknown) => {
+      expect(channel).toBe(DESKTOP_CHANNELS.nativeTaskStatusSetVisibleSessions);
+      expect(parseDesktopNativeTaskStatusVisibleSessionIds(value)).toEqual(value);
+    });
+    for (const value of [[key], ["x".repeat(1024)], Array.from({ length: 8 }, (_, index) => `visible-task-${index}`), []]) {
+      await expect(api.setVisibleSessions(value)).resolves.toBeUndefined();
+      expect(f.invoke).toHaveBeenLastCalledWith(DESKTOP_CHANNELS.nativeTaskStatusSetVisibleSessions, value);
+    }
+    f.invoke.mockClear();
+    for (const value of [key, [key, key], ["x".repeat(1025)], ["invalid\u0000identity"], [` ${key}`], [undefined],
+      Array.from({ length: 9 }, (_, index) => `visible-task-${index}`)]) {
+      expect(() => parseDesktopNativeTaskStatusVisibleSessionIds(value)).toThrow();
+      await expect(api.setVisibleSessions(value)).rejects.toThrow();
     }
     expect(f.invoke).not.toHaveBeenCalled();
   });
@@ -583,6 +608,19 @@ describe("main application preload keep-awake observer", () => {
 describe("main application preload Remote Desktop service authorization", () => {
   const snapshot = { enabled: true, active: false, controlling: false,
     permissions: { screenRecording: "notRequired", accessibility: "notRequired" }, windowsSupport: "missing" };
+
+  it("round-trips bounded setup diagnostics and rejects path-bearing or unknown diagnostic fields", async () => {
+    const loaded = loadPreload("document-current");
+    const api = loaded.exposed["remoteDesktop"] as DesktopRemoteDesktopApi;
+    const diagnostic = { step: "elevate-child", childStep: "stage-read", osError: 5 };
+    loaded.invoke.mockResolvedValue({ ...snapshot, windowsSupportDiagnostic: diagnostic });
+    await expect(api.getState()).resolves.toEqual({ ...snapshot, windowsSupportDiagnostic: diagnostic });
+    for (const windowsSupportDiagnostic of [undefined, { ...diagnostic, path: "C:\\private" },
+      { ...diagnostic, step: "C:\\private" }, { ...diagnostic, osError: -1 }]) {
+      loaded.invoke.mockResolvedValue({ ...snapshot, windowsSupportDiagnostic });
+      await expect(api.getState()).rejects.toThrow(/diagnostic/u);
+    }
+  });
 
   it("binds fresh support and explicit setup to the captured primary document", async () => {
     const loaded = loadPreload("document-current");

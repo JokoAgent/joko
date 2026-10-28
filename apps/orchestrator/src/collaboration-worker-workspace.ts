@@ -31,6 +31,7 @@ export interface WorkerWorkspacePlan {
 }
 export interface WorkerWorkspaceBinding {
   readonly format: 1;
+  readonly owner?: "side_chat";
   readonly targetId: string;
   readonly workspaceId: string;
   readonly path: string;
@@ -149,13 +150,50 @@ export function readWorkerWorkspaceBinding(store: OperationalStore, sessionId: s
   const row = store.findSetting<WorkerWorkspaceBinding>("service", sessionId, WORKER_WORKSPACE_BINDING_KEY)?.value;
   if (row === undefined) return undefined;
   if (row.format !== 1 || !row.targetId || !row.workspaceId || !isAbsolute(row.path) || !isAbsolute(row.projectRoot) || !isAbsolute(row.targetRoot)) throw new StoreError("The worker workspace binding is invalid.");
+  if (row.owner !== undefined) {
+    const session = store.findSession(sessionId)?.descriptor;
+    if (row.owner !== "side_chat" || session?.derivationOrigin?.sideChat !== true
+      || session.derivationOrigin.sourceSessionId !== row.inheritedSessionId || session.targetId !== row.targetId) {
+      throw new StoreError("The side chat workspace reference lost its original owner.");
+    }
+  }
   return row;
+}
+
+/** Call inside the original deferred Product adoption transaction. This is a
+ * read-only reference to an existing checkout, never another writable lease. */
+export function createSideChatWorkspaceReference(store: OperationalStore, source: SessionDescriptor,
+  childSessionId: string): WorkerWorkspaceBinding | undefined {
+  const current = store.getSession(source.id).descriptor;
+  const target = store.getTarget(current.targetId).descriptor;
+  if (current.archived || current.deletedAt !== undefined || !target.trusted || target.remoteWorkspace !== undefined
+    || current.binding.opaqueRef !== source.binding.opaqueRef || current.binding.generation !== source.binding.generation
+    || current.binding.nativeSessionId !== source.binding.nativeSessionId) throw new AuthorizationError("The side chat workspace source changed.");
+  const inherited = readWorkerWorkspaceBinding(store, current.id);
+  const worktree = current.worktree;
+  if (worktree?.remote !== undefined || worktree !== undefined && worktree.state !== "active") {
+    throw new AuthorizationError("The side chat checkout is unavailable.");
+  }
+  const path = inherited?.path ?? worktree?.path;
+  if (path === undefined || path === target.workspaceRoot) return undefined;
+  const binding: WorkerWorkspaceBinding = { format: 1, owner: "side_chat", targetId: target.id,
+    workspaceId: `side-chat-${childSessionId}`, path, projectRoot: target.workspaceRoot, targetRoot: target.workspaceRoot,
+    inheritedSessionId: source.id,
+    ...(worktree === undefined ? inherited?.inheritedWorktreeLeaseId === undefined ? {}
+      : { inheritedWorktreeLeaseId: inherited.inheritedWorktreeLeaseId } : { inheritedWorktreeLeaseId: worktree.leaseId }) };
+  store.setSetting("service", childSessionId, WORKER_WORKSPACE_BINDING_KEY, binding);
+  return binding;
 }
 
 export function workerWorkspaceTarget(store: OperationalStore, session: SessionDescriptor, target: TargetDescriptor): TargetDescriptor {
   const binding = readWorkerWorkspaceBinding(store, session.id);
   if (!binding) return target;
-  if (binding.targetId !== session.targetId || !target.trusted || target.remoteWorkspace !== undefined || target.workspaceRoot !== binding.targetRoot && session.worktree === undefined) throw new AuthorizationError("The worker project is unavailable.");
+  const project = store.getTarget(session.targetId).descriptor;
+  if (binding.targetId !== session.targetId || target.id !== project.id || !target.trusted || !project.trusted
+    || target.remoteWorkspace !== undefined || project.remoteWorkspace !== undefined || project.workspaceRoot !== binding.targetRoot
+    || target.workspaceRoot !== binding.targetRoot && target.workspaceRoot !== binding.path && target.workspaceRoot !== session.worktree?.path) {
+    throw new AuthorizationError("The worker project is unavailable.");
+  }
   if (binding.inheritedWorktreeLeaseId) {
     const source = binding.inheritedSessionId ? store.findSession(binding.inheritedSessionId)?.descriptor : undefined;
     if (!source || source.worktree?.leaseId !== binding.inheritedWorktreeLeaseId) throw new AuthorizationError("The inherited worker checkout is unavailable.");

@@ -59,6 +59,7 @@ type Control = { generation: number; policyGeneration: number; permissionMode: "
 type PolicySubjectKind = "file_read" | "file_write" | "command" | "network" | "mcp" | "browser" | "resource" | "extra_directory";
 type PolicyRisk = "read_only" | "low" | "medium" | "high" | "critical";
 type PolicyObservation = { subjectKind: PolicySubjectKind; risk: PolicyRisk; workspaceRelativePath?: string; toolProviderId?: string; toolName?: string };
+type PolicyDecisionReply = { decision: "allow" | "deny" | "ask" | "default" | "stale" | "delegated_allow"; ownerUserInstructions: readonly string[] };
 type McpTool = { serverId: string; name: string; runtimeName?: string; policySubject?: PolicySubjectKind; description: string; inputSchema: Record<string, unknown>; outputSchema?: Record<string, unknown>; requiresPermission: boolean; requiresNativeRoot?: true };
 type McpDescriptor = { endpoint: string; generation: number; sessionId: string; targetId: string; tools: McpTool[] };
 type McpBridgeErrorCode = "resource_exhausted" | "artifact_unavailable" | "invalid_result";
@@ -475,19 +476,49 @@ async function orderedPolicyDecision(
   control: Control,
   observation: PolicyObservation,
   toolCall: { toolName: string; input: unknown },
-): Promise<"allow" | "deny" | "ask" | "default" | "stale" | "delegated_allow"> {
-  if (!ctx.hasUI) return "stale";
+): Promise<PolicyDecisionReply> {
+  const stale: PolicyDecisionReply = { decision: "stale", ownerUserInstructions: [] };
+  if (!ctx.hasUI) return stale;
   const encoded = Buffer.from(JSON.stringify({
     format: 1,
     policyGeneration: control.policyGeneration,
     toolCall,
     ...observation,
   }), "utf8").toString("base64url");
-  if (encoded.length > MAX_POLICY_DECISION_ENVELOPE_CHARACTERS) return "stale";
+  if (encoded.length > MAX_POLICY_DECISION_ENVELOPE_CHARACTERS) return stale;
   const response = await ctx.ui.input(POLICY_DECISION_REQUEST_PREFIX + encoded, "");
-  return response === "allow" || response === "deny" || response === "ask" || response === "default" || response === "stale" || response === "delegated_allow"
-    ? response
-    : "stale";
+  const decisions = ["allow", "deny", "ask", "default", "stale", "delegated_allow"];
+  if (decisions.includes(response)) return { decision: response, ownerUserInstructions: [] };
+  if (typeof response !== "string" || response.length > 128 * 1024) return stale;
+  try {
+    const value = JSON.parse(response);
+    if (!value || Object.keys(value).sort().join(",") !== "decision,ownerUserInstructions" || !decisions.includes(value.decision)
+      || !Array.isArray(value.ownerUserInstructions) || value.ownerUserInstructions.length > 64
+      || value.ownerUserInstructions.some((text: unknown) => typeof text !== "string")
+      || value.ownerUserInstructions.reduce((size: number, text: string) => size + text.length, 0) > 16_000) return stale;
+    return value;
+  } catch { return stale; }
+}
+
+function ownerReviewContext(ctx: any, ownerUserInstructions: readonly string[]): any {
+  // Native IDs only detect a changed branch. Native message contents, including
+  // a fork's inherited transcript, never author the approval evidence.
+  const boundary = (): string | undefined => {
+    try {
+      const branch = ctx.sessionManager?.getBranch();
+      if (!Array.isArray(branch)) return undefined;
+      const ids: string[] = [];
+      for (const entry of branch) if (entry?.type === "message" && entry.message?.role === "user") {
+        if (typeof entry.id !== "string" || !entry.id) return undefined;
+        ids.push(entry.id);
+      }
+      return JSON.stringify(ids);
+    } catch { return undefined; }
+  };
+  const original = boundary();
+  return { cwd: ctx.cwd, model: ctx.model, modelRegistry: ctx.modelRegistry, signal: ctx.signal,
+    sessionManager: { getBranch: () => original !== undefined && boundary() === original
+      ? ownerUserInstructions.map(content => ({ type: "message", message: { role: "user", content } })) : [] } };
 }
 
 function messageText(message: unknown): string {
@@ -809,7 +840,8 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
       return { block: true, reason: "Plan mode blocked a tool outside the read-only allowlist" };
     }
     const reviewInput = (event.toolName === "write" || event.toolName === "edit") ? { path: toolPath(event.input) } : event.input;
-    const orderedDecision = await orderedPolicyDecision(ctx, control, policyObservation(event.toolName, event.input, risk), { toolName: event.toolName, input: reviewInput });
+    const ordered = await orderedPolicyDecision(ctx, control, policyObservation(event.toolName, event.input, risk), { toolName: event.toolName, input: reviewInput });
+    const orderedDecision = ordered.decision;
     try {
       assertPolicyUnchanged(control);
     } catch (error) {
@@ -828,7 +860,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     let decision: { verdict: "allow" | "block" | "ask"; reason: string; safeAlternative?: string };
     if (orderedDecision !== "ask" && control.permissionMode === "auto") {
       decision = await autoReviewer.review({
-        ctx,
+        ctx: ownerReviewContext(ctx, ordered.ownerUserInstructions),
         event,
         control,
         workspaceRoot,

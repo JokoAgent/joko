@@ -9,6 +9,7 @@ export const SCHEMA_VERSION = 1;
 // shapes are as much a part of the non-migrating first-release baseline as the
 // DDL: changing one must reject an existing development database for rebuild.
 const DURABLE_JSON_SHAPE_BASELINE = [
+  "model-speed:boolean|ultrafast;native-hosted:lineage+derivation;hosted-settings:idle-release-v1",
   "device-authorization:invitation/request/digests/approval/claim-v1",
   "interaction-question-request:single/multiple.allowOther=required",
   "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",
@@ -800,7 +801,7 @@ CREATE TABLE product_sessions (
         automation_schedule_id TEXT,
         automation_schedule_name TEXT,
         automation_run_id TEXT,
-        derivation_kind TEXT CHECK (derivation_kind IS NULL OR derivation_kind IN ('fork', 'clone')),
+        derivation_kind TEXT CHECK (derivation_kind IS NULL OR derivation_kind IN ('fork', 'clone', 'side_chat')),
         derivation_source_session_id TEXT,
         derivation_source_message_id TEXT,
         derivation_source_event_id TEXT,

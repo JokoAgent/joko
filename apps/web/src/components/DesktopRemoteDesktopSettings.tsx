@@ -28,6 +28,10 @@ export function DesktopRemoteDesktopSettings({ t }: { readonly t: Translator }):
       <div>
         <strong>{t("settings.remoteDesktop.windowsTitle")}</strong>
         <span>{windowsSupportMessage(state.windowsSupport, t)}</span>
+        {state.windowsSupportDiagnostic !== undefined && <span>{t("settings.remoteDesktop.windowsDiagnostic", {
+          step: [state.windowsSupportDiagnostic.step, state.windowsSupportDiagnostic.childStep].filter(Boolean).join("/"),
+          os: String(state.windowsSupportDiagnostic.osError)
+        })}</span>}
       </div>
       <Button
         tone="ghost"

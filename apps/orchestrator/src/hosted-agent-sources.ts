@@ -2,11 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fromJson, toJson, type JsonValue } from "@bufbuild/protobuf";
-import { createClient } from "@connectrpc/connect";
+import { createClient, Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { CAPABILITIES, JokoError, type AdapterContext, type BackendDescriptor, type Capability, type ProviderModel, type ToolCall, type NativeToolAuthorizationDecision,
   type ApprovedSkillSeed, type NativeSkillPolicyResolver, type ArtifactMentionResolver } from "@joko/core";
-import { HostedAgentSourceAdapter, type HostedAgentDeviceSource } from "@joko/adapter-hosted";
+import { HostedAgentSourceAdapter, HostedAgentConnectionPool, type HostedAgentDeviceSource } from "@joko/adapter-hosted";
+import { HostedAgentSettings } from "./hosted-agent-settings.js";
 import { NotFoundError, SessionRuntimeHandoffStore, TaskShareStore, type ConnectionRecord, type OperationalStore } from "@joko/store";
 import type { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import type { DevicePeerOwner } from "./device-peer-owner.js";
@@ -43,7 +44,7 @@ import { snapshotPeerSourceProject } from "./hosted-agent-peer-project-files.js"
 import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 
 const SCOPE = "hosted-sources.v1";
-const FORWARDED = new Set(["session.resume", "session.detach", "session.tree", "turn.stream", "turn.abort", "turn.steer", "turn.follow_up", "input.text",
+const FORWARDED = new Set(["session.resume", "session.detach", "session.tree", "session.fork", "session.clone", "session.side_chat", "turn.stream", "turn.abort", "turn.steer", "turn.follow_up", "input.text",
   "input.image", "model.list", "model.switch", "model.effort", "model.fast_mode", "permission.modes", "permission.change", "plan_mode", "context.usage", "context.compact",
   "context.auto_compact", "context.auto_retry", "workspace.files", "workspace.files.watch", "workspace.files.write", "workspace.diff", "workspace.generated_files",
   "runtime.commands", "runtime.tools", "runtime.user_shell", "interaction.permission", "interaction.question", "interaction.plan_review", "workspace.extra_dirs",
@@ -90,6 +91,7 @@ export class HostedAgentSources {
   readonly #entries = new Map<string, SourceEntry>();
   readonly #refreshing = new Map<string, Promise<void>>();
   readonly #pools = new Map<string, Pool>();
+  readonly #connectionPools = new Map<string, HostedAgentConnectionPool>();
   #groupSwitch?: ProviderGroupGuestSwitch;
   #groupStore?: ProviderGroupStore;
   readonly #preparedGroupMembers = new Map<string, string>();
@@ -188,6 +190,7 @@ export class HostedAgentSources {
   async close(): Promise<void> {
     await this.stopDiscovery(); this.#closed = true;
     await Promise.all([...this.#pools.values()].map(pool => pool.poller.close())); this.#pools.clear();
+    for (const pool of this.#connectionPools.values()) pool.close(); this.#connectionPools.clear();
   }
   async stopDiscovery(): Promise<void> { this.#discoveryClosed = true; await Promise.allSettled([...this.#refreshing.values()]); }
   async #refresh(connection: ConnectionRecord): Promise<void> {
@@ -222,6 +225,14 @@ export class HostedAgentSources {
     const mcps = new Map<string, HostedAgentSourceMcp>(), mcpKey = (context: AdapterContext) => JSON.stringify([context.sessionId, context.generation, context.backendInstanceGeneration]);
     const snapshot = await this.#options.registry.add({ instanceId: entry.id, adapterKind: "hosted", displayName: entry.catalog.displayName,
       create: ({ generation }) => new HostedAgentSourceAdapter({ id: entry.id, source: entry.record.source, describe: () => this.#descriptor(entry),
+        manageDerivation: async (command, signal) => {
+          const captured = this.#capture(entry, `derivation:${command.nativeSessionId}`); captured.assertCurrent();
+          await captured.client.call(`derivation:${command.nativeSessionId}`, randomUUID(), command, signal); captured.assertCurrent();
+        },
+        connectionPool: this.#connectionPool(entry), isCapacityError: error => {
+          const failure = ConnectError.from(error);
+          return failure.code === Code.ResourceExhausted && ["device", "total"].includes(failure.metadata.get("x-joko-native-capacity") ?? "");
+        },
         inferNativeText: async input => {
           const nativeGeneration = Number(entry.catalog.instanceGeneration), providerId = input.providerId, modelId = input.modelId;
           const assertCurrent = () => {
@@ -282,8 +293,14 @@ export class HostedAgentSources {
         }),
         takeGroupSwitch: context => this.#groupSwitch?.takeForOpen(context.sessionId, entry.id),
         takeNewGroupRound: context => this.#groupSwitch?.takeNewRound(context.sessionId) === true,
-        isGroupMember: context => !entry.record.received && (this.#preparedGroupMembers.get(context.sessionId) === entry.id
-          || this.#groupStore?.binding(context.sessionId)?.backendId === entry.id),
+        isGroupMember: context => {
+          if (entry.record.received) return false;
+          if (this.#preparedGroupMembers.has(context.sessionId)) return this.#preparedGroupMembers.get(context.sessionId) === entry.id;
+          const binding = this.#groupStore?.binding(context.sessionId);
+          const member = binding && this.#groupStore?.snapshot(binding.group).config?.members.find(member => member.key === binding.memberKey);
+          return binding !== undefined && binding.backendId === entry.id && member !== undefined && member.nodeId === entry.catalog.nodeId && member.nativeBackendId === entry.record.source.backendId
+            && member.providerId === binding.providerId;
+        },
         workspace: async context => {
           this.#assertContext(context);
           const peer = context.target.remoteWorkspace ? peerWorkspaces.get(mcpKey(context)) ?? await captureHostedAgentPeerWorkspace(context, this.#options.remoteExecution ?? missingPeerWorkspace(), () => this.#assertContext(context)) : undefined;
@@ -353,6 +370,17 @@ export class HostedAgentSources {
     const assertCurrent = () => { if (this.#closed) throw new Error("Native sources are closed."); authority.assertCurrent(["native_agents"]); };
     const client = new HostedAgentConnectClient(createClient(contract.HostedAgentService, createHostedAgentPeerTransport({ owner: this.#options.peers, authority })), assertCurrent);
     const pool = { client, assertCurrent, poller: new HostedAgentPoller(client) }; this.#pools.set(key, pool); return pool;
+  }
+  #connectionPool(entry: SourceEntry): HostedAgentConnectionPool {
+    const key = entry.catalog.nodeId || JSON.stringify([entry.record.source.controllerDeviceId, entry.record.source.targetDeviceId]);
+    const prior = this.#connectionPools.get(key); if (prior) return prior;
+    const pool = new HostedAgentConnectionPool({ idleMinutes: () => new HostedAgentSettings(this.#options.store).idleReleaseMinutes(),
+      maxRuns: () => {
+        const capacities = [...this.#entries.values()].filter(row => (row.catalog.nodeId || JSON.stringify([row.record.source.controllerDeviceId, row.record.source.targetDeviceId])) === key)
+          .map(row => row.catalog.maxRuns).filter(value => value > 0);
+        return capacities.length ? Math.min(...capacities) : 0;
+      } });
+    this.#connectionPools.set(key, pool); return pool;
   }
   #capture(entry: SourceEntry, runId: string): { readonly pool: Pool; readonly client: HostedAgentConnectClient; readonly assertCurrent: () => void; readonly close: (signal?: AbortSignal) => Promise<void> } {
     const received = entry.record.received;

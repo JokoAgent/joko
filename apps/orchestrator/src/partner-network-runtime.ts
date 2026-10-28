@@ -121,7 +121,7 @@ export class PartnerNetworkRuntime {
         if (room.state !== "active" || room.availability !== "available") continue;
         for (const actor of room.members) {
           if (actor.kind !== "partner" || actor.ownerId !== room.selfId || actor.homeServerId !== this.options.host.options.serverId || actor.state !== "joined") continue;
-          const key = networkHash([room.hostServerId, room.id, actor.id]); if (this.#active.has(key) || this.#active.size >= 4) continue;
+          if (this.#active.size >= 4) continue;
           try {
             const claimed = room.joinId ? await this.options.home.claim(room.joinId, actor.id)
               : this.options.host.claim(create(contract.ClaimPartnerNetworkRequestSchema, { roomId: room.id, actorId: actor.id }), room.selfId);
@@ -129,13 +129,18 @@ export class PartnerNetworkRuntime {
             if (!claimed.execution || !claimed.snapshot) continue;
             const job = claimed.execution;
             if (job.actorId !== actor.id || job.accessRevision !== actor.accessRevision || job.roomId !== room.id || job.status !== "running") throw new Error("Execution owner changed.");
+            const source = claimed.snapshot.messages.find(message => message.id === job.sourceMessageId);
+            if (!source || source.deleted) throw new Error('The original conversation message is unavailable.');
+            const topic = source.threadRootId || '';
+            const key = networkHash([room.hostServerId, room.id, actor.id, topic]);
+            if (this.#active.has(key)) throw new Error('This conversation already has a live execution.');
             let profile: PartnerProfileRecord | undefined; try { profile = this.options.profiles.getPartner(actor.partnerId); } catch { /* Claim closes an unavailable member instead of blocking the room. */ }
             if (!profile || profile.lifecycle !== "active" || profile.initializationState !== "ready") {
               const failure = create(contract.SettlePartnerNetworkRequestSchema, { roomId: room.id, executionId: job.id, lease: job.lease, action: "fail", failureCode: "runtime-unavailable" });
               if (room.joinId) await this.options.home.settle(room.joinId, failure); else this.options.host.settle(failure, room.selfId);
               continue;
             }
-            const laneKey = networkHash([room.hostServerId, room.id, actor.id, job.accessMode, job.accessRevision.toString(), profile.revision.toString()]);
+            const laneKey = networkHash([room.hostServerId, room.id, actor.id, topic, job.accessMode, job.accessRevision.toString(), profile.revision.toString()]);
             const abort = new AbortController(), work: Work = { key, joinId: room.joinId, job, snapshot: claimed.snapshot, partner: profile, abort, laneKey,
               authorization: networkHash([laneKey, job.id, job.lease.toString()]), lastLease: Date.now(), completed: false };
             this.#active.set(key, work); const flight = this.#run(work).finally(() => { this.#active.delete(key); if (work.sessionId) this.#sessions.delete(work.sessionId);

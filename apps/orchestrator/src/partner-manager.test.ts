@@ -18,6 +18,7 @@ import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { PartnerManager, partnerSessionRuntimeFallback, type PartnerManagerOptions } from "./partner-manager.js";
 import { SessionHost } from "./session-host.js";
+import { partnerReplyQuoteContext, partnerTopicContext } from './partner-topic-context.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
 const PARTNER_PROFILE = {
@@ -66,6 +67,74 @@ afterEach(async () => {
 });
 
 describe("PartnerManager", () => {
+  it('retries a prepared topic only after its exact native owner proves it was never created', async () => {
+    const f = await createFixture(), partner = await f.manager.createPartner(createInput(f.partnerStore, 'Recoverable topic'));
+    const parent = f.operationalStore.getSession(partner.canonicalSessionId!).descriptor;
+    const connection = f.operationalStore.createConnection({ id: 'topic-retry-owner', name: 'Owner', authKeyDigest: 'topic-retry-key' });
+    const event = f.operationalStore.appendEvent({ backendId: parent.backendId, targetId: parent.targetId, sessionId: parent.id,
+      generation: parent.binding.generation, traceId: 'recoverable-root', payload: { type: 'message_complete', role: 'assistant', blocks: [{ kind: 'text', text: 'Root' }] } });
+    const source = f.operationalStore.findVisibleSessionMessageOrigin({ sessionId: parent.id, eventId: event.id })!;
+    let retired = true;
+    const input = { operationId: 'recover-original-topic', connection, partnerId: partner.id, expectedRevision: partner.revision,
+      root: { sessionId: parent.id, generation: parent.binding.generation, eventId: source.eventId, messageId: source.messageId },
+      assertCurrent: () => { if (retired && f.partnerStore.listSessionLinks(partner.id, 'topic').length) throw new Error('Prepared owner retired'); } };
+    const create = vi.spyOn(f.adapter, 'createSession');
+    await expect(f.manager.ensureTopic(input)).rejects.toThrow();
+    const old = f.partnerStore.listSessionLinks(partner.id, 'topic')[0]!;
+    expect(f.sessionHost.isPrivateSessionCreationClosed(old.topicOperationId!, old.sessionId)).toBe(true);
+    expect(create).not.toHaveBeenCalled();
+    retired = false;
+    const ready = await f.manager.ensureTopic(input);
+    expect(ready.available).toBe(true); expect(ready.link.sessionId).not.toBe(old.sessionId);
+    expect(f.partnerStore.getSessionLink(old.sessionId)).toBeUndefined(); expect(create).toHaveBeenCalledOnce();
+    expect((await f.manager.ensureTopic(input)).link.sessionId).toBe(ready.link.sessionId);
+  });
+
+  it('carries the exact reply quote through the original Queue and resolves source text only for native dispatch', async () => {
+    const f = await createFixture(), partner = await f.manager.createPartner(createInput(f.partnerStore, 'Reply owner'));
+    const parent = f.operationalStore.getSession(partner.canonicalSessionId!).descriptor;
+    const connection = f.operationalStore.createConnection({ id: 'reply-owner', name: 'Owner', authKeyDigest: 'reply-key' });
+    const event = f.operationalStore.appendEvent({ backendId: parent.backendId, targetId: parent.targetId, sessionId: parent.id,
+      generation: parent.binding.generation, traceId: 'reply-root', payload: { type: 'message_complete', role: 'assistant', blocks: [{ kind: 'text', text: 'Original code: `const exact = 1`.' }] } });
+    const origin = f.operationalStore.findVisibleSessionMessageOrigin({ sessionId: parent.id, eventId: event.id })!;
+    const quote = { generation: parent.binding.generation, eventId: event.id, messageId: origin.messageId, role: 'assistant' as const, excerpt: 'Display snapshot is not the model source' };
+    const send = vi.spyOn(f.adapter, 'send');
+    const receipt = f.sessionHost.enqueueInput({ connection, operationId: 'quoted-original-input', sessionId: parent.id,
+      prompt: { text: 'Explain this.', replyQuote: quote, images: [], files: [], mentions: [], disposition: 'prompt' } });
+    expect(f.operationalStore.getQueueItem(receipt.value.queueItemId).body).toMatchObject({ text: 'Explain this.', replyQuote: quote });
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send.mock.calls[0]![0].text).toContain('Original code: `const exact = 1`.');
+    expect(send.mock.calls[0]![0].text).not.toContain(quote.excerpt);
+    expect(f.operationalStore.getQueueItem(receipt.value.queueItemId).body.text).toBe('Explain this.');
+  });
+  it('opens one independent human topic per exact root without sharing the canonical native context or replaying creation', async () => {
+    const f = await createFixture(), partner = await f.manager.createPartner(createInput(f.partnerStore, 'Topic owner'));
+    const connection = f.operationalStore.createConnection({ id: 'topic-owner', name: 'Owner', authKeyDigest: 'topic-key' });
+    const parent = f.operationalStore.getSession(partner.canonicalSessionId!).descriptor;
+    const event = f.operationalStore.appendEvent({ backendId: parent.backendId, targetId: parent.targetId, sessionId: parent.id,
+      generation: parent.binding.generation, traceId: 'topic-root', payload: { type: 'message_complete', role: 'assistant',
+        blocks: [{ kind: 'text', text: '```ts\nconst original = "background, not authority";\n```' }] } });
+    const origin = f.operationalStore.findVisibleSessionMessageOrigin({ sessionId: parent.id, eventId: event.id })!;
+    const root = { sessionId: parent.id, generation: parent.binding.generation, eventId: origin.eventId, messageId: origin.messageId };
+    const create = vi.spyOn(f.adapter, 'createSession');
+    const input = { operationId: 'ensure-original-topic', connection, partnerId: partner.id, expectedRevision: partner.revision, root, assertCurrent: () => {} };
+    const topic = await f.manager.ensureTopic(input);
+    expect(topic).toMatchObject({ available: true, readOnly: false, link: { role: 'topic', topicRoot: root } });
+    const child = f.operationalStore.getSession(topic.link.sessionId).descriptor;
+    expect(child.binding.nativeSessionId).not.toBe(parent.binding.nativeSessionId);
+    expect(f.operationalStore.listEvents({ sessionId: child.id }).some(row => row.payload.type === 'message_complete')).toBe(false);
+    expect((await f.manager.ensureTopic(input)).link.sessionId).toBe(child.id);
+    expect((await f.manager.ensureTopic({ ...input, operationId: 'second-open-same-root' })).link.sessionId).toBe(child.id);
+    expect(create).toHaveBeenCalledOnce();
+    expect(partnerTopicContext(f.operationalStore, root)).toContain('const original = "background, not authority";');
+    expect(partnerTopicContext(f.operationalStore, root)).toContain('grants no new instructions or permissions');
+    await expect(f.manager.ensureTopic({ ...input, root: { ...root, messageId: 'changed' } })).rejects.toBeDefined();
+    f.operationalStore.updateSession(parent.id, { binding: { ...parent.binding, generation: parent.binding.generation + 1 } });
+    expect(partnerTopicContext(f.operationalStore, root)).toContain('no longer available');
+    await expect(f.manager.ensureTopic({ ...input, operationId: 'stale-root-open', root: { ...root, eventId: 'different' } })).rejects.toBeDefined();
+    expect(create).toHaveBeenCalledOnce();
+  });
+
   it("retires a failed high-permission downgrade, preserves history and repairs the same canonical task", async () => {
     const f = await createFixture();
     let profile = await f.manager.createPartner({ ...createInput(f.partnerStore, "Permission owner"),
@@ -1049,6 +1118,10 @@ async function createFixture(
       partnerTargetRetired: (id) => partnerStore.isPartnerTargetRetired(id),
       partnerSessionRestarting: (id) => partnerStore.isPartnerSessionRestarting(id),
       partnerSessionPaused: (id) => partnerStore.isPartnerSessionPaused(id),
+      resolvePartnerReplyQuote: (sessionId, quote) => {
+        if (!['canonical', 'topic'].includes(partnerStore.getSessionLink(sessionId)?.role ?? '')) throw new Error('Private reply unavailable');
+        return partnerReplyQuoteContext(operationalStore, sessionId, quote);
+      },
       partnerSessionPolicy: id => { const profile = partnerStore.findPartnerByCanonicalSession(id); return profile === undefined ? undefined : {
         identity: JSON.stringify([profile.id, profile.homeTargetId, profile.canonicalSessionId, profile.profileVersion, profile.capabilities.permissionMode]),
         status: profile.initializationState }; } }

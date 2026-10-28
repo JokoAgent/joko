@@ -60,6 +60,7 @@ export class HostedAgentExchange {
   emit(event: EventPayload, metadata?: AdapterEventMetadata, operationId?: string): void {
     this.#append({ kind: "event", event, ...(metadata === undefined ? {} : { metadata }), ...(operationId === undefined ? {} : { operationId }) });
   }
+  get pendingRequests(): number { return this.#pending.size; }
   /** Used only by the authenticated service relay. SDK events use emit and
    * cannot manufacture control frames or request identities. */
   forward(payload: HostedAgentFrame["payload"]): void { this.#append(payload); }

@@ -2595,7 +2595,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     readonly binding: NativeSessionBinding; readonly nativeHistory?: NativeHistoryProjection;
   }> {
     this.#assertUsable();
-    const runtime = this.#requireIdleRuntime(context);
+    const completedSnapshot = "completedSnapshot" in derivation && derivation.completedSnapshot;
+    if (completedSnapshot && (replacement || completedSnapshot.kind !== "completed_assistant" || completedSnapshot.nativeBoundaryId !== entryId)) throw invalidForkBoundary();
+    const runtime = completedSnapshot ? this.#requireRuntime(context) : this.#requireIdleRuntime(context);
     const phase = replacement ? "session_navigation" : entryId === undefined ? "session_clone" : "session_fork";
     const derivedTarget = "target" in derivation ? derivation.target : context.target;
     const sourceRoute = parseBindingRoute(runtime.binding);
@@ -2617,13 +2619,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     this.#assertStandardRuntime(runtime, "derive native history");
     if (context.signal.aborted) throw claudeCodeError(entryId === undefined ? "NATIVE_SESSION_CLONE_CANCELLED" : "NATIVE_SESSION_FORK_CANCELLED", "The native Session copy was cancelled.", phase);
-    if (runtime.nativeTasks.hasActiveTasks() || runtime.sdkRuntime.ownsSessionFork(runtime.nativeSessionId)) {
+    if ((!completedSnapshot && runtime.nativeTasks.hasActiveTasks()) || runtime.sdkRuntime.ownsSessionFork(runtime.nativeSessionId)) {
       throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase, {
         recovery: "Wait for native work to finish before copying this Session."
       });
     }
     const token = Symbol();
-    runtime.pendingControl = token;
+    if (!completedSnapshot) runtime.pendingControl = token;
     const signal = AbortSignal.any([context.signal, runtime.abortController.signal]);
     let dispatched = false;
     let registered: NativeSessionBinding | undefined;
@@ -2664,16 +2666,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         const selectedIndex = sourceHistory.findIndex((entry) => entry.uuid === entryId.toLowerCase());
         const selected = sourceHistory[selectedIndex];
         if (selected === undefined || selected.child || selected.type === "system") throw invalidForkBoundary();
+        if (completedSnapshot && selected.type !== "assistant") throw invalidForkBoundary();
         if (replacement && rewindBeforeEntry(sourceHistory, selectedIndex + 1) !== selected.uuid) throw invalidRewindBoundary();
         // The product stores normalized UUID identity; dispatch the exact spelling
         // returned by the SDK, whose public boundary lookup is case-sensitive.
         boundaryId = history.messages[selectedIndex]!.uuid;
         prefix = sourceHistory.slice(0, selectedIndex + 1).filter((entry) => !entry.child && entry.type !== "system");
-        await this.#assertForkSourceUnchanged(runtime, context, info, signal);
+        if (completedSnapshot) await this.#assertCompletedSnapshotPrefix(runtime, context, prefix, signal);
+        else await this.#assertForkSourceUnchanged(runtime, context, info, signal);
       }
       signal.throwIfAborted();
       this.#assertCurrent(runtime, context, context.binding);
-      if (runtime.nativeTasks.hasActiveTasks()) throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase);
+      if (!completedSnapshot && runtime.nativeTasks.hasActiveTasks()) throw claudeCodeError("SESSION_BUSY", "Native history still has an active writer.", phase);
       const recordSessionId = (sessionId: string): void => {
         if (!uuidPattern().test(sessionId)) throw new Error("Native Session copy returned an invalid identity.");
         const normalized = sessionId.toLowerCase();
@@ -2768,7 +2772,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           || derivedMessages.some((entry, index) => entry.type !== prefix[index]!.type || !isDeepStrictEqual(entry.message, prefix[index]!.message))) {
           throw new Error("The native Session fork did not preserve its inclusive message boundary.");
         }
-        await this.#assertForkSourceUnchanged(runtime, context, info, signal);
+        if (completedSnapshot) await this.#assertCompletedSnapshotPrefix(runtime, context, prefix, signal);
+        else await this.#assertForkSourceUnchanged(runtime, context, info, signal);
         nativeHistory = projectNativeHistory(derivedHistory.messages, result.sessionId.toLowerCase(), this.#projection);
       } else {
         await this.#assertForkSourceUnchanged(runtime, context, info, signal);
@@ -2858,6 +2863,17 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (!Number.isFinite(initialInfo.lastModified) || info.lastModified !== initialInfo.lastModified || runtime.nativeTasks.hasActiveTasks()) {
       throw claudeCodeError("NATIVE_SESSION_FORK_SOURCE_CHANGED", "Native history changed while its fork was being prepared.", "session_fork");
     }
+  }
+  async #assertCompletedSnapshotPrefix(runtime: NativeRuntime, context: AdapterContext, prefix: readonly ValidatedHistoryMessage[], signal: AbortSignal): Promise<void> {
+    this.#assertCurrent(runtime, context, context.binding);
+    const history = await this.#readForkHistory(runtime, runtime.nativeSessionId, signal);
+    this.#assertCurrent(runtime, context, context.binding);
+    const boundary = prefix.at(-1);
+    if (!boundary || boundary.type !== "assistant") throw invalidForkBoundary();
+    const position = history.entries.findIndex(entry => entry.uuid === boundary.uuid);
+    const current = history.entries.slice(0, position + 1).filter(entry => !entry.child && entry.type !== "system");
+    if (position < 0 || !isDeepStrictEqual(current, prefix)) throw claudeCodeError("NATIVE_COMPLETED_SNAPSHOT_CHANGED", "The completed native history prefix changed.", "session_fork", {
+      retryable: true, recovery: "Refresh the completed assistant boundary and open a new Side Chat operation." });
   }
 
   async getBackgroundTaskOutput(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult> {
@@ -3536,7 +3552,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       throw invalidReviewProfile();
     }
     if (launch.runtimePolicy === "review_read_only" && (
-      launch.resume
+      launch.resume && context.persistentReadOnly !== "side_chat"
       || launch.permissionMode !== "ask"
       || launch.title !== undefined
       || launch.appendSystemPrompt !== undefined
@@ -4013,7 +4029,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
                   "no-chrome": null
                 },
                 settings: {
-                  allowedMcpServers: [],
+                  allowedMcpServers: context.persistentReadOnly === "side_chat" && context.hostedExecution ? [claudeMcpServerName(CLAUDE_HOSTED_EXECUTOR_SERVER)] : [],
                   autoMemoryEnabled: false,
                   autoDreamEnabled: false,
                   disableAgentView: true,
@@ -4072,7 +4088,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             : {}),
           ...(launch.runtimePolicy === "standard" ? { extraArgs: { "replay-user-messages": null } } : {}),
           includePartialMessages: true,
-          mcpTools: context.hostedExecution || launch.mcpLease ? [...(context.hostedExecution ? createClaudeHostedTools(context.hostedExecution) : []), ...(launch.mcpLease?.tools.map((tool) => ({
+          mcpTools: context.hostedExecution || launch.mcpLease ? [...(context.hostedExecution ? createClaudeHostedTools(context.hostedExecution)
+            .filter(tool => launch.runtimePolicy !== "review_read_only" || context.persistentReadOnly === "side_chat" && tool.name === "Read") : []), ...(launch.mcpLease?.tools.map((tool) => ({
             ...tool,
             call: (arguments_: Readonly<Record<string, unknown>>, options: Parameters<typeof productMcpCall>[2]) => productMcpCall(tool, arguments_, options)
           })) ?? [])] : undefined,
@@ -4086,7 +4103,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           })),
           ...(launch.runtimePolicy === "review_read_only"
             ? {
-                disallowedTools: [...REVIEW_DISALLOWED_TOOLS],
+                disallowedTools: context.persistentReadOnly === "side_chat" && context.hostedExecution
+                  ? [...REVIEW_DISALLOWED_TOOLS.filter(tool => tool !== "mcp__*"), ...CLAUDE_HOSTED_DISALLOWED_TOOLS] : [...REVIEW_DISALLOWED_TOOLS],
                 mcpServers: {},
                 skills: []
               }
@@ -4095,7 +4113,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           ...(launch.modelId === undefined ? {} : { model: launch.modelId }),
           ...(this.#pathToExecutable === undefined ? {} : { pathToClaudeCodeExecutable: this.#pathToExecutable }),
           permissionMode: toSdkPermissionMode(launch.permissionMode),
-          persistSession: launch.runtimePolicy !== "review_read_only",
+          persistSession: launch.runtimePolicy !== "review_read_only" || context.persistentReadOnly === "side_chat",
           ...(storedSessionAccess === undefined ? {} : { sessionStoreAccess: storedSessionAccess }),
           ...(freshContext === undefined ? {} : { freshContextClaim: freshContext }),
           ...(launch.resume ? { resume: nativeSessionId } : { sessionId: nativeSessionId }),
@@ -4108,7 +4126,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           },
           ...(launch.title === undefined || launch.resume ? {} : { title: launch.title }),
           tools: launch.runtimePolicy === "review_read_only"
-            ? [...REVIEW_READ_TOOLS]
+            ? context.persistentReadOnly === "side_chat" && context.hostedExecution ? [] : [...REVIEW_READ_TOOLS]
             : context.hostedExecution?.trust === "guest" ? [...CLAUDE_HOSTED_GUEST_TOOLS] : { type: "preset", preset: "claude_code" }
         }
       });
@@ -4202,12 +4220,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         runtime.capabilities.add(name);
       }
       const tools = Array.isArray(envelope["tools"]) ? envelope["tools"] : [];
-      if (runtime.runtimePolicy === "review_read_only") assertReviewInitEnvelope(envelope, tools);
+      if (runtime.runtimePolicy === "review_read_only") assertReviewInitEnvelope(envelope, tools, runtime.baseContext);
       for (const tool of tools) {
         const name = this.#projection.identifier(tool, "");
         if (name.length === 0) continue;
         if (runtime.runtimePolicy === "review_read_only"
-          && !(REVIEW_READ_TOOLS as readonly string[]).includes(name)) {
+          && !readOnlyNativeToolNames(runtime.baseContext).includes(name)) {
           throw invalidReviewProfile();
         }
         if (this.#toolNames.size >= MAX_DESCRIPTOR_ITEMS && !this.#toolNames.has(name)) {
@@ -5830,7 +5848,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         if (reason) return denied(reason);
       }
       if (runtime.runtimePolicy === "review_read_only") {
-        const review = await reviewToolDecision(runtime.target.workspaceRoot, input.tool_name, toolInput);
+        const review = await persistentSideChatReadDecision(runtime.baseContext, runtime.target.workspaceRoot, input.tool_name, toolInput);
         if (review.behavior === "deny") return denied(review.message);
       }
       signal.throwIfAborted(); runtime.assertRuntimeCurrent();
@@ -5882,7 +5900,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return { behavior: "deny", message: "The originating turn is no longer active." };
     }
     if (runtime.runtimePolicy === "review_read_only") {
-      return reviewToolDecision(runtime.target.workspaceRoot, toolName, input);
+      return persistentSideChatReadDecision(runtime.baseContext, runtime.target.workspaceRoot, toolName, input);
     }
     if (turn.context.hostedExecution) {
       const reason = this.#hostedToolDenial(runtime, toolName, input);
@@ -7176,12 +7194,14 @@ function reviewRuntimePolicy(
   return "review_read_only";
 }
 
-function reviewResumeRuntimePolicy(context: AdapterContext): "standard" {
+function reviewResumeRuntimePolicy(context: AdapterContext): "standard" | "review_read_only" {
+  if (context.runtimePolicy === "review_read_only" && context.persistentReadOnly === "side_chat") return "review_read_only";
   if (context.runtimePolicy === "review_read_only") throw invalidReviewProfile();
   return "standard";
 }
 
 function assertStandardReviewContext(context: AdapterContext, operation: string): void {
+  if (context.persistentReadOnly === "side_chat" && ["inspect a detached native Session", "read persisted native history", "inspect native Session deletion", "delete native Session state"].includes(operation)) return;
   if (context.runtimePolicy !== "review_read_only") return;
   throw claudeCodeError(
     "CLAUDE_CODE_REVIEW_OPERATION_DENIED",
@@ -7209,16 +7229,22 @@ function assertReviewInitialization(initialization: ClaudeSdkInitializationResul
 
 function assertReviewInitEnvelope(
   envelope: Readonly<Record<string, unknown>>,
-  tools: readonly unknown[]
+  tools: readonly unknown[],
+  context?: AdapterContext
 ): void {
-  if (tools.length !== REVIEW_READ_TOOLS.length) throw invalidReviewProfile();
+  const expectedTools = readOnlyNativeToolNames(context);
+  if (tools.length !== expectedTools.length) throw invalidReviewProfile();
   const observedTools = new Set(tools.map((tool) => typeof tool === "string" ? tool : ""));
-  if (observedTools.size !== REVIEW_READ_TOOLS.length
-    || REVIEW_READ_TOOLS.some((tool) => !observedTools.has(tool))) {
+  if (observedTools.size !== expectedTools.length
+    || expectedTools.some((tool) => !observedTools.has(tool))) {
     throw invalidReviewProfile();
   }
   for (const key of ["mcp_servers", "slash_commands", "skills", "plugins"] as const) {
     const value = envelope[key];
+    if (key === "mcp_servers" && context?.persistentReadOnly === "side_chat" && context.hostedExecution) {
+      if (!Array.isArray(value) || value.length !== 1 || !isRecord(value[0]) || value[0]["name"] !== claudeMcpServerName(CLAUDE_HOSTED_EXECUTOR_SERVER)) throw invalidReviewProfile();
+      continue;
+    }
     if (!Array.isArray(value) || value.length !== 0) throw invalidReviewProfile();
   }
   const agents = envelope["agents"];
@@ -7227,6 +7253,22 @@ function assertReviewInitEnvelope(
     || (!Array.isArray(agents) && (typeof agents !== "object" || agents === null || Object.keys(agents).length !== 0))
   )) throw invalidReviewProfile();
   assertReviewFastModeDisabled(envelope["fast_mode_state"]);
+}
+
+function readOnlyNativeToolNames(context?: AdapterContext): readonly string[] {
+  return context?.persistentReadOnly === "side_chat" && context.hostedExecution
+    ? [`mcp__${claudeMcpServerName(CLAUDE_HOSTED_EXECUTOR_SERVER)}__Read`] : REVIEW_READ_TOOLS;
+}
+
+async function persistentSideChatReadDecision(context: AdapterContext, root: string, name: string, input: Readonly<Record<string, unknown>>): Promise<ClaudePermissionResult> {
+  if (context.persistentReadOnly !== "side_chat" || !context.hostedExecution) return reviewToolDecision(root, name, input);
+  if (!readOnlyNativeToolNames(context).includes(name)) return { behavior: "deny", message: "The read-only Side Chat permits its Source file reader only." };
+  const value = input["file_path"];
+  if (typeof value !== "string" || !value || value.length > 4096 || value.includes("\0")) return { behavior: "deny", message: "The Source file path is invalid." };
+  const suffix = relative(resolve(root), resolve(root, value));
+  if (suffix === ".." || suffix.startsWith(`..${sep}`) || isAbsolute(suffix) || reviewPathSegmentsAreSensitive(suffix.split(/[\\/]/gu))) return { behavior: "deny", message: "The Source read is outside the read-only workspace boundary." };
+  try { assertHostedExecution(context.hostedExecution); } catch { return { behavior: "deny", message: "The Source workspace authority changed." }; }
+  return { behavior: "allow", updatedInput: { ...input } };
 }
 
 function assertReviewFastModeDisabled(value: unknown): void {
@@ -7615,6 +7657,7 @@ function capabilityManifest(
     "session.resume",
     "session.clone",
     "session.fork",
+    "session.side_chat",
     "session.rewind",
     "session.detach",
     "session.discovery",

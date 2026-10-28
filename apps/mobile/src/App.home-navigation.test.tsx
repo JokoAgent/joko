@@ -6,7 +6,7 @@ import { SessionSchema, SessionState, SnapshotSchema, EventSchema, MessageRole, 
   SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MobileState } from "./mobile-client";
+import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileHomeViewState } from "./mobile-task-home-navigation";
 import { mobileMessage } from "./mobile-messages";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -35,7 +35,12 @@ const homeConnectionId = "home-connection";
 const select = vi.fn(async (_sessionId?: string) => {});
 const searchHome = vi.fn(async () => {});
 const setSessionPinned = vi.fn(async () => true);
-const setSessionArchived = vi.fn(async () => true);
+const setSessionArchived = vi.fn(async (_sessionId: string, _archived: boolean, _archiveConfirmation?: string) => true);
+const archiveConfirmation = "a".repeat(64);
+const prepareSessionArchive = vi.fn<MobileClient["prepareSessionArchive"]>(async sessionId => ({
+  preview: { hasWorktree: false, dirty: false, activeBoundScheduleCount: 0, activeBoundScheduleNames: [], archiveConfirmation },
+  archive: () => setSessionArchived(sessionId, true, archiveConfirmation)
+}));
 const renameSession = vi.fn(async () => true);
 const deleteSession = vi.fn(async () => true);
 const suggestTaskTitle = vi.fn(async (_key: string, _signal: AbortSignal) => create(SuggestSessionTitleResponseSchema, {
@@ -88,7 +93,7 @@ let learningPartner: typeof profilePartner | undefined;
 let collaborationApi: import("./mobile-collaboration").MobileCollaborationApi | undefined;
 let learningProfileProps: ComponentProps<typeof import("./MobilePartnerProfileSheet").MobilePartnerProfileSheet> | undefined;
 const client = new Proxy({
-  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, renameSession, deleteSession, suggestTaskTitle, reconcile, refresh,
+  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, refresh,
   taskQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
   subscribe: () => () => {}, taskForeground: () => true, taskQueueCapabilities: () => ({}), taskPendingImagePasteCount: () => 0,
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
@@ -172,6 +177,7 @@ beforeAll(async () => {
   vi.doMock("expo", () => ({ requireOptionalNativeModule: () => null }));
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
   vi.doMock("./storage", () => new Proxy({ mobileLocalePreferences: { snapshot: { effectiveLocale: "en" } },
+    mobileReplyQuotePreferences: { snapshot: { ready: true, visible: true, saving: false, failed: false }, subscribe: () => () => {}, hydrate: async () => {} },
     mobileComposerDrafts: drafts, mobileNewTaskDrafts: { flush: newTaskFlush } }, {
     get: (object, key) => key in object ? object[key as keyof typeof object] : {}, has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} })
@@ -198,7 +204,7 @@ beforeAll(async () => {
       has: () => true, getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: () => null }) }));
   vi.doMock("./SwipeableSessionRow", () => ({ SwipeableSessionRow: surface }));
   vi.doMock("./MobileActionSheet", () => ({ MobileActionSheet: (props: NonNullable<typeof messageActionsProps>) => {
-    messageActionsProps = props;
+    if (props.items.some(item => item.id === "copy-text" || item.id === "add-to-composer")) messageActionsProps = props;
     return null;
   } }));
   vi.doMock("./MobilePartnerProfileSheet", () => ({ MobilePartnerProfileSheet: (props: NonNullable<typeof learningProfileProps>) => {
@@ -243,7 +249,7 @@ beforeEach(async () => {
   headerSourceEpoch = 0;
   vi.useFakeTimers();
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
-  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, refresh,
+  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
   draftFlush.mockReset().mockImplementation(originalDraftFlush);
@@ -313,7 +319,8 @@ describe("actual Home navigation hosts", () => {
     await act(async () => headerProps.actions.find(action => action.id === "pin")!.onPress());
     await act(async () => headerProps.actions.find(action => action.id === "archive")!.onPress());
     expect(setSessionPinned).toHaveBeenCalledExactlyOnceWith("current", false);
-    expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true);
+    expect(prepareSessionArchive).toHaveBeenCalledExactlyOnceWith("current");
+    expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true, archiveConfirmation);
     state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, sessions: state.detail!.sessions.map(session =>
       create(SessionSchema, { ...session, archived: session.sessionId === "current" })) }) };
     await renderTask();
@@ -467,7 +474,8 @@ describe("actual Home navigation hosts", () => {
     await option(message("common.unpin"));
     expect(setSessionPinned).toHaveBeenCalledExactlyOnceWith("current", false);
     await option(message("common.archive"));
-    expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true);
+    expect(prepareSessionArchive).toHaveBeenCalledExactlyOnceWith("current");
+    expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true, archiveConfirmation);
     await option(message("common.rename"));
     await type(message("home.taskName"), "Renamed"); await press(message("common.rename"));
     expect(renameSession).toHaveBeenCalledExactlyOnceWith("current", "Renamed");
@@ -483,13 +491,15 @@ describe("actual Home navigation hosts", () => {
     expect(button(message("common.rename")).disabled).toBe(true);
     expect(button(message("common.unpin")).disabled).toBe(true);
     expect(button(message("common.archive")).disabled).toBe(true);
+    expect(prepareSessionArchive).not.toHaveBeenCalled();
     expect(button(message("actions.copyTaskLink")).disabled).toBe(false);
     expect(button(message("common.new")).disabled).toBe(true);
     await press(message("common.cancel")); await press(message("common.retry"));
     expect(refresh).toHaveBeenCalledOnce();
     await render({ state: { ...state, status: "connected" } });
     await option(message("common.archive"));
-    expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true);
+    expect(prepareSessionArchive).toHaveBeenCalledExactlyOnceWith("current");
+    expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true, archiveConfirmation);
   });
 
   it("retires debounced reads on unmount and does not read or navigate while hidden", async () => {

@@ -60,6 +60,10 @@ export function projectNativeTaskStatusSnapshot(
       activityLines,
       ...(session.activeRunStartedAt === undefined ? {} : { startedAt: session.activeRunStartedAt }),
       updatedAt: Math.max(session.updatedAt, session.attention?.updatedAt ?? 0, interaction?.createdAt ?? 0),
+      ...(session.attention === undefined || phase !== "completed" && phase !== "error" ? {} : { completionIdentity: JSON.stringify([
+        session.attention.subjectCursor.sequence.toString(), session.attention.subjectCursor.generation.toString(),
+        session.attention.attentionCursor.sequence.toString(), session.attention.attentionCursor.generation.toString()
+      ]) }),
       ...(permission === undefined ? {} : { permission })
     } satisfies JokoDesktopNativeTaskStatusSnapshot["sessions"][number]];
   });

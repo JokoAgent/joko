@@ -1,4 +1,5 @@
 import type { SessionWorktreeRemovalPreviewView } from "./model.js";
+import { readSessionArchivePreview, type SessionArchivePreview } from "@joko/contracts";
 
 export type WorktreeRemovalPreflight = "clean" | "dirty" | "unknown";
 
@@ -6,6 +7,10 @@ export interface WorktreeRemovalPreflightSummary {
   readonly clean: number;
   readonly dirty: number;
   readonly unknown: number;
+  readonly activeBoundScheduleCount?: number;
+  readonly activeBoundScheduleNames?: readonly string[];
+  readonly archiveConfirmations?: Readonly<Record<string, string>>;
+  readonly archiveUnavailable?: boolean;
 }
 
 export type WorktreeRemovalPreviewReader = (
@@ -84,6 +89,40 @@ export async function summarizeWorktreeRemovalPreflights(
 
 export function resetWorktreeRemovalPreflightCache(): void {
   preflightCache.clear();
+}
+
+/** Archive bindings are always read afresh, independently of the dirty-worktree cache. */
+export async function summarizeSessionArchivePreflights(
+  sessionIds: readonly string[],
+  readPreview: (sessionId: string, signal: AbortSignal) => Promise<SessionWorktreeRemovalPreviewView>
+): Promise<WorktreeRemovalPreflightSummary> {
+  const results = await Promise.all([...new Set(sessionIds)].map(async (sessionId) => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const value = await Promise.race([
+        Promise.resolve().then(() => readPreview(sessionId, controller.signal)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error("Archive preview timed out."));
+          }, 3_000);
+        })
+      ]);
+      return { sessionId, preview: readSessionArchivePreview(value as SessionArchivePreview) };
+    } catch { return { sessionId, preview: undefined }; }
+    finally { if (timer !== undefined) clearTimeout(timer); }
+  }));
+  return {
+    clean: results.filter(({ preview }) => preview !== undefined && !preview.dirty).length,
+    dirty: results.filter(({ preview }) => preview?.dirty === true).length,
+    unknown: results.filter(({ preview }) => preview === undefined).length,
+    archiveUnavailable: results.some(({ preview }) => preview === undefined),
+    activeBoundScheduleCount: results.reduce((count, { preview }) => count + (preview?.activeBoundScheduleCount ?? 0), 0),
+    activeBoundScheduleNames: results.flatMap(({ preview }) => preview?.activeBoundScheduleNames ?? []).slice(0, 20),
+    archiveConfirmations: Object.fromEntries(results.flatMap(({ sessionId, preview }) =>
+      preview === undefined ? [] : [[sessionId, preview.archiveConfirmation]]))
+  };
 }
 
 function cacheKey(ownerId: string, sessionId: string): string {

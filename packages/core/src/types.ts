@@ -48,6 +48,7 @@ export const CAPABILITIES = [
   "session.resume",
   "session.detach",
   "session.fork",
+  "session.side_chat",
   "session.rewind",
   "session.rewind_to_start",
   "session.tree",
@@ -355,6 +356,7 @@ export interface PromptInput {
   readonly images: readonly ImageInput[];
   readonly files: readonly FileInput[];
   readonly mentions: readonly MentionInput[];
+  readonly replyQuote?: { readonly generation: number; readonly eventId: string; readonly messageId: string; readonly role: 'user' | 'assistant'; readonly excerpt: string };
   /** Queue-only authority for typed Session mentions. Public mappers never
    * accept or emit this field, and dispatch removes it before Adapter input. */
   readonly sessionReferenceSnapshots?: readonly SessionReferenceSnapshot[];
@@ -931,6 +933,8 @@ export interface SessionDescriptor {
 
 export interface SessionDerivationOrigin {
   readonly kind: "fork" | "clone";
+  /** Independent follow-up; inherited history supplies context, never authority. */
+  readonly sideChat?: true;
   readonly sourceSessionId: SessionId;
   /** Product timeline identity, never a Backend-native entry identifier. */
   readonly sourceMessageId?: string;

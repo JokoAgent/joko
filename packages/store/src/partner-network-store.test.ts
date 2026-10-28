@@ -19,6 +19,21 @@ function fixture() {
   return { store, database, room, current, ownerId, guestId, manage, invite, accept, send, advance: (ms: number) => { now += ms; } };
 }
 describe("conversation authority and foreign membership", () => {
+  it('allows one companion to work in separate topics concurrently while serializing each original topic', () => {
+    const f = fixture(), companion = networkPartnerId('home-a', 'helper');
+    const rootA = f.send('Topic A', f.ownerId, 'root-a', []), rootB = f.send('Topic B', f.ownerId, 'root-b', []);
+    const topic = (operationId: string, root: string) => f.store.send({ operationId, roomId: f.room.id, actorId: f.ownerId,
+      text: operationId, mentions: [companion], mentionAll: false, threadRootId: root, quoteId: '', attachments: [] });
+    const a = topic('topic-a-one', rootA.id), same = topic('topic-a-two', rootA.id), b = topic('topic-b-one', rootB.id);
+    const first = f.store.claim(f.room.id, f.ownerId, companion)!;
+    const second = f.store.claim(f.room.id, f.ownerId, companion)!;
+    expect([first.sourceMessageId, second.sourceMessageId]).toEqual([a.id, b.id]);
+    expect(f.store.claim(f.room.id, f.ownerId, companion)).toBeUndefined();
+    f.store.settle({ roomId: f.room.id, ownerId: f.ownerId, executionId: first.id, lease: first.lease, action: 'complete', text: 'Done A', failureCode: '' });
+    expect(f.store.claim(f.room.id, f.ownerId, companion)?.sourceMessageId).toBe(same.id);
+    expect(f.store.validateExecution(f.room.id, second.id, second.lease, f.ownerId).job.sourceMessageId).toBe(b.id);
+  });
+
   it("revokes foreign owner credentials and all old invitations without changing local history or roles", () => {
     const f = fixture(); f.invite("guest", true); f.accept("guest");
     f.send("Keep this original message", f.guestId);

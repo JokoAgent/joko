@@ -47,6 +47,8 @@
 .partner-conversation-identity .partner-avatar > span { transform: scale(.65) rotate(-12deg); }
 .partner-conversation-placeholder { display: flex; align-items: center; gap: 8px; color: var(--text-muted); }
 .partner-conversation-error { max-width: 32ch; color: var(--text-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.partner-reply-quote { display: grid; gap: 4px; max-width: min(52ch, 100%); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); padding: 8px 10px; background: var(--surface-sunken); color: var(--text-soft); font: inherit; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.partner-reply-quote strong { color: var(--text-muted); font-size: 12px; }
 .partner-card__identity { min-height: 42px; display: -webkit-box; overflow: hidden; color: var(--text-soft); font-size: var(--text-11); line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .partner-card__activity { min-height: 25px; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--text-faint); font-size: var(--text-9); }
 .partner-card__activity > span:not(.pill) { border-left: 1px solid var(--line); padding-left: 7px; }
@@ -160,6 +162,13 @@
 .partner-unread-divider { display: flex; align-items: center; gap: 12px; margin: 14px 0; color: var(--text-soft); font-size: var(--text-10); }
 .partner-unread-divider::before, .partner-unread-divider::after { content: ""; height: 1px; flex: 1; background: var(--line); }
 .partner-private-receipt { display: flex; justify-content: center; padding: 8px 0; }
+.partner-follow-up-invitation { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; max-width: 30rem; font-size: .8rem; }
+.partner-glance { position: relative; font-size: .85rem; }
+.partner-glance > summary { cursor: pointer; padding: .45rem; }
+.partner-glance__content { position: absolute; z-index: 35; right: 0; top: 100%; width: min(26rem, calc(100vw - 2rem)); max-height: min(36rem, 75dvh); overflow: auto; padding: .8rem; border: 1px solid var(--line); border-radius: .7rem; background: var(--surface); color: var(--text); box-shadow: 0 .5rem 2rem #0003; }
+.partner-glance__content ul { list-style: none; padding: 0; }
+.partner-glance__content li > button { display: grid; gap: .2rem; width: 100%; padding: .5rem; text-align: start; overflow-wrap: anywhere; }
+.partner-glance__content label { display: flex; align-items: start; gap: .4rem; padding-top: .6rem; }
 .partner-private-receipt > button { display: flex; align-items: center; gap: 6px; border: 0; padding: 4px 8px; background: transparent; color: var(--text-faint); font: inherit; font-size: var(--text-10); cursor: pointer; }
 .partner-private-receipt > button:disabled { cursor: default; }
 .partner-private-receipt svg { width: 14px; height: 14px; }

@@ -56,7 +56,7 @@ export function QuestionTextInput({ controller, ownerKey, enabled, label, value,
         else void voice.finish();
       } else onKeyDown?.(event);
     } };
-  return <div ref={setRoot} className="question-dictation" onBlur={event => {
+  return <div ref={setRoot} className="question-dictation" data-question-dictating={voice.active || undefined} onBlur={event => {
     const next = event.relatedTarget;
     if (!(next instanceof event.currentTarget.ownerDocument.defaultView!.Node) || !event.currentTarget.contains(next)) voice.cancel();
   }}>

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY,
+import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY, createSideChatWorkspaceReference,
   type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import type { McpAppMessageGuard } from "./mcp-apps/message.js";
 import type { McpAppModelContext } from "./mcp-apps/host.js";
@@ -136,6 +136,7 @@ import {
 import { activeNativeTimeline } from "./snapshot-projector.js";
 import { policySnapshotFor } from "./policy-settings.js";
 import { reviewNativeToolPolicy } from "./native-tool-policy.js";
+import { readNativeOwnerInstructions } from "./native-owner-intent.js";
 import { clearProviderRateLimit, recordProviderRateLimit } from "./provider-rate-limit.js";
 import type { CreateFreshReviewerInput, ReviewRuntimeDispatch, ReviewRuntimeOutcome } from "./review-coordinator.js";
 import type { ScheduleRunNotificationController } from "./schedule-run-notifications.js";
@@ -612,6 +613,8 @@ export interface DeriveSessionInput {
   readonly title: string;
   readonly entryId?: string;
   readonly kind: "fork" | "clone";
+  readonly sideChat?: true;
+  readonly expectedGeneration?: number;
   readonly sourceMessage?: {
     readonly messageId: string;
     readonly eventId: string;
@@ -990,6 +993,7 @@ export class SessionHost {
   readonly #partnerPauseFlights = new Map<string, Promise<void>>();
   readonly #partnerTargetRetired: (targetId: string) => boolean;
   readonly #resolveServiceRuntimePrompt: ((session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>) | undefined;
+  readonly #resolvePartnerReplyQuote: ((sessionId: string, quote: NonNullable<PromptInput['replyQuote']>) => string) | undefined;
   readonly #decorateRuntimePrompt: ((base: string | undefined) => string | undefined) | undefined;
   readonly #serviceRuntimePrompts = new Map<string, { readonly baseDigest: string; readonly text: string }>();
   readonly #resolveServiceRuntimeConfiguration: ((session: SessionDescriptor) => string | undefined) | undefined;
@@ -1124,6 +1128,7 @@ export class SessionHost {
       readonly partnerTargetRetired?: (targetId: string) => boolean;
       /** Private service identity resolved at native activation, never supplied through RPC or persisted in Session data. */
       readonly resolveServiceRuntimePrompt?: (session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>;
+      readonly resolvePartnerReplyQuote?: (sessionId: string, quote: NonNullable<PromptInput['replyQuote']>) => string;
       /** Private instructions applied equally to initial creation and later native contexts. */
       readonly decorateRuntimePrompt?: (base: string | undefined) => string | undefined;
       /** Native resource selections are private identity, never natural-language prompt declarations. */
@@ -1208,6 +1213,7 @@ export class SessionHost {
     this.#partnerSessionPolicy = options.partnerSessionPolicy ?? (() => undefined);
     this.#partnerTargetRetired = options.partnerTargetRetired ?? (() => false);
     this.#resolveServiceRuntimePrompt = options.resolveServiceRuntimePrompt;
+    this.#resolvePartnerReplyQuote = options.resolvePartnerReplyQuote;
     this.#decorateRuntimePrompt = options.decorateRuntimePrompt;
     this.#resolveServiceRuntimeConfiguration = options.resolveServiceRuntimeConfiguration;
     this.#prepareManagedProviderRuntime = options.prepareManagedProviderRuntime;
@@ -4635,6 +4641,20 @@ export class SessionHost {
     }
   }
 
+  async openSideChat(input: { readonly operationId: string; readonly connection: ConnectionRecord; readonly sourceSessionId: string;
+    readonly title: string; readonly expectedGeneration: number }): Promise<OperationExecution<{ readonly sessionId: string }>> {
+    this.#assertOpen();
+    const prior = this.#store.findOperation(input.operationId), body = prior?.body;
+    const anchor = prior === undefined ? this.#store.findCompletedSessionAssistantOrigin(input.sourceSessionId) : undefined;
+    const persisted = isRecord(body) && body["sideChat"] === true && body["sourceSessionId"] === input.sourceSessionId
+      && typeof body["entryId"] === "string" && typeof body["sourceMessageId"] === "string" && typeof body["sourceEventId"] === "string"
+      ? { nativeEntryId: body["entryId"], messageId: body["sourceMessageId"], eventId: body["sourceEventId"] } : undefined;
+    const selected = persisted ?? anchor;
+    if (!selected) throw new StoreError("A Side Chat requires a completed assistant reply in the current native history.");
+    return this.deriveSession({ ...input, kind: "fork", sideChat: true, entryId: selected.nativeEntryId,
+      sourceMessage: { messageId: selected.messageId, eventId: selected.eventId } });
+  }
+
   async deriveSession(input: DeriveSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
     const persistedOperation = this.#store.findOperation(input.operationId);
@@ -4654,6 +4674,7 @@ export class SessionHost {
       sourceSessionId: input.sourceSessionId,
       title: input.title,
       kind: input.kind,
+      ...(input.sideChat ? { sideChat: true, expectedGeneration: input.expectedGeneration } : {}),
       ...(input.entryId === undefined ? {} : { entryId: input.entryId }),
       ...(sourceMessage === undefined ? {} : {
         sourceMessageId: sourceMessage.messageId,
@@ -4666,7 +4687,13 @@ export class SessionHost {
       { id: input.operationId, kind: `${input.kind}_session`, body: logicalBody },
       (store) => {
         const source = store.getSession(input.sourceSessionId);
-        this.assertSessionDerivationSource(source);
+        this.assertSessionDerivationSource(source, input.sideChat === true);
+        if (input.expectedGeneration !== undefined && source.descriptor.binding.generation !== input.expectedGeneration) throw new StoreError("The Side Chat source generation changed.");
+        if (input.sideChat) {
+          if (input.kind !== "fork" || source.descriptor.derivationOrigin?.sideChat || this.#store.getBackend(source.descriptor.backendId).descriptor.capabilities.get("session.side_chat")?.supported !== true) throw new StoreError("This native Session cannot open a completed-history Side Chat.");
+          const completion = store.findCompletedSessionAssistantOrigin(source.descriptor.id);
+          if (persistedOperation === undefined && (completion?.eventId !== sourceMessage?.eventId || completion?.nativeEntryId !== input.entryId)) throw new StoreError("The completed Side Chat source changed before its operation was prepared.");
+        }
         if (input.kind === "fork") requiredEntryId(input.entryId);
         if (sourceMessage !== undefined) {
           const visible = store.findVisibleSessionMessageOrigin({
@@ -4680,6 +4707,10 @@ export class SessionHost {
       }
     );
     if (!claim.claimed) {
+      if (input.sideChat) {
+        const child = this.#store.getSession(claim.value.sessionId).descriptor, workspace = readWorkerWorkspaceBinding(this.#store, child.id);
+        if (workspace?.owner === "side_chat") await this.#worktrees?.registerWorkerWorkspace(workspace, child.title, this.#store.getTarget(child.targetId).descriptor.trusted);
+      }
       await this.adoptNativeSessionDerivation(claim.operation.id);
       return { replayed: true, value: claim.value, operation: claim.operation };
     }
@@ -4688,6 +4719,7 @@ export class SessionHost {
     let releaseBackendAdmission: (() => void) | undefined;
     let sideEffectLease: ActiveBackendSideEffectLease | undefined;
     let acquiredDerivedWorktree: SessionWorktreeBinding | undefined;
+    let sideChatWorkspace: ReturnType<typeof createSideChatWorkspaceReference>;
     try {
       const admittedSource = this.#store.getSession(input.sourceSessionId);
       const admittedTarget = this.#store.getTarget(admittedSource.descriptor.targetId);
@@ -4711,7 +4743,7 @@ export class SessionHost {
       const active = await this.activate(input.sourceSessionId);
       sideEffectLease = this.beginActiveBackendSideEffect(input.sourceSessionId, active, input.operationId);
       const source = sideEffectLease.stored;
-      this.assertSessionDerivationSource(source);
+      this.assertSessionDerivationSource(source, input.sideChat === true);
       const sourceContext = sideEffectLease.context;
       this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
       const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
@@ -4722,7 +4754,8 @@ export class SessionHost {
             sourceSessionId: source.descriptor.id
           })
         : undefined;
-      let derivedWorktree = source.descriptor.worktree !== undefined
+      let readOnlySideChat = input.sideChat === true && !derivesWorkspace;
+      let derivedWorktree = !readOnlySideChat && source.descriptor.worktree !== undefined
         && source.descriptor.remoteWorkspace === undefined
         ? await this.#worktrees!.derive({
             sessionId,
@@ -4735,7 +4768,8 @@ export class SessionHost {
             })
           : undefined;
       if (derivedWorktree !== undefined) acquiredDerivedWorktree = derivedWorktree;
-      const derivationTarget = derivedWorktree === undefined
+      if (input.sideChat && derivedWorktree === undefined && remotePlan === undefined) readOnlySideChat = true;
+      const derivationTarget = readOnlySideChat ? sourceContext.target : derivedWorktree === undefined
         ? remotePlan === undefined
           ? sourceContext.target
           : { ...admittedTarget.descriptor, workspaceRoot: remotePlan.path }
@@ -4792,6 +4826,7 @@ export class SessionHost {
       const derivation: NativeSessionDerivation = {
         sessionId,
         target: derivationTarget,
+        ...(input.sideChat ? { completedSnapshot: { kind: "completed_assistant" as const, nativeBoundaryId: requiredEntryId(input.entryId) } } : {}),
         recordBinding: (binding) => {
           this.#store.recordNativeSessionDerivation({
             operationId: claim.operation.id,
@@ -4835,7 +4870,7 @@ export class SessionHost {
         (store) => {
           const currentSource = store.getSession(input.sourceSessionId);
           assertBindingFence(source, currentSource);
-          this.assertSessionDerivationSource(currentSource);
+          this.assertSessionDerivationSource(currentSource, input.sideChat === true);
           this.assertSessionDerivationTarget(admittedTarget, currentSource, sourceContext);
           if (
             store.getBackend(currentSource.descriptor.backendId).descriptor.instanceGeneration
@@ -4843,6 +4878,7 @@ export class SessionHost {
           ) throw staleBackendInstanceContextError();
           const duplicate = store.findLiveSessionByNativeBinding(currentSource.descriptor.backendId, binding.opaqueRef);
           if (duplicate !== undefined) throw nativeBindingConflict(duplicate.descriptor.id);
+          if (readOnlySideChat) sideChatWorkspace = createSideChatWorkspaceReference(store, currentSource.descriptor, sessionId);
           const created = store.createSession({
             ...currentSource.descriptor,
             id: sessionId,
@@ -4853,12 +4889,14 @@ export class SessionHost {
             summaryUpdatedAt: undefined,
             automationOrigin: undefined,
             binding,
-            ...(derivedWorktree === undefined ? {} : { worktree: derivedWorktree }),
+            ...(readOnlySideChat ? { worktree: undefined, permissionMode: "ask" as const, planMode: false, fastMode: false }
+              : derivedWorktree === undefined ? {} : { worktree: derivedWorktree }),
             pinned: false,
             archived: false,
             deletedAt: undefined,
             derivationOrigin: {
               kind: input.kind,
+              ...(input.sideChat ? { sideChat: true as const } : {}),
               sourceSessionId: input.sourceSessionId,
               ...(sourceMessage === undefined ? {} : {
                 sourceMessageId: sourceMessage.messageId,
@@ -4906,6 +4944,7 @@ export class SessionHost {
         }
       );
       acquiredDerivedWorktree = undefined;
+      if (sideChatWorkspace) await this.#worktrees?.registerWorkerWorkspace(sideChatWorkspace, input.title, admittedTarget.descriptor.trusted);
       await this.adoptNativeSessionDerivation(claim.operation.id);
       return execution;
     } catch (error) {
@@ -4932,7 +4971,7 @@ export class SessionHost {
     }
   }
 
-  private assertSessionDerivationSource(source: StoredSession): void {
+  private assertSessionDerivationSource(source: StoredSession, completedSnapshot = false): void {
     if (this.isReviewReadOnlySession(source.descriptor.id)) {
       throw new StoreError("Reviewer Sessions cannot be attached, forked, or cloned.");
     }
@@ -4950,6 +4989,8 @@ export class SessionHost {
     }
     const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
       .descriptor.capabilities.get("workspace.derive")?.supported === true;
+    if (completedSnapshot && worktree !== undefined && this.#worktrees === undefined) throw new StoreError("The Side Chat workspace reference requires its active coordinator.");
+    if (completedSnapshot && !derivesWorkspace) return;
     const requiresIsolation = worktree !== undefined || derivesWorkspace;
     if (!requiresIsolation) return;
     if (this.#worktrees === undefined || !derivesWorkspace) {
@@ -4962,7 +5003,7 @@ export class SessionHost {
         recovery: "Use a Backend that advertises workspace.derive with an available workspace coordinator."
       });
     }
-    if (this.hasDurableSessionWork(source.descriptor.id)) {
+    if (!completedSnapshot && this.hasDurableSessionWork(source.descriptor.id)) {
       throw new JokoError({
         code: "SESSION_DERIVATION_WORKTREE_BUSY",
         message: "The source workspace still has active or queued work.",
@@ -5015,6 +5056,11 @@ export class SessionHost {
     expectedWorktree?: SessionWorktreeBinding
   ): Promise<NativeSessionDerivationLifecycle> {
     const target = this.#store.getTarget(record.targetId).descriptor;
+    const sourceStored = this.#store.getSession(record.sourceSessionId), source = sourceStored.descriptor;
+    const operation = this.#store.getOperation(record.operationId);
+    const completedSnapshot = operation.kind === "fork_session" && isRecord(operation.body) && operation.body["sideChat"] === true;
+    const readOnlySourceRoot = completedSnapshot && record.worktree === undefined
+      && sameNativeBinding(source.binding, record.sourceBinding) && this.targetForSession(sourceStored).workspaceRoot === record.effectiveWorkspaceRoot;
     if (target.backendId !== record.backendId && (!target.trusted || target.remoteWorkspace !== undefined)
       || !sameRemoteWorkspaceBinding(target.remoteWorkspace, record.remoteWorkspace)) {
       throw new StoreError("The native derivation lifecycle target authority changed.");
@@ -5025,7 +5071,11 @@ export class SessionHost {
     }
     const worktree = record.worktree ?? expectedWorktree;
     let effectiveTarget = { ...target, backendId: record.backendId };
-    if (target.workspaceRoot !== record.effectiveWorkspaceRoot) {
+    if (target.workspaceRoot !== record.effectiveWorkspaceRoot && readOnlySourceRoot) {
+      if (source.worktree !== undefined && (source.worktree.state !== "active"
+        || this.#worktrees?.activeWorkspacePath(source.id, source.worktree) === undefined)) throw new StoreError("The Side Chat source workspace lease is unavailable.");
+      effectiveTarget = { ...effectiveTarget, workspaceRoot: record.effectiveWorkspaceRoot };
+    } else if (target.workspaceRoot !== record.effectiveWorkspaceRoot) {
       if (worktree === undefined || (worktree.remote === undefined
         ? resolve(worktree.path) !== resolve(record.effectiveWorkspaceRoot)
         : worktree.path !== record.effectiveWorkspaceRoot)) {
@@ -5052,14 +5102,11 @@ export class SessionHost {
         throw new StoreError("The native derivation lifecycle Product worktree authority changed.");
       }
     }
-    const source = this.#store.getSession(record.sourceSessionId).descriptor;
     if (source.backendId !== record.backendId || source.targetId !== record.targetId) {
       throw new StoreError("The native derivation lifecycle source authority changed.");
     }
-    const sourceTarget = source.worktree === undefined
-      ? { ...target, backendId: source.backendId }
-      : { ...target, backendId: source.backendId, workspaceRoot: source.worktree.path };
-    const operationKind = this.#store.getOperation(record.operationId).kind;
+    const sourceTarget = this.targetForSession(sourceStored);
+    const operationKind = operation.kind;
     const kind = operationKind === "fork_session"
       ? "fork"
       : operationKind === "clone_session"
@@ -6615,6 +6662,7 @@ export class SessionHost {
       quotesEncoded: _untrustedQuotesEncoded,
       pastedTextRanges: _untrustedPastedTextRanges,
       mentionRanges: _untrustedMentionRanges,
+      replyQuote: _untrustedReplyQuote,
       ...publicProposal
     } = proposed;
     return this.canonicalQueuedPrompt(current.sessionId, {
@@ -6622,6 +6670,7 @@ export class SessionHost {
       text: replayed.text,
       images: current.body.images,
       files: current.body.files,
+      ...(current.body.replyQuote ? { replyQuote: current.body.replyQuote } : {}),
       mentions,
       ...(replayed.pastedTextRanges.length === 0
         ? {}
@@ -6763,6 +6812,10 @@ export class SessionHost {
       readonly preserveArtifactReferenceSnapshots?: boolean;
     } = {}
   ): PromptInput {
+    if (prompt.replyQuote) {
+      if (!this.#resolvePartnerReplyQuote) throw inputCapabilityError('INPUT_PARTNER_QUOTE_UNAVAILABLE', 'Private reply quotes are unavailable.');
+      this.#resolvePartnerReplyQuote(sessionId, prompt.replyQuote);
+    }
     const workspaceId = prompt.mentions.some((mention) =>
       mention.kind === "workspace_file" || mention.kind === "workspace_directory")
       ? this.inputWorkspaceId(sessionId)
@@ -13462,6 +13515,13 @@ export class SessionHost {
           );
           this.assertQueueProviderAuthentication(item, stored);
           let dispatchBody = this.resolveSessionReferencesForDispatch(sessionId, item.body);
+          if (item.body.replyQuote) {
+            if (!this.#resolvePartnerReplyQuote) throw inputCapabilityError('INPUT_PARTNER_QUOTE_UNAVAILABLE', 'Private reply quotes are unavailable.');
+            const prefix = `${this.#resolvePartnerReplyQuote(sessionId, item.body.replyQuote)}\n\n`;
+            dispatchBody = { ...dispatchBody, text: prefix + dispatchBody.text,
+              ...(dispatchBody.pastedTextRanges ? { pastedTextRanges: dispatchBody.pastedTextRanges.map(range => ({ ...range, start: range.start + prefix.length, end: range.end + prefix.length })) } : {}),
+              ...(dispatchBody.mentionRanges ? { mentionRanges: dispatchBody.mentionRanges.map(range => ({ ...range, start: range.start + prefix.length, end: range.end + prefix.length })) } : {}) };
+          }
           const appContext = reviewReadOnly || dispatchBody.text.trimStart().startsWith("/")
             ? undefined : await this.#resolveMcpAppModelContext?.(sessionId);
           if (appContext?.text) dispatchBody = { ...dispatchBody, text: dispatchBody.text + appContext.text };
@@ -13836,6 +13896,11 @@ export class SessionHost {
     worktree?: SessionDescriptor["worktree"],
     nativeBackgroundTaskId?: string
   ): AdapterContext {
+    let persistentReadOnly: "side_chat" | undefined;
+    try {
+      const session = this.#store.getSession(sessionId).descriptor;
+      if (session.derivationOrigin?.sideChat && session.worktree === undefined) { runtimePolicy = "review_read_only"; persistentReadOnly = "side_chat"; }
+    } catch (error) { if (!(error instanceof NotFoundError && error.resource === "Session")) throw error; }
     const signal = new AbortController().signal;
     const backend = this.#store.getBackend(target.backendId).descriptor;
     const backendInstanceGeneration = backendInstanceGenerationOverride ??
@@ -13854,6 +13919,10 @@ export class SessionHost {
         required: this.#extensionNativeToolAuthorization?.(sessionId)?.required === true,
         capture: () => JSON.stringify([policySnapshotFor(this.#store, target).generation, this.#extensionNativeToolAuthorization?.(sessionId)?.capture() ?? null]),
         snapshot: () => { context.nativeToolAuthorization!.assertCurrent(); return policySnapshotFor(this.#store, target); },
+        readOwnerUserInstructions: () => {
+          context.nativeToolAuthorization!.assertCurrent();
+          return readNativeOwnerInstructions(this.#store, context);
+        },
         ...(nativeBackgroundTaskId !== undefined || runId === undefined || attemptId === undefined || operationId === undefined ? {} : {
           forBackgroundTask: (taskId: string) => {
             if (!taskId || taskId.length > 256 || /[\0\r\n]/u.test(taskId)) throw new StoreError("The native background task identity is invalid.");
@@ -13934,6 +14003,7 @@ export class SessionHost {
       }),
       policySnapshot: policySnapshotFor(this.#store, target),
       ...(runtimePolicy === undefined ? {} : { runtimePolicy }),
+      ...(persistentReadOnly ? { persistentReadOnly } : {}),
       ...(runtimePolicy === "review_read_only" || appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
       extraDirectories: runtimePolicy === "review_read_only" || !extraDirectoriesSupported
         ? []

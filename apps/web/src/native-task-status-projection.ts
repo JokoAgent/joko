@@ -7,13 +7,20 @@ export interface NativeTaskStatusRoute {
   readonly profileId: string; readonly serverId: string; readonly sessionId: string; readonly generation: bigint;
   readonly sourceGeneration: bigint;
   readonly epoch?: number; readonly partnerId?: string;
+  readonly profileKey?: string;
+  readonly connectionGeneration?: number;
+}
+export function nativeTaskStatusProfileKey(profile: ConnectionProfile): string {
+  return JSON.stringify([profile.id, profile.serverId, profile.deviceId, profile.origin, profile.endpointPublicKey ?? "",
+    profile.transportKind ?? "https", profile.entryId ?? ""]);
 }
 export function nativeTaskStatusRouteKey(route: NativeTaskStatusRoute): string {
-  return JSON.stringify([route.profileId, route.serverId, route.sourceGeneration.toString(), route.generation.toString(), route.sessionId]);
+  return JSON.stringify([route.profileId, route.serverId, route.sourceGeneration.toString(), route.generation.toString(), route.sessionId,
+    route.profileKey ?? "", route.connectionGeneration ?? null]);
 }
 export function composeNativeTaskStatusProjection(input: {
   readonly ownerId: string; readonly revision: bigint; readonly locale: JokoDesktopNativeTaskStatusSnapshot["locale"];
-  readonly primary?: { readonly profile: ConnectionProfile; readonly snapshot: AppSnapshot };
+  readonly primary?: { readonly profile: ConnectionProfile; readonly snapshot: AppSnapshot; readonly connectionGeneration?: number };
   readonly remotes: readonly NativeTaskStatusLiveSource[]; readonly selectedProfileIds: ReadonlySet<string>;
 }): { readonly snapshot: JokoDesktopNativeTaskStatusSnapshot; readonly routes: ReadonlyMap<string, NativeTaskStatusRoute> } {
   const routes = new Map<string, NativeTaskStatusRoute>();
@@ -41,6 +48,8 @@ export function composeNativeTaskStatusProjection(input: {
       const session = eligible.find(value => value.id === projected.sessionId)!;
       const partner = partners.get(session.id);
       const route: NativeTaskStatusRoute = { profileId: profile.id, serverId: profile.serverId, sessionId: session.id,
+        profileKey: nativeTaskStatusProfileKey(profile),
+        ...(source || input.primary?.connectionGeneration === undefined ? {} : { connectionGeneration: input.primary.connectionGeneration }),
         generation: session.generation, sourceGeneration: snapshot.generation, ...(source ? { epoch: source.epoch } : {}), ...(partner ? { partnerId: partner.id } : {}) };
       const sessionId = nativeTaskStatusRouteKey(route);
       if (sessionId.length > 1024) continue;

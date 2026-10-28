@@ -15,6 +15,7 @@ export function registerVoiceQuestionTarget(input: { readonly serverId: string; 
       const { root } = input;
       const modal = [...root.ownerDocument.querySelectorAll('[aria-modal="true"]')].at(-1);
       return active && targets.get(key) === target && root.isConnected && !root.closest('[inert]')
+        && !root.querySelector('[data-question-dictating="true"]')
         && root.ownerDocument.visibilityState === 'visible' && (!modal || modal.contains(root));
     }, receive: text => { if (target.isCurrent()) input.receive(text); } };
   targets.set(key, target);

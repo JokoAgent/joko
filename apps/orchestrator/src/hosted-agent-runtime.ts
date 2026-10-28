@@ -14,6 +14,7 @@ import { toProtoCapability, toProtoModelDescriptor } from "./proto-mapper.js";
 import { HOSTED_AGENT_WIRE_FORMAT } from "./hosted-agent-wire.js";
 import { purgeHostedAgentStorage } from "./hosted-agent-run.js";
 import type { HostedAgentNativeMcp } from "./hosted-agent-native-mcp.js";
+import { HostedAgentDerivations } from "./hosted-agent-derivations.js";
 
 export interface HostedAgentBackendFactory {
   readonly backendId: string;
@@ -58,6 +59,7 @@ export class HostedAgentRuntime {
   readonly host: HostedAgentHost;
   readonly #factories: ReadonlyMap<string, HostedAgentBackendFactory>;
   readonly #options: HostedAgentRuntimeOptions;
+  readonly #derivations: HostedAgentDerivations;
   #endpoint?: HostedAgentLifecycleEndpointPort;
   #extensionSync?: {
     invoke(peerScope: string, bytes: Uint8Array, signal: AbortSignal, assertCurrent: () => void): Promise<Uint8Array>;
@@ -75,7 +77,23 @@ export class HostedAgentRuntime {
     this.#options = options; this.settings = new HostedAgentSettings(options.store); this.slots = new HostedAgentSessionSlots(() => this.settings.limits());
     this.#factories = new Map(options.factories.map(factory => [factory.backendId, factory]));
     if (this.#factories.size !== options.factories.length) throw new Error("Hosted Agent Backend factories conflict.");
-    this.host = new HostedAgentHost({ authorize: this.#authorize, infer: this.#infer, authorizeInference: this.#inferenceAccess });
+    const derivations = this.#derivations = new HostedAgentDerivations({ root: options.root, store: new HostedAgentStore(options.store), slots: this.slots,
+      artifactCapacityBytes: options.artifactCapacityBytes, isRunning: (source, operation) => this.host.hasNativeDerivation(source, operation),
+      assertAdoption: (principal, record) => {
+        const route = record.derivation!;
+        this.assertGuestSelection(principal, { backendId: record.owner.backendId, providerId: route.providerId, modelId: route.modelId });
+      },
+      createAdapter: (record, creation, assertCurrent) => {
+        const route = record.derivation!, factory = this.#factories.get(record.owner.backendId);
+        if (!factory || record.owner.trust === "guest" && factory.isolatedGuests?.() !== true) throw new HostedAgentHostError("UNAVAILABLE");
+        const assertModelAllowed = (providerId: string, modelId: string) => {
+          assertCurrent(); if (providerId !== route.providerId || modelId !== route.modelId) throw new HostedAgentHostError("ACCESS_DENIED");
+        };
+        return factory.create({ ...creation, trust: record.owner.trust, providerId: route.providerId, providerIds: [route.providerId], modelIds: [route.modelId], assertModelAllowed,
+          readBlob: async () => { throw new Error("Native cleanup has no input Blob authority."); } });
+      } });
+    this.host = new HostedAgentHost({ authorize: this.#authorize, infer: this.#infer, authorizeInference: this.#inferenceAccess,
+      manageDerivation: (principal, command) => derivations.manage(principal, command, AbortSignal.timeout(25_000)) });
   }
   connectOptions(): HostedAgentConnectOptions {
     const runtime = this;
@@ -95,7 +113,7 @@ export class HostedAgentRuntime {
         remoteControlEnabled: snapshot.value.remoteControlEnabled,
         backends: [...this.#factories.values()].map(factory => {
           const models = factory.models();
-          return { backendId: factory.backendId, instanceGeneration: BigInt(this.#options.store.getBackend(factory.backendId).descriptor.instanceGeneration), displayName: factory.displayName ?? factory.backendId, nativeAdapterKind: factory.describe?.().adapterKind ?? "", nodeId: this.#options.nodeId ?? "",
+          return { backendId: factory.backendId, instanceGeneration: BigInt(this.#options.store.getBackend(factory.backendId).descriptor.instanceGeneration), displayName: factory.displayName ?? factory.backendId, nativeAdapterKind: factory.describe?.().adapterKind ?? "", nodeId: this.#options.nodeId ?? "", maxRuns: this.settings.limits().perDevice,
             capabilities: [...(factory.capabilities?.().values() ?? [])].map(toProtoCapability), version: factory.version?.() ?? "",
             providers: factory.providerIds().map(providerId => {
               const current = models.filter(model => model.providerId === providerId);
@@ -123,6 +141,7 @@ export class HostedAgentRuntime {
     const errors: unknown[] = [];
     if (this.#endpoint && this.#endpoint !== this.host) { try { await this.#endpoint.dispose(); } catch (error) { errors.push(error); } }
     try { await this.host.dispose(); } catch (error) { errors.push(error); }
+    try { await this.#derivations.dispose(); } catch (error) { errors.push(error); }
     if (errors.length) throw new AggregateError(errors, "Native endpoint cleanup could not be confirmed.");
   }
   /** Reconcile private data left by a previously confirmed closed guest.
@@ -130,14 +149,22 @@ export class HostedAgentRuntime {
   async purgeClosedProviderSessions(removed: (owner: HostedNativeProviderGrantOwner) => boolean): Promise<void> {
     const store = new HostedAgentStore(this.#options.store);
     for (const record of store.list()) if (record.owner.providerGrant && removed(record.owner.providerGrant)
-      && (record.state === "closed" || record.state === "purging")) {
+      && this.#canPurgeNativeRecord(store, record)) {
       await purgeHostedAgentStorage({ root: this.#options.root, store, key: record.key, leaseId: record.leaseId });
     }
   }
   async purgeClosedRelayedGuestSessions(authorityId: string, backendId: string): Promise<void> {
     const store = new HostedAgentStore(this.#options.store);
     for (const record of store.list()) if (record.owner.trust === "guest" && record.owner.authorityId === authorityId && record.owner.backendId === backendId
-      && (record.state === "closed" || record.state === "purging")) await purgeHostedAgentStorage({ root: this.#options.root, store, key: record.key, leaseId: record.leaseId });
+      && this.#canPurgeNativeRecord(store, record)) await purgeHostedAgentStorage({ root: this.#options.root, store, key: record.key, leaseId: record.leaseId });
+  }
+  #canPurgeNativeRecord(store: HostedAgentStore, record: import("@joko/store").HostedNativeSessionRecord): boolean {
+    if (this.#derivations.hasPhysicalOwner(record.key)) return false;
+    if (record.state === "closed" || record.state === "purging") return true;
+    const derivation = record.derivation;
+    if (!derivation || derivation.adopted || this.host.hasNativeDerivation(derivation.sourceKey, derivation.operationId)) return false;
+    const source = store.find(derivation.sourceKey);
+    return source === undefined || source.state === "closed" || source.state === "purging";
   }
   authenticate(context: HandlerContext): HostedAgentPrincipal | Promise<HostedAgentPrincipal> {
     if ((context.requestHeader.get("authorization") ?? "").startsWith("ProviderShareGuest ")) {
@@ -168,7 +195,7 @@ export class HostedAgentRuntime {
     const models = available.filter(model => this.settings.allowsModel(backendId, providerId, model.modelId));
     const descriptor = factory.describe?.(), provider = descriptor?.providers?.find(item => item.providerId === providerId);
     const catalog = create(contract.HostedAgentBackendCatalogSchema, { backendId, instanceGeneration: BigInt(this.#options.store.getBackend(backendId).descriptor.instanceGeneration), displayName: factory.displayName ?? backendId, nativeAdapterKind: descriptor?.adapterKind ?? "", nodeId: this.#options.nodeId ?? "",
-      version: factory.version?.() ?? "", capabilities: [...(factory.capabilities?.().values() ?? [])].map(toProtoCapability),
+      version: factory.version?.() ?? "", capabilities: [...(factory.capabilities?.().values() ?? [])].map(toProtoCapability), maxRuns: this.settings.limits().perDevice,
       providers: [{ providerId, displayName: providerId, accessKind: provider?.accessKind ?? "", accessProduct: provider?.accessProduct ?? "",
         remoteInvocationEnabled: true, connected: true, models: models.map(model => toProtoModelDescriptor(backendId, model)) }] });
     return { models, catalog, assertCurrent };

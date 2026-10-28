@@ -678,7 +678,7 @@ describe("BrowserToolBridgeProvider", () => {
         ? {
             ok: true,
             data: { targetId: "remote-page" },
-            binary: { bytes: Uint8Array.from([1, 2, 3]), mediaType: "image/png" as const }
+            binary: { bytes: Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]), mediaType: "image/png" as const }
           }
         : { ok: true, data: { accepted: true, arguments: request.arguments } });
     const route = {
@@ -718,7 +718,7 @@ describe("BrowserToolBridgeProvider", () => {
       action: "screenshot", target: "node", node: "node-a", targetId: "remote-page"
     });
     expect(screenshot.content).toContainEqual({
-      type: "image", data: Buffer.from([1, 2, 3]).toString("base64"), mimeType: "image/png"
+      type: "image", data: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString("base64"), mimeType: "image/png"
     });
 
     await expect(bridge.callTool("browser", {

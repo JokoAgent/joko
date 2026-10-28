@@ -744,6 +744,44 @@ describe("public computer automation surface", () => {
     expect(connection.callRequests).toHaveLength(callsBeforeStaleAction);
   });
 
+  it("requests structured current-driver rows and translates fresh index actions into native tokens", async () => {
+    const currentDriver = structuredClone(driverContract);
+    for (const tool of currentDriver.tools) {
+      const schema = tool.inputSchema as { properties: Record<string, unknown>; required?: string[]; additionalProperties?: boolean };
+      if (tool.name === "get_window_state") schema.properties["tree_format"] = { type: "string", enum: ["markdown", "json", "both"] };
+      if (tool.name === "click") {
+        delete schema.properties["element_index"];
+        delete schema.properties["snapshot_id"];
+        delete schema.properties["delivery_mode"];
+        schema.properties["element_token"] = { type: "string" };
+      }
+    }
+    let observation = 0;
+    const connection = new FakeConnection({
+      listTools: async () => currentDriver,
+      callTool: async (name, args) => name === "get_window_state"
+        ? { structuredContent: args["tree_format"] === "both"
+          ? { ok: true, snapshot_id: `native-${++observation}`, elements: [{ element_index: 3, element_token: `native-${observation}:3` }] }
+          : { ok: true, tree: "Markdown without actionable rows" } }
+        : { structuredContent: { ok: true } }
+    });
+    const provider = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([connection]).factory });
+    const fence = await provider.openSession("current-driver");
+    const observed = await provider.callTool(fence, "get_window_state", { pid: 10, window_id: 2, include_screenshot: false });
+    const snapshotId = observed.structuredContent?.["snapshot_id"];
+    await provider.callTool(fence, "click", { pid: 10, window_id: 2, snapshot_id: snapshotId, element_index: 3, delivery_mode: "background" });
+    expect(connection.callRequests[1]?.arguments).toMatchObject({ element_token: "native-1:3" });
+    expect(connection.callRequests[1]?.arguments).not.toHaveProperty("element_index");
+    expect(connection.callRequests[1]?.arguments).not.toHaveProperty("snapshot_id");
+    expect(connection.callRequests[1]?.arguments).not.toHaveProperty("delivery_mode");
+    await provider.callTool(fence, "get_window_state", { pid: 10, window_id: 2, include_screenshot: false });
+    const count = connection.callRequests.length;
+    expect(await provider.callTool(fence, "click", { pid: 10, window_id: 2, snapshot_id: snapshotId, element_index: 3 }))
+      .toMatchObject({ isError: true, structuredContent: { errorCode: "STALE_SNAPSHOT" } });
+    expect(connection.callRequests).toHaveLength(count);
+    await provider.closeAll();
+  });
+
   it.each([
     { name: "MCP error", result: { isError: true } },
     { name: "structured failure", result: { structuredContent: { ok: false } } },

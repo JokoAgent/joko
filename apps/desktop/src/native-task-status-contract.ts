@@ -24,12 +24,13 @@ export function parseSnapshot(value: unknown): NativeTaskStatusSnapshot {
 
 function parseSession(value: unknown): NativeTaskStatusSession {
   if (!record(value) || !keys(value, ["activityLines", "detail", "phase", "sessionId", "title", "updatedAt"],
-    ["interactionKind", "inputHandoff", "permission", "startedAt", "remote"]) ||
+    ["interactionKind", "inputHandoff", "permission", "startedAt", "remote", "completionIdentity"]) ||
     !identity(value["sessionId"], 1024) || !display(value["title"], 160) || !display(value["detail"], 600) ||
     !phase(value["phase"]) || !timestamp(value["updatedAt"]) ||
     (value["startedAt"] !== undefined && !timestamp(value["startedAt"])) ||
     (value["interactionKind"] !== undefined && !interactionKind(value["interactionKind"])) ||
     (value["inputHandoff"] !== undefined && value["inputHandoff"] !== true) ||
+    (value["completionIdentity"] !== undefined && !identity(value["completionIdentity"], 256)) ||
     !Array.isArray(value["activityLines"]) || value["activityLines"].length > 3) {
     throw new TypeError("Native task-status task is invalid.");
   }
@@ -43,6 +44,7 @@ function parseSession(value: unknown): NativeTaskStatusSession {
   return Object.freeze({ sessionId: value["sessionId"], title: value["title"], detail: value["detail"], phase: value["phase"],
     ...(value["interactionKind"] === undefined ? {} : { interactionKind: value["interactionKind"] }),
     ...(value["inputHandoff"] ? { inputHandoff: true as const } : {}),
+    ...(value["completionIdentity"] === undefined ? {} : { completionIdentity: value["completionIdentity"] }),
     activityLines: Object.freeze(value["activityLines"].map(parseActivityLine)),
     ...(value["startedAt"] === undefined ? {} : { startedAt: value["startedAt"] }), updatedAt: value["updatedAt"],
     ...(permission === undefined ? {} : { permission }), ...(remote === undefined ? {} : { remote }) });

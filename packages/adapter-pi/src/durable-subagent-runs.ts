@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, rmd
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { piError } from "./errors.js";
+import { readManagedSubagentRecoveryInventory } from "./managed-subagent-process-inventory.js";
 
 const RUN_FORMAT = 1;
 const MAX_STATUS_BYTES = 512 * 1024;
@@ -37,6 +38,8 @@ interface ValidatedDurableRun {
   readonly providerId?: string;
   readonly claimPid?: number;
   readonly hasRunnerClaim: boolean;
+  /** In-memory proof from this pass's uncached OS inventory; never persisted. */
+  readonly processExitVerified?: true;
 }
 
 export interface ManagedSubagentRecoveryRunInput {
@@ -211,6 +214,7 @@ export async function validateManagedSubagentRecoveryRun(
  * claim have all validated and no claimed runner process is alive.
  */
 export async function reconcileManagedSubagentAuthHomes(root: string): Promise<number> {
+  const deadline = Date.now() + 8_000;
   const normalizedRoot = resolve(root);
   if (!isAbsolute(root) || normalizedRoot !== root) {
     throw piError("PI_SUBAGENT_RECOVERY_SCOPE_INVALID", "Managed background recovery scope is invalid", "provision");
@@ -238,7 +242,7 @@ export async function reconcileManagedSubagentAuthHomes(root: string): Promise<n
     }
     const productSessionId = await discoverProductSessionId(sessionDirectory, entry.name);
     if (productSessionId === undefined) continue;
-    const runs = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId));
+    const runs = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId, deadline));
     for (const run of runs) {
       if (!TERMINAL_STATES.has(run.status.state) || !run.hasRunnerClaim || ownedRunnerIsAlive(run)) continue;
       if (await removeManagedSubagentAuthRun(root, entry.name, run.status.runId)) removed += 1;
@@ -257,6 +261,7 @@ export async function stopAndRemoveManagedSubagentRuns(
   productSessionId: string,
   timeoutMs: number
 ): Promise<void> {
+  const deadline = Date.now() + Math.max(1_000, timeoutMs);
   const normalizedRoot = resolve(root);
   if (!isAbsolute(root) || normalizedRoot !== root || productSessionId.trim() === "") {
     throw piError("PI_SUBAGENT_DELETE_SCOPE_INVALID", "Managed background deletion scope is invalid", "session");
@@ -286,7 +291,7 @@ export async function stopAndRemoveManagedSubagentRuns(
     throw piError("PI_SUBAGENT_SESSION_ROOT_UNSAFE", "Managed background session storage is not a canonical private directory", "session");
   }
 
-  const runs = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId));
+  const runs = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId, deadline));
   const active = runs.filter((entry) => !TERMINAL_STATES.has(entry.status.state));
   const requestedAt = Date.now();
   await Promise.all(active.map(async ({ directory, status }, index) => {
@@ -304,9 +309,8 @@ export async function stopAndRemoveManagedSubagentRuns(
     await atomicWriteJson(join(directory, "control.json"), control);
   }));
 
-  const deadline = Date.now() + Math.max(1_000, timeoutMs);
   for (;;) {
-    const remaining = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId));
+    const remaining = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId, deadline));
     const nonterminal = remaining.filter((entry) => !TERMINAL_STATES.has(entry.status.state));
     const ownersStillExiting = remaining.filter((entry) =>
       TERMINAL_STATES.has(entry.status.state) && ownedRunnerIsAlive(entry));
@@ -345,6 +349,7 @@ export async function stopManagedSubagentRunsByProvider(
   providerId: string,
   timeoutMs: number
 ): Promise<void> {
+  const deadline = Date.now() + Math.max(1_000, timeoutMs);
   const normalizedRoot = resolve(root);
   if (!isAbsolute(root) || normalizedRoot !== root
       || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(providerId)) {
@@ -372,7 +377,7 @@ export async function stopManagedSubagentRunsByProvider(
     }
     const productSessionId = await discoverProductSessionId(sessionDirectory, entry.name);
     if (productSessionId === undefined) continue;
-    const runs = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId));
+    const runs = await reconcileDeadRunOwners(await readRunStatuses(sessionDirectory, productSessionId, deadline));
     for (const run of runs) {
       if ((!TERMINAL_STATES.has(run.status.state) || ownedRunnerIsAlive(run))
           && run.providerId === undefined) {
@@ -409,13 +414,12 @@ export async function stopManagedSubagentRunsByProvider(
     })];
   }));
 
-  const deadline = Date.now() + Math.max(1_000, timeoutMs);
   for (;;) {
     let pending = false;
     for (const target of targets) {
       const sessionDirectory = join(root, target.sessionKey);
       const current = (await reconcileDeadRunOwners(
-        await readRunStatuses(sessionDirectory, target.productSessionId)
+        await readRunStatuses(sessionDirectory, target.productSessionId, deadline)
       )).find((entry) => entry.status.runId === target.run.status.runId);
       if (current !== undefined && (!TERMINAL_STATES.has(current.status.state) || ownedRunnerIsAlive(current))) {
         pending = true;
@@ -481,9 +485,12 @@ async function discoverProductSessionId(sessionDirectory: string, expectedSessio
   if (!runInfo.isDirectory() || runInfo.isSymbolicLink() || !samePath(await realpath(runDirectory), runDirectory)) {
     throw piError("PI_SUBAGENT_RUN_DIRECTORY_UNSAFE", "Managed background run storage contains a path alias", "provision");
   }
-  const status = await readBoundedJson(join(runDirectory, "status.json"));
-  const productSessionId = status !== null && typeof status === "object" && !Array.isArray(status)
-    ? (status as Record<string, unknown>)["productSessionId"]
+  const status = await readStatusCandidate(join(runDirectory, "status.json"));
+  const source = status !== null && typeof status === "object" && !Array.isArray(status)
+    && typeof (status as Record<string, unknown>)["productSessionId"] === "string"
+    ? status : await readBoundedJson(join(runDirectory, "config.json"));
+  const productSessionId = source !== null && typeof source === "object" && !Array.isArray(source)
+    ? (source as Record<string, unknown>)["productSessionId"]
     : undefined;
   if (typeof productSessionId !== "string" || productSessionId.trim() === ""
       || managedSubagentSessionKey(productSessionId) !== expectedSessionKey) {
@@ -541,7 +548,8 @@ async function removeManagedSubagentAuthRun(
 
 async function readRunStatuses(
   sessionDirectory: string,
-  productSessionId: string
+  productSessionId: string,
+  deadline: number
 ): Promise<readonly ValidatedDurableRun[]> {
   const entries = await readdir(sessionDirectory, { withFileTypes: true });
   const values: ValidatedDurableRun[] = [];
@@ -553,12 +561,7 @@ async function readRunStatuses(
     if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(directory), directory)) {
       throw piError("PI_SUBAGENT_RUN_DIRECTORY_UNSAFE", "Managed background run storage contains a path alias", "session");
     }
-    const status = await readBoundedJson(join(directory, "status.json"));
-    if (!isDurableRunStatus(status, entry.name, productSessionId)) {
-      throw piError("PI_SUBAGENT_STATUS_INVALID", "Managed background status failed ownership validation", "session", {
-        recovery: "Quarantine the corrupt private run directory before retrying parent deletion."
-      });
-    }
+    const candidate = await readStatusCandidate(join(directory, "status.json"));
     const config = await readBoundedJson(join(directory, "config.json"));
     const owner = await readBoundedJson(join(directory, "owner.json"));
     const claim = await readBoundedJson(join(directory, "runner.claim.json")).catch((error: NodeJS.ErrnoException) => {
@@ -566,6 +569,13 @@ async function readRunStatuses(
       throw error;
     });
     const runnerScript = join(directory, "joko-managed-subagent-runner.cjs");
+    const recovered = !isDurableRunStatus(candidate, entry.name, productSessionId);
+    const status = recovered
+      ? await terminalStatusFromReceipt(directory, entry.name, productSessionId, config, owner, claim)
+      : candidate;
+    if (status === undefined || !isDurableRunStatus(status, entry.name, productSessionId)) {
+      throw invalidTerminalRecovery();
+    }
     if (!isRunManifest(config, status, runnerScript) || !isRunOwnerManifest(owner, status, runnerScript)) {
       throw piError("PI_SUBAGENT_OWNER_INVALID", "Managed background owner manifest failed exact run validation", "session", {
         recovery: "Quarantine the corrupt private run directory before retrying parent deletion."
@@ -587,13 +597,68 @@ async function readRunStatuses(
       config: configRecord,
       ...(providerId === undefined ? {} : { providerId }),
       hasRunnerClaim: claim !== undefined,
+      ...(recovered ? { processExitVerified: true as const } : {}),
       ...((claim !== null && typeof claim === "object" && !Array.isArray(claim)
         && Number.isSafeInteger((claim as Record<string, unknown>)["runnerPid"]))
         ? { claimPid: Number((claim as Record<string, unknown>)["runnerPid"]) }
         : {})
     });
   }
+  const recovered = values.filter(value => value.processExitVerified);
+  if (recovered.length) {
+    // Read every receipt before the OS inventory. A cached or earlier process
+    // table could miss a newly launched child carrying a later receipt's ID.
+    const commands = await readManagedSubagentRecoveryInventory(deadline);
+    if (commands === undefined || recovered.some(value => {
+      const nativeSessionId = String(value.config["nativeSessionId"]).toLowerCase();
+      return commands.some(command => command.toLowerCase().includes(value.status.runId.toLowerCase())
+        || command.toLowerCase().includes(nativeSessionId));
+    })) throw invalidTerminalRecovery();
+  }
   return values;
+}
+
+async function readStatusCandidate(path: string): Promise<unknown> {
+  try { return await readBoundedJson(path); }
+  catch (error) {
+    // Unsafe aliases, links and oversized files remain blocked. A missing or
+    // corrupt regular JSON snapshot can be reconciled using independent proof.
+    if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function invalidTerminalRecovery(): Error {
+  return piError("PI_SUBAGENT_STATUS_INVALID", "Managed background status has no verified terminal recovery", "session", {
+    recovery: "Keep the original run intact until its exact terminal receipt and complete process-exit inventory can be verified. No disk PID was signalled."
+  });
+}
+
+async function terminalStatusFromReceipt(directory: string, runId: string, productSessionId: string,
+  configValue: unknown, ownerValue: unknown, claimValue: unknown): Promise<DurableRunStatus | undefined> {
+  try {
+    const record = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown> : undefined;
+    const config = record(configValue), owner = record(ownerValue), claim = record(claimValue);
+    const receipt = record(await readBoundedJson(join(directory, "result.json")));
+    if (!config || !owner || !claim || !receipt || config["runDir"] !== directory
+      || !UUID_PATTERN.test(String(config["nativeSessionId"] ?? ""))
+      || receipt["format"] !== RUN_FORMAT || receipt["runId"] !== runId || receipt["productSessionId"] !== productSessionId
+      || receipt["launchToken"] !== config["launchToken"] || receipt["taskId"] !== config["taskId"]
+      || receipt["runnerInstanceId"] !== config["runnerInstanceId"] || receipt["runnerInstanceId"] !== owner["runnerInstanceId"]
+      || receipt["runnerScriptSha256"] !== config["runnerScriptSha256"]
+      || receipt["nativeSessionId"] !== config["nativeSessionId"]
+      || !TERMINAL_STATES.has(String(receipt["state"])) || !Number.isSafeInteger(receipt["completedAt"])
+      || Number(receipt["completedAt"]) < 0 || !Number.isSafeInteger(receipt["runnerPid"]) || Number(receipt["runnerPid"]) < 1
+      || owner["runnerPid"] !== receipt["runnerPid"]) return undefined;
+    const status = { ...config, state: receipt["state"], runnerPid: receipt["runnerPid"],
+      heartbeatAt: receipt["completedAt"], runnerInstanceId: receipt["runnerInstanceId"] };
+    if (!isDurableRunStatus(status, runId, productSessionId)
+      || !isRunManifest(config, status, join(directory, "joko-managed-subagent-runner.cjs"))
+      || !isRunOwnerManifest(owner, status, status.runnerScript)
+      || !isRunnerClaim(claim, status, status.runnerScriptSha256, owner)) return undefined;
+    return status;
+  } catch { return undefined; }
 }
 
 async function reconcileDeadRunOwners(
@@ -765,6 +830,7 @@ async function claimAbandonedLaunch(entry: ValidatedDurableRun): Promise<boolean
 }
 
 function ownedRunnerIsAlive(entry: ValidatedDurableRun): boolean {
+  if (entry.processExitVerified) return false;
   const observedPid = entry.status.runnerPid > 0 ? entry.status.runnerPid : entry.claimPid;
   return processIsAlive(observedPid ?? 0);
 }

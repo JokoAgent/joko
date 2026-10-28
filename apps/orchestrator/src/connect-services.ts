@@ -1548,7 +1548,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
     application.partnerConnections,
     application.partnerSkills,
     application.partnerSessionTasks,
-    application.partnerTaskOutputs
+    application.partnerTaskOutputs,
+    application.partnerAutonomy
   );
   const partnerRoutine = createPartnerRoutineConnectService(application.partnerRoutines, context => authenticate(context));
   const partnerGroup = createPartnerGroupConnectService(application.partnerGroups, application.store, context => authenticate(context),
@@ -11005,7 +11006,15 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
       : {
           mainView: create(contract.ExtensionMainViewDescriptorSchema, {
             ...(item.mainView.title === undefined ? {} : { title: item.mainView.title }),
-            icon: protoExtensionMainViewIcon(item.mainView.icon)
+            icon: protoExtensionMainViewIcon(item.mainView.icon),
+            open: item.mainView.open === "sidebar" ? contract.ExtensionMainViewOpenMode.SIDEBAR
+              : item.mainView.open === "window" ? contract.ExtensionMainViewOpenMode.WINDOW
+              : item.mainView.open === "page" ? contract.ExtensionMainViewOpenMode.PAGE : contract.ExtensionMainViewOpenMode.UNSPECIFIED,
+            side: item.mainView.side === "left" ? contract.ExtensionTabSide.LEFT
+              : item.mainView.side === "right" ? contract.ExtensionTabSide.RIGHT
+              : item.mainView.side === "top" ? contract.ExtensionTabSide.TOP
+              : item.mainView.side === "bottom" ? contract.ExtensionTabSide.BOTTOM : contract.ExtensionTabSide.UNSPECIFIED,
+            multiple: item.mainView.multiple === true
           })
         }),
     ...(item.library === undefined
@@ -11083,6 +11092,9 @@ function requireExtensionMainViewAuthority(
     extensionEntry: extension.mainView.extensionEntry,
     mainView: {
       html: extension.mainView.html,
+      ...(extension.mainView.open === undefined ? {} : { open: extension.mainView.open }),
+      ...(extension.mainView.side === undefined ? {} : { side: extension.mainView.side }),
+      ...(extension.mainView.multiple === undefined ? {} : { multiple: extension.mainView.multiple }),
       ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
       ...(extension.mainView.icon === undefined ? {} : { icon: extension.mainView.icon })
     },
@@ -11107,6 +11119,8 @@ function assertCurrentExtensionMainViewAuthority(
     || current.packageVersion !== expected.packageVersion || current.extensionEntry !== expected.extensionEntry
     || current.mainView.html !== expected.mainView.html || current.mainView.title !== expected.mainView.title
     || current.mainView.icon !== expected.mainView.icon
+    || current.mainView.open !== expected.mainView.open || current.mainView.side !== expected.mainView.side
+    || current.mainView.multiple !== expected.mainView.multiple
     || current.library?.schemaVersion !== expected.library?.schemaVersion
     || (current.library === undefined) !== (expected.library === undefined)) throw new Error("Extension main-view authority changed.");
 }
@@ -16930,6 +16944,11 @@ async function dispatchMutation(
           body: mutation,
           sessionLifecycleFenceId: payload.value.sessionId,
           precondition: (store) => {
+            const schedules = store.readSessionArchiveSchedules(payload.value.sessionId);
+            if ((schedules.count > 0 || payload.value.archiveConfirmation !== "")
+              && payload.value.archiveConfirmation !== schedules.confirmation) {
+              throw new ConnectError("Review the current active automations before archiving this task.", Code.FailedPrecondition);
+            }
             assertSessionArchiveIdle(store, payload.value.sessionId);
             try {
               dependencies.sessionHost.assertSessionLifecycleIdle(payload.value.sessionId);
@@ -17065,6 +17084,26 @@ async function dispatchMutation(
         }
         throw error;
       }
+    }
+    case "openSideChat": {
+      const expected = mutation.preconditions.find((value) => value.entity?.kind === contract.EntityKind.SESSION
+        && value.entity.id === payload.value.sourceSessionId)?.expectedGeneration;
+      if (expected === undefined || expected < 1n || expected > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw invalidArgument("open_side_chat requires the current source Session generation");
+      }
+      const nestedId = nestedOperationId(payload.case, operationId);
+      const sessionId = stableId("session", nestedId);
+      const execution = await host.mutate({
+        operationId, connection, kind: payload.case, body: mutation,
+        commit: () => ({ accepted: true, resultCase: "session", entityId: sessionId } satisfies OperationOutcome),
+        effect: async () => {
+          const nested = await host.openSideChat({ operationId: nestedId, connection,
+            sourceSessionId: payload.value.sourceSessionId, title: payload.value.newDisplayName,
+            expectedGeneration: Number(expected) });
+          if (nested.value.sessionId !== sessionId) throw new Error("OpenSideChat returned a non-deterministic Session ID.");
+        }
+      });
+      return presented(execution);
     }
     case "forkSession": {
       const sourceMessage = derivationSourceMessageInput(

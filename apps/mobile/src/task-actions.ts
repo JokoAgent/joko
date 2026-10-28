@@ -18,7 +18,7 @@ import { insertMobileMessageReference, mobileVisibleSelectionQuoteText,
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 
-export type MobileMessageActionId = "add-to-composer" | "quote-selection" | "copy-text" | "copy-link" | "share-image" | "fork" | "rewind" | "delete";
+export type MobileMessageActionId = "add-to-composer" | "reply" | "quote-selection" | "copy-text" | "copy-link" | "share-image" | "fork" | "rewind" | "delete";
 
 export interface MobileMessageActionItem {
   readonly id: MobileMessageActionId;
@@ -75,7 +75,7 @@ export function commitMobileMessageReference(input: { readonly lease: MobileMess
 
 export function buildMobileMessageActions(
   row: TimelineRow,
-  input: { readonly canDelete: boolean; readonly canFork?: boolean; readonly canRewind?: boolean; readonly canAddToComposer?: boolean;
+  input: { readonly canDelete: boolean; readonly canFork?: boolean; readonly canRewind?: boolean; readonly canAddToComposer?: boolean; readonly canReplyQuote?: boolean;
     readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly shareDisabled?: boolean }
 ): readonly MobileMessageActionItem[] {
   if (!row.completed || row.optimistic || row.internalInput || row.kind === "user" && row.partnerPrivateOrigin
@@ -84,7 +84,8 @@ export function buildMobileMessageActions(
   if (buildMobileMessageCopyText(row, input.locale).trim()) actions.push({ id: "copy-text",
     label: mobileMessage(input.locale, input.copyDisabled ? "actions.copyingMessage" : "actions.copyMessage"),
     ...(input.copyDisabled ? { disabled: true } : {}) });
-  if (input.canAddToComposer !== false) actions.push({ id: "add-to-composer", label: mobileMessage(input.locale, "actions.addToComposer") });
+  if (input.canReplyQuote) actions.push({ id: 'reply', label: input.locale === 'zh-CN' ? '引用回复' : 'Reply' });
+  else if (input.canAddToComposer !== false) actions.push({ id: "add-to-composer", label: mobileMessage(input.locale, "actions.addToComposer") });
   if (row.quoteSource !== undefined) actions.push({ id: "quote-selection", label: mobileMessage(input.locale, "actions.quoteSelection") });
   actions.push({
     id: "copy-link",
@@ -196,7 +197,7 @@ export function editQueueItemText(
   if (replacementText === visibleText) return undefined;
   const parts = [create(InputPartSchema, { content: { case: "text", value: replacementText } })];
   return {
-    input: create(InputContentSchema, { parts }),
+    input: create(InputContentSchema, { parts, ...(input.replyQuote ? { replyQuote: input.replyQuote } : {}) }),
     textSplices: [create(QueueTextEditSpliceSchema, {
       start: 0,
       end: originalText.length,

@@ -1,7 +1,10 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { DesktopRemoteDesktopInput } from "../src/remote-desktop-input.js";
 vi.mock("electron", () => ({ app: { isPackaged: false }, screen: {}, nativeImage: {} }));
-import { DesktopRemoteDesktopWindowsHost, type DesktopRemoteDesktopWindowsConnection,
+import { DesktopRemoteDesktopWindowsHost, parseDesktopRemoteDesktopWindowsDiagnostic, prepareDevelopmentWindowsAddon, type DesktopRemoteDesktopWindowsConnection,
   type DesktopRemoteDesktopWindowsRuntime } from "../src/remote-desktop-windows-host.js";
 import { DesktopRemoteDesktopWindowsInput } from "../src/remote-desktop-windows-input.js";
 import { DesktopRemoteDesktopWindowsCapture, decodeDesktopRemoteDesktopWindowsFrame } from "../src/remote-desktop-windows-capture.js";
@@ -17,11 +20,42 @@ function fallback() { return { start: vi.fn(async () => undefined), stop: vi.fn(
   retire: vi.fn(async () => undefined), send: vi.fn(), pauseForPrivacy: vi.fn(), resumeAfterPrivacy: vi.fn() } as unknown as DesktopRemoteDesktopInput; }
 
 describe("Windows authorized service boundary", () => {
-  it("never loads the addon or requests elevation from a development install", async () => {
+  it("uses explicit development setup only for the fixed source-mode runtime", async () => {
     const native = runtime({ packaged: false }); const host = new DesktopRemoteDesktopWindowsHost(native);
-    expect(await host.readSupport()).toBe("installRequired");
+    expect(await host.readSupport()).toBe("ready");
+    await host.configure(true);
+    expect(native.execute).toHaveBeenCalledWith("protected-host.exe", ["--elevate-install", String(process.pid), "--development"], 130_000);
+    await host.configure(false);
+    expect(native.execute).toHaveBeenCalledWith("protected-host.exe", ["--elevate-uninstall"], 130_000);
+  });
+  it("keeps only bounded typed setup diagnostics through failure and clears them after confirmed setup", async () => {
+    const execute = vi.fn(async () => "missing\n");
+    execute.mockRejectedValueOnce(Object.assign(new Error("C:\\private\\source"), { stdout: "error elevate-child/stage-write 5\n" }));
+    const native = runtime({ execute }); const host = new DesktopRemoteDesktopWindowsHost(native);
     await expect(host.configure(true)).rejects.toThrow("REMOTE_DESKTOP_SYSTEM_SERVICE_UNAVAILABLE");
-    expect(native.resolve).not.toHaveBeenCalled(); expect(native.open).not.toHaveBeenCalled(); expect(native.execute).not.toHaveBeenCalled();
+    expect(host.diagnostic).toEqual({ step: "elevate-child", childStep: "stage-write", osError: 5 });
+    expect(await host.readSupport()).toBe("missing");
+    expect(host.diagnostic?.step).toBe("elevate-child");
+    execute.mockResolvedValue("ready\n"); await host.configure(true);
+    expect(host.diagnostic).toBeUndefined();
+    expect(parseDesktopRemoteDesktopWindowsDiagnostic("installRequired protected-reparse 0")).toEqual({ step: "protected-reparse", osError: 0 });
+    for (const invalid of ["error C:\\private 5", "error credential-account 5", "error stage-read -1", "error stage-read 5\nC:\\private"]) {
+      expect(parseDesktopRemoteDesktopWindowsDiagnostic(invalid)).toBeUndefined();
+    }
+  });
+  it("keeps loaded source addons immutable across rebuilds and refuses altered cached bytes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-windows-addon-"));
+    try {
+      const source = join(directory, "source.node"), cache = join(directory, "cache");
+      await writeFile(source, "first native build");
+      const first = await prepareDevelopmentWindowsAddon(source, cache);
+      await writeFile(source, "second native build");
+      const second = await prepareDevelopmentWindowsAddon(source, cache);
+      expect(second).not.toBe(first); expect(await readFile(first, "utf8")).toBe("first native build");
+      expect(await prepareDevelopmentWindowsAddon(source, cache)).toBe(second);
+      await writeFile(second, "unexpected replacement");
+      await expect(prepareDevelopmentWindowsAddon(source, cache)).rejects.toThrow("REMOTE_DESKTOP_SYSTEM_SERVICE_UNAVAILABLE");
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
   it("requires an authenticated Main probe and actual release, retaining failed close for retry", async () => {
     const probe = connection(); vi.mocked(probe.close).mockRejectedValueOnce(new Error("private OS detail"));

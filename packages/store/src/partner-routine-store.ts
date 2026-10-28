@@ -62,6 +62,8 @@ function assertState(value: unknown): asserts value is RoutineState {
       || !Array.isArray(routine.triggers) || routine.triggers.length > 32
       || routine.enabled && routine.triggers.length === 0) invalid();
     ids.add(routine.id);
+    if (routine.builtin !== undefined && routine.builtin !== "follow-up"
+      || routine.builtinVersion !== undefined && (routine.builtin === undefined || !positive(routine.builtinVersion))) invalid();
     if (routine.preRunHook !== undefined) {
       const hook = record(routine.preRunHook);
       if (typeof hook.command !== "string" || !hook.command.trim() || hook.command.length > 32_000

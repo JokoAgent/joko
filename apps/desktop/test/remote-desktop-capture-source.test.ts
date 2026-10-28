@@ -10,6 +10,34 @@ const cleanup: (() => void)[] = [];
 afterEach(() => { for (const stop of cleanup.splice(0)) stop(); });
 
 describe("Remote Desktop active capture source", () => {
+  it("releases congested input without losing requests, then resumes only fresh input", async () => {
+    const h = await harness(), channel = h.openInputChannel();
+    const pending: (() => void)[] = [];
+    h.input.mockImplementation(() => new Promise<void>(resolve => { pending.push(resolve); }));
+    for (let sequence = 1; sequence <= 9; sequence++) channel.receive({ sequence, events: [{ kind: "key", code: "KeyA", down: true }] });
+    expect(h.input).toHaveBeenCalledTimes(9);
+    expect(h.input.mock.calls[8]).toEqual(["lease", 9, [{ kind: "release" }]]);
+    channel.receive({ sequence: 10, events: [{ kind: "move", x: 0.5, y: 0.5 }] });
+    expect(h.input).toHaveBeenCalledTimes(9);
+    channel.receive({ type: "request", id: "during-release", request: { op: "capabilities" } });
+    await vi.waitFor(() => expect(channel.send).toHaveBeenCalled());
+    expect(channel.close).not.toHaveBeenCalled();
+    pending.splice(0).forEach(resolve => { resolve(); });
+    await vi.waitFor(() => { channel.receive({ sequence: 11, events: [{ kind: "release" }] }); expect(h.input).toHaveBeenCalledTimes(10); });
+    pending.splice(0).forEach(resolve => { resolve(); });
+    h.command({ op: "stop" });
+  });
+
+  it("rejects malformed input while congested and ignores messages on a retired channel", async () => {
+    const h = await harness(), channel = h.openInputChannel();
+    h.input.mockImplementation(() => new Promise<void>(() => undefined));
+    for (let sequence = 1; sequence <= 8; sequence++) channel.receive({ sequence, events: [{ kind: "release" }] });
+    channel.receive({ sequence: 9, events: [{ kind: "key", code: "untrusted-code", down: true }] });
+    expect(channel.close).toHaveBeenCalledOnce();
+    channel.receive({ sequence: 10, events: [{ kind: "release" }] });
+    expect(h.input).toHaveBeenCalledTimes(8);
+  });
+
   it("answers with video after an initial audio failure and fills the negotiated sender with bounded retry", async () => {
     const h = await harness({ audio: true, capture: async () => { throw new Error("permission"); } });
     expect(h.audioTransceiver.direction).toBe("sendonly");
@@ -157,9 +185,12 @@ async function harness(options: { audio?: boolean; capture?: () => Promise<Strea
   const draw = vi.fn();
   const receipts: { id: string; value: DesktopRemoteDesktopCaptureReply }[] = [];
   const peerConfigurations: unknown[] = [];
+  const input = vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined);
   let listener!: (_event: unknown, command: DesktopRemoteDesktopCaptureCommand) => void;
+  let activePeer!: Peer;
   class Peer {
-    constructor(configuration: unknown) { peerConfigurations.push(configuration); }
+    constructor(configuration: unknown) { peerConfigurations.push(configuration); activePeer = this; }
+    ondatachannel?: (event: { channel: ReturnType<typeof inputChannel> }) => void;
     localDescription = { sdp: "answer" };
     close = peerClose;
     getSenders = () => [sender, audioSender];
@@ -172,6 +203,7 @@ async function harness(options: { audio?: boolean; capture?: () => Promise<Strea
   const ipc = { on: (_channel: string, callback: typeof listener) => { listener = callback; },
     invoke: async (channel: string, ...args: unknown[]) => {
       if (channel.endsWith(":native-frame")) return nativeRead(...args);
+      if (channel.endsWith(":input")) return input(...args);
       if (channel.endsWith(":reply")) receipts.push({ id: args[0] as string, value: args[1] as DesktopRemoteDesktopCaptureReply });
       return undefined;
     } };
@@ -184,7 +216,7 @@ async function harness(options: { audio?: boolean; capture?: () => Promise<Strea
       getContext: () => ({ drawImage: draw, clearRect: vi.fn(), getImageData: () => ({ data: new Uint8ClampedArray(4) }) }),
       captureStream: () => { const item = track(); nativeTracks.push(item); return new Stream([item]); } }) },
     createImageBitmap: async () => ({ width: 1, height: 1, close: vi.fn() }),
-    Blob, atob, Uint8Array, Uint8ClampedArray,
+    Blob, atob, Uint8Array, Uint8ClampedArray, TextEncoder,
     setTimeout: (run: () => void, delay: number) => {
       if ((REMOTE_DESKTOP_AUDIO_RETRY_MS as readonly number[]).includes(delay)) {
         const token = {}; audioTimers.set(token, { delay, run }); return token;
@@ -198,6 +230,13 @@ async function harness(options: { audio?: boolean; capture?: () => Promise<Strea
     Date: class extends Date { static override now() { return now; } },
     performance: { now: () => Date.now() }, crypto: { randomUUID: () => "11111111-1111-4111-8111-111111111111" } });
   const command = (value: DesktopRemoteDesktopCaptureCommand) => listener({}, value);
+  const inputChannel = () => {
+    const channel = { label: "input-v1", ordered: true, readyState: "open", bufferedAmount: 0,
+      onmessage: undefined as ((event: { data: string }) => void) | undefined,
+      close: vi.fn(() => { channel.readyState = "closed"; }), send: vi.fn(),
+      receive: (value: unknown) => { channel.onmessage?.({ data: JSON.stringify(value) }); } };
+    return channel;
+  };
   cleanup.push(() => command({ op: "stop" }));
   command({ op: "offer", id: "offer", leaseId: "lease", attemptId: "attempt", offerSdp: "offer", iceServers: [],
     nativeCapture: true, nativeVideo: false, chromiumCapture: true, portalCapture: false, sourceRevision: 0, cursorOverlay: false,
@@ -205,7 +244,8 @@ async function harness(options: { audio?: boolean; capture?: () => Promise<Strea
     profile: desktopRemoteDesktopVideoProfile({ fps: 30, quality: "auto", audio: options.audio === true }) });
   await vi.waitFor(() => expect(receipts).toEqual([{ id: "offer", value: { kind: "offer", answerSdp: "answer" } }]));
   return { original, sender, frame, nativeRead, getDisplayMedia, nativeTracks, draw, receipts, command, peerConfigurations,
-    audioSender, audioTransceiver, peerClose,
+    audioSender, audioTransceiver, peerClose, input,
+    openInputChannel: () => { const channel = inputChannel(); activePeer.ondatachannel!({ channel }); return channel; },
     nextAudioRetry: () => audioTimers.values().next().value?.delay,
     retryAudio: async () => {
       await vi.waitFor(() => expect(audioTimers.size).toBe(1));

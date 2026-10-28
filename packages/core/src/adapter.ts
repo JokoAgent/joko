@@ -76,6 +76,9 @@ export interface AdapterContext {
   readonly appendSystemPrompt?: string;
   /** Host-owned immutable isolation policy. Backends must fail closed on unknown values. */
   readonly runtimePolicy?: "review_read_only";
+  /** Host-derived from a durable Side Chat origin. It permits native history
+   * persistence/resumption while retaining every read-only tool restriction. */
+  readonly persistentReadOnly?: "side_chat";
   /** Canonical service-node roots approved for this invocation. */
   readonly extraDirectories?: readonly ApprovedDirectory[];
   /** Current service-owned ordered policy authority for this Backend/Target/workspace. */
@@ -262,6 +265,9 @@ export interface NativeSessionDerivation {
   /** Exact workspace authority for the detached native child. It may differ
    * from the source context only when the Backend advertises workspace.derive. */
   readonly target: TargetDescriptor;
+  /** A native completed assistant boundary, never the current streaming tail.
+   * The Backend must independently prove this prefix before creating a child. */
+  readonly completedSnapshot?: { readonly kind: "completed_assistant"; readonly nativeBoundaryId: string };
   readonly recordBinding: (binding: NativeSessionBinding) => void;
 }
 

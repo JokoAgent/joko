@@ -25,6 +25,7 @@ import {
 } from "@joko/tool-browser";
 
 import type { ArtifactStore } from "./artifact-store.js";
+import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-builtin-catalog.js";
 import { BROWSER_RECIPE_AUTHOR_RULES, BROWSER_WORKFLOW_RULES } from "./browser-rules.js";
 import { hasSecretPages, isSecretPage } from "./input-handoff/secretTaint.js";
@@ -1325,6 +1326,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     }
     const bytes = boundedInlineBytes(result.binary.bytes, "Remote Browser binary result");
     if (result.binary.mediaType === "image/png" || result.binary.mediaType === "image/jpeg") {
+      if (sniffMediaMime(bytes) !== result.binary.mediaType) throw new Error("Remote Browser image MIME does not match its bytes.");
       return browserMixedResult(action, {
         node: nodeId,
         generation,

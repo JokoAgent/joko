@@ -92,6 +92,7 @@ function fromProtoOperator(value: contract.RoutineFilterOperator): "equals" | "c
 }
 function toProtoRoutine(value: Routine): contract.PartnerRoutine {
   return create(contract.PartnerRoutineSchema, { id: value.id, partnerId: value.partnerId, revision: toProtoRevision(BigInt(value.revision)),
+    ...(value.builtin ? { builtin: value.builtin, builtinVersion: value.builtinVersion } : {}),
     definition: { name: value.name, prompt: value.prompt, enabled: value.enabled, silentWhenIdle: value.silentWhenIdle,
       ...(value.preRunHook ? { preRunHook: { command: value.preRunHook.command,
         ...(value.preRunHook.timeoutMs === undefined ? {} : { timeoutMs: BigInt(value.preRunHook.timeoutMs) }) } } : {}),

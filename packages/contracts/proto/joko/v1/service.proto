@@ -21,6 +21,7 @@ import "joko/v1/model.proto";
 import "joko/v1/objective.proto";
 import "joko/v1/operation.proto";
 import "joko/v1/partner.proto";
+import "joko/v1/partner_autonomy.proto";
 import "joko/v1/partner_workbench.proto";
 import "joko/v1/pi.proto";
 import "joko/v1/portable_session.proto";
@@ -326,6 +327,9 @@ service ContactService {
 // filesystem paths remain private; clients receive only stable Target and
 // canonical Session identities.
 service PartnerService {
+  rpc GetPartnerAutonomySettings(GetPartnerAutonomySettingsRequest) returns (GetPartnerAutonomySettingsResponse);
+  rpc UpdatePartnerAutonomySettings(UpdatePartnerAutonomySettingsRequest) returns (UpdatePartnerAutonomySettingsResponse);
+  rpc GetPartnerGlance(GetPartnerGlanceRequest) returns (GetPartnerGlanceResponse);
   rpc ListPartnerMemories(ListPartnerMemoriesRequest) returns (ListPartnerMemoriesResponse);
   rpc ReadPartnerMemory(ReadPartnerMemoryRequest) returns (ReadPartnerMemoryResponse);
   rpc UpdatePartnerMemory(UpdatePartnerMemoryRequest) returns (UpdatePartnerMemoryResponse);
@@ -360,6 +364,8 @@ service PartnerService {
   rpc RetryPartnerInitialization(RetryPartnerInitializationRequest) returns (RetryPartnerInitializationResponse);
   rpc UpdatePartnerDefaults(UpdatePartnerDefaultsRequest) returns (UpdatePartnerDefaultsResponse);
   rpc ListPartnerSessions(ListPartnerSessionsRequest) returns (ListPartnerSessionsResponse);
+  rpc EnsurePartnerTopic(EnsurePartnerTopicRequest) returns (EnsurePartnerTopicResponse);
+  rpc GetPartnerTopic(GetPartnerTopicRequest) returns (GetPartnerTopicResponse);
   rpc ListPartnerTaskOutputs(ListPartnerTaskOutputsRequest) returns (ListPartnerTaskOutputsResponse);
   rpc ControlPartnerSessionTask(ControlPartnerSessionTaskRequest) returns (ControlPartnerSessionTaskResponse);
   rpc MarkPartnerRead(MarkPartnerReadRequest) returns (MarkPartnerReadResponse);
@@ -1753,6 +1759,10 @@ message GetSessionWorktreeRemovalPreviewResponse {
   string session_id = 1;
   bool has_worktree = 2;
   bool dirty = 3;
+  uint32 active_bound_schedule_count = 4;
+  repeated string active_bound_schedule_names = 5;
+  // Exact binding set observed by the user; not an authorization credential.
+  string archive_confirmation = 6;
 }
 
 enum WorktreeRecycleState {

@@ -5,6 +5,27 @@ import { createWebRtcPeer } from './webrtc-peer.js';
 
 export const WEBRTC_DATA_LABEL = 'linkspan-http';
 const MAXIMUM_SDP_BYTES = 65_536;
+export const WEBRTC_RECORD_WRITE_TIMEOUT_MS = 15_000;
+
+/** Bound one complete HTTP record, preserving streaming duration and ordering.
+ * A timed-out write retires its channel; application effects remain unknown. */
+export function boundWebRtcRecordWrites(channel: ByteChannel): ByteChannel {
+  return {
+    closed: channel.closed,
+    receive: options => channel.receive(options),
+    close: () => channel.close(),
+    abort: reason => channel.abort(reason),
+    send: async (bytes, options = {}) => {
+      const deadline = Math.min(options.deadline ?? Infinity, Date.now() + WEBRTC_RECORD_WRITE_TIMEOUT_MS);
+      const scope = createOperationScope({ ...options, deadline });
+      try {
+        scope.check();
+        await scope.wait(channel.send(bytes, { signal: scope.signal, deadline }));
+      } catch (error) { channel.abort(error); throw asLinkspanError(error); }
+      finally { scope.dispose(); }
+    }
+  };
+}
 
 /** The fingerprint is supplied by the pinned Noise signaling endpoint. */
 export function webRtcFingerprint(sdp: string): string {
@@ -84,7 +105,7 @@ export async function connectWebRtcEndpoint(input: OperationOptions & { readonly
     const channel = await scope.wait(openWebRtcChannel({ peerConnection: selected, dataChannel, expectedFingerprint,
       ownsPeerConnection: true, signal: input.signal, deadline: Date.now() + 10_000 }));
     scope.check();
-    return channel;
+    return boundWebRtcRecordWrites(channel);
   } catch (error) { peer?.close(); throw asLinkspanError(error); }
   finally { scope.dispose(); }
 }

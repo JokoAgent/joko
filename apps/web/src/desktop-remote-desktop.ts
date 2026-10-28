@@ -172,7 +172,8 @@ export function useDesktopRemoteDesktop(refreshWindowsSupport = false): {
       const hasNewerSnapshot = snapshotRevisionRef.current !== snapshotRevision;
       if (hasNewerSnapshot && error !== "windowsSupport") return;
       const adopted = hasNewerSnapshot && confirmedRef.current !== undefined
-        ? { ...confirmedRef.current, ...(snapshot.windowsSupport === undefined ? {} : { windowsSupport: snapshot.windowsSupport }) }
+        ? { ...confirmedRef.current, ...(snapshot.windowsSupport === undefined ? {} : { windowsSupport: snapshot.windowsSupport,
+          windowsSupportDiagnostic: snapshot.windowsSupportDiagnostic }) }
         : snapshot;
       confirmedRef.current = adopted;
       setState({ ...readyState(adopted), saving: true });
@@ -246,7 +247,10 @@ function normalizeSnapshot(value: unknown): JokoDesktopRemoteDesktopSnapshot {
   const controllerDeviceId = optionalIdentity(record["controllerDeviceId"]);
   const displayId = optionalIdentity(record["displayId"]);
   const windowsSupport = record["windowsSupport"];
-  if (Object.hasOwn(record, "windowsSupport") && !isWindowsSupport(windowsSupport)) {
+  const windowsSupportDiagnostic = Object.hasOwn(record, "windowsSupportDiagnostic")
+    ? normalizeWindowsSupportDiagnostic(record["windowsSupportDiagnostic"]) : undefined;
+  if ((Object.hasOwn(record, "windowsSupport") && !isWindowsSupport(windowsSupport))
+    || (windowsSupportDiagnostic !== undefined && !isWindowsSupport(windowsSupport))) {
     throw new TypeError("Invalid Remote Desktop service support.");
   }
   if ((!record["active"] && record["controlling"])
@@ -260,12 +264,25 @@ function normalizeSnapshot(value: unknown): JokoDesktopRemoteDesktopSnapshot {
     ...(controllerDeviceId === undefined ? {} : { controllerDeviceId }),
     ...(displayId === undefined ? {} : { displayId }),
     ...(isWindowsSupport(windowsSupport) ? { windowsSupport } : {}),
+    ...(windowsSupportDiagnostic === undefined ? {} : { windowsSupportDiagnostic }),
     permissions: normalizePermissions(record["permissions"])
   };
 }
 
 function isWindowsSupport(value: unknown): value is JokoDesktopRemoteDesktopWindowsSupport {
   return value === "ready" || value === "missing" || value === "installRequired" || value === "unavailable";
+}
+
+function normalizeWindowsSupportDiagnostic(value: unknown): NonNullable<JokoDesktopRemoteDesktopSnapshot["windowsSupportDiagnostic"]> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Invalid Windows setup diagnostic.");
+  const record = value as Record<string, unknown>;
+  const child = Object.hasOwn(record, "childStep");
+  const step = (candidate: unknown): candidate is string => typeof candidate === "string" && /^[a-z][a-z-]{0,31}$/u.test(candidate);
+  if (Object.keys(record).sort().join(",") !== (child ? "childStep,osError,step" : "osError,step")
+    || !step(record["step"]) || (child && !step(record["childStep"]))
+    || typeof record["osError"] !== "number" || !Number.isSafeInteger(record["osError"])
+    || record["osError"] < 0 || record["osError"] > 0x00ff_ffff) throw new TypeError("Invalid Windows setup diagnostic.");
+  return { step: record["step"], osError: record["osError"], ...(child ? { childStep: record["childStep"] as string } : {}) };
 }
 
 function normalizePermissions(value: unknown): JokoDesktopRemoteDesktopPermissions {

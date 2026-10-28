@@ -73,6 +73,7 @@ message OperationMutation {
     ArchiveSessionMutation archive_session = 26;
     DeleteSessionMutation delete_session = 27;
     ForkSessionMutation fork_session = 28;
+    OpenSideChatMutation open_side_chat = 225;
     CloneSessionMutation clone_session = 29;
     NavigateSessionBranchMutation navigate_session_branch = 30;
     CompactSessionMutation compact_session = 31;
@@ -658,6 +659,7 @@ message PinSessionMutation {
 message ArchiveSessionMutation {
   string session_id = 1;
   bool archived = 2;
+  string archive_confirmation = 3;
 }
 
 message DeleteSessionMutation {
@@ -709,6 +711,11 @@ message ForkSessionMutation {
   string new_display_name = 3;
   optional string source_message_id = 4;
   optional string source_event_id = 5;
+}
+
+message OpenSideChatMutation {
+  string source_session_id = 1;
+  string new_display_name = 2;
 }
 
 message CloneSessionMutation {

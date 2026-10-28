@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+// Observation responsibility does not authorize answering or changing a task.
+message PartnerAutonomySettings {
+  Revision revision = 1;
+  bool customized = 2;
+  optional string scheduler_partner_id = 3;
+  repeated string scheduler_fallback_partner_ids = 4;
+}
+message PartnerAutonomyFallback {
+  string partner_id = 1;
+  bool allow = 2;
+}
+message GetPartnerAutonomySettingsRequest {}
+message GetPartnerAutonomySettingsResponse { PartnerAutonomySettings settings = 1; }
+message UpdatePartnerAutonomySettingsRequest {
+  string operation_id = 1;
+  Revision expected_revision = 2;
+  oneof choice {
+    string scheduler_partner_id = 3;
+    bool disabled = 4;
+    bool reset = 5;
+    PartnerAutonomyFallback fallback = 6;
+  }
+}
+message UpdatePartnerAutonomySettingsResponse { PartnerAutonomySettings settings = 1; }
+
+enum PartnerGlancePhase {
+  PARTNER_GLANCE_PHASE_UNSPECIFIED = 0;
+  PARTNER_GLANCE_PHASE_RUNNING = 1;
+  PARTNER_GLANCE_PHASE_WAITING_PERMISSION = 2;
+  PARTNER_GLANCE_PHASE_WAITING_ANSWER = 3;
+  PARTNER_GLANCE_PHASE_ERRORED = 4;
+  PARTNER_GLANCE_PHASE_USAGE_LIMIT = 5;
+}
+message PartnerGlanceRow {
+  string session_id = 1;
+  uint64 generation = 2;
+  string target_id = 3;
+  string title = 4;
+  PartnerGlancePhase phase = 5;
+  google.protobuf.Timestamp phase_since = 6;
+  google.protobuf.Timestamp started_at = 7;
+  optional string question = 8;
+  optional string creator_partner_id = 9;
+  optional string follower_partner_id = 10;
+  optional string interaction_id = 11;
+  bool read_only = 12;
+  optional string device_id = 13;
+  optional string device_name = 14;
+  bool online = 15;
+}
+message GetPartnerGlanceRequest {
+  string partner_id = 1;
+  string snapshot_token = 2;
+  uint32 offset = 3;
+}
+message GetPartnerGlanceResponse {
+  string partner_id = 1;
+  Revision partner_revision = 2;
+  bool all_tasks = 3;
+  repeated PartnerGlanceRow rows = 4;
+  string snapshot_token = 5;
+  optional uint32 next_offset = 6;
+  uint32 waiting_count = 7;
+  uint32 working_count = 8;
+  uint32 done_today = 9;
+  google.protobuf.Timestamp observed_at = 10;
+}

@@ -688,6 +688,21 @@ let inspectorWindow: BrowserWindow | undefined;
 let inspectorWindowOwner: WebContents | undefined;
 let inspectorWindowLifecycle: InspectorWindowLifecycle<BrowserWindow, BrowserWindow> | undefined;
 let inspectorWindowOccurrence: string | undefined;
+interface InspectorWindowEntry {
+  readonly window: BrowserWindow;
+  readonly owner: BrowserWindow;
+  readonly occurrence: string;
+  readonly lifecycle: InspectorWindowLifecycle<BrowserWindow, BrowserWindow>;
+  readonly frameName: string;
+  closing: boolean;
+}
+const inspectorWindows = new Map<BrowserWindow, InspectorWindowEntry>();
+function liveInspectorWindows(): BrowserWindow[] { return [...inspectorWindows.keys()].filter(window => !window.isDestroyed()); }
+function syncFirstInspectorWindow(): void {
+  const entry = inspectorWindows.values().next().value as InspectorWindowEntry | undefined;
+  inspectorWindow = entry?.window; inspectorWindowOwner = entry?.owner.webContents;
+  inspectorWindowLifecycle = entry?.lifecycle; inspectorWindowOccurrence = entry?.occurrence;
+}
 let runtimeProcessMonitorWindow: BrowserWindow | undefined;
 let runtimeProcessMonitorOwnerWindow: BrowserWindow | undefined;
 let releaseRuntimeProcessMonitorOwnerLifecycle: (() => void) | undefined;
@@ -1347,7 +1362,7 @@ function createWindow(): void {
       // Inspector intentionally retires on every non-in-place main-frame
       // attempt; main-Document authority rotates only when the next preload
       // synchronously captures its occurrence.
-      inspectorWindowLifecycle?.ownerRetired(window);
+      for (const entry of [...inspectorWindows.values()]) entry.lifecycle.ownerRetired(window);
     }
   });
   window.webContents.on("did-start-loading", () => {
@@ -1363,7 +1378,7 @@ function createWindow(): void {
     retireMainWindowDocument(window, window.webContents, true);
     recordPackagedSmokeNativeCleanup("main_render_process_gone_document_retired");
     recordPackagedSmokeNativeCleanup("main_render_process_gone_inspector_retirement_started");
-    inspectorWindowLifecycle?.ownerRetired(window);
+    for (const entry of [...inspectorWindows.values()]) entry.lifecycle.ownerRetired(window);
     recordPackagedSmokeNativeCleanup("main_render_process_gone_inspector_retirement_completed");
     recordPackagedSmokeNativeCleanup("main_render_process_gone_voice_shortcut_unregister_started");
     unregisterGlobalVoiceShortcut();
@@ -1441,7 +1456,7 @@ function createWindow(): void {
   window.webContents.setWindowOpenHandler(({ url, frameName, features, postBody }) => {
     if (isInspectorWindowOpenRequest(url, frameName) &&
       features === INSPECTOR_WINDOW_FEATURES && postBody === undefined) {
-      if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed()) {
+      if (inspectorWindows.size >= 8 || [...inspectorWindows.values()].some(entry => entry.frameName === frameName)) {
         return { action: "deny" };
       }
       const inspectorFrameOptions = process.platform === "darwin"
@@ -1485,13 +1500,13 @@ function createWindow(): void {
     return { action: "deny" };
   });
   window.webContents.on("did-create-window", (childWindow, details) => {
-    if (!isInspectorWindowOpenRequest(details.url, details.frameName) ||
-      (inspectorWindow !== undefined && !inspectorWindow.isDestroyed())) {
+    if (!isInspectorWindowOpenRequest(details.url, details.frameName) || inspectorWindows.size >= 8 ||
+      [...inspectorWindows.values()].some(entry => entry.frameName === details.frameName)) {
       childWindow.destroy();
       return;
     }
     inspectorWindowState.manage(childWindow);
-    installInspectorWindowSecurity(childWindow, window);
+    installInspectorWindowSecurity(childWindow, window, details.frameName);
   });
   window.webContents.on("will-navigate", (event, url) => {
     if (!isAllowedPrimaryWindowNavigation(url, navigationPolicy)) {
@@ -1591,10 +1606,10 @@ function createWindow(): void {
       () => mainWindow === window && !window.isDestroyed() && canApplyMainWindowClose());
     else void closeController.request();
   });
-  window.on("hide", () => inspectorWindowLifecycle?.ownerHidden(window));
-  window.on("minimize", () => inspectorWindowLifecycle?.ownerHidden(window));
-  window.on("show", () => inspectorWindowLifecycle?.ownerShown(window));
-  window.on("restore", () => inspectorWindowLifecycle?.ownerShown(window));
+  window.on("hide", () => { for (const entry of inspectorWindows.values()) entry.lifecycle.ownerHidden(window); });
+  window.on("minimize", () => { for (const entry of inspectorWindows.values()) entry.lifecycle.ownerHidden(window); });
+  window.on("show", () => { for (const entry of inspectorWindows.values()) entry.lifecycle.ownerShown(window); });
+  window.on("restore", () => { for (const entry of inspectorWindows.values()) entry.lifecycle.ownerShown(window); });
   if (packagedSmoke) {
     const timeout = setTimeout(() => {
       process.stderr.write("JOKO_DESKTOP_SMOKE_TIMEOUT\n");
@@ -6547,22 +6562,20 @@ function showCurrentMainWindowOwner(owner: WebContents): boolean {
   return showMainWindow() && owner === mainWindow?.webContents && !owner.isDestroyed();
 }
 
-function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: BrowserWindow): void {
+function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: BrowserWindow, frameName = INSPECTOR_WINDOW_FRAME_NAME): void {
   const occurrence = randomUUID();
-  inspectorWindow = childWindow;
-  inspectorWindowOwner = owner.webContents;
-  inspectorWindowOccurrence = occurrence;
   const lifecycle = new InspectorWindowLifecycle({
     owner,
     child: childWindow,
     isCurrent: (candidateOwner, candidateChild) =>
       mainWindow === candidateOwner &&
-      inspectorWindowOwner === candidateOwner.webContents &&
-      inspectorWindow === candidateChild &&
-      inspectorWindowOccurrence === occurrence,
+      inspectorWindows.get(candidateChild)?.owner === candidateOwner &&
+      inspectorWindows.get(candidateChild)?.occurrence === occurrence,
     retire: (_candidateOwner, candidateChild) => retireInspectorWindow(candidateChild)
   });
-  inspectorWindowLifecycle = lifecycle;
+  const entry: InspectorWindowEntry = { window: childWindow, owner, occurrence, lifecycle, frameName, closing: false };
+  inspectorWindows.set(childWindow, entry);
+  syncFirstInspectorWindow();
   childWindow.webContents.setZoomFactor(currentWindowZoomFactor);
 
   installSelectionContextMenu(childWindow, {
@@ -6576,12 +6589,17 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
   // must never become a second application renderer or navigation surface.
   childWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   childWindow.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
-  childWindow.on("close", () => {
-    inspectorWindowLifecycle?.markUserClosing(childWindow);
-    if (!quitting) inspectorWindowLifecycle?.returnFocusBeforeClose(childWindow);
+  childWindow.on("close", event => {
+    if (!quitting && !entry.closing && frameName !== INSPECTOR_WINDOW_FRAME_NAME && lifecycle.owns(owner, childWindow)) {
+      event.preventDefault();
+      childWindow.webContents.send(DESKTOP_CHANNELS.inspectorWindowCloseRequested);
+      return;
+    }
+    lifecycle.markUserClosing(childWindow);
+    if (!quitting) lifecycle.returnFocusBeforeClose(childWindow);
   });
   childWindow.webContents.on("render-process-gone", () => {
-    if (inspectorWindowLifecycle?.markChildFailed(childWindow) === true) {
+    if (lifecycle.markChildFailed(childWindow) === true) {
       setImmediate(() => {
         if (childWindow.isDestroyed()) return;
         recordPackagedSmokeProgress("inspector_child_failure_native_destroy_started");
@@ -6599,14 +6617,12 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
   });
   childWindow.webContents.setWebRTCIPHandlingPolicy("disable_non_proxied_udp");
   childWindow.once("closed", () => {
-    const activeLifecycle = inspectorWindowLifecycle;
-    const decision = activeLifecycle?.closeDecision(childWindow);
+    const decision = lifecycle.closeDecision(childWindow);
     if (decision === undefined) return;
-    inspectorWindow = undefined;
-    const notifyOwner = inspectorWindowOwner;
-    inspectorWindowOwner = undefined;
-    inspectorWindowLifecycle = undefined;
-    inspectorWindowOccurrence = undefined;
+    if (inspectorWindows.get(childWindow) !== entry) return;
+    inspectorWindows.delete(childWindow);
+    syncFirstInspectorWindow();
+    const notifyOwner = owner.webContents;
     if (notifyOwner === undefined || notifyOwner.isDestroyed() || notifyOwner !== owner.webContents || mainWindow !== owner) return;
     if (decision.notifyOwner && decision.reason !== undefined && !quitting) {
       try {
@@ -6617,21 +6633,17 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
 }
 
 function destroyInspectorWindow(expectedWindow?: BrowserWindow): void {
-  if (expectedWindow !== undefined && inspectorWindow !== expectedWindow) return;
-  const childWindow = inspectorWindow;
-  inspectorWindow = undefined;
-  inspectorWindowOwner = undefined;
-  inspectorWindowLifecycle = undefined;
-  inspectorWindowOccurrence = undefined;
-  if (childWindow !== undefined && !childWindow.isDestroyed()) childWindow.destroy();
+  const windows = expectedWindow === undefined ? [...inspectorWindows.keys()] : [expectedWindow];
+  for (const child of windows) {
+    if (!inspectorWindows.delete(child)) continue;
+    syncFirstInspectorWindow();
+    if (!child.isDestroyed()) child.destroy();
+  }
 }
 
 function retireInspectorWindow(expectedWindow: BrowserWindow): void {
-  if (inspectorWindow !== expectedWindow) return;
-  inspectorWindow = undefined;
-  inspectorWindowOwner = undefined;
-  inspectorWindowLifecycle = undefined;
-  inspectorWindowOccurrence = undefined;
+  if (!inspectorWindows.delete(expectedWindow)) return;
+  syncFirstInspectorWindow();
   recordPackagedSmokeProgress("inspector_passive_retirement_fenced");
   // Destroying a window.open guest synchronously from did-start-navigation can
   // cancel the owner's own navigation. Fence the occurrence immediately, then
@@ -7259,9 +7271,9 @@ async function playDesktopNativeTaskStatusSound(sound: DesktopNativeTaskStatusSo
   });
 }
 
-function dispatchNativeTaskStatusAction(action: DesktopNativeTaskStatusAction): void {
-  if (!nativeTaskStatusSupported) return;
-  deliverDesktopNativeTaskStatusAction(action, {
+function dispatchNativeTaskStatusAction(action: DesktopNativeTaskStatusAction): boolean {
+  if (!nativeTaskStatusSupported) return false;
+  return deliverDesktopNativeTaskStatusAction(action, {
     revealMainWindow: showMainWindow,
     currentMainWindow: () => mainWindow,
     isWindowAvailable: (window) => !window.isDestroyed() && !window.webContents.isDestroyed(),
@@ -7754,9 +7766,14 @@ async function desktopRemoteDesktopSnapshot(refreshWindowsSupport = false): Prom
   const permissions = await readDesktopRemoteDesktopPermissions() as DesktopRemoteDesktopPermissions;
   const enabled = requireDesktopRemoteDesktopSettings().get().enabled;
   const state = desktopRemoteDesktopHost?.state;
+  const windowsSupportDiagnostic = desktopRemoteDesktopWindowsHost.diagnostic;
+  const windowsSupport = {
+    ...(desktopRemoteDesktopWindowsSupport === undefined ? {} : { windowsSupport: desktopRemoteDesktopWindowsSupport }),
+    ...(windowsSupportDiagnostic === undefined ? {} : { windowsSupportDiagnostic })
+  };
   return state === undefined
     ? Object.freeze({ enabled, active: false, controlling: false, permissions,
-        ...(desktopRemoteDesktopWindowsSupport === undefined ? {} : { windowsSupport: desktopRemoteDesktopWindowsSupport }) })
+        ...windowsSupport })
     : Object.freeze({
         enabled,
         active: true,
@@ -7765,7 +7782,7 @@ async function desktopRemoteDesktopSnapshot(refreshWindowsSupport = false): Prom
         controllerDeviceId: state.controllerDeviceId,
         displayId: state.displayId,
         permissions,
-        ...(desktopRemoteDesktopWindowsSupport === undefined ? {} : { windowsSupport: desktopRemoteDesktopWindowsSupport })
+        ...windowsSupport
       });
 }
 
@@ -8757,30 +8774,31 @@ function registerIpc(): void {
     throw new Error("Desktop close requests are restricted to application windows.");
   });
   ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowActivate, (event, ...parameters: unknown[]) => {
-    if (parameters.length !== 0) throw new TypeError("Inspector activation does not accept parameters.");
+    if (parameters.length > 1 || parameters.length === 1 && (typeof parameters[0] !== "string" || !/^[0-9a-f-]{36}$/u.test(parameters[0]))) throw new TypeError("Inspector activation requires an optional exact occurrence.");
     assertTrustedIpcSender(event);
     const owner = BrowserWindow.fromWebContents(event.sender);
     if (owner === null || owner !== mainWindow || event.sender !== owner.webContents) {
       throw new Error("Inspector activation did not originate from the trusted primary application window.");
     }
-    const child = inspectorWindow;
-    const lifecycle = inspectorWindowLifecycle;
-    if (child === undefined || child.isDestroyed() || inspectorWindowOwner !== owner.webContents ||
-      lifecycle === undefined || !lifecycle.owns(owner, child) || BrowserWindow.getFocusedWindow() !== owner) return false;
-    return lifecycle.activate(owner, child);
+    const entry = parameters.length === 0 ? inspectorWindows.values().next().value as InspectorWindowEntry | undefined
+      : [...inspectorWindows.values()].find(candidate => candidate.occurrence === parameters[0]);
+    if (entry === undefined || entry.window.isDestroyed() || entry.owner !== owner ||
+      !entry.lifecycle.owns(owner, entry.window) || BrowserWindow.getFocusedWindow() !== owner) return false;
+    return entry.lifecycle.activate(owner, entry.window);
   });
   ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowIdentity, (event, ...parameters: unknown[]) => {
     if (parameters.length !== 0) throw new TypeError("Inspector identity does not accept parameters.");
-    assertTrustedInspectorWindowSender(event);
-    if (inspectorWindowOccurrence === undefined) {
+    const child = assertTrustedInspectorWindowSender(event);
+    const occurrence = inspectorWindows.get(child)?.occurrence;
+    if (occurrence === undefined) {
       throw new Error("Inspector identity is unavailable for a retired occurrence.");
     }
-    return inspectorWindowOccurrence;
+    return occurrence;
   });
   ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowReady, (event, ...parameters: unknown[]) => {
     if (parameters.length !== 0) throw new TypeError("Inspector readiness does not accept parameters.");
     const window = assertTrustedInspectorWindowSender(event);
-    const lifecycle = inspectorWindowLifecycle;
+    const lifecycle = inspectorWindows.get(window)?.lifecycle;
     if (lifecycle === undefined || !lifecycle.markReady(window)) {
       throw new Error("Inspector readiness did not originate from the current detached Inspector.");
     }
@@ -8810,21 +8828,21 @@ function registerIpc(): void {
     }
     currentWindowZoomFactor = zoomFactor;
     for (const applicationWindow of applicationWindows()) applicationWindow.webContents.setZoomFactor(zoomFactor);
-    if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed()) {
-      inspectorWindow.webContents.setZoomFactor(zoomFactor);
-    }
+    for (const child of liveInspectorWindows()) child.webContents.setZoomFactor(zoomFactor);
   });
   ipcMain.handle(DESKTOP_CHANNELS.inspectorWindowClose, (event, ...parameters: unknown[]) => {
     if (parameters.length !== 1 || (parameters[0] !== "user" && parameters[0] !== "passive")) {
       throw new TypeError("Inspector close requires one current-v1 close kind.");
     }
     const window = assertTrustedInspectorWindowSender(event);
-    const lifecycle = inspectorWindowLifecycle;
+    const entry = inspectorWindows.get(window);
+    const lifecycle = entry?.lifecycle;
     if (lifecycle === undefined || (parameters[0] === "user"
       ? !lifecycle.markUserClosing(window)
       : !lifecycle.markPassiveClosing(window))) {
       throw new Error("Inspector close did not originate from the current detached Inspector.");
     }
+    entry!.closing = true;
     window.close();
   });
   ipcMain.handle(DESKTOP_CHANNELS.traySetIcon, (event, ...parameters: unknown[]) => {
@@ -9010,6 +9028,13 @@ function registerIpc(): void {
       || parameters[2].length > 2048) throw new TypeError("Native task focus acknowledgement requires its current owner and entry.");
     const ids = parseDesktopNativeTaskStatusVisibleSessionIds([parameters[1]]);
     macNativeTaskStatusHost?.acknowledgeFocus(ids[0]!, parameters[2]);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.nativeTaskStatusCompletionResult, (event, ...parameters: unknown[]) => {
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    if (parameters.length !== 4 || typeof parameters[2] !== "string" || parameters[2].length > 2048
+      || typeof parameters[3] !== "boolean") throw new TypeError("Native completion requires its original entry and a definitive result.");
+    const ids = parseDesktopNativeTaskStatusVisibleSessionIds([parameters[1]]);
+    macNativeTaskStatusHost?.finishCompletion(ids[0]!, parameters[2], parameters[3]);
   });
   ipcMain.handle(DESKTOP_CHANNELS.nativeTaskStatusSetVisibleSessions, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -11007,17 +11032,17 @@ function assertGlobalVoiceOverlaySender(event: IpcMainInvokeEvent): BrowserWindo
 
 function assertTrustedInspectorWindowSender(event: IpcMainInvokeEvent): BrowserWindow {
   const window = BrowserWindow.fromWebContents(event.sender);
+  const entry = window === null ? undefined : inspectorWindows.get(window);
   if (
     window === null ||
-    window !== inspectorWindow ||
+    entry === undefined ||
     window.isDestroyed() ||
     event.sender !== window.webContents ||
     event.senderFrame !== event.sender.mainFrame ||
     event.sender.getURL() !== INSPECTOR_WINDOW_URL ||
-    inspectorWindowOwner === undefined ||
-    inspectorWindowOwner.isDestroyed() ||
-    inspectorWindowOwner !== mainWindow?.webContents ||
-    mainWindow === undefined || inspectorWindowLifecycle?.owns(mainWindow, window) !== true
+    entry.owner.isDestroyed() ||
+    entry.owner !== mainWindow ||
+    mainWindow === undefined || entry.lifecycle.owns(mainWindow, window) !== true
   ) {
     throw new Error("Inspector IPC did not originate from the trusted detached Inspector main frame.");
   }

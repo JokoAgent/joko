@@ -453,6 +453,7 @@ message SessionDerivationOrigin {
   optional string source_event_id = 4;
   bool source_session_available = 5;
   bool source_message_available = 6;
+  bool side_chat = 7;
 }
 
 enum SessionWorktreeState {
@@ -700,6 +701,17 @@ message InputContent {
   // Exact UTF-16 occurrences in the concatenated text parts. mention_index is
   // the zero-based index after filtering parts to typed mentions only.
   repeated InputMentionRange mention_ranges = 4;
+  // A reply in this exact private Partner conversation. The service re-reads
+  // the original visible message; the bounded excerpt is display data only.
+  PartnerReplyQuote reply_quote = 5;
+}
+
+message PartnerReplyQuote {
+  uint64 generation = 1;
+  string event_id = 2;
+  string message_id = 3;
+  string role = 4;
+  string excerpt = 5;
 }
 
 message InputMentionRange {

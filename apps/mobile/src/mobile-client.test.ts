@@ -1087,6 +1087,8 @@ function fakeNetwork(): MobileNetwork {
       targetId, eligibility: "eligible" as const, canRefreshRemote: true
     })),
     listTargetWorktreeSources: vi.fn(async () => []),
+    readSessionArchivePreview: vi.fn(async () => ({ hasWorktree: false, dirty: false,
+      activeBoundScheduleCount: 0, activeBoundScheduleNames: [], archiveConfirmation: "a".repeat(64) })),
     downloadBlob: vi.fn(async () => { throw new Error("No Blob fixture was configured."); }),
     readImageThumbnail: vi.fn(async () => undefined),
     authorizeBlobDownload: vi.fn(async () => { throw new Error("No Blob authorization fixture was configured."); }),
@@ -10637,12 +10639,13 @@ describe("native composer task-link resolution", () => {
 });
 
 describe("native current-task cloning", () => {
-  function fixture() {
+  function fixture(sideChat = false) {
     const state = {
       session: runtimeSession,
       backend: create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
         ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
-          create(CapabilitySchema, { name: capabilityNames.sessionClone, support: CapabilitySupport.SUPPORTED })]
+          create(CapabilitySchema, { name: capabilityNames.sessionClone, support: CapabilitySupport.SUPPORTED }),
+          ...(sideChat ? [create(CapabilitySchema, { name: capabilityNames.sessionSideChat, support: CapabilitySupport.SUPPORTED })] : [])]
       }) }),
       reviews: [] as Snapshot["reviewRuns"],
       derived: undefined as Snapshot["sessions"][number] | undefined
@@ -10655,13 +10658,48 @@ describe("native current-task cloning", () => {
     network.readSession = vi.fn(async () => projection(true));
     const child = () => create(SessionSchema, { ...runtimeSession, sessionId: "cloned-task",
       nativeBinding: create(NativeSessionBindingSchema, { ...runtimeSession.nativeBinding!, backendId: "backend", opaqueReference: "cloned-native" }),
-      derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.CLONE, sourceSessionId: "session" }) });
+      derivationOrigin: create(SessionDerivationOriginSchema, { kind: sideChat ? SessionDerivationKind.FORK : SessionDerivationKind.CLONE,
+        sourceSessionId: "session", ...(sideChat ? { sideChat: true, sourceMessageId: "completed-native", sourceEventId: "completed-event" } : {}) }) });
     const operation = (operationId: string, derived = child()) => create(OperationSchema, {
       operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      ...(sideChat ? { mutation: { payload: { case: "openSideChat" as const, value: { sourceSessionId: "session" } } } } : {}),
       result: { payload: { case: "session", value: derived } }
     });
     return { state, network, child, operation };
   }
+
+  it("retains a side chat draft through the exact original operation and uses only a generation fence", async () => {
+    const f = fixture(true), saved = memoryStorage(credential), drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(saved.pending()).toMatchObject([{ operationId, kind: "session-side-chat", sourceGeneration: "8" }]);
+      expect(mutation.payload.case).toBe("openSideChat");
+      expect(mutation.preconditions[0]).toMatchObject({ expectedGeneration: 8n });
+      expect(mutation.preconditions[0]?.expectedRevision).toBeUndefined();
+      f.state.derived = f.child(); return f.operation(operationId);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, () => "side-chat-once", undefined, drafts);
+    await app.start();
+    await expect(app.openSideChat(app.taskSideChatControls()!.authorityKey, plainTextMobileComposerDraft("Follow up")))
+      .resolves.toEqual({ kind: "opened", sessionId: "cloned-task" });
+    expect(saved.pending()).toEqual([]);
+    expect(f.network.submit).toHaveBeenCalledOnce();
+    expect((await drafts.composer.read({ profileId: credential.profileId, sessionId: "cloned-task" }))?.text).toBe("Follow up");
+  });
+
+  it("reconciles a lost side chat response without creating another child or dropping its retained draft", async () => {
+    const f = fixture(true), saved = memoryStorage(credential), drafts = memoryDraftStores();
+    vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));
+    const app = client(f.network, saved.storage, undefined, undefined, () => "side-chat-lost", undefined, drafts);
+    await app.start();
+    await expect(app.openSideChat(app.taskSideChatControls()!.authorityKey, plainTextMobileComposerDraft("Retain me")))
+      .resolves.toEqual({ kind: "unknown" });
+    expect(app.taskSideChatControls()?.canOpen).toBe(false);
+    f.state.derived = f.child();
+    vi.mocked(f.network.getOperation).mockResolvedValueOnce(f.operation("side-chat-lost"));
+    await app.reconcile();
+    expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
+    expect((await drafts.composer.read({ profileId: credential.profileId, sessionId: "cloned-task" }))?.text).toBe("Retain me");
+  });
 
   it("clones an active task through a preconditioned typed operation after saving a body-free receipt", async () => {
     const f = fixture();

@@ -19,6 +19,7 @@ it('keeps the original save operation after a lost reply and restores focus when
   Object.defineProperty(window, 'jokoDesktop', { configurable: true, value: { voiceConversation: { control: vi.fn(async (_serverId: string, bytes: Uint8Array) => {
     const request = fromBinary(ControlDesktopVoiceConversationRequestSchema, bytes);
     if (request.action === Action.SAVE_PREFERENCE) {
+      if (!request.preference) throw new Error('Missing original voice preference.');
       saved.push(request); preference = create(DesktopVoiceConversationPreferenceSchema, { ...request.preference, revision: 1n });
       if (saved.length === 1) throw new Error('Reply lost after saving.');
     }

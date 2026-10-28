@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { AdapterContext, CreateNativeSessionInput } from "@joko/core";
 import { OperationalStore } from "@joko/store";
+import { createSideChatWorkspaceReference, workerWorkspaceTarget } from "./collaboration-worker-workspace.js";
 import { DEFAULT_COLLABORATION_SETTINGS } from "@joko/runtime-governance";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, expect, it } from "vitest";
@@ -14,6 +15,7 @@ import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { SessionHost } from "./session-host.js";
 import { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
+import { projectNativeHistory } from "./native-history.js";
 import { WorkspaceService } from "./workspace-service.js";
 import { mkdtemp } from "./test-paths.js";
 import { planWorkerWorkspace, prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, WORKER_WORKSPACE_PLAN_KEY } from "./collaboration-worker-workspace.js";
@@ -36,6 +38,7 @@ async function fixture(isolateLead = false) {
   await mkdir(subproject, { recursive: true });
   await git(project, "init", "-b", "main");
   await git(project, "config", "user.email", "worker@example.test"); await git(project, "config", "user.name", "Worker test");
+  await git(project, "config", "core.autocrlf", "false");
   await writeFile(join(project, "root.txt"), "committed root\n"); await writeFile(join(subproject, "app.txt"), "committed app\n");
   await git(project, "add", "."); await git(project, "commit", "-m", "Initial project");
   const sourceCommit = await git(project, "rev-parse", "HEAD");
@@ -62,6 +65,29 @@ async function fixture(isolateLead = false) {
   return { root, project, subproject, sourceCommit, store, adapter, host, manager, workspaces, worktrees, leadId, input };
 }
 
+it("keeps the original checkout alive through an exact side chat read-only workspace reference", async () => {
+  const f = await fixture(true), source = f.store.getSession(f.leadId).descriptor;
+  const projection = projectNativeHistory(source.id, source.binding.opaqueRef, { events: [{
+    nativeEntryId: "completed-native", projectionKind: "message", contentIndex: 0,
+    payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Completed reference" }] }
+  }], activeEntryId: "completed-native" })[0]!;
+  const event = f.store.appendEvent({ backendId: source.backendId, targetId: source.targetId, sessionId: source.id,
+    generation: source.binding.generation, traceId: "completed-side-chat-anchor", ...projection });
+  const origin = f.store.findVisibleSessionMessageOrigin({ sessionId: source.id, eventId: event.id, completedAssistantOnly: true });
+  expect(origin).toBeDefined();
+  const binding = createSideChatWorkspaceReference(f.store, source, "side-chat-child")!;
+  const child = f.store.createSession({ ...source, id: "side-chat-child", worktree: undefined,
+    binding: { opaqueRef: "readonly-side-chat-native", generation: 1 }, derivationOrigin: { kind: "fork", sideChat: true,
+      sourceSessionId: source.id, sourceMessageId: origin!.messageId, sourceEventId: event.id } }).descriptor;
+  await f.worktrees.registerWorkerWorkspace(binding, "Side chat", true);
+  expect(workerWorkspaceTarget(f.store, child, f.store.getTarget("project").descriptor).workspaceRoot).toBe(source.worktree!.path);
+  expect(child.worktree).toBeUndefined();
+  await f.worktrees.release(source.id);
+  expect(f.store.getSession(source.id).descriptor.worktree?.state).toBe("preserved");
+  expect((await stat(binding.path)).isDirectory()).toBe(true);
+  expect(readWorkerWorkspaceBinding(f.store, child.id)?.inheritedWorktreeLeaseId).toBe(source.worktree!.leaseId);
+});
+
 it("creates a worker in its approved subproject and replays only the original directory operation", async () => {
   const f = await fixture(), request = { ...f.input("subproject-worker"), workspace: { workingDirectory: f.subproject, createWorktree: false } };
   const result = await f.manager.createWorker(request), sessionId = result.worker.sessionId!;
@@ -76,6 +102,22 @@ it("creates a worker in its approved subproject and replays only the original di
   const outside = join(f.root, "outside"); await mkdir(outside);
   await expect(f.manager.createWorker({ ...f.input("outside-worker"), workspace: { workingDirectory: outside, createWorktree: false } })).rejects.toThrow("trust this directory");
   expect(f.store.findOperation("outside-worker")).toBeUndefined();
+});
+
+it("projects its exact approved directory twice while rejecting a fresh project trust or root change", async () => {
+  const f = await fixture(), result = await f.manager.createWorker({ ...f.input("projected-worker"),
+    workspace: { workingDirectory: f.subproject, createWorktree: false } });
+  const session = f.store.getSession(result.worker.sessionId!).descriptor, project = f.store.getTarget("project").descriptor;
+  const projected = workerWorkspaceTarget(f.store, session, project);
+  expect(workerWorkspaceTarget(f.store, session, projected)).toEqual(projected);
+  expect(() => workerWorkspaceTarget(f.store, session, { ...projected, workspaceRoot: f.root })).toThrow("project is unavailable");
+  try {
+    f.store.upsertTarget({ ...project, trusted: false });
+    expect(() => workerWorkspaceTarget(f.store, session, projected)).toThrow("project is unavailable");
+    const replacement = join(f.root, "replacement"); await mkdir(replacement);
+    f.store.upsertTarget({ ...project, workspaceRoot: replacement });
+    expect(() => workerWorkspaceTarget(f.store, session, projected)).toThrow("project is unavailable");
+  } finally { f.store.upsertTarget(project); }
 });
 
 it("pins an isolated worker's chosen revision, preserves the subproject and leaves dirty source files behind", { timeout: 30_000 }, async () => {
@@ -103,6 +145,18 @@ it("inherits the lead's real checkout and retains its lease while a worker still
   expect(f.store.getSession(f.leadId).descriptor.worktree?.state).toBe("preserved");
   expect((await stat(source.path)).isDirectory()).toBe(true);
   expect(f.host.captureToolWorkspace({ sessionId: worker.sessionId!, targetId: "project", generation: worker.sessionGeneration! }).root).toBe(source.path);
+  await f.host.closeIfActive(worker.sessionId!);
+  f.worktrees.dispose();
+  const restarted = new SessionWorktreeCoordinator({ store: f.store, workspaces: f.workspaces, storageRoot: join(f.root, "worktrees") });
+  try {
+    await restarted.initialize();
+    expect((await stat(source.path)).isDirectory()).toBe(true);
+    expect(restarted.effectiveTarget(f.store.getSession(worker.sessionId!)).workspaceRoot).toBe(source.path);
+    f.store.updateSession(worker.sessionId!, { archived: true, deletedAt: Date.now() });
+    restarted.unregisterWorkerWorkspace(worker.sessionId!);
+    await restarted.release(f.leadId);
+    await expect(stat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally { restarted.dispose(); }
 });
 
 it("keeps native creation with an unknown outcome fenced to the same worker and original project", async () => {

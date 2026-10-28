@@ -1,6 +1,12 @@
-.selection-quote-button {
+.selection-quote-actions {
   position: fixed;
   z-index: 80;
+  display: flex;
+  max-width: calc(100vw - 16px);
+  gap: 6px;
+}
+
+.selection-quote-button {
   min-height: 28px;
   display: inline-flex;
   align-items: center;
