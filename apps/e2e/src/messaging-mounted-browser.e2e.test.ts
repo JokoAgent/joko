@@ -1,4 +1,5 @@
-import { chromium, type Browser, type Page } from "playwright-core";
+import { fromBinary } from "@bufbuild/protobuf";
+import { chromium, type Browser, type Page, type Response } from "playwright-core";
 import {
   DingTalkGroupActivation,
   DiscordEmojiReactions,
@@ -11,7 +12,10 @@ import {
   PermissionMode,
   TelegramEmojiReactions,
   TelegramGroupActivation,
-  TelegramReplyQuoteMode
+  TelegramReplyQuoteMode,
+  UpdateFeishuMessagingConfigurationRequestSchema,
+  UpdateFeishuMessagingConfigurationResponseSchema,
+  type MessagingConnection
 } from "@joko/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -119,7 +123,7 @@ describe("mounted Messaging Settings product chain", () => {
       state: "visible",
       timeout: 30_000
     });
-    browserErrors.splice(0);
+    browserErrors.clear();
     expect(await settings.locator(".messaging-channel").count()).toBe(8);
     expect(await settings.locator(".messaging-channel.is-available").count()).toBe(8);
     await settings.getByText("Telegram", { exact: true }).first().waitFor({ state: "visible" });
@@ -465,7 +469,7 @@ describe("mounted Messaging Settings product chain", () => {
     await larkConfigurationDialog.getByRole("button", { name: "Save", exact: true }).click();
     await larkConfigurationDialog.waitFor({ state: "hidden" });
 
-    await waitFor(
+    const persistedFeishuAndLark = await waitFor(
       () => inspector.clients.messaging.getMessagingSettings({}),
       (value) => value.connections.some((connection) =>
         connection.channel === MessagingChannel.LARK
@@ -475,6 +479,7 @@ describe("mounted Messaging Settings product chain", () => {
       "the mounted Lark behavior matrix",
       15_000
     );
+    await browserErrors.verifyFeishuRecovery(persistedFeishuAndLark.connections);
 
     await card.getByRole("button", { name: "Clear token", exact: true }).click();
     const clearDialog = page.getByRole("alertdialog", { name: "Clear bot token?" });
@@ -557,7 +562,7 @@ describe("mounted Messaging Settings product chain", () => {
     expect(await feishuCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await larkCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await wecomCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
-    expect(browserErrors).toEqual([]);
+    expect(browserErrors.unexpected()).toEqual([]);
 
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),
@@ -573,8 +578,10 @@ describe("mounted Messaging Settings product chain", () => {
   });
 });
 
-function observeBrowserErrors(page: Page): string[] {
+function observeBrowserErrors(page: Page) {
   const errors: string[] = [];
+  const recovered: string[] = [];
+  const feishuSaves: Response[] = [];
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
   page.on("console", (message) => {
     if (message.type() === "error") {
@@ -584,8 +591,64 @@ function observeBrowserErrors(page: Page): string[] {
   });
   page.on("response", (response) => {
     if (response.status() >= 400) errors.push(`response:${response.status()}:${response.url()}`);
+    if (new URL(response.url()).pathname === "/joko.v1.MessagingService/UpdateFeishuMessagingConfiguration") {
+      feishuSaves.push(response);
+    }
   });
-  return errors;
+  return {
+    clear: () => { errors.splice(0); recovered.splice(0); feishuSaves.splice(0); },
+    verifyFeishuRecovery: async (persisted: readonly MessagingConnection[]) => {
+      // Runtime cursor updates can race a save. Accept only an actual revision-only
+      // retry with an unchanged payload, a successful receipt, and durable settings.
+      const saves = feishuSaves.map(response => {
+        const request = response.request();
+        expect(request.method()).toBe("POST");
+        expect(request.headers()["content-type"]).toMatch(/^application\/proto/u);
+        const bytes = required(request.postDataBuffer(), "Feishu configuration request");
+        expect(bytes.length).toBeLessThanOrEqual(64 * 1024);
+        return { response, input: fromBinary(UpdateFeishuMessagingConfigurationRequestSchema, bytes) };
+      });
+      const verifiedConnections = new Set<string>();
+      for (const [index, failed] of saves.entries()) {
+        if (failed.response.status() !== 409) continue;
+        expect(await failed.response.json()).toMatchObject({
+          code: "aborted", message: "Messaging connection changed. Refresh and retry."
+        });
+        expect(verifiedConnections.has(failed.input.connectionId)).toBe(false);
+        const retry = required(saves.slice(index + 1).find(save =>
+          save.input.connectionId === failed.input.connectionId), "successful Feishu revision retry");
+        expect(retry.response.status()).toBe(200);
+        expect(retry.input.expectedGeneration).toBe(failed.input.expectedGeneration);
+        expect(retry.input.configuration).toEqual(required(failed.input.configuration, "original Feishu configuration"));
+        expect(required(retry.input.expectedRevision, "retry revision").value)
+          .toBeGreaterThan(required(failed.input.expectedRevision, "original revision").value);
+        const receipt = required(fromBinary(UpdateFeishuMessagingConfigurationResponseSchema,
+          await retry.response.body()).connection, "Feishu save receipt");
+        expect(receipt.connectionId).toBe(failed.input.connectionId);
+        expect(receipt.generation).toBe(retry.input.expectedGeneration + 1n);
+        expect(receipt.feishuConfiguration).toEqual(retry.input.configuration);
+        expect(required(receipt.revision, "saved revision").value)
+          .toBeGreaterThan(required(retry.input.expectedRevision, "retry revision").value);
+        const durable = required(persisted.find(connection => connection.connectionId === receipt.connectionId),
+          "durable Feishu settings");
+        expect(durable.generation).toBe(receipt.generation);
+        expect(durable.feishuConfiguration).toEqual(receipt.feishuConfiguration);
+        expect(required(durable.revision, "durable revision").value)
+          .toBeGreaterThanOrEqual(required(receipt.revision, "saved revision").value);
+        verifiedConnections.add(failed.input.connectionId);
+        recovered.push(`response:409:${failed.response.url()}`,
+          `console:Failed to load resource: the server responded with a status of 409 (Conflict):${failed.response.url()}:0`);
+      }
+    },
+    unexpected: () => {
+      const remaining = [...errors];
+      for (const error of recovered) {
+        const index = remaining.indexOf(error);
+        if (index !== -1) remaining.splice(index, 1);
+      }
+      return remaining;
+    }
+  };
 }
 
 async function overflow(page: Page): Promise<number> {
