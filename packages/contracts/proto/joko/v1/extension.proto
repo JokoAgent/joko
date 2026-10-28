@@ -326,6 +326,18 @@ message ExtensionMainViewDescriptor {
   bool multiple = 5;
 }
 
+message ExtensionSettingsDescriptor {
+  optional string title = 1;
+  uint32 height = 2;
+  bool mobile_custom = 3;
+}
+
+message ExtensionSettingsRoutingData {
+  string revision = 1;
+  // Bounded, non-secret plugin routing parameters, shared with its own runtime.
+  string data_json = 2;
+}
+
 message ExtensionLibraryDescriptor {
   uint32 schema_version = 1;
 }
@@ -643,6 +655,8 @@ message ExtensionMainViewSurface {
   string backend_id = 8;
   Revision backend_revision = 9;
   uint64 backend_generation = 10;
+  bool settings = 11;
+  bool mobile_settings = 12;
 }
 
 // Generic Extension projection. Executable bytes and secrets are deliberately
@@ -672,6 +686,7 @@ message ExtensionCatalogEntry {
   optional ExtensionMainViewDescriptor main_view = 21;
   optional ExtensionLibraryDescriptor library = 22;
   repeated ExtensionRecommendationDescriptor recommendations = 23;
+  optional ExtensionSettingsDescriptor settings = 24;
 }
 
 message ExtensionCatalogSnapshot {

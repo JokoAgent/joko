@@ -1,5 +1,5 @@
 import type { PartnerLearningReceipt, PartnerLearningTurnSource } from "@joko/core";
-import type { MakerMemoryEntry, OperationalStore, PartnerLearningTurnRecord, PartnerStore, PersistedEvent } from "@joko/store";
+import type { MakerMemoryEntry, OperationalStore, PartnerLearningTurnRecord, PartnerStore, PersistedEvent, QueueItemRecord } from "@joko/store";
 import type { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 import type { MakerMemoryController } from "./maker-memory.js";
 import type { PartnerLearningSaveCapture } from "./mcp-router.js";
@@ -15,9 +15,14 @@ export interface PartnerLearningManagerOptions {
   readonly memory: MakerMemoryController;
   readonly skills: PartnerSkillsManager;
   readonly auxiliary: Pick<AuxiliaryTextRouting, "capture" | "run">;
+  readonly assertMessagingSource?: (item: QueueItemRecord) => void;
 }
 
 type OrderedMessage = PartnerLearningReviewMessage & { readonly cursor: bigint };
+interface LearningProgress {
+  readonly version: 1; readonly generation: number; readonly bindingFingerprint: string;
+  readonly cursor: string; readonly offset: number;
+}
 
 /** Learning observes the existing write Owners and never grants a new tool or caller permission. */
 export class PartnerLearningManager {
@@ -33,17 +38,24 @@ export class PartnerLearningManager {
     const session = store.getSession(source.sessionId).descriptor;
     const target = store.getTarget(source.targetId);
     const link = profiles.getSessionLink(source.sessionId);
-    if (!link || link.role !== "canonical" && link.role !== "history" || canonical && link.role !== "canonical"
+    if (!link || link.role !== "canonical" && link.role !== "history" && link.role !== "topic" && link.role !== 'channel'
+      || canonical && link.role !== "canonical" && link.role !== "topic" && link.role !== 'channel'
       || partnerId !== undefined && link.partnerId !== partnerId) throw new Error("Learning source is unavailable.");
     const profile = partners.getPartner(link.partnerId);
     const queue = store.getQueueItem(source.sourceQueueItemId);
+    if (queue.body.messagingOrigin && (!queue.body.messagingOrigin.isOwner || queue.body.messagingOrigin.partnerId !== profile.id)) throw new Error('Only the original owner message can be learned.');
+    if (queue.body.messagingOrigin) {
+      if (!this.options.assertMessagingSource) throw new Error('The owner message authority is unavailable.');
+      this.options.assertMessagingSource(queue);
+    }
+    if (link.role === 'channel' && !queue.body.messagingOrigin) throw new Error('Channel learning requires its original owner message.');
     const operation = store.getOperation(queue.operationId);
     const operationBody = operation.body !== null && typeof operation.body === "object"
       ? operation.body as Readonly<Record<string, unknown>> : undefined;
     if (operationBody?.["partnerPrivateOrigin"] !== undefined || profile.lifecycle === "deleted" || !association && (profile.lifecycle !== "active"
       || profile.initializationState !== "ready" || profile.pauseCleanupPending
       || partners.listPendingRestarts().some(item => item.partnerId === profile.id))
-      || profile.homeTargetId !== source.targetId || canonical && profile.canonicalSessionId !== source.sessionId
+      || profile.homeTargetId !== source.targetId || canonical && link.role === "canonical" && profile.canonicalSessionId !== source.sessionId
       || !association && session.archived || session.deletedAt !== undefined || !target.descriptor.trusted
       || session.remoteWorkspace !== undefined || target.descriptor.remoteWorkspace !== undefined
       || session.targetId !== source.targetId || session.backendId !== source.backendId
@@ -141,7 +153,15 @@ export class PartnerLearningManager {
     };
     const current = (): boolean => { try { assertCurrent(); return true; } catch { return false; } };
     assertCurrent();
-    const messages = await this.#messages(turn, assertCurrent);
+    const currentMessages = await this.#messages(turn, assertCurrent);
+    const backfill = await this.#backfill(turn, assertCurrent);
+    const seenMessages = new Set<string>();
+    const messages = [...currentMessages, ...backfill.messages].filter(message => {
+      const identity = JSON.stringify(message); if (seenMessages.has(identity)) return false; seenMessages.add(identity); return true;
+    }).sort((left, right) => {
+      const a = store.findEvent(left.id)?.globalCursor ?? 0n, b = store.findEvent(right.id)?.globalCursor ?? 0n;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
     if (!messages.some(message => message.role === "user")) return;
     const memories = memory.enabledForTarget(owner.profile.homeTargetId)
       ? memory.list(owner.profile.homeTargetId).filter((entry): entry is MakerMemoryEntry & { kind: Exclude<MakerMemoryEntry["kind"], "digest"> } => entry.kind !== "digest") : [];
@@ -206,7 +226,59 @@ export class PartnerLearningManager {
     } finally {
       if (memorySaved) memory.requestEntriesRefresh();
       if (skillSaved && current()) skills.requestRefresh?.(turn.source.sessionId);
+      // Each conversation owns its own coverage. A topic can never move the canonical cursor.
+      if (current()) store.setSetting("session", turn.source.sessionId, "partner.learning.progress.v1", backfill.progress);
     }
+  }
+
+  async #backfill(turn: PartnerLearningTurnRecord, assertCurrent: () => void): Promise<{ readonly messages: readonly PartnerLearningReviewMessage[]; readonly progress: LearningProgress }> {
+    const store = this.options.store, completion = store.findEvent(turn.completionEventId!)!;
+    let progress = store.findSetting<LearningProgress>("session", turn.source.sessionId, "partner.learning.progress.v1")?.value;
+    if (progress && (progress.version !== 1 || progress.generation !== turn.source.bindingGeneration
+      || progress.bindingFingerprint !== turn.source.bindingFingerprint || !/^\d{1,20}$/u.test(progress.cursor)
+      || !Number.isSafeInteger(progress.offset) || progress.offset < 0 || BigInt(progress.cursor) > completion.globalCursor)) progress = undefined;
+    if (!progress) {
+      // Enabling topic learning starts at the prior completed reply, rather than scanning old history.
+      let before = completion.globalCursor, boundary = 0n;
+      for (;;) {
+        assertCurrent(); const page = store.listEvents({ sessionId: turn.source.sessionId, beforeCursor: before, order: "desc", limit: 1000, activeNativeTimeline: true });
+        const previous = page.find(event => event.generation === turn.source.bindingGeneration && event.payload.type === "message_complete"
+          && event.payload.role === "assistant" && event.runId !== turn.source.sourceRunId
+          && event.runId !== undefined && store.findRun(event.runId)?.descriptor.state === "completed");
+        if (previous) { boundary = previous.globalCursor; break; }
+        if (page.length === 0) break;
+        const next = page.at(-1)!.globalCursor; if (next >= before) break; before = next; await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      progress = { version: 1, generation: turn.source.bindingGeneration, bindingFingerprint: turn.source.bindingFingerprint, cursor: boundary.toString(), offset: 0 };
+      assertCurrent(); store.setSetting("session", turn.source.sessionId, "partner.learning.progress.v1", progress);
+    }
+    const messages: PartnerLearningReviewMessage[] = []; let remaining = 16_000;
+    let cursor = BigInt(progress.cursor), offset = progress.offset, stop = false;
+    while (!stop && (cursor < completion.globalCursor || offset > 0)) {
+      assertCurrent(); const page = store.listEvents({ sessionId: turn.source.sessionId,
+        afterCursor: offset > 0 && cursor > 0n ? cursor - 1n : cursor, order: "asc", limit: 1000, activeNativeTimeline: true });
+      if (page.length === 0) break;
+      for (const event of page) {
+        if (event.globalCursor > completion.globalCursor) { stop = true; break; }
+        const record = event.generation === turn.source.bindingGeneration && event.targetId === turn.source.targetId
+          && event.backendId === turn.source.backendId ? this.#reviewMessage(event, false) : undefined;
+        if (record && record.message.text) {
+          let start = event.globalCursor === cursor ? offset : 0;
+          while (start < record.message.text.length) {
+            const message = { ...record.message, text: record.message.text.slice(start, start + 6000) }, cost = JSON.stringify(message).length;
+            if (cost > remaining || messages.length >= 40) { cursor = start > 0 ? event.globalCursor : event.globalCursor - 1n; offset = start; stop = true; break; }
+            messages.push(message); remaining -= cost;
+            if (start + 6000 >= record.message.text.length) { start = record.message.text.length; break; }
+            start += 5800;
+          }
+          if (stop) break;
+        }
+        cursor = event.globalCursor; offset = 0;
+        if (cursor === completion.globalCursor) { stop = true; break; }
+      }
+      if (!stop) await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    return { messages, progress: { ...progress, cursor: cursor.toString(), offset } };
   }
 
   async #messages(turn: PartnerLearningTurnRecord, assertCurrent: () => void): Promise<PartnerLearningReviewMessage[]> {
@@ -222,7 +294,7 @@ export class PartnerLearningManager {
       for (const event of page) {
         if (event.generation !== turn.source.bindingGeneration || event.backendId !== turn.source.backendId
           || event.targetId !== turn.source.targetId) continue;
-        const record = reviewMessage(event);
+        const record = this.#reviewMessage(event);
         if (record && !seen.has(record.identity)) {
           seen.add(record.identity);
           const group = record.message.role === "user" ? users : others;
@@ -245,6 +317,22 @@ export class PartnerLearningManager {
       ({ cursor: cursor.toString(), ...message })), 40_000);
     return selected.sort((a, b) => BigInt(a.cursor) < BigInt(b.cursor) ? -1 : 1).map(({ cursor: _cursor, ...message }) => message);
   }
+
+  #reviewMessage(event: PersistedEvent, clip = true) {
+    const queue = event.sessionId && event.runId ? this.options.store.findQueueItemByRunId(event.sessionId, event.runId) : undefined;
+    const origin = queue?.body.messagingOrigin;
+    if (origin) {
+      if (!origin.isOwner) return undefined;
+      const record = reviewMessage(event, clip);
+      // The actual owner utterance is evidence. Group history, quotes and
+      // other speakers appended to the model prompt are not owner evidence.
+      if (record && record.message.role === 'user') return { ...record, message: { ...record.message,
+        text: origin.userText.slice(0, clip ? 6000 : undefined) } };
+      return record;
+    }
+    if (event.sessionId && this.options.profiles.getSessionLink(event.sessionId)?.role === 'channel') return undefined;
+    return reviewMessage(event, clip);
+  }
 }
 
 function sameSource(left: PartnerLearningTurnSource, right: PartnerLearningTurnSource): boolean {
@@ -252,16 +340,17 @@ function sameSource(left: PartnerLearningTurnSource, right: PartnerLearningTurnS
     && Object.entries(left).every(([key, value]) => right[key as keyof PartnerLearningTurnSource] === value);
 }
 
-function reviewMessage(event: PersistedEvent): { readonly identity: string; readonly message: PartnerLearningReviewMessage } | undefined {
+function reviewMessage(event: PersistedEvent, clip = true): { readonly identity: string; readonly message: PartnerLearningReviewMessage } | undefined {
   const payload = event.payload;
   if (payload.type === "message_complete") {
     if (payload.partnerPrivateOrigin !== undefined || payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined || payload.inputHandoffContinuation !== undefined
       || payload.role === "user" && payload.acceptedInput === undefined) return undefined;
     return { identity: `${payload.role}:${payload.nativeHistory?.identity?.entryId ?? event.id}`,
-      message: { id: event.id, role: payload.role, text: payload.blocks.flatMap(block => block.kind === "text" ? [block.text] : []).join("\n").slice(0, 6_000) } };
+      message: { id: event.id, role: payload.role, text: payload.blocks.flatMap(block => block.kind === "text" ? [block.text] : []).join("\n").slice(0, clip ? 6000 : undefined) } };
   }
   if (payload.type !== "tool_start" && payload.type !== "tool_result") return undefined;
+  if (payload.type === "tool_result" && payload.isError) return undefined;
   return { identity: `${payload.type}:${payload.nativeHistory?.identity?.entryId ?? payload.callId}`,
     message: { id: event.id, role: payload.type === "tool_start" ? "tool_use" : "tool_result",
-      text: (payload.type === "tool_start" ? payload.input : payload.output).slice(0, 6_000) } };
+      text: (payload.type === "tool_start" ? payload.input : payload.output).slice(0, clip ? 6000 : undefined) } };
 }

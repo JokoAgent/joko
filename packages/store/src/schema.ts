@@ -10,6 +10,7 @@ export const SCHEMA_VERSION = 1;
 // DDL: changing one must reject an existing development database for rebuild.
 const DURABLE_JSON_SHAPE_BASELINE = [
   "model-speed:boolean|ultrafast;native-hosted:lineage+derivation;hosted-settings:idle-release-v1",
+  "provisional-session:exact-owner+configuration+target-revision-v1",
   "device-authorization:invitation/request/digests/approval/claim-v1",
   "interaction-question-request:single/multiple.allowOther=required",
   "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",
@@ -1651,8 +1652,10 @@ CREATE TABLE messaging_conversations (
         ),
         conversation_kind TEXT NOT NULL CHECK (conversation_kind IN ('direct', 'group', 'channel')),
         status TEXT NOT NULL CHECK (status IN ('observed', 'active', 'retired')),
-        session_id TEXT UNIQUE REFERENCES product_sessions(id) ON DELETE RESTRICT,
+        session_id TEXT REFERENCES product_sessions(id) ON DELETE RESTRICT,
         session_generation INTEGER CHECK (session_generation IS NULL OR session_generation >= 0),
+        partner_id TEXT,
+        partner_binding_revision INTEGER CHECK (partner_binding_revision IS NULL OR partner_binding_revision >= 1),
         route_scope_key TEXT REFERENCES messaging_routes(scope_key) ON DELETE RESTRICT,
         target_id TEXT REFERENCES targets(id) ON DELETE RESTRICT,
         backend_id TEXT REFERENCES backends(id) ON DELETE RESTRICT,
@@ -1679,13 +1682,15 @@ CREATE TABLE messaging_conversations (
         ),
         CHECK (
           status <> 'active' OR (
-            session_id IS NOT NULL AND session_generation IS NOT NULL AND route_scope_key IS NOT NULL
+            session_id IS NOT NULL AND session_generation IS NOT NULL AND (route_scope_key IS NOT NULL OR partner_id IS NOT NULL)
             AND target_id IS NOT NULL AND backend_id IS NOT NULL AND fast_mode IS NOT NULL
             AND permission_mode IS NOT NULL AND plan_mode IS NOT NULL AND retired_at IS NULL
           )
         ),
+        CHECK ((partner_id IS NULL) = (partner_binding_revision IS NULL)),
         CHECK (status = 'retired' OR retired_at IS NULL)
       ) STRICT;
+CREATE INDEX messaging_conversations_session_idx ON messaging_conversations(session_id);
 
 CREATE TABLE messaging_poll_batches (
         connection_id TEXT PRIMARY KEY REFERENCES messaging_channels(id) ON DELETE CASCADE,

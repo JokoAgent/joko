@@ -258,7 +258,73 @@ message GetMessagingSettingsResponse {
   repeated MessagingConnection connections = 1;
   repeated MessagingRoute routes = 2;
   repeated MessagingChannelCapability channels = 3;
+  repeated PartnerMessagingBinding partner_bindings = 4;
 }
+
+message PartnerMessagingBinding {
+  string connection_id = 1;
+  optional string partner_id = 2;
+  uint64 revision = 3;
+  uint64 connection_generation = 4;
+}
+message SetPartnerMessagingBindingRequest {
+  string operation_id = 1;
+  string connection_id = 2;
+  Revision expected_connection_revision = 3;
+  uint64 expected_connection_generation = 4;
+  uint64 expected_binding_revision = 5;
+  oneof destination { string partner_id = 6; bool personal = 7; }
+  Revision expected_partner_revision = 8;
+}
+message SetPartnerMessagingBindingResponse { PartnerMessagingBinding binding = 1; MessagingConnection connection = 2; }
+enum PartnerMessagingLaneKind {
+  PARTNER_MESSAGING_LANE_KIND_UNSPECIFIED = 0;
+  PARTNER_MESSAGING_LANE_KIND_OWNER_DM = 1;
+  PARTNER_MESSAGING_LANE_KIND_GROUP = 2;
+  PARTNER_MESSAGING_LANE_KIND_TOPIC = 3;
+  PARTNER_MESSAGING_LANE_KIND_GUEST_DM = 4;
+}
+message PartnerMessagingLane {
+  string conversation_id = 1;
+  string session_id = 2;
+  uint64 generation = 3;
+  PartnerMessagingLaneKind kind = 4;
+  string title = 5;
+  bool running = 6;
+  bool failed = 7;
+  google.protobuf.Timestamp last_activity_at = 8;
+  uint64 context_message_count = 9;
+  bool can_restart = 10;
+}
+message ListPartnerMessagingLanesRequest { string connection_id = 1; }
+message ListPartnerMessagingLanesResponse { PartnerMessagingBinding binding = 1; repeated PartnerMessagingLane lanes = 2; }
+enum PartnerMessagingRestartPhase {
+  PARTNER_MESSAGING_RESTART_PHASE_UNSPECIFIED = 0;
+  PARTNER_MESSAGING_RESTART_PHASE_CLOSING = 1;
+  PARTNER_MESSAGING_RESTART_PHASE_READY = 2;
+  PARTNER_MESSAGING_RESTART_PHASE_FAILED = 3;
+}
+message PartnerMessagingRestart {
+  string operation_id = 1;
+  string connection_id = 2;
+  string conversation_id = 3;
+  string session_id = 4;
+  uint64 source_generation = 5;
+  PartnerMessagingRestartPhase phase = 6;
+  optional string failure_code = 7;
+}
+message RestartPartnerMessagingLaneRequest {
+  string operation_id = 1;
+  string connection_id = 2;
+  string conversation_id = 3;
+  uint64 expected_binding_revision = 4;
+  uint64 expected_session_generation = 5;
+}
+message RestartPartnerMessagingLaneResponse { PartnerMessagingRestart restart = 1; }
+message GetPartnerMessagingRestartRequest { string operation_id = 1; }
+message GetPartnerMessagingRestartResponse { PartnerMessagingRestart restart = 1; }
+message RetryPartnerMessagingRestartRequest { string operation_id = 1; }
+message RetryPartnerMessagingRestartResponse { PartnerMessagingRestart restart = 1; }
 
 message CreateMessagingConnectionRequest {
   MessagingChannel channel = 1;

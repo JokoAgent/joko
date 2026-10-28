@@ -20,6 +20,90 @@ import { HostedAgentConnectClient } from "./hosted-agent-connect-client.js";
 const databases: OperationalStore[] = [];
 afterEach(() => { for (const store of databases.splice(0)) store.close(); });
 
+it.each(["same", "opaqueRef", "nativeSessionId", "generation"] as const)("confirms a persisted Side Chat child binding by native identity (%s)", async change => {
+  const root = await mkdtemp(join(tmpdir(), "joko-hosted-side-chat-binding-")), database = new OperationalStore(":memory:"), store = new HostedAgentStore(database);
+  const sourceBinding = { opaqueRef: "native-source", nativeSessionId: "source-native", generation: 1 };
+  // Pi reserves this order; durable Store JSON sorts the fields on readback.
+  const childBinding = { opaqueRef: "native-child", nativeSessionId: "child-native", generation: 1 };
+  const returned = change === "opaqueRef" ? { ...childBinding, opaqueRef: "other-native-reference" }
+    : change === "nativeSessionId" ? { ...childBinding, nativeSessionId: "other-native-child" }
+      : change === "generation" ? { ...childBinding, generation: 2 } : childBinding;
+  let forks = 0;
+  const adapter = { id: "native", hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },
+    createSession: async () => sourceBinding,
+    describe: async () => ({ id: "native", adapterKind: "controlled", instanceGeneration: 1, displayName: "Native", version: "1",
+      health: "healthy", installationState: "installed", authenticationState: "not_required",
+      capabilities: new Map([["session.side_chat", { key: "session.side_chat", supported: true }]]), models: [], tools: [], diagnostics: [] }),
+    fork: async (_entry, context, derivation) => {
+      forks++; expect(context.binding).toEqual(sourceBinding);
+      expect(derivation.completedSnapshot).toEqual({ kind: "completed_assistant", nativeBoundaryId: "completed-reply" });
+      derivation.recordBinding(childBinding); return { binding: returned };
+    }, dispose: async () => {}
+  } satisfies Partial<BackendAdapter>;
+  let run: NativeRun | undefined;
+  try {
+    run = await NativeRun.create({ root, runId: "source-run", nativeSessionId: "source-alias", start: "create", store, slots: new HostedAgentSessionSlots(),
+      source: { authorityId: "approved-share", deviceId: "source-device", sessionId: "source-task", targetId: "source-target", generation: 1 },
+      trust: "guest", backendId: "native", providerId: "provider", modelId: "model", modelIds: ["model"], permissionMode: "ask", fastMode: false,
+      workspace: { platform: process.platform as "win32" | "darwin" | "linux", shell: "native", isGitRepository: false }, artifactCapacityBytes: 1024,
+      assertCurrent: () => {}, assertModelAllowed: () => {}, createAdapter: () => adapter as unknown as BackendAdapter });
+    const command = { kind: "derive" as const, derivationKind: "fork" as const, sessionId: "side-chat-task", targetId: "source-target",
+      nativeSessionId: "child-alias", entryId: "completed-reply", completedSnapshot: { kind: "completed_assistant" as const, nativeBoundaryId: "completed-reply" } };
+    if (change === "same") {
+      await expect(run.call("side-chat-fork", command)).resolves.toEqual({});
+      await expect(run.call("side-chat-fork", command)).resolves.toEqual({});
+    } else {
+      await expect(run.call("side-chat-fork", command)).rejects.toThrow("exact child binding");
+      await expect(run.call("side-chat-fork", command)).rejects.toThrow("exact child binding");
+    }
+    expect(forks).toBe(1);
+    const child = store.list().find(record => record.owner.sessionId === "side-chat-task")!;
+    expect(child.binding).toEqual(childBinding);
+    expect(child.derivation).toMatchObject({ state: change === "same" ? "settled" : "unknown", nativeAdopted: change === "same", adopted: false,
+      completedSnapshot: { kind: "completed_assistant", nativeBoundaryId: "completed-reply" } });
+    expect(() => store.claim(child.owner, "unadopted-child-process", "resume")).toThrow("cannot");
+  } finally {
+    await run?.close(); run?.disposeExchange(); database.close();
+    if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("preserves the original sharing usage turn through steer and queued follow-up without inventing missing usage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-hosted-usage-turn-")), database = new OperationalStore(":memory:");
+  const store = new HostedAgentStore(database), contexts = new Map<string, AdapterContext>();
+  const binding = { opaqueRef: "native-usage", nativeSessionId: "native-usage", generation: 1 };
+  const usage = (totalTokens: number) => ({ inputTokens: totalTokens - 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens, cost: 0 });
+  const ledger = { begin: vi.fn(), finish: vi.fn() }; let streaming = false;
+  const adapter = { id: "native", hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },
+    createSession: async () => binding,
+    inspectSession: async () => ({ binding, streaming, compacting: false, pendingMessages: 0, usage: usage(10), fastMode: false, permissionMode: "ask" }),
+    send: async (_input, context) => { contexts.set(context.operationId!, context); streaming = true; }, dispose: async () => {} } satisfies Partial<BackendAdapter>;
+  let run: NativeRun | undefined;
+  try {
+    run = await NativeRun.create({ root, runId: "usage-host", nativeSessionId: "usage-alias", start: "create", store, slots: new HostedAgentSessionSlots(),
+      source: { authorityId: "owner", deviceId: "source", sessionId: "task", targetId: "workspace", generation: 1 },
+      trust: "owner", backendId: "native", providerId: "provider", modelId: "model", modelIds: ["model"], permissionMode: "ask", fastMode: false,
+      workspace: { platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false }, artifactCapacityBytes: 1024,
+      usage: ledger, assertCurrent: () => {}, assertModelAllowed: () => {}, createAdapter: () => adapter as unknown as BackendAdapter });
+    const send = (id: string, disposition: "prompt" | "steer" | "follow_up") => run!.call(id, { kind: "send", durableFence: false,
+      input: { text: id, images: [], files: [], mentions: [], disposition } });
+    await send("original-turn", "prompt"); await contexts.get("original-turn")!.emit({ type: "usage", usage: usage(20) });
+    await send("steering-input", "steer"); await send("queued-follow-up", "follow_up");
+    expect(ledger.begin).toHaveBeenCalledExactlyOnceWith("original-turn", "model", usage(10));
+    await contexts.get("original-turn")!.emit({ type: "run_state", state: "completed" });
+    await contexts.get("original-turn")!.emit({ type: "done", outcome: "completed" });
+    expect(ledger.finish).toHaveBeenCalledExactlyOnceWith("original-turn", usage(20));
+    await contexts.get("queued-follow-up")!.emit({ type: "run_state", state: "running" });
+    expect(ledger.begin).toHaveBeenLastCalledWith("queued-follow-up", "model", usage(20));
+    await contexts.get("queued-follow-up")!.emit({ type: "run_state", state: "completed" });
+    expect(ledger.finish).toHaveBeenLastCalledWith("queued-follow-up", undefined);
+    expect(ledger.finish).toHaveBeenCalledTimes(2);
+  } finally {
+    await run?.close(); run?.disposeExchange(); database.close();
+    if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
+  }
+});
+
 it("protects background work from idle release and retries only the approved native close when its outcome is uncertain", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-hosted-idle-")), database = new OperationalStore(":memory:"), store = new HostedAgentStore(database);
   let now = 0, context!: AdapterContext, disposals = 0; const clock = vi.spyOn(Date, "now").mockImplementation(() => now);

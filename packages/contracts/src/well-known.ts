@@ -9,6 +9,7 @@ export const capabilityNames = {
   sessionDetach: "session.detach",
   sessionFork: "session.fork",
   sessionSideChat: "session.side_chat",
+  sessionPrewarm: "session.prewarm",
   sessionClone: "session.clone",
   sessionRewind: "session.rewind",
   sessionTree: "session.tree",

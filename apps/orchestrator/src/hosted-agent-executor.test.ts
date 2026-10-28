@@ -9,7 +9,7 @@ import { HostedAgentExecutor, type HostedAgentExecutorPolicy } from "./hosted-ag
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture() {
+async function fixture(sideChat = false) {
   const root = await mkdtemp(join(tmpdir(), "joko-task-executor-")), task = join(root, "task"), agent = join(root, "agent");
   await mkdir(task); await mkdir(agent);
   let current = true;
@@ -19,6 +19,7 @@ async function fixture() {
   const context: AdapterContext = { sessionId: "original-session", generation: 2,
     target: { id: "original-target", backendId: "pi", displayName: "Task", workspaceRoot: task, managed: true, trusted: true },
     signal: new AbortController().signal, emit: async () => {},
+    ...(sideChat ? { runtimePolicy: "review_read_only" as const, persistentReadOnly: "side_chat" as const } : {}),
     requestInteraction: async question => { questions.push(question); return answer(question); },
     artifactCapacityBytes: 1024, storeArtifact: async () => { throw new Error("No Artifact expected."); } };
   const gate = createCommandConcurrencyGate({ readMaximum: () => 1 });
@@ -56,6 +57,28 @@ it("executes native file operations on the task computer and round-trips project
   expect(Buffer.from(String((await f.call("fs.read", { path: join(f.agent, "data.bin") })).data), "base64")).toEqual(binary);
   expect(await f.call("fs.readdir", { path: f.agent })).toEqual({ entries: ["data.bin", "source.json"] });
   expect(f.questions).toEqual([]);
+});
+
+it("reads a side chat's original Source workspace through a bounded immutable native facade", async () => {
+  const f = await fixture(true);
+  await writeFile(join(f.task, "answer.txt"), "Source workspace answer");
+  await writeFile(join(f.agent, "answer.txt"), "Provider shadow must not be read");
+  await writeFile(join(f.task, ".env"), "PRIVATE_CREDENTIAL=never-send");
+  let sequence = 0;
+  const request = (callId: string, operation: string, payload: Record<string, unknown>) => f.executor.execute({
+    format: 1, callId, requestId: `${callId}:${++sequence}`, operation, payload });
+  await request("answer", "tool.begin", { name: "read", input: { path: join(f.agent, "answer.txt") } });
+  const result = await request("answer", "review.call", { tool: "joko_read", arguments: { path: "answer.txt" } });
+  expect(String(result.text)).toContain("Source workspace answer");
+  expect(String(result.text)).not.toContain("Provider shadow");
+  await expect(request("answer", "review.call", { tool: "bash", arguments: { command: "echo no" } })).rejects.toThrow();
+  await expect(request("answer", "review.call", { tool: "joko_read", arguments: { path: ".env" } })).rejects.toThrow();
+  await expect(f.call("fs.write", { path: join(f.agent, "answer.txt"), data: Buffer.from("overwrite").toString("base64") })).rejects.toThrow();
+  expect(await readFile(join(f.task, "answer.txt"), "utf8")).toBe("Source workspace answer");
+  f.revoke();
+  await expect(request("answer", "review.call", { tool: "joko_read", arguments: { path: "answer.txt" } })).rejects.toThrow();
+  const ordinary = await fixture();
+  await expect(ordinary.call("review.call", { tool: "joko_ls", arguments: { path: "." } })).rejects.toMatchObject({ code: "INVALID_REQUEST" });
 });
 
 it("obtains credential consent on the task computer even under Full Access and does not publish file contents", async () => {

@@ -1,4 +1,29 @@
 import { randomUuid } from "./web-crypto.js";
+import type { ConnectionProfile } from "./model.js";
+import type { AppRoute } from "./controller.js";
+
+const pageGuards = new Map<string, () => Promise<boolean>>();
+function pageKey(profile: ConnectionProfile | undefined, extensionId: string): string {
+  return JSON.stringify([profile?.id, profile?.serverId, profile?.origin, profile?.endpointPublicKey, extensionId]);
+}
+export function registerExtensionPageClose(profile: ConnectionProfile | undefined, extensionId: string, guard: () => Promise<boolean>): () => void {
+  const key = pageKey(profile, extensionId); pageGuards.set(key, guard);
+  return () => { if (pageGuards.get(key) === guard) pageGuards.delete(key); };
+}
+export function requestExtensionNavigationLeave(profile: ConnectionProfile | undefined, from: AppRoute, to: AppRoute, signal: AbortSignal): Promise<boolean> | undefined {
+  if (from.kind !== "extensionMainView" || to.kind === "extensionMainView" && to.extensionId === from.extensionId
+    && to.profileId === from.profileId && to.serverId === from.serverId) return undefined;
+  const key = pageKey(profile, from.extensionId), guard = pageGuards.get(key);
+  if (guard === undefined) return undefined;
+  return new Promise<boolean>(resolve => {
+    let done = false;
+    const finish = (allowed: boolean): void => { if (done) return; done = true; signal.removeEventListener("abort", aborted); resolve(allowed && !signal.aborted && pageGuards.get(key) === guard); };
+    const aborted = (): void => finish(false);
+    if (signal.aborted) { finish(false); return; }
+    signal.addEventListener("abort", aborted, { once: true });
+    void guard().then(finish, () => finish(false));
+  });
+}
 
 /** The exact sandboxed frame can veto a user close; expiry/removal still revoke
  * it immediately through the existing surface owner. */

@@ -42,4 +42,11 @@ describe("detached Inspector renderer contract", () => {
     await expect(activateDetachedInspectorWindow(undefined)).resolves.toBe(false);
     await expect(activateDetachedInspectorWindow(desktop([]))).resolves.toBe(false);
   });
+  it("uses distinct bounded window targets while keeping the same isolated popup policy", () => {
+    const open = vi.fn(() => null);
+    openDetachedInspectorWindow(open, "a".repeat(32)); openDetachedInspectorWindow(open, "b".repeat(32));
+    expect(open.mock.calls[0]).toEqual([INSPECTOR_WINDOW_URL, `${INSPECTOR_WINDOW_FRAME_NAME}-${"a".repeat(32)}`, INSPECTOR_WINDOW_FEATURES]);
+    expect(open.mock.calls[1]).toEqual([INSPECTOR_WINDOW_URL, `${INSPECTOR_WINDOW_FRAME_NAME}-${"b".repeat(32)}`, INSPECTOR_WINDOW_FEATURES]);
+    expect(() => openDetachedInspectorWindow(open, "arbitrary-frame")).toThrow();
+  });
 });

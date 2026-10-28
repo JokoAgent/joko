@@ -6005,10 +6005,12 @@ export class OperationalStore {
   findMessagingConversationBySessionId(sessionId: string): MessagingConversationRecord | undefined {
     this.assertOpen();
     const id = boundedPrivateIdentity(sessionId, "Messaging Session ID");
-    const row = this.database.prepare(
-      "SELECT * FROM messaging_conversations WHERE session_id = ?"
-    ).get(id) as Row | undefined;
-    return row === undefined ? undefined : messagingConversationFromRow(row);
+    const rows = this.database.prepare(
+      "SELECT * FROM messaging_conversations WHERE session_id = ? AND status = 'active' LIMIT 2"
+    ).all(id) as Row[];
+    // Canonical Partner tasks can serve several channels. Session identity
+    // alone cannot select a recipient; callers must use the source Run.
+    return rows.length === 1 ? messagingConversationFromRow(rows[0]!) : undefined;
   }
 
   listMessagingConversations(input: {
@@ -6101,6 +6103,27 @@ export class OperationalStore {
           this.getMessagingConversation(current.id).revision
         );
       }
+      return this.getMessagingConversation(current.id);
+    });
+  }
+
+  /** Trusted Partner runtime binding, separate from ordinary route validation. */
+  bindPartnerMessagingConversation(input: { readonly conversationId: string; readonly expectedRevision: bigint;
+    readonly expectedChannelGeneration: number; readonly sessionId: string; readonly expectedSessionGeneration: number;
+    readonly partnerId: string; readonly bindingRevision: number; readonly targetId: string }): MessagingConversationRecord {
+    return this.write(() => {
+      const current = this.getMessagingConversation(input.conversationId);
+      assertMessagingRevision('Messaging conversation', current.id, current.revision, input.expectedRevision);
+      const connection = this.getMessagingConnection(current.connectionId); assertMessagingGeneration(connection, input.expectedChannelGeneration);
+      const session = this.getSession(input.sessionId).descriptor;
+      if (current.status === 'retired' || current.channelGeneration !== connection.generation || session.archived || session.deletedAt !== undefined
+        || session.targetId !== input.targetId || session.binding.generation !== input.expectedSessionGeneration
+        || !Number.isSafeInteger(input.bindingRevision) || input.bindingRevision < 1) throw new StoreError('The Partner message binding changed.');
+      this.database.prepare(`UPDATE messaging_conversations SET status='active',session_id=?,session_generation=?,route_scope_key=NULL,
+        partner_id=?,partner_binding_revision=?,target_id=?,backend_id=?,provider_id=?,model_id=?,effort=?,fast_mode=?,permission_mode=?,plan_mode=?,updated_at=?,revision=?
+        WHERE id=? AND revision=?`).run(session.id, session.binding.generation, boundedPrivateIdentity(input.partnerId, 'Partner ID'), input.bindingRevision,
+          session.targetId, session.backendId, session.providerId ?? null, session.modelId ?? null, session.effort ?? null, speedInt(session.fastMode),
+          session.permissionMode, session.planMode ? 1 : 0, Math.max(current.createdAt, this.now()), asSqlInteger(this.requireActiveRevision()), current.id, asSqlInteger(current.revision));
       return this.getMessagingConversation(current.id);
     });
   }
@@ -19976,6 +19999,8 @@ function messagingRouteFromRow(row: Row): MessagingRouteRecord {
 
 function messagingConversationFromRow(row: Row): MessagingConversationRecord {
   return {
+    ...optionalString('partnerId', row['partner_id']),
+    ...optionalNumber('partnerBindingRevision', row['partner_binding_revision']),
     id: stringValue(row["id"]),
     connectionId: stringValue(row["connection_id"]),
     channelGeneration: numberValue(row["channel_generation"]),

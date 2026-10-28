@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,7 +66,9 @@ async function fixture() {
       tools: [{ serverId: "original_tools", name: "owner_echo", description: "Original task tool", inputSchema: { type: "object", properties: {} }, requiresPermission: false, requiresNativeRoot: true }],
       callTool: async (_name, _args, _signal, context) => { context.assertCurrent?.(); context.assertNativeRoot?.(); mcpCalls.push(id);
         return { content: [{ type: "text", text: `ORIGINAL_MCP_${id}` }], isError: false }; } });
-    const makePi = (home: string, mcpBridge?: PiMcpBridgeOptions) => createPiAdapter({ agentHome: home, sessionRoot: home, includeManagedSubagentTools: () => false,
+    // Match the application factory: each Adapter owns its generation while
+    // derived native contexts retain the same durable Session root.
+    const makePi = (home: string, mcpBridge?: PiMcpBridgeOptions) => createPiAdapter({ agentHome: join(home, "provider-snapshots", randomUUID()), sessionRoot: home, includeManagedSubagentTools: () => false,
       ...(mcpBridge ? { mcpBridge } : { resolveMcpBridge: () => undefined }),
       settings: { compaction: { enabled: false }, retry: { enabled: false } }, environment: { NATIVE_KEY: `private-${id}` },
       providers: [{ id: "provider", api: "openai-completions", baseUrl: `http://127.0.0.1:${port}/${id}/v1`, apiKeyEnv: "NATIVE_KEY",
@@ -168,8 +171,35 @@ it("runs same-owner C through B's group decision directly on A with the actual S
   } finally { await f.close(); }
 });
 
+it("tries another authorized group computer after a positively rejected native capacity admission", { timeout: 90_000 }, async () => {
+  const f = await fixture(); let release: (() => void) | undefined;
+  try {
+    const a = await f.node("A"), b = await f.node("B"), c = await f.node("C");
+    a.native.settings.update({ kind: "limits", value: { perDevice: 1, total: 1 } }, a.native.settings.snapshot().revision);
+    release = a.native.slots.reserve("another-owner-device").release;
+    await f.pair(b, a); await f.pair(c, b);
+    const key = { backendId: "pi", providerId: "provider" }, remoteA = b.groups.sources().find(source => source.nodeId === "A" && source.providerId === "provider")!, localB = b.groups.sources().find(source => source.kind === "local" && source.providerId === "provider")!;
+    b.groups.store.update(key, { strategy: "ordered", autoSwitch: true, members: [providerGroupDefaultMember(remoteA), providerGroupDefaultMember(localB)] }, 0n);
+    await c.sources.refresh(c.connection);
+    const sourceB = c.groups.sources().find(source => source.nodeId === "B" && source.providerId === "provider")!;
+    await c.host.registerTarget({ id: "capacity-target", backendId: sourceB.backendId, displayName: "Original C", workspaceRoot: join(c.root, "workspace"), managed: false, trusted: true });
+    const sessionId = (await c.host.createSession({ operationId: "capacity-original-create", connection: c.connection, targetId: "capacity-target", title: "Capacity route",
+      providerId: "provider", modelId: "model", permissionMode: "bypassPermissions", planMode: false, fastMode: false })).value.sessionId;
+    const queued = c.host.enqueueInput({ operationId: "capacity-original-input", connection: c.connection, sessionId,
+      prompt: { text: "Read original files once", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await vi.waitFor(() => expect(c.store.getQueueItem(queued.queueItemId).state).toBe("completed"), { timeout: 30_000 });
+    expect(f.calls.length).toBeGreaterThan(0); expect(f.calls.every(call => call.node === "B")).toBe(true);
+    expect(a.native.slots.summary().total).toBe(1);
+    expect(c.groups.taskMember(sessionId)).toMatchObject({ nodeId: "B", quotaReadable: true });
+    expect(c.store.listRuns({ sessionId })).toHaveLength(1); expect(c.store.getOperation("capacity-original-input").status).toBe("completed");
+    await c.host.detach(sessionId);
+    expect(b.native.slots.summary().total).toBe(0); expect(a.native.slots.summary().total).toBe(1);
+  } finally { release?.(); await f.close(); }
+});
+
 it("relays guest C through B to isolated A, offers one native handoff and continues C on B", { timeout: 90_000 }, async () => {
-  const f = await fixture(); let live = true;
+  const f = await fixture(); let live = true, bodyFailed = false;
+  let phase: "setup" | "side-chat" | "side-chat-resume" | "side-chat-follow-up" | "clone" | "clone-follow-up" | "grant-retirement" | "completed" = "setup";
   try {
     const a = await f.node("A"), b = await f.node("B"); await f.pair(b, a);
     const key = { backendId: "pi", providerId: "provider" }, memberA = providerGroupDefaultMember(b.groups.sources().find(source => source.nodeId === "A" && source.providerId === "provider")!), localB = providerGroupDefaultMember(b.groups.sources().find(source => source.kind === "local" && source.providerId === "provider")!);
@@ -194,10 +224,10 @@ it("relays guest C through B to isolated A, offers one native handoff and contin
       permissionMode: "bypassPermissions", planMode: false, fastMode: false })).value.sessionId;
     const report = await c.artifacts.ingestBytes(Buffer.from("GUEST_ORIGINAL_ARTIFACT_C"), { fileName: "report.txt", mimeType: "text/plain", expiresAt: Date.now() + 60_000 });
     c.store.transaction(() => c.store.adoptSessionArtifact({ blob: c.store.getArtifact(report.id).blob, sessionId: origin }));
-    f.fail(true); c.host.enqueueInput({ operationId: "guest-original", connection: c.connection, sessionId, prompt: { text: "Read original files once", images: [], files: [{ blob: c.store.getArtifact(upload.id).blob }],
+    f.fail(true); const queued = c.host.enqueueInput({ operationId: "guest-original", connection: c.connection, sessionId, prompt: { text: "Read original files once", images: [], files: [{ blob: c.store.getArtifact(upload.id).blob }],
       mentions: [{ kind: "workspace_file", workspaceId: "shared-target", reference: "proof.txt", label: "Original guest proof" },
         { kind: "artifact", reference: report.id, sourceSessionId: origin, label: "Guest original report" },
-        { kind: "resource", reference: resource.id, label: resource.name, discoveredRevision: resource.revision!, resourceVersion: resource.resourceVersion!.toString(), runtimeGeneration: resource.runtimeGeneration! }], disposition: "prompt" } });
+        { kind: "resource", reference: resource.id, label: resource.name, discoveredRevision: resource.revision!, resourceVersion: resource.resourceVersion!.toString(), runtimeGeneration: resource.runtimeGeneration! }], disposition: "prompt" } }).value;
     await vi.waitFor(() => {
       const runs = c.store.listRuns({ sessionId });
       expect(runs.some(run => run.descriptor.state === "completed") || runs.length > 1 && runs.every(run => ["failed", "aborted", "completed"].includes(run.descriptor.state))).toBe(true);
@@ -214,8 +244,29 @@ it("relays guest C through B to isolated A, offers one native handoff and contin
     expect(c.store.getSession(sessionId).descriptor.binding.nativeSessionId).not.toBe(original.nativeSessionId);
     expect(c.store.listEvents({ sessionId }).filter(event => event.payload.type === "runtime_handoff")).toHaveLength(1);
     expect(c.store.listEvents({ sessionId }).filter(event => event.payload.type === "error" && event.payload.terminal)).toEqual([]);
+    expect(c.store.getOperation("guest-original").status).toBe("completed");
+    expect(c.store.listRuns({ sessionId })).toHaveLength(2);
+    expect(c.store.listRuns({ sessionId }).find(run => run.descriptor.state === "completed")?.descriptor.parentRunId).toBe(queued.runId);
+    expect(c.store.findSetting("session", sessionId, `provider.group-error:${queued.runId}`)).toBeUndefined();
     expect(f.nativeTrust.filter(entry => entry.node === "A" || entry.node === "B").every(entry => entry.trust === "guest" && entry.guestHome)).toBe(true);
     expect(b.groups.usage.usage.rows({ group: key }).some(row => row.partyId === "member-C" && row.nodeId === "B")).toBe(true);
+    phase = "side-chat";
+    const callsBeforeSideChat = f.calls.length;
+    const sideChatId = (await c.host.openSideChat({ operationId: "guest-native-side-chat", sourceSessionId: sessionId, connection: c.connection,
+      title: "Read-only completed context", expectedGeneration: c.store.getSession(sessionId).descriptor.binding.generation })).value.sessionId;
+    const sideChat = c.store.getSession(sideChatId).descriptor;
+    expect(sideChat.derivationOrigin).toMatchObject({ sideChat: true, kind: "fork", sourceSessionId: sessionId });
+    expect(sideChat.worktree).toBeUndefined(); expect(sideChat.permissionMode).toBe("ask"); expect(f.calls).toHaveLength(callsBeforeSideChat);
+    const sideChatNative = new HostedAgentStore(b.store).list().find(record => record.owner.sessionId === sideChatId)!;
+    expect(sideChatNative.derivation).toMatchObject({ completedSnapshot: { kind: "completed_assistant" }, adopted: true });
+    phase = "side-chat-resume";
+    await c.host.resume(sideChatId); await c.host.detach(sideChatId); await c.host.resume(sideChatId);
+    phase = "side-chat-follow-up";
+    const aside = c.host.enqueueInput({ operationId: "guest-side-chat-follow-up", connection: c.connection, sessionId: sideChatId,
+      prompt: { text: "Explain the prior completed answer in this side chat only", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await vi.waitFor(() => expect(c.store.getQueueItem(aside.queueItemId).state).toBe("completed"), { timeout: 30_000 });
+    expect(f.calls.slice(callsBeforeSideChat).every(call => call.node === "B")).toBe(true);
+    phase = "clone";
     const callsBeforeClone = f.calls.length;
     const childId = (await c.host.deriveSession({ operationId: "guest-native-clone", sourceSessionId: sessionId, connection: c.connection,
       title: "Native guest history clone", kind: "clone" })).value.sessionId;
@@ -225,11 +276,23 @@ it("relays guest C through B to isolated A, offers one native handoff and contin
     const nativeChildren = new HostedAgentStore(b.store).list().filter(record => record.owner.sessionId === childId);
     expect(nativeChildren).toHaveLength(1); expect(nativeChildren[0]!.derivation).toMatchObject({ kind: "clone", state: "settled", adopted: true });
     expect(nativeChildren[0]!.storageKey).toBe(nativeChildren[0]!.derivation!.sourceKey);
+    phase = "clone-follow-up";
     const continued = c.host.enqueueInput({ operationId: "guest-clone-continue", connection: c.connection, sessionId: childId,
       prompt: { text: "Continue the cloned native history", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
     await vi.waitFor(() => expect(c.store.getQueueItem(continued.queueItemId).state).toBe("completed"), { timeout: 30_000 });
     expect(f.calls.slice(callsBeforeClone).every(call => call.node === "B")).toBe(true);
     expect(f.calls.at(-1)!.body).toContain("Read original files once");
+    expect(f.calls.at(-1)!.body).not.toContain("Explain the prior completed answer in this side chat only");
+    phase = "grant-retirement";
     live = false; await b.native.endpoint.sweep(); expect(a.native.slots.summary().total).toBe(0); expect(b.native.slots.summary().total).toBe(0);
-  } finally { await f.close(); }
+    phase = "completed";
+  } catch (error) { bodyFailed = true; throw error; }
+  finally {
+    try { await f.close(); } catch (error) {
+      console.info("native source cleanup failure", { phase, bodyFailed, grantRetired: !live, cleanupFailed: true });
+      // Preserve the already-failing scenario instead of replacing its cause
+      // with cleanup. A successful scenario still fails on unconfirmed closure.
+      if (!bodyFailed) throw error;
+    }
+  }
 });

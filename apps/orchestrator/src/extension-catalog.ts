@@ -4,7 +4,7 @@ import type { RuntimeCommand, RuntimeToolDescriptor } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
-import type { ExtensionRuntimeDescriptor, ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionRuntimeDescriptor, ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionSettingsDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
@@ -85,6 +85,7 @@ export interface ExtensionCatalogDescriptor {
   /** Private installed entry identity, never executable bytes in public contracts. */
   readonly runtimeEntryPath?: string;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
+  readonly settings?: ExtensionSettingsDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
   readonly runtime?: ExtensionRuntimeDescriptor & { readonly extensionEntry: string };
@@ -162,6 +163,7 @@ interface ExtensionDefinition {
   readonly description: string;
   readonly enabled: boolean;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
+  readonly settings?: ExtensionSettingsDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
   readonly runtime?: ExtensionRuntimeDescriptor & { readonly extensionEntry: string };
@@ -627,6 +629,30 @@ export class ExtensionCatalogManager {
     return this.#descriptor(definition);
   }
 
+  async clearSetupCredential(extensionId: string, fieldId: string, expectedRevision: bigint, assertCurrent: () => void): Promise<ExtensionCatalogDescriptor> {
+    const definition = this.#requireDefinition(extensionId), current = this.#requireRecord(extensionId, expectedRevision);
+    const requirement = definition.setupRequirements.find(field => field.id === fieldId && field.kind === "secret");
+    if (!definition.installed || !requirement?.credentialReferenceId) throw new Error("Select a declared installed credential field.");
+    const reference = requirement.credentialReferenceId, credential = this.#credentials.find(reference);
+    assertCurrent();
+    if (credential) {
+      this.#credentials.reserveManagedSecret({ credentialReferenceId: reference, kind: credential.kind });
+      this.#managedCredentialReferences.add(reference);
+      if (!await this.#credentials.retireManagedCredential(reference, credential.generation)) throw new Error("Setup credential changed concurrently.");
+    }
+    assertCurrent(); this.#requireRecord(extensionId, expectedRevision);
+    if (this.#requireDefinition(extensionId).authorityIdentity !== definition.authorityIdentity) throw new Error("Extension installation changed.");
+    this.#managedCredentialReferences.delete(reference);
+    const generations = { ...current.authorization?.credentialGenerations }; delete generations[fieldId];
+    const attemptGenerations = { ...current.attempt?.credentialGenerations }; delete attemptGenerations[fieldId];
+    const attempt = current.attempt && current.attempt.state !== "ready" ? { ...current.attempt, credentialGenerations: attemptGenerations,
+      revision: increment(current.attempt.revision), updatedAt: this.#now() } : undefined;
+    this.#replaceRecord({ ...current, attempt,
+      ...(current.authorization ? { authorization: { ...current.authorization, credentialGenerations: generations } } : {}),
+      revision: increment(current.revision), updatedAt: this.#now() });
+    return this.#descriptor(definition);
+  }
+
   #descriptor(definition: ExtensionDefinition, runtime?: ExtensionRuntimeObservation): ExtensionCatalogDescriptor {
     const record = this.#records.get(definition.id);
     if (record === undefined) throw new Error("Extension catalog is not reconciled.");
@@ -663,6 +689,7 @@ export class ExtensionCatalogManager {
       enabled: definition.enabled,
       ...(definition.runtimeEntryPath === undefined ? {} : { runtimeEntryPath: definition.runtimeEntryPath }),
       ...(definition.mainView === undefined ? {} : { mainView: { ...definition.mainView } }),
+      ...(definition.settings === undefined ? {} : { settings: { ...definition.settings } }),
       ...(definition.library === undefined ? {} : { library: { ...definition.library } }),
       ...(definition.routineEvents === undefined ? {} : { routineEvents: structuredClone(definition.routineEvents) }),
       ...(definition.runtime === undefined ? {} : { runtime: structuredClone(definition.runtime) }),
@@ -812,6 +839,7 @@ function projectDefinitions(
         ...(entry.mainView === undefined ? {} : {
           mainView: { ...entry.mainView, extensionEntry: entry.extensionRelativePath }
         }),
+        ...(entry.settings === undefined ? {} : { settings: { ...entry.settings, extensionEntry: entry.extensionRelativePath } }),
         ...(entry.library === undefined ? {} : {
           library: { ...entry.library, extensionEntry: entry.extensionRelativePath }
         }),
@@ -827,6 +855,7 @@ function projectDefinitions(
           sourceState: source.state,
           sourceContentRevision: source.contentRevision,
           library: entry.library ?? null,
+          settings: entry.settings ?? null,
           runtime: entry.runtime ?? null,
           recommendations: entry.recommendations ?? [],
           error: source.error
@@ -921,6 +950,7 @@ function projectDefinitions(
         ...(detail.mainView === undefined || detail.entryPath === undefined ? {} : {
           mainView: { ...detail.mainView, extensionEntry: detail.entryPath }
         }),
+        ...(detail.settings === undefined || detail.entryPath === undefined ? {} : { settings: { ...detail.settings, extensionEntry: detail.entryPath } }),
         ...(detail.library === undefined || detail.entryPath === undefined ? {} : {
           library: { ...detail.library, extensionEntry: detail.entryPath }
         }),
@@ -938,6 +968,7 @@ function projectDefinitions(
           state: resource.state,
           enabled: resource.enabled,
           library: detail.library ?? null,
+          settings: detail.settings ?? null,
           routineEvents: detail.routineEvents ?? null,
           runtime: detail.runtime ?? null,
           recommendations: detail.recommendations ?? [],

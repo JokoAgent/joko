@@ -31,6 +31,7 @@ import {
   type WeChatMessagingConfiguration
 } from "./messaging-manager.js";
 import { fromProtoRevision, toProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
+import type { PartnerMessagingRuntime, PartnerMessagingBinding, PartnerMessagingRestart } from './partner-messaging.js';
 import {
   WeChatAuthorizationManager,
   type WeChatAuthorizationPort,
@@ -42,6 +43,7 @@ export interface MessagingRpcOwner {
 }
 
 export interface MessagingConnectServiceOptions {
+  readonly partnerRuntime?: PartnerMessagingRuntime;
   readonly credentials?: CredentialManager;
   readonly createWeChatAuthorization?: () => WeChatAuthorizationPort;
   readonly onClientRevoked?: (connectionId: string, listener: () => void) => () => void;
@@ -82,6 +84,7 @@ export function createMessagingConnectService(
       return create(contract.GetMessagingSettingsResponseSchema, {
         connections: owner.listConnections().map(toProtoConnection),
         routes: owner.listRoutes().map(toProtoRoute),
+        partnerBindings: options.partnerRuntime?.listBindings().map(toProtoPartnerBinding) ?? [],
         channels: CHANNELS.map((channel) => create(contract.MessagingChannelCapabilitySchema, {
           channel: toProtoChannel(channel),
           available: isAvailableChannel(channel, weChatAuthorization !== undefined),
@@ -497,6 +500,43 @@ export function createMessagingConnectService(
           });
     }),
 
+    setPartnerMessagingBinding: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context), runtime = partnerRuntime(options);
+      if (!request.operationId || request.operationId.length > 256 || request.destination.case === undefined
+        || request.destination.case === 'personal' && !request.destination.value) throw new ConnectError('A message destination and operation are required.', Code.InvalidArgument);
+      const result = await runtime.setBinding({ operationId: request.operationId, owner: runtime.clientOwner(client.connectionId),
+        connectionId: request.connectionId, expectedConnectionRevision: requiredRevision(request.expectedConnectionRevision, 'expected_connection_revision'),
+        expectedConnectionGeneration: generationNumber(request.expectedConnectionGeneration), expectedBindingRevision: nonnegativeNumber(request.expectedBindingRevision),
+        ...(request.destination.case === 'partnerId' ? { partnerId: request.destination.value,
+          expectedPartnerRevision: requiredRevision(request.expectedPartnerRevision, 'expected_partner_revision') } : {}) });
+      return create(contract.SetPartnerMessagingBindingResponseSchema, { binding: toProtoPartnerBinding(result.binding), connection: toProtoConnection(result.connection) });
+    }),
+    listPartnerMessagingLanes: async (request, context) => messagingRpc(async () => {
+      authenticate(context); const runtime = partnerRuntime(options);
+      return create(contract.ListPartnerMessagingLanesResponseSchema, { binding: toProtoPartnerBinding(runtime.binding(request.connectionId)),
+        lanes: runtime.lanes(request.connectionId).map(row => create(contract.PartnerMessagingLaneSchema, {
+          conversationId: row.conversationId, sessionId: row.sessionId, generation: BigInt(row.generation), title: row.title,
+          kind: row.kind === 'owner_dm' ? contract.PartnerMessagingLaneKind.OWNER_DM : row.kind === 'group' ? contract.PartnerMessagingLaneKind.GROUP
+            : row.kind === 'topic' ? contract.PartnerMessagingLaneKind.TOPIC : contract.PartnerMessagingLaneKind.GUEST_DM,
+          running: row.running, failed: row.failed, lastActivityAt: toProtoTimestamp(row.lastActivityAt),
+          contextMessageCount: BigInt(row.contextMessageCount), canRestart: row.canRestart
+        })) });
+    }),
+    restartPartnerMessagingLane: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context), runtime = partnerRuntime(options);
+      const restart = await runtime.restart({ operationId: request.operationId, owner: runtime.clientOwner(client.connectionId), connectionId: request.connectionId,
+        conversationId: request.conversationId, expectedBindingRevision: generationNumber(request.expectedBindingRevision), expectedSessionGeneration: nonnegativeNumber(request.expectedSessionGeneration) });
+      return create(contract.RestartPartnerMessagingLaneResponseSchema, { restart: toProtoPartnerRestart(restart) });
+    }),
+    getPartnerMessagingRestart: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context), runtime = partnerRuntime(options), restart = runtime.getRestart(request.operationId, runtime.clientOwner(client.connectionId));
+      if (!restart) throw new ConnectError('The original message lane restart was not found.', Code.NotFound);
+      return create(contract.GetPartnerMessagingRestartResponseSchema, { restart: toProtoPartnerRestart(restart) });
+    }),
+    retryPartnerMessagingRestart: async (request, context) => messagingRpc(async () => {
+      const client = authenticate(context), runtime = partnerRuntime(options);
+      return create(contract.RetryPartnerMessagingRestartResponseSchema, { restart: toProtoPartnerRestart(await runtime.retry(request.operationId, runtime.clientOwner(client.connectionId))) });
+    }),
     putMessagingRoute: async (request, context) => messagingRpc(async () => {
       authenticate(context);
       const route = requireManager(manager).putRoute({
@@ -515,6 +555,25 @@ export function createMessagingConnectService(
       return create(contract.PutMessagingRouteResponseSchema, { route: toProtoRoute(route) });
     })
   } satisfies ServiceImpl<typeof contract.MessagingService>;
+}
+
+function partnerRuntime(options: MessagingConnectServiceOptions): PartnerMessagingRuntime {
+  if (!options.partnerRuntime) throw new ConnectError('Partner messaging is unavailable on this node.', Code.Unimplemented);
+  return options.partnerRuntime;
+}
+function nonnegativeNumber(value: bigint): number {
+  if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) throw new ConnectError('The message source revision is invalid.', Code.InvalidArgument);
+  return Number(value);
+}
+function toProtoPartnerBinding(value: PartnerMessagingBinding): contract.PartnerMessagingBinding {
+  return create(contract.PartnerMessagingBindingSchema, { connectionId: value.connectionId, ...(value.partnerId ? { partnerId: value.partnerId } : {}),
+    revision: BigInt(value.revision), connectionGeneration: BigInt(value.connectionGeneration) });
+}
+function toProtoPartnerRestart(value: PartnerMessagingRestart): contract.PartnerMessagingRestart {
+  return create(contract.PartnerMessagingRestartSchema, { operationId: value.operationId, connectionId: value.connectionId,
+    conversationId: value.conversationId, sessionId: value.sessionId, sourceGeneration: BigInt(value.sourceGeneration),
+    phase: value.phase === 'ready' ? contract.PartnerMessagingRestartPhase.READY : value.phase === 'failed' ? contract.PartnerMessagingRestartPhase.FAILED : contract.PartnerMessagingRestartPhase.CLOSING,
+    ...(value.failureCode ? { failureCode: value.failureCode } : {}) });
 }
 
 function requireManager(manager: MessagingManager | undefined): MessagingManager {

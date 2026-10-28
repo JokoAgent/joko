@@ -5115,6 +5115,37 @@ describe("PiBackendAdapter", () => {
     }
   });
 
+  it("copies only the completed native assistant ancestor chain without stopping or reassigning the streaming parent", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-completed-snapshot-")), workspace = await mkdtemp(join(tmpdir(), "joko-pi-completed-workspace-"));
+    const events: EventPayload[] = [], snapshotEvents: EventPayload[] = [], processes: ScriptedPiProcess[] = [];
+    const history = [
+      { type: "message", id: "completed-user", parentId: null, timestamp: new Date(0).toISOString(), message: { role: "user", content: [{ type: "text", text: "Previous question" }], timestamp: 0 } },
+      { type: "message", id: "completed-assistant", parentId: "completed-user", timestamp: new Date(1).toISOString(), message: { role: "assistant", content: [{ type: "text", text: "Completed answer" }], stopReason: "stop", timestamp: 1,
+        api: "openai-completions", provider: "local", model: "test-model", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } },
+      { type: "message", id: "active-user", parentId: "completed-assistant", timestamp: new Date(2).toISOString(), message: { role: "user", content: [{ type: "text", text: "Active question must stay in parent" }], timestamp: 2 } }
+    ];
+    const adapter = createPiAdapter({ agentHome, sessionRoot: agentHome, versionProbe: async () => "pi 99.99.99-completed-snapshot-test",
+      providers: [{ id: "local", api: "openai-completions", keyless: true, models: [{ id: "test-model", contextWindow: 32768, maxTokens: 4096 }] }],
+      processFactory: spec => { const process = new ScriptedPiProcess(spec, { holdAgentLifecycle: true, historyEntries: history, historyLeafId: "active-user" }); processes.push(process); return process as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "completed-target", backendId: "pi", displayName: "Completed source", workspaceRoot: workspace, managed: true, trusted: true };
+    const initial = makeContext(target, events);
+    try {
+      const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, initial);
+      const active = { ...initial, binding, operationId: "active-original" };
+      await adapter.send({ text: "Continue active parent", images: [], files: [], mentions: [], disposition: "prompt" }, active);
+      const recordBinding = vi.fn(), snapshot = { ...active, emit: async (payload: EventPayload) => { snapshotEvents.push(payload); }, operationId: "copy-completed" };
+      const child = await adapter.fork("completed-assistant", snapshot, { sessionId: "completed-child", target,
+        completedSnapshot: { kind: "completed_assistant", nativeBoundaryId: "completed-assistant" }, recordBinding });
+      expect(recordBinding).toHaveBeenCalledExactlyOnceWith(child.binding); expect(processes).toHaveLength(1);
+      const bytes = await readFile(child.binding.opaqueRef, "utf8"); expect(bytes).toContain("Completed answer"); expect(bytes).not.toContain("Active question must stay in parent");
+      expect(processes[0]!.isStreaming).toBe(true); expect(processes[0]!.commands.some(command => command.type === "abort" || command.type === "fork" || command.type === "clone")).toBe(false);
+      processes[0]!.emitAssistant("Parent output keeps original owner"); await flushAdapterEvents();
+      expect(events).toContainEqual(expect.objectContaining({ type: "message_complete", role: "assistant" })); expect(snapshotEvents).toEqual([]);
+      await expect(adapter.fork("active-user", snapshot, { sessionId: "invalid-child", target,
+        completedSnapshot: { kind: "completed_assistant", nativeBoundaryId: "active-user" }, recordBinding: vi.fn() })).rejects.toMatchObject({ publicError: { code: "PI_COMPLETED_SNAPSHOT_BOUNDARY_INVALID" } });
+    } finally { await adapter.dispose(); await rm(agentHome, { recursive: true, force: true }); await rm(workspace, { recursive: true, force: true }); }
+  });
+
   it("forks durable history in an isolated runtime while the source keeps streaming", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-isolated-fork-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-isolated-fork-workspace-"));

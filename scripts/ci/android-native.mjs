@@ -58,6 +58,12 @@ function build() {
     environment.JOKO_ANDROID_SIGNING_CERT_SHA256 = certificate;
     run(process.execPath, ["apps/mobile/scripts/build-android-artifacts.mjs", "--execute", "--artifacts", "apk",
       "--skip-git-gate", "--out", output], { env: environment });
+    // Configure the generated project while its original ephemeral CI signing
+    // material is still in scope; a later standalone Gradle pass must not try
+    // to read the removed signer or introduce a second signing authority.
+    run("./gradlew", [":joko-plugin-oauth:testReleaseUnitTest", "--no-daemon", "--max-workers=2"], {
+      cwd: join(root, "apps/mobile/android"), env: environment
+    });
 
     const manifest = JSON.parse(readFileSync(join(output, "joko-mobile-artifact.json"), "utf8"));
     const artifact = manifest.artifacts?.find((entry) => entry.kind === "apk");

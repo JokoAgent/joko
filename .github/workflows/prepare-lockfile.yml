@@ -1,0 +1,41 @@
+name: Prepare dependency lockfile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
+      - name: Prepare declared remote workspace packages
+        run: node scripts/prepare-linkspan.mjs
+      - name: Resolve the declared dependency graph without lifecycle effects
+        run: pnpm install --lockfile-only --ignore-scripts
+      - name: Record exact source and changes
+        run: |
+          git rev-parse HEAD 'HEAD^{tree}' > lockfile-source.txt
+          git diff -- pnpm-lock.yaml > dependency-lockfile.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-lockfile-${{ github.sha }}
+          path: |
+            pnpm-lock.yaml
+            dependency-lockfile.patch
+            lockfile-source.txt
+          if-no-files-found: error

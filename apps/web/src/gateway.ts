@@ -1,5 +1,6 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
+import { executeExtensionSettingsCall } from "@joko/connection-transport";
 import { readSessionArchivePreview } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
@@ -27,7 +28,7 @@ import type { HelpMessageView, HelpAnswerView, HelpFeedbackDraftView, WorktreeRe
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
-import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi } from "@joko/contracts";
+import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi, createPartnerMessagingApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
 import { createPartnerMemoryApi } from "@joko/contracts";
@@ -38,6 +39,7 @@ import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } fro
 import { mapPartnerWorkingStatus } from "./partner-working-status.js";
 import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
 import { createClient, ConnectError, Code, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
+import { StateImpact } from "@joko/contracts";
 import { createConnectTransport, createConnectionFetch, endpointTransportForNewDevice, rememberEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransport, trustedEndpointTransportKind, type EndpointTrust } from "@joko/connection-transport";
 import { assertTrustedEndpointServerId, EndpointTrustError, formatTrustedNodeInvitation, irohTransportForRecipient, isEndpointTrustError, isLoopbackEndpoint, normalizeEndpointPublicKey, observeEndpointTrustFailure, pairingVerificationOrigin, requireIrohRelayInvitationRequest, type NewDeviceAuthorizationOptions, type NodePairingInvitation } from "@joko/connection-transport/trust";
 import { createWebTaskSharingApi } from "./task-sharing-api.js";
@@ -2264,6 +2266,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         input: {
           parts,
           ...(draft.replyQuote ? { replyQuote: draft.replyQuote } : {}),
+          ...(draft.todoQuote ? { todoQuote: draft.todoQuote } : {}),
           quotesEncoded: serialized.quotesEncoded,
           pastedTextRanges: serialized.pastedTextRanges?.map((range) => ({
             start: bodyStart + range.start,
@@ -2760,6 +2763,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         backendId: target.backendId,
         targetId,
         displayName: draft.name.trim() || "New task",
+        provisionalDraftId: draft.provisionalDraftId ?? "",
+        reuseProvisionalSessionId: draft.reuseProvisionalSessionId ?? "",
         nativeStart,
         ...(draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", ...encodeModelSpeed(draft.fastMode) } } : {}),
         permissionMode: protoPermission(draft.permissionMode),
@@ -2786,7 +2791,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true, [{
       entity: { kind: EntityKind.TARGET, id: targetId },
       expectedRevision: { value: expectedTargetRevision }
-    }]);
+    }], undefined, undefined, draft.operationId);
     const payload = operation.result?.payload;
     if (payload?.case !== "session" || payload.value.sessionId.length === 0) {
       throw new GatewayError("Orchestrator completed task creation without a typed task result.");
@@ -2796,6 +2801,36 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator completed task creation without a valid task generation.");
     }
     return { sessionId: payload.value.sessionId, generation };
+  }
+
+  async readSessionPreparation(operationId: string, signal?: AbortSignal): Promise<import("./model.js").SessionPreparationView> {
+    const transport = this.requireTransport();
+    try {
+      const response = await createClient(OperationService, transport).getOperation({ operationId }, { signal: combinedAbortSignal(signal, this.#abort?.signal) });
+      const operation = response.operation;
+      if (!operation || !TERMINAL_OPERATION_STATES.has(operation.state)) return { state: "pending" };
+      if (operation.state !== OperationState.SUCCEEDED) return { state: "failed", error: operation.error?.message,
+        stateMayHaveChanged: !operation.error || [operation.error.queueImpact, operation.error.workspaceImpact, operation.error.nativeSessionImpact]
+          .some(impact => impact !== StateImpact.UNCHANGED) };
+      const result = operation.result?.payload;
+      if (result?.case !== "session" || !result.value.sessionId || !result.value.nativeBinding?.runtimeGeneration) throw new GatewayError("The prepared task receipt has no exact Session result.");
+      return { state: "succeeded", sessionId: result.value.sessionId, generation: result.value.nativeBinding.runtimeGeneration,
+        provisionalDraftId: result.value.provisionalDraftId || undefined };
+    } catch (error) {
+      if (ConnectError.from(error).code === Code.NotFound) return { state: "pending" };
+      throw error;
+    }
+  }
+
+  async prewarmSession(sessionId: string, provisionalDraftId = "", signal?: AbortSignal, expectedGeneration?: bigint): Promise<void> {
+    const generation = expectedGeneration ?? this.#snapshot?.sessions.find(session => session.id === sessionId)?.generation;
+    if (generation === undefined || generation < 1n) return;
+    await this.submit({ case: "prewarmSession", value: { sessionId, provisionalDraftId } }, true,
+      [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: generation }], signal);
+  }
+
+  async discardProvisionalSession(sessionId: string, provisionalDraftId: string, operationId: string, signal?: AbortSignal): Promise<void> {
+    await this.submit({ case: "deleteSession", value: { sessionId, provisionalDraftId, deleteNativeSession: true, deleteArtifacts: false } }, true, [], signal, undefined, operationId);
   }
 
   async discoverNativeSessions(targetId: string, signal?: AbortSignal): Promise<readonly NativeSessionCandidateView[]> {
@@ -3458,11 +3493,45 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: options.expectedGeneration }]);
   }
 
-  async openSideChat(sessionId: string, expectedGeneration: bigint): Promise<string> {
+  async openSideChat(sessionId: string, expectedGeneration: bigint, options?: {
+    readonly operationId?: string; readonly signal?: AbortSignal; readonly beforeDispatch?: (operationId: string) => Promise<void>;
+  }): Promise<string> {
     if (this.#taskSharing !== undefined) throw new GatewayError("Side chats require the task's original node connection.");
     const operation = await this.submit({ case: "openSideChat", value: { sourceSessionId: sessionId, newDisplayName: "" } },
-      true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }]);
+      true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }], options?.signal,
+      options?.beforeDispatch === undefined ? undefined : (id, receipt) => receipt === undefined ? options.beforeDispatch!(id) : undefined,
+      options?.operationId);
     return operationSessionId(operation);
+  }
+
+  async readSideChatOperation(record: import("./model.js").PendingSideChatDraft, signal?: AbortSignal): Promise<import("./model.js").SideChatOperationView> {
+    if (this.#taskSharing !== undefined) throw new GatewayError("Side Chat recovery requires the original node connection.");
+    const scope = this.captureActionScope(), request = combinedAbortSignal(scope.signal, signal);
+    let operation: Operation | undefined;
+    try { operation = (await createClient(OperationService, scope.transport).getOperation({ operationId: record.operationId }, { signal: request })).operation; }
+    catch (error) { if (ConnectError.from(error).code === Code.NotFound) return { state: "pending" }; throw error; }
+    if (!operation) return { state: "pending" };
+    const sourcePreconditions = operation.mutation?.preconditions.filter(value => value.entity?.kind === EntityKind.SESSION && value.entity.id === record.sourceSessionId);
+    if (operation.operationId !== record.operationId || operation.connectionId !== this.#profile?.id
+      || operation.mutation?.payload.case !== "openSideChat" || operation.mutation.payload.value.sourceSessionId !== record.sourceSessionId
+      || sourcePreconditions?.length !== 1 || sourcePreconditions[0]!.expectedGeneration !== BigInt(record.sourceGeneration)) {
+      throw new GatewayError("The original Side Chat operation does not match its saved source and generation.");
+    }
+    if (!TERMINAL_OPERATION_STATES.has(operation.state)) return { state: "pending" };
+    if (operation.state !== OperationState.SUCCEEDED) return { state: "failed", error: operation.error?.message || "The original Side Chat operation failed.",
+      stateMayHaveChanged: !operation.error || [operation.error.queueImpact, operation.error.workspaceImpact, operation.error.nativeSessionImpact].some(value => value !== StateImpact.UNCHANGED) };
+    const payload = operation.result?.payload;
+    if (payload?.case !== "session" || payload.value.sessionId === record.sourceSessionId || !payload.value.sessionId
+      || payload.value.backendId !== record.backendId || payload.value.targetId !== record.targetId
+      || payload.value.nativeBinding?.runtimeGeneration !== 1n || payload.value.derivationOrigin?.sideChat !== true
+      || payload.value.derivationOrigin.kind !== SessionDerivationKind.FORK
+      || payload.value.derivationOrigin.sourceSessionId !== record.sourceSessionId) throw new GatewayError("The original operation did not confirm this source's exact Side Chat child.");
+    await this.#refreshPromise?.catch(() => undefined); request?.throwIfAborted(); await this.refresh(); request?.throwIfAborted();
+    const child = this.#snapshot?.sessions.find(session => session.id === payload.value.sessionId);
+    if (!child || child.backendId !== record.backendId || child.targetId !== record.targetId || child.generation !== 1n
+      || child.derivationOrigin?.sideChat !== true || child.derivationOrigin.kind !== "fork"
+      || child.derivationOrigin.sourceSessionId !== record.sourceSessionId) throw new GatewayError("Refresh the exact Side Chat child before adopting its local quote.");
+    return { state: "succeeded", sessionId: child.id };
   }
 
   async forkSession(
@@ -5351,6 +5420,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       signal.throwIfAborted(); if (this.#transport !== transport || this.#abort !== owner || owner?.signal.aborted) throw new GatewayError("Task observation connection changed.");
     } });
   }
+  partnerMessagingApi(ownerKey: string) {
+    const transport = this.requireTransport(), owner = this.#abort;
+    return createPartnerMessagingApi({ rpc: createClient(MessagingService, transport), ownerKey, newOperationId: () => crypto.randomUUID(), assertCurrent: signal => {
+      signal.throwIfAborted(); if (this.#transport !== transport || this.#abort !== owner || owner?.signal.aborted) throw new GatewayError('Message platform connection changed.');
+    } });
+  }
   partnerGroupApi(ownerKey: string) {
     const transport = this.requireTransport();
     return createPartnerGroupApi({ rpc: createClient(PartnerGroupService, transport), ownerKey, newRequestId: () => crypto.randomUUID(), respond: async (interaction, decision, signal) => {
@@ -5442,6 +5517,68 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       retryWriteAccess: async (request, options) => { guard(); const result = await client.retryWriteAccess(request, { ...options, signal: options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal }); guard(); return result; }
     };
   }
+  extensionSettingsApi(): import("./model.js").ExtensionSettingsApi | undefined {
+    if (!this.#transport || !this.#abort || !this.#profile) return;
+    const scope = this.captureActionScope(), transport = this.#transport, lifetime = this.#abort, profile = this.#profile;
+    const api = createClient(ExtensionService, scope.transport);
+    const current = () => {
+      scope.signal.throwIfAborted();
+      if (this.#transport !== transport || this.#abort !== lifetime || this.#profile !== profile) throw new GatewayError("Plugin settings connection changed.");
+    };
+    const combined = (signal: AbortSignal) => AbortSignal.any([scope.signal, signal]);
+    const fresh = async (surface: ExtensionMainViewSurfaceView, signal: AbortSignal) => {
+      current(); signal.throwIfAborted();
+      const response = await api.getExtensionMainViewSurface({ surfaceId: surface.id }, { signal }); current();
+      const actual = response.surface === undefined ? undefined : mapExtensionMainViewSurface(response.surface);
+      if (surface.purpose !== "settings" || surface.mobileSettings || !actual || actual.purpose !== "settings" || actual.mobileSettings
+        || actual.id !== surface.id || actual.extensionId !== surface.extensionId || actual.endpoint !== surface.endpoint
+        || actual.owner.resourceId !== surface.owner.resourceId || actual.owner.resourceRevision !== surface.owner.resourceRevision
+        || actual.owner.discoveredRevision !== surface.owner.discoveredRevision || actual.backendId !== surface.backendId
+        || actual.backendRevision !== surface.backendRevision || actual.backendGeneration !== surface.backendGeneration || actual.expiresAt !== surface.expiresAt) throw new GatewayError("Plugin settings surface changed.");
+      const detail = await api.getExtension({ extensionId: surface.extensionId }, { signal }); current(); signal.throwIfAborted();
+      if (!detail.extension) throw new GatewayError("Plugin settings installation is unavailable.");
+      const extension = mapExtensionCatalogEntry(detail.extension);
+      if (!extension.installed || !extension.settings || extension.owner.kind !== "resource" || extension.owner.resourceId !== surface.owner.resourceId
+        || extension.owner.resourceRevision !== surface.owner.resourceRevision || extension.owner.discoveredRevision !== surface.owner.discoveredRevision) throw new GatewayError("Plugin settings installation changed.");
+      return { ...extension, extensionId: extension.id, setup: { ...extension.setup, fields: extension.setup.fields.map(field => ({ ...field, fieldId: field.id })) } };
+    };
+    return {
+      open: async (extensionId, expectedRevision, signal) => {
+        const active = combined(signal); current();
+        const response = await api.openExtensionSettings({ extensionId, expectedRevision: { value: expectedRevision }, mobile: false }, { signal: active }); current();
+        if (!response.surface) throw new GatewayError("Plugin settings surface is unavailable.");
+        const surface = mapExtensionMainViewSurface(response.surface);
+        try { await fresh(surface, active); return surface; }
+        catch (error) { void api.closeExtensionMainView({ surfaceId: surface.id }, { timeoutMs: 5_000 }).catch(() => undefined); throw error; }
+      },
+      close: async surfaceId => (await api.closeExtensionMainView({ surfaceId }, { timeoutMs: 5_000 })).closed,
+      call: async (surface, call, host, signal) => {
+        const active = combined(signal); current(); const original = await fresh(surface, active);
+        if (call.kind === "oauth.connect") {
+          const authorization = this.extensionOAuthApi();
+          if (!authorization?.canAuthorize) throw new GatewayError("Open Joko Desktop to connect a plugin account.");
+          if (!await host.confirm(original.name, call.key, active)) throw new GatewayError("Plugin authorization cancelled.");
+          current(); active.throwIfAborted();
+          const result = await authorization.authorize({ extensionId: original.id, expectedRevision: { value: original.revision }, slotKey: call.key, scopes: [...(call.scopes ?? [])] }, active);
+          await fresh(surface, active); return result;
+        }
+        const after = async (work: () => Promise<void>) => { current(); active.throwIfAborted(); await work(); current(); return { extension: await fresh(surface, active) }; };
+        return executeExtensionSettingsCall({ surface: { surfaceId: surface.id }, api, oauth: createClient(ExtensionOAuthService, scope.transport),
+          connections: createClient(ExtensionNetworkService, scope.transport), fresh: signal => fresh(surface, signal), current,
+          upload: (ticket, value, signal) => this.uploadCredentialTicket(value, ticket, { ...scope, signal }),
+          submit: async (_extension, mutation, _kind, signal) => { current(); await this.submit(mutation.payload, true, [], signal); current(); },
+          begin: extension => after(() => this.submit({ case: "beginExtensionSetup", value: { extensionId: extension.id, expectedRevision: { value: extension.revision } } }, true, [], active).then(() => undefined)),
+          field: (extension, fieldId, value) => after(() => this.submit({ case: "submitExtensionSetupInteraction", value: {
+            extensionId: extension.id, expectedRevision: { value: extension.revision }, attemptId: extension.setup.attemptId ?? "", fieldId,
+            value: typeof value === "boolean" ? { case: "confirmed", value } : { case: "text", value }
+          } }, true, [], active).then(() => undefined)),
+          secret: (extension, fieldId, value) => after(() => this.saveExtensionSetupCredential(extension.id, extension.setup.attemptId ?? "", fieldId, "headerSecret", value, extension.revision, active)),
+          complete: extension => after(() => this.submit({ case: "completeExtensionSetup", value: { extensionId: extension.id, expectedRevision: { value: extension.revision }, attemptId: extension.setup.attemptId ?? "" } }, true, [], active).then(() => undefined))
+        }, call, host, active);
+      }
+    };
+  }
+
   extensionOAuthApi(): import("./model.js").ExtensionOAuthApi | undefined {
     if (!this.#transport || !this.#abort || !this.#profile) return;
     const scope = this.captureActionScope(), transport = this.#transport, lifetime = this.#abort, profile = this.#profile;
@@ -10801,13 +10938,14 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     waitForTerminal = false,
     preconditions: readonly MutationPrecondition[] = [],
     callerSignal?: AbortSignal,
-    observeReceipt?: (operationId: string, operation?: Operation) => void
+    observeReceipt?: (operationId: string, operation?: Operation) => void | Promise<void>,
+    suppliedOperationId?: string
   ): Promise<Operation> {
     callerSignal?.throwIfAborted();
     if (this.#taskSharing !== undefined && (!this.#sharedTaskReady || this.#sharedTaskUnknownOperations.size > 0)) throw new GatewayError("Check the previous shared task operation before starting another action.", { code: "RESULT_UNKNOWN" });
     const transport = this.requireTransport();
     const client = createClient(OperationService, transport);
-    const operationId = randomUuid();
+    const operationId = suppliedOperationId ?? randomUuid();
     const request = {
       operationId,
       connectionId: this.#taskSharing === undefined ? this.#profile?.id ?? "" : "",
@@ -10815,9 +10953,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
     const signal = combinedAbortSignal(callerSignal, this.#abort?.signal);
     const options = signal === undefined ? undefined : { signal };
-    const submitOnce = () => {
+    const submitOnce = async () => {
       signal?.throwIfAborted();
-      observeReceipt?.(operationId);
+      await observeReceipt?.(operationId);
+      signal?.throwIfAborted();
       if (payload.case === "sendInput" && this.#profile !== undefined) {
         const generation = request.mutation.preconditions.find((precondition) =>
           precondition.entity?.kind === EntityKind.SESSION
@@ -10859,7 +10998,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       await this.#taskSharing.operations.finish(operationId);
       this.#sharedTaskUnknownOperations.delete(operationId);
     }
-    observeReceipt?.(operationId, operation);
+    await observeReceipt?.(operationId, operation);
     if (waitForTerminal && !TERMINAL_OPERATION_STATES.has(operation.state)) {
       const timeout = AbortSignal.timeout(OPERATION_TERMINAL_WAIT_TIMEOUT_MS);
       if (this.#taskSharing !== undefined) {
@@ -10889,7 +11028,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         throw new GatewayError("Orchestrator stopped watching the operation before it reached a terminal state.");
       }
     }
-    observeReceipt?.(operationId, operation);
+    await observeReceipt?.(operationId, operation);
     if (operation.state === OperationState.FAILED || operation.state === OperationState.CONFLICT || operation.state === OperationState.CANCELLED) {
       throw new GatewayError(operation.error?.message || `Operation ${operation.state} failed.`, {
         ...(operation.error?.code ? { code: operation.error.code } : {})
@@ -11879,7 +12018,7 @@ function projectTimelineEvent(
       const userText = kind.value.role === 1 ? messageInputText(userInput) : undefined;
       const userInputAccepted = kind.value.role === 1 && kind.value.userInputAccepted === true;
       const inputMentions = messageInputMentions(userInput);
-      if (!userInputAccepted && (inputMentions.length > 0 || userInput?.mentionRanges.length || userInput?.pastedTextRanges.length || userInput?.quotesEncoded || userInput?.replyQuote)) {
+      if (!userInputAccepted && (inputMentions.length > 0 || userInput?.mentionRanges.length || userInput?.pastedTextRanges.length || userInput?.quotesEncoded || userInput?.replyQuote || userInput?.todoQuote)) {
         throw new GatewayError("Orchestrator returned structured user input without an accepted receipt.");
       }
       const pastedTextRanges = userText === undefined
@@ -11929,6 +12068,7 @@ function projectTimelineEvent(
         ...(userInputAccepted && mentionRanges.length > 0 ? { mentionRanges } : {}),
         ...(userInputAccepted && userInput?.quotesEncoded === true ? { quotesEncoded: true } : {}),
         ...(userInputAccepted && userInput?.replyQuote ? { replyQuote: mapPrivateReplyQuote(userInput.replyQuote) } : {}),
+        ...(userInputAccepted && userInput?.todoQuote ? { todoQuote: userInput.todoQuote } : {}),
         ...(kind.value.role === 1 && pastedTextRanges.length > 0 ? { pastedTextRanges } : {}),
         ...(kind.value.role === 1 && automationOrigin !== undefined ? { automationOrigin } : {}),
         ...(kind.value.role === 1 && inputDelivery !== undefined ? { inputDelivery } : {}),
@@ -13981,6 +14121,7 @@ function mapSession(
     pinned: session.pinned,
     archived: session.archived,
     generation: session.nativeBinding?.runtimeGeneration ?? 0n,
+    ...(session.provisionalDraftId ? { provisionalDraftId: session.provisionalDraftId } : {}),
     ...(descriptor !== undefined
       ? { model: mapModel(descriptor, selectedProvider) }
       : selected === undefined ? {} : { model: unavailableSessionModel(session.backendId, selected.providerId, selected.modelId, selectedProvider) }),
@@ -14788,6 +14929,7 @@ function mapQueueItem(item: QueueItem): QueueItemView {
     text,
     ...(item.input?.quotesEncoded === true ? { quotesEncoded: true } : {}),
     ...(item.input?.replyQuote ? { replyQuote: mapPrivateReplyQuote(item.input.replyQuote) } : {}),
+    ...(item.input?.todoQuote ? { todoQuote: item.input.todoQuote } : {}),
     ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges }),
     ...(inputMentions.length === 0 ? {} : { inputMentions }),
     ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
@@ -17612,6 +17754,9 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
       ? { schemaVersion: 1 as const }
       : (() => { throw new GatewayError("Orchestrator returned an invalid Extension Library capability."); })();
   const recommendations = mapExtensionRecommendations(extension.recommendations);
+  const settings = extension.settings === undefined ? undefined : { ...(extension.settings.title === undefined ? {} : { title: extension.settings.title }),
+    height: extension.settings.height, mobileCustom: extension.settings.mobileCustom };
+  if (settings && (!Number.isInteger(settings.height) || settings.height < 160 || settings.height > 800 || settings.title !== undefined && (!settings.title.trim() || settings.title.length > 80))) throw new GatewayError("Plugin settings declaration is invalid.");
   return {
     id: extension.extensionId,
     revision,
@@ -17630,6 +17775,7 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     enabled: extension.enabled,
     ...(mainView === undefined ? {} : { mainView }),
     ...(library === undefined ? {} : { library }),
+    ...(settings === undefined ? {} : { settings }),
     sidebarSupported: extension.sidebarSupported,
     sidebarVisible: extension.sidebarVisible,
     tools: extension.tools.map((tool) => ({
@@ -17741,7 +17887,7 @@ function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): Ex
     || resourceRevision === undefined || resourceRevision < 1n
     || surface.backendId.trim() === "" || backendRevision === undefined || backendRevision < 1n
     || backendGeneration === undefined || expiresAt === undefined || !Number.isSafeInteger(expiresAt) || expiresAt < 0
-    || !validExtensionSurfaceEndpoint(surface.endpoint, surface.surfaceId)
+    || !validExtensionSurfaceEndpoint(surface.endpoint, surface.surfaceId) || surface.mobileSettings && !surface.settings
     || surface.title !== undefined && (surface.title.trim() !== surface.title || surface.title.length === 0 || surface.title.length > 80)) {
     throw new GatewayError("Orchestrator returned an invalid Extension main-view surface.");
   }
@@ -17760,7 +17906,9 @@ function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): Ex
     endpoint: surface.endpoint,
     ...(surface.title === undefined ? {} : { title: surface.title }),
     ...(icon === undefined ? {} : { icon }),
-    expiresAt
+    expiresAt,
+    ...(surface.settings ? { purpose: "settings" as const } : {}),
+    ...(surface.mobileSettings ? { mobileSettings: true as const } : {})
   };
 }
 
@@ -20653,6 +20801,7 @@ function editedQueueInput(original: InputContent, edit: QueueItemTextEditView): 
   return create(InputContentSchema, {
     parts,
     ...(original.replyQuote ? { replyQuote: original.replyQuote } : {}),
+    ...(original.todoQuote ? { todoQuote: original.todoQuote } : {}),
     quotesEncoded: false,
     pastedTextRanges: pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
     mentionRanges: mentionRanges.map((range) => create(InputMentionRangeSchema, {

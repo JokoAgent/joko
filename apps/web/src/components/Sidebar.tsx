@@ -1,4 +1,6 @@
 import { Fragment } from "react";
+import { useProvisionalTaskPreview } from "../provisional-draft-preview.js";
+import { inspectorLayoutOwner, openInspectorExtension } from "./inspector-layout.js";
 import type { JSX, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -391,6 +393,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     props.onClose();
   };
   const [query, setQuery] = useState("");
+  const [extensionPlacementMenu, setExtensionPlacementMenu] = useState<{ readonly extensionId: string; readonly x: number; readonly y: number; readonly owner?: string }>();
   const ownerLayout = sidebarOwnerLayoutFor(props.sidebarOwnerLayouts, props.sidebarOwnerId);
   const sidebarLayout = useMemo<SidebarLayout>(() => ({
     ...props.sidebarDisplayPreferences,
@@ -1612,7 +1615,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     />
   </div>;
 
-  return <><SidebarFrame
+  return <>{extensionPlacementMenu !== undefined && <ExtensionPlacementMenu {...extensionPlacementMenu} t={t} onClose={() => setExtensionPlacementMenu(undefined)} />}<SidebarFrame
     server={snapshot.server}
     appShortcutOverrides={props.appShortcutOverrides}
     probeRuntimeActivity={props.probeRuntimeActivity}
@@ -1890,6 +1893,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             className={cx(route.kind === "extensionMainView" && route.extensionId === extension.id && "is-active")}
             aria-current={route.kind === "extensionMainView" && route.extensionId === extension.id ? "page" : undefined}
             onClick={() => navigateAndClose({ kind: "extensionMainView", extensionId: extension.id })}
+            onContextMenu={event => { event.preventDefault(); setExtensionPlacementMenu({ extensionId: extension.id, x: event.clientX, y: event.clientY, owner: inspectorLayoutOwner(props.machineControl?.activeProfile) }); }}
           ><ExtensionShortcutIcon extension={extension} /><span><strong>{extension.mainView?.title ?? extension.name}</strong><small>{extension.description}</small></span></button>)}
         </section>}
         {!searchPopupOpen && props.groupNavigation}
@@ -1966,6 +1970,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             label={extension.mainView?.title ?? extension.name}
             tip={extension.mainView?.title ?? extension.name}
             onClick={() => navigateAndClose({ kind: "extensionMainView", extensionId: extension.id })}
+            onContextMenu={event => { event.preventDefault(); setExtensionPlacementMenu({ extensionId: extension.id, x: event.clientX, y: event.clientY, owner: inspectorLayoutOwner(props.machineControl?.activeProfile) }); }}
           ><ExtensionShortcutIcon extension={extension} /></IconButton>)}
           {sidebarExtensions.length > 0 && <div className="sidebar__rail-section-divider" aria-hidden="true" />}
           <div className="sidebar__rail-aggregates">
@@ -2189,6 +2194,27 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       onConfirm={() => void confirmDeleteSchedule()}
     />
   </>;
+}
+
+function ExtensionPlacementMenu({ extensionId, x, y, t, onClose, owner }: { readonly extensionId: string; readonly x: number; readonly y: number; readonly t: Translator; readonly onClose: () => void; readonly owner?: string }): JSX.Element {
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    root.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    const pointer = (event: globalThis.MouseEvent): void => { if (!root.current?.contains(event.target as Node)) onClose(); };
+    const key = (event: globalThis.KeyboardEvent): void => {
+      if (event.key === "Escape") { event.preventDefault(); onClose(); }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault(); const items = [...(root.current?.querySelectorAll<HTMLButtonElement>("button") ?? [])];
+        const index = items.indexOf(document.activeElement as HTMLButtonElement); items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
+      }
+    };
+    document.addEventListener("mousedown", pointer, true); document.addEventListener("keydown", key, true);
+    return () => { document.removeEventListener("mousedown", pointer, true); document.removeEventListener("keydown", key, true); };
+  }, [onClose]);
+  return createPortal(<div className="inspector-extension-menu" ref={root} role="menu" aria-label={t("extensions.mainView.title")}
+    style={{ left: Math.max(8, Math.min(x, window.innerWidth - 220)), top: Math.max(8, Math.min(y, window.innerHeight - 180)) }}>
+    {(["page", "sidebar", "window", "reset"] as const).map(mode => <button key={mode} type="button" role="menuitem" onClick={() => { openInspectorExtension(extensionId, mode, owner); onClose(); }}>{t(`inspector.plugin.${mode}`)}</button>)}
+  </div>, document.body);
 }
 
 function SidebarRailPanelShell({ anchor, level, onPointerEnter, onPointerLeave, children }: {
@@ -4282,8 +4308,10 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
 }
 
 function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, onSuggestTitle, canSuggestTitle, titleSuggestionOwnerKey, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
+  const draftPreview = useProvisionalTaskPreview(sessionProfileId, session.id, session.provisionalDraftId);
+  if (session.provisionalDraftId) session = { ...session, name: draftPreview || t("session.unsent") };
   const indicator = sidebarSessionIndicatorState(session, priorityContext);
-  const stateLabel = indicator === undefined
+  const stateLabel = session.provisionalDraftId ? t("session.unsent") : indicator === undefined
     ? sessionStateLabel(session.state, t)
     : sidebarRightStatusLabel(indicator, t);
   const infoPieces = sidebarSessionInfoPieces(session, sessionInfoFields, locale);

@@ -60,12 +60,12 @@ import { resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, CheckboxControl, EmptyState, IconButton, Modal, Pill, StatusDot, cx, formatRelativeTime, SelectControl } from "./ui.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
-import { extensionMainViewReady } from "./ExtensionMainViewPage.js";
+import { ExtensionMainViewPage, extensionMainViewReady } from "./ExtensionMainViewPage.js";
 import { ExtensionLibrarySection } from "./ExtensionLibrarySection.js";
 import { ExtensionNetworkSection } from "./ExtensionNetworkSection.js";
 import { ExtensionOAuthSection } from "./ExtensionOAuthSection.js";
 import { ExtensionTasksSection } from "./ExtensionTasksSection.js";
-import { openInspectorExtension } from "./inspector-layout.js";
+import { inspectorLayoutOwner, openInspectorExtension } from "./inspector-layout.js";
 import { SkillTools } from "./SkillTools.js";
 import { useExtensionSuggestionContinuation, type ExtensionSuggestionContinuationState } from "./use-extension-suggestion-continuation.js";
 import { CatalogNodePicker, CatalogNodeUnavailable, useCatalogNodeSelection, type CatalogNodeSelection } from "./CatalogNodePicker.js";
@@ -940,6 +940,9 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
   const [refreshRevision, setRefreshRevision] = useState(0);
   const [mutationKey, setMutationKey] = useState<string>();
   const [setupOpen, setSetupOpen] = useState(false);
+  const [authorSettings, setAuthorSettings] = useState<{ readonly extensionId: string; readonly owner: string }>();
+  const authorSettingsOwner = JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId,
+    controller.state.activeProfile?.origin, controller.state.activeProfile?.endpointPublicKey, controller.state.connectionGeneration]);
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const [packageIntent, setPackageIntent] = useState<ExtensionPackageIntent>();
   const [packageExport, setPackageExport] = useState<ExtensionCatalogEntryView>();
@@ -1275,11 +1278,21 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
         onExport={() => setPackageExport(selectedDetail)}
         onRemove={() => setPackageRemoval(selectedDetail)}
         onOpenMainView={() => {
-          openInspectorExtension(selectedDetail.id);
+          openInspectorExtension(selectedDetail.id, undefined, inspectorLayoutOwner(controller.state.activeProfile));
         }}
-        onOpenWindow={() => openInspectorExtension(selectedDetail.id, "window")}
+        onOpenWindow={() => openInspectorExtension(selectedDetail.id, "window", inspectorLayoutOwner(controller.state.activeProfile))}
       />}
     </section>
+    {selectedDetail?.installed && selectedDetail.settings && <Button tone="ghost" disabled={mutationKey !== undefined}
+      onClick={() => setAuthorSettings({ extensionId: selectedDetail.id, owner: authorSettingsOwner })}>{t("extensions.authorSettings")}</Button>}
+    <Modal open={authorSettings?.owner === authorSettingsOwner} title={t("extensions.authorSettings")} size="large"
+      onClose={() => { setAuthorSettings(undefined); setRefreshRevision(value => value + 1); }}>
+      {authorSettings?.owner === authorSettingsOwner && <div style={{ height: Math.max(360, selectedDetail?.settings?.height ?? 360) }}>
+        <ExtensionMainViewPage controller={controller} extensionId={authorSettings.extensionId} t={t} settings embedded
+          navigationOpen onOpenNavigation={() => undefined} onOpenIndependent={() => undefined}
+          onOpenLibrary={() => setAuthorSettings(undefined)} />
+      </div>}
+    </Modal>
     <ExtensionSetupDialog
       extension={selectedDetail}
       open={setupOpen}
@@ -1456,6 +1469,7 @@ function ExtensionDetail({ controller, extension, projectSelected, projectReady,
     {extension.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{extension.error}</p>}
     <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : extension.owner.kind === "mcp" ? t("extensions.mcpOwner") : t("extensions.sourceOwner")}</dd></div></dl>
     {extension.mainView !== undefined && <section className="extension-main-view-actions"><LayoutDashboard aria-hidden="true" /><div><strong>{extension.mainView.title ?? t("extensions.mainView.title")}</strong><p>{extensionMainViewReady(extension) ? t("extensions.mainView.readyBody") : t("extensions.mainView.notReadyBody")}</p></div><Button tone="primary" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenMainView}>{t("extensions.mainView.open")}</Button><Button tone="ghost" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenWindow}><ExternalLink aria-hidden="true" />{t("extensions.mainView.openWindow")}</Button></section>}
+    {extensionMainViewReady(extension) && <div className="extension-main-view-actions"><Button tone="ghost" disabled={busy} onClick={() => openInspectorExtension(extension.id, "sidebar", inspectorLayoutOwner(controller.state.activeProfile))}>{t("inspector.plugin.sidebar")}</Button><Button tone="ghost" disabled={busy} onClick={() => openInspectorExtension(extension.id, "reset", inspectorLayoutOwner(controller.state.activeProfile))}>{t("inspector.plugin.reset")}</Button></div>}
     {extension.library !== undefined && <ExtensionLibrarySection controller={controller} extension={extension} locale={locale} disabled={busy} t={t} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionNetworkSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionOAuthSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}

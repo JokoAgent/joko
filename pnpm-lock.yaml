@@ -90,7 +90,7 @@ importers:
         version: file:.runtime/linkspan-packages/http-connect
       '@jokoagent/linkspan-iroh':
         specifier: file:../../.runtime/linkspan-packages/iroh
-        version: file:.runtime/linkspan-packages/iroh(@jokoagent/linkspan-iroh-node@file:.runtime/linkspan-packages/iroh-node)
+        version: file:.runtime/linkspan-packages/iroh(@jokoagent/linkspan-iroh-node@file:.runtime/linkspan-packages/iroh-node(@jokoagent/linkspan-iroh-wasm@file:.runtime/linkspan-packages/iroh-wasm))(@jokoagent/linkspan-iroh-wasm@file:.runtime/linkspan-packages/iroh-wasm)
       '@jokoagent/linkspan-iroh-node':
         specifier: file:../../.runtime/linkspan-packages/iroh-node
         version: file:.runtime/linkspan-packages/iroh-node(@jokoagent/linkspan-iroh-wasm@file:.runtime/linkspan-packages/iroh-wasm)
@@ -272,7 +272,7 @@ importers:
         version: file:.runtime/linkspan-packages/noise
       '@jokoagent/linkspan-tailcat':
         specifier: file:../../.runtime/linkspan-packages/tailcat
-        version: file:.runtime/linkspan-packages/tailcat(@jokoagent/linkspan-tailcat-wasm@file:.runtime/linkspan-packages/tailcat-wasm)
+        version: file:.runtime/linkspan-packages/tailcat(@jokoagent/linkspan-tailcat-node@file:.runtime/linkspan-packages/tailcat-node)(@jokoagent/linkspan-tailcat-wasm@file:.runtime/linkspan-packages/tailcat-wasm(@jokoagent/linkspan-tailcat-node@file:.runtime/linkspan-packages/tailcat-node))
       '@jokoagent/linkspan-tailcat-wasm':
         specifier: file:../../.runtime/linkspan-packages/tailcat-wasm
         version: file:.runtime/linkspan-packages/tailcat-wasm(@jokoagent/linkspan-tailcat-node@file:.runtime/linkspan-packages/tailcat-node)
@@ -348,6 +348,9 @@ importers:
       expo-updates:
         specifier: 57.0.18
         version: 57.0.18(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)(supports-color@8.1.1)
+      expo-web-browser:
+        specifier: 57.0.2
+        version: 57.0.2(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))
       highlight.js:
         specifier: 11.11.1
         version: 11.11.1
@@ -6099,6 +6102,12 @@ packages:
       expo-dev-client:
         optional: true
 
+  expo-web-browser@57.0.2:
+    resolution: {integrity: sha512-3vl5kvd7PB48ub6PpNIJUuPxO8xVa6D8RnIgNba6SXRwqFprOfeEZgwTgtm41kz0AAtvMOztUVNEUkwrHKjqMQ==}
+    peerDependencies:
+      expo: '*'
+      react-native: '*'
+
   expo@57.0.17:
     resolution: {integrity: sha512-RG9BItgEObzSafkJKHPUh5iCnaPCFXJTDwfEJe3t7uhmqipVhcsf6gAJEtME0xaGaMp4Z3C+HLbPW9DMea8G0w==}
     hasBin: true
@@ -11498,13 +11507,6 @@ snapshots:
       '@jokoagent/linkspan-iroh-node': file:.runtime/linkspan-packages/iroh-node(@jokoagent/linkspan-iroh-wasm@file:.runtime/linkspan-packages/iroh-wasm)
       '@jokoagent/linkspan-iroh-wasm': file:.runtime/linkspan-packages/iroh-wasm
 
-  '@jokoagent/linkspan-iroh@file:.runtime/linkspan-packages/iroh(@jokoagent/linkspan-iroh-node@file:.runtime/linkspan-packages/iroh-node)':
-    dependencies:
-      '@jokoagent/linkspan-core': file:.runtime/linkspan-packages/core
-      '@jokoagent/linkspan-noise': file:.runtime/linkspan-packages/noise
-    optionalDependencies:
-      '@jokoagent/linkspan-iroh-node': file:.runtime/linkspan-packages/iroh-node(@jokoagent/linkspan-iroh-wasm@file:.runtime/linkspan-packages/iroh-wasm)
-
   '@jokoagent/linkspan-localtunnel@file:.runtime/linkspan-packages/localtunnel':
     dependencies:
       '@jokoagent/linkspan-connector-runtime': file:.runtime/linkspan-packages/connector-runtime
@@ -11560,14 +11562,6 @@ snapshots:
       '@jokoagent/linkspan-tailcat-runtime': file:.runtime/linkspan-packages/tailcat-runtime
     optionalDependencies:
       '@jokoagent/linkspan-tailcat-node': file:.runtime/linkspan-packages/tailcat-node
-      '@jokoagent/linkspan-tailcat-wasm': file:.runtime/linkspan-packages/tailcat-wasm(@jokoagent/linkspan-tailcat-node@file:.runtime/linkspan-packages/tailcat-node)
-
-  '@jokoagent/linkspan-tailcat@file:.runtime/linkspan-packages/tailcat(@jokoagent/linkspan-tailcat-wasm@file:.runtime/linkspan-packages/tailcat-wasm)':
-    dependencies:
-      '@jokoagent/linkspan-core': file:.runtime/linkspan-packages/core
-      '@jokoagent/linkspan-noise': file:.runtime/linkspan-packages/noise
-      '@jokoagent/linkspan-tailcat-runtime': file:.runtime/linkspan-packages/tailcat-runtime
-    optionalDependencies:
       '@jokoagent/linkspan-tailcat-wasm': file:.runtime/linkspan-packages/tailcat-wasm(@jokoagent/linkspan-tailcat-node@file:.runtime/linkspan-packages/tailcat-node)
 
   '@jokoagent/linkspan-turn@file:.runtime/linkspan-packages/turn':
@@ -14523,6 +14517,11 @@ snapshots:
       resolve-from: 5.0.0
     transitivePeerDependencies:
       - supports-color
+
+  expo-web-browser@57.0.2(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10)):
+    dependencies:
+      expo: 57.0.17(@babel/core@7.29.7(supports-color@8.1.1))(@expo/dom-webview@57.0.1)(bufferutil@4.1.0)(react-dom@19.2.3(react@19.2.3))(react-native-webview@13.16.1(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3))(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)(supports-color@8.1.1)(typescript@5.9.3)(utf-8-validate@5.0.10)
+      react-native: 0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10)
 
   expo@57.0.17(@babel/core@7.29.7(supports-color@8.1.1))(@expo/dom-webview@57.0.1)(bufferutil@4.1.0)(react-dom@19.2.3(react@19.2.3))(react-native-webview@13.16.1(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3))(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)(supports-color@8.1.1)(typescript@5.9.3)(utf-8-validate@5.0.10):
     dependencies:

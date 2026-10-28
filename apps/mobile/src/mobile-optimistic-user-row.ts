@@ -67,7 +67,8 @@ export function appendMobileOptimisticUserRow(
     completed: false,
     operationId,
     optimistic: true,
-    ...(draft.replyQuote ? { replyQuote: draft.replyQuote } : {})
+    ...(draft.replyQuote ? { replyQuote: draft.replyQuote } : {}),
+    ...(draft.todoQuote ? { todoQuote: draft.todoQuote } : {})
   };
   return [...current, {
     ownerKey,

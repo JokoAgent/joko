@@ -1,6 +1,8 @@
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import type { GetPartnerGlanceResponse, GetPartnerAutonomySettingsResponse, PartnerAutonomySettings,
   UpdatePartnerAutonomySettingsResponse, UpdatePartnerAutonomySettingsRequestSchema } from "./gen/joko/v1/partner_autonomy_pb.js";
+import { PartnerTodoView, PartnerTodoUiAction, type ListPartnerTodosResponse, type PartnerTodo, type UpdatePartnerTodoResponse } from "./gen/joko/v1/partner_todo_pb.js";
+import type { ListPartnerTaskOutputsResponse, PartnerTaskOutput } from "./gen/joko/v1/partner_pb.js";
 
 export type PartnerAutonomySettingChoice = NonNullable<MessageInitShape<typeof UpdatePartnerAutonomySettingsRequestSchema>["choice"]>;
 export interface PartnerAutonomyApi {
@@ -9,11 +11,17 @@ export interface PartnerAutonomyApi {
   settings(signal: AbortSignal): Promise<PartnerAutonomySettings>;
   save(operationId: string, revision: bigint, choice: PartnerAutonomySettingChoice, signal: AbortSignal): Promise<PartnerAutonomySettings>;
   glance(partnerId: string, signal: AbortSignal, page?: { readonly token: string; readonly offset: number }): Promise<GetPartnerGlanceResponse>;
+  todos(partnerId: string, view: "open" | "done", offset: number, signal: AbortSignal): Promise<ListPartnerTodosResponse>;
+  updateTodo(operationId: string, partnerId: string, partnerRevision: bigint, todo: PartnerTodo, action: "delete" | "restore", signal: AbortSignal): Promise<PartnerTodo>;
+  outputs(partnerId: string, signal: AbortSignal): Promise<readonly PartnerTaskOutput[]>;
 }
 interface AutonomyRpc {
   getPartnerAutonomySettings(request: object, options: { signal: AbortSignal }): Promise<GetPartnerAutonomySettingsResponse>;
   updatePartnerAutonomySettings(request: MessageInitShape<typeof UpdatePartnerAutonomySettingsRequestSchema>, options: { signal: AbortSignal }): Promise<UpdatePartnerAutonomySettingsResponse>;
   getPartnerGlance(request: { partnerId: string; snapshotToken: string; offset: number }, options: { signal: AbortSignal }): Promise<GetPartnerGlanceResponse>;
+  listPartnerTodos(request: { partnerId: string; view: PartnerTodoView; offset: number }, options: { signal: AbortSignal }): Promise<ListPartnerTodosResponse>;
+  updatePartnerTodo(request: { operationId: string; partnerId: string; expectedPartnerRevision: { value: bigint }; todoId: string; expectedRevision: bigint; action: PartnerTodoUiAction }, options: { signal: AbortSignal }): Promise<UpdatePartnerTodoResponse>;
+  listPartnerTaskOutputs(request: { partnerId: string }, options: { signal: AbortSignal }): Promise<ListPartnerTaskOutputsResponse>;
 }
 /** Web and Mobile share generated payloads and the same connection retirement fence. */
 export function createPartnerAutonomyApi(input: { readonly rpc: AutonomyRpc; readonly ownerKey: string;
@@ -37,6 +45,22 @@ export function createPartnerAutonomyApi(input: { readonly rpc: AutonomyRpc; rea
         throw new Error("The task observation page is invalid.");
       }
       return value;
+    }),
+    todos: (partnerId, view, offset, signal) => invoke(signal, async () => {
+      const value = await input.rpc.listPartnerTodos({ partnerId, view: view === "open" ? PartnerTodoView.OPEN : PartnerTodoView.DONE, offset }, { signal });
+      if (value.partnerId !== partnerId || !value.partnerRevision || value.items.length > 25 || value.items.some(item => !item.id || item.revision < 1n || item.status !== view)) throw new Error("The affair page owner is invalid.");
+      return value;
+    }),
+    outputs: (partnerId, signal) => invoke(signal, async () => {
+      const value = await input.rpc.listPartnerTaskOutputs({ partnerId }, { signal });
+      if (value.partnerId !== partnerId || value.outputs.some(item => !item.sessionId || !item.sourceId || !item.sourceRevision)) throw new Error("The output owner is invalid.");
+      return value.outputs;
+    }),
+    updateTodo: (operationId, partnerId, partnerRevision, todo, action, signal) => invoke(signal, async () => {
+      const value = await input.rpc.updatePartnerTodo({ operationId, partnerId, expectedPartnerRevision: { value: partnerRevision }, todoId: todo.id,
+        expectedRevision: todo.revision, action: action === "delete" ? PartnerTodoUiAction.DELETE : PartnerTodoUiAction.RESTORE }, { signal });
+      if (value.partnerId !== partnerId || !value.todo || value.todo.id !== todo.id || value.todo.revision !== todo.revision + 1n) throw new Error("The affair save receipt is invalid.");
+      return value.todo;
     }) };
 }
 
@@ -47,7 +71,8 @@ const english = {
   fallback: "Allow the scheduler Partner to observe my tasks while I am paused", reset: "Restore defaults", refresh: "Refresh", retrySave: "Retry the original save",
   saveUnknown: "The save receipt was lost. Retry the same request to recover its result.", failed: "Task observation could not refresh. Retry.", loading: "Loading…", more: "Show more",
   all: "All tasks on this node", own: "Tasks this Partner created or took over", waiting: "Waiting for you", working: "Working", done: "{count} done today",
-  empty: "None", permission: "Waiting for permission", limit: "Waiting for usage reset", task: "Open the original task", minutes: "min"
+  empty: "None", permission: "Waiting for permission", limit: "Waiting for usage reset", task: "Open the original task", minutes: "min",
+  todos: "Your affairs", completed: "Completed", remove: "Delete", undo: "Undo delete", quote: "Discuss this affair", computers: "Computer", outputs: "Outputs", here: "Home computer", online: "Online", offline: "Offline", offlineCount: "{count} offline computers", computersFailed: "Computers could not refresh. Retry."
 };
 const chinese: typeof english = {
   glance: "近况", invite: "让这位伙伴帮你跟进任务？", start: "开始跟进", notNow: "暂时不用", cancel: "取消", close: "关闭",
@@ -56,6 +81,12 @@ const chinese: typeof english = {
   fallback: "我暂停时，允许总调度伙伴观察我的任务", reset: "恢复默认", refresh: "刷新", retrySave: "重试原保存请求",
   saveUnknown: "保存回执丢失，请重试原请求取回结果。", failed: "近况刷新失败，请重试。", loading: "加载中…", more: "查看更多",
   all: "本节点全部任务", own: "这位伙伴创建或明确接手的任务", waiting: "等你", working: "在做", done: "今天完成 {count} 件",
-  empty: "暂无", permission: "等待权限确认", limit: "等待用量恢复", task: "打开原任务", minutes: "分钟"
+  empty: "暂无", permission: "等待权限确认", limit: "等待用量恢复", task: "打开原任务", minutes: "分钟",
+  todos: "待办", completed: "已完成", remove: "删除", undo: "撤销删除", quote: "引用这条待办", computers: "电脑", outputs: "输出内容", here: "主力电脑", online: "在线", offline: "离线", offlineCount: "{count} 台电脑离线", computersFailed: "无法读取电脑，请重试。"
 };
 export function partnerAutonomyMessages(locale?: string): typeof english { return locale === "zh-CN" ? chinese : english; }
+/** These RPC failures confirm rejection before a transactional settings/Todo commit. */
+export function partnerMutationWasRejected(error: unknown): boolean {
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "number" && [3, 5, 6, 7, 9, 10, 11, 16].includes(code);
+}

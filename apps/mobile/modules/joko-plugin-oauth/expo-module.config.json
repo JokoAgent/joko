@@ -1,0 +1,5 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": { "modules": ["JokoPluginOauthModule"] },
+  "android": { "modules": ["app.joko.pluginoauth.JokoPluginOauthModule"] }
+}

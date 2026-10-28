@@ -407,6 +407,8 @@ message Session {
   // A service-owned local task directory within its approved project. This
   // does not claim an isolated checkout lease owned by another Session.
   SessionLocalWorkspace local_workspace = 31;
+  // Non-empty only while this task belongs to an unsent client draft.
+  string provisional_draft_id = 32;
 }
 
 message SessionLocalWorkspace {
@@ -704,7 +706,9 @@ message InputContent {
   // A reply in this exact private Partner conversation. The service re-reads
   // the original visible message; the bounded excerpt is display data only.
   PartnerReplyQuote reply_quote = 5;
+  PartnerTodoQuote todo_quote = 6;
 }
+message PartnerTodoQuote { string partner_id = 1; string todo_id = 2; uint64 revision = 3; string title = 4; }
 
 message PartnerReplyQuote {
   uint64 generation = 1;

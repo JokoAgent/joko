@@ -1,5 +1,7 @@
 import type { JSONContent } from "@tiptap/core";
 import { resolveModelSpeed } from "../model-speed.js";
+import { ProvisionalDraftTask } from "../provisional-draft-task.js";
+import { previewProvisionalTask } from "../provisional-draft-preview.js";
 import { builtinSkillIntentForText } from "../builtin-skill-intent.js";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent, JSX } from "react";
@@ -48,6 +50,8 @@ import type {
   NewSessionDraftSelection,
   NewSessionLocalDraft,
   NewSessionModelRequest,
+  NewSessionDraft,
+  ProvisionalTaskReceipt,
   PermissionMode,
   PendingExtensionSuggestionView,
   SessionView,
@@ -263,6 +267,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const builtinSkillIntentRef = useRef<"plugin_creator" | undefined>(undefined);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [draftError, setDraftError] = useState<string>();
+  const [preparation, setPreparation] = useState<ProvisionalTaskReceipt>();
+  const [prewarmInputIntent, setPrewarmInputIntent] = useState(false);
+  const preparationRef = useRef<ProvisionalTaskReceipt | undefined>(undefined);
   const [dragging, setDragging] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [personalDevelopmentLaunch, setPersonalDevelopmentLaunch] = useState<PersonalDevelopmentLaunch>();
@@ -366,6 +373,24 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   const selectionKey = selection === undefined ? "" : newSessionSelectionValue(selection);
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
+  const preparationOwner = useMemo(() => ({}), [profileScope, controller.state.connectionGeneration]);
+  const preparationOwnerRef = useRef(preparationOwner); preparationOwnerRef.current = preparationOwner;
+  const provisionalTask = useMemo(() => new ProvisionalDraftTask({
+    api: controller,
+    read: () => preparationRef.current,
+    isCurrent: () => preparationOwnerRef.current === preparationOwner,
+    save: async receipt => {
+      if (preparationOwnerRef.current !== preparationOwner) throw new Error("The new task draft owner changed.");
+      const current = latestDraftRef.current;
+      if (!current) throw new Error("The new task draft has not been saved yet.");
+      preparationRef.current = receipt;
+      setPreparation(receipt);
+      const draft = { ...current.draft, preparation: receipt };
+      latestDraftRef.current = { controller: current.controller, draft };
+      await enqueueNewSessionDraftSave(draftSaveChainRef, { current: current.controller }, draft);
+      if (preparationOwnerRef.current !== preparationOwner) throw new Error("The new task draft owner changed.");
+    }
+  }), [preparationOwner]);
   const modelSelectionScope = useMemo(() => ({}), [selection, profileScope, controller.state.connectionGeneration]);
   const modelSelectionScopeRef = useRef(modelSelectionScope);
   modelSelectionScopeRef.current = modelSelectionScope;
@@ -1056,6 +1081,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (cancelled) return;
       const suggestion = suggestionResult.status === "fulfilled" ? suggestionResult.value : undefined;
       const draft = suggestion?.draft ?? (draftResult.status === "fulfilled" ? draftResult.value : undefined);
+      preparationRef.current = draft?.preparation; setPreparation(draft?.preparation);
+      setPrewarmInputIntent(false);
       const pending = recommendationNonce === undefined && pendingResult.status === "fulfilled" ? pendingResult.value : undefined;
       let hydrationError = draftResult.status === "rejected"
         ? messageOf(draftResult.reason)
@@ -1403,6 +1430,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useEffect(() => {
     if (!hydrated || hydratedProfileScope !== profileScope || submitting) return;
     const draft: NewSessionLocalDraft = {
+      ...(preparationRef.current === undefined ? {} : { preparation: preparationRef.current }),
       selection: selection ?? { kind: "unselected" },
       nativeStart: startKind === "attach" && selected !== undefined && nativeReference.length > 0
         ? { kind: "attach", reference: nativeReference }
@@ -1434,7 +1462,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       void enqueueNewSessionDraftSave(draftSaveChainRef, sourceControllerRef, draft).then(() => { if (!cancelled) setDraftError(undefined); }).catch((error: unknown) => { if (!cancelled) setDraftError(messageOf(error)); });
     }, 420);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [controller.saveNewSessionDraft, attachments, browserComments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, hydratedProfileScope, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, profileScope, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
+  }, [controller.saveNewSessionDraft, attachments, browserComments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, hydratedProfileScope, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, preparation, profileScope, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
 
   const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
   const attachmentsAllowed = draftAttachmentsAllowed(draftMedia, attachmentPolicy);
@@ -1457,6 +1485,42 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const personalDraft = composerBuiltInCommand(text, commandOptions)?.kind === "personalDevelopment";
   const canSend = (canFinishVoiceSend || personalDraft && personalDevelopmentSupported && hydrated && !submitting)
     && hasInput && !voice.active;
+  const prewarmDraft: NewSessionDraft | undefined = selection?.kind === "target" && selected?.trusted === true
+    && selected.remoteWorkspace === undefined && targetWorkspaceReady && startKind === "fresh"
+    && backend?.capabilities.get("session.prewarm")?.supported === true && modelRouteReady && selectedModel !== undefined
+    && !effectiveWorktreeEnabled && (!worktreeRequested || worktreeConfirmedIneligible)
+    && extraDirectoryIds.length === 0 && !personalDraft
+    ? { targetId: selected.id, expectedTargetRevision: selected.revision, name: t("session.newName"), nativeStart: { kind: "fresh" },
+      providerId: selectedModel.providerId, modelId: selectedModel.modelId,
+      ...(execution.effortSelectable && effort.length > 0 ? { effort } : {}),
+      fastMode: resolveModelSpeed(selectedModel, fastMode, execution.fastModeSelectable),
+      permissionMode: execution.permissionModes.includes(permissionMode) ? permissionMode : execution.permissionModes[0] ?? "ask",
+      planMode: execution.planModeSupported && planMode } : undefined;
+  const prewarmConfiguration = prewarmDraft === undefined ? "" : JSON.stringify(prewarmDraft, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+  const prewarmVoiceGraceRef = useRef(0);
+  useEffect(() => {
+    const profileId = controller.state.activeProfile?.id;
+    if (profileId && preparation?.sessionId) previewProvisionalTask(profileId, preparation.sessionId, preparation.draftId,
+      text || attachments[0]?.file.name || (voice.active ? t("session.unsent") : ""));
+  }, [controller.state.activeProfile?.id, preparation, text, attachments, voice.active, t]);
+  if (voice.active) prewarmVoiceGraceRef.current = Date.now() + 60_000;
+  useEffect(() => {
+    if (!hydrated || hydratedProfileScope !== profileScope || submitting || controller.state.connectionState !== "connected"
+      || !controller.readSessionPreparation || !controller.discardProvisionalSession || !controller.prewarmSession) return;
+    if (hasInput && !prewarmInputIntent && !voice.active) return;
+    let retired = false;
+    const run = async (): Promise<void> => {
+      try {
+        if ((hasInput || voice.active) && prewarmDraft) await provisionalTask.prepare(prewarmDraft);
+        else if (!voice.active && Date.now() >= prewarmVoiceGraceRef.current) await provisionalTask.retire();
+      } catch (error) { if (!retired && preparationRef.current) setDraftError(messageOf(error)); }
+    };
+    const delay = hasInput || voice.active ? 350 : Math.max(1_000, prewarmVoiceGraceRef.current - Date.now());
+    const timer = window.setTimeout(() => { void run(); }, delay);
+    const reconcile = !hasInput && !voice.active && preparation !== undefined
+      ? window.setInterval(() => { void run(); }, 5_000) : undefined;
+    return () => { retired = true; window.clearTimeout(timer); if (reconcile !== undefined) window.clearInterval(reconcile); };
+  }, [hydrated, hydratedProfileScope, profileScope, submitting, controller.state.connectionState, hasInput, text, voice.active, prewarmConfiguration, provisionalTask, preparation, prewarmInputIntent]);
   const submissionScope = useMemo(() => ({}), [
     profileScope,
     controller.state.connectionGeneration,
@@ -1561,6 +1625,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   }, [canMention, mentionPolicy.directories, palette]);
 
   const updateDocument = (nextDocument: JSONContent, isComposing = false, mapRanges?: (ranges: readonly ComposerInlineMentionRange[]) => readonly ComposerInlineMentionRange[]): void => {
+    setPrewarmInputIntent(true);
     const normalizedDocument = normalizeComposerDocument(nextDocument);
     const nextText = composerDocumentPlainText(normalizedDocument);
     // An update without its originating transaction has no occurrence authority.
@@ -2126,6 +2191,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const acceptFirstInput = (acceptance?: FirstInputAcceptance): void => {
       if (acceptance === undefined) return;
       clearAcceptedSource();
+      void provisionalTask.accepted().catch(() => undefined);
       onAccepted?.(acceptance);
     };
     const attempt = {}; submissionRef.current = attempt;
@@ -2202,7 +2268,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     try {
       await draftSaveChainRef.current;
       if (!owner.isCurrent()) return;
+      const prepared = await provisionalTask.take({ targetId: selected?.id ?? "", expectedTargetRevision: selected?.revision,
+        name: t("session.newName"), nativeStart: selected !== undefined && startKind === "attach" && nativeSelectionReady
+          ? { kind: "attach", reference: selectedNativeSession!.reference } : { kind: "fresh" }, providerId: selectedModel?.providerId ?? "", modelId: selectedModel?.modelId ?? "",
+        ...(execution.effortSelectable && effort.length > 0 ? { effort } : {}), fastMode: execution.fastModeSelectable && fastMode,
+        permissionMode: resolvedPermission, planMode: execution.planModeSupported && planMode,
+        ...(worktree === undefined ? {} : { worktree }) });
+      if (!owner.isCurrent()) return;
       await onSubmit({
+        ...prepared,
         selection,
         ...(selection.kind === "target" && selected !== undefined
           ? { expectedTargetRevision: selected.revision }
@@ -2221,6 +2295,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       }, sourceInput, owner);
     } catch (error) {
       // App owns the operation banner; the persistent draft intentionally remains.
+      if (owner.isCurrent()) setDraftError(messageOf(error));
       if (options.propagateError === true) throw error;
     } finally {
       if (submissionRef.current === attempt) {
@@ -2531,7 +2606,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     return true;
   };
 
-  return <main ref={pageRef} className="new-task-page">
+  return <main ref={pageRef} className="new-task-page" onPasteCapture={() => setPrewarmInputIntent(true)} onDropCapture={() => setPrewarmInputIntent(true)}>
     <header className="new-task-page__header">
       {!navigationOpen && <IconButton label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
       <div className="new-task-context" aria-label={t("session.newDescription")}>

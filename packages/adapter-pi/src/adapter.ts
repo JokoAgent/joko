@@ -6636,6 +6636,7 @@ export class PiBackendAdapter implements
       "session.detach",
       "session.fork",
       "session.side_chat",
+      "session.prewarm",
       "session.rewind",
       "session.rewind_to_start",
       "session.message_delete",

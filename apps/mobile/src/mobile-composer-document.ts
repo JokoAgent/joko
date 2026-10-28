@@ -172,6 +172,7 @@ export interface MobileComposerSlashCommandMark {
 
 export interface MobileComposerDraft {
   readonly replyQuote?: MobilePartnerReplyQuote;
+  readonly todoQuote?: MobilePartnerTodoQuote;
   readonly text: string;
   readonly mentions: readonly MobileComposerMention[];
   readonly atoms: readonly MobileComposerAtom[];
@@ -181,6 +182,14 @@ export interface MobileComposerDraft {
 
 export interface MobilePartnerReplyQuote {
   readonly generation: string; readonly eventId: string; readonly messageId: string; readonly role: 'user' | 'assistant'; readonly excerpt: string;
+}
+export interface MobilePartnerTodoQuote { readonly partnerId: string; readonly todoId: string; readonly revision: string; readonly title: string; }
+export function normalizeMobileTodoQuote(value: unknown): MobilePartnerTodoQuote {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The Todo quote is invalid.');
+  const row = value as Record<string, unknown>;
+  if (typeof row['revision'] !== 'string' || !/^[1-9]\d{0,15}$/u.test(row['revision']) || BigInt(row['revision']) > BigInt(Number.MAX_SAFE_INTEGER)
+    || typeof row['partnerId'] !== 'string' || typeof row['todoId'] !== 'string' || typeof row['title'] !== 'string' || row['title'].length > 300) throw new Error('The Todo quote is invalid.');
+  return { partnerId: normalizeExactIdentity(row['partnerId'], 'Todo Partner', 256), todoId: normalizeExactIdentity(row['todoId'], 'Todo', 256), revision: row['revision'], title: row['title'] };
 }
 export function normalizeMobileReplyQuote(value: unknown): MobilePartnerReplyQuote {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The private reply quote is invalid.');
@@ -365,7 +374,8 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
   });
   const attachments = normalizeMobileComposerAttachmentSet(value.attachments);
   const draft = { text: value.text, mentions, atoms, slashCommands, attachments,
-    ...(value.replyQuote ? { replyQuote: normalizeMobileReplyQuote(value.replyQuote) } : {}) };
+    ...(value.replyQuote ? { replyQuote: normalizeMobileReplyQuote(value.replyQuote) } : {}),
+    ...(value.todoQuote ? { todoQuote: normalizeMobileTodoQuote(value.todoQuote) } : {}) };
   serializeMobileComposerText(draft);
   return draft;
 }
@@ -375,6 +385,7 @@ export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComp
   return {
     text: exact.text,
     ...(exact.replyQuote ? { replyQuote: { ...exact.replyQuote } } : {}),
+    ...(exact.todoQuote ? { todoQuote: { ...exact.todoQuote } } : {}),
     mentions: exact.mentions.map((mention) => mention.kind === "workspace" && mention.lineRange !== undefined
       ? { ...mention, lineRange: { ...mention.lineRange } }
       : { ...mention }),
@@ -387,7 +398,7 @@ export function cloneMobileComposerDraft(draft: MobileComposerDraft): MobileComp
 export function mobileComposerDraftsEqual(left: MobileComposerDraft, right: MobileComposerDraft): boolean {
   const first = normalizeMobileComposerDraft(left);
   const second = normalizeMobileComposerDraft(right);
-  return JSON.stringify(first.replyQuote) === JSON.stringify(second.replyQuote) && first.text === second.text && first.mentions.length === second.mentions.length
+  return JSON.stringify(first.todoQuote) === JSON.stringify(second.todoQuote) && JSON.stringify(first.replyQuote) === JSON.stringify(second.replyQuote) && first.text === second.text && first.mentions.length === second.mentions.length
     && first.atoms.length === second.atoms.length
     && first.slashCommands.length === second.slashCommands.length
     && first.attachments.length === second.attachments.length
@@ -863,6 +874,7 @@ export function appendPlainTextToMobileComposer(draft: MobileComposerDraft, addi
   return normalizeMobileComposerDraft({
     text: `${current.text}${separator}${addition}`,
     ...(current.replyQuote ? { replyQuote: current.replyQuote } : {}),
+    ...(current.todoQuote ? { todoQuote: current.todoQuote } : {}),
     mentions: current.mentions,
     atoms: current.atoms,
     slashCommands: current.slashCommands,
@@ -878,9 +890,11 @@ export function prependMobileComposerDraft(
   const existing = normalizeMobileComposerDraft(current);
   if (source.replyQuote && existing.replyQuote && JSON.stringify(source.replyQuote) !== JSON.stringify(existing.replyQuote)) throw new Error('Keep the original reply draft separate from the new reply root.');
   const replyQuote = existing.replyQuote ?? source.replyQuote;
+  if (source.todoQuote && existing.todoQuote && JSON.stringify(source.todoQuote) !== JSON.stringify(existing.todoQuote)) throw new Error('Keep the original Todo draft separate from the new quoted affair.');
+  const todoQuote = existing.todoQuote ?? source.todoQuote;
   const attachments = mergeRecoveredAttachments(source.attachments, existing.attachments);
-  if (!source.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(existing), ...(replyQuote ? { replyQuote } : {}), attachments });
-  if (!existing.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(source), ...(replyQuote ? { replyQuote } : {}), attachments });
+  if (!source.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(existing), ...(replyQuote ? { replyQuote } : {}), ...(todoQuote ? { todoQuote } : {}), attachments });
+  if (!existing.text) return normalizeMobileComposerDraft({ ...cloneMobileComposerDraft(source), ...(replyQuote ? { replyQuote } : {}), ...(todoQuote ? { todoQuote } : {}), attachments });
   const separator = "\n\n";
   const offset = source.text.length + separator.length;
   const usedMentionIds = new Set(source.mentions.map((mention) => mention.mentionId));
@@ -914,6 +928,7 @@ export function prependMobileComposerDraft(
   return normalizeMobileComposerDraft({
     text: `${source.text}${separator}${existing.text}`,
     ...((existing.replyQuote ?? source.replyQuote) ? { replyQuote: existing.replyQuote ?? source.replyQuote } : {}),
+    ...(todoQuote ? { todoQuote } : {}),
     mentions,
     atoms,
     slashCommands,
@@ -933,12 +948,14 @@ export function mobileComposerDraftWithoutPrefix(
       existing.attachments[index]!
     ))) return undefined;
   const remainingAttachments = existing.attachments.slice(source.attachments.length).map(cloneMobileComposerAttachment);
-  if (!source.text) { const { replyQuote: _quote, ...rest } = cloneMobileComposerDraft(existing);
-    return normalizeMobileComposerDraft({ ...rest, ...(JSON.stringify(source.replyQuote) !== JSON.stringify(existing.replyQuote) && existing.replyQuote ? { replyQuote: existing.replyQuote } : {}), attachments: remainingAttachments }); }
+  if (!source.text) { const { replyQuote: _quote, todoQuote: _todo, ...rest } = cloneMobileComposerDraft(existing);
+    return normalizeMobileComposerDraft({ ...rest, ...(JSON.stringify(source.replyQuote) !== JSON.stringify(existing.replyQuote) && existing.replyQuote ? { replyQuote: existing.replyQuote } : {}),
+      ...(JSON.stringify(source.todoQuote) !== JSON.stringify(existing.todoQuote) && existing.todoQuote ? { todoQuote: existing.todoQuote } : {}), attachments: remainingAttachments }); }
   if (existing.text === source.text) {
     if (!mobileComposerDraftsEqual(source, {
       text: existing.text,
       ...(existing.replyQuote ? { replyQuote: existing.replyQuote } : {}),
+      ...(existing.todoQuote ? { todoQuote: existing.todoQuote } : {}),
       mentions: existing.mentions,
       atoms: existing.atoms,
       slashCommands: existing.slashCommands,
@@ -961,6 +978,7 @@ export function mobileComposerDraftWithoutPrefix(
   if (!mobileComposerDraftsEqual(source, {
     text: source.text,
     ...(existing.replyQuote ? { replyQuote: existing.replyQuote } : {}),
+    ...(existing.todoQuote ? { todoQuote: existing.todoQuote } : {}),
     mentions: sourceMentions,
     atoms: sourceAtoms,
     slashCommands: sourceSlashCommands,
@@ -1026,6 +1044,7 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
   return create(InputContentSchema, {
     parts: mobileComposerInputParts(exact, serialized),
     ...(exact.replyQuote ? { replyQuote: { ...exact.replyQuote, generation: BigInt(exact.replyQuote.generation) } } : {}),
+    ...(exact.todoQuote ? { todoQuote: { ...exact.todoQuote, revision: BigInt(exact.todoQuote.revision) } } : {}),
     quotesEncoded: exact.atoms.some(isMobileComposerQuoteAtom),
     pastedTextRanges: serialized.pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
     mentionRanges: exact.mentions.map((mention, mentionIndex) => create(InputMentionRangeSchema, {
@@ -1132,7 +1151,8 @@ export function restoreMobileComposerInput(input: InputContent, source: {
     mentions.push({ ...seed, mentionId: `restored-mention-${index}`, start, end: text.length } as MobileComposerMention);
   });
   return normalizeMobileComposerDraft({ text, mentions, atoms, attachments: [], slashCommands: [],
-    ...(input.replyQuote ? { replyQuote: normalizeMobileReplyQuote({ ...input.replyQuote, generation: input.replyQuote.generation.toString() }) } : {}) });
+    ...(input.replyQuote ? { replyQuote: normalizeMobileReplyQuote({ ...input.replyQuote, generation: input.replyQuote.generation.toString() }) } : {}),
+    ...(input.todoQuote ? { todoQuote: normalizeMobileTodoQuote({ ...input.todoQuote, revision: input.todoQuote.revision.toString() }) } : {}) });
 }
 
 export function mobileInputSummary(input: InputContent | undefined, typedMetadataTrusted = true): string {
@@ -1144,7 +1164,7 @@ export function mobileInputSummary(input: InputContent | undefined, typedMetadat
     const untrustedStructuredMetadata = input.parts.some((part) => part.content.case === "sessionMention"
       || part.content.case === "workspaceMention" || part.content.case === "resourceMention"
       || part.content.case === "artifactMention")
-      || input.mentionRanges.length > 0 || input.pastedTextRanges.length > 0 || input.quotesEncoded || input.replyQuote !== undefined;
+      || input.mentionRanges.length > 0 || input.pastedTextRanges.length > 0 || input.quotesEncoded || input.replyQuote !== undefined || input.todoQuote !== undefined;
     return [wireText, ...media, ...(untrustedStructuredMetadata ? ["[Untrusted structured metadata ignored]"] : [])]
       .filter((value) => value.length > 0).join("\n");
   }
@@ -1204,6 +1224,7 @@ export function replaceMobileComposerRange(
   const next = normalizeMobileComposerDraft({
     text,
     ...(exact.replyQuote ? { replyQuote: exact.replyQuote } : {}),
+    ...(exact.todoQuote ? { todoQuote: exact.todoQuote } : {}),
     mentions,
     atoms,
     slashCommands,
@@ -1252,6 +1273,7 @@ function insertMobileComposerMention(
   const next = normalizeMobileComposerDraft({
     text: result.draft.text,
     ...(result.draft.replyQuote ? { replyQuote: result.draft.replyQuote } : {}),
+    ...(result.draft.todoQuote ? { todoQuote: result.draft.todoQuote } : {}),
     mentions,
     atoms: result.draft.atoms,
     slashCommands: result.draft.slashCommands,
@@ -1282,6 +1304,7 @@ function insertMobileComposerAtom(
   const next = normalizeMobileComposerDraft({
     text: result.draft.text,
     ...(result.draft.replyQuote ? { replyQuote: result.draft.replyQuote } : {}),
+    ...(result.draft.todoQuote ? { todoQuote: result.draft.todoQuote } : {}),
     mentions: result.draft.mentions,
     atoms,
     slashCommands: result.draft.slashCommands,

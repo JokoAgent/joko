@@ -1,7 +1,7 @@
 import { MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
 import { mobileInputSummary, mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
-import { normalizeMobileReplyQuote, type MobilePartnerReplyQuote } from './mobile-composer-document';
+import { normalizeMobileReplyQuote, type MobilePartnerReplyQuote, normalizeMobileTodoQuote, type MobilePartnerTodoQuote } from './mobile-composer-document';
 import { mobileTimelineContent, mobileTimelineContentSourceKey, mobileTimelineToolMediaEvents } from "./mobile-timeline-content";
 import { projectMobileToolCall, mobileToolCallScopeKey, mobileToolCallCompleted, type MobileToolCallView } from "./mobile-tool-call";
 import {
@@ -35,6 +35,7 @@ export interface MobilePartnerPrivatePreviewCandidate {
 
 export interface TimelineRow {
   readonly replyQuote?: MobilePartnerReplyQuote;
+  readonly todoQuote?: MobilePartnerTodoQuote;
   readonly mcpApp?: import("@joko/contracts").McpAppCard;
   readonly extensionCard?: import("@joko/contracts").ExtensionCard;
   readonly learning?: PartnerLearningFeedbackView;
@@ -177,6 +178,9 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
             : {}),
           ...(message.role === MessageRole.USER && message.userInputAccepted && message.userInput?.replyQuote ? {
             replyQuote: normalizeMobileReplyQuote({ ...message.userInput.replyQuote, generation: message.userInput.replyQuote.generation.toString() })
+          } : {}),
+          ...(message.role === MessageRole.USER && message.userInputAccepted && message.userInput?.todoQuote ? {
+            todoQuote: normalizeMobileTodoQuote({ ...message.userInput.todoQuote, revision: message.userInput.todoQuote.revision.toString() })
           } : {}),
           ...(images.length === 0 ? {} : { images }) });
         break;

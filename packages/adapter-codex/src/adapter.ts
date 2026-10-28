@@ -5435,9 +5435,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     await this.validateTarget(derivation.target);
     const hostGeneration = runtime.hostGeneration;
     const dispatchSignal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
-    const boundary = nativeBoundaryId === undefined ? undefined : derivation.completedSnapshot
-      ? await this.#completedSnapshotBoundary(runtime, context, nativeBoundaryId)
-      : await this.#resolveForkTurnId(runtime, context, nativeBoundaryId);
+    const completedBoundary = nativeBoundaryId !== undefined && derivation.completedSnapshot
+      ? await this.#completedSnapshotBoundary(runtime, context, nativeBoundaryId) : undefined;
+    const boundary = completedBoundary ?? (nativeBoundaryId === undefined ? undefined
+      : await this.#resolveForkTurnId(runtime, context, nativeBoundaryId));
     const profileKey = await this.#activeProfileKey;
     const assertForkDispatch = () => {
       assertDispatchNotCancelled(dispatchSignal);
@@ -5513,11 +5514,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         });
       }
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
-      if (boundary && "expectedPrefix" in boundary) {
+      if (completedBoundary) {
         const copied = await this.#readCompleteHistoryFromHost({ host: runtime.host, hostGeneration: response.hostGeneration,
           threadId, workspaceRoot: derivation.target.workspaceRoot, remote: runtime.remote, signal: dispatchSignal, assertOwner: assertForkDispatch });
-        if (copied.thread.turns.length !== boundary.expectedPrefix.length
-          || copied.thread.turns.some((turn, index) => fullTurnSignature(turn) !== fullTurnSignature(boundary.expectedPrefix[index]))) {
+        if (copied.thread.turns.length !== completedBoundary.expectedPrefix.length
+          || copied.thread.turns.some((turn, index) => fullTurnSignature(turn) !== fullTurnSignature(completedBoundary.expectedPrefix[index]))) {
           throw adapterError({ code: "CODEX_COMPLETED_SNAPSHOT_MISMATCH", message: "The native child did not preserve the exact completed history prefix.",
             phase: "dispatch", stateMayHaveChanged: true, recovery: "Reconcile the original native derivation before creating another Side Chat." });
         }
@@ -5938,6 +5939,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "session.detach",
       "session.fork",
       "session.side_chat",
+      "session.prewarm",
       "session.clone",
       "workspace.derive",
       "session.rewind",
@@ -6792,7 +6794,7 @@ function reviewRuntimePolicy(
 }
 
 function assertStandardReviewContext(context: AdapterContext, operation: string): void {
-  if (context.persistentReadOnly === "side_chat" && ["delete native Session state", "inspect native Session deletion"].includes(operation)) return;
+  if (context.persistentReadOnly === "side_chat" && ["read persisted native history", "delete native Session state", "inspect native Session deletion"].includes(operation)) return;
   if (context.runtimePolicy !== "review_read_only") return;
   throw adapterError({
     code: "CODEX_REVIEW_OPERATION_DENIED",

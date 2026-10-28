@@ -142,6 +142,7 @@ export function resolveMobileContextControls(
   if (compaction === null) return undefined;
   const activeRuns = detail.runs.filter((run) => run.sessionId === session.sessionId && activeRunStates.has(run.state));
   const reviewReadOnly = detail.reviewRuns.some((review) => review.reviewerSessionId === session.sessionId);
+  const sideChatReadOnly = session.derivationOrigin?.sideChat === true && session.worktree === undefined;
   const stateBlocked = blockedSessionStates.has(session.state);
   const active = session.contextState?.compacting === true || compaction !== undefined;
 
@@ -151,6 +152,8 @@ export function resolveMobileContextControls(
       ? "Current context usage is unavailable."
       : normalizedUsage.usedTokens < 1n
         ? "There is no measured context to compact."
+        : sideChatReadOnly
+          ? "Read-only side chats keep their original context."
         : reviewReadOnly
           ? "Read-only review tasks cannot compact context."
           : stateBlocked || activeRuns.length > 0
@@ -205,6 +208,7 @@ export function resolveMobileContextControls(
     compaction?.compactionId ?? "",
     compaction?.tokensBefore.toString(10) ?? "",
     reviewReadOnly,
+    sideChatReadOnly,
     activeRunAuthority
   ]);
   const surfaceOwnerKey = JSON.stringify([

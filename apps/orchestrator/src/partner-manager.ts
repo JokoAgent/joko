@@ -430,7 +430,7 @@ export class PartnerManager {
 
   listSessions(partnerId: string, includeGroup = false): readonly PartnerSessionView[] {
     const partner = this.#store.getPartner(partnerId);
-    return this.#store.listSessionLinks(partner.id).filter(link => includeGroup || link.role !== "group").map((link) => {
+    return this.#store.listSessionLinks(partner.id).filter(link => includeGroup || link.role !== "group" && link.role !== 'channel').map((link) => {
       let session: SessionDescriptor | undefined;
       try {
         session = this.#operationalStore.getSession(link.sessionId).descriptor;
@@ -456,6 +456,55 @@ export class PartnerManager {
     const link = this.#store.getSessionLink(sessionId);
     if (link?.role !== 'topic') return undefined;
     return this.listSessions(link.partnerId).find(row => row.link.sessionId === sessionId);
+  }
+
+  /** The message owner supplies a private key and rechecks its exact channel
+   * grant around original Host native creation. No visible-history replay. */
+  async ensureChannel(input: { readonly partnerId: string; readonly key: string; readonly title: string;
+    readonly assertCurrent: () => void }): Promise<SessionDescriptor> {
+    const profile = this.getPartner(input.partnerId);
+    const assertOwner = () => {
+      input.assertCurrent(); const current = this.getPartner(profile.id);
+      if (current.revision !== profile.revision || current.profileVersion !== profile.profileVersion || current.lifecycle !== 'active'
+        || current.initializationState !== 'ready' || current.pauseCleanupPending) throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The Partner message route changed.');
+    };
+    assertOwner();
+    const existing = this.#store.listSessionLinks(profile.id, 'channel').find(link => link.channelKey === input.key);
+    let replaces: { readonly sessionId: string; readonly operationId: string } | undefined;
+    if (existing) {
+      try {
+        const session = this.#operationalStore.getSession(existing.sessionId).descriptor;
+        if (session.targetId === profile.homeTargetId && !session.archived && session.deletedAt === undefined) {
+          if (existing.profileVersion !== profile.profileVersion) {
+            await this.#applyCanonicalSettings({ ...profile, capabilities: { ...profile.capabilities, permissionMode: 'ask' } }, session.id);
+            assertOwner(); this.#store.advanceChannelSessionProfile(session.id, existing.profileVersion, profile.revision);
+          }
+          assertOwner(); return this.#operationalStore.getSession(session.id).descriptor;
+        }
+        throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The original channel task is inactive.');
+      } catch (error) {
+        if (!(error instanceof NotFoundError) || !existing.channelOperationId
+          || !this.#sessionHost.isPrivateSessionCreationClosed(existing.channelOperationId, existing.sessionId)) throw error;
+        replaces = { sessionId: existing.sessionId, operationId: existing.channelOperationId };
+      }
+    }
+    let operationId = `partner-channel:${createHash('sha256').update(JSON.stringify([profile.id, input.key, replaces?.operationId ?? null])).digest('hex')}`;
+    for (let retry = 0; this.#operationalStore.findOperation(operationId)?.status === 'failed'; retry++) {
+      if (retry >= 20) throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The channel creation needs attention before retrying.');
+      operationId = `partner-channel:${createHash('sha256').update(operationId).digest('hex')}`;
+    }
+    const primary = profile.capabilities.modelChain[0]!;
+    const result = await this.#sessionHost.createServiceSession({ operationId, serviceKind: 'partner', targetId: profile.homeTargetId,
+      runtimeBackendId: primary.backendId, title: `${profile.displayName}: ${input.title}`.slice(0, 200),
+      providerId: primary.providerId, modelId: primary.modelId, ...(primary.effort === undefined ? {} : { effort: primary.effort }),
+      fastMode: primary.fastMode, permissionMode: 'ask', planMode: profile.capabilities.planMode,
+      appendSystemPrompt: profile.identitySource, assertServiceScope: assertOwner,
+      preparePrivateSession: async sessionId => {
+        assertOwner(); this.#store.bindChannelSession({ partnerId: profile.id, expectedRevision: profile.revision,
+          profileVersion: profile.profileVersion, sessionId, key: input.key, operationId, ...(replaces ? { replaces } : {}) });
+        if (replaces) this.#sessionHost.releasePrivateSessionCreationReceipt(replaces.operationId, replaces.sessionId);
+      } });
+    assertOwner(); return this.#operationalStore.getSession(result.value.sessionId).descriptor;
   }
 
   async ensureTopic(input: { readonly operationId: string; readonly connection: ConnectionRecord; readonly partnerId: string;

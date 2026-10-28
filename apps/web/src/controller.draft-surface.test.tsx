@@ -5,7 +5,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { useAppController, type AppController } from "./controller.js";
 import { createOrchestratorGateway, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
-import { emptySnapshot, type ComposerDraft, type ConnectionProfile } from "./model.js";
+import { emptySnapshot, type ComposerDraft, type ConnectionProfile, type SessionView } from "./model.js";
 
 vi.mock("./gateway.js", async original => ({ ...await original<typeof import("./gateway.js")>(),
   createOrchestratorGateway: vi.fn(), probeOrchestratorOrigin: vi.fn(), discoverOrchestratorNodesAt: vi.fn(async () => []) }));
@@ -15,7 +15,7 @@ afterEach(async () => { if (root) await act(async () => root!.unmount()); root =
 const PROFILE: ConnectionProfile = { id: "profile", serverId: "server", deviceId: "device", name: "Local", origin: "http://127.0.0.1:4318" };
 const DRAFT: ComposerDraft = { text: "Own draft", attachments: [], mentions: [], deliveryMode: "prompt" };
 
-async function mount() {
+async function mount(sessions: readonly SessionView[] = []) {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   window.history.replaceState(null, "", "/?sessionWindow=1&bootSession=session#/tasks/session");
@@ -28,19 +28,54 @@ async function mount() {
     mutatePreferences: async (run: (value: typeof DEFAULT_UI_PREFERENCES) => unknown) => run(DEFAULT_UI_PREFERENCES)
   } as unknown as LocalState);
   vi.mocked(probeOrchestratorOrigin).mockResolvedValue({ serverId: PROFILE.serverId, displayName: "Local", version: "1", apiVersion: "1", pairingEnabled: false });
-  vi.mocked(createOrchestratorGateway).mockImplementation((_profile, _key, callbacks) => ({
-    connect: async () => { callbacks.onState?.("connected"); callbacks.onSnapshot?.({ ...emptySnapshot(), revision: 1n }); },
+  let project!: (sessions: readonly SessionView[]) => void;
+  vi.mocked(createOrchestratorGateway).mockImplementation((_profile, _key, callbacks) => {
+    const publish = (values: readonly SessionView[]) => callbacks.onSnapshot?.({ ...emptySnapshot(), revision: 1n, sessions: values });
+    if (callbacks.onError !== undefined) project = publish;
+    return {
+    connect: async () => { callbacks.onState?.("connected"); publish(sessions); },
     disconnect: () => undefined, taskSharingApi: () => undefined,
     inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined
-  }) as unknown as OrchestratorGateway);
+  } as unknown as OrchestratorGateway; });
   let current!: AppController;
   function Probe() { current = useAppController(); return null; }
   root = createRoot(document.body.appendChild(document.createElement("div")));
   await act(async () => root!.render(<Probe />)); await act(async () => current.connect(PROFILE));
   const getOwner = vi.fn(async () => ({ profileId: PROFILE.id, sessionId: "session", draftSlot: 1 }));
   vi.stubGlobal("jokoDesktop", { sessionWindows: { getOwner }, window: { setZoomFactor: async () => undefined }, discovery: { scan: async () => [] }, capabilities: [] });
-  return { current: () => current, getOwner, readDraft, saveDraft, readDraftSnapshot, saveDraftIfRevision };
+  return { current: () => current, getOwner, readDraft, saveDraft, readDraftSnapshot, saveDraftIfRevision, project };
 }
+
+it("uses a proven Side Chat child's own draft key with its boot source's stable native slot", async () => {
+  const child: SessionView = { id: "child", backendId: "native", targetId: "target", name: "Side Chat", state: "idle", generation: 1n,
+    pinned: false, archived: false, updatedAt: 1, permissionMode: "ask", fastMode: false, planMode: false,
+    derivationOrigin: { kind: "fork", sideChat: true, sourceSessionId: "session", sourceSessionAvailable: true, sourceMessageAvailable: true } };
+  const view = await mount([child]);
+  await view.current().readDraft("child"); await view.current().saveDraft("child", DRAFT);
+  await view.current().readDraftSnapshot("child"); await view.current().saveDraftIfRevision("child", DRAFT, 0);
+  expect(view.readDraft).toHaveBeenCalledWith("server", "profile", "child", "task-window:1");
+  expect(view.saveDraft).toHaveBeenCalledWith("server", "profile", "child", DRAFT, "task-window:1");
+  expect(view.saveDraftIfRevision).toHaveBeenCalledWith("server", "profile", "child", DRAFT, 0, "task-window:1");
+  await act(async () => view.project([{ ...child, derivationOrigin: { ...child.derivationOrigin!, sideChat: false } }]));
+  expect(view.current().state.snapshot.sessions[0]?.derivationOrigin?.sideChat).toBe(false);
+  await expect(view.current().saveDraft("child", DRAFT)).rejects.toThrow("owner is invalid");
+  await expect(view.current().saveDraft("unknown-child", DRAFT)).rejects.toThrow("owner is invalid");
+  expect(view.saveDraft).toHaveBeenCalledOnce();
+});
+
+it("rejects a child lineage change during native owner lookup before writing its draft", async () => {
+  const child: SessionView = { id: "child", backendId: "native", targetId: "target", name: "Side Chat", state: "idle", generation: 1n,
+    pinned: false, archived: false, updatedAt: 1, permissionMode: "ask", fastMode: false, planMode: false,
+    derivationOrigin: { kind: "fork", sideChat: true, sourceSessionId: "session", sourceSessionAvailable: true, sourceMessageAvailable: true } };
+  const view = await mount([child]); let finish!: (value: { profileId: string; sessionId: string; draftSlot: number }) => void;
+  view.getOwner.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const saving = view.current().saveDraft("child", DRAFT), rejected = expect(saving).rejects.toThrow("no longer current");
+  expect(view.getOwner).toHaveBeenCalledOnce();
+  await act(async () => view.project([{ ...child, derivationOrigin: { ...child.derivationOrigin!, sourceSessionId: "foreign" } }]));
+  expect(view.current().state.snapshot.sessions[0]?.derivationOrigin?.sourceSessionId).toBe("foreign");
+  finish({ profileId: "profile", sessionId: "session", draftSlot: 1 }); await rejected;
+  expect(view.saveDraft).not.toHaveBeenCalled();
+});
 
 it("routes every persisted draft and CAS operation through the exact native task slot", async () => {
   const view = await mount();

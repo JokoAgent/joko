@@ -10,6 +10,8 @@
 .app:has(.inspector-dock-group[data-edge="right"]) { --dock-right: var(--joko-dock-right-size, min(420px, 35vw)); }
 .app:has(.inspector-dock-group[data-edge="top"]) { --dock-top: var(--joko-dock-top-size, min(280px, 35vh)); }
 .app:has(.inspector-dock-group[data-edge="bottom"]) { --dock-bottom: var(--joko-dock-bottom-size, min(280px, 35vh)); }
+.app:has(.inspector-dock-group[data-edge="left"]):has(.inspector-dock-group[data-edge="right"]) { --dock-left: min(var(--joko-dock-left-size, 360px), max(0px, (100vw - var(--dock-navigation) - 280px) / 2)); --dock-right: min(var(--joko-dock-right-size, 420px), max(0px, (100vw - var(--dock-navigation) - 280px) / 2)); }
+.app:has(.inspector-dock-group[data-edge="top"]):has(.inspector-dock-group[data-edge="bottom"]) { --dock-top: min(var(--joko-dock-top-size, 280px), max(0px, (100vh - 220px) / 2)); --dock-bottom: min(var(--joko-dock-bottom-size, 280px), max(0px, (100vh - 220px) / 2)); }
 .app:has(.inspector-dock-layout) > .app__main { grid-column: 3; grid-row: 2; }
 .app:has(.inspector-dock-layout) > .sidebar { grid-column: 1; grid-row: 1 / -1; }
 .app:has(.inspector-dock-layout) > .panel-scrim--inspector { display: none; }
@@ -27,6 +29,7 @@
 .inspector-dock-mount[hidden] { display: none; }
 .inspector-dock-mount > .inspector-tab-panel { height: 100%; overflow: auto; }
 .inspector-dock-mount > .extension-main-view-page { height: 100%; }
+.inspector-dock-plugin, .inspector-dock-plugin > .extension-main-view-page { height: 100%; min-height: 0; }
 .inspector-dock-window > .inspector-dock-group { height: calc(100% - 46px); }
 .inspector-dock-window .inspector-dock-group.is-maximized { inset: 46px 0 0; }
 .inspector-dock-drop-preview { position: fixed; z-index: 800; pointer-events: none; border: 2px solid var(--accent-edge); background: var(--accent-soft); inset: 15% 15% 15% 15%; }

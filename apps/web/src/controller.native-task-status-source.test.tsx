@@ -5,7 +5,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { useAppController, type AppController } from "./controller.js";
 import { createOrchestratorGateway, probeOrchestratorOrigin, type GatewayCallbacks, type OrchestratorGateway } from "./gateway.js";
 import { LocalState, DEFAULT_UI_PREFERENCES } from "./local-state.js";
-import { emptySnapshot, type ConnectionProfile } from "./model.js";
+import { emptySnapshot, type ConnectionProfile, type SessionView } from "./model.js";
+import { nativeTaskStatusProfileKey } from "./native-task-status-projection.js";
 
 vi.mock("./gateway.js", async original => ({ ...await original<typeof import("./gateway.js")>(), createOrchestratorGateway: vi.fn(), probeOrchestratorOrigin: vi.fn() }));
 let root: Root | undefined;
@@ -27,11 +28,20 @@ it("keeps live activity independent from task scope, offline caches and optimist
     mutatePreferences: async (update: (value: typeof preferences) => typeof preferences) => update(preferences)
   } as unknown as LocalState);
   const bindings = new Map<string, GatewayCallbacks>();
-  const snapshot = { ...emptySnapshot(), generation: 1n };
+  const cursor = { opaqueToken: "completion-cursor", sequence: 12n, generation: 1n };
+  const session: SessionView = { id: "completed", backendId: "backend", targetId: "target", name: "Completed task", state: "idle",
+    pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1,
+    attention: { kind: "done", unread: true, subjectCursor: cursor, attentionCursor: cursor, readThroughCursor: { ...cursor, sequence: 0n }, updatedAt: 1 } };
+  const snapshot = { ...emptySnapshot(), generation: 1n, sessions: [session] };
+  const remoteArchive = vi.fn(async () => undefined), remoteRead = vi.fn(async () => undefined), foreignArchive = vi.fn(async () => undefined);
   vi.mocked(createOrchestratorGateway).mockImplementation((profile, _key, callbacks) => {
     if (callbacks.onLiveSnapshot) bindings.set(profile!.id, callbacks);
     return { connect: async () => { callbacks.onSnapshot?.(snapshot); callbacks.onState?.("connected"); },
-      disconnect: () => callbacks.onLiveSnapshot?.(undefined), listPartners: async () => ({ partners: [] }) } as unknown as OrchestratorGateway;
+      disconnect: () => callbacks.onLiveSnapshot?.(undefined), listPartners: async () => ({ partners: [] }),
+      archiveSession: profile?.id === second.id && callbacks.onLiveSnapshot ? remoteArchive : foreignArchive,
+      acknowledgeSessionAttention: profile?.id === second.id && callbacks.onLiveSnapshot ? remoteRead : vi.fn(),
+      getSessionWorktreeRemovalPreview: async () => ({ sessionId: session.id, archiveConfirmation: "bound-schedules", activeBoundScheduleCount: 0, activeBoundScheduleNames: [], shared: false, worktree: undefined })
+    } as unknown as OrchestratorGateway;
   });
   let app: AppController | undefined; function Probe() { app = useAppController(); return null; }
   root = createRoot(document.body.appendChild(document.createElement("div")));
@@ -43,10 +53,21 @@ it("keeps live activity independent from task scope, offline caches and optimist
   await act(async () => original.onLiveSnapshot?.(snapshot));
   const firstEpoch = app!.state.nativeTaskStatusLiveSources![0]!.epoch;
   expect(app!.state.nativeTaskStatusLiveSources![0]!.profile.id).toBe(second.id);
+  const route = { profileId: second.id, serverId: second.serverId, profileKey: nativeTaskStatusProfileKey(second), epoch: firstEpoch,
+    sessionId: session.id, generation: session.generation, sourceGeneration: snapshot.generation };
+  const completion = app!.nativeTaskStatusCompletionSource!(route)!;
+  expect(completion?.isCurrent()).toBe(true);
+  await completion.markRead(); expect(remoteRead).toHaveBeenCalledExactlyOnceWith(session.id, cursor);
+  await completion.archive("bound-schedules"); expect(remoteArchive).toHaveBeenCalledExactlyOnceWith(session.id, true, "bound-schedules");
+  expect(foreignArchive).not.toHaveBeenCalled();
+  expect(app!.nativeTaskStatusCompletionSource!({ ...route, profileKey: nativeTaskStatusProfileKey({ ...second, origin: "https://foreign.example" }) })).toBeUndefined();
   await act(async () => { original.onLiveSnapshot?.(undefined); original.onSnapshot?.(snapshot); original.onState?.("connected"); });
+  expect(completion.isCurrent()).toBe(false);
+  await expect(completion.archive("bound-schedules")).rejects.toThrow(/owner changed/u);
   expect(app!.state.nativeTaskStatusLiveSources).toEqual([]); expect(app!.state.machineCaches.some(cache => cache.profileId === second.id)).toBe(true);
   await act(async () => original.onLiveSnapshot?.(snapshot));
   expect(app!.state.nativeTaskStatusLiveSources![0]!.epoch).toBeGreaterThan(firstEpoch);
+  expect(app!.nativeTaskStatusCompletionSource!(route)).toBeUndefined();
   await act(async () => app!.forgetProfile(second.id));
   await act(async () => original.onLiveSnapshot?.(snapshot));
   expect(app!.state.nativeTaskStatusLiveSources).toEqual([]);

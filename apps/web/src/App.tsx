@@ -115,7 +115,7 @@ import {
   desktopDeepLinkRouteHash
 } from "./desktop-deep-link-navigation.js";
 import { isExtensionApplicationWindow } from "./extension-window-navigation.js";
-import { openInspectorExtension } from "./components/inspector-layout.js";
+import { inspectorLayoutOwner, openInspectorExtension } from "./components/inspector-layout.js";
 import { CLIENT_LAYOUT_RESET_EVENT, subscribeClientLayoutResetOccurrence } from "./client-layout-reset.js";
 import {
   applySessionProjectOverrides,
@@ -2369,7 +2369,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           }
         }}
         onNavigate={(route) => {
-          if (route.kind === "extensionMainView") { openInspectorExtension(route.extensionId); return; }
+          if (route.kind === "extensionMainView") { openInspectorExtension(route.extensionId, undefined, inspectorLayoutOwner(state.activeProfile)); return; }
           messageJumpGenerationRef.current += 1;
           setTimelineFocusRequest(undefined);
           setSearchTimelineWindow(undefined);
@@ -2592,7 +2592,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             navigationOpen={navigationOpen}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
             onOpenIndependent={(extensionId) => {
-              openInspectorExtension(extensionId, "window");
+              openInspectorExtension(extensionId, "window", inspectorLayoutOwner(controller.state.activeProfile));
             }}
           />)}
           {state.route.kind === "settings" && <SettingsPage controller={controller} snapshot={state.snapshot} activeTargetId={settingsTargetIdRef.current} locale={state.effectiveLocale} t={t} runAction={runAction} onImportPortableSession={portableImportTargets.length === 0 ? undefined : () => { void choosePortableSessionImport(); }} />}

@@ -8,11 +8,20 @@ export interface InspectorDockTab {
   readonly pluginIdentity?: string;
   readonly label: string;
   readonly kind: string;
+  readonly preferred?: boolean;
   readonly node: HTMLElement;
   readonly onActivate: () => void;
   readonly onClose: () => void | Promise<void>;
 }
 export interface InspectorDockAction { readonly id: string; readonly label: string; readonly disabled?: boolean; readonly run: () => void }
+
+export function moveInspectorMount(parent: HTMLElement, node: HTMLElement): void {
+  const move = (parent as HTMLElement & { moveBefore?: (node: HTMLElement, before: Node | null) => void }).moveBefore;
+  if (move !== undefined && node.isConnected && parent.isConnected && node.ownerDocument === parent.ownerDocument) {
+    try { move.call(parent, node, null); return; } catch { /* Cross-document moves use the guarded fallback. */ }
+  }
+  parent.append(node);
+}
 
 /** Owns UI mounts only. Native tasks, terminals and extension surfaces retain
  * their original controller and lifecycle authority. */
@@ -20,6 +29,7 @@ export class InspectorDock {
   readonly tabs = new Map<string, InspectorDockTab>();
   readonly actions = new Map<string, readonly InspectorDockAction[]>();
   readonly sessionOwners = new Map<string, string>();
+  readonly preferredByOwner = new Map<string, string>();
   readonly selected = new Map<string, string>();
   readonly windows = new Map<string, string>();
   focusedGroup = "right";
@@ -43,11 +53,17 @@ export class InspectorDock {
       if (added) this.onTabAdded?.(tab);
     }
     this.actions.set(owner, actions);
+    const preferred = tabs.find(tab => tab.preferred)?.key;
+    if (preferred !== undefined && this.preferredByOwner.get(owner) !== preferred) {
+      const hadPreferred = this.preferredByOwner.has(owner); this.preferredByOwner.set(owner, preferred);
+      if (hadPreferred) queueMicrotask(() => { if (this.tabs.get(preferred)?.owner === owner) this.revealTab?.(preferred); });
+    }
     if (changed) this.changed();
   }
   retire(owner: string): void {
     for (const tab of [...this.tabs.values()]) if (tab.owner === owner) this.remove(tab.key);
     this.actions.delete(owner); this.changed();
+    this.preferredByOwner.delete(owner);
     for (const [sessionId, candidate] of this.sessionOwners) if (candidate === owner) this.sessionOwners.delete(sessionId);
   }
   private remove(key: string): void { this.tabs.get(key)?.node.remove(); this.tabs.delete(key); this.windows.delete(key); }

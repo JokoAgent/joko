@@ -36,7 +36,7 @@ export interface PendingOperation {
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
     | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings" | "model-favorite" | "model-source-target"
-    | "extension-enabled" | "extension-sidebar"
+    | "extension-enabled" | "extension-sidebar" | "extension-package-adopt" | "extension-package-remove" | "extension-settings-routing" | "extension-settings-credential-clear"
     | "extension-setup-begin" | "extension-setup-interaction" | "extension-setup-credential"
     | "extension-setup-complete" | "extension-setup-cancel" | "extension-setup-revoke";
   readonly sessionId?: string;
@@ -57,6 +57,7 @@ export interface PendingOperation {
   readonly targetId?: string;
   readonly extensionId?: string;
   readonly extensionRevision?: string;
+  readonly extensionResourceId?: string;
   readonly state: "unknown" | "accepted";
 }
 
@@ -528,7 +529,7 @@ function isPending(value: unknown): value is PendingOperation {
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
       "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite", "model-source-target",
-      "extension-enabled", "extension-sidebar", "extension-setup-begin", "extension-setup-interaction",
+      "extension-enabled", "extension-sidebar", "extension-package-adopt", "extension-package-remove", "extension-settings-routing", "extension-settings-credential-clear", "extension-setup-begin", "extension-setup-interaction",
       "extension-setup-credential", "extension-setup-complete", "extension-setup-cancel",
       "extension-setup-revoke"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
@@ -555,6 +556,8 @@ function isPending(value: unknown): value is PendingOperation {
   if (record.extensionRevision !== undefined && (typeof record.extensionRevision !== "string"
     || record.extensionRevision.length > 20 || !/^[1-9][0-9]*$/u.test(record.extensionRevision)
     || BigInt(record.extensionRevision) > 18_446_744_073_709_551_615n)) return false;
+  const extensionPackage = record.kind === "extension-package-adopt" || record.kind === "extension-package-remove";
+  if (extensionPackage ? !validReceiptIdentity(record.extensionResourceId) : record.extensionResourceId !== undefined) return false;
   if (record.kind === "logout" && typeof record.targetConnectionId !== "string") return false;
   if (["revoke", "device-rename"].includes(String(record.kind)) && typeof record.targetDeviceId !== "string") return false;
   if (record.kind === "device-rename" && (record.sessionId !== undefined || record.eventId !== undefined
@@ -608,7 +611,7 @@ function isPending(value: unknown): value is PendingOperation {
       || record.targetId !== undefined)) return false;
   if (isExtensionReceiptKind(record.kind)
     && Object.keys(record).some((key) => ![
-      "operationId", "connectionId", "kind", "extensionId", "extensionRevision", "state"
+      "operationId", "connectionId", "kind", "extensionId", "extensionRevision", "extensionResourceId", "state"
     ].includes(key))) return false;
   if (!["schedule-run", "schedule-enable", "schedule-run-restart", "schedule-run-read", "schedule-runs-read",
     "schedule-run-delete", "schedule-update", "schedule-delete", "schedule-promote", "schedule-clone",
@@ -616,13 +619,14 @@ function isPending(value: unknown): value is PendingOperation {
     && (record.scheduleId !== undefined || record.triggerId !== undefined)) return false;
   if (!["schedule-run-restart", "schedule-run-read", "schedule-run-delete"].includes(String(record.kind))
     && record.triggerId !== undefined) return false;
-  if (!["schedule-create", "schedule-update", "schedule-project-reconcile", "session-rewind", "workspace-rewind"].includes(String(record.kind))
+  if (!["schedule-create", "schedule-update", "schedule-project-reconcile", "session-rewind", "workspace-rewind", "session-side-chat"].includes(String(record.kind))
     && record.targetId !== undefined) return false;
-  if (!["session-rewind", "workspace-rewind", "objective-set", "objective-pause", "objective-resume", "objective-clear",
+  if (!["session-rewind", "workspace-rewind", "session-side-chat", "objective-set", "objective-pause", "objective-resume", "objective-clear",
     "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end"].includes(String(record.kind))
     && (record.backendId !== undefined || record.sourceGeneration !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
   if (String(record.kind).startsWith("objective-") && (record.backendId !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
   if (record.kind === "session-rewind" && (record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
+  if (record.kind === "session-side-chat" && (record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
   if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (record.interactionId !== undefined || record.interactionGeneration !== undefined
       || record.interactionRevision !== undefined || record.interactionDraftKind !== undefined)) return false;
@@ -635,6 +639,10 @@ function isExtensionReceiptKind(value: unknown): boolean {
   return [
     "extension-enabled",
     "extension-sidebar",
+    "extension-package-adopt",
+    "extension-package-remove",
+    "extension-settings-routing",
+    "extension-settings-credential-clear",
     "extension-setup-begin",
     "extension-setup-interaction",
     "extension-setup-credential",

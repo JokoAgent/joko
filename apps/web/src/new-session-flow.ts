@@ -104,7 +104,7 @@ export type FirstInputAcceptance =
     };
 
 /**
- * A draft route has no product session until its first real input. Once the
+ * An eligible prepared draft adopts its original unused task on first input. Once the
  * session exists, typed slash commands expose it before command reconciliation
  * so rejection is recoverable in its Composer. The explicit Objective dialog
  * keeps Home mounted through set failure; createSession's authoritative refresh
@@ -214,6 +214,9 @@ export async function createDelayedSessionFromFirstInput(
 
 function sessionDraft(draft: DelayedNewSessionDraft): Omit<NewSessionDraft, "targetId"> {
   return {
+    ...(draft.operationId === undefined ? {} : { operationId: draft.operationId }),
+    ...(draft.provisionalDraftId === undefined ? {} : { provisionalDraftId: draft.provisionalDraftId }),
+    ...(draft.reuseProvisionalSessionId === undefined ? {} : { reuseProvisionalSessionId: draft.reuseProvisionalSessionId }),
     name: draft.name,
     nativeStart: draft.nativeStart,
     providerId: draft.providerId,

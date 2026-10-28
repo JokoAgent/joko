@@ -333,18 +333,24 @@ CREATE INDEX partner_delegations_recovery_idx
 CREATE TABLE partner_session_links (
   session_id TEXT PRIMARY KEY,
   partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK (role IN ('canonical', 'history', 'delegation', 'group', 'topic')),
+  role TEXT NOT NULL CHECK (role IN ('canonical', 'history', 'delegation', 'group', 'topic', 'channel')),
   profile_version INTEGER NOT NULL CHECK (profile_version BETWEEN 1 AND 9007199254740991),
   parent_session_id TEXT,
   delegation_id TEXT REFERENCES partner_delegations(id) ON DELETE CASCADE,
   topic_root_json TEXT,
   topic_operation_id TEXT,
+  channel_key TEXT,
+  channel_operation_id TEXT,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   CHECK ((role = 'delegation') = (delegation_id IS NOT NULL)),
   CHECK ((role IN ('delegation', 'topic')) = (parent_session_id IS NOT NULL)),
   CHECK ((role = 'topic') = (topic_root_json IS NOT NULL)),
-  CHECK ((role = 'topic') = (topic_operation_id IS NOT NULL))
+  CHECK ((role = 'topic') = (topic_operation_id IS NOT NULL)),
+  CHECK ((role = 'channel') = (channel_key IS NOT NULL)),
+  CHECK ((role = 'channel') = (channel_operation_id IS NOT NULL))
 ) STRICT;
+CREATE UNIQUE INDEX partner_session_links_channel_unique
+  ON partner_session_links(partner_id, channel_key) WHERE role = 'channel';
 CREATE UNIQUE INDEX partner_session_links_canonical_partner_unique
   ON partner_session_links(partner_id)
   WHERE role = 'canonical';
@@ -985,6 +991,44 @@ export class PartnerStore {
       }
       this.#database.prepare(`INSERT INTO partner_session_links(session_id,partner_id,role,profile_version,parent_session_id,delegation_id,topic_root_json,topic_operation_id,created_at)
         VALUES (?,?,'topic',?,?,NULL,?,?,?)`).run(sessionId, profile.id, input.profileVersion, root.sessionId, JSON.stringify(root), entityId(input.operationId, 'Topic operation ID'), this.#now());
+      return this.getSessionLink(sessionId)!;
+    });
+  }
+
+  /** Message routing owns the key; the original Host owns native creation and close proof. */
+  bindChannelSession(input: { readonly partnerId: string; readonly expectedRevision: bigint; readonly profileVersion: number;
+    readonly sessionId: string; readonly key: string; readonly operationId: string;
+    readonly replaces?: { readonly sessionId: string; readonly operationId: string } }): PartnerSessionLinkRecord {
+    return this.#write(() => {
+      const profile = this.getPartner(input.partnerId); assertMutable(profile); assertRevision(profile, input.expectedRevision);
+      if (profile.initializationState !== 'ready' || profile.profileVersion !== input.profileVersion) throw changed(profile.id);
+      const key = entityId(input.key, 'Message lane key'), sessionId = entityId(input.sessionId, 'Message lane Session ID');
+      const existing = this.getSessionLink(sessionId);
+      if (existing) {
+        if (existing.role !== 'channel' || existing.partnerId !== profile.id || existing.channelKey !== key) throw changed(profile.id);
+        return existing;
+      }
+      if (input.replaces) {
+        const old = this.getSessionLink(input.replaces.sessionId);
+        if (old?.role !== 'channel' || old.partnerId !== profile.id || old.channelKey !== key
+          || old.channelOperationId !== input.replaces.operationId) throw changed(profile.id);
+        this.#database.prepare("DELETE FROM partner_session_links WHERE session_id = ? AND role = 'channel'").run(old.sessionId);
+      }
+      this.#database.prepare(`INSERT INTO partner_session_links(session_id,partner_id,role,profile_version,channel_key,channel_operation_id,created_at)
+        VALUES (?,?,'channel',?,?,?,?)`).run(sessionId, profile.id, profile.profileVersion, key, entityId(input.operationId, 'Message lane operation ID'), this.#now());
+      return this.getSessionLink(sessionId)!;
+    });
+  }
+
+  /** Group route ownership remains in the group Store; this link owns only the private Profile. */
+  advanceChannelSessionProfile(sessionId: string, expectedProfileVersion: number, expectedPartnerRevision: bigint): PartnerSessionLinkRecord {
+    return this.#write(() => {
+      const link = this.getSessionLink(entityId(sessionId, 'Message lane Session ID'));
+      if (!link || link.role !== 'channel' || link.profileVersion !== expectedProfileVersion) throw unavailable('The channel Profile link changed.');
+      const profile = this.getPartner(link.partnerId); assertMutable(profile); assertRevision(profile, expectedPartnerRevision);
+      if (profile.initializationState !== 'ready') throw changed(profile.id);
+      this.#database.prepare("UPDATE partner_session_links SET profile_version = ? WHERE session_id = ? AND role = 'channel' AND profile_version = ?")
+        .run(profile.profileVersion, sessionId, expectedProfileVersion);
       return this.getSessionLink(sessionId)!;
     });
   }
@@ -2048,7 +2092,9 @@ function partnerSessionLink(row: Row): PartnerSessionLinkRecord {
   if ((role === "delegation") !== (delegationId !== undefined)
     || (role === "delegation" || role === "topic") !== (parentSessionId !== undefined)
     || (role === "topic") !== (row['topic_root_json'] !== null)
-    || (role === "topic") !== (row['topic_operation_id'] !== null)) {
+    || (role === "topic") !== (row['topic_operation_id'] !== null)
+    || (role === "channel") !== (row['channel_key'] !== null)
+    || (role === "channel") !== (row['channel_operation_id'] !== null)) {
     throw unavailable("The partner Session link role is inconsistent.");
   }
   return {
@@ -2060,12 +2106,13 @@ function partnerSessionLink(row: Row): PartnerSessionLinkRecord {
     ...(delegationId === undefined ? {} : { delegationId }),
     ...(role === 'topic' ? { topicRoot: topicRoot(JSON.parse(String(row['topic_root_json']))) } : {}),
     ...(role === 'topic' ? { topicOperationId: entityId(row['topic_operation_id'], 'Topic operation ID') } : {}),
+    ...(role === 'channel' ? { channelKey: entityId(row['channel_key'], 'Message lane key'), channelOperationId: entityId(row['channel_operation_id'], 'Message lane operation ID') } : {}),
     createdAt: timestamp(row["created_at"], "Partner Session link created time")
   };
 }
 
 function partnerSessionRole(value: unknown): PartnerSessionRole {
-  if (value === "canonical" || value === "history" || value === "delegation" || value === "group" || value === "topic") return value;
+  if (value === "canonical" || value === "history" || value === "delegation" || value === "group" || value === "topic" || value === "channel") return value;
   throw unavailable("The partner Session role is invalid.");
 }
 

@@ -970,6 +970,8 @@ export type MessagingConversationStatus = "observed" | "active" | "retired";
 export type MessagingConversationKind = "direct" | "group" | "channel";
 
 export interface MessagingConversationRecord {
+  readonly partnerId?: string;
+  readonly partnerBindingRevision?: number;
   readonly id: string;
   readonly connectionId: string;
   readonly channelGeneration: number;

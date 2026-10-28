@@ -31,6 +31,13 @@ export interface ExtensionLibraryDescriptor {
   readonly schemaVersion: 1;
 }
 
+export interface ExtensionSettingsDescriptor {
+  readonly html: string;
+  readonly mobileHtml?: string;
+  readonly title?: string;
+  readonly height?: number;
+}
+
 export interface ExtensionRoutineEventsDescriptor {
   readonly html: string;
   readonly events: readonly { readonly type: string; readonly name: string; readonly fields: readonly string[] }[];
@@ -57,6 +64,7 @@ export interface ExtensionSurfaceBinding {
   /** Exact package-relative runtime Extension entry. */
   readonly entry: string;
   readonly mainView?: ExtensionMainViewDescriptor;
+  readonly settings?: ExtensionSettingsDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
   readonly routineEvents?: ExtensionRoutineEventsDescriptor;
   readonly runtime?: ExtensionRuntimeDescriptor;
@@ -111,14 +119,14 @@ export function parseExtensionSurfaceManifest(
   const result: ExtensionSurfaceBinding[] = [];
   for (const rawBinding of surfaces.extensions) {
     const binding = requirePlainObject(rawBinding, "Extension surface declaration");
-    requireExactKeys(binding, ["entry", "mainView", "library", "routineEvents", "runtime", "recommendations"], ["entry"], "Extension surface declaration");
+    requireExactKeys(binding, ["entry", "mainView", "settings", "library", "routineEvents", "runtime", "recommendations"], ["entry"], "Extension surface declaration");
     const entry = requirePortablePath(binding.entry, "Extension surface entry");
     if (!EXTENSION_SUFFIXES.has(extname(entry).toLowerCase())) throw new Error("Extension surface entry has an unsupported file type.");
     if (!discoveredEntries.has(entry)) throw new Error("Extension surface entry does not exactly match a discovered Extension.");
     if (seenEntries.has(entry)) throw new Error("Extension surface entry is declared more than once.");
     seenEntries.add(entry);
 
-    if (binding.mainView === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.runtime === undefined && binding.recommendations === undefined) {
+    if (binding.mainView === undefined && binding.settings === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.runtime === undefined && binding.recommendations === undefined) {
       throw new Error("Extension surface declaration must advertise at least one current capability.");
     }
     let mainView: ExtensionMainViewDescriptor | undefined;
@@ -140,6 +148,10 @@ export function parseExtensionSurfaceManifest(
         ...(icon === undefined ? {} : { icon })
       };
     }
+    const settings = binding.settings === undefined ? undefined : parseExtensionSettings(binding.settings);
+    if (settings && (!discoveredFiles.has(settings.html) || settings.mobileHtml !== undefined && !discoveredFiles.has(settings.mobileHtml))) {
+      throw new Error("Extension settings HTML is not an inspected regular package file.");
+    }
     let library: ExtensionLibraryDescriptor | undefined;
     if (binding.library !== undefined) {
       const rawLibrary = requirePlainObject(binding.library, "Extension Library declaration");
@@ -157,6 +169,7 @@ export function parseExtensionSurfaceManifest(
     result.push({
       entry,
       ...(mainView === undefined ? {} : { mainView }),
+      ...(settings === undefined ? {} : { settings }),
       ...(library === undefined ? {} : { library }),
       ...(routineEvents === undefined ? {} : { routineEvents }),
       ...(runtime === undefined ? {} : { runtime }),
@@ -310,6 +323,26 @@ export function isExtensionMainViewDescriptor(value: unknown): value is Extensio
   } catch {
     return false;
   }
+}
+
+export function parseExtensionSettings(value: unknown): ExtensionSettingsDescriptor {
+  const raw = requirePlainObject(value, "Extension settings");
+  requireExactKeys(raw, ["html", "mobileHtml", "title", "height"], ["html"], "Extension settings");
+  const html = requirePortablePath(raw.html, "Extension settings HTML");
+  const mobileHtml = raw.mobileHtml === undefined ? undefined : requirePortablePath(raw.mobileHtml, "Mobile settings HTML");
+  if ([html, ...(mobileHtml === undefined ? [] : [mobileHtml])].some(path => extname(path) !== ".html" || posix.dirname(path) === ".")) {
+    throw new Error("Extension settings HTML must be a lowercase .html file in a self-contained directory.");
+  }
+  if (raw.height !== undefined && (typeof raw.height !== "number" || !Number.isInteger(raw.height) || raw.height < 160 || raw.height > 800)) {
+    throw new Error("Extension settings height must be between 160 and 800.");
+  }
+  return { html, ...(mobileHtml === undefined ? {} : { mobileHtml }),
+    ...(raw.title === undefined ? {} : { title: requireTitle(raw.title) }),
+    ...(typeof raw.height === "number" ? { height: raw.height } : {}) };
+}
+
+export function isExtensionSettingsDescriptor(value: unknown): value is ExtensionSettingsDescriptor {
+  try { parseExtensionSettings(value); return true; } catch { return false; }
 }
 
 function parseMainViewPlacement(value: Record<string, unknown>): Pick<ExtensionMainViewDescriptor, "open" | "side" | "multiple"> {

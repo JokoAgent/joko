@@ -66,6 +66,8 @@ import {
   type OperationalStore,
   type PutMessagingRouteInput
 } from "@joko/store";
+import type { ConnectionRecord } from '@joko/store';
+import type { PartnerMessagingRuntime, PartnerMessagingBinding } from './partner-messaging.js';
 import type { ArtifactStore } from "./artifact-store.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
@@ -510,6 +512,7 @@ export class MessagingManager {
   #mutationTail: Promise<void> = Promise.resolve();
   #initialized = false;
   #closed = false;
+  #partnerRuntime: PartnerMessagingRuntime | undefined;
 
   constructor(options: MessagingManagerOptions) {
     this.#store = options.store;
@@ -596,6 +599,56 @@ export class MessagingManager {
   listConnections(): readonly MessagingConnectionRecord[] {
     this.#assertReady();
     return this.#store.listMessagingConnections();
+  }
+
+  setPartnerRuntime(runtime: PartnerMessagingRuntime): void { this.#partnerRuntime = runtime; }
+
+  retirePartnerConnection(connectionId: string, commit: (store: OperationalStore) => void, retireConversations = true): Promise<MessagingConnectionRecord> {
+    return this.#mutate(async () => {
+      const updated = this.#store.transaction(store => {
+        commit(store); const current = store.getMessagingConnection(connectionId);
+        const stopped = current.enabled ? store.setMessagingConnectionEnabled({ connectionId: current.id,
+          expectedRevision: current.revision, expectedGeneration: current.generation, enabled: false, updatedAt: this.#now() }) : current;
+        for (const conversation of retireConversations ? store.listMessagingConversations({ connectionId, statuses: ['observed', 'active'] }) : []) store.retireMessagingConversation({
+          conversationId: conversation.id, expectedRevision: conversation.revision, retiredAt: this.#now() });
+        return stopped;
+      });
+      this.#restartWorker(connectionId); return updated;
+    });
+  }
+
+  mutatePartnerBinding(input: { readonly operationId: string; readonly owner: ConnectionRecord; readonly connectionId: string;
+    readonly expectedConnectionRevision: bigint; readonly expectedConnectionGeneration: number; readonly expectedBindingRevision: number;
+    readonly partnerId?: string; readonly expectedPartnerRevision?: bigint },
+    commit: (store: OperationalStore) => { readonly revision: number; readonly partnerId?: string }): Promise<{ readonly binding: PartnerMessagingBinding; readonly connection: MessagingConnectionRecord }> {
+    return this.#mutate(async () => {
+      const result = this.#store.runAuthorizedOperation(input.owner.id, input.owner.authKeyDigest,
+        { id: input.operationId, kind: 'partner_messaging_binding', body: { connectionId: input.connectionId,
+          expectedConnectionRevision: input.expectedConnectionRevision.toString(), expectedConnectionGeneration: input.expectedConnectionGeneration,
+          expectedBindingRevision: input.expectedBindingRevision, partnerId: input.partnerId ?? null,
+          expectedPartnerRevision: input.expectedPartnerRevision?.toString() ?? null } }, store => {
+          const before = store.getMessagingConnection(input.connectionId);
+          assertConnectionFence(before, input.expectedConnectionRevision, input.expectedConnectionGeneration);
+          const value = commit(store);
+          for (const conversation of store.listMessagingConversations({ connectionId: before.id, statuses: ['observed', 'active'] })) {
+            store.retireMessagingConversation({ conversationId: conversation.id, expectedRevision: conversation.revision, retiredAt: this.#now() });
+          }
+          const connection = store.replaceMessagingConfiguration({ connectionId: before.id, expectedRevision: before.revision,
+            expectedGeneration: before.generation, configuration: before.configuration, updatedAt: this.#now() });
+          return { binding: { connectionId: connection.id, ...(value.partnerId ? { partnerId: value.partnerId } : {}),
+            revision: value.revision, connectionGeneration: connection.generation }, connection };
+        });
+      // Stop only an old IM Run on a shared canonical task. A local turn on the
+      // same task does not belong to this channel destination change.
+      for (const conversation of this.#store.listMessagingConversations({ connectionId: input.connectionId, statuses: ['retired'] })) {
+        if (!conversation.sessionId) continue;
+        for (const run of this.#store.listRuns({ sessionId: conversation.sessionId, activeOnly: true, limit: 1000 })) {
+          const source = this.#store.findMessagingInboundRequestByRunId(run.descriptor.id);
+          if (source?.conversationId === conversation.id) await this.#sessionHost.abort(conversation.sessionId, run.descriptor.id).catch(() => undefined);
+        }
+      }
+      this.#restartWorker(input.connectionId); return result.value;
+    });
   }
 
   getConnection(connectionId: string): MessagingConnectionRecord {
@@ -1084,7 +1137,7 @@ export class MessagingManager {
   /** Called only after SessionHost has made the open Interaction durable. */
   onInteractionOpened(input: { readonly sessionId: string; readonly interactionId: string }): void {
     if (!this.#initialized || this.#closed) return;
-    const conversation = this.#store.findMessagingConversationBySessionId(input.sessionId);
+    const conversation = this.#interactionConversation(input.sessionId, input.interactionId);
     if (conversation === undefined || conversation.status !== "active") return;
     const connection = this.#store.findMessagingConnection(conversation.connectionId);
     if (connection === undefined || connection.generation !== conversation.channelGeneration || !connection.enabled) return;
@@ -1120,7 +1173,7 @@ export class MessagingManager {
   /** Called only after SessionHost has committed a terminal Interaction state. */
   onInteractionSettled(input: { readonly sessionId: string; readonly interactionId: string }): void {
     if (!this.#initialized || this.#closed) return;
-    const conversation = this.#store.findMessagingConversationBySessionId(input.sessionId);
+    const conversation = this.#interactionConversation(input.sessionId, input.interactionId, false);
     if (conversation === undefined || conversation.status !== "active") return;
     const connection = this.#store.findMessagingConnection(conversation.connectionId);
     if (connection === undefined || connection.generation !== conversation.channelGeneration || !connection.enabled) return;
@@ -1132,6 +1185,18 @@ export class MessagingManager {
     if (delivery?.status !== "sent") return;
     this.#retireSentInteractionIfSettled(connection, delivery);
     this.#scheduleDeliveryDrain(connection.id);
+  }
+
+  #interactionConversation(sessionId: string, interactionId: string, opening = true): MessagingConversationRecord | undefined {
+    const interaction = this.#store.getInteraction(interactionId);
+    if (interaction.sessionId !== sessionId || !interaction.runId) return undefined;
+    const request = this.#store.findMessagingInboundRequestByRunId(interaction.runId);
+    if (!request?.conversationId || opening && request.status !== "queued") return undefined;
+    const conversation = this.#store.findMessagingConversation(request.conversationId);
+    if (!conversation || conversation.status !== "active" || conversation.sessionId !== sessionId
+      || conversation.channelGeneration !== request.channelGeneration || conversation.connectionId !== request.connectionId
+      || conversation.sessionGeneration !== interaction.generation) return undefined;
+    return conversation;
   }
 
   /** Called only after SessionHost has made Run/Attempt/Queue terminal state durable. */
@@ -2001,10 +2066,14 @@ export class MessagingManager {
       return `Slack connection: ${connection.runtimeStatus}. This thread has ${pending} pending task${pending === 1 ? "" : "s"}.`;
     }
     if (command === "/stop") {
-      const stopped = await this.#stopMessagingSession(sessionId, interactionId);
+      const stopped = await this.#stopMessagingSession(sessionId, interactionId, conversation.partnerId ? conversation.id : undefined);
       return stopped === 0 ? "No active task needed stopping." : `Stopped ${stopped} active task${stopped === 1 ? "" : "s"}.`;
     }
     if (command === "/new") {
+      if (conversation.partnerId && this.#partnerRuntime) {
+        await this.#partnerRuntime.restartFromMessage(connection, conversation, event, interactionId);
+        return 'The original Partner context is restarting. History remains available.';
+      }
       await this.#startNewSlackSession(connection, conversation, event, interactionId);
       return "A new task is ready in this thread. Previous task history was archived.";
     }
@@ -2094,23 +2163,32 @@ export class MessagingManager {
       let stopped = 0;
       for (const candidate of conversations) {
         if (candidate.sessionId === undefined) continue;
-        stopped += await this.#stopMessagingSession(candidate.sessionId, interactionId);
+        stopped += await this.#stopMessagingSession(candidate.sessionId, interactionId, candidate.partnerId ? candidate.id : undefined);
       }
       return stopped === 0 ? "No active task needed stopping." : `Stopped ${stopped} active task${stopped === 1 ? "" : "s"}.`;
     }
     if (command === "/new") {
+      if (conversation.partnerId && this.#partnerRuntime) {
+        if (!event.speaker.isOwner) return 'Only the connection owner can restart this Partner conversation.';
+        await this.#partnerRuntime.restartFromMessage(connection, conversation, event, interactionId);
+        return 'The original Partner context is restarting. History remains available.';
+      }
       await this.#startNewWeChatSession(connection, conversation, event, interactionId);
       return "A new conversation is ready. Previous task history remains available.";
     }
     if (command === "/permission" || command.startsWith("/permission ")) {
+      if (conversation.partnerId) return 'Partner channel writes and external actions require confirmation. Manage Partner settings in Joko.';
       return this.#changeWeChatPermission(conversation, command);
     }
     return "Unknown command. Send /help to see available commands.";
   }
 
-  async #stopMessagingSession(sessionId: string, interactionId: string): Promise<number> {
+  async #stopMessagingSession(sessionId: string, interactionId: string, conversationId?: string): Promise<number> {
     let stopped = 0;
+    const ownsRun = (runId: string | undefined) => conversationId === undefined || runId !== undefined
+      && this.#store.findMessagingInboundRequestByRunId(runId)?.conversationId === conversationId;
     for (const interaction of this.#store.listInteractions({ sessionId, status: "open", limit: 1_000 })) {
+      if (!ownsRun(interaction.runId)) continue;
       this.#sessionHost.dismissInteraction(
         interaction.id,
         interaction.generation,
@@ -2120,10 +2198,12 @@ export class MessagingManager {
       stopped += 1;
     }
     for (const run of this.#store.listRuns({ sessionId, activeOnly: true, limit: 1_000 })) {
+      if (!ownsRun(run.descriptor.id)) continue;
       await this.#sessionHost.abort(sessionId, run.descriptor.id);
       stopped += 1;
     }
     for (const item of this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1_000 })) {
+      if (!ownsRun(item.runId)) continue;
       this.#store.cancelQueueItem({
         queueItemId: item.id,
         expectedRevision: item.revision,
@@ -2306,9 +2386,12 @@ export class MessagingManager {
     activeConversation = this.#store.getMessagingConversation(activeConversation.id);
     if (activeConversation.sessionId === undefined) throw new Error("Messaging conversation has no Session binding.");
     const artifacts = request.artifactIds.map((artifactId) => this.#store.getArtifact(artifactId).blob);
-    const prompt = this.#messagePrompt(activeConversation, event, artifacts);
+    const origin = this.#partnerRuntime?.origin(activeConversation, event, request.id);
+    const prompt = { ...this.#messagePrompt(activeConversation, event, artifacts), ...(origin ? { messagingOrigin: origin } : {}) };
     const configuration = decodeSupportedConnection(connection);
-    const overrides: TurnExecutionOverrides | undefined = activeConversation.conversationKind === "direct"
+    const overrides: TurnExecutionOverrides | undefined = origin
+      ? { permissionMode: 'ask' }
+      : activeConversation.conversationKind === "direct"
       ? undefined
       : !event.speaker.isOwner
         ? { permissionMode: "ask" }
@@ -2523,6 +2606,9 @@ export class MessagingManager {
     conversation: MessagingConversationRecord,
     event: MessagingInboundEvent
   ): Promise<MessagingConversationRecord> {
+    const partnerConversation = await this.#partnerRuntime?.resolve(conversation, event);
+    if (partnerConversation) return partnerConversation;
+    if (conversation.partnerId) throw invalid('The original Partner channel binding is no longer available.');
     if (conversation.status === "active" && conversation.sessionId !== undefined) return conversation;
     const route = this.#store.resolveMessagingRoute(conversation.connectionId);
     const connection = this.#store.getMessagingConnection(conversation.connectionId);

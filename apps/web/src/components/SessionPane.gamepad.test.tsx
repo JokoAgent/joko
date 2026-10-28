@@ -65,6 +65,31 @@ describe("session gamepad actions", () => {
     await view.action("stop"); await view.flush(); expect(view.api.abort).toHaveBeenCalledExactlyOnceWith("run");
   });
 
+  it("keeps side chat input and task actions while withholding immutable native controls", async () => {
+    const view = await mount();
+    const sideChat: SessionView = { ...session, derivationOrigin: {
+      kind: "fork", sideChat: true, sourceSessionId: "parent",
+      sourceSessionAvailable: true, sourceMessageAvailable: false
+    } };
+    await view.render(sideChat);
+    await view.action("toggle-fast"); await view.action("effort-increase"); await view.action("toggle-plan");
+    await view.action("fork-task");
+    expect(view.api.setModel).not.toHaveBeenCalled();
+    expect(view.api.setPlanMode).not.toHaveBeenCalled();
+    expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.host.textContent).toContain("Message input");
+    await view.action("toggle-pin"); await view.flush();
+    expect(view.api.pinSession).toHaveBeenCalledExactlyOnceWith("task", true);
+    await view.render({ ...sideChat, worktree: {
+      leaseId: "0123456789abcdef01234567", workspaceId: "workspace", workingPath: "D:/independent",
+      repositoryRoot: "D:/repository", branch: "joko/side-chat", sourceRef: "main",
+      sourceCommit: "0123456789abcdef0123456789abcdef01234567", sourceStrategy: "explicit",
+      sourceRefreshed: false, state: "active", acquiredAt: 1, updatedAt: 1
+    } });
+    await view.action("toggle-fast"); await view.flush();
+    expect(view.api.setModel).toHaveBeenCalledOnce();
+  });
+
   it("delegates archive and copy to their existing owners and opens the fork confirmation before dispatch", async () => {
     const view = await mount();
     await view.action("toggle-pin"); await view.flush(); expect(view.api.pinSession).toHaveBeenCalledExactlyOnceWith("task", true);

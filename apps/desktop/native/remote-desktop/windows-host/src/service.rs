@@ -1060,7 +1060,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod bootstrap_tests {
     use super::*;
     use std::{path::Path, process::Command};
 

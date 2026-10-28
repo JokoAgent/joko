@@ -1,5 +1,6 @@
 import "./protobuf-text-encoding.js";
 export * from "./model-speed.js";
+export * from "./extension-settings-bridge.js";
 export * from "./session-archive.js";
 export * from "./remote-desktop-viewer.js";
 export * from "./desktop-remote-desktop.js";
@@ -81,7 +82,10 @@ export * from "./gen/joko/v1/voice_pb.js";
 export * from "./gen/joko/v1/workspace_pb.js";
 export * from "./gen/joko/v1/partner_routine_pb.js";
 export * from "./gen/joko/v1/partner_autonomy_pb.js";
+export * from "./gen/joko/v1/partner_todo_pb.js";
 export * from "./partner-autonomy.js";
+export * from './partner-messaging.js';
+export * from "./partner-glance-todos.js";
 export * from "./well-known.js";
 export * from "./file-preview.js";
 export * from "./tool-presentation.js";

@@ -12,8 +12,62 @@ import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
 import { extensionNetworkCredentialReference } from "./extension-cards/network-manifest.js";
+import { ExtensionSettingsManager } from "./extension-settings.js";
+import { parseExtensionRuntime } from "./extension-surface-manifest.js";
+import type { ExtensionMainViewSurface } from "./extension-main-view-manager.js";
 
 const NOW = 1_800_000_000_000;
+
+it("keeps original runtime parameters in the Vault owner, fences ABA writes and clears only the selected secret", async () => {
+  const { root, store, credentials, catalog } = await fixture();
+  try {
+    const vault = await CredentialVault.open(join(root, "vault.key"));
+    const runtime = parseExtensionRuntime({ html: "ui/runtime/index.html", tools: [{ name: "read", description: "Read", inputSchema: { type: "object" }, readOnly: true }],
+      network: { hosts: ["api.example.com"], secrets: [
+        { key: "token", label: "Token", inject: { header: "X-Token", format: "{value}" }, check: { url: "https://api.example.com/check", bodyFormat: '{"value":"{value}"}', validPath: "active", validValue: true } },
+        { key: "secondary", label: "Second token", inject: { header: "X-Second", format: "{value}" } }
+      ] } });
+    const packageResource = resource({ kind: "package", discoveredRevision: `sha256:${"a".repeat(64)}`, resourceDetails: [{
+      kind: "extension", name: "Settings", entryPath: "extension.ts", settings: { html: "ui/settings/index.html" }, runtime,
+      compatibility: "supported", compatibilityIssues: [], detectedApis: [], adaptedApis: [], unsupportedApis: []
+    }] });
+    const extension = catalog.reconcile([packageResource], []).entries[0]!;
+    const surface: ExtensionMainViewSurface = { id: `extension_surface_${"a".repeat(32)}`, extensionId: extension.id, endpoint: "/private", expiresAt: NOW + 600_000,
+      authority: { extensionId: extension.id, resourceId: packageResource.id, resourceRevision: packageResource.versionNumber,
+        discoveredRevision: packageResource.discoveredRevision, backendId: "pi", backendRevision: 1n, backendGeneration: 1,
+        packageName: "sample-settings", extensionEntry: "extension.ts", mainView: { html: "ui/settings/index.html" }, settings: { html: "ui/settings/index.html" } } };
+    const manager = new ExtensionSettingsManager({ store, vault, credentials, catalog, fetch: vi.fn(async () => Response.json({ active: true, secret: "upstream-hidden" })) });
+    expect(manager.read(surface)).toEqual({ revision: "0", dataJson: "{}" });
+    manager.write(surface, "0", '{"folder":"inbox"}');
+    const saved = manager.read(surface);
+    expect(saved.dataJson).toBe('{"folder":"inbox"}');
+    expect(JSON.stringify(store.findSetting("service", "extension-runtime-kv", extension.id)?.value)).not.toContain("inbox");
+    // The existing runtime writes this exact encrypted setting too. Even an ABA
+    // parameter value cannot make an older editor revision current again.
+    store.setSetting("service", "extension-runtime-kv", extension.id, vault.seal('{"version":1,"data":{"folder":"other"}}', extension.id));
+    store.setSetting("service", "extension-runtime-kv", extension.id, vault.seal('{"version":1,"data":{"folder":"inbox"}}', extension.id));
+    expect(() => manager.write(surface, saved.revision, '{"folder":"stale"}')).toThrow(/changed/u);
+    const candidate = manager.beginCheck(surface, "token", "connection-one");
+    credentials.upload(candidate.credentialUploadTicketId, "uninstalled-candidate", "connection-one");
+    expect(await manager.check(surface, "token", candidate.credentialUploadTicketId, "connection-one", new AbortController().signal, () => undefined)).toEqual({ valid: true });
+    expect(credentials.list()).toHaveLength(0);
+    let current = catalog.beginSetup(extension.id, extension.revision);
+    for (const [field, secret] of [["network-secret:token", "installed-first"], ["network-secret:secondary", "installed-second"]] as const) {
+      const ticket = catalog.beginSetupCredentialUpload({ extensionId: extension.id, attemptId: current.setup.attemptId!, fieldId: field, kind: "header_secret", connectionId: "connection-one" });
+      credentials.upload(ticket.credentialUploadTicketId, secret, "connection-one");
+      current = await catalog.commitSetupCredential({ extensionId: extension.id, attemptId: current.setup.attemptId!, fieldId: field,
+        credentialUploadTicketId: ticket.credentialUploadTicketId, connectionId: "connection-one", expectedRevision: current.revision });
+    }
+    expect(credentials.list()).toHaveLength(2);
+    current = await catalog.clearSetupCredential(extension.id, "network-secret:token", current.revision, () => undefined);
+    expect(credentials.list()).toHaveLength(1);
+    expect(current.setup.fields.find(field => field.id === "network-secret:token")?.configured).toBe(false);
+    expect(current.setup.fields.find(field => field.id === "network-secret:secondary")?.configured).toBe(true);
+    expect(() => manager.write(surface, manager.read(surface).revision, '{"value":"installed-second"}')).toThrow(/credentials/u);
+    catalog.reconcile([resource({ ...packageResource, versionNumber: 5n })], []);
+    expect(() => manager.read(surface)).toThrow(/installation changed/u);
+  } finally { store.close(); }
+});
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "joko-extension-catalog-"));

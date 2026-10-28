@@ -1526,6 +1526,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
         <div className="message-user__stack">
           {item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}
           {attachments}
+          {item.userInputAccepted && item.todoQuote && <div className="partner-reply-quote"><strong>{locale === 'zh-CN' ? '待办' : 'Affair'}</strong><span>{item.todoQuote.title}</span></div>}
           {quoted && <button type="button" className="partner-reply-quote" onClick={() => partnerConversation?.locateReplyQuote?.(quoted)}>
             <strong>{quoted.role === 'assistant' ? partner?.displayName : locale === 'zh-CN' ? '你' : 'You'}</strong><span>{quoteText || (locale === 'zh-CN' ? '仅附件消息' : 'Attachment-only message')}</span>
           </button>}

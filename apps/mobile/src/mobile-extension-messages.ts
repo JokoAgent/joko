@@ -3,6 +3,21 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 type Row = readonly [key: string, en: string, zhCN: string, zhTW: string, ja: string, ko: string];
 
 const rows = [
+  ["extension.settings", "Plugin settings", "插件配置", "外掛設定", "プラグイン設定", "플러그인 설정"],
+  ["extension.settingsConfirm", "Confirm", "确认", "確認", "確認", "확인"],
+  ["extension.package.title", "Package", "安装包", "安裝套件", "パッケージ", "패키지"],
+  ["extension.package.install", "Install", "安装", "安裝", "インストール", "설치"],
+  ["extension.package.update", "Update", "更新", "更新", "更新", "업데이트"],
+  ["extension.package.replace", "Replace package source", "替换安装来源", "替換安裝來源", "パッケージのソースを置換", "패키지 소스 교체"],
+  ["extension.package.remove", "Remove package", "移除安装包", "移除安裝套件", "パッケージを削除", "패키지 제거"],
+  ["extension.package.browse", "Browse available Extensions", "浏览可安装扩展", "瀏覽可安裝擴充功能", "利用可能な拡張機能", "설치 가능한 확장 보기"],
+  ["extension.package.installedOnly", "Show installed Extensions", "显示已安装扩展", "顯示已安裝擴充功能", "インストール済みを表示", "설치된 확장 보기"],
+  ["extension.package.removeBody", "Remove {name} from this node? Its active interfaces will close.", "从此节点移除 {name}？其活动界面将关闭。", "從此節點移除 {name}？其作用中介面將關閉。", "このノードから {name} を削除しますか？開いている画面は閉じられます。", "이 노드에서 {name}을 제거할까요? 활성 화면이 닫힙니다."],
+  ["extension.package.replaceBody", "Replace the existing source {source} for {name}?", "替换 {name} 的现有来源 {source}？", "替換 {name} 的現有來源 {source}？", "{name} の既存ソース {source} を置換しますか？", "{name}의 기존 소스 {source}을 교체할까요?"],
+  ["extension.package.confirmBody", "Install the reviewed package for {name} on this node?", "在此节点安装已预览的 {name} 安装包？", "在此節點安裝已預覽的 {name} 套件？", "このノードに確認済みの {name} パッケージをインストールしますか？", "이 노드에 미리 확인한 {name} 패키지를 설치할까요?"],
+  ["extension.package.preservesEnabled", "Keeps the current enabled state.", "保留当前启用状态。", "保留目前啟用狀態。", "現在の有効状態を保持します。", "현재 활성화 상태를 유지합니다."],
+  ["extension.package.installsDisabled", "Installs disabled; enable after reviewing permissions.", "安装后保持停用，核对权限后可启用。", "安裝後保持停用，核對權限後可啟用。", "無効でインストールされます。権限確認後に有効化してください。", "비활성화 상태로 설치됩니다. 권한 확인 후 활성화하세요."],
+  ["extension.package.scriptsDisabled", "Installation scripts are disabled: {scripts}", "已禁用安装脚本：{scripts}", "已停用安裝指令碼：{scripts}", "インストールスクリプトは無効です: {scripts}", "설치 스크립트 비활성화: {scripts}"],
   ["extension.title", "Extensions", "扩展", "擴充功能", "拡張機能", "확장"],
   ["extension.menuDescription", "Browse installed Extensions and their capabilities", "浏览已安装的扩展及其能力", "瀏覽已安裝的擴充功能及其能力", "インストール済み拡張機能と機能を参照", "설치된 확장과 기능 살펴보기"],
   ["extension.search", "Search Extensions", "搜索扩展", "搜尋擴充功能", "拡張機能を検索", "확장 검색"],

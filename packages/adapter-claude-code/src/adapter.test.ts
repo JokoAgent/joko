@@ -6541,6 +6541,26 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.dispose();
   });
 
+  test("forks an immutable completed assistant prefix while the original Query keeps its active turn", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true }), adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context), messages = forkHistory(binding.nativeSessionId!);
+    runtime.messages.set(binding.nativeSessionId!, messages);
+    const active = contextFor(binding, { operationId: "active-main-task" });
+    await adapter.send(textPrompt("Continue the active main task"), active.context);
+    const query = runtime.queries[0]!, recordBinding = vi.fn();
+    const result = await adapter.fork(messages[1]!.uuid, { ...active.context, operationId: "completed-side-chat" }, { sessionId: "side-chat", target: active.context.target,
+      completedSnapshot: { kind: "completed_assistant", nativeBoundaryId: messages[1]!.uuid }, recordBinding });
+    expect(recordBinding).toHaveBeenCalledExactlyOnceWith(result.binding); expect(runtime.forks).toHaveLength(1);
+    expect(runtime.forks[0]!.options.upToMessageId).toBe(messages[1]!.uuid); expect(query.closeCalls).toBe(0);
+    expect(runtime.messages.get(result.binding.nativeSessionId!)!.map(message => message.message)).toEqual(messages.slice(0, 2).map(message => message.message));
+    expect(JSON.stringify(runtime.messages.get(result.binding.nativeSessionId!))).not.toContain("later question");
+    query.push(assistantMessage(binding.nativeSessionId!, "after-snapshot", [{ type: "text", text: "Original parent output" }]));
+    query.push(resultMessage(binding.nativeSessionId!, { result: "parent completes", totalCostUsd: 0 }));
+    await eventually(() => active.events.some(event => event.type === "done"));
+    expect(active.events).toContainEqual(expect.objectContaining({ type: "message_complete", role: "assistant" }));
+    await adapter.dispose();
+  });
+
   test("rejects full copy while a native background writer remains active after its foreground result", async () => {
     const runtime = new FakeSdkRuntime();
     const adapter = adapterFor(runtime);

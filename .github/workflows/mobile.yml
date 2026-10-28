@@ -377,6 +377,9 @@ jobs:
       - name: Check the Swift receiver and clipboard state machines
         run: node apps/mobile/scripts/test-remote-desktop-native.mjs
 
+      - name: Check the exact phone OAuth callback receiver and cancellation
+        run: node apps/mobile/scripts/test-plugin-oauth-native.mjs
+
       - name: Check the selected native CONNECT engine
         if: inputs.sdk_runtime == 'http-connect-native'
         run: node apps/mobile/scripts/test-http-connect-native.mjs

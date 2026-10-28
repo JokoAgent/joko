@@ -6,6 +6,24 @@ const entries = ["extensions/review.ts", "extensions/search/index.js"];
 const files = [...entries, "ui/review/index.html", "ui/review/app.js", "ui/search.html"];
 
 describe("Extension surface manifest", () => {
+  it("keeps original author settings separate from main-view and runtime authority", () => {
+    const manifest = (settings: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], settings }] } } });
+    const settings = { html: "ui/review/index.html", mobileHtml: "ui/search.html", title: "Configure", height: 320 };
+    const binding = parseExtensionSurfaceManifest(manifest(settings), entries, files)[0]!;
+    expect(binding).toEqual({ entry: entries[0], settings });
+    expect(binding.mainView).toBeUndefined(); expect(binding.runtime).toBeUndefined();
+    for (const invalid of [{ ...settings, html: "../index.html" }, { ...settings, mobileHtml: "ui/not-inspected.html" },
+      { ...settings, mobileHtml: "ui/review/app.js" }, { ...settings, height: 159 }, { ...settings, height: 801 },
+      { ...settings, network: true }, { ...settings, html: "index.html" }]) {
+      expect(() => parseExtensionSurfaceManifest(manifest(invalid), entries, files)).toThrow();
+    }
+  });
+  it("validates default placement and explicit multiple instances without granting runtime authority", () => {
+    const manifest = (mainView: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], mainView }] } } });
+    const mainView = { html: "ui/review/index.html", open: "sidebar", side: "bottom", multiple: true };
+    expect(parseExtensionSurfaceManifest(manifest(mainView), entries, files)[0]?.mainView).toEqual(mainView);
+    for (const invalid of [{ ...mainView, open: "remote" }, { ...mainView, open: "page" }, { ...mainView, side: "other" }, { ...mainView, multiple: false }]) expect(() => parseExtensionSurfaceManifest(manifest(invalid), entries, files)).toThrow();
+  });
   it("requires an explicit device sync capability and supports its resident runtime without model tools", () => {
     const manifest = (runtime: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime }] } } });
     const runtime = { html: "ui/review/index.html", tools: [], deviceSync: true };

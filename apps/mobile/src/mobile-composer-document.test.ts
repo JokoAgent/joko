@@ -44,6 +44,19 @@ import { segmentMobileComposerRoutePaste } from "./mobile-composer-route-links";
 import { mobileIncomingShareStorageId } from "./mobile-incoming-share-order";
 
 describe("mobile structured composer document", () => {
+  it('retains an affair quote through edits, original input restore and outbox recovery without executing its snapshot', () => {
+    const todoQuote = { partnerId: 'partner', todoId: 'todo:review', revision: '4', title: 'Review the source report' };
+    const draft = normalizeMobileComposerDraft({ ...plainTextMobileComposerDraft('Move this to Friday.'), todoQuote });
+    const edited = reconcileMobileComposerText(draft, 'Move this to Friday afternoon.').draft;
+    const wire = mobileComposerInput(edited); expect(wire.todoQuote).toMatchObject({ ...todoQuote, revision: 4n });
+    expect(wire.parts[0]?.content.value).toBe('Move this to Friday afternoon.');
+    const restored = restoreMobileComposerInput(wire, { sessionId: 'task', messageId: 'sent', eventId: 'sent-event' });
+    expect(restored.todoQuote).toEqual(todoQuote);
+    expect(recoverMobileComposerDraft(restored, plainTextMobileComposerDraft('New draft')).todoQuote).toEqual(todoQuote);
+    expect(() => recoverMobileComposerDraft(restored, normalizeMobileComposerDraft({ ...plainTextMobileComposerDraft('Another'),
+      todoQuote: { ...todoQuote, todoId: 'todo:different' } }))).toThrow();
+    expect(() => normalizeMobileComposerDraft({ ...draft, todoQuote: { ...todoQuote, revision: '0' } })).toThrow();
+  });
   it('preserves a private reply root through native typing, accepted input restore and retry recovery without inserting snapshot text', () => {
     const replyQuote = { generation: '7', eventId: 'root-event', messageId: 'root-message', role: 'assistant' as const, excerpt: 'Visible snapshot only' };
     const draft = normalizeMobileComposerDraft({ ...plainTextMobileComposerDraft('Explain'), replyQuote });

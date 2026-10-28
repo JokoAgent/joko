@@ -329,6 +329,7 @@ const desktopCapabilities = Object.freeze([
   "appearance.wallpaper",
   "application.menu",
   "inspector.detach",
+  "inspector.tabs",
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
   "files.open",
   ...(openWithDocumentOccurrence === undefined ? [] : ["files.openWith" as const]),

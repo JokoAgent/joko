@@ -44,6 +44,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
   let releases = 0;
   let surfaceManifest = authority.mainView;
   let surfaceLibrary: ExtensionMainViewAuthority["library"];
+  let surfaceSettings: ExtensionMainViewAuthority["settings"];
   const acquireInstalledPackage = vi.fn(async (): Promise<PiInstalledPackageLease> => ({
     resource: {} as PiInstalledPackageLease["resource"],
     snapshotTo: async (destination) => {
@@ -59,6 +60,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
             extensions: [{
               entry: authority.extensionEntry,
               mainView: surfaceManifest,
+              ...(surfaceSettings === undefined ? {} : { settings: surfaceSettings }),
               ...(surfaceLibrary === undefined ? {} : { library: surfaceLibrary })
             }]
           }
@@ -88,11 +90,61 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
     setCurrent(value: boolean) { current = value; },
     setSurfaceManifest(value: typeof surfaceManifest) { surfaceManifest = value; },
     setSurfaceLibrary(value: typeof surfaceLibrary) { surfaceLibrary = value; },
+    setSurfaceSettings(value: typeof surfaceSettings) { surfaceSettings = value; },
     releases: () => releases
   };
 }
 
 describe("ExtensionMainViewManager", () => {
+  it("opens the inspected mobile settings page independently of the main view and its Library authority", async () => {
+    const f = await fixture();
+    try {
+      const settings = { html: "ui/review/index.html", mobileHtml: "ui/review/secondary.html", title: "Configuration", height: 320 };
+      f.setSurfaceSettings(settings);
+      const view = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      const configuration = { ...authority, mainView: { html: settings.mobileHtml, title: settings.title }, settings, mobileSettings: true as const };
+      const page = await f.manager.open({ authority: configuration, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      expect(page.endpoint).toMatch(/secondary\.html$/u);
+      expect(f.manager.isSurfaceCurrent(view.id, "connection-a")).toBe(true);
+      expect(f.manager.isSurfaceCurrent(page.id, "connection-b")).toBe(false);
+      const [, , , , surfaceId, token, entry] = page.endpoint.split("/");
+      const html = await f.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "GET", isolatedDocument: true });
+      const programs = [...html.body!.toString().matchAll(/data:text\/javascript;base64,([A-Za-z0-9+/=]+)/gu)]
+        .map(match => Buffer.from(match[1]!, "base64").toString()).join("\n");
+      expect(programs).toContain("joko:extension-settings-request");
+      expect(programs).not.toContain("joko:extension-library-request");
+      expect(html.headers["content-security-policy"]).toContain("connect-src 'none'");
+      await expect(f.manager.open({ authority: { ...configuration, library: { schemaVersion: 1 } }, connectionId: "connection-a", assertAuthorityCurrent: () => undefined })).rejects.toThrow(/settings authority/u);
+      await f.manager.closeSurface(page.id, "connection-a");
+      expect(f.manager.isSurfaceCurrent(page.id, "connection-a")).toBe(false);
+      await expect(f.manager.getSurface(view.id, "connection-a")).resolves.toMatchObject({ id: view.id });
+    } finally { await f.manager.close(); }
+  });
+  it("retires an ordinary view only inside its owning connection when moving the single instance", async () => {
+    const revoked = vi.fn(), f = await fixture({ onSurfaceRevoked: revoked });
+    try {
+      const first = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      const other = await f.manager.open({ authority, connectionId: "connection-b", assertAuthorityCurrent: () => undefined });
+      const second = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      expect(second.id).not.toBe(first.id); expect(revoked).toHaveBeenCalledExactlyOnceWith(first.id, "connection-a");
+      await expect(f.manager.getSurface(first.id, "connection-a")).rejects.toMatchObject({ statusCode: 404 });
+      await expect(f.manager.getSurface(second.id, "connection-a")).resolves.toMatchObject({ id: second.id });
+      await expect(f.manager.getSurface(other.id, "connection-b")).resolves.toMatchObject({ id: other.id });
+    } finally { await f.manager.close(); }
+  });
+  it("allows independent surfaces only on the exact declared multiple-view generation", async () => {
+    const f = await fixture(), multi = { ...authority, mainView: { ...authority.mainView, open: "sidebar" as const, side: "left" as const, multiple: true as const } };
+    f.setSurfaceManifest(multi.mainView);
+    try {
+      const first = await f.manager.open({ authority: multi, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      const second = await f.manager.open({ authority: multi, connectionId: "connection-b", assertAuthorityCurrent: () => undefined });
+      await expect(f.manager.getSurface(first.id, "connection-a")).resolves.toMatchObject({ id: first.id });
+      await expect(f.manager.getSurface(second.id, "connection-b")).resolves.toMatchObject({ id: second.id });
+      f.setSurfaceManifest({ ...multi.mainView, side: "right" });
+      await expect(f.manager.open({ authority: multi, connectionId: "connection-c", assertAuthorityCurrent: () => undefined })).rejects.toThrow("declaration changed");
+      await expect(f.manager.getSurface(first.id, "connection-a")).resolves.toMatchObject({ id: first.id });
+    } finally { await f.manager.close(); }
+  });
   it("materializes only the current declared document and keeps the total response budget", async () => {
     const f = await fixture();
     try {

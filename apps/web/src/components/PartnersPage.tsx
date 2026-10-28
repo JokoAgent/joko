@@ -1,4 +1,6 @@
 import { Code, ConnectError } from "@connectrpc/connect";
+import { partnerMessagingMessages } from '@joko/contracts';
+import { PartnerMessagingPanel } from './PartnerMessagingPanel.js';
 import { ModelSpeedControl } from "./ModelSpeedControl.js";
 import {
   Archive,
@@ -697,7 +699,7 @@ function PartnerDefaultsDialog({ open, directory, snapshot, controller, ownerKey
   return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}>{permissionConfirmation.dialog}<div ref={(node) => { permissionConfirmation.rootRef.current = node; }} className="partner-editor"><CapabilitiesEditor value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value) || !partnerCapabilitiesAvailable(value, snapshot)} onClick={save}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
 }
 
-export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", initialPrivateThreadId, initialLearningDestination, showClose = false, onClose, onUpdated, onActivityUpdated }: {
+export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", initialPrivateThreadId, initialLearningDestination, initialHomeDestination, showClose = false, onClose, onUpdated, onActivityUpdated }: {
   readonly partner: PartnerProfileView;
   readonly partners: readonly PartnerProfileView[];
   readonly directory: PartnerDirectoryView;
@@ -708,6 +710,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   readonly initialSection?: "profile" | "activity";
   readonly initialPrivateThreadId?: string;
   readonly initialLearningDestination?: PartnerLearningSettingsDestination;
+  readonly initialHomeDestination?: import("@joko/contracts").PartnerHomeDestination;
   readonly showClose?: boolean;
   readonly onClose: () => void;
   readonly onUpdated: (result: PartnerMutationView) => void;
@@ -718,7 +721,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const [memoryVisible, setMemoryVisible] = useState(false);
   const [connectionsVisible, setConnectionsVisible] = useState(false);
   const [restartVisible, setRestartVisible] = useState(false);
-  const [homeVisible, setHomeVisible] = useState(false);
+  const [homeVisible, setHomeVisible] = useState(initialHomeDestination !== undefined);
   const homeApi = useMemo(() => controller.partnerHomeApi(ownerKey), [controller, ownerKey]);
   const [restartBusy, setRestartBusy] = useState(false);
   const [resumeVisible, setResumeVisible] = useState(false);
@@ -881,12 +884,15 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
         foreground={restartForeground} partner={restartVisible ? baseline : undefined} pending={[]} t={t}
         onClose={() => setRestartVisible(false)} onBusyChange={setRestartBusy} onChanged={() => undefined} />
       {baseline.lifecycle === "active" && baseline.initializationState === "ready" && baseline.canonicalSessionId && <Button disabled={saving || dirty || avatarPreparing || conflict || restartBusy || connectionsVisible} onClick={() => setHomeVisible(true)}>{partnerHomeMessages(controller.state.effectiveLocale).title}</Button>}
-      {homeVisible && <PartnerHomeDialog api={homeApi} partnerId={baseline.id} revision={baseline.revision} inputHandoff={baseline.capabilities.inputHandoff !== false} locale={controller.state.effectiveLocale} onClose={() => setHomeVisible(false)} onChanged={() => {
+      {homeVisible && <PartnerHomeDialog api={homeApi} partnerId={baseline.id} revision={baseline.revision} inputHandoff={baseline.capabilities.inputHandoff !== false} initialDestination={initialHomeDestination} locale={controller.state.effectiveLocale} onClose={() => setHomeVisible(false)} onChanged={() => {
         void controller.getPartner(baseline.id).then(profile => { if (ownerRef.current === ownerKey) {
           setBaseline(profile); setDraft(editorDraft(profile)); onActivityUpdated(profile); setHomeVisible(false);
           if (profile.canonicalSessionId) controller.navigate({ kind: "session", sessionId: profile.canonicalSessionId });
         } });
       }} />}
+      {baseline.canonicalSessionId && <details><summary>{partnerMessagingMessages(controller.state.effectiveLocale).title}</summary>
+        <PartnerMessagingPanel key={`messaging:${ownerKey}:${baseline.id}`} controller={controller} ownerKey={ownerKey} partner={baseline} />
+      </details>}
       <fieldset disabled={restartBusy || resumeVisible || memoryVisible || connectionsVisible || homeVisible} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
       <div className="partner-editor__status"><Pill tone={conflict || saveError !== undefined ? "danger" : saving || dirty ? "warning" : "success"}>{status}</Pill><span>{t("partners.profileVersionValue", { version: baseline.profileVersion.toString() })}</span></div>
       {(conflict || saveError !== undefined) && <div className="partner-conflict" role="alert"><CircleAlert aria-hidden="true" /><div><strong>{conflict ? t("partners.conflictTitle") : t("partners.saveFailed")}</strong><p>{conflict ? t("partners.conflictBody") : saveError}</p></div><div><Button onClick={() => void reconcile(false)}>{t("partners.reload")}</Button><Button tone="primary" onClick={() => void reconcile(true)}>{t("common.retry")}</Button></div></div>}

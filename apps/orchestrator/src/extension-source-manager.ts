@@ -13,9 +13,11 @@ import {
   parseExtensionRuntime,
   type ExtensionRuntimeDescriptor,
   isExtensionMainViewDescriptor,
+  isExtensionSettingsDescriptor,
   validateExtensionRecommendations,
   type ExtensionLibraryDescriptor,
   type ExtensionMainViewDescriptor,
+  type ExtensionSettingsDescriptor,
   type ExtensionRecommendationDescriptor
 } from "./extension-surface-manifest.js";
 
@@ -41,6 +43,7 @@ export interface ExtensionSourceEntryDescriptor {
   readonly bindingName: string;
   readonly bindingOrdinal: number;
   readonly mainView?: ExtensionMainViewDescriptor;
+  readonly settings?: ExtensionSettingsDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
   readonly runtime?: ExtensionRuntimeDescriptor;
   readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
@@ -752,6 +755,7 @@ async function discoverMarketplace(
           author: inspection.author ?? null,
           description: inspection.description,
           mainView: extension.mainView ?? null,
+          settings: extension.settings ?? null,
           library: extension.library ?? null,
           runtime: extension.runtime ?? null,
           recommendations: extension.recommendations ?? null,
@@ -768,6 +772,7 @@ async function discoverMarketplace(
           bindingName: extension.resourceName,
           bindingOrdinal: ordinal,
           ...(extension.mainView === undefined ? {} : { mainView: { ...extension.mainView } }),
+          ...(extension.settings === undefined ? {} : { settings: { ...extension.settings } }),
           ...(extension.library === undefined ? {} : { library: { ...extension.library } }),
           ...(extension.runtime === undefined ? {} : { runtime: structuredClone(extension.runtime) }),
           ...(extension.recommendations === undefined ? {} : { recommendations: copyRecommendations(extension.recommendations) }),
@@ -1028,6 +1033,7 @@ function copyEntry(entry: StoredExtensionSourceEntry): ExtensionSourceEntryDescr
   return {
     ...entry,
     ...(entry.mainView === undefined ? {} : { mainView: { ...entry.mainView } }),
+    ...(entry.settings === undefined ? {} : { settings: { ...entry.settings } }),
     ...(entry.library === undefined ? {} : { library: { ...entry.library } }),
     ...(entry.runtime === undefined ? {} : { runtime: structuredClone(entry.runtime) }),
     ...(entry.recommendations === undefined ? {} : { recommendations: copyRecommendations(entry.recommendations) })
@@ -1104,7 +1110,7 @@ function validateStoredSource(value: unknown): StoredExtensionSource {
 function validateStoredEntry(value: unknown): StoredExtensionSourceEntry {
   if (!plainObject(value) || !exactKeys(value, [
     "id", "revision", "contentRevision", "packageContentRevision", "resourceId", "packageRelativePath", "extensionRelativePath", "bindingName", "bindingOrdinal",
-    "mainView", "library", "runtime", "recommendations", "name", "packageName", "version", "author", "description"
+    "mainView", "settings", "library", "runtime", "recommendations", "name", "packageName", "version", "author", "description"
   ]) || typeof value.id !== "string" || !ENTRY_ID.test(value.id) || typeof value.revision !== "string" || !CONTENT_REVISION.test(value.revision)
     || typeof value.contentRevision !== "string" || value.contentRevision !== value.revision
     || typeof value.packageContentRevision !== "string" || !CONTENT_REVISION.test(value.packageContentRevision)
@@ -1112,6 +1118,7 @@ function validateStoredEntry(value: unknown): StoredExtensionSourceEntry {
     || normalizeRelativePath(value.packageRelativePath) !== value.packageRelativePath || normalizeRelativePath(value.extensionRelativePath) !== value.extensionRelativePath
     || typeof value.bindingName !== "string" || value.bindingName.trim() === "" || typeof value.bindingOrdinal !== "number" || !Number.isSafeInteger(value.bindingOrdinal) || value.bindingOrdinal < 0
     || value.mainView !== undefined && !isExtensionMainViewDescriptor(value.mainView)
+    || value.settings !== undefined && !isExtensionSettingsDescriptor(value.settings)
     || value.library !== undefined && !isExtensionLibraryDescriptor(value.library)
     || typeof value.name !== "string" || value.name.trim() === "" || typeof value.packageName !== "string" || value.packageName.trim() === ""
     || value.version !== undefined && (typeof value.version !== "string" || value.version.trim() === "")

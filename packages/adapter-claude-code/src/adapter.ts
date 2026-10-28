@@ -1807,7 +1807,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   supportsDetachedSessionDeletion(context: AdapterContext): boolean {
-    return context.runtimePolicy !== "review_read_only"
+    return (context.runtimePolicy !== "review_read_only" || context.persistentReadOnly === "side_chat")
       && context.target.backendId === this.id
       && context.backendInstanceGeneration === this.#instanceGeneration;
   }
@@ -7658,6 +7658,7 @@ function capabilityManifest(
     "session.clone",
     "session.fork",
     "session.side_chat",
+    "session.prewarm",
     "session.rewind",
     "session.detach",
     "session.discovery",

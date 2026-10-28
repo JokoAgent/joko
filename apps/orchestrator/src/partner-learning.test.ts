@@ -54,6 +54,46 @@ describe("Partner learning review evidence", () => {
 });
 
 describe("Partner learning save and successful reply", () => {
+  it("learns from an owned private topic without moving the canonical conversation's cursor", async () => {
+    const f = await fixture({ topic: true }); f.infer.mockResolvedValue({ status: "ok", text: plan([memoryProposal()], []) });
+    const reply = f.reply("topic-reply"); f.finish(reply.id); await f.learning.drain();
+    expect(f.infer).toHaveBeenCalledOnce(); expect(f.memory.list(f.session.targetId)).toHaveLength(1);
+    expect(f.store.findSetting("session", f.session.id, "partner.learning.progress.v1")?.value).toMatchObject({ version: 1, offset: 0, cursor: reply.globalCursor.toString() });
+    expect(f.store.findSetting("session", f.partner.canonicalSessionId!, "partner.learning.progress.v1")).toBeUndefined();
+    const messages = JSON.parse(f.infer.mock.calls[0]![1].user).messages as Array<{ text: string }>;
+    expect(messages.some(message => message.text.includes("Private topic root context"))).toBe(false);
+    f.learning.settled(f.source.occurrenceId, reply.id, "completed"); await f.learning.drain(); expect(f.infer).toHaveBeenCalledOnce();
+  });
+  it("leaves a long message tail pending and backfills that exact topic on a later successful reply", async () => {
+    const f = await fixture({ topic: true, text: "x".repeat(25_000) + userText });
+    f.infer.mockImplementation(async (_owner, input) => {
+      const messages = JSON.parse(input.user).messages as Array<{ id: string; text: string }>;
+      return { status: "ok", text: plan(messages.some(message => message.id === "accepted-user" && message.text.includes(userQuote)) ? [memoryProposal()] : [], []) };
+    });
+    const first = f.reply("long-topic-first"); f.finish(first.id); await f.learning.drain();
+    expect(f.memory.list(f.session.targetId)).toEqual([]);
+    expect(f.store.findSetting<{ offset: number }>("session", f.session.id, "partner.learning.progress.v1")!.value.offset).toBeGreaterThan(0);
+    const prompt: PromptInput = { text: "Review the rest of this conversation.", images: [], files: [], mentions: [], disposition: "prompt" };
+    f.store.createRun({ id: "later-topic-run", sessionId: f.session.id, source: "user", state: "running", createdAt: 300 });
+    f.store.createAttempt({ id: "later-topic-attempt", runId: "later-topic-run", ordinal: 1, generation: f.session.binding.generation, startedAt: 300 });
+    f.store.runOperation({ id: "later-topic-input", kind: "prompt", body: prompt }, store => { store.enqueueQueueItem({ id: "later-topic-queue", sessionId: f.session.id,
+      runId: "later-topic-run", attemptId: "later-topic-attempt", operationId: "later-topic-input", disposition: "prompt", body: prompt }); return {}; });
+    f.store.claimNextQueueItem({ sessionId: f.session.id, backendInstanceGeneration: 0, traceId: "later-topic-dispatch" });
+    f.store.updateRunState({ runId: "later-topic-run", state: "running", activeAttemptId: "later-topic-attempt", traceId: "later-topic-running" });
+    const source = { ...f.source, occurrenceId: "later-topic-occurrence", sourceRunId: "later-topic-run", sourceAttemptId: "later-topic-attempt",
+      sourceQueueItemId: "later-topic-queue", operationId: "later-topic-input", nativeOccurrence: "later-native-turn" };
+    expect(f.learning.captureSource(source)).toBe(true);
+    f.store.updateQueueState({ queueItemId: source.sourceQueueItemId, state: "backend_accepted", attemptId: source.sourceAttemptId, traceId: "later-topic-accepted" }); f.learning.accepted(source.occurrenceId);
+    const append = (id: string, payload: Parameters<OperationalStore["appendEvent"]>[0]["payload"]) => f.store.appendEvent({ id, backendId: f.session.backendId,
+      targetId: f.session.targetId, sessionId: f.session.id, generation: f.session.binding.generation, runId: source.sourceRunId, attemptId: source.sourceAttemptId, traceId: "later-topic", payload });
+    append("later-topic-user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: prompt.text }], acceptedInput: prompt });
+    const reply = append("later-topic-reply", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Reviewed." }] });
+    f.store.updateQueueState({ queueItemId: source.sourceQueueItemId, state: "completed", attemptId: source.sourceAttemptId, traceId: "later-topic-done" });
+    f.store.updateRunState({ runId: source.sourceRunId, state: "completed", activeAttemptId: source.sourceAttemptId, traceId: "later-topic-finished" });
+    f.learning.sealed(source.occurrenceId, reply.id); f.learning.settled(source.occurrenceId, reply.id, "completed"); await f.learning.drain();
+    expect(f.infer).toHaveBeenCalledTimes(2); expect(f.memory.list(f.session.targetId)).toHaveLength(1);
+    expect(f.store.findSetting("session", f.partner.canonicalSessionId!, "partner.learning.progress.v1")).toBeUndefined();
+  });
   it("records real Memory and Skill saves atomically and keeps late success on its original reply", async () => {
     const f = await fixture(), capture = f.learning.captureSave(f.source)!;
     const context = { ...f.caller, partnerLearningSave: capture };
@@ -192,7 +232,7 @@ describe("Partner learning save and successful reply", () => {
   });
 });
 
-async function fixture() {
+async function fixture(input: { readonly topic?: boolean; readonly text?: string } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "joko-partner-learning-"));
   const store = new OperationalStore(join(directory, "operational.db")), profiles = new PartnerStore(join(directory, "partners.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
@@ -205,14 +245,23 @@ async function fixture() {
   const partner = await partners.createPartner({ requestId: "create-learning-partner", expectedDirectoryRevision: profiles.directoryState().revision,
     displayName: "Ada", avatar: "orbit", identitySource: "Private identity", templateId: "general", usesDirectoryDefaults: false,
     capabilities: { modelChain: [{ backendId: profile.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
-  const session = store.getSession(partner.canonicalSessionId!).descriptor;
+  let session = store.getSession(partner.canonicalSessionId!).descriptor;
+  if (input.topic) {
+    const event = store.appendEvent({ id: "topic-root", backendId: session.backendId, targetId: session.targetId, sessionId: session.id,
+      generation: session.binding.generation, traceId: "topic-root", payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Private topic root context" }] } });
+    const root = store.findVisibleSessionMessageOrigin({ sessionId: session.id, eventId: event.id })!;
+    const connection = store.createConnection({ id: "learning-topic-owner", name: "Owner", authKeyDigest: "learning-topic-key" });
+    const topic = await partners.ensureTopic({ operationId: "learning-private-topic", connection, partnerId: partner.id, expectedRevision: partner.revision,
+      root: { sessionId: session.id, generation: session.binding.generation, eventId: root.eventId, messageId: root.messageId }, assertCurrent: () => undefined });
+    session = store.getSession(topic.link.sessionId).descriptor;
+  }
   const resources = new PiResourceManager({ store, managedRoot: join(directory, "resources") }); await resources.initialize();
   const refresh = vi.fn(() => true), memory = new MakerMemoryController({ store });
   const skills = new PartnerSkillsManager(partners, profiles, store, resources, new SkillMutationCoordinator(), refresh);
   const infer = vi.fn(async (_owner: AuxiliaryTextPlan, _input: AuxiliaryTextRunOptions): Promise<AuxiliaryTextRunResult> => ({ status: "exhausted" }));
   const auxiliary = { capture: (): AuxiliaryTextPlan => ({ models: [], revision: 1n, runtimeRevision: "original-route" }), run: infer };
   const options = { store, profiles, partners, memory, skills, auxiliary }, learning = new PartnerLearningManager(options);
-  const prompt: PromptInput = { text: userText, images: [], files: [], mentions: [], disposition: "prompt" };
+  const prompt: PromptInput = { text: input.text ?? userText, images: [], files: [], mentions: [], disposition: "prompt" };
   store.createRun({ id: "learning-run", sessionId: session.id, source: "user", state: "running", createdAt: 100 });
   store.createAttempt({ id: "learning-attempt", runId: "learning-run", ordinal: 1, generation: session.binding.generation, startedAt: 100 });
   store.runOperation({ id: "learning-input", kind: "prompt", body: prompt }, owner => { owner.enqueueQueueItem({ id: "learning-queue", sessionId: session.id,
@@ -229,7 +278,7 @@ async function fixture() {
   const append = (id: string, payload: Parameters<OperationalStore["appendEvent"]>[0]["payload"]) => store.appendEvent({ id,
     backendId: session.backendId, targetId: session.targetId, sessionId: session.id, generation: session.binding.generation,
     runId: source.sourceRunId, attemptId: source.sourceAttemptId, traceId: "learning-evidence", payload });
-  append("accepted-user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: userText }], acceptedInput: prompt });
+  append("accepted-user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: prompt.text }], acceptedInput: prompt });
   append("tool-result", { type: "tool_result", callId: "verified-workflow", name: "Read", output: toolText, isError: false });
   const reply = (id: string, bodyless = false) => append(id, { type: "message_complete", role: "assistant",
     blocks: bodyless ? [] : [{ kind: "text", text: "The work is complete." }] });

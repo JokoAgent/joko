@@ -49,6 +49,7 @@ export const CAPABILITIES = [
   "session.detach",
   "session.fork",
   "session.side_chat",
+  "session.prewarm",
   "session.rewind",
   "session.rewind_to_start",
   "session.tree",
@@ -357,6 +358,7 @@ export interface PromptInput {
   readonly files: readonly FileInput[];
   readonly mentions: readonly MentionInput[];
   readonly replyQuote?: { readonly generation: number; readonly eventId: string; readonly messageId: string; readonly role: 'user' | 'assistant'; readonly excerpt: string };
+  readonly todoQuote?: { readonly partnerId: string; readonly todoId: string; readonly revision: number; readonly title: string };
   /** Queue-only authority for typed Session mentions. Public mappers never
    * accept or emit this field, and dispatch removes it before Adapter input. */
   readonly sessionReferenceSnapshots?: readonly SessionReferenceSnapshot[];
@@ -383,6 +385,15 @@ export interface PromptInput {
   /** Queue-private completion of an owner input handoff. Public input never
    * accepts this marker; the originating live task must still authorize it. */
   readonly inputHandoffContinuation?: { readonly requestId: string };
+  /** Trusted message-service provenance. Never accepted from public input or
+   * passed to an Adapter. The original Queue keeps it through edit and retry. */
+  readonly messagingOrigin?: {
+    readonly connectionId: string; readonly channelGeneration: number;
+    readonly credentialGeneration: string; readonly bindingRevision: number;
+    readonly partnerId: string; readonly conversationId: string; readonly requestId: string;
+    readonly channel: string; readonly providerUserId: string; readonly isOwner: boolean;
+    readonly userText: string;
+  };
 }
 
 export interface AutomaticContinuationInput {

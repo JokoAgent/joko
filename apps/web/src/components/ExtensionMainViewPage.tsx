@@ -2,9 +2,10 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide-react";
 import { createConnectionFetch } from "@joko/connection-transport";
+import { parseExtensionSettingsBridgeRequest } from "@joko/contracts";
 import { mountIsolatedSurface } from "../isolated-surface.js";
 import { bindExtensionSurfaceResources } from "../extension-main-view-resource-bridge.js";
-import { bindExtensionViewClose } from "../extension-view-lifecycle.js";
+import { bindExtensionViewClose, registerExtensionPageClose } from "../extension-view-lifecycle.js";
 
 import type { AppController } from "../controller.js";
 import type {
@@ -12,7 +13,8 @@ import type {
   ExtensionLibraryCallView,
   ExtensionLibraryCallResultView,
   ExtensionLibrarySessionView,
-  ExtensionMainViewSurfaceView
+  ExtensionMainViewSurfaceView,
+  ExtensionSettingsApi
 } from "../model.js";
 import {
   EXTENSION_LIBRARY_BRIDGE_RESPONSE,
@@ -29,7 +31,7 @@ type MainViewState =
   | { readonly phase: "error" | "revoked"; readonly extension?: ExtensionCatalogEntryView };
 
 export function ExtensionMainViewPage({
-  controller,
+  controller: liveController,
   extensionId,
   t,
   navigationOpen,
@@ -37,7 +39,9 @@ export function ExtensionMainViewPage({
   onOpenIndependent,
   embedded = false,
   ownerDocument = document,
-  registerCloseGuard
+  registerCloseGuard,
+  settings = false,
+  onOpenLibrary
 }: {
   readonly controller: AppController;
   readonly extensionId: string;
@@ -48,7 +52,15 @@ export function ExtensionMainViewPage({
   readonly embedded?: boolean;
   readonly ownerDocument?: Document;
   readonly registerCloseGuard?: (guard: () => Promise<boolean>) => () => void;
+  readonly settings?: boolean;
+  readonly onOpenLibrary?: () => void;
 }) {
+  const controllerOwner = JSON.stringify([liveController.state.activeProfile?.id, liveController.state.activeProfile?.serverId,
+    liveController.state.activeProfile?.origin, liveController.state.activeProfile?.endpointPublicKey,
+    liveController.state.activeProfile?.transportKind, liveController.state.connectionGeneration, liveController.state.connectionState]);
+  const liveOwnerRef = useRef(controllerOwner); liveOwnerRef.current = controllerOwner;
+  // Snapshot refreshes are shared facts, not a new document/credential owner.
+  const controller = useMemo(() => liveController, [controllerOwner]);
   const [state, setState] = useState<MainViewState>({ phase: "loading" });
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [frameRevision, setFrameRevision] = useState(0);
@@ -61,6 +73,9 @@ export function ExtensionMainViewPage({
   const libraryOpeningRef = useRef<{ readonly surfaceId: string; readonly extensionRevision: bigint; readonly promise: Promise<ExtensionLibrarySessionView> } | undefined>(undefined);
   const bridgeEpoch = useRef(0);
   const closeGuard = useRef<() => Promise<boolean>>(async () => true);
+  const settingsApi = useRef<ExtensionSettingsApi | undefined>(undefined);
+  const settingsSurfaceClosers = useRef(new Map<string, (surfaceId: string) => Promise<boolean>>());
+  const settingsLibrary = useRef(onOpenLibrary); settingsLibrary.current = onOpenLibrary;
 
   const closeLibrary = useCallback((): void => {
     const current = libraryRef.current;
@@ -74,8 +89,12 @@ export function ExtensionMainViewPage({
     if (surface === undefined) return;
     closeLibrary();
     if (surfaceRef.current?.id === surface.id) surfaceRef.current = undefined;
-    void controller.closeExtensionMainView(surface.id).catch(() => undefined);
-  }, [closeLibrary, controller]);
+    if (settings) {
+      const close = settingsSurfaceClosers.current.get(surface.id); settingsSurfaceClosers.current.delete(surface.id);
+      if (close) void close(surface.id).catch(() => undefined);
+    }
+    else void controller.closeExtensionMainView(surface.id).catch(() => undefined);
+  }, [closeLibrary, controller, settings]);
 
   useEffect(() => {
     const request = ++requestRevision.current;
@@ -87,16 +106,26 @@ export function ExtensionMainViewPage({
     setFrameLoaded(false);
     setState({ phase: "loading" });
     void controller.getExtension(extensionId, undefined, abort.signal).then(async (catalog) => {
+      if (disposed || request !== requestRevision.current || liveOwnerRef.current !== controllerOwner || abort.signal.aborted) return;
       const extension = catalog.extensions[0];
-      if (extension === undefined || extension.id !== extensionId || !extensionMainViewReady(extension)) {
+      if (extension === undefined || extension.id !== extensionId || (settings
+        ? !extension.installed || !extension.settings || extension.owner.kind !== "resource" : !extensionMainViewReady(extension))) {
         if (!disposed && request === requestRevision.current) setState({ phase: "error", ...(extension === undefined ? {} : { extension }) });
         return;
       }
       if (!disposed && request === requestRevision.current) setState({ phase: "opening" });
-      const surface = await controller.openExtensionMainView(extension.id, extension.revision, abort.signal);
+      const api = settings ? controller.extensionSettingsApi() : undefined;
+      if (settings && !api) throw new Error("Plugin author settings are unavailable.");
+      settingsApi.current = api;
+      const surface = settings ? await api!.open(extension.id, extension.revision, abort.signal)
+        : await controller.openExtensionMainView(extension.id, extension.revision, abort.signal);
+      if (settings) settingsSurfaceClosers.current.set(surface.id, api!.close);
       if (disposed || request !== requestRevision.current || surface.extensionId !== extension.id) {
         releaseSurface(surface);
         return;
+      }
+      if (settings && (surface.purpose !== "settings" || surface.mobileSettings)) {
+        releaseSurface(surface); throw new Error("The plugin settings purpose changed.");
       }
       surfaceRef.current = surface;
       setFrameEndpoint(surface.endpoint);
@@ -105,15 +134,16 @@ export function ExtensionMainViewPage({
       if (!disposed && !abort.signal.aborted && request === requestRevision.current) setState({ phase: "error" });
     });
     const releaseOnPageHide = (): void => releaseSurface(surfaceRef.current);
-    window.addEventListener("pagehide", releaseOnPageHide);
+    const sourceWindow = ownerDocument.defaultView;
+    sourceWindow?.addEventListener("pagehide", releaseOnPageHide);
     return () => {
       disposed = true;
       requestRevision.current += 1;
       abort.abort();
-      window.removeEventListener("pagehide", releaseOnPageHide);
+      sourceWindow?.removeEventListener("pagehide", releaseOnPageHide);
       releaseSurface(surfaceRef.current);
     };
-  }, [controller, extensionId, releaseSurface, retryRevision]);
+  }, [controller, controllerOwner, extensionId, releaseSurface, retryRevision, settings, ownerDocument]);
 
   useEffect(() => {
     if (state.phase !== "ready") return undefined;
@@ -163,7 +193,7 @@ export function ExtensionMainViewPage({
       if (abort.signal.aborted || surfaceRef.current?.id !== state.surface.id) return;
       releaseSurface(state.surface); setFrameLoaded(false); setState({ phase: "error", extension: state.extension });
     };
-    const current = () => surfaceRef.current?.id === state.surface.id && controller.state.activeProfile?.id === profile?.id
+    const current = () => liveOwnerRef.current === controllerOwner && surfaceRef.current?.id === state.surface.id && controller.state.activeProfile?.id === profile?.id
       && controller.state.activeProfile?.serverId === profile?.serverId && controller.state.activeProfile?.endpointPublicKey === profile?.endpointPublicKey
       && controller.state.activeProfile?.origin === profile?.origin;
     let fetcher: typeof globalThis.fetch | undefined;
@@ -191,11 +221,12 @@ export function ExtensionMainViewPage({
     const bridge = bindExtensionViewClose(frame, () => surfaceRef.current?.id === expected && frameRef.current === frame && frame.isConnected);
     closeGuard.current = bridge.close;
     const unregister = registerCloseGuard?.(bridge.close);
-    return () => { if (closeGuard.current === bridge.close) closeGuard.current = async () => true; unregister?.(); bridge.dispose(); };
-  }, [state, frameRevision, ownerDocument, registerCloseGuard]);
+    const unregisterPage = embedded || settings ? undefined : registerExtensionPageClose(controller.state.activeProfile, extensionId, bridge.close);
+    return () => { if (closeGuard.current === bridge.close) closeGuard.current = async () => true; unregister?.(); unregisterPage?.(); bridge.dispose(); };
+  }, [state, frameRevision, ownerDocument, registerCloseGuard, embedded, extensionId, controller, settings]);
 
   useEffect(() => {
-    if (state.phase !== "ready" || state.extension.library === undefined || surfaceUrl === undefined) return undefined;
+    if (settings || state.phase !== "ready" || state.extension.library === undefined || surfaceUrl === undefined) return undefined;
     const frame = frameRef.current;
     if (frame === null) return undefined;
     const epoch = ++bridgeEpoch.current;
@@ -353,13 +384,63 @@ export function ExtensionMainViewPage({
       bridgeWindow.removeEventListener("message", onMessage);
       closeLibrary();
     };
-  }, [closeLibrary, controller, frameRevision, state, surfaceUrl, ownerDocument]);
+  }, [closeLibrary, controller, frameRevision, state, surfaceUrl, ownerDocument, settings]);
+
+  useEffect(() => {
+    const frame = frameRef.current, api = settingsApi.current, sourceWindow = ownerDocument.defaultView;
+    if (!settings || state.phase !== "ready" || state.surface.purpose !== "settings" || !frame || !api || !sourceWindow) return;
+    const profile = controller.state.activeProfile, seen = new Set<string>(), pending = new Set<AbortController>();
+    let closed = false, faulted = false, queue: Promise<unknown> = Promise.resolve();
+    const current = () => !closed && liveOwnerRef.current === controllerOwner && frameRef.current === frame && frame.isConnected && surfaceRef.current?.id === state.surface.id
+      && controller.state.activeProfile?.id === profile?.id && controller.state.activeProfile?.serverId === profile?.serverId
+      && controller.state.activeProfile?.origin === profile?.origin && controller.state.activeProfile?.endpointPublicKey === profile?.endpointPublicKey;
+    const listener = (event: MessageEvent) => {
+      if (!current() || ownerDocument.visibilityState === "hidden" || event.source !== frame.contentWindow || event.origin !== "null") return;
+      let size: number; try { size = JSON.stringify(event.data).length; } catch { return; }
+      if (size > 96 * 1024) return;
+      const request = parseExtensionSettingsBridgeRequest(event.data);
+      if (!request || seen.has(request.id) || seen.size >= 4096 || pending.size >= 16) return;
+      seen.add(request.id);
+      const respond = (ok: boolean, result?: unknown) => {
+        if (!current()) return;
+        const data = { type: "joko:extension-settings-response", version: 1, id: request.id, ok,
+          ...(ok ? { result } : { message: "Settings request could not be confirmed. Check its original operation before retrying." }) };
+        if (JSON.stringify(data, (_key, value: unknown) => typeof value === "bigint" ? value.toString(10) : value).length > 192 * 1024) throw new Error("Settings response exceeds its limit.");
+        frame.contentWindow?.postMessage(data, "*");
+      };
+      if (faulted) { respond(false); return; }
+      const abort = new AbortController(); pending.add(abort);
+      const timer = setTimeout(() => abort.abort(), request.command.kind === "oauth.connect" ? 310_000 : 60_000);
+      let dispatched = false;
+      const work = queue.then(async () => {
+        abort.signal.throwIfAborted(); if (!current() || faulted) throw new Error("Settings document retired."); dispatched = true;
+        return api.call(state.surface, request.command, {
+          locale: ownerDocument.documentElement.lang || "en",
+          confirm: async (title, body, signal) => {
+            if (!current() || signal.aborted || ownerDocument.visibilityState === "hidden") return false;
+            const accepted = sourceWindow.confirm(`${title}\n\n${body}`);
+            return accepted && current() && !signal.aborted;
+          },
+          authorize: async () => { throw new Error("Use the installed native account authorization flow."); },
+          openLibrary: async signal => { signal.throwIfAborted(); if (!current() || !settingsLibrary.current) throw new Error("Plugin Library is unavailable."); settingsLibrary.current(); }
+        }, abort.signal);
+      });
+      const stopped = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(new Error("Settings request retired.")), { once: true }));
+      const completion = Promise.race([work, stopped]); queue = completion.catch(() => undefined);
+      void completion.then(result => respond(true, result), () => {
+        if (dispatched && !["routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(request.command.kind)) faulted = true;
+        respond(false);
+      }).catch(() => { faulted = true; }).finally(() => { clearTimeout(timer); abort.abort(); pending.delete(abort); });
+    };
+    sourceWindow.addEventListener("message", listener);
+    return () => { closed = true; sourceWindow.removeEventListener("message", listener); for (const abort of pending) abort.abort(); };
+  }, [controller, frameRevision, ownerDocument, settings, state]);
 
   const extension = "extension" in state ? state.extension : undefined;
   const title = state.phase === "ready"
     ? state.surface.title ?? state.extension.mainView?.title ?? state.extension.name
     : extension?.mainView?.title ?? extension?.name ?? t("extensions.mainView.title");
-  const back = (): void => { void closeGuard.current().then(allowed => { if (allowed) controller.navigate({ kind: "tools", extensionId }); }); };
+  const back = (): void => controller.navigate({ kind: "tools", extensionId });
   const retry = (): void => setRetryRevision((value) => value + 1);
   const reload = (): void => {
     if (state.phase !== "ready") return;
@@ -464,5 +545,6 @@ export function sameExtensionMainViewSurface(left: ExtensionMainViewSurfaceView,
     && left.owner.resourceId === right.owner.resourceId && left.owner.resourceRevision === right.owner.resourceRevision
     && left.owner.discoveredRevision === right.owner.discoveredRevision && left.backendId === right.backendId
     && left.backendRevision === right.backendRevision && left.backendGeneration === right.backendGeneration
-    && left.expiresAt === right.expiresAt && left.title === right.title && left.icon === right.icon;
+    && left.expiresAt === right.expiresAt && left.title === right.title && left.icon === right.icon
+    && left.purpose === right.purpose && left.mobileSettings === right.mobileSettings;
 }

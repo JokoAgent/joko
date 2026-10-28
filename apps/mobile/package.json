@@ -69,6 +69,7 @@
     "expo-sharing": "57.0.16",
     "expo-status-bar": "57.0.1",
     "expo-updates": "57.0.18",
+    "expo-web-browser": "57.0.2",
     "highlight.js": "11.11.1",
     "katex": "0.16.47",
     "lucide-react-native": "0.468.0",

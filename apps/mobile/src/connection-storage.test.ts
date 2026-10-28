@@ -483,6 +483,22 @@ describe("current-v1 mobile connection storage", () => {
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
 
+  it("cold-restores a side chat's exact source receipt without carrying input or workspace authority", async () => {
+    const memory = drivers(), storage = createMobileStorage(memory.plain, memory.secure);
+    const receipt = { operationId: "side-chat-original", connectionId: first.connectionId, kind: "session-side-chat" as const,
+      sessionId: "source-task", backendId: "native", targetId: "source-project", sourceGeneration: "8", state: "unknown" as const };
+    await storage.savePending([receipt]);
+    const restarted = createMobileStorage(memory.plain, memory.secure);
+    await expect(restarted.loadPending()).resolves.toEqual([receipt]);
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      receipt, { ...receipt, operationId: "missing-source-generation", sourceGeneration: undefined },
+      { ...receipt, operationId: "missing-target", targetId: undefined },
+      { ...receipt, operationId: "wrong-workspace", workspaceId: "foreign-workspace" },
+      { ...receipt, operationId: "guest", taskJoinId: "foreign-join" }
+    ]));
+    await expect(restarted.loadPending()).resolves.toEqual([receipt]);
+  });
+
   it("round-trips body-free Automation receipts only with exact Schedule and trigger identities", async () => {
     const memory = drivers();
     const storage = createMobileStorage(memory.plain, memory.secure);

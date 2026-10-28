@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { ExtensionSettingsManager } from "./extension-settings.js";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
 import { createServerAccessConnectService } from './server-access-connect-service.js';
 import { TaskShareStore } from "@joko/store";
@@ -315,6 +316,7 @@ import {
 } from "./schedule-extensions.js";
 import { nextOccurrence, type ScheduleTiming } from "./scheduler.js";
 import { materializedSessionRuntimeState, SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
+import { validDraftId } from "./session-prewarm.js";
 import {
   configuredSessionRuntimeFallback,
   SESSION_RUNTIME_FALLBACK_DEFAULT_ENABLED,
@@ -566,6 +568,7 @@ export interface ConnectServiceDependencies {
   readonly extensionProjects?: ExtensionProjectPolicies;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
+  readonly extensionSettings?: ExtensionSettingsManager;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly piBackendIds?: ReadonlySet<string>;
@@ -1355,6 +1358,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.extensionProjects === undefined ? {} : { extensionProjects: application.extensionProjects }),
     ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
     ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
+    ...(application.extensionSettings === undefined ? {} : { extensionSettings: application.extensionSettings }),
     ...(application.extensionPackagePublisher === undefined ? {} : { extensionPackagePublisher: application.extensionPackagePublisher }),
     ...(application.extensionSources === undefined ? {} : { extensionSources: application.extensionSources }),
     piBackendIds: new Set(application.adapters
@@ -1525,6 +1529,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     application.messaging,
     (context) => ({ connectionId: authenticate(context).id }),
     {
+      ...(application.partnerMessaging ? { partnerRuntime: application.partnerMessaging } : {}),
       ...(dependencies.credentials === undefined ? {} : { credentials: dependencies.credentials }),
       ...(application.messagingCreateWeChatAuthorization === undefined
         ? {}
@@ -1549,7 +1554,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
     application.partnerSkills,
     application.partnerSessionTasks,
     application.partnerTaskOutputs,
-    application.partnerAutonomy
+    application.partnerAutonomy,
+    application.partnerTodos
   );
   const partnerRoutine = createPartnerRoutineConnectService(application.partnerRoutines, context => authenticate(context));
   const partnerGroup = createPartnerGroupConnectService(application.partnerGroups, application.store, context => authenticate(context),
@@ -4626,6 +4632,45 @@ export function createConnectServices(application: OrchestratorApplication, proj
         assertAuthorityCurrent
       }));
       return { surface: mapExtensionMainViewSurface(surface) };
+    },
+    openExtensionSettings: async (request, context) => {
+      const connection = authenticate(context);
+      if (!dependencies.extensionMainViews || !dependencies.extensionSettings || !request.expectedRevision) {
+        throw new ConnectError("Current plugin settings are unavailable.", Code.FailedPrecondition);
+      }
+      const authority = requireExtensionMainViewAuthority(dependencies, request.extensionId,
+        fromProtoRevision(request.expectedRevision, "open_extension_settings.expected_revision"), false, { mobile: request.mobile });
+      ensureExtensionSurfaceRevocation(connection.id);
+      const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.open({ authority, connectionId: connection.id,
+        assertAuthorityCurrent: () => { dependencies.connections.fence(connection); assertCurrentExtensionMainViewAuthority(dependencies, authority); } }));
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+      return { surface: mapExtensionMainViewSurface(surface) };
+    },
+    getExtensionSettingsRoutingData: async (request, context) => {
+      const connection = authenticate(context);
+      const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+      return { routingData: dependencies.extensionSettings!.read(surface) };
+    },
+    beginExtensionSecretCheck: async (request, context) => {
+      const connection = authenticate(context);
+      const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+      const ticket = dependencies.extensionSettings!.beginCheck(surface, request.secretKey, connection.id);
+      return { ticket: { ticketId: ticket.credentialUploadTicketId, maximumBytes: BigInt(ticket.maximumBytes), expiresAt: toProtoTimestamp(ticket.expiresAt),
+        relativeEndpoint: `/v1/credentials/upload/${encodeURIComponent(ticket.credentialUploadTicketId)}` } };
+    },
+    checkExtensionSecret: async (request, context) => {
+      const connection = authenticate(context);
+      const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
+      const assertCurrent = () => {
+        context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+        if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) throw new Error("Plugin settings document retired.");
+        assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
+      };
+      const result = await dependencies.extensionSettings!.check(surface, request.secretKey, request.credentialUploadTicketId, connection.id, context.signal, assertCurrent);
+      await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id); assertCurrent();
+      return { valid: result.valid, ...(result.expiresAt === undefined ? {} : { expiresAt: toProtoTimestamp(result.expiresAt) }) };
     },
     getExtensionMainViewSurface: async (request, context) => {
       const connection = authenticate(context);
@@ -11001,6 +11046,10 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
     }),
     useSupported: item.useSupported,
     ...(item.error === undefined ? {} : { error: item.error }),
+    ...(item.settings === undefined ? {} : { settings: create(contract.ExtensionSettingsDescriptorSchema, {
+      ...(item.settings.title === undefined ? {} : { title: item.settings.title }), height: item.settings.height ?? 360,
+      mobileCustom: item.settings.mobileHtml !== undefined
+    }) }),
     ...(item.mainView === undefined
       ? {}
       : {
@@ -11041,11 +11090,19 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
   });
 }
 
+async function requireExtensionSettingsSurface(dependencies: ConnectServiceDependencies, surfaceId: string, connectionId: string): Promise<NativeExtensionMainViewSurface> {
+  if (!dependencies.extensionMainViews || !dependencies.extensionSettings) throw new ConnectError("Plugin settings are unavailable.", Code.Unimplemented);
+  const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.getSurface(surfaceId, connectionId));
+  if (!surface.authority.settings) throw new ConnectError("This document does not own plugin settings.", Code.PermissionDenied);
+  return surface;
+}
+
 function requireExtensionMainViewAuthority(
   dependencies: ConnectServiceDependencies,
   extensionId: string,
   expectedExtensionRevision: bigint,
-  currentOnly = false
+  currentOnly = false,
+  settings?: { readonly mobile: boolean }
 ): NativeExtensionMainViewAuthority {
   if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
     throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
@@ -11053,9 +11110,9 @@ function requireExtensionMainViewAuthority(
   const extension = currentOnly
     ? requireCurrentExtensionMutation(dependencies, extensionId, expectedExtensionRevision)
     : requireExtensionMutation(dependencies, extensionId, expectedExtensionRevision);
-  if (extension.owner.kind !== "resource" || !extension.installed || !extension.enabled
-    || extension.mainView === undefined || !extension.sidebarSupported
-    || extension.setup.state !== "ready" && extension.setup.state !== "not_required") {
+  const declaration = settings ? extension.settings : extension.mainView;
+  if (extension.owner.kind !== "resource" || !extension.installed || declaration === undefined
+    || !settings && (!extension.enabled || !extension.sidebarSupported || extension.setup.state !== "ready" && extension.setup.state !== "not_required")) {
     throw new ConnectError("Extension main view is not ready.", Code.FailedPrecondition);
   }
   let resource: NativePiResourceDescriptor;
@@ -11064,17 +11121,25 @@ function requireExtensionMainViewAuthority(
   } catch (error) {
     throw new ConnectError(redactSecrets(error instanceof Error ? error.message : "Extension Resource not found."), Code.NotFound);
   }
+  const settingsDescriptor = settings && extension.settings ? {
+    html: extension.settings.html,
+    ...(extension.settings.mobileHtml === undefined ? {} : { mobileHtml: extension.settings.mobileHtml }),
+    ...(extension.settings.title === undefined ? {} : { title: extension.settings.title }),
+    ...(extension.settings.height === undefined ? {} : { height: extension.settings.height })
+  } : undefined;
   const matchingDetails = resource.resourceDetails.filter((detail) => detail.kind === "extension"
-    && detail.entryPath === extension.mainView?.extensionEntry
-    && detail.mainView?.html === extension.mainView?.html
+    && detail.entryPath === declaration.extensionEntry
+    && (settingsDescriptor ? detail.settings?.html === settingsDescriptor.html
+      && detail.settings?.mobileHtml === settingsDescriptor.mobileHtml && detail.settings?.title === settingsDescriptor.title
+      && detail.settings?.height === settingsDescriptor.height : detail.mainView?.html === extension.mainView?.html
     && detail.mainView?.title === extension.mainView?.title
     && detail.mainView?.icon === extension.mainView?.icon
     && detail.library?.schemaVersion === extension.library?.schemaVersion
-    && (detail.library === undefined) === (extension.library === undefined));
+    && (detail.library === undefined) === (extension.library === undefined)));
   if (resource.id !== extension.owner.resourceId || resource.versionNumber !== extension.owner.resourceVersion
     || resource.discoveredRevision !== extension.owner.discoveredRevision || resource.kind !== "package"
-    || resource.scope !== "managed" || resource.packageIdentity === undefined || !resource.enabled
-    || !["installed", "loaded", "update_available"].includes(resource.state) || matchingDetails.length !== 1
+    || resource.scope !== "managed" || resource.packageIdentity === undefined || !settings && !resource.enabled
+    || !(settings ? ["installed", "loaded", "disabled", "update_available"] : ["installed", "loaded", "update_available"]).includes(resource.state) || matchingDetails.length !== 1
     || extension.version !== resource.version) {
     throw new ConnectError("Extension main view does not have a current installed package authority.", Code.FailedPrecondition);
   }
@@ -11089,16 +11154,18 @@ function requireExtensionMainViewAuthority(
     discoveredRevision: resource.discoveredRevision,
     packageName: resource.packageIdentity,
     ...(resource.version === undefined ? {} : { packageVersion: resource.version }),
-    extensionEntry: extension.mainView.extensionEntry,
-    mainView: {
-      html: extension.mainView.html,
-      ...(extension.mainView.open === undefined ? {} : { open: extension.mainView.open }),
-      ...(extension.mainView.side === undefined ? {} : { side: extension.mainView.side }),
-      ...(extension.mainView.multiple === undefined ? {} : { multiple: extension.mainView.multiple }),
-      ...(extension.mainView.title === undefined ? {} : { title: extension.mainView.title }),
-      ...(extension.mainView.icon === undefined ? {} : { icon: extension.mainView.icon })
+    extensionEntry: declaration.extensionEntry,
+    mainView: settingsDescriptor ? { html: settings?.mobile ? settingsDescriptor.mobileHtml ?? settingsDescriptor.html : settingsDescriptor.html,
+      ...(settingsDescriptor.title === undefined ? {} : { title: settingsDescriptor.title }) } : {
+      html: extension.mainView!.html,
+      ...(extension.mainView!.open === undefined ? {} : { open: extension.mainView!.open }),
+      ...(extension.mainView!.side === undefined ? {} : { side: extension.mainView!.side }),
+      ...(extension.mainView!.multiple === undefined ? {} : { multiple: extension.mainView!.multiple }),
+      ...(extension.mainView!.title === undefined ? {} : { title: extension.mainView!.title }),
+      ...(extension.mainView!.icon === undefined ? {} : { icon: extension.mainView!.icon })
     },
-    ...(extension.library === undefined ? {} : { library: { schemaVersion: extension.library.schemaVersion } })
+    ...(settingsDescriptor === undefined ? {} : { settings: settingsDescriptor, ...(settings?.mobile ? { mobileSettings: true as const } : {}) }),
+    ...(settings || extension.library === undefined ? {} : { library: { schemaVersion: extension.library.schemaVersion } })
   };
 }
 
@@ -11110,7 +11177,8 @@ function assertCurrentExtensionMainViewAuthority(
     dependencies,
     expected.extensionId,
     dependencies.extensionCatalog!.get(expected.extensionId).revision,
-    true
+    true,
+    expected.settings === undefined ? undefined : { mobile: expected.mobileSettings === true }
   );
   if (current.extensionId !== expected.extensionId || current.resourceId !== expected.resourceId
     || current.backendId !== expected.backendId || current.backendRevision !== expected.backendRevision
@@ -11121,6 +11189,7 @@ function assertCurrentExtensionMainViewAuthority(
     || current.mainView.icon !== expected.mainView.icon
     || current.mainView.open !== expected.mainView.open || current.mainView.side !== expected.mainView.side
     || current.mainView.multiple !== expected.mainView.multiple
+    || JSON.stringify(current.settings) !== JSON.stringify(expected.settings) || current.mobileSettings !== expected.mobileSettings
     || current.library?.schemaVersion !== expected.library?.schemaVersion
     || (current.library === undefined) !== (expected.library === undefined)) throw new Error("Extension main-view authority changed.");
 }
@@ -12565,7 +12634,8 @@ function mapExtensionMainViewSurface(surface: NativeExtensionMainViewSurface): c
     expiresAt: toProtoTimestamp(surface.expiresAt),
     backendId: surface.authority.backendId,
     backendRevision: toProtoRevision(surface.authority.backendRevision),
-    backendGeneration: BigInt(surface.authority.backendGeneration)
+    backendGeneration: BigInt(surface.authority.backendGeneration),
+    settings: surface.authority.settings !== undefined, mobileSettings: surface.authority.mobileSettings === true
   });
 }
 
@@ -16635,7 +16705,14 @@ async function dispatchMutation(
         }
       }
       const nestedId = nestedOperationId(payload.case, operationId);
-      const sessionId = stableId("session", nestedId);
+      const provisionalDraftId = payload.value.provisionalDraftId || undefined;
+      const reuseProvisionalSessionId = payload.value.reuseProvisionalSessionId || undefined;
+      if (provisionalDraftId !== undefined && !validDraftId(provisionalDraftId)
+        || reuseProvisionalSessionId !== undefined && provisionalDraftId === undefined
+        || provisionalDraftId !== undefined && (nativeStart?.case === "attach" || nativeStart?.case === "clone" || nativeStart?.case === "fork" || payload.value.useWorktree || catalogImport !== undefined)) {
+        throw invalidArgument("The provisional task draft identity or native start is invalid.");
+      }
+      const sessionId = reuseProvisionalSessionId ?? stableId("session", nestedId);
       const outcome = { accepted: true, resultCase: "session", entityId: sessionId } satisfies OperationOutcome;
       if (nativeStart?.case === "clone" || nativeStart?.case === "fork") {
         const sourceId = nativeStart.value.sourceProductSessionId;
@@ -16696,6 +16773,8 @@ async function dispatchMutation(
               connection,
               targetId: payload.value.targetId,
               title: payload.value.displayName || "New task",
+              ...(provisionalDraftId === undefined ? {} : { provisionalDraftId }),
+              ...(reuseProvisionalSessionId === undefined ? {} : { reuseProvisionalSessionId }),
               ...(model?.model?.providerId === undefined ? {} : { providerId: model.model.providerId }),
               ...(model?.model?.modelId === undefined ? {} : { modelId: model.model.modelId }),
               ...(model?.effortId === undefined || model.effortId === "" ? {} : { effort: model.effortId }),
@@ -16737,6 +16816,13 @@ async function dispatchMutation(
     }
     case "resumeSession":
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.resume(payload.value.sessionId).then(() => undefined));
+    case "prewarmSession": {
+      const expected = mutation.preconditions.find(value => value.entity?.kind === contract.EntityKind.SESSION && value.entity.id === payload.value.sessionId)?.expectedGeneration;
+      if (expected === undefined || expected < 1n || expected > BigInt(Number.MAX_SAFE_INTEGER)) throw invalidArgument("Agent prewarm requires the original Session generation.");
+      return ackOperation(dependencies, operationId, connection, mutation, payload.case,
+        () => host.prewarmSession(payload.value.sessionId, connection, payload.value.provisionalDraftId, Number(expected)),
+        store => validatePreconditions(store, mutation));
+    }
     case "detachSession":
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.detach(payload.value.sessionId));
     case "closeSession":
@@ -17040,6 +17126,7 @@ async function dispatchMutation(
     }
     case "deleteSession": {
       const existing = dependencies.store.getSession(payload.value.sessionId);
+      if (payload.value.provisionalDraftId) host.assertProvisionalDiscard(payload.value.sessionId, connection, payload.value.provisionalDraftId);
       if (readPersonalDevelopmentPurpose(dependencies.store, payload.value.sessionId) !== undefined) {
         if (dependencies.assertPersonalDevelopmentLocalConnection === undefined) throw new ConnectError("A local Desktop connection is required.", Code.PermissionDenied);
         dependencies.assertPersonalDevelopmentLocalConnection(connection);
@@ -17053,6 +17140,7 @@ async function dispatchMutation(
           body: mutation,
           sessionLifecycleFenceId: payload.value.sessionId,
           effect: async () => {
+            if (payload.value.provisionalDraftId) host.assertProvisionalDiscard(payload.value.sessionId, connection, payload.value.provisionalDraftId);
             let cleanup = dependencies.store.findSessionLifecycleCleanup(operationId)
               ?? dependencies.store.prepareSessionLifecycleCleanup({
                 operationId,
@@ -21633,6 +21721,38 @@ async function dispatchMutation(
         ),
         async () => { dependencies.extensionPackagePublisher!.abort(exportId); }
       );
+    }
+    case "setExtensionSettingsRoutingData": {
+      if (!payload.value.expectedRevision) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "extension_settings.expected_revision");
+      const surface = await requireExtensionSettingsSurface(dependencies, payload.value.surfaceId, connection.id);
+      if (surface.extensionId !== payload.value.extensionId) throw invalidArgument("Settings document belongs to another plugin.");
+      dependencies.extensionSettings!.validateRoutingData(payload.value.dataJson);
+      return presented(await host.mutate({ operationId, connection, kind: payload.case, body: mutation,
+        commit: () => {
+          dependencies.connections.fence(connection); requireCurrentExtensionMutation(dependencies, surface.extensionId, expectedRevision);
+          if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) throw new Error("Plugin settings document retired.");
+          assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
+          dependencies.extensionSettings!.write(surface, payload.value.expectedRoutingRevision, payload.value.dataJson);
+          return { accepted: true, resultCase: "acknowledgement", entityId: surface.extensionId } satisfies OperationOutcome;
+        } }));
+    }
+    case "clearExtensionSetupCredential": {
+      if (!payload.value.expectedRevision) throw invalidArgument("expected_revision is required");
+      const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "extension_settings.expected_revision");
+      const surface = await requireExtensionSettingsSurface(dependencies, payload.value.surfaceId, connection.id);
+      if (surface.extensionId !== payload.value.extensionId) throw invalidArgument("Settings document belongs to another plugin.");
+      const assertCurrent = () => {
+        dependencies.connections.fence(connection); requireCurrentExtensionMutation(dependencies, surface.extensionId, expectedRevision);
+        if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) throw new Error("Plugin settings document retired.");
+        assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
+      };
+      assertCurrent();
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case,
+        { accepted: true, resultCase: "acknowledgement", entityId: surface.extensionId }, async () => {
+          assertCurrent(); await dependencies.extensionCatalog!.clearSetupCredential(surface.extensionId, payload.value.fieldId, expectedRevision, assertCurrent);
+          reconcileExtensionCatalog(dependencies);
+        });
     }
     case "setExtensionEnabled": {
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");

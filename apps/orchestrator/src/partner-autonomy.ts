@@ -40,6 +40,7 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
   #timer: ReturnType<typeof setInterval> | undefined; #scheduled: ReturnType<typeof setTimeout> | undefined;
   #unsubscribe: (() => void) | undefined; #sweeping = false; #closed = true; #startedAt = 0;
   readonly #snapshots = new Map<string, GlanceSnapshot>(); readonly #lastWoken = new Map<string, number>();
+  readonly #completed = new Map<string, { readonly at: number; readonly sessionId: string; readonly creatorPartnerId?: string; readonly canonicalPartnerId?: string }>();
   constructor(readonly options: { readonly store: OperationalStore; readonly profiles: PartnerStore; readonly partners: PartnerManager;
     readonly routines: PartnerRoutineManager; readonly tasks: PartnerSessionTaskManager; readonly now?: () => number }) {}
   #now(): number { return (this.options.now ?? Date.now)(); }
@@ -80,7 +81,16 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
     this.#closed = false; this.#startedAt = this.#now();
     this.options.routines.engine.registerSource({ id: PARTNER_HOST_SOURCE, name: "Joko tasks", status: "listening",
       events: TYPES.map(type => ({ type, name: type, fields: ["sessionId", "generation", "runId", "phase", "minutes", "creatorPartnerId", "followerPartnerId"] })) });
-    this.#unsubscribe = this.options.store.subscribe(() => this.refresh());
+    this.#unsubscribe = this.options.store.subscribe(event => {
+      if (event.payload.type === "run_state" && event.payload.state === "completed" && event.sessionId && event.runId) {
+        const run = this.options.store.findRun(event.runId)?.descriptor, session = this.options.store.getSession(event.sessionId).descriptor;
+        if (run?.source !== "schedule" && event.generation === session.binding.generation) {
+          const link = this.options.profiles.getSessionLink(event.sessionId), creatorPartnerId = this.#creators().get(event.sessionId);
+          if (link?.role !== "canonical") this.#completed.set(event.runId, { at: event.emittedAt, sessionId: event.sessionId, ...(creatorPartnerId ? { creatorPartnerId } : {}) });
+        }
+      }
+      this.refresh();
+    });
     this.#timer = setInterval(() => { void this.sweep().catch(() => this.#diagnose()); }, 30_000); this.#timer.unref?.();
     await this.sweep();
   }
@@ -88,6 +98,7 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
     this.#closed = true; this.#unsubscribe?.(); this.#unsubscribe = undefined;
     clearInterval(this.#timer); clearTimeout(this.#scheduled); this.#timer = this.#scheduled = undefined;
     this.#snapshots.clear(); this.#lastWoken.clear();
+    this.#completed.clear();
   }
   refresh(): void {
     if (this.#closed || this.#scheduled) return;
@@ -157,13 +168,15 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
         else if (event.payload.type === "tool_result") toolCalls.delete(event.payload.callId);
       }
       const creatorPartnerId = creators.get(session.id), canonicalPartnerId = canonical.get(session.id), remote = session.remoteWorkspace;
+      const phaseSince = interaction?.createdAt ?? run.endedAt ?? run.startedAt ?? run.createdAt;
+      if (phase === "finished" && this.#now() - phaseSince > 15 * 60_000) return [];
       const isShared = shared.has(session.id), follower = remote || isShared ? undefined : this.#follower(creatorPartnerId, settings);
       const followerPartnerId = follower === canonicalPartnerId ? undefined : follower;
       const question = interaction?.payload.kind === "question" ? compact(interaction.payload.prompt, 140)
         : interaction?.payload.kind === "permission" ? compact(interaction.payload.title, 140)
           : phase === "errored" ? compact(run.error?.message ?? "Task execution outcome is unavailable.", 140) : undefined;
       return [{ sessionId: session.id, generation: session.binding.generation, targetId: session.targetId, title: session.title,
-        phase, phaseSince: interaction?.createdAt ?? run.endedAt ?? run.startedAt ?? run.createdAt,
+        phase, phaseSince,
         ...(run.startedAt === undefined ? {} : { startedAt: run.startedAt }), ...(question ? { question } : {}),
         ...(interaction ? { interactionId: interaction.id } : {}), ...(creatorPartnerId ? { creatorPartnerId } : {}),
         ...(canonicalPartnerId ? { canonicalPartnerId } : {}), ...(followerPartnerId ? { followerPartnerId } : {}),
@@ -203,20 +216,20 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
     this.#sweeping = true;
     try {
       const now = this.#now();
+      for (const [runId, completed] of this.#completed) {
+        const key = `done.${hash(runId)}`;
+        if (!this.options.store.findSetting("service", SETTINGS_SCOPE, key)) this.options.store.setSetting("service", SETTINGS_SCOPE, key, completed);
+        this.#completed.delete(runId);
+      }
       for (const partner of this.options.partners.listPartners("active")) {
         try { this.#partner(partner.id, true); await this.options.routines.engine.ensureBuiltin(partner.id, followUpInput(partner.id), followUpId(partner.id), FOLLOW_UP_VERSION); }
         catch { /* Other Partners keep observing; this owner will be retried. */ }
       }
       if (this.#closed) return;
       for (const row of this.observe()) {
-        if (row.phase === "finished" && !row.canonicalPartnerId && row.source !== "schedule") {
-          const key = `done.${hash(row.runId)}`;
-          if (!this.options.store.findSetting("service", SETTINGS_SCOPE, key)) this.options.store.setSetting("service", SETTINGS_SCOPE, key,
-            { at: row.phaseSince, sessionId: row.sessionId, creatorPartnerId: row.creatorPartnerId });
-        }
         const type = dueEvent(row, now);
         if (!type || !row.followerPartnerId) continue;
-        const eventId = `${type}:${row.sessionId}:${row.generation}:${row.phaseSince}`, key = `event.${hash(eventId)}`;
+        const eventId = `${type}:${hash(JSON.stringify([row.sessionId, row.generation, row.runId, row.phaseSince, row.interactionId ?? ""]))}`, key = `event.${hash(eventId)}`;
         if (this.options.store.findSetting("service", SETTINGS_SCOPE, key)) continue;
         const occurrences = this.options.store.listSettingsByKeyPrefix("service", SETTINGS_SCOPE, "event.").filter(item => {
           const value = item.value as { at: number; sessionId: string; type: string };

@@ -250,6 +250,7 @@ type JokoDesktopCapability =
   | "projects.directoryPicker"
   | "extension.windows"
   | "inspector.detach"
+  | "inspector.tabs"
   | "layout.reset"
   | "microphone.lifecycle"
   | "native.taskStatus"

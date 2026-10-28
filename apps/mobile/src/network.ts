@@ -3,6 +3,8 @@ import { encodeModelSpeed } from "@joko/contracts";
 import { readSessionArchivePreview, type SessionArchivePreview } from "@joko/contracts";
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
 import { readMobileExtensionMainViewResource } from "./mobile-extension-main-view-resource";
+import { projectMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
+import { ExtensionOAuthService, ExtensionNetworkService, type CredentialUploadTicket } from "@joko/contracts";
 import type { MobileConnectionProfile } from "./connection-storage";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
@@ -26,7 +28,8 @@ import { MobilePartnerCreationRejected, projectMobilePartnerCreationOptions, pro
   type MobilePartnerCreationOptions, type MobilePartnerCreationDraft, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import { createConnectTransport, createConnectionFetch, rememberEndpointTrust, trustedEndpointPublicKey } from "@joko/connection-transport";
 import { assertTrustedEndpointServerId, endpointTransportForNewDevice, formatTrustedNodeInvitation, irohTransportForRecipient, isLoopbackEndpoint, normalizeEndpointPublicKey, pairingVerificationOrigin, requireIrohRelayInvitationRequest, trustedEndpointTransport, trustedEndpointTransportKind, type NewDeviceAuthorizationOptions, type NodePairingInvitation, type EndpointTransportKind } from "@joko/connection-transport/trust";
-import { createPartnerRoutineApi, PartnerRoutineService, type PartnerRoutineApi, createPartnerImportApi, PartnerImportService, type PartnerImportApi } from "@joko/contracts";
+import { createPartnerRoutineApi, PartnerRoutineService, type PartnerRoutineApi, createPartnerImportApi, PartnerImportService, type PartnerImportApi,
+  createPartnerAutonomyApi, type PartnerAutonomyApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService, type PartnerHomeApi } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService, type PartnerGroupApi } from "@joko/contracts";
 import { createMobilePartnerNetworkApi, type MobilePartnerNetworkApi } from "./mobile-partner-network";
@@ -298,6 +301,7 @@ export interface MobileNetwork {
     assertCurrent: (signal: AbortSignal) => void): PartnerSkillsApi;
   partnerRoutineApi?(credential: PairedCredential, partnerId: string, ownerKey: string,
     newRequestId: () => string, assertCurrent: (signal: AbortSignal) => void): PartnerRoutineApi;
+  partnerAutonomyApi?(credential: PairedCredential, ownerKey: string, newOperationId: () => string, assertCurrent: (signal: AbortSignal) => void): PartnerAutonomyApi;
   partnerGroupApi?(credential: PairedCredential, ownerKey: string, newRequestId: () => string,
     assertCurrent: (signal: AbortSignal) => void): PartnerGroupApi;
   partnerNetworkApi?(credential: PairedCredential, ownerKey: string, assertCurrent: (signal: AbortSignal) => void): MobilePartnerNetworkApi;
@@ -337,8 +341,15 @@ export interface MobileNetwork {
   controlPartnerSessionTask?(credential: PairedCredential, requestId: string, partnerId: string, partnerRevision: bigint, task: PartnerSessionTaskView,
     action: "pause" | "resume" | "cancel", signal?: AbortSignal): Promise<PartnerSessionTaskView>;
   listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
+  browseExtensions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
+  getExtensionPackagePreview?(credential: PairedCredential, expected: MobileExtension, backendId: string,
+    signal?: AbortSignal): Promise<MobileExtensionPackagePreview>;
   getExtension(credential: PairedCredential, extensionId: string, signal?: AbortSignal): Promise<MobileExtension>;
   extensionTaskApi?(credential: PairedCredential): import("@connectrpc/connect").Client<typeof ExtensionTaskService>;
+  extensionSettingsApi?(credential: PairedCredential): import("@connectrpc/connect").Client<typeof ExtensionService>;
+  extensionOAuthApi?(credential: PairedCredential): import("@connectrpc/connect").Client<typeof ExtensionOAuthService>;
+  extensionConnectionsApi?(credential: PairedCredential): import("@connectrpc/connect").Client<typeof ExtensionNetworkService>;
+  uploadPrivateExtensionInput?(credential: PairedCredential, ticket: CredentialUploadTicket, value: string, signal: AbortSignal): Promise<string>;
   getExtensionForRuntime(
     credential: PairedCredential,
     extensionId: string,
@@ -1986,6 +1997,9 @@ export const mobileNetwork: MobileNetwork = {
     return createPartnerRoutineApi({ rpc: createClient(PartnerRoutineService, credentialTransport(credential)),
       partnerId, ownerKey, newRequestId, assertCurrent });
   },
+  partnerAutonomyApi(credential, ownerKey, newOperationId, assertCurrent) {
+    return createPartnerAutonomyApi({ rpc: createClient(PartnerService, credentialTransport(credential)), ownerKey, newOperationId, assertCurrent });
+  },
   mcpAppApi(credential, ownerKey) {
     const current = credentialTransport(credential);
     const metadata = createClient(McpAppService, current), native = createClient(McpAppNativeService, current);
@@ -2313,6 +2327,23 @@ export const mobileNetwork: MobileNetwork = {
     }, requestSignal);
   },
   extensionTaskApi(credential) { return createClient(ExtensionTaskService, credentialTransport(credential)); },
+  extensionSettingsApi(credential) { return createClient(ExtensionService, credentialTransport(credential)); },
+  extensionOAuthApi(credential) { return createClient(ExtensionOAuthService, credentialTransport(credential)); },
+  extensionConnectionsApi(credential) { return createClient(ExtensionNetworkService, credentialTransport(credential)); },
+  async uploadPrivateExtensionInput(credential, ticket, value, signal) {
+    signal.throwIfAborted();
+    const bytes = new TextEncoder().encode(value);
+    try {
+      const expiry = ticket.expiresAt ? Number(ticket.expiresAt.seconds) * 1000 + Math.floor(ticket.expiresAt.nanos / 1_000_000) : 0;
+      if (!validExtensionSetupIdentity(ticket.ticketId) || bytes.byteLength === 0 || bytes.byteLength > 64 * 1024
+        || BigInt(bytes.byteLength) > ticket.maximumBytes || !Number.isSafeInteger(expiry) || expiry <= Date.now()) throw new Error("The private plugin input channel is unavailable.");
+      const endpoint = authorizedExtensionCredentialEndpoint(credential.origin, ticket.relativeEndpoint);
+      const response = await createConnectionFetch(credential)(endpoint, { method: "PUT", body: bytes, signal, cache: "no-store",
+        headers: { authorization: `Bearer ${credential.authKey}`, "content-type": "text/plain; charset=utf-8" } });
+      signal.throwIfAborted(); if (!response.ok) throw new Error("The private plugin input could not be uploaded.");
+      await response.body?.cancel(); return ticket.ticketId;
+    } finally { bytes.fill(0); }
+  },
   async getExtension(credential, extensionId, signal) {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
     const response = await createClient(ExtensionService, credentialTransport(credential))
@@ -2323,8 +2354,28 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("The Joko node returned a mismatched Extension detail.");
     }
     const extension = projectMobileExtension(response.extension);
-    if (!extension.installed) throw new Error("The selected Extension is no longer installed on this Joko node.");
     return extension;
+  },
+  async browseExtensions(credential, signal) {
+    const client = createClient(ExtensionService, credentialTransport(credential));
+    return collectMobileExtensionCatalog(async (pageToken, catalogSignal) => {
+      const response = await client.listExtensions({ query: "", page: { pageSize: 500, pageToken } }, options(catalogSignal));
+      catalogSignal.throwIfAborted();
+      const total = response.page?.totalSize;
+      if (!response.catalogRevision || !response.page || total === undefined || total > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error("The Joko node returned invalid Extension catalog metadata.");
+      }
+      return { revision: response.catalogRevision.value, recoveredFromCorruption: response.recoveredFromCorruption,
+        extensions: response.extensions, nextPageToken: response.page.nextPageToken, totalSize: Number(total) };
+    }, signal ?? new AbortController().signal);
+  },
+  async getExtensionPackagePreview(credential, expected, backendId, signal) {
+    const response = await createClient(ExtensionService, credentialTransport(credential)).getExtensionPackagePreview({
+      extensionId: expected.extensionId, expectedRevision: { value: expected.revision }, backendId
+    }, options(signal));
+    signal?.throwIfAborted();
+    if (!response.preview) throw new Error("The Joko node returned an empty Extension package preview.");
+    return projectMobileExtensionPackagePreview(response.preview, expected, backendId);
   },
   async getExtensionForRuntime(credential, extensionId, sessionId, signal) {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");

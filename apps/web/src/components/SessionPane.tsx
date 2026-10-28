@@ -69,6 +69,9 @@ import { collectConversationMarkdown, ConversationMarkdownError } from "../conve
 import { writeClipboardText } from "../clipboard-action.js";
 import { modelSourceAccess } from "../model-source-access.js";
 import { randomUuid } from "../web-crypto.js";
+import { normalizePendingSideChatDraft } from "../local-state.js";
+import { recoverSideChatDraft } from "../side-chat-draft-recovery.js";
+import type { PendingSideChatDraft } from "../model.js";
 import { requireStartedSkillLearningRun } from "../skill-learning-command.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
@@ -241,6 +244,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const exportDownload = useArtifactDownload(session.id, controller.exportSession);
   const partnerConversation = usePartnerConversation();
   const partnerRuntimeLocked = partnerConversation?.kind !== "task";
+  const sideChatRuntimeReadOnly = session.derivationOrigin?.sideChat === true && session.worktree === undefined;
+  const nativeRuntimeLocked = partnerRuntimeLocked || sideChatRuntimeReadOnly;
   const timelineResourceOwnerKey = useMemo(() => randomUuid(), [controller.getArtifactUrl, controller.releaseArtifactUrl, controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, session.id, workspace?.id]);
   const timelineResourceOwnerRef = useRef<string | undefined>(undefined);
   useLayoutEffect(() => {
@@ -265,6 +270,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [bottomInset, setBottomInset] = useState(0);
   const [composerMessageMentionInsertion, setComposerMessageMentionInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly mention: NonNullable<ReturnType<typeof createMessageComposerMention>> }>();
   const [composerSelectionQuoteInsertion, setComposerSelectionQuoteInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft }>();
+  const [sideChatRecovery, setSideChatRecovery] = useState<{ readonly record: PendingSideChatDraft; readonly state: "pending" | "working" | "failed" | "existing"; readonly error?: string; readonly canStartAgain?: boolean }>();
+  const [sideChatRecoveryLoadError, setSideChatRecoveryLoadError] = useState<string>();
+  const [sideChatRecoveryReload, setSideChatRecoveryReload] = useState(0);
   const [composerAttachmentInsertion, setComposerAttachmentInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly file: File }>();
   const [composerDraftReplacement, setComposerDraftReplacement] = useState<{ readonly id: number; readonly sessionId: string; readonly text: string; readonly editorDocument?: import("@tiptap/core").JSONContent; readonly attachments?: readonly AttachmentDraft[] }>();
   const [shareSelection, setShareSelection] = useState<ActiveShareSelection>();
@@ -489,17 +497,17 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       return { sessionId: session.id, value };
     });
   }, [session.id]);
-  const canCompact = !reviewReadOnly && backend?.capabilities.get("context.compact")?.supported === true;
+  const canCompact = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("context.compact")?.supported === true;
   const canReportSessionUsage = backend?.capabilities.get("context.usage")?.supported === true;
   const effectiveSessionUsage = statisticsUsage?.sessionId === session.id
     ? statisticsUsage.usage
     : session.usage;
   const canAcknowledgeSessionAttention = backend?.capabilities.get("session.attention")?.supported === true;
   const displayBranch = codeHostDisplayBranch(workspace, session.codeHostPullRequests);
-  const canExport = !reviewReadOnly && backend?.capabilities.get("session.export")?.supported === true;
+  const canExport = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("session.export")?.supported === true;
   const canDeriveWorkspace = session.worktree === undefined
     || backend?.capabilities.get("workspace.derive")?.supported === true;
-  const canClone = !reviewReadOnly && canDeriveWorkspace
+  const canClone = !reviewReadOnly && !sideChatRuntimeReadOnly && canDeriveWorkspace
     && backend?.capabilities.get("session.clone")?.supported === true;
   const canExportPortable = onExportPortableSession !== undefined
     && portableSessionExportSupported(session, controller.state.snapshot);
@@ -507,7 +515,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     (candidate) => !candidate.archived && candidate.remoteWorkspace === undefined
   );
   const canAddMessageReference = !reviewReadOnly && backend?.capabilities.get("input.text")?.supported === true;
-  const canForkMessage = !reviewReadOnly && canDeriveWorkspace
+  const canForkMessage = !reviewReadOnly && !sideChatRuntimeReadOnly && canDeriveWorkspace
     && backend?.capabilities.get("session.fork")?.supported === true;
   const canOpenSideChat = !guest && !reviewReadOnly && !session.archived && session.derivationOrigin?.sideChat !== true
     && (partnerConversation === undefined || partnerConversation.kind === "task")
@@ -569,12 +577,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const canAbort = backend?.capabilities.get("turn.abort")?.supported === true;
   const canAbortRetry = backend?.capabilities.get("context.auto_retry")?.supported === true;
   const canStop = session.state === "retrying" ? canAbortRetry && activeRetry?.source === "auto" : canAbort;
-  const canSwitchModel = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.switch")?.supported === true;
-  const canSetEffort = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.effort")?.supported === true;
-  const canSetFast = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.fast_mode")?.supported === true;
+  const canSwitchModel = !reviewReadOnly && !nativeRuntimeLocked && backend?.capabilities.get("model.switch")?.supported === true;
+  const canSetEffort = !reviewReadOnly && !nativeRuntimeLocked && backend?.capabilities.get("model.effort")?.supported === true;
+  const canSetFast = !reviewReadOnly && !nativeRuntimeLocked && backend?.capabilities.get("model.fast_mode")?.supported === true;
   const allowedPermissions = advertisedPermissionModes(backend);
-  const canSetPermission = !reviewReadOnly && !partnerRuntimeLocked && permissionChangeSupported(backend);
-  const canListRuntimeCommands = !reviewReadOnly && backend?.capabilities.get("runtime.commands")?.supported === true;
+  const canSetPermission = !reviewReadOnly && !nativeRuntimeLocked && permissionChangeSupported(backend);
+  const canListRuntimeCommands = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("runtime.commands")?.supported === true;
   const objectiveAccess = guest ? "hidden" : objectiveSessionAccess(session, backend, {
     connected: controller.state.connectionState === "connected",
     reviewReadOnly,
@@ -609,7 +617,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     && controller.state.connectionState === "connected"
     && backend?.capabilities.get("input.mention")?.supported === true
     && backend.capabilities.get("input.mention")?.options.includes("artifact") === true;
-  const canSetPlanMode = !reviewReadOnly && !partnerRuntimeLocked && planModeSupported(backend);
+  const canSetPlanMode = !reviewReadOnly && !nativeRuntimeLocked && planModeSupported(backend);
   const canContactOwner = controller.state.activeProfile !== undefined && controller.state.snapshot.revision > 0n;
   const canListSubagents = backend?.capabilities.get("subagents.list")?.supported === true
     && backend.capabilities.get("subagents.detail")?.supported === true;
@@ -771,8 +779,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const currentShareSelection = shareSelection?.sessionId === session.id ? shareSelection : undefined;
   const queuedMessageWork = queue.some((item) => item.sessionId === session.id && !["completed", "cancelled", "failed"].includes(item.state));
   const messageActionsIdle = session.state === "idle" && !queuedMessageWork;
-  const messageRewindSupported = !reviewReadOnly && messageActionsIdle && backend?.capabilities.get("session.rewind")?.supported === true;
-  const messageDeleteSupported = !reviewReadOnly && backend?.capabilities.get("session.message_delete")?.supported === true;
+  const messageRewindSupported = !reviewReadOnly && !sideChatRuntimeReadOnly && messageActionsIdle && backend?.capabilities.get("session.rewind")?.supported === true;
+  const messageDeleteSupported = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("session.message_delete")?.supported === true;
   const messageDeleteBlockedReason = messageActionsIdle && activeCompaction === undefined && interaction === undefined
     ? undefined
     : t("timeline.deleteMessageBusy");
@@ -1395,18 +1403,78 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     if (!canOpenSideChat) return;
     const owner = beginDerivedTaskAction();
     const sourceSessionId = session.id, sourceGeneration = session.generation;
-    const open = controller.openSideChat, save = controller.saveDraft;
+    const sourceApi = controller;
     runAction(`side-chat:${sourceSessionId}`, async () => {
-      const child = await open(sourceSessionId, sourceGeneration);
+      if (!sourceApi.readPendingSideChat || !sourceApi.savePendingSideChat) throw new Error(t("session.sideChatRecoveryUnavailable"));
+      const previous = await sourceApi.readPendingSideChat(sourceSessionId);
       if (!owner.isCurrent()) return;
-      if (quote !== undefined) {
-        const editorDocument = appendQuoteToComposerDocument(undefined, quote);
-        await save(child, { text: composerDocumentPlainText(editorDocument), editorDocument,
-          attachments: [], mentions: [], deliveryMode: "prompt" });
+      if (previous) { setSideChatRecovery({ record: previous, state: "pending" }); throw new Error(t("session.sideChatCheckOriginal")); }
+      const record = normalizePendingSideChatDraft({ operationId: randomUuid(), sourceSessionId, sourceGeneration: sourceGeneration.toString(),
+        backendId: session.backendId, targetId: session.targetId, ...(quote === undefined ? {} : { quote }) });
+      if (!record) throw new Error(t("session.sideChatRecoveryUnavailable"));
+      if (!await sourceApi.savePendingSideChat(sourceSessionId, undefined, record)) throw new Error(t("session.sideChatCheckOriginal"));
+      if (!owner.isCurrent()) return;
+      setSideChatRecovery({ record, state: "working" });
+      try {
+        const result = await recoverSideChatDraft(sourceApi, record, { isCurrent: owner.isCurrent, dispatch: true });
         if (!owner.isCurrent()) return;
+        if (result.state === "adopted") {
+          setSideChatRecovery(undefined);
+          if (onSideChatOpened !== undefined) onSideChatOpened(sourceSessionId, result.sessionId);
+          else controller.navigate({ kind: "session", sessionId: result.sessionId });
+        } else if (result.state === "stale") setSideChatRecoveryReload(value => value + 1);
+        else setSideChatRecovery({ record, state: result.state, ...(result.state === "failed" ? { error: result.error, canStartAgain: !result.stateMayHaveChanged } : {}) });
+      } catch (error) {
+        if (owner.isCurrent()) setSideChatRecovery({ record, state: "pending", error: error instanceof Error ? error.message : t("session.sideChatCheckOriginal") });
+        throw error;
       }
-      if (onSideChatOpened !== undefined) onSideChatOpened(sourceSessionId, child);
-      else controller.navigate({ kind: "session", sessionId: child });
+    });
+  };
+
+  useEffect(() => {
+    setSideChatRecovery(undefined); setSideChatRecoveryLoadError(undefined);
+    if (!controller.readPendingSideChat || guest || reviewReadOnly) return;
+    let retired = false;
+    void controller.readPendingSideChat(session.id).then(record => {
+      if (!retired && record) setSideChatRecovery({ record, state: "pending" });
+    }).catch(error => { if (!retired) setSideChatRecoveryLoadError(error instanceof Error ? error.message : t("session.sideChatRecoveryUnavailable")); });
+    return () => { retired = true; };
+  }, [controller.readPendingSideChat, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.connectionGeneration,
+    session.id, session.generation, guest, reviewReadOnly, sideChatRecoveryReload]);
+
+  const checkSideChatRecovery = (appendToExisting = false, dispatch = false, startAgain = false): void => {
+    const pending = sideChatRecovery;
+    if (!pending || pending.state === "working") return;
+    const owner = beginDerivedTaskAction(), sourceApi = controller;
+    let record = pending.record;
+    runAction(`side-chat-check:${record.operationId}`, async () => {
+      if (record.sourceSessionId !== session.id || record.sourceGeneration !== session.generation.toString()
+        || record.backendId !== session.backendId || record.targetId !== session.targetId) {
+        setSideChatRecovery({ record, state: "failed", error: t("session.sideChatSourceChanged") });
+        throw new Error(t("session.sideChatSourceChanged"));
+      }
+      setSideChatRecovery({ record, state: "working" });
+      try {
+        if (startAgain) {
+          const original = await sourceApi.readSideChatOperation?.(record);
+          if (!owner.isCurrent()) return;
+          if (original?.state !== "failed" || original.stateMayHaveChanged !== false) throw new Error(t("session.sideChatCheckOriginal"));
+          const next = { ...record, operationId: randomUuid() };
+          if (!await sourceApi.savePendingSideChat?.(record.sourceSessionId, record, next)) throw new Error(t("session.sideChatCheckOriginal"));
+          record = next; if (!owner.isCurrent()) return;
+        }
+        const result = await recoverSideChatDraft(sourceApi, record, { isCurrent: owner.isCurrent, appendToExisting, dispatch });
+        if (!owner.isCurrent()) return;
+        if (result.state === "adopted") {
+          setSideChatRecovery(undefined);
+          if (onSideChatOpened !== undefined) onSideChatOpened(session.id, result.sessionId);
+          else sourceApi.navigate({ kind: "session", sessionId: result.sessionId });
+        } else if (result.state === "stale") setSideChatRecoveryReload(value => value + 1);
+        else setSideChatRecovery({ record, state: result.state, ...(result.state === "failed" ? { error: result.error, canStartAgain: !result.stateMayHaveChanged } : {}) });
+      } catch (error) {
+        if (owner.isCurrent()) setSideChatRecovery({ record, state: "pending", error: error instanceof Error ? error.message : t("session.sideChatCheckOriginal") });
+        throw error;
+      }
     });
   };
 
@@ -2099,6 +2167,19 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         <span>{t("session.sideChatContext")}</span>
         {session.worktree === undefined && <span>{t("session.sideChatReadOnly")}</span>}
         {derivationOrigin.sourceSessionAvailable && <Button onClick={() => controller.navigate({ kind: "session", sessionId: derivationOrigin.sourceSessionId })}>{t("session.sideChatReturn")}</Button>}
+      </div>}
+      {sideChatRecoveryLoadError !== undefined && <div className="session-schedule-notice" role="alert"><span>{sideChatRecoveryLoadError}</span>
+        <Button onClick={() => setSideChatRecoveryReload(value => value + 1)}>{t("common.retry")}</Button></div>}
+      {sideChatRecovery !== undefined && sideChatRecovery.record.sourceSessionId === session.id && <div className="session-schedule-notice" role="status">
+        <span>{sideChatRecovery.error ?? t(sideChatRecovery.state === "existing" ? "session.sideChatExistingDraft" : "session.sideChatCheckOriginal")}</span>
+        <Button disabled={sideChatRecovery.state === "working"} onClick={() => checkSideChatRecovery()}>{t("session.sideChatCheck")}</Button>
+        {sideChatRecovery.state === "existing" && <Button onClick={() => checkSideChatRecovery(true)}>{t("session.sideChatInsertQuote")}</Button>}
+        {sideChatRecovery.state === "pending" && <Button onClick={() => checkSideChatRecovery(false, true)}>{t("session.sideChatRetryOriginal")}</Button>}
+        {sideChatRecovery.state === "failed" && sideChatRecovery.canStartAgain && <Button onClick={() => checkSideChatRecovery(false, true, true)}>{t("session.sideChatStartAgain")}</Button>}
+        {sideChatRecovery.record.quote !== undefined && <Button onClick={event => {
+          const ownerDocument = event.currentTarget.ownerDocument, text = sideChatRecovery.record.quote!.text;
+          runAction("side-chat-copy-quote", () => writeClipboardText(text, { ownerDocument, signal: new AbortController().signal }));
+        }}>{t("session.sideChatCopyQuote")}</Button>}
       </div>}
       {exportDownload.failed && <p className="danger-text" role="alert">{t("portable.exportFailed")}</p>}
       <NativeFileActionsContext.Provider value={controller.state.ready && controller.state.connectionState === "connected" ? {

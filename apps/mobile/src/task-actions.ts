@@ -197,7 +197,7 @@ export function editQueueItemText(
   if (replacementText === visibleText) return undefined;
   const parts = [create(InputPartSchema, { content: { case: "text", value: replacementText } })];
   return {
-    input: create(InputContentSchema, { parts, ...(input.replyQuote ? { replyQuote: input.replyQuote } : {}) }),
+    input: create(InputContentSchema, { parts, ...(input.replyQuote ? { replyQuote: input.replyQuote } : {}), ...(input.todoQuote ? { todoQuote: input.todoQuote } : {}) }),
     textSplices: [create(QueueTextEditSpliceSchema, {
       start: 0,
       end: originalText.length,

@@ -341,6 +341,7 @@ import { mobilePartnerWorkingStatus } from "./mobile-partner-working";
 import { mobilePartnerConversationRows, mobilePartnerTimeGroups, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { useMobileHiddenHistory } from "./use-mobile-hidden-history";
 import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
+import { MobilePartnerGlanceSheet } from "./MobilePartnerGlanceSheet";
 import { MobilePartnerHomeSheet } from "./MobilePartnerHomeSheet";
 import type { MobilePartnerProfileSnapshot, MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
@@ -3582,6 +3583,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
   const [sharedBackendChoices, setSharedBackendChoices] = useState(false);
   const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
+  const [partnerGlanceOwner, setPartnerGlanceOwner] = useState<string>();
   const [partnerHome, setPartnerHome] = useState<{ readonly api: import("@joko/contracts").PartnerHomeApi; readonly partnerId: string; readonly revision: bigint; readonly inputHandoff: boolean }>();
   const [partnerLearningEntry, setPartnerLearningEntry] = useState<{ readonly owner: string;
     readonly destination: PartnerLearningSettingsDestination; readonly messageId: string; readonly completionEventId: string }>();
@@ -3646,6 +3648,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const queueViewportRef = useRef<View>(null);
   const partnerConversationTransport = client.partnerConversationTransport();
   const partnerIdentity = useMobilePartnerIdentity(partnerConversationTransport);
+  const partnerGlanceApi = useMemo(() => partnerConversationTransport ? client.partnerAutonomyApi?.(partnerConversationTransport.ownerKey) : undefined,
+    [client, partnerConversationTransport?.ownerKey, state.status]);
   const [visiblePartnerRows, setVisiblePartnerRows] = useState<{
     readonly ownerKey?: string; readonly ids: ReadonlySet<string>;
   }>({ ids: new Set() });
@@ -4416,7 +4420,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     visiblePartnerRows.ownerKey === partnerConversationTransport?.ownerKey ? visiblePartnerRows.ids : new Set<string>(),
     state.status === "connected" && !state.busy && !attachmentBusy && !fileShareBusy && !galleryOpening
       && imageGallery.view === undefined && state.timelinePreview === undefined && queueEdit === undefined
-      && !conversationShare.busy && !conversationShare.active && !partnerSettingsVisible && !drawerOpen && !drawerMounted
+      && !conversationShare.busy && !conversationShare.active && !partnerSettingsVisible && partnerGlanceOwner !== partnerConversationTransport?.ownerKey && !drawerOpen && !drawerMounted
       && !messageActionsVisible && !taskActionsVisible && !interactionVisible && !contextVisible
       && !cloneVisible && forkEventId === undefined && rewindEventId === undefined && !nativeTreeVisible
       && !runtimeControlsVisible && !searchVisible && !sessionMentionsVisible && !workspaceMentionsVisible && !catalogMentionsVisible
@@ -6282,6 +6286,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         {partnerIdentity.partner && item.partnerPrivateOrigin && item.kind === "assistant" && <Text style={[styles.caption, { color: colors.muted }]}>
           {mobileMessage(locale, "partnerConversation.privateReply")}
         </Text>}
+        {partnerIdentity.partner && item.todoQuote && <View style={[styles.queueCard, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+          <Text style={{ color: colors.muted }}>{locale === 'zh-CN' ? '待办' : 'Affair'}</Text><Text style={{ color: colors.ink }}>{item.todoQuote.title}</Text>
+        </View>}
         {partnerIdentity.partner && quoteDisplay.visible && item.replyQuote && <Pressable accessibilityRole="button" onPress={() => {
           const quote = item.replyQuote!, ownerKey = client.taskHeaderSourceKey(), sessionId = state.selectedId;
           if (!ownerKey || !sessionId || quote.generation !== session?.nativeBinding?.runtimeGeneration.toString()) return;
@@ -6416,6 +6423,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         modelId={session?.model?.model?.modelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
         failed={taskAccountUsage.failed} now={taskAccountUsage.now} colors={colors} locale={locale} />}
       actions={([
+        ...(partnerIdentity.partner && partnerGlanceApi ? [{ id: 'partner-glance', label: locale === 'zh-CN' ? '近况' : 'At a glance',
+          onPress: () => setPartnerGlanceOwner(partnerConversationTransport?.ownerKey), disabled: state.status !== 'connected' || state.busy || voice.busy }] : []),
         ...(partnerIdentity.partner ? [{ id: 'reply-quotes', label: locale === 'zh-CN' ? `${quoteDisplay.visible ? '隐藏' : '显示'}引用` : `${quoteDisplay.visible ? 'Hide' : 'Show'} reply quotes`,
           onPress: () => { void mobileReplyQuotePreferences.save(!quoteDisplay.visible).catch(failure => setLocalError(errorText(failure))); }, disabled: !quoteDisplay.ready || quoteDisplay.saving }] : []),
         ...(sideChatControls?.canOpen ? [{ id: "side-chat" as const, label: mobileSideChatCopy(locale).create,
@@ -6844,6 +6853,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         colors={colors} onClose={dismissRuntimeCommandPalette}
         onRefresh={loadRuntimeCommandCatalog} onRetry={loadRuntimeCommandCatalog}
         onSelect={(candidate) => { void commitRuntimeCommand(candidate); }} />
+      {draft.todoQuote && !queueEdit && <View style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+        <Text style={{ color: colors.ink }}>{draft.todoQuote.title}</Text><Action label={mobileMessage(locale, 'common.close')} colors={colors} compact disabled={!composerOwnerReady || state.busy || voice.busy}
+          onPress={() => { const { todoQuote: _todo, ...next } = composerDraftRef.current; if (draftIdentityRef.current) saveNormalDraft(next, draftIdentityRef.current); }} />
+      </View>}
       {draft.replyQuote && !queueEdit && <View style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <Text style={[styles.caption, { color: colors.ink }]} numberOfLines={3}>{draft.replyQuote.excerpt || (locale === 'zh-CN' ? '仅附件消息' : 'Attachment-only message')}</Text>
         <Action label={mobileMessage(locale, 'common.close')} colors={colors} compact disabled={!composerOwnerReady || state.busy || voice.busy}
@@ -7086,6 +7099,19 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       inputHandoff={partnerHome.inputHandoff}
       locale={locale} colors={colors} newRequestId={randomUUID} onClose={() => setPartnerHome(undefined)} onChanged={sessionId => {
         void client.refresh().then(() => client.select(sessionId)).then(() => setPartnerHome(undefined)).catch(() => setLocalError(mobileMessage(locale, "partnerProfile.failed")));
+      }} />}
+    {partnerGlanceApi && partnerIdentity.partner && <MobilePartnerGlanceSheet key={partnerGlanceApi.ownerKey} api={partnerGlanceApi} partnerId={partnerIdentity.partner.partnerId}
+      name={partnerIdentity.partner.displayName} visible={partnerGlanceOwner === partnerConversationTransport?.ownerKey} engaged={messageRows.some(row => row.kind === 'user' && !!row.operationId)}
+      colors={colors} locale={locale} onClose={() => setPartnerGlanceOwner(undefined)}
+      onHomeSettings={() => { if (client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey) setPartnerSettingsOwner(partnerGlanceApi.ownerKey); }}
+      onOpenTask={sessionId => { if (client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey) void client.select(sessionId).catch(failure => setLocalError(errorText(failure))); }}
+      onQuote={todo => {
+        const identity = draftIdentityRef.current, active = queueEditRef.current;
+        if (!identity || !composerOwnerReady || client.partnerConversationTransport()?.ownerKey !== partnerGlanceApi.ownerKey || voice.busy
+          || identity.profileId !== client.taskDraftProfileId() || identity.sessionId !== client.state.selectedId) return;
+        const next = { ...(active?.stashedDraft ?? composerDraftRef.current), todoQuote: { partnerId: partnerIdentity.partner!.partnerId, todoId: todo.id, revision: todo.revision.toString(), title: todo.title } };
+        if (active) { const updated = { ...active, stashedDraft: next }; queueEditRef.current = updated; setQueueEdit(updated); mobileComposerDrafts.save(identity, next); }
+        else { saveNormalDraft(next, identity); composerInputRef.current?.focus(); }
       }} />}
     <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={offlineOutputsShell?.partner ?? partnerRead.partner ?? client.partnerProfileContinuationPartner()}
       initialLearningDestination={partnerLearningEntry && partnerLearningEntry.owner === partnerSettingsOwner ? partnerLearningEntry.destination : undefined}

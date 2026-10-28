@@ -155,6 +155,7 @@ import { ExtensionCatalogManager } from "./extension-catalog.js";
 import { ExtensionProjectPolicies } from "./extension-project-policy.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
+import { ExtensionSettingsManager } from "./extension-settings.js";
 import { ExtensionPackagePublisher } from "./extension-package-publisher.js";
 import { ExtensionTasks } from "./extension-tasks.js";
 import { createExtensionTaskNativeReviewer } from "./extension-task-native-reviewer.js";
@@ -266,6 +267,8 @@ import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { PartnerRoutineStore } from "@joko/store";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerAutonomyManager } from "./partner-autonomy.js";
+import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
+import { PartnerMessagingRuntime } from './partner-messaging.js';
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
 import { partnerPackageOpening } from "./partner-package-opening.js";
@@ -536,6 +539,8 @@ export interface OrchestratorApplication {
   readonly appDefaultModels?: AppDefaultModelCoordinator;
   readonly partnerRoutines?: PartnerRoutineManager;
   readonly partnerAutonomy?: PartnerAutonomyManager;
+  readonly partnerMessaging?: PartnerMessagingRuntime;
+  readonly partnerTodos?: PartnerTodoManager;
   readonly partnerImports?: PartnerImportManager;
   readonly partnerHomes?: PartnerHomeOwner;
   readonly partnerHomeRuntime?: PartnerHomeRuntimeAdapter;
@@ -553,6 +558,7 @@ export interface OrchestratorApplication {
   readonly extensionProjects?: ExtensionProjectPolicies;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
+  readonly extensionSettings?: ExtensionSettingsManager;
   readonly extensionCards?: ExtensionCardsManager;
   readonly extensionNetwork?: ExtensionNetworkSettings;
   readonly extensionOAuth?: ExtensionOAuthSettings;
@@ -1130,6 +1136,9 @@ export async function createOrchestratorApplication(
     }
   });
   await extensionMainViews.initialize();
+  const extensionSettings = new ExtensionSettingsManager({ store, vault: credentialVault, credentials, catalog: extensionCatalog,
+    fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
+      environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }) });
   const imageGenerationBridge = new ImageGenerationBridgeToolProvider({
     credentialSurfaces: providerCredentialSurfaces,
     artifacts,
@@ -1858,6 +1867,7 @@ export async function createOrchestratorApplication(
   let androidRuntimeForSessionCleanup: AndroidRuntimeSupervisor | undefined;
   let computerBridgeForSessionCleanup: ComputerToolBridgeProvider | undefined;
   let messaging: MessagingManager | undefined;
+  let partnerMessaging: PartnerMessagingRuntime | undefined;
   let objectives: ObjectiveManager | undefined;
   const configuredProviderRouteEnabled = (backendId: string, providerId: string): boolean => {
     const backend = store.getBackend(backendId).descriptor;
@@ -1868,6 +1878,7 @@ export async function createOrchestratorApplication(
     (partnerId, assertCurrent) => partnerImportStorage.environment.read(partnerId, assertCurrent), makerMemory,
     (session, partnerId) => partnerGroupRuntime?.validTarget(session, partnerId) === true || partnerNetworkLanes?.validTarget(session, partnerId) === true);
   let partnerSessionTasks: PartnerSessionTaskManager | undefined;
+  let partnerTodos: PartnerTodoManager | undefined;
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
   let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
   const sessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
@@ -1890,6 +1901,15 @@ export async function createOrchestratorApplication(
       await projectGitBootstrap.ensure(input);
     },
     freezeToolPolicies: (sessionId, targetId) => { toolPolicies.freezeSession(sessionId, targetId); },
+    assertPrewarmResources: target => {
+      if (!target.trusted || target.remoteWorkspace !== undefined) throw new Error("Agent prewarm requires an approved local project.");
+      const resources = piResources.list({ backendId: target.backendId, targetId: target.id });
+      if (resources.some(resource => !["approved", "installed", "loaded", "disabled", "removed"].includes(resource.state))) {
+        throw new Error("Approve or disable this project's pending resources before starting an Agent early.");
+      }
+      return JSON.stringify(resources.map(resource => [resource.id, resource.versionNumber.toString(), resource.discoveredRevision,
+        resource.state, resource.enabled, resource.approvedAt ?? null]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+    },
     scheduleRunNotifications,
     worktrees: sessionWorktrees,
     usageOwnerId: serverId,
@@ -1924,7 +1944,7 @@ export async function createOrchestratorApplication(
       || partnerStore.isPartnerTargetRetiring(store.getSession(sessionId).descriptor.targetId) || partnerSessionTasks?.isRetiring(sessionId) === true
       || partnerGroupRuntime?.isRetiring(sessionId) === true || partnerNetworkLanes?.isRetiring(sessionId) === true,
     partnerTargetRetired: (targetId) => partnerStore.isPartnerTargetRetired(targetId) || partnerHomeRuntime?.blocksTarget(targetId) === true,
-    partnerSessionRestarting: (sessionId) => partnerStore.isPartnerSessionRestarting(sessionId),
+    partnerSessionRestarting: (sessionId) => partnerStore.isPartnerSessionRestarting(sessionId) || partnerMessaging?.isRestarting(sessionId) === true,
     partnerSessionPaused: (sessionId) => partnerStore.isPartnerSessionPaused(sessionId) || partnerSessionTasks?.isHeld(sessionId) === true || partnerGroupRuntime?.isHeld(sessionId) === true || partnerNetworkLanes?.isHeld(sessionId) === true,
     partnerSessionPolicy: (sessionId) => {
       const profile = partnerStore.findPartnerByCanonicalSession(sessionId);
@@ -1946,6 +1966,9 @@ export async function createOrchestratorApplication(
       if (profile.lifecycle !== 'active' || profile.initializationState !== 'ready' || profile.homeTargetId !== session.targetId
         || session.archived || session.deletedAt !== undefined || quote.generation !== session.binding.generation) throw new Error('The original private conversation changed.');
       return partnerReplyQuoteContext(store, sessionId, quote);
+    },
+    resolvePartnerTodoQuote: (sessionId, quote) => {
+      if (!partnerTodos) throw new Error("Partner affairs are unavailable."); return partnerTodos.quoteContext(sessionId, quote);
     },
     resolveServiceRuntimeConfiguration: session => {
       const connections = partnerConnections?.runtimeIdentity(session), skills = partnerSkills?.runtimeIdentity(session);
@@ -2191,7 +2214,7 @@ export async function createOrchestratorApplication(
     workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes"),
     onReady: async partnerId => { await partnerImports?.activatePackage(partnerId); },
-    onRoutineLifecycle: async (partnerId, state) => { await partnerRoutines?.lifecycle(partnerId, state); await partnerGroups?.partnerLifecycle(partnerId, state); },
+    onRoutineLifecycle: async (partnerId, state) => { await partnerRoutines?.lifecycle(partnerId, state); await partnerGroups?.partnerLifecycle(partnerId, state); await partnerMessaging?.lifecycle(partnerId, state); },
     prepareImportDeletion: async partnerId => { await partnerImports?.prepareDeletion(partnerId); await startupPartnerImportRuntime?.close();
       partnerMemoryPreferences.remove(partnerStore.getPartner(partnerId).homeTargetId);
       partnerConnectionPreferences.remove(partnerStore.getPartner(partnerId).homeTargetId); },
@@ -2207,6 +2230,14 @@ export async function createOrchestratorApplication(
     forgetIndependentTasks: (partnerId) => partnerSessionTasks?.forgetPartner(partnerId),
     resumeIndependentReturns: async (partnerId) => partnerSessionTasks?.refreshPartner(partnerId)
   });
+  partnerMessaging = new PartnerMessagingRuntime({ store, profiles: partnerStore, partners, host: sessionHost, messaging,
+    pauseGoal: async (sessionId, operationId) => {
+      const goal = store.findObjective(sessionId);
+      if (goal && (goal.status === 'active' || goal.status === 'dispatch_unknown')) await objectives!.pause({ sessionId, operationId,
+        expectedRevision: goal.revision, expectedOwnerGeneration: goal.ownerGeneration, reason: 'Message lane restarted by user.' });
+    } });
+  messaging.setPartnerRuntime(partnerMessaging);
+  sessionHost.setMessagingQueueGuard(item => partnerMessaging!.assertQueueCurrent(item));
   const inputHandoffDisabled = (sessionId: string): boolean => {
     const session = store.getSession(sessionId).descriptor, link = partnerStore.getSessionLink(sessionId);
     const policy = toolPolicies.snapshot().find(value => value.toolProviderId === INPUT_HANDOFF_TOOL_PROVIDER_ID);
@@ -2277,6 +2308,8 @@ export async function createOrchestratorApplication(
     new PartnerToolBridgeProvider({ store, partners })
   );
   const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches }));
+  partnerTodos = new PartnerTodoManager(store, partnerStore, partners);
+  const unregisterPartnerTodoTools = mcpRouter.registerBridgeToolProvider(new PartnerTodoTools(partnerTodos));
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
     const result = backendLifecycleTail.catch(() => undefined).then(action);
@@ -2650,6 +2683,7 @@ export async function createOrchestratorApplication(
   piResources.setPartnerHomeDataRoot(targetId => partnerHomeRuntime!.dataRoot(targetId));
   sessionHost.setPartnerHomeInputGuard(sessionId => { if (partnerHomeRuntime!.blocksInput(sessionId)) throw new Error("The Partner is changing its execution computer. Refresh its current home."); });
   partnerLearning = new PartnerLearningManager({ store, profiles: partnerStore, partners, memory: makerMemory,
+    assertMessagingSource: item => partnerMessaging!.assertQueueCurrent(item),
     skills: partnerSkills, auxiliary: auxiliaryText });
   const unregisterPartnerSkillTools = mcpRouter.registerBridgeToolProvider(new PartnerSkillsToolProvider(partnerSkills));
   const unregisterPartnerCapabilityTools = mcpRouter.registerBridgeToolProvider(new PartnerCapabilityTools(partnerConnections,
@@ -3363,6 +3397,7 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterCollaborationGoalTools());
     await attempt(() => unregisterPartnerTools());
     await attempt(() => unregisterPartnerWorkbenchTools());
+    await attempt(() => unregisterPartnerTodoTools());
     await attempt(() => unregisterPartnerSessionTaskTools());
     await attempt(() => unregisterPartnerProfileTools());
     await attempt(() => unregisterPartnerRoutineTools());
@@ -3503,6 +3538,8 @@ export async function createOrchestratorApplication(
     appDefaultModels,
     partnerRoutines,
     partnerAutonomy,
+    partnerMessaging,
+    partnerTodos,
     partnerImports,
     partnerHomes,
     partnerHomeRuntime,
@@ -3520,6 +3557,7 @@ export async function createOrchestratorApplication(
     extensionProjects,
     extensionLibraries,
     extensionMainViews,
+    extensionSettings,
     extensionCards,
     extensionNetwork,
     extensionOAuth,
@@ -3672,6 +3710,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterCollaborationGoalTools());
         await attempt(() => unregisterPartnerTools());
         await attempt(() => unregisterPartnerWorkbenchTools());
+        await attempt(() => unregisterPartnerTodoTools());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => unregisterDocumentTools());

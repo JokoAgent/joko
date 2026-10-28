@@ -74,6 +74,9 @@ message OperationMutation {
     DeleteSessionMutation delete_session = 27;
     ForkSessionMutation fork_session = 28;
     OpenSideChatMutation open_side_chat = 225;
+    PrewarmSessionMutation prewarm_session = 226;
+    SetExtensionSettingsRoutingDataMutation set_extension_settings_routing_data = 227;
+    ClearExtensionSetupCredentialMutation clear_extension_setup_credential = 228;
     CloneSessionMutation clone_session = 29;
     NavigateSessionBranchMutation navigate_session_branch = 30;
     CompactSessionMutation compact_session = 31;
@@ -594,6 +597,12 @@ message CreateSessionMutation {
   // Catalog import presentation is committed with an attached native task so
   // grouping, archive state, and native ordering never require client repairs.
   NativeCatalogImportPresentation catalog_import = 13;
+  // A client-local draft incarnation. Input remains on the client. Only fresh,
+  // already-approved local tasks may be opened before the first real input.
+  string provisional_draft_id = 14;
+  // Adopt this exact unused provisional task instead of creating another one.
+  // The service checks the original connection, draft and complete configuration.
+  string reuse_provisional_session_id = 15;
 }
 
 message NativeCatalogImportPresentation {
@@ -638,6 +647,27 @@ message ResumeSessionMutation {
   string session_id = 1;
 }
 
+message PrewarmSessionMutation {
+  string session_id = 1;
+  // Required for an unused provisional task; empty for an ordinary user task.
+  string provisional_draft_id = 2;
+}
+
+message SetExtensionSettingsRoutingDataMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string surface_id = 3;
+  string expected_routing_revision = 4;
+  string data_json = 5;
+}
+
+message ClearExtensionSetupCredentialMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string surface_id = 3;
+  string field_id = 4;
+}
+
 message DetachSessionMutation {
   string session_id = 1;
 }
@@ -666,6 +696,8 @@ message DeleteSessionMutation {
   string session_id = 1;
   bool delete_native_session = 2;
   bool delete_artifacts = 3;
+  // A draft discard may delete only this owner's still-unused incarnation.
+  string provisional_draft_id = 4;
 }
 
 message CreateTaskTagMutation {

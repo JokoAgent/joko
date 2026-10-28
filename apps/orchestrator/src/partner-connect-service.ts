@@ -43,6 +43,8 @@ import { createPartnerSessionTaskControl, toProtoSessionTask } from "./partner-s
 import { PartnerTaskOutputChangedError, type PartnerTaskOutputProjection, type PartnerTaskOutputRow } from "./partner-task-outputs.js";
 import { createPartnerAutonomyConnectMethods } from "./partner-autonomy-connect-service.js";
 import type { PartnerAutonomyManager } from "./partner-autonomy.js";
+import { createPartnerTodoConnectMethods } from "./partner-todo-connect-service.js";
+import type { PartnerTodoManager } from "./partner-todos.js";
 
 type PublicActivity = PartnerActivitySummary & { readonly workingStatus?: contract.SessionWorkingStatus };
 
@@ -56,7 +58,8 @@ export function createPartnerConnectService(
   skills?: PartnerSkillsManager,
   tasks?: PartnerSessionTaskManager,
   outputs?: PartnerTaskOutputProjection,
-  autonomy?: PartnerAutonomyManager
+  autonomy?: PartnerAutonomyManager,
+  todos?: PartnerTodoManager
 ): ServiceImpl<typeof contract.PartnerService> {
   const owner = (): PartnerManager => {
     if (manager === undefined) throw new ConnectError("Partners are unavailable.", Code.Unimplemented);
@@ -72,6 +75,7 @@ export function createPartnerConnectService(
   };
   return {
     ...createPartnerAutonomyConnectMethods(autonomy, authenticate),
+    ...createPartnerTodoConnectMethods(todos, authenticate),
     ...createPartnerWorkbenchConnectMethods(workbench, authenticate),
     ...createPartnerMemoryConnectMethods(memory, authenticate),
     ...createPartnerConnectionMethods(connections, authenticate),
@@ -569,7 +573,7 @@ function toProtoPartnerSession(view: PartnerSessionView): contract.PartnerSessio
     partnerId: view.link.partnerId,
     role: view.link.role === "canonical"
       ? contract.PartnerSessionRole.CANONICAL
-      : view.link.role === 'topic' ? contract.PartnerSessionRole.TOPIC : view.link.role === "history"
+      : view.link.role === 'channel' ? contract.PartnerSessionRole.CHANNEL : view.link.role === 'topic' ? contract.PartnerSessionRole.TOPIC : view.link.role === "history"
         ? contract.PartnerSessionRole.HISTORY
         : contract.PartnerSessionRole.DELEGATION,
     profileVersion: BigInt(view.link.profileVersion),

@@ -1,6 +1,9 @@
 import { isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
+import { ExtensionPackageAction } from "@joko/contracts";
+import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
+import { executeExtensionSettingsCall } from "@joko/connection-transport";
 import type { SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
@@ -143,6 +146,7 @@ import type { MobilePartnerRestartReceipts, MobilePartnerRestartTransport } from
 import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
+  projectMobileExtensionMainViewSurface,
   sameMobileExtensionMainViewSurface,
   type MobileExtension,
   type MobileExtensionCommand,
@@ -749,6 +753,10 @@ const isTerminal = (state: OperationState): boolean => [
 type MobileExtensionReceiptKind = Extract<PendingOperation["kind"],
   | "extension-enabled"
   | "extension-sidebar"
+  | "extension-package-adopt"
+  | "extension-package-remove"
+  | "extension-settings-routing"
+  | "extension-settings-credential-clear"
   | "extension-setup-begin"
   | "extension-setup-interaction"
   | "extension-setup-credential"
@@ -758,6 +766,8 @@ type MobileExtensionReceiptKind = Extract<PendingOperation["kind"],
 
 function isMobileExtensionReceiptKind(kind: PendingOperation["kind"]): kind is MobileExtensionReceiptKind {
   return kind === "extension-enabled" || kind === "extension-sidebar"
+    || kind === "extension-package-adopt" || kind === "extension-package-remove"
+    || kind === "extension-settings-routing" || kind === "extension-settings-credential-clear"
     || kind === "extension-setup-begin" || kind === "extension-setup-interaction"
     || kind === "extension-setup-credential" || kind === "extension-setup-complete"
     || kind === "extension-setup-cancel" || kind === "extension-setup-revoke";
@@ -767,6 +777,10 @@ function mobileExtensionPendingMutationKind(kind: MobileExtensionReceiptKind): M
   switch (kind) {
     case "extension-enabled": return "enabled";
     case "extension-sidebar": return "sidebar";
+    case "extension-package-adopt": return "packageAdopt";
+    case "extension-package-remove": return "packageRemove";
+    case "extension-settings-routing": return "settingsRouting";
+    case "extension-settings-credential-clear": return "settingsCredentialClear";
     case "extension-setup-begin": return "setupBegin";
     case "extension-setup-interaction": return "setupInteraction";
     case "extension-setup-credential": return "setupCredential";
@@ -974,6 +988,7 @@ export class MobileClient {
   #streamSequence?: bigint;
   #streamGeneration?: bigint;
   #foreground = true;
+  #extensionOAuthRetention?: { readonly transport: MobileExtensionTransport; readonly current: () => boolean };
   #partnerRosterEpoch = 0;
   #partnerRosterNavigation?: { readonly sourceKey: string; readonly profileId: string; readonly sessionId: string; readonly partnerId: string; readonly homeTargetId: string };
   #partnerProfileSave?: { readonly action: symbol; readonly epoch: number; readonly credential: PairedCredential;
@@ -2386,6 +2401,15 @@ export class MobileClient {
         throw new Error("Partner routine owner changed.");
     });
   }
+  partnerAutonomyApi(conversationOwnerKey: string): import("@joko/contracts").PartnerAutonomyApi | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.partnerAutonomyApi || this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) return undefined;
+    return this.network.partnerAutonomyApi(context.credential, conversationOwnerKey, this.newId, signal => {
+      signal.throwIfAborted();
+      if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey
+        || this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) throw new Error("The Partner glance owner changed.");
+    });
+  }
 
   partnerRoutineEditor(partnerId: string, storage: import("@joko/contracts").RoutineReceiptStorage, conversationOwnerKey?: string): import("@joko/contracts").PartnerRoutineEditor | undefined {
     const api = this.partnerRoutineApi(partnerId, conversationOwnerKey); const credential = this.#credential;
@@ -2467,7 +2491,7 @@ export class MobileClient {
 
   extensionCatalogTransport(): MobileExtensionTransport | undefined {
     const context = this.#partnerPrivateContext();
-    if (!context) return undefined;
+    if (!context) return this.#extensionOAuthRetention?.current() ? this.#extensionOAuthRetention.transport : undefined;
     const ownerKey = context.authorityKey;
     let retired = false;
     const isCurrent = (): boolean => !retired && this.#partnerPrivateAuthorityKey(this.#state) === ownerKey
@@ -2484,7 +2508,7 @@ export class MobileClient {
       else signal.addEventListener("abort", cancel, { once: true });
       const unsubscribe = this.subscribe(() => {
         if (!isCurrent()) {
-          retired = true;
+          if (!(this.#extensionOAuthRetention?.transport === transport && settingsOwnerCurrent())) retired = true;
           request.abort();
         }
       });
@@ -2499,9 +2523,9 @@ export class MobileClient {
         signal.removeEventListener("abort", cancel);
       }
     };
-    const readExactDetail = async (expected: MobileExtension, signal: AbortSignal): Promise<MobileExtension> => {
+    const readExactDetail = async (expected: MobileExtension, signal: AbortSignal, installed = true): Promise<MobileExtension> => {
       requireCurrent(signal);
-      if (!expected.installed) throw new Error("Select an installed Extension.");
+      if (installed && !expected.installed) throw new Error("Select an installed Extension.");
       const extension = await this.network.getExtension(context.credential, expected.extensionId, signal);
       requireCurrent(signal);
       if (mobileExtensionKey(extension) !== mobileExtensionKey(expected)) {
@@ -2610,7 +2634,7 @@ export class MobileClient {
     };
     const setupMutation = (
       expected: MobileExtension,
-      receiptKind: Exclude<MobileExtensionReceiptKind, "extension-enabled" | "extension-sidebar">,
+      receiptKind: Exclude<MobileExtensionReceiptKind, "extension-enabled" | "extension-sidebar" | "extension-package-adopt" | "extension-package-remove" | "extension-settings-routing" | "extension-settings-credential-clear">,
       prepare: (
         extension: MobileExtension,
         signal: AbortSignal
@@ -2636,7 +2660,7 @@ export class MobileClient {
       "extension-setup-begin",
       (extension) => {
         if (extension.setup.state !== "required" && extension.setup.state !== "cancelled"
-          && extension.setup.state !== "failed") {
+          && extension.setup.state !== "failed" && extension.setup.state !== "ready") {
           throw new Error("This Extension setup cannot be started from its current state.");
         }
         return {
@@ -3282,6 +3306,116 @@ export class MobileClient {
         this.#releaseMutation(action);
       }
     });
+    const packageBackends = () => isCurrent() ? (this.#state.owner?.backends ?? []).filter(backend =>
+      backend.capabilities?.capabilities.some(capability => capability.name === "runtime.resources"
+        && capability.support === CapabilitySupport.SUPPORTED && capability.options.includes("package")))
+      .map(backend => ({ backendId: backend.backendId, name: backend.displayName })) : [];
+    const browse = (signal: AbortSignal) => owned(signal, current =>
+      (this.network.browseExtensions ?? this.network.listExtensions)(context.credential, current));
+    const previewPackage = (expected: MobileExtension, backendId: string, signal: AbortSignal) => owned(signal, async current => {
+      const fresh = await readExactDetail(expected, current, false);
+      if (!this.network.getExtensionPackagePreview || !packageBackends().some(backend => backend.backendId === backendId)
+        || pendingForExtension(fresh.extensionId)) throw new Error("Extension package management is unavailable or has an unresolved operation.");
+      const preview = await this.network.getExtensionPackagePreview(context.credential, fresh, backendId, current);
+      requireCurrent(current); assertMobileExtensionPackagePreview(fresh, preview);
+      return preview;
+    });
+    const packageMutation = (expected: MobileExtension, preview: MobileExtensionPackagePreview | undefined,
+      allowSourceReplacement: boolean, signal: AbortSignal) => owned(signal, async current => {
+      const action = this.#claimMutation();
+      try {
+        const fresh = await readExactDetail(expected, current, false);
+        if (pendingForExtension(fresh.extensionId)) throw new Error("Check the original Extension operation before another change.");
+        if (preview) {
+          assertMobileExtensionPackagePreview(fresh, preview);
+          if (!packageBackends().some(backend => backend.backendId === preview.backendId)
+            || preview.sourceReplacement && !allowSourceReplacement) throw new Error("Confirm this package source replacement before installing.");
+        } else if (!fresh.installed || fresh.owner.kind !== "resource") throw new Error("Select an installed package before removing it.");
+        const mutation = create(OperationMutationSchema, { payload: preview ? { case: "adoptExtensionPackage", value: {
+          extensionId: fresh.extensionId, expectedRevision: { value: fresh.revision }, backendId: preview.backendId,
+          expectedAction: preview.action === "install" ? ExtensionPackageAction.INSTALL
+            : preview.action === "update" ? ExtensionPackageAction.UPDATE : ExtensionPackageAction.REPLACE,
+          expectedCurrentResourceId: preview.currentResource?.resourceId ?? "",
+          ...(preview.currentResource ? { expectedCurrentResourceRevision: { value: preview.currentResource.revision } } : {}),
+          allowSourceReplacement
+        } } : { case: "removeExtensionPackage", value: { extensionId: fresh.extensionId, expectedRevision: { value: fresh.revision } } } });
+        const resourceId = preview?.resourceId ?? (fresh.owner.kind === "resource" ? fresh.owner.resourceId : "");
+        const result = await this.#submitTerminal(mutation, { kind: preview ? "extension-package-adopt" : "extension-package-remove",
+          extensionId: fresh.extensionId, extensionRevision: fresh.revision.toString(10), extensionResourceId: resourceId }, undefined, false, false,
+        { signal: current, isCurrent, beforeTerminalReceipt: async operation => {
+          if (operation.state === OperationState.SUCCEEDED) this.#assertExtensionPackageResult(operation, resourceId);
+        } });
+        requireCurrent(current);
+        if (!result.definitive) throw new Error("The package change result is unknown. Check its original operation; it was not resent.");
+        if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) throw new Error(result.operation?.error?.message || "The package change was rejected.");
+        return await (this.network.browseExtensions ?? this.network.listExtensions)(context.credential, current);
+      } finally { this.#releaseMutation(action); }
+    });
+    const settingsOwnerCurrent = () => !this.#disposed && this.#credential === context.credential
+      && this.#partnerPrivateAuthorityKey(this.#state, true) === ownerKey;
+    const freshSettings = async (surface: MobileExtensionMainViewSurface, signal: AbortSignal, allowBackground = false) => {
+      const assert = () => {
+        signal.throwIfAborted();
+        if (allowBackground ? !settingsOwnerCurrent() : !isCurrent()) throw new Error("Plugin settings owner changed.");
+      };
+      assert();
+      const actual = await this.network.getExtensionMainViewSurface(context.credential, surface.surfaceId, signal); assert();
+      if (surface.purpose !== "settings" || surface.mobileSettings !== true || !sameMobileExtensionMainViewSurface(surface, actual)) throw new Error("Plugin settings document changed.");
+      const extension = await this.network.getExtension(context.credential, surface.extensionId, signal); assert();
+      if (!extension.installed || !extension.settings || extension.owner.kind !== "resource" || extension.owner.resourceId !== surface.owner.resourceId
+        || extension.owner.discoveredRevision !== surface.owner.discoveredRevision || extension.owner.resourceRevision !== surface.owner.resourceRevision) throw new Error("Plugin settings installation changed.");
+      return extension;
+    };
+    const callSettings: NonNullable<MobileExtensionTransport["callSettings"]> = async (surface, call, host, signal) => {
+      requireCurrent(signal);
+      const api = this.network.extensionSettingsApi?.(context.credential), upload = this.network.uploadPrivateExtensionInput;
+      if (!api || !upload || pendingForExtension(surface.extensionId)) throw new Error("Check the original plugin operation before another settings change.");
+      const authorization = call.kind === "oauth.connect";
+      const retention = authorization ? { transport, current: settingsOwnerCurrent } : undefined;
+      if (retention) {
+        if (this.#extensionOAuthRetention) throw new Error("Another plugin authorization is in progress.");
+        this.#extensionOAuthRetention = retention;
+      }
+      const execute = (current: AbortSignal) => executeExtensionSettingsCall({ surface, api,
+        ...(this.network.extensionOAuthApi ? { oauth: this.network.extensionOAuthApi(context.credential) } : {}),
+        ...(this.network.extensionConnectionsApi ? { connections: this.network.extensionConnectionsApi(context.credential) } : {}),
+        upload: (ticket, value, signal) => upload(context.credential, ticket, value, signal),
+        current: () => { current.throwIfAborted(); if (authorization ? !settingsOwnerCurrent() : !isCurrent()) throw new Error("Plugin settings owner changed."); },
+        fresh: signal => freshSettings(surface, signal, authorization),
+        submit: async (extension, mutation, kind, signal) => {
+          const action = this.#claimMutation();
+          try {
+            const result = await this.#submitTerminal(mutation, { kind: kind === "routing" ? "extension-settings-routing" : "extension-settings-credential-clear",
+              extensionId: extension.extensionId, extensionRevision: extension.revision.toString(10) }, undefined, false, false,
+            { signal, isCurrent, beforeTerminalReceipt: async operation => {
+              if (operation.state === OperationState.SUCCEEDED) this.#assertExtensionMutationAcknowledgement(operation);
+            } });
+            requireCurrent(signal);
+            if (!result.definitive) throw new Error("Plugin settings result is unknown. Check its original operation; it was not resent.");
+            if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) throw new Error(result.operation?.error?.message || "Plugin settings change was rejected.");
+          } finally { this.#releaseMutation(action); }
+        },
+        begin: beginSetup, field: submitSetupInteraction,
+        secret: (extension, fieldId, value, signal) => saveSetupCredential(extension, fieldId, "headerSecret", value, signal), complete: completeSetup
+      }, call, host, current);
+      const request = authorization ? new AbortController() : undefined;
+      const unsubscribe = request ? this.subscribe(() => { if (!settingsOwnerCurrent()) request.abort(); }) : undefined;
+      try {
+        return request ? await execute(AbortSignal.any([signal, request.signal])) : await owned(signal, execute);
+      } finally {
+        unsubscribe?.(); request?.abort();
+        if (retention && this.#extensionOAuthRetention === retention) { this.#extensionOAuthRetention = undefined; this.#set({}); }
+      }
+    };
+    const openSettings: NonNullable<MobileExtensionTransport["openSettings"]> = (expected, signal) => owned(signal, async current => {
+      const extension = await readExactDetail(expected, current), api = this.network.extensionSettingsApi?.(context.credential);
+      if (!extension.settings || !api || pendingForExtension(extension.extensionId)) throw new Error("Plugin author settings are unavailable.");
+      const response = await api.openExtensionSettings({ extensionId: extension.extensionId, expectedRevision: { value: extension.revision }, mobile: true }, { signal: current });
+      if (!response.surface) throw new Error("The Joko node returned an empty plugin settings surface.");
+      const surface = projectMobileExtensionMainViewSurface(response.surface, context.credential.origin);
+      try { await freshSettings(surface, current); return surface; }
+      catch (error) { await this.network.closeExtensionMainView(context.credential, surface.surfaceId).catch(() => undefined); throw error; }
+    });
     const exactPending = (operationId: string) => {
       const matches = this.#state.pending.filter((receipt) => receipt.operationId === operationId
         && receipt.connectionId === context.credential.connectionId
@@ -3289,8 +3423,10 @@ export class MobileClient {
       if (matches.length !== 1) throw new Error("Select a current Extension operation receipt.");
       return matches[0]!;
     };
-    return {
+    const transport: MobileExtensionTransport = {
       ownerKey,
+      openSettings,
+      callSettings,
       pending: Object.freeze(this.#state.pending.flatMap((receipt) => receipt.connectionId === context.credential.connectionId
         && receipt.extensionId !== undefined && isMobileExtensionReceiptKind(receipt.kind)
         ? [{ operationId: receipt.operationId, extensionId: receipt.extensionId,
@@ -3298,6 +3434,11 @@ export class MobileClient {
             state: receipt.state }]
         : [])),
       list: (signal) => owned(signal, (current) => this.network.listExtensions(context.credential, current)),
+      browse,
+      packageBackends,
+      previewPackage,
+      adoptPackage: (expected, preview, allow, signal) => packageMutation(expected, preview, allow, signal),
+      removePackage: (expected, signal) => packageMutation(expected, undefined, false, signal),
       getTaskPreferences: (expected, signal) => owned(signal, async current => {
         await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
         if (!api) throw new Error("Plugin task preferences are unavailable.");
@@ -3317,7 +3458,7 @@ export class MobileClient {
         const result = await api.retryWriteAccess({ extensionId: expected.extensionId, taskId }, { signal: current }); requireCurrent(current);
         if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin permission owner changed."); return result.preferences;
       }),
-      detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current)),
+      detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current, false)),
       setEnabled: (expected, enabled, signal) => mutate(expected, "enabled", enabled, signal),
       setSidebarVisible: (expected, visible, signal) => mutate(expected, "sidebar", visible, signal),
       beginSetup,
@@ -3361,12 +3502,21 @@ export class MobileClient {
         requireCurrent(current);
       })
     };
+    return transport;
   }
 
   #assertExtensionMutationAcknowledgement(operation: Operation): void {
     const payload = operation.result?.payload;
     if (payload?.case !== "acknowledgement" || payload.value.accepted !== true) {
       throw new Error("The Joko node completed the Extension change without an accepted acknowledgement.");
+    }
+  }
+
+  #assertExtensionPackageResult(operation: Operation, expectedResourceId?: string): void {
+    const payload = operation.result?.payload;
+    if (payload?.case !== "resource" || !payload.value.resourceId
+      || expectedResourceId !== undefined && payload.value.resourceId !== expectedResourceId) {
+      throw new Error("The Joko node completed the package change without its original Resource result.");
     }
   }
 
@@ -3775,11 +3925,11 @@ export class MobileClient {
       credential.connectionId, credential.deviceId].join("\u001f");
   }
 
-  #partnerPrivateAuthorityKey(state: MobileState): string | undefined {
+  #partnerPrivateAuthorityKey(state: MobileState, allowBackground = false): string | undefined {
     const credential = this.#credential;
     const node = state.node;
     const owner = state.owner;
-    if (this.#disposed || !this.#foreground || !credential || !node || !owner
+    if (this.#disposed || !allowBackground && !this.#foreground || !credential || !node || !owner
       || state.status !== "connected" || state.activeProfileId !== credential.profileId
       || this.#activeProfileId !== credential.profileId || state.origin !== credential.origin
       || node.serverId !== credential.serverId || owner.server?.serverId !== credential.serverId
@@ -10920,13 +11070,17 @@ export class MobileClient {
     if (this.#joinedTask) return resolveMobileSharedRuntimeControls(this.#state.detail, this.#taskAuthorityKey());
     const credential = this.#credential;
     if (!credential || !this.#taskAuthorityKey()) return undefined;
-    const controls = resolveMobileRuntimeControls({
+    const resolved = resolveMobileRuntimeControls({
       profileId: credential.profileId,
       connectionId: credential.connectionId,
       deviceId: credential.deviceId,
       serverId: credential.serverId
     }, this.#state.owner, this.#state.detail, this.#state.selectedId, this.network.getSessionRuntimeControl !== undefined);
-    if (!controls) return undefined;
+    if (!resolved) return undefined;
+    const controls = resolved.session.derivationOrigin?.sideChat === true && resolved.session.worktree === undefined
+      ? { ...resolved, canSwitchModel: false, canSetEffort: false, canSetFastMode: false,
+        canSetPermission: false, canSetPlanMode: false }
+      : resolved;
     const runtimeSelection = this.#runtimeModelSelection;
     const pending = runtimeSelection && runtimeSelection.ownerKey === this.#taskAuthorityKey() ? runtimeSelection.control.pending : undefined;
     const route = pending ? controls.models.find(route => route.backendId === pending.backendId && route.providerId === pending.providerId && route.modelId === pending.modelId) : undefined;
@@ -16134,7 +16288,7 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision" | "extensionResourceId">,
     operationId?: string
   ): Promise<boolean> {
     return (await this.#submitTracked(mutation, identity, false, operationId)).accepted;
@@ -16142,7 +16296,7 @@ export class MobileClient {
 
   async #submitTerminal(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision" | "extensionResourceId">,
     operationId?: string,
     markBusy = true,
     refreshAfter = true,
@@ -16155,7 +16309,7 @@ export class MobileClient {
 
   async #submitTracked(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision">,
+    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision" | "extensionResourceId">,
     waitForTerminal: boolean,
     operationId = this.newId(),
     markBusy = true,
@@ -16336,7 +16490,8 @@ export class MobileClient {
           const exactOperation = operation.operationId === pending.operationId && operation.connectionId === pending.connectionId;
           if (isMobileExtensionReceiptKind(pending.kind)
             && exactOperation && operation.state === OperationState.SUCCEEDED) {
-            this.#assertExtensionMutationAcknowledgement(operation);
+            if (pending.kind === "extension-package-adopt" || pending.kind === "extension-package-remove") this.#assertExtensionPackageResult(operation, pending.extensionResourceId);
+            else this.#assertExtensionMutationAcknowledgement(operation);
           }
           if (messageRewind && exactOperation && operation.state === OperationState.SUCCEEDED) {
             await this.#recoverMessageRewindReceipt(pending, operation, epoch);

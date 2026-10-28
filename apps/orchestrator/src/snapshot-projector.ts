@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
+import { readProvisionalSession } from "./session-prewarm.js";
 import { sessionTaskActivity } from "./session-task-activity.js";
 import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 
@@ -174,6 +175,7 @@ export function sessionProjectionContext(
   const lastUserInputAt = store.findLatestVisibleUserMessageAt(session.descriptor.id);
   const localWorkspace = readWorkerWorkspaceBinding(store, session.descriptor.id);
   return {
+    ...(session.descriptor.deletedAt !== undefined ? {} : { provisionalDraftId: readProvisionalSession(store, session.descriptor.id)?.draftId }),
     ...(localWorkspace === undefined ? {} : { localWorkspace: { workspaceId: localWorkspace.workspaceId, path: localWorkspace.path } }),
     ...(options.activeRun === undefined ? {} : { activeRun: options.activeRun }),
     ...(options.runtimeAttached === undefined ? {} : { runtimeAttached: options.runtimeAttached }),

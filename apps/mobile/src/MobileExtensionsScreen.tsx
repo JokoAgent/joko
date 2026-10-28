@@ -31,6 +31,7 @@ import { mobileExtensionLibraryReady, mobileExtensionLibrarySupported } from "./
 import { MobileExtensionLibrary } from "./MobileExtensionLibrary";
 import { MobileExtensionTaskPreferences } from "./MobileExtensionTaskPreferences";
 import { MobileExtensionMainView } from "./MobileExtensionMainView";
+import { MobileExtensionPackages } from "./MobileExtensionPackages";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 
 export interface MobileExtensionsScreenProps {
@@ -74,6 +75,7 @@ type UseSelection = {
 type MainViewSelection = {
   readonly ownerKey: string;
   readonly extension: MobileExtension;
+  readonly settings?: true;
 };
 
 type LibrarySelection = {
@@ -168,6 +170,7 @@ export function MobileExtensionsScreen({
   const useInFlight = useRef(false);
   const [attempt, setAttempt] = useState(0);
   const [query, setQuery] = useState("");
+  const [browseAvailable, setBrowseAvailable] = useState(false);
   const [directory, setDirectory] = useState<DirectoryState>(emptyDirectory);
   const [detail, setDetail] = useState<DetailState>(emptyDetail);
   const [mutation, setMutation] = useState<MutationState | undefined>();
@@ -218,7 +221,7 @@ export function MobileExtensionsScreen({
     setDirectory((current) => current.ownerKey === ownerKey && current.catalog
       ? { ...current, status: "ready", refreshing: true }
       : { ownerKey, status: "loading", refreshing: false });
-    void transport.list(controller.signal).then((catalog) => {
+    void (browseAvailable && transport.browse ? transport.browse(controller.signal) : transport.list(controller.signal)).then((catalog) => {
       if (controller.signal.aborted || transportRef.current?.ownerKey !== ownerKey) return;
       setDirectory({ ownerKey, status: "ready", refreshing: false, catalog });
     }, () => {
@@ -228,7 +231,7 @@ export function MobileExtensionsScreen({
         : { ownerKey, status: "error", refreshing: false });
     });
     return () => controller.abort();
-  }, [attempt, ownerKey]);
+  }, [attempt, browseAvailable, ownerKey]);
 
   useEffect(() => () => {
     listAbort.current?.abort();
@@ -471,6 +474,9 @@ export function MobileExtensionsScreen({
   }, [taskChoices, taskQuery]);
 
   const directoryPane = <View style={[styles.pane, wide && styles.directoryPane]} testID="extensions.directory">
+    {transport?.browse && <Action colors={colors} label={mobileMessage(locale,
+      browseAvailable ? "extension.package.installedOnly" : "extension.package.browse")}
+      disabled={mutation !== undefined} onPress={() => setBrowseAvailable(value => !value)} />}
     <View style={styles.header}>
       <Action label={mobileMessage(locale, "common.back")} colors={colors} onPress={onBack} />
       <View style={styles.grow}>
@@ -554,6 +560,13 @@ export function MobileExtensionsScreen({
           </View>
           : <ScrollView contentContainerStyle={styles.detailContent}>
             {extension.description.length > 0 && <Text style={[styles.body, { color: colors.ink }]}>{extension.description}</Text>}
+            {extension.settings && transport?.openSettings && <Action colors={colors} label={mobileMessage(locale, "extension.settings")}
+              disabled={!extension.installed || selectedBusy || mutation !== undefined || pending.length > 0}
+              onPress={() => { const active = transportRef.current; if (active) { setLibraryView(undefined); setMainView({ ownerKey: active.ownerKey, extension, settings: true }); } }}
+              testID="extensions.settings.open" />}
+            {transport && <MobileExtensionPackages extension={extension} transport={transport} colors={colors} locale={locale}
+              disabled={selectedBusy || mutation !== undefined || pending.length > 0}
+              onChanged={catalog => { setDirectory({ ownerKey, status: "ready", refreshing: false, catalog }); closeDetail(); }} />}
             <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
               <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale,
                 extension.enabled ? "extension.enabled" : "extension.disabled")}</Text>
@@ -632,7 +645,7 @@ export function MobileExtensionsScreen({
                     extension.enabled ? "extension.enabled" : "extension.disabled")}</Text>
                 </View>
                 <Action label={mobileMessage(locale, extension.enabled ? "extension.disable" : "extension.enable")}
-                  colors={colors} disabled={mutation !== undefined || pending.length > 0}
+                  colors={colors} disabled={!extension.installed || mutation !== undefined || pending.length > 0}
                   onPress={() => changeExtension(extension, "enabled", !extension.enabled)}
                   testID="extensions.enabled" />
               </View>
@@ -873,14 +886,16 @@ export function MobileExtensionsScreen({
           transport={transport} onBack={() => setLibraryView(undefined)} />
         : visibleMainView && transport
           ? <MobileExtensionMainView colors={colors} extension={visibleMainView.extension} locale={locale}
-            transport={transport} onBack={() => setMainView(undefined)} />
+            transport={transport} settings={visibleMainView.settings === true} onBack={() => setMainView(undefined)}
+            onOpenLibrary={() => { setMainView(undefined); setLibraryView({ ownerKey: transport.ownerKey, extension: visibleMainView.extension }); }} />
           : detailPane}</View>
         : visibleLibrary && transport
           ? <MobileExtensionLibrary colors={colors} extension={visibleLibrary.extension} locale={locale}
             transport={transport} onBack={() => setLibraryView(undefined)} />
           : visibleMainView && transport
             ? <MobileExtensionMainView colors={colors} extension={visibleMainView.extension} locale={locale}
-              transport={transport} onBack={() => setMainView(undefined)} />
+              transport={transport} settings={visibleMainView.settings === true} onBack={() => setMainView(undefined)}
+              onOpenLibrary={() => { setMainView(undefined); setLibraryView({ ownerKey: transport.ownerKey, extension: visibleMainView.extension }); }} />
             : visibleDetail.extensionId ? detailPane : directoryPane}
     </View>
     <Modal visible={visibleUseSelection !== undefined} transparent animationType="fade"

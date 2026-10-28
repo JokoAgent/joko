@@ -1,0 +1,14 @@
+import groovy.json.JsonSlurper
+
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+group = 'app.joko.pluginoauth'
+def host = new JsonSlurper().parse(new File(projectDir, '../../../package.json'))
+version = host.version
+android {
+  namespace 'app.joko.pluginoauth'
+  defaultConfig { minSdkVersion 24; versionName host.version }
+}
+dependencies { testImplementation 'junit:junit:4.13.2' }

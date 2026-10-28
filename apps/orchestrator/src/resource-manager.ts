@@ -35,6 +35,7 @@ import {
   parseExtensionRoutineEvents,
   parseExtensionRuntime,
   isExtensionMainViewDescriptor,
+  isExtensionSettingsDescriptor,
   validateExtensionRecommendations,
   type ExtensionRecommendationDescriptor
 } from "./extension-surface-manifest.js";
@@ -5069,6 +5070,7 @@ function copyResourceDetail(detail: PiPackageResourceDetail): PiPackageResourceD
     name: detail.name,
     ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
     ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
+    ...(detail.settings === undefined ? {} : { settings: { ...detail.settings } }),
     ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
     ...(detail.routineEvents === undefined ? {} : { routineEvents: parseExtensionRoutineEvents(detail.routineEvents) }),
     ...(detail.runtime === undefined ? {} : { runtime: parseExtensionRuntime(detail.runtime) }),
@@ -5161,11 +5163,12 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       !detail || typeof detail !== "object" || !kinds.has(detail.kind) || !compatibility.has(detail.compatibility)
       || typeof detail.name !== "string" || detail.name.trim() === "" || detail.name.length > 256
       || Object.keys(detail).some((key) => ![
-        "kind", "name", "entryPath", "mainView", "library", "routineEvents", "runtime", "recommendations", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
+        "kind", "name", "entryPath", "mainView", "settings", "library", "routineEvents", "runtime", "recommendations", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
       ].includes(key))
       || detail.kind === "extension" !== (typeof detail.entryPath === "string")
       || detail.entryPath !== undefined && !isStoredPackageRelativePath(detail.entryPath)
       || detail.mainView !== undefined && (detail.kind !== "extension" || !isExtensionMainViewDescriptor(detail.mainView))
+      || detail.settings !== undefined && (detail.kind !== "extension" || !isExtensionSettingsDescriptor(detail.settings))
       || detail.library !== undefined && (detail.kind !== "extension" || !isExtensionLibraryDescriptor(detail.library))
       || detail.routineEvents !== undefined && detail.kind !== "extension"
       || detail.runtime !== undefined && detail.kind !== "extension"
@@ -5185,6 +5188,7 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       name: detail.name,
       ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
       ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
+      ...(detail.settings === undefined ? {} : { settings: { ...detail.settings } }),
       ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
     ...(detail.routineEvents === undefined ? {} : { routineEvents: parseExtensionRoutineEvents(detail.routineEvents) }),
     ...(detail.runtime === undefined ? {} : { runtime: parseExtensionRuntime(detail.runtime) }),

@@ -370,6 +370,7 @@ export interface RunMappingContext {
 }
 
 export interface SessionMappingContext {
+  readonly provisionalDraftId?: string;
   readonly localWorkspace?: { readonly workspaceId: string; readonly path: string };
   readonly taskActivity?: import("./session-task-activity.js").SessionTaskActivityProjection;
   readonly activeRun?: StoredRun;
@@ -661,6 +662,7 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
         }
   );
   return message<ProtoSession>("joko.v1.Session", {
+    provisionalDraftId: context.provisionalDraftId ?? "",
     ...(context.localWorkspace === undefined ? {} : { localWorkspace: context.localWorkspace }),
     sessionId: session.id,
     backendId: session.backendId,
@@ -1292,6 +1294,7 @@ export function toProtoInputContent(input: PromptInput): InputContent {
   return message<InputContent>("joko.v1.InputContent", {
     parts,
     ...(input.replyQuote ? { replyQuote: message<contract.PartnerReplyQuote>('joko.v1.PartnerReplyQuote', { ...input.replyQuote, generation: BigInt(input.replyQuote.generation) }) } : {}),
+    ...(input.todoQuote ? { todoQuote: message<contract.PartnerTodoQuote>('joko.v1.PartnerTodoQuote', { ...input.todoQuote, revision: BigInt(input.todoQuote.revision) }) } : {}),
     quotesEncoded: input.quotesEncoded === true,
     pastedTextRanges: pastedTextRanges.map((range) => message<ProtoInlineTextRange>("joko.v1.InlineTextRange", {
       start: range.start,
@@ -1402,12 +1405,18 @@ export function fromProtoInputContent(
     mentions,
     disposition,
     ...(content?.replyQuote ? { replyQuote: fromProtoPartnerReplyQuote(content.replyQuote) } : {}),
+    ...(content?.todoQuote ? { todoQuote: fromProtoPartnerTodoQuote(content.todoQuote) } : {}),
     ...(content?.quotesEncoded === true ? { quotesEncoded: true } : {}),
     ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges }),
     ...(mentionRanges.length === 0 ? {} : { mentionRanges })
   };
 }
 
+function fromProtoPartnerTodoQuote(value: contract.PartnerTodoQuote): NonNullable<PromptInput['todoQuote']> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value.partnerId) || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value.todoId)
+    || value.revision < 1n || value.revision > BigInt(Number.MAX_SAFE_INTEGER) || value.title.length > 300) throw new ProtoMappingError('invalid_argument', 'input.todo_quote', 'The Todo quote is invalid.');
+  return { partnerId: value.partnerId, todoId: value.todoId, revision: Number(value.revision), title: value.title };
+}
 function fromProtoPartnerReplyQuote(value: contract.PartnerReplyQuote): NonNullable<PromptInput['replyQuote']> {
   if (value.generation < 1n || value.generation > BigInt(Number.MAX_SAFE_INTEGER) || !value.eventId || value.eventId.length > 256
     || !value.messageId || value.messageId.length > 256 || !['user', 'assistant'].includes(value.role) || value.excerpt.length > 280) {

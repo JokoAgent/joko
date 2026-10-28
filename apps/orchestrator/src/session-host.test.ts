@@ -107,9 +107,60 @@ import { materializedSessionRuntimeState, SESSION_RUNTIME_STATE_SETTING_KEY } fr
 import { materializedRuntimeCommands, SESSION_RUNTIME_COMMANDS_SETTING_KEY } from "./runtime-command-state.js";
 import { providerRateLimitSettingKey } from "./provider-rate-limit.js";
 import { MANAGED_GGUF_PROVIDER_ID } from "./managed-gguf-provider.js";
+import { readProvisionalSession } from "./session-prewarm.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
+
+it("adopts an approved draft's original native task on first send and rejects another connection's discard", async () => {
+  class PrewarmAdapter extends FakeBackendAdapter {
+    creations = 0;
+    override async describe() { const value = await super.describe(); return { ...value, adapterKind: "pi", capabilities: new Map(value.capabilities)
+      .set("session.prewarm", { name: "session.prewarm", supported: true }) }; }
+    override async createSession(input: CreateNativeSessionInput, context: AdapterContext) { this.creations++; return super.createSession(input, context); }
+  }
+  const adapter = new PrewarmAdapter(PI_LIKE_PROFILE), f = await createFixture(adapter, { assertPrewarmResources: () => "approved-resources" });
+  const model = PI_LIKE_PROFILE.models[0]!;
+  const input = { operationId: "prepare-original-task", connection: f.connection, targetId: "target-one", title: "Unsent task",
+    provisionalDraftId: "original_draft_incarnation", providerId: model.providerId, modelId: model.modelId,
+    permissionMode: "ask" as const, planMode: false, fastMode: false };
+  const prepared = await f.host.createSession(input), sessionId = prepared.value.sessionId;
+  expect(readProvisionalSession(f.store, sessionId)?.draftId).toBe(input.provisionalDraftId);
+  expect(f.store.listRuns({ sessionId })).toEqual([]);
+  const other = f.store.createConnection({ id: "other-prewarm-owner", name: "Other", authKeyDigest: "other-digest" });
+  expect(() => f.host.assertProvisionalDiscard(sessionId, other, input.provisionalDraftId)).toThrow("different draft or connection");
+  await f.host.prewarmSession(sessionId, f.connection, input.provisionalDraftId);
+  const adopted = await f.host.createSession({ ...input, operationId: "adopt-original-task", title: "First real task", reuseProvisionalSessionId: sessionId });
+  expect(adopted.value.sessionId).toBe(sessionId); expect(adapter.creations).toBe(1);
+  expect(readProvisionalSession(f.store, sessionId)).toBeUndefined();
+  expect(() => f.host.assertProvisionalDiscard(sessionId, f.connection, input.provisionalDraftId)).toThrow();
+  f.host.enqueueInput({ operationId: "prepared-first-input", connection: f.connection, sessionId,
+    prompt: { text: "One first input", images: [], files: [], mentions: [], disposition: "prompt" } });
+  await vi.waitFor(() => expect(f.store.listRuns({ sessionId })[0]?.descriptor.state).toBe("completed"));
+  expect(adapter.creations).toBe(1);
+});
+
+it("does not start a draft Agent when Project Trust or resource approval is missing", async () => {
+  class PrewarmAdapter extends FakeBackendAdapter {
+    creations = 0;
+    override async describe() { const value = await super.describe(); return { ...value, adapterKind: "pi", capabilities: new Map(value.capabilities)
+      .set("session.prewarm", { name: "session.prewarm", supported: true }) }; }
+    override async createSession(input: CreateNativeSessionInput, context: AdapterContext) { this.creations++; return super.createSession(input, context); }
+  }
+  let approved = false;
+  const adapter = new PrewarmAdapter(PI_LIKE_PROFILE), f = await createFixture(adapter, { assertPrewarmResources: () => {
+    if (!approved) throw new Error("Project resource approval is required"); return "approved";
+  } });
+  const model = PI_LIKE_PROFILE.models[0]!, input = { operationId: "approval-blocked-prewarm", connection: f.connection, targetId: "target-one", title: "Unsent",
+    provisionalDraftId: "approval_draft_incarnation", providerId: model.providerId, modelId: model.modelId,
+    permissionMode: "ask" as const, planMode: false, fastMode: false };
+  await expect(f.host.createSession(input)).rejects.toThrow("approval is required"); expect(adapter.creations).toBe(0);
+  approved = true;
+  const target = f.store.getTarget("target-one").descriptor;
+  await f.host.registerTarget({ ...target, trusted: false });
+  await expect(f.host.createSession({ ...input, operationId: "untrusted-prewarm" })).rejects.toThrow("before its first input");
+  expect(adapter.creations).toBe(0); expect(f.store.listSessions()).toEqual([]);
+});
 
 it("retains closed native usage through placeholder readings and fences it when the native binding changes", async () => {
   class UsageAdapter extends FakeBackendAdapter {
@@ -16444,6 +16495,7 @@ async function createFixture(
   hostOptions: {
     readonly workspaceCapture?: WorkspaceRunCapture;
     readonly prepareProjectGit?: NonNullable<ConstructorParameters<typeof SessionHost>[3]>["prepareProjectGit"];
+    readonly assertPrewarmResources?: NonNullable<ConstructorParameters<typeof SessionHost>[3]>["assertPrewarmResources"];
     readonly partnerLearning?: PartnerLearningHostPort;
     readonly registerPartnerLearningToolAuthority?: (authority: PartnerLearningToolAuthority) => string;
     readonly worktrees?: SessionWorktreeCoordinator;

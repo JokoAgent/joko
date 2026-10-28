@@ -136,6 +136,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly onCompact?: () => void;
 }): JSX.Element {
   const [text, setText] = useState("");
+  const [prewarmInputIntent, setPrewarmInputIntent] = useState(false);
   const partnerConversation = usePartnerConversation();
   const guest = controller.state.sessionAccess?.role === "guest";
   const readOnly = taskReadOnly || partnerConversation?.partner?.lifecycle === "paused";
@@ -199,6 +200,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   operationGuardRef.current = operationGuard;
   operationGuardRef.current.activate(session.id);
   const markDraftEdited = (sessionId: string): void => {
+    setPrewarmInputIntent(true);
     operationGuardRef.current.markDraftEdited(sessionId);
     onDraftMutation?.();
   };
@@ -505,6 +507,17 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   });
   const voiceUpdate = voice.update;
   const voiceActive = voice.active;
+  useEffect(() => { setPrewarmInputIntent(false); }, [session.id, session.generation, voiceDictionaryOwnerKey]);
+  useEffect(() => {
+    if (readOnly || effectiveBashMode || hydratedSession !== session.id || submissionKind !== undefined || turnRunning
+      || controller.state.connectionState !== "connected" || backend?.capabilities.get("session.prewarm")?.supported !== true
+      || !controller.prewarmSession || !voiceActive && (!prewarmInputIntent || text.trim() === "" && attachments.length === 0 && browserComments.length === 0)) return;
+    const request = new AbortController(), api = controller.prewarmSession, sessionId = session.id, draftId = session.provisionalDraftId;
+    const generation = session.generation;
+    const timer = window.setTimeout(() => { void api(sessionId, draftId, request.signal, generation).catch(() => undefined); }, 350);
+    return () => { window.clearTimeout(timer); request.abort(); };
+  }, [readOnly, effectiveBashMode, hydratedSession, session.id, session.generation, session.provisionalDraftId, submissionKind, turnRunning,
+    controller.state.connectionState, controller.prewarmSession, backend?.capabilities, prewarmInputIntent, text, attachments.length, browserComments.length, voiceActive]);
   const composerLocked = readOnly || partnerConversation !== undefined && !partnerConversation.confirmed || submissionKind !== undefined || voiceActive;
   const composerEditorLocked = readOnly || (submissionKind !== undefined && submissionKind !== "send") || voiceActive;
   const cancelVoiceInput = voice.cancel;
@@ -1896,6 +1909,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     promptRecommendationStore.dismiss(sourceSessionId);
     const sourceText = draftText.trim();
     const sourceReplyQuote = partnerConversation?.replyQuote;
+    const sourceTodoQuote = partnerConversation?.todoQuote;
+    const clearSentTodoQuote = partnerConversation?.clearSentTodoQuote;
     const clearSentReplyQuote = partnerConversation?.clearSentReplyQuote;
     const sourceEditorDocument = draftDocument;
     const sourceAttachments = [...attachments];
@@ -2002,6 +2017,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         await sourceSend(sourceSessionId, {
           text: sourceText,
           ...(sourceReplyQuote ? { replyQuote: sourceReplyQuote } : {}),
+          ...(sourceTodoQuote ? { todoQuote: { partnerId: sourceTodoQuote.partnerId, todoId: sourceTodoQuote.todoId, revision: sourceTodoQuote.revision, title: sourceTodoQuote.title } } : {}),
           builtinSkillIntent: sourceBuiltinSkillIntent,
           editorDocument: sourceEditorDocument,
           attachments: sourceAttachments,
@@ -2012,6 +2028,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           ...(sourceExtraDirectoryIds === undefined ? {} : { extraDirectoryIds: sourceExtraDirectoryIds })
         }, { expectedGeneration: sourceGeneration });
         if (sourceReplyQuote) clearSentReplyQuote?.(sourceReplyQuote);
+        if (sourceTodoQuote) clearSentTodoQuote?.(sourceTodoQuote);
         partnerConversation?.userSent?.();
         revokeAttachments(sourceAttachments);
         revokeBrowserCommentPreviews(sourceBrowserComments);
@@ -2702,6 +2719,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           if (!effectiveBashMode && !composerLocked) addFiles(event.dataTransfer.files);
         }}
       >
+        {partnerConversation?.todoQuote && <div className="composer-reference-list"><div className="composer-reference-chip"><span>{partnerConversation.todoQuote.title}</span>
+          <IconButton label={t('common.close')} disabled={composerLocked} onClick={partnerConversation.clearTodoQuote}><X aria-hidden="true" /></IconButton></div></div>}
         {partnerConversation?.replyQuote && <div className="composer-reference-list"><div className="composer-reference-chip">
           <button type="button" onClick={() => partnerConversation.locateReplyQuote?.(partnerConversation.replyQuote!)}>{partnerConversation.replyQuote.excerpt || t('timeline.inputReferences')}</button>
           <IconButton label={t('common.close')} disabled={composerLocked} onClick={partnerConversation.clearReplyQuote}><X aria-hidden="true" /></IconButton>

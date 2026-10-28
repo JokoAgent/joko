@@ -334,6 +334,7 @@ import { probeManagedRuntimeActivity } from "./managed-runtime-activity.js";
 import {
   createPackagedSmokeTaskInvitation,
   createPackagedSmokeTask,
+  findPackagedSmokeTaskVisibilityKey,
   runPackagedSmokeTimelineTurn,
   verifyPackagedSmokeTask,
   type PackagedSmokeTask,
@@ -1961,6 +1962,7 @@ async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise
     () => owner.isVisible() && !owner.isMinimized(),
     "owner reveal before first detach"
   );
+  await verifyPackagedSmokeInspectorMultipleWindows(owner);
   await installPackagedSmokeInspectorCloseObserver(owner);
 
   const initial = await openPackagedSmokeInspector(owner);
@@ -2263,7 +2265,48 @@ function observePackagedSmokeInspectorSurfaceRetirement(window: BrowserWindow, o
   });
 }
 
-async function inspectPackagedSmokeInspectorSurface(window: BrowserWindow): Promise<void> {
+async function verifyPackagedSmokeInspectorMultipleWindows(owner: BrowserWindow): Promise<void> {
+  const names = ["1", "2"].map(value => `${INSPECTOR_WINDOW_FRAME_NAME}-${value.repeat(32)}`);
+  try {
+    for (const name of names) {
+      const opened = await owner.webContents.executeJavaScript(`(() => {
+        const child = window.open(${JSON.stringify(INSPECTOR_WINDOW_URL)}, ${JSON.stringify(name)}, ${JSON.stringify(INSPECTOR_WINDOW_FEATURES)});
+        (globalThis.__jokoInspectorMulti ??= []).push(child); return child !== null;
+      })()`, true);
+      if (!opened) throw new Error("Packaged multi-tab Inspector rejected a distinct window.");
+    }
+    await waitForPackagedSmokeInspectorCondition(() => names.every(name => [...inspectorWindows.values()].some(entry => entry.frameName === name)), "multiple independent registrations");
+    const entries = names.map(name => [...inspectorWindows.values()].find(entry => entry.frameName === name)!);
+    if (entries[0]!.occurrence === entries[1]!.occurrence) throw new Error("Packaged Inspectors reused a window occurrence.");
+    for (const entry of entries) await inspectPackagedSmokeInspectorSurface(entry.window, entry.occurrence);
+    const second = entries[1]!;
+    await second.window.webContents.executeJavaScript(`(() => {
+      globalThis.__jokoInspectorCloseRequests = 0;
+      window.jokoInspectorDesktop.window.onCloseRequested(() => { globalThis.__jokoInspectorCloseRequests++; });
+    })()`, true);
+    second.window.close();
+    await waitForPackagedSmokeInspectorCondition(async () => !second.window.isDestroyed()
+      && await second.window.webContents.executeJavaScript("globalThis.__jokoInspectorCloseRequests", true) === 1, "tab-close veto delivery");
+    if (!inspectorWindows.has(second.window) || !second.lifecycle.owns(owner, second.window)) throw new Error("A tab-close request retired its vetoed window.");
+    owner.hide();
+    await waitForPackagedSmokeInspectorCondition(() => entries.every(entry => !entry.window.isVisible()), "all child windows follow owner hide");
+    owner.showInactive();
+    await waitForPackagedSmokeInspectorCondition(() => entries.every(entry => entry.window.isVisible()), "all ready child windows follow owner show");
+    const first = entries[0]!;
+    void first.window.webContents.executeJavaScript("window.jokoInspectorDesktop.window.close('passive')", true).catch(() => undefined);
+    await waitForPackagedSmokeInspectorDestroyed(first.window, "first independent window retirement");
+    const surviving = await second.window.webContents.executeJavaScript("window.jokoInspectorDesktop.window.identity()", true);
+    if (surviving !== second.occurrence || inspectorWindows.get(second.window) !== second) throw new Error("Closing one Inspector invalidated another.");
+    void second.window.webContents.executeJavaScript("window.jokoInspectorDesktop.window.close('passive')", true).catch(() => undefined);
+    await waitForPackagedSmokeInspectorDestroyed(second.window, "second independent window retirement");
+    if (inspectorWindows.size !== 0 || inspectorWindow !== undefined) throw new Error("Independent Inspectors retained retired native ownership.");
+    recordPackagedSmokeProgress("inspector_multiple_windows_and_close_veto_verified");
+  } finally {
+    for (const entry of [...inspectorWindows.values()]) if (names.includes(entry.frameName)) destroyInspectorWindow(entry.window);
+  }
+}
+
+async function inspectPackagedSmokeInspectorSurface(window: BrowserWindow, expectedOccurrence = inspectorWindowOccurrence): Promise<void> {
   const deadline = Date.now() + 10_000;
   let serialized: unknown;
   while (Date.now() < deadline && !window.isDestroyed()) {
@@ -2301,9 +2344,9 @@ async function inspectPackagedSmokeInspectorSurface(window: BrowserWindow): Prom
     readonly href?: unknown;
   };
   if (value.hasGeneralDesktopBridge !== false || typeof value.platform !== "string" ||
-    value.href !== INSPECTOR_WINDOW_URL || value.identity !== inspectorWindowOccurrence || !Array.isArray(value.keys) ||
+    value.href !== INSPECTOR_WINDOW_URL || value.identity !== expectedOccurrence || !Array.isArray(value.keys) ||
     value.keys.join(",") !== "platform,selectionContextMenu,window" ||
-    !Array.isArray(value.windowKeys) || value.windowKeys.join(",") !== "close,identity,minimize,ready,toggleMaximize" ||
+    !Array.isArray(value.windowKeys) || value.windowKeys.join(",") !== "close,identity,minimize,onCloseRequested,ready,toggleMaximize" ||
     !Array.isArray(value.selectionKeys) || value.selectionKeys.join(",") !== "onAddToChat") {
     throw new Error("Packaged Inspector exposed a non-minimal preload surface.");
   }
@@ -2658,6 +2701,19 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
     throw new Error("Packaged smoke Task-window owner changed while its UI was loading.");
   }
   recordPackagedSmokeProgress("task_window_product_ready");
+  let visibleTaskKey: string | undefined;
+  if (nativeTaskStatusSupported) {
+    const visibilityDeadline = Date.now() + 5_000;
+    while (Date.now() < visibilityDeadline) {
+      visibleTaskKey = findPackagedSmokeTaskVisibilityKey(connection, task,
+        nativeTaskStatusVisibleSessionsByContents.get(taskContents) ?? []);
+      if (visibleTaskKey !== undefined) break;
+      await waitForPackagedSmokePoll();
+    }
+    if (visibleTaskKey === undefined) {
+      throw new Error("Packaged smoke Task window did not publish its visible Task state.");
+    }
+  }
   await verifyPackagedSmokeSystemHandoff(owner, taskWindow, taskOwner);
   await assertPackagedSmokeTaskWindowProfileFence(taskWindow, taskOwner);
   if ([...sessionWindows.values()].filter((candidate) => !candidate.isDestroyed()).length !== 1) {
@@ -2666,15 +2722,9 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   recordPackagedSmokeProgress("task_window_cross_profile_fenced");
 
   if (nativeTaskStatusSupported) {
-    const visibleTaskKey = JSON.stringify([
-      connection.profileId, connection.serverId, task.sourceGeneration.toString(), task.generation.toString(), task.sessionId
-    ]);
-    const visibilityDeadline = Date.now() + 5_000;
-    while (Date.now() < visibilityDeadline
-      && nativeTaskStatusVisibleSessionsByContents.get(taskContents)?.includes(visibleTaskKey) !== true) {
-      await waitForPackagedSmokePoll();
-    }
-    if (nativeTaskStatusVisibleSessionsByContents.get(taskContents)?.includes(visibleTaskKey) !== true) {
+    assertPackagedSmokeTaskWindowOwner(taskWindow, taskOwner);
+    if (visibleTaskKey === undefined || findPackagedSmokeTaskVisibilityKey(connection, task,
+      nativeTaskStatusVisibleSessionsByContents.get(taskContents) ?? []) !== visibleTaskKey) {
       throw new Error("Packaged smoke Task window did not publish its visible Task state.");
     }
   }
@@ -6160,7 +6210,7 @@ function applicationWindows(): readonly BrowserWindow[] {
 function visibleSessionDragTargetBounds(): readonly DesktopRectangle[] {
   const windows = [
     ...applicationWindows(),
-    ...(inspectorWindow === undefined || inspectorWindow.isDestroyed() ? [] : [inspectorWindow])
+    ...liveInspectorWindows()
   ];
   return windows
     .filter((window) => window.isVisible() && !window.isMinimized())
@@ -6191,7 +6241,7 @@ function isDesktopApplicationForeground(): boolean {
 function isProviderModelApplicationForeground(): boolean {
   return [
     mainWindow,
-    inspectorWindow,
+    ...liveInspectorWindows(),
     runtimeProcessMonitorWindow,
     ...sessionWindows.values(),
     ...extensionWindows.values()
@@ -6295,8 +6345,8 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
     else targets.push({ window, state, defaults: EXTENSION_WINDOW_DEFAULT_GEOMETRY });
   }
   if (managedInspectorWindowState !== undefined) {
-    if (inspectorWindow !== undefined && !inspectorWindow.isDestroyed()) {
-      targets.push({ window: inspectorWindow, state: managedInspectorWindowState, defaults: INSPECTOR_WINDOW_DEFAULT_GEOMETRY });
+    if (liveInspectorWindows().length) {
+      for (const child of liveInspectorWindows()) targets.push({ window: child, state: managedInspectorWindowState, defaults: INSPECTOR_WINDOW_DEFAULT_GEOMETRY });
     } else {
       resetDormantManagedWindowState(managedInspectorWindowState);
     }
@@ -6337,7 +6387,7 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
     ...(runtimeProcessMonitorWindow === undefined ? [] : [runtimeProcessMonitorWindow]),
     ...sessionWindows.values(),
     ...extensionWindows.values(),
-    ...(inspectorWindow === undefined ? [] : [inspectorWindow])
+    ...liveInspectorWindows()
   ], initiatingContents);
 }
 
@@ -8713,7 +8763,7 @@ function registerIpc(): void {
       .setSwallowActivationClick(parameters[0]);
     broadcastDesktopWindowInteractionSettings([
       ...applicationWindows(),
-      ...(inspectorWindow === undefined ? [] : [inspectorWindow])
+      ...liveInspectorWindows()
     ], DESKTOP_CHANNELS.windowInteractionChanged, settings);
     return settings;
   });

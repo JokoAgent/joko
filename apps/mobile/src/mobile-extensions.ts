@@ -62,6 +62,7 @@ export interface MobileExtension {
     readonly title?: string;
     readonly icon?: "activity" | "box" | "code" | "fileText" | "globe" | "layout" | "search" | "sparkles" | "terminal" | "tool";
   };
+  readonly settings?: { readonly title?: string; readonly height: number; readonly mobileCustom: boolean };
   readonly library?: { readonly schemaVersion: 1 };
   readonly tools: readonly {
     readonly name: string;
@@ -115,6 +116,10 @@ export type MobileExtensionCredentialKind = "apiKey" | "oauth" | "headerSecret";
 export type MobileExtensionPendingMutationKind =
   | "enabled"
   | "sidebar"
+  | "packageAdopt"
+  | "packageRemove"
+  | "settingsRouting"
+  | "settingsCredentialClear"
   | "setupBegin"
   | "setupInteraction"
   | "setupCredential"
@@ -146,6 +151,8 @@ export interface MobileExtensionMainViewSurface {
   readonly title?: string;
   readonly icon?: NonNullable<MobileExtension["mainView"]>["icon"];
   readonly expiresAt: number;
+  readonly purpose?: "settings";
+  readonly mobileSettings?: true;
 }
 
 export interface MobileExtensionMainViewResource {
@@ -175,6 +182,15 @@ export type MobileExtensionUseResult =
   | { readonly kind: "task"; readonly sessionId: string };
 
 export interface MobileExtensionTransport {
+  openSettings?(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
+  callSettings?(surface: MobileExtensionMainViewSurface, call: import("@joko/contracts").ExtensionSettingsCall,
+    host: import("./mobile-extension-settings").MobileExtensionSettingsHost, signal: AbortSignal): Promise<unknown>;
+  packageBackends?(): readonly { readonly backendId: string; readonly name: string }[];
+  browse?(signal: AbortSignal): Promise<MobileExtensionCatalog>;
+  previewPackage?(expected: MobileExtension, backendId: string, signal: AbortSignal): Promise<import("./mobile-extension-packages").MobileExtensionPackagePreview>;
+  adoptPackage?(expected: MobileExtension, preview: import("./mobile-extension-packages").MobileExtensionPackagePreview,
+    allowSourceReplacement: boolean, signal: AbortSignal): Promise<MobileExtensionCatalog>;
+  removePackage?(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionCatalog>;
   getTaskPreferences?(expected: MobileExtension, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
   retryTaskWriteAccess?(expected: MobileExtension, taskId: string, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
   setTaskPreferences?(expected: MobileExtension, preferences: import("@joko/contracts").ExtensionTaskPreferences, model: import("@joko/contracts").ExtensionTaskRoute | undefined,
@@ -306,6 +322,7 @@ export function projectMobileExtensionMainViewSurface(
   const backendGeneration = value.backendGeneration <= BigInt(Number.MAX_SAFE_INTEGER)
     ? Number(value.backendGeneration)
     : undefined;
+  if (value.mobileSettings && !value.settings) invalid("Extension settings surface purpose");
   const expiresAt = timestampMilliseconds(value.expiresAt);
   if (backendGeneration === undefined || backendGeneration < 0 || expiresAt === undefined) {
     invalid("Extension main-view authority");
@@ -327,7 +344,9 @@ export function projectMobileExtensionMainViewSurface(
     url: `${base.origin}${value.endpoint}`,
     ...(title === undefined ? {} : { title }),
     ...(icon === undefined ? {} : { icon }),
-    expiresAt
+    expiresAt,
+    ...(value.settings ? { purpose: "settings" as const } : {}),
+    ...(value.mobileSettings ? { mobileSettings: true as const } : {})
   };
 }
 
@@ -336,7 +355,7 @@ export function assertMobileExtensionMainViewSurface(
   surface: MobileExtensionMainViewSurface,
   now = Date.now()
 ): void {
-  if (!mobileExtensionMainViewReady(extension)
+  if (surface.purpose !== undefined || !mobileExtensionMainViewReady(extension)
     || surface.extensionId !== extension.extensionId
     || surface.owner.resourceId !== extension.owner.resourceId
     || surface.owner.resourceRevision !== extension.owner.resourceRevision
@@ -357,7 +376,8 @@ export function sameMobileExtensionMainViewSurface(
     && left.owner.resourceRevision === right.owner.resourceRevision
     && left.backendId === right.backendId && left.backendRevision === right.backendRevision
     && left.backendGeneration === right.backendGeneration && left.url === right.url
-    && left.title === right.title && left.icon === right.icon && left.expiresAt === right.expiresAt;
+    && left.title === right.title && left.icon === right.icon && left.expiresAt === right.expiresAt
+    && left.purpose === right.purpose && left.mobileSettings === right.mobileSettings;
 }
 
 export function allowMobileExtensionMainViewNavigation(
@@ -412,6 +432,11 @@ export function projectMobileExtension(value: ExtensionCatalogEntry): MobileExte
       ? {}
       : { icon: projectMainViewIcon(value.mainView.icon)! })
   };
+  const settings = value.settings === undefined ? undefined : {
+    ...(value.settings.title === undefined ? {} : { title: requiredText(value.settings.title, 80, "Extension settings title") }),
+    height: value.settings.height, mobileCustom: value.settings.mobileCustom
+  };
+  if (settings && (!Number.isInteger(settings.height) || settings.height < 160 || settings.height > 800)) invalid("Extension settings height");
   if (value.sidebarSupported !== (mainView !== undefined) || value.sidebarVisible && mainView === undefined) {
     invalid("Extension main-view capability");
   }
@@ -499,6 +524,7 @@ export function projectMobileExtension(value: ExtensionCatalogEntry): MobileExte
     sidebarSupported: value.sidebarSupported,
     sidebarVisible: value.sidebarVisible,
     ...(mainView === undefined ? {} : { mainView }),
+    ...(settings === undefined ? {} : { settings }),
     ...(library === undefined ? {} : { library }),
     tools,
     permissions,

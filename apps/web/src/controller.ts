@@ -57,6 +57,7 @@ import { normalizeNavigationWidth, type NavigationLayout } from "./navigation-la
 import type { RecentProject } from "./recent-projects.js";
 import { parseWorkspaceFilesHash, workspaceFilesHash } from "./workspace-files-navigation.js";
 import { requestWorkspaceDocumentLeave, workspaceRouteLeaveRequest } from "./workspace-document-lifecycle.js";
+import { requestExtensionNavigationLeave } from "./extension-view-lifecycle.js";
 import type {
   AppSnapshot,
   BrowserSettingsView,
@@ -322,6 +323,9 @@ export interface AppController extends OperationApi {
   saveDraft(sessionId: string, draft: ComposerDraft): Promise<void>;
   readDraftSnapshot(sessionId: string): Promise<import("./local-state.js").ComposerDraftSnapshot>;
   saveDraftIfRevision(sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined>;
+  readPendingSideChat?(sessionId: string): Promise<import("./model.js").PendingSideChatDraft | undefined>;
+  savePendingSideChat?(sourceSessionId: string, expected: import("./model.js").PendingSideChatDraft | undefined, next: import("./model.js").PendingSideChatDraft | undefined): Promise<boolean>;
+  adoptPendingSideChat?(record: import("./model.js").PendingSideChatDraft, childSessionId: string, appendToExisting: boolean, isCurrent: () => boolean): Promise<"adopted" | "existing" | "stale">;
   restoreFirstInputDraft(sessionId: string, input: ComposerDraft): Promise<void>;
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
@@ -789,7 +793,8 @@ export function useAppController(): AppController {
       const leave = workspaceRouteLeaveRequest(routeRef.current, next);
       const requestAbort = new AbortController();
       const leavePartner = requestPartnerNavigationLeave(requestAbort.signal);
-      if (leave === undefined && leavePartner === undefined) { commitRoute(next); return; }
+      const leaveExtension = requestExtensionNavigationLeave(activeProfileRef.current, routeRef.current, next, requestAbort.signal);
+      if (leave === undefined && leavePartner === undefined && leaveExtension === undefined) { commitRoute(next); return; }
       navigationAbortRef.current = requestAbort;
       let currentHash = appRouteHash(routeRef.current);
       if (event.oldURL !== "") {
@@ -801,6 +806,7 @@ export function useAppController(): AppController {
       }
       window.history.replaceState(window.history.state, "", currentHash);
       const acceptedLeave = async (): Promise<boolean> => {
+        if (leaveExtension !== undefined && !await leaveExtension) return false;
         if (leavePartner !== undefined && !await leavePartner) return false;
         if (requestAbort.signal.aborted) return false;
         return leave === undefined || await requestWorkspaceDocumentLeave({ ...leave, signal: requestAbort.signal });
@@ -1946,6 +1952,7 @@ export function useAppController(): AppController {
     };
     const leave = workspaceRouteLeaveRequest(routeRef.current, effectiveRoute);
     const leavePartner = appRouteHash(routeRef.current) === hash ? undefined : requestPartnerNavigationLeave(signal);
+    const leaveExtension = requestExtensionNavigationLeave(activeProfileRef.current, routeRef.current, effectiveRoute, signal);
     const afterPartner = (): void => {
       if (!ownerIsCurrent()) { finish(); return; }
       if (leave === undefined) { commit(); return; }
@@ -1953,8 +1960,12 @@ export function useAppController(): AppController {
         if (accepted && ownerIsCurrent()) commit(); else finish();
       });
     };
-    if (leavePartner === undefined) afterPartner();
-    else void leavePartner.then(accepted => { if (accepted) afterPartner(); else finish(); });
+    const afterExtension = (): void => {
+      if (leavePartner === undefined) afterPartner();
+      else void leavePartner.then(accepted => { if (accepted) afterPartner(); else finish(); });
+    };
+    if (leaveExtension === undefined) afterExtension();
+    else void leaveExtension.then(accepted => { if (accepted) afterExtension(); else finish(); });
   }, [updatePreferences]);
 
   useEffect(() => {
@@ -2853,14 +2864,23 @@ export function useAppController(): AppController {
   const withDraftSurface = useCallback(async <T,>(sessionId: string, run: (surface: import("./local-state.js").SessionDraftSurface) => Promise<T>): Promise<T> => {
     if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to Joko before using a task draft.");
     const search = window.location.search, bridge = window.jokoDesktop?.sessionWindows;
+    const bootSession = new URLSearchParams(search).get("bootSession");
+    const child = snapshotRef.current.sessions.find(session => session.id === sessionId);
+    const sideChatSource = bootSession && bootSession !== sessionId && child?.derivationOrigin?.sideChat === true
+      && child.derivationOrigin.sourceSessionId === bootSession ? bootSession : undefined;
+    const lineage = (value: typeof child) => value === undefined ? undefined : JSON.stringify([
+      value.id, value.backendId, value.targetId, value.generation.toString(), value.derivationOrigin
+    ]);
+    const originalLineage = lineage(child);
     let retired = false;
     const retire = () => { retired = true; };
     window.addEventListener("pagehide", retire, { once: true });
     const current = () => !retired && window.location.search === search && window.jokoDesktop?.sessionWindows === bridge && gatewayRef.current === artifactGateway
       && gatewayGenerationRef.current === linkGatewayGeneration && activeProfileRef.current?.serverId === draftServerId
-      && activeProfileRef.current.id === draftProfileId;
+      && activeProfileRef.current.id === draftProfileId
+      && (sideChatSource === undefined || lineage(snapshotRef.current.sessions.find(session => session.id === sessionId)) === originalLineage);
     try {
-      const surface = await sessionDraftSurface(draftProfileId, sessionId, current);
+      const surface = await sessionDraftSurface(draftProfileId, sessionId, current, sideChatSource);
       if (surface !== "application" && !current()) throw new Error("The task draft window owner is no longer current.");
       const result = await run(surface);
       if (surface !== "application" && !current()) throw new Error("The task draft window owner is no longer current.");
@@ -2950,6 +2970,29 @@ export function useAppController(): AppController {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
     return withDraftSurface(sessionId, surface => requireLocal(draftStore).saveDraftIfRevision(draftServerId, draftProfileId, sessionId, draft, revision, surface));
   }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
+  const readPendingSideChat = useCallback(async (sourceSessionId: string) => {
+    if (!draftServerId || !draftProfileId) throw new Error("Connect to the original node before checking a Side Chat draft.");
+    return withDraftSurface(sourceSessionId, surface => requireLocal(draftStore).readPendingSideChat(draftServerId, draftProfileId, sourceSessionId, surface));
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
+  const savePendingSideChat = useCallback(async (sourceSessionId: string, expected: import("./model.js").PendingSideChatDraft | undefined, next: import("./model.js").PendingSideChatDraft | undefined) => {
+    if (!draftServerId || !draftProfileId) throw new Error("Connect to the original node before saving a Side Chat draft.");
+    return withDraftSurface(sourceSessionId, surface => requireLocal(draftStore).compareAndSetPendingSideChat(draftServerId, draftProfileId, sourceSessionId, expected, next, surface));
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
+  const adoptPendingSideChat = useCallback(async (record: import("./model.js").PendingSideChatDraft, childSessionId: string, appendToExisting: boolean, isCurrent: () => boolean) => {
+    if (!draftServerId || !draftProfileId) throw new Error("Connect to the original node before restoring a Side Chat draft.");
+    const sourceCurrent = () => {
+      const source = snapshotRef.current.sessions.find(session => session.id === record.sourceSessionId);
+      const child = snapshotRef.current.sessions.find(session => session.id === childSessionId);
+      return isCurrent() && gatewayRef.current === artifactGateway && gatewayGenerationRef.current === linkGatewayGeneration
+        && activeProfileRef.current?.serverId === draftServerId && activeProfileRef.current.id === draftProfileId
+        && source?.generation.toString() === record.sourceGeneration && source.backendId === record.backendId && source.targetId === record.targetId
+        && child?.generation === 1n && child.backendId === record.backendId && child.targetId === record.targetId
+        && child.derivationOrigin?.kind === "fork" && child.derivationOrigin.sideChat === true && child.derivationOrigin.sourceSessionId === record.sourceSessionId;
+    };
+    if (!sourceCurrent()) return "stale" as const;
+    return withDraftSurface(record.sourceSessionId, sourceSurface => withDraftSurface(childSessionId, childSurface =>
+      requireLocal(draftStore).adoptPendingSideChat(draftServerId, draftProfileId, record, childSessionId, sourceSurface, childSurface, appendToExisting, sourceCurrent)));
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface, artifactGateway, linkGatewayGeneration]);
   const rejectedFirstInputRecoverySequenceRef = useRef(0);
   const restoreFirstInputDraft = useCallback<AppController["restoreFirstInputDraft"]>(async (sessionId, input) => {
     if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to Joko before restoring a task draft.");
@@ -3117,7 +3160,10 @@ export function useAppController(): AppController {
       createSession: async (draft: NewSessionDraft) => original().createSession(sessionDraftWithPersonalization(
         draft,
         personalizationPromptForOwner(preferencesRef.current.personalizationPrompts, inputOwnerId)
-      ))
+      )),
+      readSessionPreparation: (...args: Parameters<NonNullable<OperationApi["readSessionPreparation"]>>) => original().readSessionPreparation!(...args),
+      prewarmSession: (...args: Parameters<NonNullable<OperationApi["prewarmSession"]>>) => original().prewarmSession!(...args),
+      discardProvisionalSession: (...args: Parameters<NonNullable<OperationApi["discardProvisionalSession"]>>) => original().discardProvisionalSession!(...args)
     };
   }, [artifactGateway, inputOwnerId]);
   const voiceApi = useMemo(() => {
@@ -3600,6 +3646,9 @@ export function useAppController(): AppController {
     saveDraft,
     readDraftSnapshot,
     saveDraftIfRevision,
+    readPendingSideChat,
+    savePendingSideChat,
+    adoptPendingSideChat,
     restoreFirstInputDraft,
     ...newTaskDraftApi,
     ...inputApi,
@@ -3639,7 +3688,8 @@ export function useAppController(): AppController {
     suggestSessionTitle: (sessionId, signal) => gateway().suggestSessionTitle(sessionId, signal),
     pinSession: (sessionId, pinned) => gateway().pinSession(sessionId, pinned),
     archiveSession: (sessionId, archived, confirmation) => gateway().archiveSession(sessionId, archived, confirmation),
-    openSideChat: (sessionId, generation) => gateway().openSideChat(sessionId, generation),
+    openSideChat: (...args) => gateway().openSideChat(...args),
+    readSideChatOperation: (...args) => gateway().readSideChatOperation!(...args),
     getSessionWorktreeRemovalPreview: (sessionId, signal) => gateway().getSessionWorktreeRemovalPreview(sessionId, signal),
     moveSessionProject: (sessionId, projectId, catalogImport) => gateway().moveSessionProject(sessionId, projectId, catalogImport),
     acknowledgeSessionAttention: (sessionId, throughCursor) => gateway().acknowledgeSessionAttention(sessionId, throughCursor),
@@ -3797,6 +3847,7 @@ export function useAppController(): AppController {
     terminateRuntimeProcess: (process) => gateway().terminateRuntimeProcess(process),
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
     listExtensions: async (options) => catalogGateway().listExtensions(options),
+    extensionSettingsApi: () => catalogGateway().extensionSettingsApi?.(),
     getExtension: async (extensionId, sessionId, signal, includeProjectDisabled) => catalogGateway().getExtension(extensionId, sessionId, signal, includeProjectDisabled),
     openExtensionMainView: async (extensionId, expectedRevision, signal) =>
       catalogGateway().openExtensionMainView(extensionId, expectedRevision, signal),
@@ -3946,6 +3997,7 @@ export function useAppController(): AppController {
     listPartners: (lifecycle, signal) => gateway().listPartners(lifecycle, signal),
     partnerRoutineApi: (partnerId, ownerKey) => gateway().partnerRoutineApi(partnerId, ownerKey),
     partnerAutonomyApi: ownerKey => gateway().partnerAutonomyApi(ownerKey),
+    partnerMessagingApi: ownerKey => gateway().partnerMessagingApi(ownerKey),
     partnerGroupApi: ownerKey => gateway().partnerGroupApi(ownerKey),
     mcpAppApi: () => gateway().mcpAppApi(),
     extensionCardApi: () => gateway().extensionCardApi(),

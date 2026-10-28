@@ -1429,6 +1429,7 @@ export interface TaskTagDeletePreviewView {
 }
 
 export interface SessionView {
+  readonly provisionalDraftId?: string;
   readonly localWorkspace?: { readonly workspaceId: string; readonly path: string };
   readonly taskActivity?: {
     readonly runId: string;
@@ -1569,6 +1570,7 @@ export interface ContextView {
 
 export interface TimelineItemView {
   readonly replyQuote?: PartnerReplyQuoteView;
+  readonly todoQuote?: { readonly partnerId: string; readonly todoId: string; readonly revision: bigint; readonly title: string };
   readonly extensionCard?: import("@joko/contracts").ExtensionCard;
   readonly mcpApp?: import("@joko/contracts").McpAppCard;
   readonly personalDevelopmentReport?: PersonalDevelopmentDoctorRun;
@@ -1961,6 +1963,7 @@ export interface ErrorRecoveryActionView {
 
 export interface QueueItemView {
   readonly replyQuote?: PartnerReplyQuoteView;
+  readonly todoQuote?: { readonly partnerId: string; readonly todoId: string; readonly revision: bigint; readonly title: string };
   readonly sharedTaskAuthor?: import("@joko/contracts").SharedTaskAuthor;
   readonly id: string;
   readonly sessionId: string;
@@ -4239,6 +4242,7 @@ export interface ExtensionCatalogEntryView {
     readonly multiple?: true;
   };
   readonly library?: { readonly schemaVersion: 1 };
+  readonly settings?: { readonly title?: string; readonly height: number; readonly mobileCustom: boolean };
   readonly sidebarSupported: boolean;
   readonly sidebarVisible: boolean;
   readonly tools: readonly { readonly name: string; readonly description: string; readonly requiresPermission: boolean }[];
@@ -4299,6 +4303,15 @@ export interface ExtensionMainViewSurfaceView {
   readonly title?: string;
   readonly icon?: ExtensionMainViewIconView;
   readonly expiresAt: number;
+  readonly purpose?: "settings";
+  readonly mobileSettings?: true;
+}
+
+export interface ExtensionSettingsApi {
+  open(extensionId: string, expectedRevision: bigint, signal: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
+  close(surfaceId: string): Promise<boolean>;
+  call(surface: ExtensionMainViewSurfaceView, call: import("@joko/contracts").ExtensionSettingsCall,
+    host: import("@joko/contracts").ExtensionSettingsHost, signal: AbortSignal): Promise<unknown>;
 }
 
 export type ExtensionLibraryStateView = "ready" | "readOnly" | "unavailable";
@@ -5437,7 +5450,29 @@ export interface NativeCatalogAdoptionResolutionView {
   readonly inspection: "present" | "absent" | "unknown";
 }
 
+export interface ProvisionalTaskReceipt {
+  readonly draftId: string;
+  readonly operationId: string;
+  readonly configurationKey: string;
+  readonly sessionId?: string;
+  readonly discardOperationId?: string;
+  readonly adoptOperationId?: string;
+}
+
+export interface SessionPreparationView {
+  readonly state: "pending" | "failed" | "succeeded";
+  readonly sessionId?: string;
+  readonly generation?: bigint;
+  readonly provisionalDraftId?: string;
+  readonly error?: string;
+  readonly stateMayHaveChanged?: boolean;
+}
+
 export interface NewSessionDraft {
+  /** Stable, client-owned preparation receipt; never contains first input. */
+  readonly operationId?: string;
+  readonly provisionalDraftId?: string;
+  readonly reuseProvisionalSessionId?: string;
   readonly targetId: string;
   /** Exact Target revision whose workspace was prepared for this creation. */
   readonly expectedTargetRevision?: bigint;
@@ -5513,6 +5548,7 @@ export interface NewSessionModelRequest {
  * opaque approved-record IDs and is revalidated against the current snapshot
  * before it is shown or sent; server paths are never copied into this record. */
 export interface NewSessionLocalDraft {
+  readonly preparation?: ProvisionalTaskReceipt;
   readonly builtinSkillIntent?: "plugin_creator";
   readonly selection: NewSessionDraftSelection | { readonly kind: "unselected" };
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
@@ -5626,8 +5662,24 @@ export type ComposerSelectionQuoteDraft =
   | ComposerMessageSelectionQuoteDraft
   | ComposerFileSelectionQuoteDraft;
 
+/** Client-owned recovery for one original Side Chat operation. */
+export interface PendingSideChatDraft {
+  readonly operationId: string;
+  readonly sourceSessionId: string;
+  readonly sourceGeneration: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly quote?: ComposerSelectionQuoteDraft;
+}
+
+export type SideChatOperationView =
+  | { readonly state: "pending" }
+  | { readonly state: "failed"; readonly error: string; readonly stateMayHaveChanged: boolean }
+  | { readonly state: "succeeded"; readonly sessionId: string };
+
 export interface ComposerDraft {
   readonly replyQuote?: PartnerReplyQuoteView;
+  readonly todoQuote?: { readonly partnerId: string; readonly todoId: string; readonly revision: bigint; readonly title: string };
   readonly builtinSkillIntent?: "plugin_creator";
   readonly text: string;
   /** Ordered rich-text source of truth for inline selected-text quote atoms. */
@@ -6033,6 +6085,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   extensionNetworkApi(): ExtensionNetworkApi | undefined;
   extensionOAuthApi(): ExtensionOAuthApi | undefined;
   extensionTaskApi?(): ExtensionTaskApi | undefined;
+  extensionSettingsApi?(): ExtensionSettingsApi | undefined;
   getTerminalCapabilities(sessionId?: string, signal?: AbortSignal): Promise<TerminalCapabilitiesView>;
   listTerminals(sessionId: string, signal?: AbortSignal): Promise<readonly TerminalView[]>;
   createTerminal(sessionId: string, requestId: string, shellId: string, columns: number, rows: number, initialPalette: TerminalPaletteView, signal?: AbortSignal): Promise<TerminalView>;
@@ -6099,7 +6152,10 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   suggestSessionTitle(sessionId: string, signal?: AbortSignal): Promise<SessionTitleSuggestionView>;
   pinSession(sessionId: string, pinned: boolean): Promise<void>;
   archiveSession(sessionId: string, archived: boolean, archiveConfirmation?: string): Promise<void>;
-  openSideChat(sessionId: string, expectedGeneration: bigint): Promise<string>;
+  openSideChat(sessionId: string, expectedGeneration: bigint, options?: {
+    readonly operationId?: string; readonly signal?: AbortSignal; readonly beforeDispatch?: (operationId: string) => Promise<void>;
+  }): Promise<string>;
+  readSideChatOperation?(record: PendingSideChatDraft, signal?: AbortSignal): Promise<SideChatOperationView>;
   getSessionWorktreeRemovalPreview(sessionId: string, signal?: AbortSignal): Promise<SessionWorktreeRemovalPreviewView>;
   moveSessionProject(
     sessionId: string,
@@ -6110,6 +6166,9 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   acknowledgeSessionError(sessionId: string, throughCursor: TimelineHistoryCursorView): Promise<void>;
   deleteSession(sessionId: string, deleteNative: boolean): Promise<void>;
   createSession(draft: NewSessionDraft): Promise<{ readonly sessionId: string; readonly generation: bigint }>;
+  readSessionPreparation?(operationId: string, signal?: AbortSignal): Promise<SessionPreparationView>;
+  prewarmSession?(sessionId: string, provisionalDraftId?: string, signal?: AbortSignal, expectedGeneration?: bigint): Promise<void>;
+  discardProvisionalSession?(sessionId: string, provisionalDraftId: string, operationId: string, signal?: AbortSignal): Promise<void>;
   askHelp(messages: readonly HelpMessageView[], locale: string, signal?: AbortSignal): Promise<HelpAnswerView>;
   createHelpFeedbackDraft(draft: HelpFeedbackDraftView, signal?: AbortSignal): Promise<string>;
   listWorktreeRecycleStatus(signal?: AbortSignal): Promise<readonly WorktreeRecycleRecordView[]>;
@@ -6605,6 +6664,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView>;
   partnerRoutineApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerRoutineApi;
   partnerAutonomyApi?(ownerKey: string): import("@joko/contracts").PartnerAutonomyApi;
+  partnerMessagingApi?(ownerKey: string): import('@joko/contracts').PartnerMessagingApi;
   partnerGroupApi(ownerKey: string): import("@joko/contracts").PartnerGroupApi;
   uploadPartnerGroupFile(file: File, signal: AbortSignal): Promise<import("@joko/contracts").BlobRef>;
   partnerMemoryApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerMemoryApi;

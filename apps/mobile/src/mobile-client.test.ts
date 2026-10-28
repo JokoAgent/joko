@@ -10246,6 +10246,29 @@ describe("native current-task runtime controls", () => {
     });
   });
 
+  it("withholds immutable native controls from a read-only side chat before saving any mutation", async () => {
+    const network = fakeNetwork();
+    const saved = memoryStorage(credential);
+    const sideChat = create(SessionSchema, { ...runtimeSession,
+      derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.FORK,
+        sourceSessionId: "parent", sideChat: true }) });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(sideChat, false) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(sideChat, true));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const controls = app.taskRuntimeControls()!;
+    expect(controls).toMatchObject({ canSwitchModel: false, canSetEffort: false, canSetFastMode: false,
+      canSetPermission: false, canSetPlanMode: false });
+    expect(controls.currentModel?.modelId).toBe("a");
+    expect(app.taskContextControls()).toMatchObject({ usageSupported: true, canCompact: false });
+    await expect(app.setTaskPlanMode(controls.authorityKey, true)).rejects.toThrow();
+    await expect(app.setTaskPermission(controls.authorityKey, PermissionMode.AUTO)).rejects.toThrow();
+    await expect(app.setTaskModel(controls.authorityKey, { providerId: "beta", modelId: "b", fastMode: false })).rejects.toThrow();
+    await expect(app.compactTaskContext(app.taskContextControls()!.authorityKey)).rejects.toThrow();
+    expect(saved.pending()).toEqual([]);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("retains an unknown control receipt and never replays the mutation", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);

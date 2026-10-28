@@ -371,3 +371,11 @@
   .messaging-switch-label { justify-content: space-between; }
   .messaging-connection-card > footer .button { flex: 1 1 140px; }
 }
+.partner-messaging-panel { display: grid; gap: 12px; min-width: 0; }
+.partner-messaging-panel > p { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.partner-messaging-panel__connection { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; min-width: 0; }
+.partner-messaging-panel__connection > .field { flex: 1 1 200px; }
+.partner-messaging-panel__connection > div { flex: 1 1 100%; min-width: 0; }
+.partner-messaging-panel__lane { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; }
+.partner-messaging-panel__lane > strong { overflow-wrap: anywhere; flex: 1 1 160px; }
+.partner-messaging-panel__lane > span { color: var(--text-secondary); font-size: 12px; }

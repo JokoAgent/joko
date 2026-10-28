@@ -1,0 +1,54 @@
+syntax = "proto3";
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+message PartnerTodoDeadline { string kind = 1; string date = 2; string time_zone = 3; optional string at = 4; }
+message PartnerTodoSource { string kind = 1; string label = 2; optional string ref = 3; }
+message PartnerTodoCompletion { string summary = 1; optional string ref = 2; string at = 3; }
+// Public presentation omits internal ingestion keys and model-side instructions.
+message PartnerTodo {
+  string id = 1;
+  uint64 revision = 2;
+  string title = 3;
+  string progress = 4;
+  string outcome = 5;
+  string value = 6;
+  optional string next_label = 7;
+  optional string next_kind = 8;
+  repeated PartnerTodoSource sources = 9;
+  string status = 10;
+  string created_at = 11;
+  string updated_at = 12;
+  PartnerTodoDeadline deadline = 13;
+  repeated PartnerTodoCompletion history = 14;
+}
+enum PartnerTodoView {
+  PARTNER_TODO_VIEW_UNSPECIFIED = 0;
+  PARTNER_TODO_VIEW_OPEN = 1;
+  PARTNER_TODO_VIEW_DONE = 2;
+}
+enum PartnerTodoUiAction {
+  PARTNER_TODO_UI_ACTION_UNSPECIFIED = 0;
+  PARTNER_TODO_UI_ACTION_DELETE = 1;
+  PARTNER_TODO_UI_ACTION_RESTORE = 2;
+}
+message ListPartnerTodosRequest { string partner_id = 1; PartnerTodoView view = 2; uint32 offset = 3; }
+message ListPartnerTodosResponse {
+  string partner_id = 1;
+  Revision partner_revision = 2;
+  repeated PartnerTodo items = 3;
+  uint32 total = 4;
+  optional uint32 next_offset = 5;
+  optional google.protobuf.Timestamp next_deferred_at = 6;
+}
+message UpdatePartnerTodoRequest {
+  string operation_id = 1;
+  string partner_id = 2;
+  Revision expected_partner_revision = 3;
+  string todo_id = 4;
+  uint64 expected_revision = 5;
+  PartnerTodoUiAction action = 6;
+}
+message UpdatePartnerTodoResponse { string partner_id = 1; PartnerTodo todo = 2; }

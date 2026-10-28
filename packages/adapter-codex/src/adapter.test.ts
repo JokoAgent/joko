@@ -1437,7 +1437,8 @@ describe("CodexBackendAdapter", () => {
     expect(descriptor.models.find((model) => model.modelId === "gpt-6.1-sol")).toMatchObject({
       contextWindow: 272_000,
       maxOutputTokens: 128_000,
-      supportsFastMode: true,
+      supportsFastMode: false,
+      declaredSupportsFastMode: false,
       defaultVisible: true,
       cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
       pricing: { currencyCode: "USD", fastModeMultiplier: 2, longContext: { inputTokenThreshold: 272_000 } }
@@ -3537,6 +3538,10 @@ describe("CodexBackendAdapter", () => {
       runtimePolicy: "review_read_only" as const, persistentReadOnly: "side_chat" as const };
     await expect(setup.adapter.resumeSession(derived.binding, persistent)).resolves.toMatchObject({ permissionMode: "ask", fastMode: false });
     await expect(setup.adapter.getNativeHistoryProjection(persistent)).resolves.toMatchObject({ events: expect.any(Array) });
+    await expect(setup.adapter.getNativeHistoryProjection({ ...persistent, persistentReadOnly: undefined }))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REVIEW_OPERATION_DENIED" } });
+    await expect(setup.adapter.setFastMode(true, persistent))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REVIEW_OPERATION_DENIED" } });
     expect(setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params).toMatchObject({ ephemeral: false,
       approvalPolicy: "never", permissions: "joko-review-readonly", environments: [] });
     await setup.fake.completeTurn(binding.nativeSessionId!);

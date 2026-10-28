@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type JSX } from "react";
 import { ModelSpeedControl } from "./ModelSpeedControl.js";
+import { PartnerMessagingPanel } from './PartnerMessagingPanel.js';
 import { resolveModelSpeed } from "../model-speed.js";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
@@ -727,6 +728,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
                 <div><strong>{t("messaging.connectionRoute")}</strong><RouteSummary route={route} fallback={globalRoute} snapshot={snapshot} t={t} compact /></div>
                 <Button tone="ghost" onClick={() => setDialog({ kind: "route", connectionId: connection.id })}>{t("common.edit")}</Button>
               </div>
+              <PartnerMessagingPanel key={`${ownerKey}:${connection.id}`} controller={controller} ownerKey={ownerKey} connectionId={connection.id} />
 
               <footer>
                 <Button tone="secondary" disabled={pending || !connection.credentialConfigured} onClick={() => { void testConnection(connection); }}>

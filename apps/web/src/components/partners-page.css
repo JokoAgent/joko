@@ -169,6 +169,7 @@
 .partner-glance__content ul { list-style: none; padding: 0; }
 .partner-glance__content li > button { display: grid; gap: .2rem; width: 100%; padding: .5rem; text-align: start; overflow-wrap: anywhere; }
 .partner-glance__content label { display: flex; align-items: start; gap: .4rem; padding-top: .6rem; }
+.partner-todo-due { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-inline: 6px; background: var(--danger, #bd3535); vertical-align: middle; }
 .partner-private-receipt > button { display: flex; align-items: center; gap: 6px; border: 0; padding: 4px 8px; background: transparent; color: var(--text-faint); font: inherit; font-size: var(--text-10); cursor: pointer; }
 .partner-private-receipt > button:disabled { cursor: default; }
 .partner-private-receipt svg { width: 14px; height: 14px; }

@@ -137,6 +137,7 @@ import { activeNativeTimeline } from "./snapshot-projector.js";
 import { policySnapshotFor } from "./policy-settings.js";
 import { reviewNativeToolPolicy } from "./native-tool-policy.js";
 import { readNativeOwnerInstructions } from "./native-owner-intent.js";
+import { assertProvisionalSessionOwner, PROVISIONAL_SESSION_KEY, provisionalConfiguration, readProvisionalSession, SessionPrewarmer, validDraftId } from "./session-prewarm.js";
 import { clearProviderRateLimit, recordProviderRateLimit } from "./provider-rate-limit.js";
 import type { CreateFreshReviewerInput, ReviewRuntimeDispatch, ReviewRuntimeOutcome } from "./review-coordinator.js";
 import type { ScheduleRunNotificationController } from "./schedule-run-notifications.js";
@@ -497,6 +498,8 @@ export interface CreateSessionInput {
   readonly connection: ConnectionRecord;
   readonly targetId: string;
   readonly title: string;
+  readonly provisionalDraftId?: string;
+  readonly reuseProvisionalSessionId?: string;
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
@@ -893,6 +896,7 @@ export class SessionHost {
   readonly #inputHandoffQueueScopes = new Map<string, InputHandoffTaskScope>();
   readonly #inputHandoffAdmissions = new WeakSet<PromptInput>();
   #partnerHomeInputGuard: ((sessionId: string) => void) | undefined;
+  #messagingQueueGuard: ((item: QueueItemRecord) => void) | undefined;
   #extensionTaskQueueGuard?: (item: QueueItemRecord) => void;
   #extensionNativeToolAuthorization?: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined;
   readonly #resolveMcpAppModelContext: ((sessionId: string) => Promise<McpAppModelContext>) | undefined;
@@ -935,6 +939,9 @@ export class SessionHost {
     readonly closed: UsageSnapshot | undefined;
   }>();
   readonly #sessionRuntimeControlTails = new Map<string, Promise<void>>();
+  readonly #prewarmer = new SessionPrewarmer({ onError: error => this.recordFailure("session_prewarm_release", error) });
+  readonly #prewarmReleaseOperations = new Map<string, { readonly operationId: string; readonly bodyHash: string; readonly binding: NativeSessionBinding; closed: boolean }>();
+  readonly #assertPrewarmResources: ((target: TargetDescriptor) => string) | undefined;
   readonly #sessionRuntimeControlEffects = new Set<string>();
   readonly #sessionRuntimeRecoveries = new Map<string, SessionRuntimeRecoveryState>();
   #providerGroups?: ProviderGroupRuntime;
@@ -994,6 +1001,7 @@ export class SessionHost {
   readonly #partnerTargetRetired: (targetId: string) => boolean;
   readonly #resolveServiceRuntimePrompt: ((session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>) | undefined;
   readonly #resolvePartnerReplyQuote: ((sessionId: string, quote: NonNullable<PromptInput['replyQuote']>) => string) | undefined;
+  readonly #resolvePartnerTodoQuote: ((sessionId: string, quote: NonNullable<PromptInput['todoQuote']>) => string) | undefined;
   readonly #decorateRuntimePrompt: ((base: string | undefined) => string | undefined) | undefined;
   readonly #serviceRuntimePrompts = new Map<string, { readonly baseDigest: string; readonly text: string }>();
   readonly #resolveServiceRuntimeConfiguration: ((session: SessionDescriptor) => string | undefined) | undefined;
@@ -1101,6 +1109,8 @@ export class SessionHost {
       readonly partnerLearning?: PartnerLearningHostPort;
       readonly registerPartnerLearningToolAuthority?: (authority: PartnerLearningToolAuthority) => string;
       readonly freezeToolPolicies?: (sessionId: string, targetId: string) => void;
+      /** Pure approval snapshot. This callback must never execute/discover project resources. */
+      readonly assertPrewarmResources?: (target: TargetDescriptor) => string;
       readonly onSessionRuntimeClosed?: (sessionId: string) => void;
       /** Confirm user-owned interactive processes before releasing a Session workspace. */
       readonly closeSessionTerminals?: (sessionId: string) => Promise<void>;
@@ -1129,6 +1139,7 @@ export class SessionHost {
       /** Private service identity resolved at native activation, never supplied through RPC or persisted in Session data. */
       readonly resolveServiceRuntimePrompt?: (session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>;
       readonly resolvePartnerReplyQuote?: (sessionId: string, quote: NonNullable<PromptInput['replyQuote']>) => string;
+      readonly resolvePartnerTodoQuote?: (sessionId: string, quote: NonNullable<PromptInput['todoQuote']>) => string;
       /** Private instructions applied equally to initial creation and later native contexts. */
       readonly decorateRuntimePrompt?: (base: string | undefined) => string | undefined;
       /** Native resource selections are private identity, never natural-language prompt declarations. */
@@ -1200,6 +1211,7 @@ export class SessionHost {
     this.#workspaceCapture = options.workspaceCapture;
     this.#prepareProjectGit = options.prepareProjectGit;
     this.#freezeToolPolicies = options.freezeToolPolicies;
+    this.#assertPrewarmResources = options.assertPrewarmResources;
     this.#onSessionRuntimeClosed = options.onSessionRuntimeClosed;
     this.#closeSessionTerminals = options.closeSessionTerminals;
     this.#scheduleRunNotifications = options.scheduleRunNotifications;
@@ -1214,6 +1226,7 @@ export class SessionHost {
     this.#partnerTargetRetired = options.partnerTargetRetired ?? (() => false);
     this.#resolveServiceRuntimePrompt = options.resolveServiceRuntimePrompt;
     this.#resolvePartnerReplyQuote = options.resolvePartnerReplyQuote;
+    this.#resolvePartnerTodoQuote = options.resolvePartnerTodoQuote;
     this.#decorateRuntimePrompt = options.decorateRuntimePrompt;
     this.#resolveServiceRuntimeConfiguration = options.resolveServiceRuntimeConfiguration;
     this.#prepareManagedProviderRuntime = options.prepareManagedProviderRuntime;
@@ -1871,6 +1884,7 @@ export class SessionHost {
   async createSession(input: CreateSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
     validateAppendSystemPrompt(input.appendSystemPrompt);
+    if (input.reuseProvisionalSessionId !== undefined) return this.adoptProvisionalSession(input);
     const target = this.#store.getTarget(input.targetId);
     if (input.nativeStart?.kind !== "attach") {
       this.validateFastSelection(
@@ -1895,7 +1909,18 @@ export class SessionHost {
       }
       return existingLock.task;
     }
-    const task = this.createSessionOnce(input).finally(() => this.#creationLocks.delete(input.operationId));
+    const create = () => this.createSessionOnce(input);
+    const task = (input.provisionalDraftId === undefined ? create() : (async () => {
+      this.assertProvisionalCreationReady(input);
+      const sessionId = stableId("session", input.operationId);
+      let safelyFailed = false;
+      const execution = await this.#prewarmer.start(sessionId, async () => {
+        try { return await create(); }
+        catch (error) { safelyFailed = error instanceof JokoError && error.publicError.stateMayHaveChanged === false; throw error; }
+      }, stillUnused => safelyFailed ? Promise.resolve(true) : this.releasePrewarmedSession(sessionId, stillUnused));
+      if (!execution) throw new StoreError("Unused Agent prewarm capacity is occupied. The first send can create the task normally.");
+      return execution;
+    })()).finally(() => this.#creationLocks.delete(input.operationId));
     this.#creationLocks.set(input.operationId, {
       bodyHash,
       connectionId: input.connection.id,
@@ -1903,6 +1928,135 @@ export class SessionHost {
       task
     });
     return task;
+  }
+
+  private assertProvisionalCreationReady(input: CreateSessionInput): string {
+    const target = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
+    const backend = this.#store.getBackend(target.descriptor.backendId).descriptor;
+    if (!validDraftId(input.provisionalDraftId) || !input.providerId || !input.modelId || input.worktree !== undefined
+      || input.catalogImport !== undefined || input.nativeStart?.kind === "attach" || input.nativeStart?.kind === "new" && input.nativeStart.parentNativeReference !== undefined
+      || !target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined
+      || backend.capabilities.get("session.prewarm")?.supported !== true || !this.#assertPrewarmResources
+      || !["pi", "codex", "claude-code"].includes(backend.adapterKind)) {
+      throw new StoreError("This draft cannot start an Agent before its first input.");
+    }
+    const source = this.#providerGroups?.directory.sources().find(value => value.backendId === backend.id && value.providerId === input.providerId);
+    if (source?.kind === "device" || source?.kind === "share"
+      || this.#providerGroups?.service.snapshot({ backendId: backend.id, providerId: input.providerId }).config !== undefined) throw new StoreError("Shared model runtimes start on the first real input.");
+    return JSON.stringify([target.revision.toString(), backend.instanceGeneration, this.#assertPrewarmResources(target.descriptor)]);
+  }
+
+  private async adoptProvisionalSession(input: CreateSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
+    const sessionId = input.reuseProvisionalSessionId!;
+    await this.#prewarmer.settle(sessionId);
+    if (this.#prewarmReleaseOperations.has(sessionId)) await this.releasePrewarmedSession(sessionId, () => true);
+    return this.#withSessionRuntimeControlLock(sessionId, async () => {
+      const validate = (store: OperationalStore): StoredSession => {
+        const owner = assertProvisionalSessionOwner(store, sessionId, input.connection, input.provisionalDraftId ?? "");
+        const stored = store.getSession(sessionId), session = stored.descriptor, target = store.getTarget(input.targetId);
+        if (owner.configuration !== provisionalConfiguration(input) || owner.targetRevision !== target.revision.toString()
+          || session.targetId !== input.targetId || session.archived || session.deletedAt !== undefined || session.binding.generation !== 1
+          || session.worktree !== undefined || session.derivationOrigin !== undefined || this.hasDurableSessionWork(sessionId)
+          || store.listRuns({ sessionId, limit: 1 }).length > 0
+          || provisionalConfiguration({ ...session, targetId: session.targetId, permissionMode: session.permissionMode,
+            planMode: session.planMode, fastMode: session.fastMode, initialPlacement: input.initialPlacement }) !== owner.configuration) {
+          throw new StoreError("The unused draft task configuration changed. Keep the draft and prepare it again.");
+        }
+        this.assertProvisionalCreationReady({ ...input, reuseProvisionalSessionId: undefined });
+        return stored;
+      };
+      return this.mutate({ operationId: input.operationId, connection: input.connection, kind: "adopt_provisional_session",
+        body: createSessionOperationBody(input), sessionLifecycleFenceId: sessionId, precondition: store => { validate(store); },
+        effect: async () => {
+          validate(this.#store);
+          const target = this.#store.getTarget(input.targetId).descriptor;
+          if (!target.managed && this.#prepareProjectGit) await this.#prepareProjectGit({ workspaceRoot: target.workspaceRoot,
+            assertCurrent: () => { this.#assertOpen(); validate(this.#store); } });
+          validate(this.#store);
+        },
+        commit: store => {
+          const stored = validate(store);
+          store.deleteSetting("service", sessionId, PROVISIONAL_SESSION_KEY);
+          store.updateSession(sessionId, { title: input.title }, stored.revision);
+          return { sessionId };
+        }, afterCommit: () => this.#prewarmer.used(sessionId)
+      });
+    });
+  }
+
+  assertProvisionalDiscard(sessionId: string, connection: ConnectionRecord, draftId: string): void {
+    assertProvisionalSessionOwner(this.#store, sessionId, connection, draftId);
+    if (this.#store.listRuns({ sessionId, limit: 1 }).length > 0 || this.hasDurableSessionWork(sessionId)) {
+      throw new StoreError("This task has already accepted input and cannot be discarded as a draft.");
+    }
+  }
+
+  async prewarmSession(sessionId: string, connection: ConnectionRecord, draftId: string, expectedGeneration?: number): Promise<void> {
+    const stored = this.#store.getSession(sessionId), session = stored.descriptor;
+    if (expectedGeneration !== undefined && session.binding.generation !== expectedGeneration) throw new StoreError("The prewarm task generation changed.");
+    const provisional = readProvisionalSession(this.#store, sessionId);
+    if (provisional) assertProvisionalSessionOwner(this.#store, sessionId, connection, draftId);
+    else if (draftId) throw new StoreError("The provisional task was already adopted or discarded.");
+    const current = this.#store.getConnection(connection.id);
+    if (current.state !== "active" || current.authKeyDigest !== connection.authKeyDigest || session.archived || session.deletedAt !== undefined
+      || this.#store.sessionCreationServiceKind(sessionId) !== undefined || session.automationOrigin !== undefined
+      || this.#partnerSessionPolicy?.(sessionId) !== undefined || this.isReviewReadOnlySession(sessionId) || this.hasDurableSessionWork(sessionId)) return;
+    this.assertProvisionalCreationReady({ operationId: "prewarm", connection, title: session.title, targetId: session.targetId,
+      provisionalDraftId: provisional?.draftId ?? "ordinary_user_task", providerId: session.providerId, modelId: session.modelId,
+      effort: session.effort, fastMode: session.fastMode, permissionMode: session.permissionMode, planMode: session.planMode,
+      ...(session.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: session.appendSystemPrompt }),
+      ...(session.worktree === undefined ? {} : { worktree: { refreshRemote: false } }) });
+    if (this.#active.has(sessionId)) { this.#prewarmer.touch(sessionId); return; }
+    await this.#prewarmer.start(sessionId, async () => {
+      await this.activate(sessionId);
+      const current = this.#store.getConnection(connection.id);
+      if (current.state !== "active" || current.authKeyDigest !== connection.authKeyDigest
+        || this.#store.getSession(sessionId).descriptor.binding.generation !== session.binding.generation) throw new StoreError("The prewarm connection or task generation changed.");
+      return true;
+    }, stillUnused => this.releasePrewarmedSession(sessionId, stillUnused));
+  }
+
+  private async releasePrewarmedSession(sessionId: string, stillUnused: () => boolean): Promise<boolean> {
+    return this.#withSessionRuntimeControlLock(sessionId, async () => {
+      if (!stillUnused()) return true;
+      if (this.#store.hasActiveSessionBackgroundTasks(sessionId)) return false;
+      this.assertMessageDeletionIdle(sessionId, this.#store);
+      const active = this.#active.get(sessionId);
+      const interrupted = this.#prewarmReleaseOperations.get(sessionId);
+      if (!active) {
+        if (interrupted) {
+          if (!interrupted.closed) throw new StoreError("The original unused runtime close is still uncertain.");
+          this.#store.completeDeferredEffectOperation(interrupted.operationId, interrupted.bodyHash, () => ({ closed: true }));
+          this.#prewarmReleaseOperations.delete(sessionId);
+          if (this.#sessionLifecycleFences.get(sessionId) === interrupted.operationId) this.#sessionLifecycleFences.delete(sessionId);
+        }
+        return true;
+      }
+      const stored = this.#store.getSession(sessionId), state = await active.adapter.inspectSession(stored.descriptor.binding, this.contextFor(stored));
+      if (!stillUnused()) return true;
+      if (this.#store.hasActiveSessionBackgroundTasks(sessionId)) return false;
+      assertNativeDeletionIdle(state); this.assertMessageDeletionIdle(sessionId, this.#store);
+      let pending = this.#prewarmReleaseOperations.get(sessionId);
+      if (!pending) {
+        const operationId = `prewarm-release:${sessionId}:${randomUUID()}`;
+        const claim = this.#store.claimDeferredEffectOperation({ id: operationId, kind: "release_unused_agent", body: { sessionId, binding: stored.descriptor.binding } });
+        if (!claim.claimed) return true;
+        pending = { operationId, bodyHash: claim.operation.bodyHash, binding: stored.descriptor.binding, closed: false };
+        this.#prewarmReleaseOperations.set(sessionId, pending);
+      }
+      if (!sameNativeBinding(pending.binding, stored.descriptor.binding)) throw new StoreError("The original unused runtime close owner changed.");
+      this.#sessionLifecycleFences.set(sessionId, pending.operationId);
+      let confirmed = false;
+      try {
+        await this.closeIfActive(sessionId);
+        pending.closed = true;
+        this.#store.completeDeferredEffectOperation(pending.operationId, pending.bodyHash, () => ({ closed: true }));
+        confirmed = true; this.#prewarmReleaseOperations.delete(sessionId);
+        return true;
+      } finally {
+        if (confirmed && this.#sessionLifecycleFences.get(sessionId) === pending.operationId) this.#sessionLifecycleFences.delete(sessionId);
+      }
+    });
   }
 
   /** Service-owned Session creation used by Scheduler. The operation is
@@ -2893,6 +3047,8 @@ export class SessionHost {
     });
     const result = { sessionId: input.sessionId, runId, attemptId, queueItemId };
     if ((input.source ?? "user") === "user") {
+      store.deleteSetting("service", input.sessionId, PROVISIONAL_SESSION_KEY);
+      this.#prewarmer.used(input.sessionId);
       if (store.getQueueControl(input.sessionId).resumeOnUserInput) {
         store.setQueuePaused({ sessionId: input.sessionId, paused: false, traceId: `restart-resume:${input.operationId}` });
       }
@@ -6663,6 +6819,8 @@ export class SessionHost {
       pastedTextRanges: _untrustedPastedTextRanges,
       mentionRanges: _untrustedMentionRanges,
       replyQuote: _untrustedReplyQuote,
+      todoQuote: _untrustedTodoQuote,
+      messagingOrigin: _untrustedMessagingOrigin,
       ...publicProposal
     } = proposed;
     return this.canonicalQueuedPrompt(current.sessionId, {
@@ -6671,6 +6829,8 @@ export class SessionHost {
       images: current.body.images,
       files: current.body.files,
       ...(current.body.replyQuote ? { replyQuote: current.body.replyQuote } : {}),
+      ...(current.body.todoQuote ? { todoQuote: current.body.todoQuote } : {}),
+      ...(current.body.messagingOrigin ? { messagingOrigin: current.body.messagingOrigin } : {}),
       mentions,
       ...(replayed.pastedTextRanges.length === 0
         ? {}
@@ -6812,6 +6972,10 @@ export class SessionHost {
       readonly preserveArtifactReferenceSnapshots?: boolean;
     } = {}
   ): PromptInput {
+    if (prompt.todoQuote) {
+      if (!this.#resolvePartnerTodoQuote) throw inputCapabilityError('INPUT_PARTNER_TODO_UNAVAILABLE', 'Partner Todo quotes are unavailable.');
+      this.#resolvePartnerTodoQuote(sessionId, prompt.todoQuote);
+    }
     if (prompt.replyQuote) {
       if (!this.#resolvePartnerReplyQuote) throw inputCapabilityError('INPUT_PARTNER_QUOTE_UNAVAILABLE', 'Private reply quotes are unavailable.');
       this.#resolvePartnerReplyQuote(sessionId, prompt.replyQuote);
@@ -7064,6 +7228,7 @@ export class SessionHost {
       artifactReferenceSnapshots: _artifactReferenceSnapshots,
       objectiveContinuation: _objectiveContinuation,
       inputHandoffContinuation: _inputHandoffContinuation,
+      messagingOrigin: _messagingOrigin,
       ...adapterPrompt
     } = prompt;
     const sessionMentions = prompt.mentions.flatMap((mention, mentionIndex) => mention.kind === "session"
@@ -10181,6 +10346,7 @@ export class SessionHost {
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#prewarmer.dispose();
     for (const recovery of this.#providerGroupRecoveries.values()) recovery.controller.abort();
     this.#providerGroupRecoveries.clear();
     await this.#providerGroups?.service.close();
@@ -10890,6 +11056,7 @@ export class SessionHost {
     if ("assertServiceScope" in input) input.assertServiceScope?.();
     const logicalBody = createSessionOperationBody(input);
     const authorized = "connection" in input;
+    const provisionalReadiness = authorized && input.provisionalDraftId !== undefined ? this.assertProvisionalCreationReady(input) : undefined;
     const operationKind = authorized
       ? "create_session"
       : "serviceKind" in input
@@ -11105,7 +11272,7 @@ export class SessionHost {
         this.#store.setSetting("service", sessionId, WORKER_WORKSPACE_BINDING_KEY, workerWorkspace);
         preparedWorkerSessionId = sessionId;
       }
-      if (nativeStart.kind === "new" && input.worktree === undefined && !target.descriptor.managed &&
+      if (nativeStart.kind === "new" && !("provisionalDraftId" in input && input.provisionalDraftId) && input.worktree === undefined && !target.descriptor.managed &&
           target.descriptor.remoteWorkspace === undefined && this.#prepareProjectGit !== undefined) {
         const assertCurrent = (): void => {
           this.#assertOpen();
@@ -11236,6 +11403,9 @@ export class SessionHost {
                 this.#runtimeHandoffs.creationPhase(claim.operation.id, "effect"); groupCreationEffectDispatched = true;
               }
               if ("assertServiceScope" in input) input.assertServiceScope?.();
+              if (provisionalReadiness !== undefined && "connection" in input && this.assertProvisionalCreationReady(input) !== provisionalReadiness) {
+                throw new StoreError("Draft runtime approval changed before native startup.");
+              }
               binding = await adapter.createSession({ target: runtimeTarget, name: input.title,
                 ...(!attaching && routedInput.providerId !== undefined ? { providerId: routedInput.providerId } : {}),
                 ...(!attaching && routedInput.modelId !== undefined ? { modelId: routedInput.modelId } : {}),
@@ -11304,6 +11474,9 @@ export class SessionHost {
           backendInstanceGeneration
         );
         const complete = (store: OperationalStore): { readonly sessionId: string } => {
+            if (provisionalReadiness !== undefined && "connection" in input && this.assertProvisionalCreationReady(input) !== provisionalReadiness) {
+              throw new StoreError("Draft runtime approval changed before adoption.");
+            }
             if ("assertServiceScope" in input) input.assertServiceScope?.();
             const catalogAdoption = store.findNativeCatalogAdoption(input.operationId);
             if (catalogAdoption !== undefined) {
@@ -11380,6 +11553,10 @@ export class SessionHost {
               createdAt: presentationCreatedAt,
               updatedAt: presentationAt
             };
+            if ("connection" in input && input.provisionalDraftId !== undefined) store.setSetting("service", sessionId, PROVISIONAL_SESSION_KEY, {
+              format: 1, draftId: input.provisionalDraftId, connectionId: input.connection.id, authKeyDigest: input.connection.authKeyDigest,
+              configuration: provisionalConfiguration(input), targetRevision: currentTarget.revision.toString()
+            });
             const created = store.createSession(descriptor, {
               ...(automationOrigin && "assertServiceScope" in input && input.assertServiceScope ? {
                 automationOccurrenceRouting: { backendId: target.descriptor.backendId, targetId: input.targetId }
@@ -13515,6 +13692,13 @@ export class SessionHost {
           );
           this.assertQueueProviderAuthentication(item, stored);
           let dispatchBody = this.resolveSessionReferencesForDispatch(sessionId, item.body);
+          if (item.body.todoQuote) {
+            if (!this.#resolvePartnerTodoQuote) throw inputCapabilityError('INPUT_PARTNER_TODO_UNAVAILABLE', 'Partner Todo quotes are unavailable.');
+            const prefix = `${this.#resolvePartnerTodoQuote(sessionId, item.body.todoQuote)}\n\n`;
+            dispatchBody = { ...dispatchBody, text: prefix + dispatchBody.text,
+              ...(dispatchBody.pastedTextRanges ? { pastedTextRanges: dispatchBody.pastedTextRanges.map(range => ({ ...range, start: range.start + prefix.length, end: range.end + prefix.length })) } : {}),
+              ...(dispatchBody.mentionRanges ? { mentionRanges: dispatchBody.mentionRanges.map(range => ({ ...range, start: range.start + prefix.length, end: range.end + prefix.length })) } : {}) };
+          }
           if (item.body.replyQuote) {
             if (!this.#resolvePartnerReplyQuote) throw inputCapabilityError('INPUT_PARTNER_QUOTE_UNAVAILABLE', 'Private reply quotes are unavailable.');
             const prefix = `${this.#resolvePartnerReplyQuote(sessionId, item.body.replyQuote)}\n\n`;
@@ -13916,7 +14100,8 @@ export class SessionHost {
       ? turnBudget.budgets : this.captureModelWorkingContexts(target.backendId);
     const context: AdapterContext = {
       nativeToolAuthorization: {
-        required: this.#extensionNativeToolAuthorization?.(sessionId)?.required === true,
+        required: this.#extensionNativeToolAuthorization?.(sessionId)?.required === true
+          || runId !== undefined && this.#store.findQueueItemByRunId(sessionId, runId)?.body.messagingOrigin !== undefined,
         capture: () => JSON.stringify([policySnapshotFor(this.#store, target).generation, this.#extensionNativeToolAuthorization?.(sessionId)?.capture() ?? null]),
         snapshot: () => { context.nativeToolAuthorization!.assertCurrent(); return policySnapshotFor(this.#store, target); },
         readOwnerUserInstructions: () => {
@@ -13942,6 +14127,10 @@ export class SessionHost {
             const attempt = attemptId !== undefined
               ? this.#store.getAttempt(attemptId).descriptor : undefined;
             const queue = attempt === undefined ? undefined : this.#store.findQueueItemByRunId(sessionId, runId);
+            if (queue?.body.messagingOrigin) {
+              if (!this.#messagingQueueGuard) throw new StoreError('The originating message channel is unavailable.');
+              this.#messagingQueueGuard(queue);
+            }
             const ownsDispatch = attempt !== undefined && queue !== undefined
               && run.sessionId === sessionId && run.activeAttemptId === attemptId
               && attempt.runId === runId && attempt.generation === generation
@@ -14606,8 +14795,13 @@ export class SessionHost {
   setExtensionTaskQueueGuard(guard: (item: QueueItemRecord) => void): void { this.#extensionTaskQueueGuard = guard; }
   setExtensionNativeToolAuthorization(factory: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined): void { this.#extensionNativeToolAuthorization = factory; }
   setPartnerHomeInputGuard(guard: (sessionId: string) => void): void { this.#partnerHomeInputGuard = guard; }
+  setMessagingQueueGuard(guard: (item: QueueItemRecord) => void): void { this.#messagingQueueGuard = guard; }
 
   async #assertApplicationQueueCurrent(item: QueueItemRecord): Promise<void> {
+    if (item.body.messagingOrigin) {
+      if (!this.#messagingQueueGuard) throw new StoreError('The originating message channel is unavailable.');
+      this.#messagingQueueGuard(item);
+    }
     const completion = item.body.inputHandoffContinuation;
     if (completion) {
       const scope = this.#inputHandoffQueueScopes.get(item.id);
@@ -17798,6 +17992,8 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
     targetId: input.targetId,
     ...("runtimeBackendId" in input && input.runtimeBackendId !== undefined ? { runtimeBackendId: input.runtimeBackendId } : {}),
     title: input.title,
+    ...("provisionalDraftId" in input && input.provisionalDraftId !== undefined ? { provisionalDraftId: input.provisionalDraftId } : {}),
+    ...("reuseProvisionalSessionId" in input && input.reuseProvisionalSessionId !== undefined ? { reuseProvisionalSessionId: input.reuseProvisionalSessionId } : {}),
     providerId: input.providerId,
     modelId: input.modelId,
     effort: input.effort,

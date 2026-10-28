@@ -15,6 +15,9 @@ import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
 import type { PendingTaskSharingAction } from "./task-sharing.js";
 import { composerDocumentPlainText, normalizeComposerDocument } from "./composer-quote-document.js";
 import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
+import { normalizeSelectionQuoteDrafts } from "./selection-quote.js";
+import { appendQuoteToComposerDocument } from "./composer-quote-document.js";
+import type { PendingSideChatDraft } from "./model.js";
 import { normalizeAppShortcutOverrides, type AppShortcutOverrides } from "./app-shortcuts.js";
 import {
   DEFAULT_APPEARANCE_PREFERENCES,
@@ -447,6 +450,25 @@ function currentDraftRecord(value: unknown): ComposerDraftRecord | undefined {
 
 export type SessionDraftSurface = "application" | `task-window:${number}`;
 
+export function normalizePendingSideChatDraft(value: unknown): PendingSideChatDraft | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some(key => !["operationId", "sourceSessionId", "sourceGeneration", "backendId", "targetId", "quote"].includes(key))
+    || ![record["operationId"], record["sourceSessionId"], record["backendId"], record["targetId"]].every(value => validConnectionIdentity(value, 512))
+    || typeof record["sourceGeneration"] !== "string" || !/^[1-9][0-9]{0,15}$/u.test(record["sourceGeneration"])
+    || BigInt(record["sourceGeneration"]) > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+  const quote = record["quote"] === undefined ? undefined : normalizeSelectionQuoteDrafts([record["quote"]])[0];
+  if (record["quote"] !== undefined && (!quote || quote.sessionId !== record["sourceSessionId"])) return undefined;
+  return { operationId: record["operationId"] as string, sourceSessionId: record["sourceSessionId"] as string,
+    backendId: record["backendId"] as string, targetId: record["targetId"] as string, sourceGeneration: record["sourceGeneration"],
+    ...(quote === undefined ? {} : { quote }) };
+}
+
+function pendingSideChatKey(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface): string {
+  sessionDraftKey(serverId, profileId, sessionId, surface);
+  return JSON.stringify(["side-chat-v1", serverId, profileId, sessionId, surface]);
+}
+
 function sessionDraftKey(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface): string {
   if (!validConnectionIdentity(serverId, 512) || !validConnectionIdentity(profileId, 512)
     || !validConnectionIdentity(sessionId, 512) || !validSessionDraftSurface(surface)) {
@@ -871,6 +893,52 @@ export class LocalState {
     } };
   }
 
+  async readPendingSideChat(serverId: string, profileId: string, sourceSessionId: string, surface: SessionDraftSurface = "application"): Promise<PendingSideChatDraft | undefined> {
+    const raw = await this.get<unknown>(DRAFT_STORE, pendingSideChatKey(serverId, profileId, sourceSessionId, surface));
+    if (raw === undefined) return undefined;
+    const value = normalizePendingSideChatDraft(raw);
+    if (!value || value.sourceSessionId !== sourceSessionId) throw new Error("The saved Side Chat draft owner is invalid.");
+    return value;
+  }
+
+  async compareAndSetPendingSideChat(serverId: string, profileId: string, sourceSessionId: string,
+    expected: PendingSideChatDraft | undefined, next: PendingSideChatDraft | undefined, surface: SessionDraftSurface = "application"): Promise<boolean> {
+    const before = expected === undefined ? undefined : normalizePendingSideChatDraft(expected), after = next === undefined ? undefined : normalizePendingSideChatDraft(next);
+    if (expected !== undefined && (!before || before.sourceSessionId !== sourceSessionId)
+      || next !== undefined && (!after || after.sourceSessionId !== sourceSessionId)) throw new Error("The Side Chat recovery identity is invalid.");
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite"), store = transaction.objectStore(DRAFT_STORE);
+    const done = transactionDone(transaction), key = pendingSideChatKey(serverId, profileId, sourceSessionId, surface);
+    const raw = await requestResult<unknown>(store.get(key));
+    const current = raw === undefined ? undefined : normalizePendingSideChatDraft(raw);
+    if (raw !== undefined && current === undefined) throw new Error("The saved Side Chat recovery is invalid.");
+    if (JSON.stringify(current) !== JSON.stringify(before)) { await done; return false; }
+    if (after === undefined) store.delete(key); else store.put(after, key);
+    await done; return true;
+  }
+
+  /** The exact pending receipt and child draft are adopted in one local transaction. */
+  async adoptPendingSideChat(serverId: string, profileId: string, expected: PendingSideChatDraft, childSessionId: string,
+    sourceSurface: SessionDraftSurface = "application", childSurface: SessionDraftSurface = "application", appendToExisting = false,
+    isCurrent: () => boolean = () => true): Promise<"adopted" | "existing" | "stale"> {
+    const record = normalizePendingSideChatDraft(expected);
+    if (!record || childSessionId === record.sourceSessionId) throw new Error("The Side Chat child identity is invalid.");
+    const pendingKey = pendingSideChatKey(serverId, profileId, record.sourceSessionId, sourceSurface), childKey = sessionDraftKey(serverId, profileId, childSessionId, childSurface);
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite"), store = transaction.objectStore(DRAFT_STORE), done = transactionDone(transaction);
+    const current = normalizePendingSideChatDraft(await requestResult<unknown>(store.get(pendingKey)));
+    if (JSON.stringify(current) !== JSON.stringify(record)) { await done; return "stale"; }
+    const child = currentDraftRecord(await requestResult<unknown>(store.get(childKey)));
+    if (!isCurrent()) { await done; return "stale"; }
+    if (child && !appendToExisting && record.quote !== undefined) { await done; return "existing"; }
+    if (record.quote !== undefined) {
+      const previous = child?.draft, editorDocument = appendQuoteToComposerDocument(previous?.editorDocument ?? normalizeComposerDocument(undefined, previous?.text), record.quote);
+      const revision = child?.revision ?? 0;
+      if (revision >= Number.MAX_SAFE_INTEGER) throw new Error("The child draft revision is exhausted.");
+      store.put({ revision: revision + 1, draft: { ...(previous ?? { deliveryMode: "prompt", attachments: [], browserComments: [], mentions: [] }),
+        text: composerDocumentPlainText(editorDocument), editorDocument } }, childKey);
+    }
+    store.delete(pendingKey); await done; return "adopted";
+  }
+
   async saveNewSessionDraft(scope: string, draft: NewSessionLocalDraft): Promise<void> {
     const normalized = normalizeNewSessionLocalDraft(draft);
     if (normalized === undefined) throw new Error("The new-task draft is invalid.");
@@ -1163,7 +1231,10 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
   const rawWorktree = record["worktree"];
   const worktree = normalizeNewSessionWorktreeDraft(rawWorktree);
   if (rawWorktree !== undefined && worktree === undefined) return undefined;
+  const preparation = normalizeProvisionalTaskReceipt(record["preparation"]);
+  if (record["preparation"] !== undefined && preparation === undefined) return undefined;
   return {
+    ...(preparation === undefined ? {} : { preparation }),
     selection,
     nativeStart,
     providerId: typeof record["providerId"] === "string" ? record["providerId"] : "",
@@ -1182,6 +1253,22 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
     browserComments,
     ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
   };
+}
+
+export function normalizeProvisionalTaskReceipt(value: unknown): import("./model.js").ProvisionalTaskReceipt | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some(key => !["draftId", "operationId", "configurationKey", "sessionId", "discardOperationId", "adoptOperationId"].includes(key))
+    || typeof record["draftId"] !== "string" || !/^[a-zA-Z0-9_-]{16,128}$/u.test(record["draftId"])
+    || !validId(record["operationId"]) || typeof record["configurationKey"] !== "string"
+    || record["configurationKey"].length < 2 || record["configurationKey"].length > 16_384
+    || record["sessionId"] !== undefined && !validId(record["sessionId"])
+    || record["discardOperationId"] !== undefined && !validId(record["discardOperationId"])
+    || record["adoptOperationId"] !== undefined && !validId(record["adoptOperationId"])) return undefined;
+  return { draftId: record["draftId"], operationId: record["operationId"], configurationKey: record["configurationKey"],
+    ...(record["sessionId"] === undefined ? {} : { sessionId: record["sessionId"] as string }),
+    ...(record["discardOperationId"] === undefined ? {} : { discardOperationId: record["discardOperationId"] as string }),
+    ...(record["adoptOperationId"] === undefined ? {} : { adoptOperationId: record["adoptOperationId"] as string }) };
 }
 
 export function normalizePendingExtensionUse(value: unknown): PendingExtensionUseView | undefined {

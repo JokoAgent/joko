@@ -22,6 +22,7 @@ import "joko/v1/objective.proto";
 import "joko/v1/operation.proto";
 import "joko/v1/partner.proto";
 import "joko/v1/partner_autonomy.proto";
+import "joko/v1/partner_todo.proto";
 import "joko/v1/partner_workbench.proto";
 import "joko/v1/pi.proto";
 import "joko/v1/portable_session.proto";
@@ -266,6 +267,11 @@ service SettingsService {
 // Authenticated node-owned third-party Messaging authority. Credentials enter
 // only through connection-bound one-shot upload tickets and are never projected.
 service MessagingService {
+  rpc SetPartnerMessagingBinding(SetPartnerMessagingBindingRequest) returns (SetPartnerMessagingBindingResponse);
+  rpc ListPartnerMessagingLanes(ListPartnerMessagingLanesRequest) returns (ListPartnerMessagingLanesResponse);
+  rpc RestartPartnerMessagingLane(RestartPartnerMessagingLaneRequest) returns (RestartPartnerMessagingLaneResponse);
+  rpc GetPartnerMessagingRestart(GetPartnerMessagingRestartRequest) returns (GetPartnerMessagingRestartResponse);
+  rpc RetryPartnerMessagingRestart(RetryPartnerMessagingRestartRequest) returns (RetryPartnerMessagingRestartResponse);
   rpc GetMessagingSettings(GetMessagingSettingsRequest) returns (GetMessagingSettingsResponse);
   rpc CreateMessagingConnection(CreateMessagingConnectionRequest) returns (CreateMessagingConnectionResponse);
   rpc BeginMessagingCredentialUpload(BeginMessagingCredentialUploadRequest) returns (BeginMessagingCredentialUploadResponse);
@@ -330,6 +336,8 @@ service PartnerService {
   rpc GetPartnerAutonomySettings(GetPartnerAutonomySettingsRequest) returns (GetPartnerAutonomySettingsResponse);
   rpc UpdatePartnerAutonomySettings(UpdatePartnerAutonomySettingsRequest) returns (UpdatePartnerAutonomySettingsResponse);
   rpc GetPartnerGlance(GetPartnerGlanceRequest) returns (GetPartnerGlanceResponse);
+  rpc ListPartnerTodos(ListPartnerTodosRequest) returns (ListPartnerTodosResponse);
+  rpc UpdatePartnerTodo(UpdatePartnerTodoRequest) returns (UpdatePartnerTodoResponse);
   rpc ListPartnerMemories(ListPartnerMemoriesRequest) returns (ListPartnerMemoriesResponse);
   rpc ReadPartnerMemory(ReadPartnerMemoryRequest) returns (ReadPartnerMemoryResponse);
   rpc UpdatePartnerMemory(UpdatePartnerMemoryRequest) returns (UpdatePartnerMemoryResponse);
@@ -480,6 +488,10 @@ service ExtensionService {
   rpc ListExtensionPackageExports(ListExtensionPackageExportsRequest) returns (ListExtensionPackageExportsResponse);
   rpc GetExtensionPackageExport(GetExtensionPackageExportRequest) returns (GetExtensionPackageExportResponse);
   rpc OpenExtensionMainView(OpenExtensionMainViewRequest) returns (OpenExtensionMainViewResponse);
+  rpc OpenExtensionSettings(OpenExtensionSettingsRequest) returns (OpenExtensionSettingsResponse);
+  rpc GetExtensionSettingsRoutingData(GetExtensionSettingsRoutingDataRequest) returns (GetExtensionSettingsRoutingDataResponse);
+  rpc BeginExtensionSecretCheck(BeginExtensionSecretCheckRequest) returns (BeginExtensionSecretCheckResponse);
+  rpc CheckExtensionSecret(CheckExtensionSecretRequest) returns (CheckExtensionSecretResponse);
   rpc GetExtensionMainViewSurface(GetExtensionMainViewSurfaceRequest) returns (GetExtensionMainViewSurfaceResponse);
   rpc CloseExtensionMainView(CloseExtensionMainViewRequest) returns (CloseExtensionMainViewResponse);
   rpc GetExtensionLibraryOverview(GetExtensionLibraryOverviewRequest) returns (GetExtensionLibraryOverviewResponse);
@@ -2595,6 +2607,37 @@ message OpenExtensionMainViewRequest {
 
 message OpenExtensionMainViewResponse {
   ExtensionMainViewSurface surface = 1;
+}
+
+message OpenExtensionSettingsRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  bool mobile = 3;
+}
+message OpenExtensionSettingsResponse {
+  ExtensionMainViewSurface surface = 1;
+}
+message GetExtensionSettingsRoutingDataRequest {
+  string surface_id = 1;
+}
+message GetExtensionSettingsRoutingDataResponse {
+  ExtensionSettingsRoutingData routing_data = 1;
+}
+message BeginExtensionSecretCheckRequest {
+  string surface_id = 1;
+  string secret_key = 2;
+}
+message BeginExtensionSecretCheckResponse {
+  CredentialUploadTicket ticket = 1;
+}
+message CheckExtensionSecretRequest {
+  string surface_id = 1;
+  string secret_key = 2;
+  string credential_upload_ticket_id = 3;
+}
+message CheckExtensionSecretResponse {
+  bool valid = 1;
+  optional google.protobuf.Timestamp expires_at = 2;
 }
 
 message GetExtensionMainViewSurfaceRequest {

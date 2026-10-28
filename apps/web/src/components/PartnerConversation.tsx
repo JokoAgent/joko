@@ -2,12 +2,13 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 import type { AppController } from "../controller.js";
 import type { PartnerListView, PartnerMutationView, PartnerProfileView, PartnerSessionView, PartnerReplyQuoteView, SessionView, TimelineItemView } from "../model.js";
-import { clearSentPartnerReplyQuote, partnerReplyQuoteFor, setPendingPartnerReplyQuote, usePendingPartnerReplyQuote } from '../partner-reply-quote.js';
+import { clearSentPartnerReplyQuote, partnerReplyQuoteFor, setPendingPartnerReplyQuote, usePendingPartnerReplyQuote, clearSentPartnerTodoQuote,
+  setPendingPartnerTodoQuote, usePendingPartnerTodoQuote, type PendingPartnerTodoQuote } from '../partner-reply-quote.js';
 import { isLoopbackHostname } from "../connection-origin.js";
 import { validatePartnerSourceSession } from "../partner-sources.js";
 import { taskSourceKey } from "../task-sharing.js";
 import { PartnerSettingsDialog } from "./PartnersPage.js";
-import type { PartnerLearningSettingsDestination } from "@joko/contracts";
+import type { PartnerHomeApi, PartnerHomeDestination, PartnerLearningSettingsDestination } from "@joko/contracts";
 import type { Translator } from "./types.js";
 
 type ConversationIdentity =
@@ -59,6 +60,14 @@ export interface PartnerConversationView {
   readonly engaged?: boolean;
   readonly userSent?: () => void;
   readonly openObservedTask?: (sessionId: string) => void;
+  readonly openOutputFile?: (sessionId: string, path: string) => void;
+  readonly homeLabel?: string;
+  readonly homeApi?: PartnerHomeApi;
+  readonly openHomeSettings?: (destination: PartnerHomeDestination) => void;
+  readonly todoQuote?: PendingPartnerTodoQuote;
+  readonly quoteTodo?: (todo: import("@joko/contracts").PartnerTodo) => void;
+  readonly clearTodoQuote?: () => void;
+  readonly clearSentTodoQuote?: (value: PendingPartnerTodoQuote) => void;
   readonly workbenchAvailable: boolean;
   readonly workbenchRequest?: number;
   readonly workbenchOpenFailed: boolean;
@@ -88,7 +97,9 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   const sharedTask = source?.kind === "joined" && profile !== undefined && access?.role === "guest" && access.memberId === source.memberId
     && source.sessionId === session.id && source.homeProfileId === profile?.id
     && source.homeServerId === profile.serverId && source.homeOrigin === profile.origin;
-  const expectedPartnerId = controller.state.route?.kind === "session" ? controller.state.route.partnerId : undefined;
+  const expectedPartnerId = controller.state.route?.kind === "session"
+    && (controller.state.route.sessionId === undefined || controller.state.route.sessionId === session.id)
+    ? controller.state.route.partnerId : undefined;
   const ownerKey = JSON.stringify([profile?.id, profile?.serverId, profile?.origin, expectedPartnerId,
     taskSourceKey(source ?? { kind: "own" }), access?.role, access?.memberId,
     String(controller.state.snapshot.generation), session.id, session.targetId, String(session.generation)]);
@@ -103,11 +114,12 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   requestOwnerRef.current = requestOwner;
   const quoteOwner = JSON.stringify([profile?.serverId, profile?.id, session.id, session.generation.toString()]);
   const pendingQuote = usePendingPartnerReplyQuote(quoteOwner);
+  const pendingTodoQuote = usePendingPartnerTodoQuote(quoteOwner);
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   const [projection, setProjection] = useState<IdentityProjection>();
   const [settings, setSettings] = useState<{ readonly owner: object; readonly section: "profile" | "activity";
-    readonly threadId?: string; readonly learningDestination?: PartnerLearningSettingsDestination }>();
+    readonly threadId?: string; readonly learningDestination?: PartnerLearningSettingsDestination; readonly homeDestination?: PartnerHomeDestination }>();
   const entryReadRef = useRef<{ readonly owner: object; readonly partnerId: string; readonly cursor: bigint } | undefined>(undefined);
   const [readRetry, setReadRetry] = useState(0);
   const [readFailure, setReadFailure] = useState<object>();
@@ -119,6 +131,10 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   const autonomyApi = useMemo(() => {
     if (!connected || sharedSource || !controller.partnerAutonomyApi) return undefined;
     try { return controller.partnerAutonomyApi(ownerKey); } catch { return undefined; }
+  }, [controller, connected, sharedSource, ownerKey]);
+  const homeApi = useMemo(() => {
+    if (!connected || sharedSource || !controller.partnerHomeApi) return undefined;
+    try { return controller.partnerHomeApi(ownerKey); } catch { return undefined; }
   }, [controller, connected, sharedSource, ownerKey]);
   const topicAttempts = useRef(new Map<string, { readonly operationId: string; readonly revision: bigint }>());
   const readFlightRef = useRef<{ readonly owner: object; readonly abort: AbortController; pending: bigint; committed: bigint; running: boolean; failed: boolean } | undefined>(undefined);
@@ -315,6 +331,14 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
     autonomyApi: partnerIdentity && !partnerIdentity.topic ? autonomyApi : undefined, engaged: engagedOwner === ownerKey,
     userSent: () => { if (conversationOwnerRef.current === conversationOwner) setEngagedOwner(ownerKey); },
     openObservedTask: sessionId => { if (conversationOwnerRef.current === conversationOwner && editable) void controller.navigate({ kind: "session", sessionId }); },
+    openOutputFile: (sessionId, path) => { if (conversationOwnerRef.current === conversationOwner && editable) void controller.navigate({ kind: "files", sessionId, file: path }); },
+    homeLabel: profile?.origin,
+    homeApi: partnerIdentity && !partnerIdentity.topic && editable ? homeApi : undefined,
+    openHomeSettings: destination => { if (editable && partnerIdentity && conversationOwnerRef.current === conversationOwner) setSettings({ owner: conversationOwner, section: "profile", homeDestination: destination }); },
+    todoQuote: partnerIdentity ? pendingTodoQuote : undefined,
+    quoteTodo: todo => { if (editable && partnerIdentity && conversationOwnerRef.current === conversationOwner) setPendingPartnerTodoQuote(quoteOwner, partnerIdentity.partner.id, todo); },
+    clearTodoQuote: () => { if (partnerIdentity) setPendingPartnerTodoQuote(quoteOwner, partnerIdentity.partner.id); },
+    clearSentTodoQuote: todo => clearSentPartnerTodoQuote(quoteOwner, todo),
     workbenchAvailable, workbenchRequest: workbenchRequest?.owner === ownerKey ? workbenchRequest.sequence : undefined,
     workbenchOpenFailed: workbenchOpenFailure === conversationOwner, openWorkbench
   };
@@ -324,7 +348,7 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
       key={`${ownerKey}\u0000${partnerIdentity.partner.id}`}
       partner={partnerIdentity.partner} partners={partnerIdentity.catalog.partners} directory={partnerIdentity.catalog.directory}
       snapshot={controller.state.snapshot} controller={controller} ownerKey={ownerKey} t={t}
-      initialSection={settings.section} initialPrivateThreadId={settings.threadId} initialLearningDestination={settings.learningDestination}
+      initialSection={settings.section} initialPrivateThreadId={settings.threadId} initialLearningDestination={settings.learningDestination} initialHomeDestination={settings.homeDestination}
       showClose onClose={() => setSettings(undefined)} onUpdated={acceptMutation}
       onActivityUpdated={(partner) => acceptMutation({ partner, directory: partnerIdentity.catalog.directory })}
     />}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, AppState, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { WebView } from "react-native-webview";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import {
@@ -12,6 +12,7 @@ import {
   type MobileExtensionTransport
 } from "./mobile-extensions";
 import { MobileExtensionLibraryBridge, mobileExtensionLibraryBootstrap } from "./mobile-extension-library-bridge";
+import { MobileExtensionSettingsBridge, mobileExtensionSettingsBootstrap } from "./mobile-extension-settings";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
@@ -23,15 +24,18 @@ type SurfaceState =
   | { readonly phase: "ready"; readonly surface: MobileExtensionMainViewSurface; readonly document: PreparedExtensionMainViewDocument; readonly logicalUrl: string }
   | { readonly phase: "error" | "revoked" };
 
-export function MobileExtensionMainView({ colors, extension, locale, onBack, transport }: {
+export function MobileExtensionMainView({ colors, extension, locale, onBack, transport, settings = false, onOpenLibrary }: {
   readonly colors: MobilePartnersColors;
   readonly extension: MobileExtension;
   readonly locale: MobileSupportedLocale;
   readonly onBack: () => void;
   readonly transport: MobileExtensionTransport;
+  readonly settings?: boolean;
+  readonly onOpenLibrary?: () => void;
 }) {
   const transportRef = useRef(transport);
   transportRef.current = transport;
+  const openLibraryRef = useRef(onOpenLibrary); openLibraryRef.current = onOpenLibrary;
   const leaseTransport = useRef<MobileExtensionTransport | undefined>(undefined);
   const surfaceRef = useRef<MobileExtensionMainViewSurface | undefined>(undefined);
   const documentRef = useRef<PreparedExtensionMainViewDocument | undefined>(undefined);
@@ -39,6 +43,8 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
   const reloadAbort = useRef<AbortController | undefined>(undefined);
   const webRef = useRef<WebView>(null);
   const bridgeRef = useRef<MobileExtensionLibraryBridge | undefined>(undefined);
+  const settingsBridge = useRef<MobileExtensionSettingsBridge | undefined>(undefined);
+  const authorizing = useRef(false);
   const frameOwner = useRef<{ readonly id: string; readonly url: string; started: boolean; resources: Set<AbortController> } | undefined>(undefined);
   const [attempt, setAttempt] = useState(0);
   const [frameRevision, setFrameRevision] = useState(0);
@@ -49,6 +55,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
   const release = useCallback((surface: MobileExtensionMainViewSurface | undefined): void => {
     bridgeRef.current?.dispose();
     bridgeRef.current = undefined;
+    settingsBridge.current?.dispose(); settingsBridge.current = undefined;
     for (const request of frameOwner.current?.resources ?? []) request.abort();
     frameOwner.current = undefined;
     const document = documentRef.current; documentRef.current = undefined;
@@ -69,7 +76,9 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     setFrameLoaded(false);
     setReloading(false);
     setState({ phase: "opening" });
-    void currentTransport.openMainView(extension, controller.signal).then(async (surface) => {
+    const opening = settings ? currentTransport.openSettings?.(extension, controller.signal)
+      ?? Promise.reject(new Error("Plugin author settings are unavailable.")) : currentTransport.openMainView(extension, controller.signal);
+    void opening.then(async (surface) => {
       if (controller.signal.aborted || occurrence.current !== request
         || transportRef.current.ownerKey !== currentTransport.ownerKey) {
         void currentTransport.closeMainView(surface).catch(() => undefined);
@@ -97,7 +106,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
       if (occurrence.current === request) occurrence.current = undefined;
       release(surfaceRef.current);
     };
-  }, [attempt, extension.extensionId, extension.revision, release, transport.ownerKey]);
+  }, [attempt, extension.extensionId, extension.revision, release, settings, transport.ownerKey]);
 
   const revoke = useCallback((surface: MobileExtensionMainViewSurface, phase: "error" | "revoked") => {
     if (surfaceRef.current?.surfaceId !== surface.surfaceId) return;
@@ -110,6 +119,15 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
   }, [release]);
 
   useEffect(() => {
+    if (!settings) return;
+    const listener = AppState.addEventListener("change", value => {
+      const surface = surfaceRef.current;
+      if (value !== "active" && !authorizing.current && surface) revoke(surface, "revoked");
+    });
+    return () => listener.remove();
+  }, [revoke, settings]);
+
+  useEffect(() => {
     if (state.phase !== "ready") return undefined;
     const expected = state.surface;
     const currentTransport = leaseTransport.current;
@@ -117,19 +135,20 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     let probing = false;
     const controller = new AbortController();
     const timer = setInterval(() => {
+      if (settings && authorizing.current && AppState.currentState !== "active") return;
       if (probing || surfaceRef.current?.surfaceId !== expected.surfaceId) return;
       probing = true;
       void currentTransport.probeMainView(expected, controller.signal).then((current) => {
         if (!sameMobileExtensionMainViewSurface(expected, current)) throw new Error("Extension main view changed.");
       }).catch(() => {
-        if (!controller.signal.aborted) revoke(expected, "revoked");
+        if (!controller.signal.aborted && !(settings && authorizing.current)) revoke(expected, "revoked");
       }).finally(() => { probing = false; });
     }, 15_000);
     return () => {
       controller.abort();
       clearInterval(timer);
     };
-  }, [revoke, state]);
+  }, [revoke, settings, state]);
 
   const reload = (destination?: string): void => {
     if (state.phase !== "ready" || reloading) return;
@@ -140,6 +159,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     if (!allowMobileExtensionMainViewNavigation(expected, logicalUrl)) return;
     bridgeRef.current?.dispose();
     bridgeRef.current = undefined;
+    settingsBridge.current?.dispose(); settingsBridge.current = undefined;
     for (const request of frameOwner.current?.resources ?? []) request.abort();
     frameOwner.current = undefined;
     const previousDocument = documentRef.current; documentRef.current = undefined;
@@ -170,7 +190,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     });
   };
 
-  const title = state.phase === "ready"
+  const title = settings ? extension.settings?.title ?? mobileMessage(locale, "extension.settings") : state.phase === "ready"
     ? state.surface.title ?? extension.mainView?.title ?? extension.name
     : extension.mainView?.title ?? extension.name;
   const readySurface = state.phase === "ready" ? state.surface : undefined;
@@ -185,7 +205,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
   const extensionKey = mobileExtensionKey(extension);
   useEffect(() => {
     const owner = leaseTransport.current;
-    if (frame === undefined || readySurface === undefined || extension.library === undefined || owner === undefined) return undefined;
+    if (settings || frame === undefined || readySurface === undefined || extension.library === undefined || owner === undefined) return undefined;
     const bridge = new MobileExtensionLibraryBridge({
       extension, surface: readySurface, frameId: frame.id, transport: owner, documentUrl: frame.url,
       current: () => frameOwner.current === frame && surfaceRef.current?.surfaceId === readySurface.surfaceId
@@ -200,7 +220,43 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
       bridge.dispose();
       if (bridgeRef.current === bridge) bridgeRef.current = undefined;
     };
-  }, [extensionKey, frame, readySurface, transport.ownerKey]);
+  }, [extensionKey, frame, readySurface, settings, transport.ownerKey]);
+  useEffect(() => {
+    const owner = leaseTransport.current;
+    if (!settings || !frame || !readySurface || readySurface.purpose !== "settings" || !owner?.callSettings) return;
+    const current = () => frameOwner.current === frame && surfaceRef.current?.surfaceId === readySurface.surfaceId
+      && transportRef.current.ownerKey === owner.ownerKey;
+    const bridge = new MobileExtensionSettingsBridge({ surface: readySurface, frameId: frame.id, documentUrl: frame.url, transport: owner,
+      current, foreground: () => AppState.currentState === "active", send: message => {
+        if (!webRef.current) throw new Error("Settings document retired."); webRef.current.postMessage(message);
+      }, host: {
+        locale,
+        confirm: (title, body, signal) => new Promise<boolean>(resolve => {
+          let settled = false;
+          const finish = (accepted: boolean) => {
+            if (settled) return; settled = true; clearTimeout(timer); signal.removeEventListener("abort", cancel);
+            resolve(accepted && !signal.aborted && current() && AppState.currentState === "active");
+          };
+          const cancel = () => finish(false), timer = setTimeout(cancel, 60_000);
+          signal.addEventListener("abort", cancel, { once: true });
+          if (signal.aborted || !current()) { cancel(); return; }
+          Alert.alert(title, body, [{ text: mobileMessage(locale, "common.cancel"), style: "cancel", onPress: cancel },
+            { text: mobileMessage(locale, "extension.settingsConfirm"), onPress: () => finish(true) }], { cancelable: true, onDismiss: cancel });
+        }),
+        authorize: async (authorization, expiresAt, signal) => {
+          authorizing.current = true;
+          try {
+            const driver = await import("./mobile-extension-oauth");
+            return await driver.authorizeMobileExtensionAccount(authorization, expiresAt, signal, () => {
+              signal.throwIfAborted(); if (!current()) throw new Error("Plugin settings owner changed.");
+            });
+          } finally { authorizing.current = false; }
+        },
+        openLibrary: async signal => { signal.throwIfAborted(); if (!current() || !openLibraryRef.current) throw new Error("Plugin Library is unavailable."); openLibraryRef.current(); }
+      } });
+    settingsBridge.current = bridge;
+    return () => { bridge.dispose(); if (settingsBridge.current === bridge) settingsBridge.current = undefined; };
+  }, [extensionKey, frame, locale, readySurface, settings, transport.ownerKey]);
   const currentFrame = (): boolean => frame !== undefined && frameOwner.current === frame
     && surfaceRef.current?.surfaceId === readySurface?.surfaceId;
   const receiveResource = (data: string, documentUrl: string): boolean => {
@@ -290,12 +346,15 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
             allowFileAccess={false} allowFileAccessFromFileURLs={false} allowUniversalAccessFromFileURLs={false}
             mediaCapturePermissionGrantType="deny" sharedCookiesEnabled={false} thirdPartyCookiesEnabled={false}
             domStorageEnabled={false} incognito={Platform.OS === "ios"} cacheEnabled={false} mixedContentMode="never"
-            injectedJavaScriptBeforeContentLoaded={`globalThis[Symbol.for('joko.extension.surface.base')]=${JSON.stringify(logicalUrl)};${extension.library && frame ? mobileExtensionLibraryBootstrap(frame.id, readySurface.surfaceId) : "true;"}`}
-            injectedJavaScript={`globalThis[Symbol.for('joko.extension.surface.base')]=${JSON.stringify(logicalUrl)};${extension.library && frame ? mobileExtensionLibraryBootstrap(frame.id, readySurface.surfaceId) : "true;"}`}
+            injectedJavaScriptBeforeContentLoaded={`globalThis[Symbol.for('joko.extension.surface.base')]=${JSON.stringify(logicalUrl)};${settings && frame ? mobileExtensionSettingsBootstrap(frame.id, readySurface.surfaceId) : extension.library && frame ? mobileExtensionLibraryBootstrap(frame.id, readySurface.surfaceId) : "true;"}`}
+            injectedJavaScript={`globalThis[Symbol.for('joko.extension.surface.base')]=${JSON.stringify(logicalUrl)};${settings && frame ? mobileExtensionSettingsBootstrap(frame.id, readySurface.surfaceId) : extension.library && frame ? mobileExtensionLibraryBootstrap(frame.id, readySurface.surfaceId) : "true;"}`}
             injectedJavaScriptBeforeContentLoadedForMainFrameOnly injectedJavaScriptForMainFrameOnly
             onMessage={(event) => {
               if (!currentFrame()) return;
-              if (!receiveResource(event.nativeEvent.data, event.nativeEvent.url) && extension.library) bridgeRef.current?.receive(event.nativeEvent.data, event.nativeEvent.url);
+              if (!receiveResource(event.nativeEvent.data, event.nativeEvent.url)) {
+                if (settings) settingsBridge.current?.receive(event.nativeEvent.data, event.nativeEvent.url);
+                else if (extension.library) bridgeRef.current?.receive(event.nativeEvent.data, event.nativeEvent.url);
+              }
             }}
             onShouldStartLoadWithRequest={(request) => {
               if (!currentFrame() || request.isTopFrame === false) return false;
