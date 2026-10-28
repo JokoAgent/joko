@@ -131,6 +131,7 @@ import {
   stopAndRemoveManagedSubagentRuns
 } from "./durable-subagent-runs.js";
 import { handleExtensionUiRequest } from "./interactions.js";
+import { createPiModelCatalogAdditions } from "./model-catalog-additions.js";
 import {
   assertManagedSubagentControlTarget,
   ManagedSubagentObserver,
@@ -7322,6 +7323,8 @@ function usageFromStats(
 }
 
 function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[], supportsFastMode = false): ProviderModel {
+  const metadata = createPiModelCatalogAdditions().referenceCatalogMetadata({ id: model.id, provider: model.provider, api: model.api,
+    ...(typeof model["baseUrl"] === "string" ? { baseUrl: model["baseUrl"] } : {}) });
   const thinkingLevelMap = isRecord(model.thinkingLevelMap)
     ? model.thinkingLevelMap as Readonly<Record<string, string | null>>
     : undefined;
@@ -7336,7 +7339,7 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
     api: model.api ?? "unknown",
     ...(model.api === undefined ? {} : { referenceApi: model.api, protocolMode: "matching" as const }),
     ...(Array.isArray(model.input) ? { declaredInputModalities: [...model.input], declaredSupportsImages: model.input.includes("image") } : {}),
-    ...(thinkingLevels.includes("medium") ? { defaultEffort: "medium" } : {}),
+    ...(thinkingLevels.includes(metadata?.defaultEffort ?? "medium") ? { defaultEffort: metadata?.defaultEffort ?? "medium" } : {}),
     contextWindow,
     maxOutputTokens: piModelOutputTokenLimit(optionalNumeric(model.maxTokens), contextWindow),
     ...(model.contextWindow === undefined ? {} : { contextWindowSource: "declared" as const }),

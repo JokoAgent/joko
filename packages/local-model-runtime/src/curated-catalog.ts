@@ -1,99 +1,225 @@
 import type { CuratedLocalModel } from "./types.js";
-import { MODEL_SEARCH_TERMS } from "./i18n/model-search-terms.js";
 
 const GIB = 1024 ** 3;
 
 interface CatalogEntry {
   readonly id: string;
   readonly displayName: string;
-  readonly genericName: string;
-  readonly appleName?: string;
   readonly aliases: readonly string[];
-  readonly sizeBytes: number;
-  readonly minimumMemoryGb: number;
-  readonly appleSiliconOnly?: boolean;
+  readonly variants: readonly {
+    readonly libraryName: string;
+    readonly sizeBytes: number;
+    readonly minimumMemoryGb: number;
+    readonly appleSiliconOnly?: boolean;
+  }[];
 }
 
 const CATALOG: readonly CatalogEntry[] = [
   {
-    id: "qwen38-27b",
-    displayName: "Qwen3.8 27B",
-    genericName: "qwen3.8:27b",
-    appleName: "qwen3.8:27b-mlx",
-    aliases: MODEL_SEARCH_TERMS.qwen,
-    sizeBytes: 18 * GIB,
-    minimumMemoryGb: 32
+    "id": "qwen38-27b",
+    "displayName": "Qwen3.8 27B",
+    "aliases": [
+      "qwen",
+      "qwen3.8",
+      "qwen3",
+      "tongyi",
+      "qwq",
+      "通义",
+      "通義",
+      "千问",
+      "千問"
+    ],
+    "variants": [
+      {
+        "libraryName": "qwen3.8:27b-mxfp8",
+        "sizeBytes": 31655335990,
+        "minimumMemoryGb": 64,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "qwen3.8:27b-mlx",
+        "sizeBytes": 18174721596,
+        "minimumMemoryGb": 32,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "qwen3.8:27b",
+        "sizeBytes": 17741871939,
+        "minimumMemoryGb": 32,
+        "appleSiliconOnly": false
+      }
+    ]
   },
   {
-    id: "gpt-oss-20b",
-    displayName: "gpt-oss 20B",
-    genericName: "gpt-oss:20b",
-    aliases: ["gpt", "openai", "oss", "gpt-oss"],
-    sizeBytes: 14 * GIB,
-    minimumMemoryGb: 16
+    "id": "qwen35-4b",
+    "displayName": "Qwen3.5 4B",
+    "aliases": [
+      "qwen",
+      "qwen3.5",
+      "通义",
+      "通義",
+      "千问",
+      "千問"
+    ],
+    "variants": [
+      {
+        "libraryName": "qwen3.5:4b-mlx",
+        "sizeBytes": 3973304734,
+        "minimumMemoryGb": 8,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "qwen3.5:4b-q4_K_M",
+        "sizeBytes": 3389983260,
+        "minimumMemoryGb": 8
+      }
+    ]
   },
   {
-    id: "gemma4-e2b",
-    displayName: "Gemma 4 E2B",
-    genericName: "gemma4:e2b",
-    appleName: "gemma4:e2b-mlx",
-    aliases: ["gemma", "gemma4", "google"],
-    sizeBytes: 6.2 * GIB,
-    minimumMemoryGb: 8
+    "id": "qwen35-9b",
+    "displayName": "Qwen3.5 9B",
+    "aliases": [
+      "qwen",
+      "qwen3.5",
+      "通义",
+      "通義",
+      "千问",
+      "千問"
+    ],
+    "variants": [
+      {
+        "libraryName": "qwen3.5:9b-mlx",
+        "sizeBytes": 8903014479,
+        "minimumMemoryGb": 16,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "qwen3.5:9b-q4_K_M",
+        "sizeBytes": 6594474236,
+        "minimumMemoryGb": 16
+      }
+    ]
   },
   {
-    id: "gemma4-e4b",
-    displayName: "Gemma 4 E4B",
-    genericName: "gemma4:e4b",
-    appleName: "gemma4:e4b-mlx",
-    aliases: ["gemma", "gemma4", "google"],
-    sizeBytes: 7.2 * GIB,
-    minimumMemoryGb: 12
+    "id": "gemma4-12b",
+    "displayName": "Gemma 4 12B",
+    "aliases": [
+      "gemma",
+      "gemma4",
+      "google",
+      "宝石",
+      "寶石"
+    ],
+    "variants": [
+      {
+        "libraryName": "gemma4:12b-mlx",
+        "sizeBytes": 7714091072,
+        "minimumMemoryGb": 16,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "gemma4:12b-it-q4_K_M",
+        "sizeBytes": 7556507848,
+        "minimumMemoryGb": 16
+      }
+    ]
   },
   {
-    id: "gemma4-12b",
-    displayName: "Gemma 4 12B",
-    genericName: "gemma4:12b",
-    appleName: "gemma4:12b-mlx",
-    aliases: ["gemma", "gemma4", "google"],
-    sizeBytes: 8.5 * GIB,
-    minimumMemoryGb: 16
+    "id": "qwen36-35b",
+    "displayName": "Qwen3.6 35B A3B",
+    "aliases": [
+      "qwen",
+      "qwen3.6",
+      "通义",
+      "通義",
+      "moe"
+    ],
+    "variants": [
+      {
+        "libraryName": "qwen3.6:35b-mlx",
+        "sizeBytes": 23598465441,
+        "minimumMemoryGb": 32,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "qwen3.6:35b-a3b-q4_K_M",
+        "sizeBytes": 23938333115,
+        "minimumMemoryGb": 32
+      }
+    ]
   },
   {
-    id: "gemma4-31b",
-    displayName: "Gemma 4 31B",
-    genericName: "gemma4:31b",
-    appleName: "gemma4:31b-mlx",
-    aliases: ["gemma", "gemma4", "google"],
-    sizeBytes: 20 * GIB,
-    minimumMemoryGb: 32
+    "id": "nemotron35-30b",
+    "displayName": "Nemotron 3.5 Lightning 30B",
+    "aliases": [
+      "nemotron",
+      "nvidia",
+      "lightning",
+      "moe"
+    ],
+    "variants": [
+      {
+        "libraryName": "nemotron-3.5-lightning:30b-mlx",
+        "sizeBytes": 22666641292,
+        "minimumMemoryGb": 48,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "nemotron-3.5-lightning:30b",
+        "sizeBytes": 25430749137,
+        "minimumMemoryGb": 48
+      }
+    ]
   },
   {
-    id: "gemma4-26b",
-    displayName: "Gemma 4 26B",
-    genericName: "gemma4:26b",
-    appleName: "gemma4:26b-mlx",
-    aliases: ["gemma", "gemma4", "google"],
-    sizeBytes: 18 * GIB,
-    minimumMemoryGb: 32
+    "id": "qwen38-flash-next",
+    "displayName": "Qwen3.8 Flash-Next",
+    "aliases": [
+      "qwen",
+      "flash-next",
+      "通义",
+      "通義",
+      "moe"
+    ],
+    "variants": [
+      {
+        "libraryName": "qwen3.8-flash-next:125b-mlx",
+        "sizeBytes": 104852025885,
+        "minimumMemoryGb": 192,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "qwen3.8-flash-next:125b-a6b-q4_K_M",
+        "sizeBytes": 120058268208,
+        "minimumMemoryGb": 192
+      }
+    ]
   },
   {
-    id: "ornith15-35b",
-    displayName: "Ornith 1.5 35B",
-    genericName: "hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M",
-    aliases: ["ornith", "coder", "code", "coding", "agent"],
-    sizeBytes: 21.7 * GIB,
-    minimumMemoryGb: 32
-  },
-  {
-    id: "glm-47-flash",
-    displayName: "GLM-4.7 Flash",
-    genericName: "glm-4.7-flash",
-    aliases: ["glm", "flash", "coder", "code", "coding", "zhipu"],
-    sizeBytes: 19 * GIB,
-    minimumMemoryGb: 32
+    "id": "laguna-s21-118b",
+    "displayName": "Laguna S 2.1 118B A8B",
+    "aliases": [
+      "laguna",
+      "poolside",
+      "laguna-s-2.1",
+      "118b",
+      "moe"
+    ],
+    "variants": [
+      {
+        "libraryName": "laguna-s-2.1:nvfp4",
+        "sizeBytes": 66189691080,
+        "minimumMemoryGb": 128,
+        "appleSiliconOnly": true
+      },
+      {
+        "libraryName": "laguna-s-2.1:q4_K_M",
+        "sizeBytes": 96031832391,
+        "minimumMemoryGb": 192
+      }
+    ]
   }
-] as const;
+];
 
 function isAppleSilicon(platform: NodeJS.Platform, arch: NodeJS.Architecture): boolean {
   return platform === "darwin" && arch === "arm64";
@@ -107,28 +233,17 @@ export function curatedModelsForHost(input: {
   const apple = isAppleSilicon(input.platform, input.arch);
   const memoryGb = Math.max(0, Math.floor(input.totalMemoryBytes / GIB));
   return CATALOG
-    .filter((model) => model.appleSiliconOnly !== true || apple)
-    .map((model) => {
-      if (model.id === "qwen38-27b" && apple && memoryGb >= 64) {
-        return {
-          id: model.id,
-          displayName: model.displayName,
-          libraryName: "qwen3.8:27b-mxfp8",
-          aliases: model.aliases,
-          sizeBytes: 32 * GIB,
-          minimumMemoryGb: 64,
-          appleSiliconOnly: true
-        };
-      }
-      return {
+    .flatMap((model) => {
+      const variants = model.variants.filter(variant => variant.appleSiliconOnly !== true || apple);
+      const variant = variants.find(value => memoryGb >= value.minimumMemoryGb)
+        ?? [...variants].sort((left, right) => left.minimumMemoryGb - right.minimumMemoryGb)[0];
+      return variant === undefined ? [] : [{
         id: model.id,
         displayName: model.displayName,
-        libraryName: apple && model.appleName !== undefined ? model.appleName : model.genericName,
         aliases: model.aliases,
-        sizeBytes: Math.round(model.sizeBytes),
-        minimumMemoryGb: model.minimumMemoryGb,
-        appleSiliconOnly: apple && model.appleName !== undefined ? true : model.appleSiliconOnly === true
-      };
+        ...variant,
+        appleSiliconOnly: variant.appleSiliconOnly === true
+      }];
     })
     .sort((left, right) => {
       const leftFits = memoryGb >= left.minimumMemoryGb ? 0 : 1;
@@ -145,7 +260,7 @@ export function recommendedModelsForHost(input: {
   const memoryGb = Math.max(0, Math.floor(input.totalMemoryBytes / GIB));
   const catalog = curatedModelsForHost(input);
   const fitting = catalog.filter((model) => memoryGb >= model.minimumMemoryGb);
-  const featured = ["qwen38-27b", "gpt-oss-20b", "ornith15-35b"];
+  const featured = ["qwen38-flash-next", "qwen38-27b"];
   return featured.flatMap((id) => fitting.find((model) => model.id === id) ?? []).slice(0, 3);
 }
 

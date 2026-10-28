@@ -14,23 +14,42 @@ async function nativeRuntime() {
 }
 
 describe("Pi model catalog additions", () => {
+  it("provides exact native routes for the additional public models and preserves provider-specific prices", async () => {
+    const runtime = await nativeRuntime(), additions = createPiModelCatalogAdditions();
+    const models = (providerId: string) => additions.extendProvider(runtime.getProvider(providerId)!).getModels();
+    expect(models('opencode-go').find(model => model.id === 'deepseek-v4.1-flash')).toMatchObject({
+      provider: 'opencode-go', baseUrl: 'https://opencode.ai/zen/go/v1', api: 'openai-completions', contextWindow: 1_000_000,
+      maxTokens: 384_000, input: ['text', 'image'], cost: { input: 0.15, output: 0.6, cacheRead: 0.003 },
+      compat: { supportsStore: false, maxTokensField: 'max_tokens', requiresReasoningContentOnAssistantMessages: true }
+    });
+    const build = models('xai').find(model => model.id === 'grok-build-0.1')!;
+    expect(build).toMatchObject({ api: 'openai-responses', contextWindow: 256_000, maxTokens: 256_000 });
+    expect(additions.referenceCatalogMetadata(build)).toEqual({ defaultVisible: false });
+    expect(models('openrouter').find(model => model.id === 'deepseek/deepseek-v4-flash')?.cost)
+      .toEqual({ input: 0.08498, output: 0.16996, cacheRead: 0.016996, cacheWrite: 0 });
+    expect(models('openrouter').find(model => model.id === 'deepseek/deepseek-v4-pro')?.cost)
+      .toEqual({ input: 0.880266, output: 1.760532, cacheRead: 0.073356, cacheWrite: 0 });
+    expect(additions.referenceCatalogMetadata(models('kimi-coding').find(model => model.id === 'kimi-for-coding')!)).toMatchObject({ defaultEffort: 'max' });
+    expect(additions.referenceCatalogMetadata(models('deepseek').find(model => model.id === 'deepseek-flash')!)).toMatchObject({ defaultEffort: 'high' });
+  });
   it("preserves both native Astra routes and their fixed installed-runtime metadata", async () => {
     const runtime = await nativeRuntime();
     const additions = createPiModelCatalogAdditions();
-    for (const [providerId, api, minimal] of [
-      ["openai", "openai-responses", null],
-      ["openai-codex", "openai-codex-responses", "low"]
+    for (const [providerId, api] of [
+      ["openai", "openai-responses"],
+      ["openai-codex", "openai-codex-responses"]
     ] as const) {
       const provider = runtime.getProvider(providerId)!;
       const extended = additions.extendProvider(provider);
       expect(extended.auth).toBe(provider.auth);
       expect(extended.filterModels).toBe(provider.filterModels);
       expect(extended.refreshModels).toBe(provider.refreshModels);
-      expect(extended.getModels()).toEqual(expect.arrayContaining([...provider.getModels()]));
+      expect(extended.getModels().filter(model => model.id !== "gpt-6-astra"))
+        .toEqual(provider.getModels().filter(model => model.id !== "gpt-6-astra"));
       runtime.registerNativeProvider(extended);
       const astra = runtime.getModel(providerId, "gpt-6-astra")!;
-      expect(astra).toMatchObject({ api, contextWindow: 272_000, maxTokens: 128_000, input: ["text", "image"],
-        thinkingLevelMap: { off: null, minimal, xhigh: "xhigh", max: "max" },
+      expect(astra).toMatchObject({ api, contextWindow: providerId === "openai" ? 1_050_000 : 272_000, maxTokens: 128_000, input: ["text", "image"],
+        thinkingLevelMap: { off: null, minimal: null, xhigh: "xhigh", max: "max" },
         cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5,
           tiers: [{ inputTokensAbove: 272_000, input: 20, output: 75, cacheRead: 2, cacheWrite: 25 }] } });
       const future = { ...astra, contextWindow: 872_000, maxTokens: 160_000 };
@@ -40,6 +59,17 @@ describe("Pi model catalog additions", () => {
       const custom = { ...provider, baseUrl: "https://gateway.example.test/v1" };
       expect(additions.extendProvider(custom)).toBe(custom);
     }
+  });
+
+  it.each(['github-copilot', 'google', 'google-vertex', 'opencode', 'vercel-ai-gateway'])("withdraws Gemini minimal effort on its exact %s route", async providerId => {
+    const runtime = await nativeRuntime(), additions = createPiModelCatalogAdditions(), provider = runtime.getProvider(providerId)!;
+    const extended = additions.extendProvider(provider);
+    const model = extended.getModels().find(model => /^(?:google\/)?gemini-3\.8-flash$/.test(model.id));
+    expect(model?.thinkingLevelMap?.minimal).toBeNull();
+    expect(extended.auth).toBe(provider.auth);
+    expect(extended.filterModels).toBe(provider.filterModels);
+    const custom = { ...provider, baseUrl: 'https://custom.test/api' };
+    expect(additions.extendProvider(custom)).toBe(custom);
   });
 
   it("projects only the admitted exact provider routes and keeps unknown subscription pricing unknown", async () => {
@@ -56,7 +86,7 @@ describe("Pi model catalog additions", () => {
       thinkingLevelMap: { low: "low", high: "high", max: "max" }
     });
     expect(additions.referenceCatalogMetadata(models("kimi-coding").find((model) => model.id === "kimi-for-coding")!))
-      .toEqual({ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+      .toEqual({ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, defaultEffort: "max" });
 
     const deepSeek = models("deepseek");
     expect(deepSeek.some((model) => model.id === "deepseek-v4-flash")).toBe(false);

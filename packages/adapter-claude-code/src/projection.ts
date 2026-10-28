@@ -281,6 +281,8 @@ export class PartialMessageBuffer {
 export function providerModel(model: ClaudeSdkModelInfo, projection: SafeProjection): ProviderModel {
   const modelId = projection.identifier(model.value, "unknown-model");
   const estimate = claudeModelEstimate(modelId);
+  const thinkingLevels = estimate?.thinkingLevels
+    ?? (model.supportsEffort ? [...(model.supportedEffortLevels ?? ["low", "medium", "high"])] : []);
   return {
     providerId: "claude-code",
     modelId,
@@ -297,8 +299,8 @@ export function providerModel(model: ClaudeSdkModelInfo, projection: SafeProject
     supportsImages: estimate?.supportsImages ?? false,
     ...(estimate?.defaultVisible === undefined ? {} : { defaultVisible: estimate.defaultVisible }),
     supportsFastMode: model.supportsFastMode === true || estimate?.fastModeMultiplier !== undefined,
-    thinkingLevels: estimate?.thinkingLevels
-      ?? (model.supportsEffort ? [...(model.supportedEffortLevels ?? ["low", "medium", "high"])] : []),
+    thinkingLevels,
+    ...(estimate?.defaultEffort !== undefined && thinkingLevels.includes(estimate.defaultEffort) ? { defaultEffort: estimate.defaultEffort } : {}),
     cost: estimate?.price ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     ...(estimate?.price === undefined ? {} : {
       pricing: {

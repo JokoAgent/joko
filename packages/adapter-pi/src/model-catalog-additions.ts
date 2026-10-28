@@ -10,6 +10,7 @@ type CatalogMetadata = Readonly<{
   pricing?: ProviderModel["pricing"];
   defaultVisible?: boolean;
   supportsFastMode?: boolean;
+  defaultEffort?: string;
 }>;
 
 /**
@@ -29,6 +30,13 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
   const routes = {
     openai: { baseUrl: "https://api.openai.com/v1" },
     "openai-codex": { baseUrl: "https://chatgpt.com/backend-api" },
+    openrouter: { baseUrl: "https://openrouter.ai/api/v1" },
+    "opencode-go": { baseUrl: "https://opencode.ai/zen/go/v1" },
+    "github-copilot": { baseUrl: "https://api.individual.githubcopilot.com" },
+    google: { baseUrl: "https://generativelanguage.googleapis.com/v1beta" },
+    "google-vertex": { baseUrl: "https://{location}-aiplatform.googleapis.com" },
+    opencode: { baseUrl: "https://opencode.ai/zen/v1" },
+    "vercel-ai-gateway": { baseUrl: "https://ai-gateway.vercel.sh" },
     xai: { baseUrl: "https://api.x.ai/v1" },
     deepseek: { baseUrl: "https://api.deepseek.com" },
     "kimi-coding": { baseUrl: "https://api.kimi.com/coding" },
@@ -41,7 +49,8 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
   const exactBaseUrl = (value: string | undefined) => value?.replace(/\/+$/, "");
   const routeFor = (provider: { readonly id: string; readonly baseUrl?: string }) => {
     const route = routes[provider.id as keyof typeof routes];
-    return route !== undefined && exactBaseUrl(provider.baseUrl) === route.baseUrl ? route : undefined;
+    return route !== undefined && (exactBaseUrl(provider.baseUrl) === route.baseUrl
+      || provider.id === "google-vertex" && provider.baseUrl === undefined) ? route : undefined;
   };
 
   function isAstra(model: { readonly id: string; readonly api?: string }): boolean {
@@ -122,9 +131,51 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
   function projectModels(provider: NativeProvider): readonly NativeModel[] {
     if (routeFor(provider) === undefined) return provider.getModels();
     const native = provider.getModels();
+    if (provider.id === "openai" || provider.id === "openai-codex") {
+      return native.map(model => {
+        if (model.id !== "gpt-6-astra" || !isAstra(model)) return model;
+        const contextWindow = provider.id === "openai" && model.contextWindow === 272_000 ? 1_050_000 : model.contextWindow;
+        if (contextWindow === model.contextWindow && model.thinkingLevelMap?.off === null && model.thinkingLevelMap?.minimal === null) return model;
+        // The product catalog exposes reasoning efforts only. Native off ->
+        // low is not an additional selectable effort in that catalog.
+        return exactModel(model, { contextWindow, thinkingLevelMap: { ...model.thinkingLevelMap, off: null, minimal: null } });
+      });
+    }
+    if (["github-copilot", "google", "google-vertex", "opencode", "vercel-ai-gateway"].includes(provider.id)) {
+      return native.map(model => ["gemini-3.8-flash", "google/gemini-3.8-flash"].includes(model.id)
+        && exactBaseUrl(model.baseUrl) === routes[provider.id as keyof typeof routes].baseUrl
+        ? exactModel(model, { thinkingLevelMap: { ...model.thinkingLevelMap, minimal: null } }) : model);
+    }
+    if (provider.id === "openrouter") {
+      return native.map(model => model.id === "deepseek/deepseek-v4-flash" ? exactModel(model, {
+        cost: { input: 0.08498, output: 0.16996, cacheRead: 0.016996, cacheWrite: 0 }
+      }) : model.id === "deepseek/deepseek-v4-pro" ? exactModel(model, {
+        cost: { input: 0.880266, output: 1.760532, cacheRead: 0.073356, cacheWrite: 0 }
+      }) : model);
+    }
+    if (provider.id === "opencode-go") {
+      const id = "deepseek-v4.1-flash";
+      if (native.some(model => model.id === id)) return native;
+      return [...native, exactModel({ id } as NativeModel, {
+        id, name: "DeepSeek V4.1 Flash", provider: provider.id, baseUrl: routes["opencode-go"].baseUrl,
+        api: "openai-completions", contextWindow: 1_000_000, maxTokens: 384_000, reasoning: true, input: ["text", "image"],
+        cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
+        thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", max: "max" },
+        compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens",
+          requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" }
+      })];
+    }
     if (provider.id === "xai") {
-      const projected = native.map((model) => model.id === "grok-4.7" ? grokModel(model) : model);
-      return projected.some((model) => model.id === "grok-4.7") ? projected : [...projected, grokModel()];
+      const projected = native.map((model) => model.id === "grok-4.7" ? grokModel(model)
+        : model.id === "grok-4.6" ? exactModel(model, { compat: { ...model.compat, supportsReasoningEffort: true } }) : model);
+      if (!projected.some(model => model.id === "grok-4.7")) projected.push(grokModel());
+      if (!projected.some(model => model.id === "grok-build-0.1")) projected.push(exactModel({ id: "grok-build-0.1" } as NativeModel, {
+        id: "grok-build-0.1", name: "Grok Build 0.1", provider: "xai", baseUrl: routes.xai.baseUrl,
+        api: "openai-responses", contextWindow: 256_000, maxTokens: 256_000, reasoning: true, input: ["text", "image"],
+        cost: { input: 1, output: 2, cacheRead: 0.2, cacheWrite: 0 },
+        thinkingLevelMap: { off: null, minimal: null }, compat: { supportsLongCacheRetention: false }
+      }));
+      return projected;
     }
     if (provider.id === "deepseek") {
       const current = native.find((model) => model.id === "deepseek-flash")
@@ -245,6 +296,7 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
     }
     if (provider === "xai" && model.id === "grok-4.7") {
       return {
+        defaultEffort: "high",
         ...priced({ input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 }, Date.UTC(2026, 8, 24), {
           cacheReadAvailable: true,
           cacheWriteAvailable: false,
@@ -263,20 +315,23 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
       };
     }
     if (provider === "deepseek" && model.id === "deepseek-v4-pro") {
-      return priced(
+      return { defaultEffort: "high", ...priced(
         { input: 1.32, output: 3.96, cacheRead: 0.044, cacheWrite: 0 },
         Date.UTC(2026, 7, 16),
         { cacheReadAvailable: true, cacheWriteAvailable: false }
-      );
+      ) };
     }
     if (provider === "deepseek" && model.id === "deepseek-flash") {
-      return priced(
+      return { defaultEffort: "high", ...priced(
         { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
         Date.UTC(2026, 8, 11),
         { cacheReadAvailable: true, cacheWriteAvailable: false }
-      );
+      ) };
     }
-    if (provider === "kimi-coding" && model.id === "kimi-for-coding") return { cost: zeroCost() };
+    if (provider === "kimi-coding" && model.id === "kimi-for-coding") return { cost: zeroCost(), defaultEffort: "max" };
+    if (provider === "opencode-go" && model.id === "deepseek-v4.1-flash") return { defaultEffort: "high" };
+    if (provider === "openrouter" && ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"].includes(model.id)) return { defaultEffort: "high" };
+    if (provider === "xai" && model.id === "grok-build-0.1") return { defaultVisible: false };
     if (provider === "moonshotai" && model.id === "kimi-k3") {
       return priced(
         { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 },

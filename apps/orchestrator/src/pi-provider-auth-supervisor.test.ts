@@ -358,10 +358,10 @@ describe("PiProviderAuthSupervisor", () => {
       || (model.providerId === "xai" && model.modelId === "grok-4.7"))).toBe(true);
     for (const [providerId, thinkingLevels] of [
       ["openai", ["low", "medium", "high", "xhigh", "max"]],
-      ["openai-codex", ["minimal", "low", "medium", "high", "xhigh", "max"]]
+      ["openai-codex", ["low", "medium", "high", "xhigh", "max"]]
     ] as const) {
       expect(nativeModels.find((model) => model.providerId === providerId && model.modelId === "gpt-6-astra")).toMatchObject({
-        contextWindow: 272_000,
+        contextWindow: providerId === "openai" ? 1_050_000 : 272_000,
         maxOutputTokens: 128_000,
         thinkingLevels,
         supportsFastMode: true,
@@ -370,11 +370,11 @@ describe("PiProviderAuthSupervisor", () => {
     }
     expect(nativeModels.find((model) => model.providerId === "kimi-coding" && model.modelId === "kimi-for-coding"))
       .toMatchObject({ displayName: "Kimi K2.8 Preview", contextWindow: 1_048_576, supportsImages: true,
-        thinkingLevels: ["low", "high", "max"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+        thinkingLevels: ["low", "high", "max"], defaultEffort: "max", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
     expect(nativeModels.some((model) => model.providerId === "deepseek" && model.modelId === "deepseek-v4-flash"))
       .toBe(false);
     expect(nativeModels.find((model) => model.providerId === "deepseek" && model.modelId === "deepseek-flash"))
-      .toMatchObject({ contextWindow: 1_048_576, supportsImages: true,
+      .toMatchObject({ contextWindow: 1_048_576, supportsImages: true, defaultEffort: "high",
         cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 } });
     expect(nativeModels.find((model) => model.providerId === "xiaomi" && model.modelId === "mimo-v2.6-pro"))
       .toMatchObject({ contextWindow: 1_048_576, maxOutputTokens: 131_072, supportsImages: true,
@@ -385,7 +385,7 @@ describe("PiProviderAuthSupervisor", () => {
       .toMatchObject({ contextWindow: 1_048_576, maxOutputTokens: 131_072, supportsImages: true,
         thinkingLevels: [], pricing: { currencyCode: "CNY" } });
     expect(nativeModels.find((model) => model.providerId === "xai" && model.modelId === "grok-4.7"))
-      .toMatchObject({ contextWindow: 500_000, supportsFastMode: true,
+      .toMatchObject({ contextWindow: 500_000, supportsFastMode: true, defaultEffort: "high",
         pricing: { longContext: { inputTokenThreshold: 199_999, fastInputTokenThreshold: 200_000 } } });
     for (const model of nativeModels) {
       expect(model.api).not.toBe("");

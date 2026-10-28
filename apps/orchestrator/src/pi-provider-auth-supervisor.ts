@@ -1109,6 +1109,8 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
       const metadata = additions.referenceCatalogMetadata(model);
       const cost = metadata?.cost ?? nativeCost;
       const pricing = metadata?.pricing;
+      const thinkingLevels = nativeThinkingLevels(model.reasoning === true, model.thinkingLevelMap);
+      const defaultEffort = metadata?.defaultEffort ?? "medium";
       models.push({
         providerId,
         modelId,
@@ -1122,7 +1124,8 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
         // exposes serviceTier and maps it to the Provider request payload.
         ...(metadata?.defaultVisible === undefined ? {} : { defaultVisible: metadata.defaultVisible }),
         supportsFastMode: api === "openai-codex-responses" || metadata?.supportsFastMode === true,
-        thinkingLevels: nativeThinkingLevels(model.reasoning === true, model.thinkingLevelMap),
+        thinkingLevels,
+        ...(thinkingLevels.includes(defaultEffort) ? { defaultEffort } : {}),
         cost,
         ...(pricing === undefined ? {} : { pricing })
       });

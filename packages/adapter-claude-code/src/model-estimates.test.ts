@@ -11,6 +11,7 @@ describe("Claude model estimates", () => {
       maximumOutputTokens: 128_000,
       supportsImages: true,
       thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "medium",
       fastModeMultiplier: 2,
       updatedAt: Date.UTC(2026, 8, 23),
       price: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 }
@@ -41,6 +42,7 @@ describe("Claude model estimates", () => {
       supportsImages: true,
       supportsFastMode: true,
       thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "medium",
       cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
       pricing: {
         source: "providerReference",
@@ -57,4 +59,12 @@ describe("Claude model estimates", () => {
     "keeps superseded native model %s available but default-hidden",
     (modelId) => expect(claudeModelEstimate(modelId)).toEqual({ defaultVisible: false })
   );
+
+  it.each(["claude-sonnet-5-5", "claude-haiku-5-5"])("enriches a runtime-discovered %s without inventing reference prices", modelId => {
+    const projected = providerModel({ value: modelId, displayName: modelId, description: "", supportsEffort: true }, new SafeProjection([]));
+    expect(projected).toMatchObject({ modelId, contextWindow: 1_000_000, maxOutputTokens: 128_000, supportsImages: true,
+      thinkingLevels: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium" });
+    expect(projected.pricing).toBeUndefined();
+    expect(claudeModelEstimate('private/' + modelId)).toBeUndefined();
+  });
 });

@@ -32,7 +32,7 @@ const MODEL_ESTIMATES: Readonly<Record<string, CodexModelEstimate>> = Object.fre
       cacheWriteMultiplier: 2
     }
   },
-  "gpt-6.1-sol": gpt6Estimate(2, 10, 0.1, 2.5, Date.UTC(2026, 8, 29)),
+  "gpt-6.1-sol": { ...gpt6Estimate(2, 10, 0.1, 2.5, Date.UTC(2026, 8, 29)), contextWindow: 500_000 },
   "gpt-6-sol": gpt6Estimate(2, 10, 0.2, 2.5, Date.UTC(2026, 8, 23)),
   "gpt-6-luna": gpt6Estimate(0.1, 0.5, 0.01, 0.125, Date.UTC(2026, 8, 23)),
   "gpt-5.6-sol": { ...estimate(272_000, 128_000, 4, 20, 0.4, 5), defaultVisible: false },
