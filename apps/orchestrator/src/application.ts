@@ -2981,9 +2981,10 @@ export async function createOrchestratorApplication(
   });
   managedModelRuntimeForSession = managedModelRuntimeSystem;
 
-  const runMaintenance = (): Promise<void> => {
+  const runMaintenance = (full = true): Promise<void> => {
     const maintenance = maintenanceTail.catch(() => undefined).then(async () => {
       if (closed) return;
+      if (!full) { await sessionHost.reapIdleRuntimes(undefined, "ordinaryPi"); return; }
       const now = Date.now();
       store.expireToolLeases(now);
       store.prunePairings({
@@ -2998,8 +2999,9 @@ export async function createOrchestratorApplication(
     return maintenance;
   };
   const armMaintenance = (): void => {
+    let scans = 0;
     maintenanceTimer = setInterval(() => {
-      void runMaintenance().catch(() => {
+      void runMaintenance(++scans % 3 === 0).catch(() => {
         if (closed) return;
         store.appendDiagnostic({
           severity: "warning",
@@ -3009,7 +3011,7 @@ export async function createOrchestratorApplication(
           details: {}
         });
       });
-    }, 15 * 60_000);
+    }, 5 * 60_000);
     maintenanceTimer.unref();
   };
 

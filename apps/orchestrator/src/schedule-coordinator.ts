@@ -569,6 +569,20 @@ export class ScheduleCoordinator {
       return { runId, status: "skipped" };
     }
 
+    if (schedule.sessionMode !== "fresh" && schedule.sessionId !== undefined) {
+      const session = this.#store.findSession(schedule.sessionId);
+      if (session && session.descriptor.deletedAt === undefined
+        && (session.descriptor.archived || session.descriptor.worktree?.state === "preserved")) {
+        await this.#host.restoreScheduledTarget({ sessionId: session.descriptor.id, operationId: `${operationId}-restore`, assertCurrent: () => {
+          signal.throwIfAborted();
+          const current = this.#store.findSchedule(schedule.id);
+          if (!current || current.revision !== schedule.revision || current.sessionId !== session.descriptor.id
+            || this.#deletionFences.has(schedule.id) || this.#recovery.wasForceReleased(runId) || options.canDispatch?.() === false) {
+            throw new Error("The Schedule changed or was cancelled before its task could be restored.");
+          }
+        } });
+      }
+    }
     const preRunRevision = schedule.revision;
     this.#recovery.transition(runId, "running", { executionMode: extension.executionMode });
     const preRun = await this.evaluatePreRunHook(schedule, runId, scheduledAt, extension.preRunHook, signal);
@@ -701,13 +715,19 @@ export class ScheduleCoordinator {
   ): Promise<{ readonly result: SchedulePreRunHookResult; readonly detail: Readonly<Record<string, unknown>> } | undefined> {
     if (hook === undefined) return undefined;
     const capturedTarget = this.#store.getTarget(schedule.targetId);
-    const target = capturedTarget.descriptor;
+    const isolated = schedule.sessionMode !== "fresh" && schedule.sessionId !== undefined
+      && this.#store.getSession(schedule.sessionId).descriptor.worktree !== undefined;
+    const target = isolated
+      ? this.#host.scheduledExecutionTarget(schedule.sessionId!) : capturedTarget.descriptor;
     const assertCurrent = () => {
       signal.throwIfAborted();
+      if (schedule.sessionMode === "bound" || schedule.sessionMode === "persistent" && schedule.sessionId !== undefined
+        && this.#store.findSession(schedule.sessionId)?.descriptor.deletedAt === undefined) this.requireUsableSession(schedule, schedule.sessionId);
       const current = this.#store.getTarget(schedule.targetId);
+      const currentExecution = isolated ? this.#host.scheduledExecutionTarget(schedule.sessionId!) : current.descriptor;
       if (this.#deletionFences.has(schedule.id) || this.#recovery.wasForceReleased(runId)
         || this.#store.findSchedule(schedule.id)?.revision !== schedule.revision
-        || current.revision !== capturedTarget.revision || current.descriptor.workspaceRoot !== target.workspaceRoot
+        || current.revision !== capturedTarget.revision || currentExecution.workspaceRoot !== target.workspaceRoot
         || !current.descriptor.trusted) throw new Error("The pre-run hook workspace or Schedule authority changed.");
     };
     let result: SchedulePreRunHookResult;
@@ -819,6 +839,10 @@ export class ScheduleCoordinator {
       });
       return { runId: input.runId, status: "failed" };
     }
+    input.signal.throwIfAborted();
+    if (this.#store.findSchedule(input.schedule.id)?.revision !== input.schedule.revision || this.#deletionFences.has(input.schedule.id)) {
+      throw new Error("The Schedule changed before script execution.");
+    }
     this.#store.recordScheduleOccurrence({
       scheduleId: input.schedule.id,
       runId: input.runId,
@@ -838,10 +862,15 @@ export class ScheduleCoordinator {
     });
     const runningSchedule = structuredClone(this.#store.getSchedule(input.schedule.id));
     const target = this.#store.getTarget(runningSchedule.targetId);
+    const isolated = runningSchedule.sessionMode === "bound" && runningSchedule.sessionId !== undefined
+      && this.#store.getSession(runningSchedule.sessionId).descriptor.worktree !== undefined;
+    const executionTarget = isolated
+      ? this.#host.scheduledExecutionTarget(runningSchedule.sessionId!) : target.descriptor;
     let scopeOpen = true;
     const assertCurrent = () => {
       input.signal.throwIfAborted();
-      if (!scopeOpen || this.#recovery.wasForceReleased(input.runId) || this.#deletionFences.has(runningSchedule.id) || !this.#store.findSchedule(runningSchedule.id)) {
+      if (!scopeOpen || this.#recovery.wasForceReleased(input.runId) || this.#deletionFences.has(runningSchedule.id)
+        || this.#store.findSchedule(runningSchedule.id)?.revision !== runningSchedule.revision) {
         throw new Error("The Schedule occurrence is no longer active.");
       }
       const current = this.#store.getTarget(runningSchedule.targetId);
@@ -849,12 +878,15 @@ export class ScheduleCoordinator {
         throw new Error("The Schedule workspace changed or is no longer trusted.");
       }
       if (runningSchedule.sessionMode === "bound") this.requireUsableSession(runningSchedule, runningSchedule.sessionId);
+      if (isolated && this.#host.scheduledExecutionTarget(runningSchedule.sessionId!).workspaceRoot !== executionTarget.workspaceRoot) {
+        throw new Error("The Schedule task workspace changed.");
+      }
     };
     try {
       assertCurrent();
       const result = await this.#executeScript({
         command: config.command,
-        cwd: target.descriptor.workspaceRoot,
+        cwd: executionTarget.workspaceRoot,
         schedule: runningSchedule,
         assertCurrent,
         runId: input.runId,
@@ -1089,6 +1121,12 @@ export class ScheduleCoordinator {
     runId: string,
     worktree: ScheduleWorktreeConfiguration
   ): Promise<{ readonly schedule: ScheduleRecord; readonly sessionId: string }> {
+    const assertSchedule = () => {
+      if (this.#store.findSchedule(schedule.id)?.revision !== schedule.revision || this.#deletionFences.has(schedule.id)) {
+        throw new Error("The Schedule changed before task admission.");
+      }
+    };
+    assertSchedule();
     if (schedule.sessionMode === "bound") {
       return { schedule, sessionId: this.requireUsableSession(schedule, schedule.sessionId) };
     }
@@ -1096,17 +1134,17 @@ export class ScheduleCoordinator {
       const existing = this.#store.getSession(schedule.sessionId);
       if (
         existing.descriptor.deletedAt === undefined &&
-        !existing.descriptor.archived &&
         existing.descriptor.backendId === schedule.backendId &&
         existing.descriptor.targetId === schedule.targetId
       ) {
-        return { schedule, sessionId: existing.descriptor.id };
+        return { schedule, sessionId: this.requireUsableSession(schedule, existing.descriptor.id) };
       }
     }
 
     const execution = scheduleCreationSnapshot(schedule.executionSnapshot);
     const created = await this.#host.createScheduledSession({
       operationId: `${operationId}-session`,
+      assertServiceScope: assertSchedule,
       targetId: schedule.targetId,
       title: schedule.name,
       automationOrigin: { scheduleId: schedule.id, scheduleName: schedule.name, runId, scheduleRevision: schedule.revision },

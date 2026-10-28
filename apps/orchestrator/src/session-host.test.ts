@@ -8883,6 +8883,21 @@ describe("SessionHost", () => {
     await restartedHost.dispose();
   });
 
+  it("retains the original idle runtime when detach fails and retries that instance without resuming a replacement", async () => {
+    let monotonicNow = 0;
+    const adapter = new ResumeCountingFakeAdapter(), fixture = await createFixture(adapter, { monotonicNow: () => monotonicNow });
+    const sessionId = (await fixture.host.createSession({ operationId: "idle-close-failure", connection: fixture.connection,
+      targetId: "target-one", title: "Idle close failure", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const detach = vi.spyOn(adapter, "detachSession").mockRejectedValueOnce(new Error("close not confirmed"));
+    monotonicNow = 1_001;
+    expect(await fixture.host.reapIdleRuntimes(1_000)).toEqual([]);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(adapter.resumeCalls).toBe(0);
+    expect(await fixture.host.reapIdleRuntimes(1_000)).toEqual([sessionId]);
+    expect(detach).toHaveBeenCalledTimes(2);
+    expect(adapter.resumeCalls).toBe(0);
+  });
+
   it("recreates a crash-recovered blank native task from its exact durable launch profile", async () => {
     const originalAdapter = new BlankNativeRecoveryFakeAdapter();
     const fixture = await createFixture(originalAdapter);

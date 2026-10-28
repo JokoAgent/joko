@@ -31,6 +31,81 @@ afterEach(async () => {
 });
 
 describe("scheduled isolated workspaces", () => {
+  it("restores an archived ordinary task without creating another native context", async () => {
+    const fixture = await createFixture(), scheduler = new ScheduleCoordinator(fixture.store, fixture.host), id = "restore-plain";
+    const executionSnapshot = { ...(worktreeSchedule(id).executionSnapshot as Record<string, unknown>), useWorktree: false };
+    fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "persistent", executionSnapshot }));
+    const first = await scheduler.runNowWithResult(id, "initial-plain");
+    await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
+    await fixture.host.closeIfActive(first.sessionId!);
+    const stored = fixture.store.getSession(first.sessionId!);
+    fixture.store.updateSession(first.sessionId!, { archived: true }, stored.revision);
+    const second = await scheduler.runNowWithResult(id, "restored-plain");
+    expect(second.sessionId).toBe(first.sessionId);
+    await eventually(() => fixture.store.getRun(second.runId).descriptor.state === "completed");
+    expect(fixture.store.getSession(first.sessionId!).descriptor.archived).toBe(false);
+    expect(fixture.adapter.creationRoots).toHaveLength(1);
+    expect(fixture.worktrees.restores).toEqual([]);
+  });
+  it.each(["bound", "persistent"] as const)("restores the original archived %s task and worktree before dispatch and leaves it restored", async sessionMode => {
+    const fixture = await createFixture(), scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
+    const id = `restore-${sessionMode}`;
+    fixture.store.upsertSchedule(worktreeSchedule(id));
+    const first = await scheduler.runNowWithResult(id, `initial-${sessionMode}`);
+    await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+    expect(fixture.store.getSession(first.sessionId!).descriptor).toMatchObject({ archived: true, worktree: { state: "preserved" } });
+    const current = fixture.store.getSchedule(id);
+    fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode, sessionId: first.sessionId, expectedRevision: current.revision,
+      executionSnapshot: { ...(current.executionSnapshot as Record<string, unknown>), useWorktree: false } }));
+    const second = await scheduler.runNowWithResult(id, `restored-${sessionMode}`);
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(fixture.worktrees.restores).toEqual([first.sessionId]);
+    await eventually(() => fixture.store.getRun(second.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+    expect(fixture.store.getSession(first.sessionId!).descriptor).toMatchObject({ archived: false, worktree: { state: "active" } });
+    expect(fixture.adapter.creationRoots).toHaveLength(1);
+    expect(fixture.store.getSchedule(id).sessionId).toBe(first.sessionId);
+  });
+
+  it("keeps an unconfirmed worktree restore on its original operation and does not repeat it", async () => {
+    const fixture = await createFixture(), scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
+    const id = "restore-unknown";
+    fixture.store.upsertSchedule(worktreeSchedule(id));
+    const first = await scheduler.runNowWithResult(id, "initial-unknown");
+    await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+    const current = fixture.store.getSchedule(id);
+    fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "bound", sessionId: first.sessionId, expectedRevision: current.revision,
+      executionSnapshot: { ...(current.executionSnapshot as Record<string, unknown>), useWorktree: false } }));
+    const restore = vi.spyOn(fixture.worktrees, "restore").mockRejectedValueOnce(new Error("restore result unknown"));
+    await expect(scheduler.runNowWithResult(id, "same-restore")).rejects.toThrow("restore result unknown");
+    await expect(scheduler.runNowWithResult(id, "same-restore")).rejects.toThrow();
+    expect(restore).toHaveBeenCalledOnce();
+    expect(fixture.store.getSession(first.sessionId!).descriptor.archived).toBe(true);
+    expect(fixture.store.getOperation("manual-schedule-same-restore-restore").status).toBe("started");
+    expect(fixture.adapter.creationRoots).toHaveLength(1);
+  });
+
+  it("does not unarchive or dispatch when the Schedule changes during worktree recovery", async () => {
+    const fixture = await createFixture(), scheduler = new ScheduleCoordinator(fixture.store, fixture.host), id = "restore-revoked";
+    fixture.store.upsertSchedule(worktreeSchedule(id));
+    const first = await scheduler.runNowWithResult(id, "initial-revoked");
+    await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+    const current = fixture.store.getSchedule(id), executionSnapshot = { ...(current.executionSnapshot as Record<string, unknown>), useWorktree: false };
+    fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "bound", sessionId: first.sessionId, expectedRevision: current.revision, executionSnapshot }));
+    const restore = fixture.worktrees.restore.bind(fixture.worktrees);
+    vi.spyOn(fixture.worktrees, "restore").mockImplementationOnce(async sessionId => {
+      await restore(sessionId);
+      fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "bound", sessionId, enabled: false,
+        expectedRevision: fixture.store.getSchedule(id).revision, executionSnapshot }));
+    });
+    await expect(scheduler.runNowWithResult(id, "revoked-restore")).rejects.toThrow(/changed|cancelled/u);
+    expect(fixture.store.getSession(first.sessionId!).descriptor.archived).toBe(true);
+    expect(fixture.adapter.creationRoots).toHaveLength(1);
+    expect(fixture.store.listRuns({ sessionId: first.sessionId! })).toHaveLength(1);
+  });
   it("acquires a distinct checkout for every fresh fire and preserves the binding after safe release", async () => {
     const fixture = await createFixture();
     const scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
@@ -257,6 +332,7 @@ async function createFixture(
 class FakeSessionWorktrees {
   readonly acquisitions: AcquireSessionWorktreeInput[] = [];
   readonly releases: string[] = [];
+  readonly restores: string[] = [];
   readonly #store: OperationalStore;
   readonly #root: string;
   #sequence = 0;
@@ -298,6 +374,11 @@ class FakeSessionWorktrees {
     this.releases.push(sessionId);
     const binding = this.#store.findSessionWorktree(sessionId);
     if (binding?.state === "active") this.#store.updateSessionWorktreeState(sessionId, "preserved");
+  }
+
+  async restore(sessionId: string): Promise<void> {
+    this.restores.push(sessionId);
+    this.#store.updateSessionWorktreeState(sessionId, "active");
   }
 }
 
