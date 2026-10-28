@@ -21,14 +21,9 @@ export function splitTelegramText(source: string, limit = TELEGRAM_TEXT_LIMIT): 
     const space = candidate.lastIndexOf(" ");
     const preferred = Math.max(newline, space);
     if (preferred >= Math.floor(limit * 0.6)) end = preferred + 1;
-    const chunk = remaining.slice(0, end).trimEnd();
-    if (chunk.length === 0) {
-      end = safeUtf16Boundary(remaining, limit);
-      chunks.push(remaining.slice(0, end));
-    } else {
-      chunks.push(chunk);
-    }
-    remaining = remaining.slice(end).trimStart();
+    if (end === 0) throw new MessagingTransportError("invalid_input", "Telegram text limit cannot fit a code point.", { retryable: false, effect: "none" });
+    chunks.push(remaining.slice(0, end));
+    remaining = remaining.slice(end);
   }
   if (remaining.length > 0) chunks.push(remaining);
   return chunks;

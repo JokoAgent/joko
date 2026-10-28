@@ -97,6 +97,23 @@ describe("TelegramApi", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it.each([400, 429])("distinguishes an explicit %s refusal from an unacknowledged write", async status => {
+    const api = new TelegramApi({ token: TOKEN, fetch: fakeFetch(async () => jsonResponse({
+      ok: false, error_code: status, description: 'rejected', parameters: { retry_after: 172_801 }
+    }, status)) });
+    await expect(api.call('sendMessage', { chat_id: 42, text: 'hello' }, { effect: 'unknown' }))
+      .rejects.toMatchObject({ options: { effect: 'none', providerStatus: status,
+        ...(status === 429 ? { retryAfterMs: 172_801_000 } : {}) } });
+    await expect(api.callForm('sendDocument', new FormData(), { effect: 'unknown' }))
+      .rejects.toMatchObject({ options: { effect: 'none', providerStatus: status } });
+  });
+
+  it.each([{ ok: false, error_code: 500 }, { error_code: 400 }, { ok: false }])("keeps unproven send results unknown (%j)", async envelope => {
+    const api = new TelegramApi({ token: TOKEN, fetch: fakeFetch(async () => jsonResponse(envelope, 'error_code' in envelope ? envelope.error_code! : 400)) });
+    await expect(api.call('sendMessage', { chat_id: 42, text: 'hello' }, { effect: 'unknown' }))
+      .rejects.toMatchObject({ options: { effect: 'unknown' } });
+  });
+
   it("allows only HTTPS or a loopback HTTP provider", () => {
     expect(() => new TelegramApi({ token: TOKEN, apiBaseUrl: "http://example.com" }))
       .toThrowError(expect.objectContaining({ code: "invalid_input" }));

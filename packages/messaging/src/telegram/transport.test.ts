@@ -196,6 +196,11 @@ describe("TelegramTransport", () => {
 });
 
 describe("splitTelegramText", () => {
+  it("preserves code indentation and all whitespace across split boundaries", () => {
+    const source = ('line  \n    indented 😀 line\n\n' + 'x'.repeat(40) + '   ').repeat(4);
+    expect(splitTelegramText(source, 32).join('')).toBe(source);
+    expect(() => splitTelegramText('😀😀', 1)).toThrow(/code point/u);
+  });
   it("prefers readable boundaries and never bisects surrogate pairs", () => {
     const chunks = splitTelegramText(`alpha beta gamma 😀 delta`, 12);
     expect(chunks.join(" ").replace(/\s+/gu, " ")).toBe("alpha beta gamma 😀 delta");

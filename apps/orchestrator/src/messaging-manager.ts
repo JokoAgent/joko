@@ -1570,7 +1570,7 @@ export class MessagingManager {
         const retry = this.#runtimeFailure(connectionId, generation, error);
         if (!retry) return;
         attempt += 1;
-        await abortableDelay(retryDelay(error, attempt, this.#retryDelayMs), signal).catch(() => undefined);
+        await abortableDelay(retryDelay(error, attempt, this.#retryDelayMs, current.channel), signal).catch(() => undefined);
       } finally {
         const worker = this.#workers.get(connectionId);
         if (worker?.generation === generation) worker.transport = undefined;
@@ -3521,12 +3521,14 @@ export class MessagingManager {
           errorCode: transportErrorCode(error),
           settledAt: this.#now()
         });
-        if (!unknown && retryableKnownFailure(error) && settled.attempts < 5) {
+        const retryLimit = connection.channel === "telegram" && error instanceof MessagingTransportError
+          && error.options.providerStatus === 429 ? 2 : 5;
+        if (!unknown && retryableKnownFailure(error) && settled.attempts < retryLimit) {
           this.#store.retryMessagingDelivery({
             deliveryId: settled.id,
             expectedRevision: settled.revision,
             expectedChannelGeneration: connection.generation,
-            availableAt: this.#now() + retryDelay(error, settled.attempts, this.#retryDelayMs)
+            availableAt: this.#now() + retryDelay(error, settled.attempts, this.#retryDelayMs, connection.channel)
           });
         }
         if (isConnectionFailure(error)) throw error;
@@ -4783,9 +4785,10 @@ function runtimeFailure(error: unknown, channel: string): {
   return { status: "error", code: "processing_failed", summary: `${name} message processing could not continue.`, retryable: true };
 }
 
-function retryDelay(error: unknown, attempt: number, baseline: number): number {
+function retryDelay(error: unknown, attempt: number, baseline: number, channel?: string): number {
   if (error instanceof MessagingTransportError && error.options.retryAfterMs !== undefined) {
-    return Math.max(1, Math.min(error.options.retryAfterMs, 24 * 60 * 60_000));
+    const delay = error.options.retryAfterMs;
+    if (Number.isFinite(delay) && delay > 0) return channel === "telegram" ? delay : Math.min(delay, 24 * 60 * 60_000);
   }
   return Math.min(baseline * 2 ** Math.min(Math.max(attempt - 1, 0), 6), 60_000);
 }
@@ -5151,16 +5154,16 @@ function unavailableChannel(): MessagingManagerError {
   return new MessagingManagerError("channel_unavailable", "This Messaging channel is not available yet.");
 }
 
-function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new DOMException("Aborted", "AbortError"));
-      return;
-    }
-    const timer = setTimeout(resolve, milliseconds);
-    signal.addEventListener("abort", () => {
-      clearTimeout(timer);
-      reject(new DOMException("Aborted", "AbortError"));
-    }, { once: true });
-  });
+async function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  const started = performance.now();
+  do {
+    signal.throwIfAborted();
+    const remaining = milliseconds - (performance.now() - started);
+    if (remaining <= 0) return;
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => { clearTimeout(timer); reject(new DOMException("Aborted", "AbortError")); };
+      const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, Math.min(remaining, 2_147_483_647));
+      signal.addEventListener("abort", abort, { once: true });
+    });
+  } while (true);
 }
