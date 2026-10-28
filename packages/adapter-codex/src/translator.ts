@@ -77,7 +77,7 @@ export interface TranslatorState {
   activeTurnId?: string;
   activePlan?: { readonly turnId: string; readonly input: string };
   usage?: UsageSnapshot;
-  observedFastMode?: boolean;
+  observedFastMode?: boolean | "ultrafast";
   readonly itemNames: Map<string, string>;
   readonly terminalTurnIds: Set<string>;
 }
@@ -719,7 +719,7 @@ function toolResult(item: NativeThreadItem, state: TranslatorState, output: stri
   };
 }
 
-function usageFromNotification(params: JsonValue, observedFastMode: boolean | undefined): UsageSnapshot {
+function usageFromNotification(params: JsonValue, observedFastMode: boolean | "ultrafast" | undefined): UsageSnapshot {
   const record = objectValue(params, "token usage");
   const tokenUsage = objectValue(record["tokenUsage"], "thread token usage");
   const last = objectValue(tokenUsage["last"], "last token usage");

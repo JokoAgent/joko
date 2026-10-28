@@ -81,6 +81,7 @@ message ModelCapabilityOptions {
   bool supports_effort = 3;
   bool supports_fast_mode = 4;
   repeated string effort_ids = 5;
+  bool supports_ultrafast_mode = 6;
 }
 
 message PermissionCapabilityOptions {

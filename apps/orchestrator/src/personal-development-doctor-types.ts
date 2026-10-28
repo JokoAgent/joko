@@ -28,7 +28,7 @@ export interface DevelopmentUpstreamQuery {
 }
 export interface DevelopmentDoctorRoute {
   readonly targetId: string; readonly title: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string;
-  readonly fastMode: boolean; readonly permissionMode: PermissionMode; readonly planMode: boolean;
+  readonly fastMode: boolean | "ultrafast"; readonly permissionMode: PermissionMode; readonly planMode: boolean;
 }
 export interface DevelopmentDoctorStartInput extends DevelopmentDoctorRoute {
   readonly operationId: string; readonly sessionId?: string; readonly mode: "check" | "prepare"; readonly request: string;

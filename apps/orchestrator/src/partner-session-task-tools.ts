@@ -18,7 +18,7 @@ export class PartnerSessionTaskTools implements BridgeToolProvider {
       instruction: { type: "string", minLength: 1, maxLength: 12_000 }, title: { type: "string", minLength: 1, maxLength: 120 },
       working_dir: { type: "string", minLength: 1, maxLength: 1_024 }, use_worktree: { type: "boolean" },
       context_refs: { type: "array", maxItems: 32, items: { type: "string", maxLength: 512 } }, timeout_ms: { type: "integer", minimum: 1_000, maximum: 86_400_000 },
-      model_selection: object({ id: { type: "string", minLength: 1, maxLength: 2048 }, effort: { type: "string", maxLength: 64 }, fast_mode: { type: "boolean" } }, ["id"])
+      model_selection: object({ id: { type: "string", minLength: 1, maxLength: 2048 }, effort: { type: "string", maxLength: 64 }, fast_mode: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["ultrafast"] }] } }, ["id"])
     }, ["instruction"], true),
     tool("check_session_task", "Read your own independent task's state, working directory, pending interactions, owned queue, result, artifacts and stop confirmation. Optional queued_message_id reads its exact durable Queue receipt. Accepted/dispatched input does not prove the model acted on it. Read only for a concrete progress or recovery need.", { task_id: id, queued_message_id: id }, ["task_id"]),
     tool("message_session_task", "Follow up on the same task. queue uses a fresh execution with the original time budget after completion; steer requires a running capable Backend and never falls back to queue. edit/withdraw affect only your own unconsumed queued_message_id. resume releases a confirmed pause and preserves completed work. For an exact open interaction supply its id/generation and decision or typed answers. Resume before answering a paused task.", {
@@ -60,7 +60,7 @@ export class PartnerSessionTaskTools implements BridgeToolProvider {
         if (raw !== undefined) {
           if (!record(raw)) invalid(); keys(raw, ["id", "effort", "fast_mode"]);
           selection = { id: required(raw, "id", 2048), ...(raw["effort"] === undefined ? {} : { effort: required(raw, "effort", 64) }),
-            ...(raw["fast_mode"] === undefined ? {} : { fastMode: boolean(raw["fast_mode"]) }) };
+            ...(raw["fast_mode"] === undefined ? {} : { fastMode: raw["fast_mode"] === "ultrafast" ? "ultrafast" : boolean(raw["fast_mode"]) }) };
         }
         const start: StartPartnerSessionTask = { instruction: required(input, "instruction", 12_000),
           ...(input["title"] === undefined ? {} : { title: required(input, "title", 120) }),

@@ -36,7 +36,7 @@ export function resolveNewSessionExecutionOptions(backend: BackendView | undefin
     effortSupported,
     effortSelectable: effortSupported && (selectedModel?.efforts.length ?? 0) > 0,
     fastModeSupported,
-    fastModeSelectable: fastModeSupported && selectedModel?.supportsFast === true,
+    fastModeSelectable: fastModeSupported && (selectedModel?.supportsFast === true || selectedModel?.supportsUltrafast === true),
     permissionModes,
     permissionSelectable: backend?.capabilities.get("permission.modes")?.supported === true && permissionModes.length > 1,
     planModeSupported: backend?.capabilities.get("plan_mode")?.supported === true

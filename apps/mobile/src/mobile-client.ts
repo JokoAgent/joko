@@ -1,5 +1,6 @@
 import { isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
+import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
@@ -5347,7 +5348,7 @@ export class MobileClient {
   }
   newTaskSharingActionId(): string { return this.newId(); }
 
-  async setSharedTaskRuntime(change: { readonly backendId?: string; readonly effort?: string; readonly fastMode?: boolean }): Promise<boolean> {
+  async setSharedTaskRuntime(change: { readonly backendId?: string; readonly effort?: string; readonly fastMode?: boolean | "ultrafast" }): Promise<boolean> {
     const joined = this.#joinedTask;
     if (!joined || !this.#taskAuthorityKey()) throw new Error("The shared task controls are unavailable.");
     const signal = this.#abort!.signal, source = this.#taskAuthorityKey();
@@ -5357,7 +5358,9 @@ export class MobileClient {
     const action = this.#claimMutation();
     try {
       const result = await this.#submitTerminal(create(OperationMutationSchema, { payload: { case: "setSessionRuntime", value: create(SetSessionRuntimeMutationSchema, {
-        sessionId: joined.source.joined.share!.sessionId, expectedRuntimeGeneration: response.control.generation, ...change
+        sessionId: joined.source.joined.share!.sessionId, expectedRuntimeGeneration: response.control.generation,
+        ...(change.backendId === undefined ? {} : { backendId: change.backendId }), ...(change.effort === undefined ? {} : { effort: change.effort }),
+        ...(change.fastMode === undefined ? {} : encodeModelSpeed(change.fastMode))
       }) } }), { kind: "session-model", sessionId: joined.source.joined.share!.sessionId });
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
@@ -9511,13 +9514,13 @@ export class MobileClient {
     if (!settings?.revision) throw new Error("Model favorites are unavailable.");
     if (settings.favorites.some(favorite => favorite.backendId === selection.backendId && favorite.selection?.model?.providerId === selection.providerId
       && favorite.selection.model.modelId === selection.modelId && (favorite.selection.effortId || "") === (selection.effortId ?? "")
-      && favorite.selection.fastMode === selection.fastMode)) throw new Error("The same model favorite configuration is already saved.");
+        && decodeModelSpeed(favorite.selection) === selection.fastMode)) throw new Error("The same model favorite configuration is already saved.");
     if (this.#state.pending.some(row => row.kind === "model-favorite")) throw new Error("The previous favorite change is still pending.");
     const result = await this.#submitTerminal(create(OperationMutationSchema, { payload: { case: "updateModelFavorites", value: create(UpdateModelFavoritesMutationSchema, {
       expectedRevision: settings.revision, change: { case: "add", value: create(ModelFavoriteConfigurationSchema, {
         favoriteId: this.newModelFavoriteId(), backendId: selection.backendId, selection: create(ModelSelectionSchema, {
           model: create(ModelKeySchema, { providerId: selection.providerId, modelId: selection.modelId }),
-          effortId: selection.effortId ?? "", fastMode: selection.fastMode }) }) } }) } }), { kind: "model-favorite" });
+          effortId: selection.effortId ?? "", ...encodeModelSpeed(selection.fastMode) }) }) } }) } }), { kind: "model-favorite" });
     if (!result.accepted || !result.definitive) throw new Error("The model favorite result is unconfirmed. It was not resent.");
   }
 
@@ -9633,7 +9636,7 @@ export class MobileClient {
               modelId: submission.model.modelId
             }),
             effortId: submission.model.effortId ?? "",
-            fastMode: submission.model.fastMode
+            ...encodeModelSpeed(submission.model.fastMode)
           })
         }),
         permissionMode: PermissionMode.ASK,
@@ -10925,7 +10928,7 @@ export class MobileClient {
     const runtimeSelection = this.#runtimeModelSelection;
     const pending = runtimeSelection && runtimeSelection.ownerKey === this.#taskAuthorityKey() ? runtimeSelection.control.pending : undefined;
     const route = pending ? controls.models.find(route => route.backendId === pending.backendId && route.providerId === pending.providerId && route.modelId === pending.modelId) : undefined;
-    return route && pending ? { ...controls, pendingModel: { ...route, effortId: pending.effort, fastMode: pending.fastMode } } : controls;
+    return route && pending ? { ...controls, pendingModel: { ...route, effortId: pending.effort, fastMode: decodeModelSpeed(pending) } } : controls;
   }
 
   async refreshTaskRuntimeSelection(): Promise<boolean> {
@@ -12344,7 +12347,7 @@ export class MobileClient {
           payload: { case: "setSessionRuntime", value: create(SetSessionRuntimeMutationSchema, {
             sessionId: controls.session.sessionId, expectedRuntimeGeneration: control.generation,
             backendId: selected.backendId ?? controls.backend.backendId, providerId: selected.providerId,
-            modelId: selected.modelId, effort: selected.effortId ?? "", fastMode: selected.fastMode
+            modelId: selected.modelId, effort: selected.effortId ?? "", ...encodeModelSpeed(selected.fastMode)
           }) }
         }), { kind: "session-model", sessionId: controls.session.sessionId });
         if (result.accepted && result.definitive) await this.refreshTaskRuntimeSelection().catch(() => undefined);
@@ -12357,7 +12360,7 @@ export class MobileClient {
           model: create(ModelSelectionSchema, {
             model: create(ModelKeySchema, { providerId: selected.providerId, modelId: selected.modelId }),
             effortId: selected.effortId ?? "",
-            fastMode: selected.fastMode
+            ...encodeModelSpeed(selected.fastMode)
           })
         }) }
       }), { kind: "session-model", sessionId: controls.session.sessionId });
@@ -12399,7 +12402,7 @@ export class MobileClient {
                 modelId: normalized.item.modelId
               }),
               effortId: normalized.item.effortId ?? "",
-              fastMode: normalized.item.fastMode
+              ...encodeModelSpeed(normalized.item.fastMode)
             })
           })
         };
@@ -12754,7 +12757,7 @@ export class MobileClient {
     const source = resolveMobileMessageRewindSource(events, session.sessionId, eventId, owner.generation,
       mobileRewindToStartSupported(backend, target));
     if (!source || !timelineRows(events).some((row) => row.id === source.messageId && row.eventId === eventId && row.completed && row.kind === "user")) return undefined;
-    const workspaceId = session.worktree?.workspaceId || target.workspaceId;
+    const workspaceId = session.localWorkspace?.workspaceId || session.worktree?.workspaceId || target.workspaceId;
     const workspaces = owner.workspaces.filter((value) => value.workspaceId === workspaceId && value.targetId === session.targetId);
     const detailWorkspaces = detail.workspaces.filter((value) => value.workspaceId === workspaceId && value.targetId === session.targetId);
     const workspace = workspaceId && workspaces.length === 1 && detailWorkspaces.length === 1
@@ -13035,7 +13038,8 @@ export class MobileClient {
       authorityKey: runtime.authorityKey,
       surfaceOwnerKey: JSON.stringify([runtime.surfaceOwnerKey, this.#state.owner!.generation.toString(10),
         entityVersionKey(target.version), backendAuthorityKey(runtime.backend), runtime.session.nativeBinding?.opaqueReference,
-        runtime.session.worktree?.leaseId ?? "", runtime.session.worktree?.workspaceId ?? "", runtime.session.worktree?.state ?? 0]),
+        runtime.session.worktree?.leaseId ?? "", runtime.session.worktree?.workspaceId ?? "", runtime.session.worktree?.state ?? 0,
+        runtime.session.localWorkspace?.workspaceId ?? "", runtime.session.localWorkspace?.path ?? ""]),
       sourceSessionId: runtime.session.sessionId, sourceName: runtime.session.displayName
     };
     return { controls, canDerive, runtime };
@@ -16785,7 +16789,7 @@ function sameMobileModelSelection(
   return actual?.model?.providerId === expected.providerId
     && actual.model.modelId === expected.modelId
     && actual.effortId === (expected.effortId ?? "")
-    && actual.fastMode === expected.fastMode;
+      && decodeModelSpeed(actual) === expected.fastMode;
 }
 
 function uniqueValue<T>(values: readonly T[], predicate: (value: T) => boolean): T | undefined {

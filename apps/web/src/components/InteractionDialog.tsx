@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { JSX, KeyboardEvent as ReactKeyboardEvent } from "react";
 import { PlanReviewDecisionKind } from "@joko/contracts";
 import { AlertTriangle, ArrowRight, Check, Clock3, CornerDownLeft, FileText, HelpCircle, ListChecks, Pencil, Shield, X } from "lucide-react";
@@ -14,6 +14,7 @@ import { Button, IconButton, Modal, Pill, StatusDot, cx, formatRelativeTime, Che
 import { QuestionTextInput } from "./QuestionTextInput.js";
 import { QuestionReferenceText } from "./QuestionReferenceText.js";
 import type { TimelineReferenceActions } from "./TimelineReferenceContent.js";
+import { parseVoiceQuestionSelection, registerVoiceQuestionTarget } from "../voice-question-bridge.js";
 
 type AnswerMap = Record<string, QuestionAnswerDraft>;
 type InteractionOwnershipState = { readonly scope: string; readonly snapshot: InteractionOwnershipSnapshot<QuestionWizardDraft> };
@@ -299,7 +300,7 @@ export function InteractionDialog({ controller, interaction, remaining, inline =
         {interaction.kind === "permission" && interaction.permissionSubject !== undefined && <PermissionSubject subject={interaction.permissionSubject} t={t} />}
         {(interaction.kind === "question" || interaction.kind === "permission") && !ownsInteraction && <div className="interaction-ownership" role="status"><p>{ownershipStatus === "unavailable" ? t("interaction.ownershipUnavailable") : ownershipStatus === "observer" ? t("interaction.ownershipElsewhere") : ownershipStatus === "handoff" ? t("interaction.ownershipHandoff") : ownershipStatus === "settled" ? t("interaction.ownershipSettled") : t("interaction.ownershipClaiming")}</p>{ownershipStatus === "observer" && <Button onClick={continueHere}>{t("interaction.ownershipContinueHere")}</Button>}</div>}
         {interaction.kind === "permission" && <PermissionDecision disabled={!ownsInteraction || settling} interaction={interaction} onResolve={(decisionId) => resolve({ kind: "permission", decisionId })} t={t} />}
-        {interaction.kind === "question" && <QuestionDecision controller={controller} ownerKey={`${actionScope}:${renderedOwnerToken}`} workspaceRoot={workspaceRoot} sessionId={interaction.sessionId} disabled={!ownsQuestionDraft || settling} fields={interaction.fields} answers={visibleAnswers} otherText={visibleOtherText} currentIndex={visibleQuestionIndex} onCurrentIndexChange={(currentIndex) => updateQuestionDraft((draft) => ({ ...draft, currentIndex }))} onChange={(answers) => updateQuestionDraft((draft) => ({ ...draft, answers }))} onOtherTextChange={(otherText) => updateQuestionDraft((draft) => ({ ...draft, otherText }))} onMinimize={() => updateQuestionDraft((draft) => ({ ...draft, minimized: true }))} onResolve={(submittedAnswers) => resolve({ kind: "question", answers: submittedAnswers })} t={t} />}
+        {interaction.kind === "question" && <QuestionDecision controller={controller} ownerKey={`${actionScope}:${renderedOwnerToken}`} runId={interaction.runId} workspaceRoot={workspaceRoot} sessionId={interaction.sessionId} disabled={!ownsQuestionDraft || settling} fields={interaction.fields} answers={visibleAnswers} otherText={visibleOtherText} currentIndex={visibleQuestionIndex} onCurrentIndexChange={(currentIndex) => updateQuestionDraft((draft) => ({ ...draft, currentIndex }))} onChange={(answers) => updateQuestionDraft((draft) => ({ ...draft, answers }))} onOtherTextChange={(otherText) => updateQuestionDraft((draft) => ({ ...draft, otherText }))} onMinimize={() => updateQuestionDraft((draft) => ({ ...draft, minimized: true }))} onResolve={(submittedAnswers) => resolve({ kind: "question", answers: submittedAnswers })} t={t} />}
         {interaction.kind === "select" && <OptionDecision interaction={interaction} onResolve={(value) => resolve({ kind: "extension", value })} />}
         {(interaction.kind === "input" || interaction.kind === "editor") && <TextDecision interaction={interaction} value={extensionValue} onChange={setExtensionValue} onResolve={() => resolve({ kind: "extension", value: extensionValue })} onDismiss={dismiss} t={t} />}
         {interaction.kind === "confirm" && <ConfirmDecision onResolve={(value) => resolve({ kind: "extension", value })} t={t} />}
@@ -476,9 +477,10 @@ function permissionDecision(id: string, fallbackLabel: string, fallbackDescripti
   return { label: fallbackLabel, description: fallbackDescription ?? t("interaction.chooseHelp") };
 }
 
-function QuestionDecision({ controller, ownerKey, sessionId, workspaceRoot, disabled, fields, answers, otherText, currentIndex, onCurrentIndexChange, onChange, onOtherTextChange, onMinimize, onResolve, t }: {
+function QuestionDecision({ controller, ownerKey, runId, sessionId, workspaceRoot, disabled, fields, answers, otherText, currentIndex, onCurrentIndexChange, onChange, onOtherTextChange, onMinimize, onResolve, t }: {
   readonly controller: AppController;
   readonly ownerKey: string;
+  readonly runId?: string;
   readonly sessionId: string;
   readonly workspaceRoot?: string;
   readonly disabled: boolean;
@@ -500,6 +502,15 @@ function QuestionDecision({ controller, ownerKey, sessionId, workspaceRoot, disa
   const last = step === fields.length - 1;
   const [slideDirection, setSlideDirection] = useState<"left" | "right">();
   const transitionTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [voiceFeedback, setVoiceFeedback] = useState<"hint" | "confirm" | "unknown" | "cancelled">("hint");
+  const voiceHandler = useRef<(text: string) => void>(() => {});
+  const voiceStep = JSON.stringify([ownerKey, field, field ? answers[field.id] : undefined, field ? otherText[field.id] : undefined, voiceFeedback]);
+  const voiceServer = controller.state.activeProfile?.serverId;
+  useLayoutEffect(() => {
+    if (disabled || slideDirection !== undefined || !field || !runId || !voiceServer || !formRef.current) return;
+    return registerVoiceQuestionTarget({ serverId: voiceServer, sessionId, runId, stepKey: voiceStep, root: formRef.current,
+      receive: text => voiceHandler.current(text) });
+  }, [disabled, slideDirection, runId, voiceServer, sessionId, voiceStep]);
   useEffect(() => () => {
     if (transitionTimerRef.current !== undefined) clearTimeout(transitionTimerRef.current);
   }, []);
@@ -531,6 +542,40 @@ function QuestionDecision({ controller, ownerKey, sessionId, workspaceRoot, disa
       if (fields.every((candidate) => validQuestionAnswer(candidate, nextAnswers[candidate.id]))) onResolve(nextAnswers);
     }
     else navigateQuestion(step + 1, "left");
+  };
+  voiceHandler.current = (text): void => {
+    if (disabled || slideDirection !== undefined || !field) return;
+    const labels = field.kind === "boolean" ? [t("common.yes"), t("common.no")] : field.options.map(option => option.label);
+    const parsed = parseVoiceQuestionSelection(text, labels);
+    if (parsed.kind === "cancel") {
+      const next = { ...answers }; delete next[field.id]; onChange(next);
+      onOtherTextChange({ ...otherText, [field.id]: "" }); setVoiceFeedback("cancelled"); return;
+    }
+    if (parsed.kind === "confirm") {
+      if (voiceFeedback === "confirm" && validQuestionAnswer(field, answers[field.id])) { setVoiceFeedback("hint"); advance(); }
+      else setVoiceFeedback("unknown");
+      return;
+    }
+    if (field.kind === "text" && parsed.kind === "unknown") {
+      onChange({ ...answers, [field.id]: { kind: "text", value: text.trim() } }); setVoiceFeedback("confirm"); return;
+    }
+    if (parsed.kind !== "select") { setVoiceFeedback("unknown"); return; }
+    if (field.kind === "single" && parsed.indices.length === 1) {
+      const option = field.options[parsed.indices[0]!]; if (!option) return;
+      const next = { ...answers, [field.id]: { kind: "single", selection: { kind: "choice", choiceId: option.id } } as const };
+      onChange(next); setVoiceFeedback("hint"); advance(next); return;
+    }
+    if (field.kind === "boolean" && parsed.indices.length === 1) {
+      onChange({ ...answers, [field.id]: { kind: "boolean", value: parsed.indices[0] === 0 } }); setVoiceFeedback("confirm"); return;
+    }
+    if (field.kind === "multiple") {
+      const before = answers[field.id], selected = before?.kind === "multiple" ? before.choiceIds : [];
+      const ids = [...new Set([...selected, ...parsed.indices.flatMap(index => field.options[index] ? [field.options[index]!.id] : [])])];
+      const next: QuestionAnswerDraft = { kind: "multiple", choiceIds: ids, ...(before?.kind === "multiple" && before.otherText ? { otherText: before.otherText } : {}) };
+      if (field.maximumSelections !== undefined && ids.length + (next.otherText ? 1 : 0) > field.maximumSelections) { setVoiceFeedback("unknown"); return; }
+      onChange({ ...answers, [field.id]: next }); setVoiceFeedback("confirm"); return;
+    }
+    setVoiceFeedback("unknown");
   };
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLFormElement>): void => {
     if (disabled) return;
@@ -591,6 +636,9 @@ function QuestionDecision({ controller, ownerKey, sessionId, workspaceRoot, disa
   return (
     <form ref={formRef} className="question-form question-wizard" aria-disabled={disabled} onKeyDown={handleKeyDown} onSubmit={(event) => { event.preventDefault(); if (!disabled) advance(); }}>
       <fieldset className="question-wizard__lease" disabled={disabled}>
+        {runId && !disabled && <p className="muted" role="status">{controller.state.effectiveLocale === "zh-CN"
+          ? voiceFeedback === "confirm" ? "已填写语音答案。请说“确认”提交，或说“取消”清除。" : voiceFeedback === "unknown" ? "未识别明确选项，请重说或使用当前提问卡。" : "通话中可口述当前问题的选项；自由回答和多选请说“确认”提交。"
+          : voiceFeedback === "confirm" ? 'Voice answer filled. Say “confirm” to submit or “cancel” to clear.' : voiceFeedback === "unknown" ? 'No clear choice was recognized. Repeat or use this question card.' : 'During a call, speak a choice for this question; confirm free text and multiple choices explicitly.'}</p>}
         {fields.length === 0 && <p className="muted">{t("interaction.noFields")}</p>}
         {field !== undefined && <><div className="question-wizard__progress" aria-live="polite"><span>{t("interaction.step", { current: step + 1, total: fields.length })}</span><progress value={step + 1} max={fields.length} /></div><div className="question-wizard__scroll"><div className={cx("question-wizard__step", slideDirection === "left" && "is-leaving-left", slideDirection === "right" && "is-leaving-right")}><QuestionField key={field.id} controller={controller} ownerKey={ownerKey} sessionId={sessionId} workspaceRoot={workspaceRoot} disabled={disabled || slideDirection !== undefined} ownerRoot={formRef} field={field} value={answers[field.id]} otherText={otherText[field.id] ?? questionOtherAnswer(field, answers[field.id])} autoFocus={!disabled} lastQuestion={last} t={t} onAdvance={advance} onSkip={skip} onMinimize={onMinimize} onSingleChoice={(choiceId) => { const nextAnswers = { ...answers, [field.id]: { kind: "single", selection: { kind: "choice", choiceId } } as const }; onChange(nextAnswers); advance(nextAnswers); }} onOtherTextChange={(value) => onOtherTextChange({ ...otherText, [field.id]: value })} onChange={(value) => onChange({ ...answers, [field.id]: value })} /></div></div></>}
         <div className="modal__actions question-wizard__actions">

@@ -23,7 +23,7 @@ export type HostedNativeCommand =
   | { readonly kind: "delete" }
   | { readonly kind: "set_model"; readonly providerId: string; readonly modelId: string }
   | { readonly kind: "set_effort"; readonly effort: string }
-  | { readonly kind: "set_fast"; readonly enabled: boolean }
+  | { readonly kind: "set_fast"; readonly enabled: boolean | "ultrafast" }
   | { readonly kind: "set_permission"; readonly mode: PermissionMode }
   | { readonly kind: "set_plan"; readonly enabled: boolean }
   | { readonly kind: "set_name"; readonly name: string }
@@ -55,7 +55,7 @@ export interface HostedNativeOpen {
   readonly modelId: string;
   readonly name?: string;
   readonly permissionMode: PermissionMode;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly effort?: string;
   /** One-use capability from this Provider's authenticated stream. */
   readonly groupSwitch?: string;

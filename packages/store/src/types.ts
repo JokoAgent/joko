@@ -672,7 +672,7 @@ export interface CollaborationWorkerRecord {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly sessionGeneration?: number;
@@ -730,7 +730,7 @@ export interface CreateCollaborationWorkerInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly parentWorkerId?: string;
@@ -945,7 +945,7 @@ export interface MessagingRouteRecord {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly createdAt: UnixMillis;
@@ -960,7 +960,7 @@ export interface PutMessagingRouteInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly updatedAt?: UnixMillis;
@@ -985,7 +985,7 @@ export interface MessagingConversationRecord {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode?: boolean;
+  readonly fastMode?: boolean | "ultrafast";
   readonly permissionMode?: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode?: boolean;
   readonly createdAt: UnixMillis;

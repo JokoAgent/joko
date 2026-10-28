@@ -26,7 +26,8 @@ import { HostedAgentPoller } from "./hosted-agent-poller.js";
 import { createHostedAgentSourceController } from "./hosted-agent-source-controller.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex"), signal = () => new AbortController().signal;
-async function fixture(options: { readonly backendId?: string; readonly origin?: string | (() => string); readonly createNative?: (creation: HostedAgentBackendCreation) => BackendAdapter | Promise<BackendAdapter> } = {}) {
+async function fixture(options: { readonly backendId?: string; readonly origin?: string | (() => string); readonly createNative?: (creation: HostedAgentBackendCreation) => BackendAdapter | Promise<BackendAdapter>;
+  readonly readQuota?: (backendId: string, providerId: string, signal: AbortSignal) => Promise<readonly contract.ProviderSharingQuotaAccount[]> } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-provider-sharing-service-"))), database = new OperationalStore(":memory:"), connections = new ConnectionManager(database);
   database.createConnection({ id: "owner", name: "Owner", authKeyDigest: hash("private-owner-key") });
   let sharing!: ProviderSharingHost, captured: AdapterContext | undefined, created = 0, disposed = 0, cleanupUnknown = false;
@@ -53,7 +54,8 @@ async function fixture(options: { readonly backendId?: string; readonly origin?:
       } }] });
   let settings = native.settings.update({ kind: "remote_control", enabled: true }, 0n);
   for (const providerId of ["provider", "foreign-provider"]) settings = native.settings.update({ kind: "provider", backendId, providerId, enabled: true }, settings.revision);
-  sharing = new ProviderSharingHost({ store: database, serverId: "issuer-home", origin: options.origin ?? "http://127.0.0.1:43210", endpointPublicKey: `ed25519:${"a".repeat(64)}`, native });
+  sharing = new ProviderSharingHost({ store: database, serverId: "issuer-home", origin: options.origin ?? "http://127.0.0.1:43210", endpointPublicKey: `ed25519:${"a".repeat(64)}`, native,
+    ...(options.readQuota ? { readQuota: options.readQuota } : {}) });
   const vault = await CredentialVault.open(join(root, "master.key")), homeDirectory = join(root, "received-home");
   let loseSubmit = false, submits = 0, seenSecret = "", afterRead: (() => Promise<void>) | undefined;
   const connect = (options: ProviderSharingRemoteOptions): ProviderSharingRemote => {
@@ -90,6 +92,69 @@ async function fixture(options: { readonly backendId?: string; readonly origin?:
     restart: async () => { await home.close(); home = new ProviderSharingHome({ directory: homeDirectory, serverId: "recipient-home", vault, connect }); await home.initialize(); },
     close: async () => { await home.close(); sharing.close(); await native.close(); database.close(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe fixture cleanup."); await rm(root, { recursive: true, force: true }); } };
 }
+
+it("intersects Provider and member selections at catalogs, native dispatch and revoked existing runs", async () => {
+  const f = await fixture(); try {
+    const intent = await f.apply(f.issue().link), received = await f.approve(intent.request!.requestId), captured = f.home().captureNative(received, "source");
+    await captured.client.open(f.open("model-grant"), signal());
+    expect(await captured.client.call("model-grant", "before-revoke", { kind: "state" }, signal()))
+      .toMatchObject({ binding: { nativeSessionId: "sdk-1" }, streaming: false });
+    expect(f.created()).toBe(1);
+    const share = f.sharing.list()[0]!, member = share.members[0]!;
+    const request = create(contract.SetProviderShareModelAccessRequestSchema, { operationId: "deny-models", shareId: share.shareId, memberId: member.memberId,
+      expectedRevision: share.revision, memberGeneration: member.generation, access: contract.toRemoteModelAccess([]) });
+    f.sharing.setModelAccess(request); f.sharing.setModelAccess(request);
+    await expect(captured.client.call("model-grant", "after-revoke", { kind: "state" }, signal())).rejects.toBeDefined();
+    const catalog = await captured.client.catalog(signal()); expect(catalog.backends[0]!.providers[0]!.models).toEqual([]);
+    expect(catalog.backends[0]!.providers[0]!.manageableModels).toEqual([]);
+    await expect(captured.client.open(f.open("denied-model"), signal())).rejects.toMatchObject({ code: Code.PermissionDenied });
+    expect(f.created()).toBe(1);
+    expect(() => f.sharing.setModelAccess(create(contract.SetProviderShareModelAccessRequestSchema, { ...request, access: contract.toRemoteModelAccess(undefined) }))).toThrow();
+    const denied = f.sharing.list()[0]!;
+    f.sharing.setModelAccess(create(contract.SetProviderShareModelAccessRequestSchema, { operationId: "select-model", shareId: share.shareId, memberId: member.memberId,
+      expectedRevision: denied.revision, memberGeneration: denied.members[0]!.generation, access: contract.toRemoteModelAccess(["model"]) }));
+    const settings = f.native.settings.snapshot();
+    f.native.settings.update({ kind: "model_access", backendId: "native", providerId: "provider", modelIds: ["other-model"] }, settings.revision);
+    expect((await captured.client.catalog(signal())).backends[0]!.providers[0]!.models).toEqual([]);
+    await f.home().refresh(f.authority); expect(f.home().received()[0]!.models).toEqual([]);
+  } finally { await f.close(); }
+});
+
+it("reads quota and only the requesting member's numeric usage on demand and fences a late quota after visibility changes", async () => {
+  let release!: () => void, delayed = false;
+  const readQuota = vi.fn(async () => {
+    if (delayed) await new Promise<void>(resolve => { release = resolve; });
+    return [create(contract.ProviderSharingQuotaAccountSchema, { state: "ready", usage: { providerId: "shared-provider", observedAt: { seconds: BigInt(Math.floor(Date.now() / 1000)) }, primaryWindow: { usedPercent: 25 } } })];
+  });
+  const f = await fixture({ readQuota });
+  try {
+    const intent = await f.apply(f.issue().link), received = await f.approve(intent.request!.requestId);
+    let value = await f.home().insights(received.joinId, false, f.authority);
+    expect(value.quotaStatus).toBe("disabled"); expect(value.usageStatus).toBe("disabled"); expect(readQuota).not.toHaveBeenCalled();
+    let share = f.sharing.list()[0]!;
+    f.sharing.setVisibility(create(contract.SetProviderShareVisibilityRequestSchema, { operationId: "share-insights", shareId: share.shareId, expectedRevision: share.revision,
+      visibility: { quota: true, usage: true } }));
+    await f.home().refresh(f.authority);
+    value = await f.home().insights(received.joinId, false, f.authority);
+    expect(value).toMatchObject({ quotaStatus: "ready", usageStatus: "not_requested", days: [] }); expect(readQuota).toHaveBeenCalledTimes(1);
+    const captured = f.home().captureNative(f.home().listReceived()[0]!, "source"); await captured.client.open(f.open("usage-turn"), signal());
+    await captured.client.call("usage-turn", "usage-send", { kind: "send", durableFence: false, input: { text: "Work", images: [], files: [], mentions: [], disposition: "prompt" } }, signal());
+    await f.captured()!.emit({ type: "usage", usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 15, cost: 0.0001,
+      nativeAccounting: { sourceId: "accounting", tokensComplete: true, costComplete: true, costEstimated: false } } });
+    await f.captured()!.emit({ type: "done", outcome: "completed" });
+    value = await f.home().insights(received.joinId, true, f.authority);
+    expect(value.days).toHaveLength(1); expect(value.days[0]).toMatchObject({ turns: 1n, inputTokens: 10n, outputTokens: 5n, costMicros: 100n });
+    expect(JSON.stringify(value, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("private-native");
+    delayed = true; const reading = f.home().insights(received.joinId, true, f.authority);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    share = f.sharing.list()[0]!;
+    f.sharing.setVisibility(create(contract.SetProviderShareVisibilityRequestSchema, { operationId: "stop-insights", shareId: share.shareId,
+      expectedRevision: share.revision, visibility: { quota: false, usage: false } }));
+    release(); await expect(reading).rejects.toBeDefined(); delayed = false;
+    await f.home().refresh(f.authority); value = await f.home().insights(received.joinId, true, f.authority);
+    expect(value).toMatchObject({ quotaStatus: "disabled", usageStatus: "disabled", accounts: [], days: [] });
+  } finally { release?.(); await f.close(); }
+});
 
 it("publishes the current Provider entrance while preserving the recipient's pinned locator after withdrawal", async () => {
   let origin = "http://127.0.0.1:43210";

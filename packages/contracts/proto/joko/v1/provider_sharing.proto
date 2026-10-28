@@ -17,6 +17,9 @@ service ProviderSharingService {
   rpc RefreshProviderSharing(RefreshProviderSharingRequest) returns (RefreshProviderSharingResponse);
   rpc WithdrawProviderShare(WithdrawProviderShareRequest) returns (WithdrawProviderShareResponse);
   rpc LeaveReceivedProviderShare(LeaveReceivedProviderShareRequest) returns (LeaveReceivedProviderShareResponse);
+  rpc SetProviderShareModelAccess(SetProviderShareModelAccessRequest) returns (SetProviderShareModelAccessResponse);
+  rpc SetProviderShareVisibility(SetProviderShareVisibilityRequest) returns (SetProviderShareVisibilityResponse);
+  rpc GetReceivedProviderShareInsights(GetReceivedProviderShareInsightsRequest) returns (GetReceivedProviderShareInsightsResponse);
 }
 service ProviderSharingGuestService {
   rpc InspectProviderShare(InspectProviderShareRequest) returns (InspectProviderShareResponse);
@@ -28,12 +31,14 @@ service ProviderSharingGuestService {
   rpc GetProviderShareLeaveReceipt(GetProviderShareLeaveReceiptRequest) returns (GetProviderShareLeaveReceiptResponse);
   rpc SyncProviderReshares(SyncProviderResharesRequest) returns (SyncProviderResharesResponse);
   rpc CloseProviderShareRun(CloseProviderShareRunRequest) returns (CloseProviderShareRunResponse);
+  rpc ReadProviderShareInsights(ReadProviderShareInsightsRequest) returns (ReadProviderShareInsightsResponse);
 }
 
 message ProviderSharingPerson { string name = 1; optional string avatar_url = 2; }
 message ProviderSharingMember {
   string member_id = 1; uint64 generation = 2; ProviderSharingPerson person = 3;
   string status = 4; uint64 joined_at_ms = 5; string home_server_id = 6;
+  HostedAgentModelAccess model_access = 7;
 }
 message ProviderSharingRequest {
   string request_id = 1; string share_id = 2; string link_id = 3; ProviderSharingPerson person = 4;
@@ -50,17 +55,22 @@ message ProviderSharingOwned {
   string provider_name = 5; ProviderSharingPerson owner = 6; uint64 revision = 7;
   repeated ProviderSharingMember members = 8; repeated ProviderSharingRequest requests = 9;
   repeated ProviderSharingReshare reshares = 10;
+  HostedAgentModelAccess provider_model_access = 11;
+  repeated ModelDescriptor available_models = 12;
+  ProviderSharingVisibility visibility = 13;
 }
 message ProviderSharingPreview {
   string host_origin = 1; string host_server_id = 2; string share_id = 3; string backend_id = 4;
   string provider_id = 5; string provider_name = 6; ProviderSharingPerson owner = 7;
   string state = 8; uint64 expires_at_ms = 9;
+  ProviderSharingVisibility visibility = 10; uint64 access_revision = 11;
 }
 message ProviderSharingReceived {
   string join_id = 1; string host_origin = 2; string host_server_id = 3; string share_id = 4;
   string member_id = 5; uint64 generation = 6; string backend_id = 7; string native_backend_id = 8;
   string provider_id = 9; string provider_name = 10; ProviderSharingPerson owner = 11;
   string state = 12; repeated ModelDescriptor models = 13;
+  ProviderSharingVisibility visibility = 14; uint64 access_revision = 15;
 }
 message ProviderSharingIntent {
   string operation_id = 1; string join_id = 2; string status = 3; string error_code = 4;
@@ -119,3 +129,41 @@ message ProviderSharingReshareState { string key = 1; string state = 2; }
 message SyncProviderResharesResponse { repeated ProviderSharingReshareState entries = 1; ProviderSharingReshareBatch batch = 2; bool complete = 3; }
 message CloseProviderShareRunRequest { string run_id = 1; }
 message CloseProviderShareRunResponse {}
+
+message SetProviderShareModelAccessRequest {
+  string operation_id = 1; string share_id = 2; string member_id = 3;
+  uint64 expected_revision = 4; uint64 member_generation = 5;
+  HostedAgentModelAccess access = 6;
+}
+message SetProviderShareModelAccessResponse { ProviderSharingOwned share = 1; }
+message ProviderSharingVisibility { bool quota = 1; bool usage = 2; }
+message SetProviderShareVisibilityRequest {
+  string operation_id = 1; string share_id = 2; uint64 expected_revision = 3;
+  ProviderSharingVisibility visibility = 4;
+}
+message SetProviderShareVisibilityResponse { ProviderSharingOwned share = 1; }
+message ProviderSharingQuotaAccount {
+  string state = 1; ProviderAccountUsageSnapshot usage = 2;
+}
+message ProviderSharingUsageDay {
+  string day = 1; string model_id = 2;
+  uint64 turns = 3; uint64 input_tokens = 4; uint64 output_tokens = 5;
+  uint64 cache_read_tokens = 6; uint64 cache_write_tokens = 7;
+  uint64 cost_micros = 8; string currency_code = 9;
+  bool tokens_complete = 10; bool cost_complete = 11; bool estimated = 12;
+}
+// Only the requesting member's bounded numeric usage is exposed. No native
+// history, other members, routes, credentials or task identities cross this API.
+message ProviderSharingInsights {
+  ProviderSharingVisibility visibility = 1;
+  string quota_status = 2; string usage_status = 3;
+  repeated ProviderSharingQuotaAccount accounts = 4;
+  bool quota_partial = 5;
+  repeated ProviderSharingUsageDay days = 6;
+  bool usage_partial = 7;
+  string coverage_start = 8;
+}
+message ReadProviderShareInsightsRequest { string share_id = 1; bool include_usage = 2; }
+message ReadProviderShareInsightsResponse { ProviderSharingInsights insights = 1; }
+message GetReceivedProviderShareInsightsRequest { string join_id = 1; bool include_usage = 2; }
+message GetReceivedProviderShareInsightsResponse { ProviderSharingInsights insights = 1; }

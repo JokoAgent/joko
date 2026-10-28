@@ -360,6 +360,14 @@ const desktopCapabilities = Object.freeze([
 ] as const);
 
 const desktopApi = Object.freeze({
+  ...(mainDocumentOccurrence === undefined ? {} : { voiceConversation: Object.freeze({
+    control: (serverId: string, bytes: Uint8Array): Promise<Uint8Array> => {
+      if (typeof serverId !== "string" || !(bytes instanceof Uint8Array) || bytes.byteLength > 128 * 1024) return Promise.reject(new Error("Invalid voice request."));
+      return ipcRenderer.invoke("joko:voice-conversation:control", mainDocumentOccurrence, serverId, new Uint8Array(bytes)).then((result: unknown) => {
+        if (!(result instanceof Uint8Array) || result.byteLength > 8 * 1024 * 1024) throw new Error("Invalid voice reply."); return new Uint8Array(result);
+      });
+    }
+  }) }),
   ...(linkspanDocument === undefined ? {} : { linkspan: Object.freeze({
     request: (kind: "iroh" | "tailcat" | "http-connect", message: StreamBridgeRequest): Promise<unknown> => {
       if ((kind !== "iroh" && kind !== "tailcat" && kind !== "http-connect") || !message || typeof message !== "object" ||

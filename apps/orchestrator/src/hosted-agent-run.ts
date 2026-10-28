@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import type { AdapterContext, AdapterEventMetadata, BackendAdapter, BlobRef, CreateNativeSessionInput, EventPayload, HostedExecution, NativeSessionBinding, PermissionMode, PromptInput, SubagentControlInput, UserShellInput } from "@joko/core";
+import type { AdapterContext, AdapterEventMetadata, BackendAdapter, BlobRef, CreateNativeSessionInput, EventPayload, HostedExecution, NativeSessionBinding, PermissionMode, PromptInput, SubagentControlInput, UsageSnapshot, UserShellInput } from "@joko/core";
 import { JokoError } from "@joko/core";
 import { assertManagedSubagentHostedToolScope, managedSubagentRunRoot, type PiHostedBackgroundScope } from "@joko/adapter-pi";
 import type { HostedAgentStore, HostedNativeSessionOwner, HostedNativeProviderGrantOwner } from "@joko/store";
@@ -32,13 +32,17 @@ export interface HostedAgentRunOptions {
   readonly name?: string;
   readonly modelIds: readonly string[];
   readonly permissionMode: PermissionMode;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly effort?: string;
   readonly workspace: Omit<HostedExecution["workspace"], "root" | "additionalRoots">;
   readonly artifactCapacityBytes: number;
   readonly slots: HostedAgentSessionSlots;
   readonly assertCurrent: () => void;
   readonly assertModelAllowed: (providerId: string, modelId: string) => void;
+  readonly usage?: {
+    begin(callId: string, modelId: string, baseline: UsageSnapshot | undefined): void;
+    finish(callId: string, observation: UsageSnapshot | undefined): void;
+  };
   /** Internal startup owner, before SDK initialization can call Source tools. */
   readonly onCreated?: (run: HostedAgentRun) => void;
   /** A dedicated native Adapter with this run's isolated credential snapshot.
@@ -90,6 +94,9 @@ export class HostedAgentRun {
   #shellOperationId?: string;
   #inputImages: readonly BlobRef[] = [];
   #activeProvider?: string;
+  #usageTurn?: string;
+  #lastUsage?: UsageSnapshot;
+  #usageObserved = false;
   readonly #toolOwners = new Map<string, { readonly operationId: string; readonly origin: string; readonly backgroundScope?: string }>();
   readonly #backgroundOwners = new Map<string, { readonly operationId: string; readonly scope: PiHostedBackgroundScope; readonly generation: number }>();
   readonly #nativeToolOwners = new Map<string, string>();
@@ -271,6 +278,10 @@ export class HostedAgentRun {
   }
   async #emit(event: EventPayload, metadata?: AdapterEventMetadata, operationId?: string): Promise<void> {
     this.#assertAuthority();
+    if (event.type === "usage") { this.#lastUsage = event.usage; this.#usageObserved = true; }
+    if (this.#usageTurn && (event.type === "done" || event.type === "run_state" && ["completed", "aborted", "failed"].includes(event.state))) {
+      this.#options.usage?.finish(this.#usageTurn, this.#usageObserved ? this.#lastUsage : undefined); this.#usageTurn = undefined;
+    }
     if (event.type === "done" || event.type === "run_state" && ["completed", "aborted", "failed"].includes(event.state)) this.#activeProvider = undefined;
     else if (event.type === "run_state" && ["running", "waiting", "retrying", "dispatch_unknown"].includes(event.state)) this.#activeProvider = this.#context?.modelSelection?.providerId ?? this.#options.providerId;
     if (event.type === "native_session_changed") {
@@ -463,6 +474,12 @@ export class HostedAgentRun {
     switch (command.kind) {
       case "state": return adapter.inspectSession(this.#binding!, context);
       case "send":
+        if (this.#options.usage) {
+          const state = await adapter.inspectSession(this.#binding!, context); this.#assertCurrent();
+          this.#lastUsage = state.usage;
+          this.#usageObserved = false;
+          this.#options.usage.begin(id, context.modelSelection!.modelId, state.usage); this.#usageTurn = id;
+        }
         this.#activeProvider = context.modelSelection?.providerId ?? this.#options.providerId;
         this.#inputOperationId = id;
         this.#inputImages = command.input.images.map(image => ({ ...image.blob }));

@@ -63,6 +63,7 @@ import { currentGamepadTaskRoot, useGamepadActions } from "../gamepad-actions.js
 import { isGamepadSkillBinding, type GamepadSkillBinding } from "../gamepad-input.js";
 import { useAppInputComposerOwner, type AppInputSkillIdentity } from "../app-input-owners.js";
 import { VoiceInputButton } from "./VoiceInputButton.js";
+import { DesktopVoiceConversationEntry } from "./DesktopVoiceConversation.js";
 import { VoiceInputOverlay } from "./VoiceInputOverlay.js";
 import { applyVoiceDraftResult, createVoiceDraftFence } from "./voice-draft-fence.js";
 import { createVoiceInsertedEditTracker } from "./voice-inserted-edit.js";
@@ -2914,6 +2915,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
               />}
             </div>}
             {!effectiveBashMode && voice.supported && <VoiceInputButton phase={voice.phase} held={heldVoice.held} sendTargetActive={heldVoice.sendTargetActive} startedAt={voice.startedAt} ownerWindow={voice.ownerWindow} enabled={!readOnly && submissionKind === undefined && hydratedSession === session.id} buttonProps={heldVoice.buttonProps} t={t} />}
+            {!effectiveBashMode && <DesktopVoiceConversationEntry controller={controller} session={session} disabled={readOnly || submissionKind !== undefined || voice.phase !== undefined && voice.phase !== "idle" || hydratedSession !== session.id} />}
             {bashCapable && <IconButton label={effectiveBashMode ? t("composer.shellExit") : t("composer.shellEnter")} disabled={composerLocked} aria-pressed={effectiveBashMode} onClick={() => { closePalette(); setBashMode((current) => !current); requestComposerFrame(() => richEditorRef.current?.focus()); }}><Terminal aria-hidden="true" /></IconButton>}
             {effectiveBashMode && <label className="composer__bash-option"><CheckboxControl checked={shellDraft?.excludeFromContext ?? bashExcluded} disabled={composerLocked || shellDraft?.prefix === "exclude"} onChange={(event) => setBashExcluded(event.target.checked)} />{t("composer.shellExclude")}</label>}
             {saved && <span className="draft-saved" role="status"><CircleCheck aria-hidden="true" />{t("composer.saved")}</span>}

@@ -329,7 +329,7 @@ interface SessionRuntime {
   providerId?: string;
   modelId?: string;
   effort?: string;
-  fastMode: boolean;
+  fastMode: boolean | "ultrafast";
   name?: string;
   permissionMode: PermissionMode;
   planMode: boolean;
@@ -1167,7 +1167,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             excludeTurns: true,
             ...(input.modelId === undefined ? {} : { model: input.modelId }),
             ...(input.providerId === undefined ? {} : { modelProvider: input.providerId }),
-            ...(input.fastMode ? { serviceTier: "fast" } : {}),
+            serviceTier: fastServiceTier(input.fastMode),
             ...permissionParams(input.permissionMode)
           }
         }
@@ -1179,7 +1179,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ...(input.modelId === undefined ? {} : { model: input.modelId }),
             ...(input.providerId === undefined ? {} : { modelProvider: input.providerId }),
             ...(reviewThreadProfile === undefined
-              ? input.fastMode ? { serviceTier: "fast" } : {}
+              ? { serviceTier: fastServiceTier(input.fastMode) }
               : reviewThreadProfile),
             ...(runtimePolicy === "review_read_only"
               || (input.appendSystemPrompt === undefined && context.appendSystemPrompt === undefined)
@@ -2031,7 +2031,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               serviceTierForTurn: "default"
             }
           : {
-              ...(runtime.fastMode ? { serviceTier: "fast" } : {}),
+              serviceTier: fastServiceTier(runtime.fastMode),
               ...(context.nativeToolAuthorization?.required ? { approvalPolicy: "untrusted", approvalsReviewer: "user", sandboxPolicy: { type: "readOnly" } } : {}),
               ...(context.nativeToolAuthorization?.required || runtime.permissionMode === "bypassPermissions" || runtime.nativeMemoryDirectory === undefined
                 ? {}
@@ -2538,6 +2538,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const response = await runtime.host.request("thread/settings/update", {
       threadId: runtime.threadId,
       model: modelId,
+      serviceTier: fastServiceTier(modelSupportsSpeed(model, runtime.fastMode) ? runtime.fastMode : false),
       ...(collaborationMode === undefined ? {} : { collaborationMode })
     }, {
       mutation: true,
@@ -2548,7 +2549,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     runtime.providerId = providerId;
     runtime.modelId = modelId;
     runtime.effort = nextEffort;
-    if (!model.supportsFastMode) runtime.fastMode = false;
+    if (!modelSupportsSpeed(model, runtime.fastMode)) runtime.fastMode = false;
     runtime.nativeTasks.updateRoute(runtime.providerId, runtime.modelId, runtime.effort);
     return model;
   }
@@ -2590,20 +2591,20 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     runtime.nativeTasks.updateRoute(runtime.providerId, runtime.modelId, runtime.effort);
   }
 
-  override async setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
+  override async setFastMode(enabled: boolean | "ultrafast", context: AdapterContext): Promise<void> {
     return this.#withNativeMutation(context, () => this.#setFastMode(enabled, context));
   }
 
-  async #setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
+  async #setFastMode(enabled: boolean | "ultrafast", context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change Fast Mode");
     assertYieldContinuationIdle(runtime);
     if (enabled) {
       const model = await this.#requireRuntimeModel(runtime, context);
-      if (!model.supportsFastMode) {
+      if (!modelSupportsSpeed(model, enabled)) {
         throw adapterError({
           code: "CODEX_FAST_MODE_UNAVAILABLE",
-          message: "Fast Mode is not supported by the active Codex model.",
+          message: "The selected speed is not supported by the active Codex model.",
           phase: "dispatch",
           recovery: "Choose a model that advertises Fast Mode or leave it disabled."
         });
@@ -2612,7 +2613,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const hostGeneration = runtime.hostGeneration;
     const response = await runtime.host.request("thread/settings/update", {
       threadId: runtime.threadId,
-      serviceTier: enabled ? "fast" : null
+      serviceTier: fastServiceTier(enabled)
     }, {
       mutation: true,
       signal: context.signal,
@@ -4026,7 +4027,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration, ...this.#taskShellConfiguration(context),
         ...nativeWebPolicyConfiguration(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot),
         ...(runtime.effort === undefined ? {} : { model_reasoning_effort: runtime.effort }),
-        service_tier: runtime.fastMode ? "fast" : null
+        service_tier: fastServiceTier(runtime.fastMode)
       }, context, providerId, modelId);
       const response = await this.#resumeNativeThread(
         { ...this.#scopeForRuntime(runtime), assertCurrent: () => { assertCurrent(); nativeSkills?.assertCurrent(); } },
@@ -4080,7 +4081,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     providerId: string | undefined,
     modelId: string | undefined,
     effort: string | undefined,
-    fastMode: boolean
+    fastMode: boolean | "ultrafast"
   ): Promise<ProviderModel | undefined> {
     if ((providerId === undefined) !== (modelId === undefined)) {
       throw adapterError({
@@ -4117,7 +4118,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Choose one of the reasoning levels advertised for the selected model."
       });
     }
-    if (fastMode && !model.supportsFastMode) {
+    if (!modelSupportsSpeed(model, fastMode)) {
       throw adapterError({
         code: "CODEX_FAST_MODE_UNAVAILABLE",
         message: "Fast Mode is not supported by the selected Codex model.",
@@ -4332,8 +4333,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly providerId?: string;
     readonly modelId?: string;
     readonly effort?: string;
-    readonly fastMode?: boolean;
-    readonly observedFastMode?: boolean;
+    readonly fastMode?: boolean | "ultrafast";
+    readonly observedFastMode?: boolean | "ultrafast";
     readonly name?: string;
     readonly nativeAuthenticationAdmission: number | undefined;
     readonly reviewWorkingDirectory?: string;
@@ -5907,7 +5908,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       supported.add("memory.native");
     }
     if (this.#models.some((model) => model.thinkingLevels.length > 0)) supported.add("model.effort");
-    if (this.#models.some((model) => model.supportsFastMode)) supported.add("model.fast_mode");
+    if (this.#models.some((model) => model.supportsFastMode || model.supportsUltrafastMode)) supported.add("model.fast_mode");
     if (this.#account?.supportsLogin === true) supported.add("provider.login");
     if (this.#account?.supportsLogout === true) supported.add("provider.logout");
     if (this.#resolvers.readBlob !== undefined) supported.add("input.image");
@@ -5955,6 +5956,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ? { reason: "not_implemented" as const }
             : {}),
         ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {}),
+        ...(key === "model.fast_mode" ? { options: [
+          ...(this.#models.some(model => model.supportsFastMode) ? ["fast"] : []),
+          ...(this.#models.some(model => model.supportsUltrafastMode) ? ["ultrafast"] : [])
+        ] } : {}),
         ...(key === "runtime.resources" && available ? { options: ["skill"] } : {}),
         ...(key === "input.mention" && available
           ? { options: ["workspace_file", ...(this.#resolvers.resolveArtifactMention === undefined ? [] : ["artifact"]),
@@ -8337,7 +8342,8 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
       declaredSupportsImages: model.inputModalities.includes("image")
     }),
     ...(model.serviceTiersDeclared !== true ? {} : {
-      declaredSupportsFastMode: model.serviceTiers.some((tier) => tier.id === "fast" || tier.id === "priority")
+      declaredSupportsFastMode: model.serviceTiers.some((tier) => tier.id === "fast" || tier.id === "priority"),
+      declaredSupportsUltrafastMode: model.serviceTiers.some((tier) => tier.id === "ultrafast")
     }),
     contextWindow: estimate?.contextWindow ?? 0,
     maxOutputTokens: estimate?.maximumOutputTokens ?? 0,
@@ -8345,7 +8351,8 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
     supportsImages: model.inputModalities.includes("image"),
     defaultVisible: estimate?.defaultVisible ?? !model.hidden,
     supportsFastMode: model.serviceTiers.some((tier) => tier.id === "fast" || tier.id === "priority")
-      || estimate?.fastModeMultiplier !== undefined,
+      || model.serviceTiersDeclared !== true && estimate?.fastModeMultiplier !== undefined,
+    supportsUltrafastMode: model.serviceTiers.some((tier) => tier.id === "ultrafast"),
     thinkingLevels: model.supportedReasoningEfforts.map((effort) => effort.reasoningEffort),
     cost: estimate?.price === undefined ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } : {
       input: estimate.price.input,
@@ -8389,8 +8396,22 @@ function workingContextConfiguration(configuration: JsonObject | undefined, cont
   return result;
 }
 
-function isFastServiceTier(value: JsonValue | undefined): boolean {
-  return value === "fast" || value === "priority";
+function isFastServiceTier(value: JsonValue | undefined): boolean | "ultrafast" {
+  if (value === "ultrafast") return "ultrafast";
+  if (value === "fast" || value === "priority") return true;
+  if (value === undefined || value === null || value === "default" || value === "standard" || value === "auto") return false;
+  throw adapterError({ code: "CODEX_SERVICE_TIER_UNSUPPORTED", message: "The native model returned an unsupported service tier.",
+    phase: "session", recovery: "Refresh the current model and runtime capabilities before retrying." });
+}
+
+function fastServiceTier(value: boolean | "ultrafast"): "fast" | "ultrafast" | null {
+  if (value === "ultrafast") return "ultrafast";
+  if (typeof value !== "boolean") throw adapterError({ code: "CODEX_SERVICE_TIER_INVALID", message: "The requested model speed is invalid.", phase: "provision" });
+  return value ? "fast" : null;
+}
+
+function modelSupportsSpeed(model: ProviderModel, value: boolean | "ultrafast"): boolean {
+  return value === false || (value === "ultrafast" ? model.supportsUltrafastMode === true : value === true && model.supportsFastMode === true);
 }
 
 function cancelledDispatch() {
@@ -8455,9 +8476,9 @@ function waitForHistoryRead<T>(pending: Promise<T>, signal: AbortSignal, cancell
   });
 }
 
-function observedFastServiceTier(record: JsonObject): boolean | undefined {
+function observedFastServiceTier(record: JsonObject): boolean | "ultrafast" | undefined {
   const tier = record["serviceTier"];
-  return isFastServiceTier(tier) ? true : tier === null || tier === "default" ? false : undefined;
+  return tier === undefined ? undefined : isFastServiceTier(tier);
 }
 
 function versionFromUserAgent(userAgent: string | undefined): string {

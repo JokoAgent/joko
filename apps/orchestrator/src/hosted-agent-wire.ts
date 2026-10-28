@@ -37,7 +37,7 @@ const callSchema = z.discriminatedUnion("kind", [
   ...noArgs.map(kind => z.strictObject({ kind: z.literal(kind) })),
   z.strictObject({ kind: z.literal("set_model"), providerId: id, modelId: id }),
   z.strictObject({ kind: z.literal("set_effort"), effort: id }),
-  z.strictObject({ kind: z.literal("set_fast"), enabled: z.boolean() }),
+  z.strictObject({ kind: z.literal("set_fast"), enabled: z.union([z.boolean(), z.literal("ultrafast")]) }),
   z.strictObject({ kind: z.literal("set_permission"), mode: permission }),
   z.strictObject({ kind: z.literal("set_plan"), enabled: z.boolean() }),
   z.strictObject({ kind: z.literal("set_name"), name: text }),
@@ -56,7 +56,7 @@ const callSchema = z.discriminatedUnion("kind", [
 ]);
 const openSchema = z.strictObject({ runId: id, nativeSessionId: id, start: z.enum(["create", "resume"]), sessionId: id, targetId: id, generation: unsigned, backendId: id, providerId: id, modelId: id,
   name: z.string().max(16_384).refine(value => !value.includes("\0")).optional(), groupSwitch: z.string().regex(/^[a-f0-9]{64}$/u).optional(), groupMember: z.boolean().optional(),
-  permissionMode: permission, fastMode: z.boolean(), effort: id.optional(), workspace: z.strictObject({ platform: z.enum(["win32", "darwin", "linux"]),
+  permissionMode: permission, fastMode: z.union([z.boolean(), z.literal("ultrafast")]), effort: id.optional(), workspace: z.strictObject({ platform: z.enum(["win32", "darwin", "linux"]),
     shell: z.string().max(16_384), isGitRepository: z.boolean(), personalInstructions: z.string().max(1024 * 1024).optional(),
     memoryInstructions: z.string().max(1024 * 1024).optional(), mcpEnabled: z.literal(true).optional(), subagentsEnabled: z.boolean().optional(),
     additionalDirectoryIds: z.array(z.string().regex(/^[a-f0-9]{64}$/u)).max(128).refine(ids => new Set(ids).size === ids.length).optional(),

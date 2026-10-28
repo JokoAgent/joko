@@ -1,4 +1,6 @@
 import { Buffer } from "node:buffer";
+import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY,
+  type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import type { McpAppMessageGuard } from "./mcp-apps/message.js";
 import type { McpAppModelContext } from "./mcp-apps/host.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -418,7 +420,7 @@ interface TurnOverrideLease {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly modelChanged: boolean;
@@ -434,7 +436,7 @@ interface RuntimeProfileChanges {
   readonly model: boolean;
   readonly effort: boolean;
   readonly effortClear: boolean;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 interface MessageDeletionPlan {
@@ -497,7 +499,7 @@ export interface CreateSessionInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   /** Private creation snapshot; attached native tasks always ignore it. */
@@ -523,7 +525,7 @@ export interface CreateScheduledSessionInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly appendSystemPrompt?: undefined;
@@ -556,7 +558,7 @@ export interface CreateServiceSessionInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   /** Private, bounded identity snapshot for service-owned partner creation. */
@@ -571,6 +573,8 @@ export interface CreateServiceSessionInput {
   /** Prime private group ownership before a native context freezes tools, Skills or identity. */
   readonly preparePrivateSession?: (sessionId: string, target: TargetDescriptor) => Promise<void>;
   readonly worktree?: { readonly sourceRef?: string; readonly refreshRemote: boolean };
+  /** Exact local project snapshot adopted only by the collaboration owner. */
+  readonly workerWorkspace?: WorkerWorkspacePlan;
   /** Private personal-task intent, committed before checkout/native effects. */
   readonly onPreparing?: (store: OperationalStore, input: {
     readonly sessionId: string; readonly target: StoredTarget; readonly backendGeneration: number;
@@ -646,7 +650,7 @@ export interface ImportPortableSessionInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly overwrite: boolean;
@@ -1448,13 +1452,16 @@ export class SessionHost {
         || this.#store.getTarget(context.targetId).revision !== targetRevision
         || JSON.stringify([session.worktree, session.remoteWorkspace, current.workspaceRoot, current.remoteWorkspace]) !== identity
         || session.worktree !== undefined && session.worktree.remote === undefined
-          && this.#worktrees?.activeWorkspacePath(session.id, session.worktree) !== current.workspaceRoot) {
+          && (() => { const root = this.#worktrees?.activeWorkspacePath(session.id, session.worktree);
+            return root === undefined || !workerPathWithin(root, current.workspaceRoot); })()) {
         throw new Error("The tool's task Workspace changed.");
       }
     };
     assertCurrent();
     return { root: target.workspaceRoot, remote: target.remoteWorkspace !== undefined, assertCurrent };
   }
+
+  supportsLocalWorkerWorkspace(): boolean { return this.#worktrees !== undefined; }
 
   appDefaultModelChoices() {
     return this.#store.listBackends().flatMap(({ descriptor: backend }) => {
@@ -1466,6 +1473,7 @@ export class SessionHost {
           effort: backend.capabilities.get("model.effort")?.supported === true ? model.thinkingLevels[0] ?? "" : "", fastMode: false,
           efforts: backend.capabilities.get("model.effort")?.supported === true ? model.thinkingLevels : [],
           supportsFastMode: backend.capabilities.get("model.fast_mode")?.supported === true && model.supportsFastMode === true,
+          supportsUltrafastMode: backend.capabilities.get("model.fast_mode")?.supported === true && model.supportsUltrafastMode === true,
           instanceGeneration: backend.instanceGeneration,
           ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible })
         }));
@@ -1921,6 +1929,11 @@ export class SessionHost {
     if (input.hidden !== undefined && (!input.assertServiceScope || !["extension", "collaboration"].includes(input.serviceKind))) throw new StoreError("Hidden service tasks require their exact installation or team owner.");
     if (input.catalogImport !== undefined && (input.serviceKind !== "partner" || input.originSessionId === undefined
       || input.originSessionGeneration === undefined || input.assertServiceScope === undefined)) throw new StoreError("A service catalog import requires its exact Partner scope.");
+    if (input.workerWorkspace !== undefined && (input.serviceKind !== "collaboration" || input.assertServiceScope === undefined
+      || input.nativeStart?.kind === "attach" || input.workerWorkspace.targetId !== input.targetId)) {
+      throw new StoreError("Worker project selection requires its exact collaboration scope.");
+    }
+    if (input.workerWorkspace !== undefined && this.#worktrees === undefined) throw new StoreError("Local worker workspaces are unavailable.");
     validateAppendSystemPrompt(input.appendSystemPrompt);
     if (input.serviceKind === "session_handoff" && input.appendSystemPrompt !== undefined) {
       throw new StoreError("A handed-off task cannot supply a private system prompt.");
@@ -2152,7 +2165,7 @@ export class SessionHost {
     readonly providerId: string;
     readonly modelId: string;
     readonly effort?: string;
-    readonly fastMode: boolean;
+    readonly fastMode: boolean | "ultrafast";
     readonly assertCurrent: () => void;
     readonly commit: (store: OperationalStore) => T;
   }): Promise<T> {
@@ -5609,7 +5622,7 @@ export class SessionHost {
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.fastMode && profile.fastMode) {
-        await active.adapter.setFastMode(true, context);
+        await active.adapter.setFastMode(profile.fastMode, context);
         assertAuthority();
         this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
@@ -5682,7 +5695,7 @@ export class SessionHost {
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.fastMode && profile.fastMode) {
-        await active.adapter.setFastMode(true, context);
+        await active.adapter.setFastMode(profile.fastMode, context);
         assertAuthority();
         this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
         this.assertActiveBackendSideEffectLease(lease);
@@ -6095,7 +6108,7 @@ export class SessionHost {
     readonly providerId?: string;
     readonly modelId?: string;
     readonly effort?: string;
-    readonly fastMode?: boolean;
+    readonly fastMode?: boolean | "ultrafast";
     readonly permissionMode?: PermissionMode;
     readonly planMode?: boolean;
   }, options: {
@@ -6219,8 +6232,8 @@ export class SessionHost {
         await active.adapter.setEffort(fields.effort, context);
         this.assertActiveBackendSideEffectLease(lease);
       }
-      if (fastModeChanged && fields.fastMode === true) {
-        await active.adapter.setFastMode(true, context);
+      if (fastModeChanged && fields.fastMode) {
+        await active.adapter.setFastMode(fields.fastMode, context);
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (permissionModeChanged && fields.permissionMode !== undefined) {
@@ -6733,6 +6746,8 @@ export class SessionHost {
 
   private inputWorkspaceId(sessionId: string): string {
     const session = this.#store.getSession(sessionId).descriptor;
+    const workerWorkspace = readWorkerWorkspaceBinding(this.#store, sessionId);
+    if (workerWorkspace) return workerWorkspace.workspaceId;
     if (session.worktree !== undefined) return session.worktree.workspaceId;
     const target = this.#store.getTarget(session.targetId);
     const workspaceId = isRecord(target.metadata) ? target.metadata["workspaceId"] : undefined;
@@ -7149,8 +7164,8 @@ export class SessionHost {
         await active.adapter.setEffort(overrides.effort, context);
         this.assertSessionNotPendingScheduleDeletion(stored.descriptor.id);
       }
-      if (fastModeChanged && overrides.fastMode === true) {
-        await active.adapter.setFastMode(true, context);
+      if (fastModeChanged && overrides.fastMode) {
+        await active.adapter.setFastMode(overrides.fastMode, context);
         this.assertSessionNotPendingScheduleDeletion(stored.descriptor.id);
       }
       if (permissionModeChanged && overrides.permissionMode !== undefined) {
@@ -7250,7 +7265,7 @@ export class SessionHost {
       await active.adapter.setModel(lease.providerId, lease.modelId, context);
     }
     if (lease.effortChanged && lease.effort !== undefined) await active.adapter.setEffort(lease.effort, context);
-    if (lease.fastModeChanged && lease.fastMode) await active.adapter.setFastMode(true, context);
+    if (lease.fastModeChanged && lease.fastMode) await active.adapter.setFastMode(lease.fastMode, context);
     if (lease.permissionModeChanged) await active.adapter.setPermissionMode(lease.permissionMode, context);
     if (lease.planModeChanged) await active.adapter.setPlanMode(lease.planMode, context);
     if (lease.extraDirectoriesChanged && active.adapter.setExtraDirectories !== undefined) {
@@ -7273,7 +7288,7 @@ export class SessionHost {
         ? { providerId: value["providerId"], modelId: value["modelId"] }
         : {}),
       ...(typeof value["effort"] === "string" ? { effort: value["effort"] } : {}),
-      ...(typeof value["fastMode"] === "boolean" ? { fastMode: value["fastMode"] } : {}),
+      ...(typeof value["fastMode"] === "boolean" || value["fastMode"] === "ultrafast" ? { fastMode: value["fastMode"] } : {}),
       ...(permissionMode === "ask" || permissionMode === "auto" || permissionMode === "acceptEdits" || permissionMode === "bypassPermissions"
         ? { permissionMode }
         : {}),
@@ -10858,6 +10873,7 @@ export class SessionHost {
     let personalNativeCreationClosed = false;
     let contextForCleanup: AdapterContext | undefined;
     let acquiredWorktreeSessionId: string | undefined;
+    let preparedWorkerSessionId: string | undefined;
     let scheduledWorktreeSessionId: string | undefined;
     let releaseBackendAdmission: (() => void) | undefined;
     let privateCreationSessionId: string | undefined;
@@ -11007,7 +11023,9 @@ export class SessionHost {
         ? undefined
         : await this.#worktrees!.acquire({
             sessionId,
-            target: registeredTarget.descriptor,
+            target: "workerWorkspace" in input && input.workerWorkspace?.worktreeRoot
+              ? { ...registeredTarget.descriptor, workspaceRoot: input.workerWorkspace.worktreeRoot }
+              : registeredTarget.descriptor,
             ...(input.worktree.sourceRef === undefined ? {} : { sourceRef: input.worktree.sourceRef }),
             refreshRemote: input.worktree.refreshRemote
           });
@@ -11025,6 +11043,15 @@ export class SessionHost {
       let runtimeTarget = sessionWorktree === undefined
         ? target.descriptor
         : { ...target.descriptor, workspaceRoot: sessionWorktree.path };
+      const workerWorkspace = "workerWorkspace" in input && input.workerWorkspace
+        ? await prepareWorkerRuntimeWorkspace(this.#store, input.workerWorkspace, sessionId, sessionWorktree)
+        : undefined;
+      if (workerWorkspace) {
+        runtimeTarget = { ...runtimeTarget, workspaceRoot: workerWorkspace.path };
+        await this.#worktrees!.registerWorkerWorkspace(workerWorkspace, input.title, target.descriptor.trusted);
+        this.#store.setSetting("service", sessionId, WORKER_WORKSPACE_BINDING_KEY, workerWorkspace);
+        preparedWorkerSessionId = sessionId;
+      }
       if (nativeStart.kind === "new" && input.worktree === undefined && !target.descriptor.managed &&
           target.descriptor.remoteWorkspace === undefined && this.#prepareProjectGit !== undefined) {
         const assertCurrent = (): void => {
@@ -11145,7 +11172,7 @@ export class SessionHost {
         } else {
           if (privateCreationSessionId !== undefined) this.#store.setSetting("service", privateCreationSessionId, PRIVATE_CREATION_RECEIPT_KEY,
             { version: 1, operationId: claim.operation.id, phase: "creating" } satisfies PrivateCreationReceipt);
-          if ("serviceKind" in input && input.serviceKind === "personal_development") personalNativeCreationDispatched = true;
+          if ("serviceKind" in input && (input.serviceKind === "personal_development" || input.workerWorkspace !== undefined)) personalNativeCreationDispatched = true;
           for (;;) {
             try {
               if (groupAssignment) {
@@ -11308,6 +11335,7 @@ export class SessionHost {
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined
             });
+            if (workerWorkspace) store.setSetting("service", sessionId, WORKER_WORKSPACE_BINDING_KEY, workerWorkspace);
             groupAssignment?.commit();
             this.#runtimeHandoffs.finishCreation(claim.operation.id);
             if ("onAdmitted" in input && input.onAdmitted !== undefined) input.onAdmitted(store, created);
@@ -11378,6 +11406,7 @@ export class SessionHost {
         if (privateCreationSessionId !== undefined) this.#store.deleteSetting("service", privateCreationSessionId, PRIVATE_CREATION_RECEIPT_KEY);
         createdBinding = undefined;
         acquiredWorktreeSessionId = undefined;
+        preparedWorkerSessionId = undefined;
         return result;
       };
 
@@ -11434,6 +11463,13 @@ export class SessionHost {
           await this.#worktrees.release(acquiredWorktreeSessionId).catch(() => undefined);
         }
         this.#store.deleteSetting("service", acquiredWorktreeSessionId, SCHEDULED_WORKTREE_OWNER_SETTING_KEY);
+      }
+      if (preparedWorkerSessionId !== undefined && ((!personalNativeCreationDispatched && !groupCreationEffectDispatched) || personalNativeCreationClosed)) {
+        this.#worktrees?.unregisterWorkerWorkspace(preparedWorkerSessionId);
+        this.#store.deleteSetting("service", preparedWorkerSessionId, WORKER_WORKSPACE_BINDING_KEY);
+      }
+      if (preparedWorkerSessionId !== undefined && personalNativeCreationDispatched && !personalNativeCreationClosed) {
+        throw new OperationInProgressError(claim.operation.id);
       }
       return this.failClaimedEffect(operationKind, claim.operation.id, claim.operation.bodyHash, error);
     } finally {
@@ -11850,7 +11886,7 @@ export class SessionHost {
     input: {
       readonly providerId?: string;
       readonly modelId?: string;
-      readonly fastMode: boolean;
+      readonly fastMode: boolean | "ultrafast";
     },
     unavailableMessage: string
   ): void {
@@ -11865,7 +11901,7 @@ export class SessionHost {
   private assertBackendCreationReady<T extends {
     readonly providerId?: string;
     readonly modelId?: string;
-    readonly fastMode: boolean;
+    readonly fastMode: boolean | "ultrafast";
     readonly nativeStart?: NativeSessionStart;
   }>(
     backendId: string,
@@ -11964,7 +12000,7 @@ export class SessionHost {
     if (input.fastMode && (
       selectedModel === undefined
       || backend.capabilities.get("model.fast_mode")?.supported !== true
-      || selectedModel.supportsFastMode !== true
+      || (input.fastMode === "ultrafast" ? selectedModel.supportsUltrafastMode !== true : selectedModel.supportsFastMode !== true)
     )) {
       throw new JokoError({
         code: "MODEL_FAST_MODE_UNAVAILABLE",
@@ -13711,7 +13747,7 @@ export class SessionHost {
         })()
       : stored.descriptor.remoteWorkspace;
     return {
-      ...current,
+      ...workerWorkspaceTarget(this.#store, stored.descriptor, current),
       backendId: stored.descriptor.backendId,
       remoteWorkspace
     };
@@ -16249,7 +16285,7 @@ export class SessionHost {
     backendId: string,
     providerId: string | undefined,
     modelId: string | undefined,
-    enabled: boolean,
+    enabled: boolean | "ultrafast",
     operation: string
   ): void {
     if (!enabled) return;
@@ -16260,7 +16296,7 @@ export class SessionHost {
     const capability = backend.capabilities.get("model.fast_mode");
     const model = backend.models.find((candidate) =>
       candidate.providerId === providerId && candidate.modelId === modelId);
-    if (capability?.supported !== true || model?.supportsFastMode !== true) {
+    if (capability?.supported !== true || (enabled === "ultrafast" ? model?.supportsUltrafastMode !== true : model?.supportsFastMode !== true)) {
       throw turnOverrideError(
         "FAST_MODE_MODEL_UNSUPPORTED",
         `${operation} cannot enable Fast Mode for '${providerId}/${modelId}'.`
@@ -17700,6 +17736,7 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
     planMode: input.planMode,
     nativeStart: input.nativeStart ?? { kind: "new" },
     worktree: input.worktree,
+    ...("workerWorkspace" in input && input.workerWorkspace ? { workerWorkspace: input.workerWorkspace } : {}),
     ...("connection" in input || "initialPlacement" in input ? { initialPlacement: input.initialPlacement ?? "project" } : {}),
     ...(input.catalogImport !== undefined
       ? { catalogImport: input.catalogImport }
@@ -17908,7 +17945,7 @@ function scheduleTurnOverrides(value: unknown): TurnExecutionOverrides | undefin
   const providerId = typeof value["providerId"] === "string" ? value["providerId"] : undefined;
   const modelId = typeof value["modelId"] === "string" ? value["modelId"] : undefined;
   const effort = typeof value["effort"] === "string" ? value["effort"] : undefined;
-  const fastMode = typeof value["fastMode"] === "boolean" ? value["fastMode"] : undefined;
+  const fastMode = typeof value["fastMode"] === "boolean" || value["fastMode"] === "ultrafast" ? value["fastMode"] : undefined;
   const permissionMode = value["permissionMode"] === "ask" || value["permissionMode"] === "auto" || value["permissionMode"] === "acceptEdits" || value["permissionMode"] === "bypassPermissions"
     ? value["permissionMode"]
     : undefined;
@@ -18200,6 +18237,8 @@ function backendAuthenticationRequiredFailure(backend: BackendDescriptor): Publi
 }
 
 function modelUsageCostRates(model: ProviderModel, usage: UsageSnapshot) {
+  // Ultrafast is a separate upstream price tier; ordinary Fast rates cannot price it.
+  if (usage.pricingContext?.fastMode === "ultrafast") return undefined;
   if (model.pricing === undefined
     && model.cost.input === 0
     && model.cost.output === 0

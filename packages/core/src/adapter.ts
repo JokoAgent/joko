@@ -157,7 +157,7 @@ export interface CreateNativeSessionInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly appendSystemPrompt?: string;
   readonly nativeStart?: NativeSessionStart;
@@ -174,7 +174,7 @@ export interface NativeSessionState {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   /** Current Backend-native Plan mode when it can be observed exactly. */
   readonly planMode?: boolean;
@@ -604,7 +604,7 @@ export interface BackendAdapter {
   refreshModelWorkingContext?(context: AdapterContext): Promise<void>;
   setEffort(level: string, context: AdapterContext): Promise<void>;
   /** Apply the service-tier policy for subsequent Provider requests. */
-  setFastMode(enabled: boolean, context: AdapterContext): Promise<void>;
+  setFastMode(enabled: boolean | "ultrafast", context: AdapterContext): Promise<void>;
   setPermissionMode(mode: PermissionMode, context: AdapterContext): Promise<void>;
   setPlanMode(enabled: boolean, context: AdapterContext): Promise<void>;
   /** Hot-replace ordered policy authority without starting a sleeping runtime. */

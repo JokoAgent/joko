@@ -1,4 +1,5 @@
 import { create } from "@bufbuild/protobuf";
+import { encodeModelSpeed } from "@joko/contracts";
 import {
   BackendHealth,
   ExtraDirectoryAccess,
@@ -560,7 +561,7 @@ export function buildMobileAutomationScheduleInput(
       ...(model === undefined ? {} : { model: {
         model: { providerId: model.providerId, modelId: model.modelId },
         effortId: model.effortId ?? "",
-        fastMode: model.fastMode
+        ...encodeModelSpeed(model.fastMode)
       } }),
       permissionMode,
       planMode: !scriptMode && draft.planMode,

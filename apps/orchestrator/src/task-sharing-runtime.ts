@@ -165,7 +165,7 @@ export function createTaskSharingRuntime(
           if (!selection || !model) throw new ConnectError("A model selection is required.", Code.InvalidArgument);
           return effect(async (signal, complete) => host.applyAuthorizedSessionModel({ sessionId,
             providerId: model.providerId, modelId: model.modelId,
-            ...(selection.effortId ? { effort: selection.effortId } : {}), fastMode: selection.fastMode,
+            ...(selection.effortId ? { effort: selection.effortId } : {}), fastMode: contract.decodeModelSpeed(selection),
             assertCurrent: () => { lease.assertCurrent(); signal.throwIfAborted(); }, commit: () => complete()
           }), { accepted: true, resultCase: "session", entityId: sessionId });
         }
@@ -176,7 +176,7 @@ export function createTaskSharingRuntime(
             ...(value.providerId === undefined ? {} : { providerId: value.providerId }),
             ...(value.modelId === undefined ? {} : { modelId: value.modelId }),
             ...(value.effort === undefined ? {} : { effort: value.effort }),
-            ...(value.fastMode === undefined ? {} : { fastMode: value.fastMode }) };
+            ...(value.fastMode === undefined && value.ultrafastMode === undefined ? {} : { fastMode: contract.decodeModelSpeed(value) }) };
           return effect(async (signal, complete) => {
             await host.setSessionRuntimeControl({ sessionId, expectedGeneration, patch,
               assertAuthority: () => { lease.assertCurrent(); signal.throwIfAborted(); } });

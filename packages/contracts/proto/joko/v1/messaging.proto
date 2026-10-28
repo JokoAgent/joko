@@ -249,6 +249,7 @@ message MessagingRoute {
   google.protobuf.Timestamp created_at = 11;
   google.protobuf.Timestamp updated_at = 12;
   Revision revision = 13;
+  bool ultrafast_mode = 14;
 }
 
 message GetMessagingSettingsRequest {}
@@ -472,6 +473,7 @@ message PutMessagingRouteRequest {
   bool fast_mode = 7;
   PermissionMode permission_mode = 8;
   bool plan_mode = 9;
+  bool ultrafast_mode = 10;
 }
 
 message PutMessagingRouteResponse {

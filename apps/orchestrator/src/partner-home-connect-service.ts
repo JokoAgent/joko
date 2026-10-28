@@ -104,11 +104,11 @@ function capabilities(value: contract.PartnerCapabilities | undefined): PartnerC
     throw new ConnectError("Select a model and permissions for the new computer.", Code.InvalidArgument);
   }
   return { modelChain: value.modelChain.map(route => ({ backendId: route.backendId, providerId: route.providerId, modelId: route.modelId,
-    ...(route.effort === undefined ? {} : { effort: route.effort }), fastMode: route.fastMode })),
+    ...(route.effort === undefined ? {} : { effort: route.effort }), fastMode: contract.decodeModelSpeed(route) })),
     permissionMode: value.permissionMode === contract.PermissionMode.ASK ? "ask" : value.permissionMode === contract.PermissionMode.ACCEPT_EDITS ? "acceptEdits" : value.permissionMode === contract.PermissionMode.AUTO ? "auto" : "bypassPermissions",
     planMode: value.planMode, inputHandoff: value.inputHandoff ?? true };
 }
 function model(value: PartnerHomeModel): contract.PartnerHomeModelChoice {
-  return create(contract.PartnerHomeModelChoiceSchema, { route: value.route, displayName: value.displayName, canSetPlanMode: value.canSetPlanMode,
+  return create(contract.PartnerHomeModelChoiceSchema, { route: { ...value.route, ...contract.encodeModelSpeed(value.route.fastMode) }, displayName: value.displayName, canSetPlanMode: value.canSetPlanMode,
     permissionModes: value.permissionModes.map(mode => mode === "ask" ? contract.PermissionMode.ASK : mode === "acceptEdits" ? contract.PermissionMode.ACCEPT_EDITS : mode === "auto" ? contract.PermissionMode.AUTO : contract.PermissionMode.BYPASS_PERMISSIONS) });
 }

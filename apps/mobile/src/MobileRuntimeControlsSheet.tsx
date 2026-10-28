@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { MobileModelSpeedControl } from "./MobileModelSpeedControl";
+import { mobileModelSupportsSpeed, resolveMobileModelSpeed } from "./mobile-runtime-controls";
 import {
   Modal,
   Platform,
@@ -283,7 +285,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
     <SectionTitle label={mobileMessage(locale, "common.model")} colors={colors} />
     {controls.pendingModel && <View style={[styles.currentCard, { borderColor: colors.accent, backgroundColor: colors.background }]}>
       <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobileMessage(locale, "controls.pendingModel")}: {controls.pendingModel.displayName}</Text>
-      <Text style={[styles.caption, { color: colors.muted }]}>{mobileModelSourceLabel(controls.pendingModel)} · {controls.pendingModel.effortId ?? ""}{controls.pendingModel.fastMode ? " · Fast" : ""}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileModelSourceLabel(controls.pendingModel)} · {controls.pendingModel.effortId ?? ""}{controls.pendingModel.fastMode === "ultrafast" ? " · Ultrafast" : controls.pendingModel.fastMode ? " · Fast" : ""}</Text>
     </View>}
     {current ? <Pressable accessibilityRole={configurableCurrent ? "button" : undefined}
       accessibilityLabel={mobileMessage(locale, "controls.currentModelLabel", { name: current.displayName })}
@@ -296,7 +298,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
         <Text style={[styles.caption, { color: colors.muted }]}>{current.providerName} · {current.providerId}/{current.modelId}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>
           {current.effortId ? mobileMessage(locale, "controls.effortValue", { effort: current.effortId })
-            : mobileMessage(locale, "controls.defaultEffort")}{current.fastMode ? mobileMessage(locale, "controls.fastSuffix") : ""}
+            : mobileMessage(locale, "controls.defaultEffort")}{current.fastMode === "ultrafast" ? " · Ultrafast" : current.fastMode ? mobileMessage(locale, "controls.fastSuffix") : ""}
         </Text>
         {!current.selectable && <Text style={[styles.warning, { color: colors.negative }]}>{mobileMessage(locale, "controls.routeUnavailable")}</Text>}
       </View>
@@ -320,7 +322,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
               {route.source && <Text style={[styles.caption, { color: colors.muted }]}>{mobileModelSourceLabel(route)}</Text>}
               <Text style={[styles.caption, { color: colors.muted }]}>{favorite.effortId
                 ? mobileMessage(locale, "controls.effortValue", { effort: favorite.effortId })
-                : mobileMessage(locale, "controls.defaultEffort")}{favorite.fastMode ? mobileMessage(locale, "controls.fastSuffix") : ""}</Text>
+                : mobileMessage(locale, "controls.defaultEffort")}{favorite.fastMode === "ultrafast" ? " · Ultrafast" : favorite.fastMode ? mobileMessage(locale, "controls.fastSuffix") : ""}</Text>
             </View>
             <Text style={[styles.disclosure, { color: selected ? colors.accent : colors.muted }]}>{selected ? "✓" : "›"}</Text>
           </Pressable>;
@@ -423,7 +425,7 @@ function ModelOptions({ route, controls, selection, favorite, disabled, colors, 
   const favoriteSelectionValid = route.providerId === selection.providerId && route.modelId === selection.modelId
     && (selection.effortId === undefined || (route.canSetEffort ?? controls.canSetEffort)
       && route.efforts.some((effort) => effort.id === selection.effortId))
-    && (!selection.fastMode || (route.canSetFastMode ?? controls.canSetFastMode) && route.supportsFastMode);
+    && (!selection.fastMode || (route.canSetFastMode ?? controls.canSetFastMode) && mobileModelSupportsSpeed(route, selection.fastMode));
   return <View style={styles.stack}>
     <View style={[styles.currentCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
       <Text style={[styles.modelTitle, { color: colors.ink }]}>{route.displayName}</Text>
@@ -447,10 +449,8 @@ function ModelOptions({ route, controls, selection, favorite, disabled, colors, 
           <Text style={[styles.caption, { color: colors.muted }]}>{route.supportsFastMode
             ? mobileMessage(locale, "controls.fastSupported") : mobileMessage(locale, "controls.fastUnsupported")}</Text>
         </View>
-        <Switch accessibilityLabel={mobileMessage(locale, "controls.fastMode")} accessibilityState={{ disabled: disabled || !route.supportsFastMode }}
-          disabled={disabled || !route.supportsFastMode} value={selection.fastMode}
-          onValueChange={(fastMode) => onSelection({ ...selection, fastMode })}
-          trackColor={{ false: colors.border, true: colors.accent }} thumbColor={colors.surface} />
+        <MobileModelSpeedControl value={selection.fastMode} supportsFast={route.supportsFastMode} supportsUltrafast={route.supportsUltrafastMode}
+          disabled={disabled} colors={colors} locale={locale} onChange={fastMode => onSelection({ ...selection, fastMode })} />
       </View>
     </>}
     {validationError && <Text accessibilityRole="alert" style={[styles.warning, { color: colors.negative }]}>{validationError}</Text>}
@@ -576,7 +576,7 @@ function favoriteModelSelection(
     ...((route.canSetEffort ?? controls.canSetEffort) && (favoriteEffort ?? defaultEffort) !== undefined
       ? { effortId: favoriteEffort ?? defaultEffort }
       : {}),
-    fastMode: (route.canSetFastMode ?? controls.canSetFastMode) && route.supportsFastMode && favorite.fastMode
+    fastMode: resolveMobileModelSpeed(route, favorite.fastMode, route.canSetFastMode ?? controls.canSetFastMode)
   };
 }
 

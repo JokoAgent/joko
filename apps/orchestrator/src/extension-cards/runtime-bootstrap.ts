@@ -19,6 +19,16 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
       reportInsufficientScopes: (key, scopes) => request({ type: "oauth-insufficient-scopes", key, scopes }) }) } : {}),
     ...(capabilities.agent ? { agent: Object.freeze({ run: payload => request({ ...payload, type: "agent-run" }) }) } : {}),
     ...(capabilities.text ? { text: Object.freeze({ oneshot: payload => request({ ...payload, type: "text-oneshot" }) }) } : {}),
+    ...(capabilities.deviceSync ? { deviceSync: Object.freeze({
+      status: () => request({ type: "device-sync-request", op: "status" }),
+      request: (peer, data) => request({ type: "device-sync-request", op: "request", peer, data }),
+      reply: (requestId, data) => request({ type: "device-sync-request", op: "reply", requestId, data })
+    }) } : {}),
+    ...(capabilities.targets ? { targets: Object.freeze(Object.fromEntries(["list", "resolve", "send", "cancel"].map(kind => [kind, async (payload = {}) => {
+      const response = await request({ ...payload, type: "targets-request", kind });
+      if (!response.ok) throw Object.assign(new Error(response.message || "Plugin target delivery failed."), { code: response.errorCode });
+      return response.result;
+    }]))) } : {}),
     ...(capabilities.tasks ? { tasks: Object.freeze(Object.fromEntries(["capabilities", "models", "create", "get", "list", "setModel", "send", "getRun", "listRuns", "readMessages", "cancel", "setHidden", "requestWriteAccess", "startTeam", "getTeam", "setTeamPlan", "releaseWorker"].map(kind => [kind, async (payload = {}) => {
       const response = await request({ ...payload, type: "tasks-request", kind });
       if (!response.ok) throw Object.assign(new Error(response.message || "Plugin task request failed."), { code: response.errorCode });

@@ -34,6 +34,29 @@ afterEach(async () => {
 });
 
 describe("CollaborationGoalPanel", () => {
+  it("submits the chosen project directory and source revision while retaining a failed worker draft", async () => {
+    const createCollaborationWorker = vi.fn().mockRejectedValueOnce(new Error("Project source unavailable"));
+    await render(panel(controller({ createCollaborationWorker })));
+    const form = required(host.querySelector<HTMLFormElement>(".collaboration-panel__create-worker form"));
+    const input = (key: string) => required([...form.querySelectorAll("label")].find(label => label.textContent?.startsWith(key))?.querySelector<HTMLInputElement>("input"));
+    const assignment = required(form.querySelector<HTMLTextAreaElement>("textarea"));
+    await act(async () => {
+      changeValue(input("collaboration.workerLabel"), "Project worker");
+      changeValue(input("collaboration.workerRole"), "developer");
+      changeValue(assignment, "Implement the selected subproject");
+      changeValue(input("collaboration.workerDirectory"), "/workspace/packages/app");
+      required([...form.querySelectorAll("label")].find(label => label.textContent?.includes("collaboration.workerWorktree"))?.querySelector<HTMLButtonElement>("[role=checkbox]")).click();
+    });
+    await act(async () => changeValue(input("collaboration.workerSourceRef"), "feature/source"));
+    await act(async () => { button("collaboration.addWorker", form).click(); await settle(); });
+    expect(createCollaborationWorker).toHaveBeenCalledWith(expect.objectContaining({ id: "goal-one" }), expect.objectContaining({
+      targetId: "target-one", label: "Project worker", workspace: { workingDirectory: "/workspace/packages/app", createWorktree: true, sourceRef: "feature/source" }
+    }), expect.any(AbortSignal));
+    expect(input("collaboration.workerDirectory").value).toBe("/workspace/packages/app");
+    expect(input("collaboration.workerSourceRef").value).toBe("feature/source");
+    expect(host.textContent).toContain("Project source unavailable");
+  });
+
   it("uses exact worker and Queue revisions for contiguous merge and interrupt replacement", async () => {
     const current = tree();
     const mergeCollaborationDispatches = vi.fn(async () => current);

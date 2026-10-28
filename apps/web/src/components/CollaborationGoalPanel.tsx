@@ -32,6 +32,7 @@ import type {
 } from "../model.js";
 import { Button, CheckboxControl, IconButton, Modal, Pill, Spinner, StatusDot, cx } from "./ui.js";
 import type { Translator } from "./types.js";
+import { ModelSpeedControl } from "./ModelSpeedControl.js";
 import "./collaboration-goal-panel.css";
 
 const POLL_INTERVAL_MS = 2_500;
@@ -50,7 +51,10 @@ interface WorkerDraft {
   readonly targetId: string;
   readonly modelKey: string;
   readonly effort: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
+  readonly workingDirectory: string;
+  readonly createWorktree: boolean;
+  readonly sourceRef: string;
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
 }
@@ -261,6 +265,13 @@ export function CollaborationGoalPanel({
   const draftTarget = workerTargets.find((candidate) => candidate.id === workerDraft.targetId);
   const draftModels = models.filter((candidate) => candidate.available && candidate.backendId === draftTarget?.backendId);
   const draftModel = modelForKey(draftModels, workerDraft.modelKey);
+  const localProject = draftTarget !== undefined && draftTarget.remoteWorkspace === undefined && session.remoteWorkspace === undefined;
+  const draftWorkspace = controller.state.snapshot.workspaces.find(workspace => workspace.id === draftTarget?.workspaceId);
+  const inheritedDirectory = draftTarget?.id === session.targetId
+    ? session.localWorkspace?.path ?? session.worktree?.workingPath ?? draftWorkspace?.serverPath
+    : draftWorkspace?.serverPath;
+  const speedSupported = workerDraft.fastMode === "ultrafast" ? draftModel?.supportsUltrafast === true
+    : workerDraft.fastMode === false || draftModel?.supportsFast === true;
 
   const createGoal = (event: FormEvent): void => {
     event.preventDefault();
@@ -280,7 +291,7 @@ export function CollaborationGoalPanel({
 
   const createWorker = (event: FormEvent): void => {
     event.preventDefault();
-    if (tree === undefined || !goalActive || draftTarget === undefined) return;
+    if (tree === undefined || !goalActive || draftTarget === undefined || !speedSupported) return;
     const label = workerDraft.label.trim();
     const role = workerDraft.role.trim();
     const assignment = workerDraft.assignment.trim();
@@ -293,9 +304,14 @@ export function CollaborationGoalPanel({
       targetId: draftTarget.id,
       ...(draftModel === undefined ? {} : { providerId: draftModel.providerId, modelId: draftModel.modelId }),
       ...(workerDraft.effort === "" ? {} : { effort: workerDraft.effort }),
-      fastMode: draftModel?.supportsFast === true && workerDraft.fastMode,
+      fastMode: workerDraft.fastMode,
       permissionMode: workerDraft.permissionMode,
-      planMode: workerDraft.planMode
+      planMode: workerDraft.planMode,
+      ...(!localProject ? {} : { workspace: {
+        ...(workerDraft.workingDirectory.trim() ? { workingDirectory: workerDraft.workingDirectory.trim() } : {}),
+        createWorktree: workerDraft.createWorktree,
+        ...(workerDraft.createWorktree && workerDraft.sourceRef.trim() ? { sourceRef: workerDraft.sourceRef.trim() } : {})
+      } })
     };
     void runMutation("create-worker", (signal) => latestControllerRef.current.createCollaborationWorker(tree.goal, draft, signal))
       .then((succeeded) => { if (succeeded) setWorkerDraft((current) => ({ ...current, label: "", role: "", assignment: "", parentWorkerId: "" })); });
@@ -403,14 +419,21 @@ export function CollaborationGoalPanel({
                 const targetId = event.currentTarget.value;
                 const nextTarget = workerTargets.find((candidate) => candidate.id === targetId);
                 const nextModel = models.find((candidate) => candidate.available && candidate.backendId === nextTarget?.backendId);
-                setWorkerDraft((current) => ({ ...current, targetId, modelKey: nextModel === undefined ? "" : modelKey(nextModel), effort: "", fastMode: false }));
+                setWorkerDraft((current) => ({ ...current, targetId, modelKey: nextModel === undefined ? "" : modelKey(nextModel), effort: "", fastMode: false, workingDirectory: "", createWorktree: false, sourceRef: "" }));
               }}>{workerTargets.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}</select></label>
+              {localProject && <>
+                <label className="is-wide">{t("collaboration.workerDirectory")}<input value={workerDraft.workingDirectory} maxLength={32768} placeholder={inheritedDirectory ?? t("collaboration.workerInheritDirectory")} onChange={event => { const value = event.currentTarget.value; setWorkerDraft(current => ({ ...current, workingDirectory: value })); }} /></label>
+                <p className="is-wide">{t("collaboration.workerDirectoryRule")}</p>
+                <label className="collaboration-panel__choice"><CheckboxControl checked={workerDraft.createWorktree} onChange={event => { const checked = event.currentTarget.checked; setWorkerDraft(current => ({ ...current, createWorktree: checked })); }} />{t("collaboration.workerWorktree")}</label>
+                {workerDraft.createWorktree && <label>{t("collaboration.workerSourceRef")}<input value={workerDraft.sourceRef} maxLength={1024} placeholder="HEAD" onChange={event => { const value = event.currentTarget.value; setWorkerDraft(current => ({ ...current, sourceRef: value })); }} /></label>}
+                {workerDraft.createWorktree && draftWorkspace?.dirty && <p className="is-wide" role="status">{t("collaboration.workerDirtySource")}</p>}
+              </>}
               <label>{t("controls.model")}<select value={workerDraft.modelKey} onChange={(event) => { const value = event.currentTarget.value; setWorkerDraft((current) => ({ ...current, modelKey: value, effort: "", fastMode: false })); }}><option value="">{t("common.none")}</option>{draftModels.map((candidate) => <option key={modelKey(candidate)} value={modelKey(candidate)}>{candidate.providerName} · {candidate.name}</option>)}</select></label>
               <label>{t("controls.effort")}<select value={workerDraft.effort} onChange={(event) => { const value = event.currentTarget.value; setWorkerDraft((current) => ({ ...current, effort: value })); }}><option value="">{t("common.none")}</option>{draftModel?.efforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
               <label>{t("controls.permission")}<select value={workerDraft.permissionMode} onChange={(event) => { const value = event.currentTarget.value as PermissionMode; setWorkerDraft((current) => ({ ...current, permissionMode: value })); }}><option value="ask">{t("permission.ask")}</option>{controller.state.snapshot.backends.find(candidate => candidate.id === draftTarget?.backendId)?.capabilities.get("permission.modes")?.options.includes("acceptEdits") && <option value="acceptEdits">{t("permission.edits")}</option>}<option value="auto">{t("permission.auto")}</option><option value="bypassPermissions">{t("permission.full")}</option></select></label>
-              <label className="collaboration-panel__choice"><CheckboxControl checked={workerDraft.fastMode} disabled={draftModel?.supportsFast !== true} onChange={(event) => { const checked = event.currentTarget.checked; setWorkerDraft((current) => ({ ...current, fastMode: checked })); }} />{t("controls.fast")}</label>
+              <ModelSpeedControl value={workerDraft.fastMode} supportsFast={draftModel?.supportsFast === true} supportsUltrafast={draftModel?.supportsUltrafast === true} disabled={pendingAction !== undefined} className="collaboration-panel__choice" t={t} onChange={fastMode => setWorkerDraft(current => ({ ...current, fastMode }))} />
               <label className="collaboration-panel__choice"><CheckboxControl checked={workerDraft.planMode} onChange={(event) => { const checked = event.currentTarget.checked; setWorkerDraft((current) => ({ ...current, planMode: checked })); }} />{t("controls.plan")}</label>
-              <Button tone="primary" type="submit" disabled={collaborationReadOnly || pendingAction !== undefined || workerTargets.length === 0}><Plus aria-hidden="true" />{t("collaboration.addWorker")}</Button>
+              <Button tone="primary" type="submit" disabled={collaborationReadOnly || pendingAction !== undefined || workerTargets.length === 0 || !speedSupported}><Plus aria-hidden="true" />{t("collaboration.addWorker")}</Button>
             </form>
           </details>}
         </section>
@@ -438,10 +461,13 @@ export function CollaborationGoalPanel({
             </form> : <p className="collaboration-panel__assignment">{selectedWorker.assignment}</p>}
             <dl className="collaboration-panel__route">
               <div><dt>{t("subagents.target")}</dt><dd>{targetName(controller.state.snapshot.targets, selectedWorker.route.targetId)}</dd></div>
+              {selectedWorker.workspace && <div><dt>{t("collaboration.workerDirectory")}</dt><dd>{selectedWorker.workspace.workingDirectory}</dd></div>}
+              {selectedWorker.workspace?.worktreePath && <div><dt>{t("collaboration.workerWorktree")}</dt><dd>{selectedWorker.workspace.worktreePath}</dd></div>}
+              {selectedWorker.workspace?.sourceRef && <div><dt>{t("collaboration.workerSourceRef")}</dt><dd>{selectedWorker.workspace.sourceRef}</dd></div>}
               <div><dt>{t("settings.provider")}</dt><dd>{selectedWorker.route.providerId ?? t("common.none")}</dd></div>
               <div><dt>{t("controls.model")}</dt><dd>{selectedWorker.route.modelId ?? t("common.none")}</dd></div>
               <div><dt>{t("controls.effort")}</dt><dd>{selectedWorker.route.effort ?? t("common.none")}</dd></div>
-              <div><dt>{t("controls.fast")}</dt><dd>{t(selectedWorker.route.fastMode ? "common.on" : "common.off")}</dd></div>
+              <div><dt>{t("controls.speed")}</dt><dd>{t(selectedWorker.route.fastMode === "ultrafast" ? "controls.ultrafast" : selectedWorker.route.fastMode ? "controls.fast" : "controls.standard")}</dd></div>
               <div><dt>{t("controls.permission")}</dt><dd>{permissionLabel(selectedWorker.route.permissionMode, t)}</dd></div>
               <div><dt>{t("controls.plan")}</dt><dd>{t(selectedWorker.route.planMode ? "common.on" : "common.off")}</dd></div>
               <div><dt>{t("collaboration.generation")}</dt><dd>{selectedWorker.sessionGeneration?.toString() ?? "—"}</dd></div>
@@ -562,6 +588,9 @@ function initialWorkerDraft(session: SessionView, targets: readonly TargetView[]
     modelKey: model === undefined ? "" : modelKey(model),
     effort: session.effort ?? "",
     fastMode: session.fastMode,
+    workingDirectory: "",
+    createWorktree: false,
+    sourceRef: "",
     permissionMode: session.permissionMode,
     planMode: session.planMode
   };

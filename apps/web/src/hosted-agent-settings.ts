@@ -1,20 +1,22 @@
-import type { GetHostedAgentCatalogResponse, HostedAgentSettings, UpdateHostedAgentSettingsRequest } from "@joko/contracts";
+import { readRemoteModelAccess, toRemoteModelAccess, type GetHostedAgentCatalogResponse, type HostedAgentSettings, type UpdateHostedAgentSettingsRequest } from "@joko/contracts";
 
 export interface HostedAgentSettingsView {
   readonly revision: bigint;
   readonly remoteControlEnabled: boolean;
-  readonly providers: readonly { readonly backendId: string; readonly providerId: string; readonly enabled: boolean }[];
+  readonly providers: readonly { readonly backendId: string; readonly providerId: string; readonly enabled: boolean; readonly modelIds?: readonly string[] }[];
   readonly limits: { readonly perDevice: number; readonly total: number };
   readonly limitsOverridden: boolean;
   readonly usage?: { readonly total: number; readonly devices: number; readonly maximumDevice: number };
 }
 export interface HostedAgentCatalogView {
   readonly backends: readonly { readonly backendId: string; readonly displayName: string;
-    readonly providers: readonly { readonly providerId: string; readonly displayName: string; readonly connected: boolean; readonly modelCount: number }[] }[];
+    readonly providers: readonly { readonly providerId: string; readonly displayName: string; readonly connected: boolean; readonly modelCount: number;
+      readonly models?: readonly { readonly id: string; readonly name: string }[] }[] }[];
 }
 export type HostedAgentSettingsUpdate =
   | { readonly kind: "remoteControl"; readonly enabled: boolean }
   | { readonly kind: "provider"; readonly backendId: string; readonly providerId: string; readonly enabled: boolean }
+  | { readonly kind: "modelAccess"; readonly backendId: string; readonly providerId: string; readonly modelIds: readonly string[] | undefined }
   | { readonly kind: "limits"; readonly perDevice: number; readonly total: number }
   | { readonly kind: "resetLimits" };
 export interface HostedAgentSettingsApi {
@@ -26,7 +28,8 @@ export function projectHostedAgentSettings(value: HostedAgentSettings | undefine
   if (!value || value.revision < 0n || !value.limits || !validLimit(value.limits.perDevice) || !validLimit(value.limits.total)) throw new Error("Invalid hosted Agent settings.");
   const providers = value.providers.map(provider => {
     identity(provider.backendId); identity(provider.providerId);
-    return { backendId: provider.backendId, providerId: provider.providerId, enabled: provider.enabled };
+    const modelIds = readRemoteModelAccess(provider.modelAccess);
+    return { backendId: provider.backendId, providerId: provider.providerId, enabled: provider.enabled, ...(modelIds === undefined ? {} : { modelIds }) };
   });
   if (new Set(providers.map(provider => JSON.stringify([provider.backendId, provider.providerId]))).size !== providers.length) throw new Error("Invalid hosted Agent Providers.");
   if (value.usage && ![value.usage.total, value.usage.devices, value.usage.maximumDevice].every(number => Number.isSafeInteger(number) && number >= 0)) throw new Error("Invalid hosted Agent usage.");
@@ -41,12 +44,13 @@ export function projectHostedAgentCatalog(value: GetHostedAgentCatalogResponse):
     const providerIds = new Set<string>();
     return { backendId: backend.backendId, displayName: backend.displayName || backend.backendId, providers: backend.providers.map(provider => {
       identity(provider.providerId); if (providerIds.has(provider.providerId)) throw new Error("Invalid hosted Agent catalog."); providerIds.add(provider.providerId);
-      const models = new Set<string>();
-      for (const model of provider.models) {
+      const models = new Set<string>(), available = provider.manageableModels.length ? provider.manageableModels : provider.models;
+      for (const model of available) {
         if (model.backendId !== backend.backendId || model.key?.providerId !== provider.providerId) throw new Error("Hosted Agent model ownership changed.");
         identity(model.key.modelId); if (models.has(model.key.modelId)) throw new Error("Invalid hosted Agent catalog."); models.add(model.key.modelId);
       }
-      return { providerId: provider.providerId, displayName: provider.displayName || provider.providerId, connected: provider.connected, modelCount: models.size };
+      return { providerId: provider.providerId, displayName: provider.displayName || provider.providerId, connected: provider.connected, modelCount: provider.models.length,
+        models: available.map(model => ({ id: model.key!.modelId, name: model.displayName || model.key!.modelId })) };
     }) };
   }) };
 }
@@ -55,6 +59,8 @@ export function hostedAgentSettingsMutation(update: HostedAgentSettingsUpdate): 
     case "remoteControl": return { case: "remoteControl", value: { $typeName: "joko.v1.HostedAgentRemoteControlPermission", enabled: update.enabled } };
     case "provider": identity(update.backendId); identity(update.providerId); return { case: "provider", value: {
       $typeName: "joko.v1.HostedAgentProviderPermission", backendId: update.backendId, providerId: update.providerId, enabled: update.enabled } };
+    case "modelAccess": identity(update.backendId); identity(update.providerId); return { case: "modelAccess", value: {
+      $typeName: "joko.v1.HostedAgentProviderModelAccess", backendId: update.backendId, providerId: update.providerId, access: toRemoteModelAccess(update.modelIds) } };
     case "limits": if (!validLimit(update.perDevice) || !validLimit(update.total)) throw new Error("Hosted Agent limits must be integers from 1 to 1000.");
       return { case: "limits", value: { $typeName: "joko.v1.HostedAgentLimits", perDevice: update.perDevice, total: update.total } };
     case "resetLimits": return { case: "resetLimits", value: { $typeName: "joko.v1.HostedAgentResetLimits" } };

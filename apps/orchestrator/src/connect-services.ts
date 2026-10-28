@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
 import { createServerAccessConnectService } from './server-access-connect-service.js';
 import { TaskShareStore } from "@joko/store";
 import { taskShareEventAuthor } from "./task-sharing-author.js";
@@ -24,6 +25,7 @@ import { createExtensionTaskConnectService } from "./extension-task-connect-serv
 import { createMcpAppNativeService } from "./mcp-apps/native-service.js";
 import { createPersonalDevelopmentConnectService } from "./personal-development-connect-service.js";
 import { createPersonalDevelopmentNativeConnectService } from "./personal-development-native-connect-service.js";
+import { createDesktopVoiceConversationService } from "./voice-conversation/connect-service.js";
 import { createModelWorkingContextConnectMethods } from "./model-working-context-connect-service.js";
 import { createScheduleHookConnectMethods } from "./schedule-hook-connect-service.js";
 import { validateScheduleHookScriptBinding, type ScheduleHookScriptInstaller } from "./schedule-hook-script-installer.js";
@@ -1171,6 +1173,8 @@ const RUNTIME_GENERATION = BigInt(Date.now());
 
 /** Register all public v1 services. Every descriptor method receives a concrete handler. */
 export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
+  router.service(contract.DesktopVoiceConversationService, createDesktopVoiceConversationService(application.desktopVoiceConversation, application.connections),
+    { readMaxBytes: 128 * 1024, writeMaxBytes: 8 * 1024 * 1024 });
   router.service(contract.ServerAccessService, withConnectErrors(createServerAccessConnectService(application)), { readMaxBytes: 65536 });
   const services = createConnectServices(application, projectionShutdownSignal);
   if (application.hostedAgents) router.service(contract.HostedAgentService, createHostedAgentConnectService(application.hostedAgents.connectOptions()),
@@ -2570,8 +2574,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const connection = authenticate(context);
       context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       const control = dependencies.sessionHost.getSessionRuntimeControl(request.sessionId);
-      return { control: { generation: BigInt(control.generation), baseline: control.baseline, effective: control.effective,
-        ...(control.pending ? { pending: control.pending.profile, pendingGeneration: BigInt(control.pending.generation) } : {}),
+      return { control: { generation: BigInt(control.generation), baseline: control.baseline && { ...control.baseline, ...contract.encodeModelSpeed(control.baseline.fastMode) },
+        effective: control.effective && { ...control.effective, ...contract.encodeModelSpeed(control.effective.fastMode) },
+        ...(control.pending ? { pending: { ...control.pending.profile, ...contract.encodeModelSpeed(control.pending.profile.fastMode) }, pendingGeneration: BigInt(control.pending.generation) } : {}),
         handoffState: control.handoffState ?? "" } };
     },
     listSessions: async (request, context) => {
@@ -3032,7 +3037,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         ...(request.model?.effortId === undefined || request.model.effortId === ""
           ? {}
           : { effort: request.model.effortId }),
-        fastMode: request.model?.fastMode ?? false,
+        fastMode: contract.decodeModelSpeed(request.model ?? {}),
         permissionMode: corePermission(request.permissionMode),
         planMode: request.planMode,
         overwrite: request.overwrite,
@@ -6903,7 +6908,7 @@ export function mutationFromRecord(store: OperationalStore, record: OperationRec
     const selection = providerId === "" && modelId === "" ? undefined : create(contract.ModelSelectionSchema, {
       model: create(contract.ModelKeySchema, { providerId, modelId }),
       effortId: stringValue(body["effort"]) ?? "",
-      fastMode: booleanValue(body["fastMode"]) ?? false
+      ...contract.encodeModelSpeed(body["fastMode"] === "ultrafast" ? "ultrafast" : booleanValue(body["fastMode"]) ?? false)
     });
     return create(contract.OperationMutationSchema, {
       preconditions: [],
@@ -7969,7 +7974,8 @@ function targetForWorkspace(store: OperationalStore, workspaceId: string): Store
 
 function sessionForIsolatedWorkspace(store: OperationalStore, workspaceId: string): StoredSession | undefined {
   return store.listSessions({ includeArchived: true, includeDeleted: false })
-    .find((session) => session.descriptor.worktree?.workspaceId === workspaceId);
+    .find((session) => session.descriptor.worktree?.workspaceId === workspaceId
+      || readWorkerWorkspaceBinding(store, session.descriptor.id)?.workspaceId === workspaceId);
 }
 
 const GIT_WRITE_BUSY_QUEUE_STATES = [
@@ -13871,7 +13877,7 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
               modelId: favorite.modelId
             }),
             effortId: favorite.effortId ?? "",
-            fastMode: favorite.fastMode
+            ...contract.encodeModelSpeed(favorite.fastMode)
           })
         })),
         seeded: settings.seeded,
@@ -16679,7 +16685,7 @@ async function dispatchMutation(
               ...(model?.model?.providerId === undefined ? {} : { providerId: model.model.providerId }),
               ...(model?.model?.modelId === undefined ? {} : { modelId: model.model.modelId }),
               ...(model?.effortId === undefined || model.effortId === "" ? {} : { effort: model.effortId }),
-              fastMode: model?.fastMode ?? false,
+              fastMode: contract.decodeModelSpeed(model ?? {}),
               permissionMode: corePermission(payload.value.permissionMode),
               planMode: payload.value.planMode,
               initialPlacement,
@@ -17199,7 +17205,7 @@ async function dispatchMutation(
             ...(value.providerId === undefined ? {} : { providerId: value.providerId }),
             ...(value.modelId === undefined ? {} : { modelId: value.modelId }),
             ...(value.effort === undefined ? {} : { effort: value.effort }),
-            ...(value.fastMode === undefined ? {} : { fastMode: value.fastMode }) },
+            ...(value.fastMode === undefined && value.ultrafastMode === undefined ? {} : { fastMode: contract.decodeModelSpeed(value) }) },
           assertAuthority: () => dependencies.connections.fence(connection) });
       });
     }
@@ -17227,7 +17233,7 @@ async function dispatchMutation(
         readonly providerId: string;
         readonly modelId: string;
         readonly effort: string | null;
-        readonly fastMode: boolean;
+        readonly fastMode: boolean | "ultrafast";
       } | undefined;
       const execution = await host.mutate({
         operationId,
@@ -17240,13 +17246,13 @@ async function dispatchMutation(
                 effort: selectedModel?.thinkingLevels.length === 0
                   ? null
                   : model.effortId || undefined,
-                fastMode: model.fastMode
+                fastMode: contract.decodeModelSpeed(model)
               })
             : await host.applySessionSettings(payload.value.sessionId, {
                 providerId: modelKey.providerId,
                 modelId: modelKey.modelId,
                 effort: model.effortId || undefined,
-                fastMode: model.fastMode
+                fastMode: contract.decodeModelSpeed(model)
               }, { requireNativeObservation: true });
           if (
             state === undefined || state.providerId !== modelKey.providerId ||
@@ -18985,7 +18991,7 @@ async function dispatchMutation(
         }
         if (patch.defaultModel.fastMode && (
           backend.capabilities.get("model.fast_mode")?.supported !== true
-          || model.supportsFastMode !== true
+          || (patch.defaultModel.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true)
         )) {
           return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The selected Backend model does not support Fast Mode.");
         }
@@ -19949,7 +19955,7 @@ async function dispatchMutation(
         providerId: item.selection!.model!.providerId,
         modelId: item.selection!.model!.modelId,
         ...(item.selection!.effortId === "" ? {} : { effortId: item.selection!.effortId }),
-        fastMode: item.selection!.fastMode
+        fastMode: contract.decodeModelSpeed(item.selection!)
       };
       const requested = change.case === "removeFavoriteId"
         ? { kind: "remove" as const, favoriteId: change.value }
@@ -23529,7 +23535,7 @@ function scheduleExecutionSnapshot(
   const base = {
     ...(model === undefined ? {} : { providerId: model.providerId, modelId: model.modelId }),
     ...(input.model?.effortId === undefined || input.model.effortId === "" ? {} : { effort: input.model.effortId }),
-    ...(input.model === undefined ? {} : { fastMode: input.model.fastMode }),
+    ...(input.model === undefined ? {} : { fastMode: contract.decodeModelSpeed(input.model) }),
     permissionMode: corePermission(input.permissionMode),
     planMode: input.planMode,
     useWorktree: input.useWorktree,
@@ -23932,7 +23938,7 @@ export function coreTurnOverrides(value: contract.PerTurnOverrides | undefined):
   const overrides: TurnExecutionOverrides = {
     ...(model === undefined ? {} : { providerId: model.providerId, modelId: model.modelId }),
     ...(value.model?.effortId === undefined || value.model.effortId === "" ? {} : { effort: value.model.effortId }),
-    ...(value.model === undefined ? {} : { fastMode: value.model.fastMode }),
+    ...(value.model === undefined ? {} : { fastMode: contract.decodeModelSpeed(value.model) }),
     ...(value.permissionMode === undefined ? {} : { permissionMode: corePermission(value.permissionMode) }),
     ...(value.planMode === undefined ? {} : { planMode: value.planMode }),
     ...(value.extraDirectoryIds.length === 0 ? {} : { extraDirectoryIds: [...value.extraDirectoryIds] })

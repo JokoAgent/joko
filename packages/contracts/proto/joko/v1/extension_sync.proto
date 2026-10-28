@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package joko.v1;
+
+// Exchanged only through the current authenticated Desktop Device route.
+// An empty transfer is a key offer. Business data is AES-GCM ciphertext and
+// contains only one same-namespace plugin request/response, at most 64 KiB.
+message ExtensionDeviceSyncEnvelope {
+  uint32 format = 1;
+  string public_key = 2;
+  string transfer_id = 3;
+  string iv = 4;
+  string tag = 5;
+  bytes data = 6;
+}

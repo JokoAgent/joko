@@ -1,0 +1,109 @@
+syntax = "proto3";
+package joko.v1;
+
+// This service requires the Main-only, private Desktop host authorization in
+// addition to the ordinary Connection. It is absent from remote/plugin grants.
+service DesktopVoiceConversationService {
+  rpc ControlDesktopVoiceConversation(ControlDesktopVoiceConversationRequest) returns (ControlDesktopVoiceConversationResponse);
+}
+
+enum DesktopVoiceConversationAction {
+  DESKTOP_VOICE_CONVERSATION_ACTION_UNSPECIFIED = 0;
+  DESKTOP_VOICE_CONVERSATION_ACTION_SNAPSHOT = 1;
+  DESKTOP_VOICE_CONVERSATION_ACTION_SAVE_PREFERENCE = 2;
+  DESKTOP_VOICE_CONVERSATION_ACTION_START = 3;
+  DESKTOP_VOICE_CONVERSATION_ACTION_SUBMIT = 4;
+  DESKTOP_VOICE_CONVERSATION_ACTION_PROMOTE = 5;
+  DESKTOP_VOICE_CONVERSATION_ACTION_INTERRUPT = 6;
+  DESKTOP_VOICE_CONVERSATION_ACTION_END = 7;
+  DESKTOP_VOICE_CONVERSATION_ACTION_SPEAK = 8;
+  DESKTOP_VOICE_CONVERSATION_ACTION_READ_SPEECH = 9;
+  DESKTOP_VOICE_CONVERSATION_ACTION_VOICES = 10;
+  DESKTOP_VOICE_CONVERSATION_ACTION_CLASSIFY_EXIT = 11;
+}
+
+message DesktopSpeechSelection {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+  string protocol = 4;
+  string voice = 5;
+  optional double speed = 6;
+}
+message DesktopSpeechModel {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+  string display_name = 4;
+  string provider_name = 5;
+  optional string protocol = 6;
+  bool protocol_locked = 7;
+}
+message DesktopVoiceConversationPreference {
+  DesktopSpeechSelection conversation = 1;
+  DesktopSpeechSelection playback = 2;
+  bool sentence_playback = 3;
+  uint64 revision = 4;
+}
+message DesktopVoiceCallTurn {
+  string id = 1;
+  string role = 2;
+  string text = 3;
+  uint64 created_at_ms = 4;
+  bool complete = 5;
+  bool failed = 6;
+}
+message DesktopVoiceCallHandoff {
+  string id = 1;
+  string input_id = 2;
+  string text = 3;
+  string state = 4;
+  optional string result = 5;
+  optional string run_id = 6;
+  optional string queue_item_id = 7;
+}
+message DesktopVoiceCallRecord {
+  string call_id = 1;
+  string session_id = 2;
+  uint64 session_generation = 3;
+  uint64 started_at_ms = 4;
+  optional uint64 ended_at_ms = 5;
+  repeated DesktopVoiceCallTurn turns = 6;
+  repeated DesktopVoiceCallHandoff handoffs = 7;
+  string kind = 8;
+}
+message DesktopSpeechVoice { string id = 1; string name = 2; }
+message DesktopSpeechVoiceCatalog {
+  string source = 1;
+  repeated DesktopSpeechVoice voices = 2;
+  bool truncated = 3;
+  bool custom_voices_unavailable = 4;
+}
+message ControlDesktopVoiceConversationRequest {
+  // Assigned by Desktop Main from the trusted top-level WebContents.
+  string window_id = 1;
+  string session_id = 2;
+  uint64 session_generation = 3;
+  string call_id = 4;
+  DesktopVoiceConversationAction action = 5;
+  string operation_id = 6;
+  string input_id = 7;
+  string text = 8;
+  bool force_handoff = 9;
+  DesktopSpeechSelection selection = 10;
+  DesktopVoiceConversationPreference preference = 11;
+  string speech_request_id = 12;
+  bool playback_only = 13;
+}
+message ControlDesktopVoiceConversationResponse {
+  DesktopVoiceConversationPreference preference = 1;
+  repeated DesktopSpeechModel models = 2;
+  DesktopVoiceCallRecord call = 3;
+  repeated DesktopVoiceCallRecord history = 4;
+  DesktopSpeechVoiceCatalog voices = 5;
+  bytes pcm = 6;
+  bool speech_done = 7;
+  uint32 sample_rate = 8;
+  bool accepted = 9;
+  string exit_decision = 10;
+}

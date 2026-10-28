@@ -11,7 +11,8 @@ import {
 import {
   CollaborationGoalManagerError,
   type CollaborationGoalManager,
-  type CollaborationGoalTreeView
+  type CollaborationGoalTreeView,
+  type CollaborationWorkerProjection
 } from "./collaboration-goal-manager.js";
 import type {
   BridgeToolCallContext,
@@ -54,7 +55,7 @@ const WORKER_ROUTE_PROPERTIES = Object.freeze({
   provider_id: ID_SCHEMA,
   model_id: ID_SCHEMA,
   effort: { type: "string", minLength: 1, maxLength: 64 },
-  fast_mode: { type: "boolean" },
+  fast_mode: { anyOf: [{ type: "boolean" }, { const: "ultrafast" }] },
   permission_mode: { type: "string", enum: ["ask", "acceptEdits", "auto", "bypassPermissions"] },
   plan_mode: { type: "boolean" }
 });
@@ -64,6 +65,10 @@ const WORKER_SPEC_PROPERTIES = Object.freeze({
   role: { type: "string", minLength: 1, maxLength: 128 },
   assignment: MESSAGE_SCHEMA,
   parent_worker_id: ID_SCHEMA,
+  working_directory: { type: "string", minLength: 1, maxLength: 32768, description: "Existing directory in the selected trusted project; omission inherits the lead's actual current checkout." },
+  worktree: { type: "object", additionalProperties: false, properties: {
+    source_ref: { type: "string", minLength: 1, maxLength: 1024, description: "Existing branch or commit; omission pins the selected directory's current HEAD." }
+  } },
   ...WORKER_ROUTE_PROPERTIES
 });
 
@@ -398,7 +403,7 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
     }
     const lead = requireLead(caller);
     if (name === "create_worker") {
-      return publicWorkerResult(await this.#createWorker(input, lead, operationId(context, name)));
+      return publicWorkerResult(await this.#createWorker(input, lead, operationId(context, name), signal));
     }
     if (name === "create_workers") {
       assertKeys(input, ["workers"]);
@@ -423,7 +428,7 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
         signal?.throwIfAborted();
         const value = specifications[index]!;
         try {
-          const result = await this.#createWorker(value, lead, `${batchOperationId}:${index}`);
+          const result = await this.#createWorker(value, lead, `${batchOperationId}:${index}`, signal);
           results.push({ index, ok: true, ...publicWorkerResult(result) });
         } catch (error) {
           const mapped = toolError(error);
@@ -630,7 +635,8 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
   async #createWorker(
     input: Readonly<Record<string, unknown>>,
     lead: Extract<Caller, { readonly kind: "lead" }>,
-    operationIdValue: string
+    operationIdValue: string,
+    signal?: AbortSignal
   ) {
     validateWorkerSpecInput(input);
     const currentGoal = this.#manager.getTree(lead.goalId).goal;
@@ -650,8 +656,12 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
     ) ?? caller.permissionMode;
     const parentWorkerId = optionalId(input["parent_worker_id"], "parent_worker_id");
     const effort = optionalText(input["effort"], "effort", 64) ?? caller.effort;
+    const workingDirectory = optionalText(input["working_directory"], "working_directory", 32768);
+    const worktree = input["worktree"] === undefined ? undefined : requiredRecord(input, "worktree");
+    const sourceRef = worktree ? optionalText(worktree["source_ref"], "worktree.source_ref", 1024) : undefined;
     const creation = {
       operationId: operationIdValue,
+      ...(signal === undefined ? {} : { signal }),
       goalId: lead.goalId,
       callerLeadSessionId: lead.session.id,
       expectedGoalRevision: currentGoal.revision,
@@ -659,11 +669,15 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
       label: requiredText(input, "label", 64),
       role: requiredText(input, "role", 128),
       assignment: requiredText(input, "assignment", 32_000, true),
+      ...(workingDirectory === undefined && worktree === undefined ? {} : { workspace: {
+        ...(workingDirectory === undefined ? {} : { workingDirectory }), createWorktree: worktree !== undefined,
+        ...(sourceRef === undefined ? {} : { sourceRef })
+      } }),
       route: {
         targetId: optionalId(input["target_id"], "target_id") ?? caller.targetId,
         ...inheritedProvider,
         ...(effort === undefined ? {} : { effort }),
-        fastMode: optionalBoolean(input["fast_mode"], "fast_mode") ?? caller.fastMode,
+        fastMode: optionalFastMode(input["fast_mode"]) ?? caller.fastMode,
         permissionMode: permission as PermissionMode,
         planMode: optionalBoolean(input["plan_mode"], "plan_mode") ?? caller.planMode
       }
@@ -723,7 +737,7 @@ function publicWorkerResult(result: {
   readonly tree: CollaborationGoalTreeView;
   readonly worker: CollaborationWorkerRecord;
 }): Readonly<Record<string, unknown>> {
-  return { tree: publicTree(result.tree), worker: publicWorker(result.worker) };
+  return { tree: publicTree(result.tree), worker: publicWorker(result.tree.workers.find(worker => worker.id === result.worker.id) ?? result.worker) };
 }
 
 function publicTree(tree: CollaborationGoalTreeView): Readonly<Record<string, unknown>> {
@@ -760,7 +774,7 @@ function publicWorkerGoal(tree: CollaborationGoalTreeView, workerId: string): Re
   };
 }
 
-function publicWorker(worker: CollaborationWorkerRecord): Readonly<Record<string, unknown>> {
+function publicWorker(worker: CollaborationWorkerProjection): Readonly<Record<string, unknown>> {
   return {
     id: worker.id,
     revision: worker.revision.toString(10),
@@ -775,6 +789,8 @@ function publicWorker(worker: CollaborationWorkerRecord): Readonly<Record<string
     focused: worker.focused,
     runtime_released: worker.runtimeReleased,
     soft_limit_warning: worker.softLimitWarning,
+    ...(worker.workspace === undefined ? {} : { working_directory: worker.workspace.workingDirectory,
+      worktree: worker.workspace.worktreePath ? { path: worker.workspace.worktreePath, source_ref: worker.workspace.sourceRef ?? null } : null }),
     route: {
       backend_id: worker.backendId,
       target_id: worker.targetId,
@@ -882,7 +898,7 @@ function requiredGeneration(value: number | undefined): number {
 function validateWorkerSpecInput(input: Readonly<Record<string, unknown>>): void {
   assertKeys(input, [
     "label", "role", "assignment", "parent_worker_id", "target_id", "provider_id", "model_id",
-    "effort", "fast_mode", "permission_mode", "plan_mode"
+    "effort", "fast_mode", "permission_mode", "plan_mode", "working_directory", "worktree"
   ]);
   requiredText(input, "label", 64);
   requiredText(input, "role", 128);
@@ -895,7 +911,12 @@ function validateWorkerSpecInput(input: Readonly<Record<string, unknown>>): void
     throw new CollaborationToolError("INVALID_ARGS", "provider_id and model_id must be supplied together.");
   }
   optionalText(input["effort"], "effort", 64);
-  optionalBoolean(input["fast_mode"], "fast_mode");
+  optionalFastMode(input["fast_mode"]);
+  optionalText(input["working_directory"], "working_directory", 32768);
+  if (input["worktree"] !== undefined) {
+    const worktree = requiredRecord(input, "worktree"); assertKeys(worktree, ["source_ref"]);
+    optionalText(worktree["source_ref"], "worktree.source_ref", 1024);
+  }
   optionalEnum(input["permission_mode"], "permission_mode", ["ask", "acceptEdits", "auto", "bypassPermissions"] as const);
   optionalBoolean(input["plan_mode"], "plan_mode");
 }
@@ -965,6 +986,11 @@ function requiredText(
 function optionalText(value: unknown, field: string, maximum: number, multiline = false): string | undefined {
   if (value === undefined) return undefined;
   return requiredText({ [field]: value }, field, maximum, multiline);
+}
+
+function optionalFastMode(value: unknown): boolean | "ultrafast" | undefined {
+  if (value === "ultrafast") return value;
+  return optionalBoolean(value, "fast_mode");
 }
 
 function optionalBoolean(value: unknown, field: string): boolean | undefined {

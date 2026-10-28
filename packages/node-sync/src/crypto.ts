@@ -13,6 +13,7 @@ import {
 } from "node:crypto";
 
 export type NodeSyncPurpose = "contacts" | "voice-dictionary";
+export type NodeSyncEncryptionPurpose = NodeSyncPurpose | "plugin-data";
 
 export function nodeSyncDomain(purpose: NodeSyncPurpose): { readonly encryption: string; readonly lanAuth: string; readonly magic: string; readonly multicastPort: number } {
   if (purpose !== "contacts" && purpose !== "voice-dictionary") throw new TypeError("Node sync purpose is invalid.");
@@ -93,7 +94,7 @@ export function isValidNodeSyncPrivateKey(value: unknown): value is string {
 }
 
 export function encryptNodeSyncBytes(
-  purpose: NodeSyncPurpose,
+  purpose: NodeSyncEncryptionPurpose,
   plaintext: Uint8Array,
   ownPrivateKey: string,
   peerPublicKey: string,
@@ -109,7 +110,7 @@ export function encryptNodeSyncBytes(
 }
 
 export function decryptNodeSyncBytes(
-  purpose: NodeSyncPurpose,
+  purpose: NodeSyncEncryptionPurpose,
   encrypted: NodeSyncEncryptedBytes,
   ownPrivateKey: string,
   peerPublicKey: string,
@@ -185,13 +186,13 @@ export function verifyNodeSyncProbeProof(
 }
 
 function deriveEncryptionKey(
-  purpose: NodeSyncPurpose,
+  purpose: NodeSyncEncryptionPurpose,
   ownPrivateKey: string,
   peerPublicKey: string,
   context: NodeSyncEncryptionContext
 ): Buffer {
   const nodePair = [context.sourceNodeId, context.destinationNodeId].sort().join("\u0000");
-  return deriveSharedKey(ownPrivateKey, peerPublicKey, `${nodeSyncDomain(purpose).encryption}\u0000${nodePair}`);
+  return deriveSharedKey(ownPrivateKey, peerPublicKey, `${encryptionDomain(purpose)}\u0000${nodePair}`);
 }
 
 function deriveSharedKey(ownPrivateKey: string, peerPublicKey: string, info: string): Buffer {
@@ -199,9 +200,12 @@ function deriveSharedKey(ownPrivateKey: string, peerPublicKey: string, info: str
   return Buffer.from(hkdfSync("sha256", shared, Buffer.alloc(0), Buffer.from(info, "utf8"), 32));
 }
 
-function buildEncryptionAad(purpose: NodeSyncPurpose, context: NodeSyncEncryptionContext): Buffer {
+function encryptionDomain(purpose: NodeSyncEncryptionPurpose): string {
+  return purpose === "plugin-data" ? "joko:plugin-device-sync:v1" : nodeSyncDomain(purpose).encryption;
+}
+function buildEncryptionAad(purpose: NodeSyncEncryptionPurpose, context: NodeSyncEncryptionContext): Buffer {
   return Buffer.from([
-    nodeSyncDomain(purpose).encryption,
+    encryptionDomain(purpose),
     context.sourceNodeId,
     context.destinationNodeId,
     context.transferId,

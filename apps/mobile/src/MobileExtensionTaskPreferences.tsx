@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { PermissionMode, type ExtensionTaskPreferences, type ExtensionTaskRoute } from "@joko/contracts";
+import { PermissionMode, encodeModelSpeed, decodeModelSpeed, type ExtensionTaskPreferences, type ExtensionTaskRoute } from "@joko/contracts";
+import { MobileModelSpeedControl } from "./MobileModelSpeedControl";
 import type { MobileExtension, MobileExtensionTransport } from "./mobile-extensions";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
@@ -32,7 +33,8 @@ export function MobileExtensionTaskPreferences({ extension, transport, colors, l
       {state.models.map(value => value.route && action(`${value.name} · ${value.route.backendId} · ${value.route.providerId}`, () => { setModel(value.route); setExpanded(false); }, !!model && key(model) === key(value.route)))}
     </ScrollView>}
     {model && <><Text style={{ color: colors.muted }}>{label("Reasoning effort", "思考强度")}</Text><View style={styles.row}>{selected?.efforts.map(effort => action(effort, () => setModel({ ...model, effort }), model.effort === effort))}</View>
-      {selected?.supportsFastMode && action(label("Fast mode", "Fast 模式"), () => setModel({ ...model, fastMode: !model.fastMode }), model.fastMode)}</>}
+      <MobileModelSpeedControl value={decodeModelSpeed(model)} supportsFast={selected?.supportsFastMode === true} supportsUltrafast={selected?.supportsUltrafastMode}
+        disabled={disabled || busy} colors={colors} locale={locale} onChange={speed => setModel({ ...model, ...encodeModelSpeed(speed) })} /></>}
     {state.tasksAvailable && <><Text style={{ color: colors.muted }}>{label("Task permissions", "任务权限")}</Text><View style={styles.row}>
       {action(label("Ask before changes", "修改前询问"), () => setPermission(PermissionMode.ASK), permission === PermissionMode.ASK)}
       {action(label("Accept file edits", "允许文件编辑"), () => setPermission(PermissionMode.ACCEPT_EDITS), permission === PermissionMode.ACCEPT_EDITS)}

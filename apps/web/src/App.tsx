@@ -1180,9 +1180,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     fileAttachmentInsertionIdRef.current = nextId;
     setFileAttachmentInsertion(insertion);
   }, [activeImageAttachments]);
-  const activeWorkspaceId = activeSession?.worktree === undefined
+  const activeWorkspaceId = activeSession?.localWorkspace?.workspaceId ?? (activeSession?.worktree === undefined
     ? activeTarget?.workspaceId
-    : activeSession.worktree.state === "active" ? activeSession.worktree.workspaceId : undefined;
+    : activeSession.worktree.state === "active" ? activeSession.worktree.workspaceId : undefined);
   const activeWorkspace = activeWorkspaceId === undefined
     ? undefined
     : state.snapshot.workspaces.find((workspace) => workspace.id === activeWorkspaceId);
@@ -2791,9 +2791,9 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
   const target = snapshot.targets.find((candidate) => candidate.id === session.targetId);
   const backend = snapshot.backends.find((candidate) => candidate.id === session.backendId);
   const reviewer = reviewRunForReviewerSession(snapshot.reviewRuns, session.id);
-  const workspaceId = session.worktree === undefined
+  const workspaceId = session.localWorkspace?.workspaceId ?? (session.worktree === undefined
     ? target?.workspaceId
-    : session.worktree.state === "active" ? session.worktree.workspaceId : undefined;
+    : session.worktree.state === "active" ? session.worktree.workspaceId : undefined);
   const workspace = workspaceId === undefined ? undefined : snapshot.workspaces.find((candidate) => candidate.id === workspaceId);
   const interactions = [...snapshot.interactions]
     .filter((interaction) => interaction.sessionId === sessionId)

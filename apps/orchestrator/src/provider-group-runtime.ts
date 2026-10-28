@@ -14,7 +14,7 @@ import { ProviderGroupService, type ProviderGroupSessionPort } from "./provider-
 import { ProviderGroupUsage } from "./provider-group-usage.js";
 import type { ProviderGroupConnectOptions } from "./provider-group-connect-service.js";
 import type { ProviderSharingDirectoryPort, ProviderSharingRecipient } from "./provider-sharing-ports.js";
-import { fromGroupAccountUsage, toGroupStrategy } from "./provider-group-wire.js";
+import { fromGroupAccountUsage, toGroupAccountUsage, toGroupStrategy } from "./provider-group-wire.js";
 import { toProtoCapability, toProtoModelDescriptor } from "./proto-mapper.js";
 import { ProviderGroupGuestSwitch } from "./provider-group-guest-switch.js";
 import type { HostedAgentPrincipal } from "./hosted-agent-host.js";
@@ -49,6 +49,31 @@ export class ProviderGroupRuntime {
   readonly #remoteRunning = new Map<string, number>();
   readonly #options: ProviderGroupRuntimeOptions;
   nodeName(): string { return this.#options.nodeName(); }
+  async sharedQuota(key: ProviderGroupKey, signal: AbortSignal): Promise<readonly contract.ProviderSharingQuotaAccount[]> {
+    signal.throwIfAborted(); const generation = this.#options.ownerGeneration(), snapshot = this.store.snapshot(key);
+    const assertCurrent = () => {
+      signal.throwIfAborted(); if (generation !== this.#options.ownerGeneration() || this.store.snapshot(key).revision !== snapshot.revision) throw new Error("Provider group changed.");
+    };
+    const read = async (backendId: string, providerId: string, kind: "local" | "device" | "share", sourceKey?: string) => {
+      assertCurrent();
+      if (kind === "share") return create(contract.ProviderSharingQuotaAccountSchema, { state: "unsupported" });
+      const source = this.sources().find(source => source.backendId === backendId && source.providerId === providerId && (!sourceKey || source.key === sourceKey));
+      if (!source?.available) return create(contract.ProviderSharingQuotaAccountSchema, { state: "offline" });
+      source.assertCurrent();
+      const value = kind === "local" ? await this.#options.readAccountUsage(backendId, providerId, signal) : await (async () => {
+        const captured = this.#options.sources.captureGroupPeer(backendId), client = createClient(contract.ProviderGroupService, captured.transport);
+        const result = await client.getProviderSchedulingState({ key: { backendId: captured.nativeBackendId, providerId }, modelId: "" }, { signal });
+        captured.assertCurrent(); return fromGroupAccountUsage(result.accountUsage);
+      })();
+      assertCurrent(); source.assertCurrent();
+      return create(contract.ProviderSharingQuotaAccountSchema, { state: value ? "ready" : "unsupported",
+        usage: value ? toGroupAccountUsage({ ...value, providerId: "shared-provider" }) : undefined });
+    };
+    const tasks = snapshot.config?.members.map(member => read(member.backendId, member.providerId, member.kind, member.key))
+      ?? [read(key.backendId, key.providerId, "local")];
+    const result = await Promise.allSettled(tasks); assertCurrent();
+    return result.map(value => value.status === "fulfilled" ? value.value : create(contract.ProviderSharingQuotaAccountSchema, { state: "unavailable" }));
+  }
   taskMember(sessionId: string): ProviderGroupTaskMember | undefined {
     const binding = this.store.binding(sessionId); if (!binding) return undefined;
     const member = this.store.snapshot(binding.group).config?.members.find(member => member.key === binding.memberKey); if (!member) return undefined;

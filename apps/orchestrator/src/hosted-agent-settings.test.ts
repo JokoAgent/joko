@@ -3,6 +3,29 @@ import { OperationalStore, RevisionConflictError } from "@joko/store";
 import { HostedAgentSettings, HOSTED_AGENT_SETTING_KEY } from "./hosted-agent-settings.js";
 import { HostedAgentSessionSlots } from "./hosted-agent-limits.js";
 
+it("keeps explicit empty model grants across pause and restart and retires earlier captures even after restoration", () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    const settings = new HostedAgentSettings(store);
+    let snapshot = settings.update({ kind: "remote_control", enabled: true }, 0n);
+    snapshot = settings.update({ kind: "provider", backendId: "native", providerId: "provider", enabled: true }, snapshot.revision);
+    const captured = settings.captureProvider("native", "provider");
+    snapshot = settings.update({ kind: "model_access", backendId: "native", providerId: "provider", modelIds: [] }, snapshot.revision);
+    expect(settings.allowsModel("native", "provider", "model")).toBe(false);
+    expect(() => captured()).toThrow("changed");
+    snapshot = settings.update({ kind: "provider", backendId: "native", providerId: "provider", enabled: false }, snapshot.revision);
+    snapshot = settings.update({ kind: "provider", backendId: "native", providerId: "provider", enabled: true }, snapshot.revision);
+    expect(new HostedAgentSettings(store).modelIds("native", "provider")).toEqual([]);
+    snapshot = settings.update({ kind: "model_access", backendId: "native", providerId: "provider", modelIds: ["model", "temporarily-missing"] }, snapshot.revision);
+    expect(settings.allowsModel("native", "provider", "model")).toBe(true);
+    expect(settings.allowsModel("native", "provider", "new-model")).toBe(false);
+    const selected = settings.captureProvider("native", "provider");
+    settings.update({ kind: "model_access", backendId: "native", providerId: "provider", modelIds: undefined }, snapshot.revision);
+    expect(settings.allowsModel("native", "provider", "new-model")).toBe(true);
+    expect(() => selected()).toThrow("changed"); expect(() => captured()).toThrow("changed");
+  } finally { store.close(); }
+});
+
 it("requires ordered opt-in, preserves Provider permission during a computer pause, and fences old captures after re-enabling", () => {
   const store = new OperationalStore(":memory:");
   try {

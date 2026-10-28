@@ -4,6 +4,7 @@ import type { AppController } from "../controller.js";
 import type { HostedAgentSettingsApi, HostedAgentCatalogView, HostedAgentSettingsUpdate, HostedAgentSettingsView } from "../hosted-agent-settings.js";
 import type { Translator } from "./types.js";
 import { Button, Pill, SwitchControl } from "./ui.js";
+import { RemoteModelAccessEditor } from "./RemoteModelAccessEditor.js";
 import "./hosted-agent-settings.css";
 
 type Feedback = "loadFailed" | "saveFailed" | "conflict" | "saved";
@@ -97,13 +98,15 @@ function HostedAgentSettingsPanel({ controller, nodeName, t }: { readonly contro
       {active.catalog?.backends.map(backend => <div className="settings-card" key={backend.backendId}>
         <div className="setting-row"><div><strong>{backend.displayName}</strong><span>{t("settings.hostedAgents.providersBody")}</span></div></div>
         {backend.providers.map(provider => {
-          const allowed = settings.providers.find(permission => permission.backendId === backend.backendId && permission.providerId === provider.providerId)?.enabled === true;
-          return <div className="setting-row hosted-agent-settings__toggle" key={provider.providerId}>
+          const permission = settings.providers.find(permission => permission.backendId === backend.backendId && permission.providerId === provider.providerId), allowed = permission?.enabled === true;
+          return <div key={provider.providerId}><div className="setting-row hosted-agent-settings__toggle">
             <div><strong>{provider.displayName}</strong><span>{provider.connected ? t("settings.hostedAgents.models", { count: provider.modelCount }) : t("settings.hostedAgents.disconnected")}</span></div>
             <SwitchControl checked={allowed} disabled={busy || !settings.remoteControlEnabled}
               aria-label={t("settings.hostedAgents.providerAria", { backend: backend.displayName, name: provider.displayName })}
               onChange={event => { void change({ kind: "provider", backendId: backend.backendId, providerId: provider.providerId, enabled: event.target.checked }); }} />
-          </div>;
+          </div><RemoteModelAccessEditor key={JSON.stringify(permission?.modelIds)} selected={permission?.modelIds} models={provider.models ?? []}
+            disabled={busy} language={controller.state.effectiveLocale}
+            onSave={modelIds => change({ kind: "modelAccess", backendId: backend.backendId, providerId: provider.providerId, modelIds })} /></div>;
         })}
         {backend.providers.length === 0 && <p className="hosted-agent-settings__note muted">{t("settings.hostedAgents.noProviders")}</p>}
       </div>)}

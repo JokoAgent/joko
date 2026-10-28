@@ -8,6 +8,7 @@ message AppDefaultModelRoute {
   string model_id = 3;
   string effort = 4;
   bool fast_mode = 5;
+  bool ultrafast_mode = 6;
 }
 
 // A live renderer owns the preference; Orchestrator keeps only its mirror.

@@ -29,6 +29,10 @@ export function createProviderSharingConnectService(options: ProviderSharingConn
     createProviderShareLink: (request, context) => owner(context, () => options.host.issue(request)),
     decideProviderShareRequest: (request, context) => owner(context, () => create(contract.DecideProviderShareRequestResponseSchema, { share: options.host.decide(request) })),
     setProviderShareMember: (request, context) => owner(context, () => create(contract.SetProviderShareMemberResponseSchema, { share: options.host.member(request) })),
+    setProviderShareModelAccess: (request, context) => owner(context, () => create(contract.SetProviderShareModelAccessResponseSchema, { share: options.host.setModelAccess(request) })),
+    setProviderShareVisibility: (request, context) => owner(context, () => create(contract.SetProviderShareVisibilityResponseSchema, { share: options.host.setVisibility(request) })),
+    getReceivedProviderShareInsights: (request, context) => owner(context, async authority => create(contract.GetReceivedProviderShareInsightsResponseSchema, {
+      insights: await options.home.insights(request.joinId, request.includeUsage, authority) })),
     decideProviderReshare: (request, context) => owner(context, () => create(contract.DecideProviderReshareResponseSchema, { share: options.host.decideReshare(request) })),
     previewProviderShare: (request, context) => owner(context, async authority => create(contract.PreviewProviderShareResponseSchema, { preview: await options.home.preview(request.link, authority) })),
     applyProviderShare: (request, context) => owner(context, async authority => create(contract.ApplyProviderShareResponseSchema, { intent: await options.home.apply(request, authority) })),
@@ -51,6 +55,8 @@ export function createProviderSharingGuestConnectService(host: ProviderSharingHo
     getProviderShareRequest: (request, context) => invoke(context, () => host.request(request.requestId, authorization(context))),
     withdrawProviderShareRequest: (request, context) => invoke(context, () => host.withdraw(request.operationId, request.requestId, authorization(context))),
     readProviderShare: (request, context) => invoke(context, () => host.read(request.shareId, authorization(context))),
+    readProviderShareInsights: (request, context) => invoke(context, async () => create(contract.ReadProviderShareInsightsResponseSchema, {
+      insights: await host.readInsights(request, authorization(context), context.signal) })),
     leaveProviderShare: (request, context) => invoke(context, () => host.leave(request.operationId, request.shareId, authorization(context))),
     getProviderShareLeaveReceipt: (request, context) => invoke(context, () => host.leaveReceipt(request.operationId, request.shareId, authorization(context))),
     syncProviderReshares: (request, context) => invoke(context, () => host.sync(request, context)),

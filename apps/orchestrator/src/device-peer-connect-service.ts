@@ -1045,11 +1045,12 @@ function commandMetadata(command: contract.DevicePeerCommand): {
   const action = command.action.case;
   if (action === "invokeHostedAgent") {
     const effectKind = devicePeerNativeAgentMethodEffect(command.action.value.method);
-    if (effectKind === undefined || command.capability !== contract.DevicePeerCapabilityKind.NATIVE_AGENTS
+    const extension = command.action.value.method === contract.HostedAgentPeerMethod.EXTENSION_SYNC;
+    if (effectKind === undefined || command.capability !== (extension ? contract.DevicePeerCapabilityKind.EXTENSION_SYNC : contract.DevicePeerCapabilityKind.NATIVE_AGENTS)
       || command.effect !== (effectKind === "read_only" ? contract.DevicePeerEffectKind.READ_ONLY : contract.DevicePeerEffectKind.SIDE_EFFECT)) {
       throw protocolViolation("The native Agent command capability or effect is invalid.");
     }
-    return { capability: "native_agents", effectKind };
+    return { capability: extension ? "extension_sync" : "native_agents", effectKind };
   }
   if (action === undefined) throw protocolViolation("The Device peer command action is required.");
   const readOnly = action === "listRecentDirectories" || action === "listDirectories"
@@ -1287,6 +1288,7 @@ function toProtoCapability(value: DevicePeerCapability): contract.DevicePeerCapa
     case "forwarding": return contract.DevicePeerCapabilityKind.FORWARDING;
     case "remote_desktop": return contract.DevicePeerCapabilityKind.REMOTE_DESKTOP;
     case "native_agents": return contract.DevicePeerCapabilityKind.NATIVE_AGENTS;
+    case "extension_sync": return contract.DevicePeerCapabilityKind.EXTENSION_SYNC;
   }
 }
 
@@ -1298,6 +1300,7 @@ function fromProtoCapability(value: contract.DevicePeerCapabilityKind): DevicePe
     case contract.DevicePeerCapabilityKind.FORWARDING: return "forwarding";
     case contract.DevicePeerCapabilityKind.REMOTE_DESKTOP: return "remote_desktop";
     case contract.DevicePeerCapabilityKind.NATIVE_AGENTS: return "native_agents";
+    case contract.DevicePeerCapabilityKind.EXTENSION_SYNC: return "extension_sync";
     default: throw new ConnectError("The Device peer capability is invalid.", Code.InvalidArgument);
   }
 }

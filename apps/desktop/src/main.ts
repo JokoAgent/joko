@@ -423,6 +423,7 @@ import {
 import { NativeArtifactSourceRevealer } from "./native-artifact-source-revealer.js";
 import { DesktopPersonalDevelopmentHost } from "./personal-development-native-host.js";
 import { DesktopInputHandoffHost } from "./input-handoff-native-host.js";
+import { DesktopVoiceConversationHost } from "./voice-conversation-host.js";
 import { DesktopPersonalDevelopmentVersions } from "./personal-development-native-versions.js";
 import { personalVersionProfileOverride } from "./personal-development-version-bootstrap.js";
 import { resolveManagedArtifactSource } from "./managed-artifact-source.js";
@@ -942,6 +943,8 @@ let desktopCompleteExitQuitHandoffPending = false;
 let desktopPersonalVersionQuitHandoffPending = false;
 let desktopPersonalDevelopmentHost: DesktopPersonalDevelopmentHost | undefined;
 let desktopInputHandoffHost: DesktopInputHandoffHost | undefined;
+let desktopVoiceConversationHost: DesktopVoiceConversationHost | undefined;
+const desktopVoiceDocuments = new WeakMap<WebContents, Set<string>>();
 let desktopCompleteExit: Promise<void> | undefined;
 let desktopUpdateAutoRelaunchPolicy: DesktopUpdateAutoRelaunchPolicy | undefined;
 let desktopUpdateAutoRelaunchPolicyInitialization: Promise<void> | undefined;
@@ -1044,6 +1047,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on("before-quit", (event) => {
     desktopPersonalDevelopmentHost?.close();
     desktopInputHandoffHost?.close();
+    desktopVoiceConversationHost?.close();
     nativeFileClipboard?.cancelPending();
     nativeFileOpener?.cancelPending();
     windowsOpenWithApps?.cancelPending();
@@ -4713,7 +4717,7 @@ function startGlobalVoiceInputLease(
   const mode = globalVoiceStartModes.get(generation) ?? "start";
   globalVoiceStartModes.delete(generation);
   if (globalVoiceAdmissionUnavailable() || globalVoiceShortcutRecordingActive()
-    || externalTextInsertionCoordinator.busy()) return false;
+    || externalTextInsertionCoordinator.busy() || desktopVoiceConversationHost?.active) return false;
   const recording = globalVoiceInputLease.snapshot();
   if (recording.state === "idle" || recording.generation !== generation || recording.source !== source
     || globalVoiceActiveGeneration !== undefined) return false;
@@ -7906,6 +7910,10 @@ function reconcileDesktopDevicePeerAgentLifecycle(): void {
       readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent });
   }
   desktopInputHandoffHost?.setConnection(connection);
+  if (desktopVoiceConversationHost === undefined && connection !== undefined) desktopVoiceConversationHost = new DesktopVoiceConversationHost({
+    readAuthKey: readCredential, readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent,
+    dictationActive: () => globalVoiceInputLease.snapshot().state !== "idle" });
+  desktopVoiceConversationHost?.setConnection(connection);
   desktopDevicePeerAgentLifecycle?.setConnection(connection);
   if (desktopPersonalDevelopmentHost === undefined && connection !== undefined) {
     const versions = new DesktopPersonalDevelopmentVersions({ profileDirectory: app.getPath("userData"),
@@ -8130,9 +8138,11 @@ function installMicrophoneLifecycle(): void {
   microphoneLifecycleInstalled = true;
   const broadcast = (reason: "system-suspend" | "screen-lock"): void => {
     globalVoiceNativeShortcut.releaseActiveTrigger();
-    const contents = mainWindow?.webContents;
-    if (contents === undefined || contents.isDestroyed()) return;
-    contents.send(DESKTOP_CHANNELS.microphoneRelease, reason);
+    desktopVoiceConversationHost?.retireAll();
+    for (const window of applicationWindows()) {
+      const contents = window.webContents;
+      if (!contents.isDestroyed() && isTrustedApplicationContents(contents)) contents.send(DESKTOP_CHANNELS.microphoneRelease, reason);
+    }
   };
   const onSuspend = (): void => broadcast("system-suspend");
   const onLockScreen = (): void => broadcast("screen-lock");
@@ -8231,6 +8241,22 @@ function registerIpc(): void {
   desktopLinkspan.register();
   desktopMcpApps.register();
   desktopExtensionOAuth.register();
+  ipcMain.handle("joko:voice-conversation:control", async (event, occurrence: unknown, serverId: unknown, bytes: unknown) => {
+    assertTrustedIpcSender(event);
+    if (typeof occurrence !== "string" || !mainWindowDocuments.isCurrent(event.sender, occurrence)
+      || typeof serverId !== "string" || !(bytes instanceof Uint8Array) || bytes.byteLength > 128 * 1024 || !desktopVoiceConversationHost) throw new Error("Local voice host is unavailable.");
+    const assertDocument = () => { assertTrustedIpcSender(event); if (quitting || !mainWindowDocuments.isCurrent(event.sender, occurrence)) throw new Error("Voice document retired."); };
+    const windowId = `desktop-${event.sender.id}-${occurrence}`;
+    let documents = desktopVoiceDocuments.get(event.sender);
+    if (!documents) {
+      documents = new Set(); desktopVoiceDocuments.set(event.sender, documents);
+      const retire = () => { for (const id of documents!) desktopVoiceConversationHost?.retireWindow(id); documents!.clear(); };
+      event.sender.once("destroyed", retire); event.sender.on("render-process-gone", retire);
+      event.sender.on("did-start-navigation", (_navigation, _url, inPlace, mainFrame) => { if (mainFrame && !inPlace) retire(); });
+    }
+    documents.add(windowId);
+    return desktopVoiceConversationHost.request(serverId, windowId, bytes, assertDocument);
+  });
   desktopRemoteDesktopViewers.register();
   ipcMain.on(DESKTOP_CHANNELS.preferredSystemLocaleGet, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);

@@ -8,7 +8,7 @@ function route(value: contract.AppDefaultModelRoute | undefined): contract.AppDe
   if (value === undefined) return undefined;
   if ([value.backendId, value.providerId, value.modelId].some(part => !part.trim() || part !== part.trim() || part.length > 512 || /[\u0000-\u001f\u007f]/u.test(part))
     || value.effort.length > 64 || /[\u0000-\u001f\u007f]/u.test(value.effort)) throw new ConnectError("Invalid UI model route.", Code.InvalidArgument);
-  return { backendId: value.backendId, providerId: value.providerId, modelId: value.modelId, effort: value.effort, fastMode: value.fastMode };
+  return { backendId: value.backendId, providerId: value.providerId, modelId: value.modelId, effort: value.effort, fastMode: contract.decodeModelSpeed(value) };
 }
 export function createAppDefaultModelConnectService(defaults: AppDefaultModelCoordinator | undefined, connections: ConnectionManager): ServiceImpl<typeof contract.AppDefaultModelService> {
   const owner = () => { if (!defaults) throw new ConnectError("The application default-model bridge is unavailable.", Code.Unavailable); return defaults; };
@@ -40,7 +40,8 @@ export function createAppDefaultModelConnectService(defaults: AppDefaultModelCoo
       const connection = connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
       context.signal.throwIfAborted(); const result = owner().claim(connection.id, request.uiOwnerId, request.requestId);
       return create(contract.ClaimAppDefaultModelResponseSchema, { remainingMs: result.remainingMs,
-        ...(result.expected === undefined ? {} : { expected: result.expected }), requested: result.requested });
+        ...(result.expected === undefined ? {} : { expected: { ...result.expected, ...contract.encodeModelSpeed(result.expected.fastMode) } }),
+        requested: { ...result.requested, ...contract.encodeModelSpeed(result.requested.fastMode) } });
     }
   };
 }

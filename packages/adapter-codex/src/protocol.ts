@@ -232,12 +232,15 @@ export function parseModels(
     const modalities = Array.isArray(model["inputModalities"])
       ? model["inputModalities"].filter((item): item is string => typeof item === "string")
       : [];
-    const tiers = Array.isArray(model["serviceTiers"])
+    const serviceTiers = Array.isArray(model["serviceTiers"])
       ? model["serviceTiers"].flatMap((tier) => {
           if (!isJsonObject(tier) || typeof tier["id"] !== "string") return [];
           return [{ id: tier["id"] }];
         })
       : [];
+    const additionalTiers = Array.isArray(model["additionalSpeedTiers"])
+      ? model["additionalSpeedTiers"].flatMap(tier => typeof tier === "string" ? [{ id: tier }] : []) : [];
+    const tiers = [...new Map([...serviceTiers, ...additionalTiers].map(tier => [tier.id, tier])).values()];
     return {
       id: stringValue(model["id"], "model id"),
       model: stringValue(model["model"], "model slug"),
@@ -250,7 +253,7 @@ export function parseModels(
       inputModalities: modalities,
       inputModalitiesDeclared: Array.isArray(model["inputModalities"]),
       serviceTiers: tiers,
-      serviceTiersDeclared: Array.isArray(model["serviceTiers"]),
+      serviceTiersDeclared: Array.isArray(model["serviceTiers"]) || Array.isArray(model["additionalSpeedTiers"]),
       ...(typeof model["defaultServiceTier"] === "string" ? { defaultServiceTier: model["defaultServiceTier"] } : {}),
       isDefault: model["isDefault"] === true
     };

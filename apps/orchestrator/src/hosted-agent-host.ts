@@ -280,7 +280,7 @@ function validId(value: unknown): value is string { return typeof value === "str
 function validateOpen(value: HostedAgentOpen): void {
   if (!value || ![value.runId, value.nativeSessionId, value.sessionId, value.targetId, value.backendId, value.providerId, value.modelId].every(validId)
     || !["create", "resume"].includes(value.start)
-    || !Number.isSafeInteger(value.generation) || value.generation < 0 || typeof value.fastMode !== "boolean"
+    || !Number.isSafeInteger(value.generation) || value.generation < 0 || (typeof value.fastMode !== "boolean" && value.fastMode !== "ultrafast")
     || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(value.permissionMode)
     || value.name !== undefined && (typeof value.name !== "string" || value.name.length > 16_384 || value.name.includes("\0"))
     || value.effort !== undefined && !validId(value.effort) || Buffer.byteLength(JSON.stringify(value)) > 8 * 1024 * 1024) throw new HostedAgentHostError("INVALID_REQUEST");

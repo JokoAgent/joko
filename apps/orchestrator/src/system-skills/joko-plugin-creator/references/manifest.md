@@ -28,8 +28,9 @@ and tools array; do not confuse it with a native process or grant Node access.
 Optional current fields include mainView, library (`schemaVersion: 1`),
 routineEvents, runtime and recommendations. A recommendation is authored text,
 never authority to invoke an undeclared command. Runtime supports declared tools,
-cards, mail readers, scoped networking, original-task continuation, managed tasks
-and one-shot text only through the actual declared host SDK. Read the relevant
+cards, mail readers, scoped networking, original-task continuation, managed tasks,
+independently approved target delivery and encrypted same-plugin device exchange
+only through the actual declared host SDK. Read the relevant
 reference and inspect a real host response before using an unfamiliar capability.
 
 No migration, alternate manifest, compatibility reader or dual write is required

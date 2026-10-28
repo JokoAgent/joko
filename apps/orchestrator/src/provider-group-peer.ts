@@ -54,7 +54,7 @@ export function withProviderGroupPeerPort(base: DevicePeerNativeAgentPort, optio
   // A multipart usage report spans requests. Its service owner must survive
   // each request so an incomplete batch never replaces a complete snapshot.
   const controllers = new Map<string, Client<typeof contract.ProviderGroupService>>();
-  return { invoke: async (kind, bytes, signal, authority) => {
+  return { supportsExtensionSync: base.supportsExtensionSync, invoke: async (kind, bytes, signal, authority) => {
     const method = providerGroupPeerDescriptor(kind); if (!method) return base.invoke(kind, bytes, signal, authority);
     assertAuthorityCurrent(); lifetime.signal.throwIfAborted(); signal.throwIfAborted();
     const principal = { id: authority.controllerDeviceId, trust: "owner" as const, management: false,

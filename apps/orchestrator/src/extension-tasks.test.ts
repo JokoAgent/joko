@@ -35,7 +35,7 @@ async function fixture(options: { readonly edits?: boolean; readonly review?: Co
   const teams = new CollaborationGoalManager({ store, sessionHost: host, readSettings: () => DEFAULT_COLLABORATION_SETTINGS,
     assertWorkerAdmission: lead => tasks.assertTeamWorkerCurrent(lead) });
   const projects = new ExtensionProjectPolicies(store);
-  const tasks = new ExtensionTasks({ store, host, catalog: { get: () => descriptor() }, projects, defaults: { current: () => ({ ...route, effort: "" }) }, rootDirectory: join(root, "tasks"), redact: value => value, teams, reviewNativeTool: options.review });
+  const tasks = new ExtensionTasks({ store, host, artifacts, catalog: { get: () => descriptor() }, projects, defaults: { current: () => ({ ...route, effort: "" }) }, rootDirectory: join(root, "tasks"), redact: value => value, teams, reviewNativeTool: options.review });
   await teams.initialize();
   installation = tasks.installation(extensionId, "resource");
   host.setExtensionTaskQueueGuard(item => tasks.assertQueueCurrent(item));
@@ -43,8 +43,23 @@ async function fixture(options: { readonly edits?: boolean; readonly review?: Co
     assertCurrent: () => { if (!enabled || !installed || installation !== owner.installation) throw new Error("Retired source"); } };
   cleanups.push(async () => { await teams.close(); await host.dispose(); store.close(); await rm(root, { recursive: true, force: true }); });
   const request = (value: Record<string, unknown>) => tasks.request(owner, { type: "tasks-request", ...value });
-  return { root, store, host, teams, tasks, owner, extensionId, route, request, projects, descriptor, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
+  return { root, store, host, artifacts, teams, tasks, owner, extensionId, route, request, projects, descriptor, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
 }
+it("adopts bounded plugin images through its own task Queue and preserves input-key replay", async () => {
+  const f = await fixture(), model = PI_LIKE_PROFILE.models.find(model => model.supportsImages)!;
+  f.tasks.updatePreferences(f.extensionId, 0n, { model: { ...f.route, providerId: model.providerId, modelId: model.modelId }, permissionMode: "ask" }, () => {});
+  const task = await f.request({ kind: "create", requestKey: "image-task", title: "Plugin images" }) as { taskId: string; revision: string };
+  f.store.setQueuePaused({ sessionId: task.taskId, paused: true, reason: "Owner wait", traceId: "test" });
+  const fresh = await f.request({ kind: "get", taskId: task.taskId }) as { revision: string };
+  const pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2ioAAAAASUVORK5CYII=";
+  const input = { kind: "send", taskId: task.taskId, expectedRevision: fresh.revision, requestKey: "image-input", text: "Inspect the supplied image", attachments: [{ base64: pixel }] };
+  const result = await f.request(input) as { runId: string };
+  const queue = f.store.findQueueItemByRunId(task.taskId, result.runId)!;
+  expect(queue.body.images).toHaveLength(1);
+  expect(f.store.getArtifact(queue.body.images[0]!.blob.id)).toMatchObject({ sessionId: task.taskId, runId: result.runId });
+  expect(await f.request(input)).toMatchObject({ runId: result.runId });
+  await expect(f.request({ ...input, attachments: [{ base64: pixel, name: "different.png" }] })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+});
 it("checks project exceptions for new plugin tasks and subsequent access to an existing task", async () => {
   const f = await fixture();
   f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "ask" }, () => {});

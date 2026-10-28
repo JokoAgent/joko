@@ -12,10 +12,12 @@ import type { NativeToolAuthorization, NativeToolAuthorizationDecision, NativeTo
 import { classifyToolCall, evaluateOrderedPolicyRules, policyObservationForToolCall, type PolicyContext, type PolicySnapshot } from "@joko/core";
 import { modelRoutingEnabled } from "./backend-model-access.js";
 import { policySnapshotFor } from "./policy-settings.js";
+import type { ArtifactStore } from "./artifact-store.js";
+import { stageExtensionMessageImages, withExtensionMessageImages, type ExtensionMessageImage } from "./extension-message-attachments.js";
 
 export interface ExtensionTaskRoute {
   readonly backendId: string; readonly providerId: string; readonly modelId: string;
-  readonly effort?: string; readonly fastMode: boolean;
+  readonly effort?: string; readonly fastMode: boolean | "ultrafast";
 }
 export interface ExtensionTaskPreferences {
   readonly model?: ExtensionTaskRoute; readonly targetId?: string; readonly permissionMode: "ask" | "acceptEdits" | "auto";
@@ -94,6 +96,7 @@ export class ExtensionTasks {
   readonly #writes = new Set<Promise<unknown>>();
   readonly #writeAttempts = new Map<string, { readonly extensionId: string; readonly taskId: string; readonly installation: string; readonly mode: "acceptEdits" | "auto"; pending: boolean }>();
   constructor(readonly options: { readonly store: OperationalStore; readonly host: SessionHost;
+    readonly artifacts?: Pick<ArtifactStore, "ingestBytes">;
     readonly catalog: Pick<ExtensionCatalogManager, "get">; readonly defaults: Pick<AppDefaultModelCoordinator, "current">;
     readonly projects?: Pick<ExtensionProjectPolicies, "enabledForTarget" | "assertEnabledForSession">;
     readonly rootDirectory: string; readonly redact: (text: string) => string; readonly teams?: CollaborationGoalManager;
@@ -200,6 +203,7 @@ export class ExtensionTasks {
       || extension.permissions.some(permission => permission.required && !permission.granted)
       || hidden && !extension.runtime.tasks.hidden || !installation?.active || installation.id !== owner.installation) failure("PERMISSION_DENIED", "Plugin task authority is unavailable.");
   }
+  assertOwner(owner: ExtensionTaskOwner): void { this.#assert(owner); }
   preferences(id: string) {
     const extension = this.options.catalog.get(id);
     if (!extension.installed || !extension.runtime || !extension.runtime.tasks && !extension.runtime.text) failure("PERMISSION_DENIED", "Plugin task preferences are unavailable.");
@@ -228,17 +232,18 @@ export class ExtensionTasks {
     return this.options.store.listBackends().flatMap(backend => backend.descriptor.models.filter(model => modelRoutingEnabled(this.options.store, backend.descriptor.id, model.providerId, model.modelId)).map(model => ({
       route: { backendId: backend.descriptor.id, providerId: model.providerId, modelId: model.modelId,
         ...(model.defaultEffort ? { effort: model.defaultEffort } : {}), fastMode: false },
-      efforts: model.thinkingLevels, supportsFastMode: model.supportsFastMode === true, name: model.displayName
+      efforts: model.thinkingLevels, supportsFastMode: model.supportsFastMode === true, supportsUltrafastMode: model.supportsUltrafastMode === true, name: model.displayName
     })));
   }
   #route(input: unknown): ExtensionTaskRoute {
     const value = record(input); exact(value, ["backendId", "providerId", "modelId", "effort", "fastMode"]);
     const route: ExtensionTaskRoute = { backendId: text(value.backendId), providerId: text(value.providerId), modelId: text(value.modelId),
-      ...(value.effort === undefined || value.effort === "" ? {} : { effort: text(value.effort, 32) }), fastMode: value.fastMode === true };
-    if (typeof value.fastMode !== "boolean") failure("INVALID_REQUEST", "Fast mode must be boolean.");
+      ...(value.effort === undefined || value.effort === "" ? {} : { effort: text(value.effort, 32) }), fastMode: value.fastMode === "ultrafast" ? "ultrafast" : value.fastMode === true };
+    if (typeof value.fastMode !== "boolean" && value.fastMode !== "ultrafast") failure("INVALID_REQUEST", "The model speed is invalid.");
     const backend = this.options.store.getBackend(route.backendId);
     const model = backend.descriptor.models.find(candidate => candidate.providerId === route.providerId && candidate.modelId === route.modelId);
-    if (!model || !modelRoutingEnabled(this.options.store, route.backendId, route.providerId, route.modelId) || route.effort && !model.thinkingLevels.includes(route.effort) || route.fastMode && model.supportsFastMode !== true) failure("ROUTE_UNAVAILABLE", "The selected model route is unavailable.");
+    if (!model || !modelRoutingEnabled(this.options.store, route.backendId, route.providerId, route.modelId) || route.effort && !model.thinkingLevels.includes(route.effort)
+      || route.fastMode && (route.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true)) failure("ROUTE_UNAVAILABLE", "The selected model route is unavailable.");
     return route;
   }
   #target(id: string, backendId?: string) {
@@ -401,6 +406,15 @@ export class ExtensionTasks {
     do { const tail = this.#tail; await Promise.allSettled([tail, ...this.#writes]); if (tail === this.#tail && !this.#writes.size) return; } while (true);
   }
   async request(owner: ExtensionTaskOwner, input: unknown): Promise<unknown> {
+    const request = record(input);
+    if (request.kind === "send") return withExtensionMessageImages(request.attachments, images => this.#request(owner, input, undefined, images));
+    return this.#request(owner, input);
+  }
+  createForTarget(owner: ExtensionTaskOwner, request: { readonly requestKey: string; readonly title: string; readonly route?: unknown },
+    target: { readonly targetId: string; readonly assertCurrent: () => void }): Promise<unknown> {
+    target.assertCurrent(); return this.#request(owner, { kind: "create", ...request }, target);
+  }
+  async #request(owner: ExtensionTaskOwner, input: unknown, target?: { readonly targetId: string; readonly assertCurrent: () => void }, images: readonly ExtensionMessageImage[] = []): Promise<unknown> {
     const early = record(input);
     if (early.kind === "requestWriteAccess") {
       const pending = this.#writeAccess(owner, early); this.#writes.add(pending);
@@ -409,17 +423,17 @@ export class ExtensionTasks {
     return this.#exclusive(async () => {
       const request = record(input), kind = text(request.kind, 32);
       const keys: Record<string, readonly string[]> = { capabilities: [], models: [], create: ["requestKey", "title", "route", "hidden", "isolatedWorkspace", "callId"], get: ["taskId"], list: ["after", "limit"],
-        setModel: ["taskId", "expectedRevision", "route"], send: ["taskId", "expectedRevision", "requestKey", "text"], getRun: ["runId"], listRuns: ["taskId", "after", "limit"], readMessages: ["taskId", "after", "limit"], cancel: ["runId"], setHidden: ["taskId", "hidden"],
+        setModel: ["taskId", "expectedRevision", "route"], send: ["taskId", "expectedRevision", "requestKey", "text", "attachments"], getRun: ["runId"], listRuns: ["taskId", "after", "limit"], readMessages: ["taskId", "after", "limit"], cancel: ["runId"], setHidden: ["taskId", "hidden"],
         startTeam: ["taskId"], getTeam: ["taskId"], setTeamPlan: ["taskId", "plan"], releaseWorker: ["taskId", "workerId", "completedAt"] };
       if (!keys[kind]) failure("INVALID_REQUEST", "Unsupported plugin task operation.");
-      exact(request, ["type", "kind", ...keys[kind]!]); this.#assert(owner);
+      exact(request, ["type", "kind", "callId", ...keys[kind]!]); this.#assert(owner);
       if (kind === "capabilities") return { version: 1, operations: OPERATIONS.filter(operation => this.options.teams || !["startTeam", "getTeam", "setTeamPlan", "releaseWorker"].includes(operation)), scope: "own-plugin-local-session", exactRoute: true, pluginDefaultModel: true, sourceCallContext: true, writeAccessModes: ["acceptEdits", "auto"], hiddenTasks: this.options.catalog.get(owner.extensionId).runtime?.tasks?.hidden === true };
       if (kind === "models") return { items: this.models() };
       if (kind === "create") {
         const title = text(request.title, 120), requestKey = text(request.requestKey), hidden = request.hidden === true;
         if (request.hidden !== undefined && typeof request.hidden !== "boolean" || request.isolatedWorkspace !== undefined && typeof request.isolatedWorkspace !== "boolean") failure("INVALID_REQUEST", "Task flags must be boolean.");
         this.#assert(owner, hidden);
-        const operationId = `extension-create-${hash([owner.extensionId, owner.installation, requestKey])}`, fingerprint = hash(request);
+        const operationId = `extension-create-${hash([owner.extensionId, owner.installation, requestKey])}`, fingerprint = hash(target ? { ...request, targetId: target.targetId } : request);
         const previous = this.options.store.findSetting<TaskReceipt>("service", TASKS, operationId)?.value;
         if (previous) {
           if (previous.fingerprint !== fingerprint) failure("IDEMPOTENCY_CONFLICT", "The request key has different content.");
@@ -427,7 +441,7 @@ export class ExtensionTasks {
           return this.#view(this.#own(owner, previous.sessionId!));
         }
         const route = this.#resolve(owner, request.route), preferences = this.preferences(owner.extensionId), stamp = hash(preferences.config);
-        let targetId = preferences.config.targetId;
+        let targetId = target?.targetId ?? preferences.config.targetId;
         if (!targetId) {
           const root = join(this.options.rootDirectory, hash([owner.extensionId, route.backendId]));
           await mkdir(root, { recursive: true, mode: 0o700 }); this.#assert(owner, hidden);
@@ -437,7 +451,7 @@ export class ExtensionTasks {
             displayName: this.options.catalog.get(owner.extensionId).name, workspaceRoot, managed: true, trusted: true });
         }
         this.#target(targetId, route.backendId);
-        const current = () => { this.#assert(owner, hidden); this.#target(targetId!, route.backendId);
+        const current = () => { target?.assertCurrent(); this.#assert(owner, hidden); this.#target(targetId!, route.backendId);
           if (this.options.projects?.enabledForTarget(owner.extensionId, targetId!) === false) failure("PERMISSION_DENIED", "Plugin is disabled for this project.");
           if (stamp !== hash(this.preferences(owner.extensionId).config)) failure("STALE_REVISION", "Plugin task settings changed during creation."); this.#route(route); };
         current();
@@ -563,14 +577,23 @@ export class ExtensionTasks {
         const preferences = this.preferences(owner.extensionId).config;
         if (task.descriptor.planMode || !permissionAllowed(task.descriptor.permissionMode, preferences.permissionMode)) failure("PERMISSION_DENIED", "Task permissions exceed plugin policy.");
         this.#assert(owner);
+        if (images.length && !this.options.artifacts) failure("HOST_NOT_READY", "Plugin image storage is unavailable.");
+        const inputScope = taskScope(task);
+        const current = () => { this.#assert(owner); if (taskScope(this.#own(owner, task.descriptor.id)) !== inputScope
+          || !permissionAllowed(task.descriptor.permissionMode, this.preferences(owner.extensionId).config.permissionMode)) failure("STALE_REVISION", "The task changed during image delivery."); };
+        const staging = images.length ? await stageExtensionMessageImages(images, this.options.artifacts!, this.options.store, current) : undefined;
+        try {
+        current();
         const result = this.options.host.enqueueServiceInput({ operationId, sessionId: task.descriptor.id, source: "system",
-          prompt: { text: `[Plugin input from ${owner.extensionId}: external application data]\n${message}`, mentions: [], images: [], files: [], disposition: "prompt" },
+          prompt: { text: `[Plugin input from ${owner.extensionId}: external application data]\n${message}`, mentions: [], images: staging?.images ?? [], files: [], disposition: "prompt" },
           onAdmitted: (store, accepted) => {
             this.#assert(owner);
+            staging?.adopt(store, accepted);
             const receipt: InputReceipt = { version: 1, extensionId: owner.extensionId, resourceId: owner.resourceId, installation: owner.installation, operationId, fingerprint, ...accepted };
             store.setSetting("service", INPUTS, accepted.runId, receipt); store.setSetting("service", INPUTS, operationId, receipt);
           } });
         return this.#run(owner, result.value.runId).value;
+        } finally { staging?.release(); }
       }
       return failure("INVALID_REQUEST", "Unsupported plugin task operation.");
     });
@@ -609,7 +632,7 @@ export function isExtensionTaskControlled(store: OperationalStore, sessionId: st
 export function assertExtensionWorkerPlan(store: OperationalStore, leadSessionId: string, input: {
   readonly label: string; readonly assignment: string; readonly parentWorkerId?: string;
   readonly existingWorkerId?: string;
-  readonly route: { readonly targetId: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode: boolean; readonly permissionMode: string; readonly planMode: boolean };
+  readonly route: { readonly targetId: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode: boolean | "ultrafast"; readonly permissionMode: string; readonly planMode: boolean };
 }): void {
   if (!isExtensionTaskControlled(store, leadSessionId)) return;
   const receipt = store.findSetting<TaskReceipt>("service", TASKS, leadSessionId)?.value;
@@ -624,7 +647,7 @@ export function assertExtensionWorkerPlan(store: OperationalStore, leadSessionId
   if (!receipt || receipt.revoked || !target.descriptor.trusted || target.descriptor.remoteWorkspace || !store.getTarget(lead.descriptor.targetId).descriptor.trusted
     || !within && (!extra?.descriptor.trusted || extra.descriptor.remoteWorkspace || realpathSync(extra.descriptor.workspaceRoot) !== directory)
     || !model || !modelRoutingEnabled(store, backend.id, model.providerId, model.modelId) || input.route.effort && !model.thinkingLevels.includes(input.route.effort)
-    || input.route.fastMode && model.supportsFastMode !== true || input.route.permissionMode !== "auto" || input.route.planMode || config?.permissionMode !== "auto") failure("PERMISSION_DENIED", "The worker request exceeds the plugin's directory, model or permission policy.");
+    || input.route.fastMode && (input.route.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true) || input.route.permissionMode !== "auto" || input.route.planMode || config?.permissionMode !== "auto") failure("PERMISSION_DENIED", "The worker request exceeds the plugin's directory, model or permission policy.");
   if (!plan) return;
   if (!item || registered?.settledLabels?.includes(input.label) || item.targetId !== input.route.targetId
     || target.descriptor.backendId !== item.route.backendId || input.route.providerId !== item.route.providerId || input.route.modelId !== item.route.modelId

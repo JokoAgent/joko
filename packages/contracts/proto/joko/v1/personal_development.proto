@@ -235,6 +235,7 @@ message StartPersonalDevelopmentDoctorRequest {
   bool fast_mode = 10;
   string permission_mode = 11;
   bool plan_mode = 12;
+  bool ultrafast_mode = 13;
 }
 message ControlPersonalDevelopmentDoctorRequest {
   string operation_id = 1;
@@ -327,6 +328,7 @@ message StartPersonalDevelopmentTaskRequest {
   bool fast_mode = 9;
   string permission_mode = 10;
   bool plan_mode = 11;
+  bool ultrafast_mode = 12;
 }
 message StartPersonalDevelopmentTaskResponse {
   string operation_id = 1;

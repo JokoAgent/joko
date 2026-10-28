@@ -269,7 +269,7 @@ export class HostedAgentSources {
           this.#assertContext(context);
           const session = this.#options.store.getSession(context.sessionId).descriptor, target = this.#options.store.getTarget(context.target.id);
           const metadata = target.metadata, value = metadata !== null && typeof metadata === "object" && !Array.isArray(metadata) && "workspaceId" in metadata ? metadata.workspaceId : undefined;
-          const workspaceId = session.worktree?.workspaceId
+          const workspaceId = readWorkerWorkspaceBinding(this.#options.store, session.id)?.workspaceId ?? session.worktree?.workspaceId
             ?? (typeof value === "string" && value ? value : target.descriptor.id);
           return prepareSourceWorkspaceInput(input, context, { shadow, workspaceId, resources, assertCurrent: () => this.#assertContext(context),
             ...(peerWorkspaces.get(mcpKey(context)) ? { capturePath: (reference: string, directory: boolean, stageFile: boolean) => peerWorkspaces.get(mcpKey(context))!.captureInput(reference, directory, shadow,
@@ -480,6 +480,7 @@ function fromModel(model: contract.ModelDescriptor): ProviderModel {
     api: model.api, contextWindow: number(model.contextWindowTokens), maxOutputTokens: number(model.maximumOutputTokens),
     supportsImages: model.inputModalities.includes(contract.ModelInputModality.IMAGE), thinkingLevels: model.effortLevels.map(level => level.effortId),
     ...(model.defaultEffort === undefined ? {} : { defaultEffort: model.defaultEffort }), supportsFastMode: model.supportsFastMode,
+    supportsUltrafastMode: model.supportsUltrafastMode,
     ...(model.description === undefined ? {} : { description: model.description }),
     ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible }),
     ...(model.displayThinkingLevels.length ? { displayThinkingLevels: [...model.displayThinkingLevels] } : {}),
@@ -487,6 +488,7 @@ function fromModel(model: contract.ModelDescriptor): ProviderModel {
     ...(model.declaredModalities?.output === undefined ? {} : { declaredOutputModalities: [...model.declaredModalities.output.values] }),
     ...(model.declaredSupportsImages === undefined ? {} : { declaredSupportsImages: model.declaredSupportsImages }),
     ...(model.declaredSupportsFastMode === undefined ? {} : { declaredSupportsFastMode: model.declaredSupportsFastMode }),
+    ...(model.declaredSupportsUltrafastMode === undefined ? {} : { declaredSupportsUltrafastMode: model.declaredSupportsUltrafastMode }),
     ...(model.referenceApi === undefined ? {} : { referenceApi: model.referenceApi }),
     ...(["matching", "compatibility", "unknown"].includes(model.protocolMode ?? "") ? { protocolMode: model.protocolMode as ProviderModel["protocolMode"] } : {}),
     ...(["declared", "estimated"].includes(model.contextWindowSource ?? "") ? { contextWindowSource: model.contextWindowSource as "declared" | "estimated" } : {}),
@@ -497,3 +499,4 @@ function fromModel(model: contract.ModelDescriptor): ProviderModel {
     cost: { input: number(model.inputCostMicrosPerMillion) / 1_000_000, output: number(model.outputCostMicrosPerMillion) / 1_000_000,
       cacheRead: number(model.cacheReadCostMicrosPerMillion) / 1_000_000, cacheWrite: number(model.cacheWriteCostMicrosPerMillion) / 1_000_000 } };
 }
+import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";

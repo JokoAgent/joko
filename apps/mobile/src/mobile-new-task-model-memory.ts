@@ -44,5 +44,5 @@ function valid(value: unknown): value is MobileNewTaskSourceSelection {
   const row = value as Record<string, unknown>;
   return Object.keys(row).every(field => ["backendId", "providerId", "modelId", "effortId", "fastMode"].includes(field))
     && [row["backendId"], row["providerId"], row["modelId"]].every(id)
-    && (row["effortId"] === undefined || id(row["effortId"])) && typeof row["fastMode"] === "boolean";
+    && (row["effortId"] === undefined || id(row["effortId"])) && (typeof row["fastMode"] === "boolean" || row["fastMode"] === "ultrafast");
 }

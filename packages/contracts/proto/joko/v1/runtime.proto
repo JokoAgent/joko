@@ -404,6 +404,14 @@ message Session {
   // Service-owned activity facts; task summaries are navigation aids and must
   // not be reused as the completed reply or delivery ownership.
   SessionTaskActivity task_activity = 30;
+  // A service-owned local task directory within its approved project. This
+  // does not claim an isolated checkout lease owned by another Session.
+  SessionLocalWorkspace local_workspace = 31;
+}
+
+message SessionLocalWorkspace {
+  string workspace_id = 1;
+  string path = 2;
 }
 
 enum TaskCompletionNotification {

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { MobileModelSpeedControl } from "./MobileModelSpeedControl";
 import { partnerTaskModelMessages } from "@joko/contracts";
 import { Pressable, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { MobilePartnerPhotoPicker } from "./MobilePartnerPhotoPicker";
@@ -90,12 +91,9 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
                   {model?.efforts.map((effort) => <View key={effort.id}>{action(effort.label,
                     () => updateRoute(index, { ...route, effort: effort.id }), !capabilitiesEditable || !(snapshot.taskModels?.find(candidate => candidate.backendId === route.backendId && candidate.key === model?.key)?.canSetEffort ?? snapshot.canSetEffort), route.effort === effort.id)}</View>)}
                 </View>
-                <View style={styles.toggle}>
-                  <Text style={[styles.body, styles.grow, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.fast")}</Text>
-                  <Switch accessibilityLabel={`${mobileMessage(locale, "partnerProfile.fast")} ${index + 1}`} value={route.fastMode}
-                    disabled={!capabilitiesEditable || (!model?.supportsFastMode || !(snapshot.taskModels?.find(candidate => candidate.backendId === route.backendId && candidate.key === model?.key)?.canSetFastMode ?? snapshot.canSetFastMode)) && !route.fastMode}
-                    onValueChange={(fastMode) => updateRoute(index, { ...route, fastMode })} />
-                </View>
+                  <MobileModelSpeedControl value={route.fastMode} supportsFast={model?.supportsFastMode === true} supportsUltrafast={model?.supportsUltrafastMode}
+                    disabled={!capabilitiesEditable || !(snapshot.taskModels?.find(candidate => candidate.backendId === route.backendId && candidate.key === model?.key)?.canSetFastMode ?? snapshot.canSetFastMode)}
+                    colors={colors} locale={locale} onChange={fastMode => updateRoute(index, { ...route, fastMode })} />
                 {effective.modelChain.length > 1 && action(mobileMessage(locale, "partnerProfile.removeModel", { index: index + 1 }), () => {
                   change({ ...draft, capabilities: { ...draft.capabilities,
                     modelChain: draft.capabilities.modelChain.filter((_candidate, position) => position !== index) } }); setModelIndex(undefined);
@@ -139,9 +137,9 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
                     {model.efforts.map(effort => <View key={effort.id}>{action(`${m.effort}: ${effort.label}`, () => select({ ...route, effort: effort.id }),
                       !editable || !model.canSetEffort, effort.id === route.effort)}</View>)}
                   </View>}
-                  {(model?.supportsFastMode || route.fastMode) && <View style={styles.toggle}><Text style={[styles.body, styles.grow, { color: colors.ink }]}>{m.fast}</Text>
-                    <Switch accessibilityLabel={m.fast} value={route.fastMode} disabled={!editable || !model?.canSetFastMode || !model.supportsFastMode}
-                      onValueChange={fastMode => select({ ...route, fastMode })} /></View>}
+                    {(model?.supportsFastMode || model?.supportsUltrafastMode || route.fastMode) && <MobileModelSpeedControl value={route.fastMode}
+                      supportsFast={model?.supportsFastMode === true} supportsUltrafast={model?.supportsUltrafastMode} disabled={!editable || !model?.canSetFastMode}
+                      colors={colors} locale={locale} onChange={fastMode => select({ ...route, fastMode })} />}
                   {draft.taskModelOverride === undefined ? <Text style={[styles.body, { color: colors.ink }]}>{m.inheriting}</Text>
                     : action(m.inherit, () => select(undefined), !editable)}
                   <Text style={[styles.body, { color: colors.ink }]}>{m.help}</Text>

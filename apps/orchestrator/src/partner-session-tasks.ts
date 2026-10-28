@@ -22,7 +22,7 @@ function sameComputer(target: TargetDescriptor, home: TargetDescriptor): boolean
 }
 const activeStates = ["preparing", "queued", "running", "waiting"] as const;
 export type PartnerSessionTaskStatus = typeof activeStates[number] | "completed" | "failed" | "cancelled" | "timed-out" | "unknown";
-export interface TaskModelSelection { readonly id: string; readonly effort?: string; readonly fastMode?: boolean }
+export interface TaskModelSelection { readonly id: string; readonly effort?: string; readonly fastMode?: boolean | "ultrafast" }
 export interface StartPartnerSessionTask {
   readonly instruction: string; readonly title?: string; readonly workingDir?: string; readonly useWorktree?: boolean;
   readonly contextRefs?: readonly string[]; readonly timeoutMs?: number; readonly modelSelection?: TaskModelSelection;
@@ -147,7 +147,7 @@ export class PartnerSessionTaskManager {
         ...(model.thinkingLevels.length ? { effort: model.thinkingLevels.includes("medium") ? "medium" : model.thinkingLevels[0]! } : {}), fastMode: false };
       try {
         this.#resolveModel(sessionId, route).assertCurrent();
-        available.push({ id: routeId(route), ...route, name: model.displayName, efforts: model.thinkingLevels, supportsFastMode: model.supportsFastMode === true });
+        available.push({ id: routeId(route), ...route, name: model.displayName, efforts: model.thinkingLevels, supportsFastMode: model.supportsFastMode === true, supportsUltrafastMode: model.supportsUltrafastMode === true });
       } catch { /* Unavailable or disabled routes are never selectable. */ }
     }
     return { current: profile.taskModelOverride ?? this.host.getSessionRuntimeControl(sessionId).effective, partnerRevision: profile.revision.toString(), available };
@@ -580,7 +580,7 @@ function normalizeStart(input: StartPartnerSessionTask) {
   const modelSelection = input.modelSelection === undefined ? undefined : { id: bounded(input.modelSelection.id, 2048),
     ...(input.modelSelection.effort === undefined ? {} : { effort: bounded(input.modelSelection.effort, 64) }),
     ...(input.modelSelection.fastMode === undefined ? {} : { fastMode: input.modelSelection.fastMode }) };
-  if (modelSelection?.fastMode !== undefined && typeof modelSelection.fastMode !== "boolean") throw invalid("Fast mode must be a boolean.");
+  if (modelSelection?.fastMode !== undefined && typeof modelSelection.fastMode !== "boolean" && modelSelection.fastMode !== "ultrafast") throw invalid("The model speed is invalid.");
   return { instruction: bounded(input.instruction, 12_000), ...(input.title === undefined ? {} : { title: bounded(input.title, 120) }),
     ...(input.workingDir === undefined ? {} : { workingDir: bounded(input.workingDir, 1_024) }), useWorktree: input.useWorktree ?? false,
     contextRefs: contextRefs.map(value => bounded(value, 512)), timeoutMs, ...(modelSelection ? { modelSelection } : {}) };
@@ -610,5 +610,5 @@ function readRecord(value: unknown): PartnerSessionTaskRecord {
 function validRoute(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false; const route = value as Record<string, unknown>;
   return Object.keys(route).every(key => ["backendId", "providerId", "modelId", "effort", "fastMode"].includes(key))
-    && ["backendId", "providerId", "modelId"].every(key => typeof route[key] === "string" && route[key] !== "") && typeof route["fastMode"] === "boolean" && (route["effort"] === undefined || typeof route["effort"] === "string");
+    && ["backendId", "providerId", "modelId"].every(key => typeof route[key] === "string" && route[key] !== "") && (typeof route["fastMode"] === "boolean" || route["fastMode"] === "ultrafast") && (route["effort"] === undefined || typeof route["effort"] === "string");
 }

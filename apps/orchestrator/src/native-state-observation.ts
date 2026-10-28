@@ -38,7 +38,7 @@ export interface MaterializedNativeState {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: NativeSessionState["permissionMode"];
   readonly usage?: UsageSnapshot;
   readonly autoCompaction?: boolean;
@@ -155,7 +155,7 @@ function normalizeMaterializedNativeState(value: unknown): MaterializedNativeSta
   const permissionMode = value["permissionMode"];
   if (
     typeof streaming !== "boolean" || typeof compacting !== "boolean" ||
-    pendingMessages === undefined || typeof fastMode !== "boolean" ||
+    pendingMessages === undefined || (typeof fastMode !== "boolean" && fastMode !== "ultrafast") ||
     (permissionMode !== "ask" && permissionMode !== "auto" && permissionMode !== "acceptEdits" && permissionMode !== "bypassPermissions")
   ) throw new Error("Native state observation fields are invalid.");
   const nativeSessionId = optionalNativeIdentifier(value["nativeSessionId"]);

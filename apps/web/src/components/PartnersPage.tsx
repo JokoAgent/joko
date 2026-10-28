@@ -1,4 +1,5 @@
 import { Code, ConnectError } from "@connectrpc/connect";
+import { ModelSpeedControl } from "./ModelSpeedControl.js";
 import {
   Archive,
   ArrowDown,
@@ -1270,6 +1271,7 @@ function TaskModelEditor({ value, capabilities, snapshot, disabled, locale, onCh
   });
   const model = models.find(candidate => modelKey(candidate) === routeKey(route));
   const fastSupported = model?.supportsFast === true && snapshot.backends.find(candidate => candidate.id === route.backendId)?.capabilities.get("model.fast_mode")?.supported === true;
+  const ultrafastSupported = model?.supportsUltrafast === true && snapshot.backends.find(candidate => candidate.id === route.backendId)?.capabilities.get("model.fast_mode")?.supported === true;
   return <fieldset className="partner-capabilities" disabled={disabled}><legend>{m.title}</legend>
     <label className="field"><span>{m.choose}</span><SelectControl value={routeKey(route)} onChange={event => {
       const next = models.find(candidate => modelKey(candidate) === event.target.value); if (next) onChange(routeForModel(next));
@@ -1277,8 +1279,9 @@ function TaskModelEditor({ value, capabilities, snapshot, disabled, locale, onCh
       {models.map(candidate => <option key={modelKey(candidate)} value={modelKey(candidate)}>{candidate.providerName} · {candidate.name}</option>)}</SelectControl></label>
     {model !== undefined && model.efforts.length > 0 && <label className="field"><span>{m.effort}</span><SelectControl value={route.effort ?? ""}
       onChange={event => onChange({ ...route, effort: event.target.value })}>{model.efforts.map(effort => <option value={effort} key={effort}>{effort}</option>)}</SelectControl></label>}
-    {(fastSupported || route.fastMode) && <label className="partner-route-check"><CheckboxControl checked={route.fastMode}
-      disabled={!fastSupported} onChange={event => onChange({ ...route, fastMode: event.target.checked })} /><span>{m.fast}</span></label>}
+    {(fastSupported || ultrafastSupported || route.fastMode) && <ModelSpeedControl className="partner-route-check" value={route.fastMode}
+      supportsFast={fastSupported} supportsUltrafast={ultrafastSupported} locale={locale} disabled={disabled}
+      onChange={fastMode => onChange({ ...route, fastMode })} />}
     {value === undefined ? <p className="muted">{m.inheriting}</p> : <Button tone="ghost" onClick={() => onChange(undefined)}>{m.inherit}</Button>}
     <p className="muted">{m.help}</p>
   </fieldset>;
@@ -1338,7 +1341,9 @@ function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: 
         <span className="partner-model-route__number">{index + 1}</span>
         <label className="field"><span>{index === 0 ? t("partners.primaryModel") : t("partners.fallbackModel")}</span><SelectControl value={routeKey(route)} onChange={(event) => selectModel(index, event.target.value)}>{model === undefined && <option value={routeKey(route)}>{route.providerId} · {route.modelId}</option>}{options.map((candidate) => <option key={modelKey(candidate)} value={modelKey(candidate)} disabled={!canSelectModel(candidate, index) || value.modelChain.some((used, usedIndex) => usedIndex !== index && routeKey(used) === modelKey(candidate))}>{modelLabel(candidate)}</option>)}</SelectControl></label>
         {model !== undefined && model.efforts.length > 0 && <label className="field"><span>{t("controls.effort")}</span><SelectControl value={route.effort ?? ""} onChange={(event) => replaceRoute(index, { ...route, effort: event.target.value })}>{model.efforts.map((effort) => <option value={effort} key={effort}>{effort}</option>)}</SelectControl></label>}
-        {model?.supportsFast === true && <label className="partner-route-check"><CheckboxControl checked={route.fastMode} onChange={(event) => replaceRoute(index, { ...route, fastMode: event.target.checked })} /><span>{t("controls.fast")}</span></label>}
+        {model && (model.supportsFast || model.supportsUltrafast) && <ModelSpeedControl className="partner-route-check" value={route.fastMode}
+          supportsFast={model.supportsFast} supportsUltrafast={model.supportsUltrafast} disabled={disabled} t={t}
+          onChange={fastMode => replaceRoute(index, { ...route, fastMode })} />}
         {index > 0 && <div className="partner-model-route__actions">
           <IconButton label={t("partners.moveFallbackUp")} disabled={disabled || index === 1} onClick={() => moveFallback(index, -1)}><ArrowUp aria-hidden="true" /></IconButton>
           <IconButton label={t("partners.moveFallbackDown")} disabled={disabled || index === value.modelChain.length - 1} onClick={() => moveFallback(index, 1)}><ArrowDown aria-hidden="true" /></IconButton>
@@ -1425,7 +1430,7 @@ function partnerCapabilitiesAvailable(value: PartnerCapabilitiesView, snapshot: 
     return model !== undefined && backend?.capabilities.get("permission.modes")?.supported === true
       && backend.capabilities.get("permission.modes")?.options.includes(value.permissionMode) === true
       && (route.effort === undefined || model.efforts.includes(route.effort))
-      && (!route.fastMode || model.supportsFast === true && backend.capabilities.get("model.fast_mode")?.supported === true)
+      && (!route.fastMode || (route.fastMode === "ultrafast" ? model.supportsUltrafast === true : model.supportsFast) && backend.capabilities.get("model.fast_mode")?.supported === true)
       && (!value.planMode || backend.capabilities.get("plan_mode")?.supported === true);
   });
 }

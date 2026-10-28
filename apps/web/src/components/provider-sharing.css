@@ -11,3 +11,12 @@
 .provider-sharing-code { display: block; font-family: var(--font-mono); font-size: 28px; font-weight: 600; letter-spacing: .25em; font-variant-numeric: tabular-nums; }
 .provider-sharing-settings .provider-sharing-compare { display: flex; align-items: center; gap: var(--settings-row-gap); }
 @media (max-width: 640px) { .provider-sharing-settings .settings-actions > button { max-width: 100%; white-space: normal; } }
+.remote-model-access { padding: 12px 0; }
+.remote-model-access summary { cursor: pointer; }
+.remote-model-access form { display: grid; gap: 12px; }
+.remote-model-access label { display: flex; align-items: flex-start; gap: 8px; }
+.remote-model-access input[type="checkbox"], .provider-sharing-insights input[type="checkbox"] { width: auto; flex: 0 0 auto; }
+.remote-model-access__models { max-height: 18rem; overflow: auto; display: grid; gap: 8px; }
+.remote-model-access__models span, .remote-model-access__models small { overflow-wrap: anywhere; }
+.remote-model-access__models small { display: block; }
+.provider-sharing-insights { display: grid; gap: 12px; overflow-wrap: anywhere; }

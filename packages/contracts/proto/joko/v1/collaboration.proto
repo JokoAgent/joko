@@ -81,6 +81,21 @@ message CollaborationWorkerRoute {
   bool fast_mode = 6;
   PermissionMode permission_mode = 7;
   bool plan_mode = 8;
+  bool ultrafast_mode = 9;
+}
+
+// The selected Target remains the Project Trust boundary. A local directory
+// must belong to that project or the lead's exact current checkout.
+message CollaborationWorkerWorkspaceRequest {
+  optional string working_directory = 1;
+  bool create_worktree = 2;
+  optional string source_ref = 3;
+}
+
+message CollaborationWorkerWorkspace {
+  string working_directory = 1;
+  optional string worktree_path = 2;
+  optional string source_ref = 3;
 }
 
 message CollaborationWorker {
@@ -103,6 +118,7 @@ message CollaborationWorker {
   google.protobuf.Timestamp created_at = 17;
   google.protobuf.Timestamp updated_at = 18;
   Revision revision = 19;
+  CollaborationWorkerWorkspace workspace = 20;
 }
 
 message CollaborationDispatch {
@@ -197,6 +213,8 @@ message CreateCollaborationWorkerRequest {
   bool fast_mode = 13;
   PermissionMode permission_mode = 14;
   bool plan_mode = 15;
+  CollaborationWorkerWorkspaceRequest workspace = 16;
+  bool ultrafast_mode = 17;
 }
 
 message CreateCollaborationWorkerResponse {

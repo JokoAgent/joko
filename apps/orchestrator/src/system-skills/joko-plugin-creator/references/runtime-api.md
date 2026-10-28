@@ -83,6 +83,37 @@ const accepted = await joko.agent.run({mode:"continue",
 task selector or permanent continuation grant. New managed tasks instead use the
 separately declared [tasks API](tasks.md).
 
+## Encrypted exchange with another Desktop
+
+Declare `runtime.deviceSync:true` and obtain its independent installation
+permission. The resident `joko.deviceSync` API is available only to that approved
+runtime. `await joko.deviceSync.status()` returns current authorized Desktop
+peers, their `deviceId`/`deviceName`, and `maxBytes`. A device route, permission or
+installed package change can retire the result; resolve the peer again for new work.
+
+```js
+const result = await joko.deviceSync.request(peer.deviceId, {operationId, changes});
+if (!result.ok) {
+  // SYNC_RESULT_UNKNOWN means a remote effect may have happened. Query or
+  // reconcile the original operationId in your own application protocol.
+  return;
+}
+joko.onHostMessage(async event => {
+  if (event.type !== "device-sync-request") return;
+  const result = await reconcileIdempotently(event.data);
+  await joko.deviceSync.reply(event.requestId, result);
+});
+```
+
+Only the same installed package entry and verified acquisition namespace can
+receive the request. Local packages use the explicitly approved local namespace.
+Payloads are opaque JSON within a 64 KiB packet, with two concurrent exchanges
+per plugin, 32 in total and a 30 second deadline. A reply must use the delivered
+request ID. Host errors preserve stable `errorCode` values; the host never
+retries an unknown delivery. The plugin owns persistence, merge rules and
+business idempotency. Neither side receives file access, task history, model
+execution, another plugin's Library or the other device's credentials.
+
 ## Private runtime storage and locale
 
 The resident page may GET `/kv` for its plugin-scoped JSON object and PUT `/kv`

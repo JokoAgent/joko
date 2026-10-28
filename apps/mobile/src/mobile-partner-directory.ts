@@ -1,5 +1,6 @@
 import { projectMobilePartnerAvatar, type MobilePartnerAvatarValue } from "./mobile-partner-avatar";
 import { projectPartnerDeletion } from "@joko/contracts";
+import { decodeModelSpeed } from "@joko/contracts";
 import { projectPartnerRestart } from "@joko/contracts";
 import {
   PartnerInitializationErrorCode,
@@ -29,7 +30,7 @@ export interface MobilePartnerModelRoute {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 export interface MobilePartnerCapabilities {
@@ -270,7 +271,7 @@ function projectMobilePartnerModelRoute(route: NonNullable<PartnerCapabilities>[
     providerId: id(route.providerId, "Partner Provider ID"),
     modelId: label(route.modelId, 128, "Partner model ID"),
     ...(route.effort === undefined ? {} : { effort: label(route.effort, 64, "Partner effort") }),
-    fastMode: route.fastMode
+    fastMode: decodeModelSpeed(route)
   };
 }
 

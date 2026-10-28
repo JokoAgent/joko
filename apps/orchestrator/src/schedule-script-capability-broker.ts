@@ -206,7 +206,7 @@ function scheduleCreationSnapshot(value: unknown): {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
 } {
@@ -220,7 +220,7 @@ function scheduleCreationSnapshot(value: unknown): {
   return {
     ...((providerId === undefined || modelId === undefined) ? {} : { providerId, modelId }),
     ...(effort === undefined ? {} : { effort }),
-    fastMode: record["fastMode"] === true,
+    fastMode: record["fastMode"] === "ultrafast" ? "ultrafast" : record["fastMode"] === true,
     permissionMode,
     planMode: record["planMode"] === true
   };

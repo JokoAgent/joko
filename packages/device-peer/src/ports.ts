@@ -24,6 +24,7 @@ import {
 /** Present only when an actual Orchestrator owns native Agent factories.
  * A generic file/process agent must not advertise or emulate this service. */
 export interface DevicePeerNativeAgentPort {
+  readonly supportsExtensionSync?: boolean;
   invoke(method: HostedAgentPeerMethod, request: Uint8Array, signal: AbortSignal,
     authority: { readonly controllerDeviceId: string }): Promise<Uint8Array>;
   /** Retires only the native authority owned by this exact route instance. */

@@ -4,9 +4,9 @@
 
 import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
-import type { ModelDescriptor } from "./model_pb.js";
+import type { ModelDescriptor, ProviderAccountUsageSnapshot } from "./model_pb.js";
 import { file_joko_v1_model } from "./model_pb.js";
-import type { GetHostedAgentCatalogResponse } from "./hosted_agent_pb.js";
+import type { GetHostedAgentCatalogResponse, HostedAgentModelAccess } from "./hosted_agent_pb.js";
 import { file_joko_v1_hosted_agent } from "./hosted_agent_pb.js";
 import type { Message } from "@bufbuild/protobuf";
 
@@ -14,7 +14,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/provider_sharing.proto.
  */
 export const file_joko_v1_provider_sharing: GenFile = /*@__PURE__*/
-  fileDesc("Ch5qb2tvL3YxL3Byb3ZpZGVyX3NoYXJpbmcucHJvdG8SB2pva28udjEiTQoVUHJvdmlkZXJTaGFyaW5nUGVyc29uEgwKBG5hbWUYASABKAkSFwoKYXZhdGFyX3VybBgCIAEoCUgAiAEBQg0KC19hdmF0YXJfdXJsIqwBChVQcm92aWRlclNoYXJpbmdNZW1iZXISEQoJbWVtYmVyX2lkGAEgASgJEhIKCmdlbmVyYXRpb24YAiABKAQSLgoGcGVyc29uGAMgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdQZXJzb24SDgoGc3RhdHVzGAQgASgJEhQKDGpvaW5lZF9hdF9tcxgFIAEoBBIWCg5ob21lX3NlcnZlcl9pZBgGIAEoCSL5AQoWUHJvdmlkZXJTaGFyaW5nUmVxdWVzdBISCgpyZXF1ZXN0X2lkGAEgASgJEhAKCHNoYXJlX2lkGAIgASgJEg8KB2xpbmtfaWQYAyABKAkSLgoGcGVyc29uGAQgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdQZXJzb24SFAoMcGFpcmluZ19jb2RlGAUgASgJEg4KBnN0YXR1cxgGIAEoCRIVCg1jcmVhdGVkX2F0X21zGAcgASgEEhUKDWV4cGlyZXNfYXRfbXMYCCABKAQSFgoJbWVtYmVyX2lkGAkgASgJSACIAQFCDAoKX21lbWJlcl9pZCLvAQoWUHJvdmlkZXJTaGFyaW5nUmVzaGFyZRIKCgJpZBgBIAEoCRIQCghzaGFyZV9pZBgCIAEoCRIRCgltZW1iZXJfaWQYAyABKAkSEQoJZGV2aWNlX2lkGAQgASgJEgsKA2tleRgFIAEoCRIuCgZwZXJzb24YBiABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1BlcnNvbhINCgVzdGF0ZRgHIAEoCRIXCg9yZXF1ZXN0ZWRfYXRfbXMYCCABKAQSGgoNZGVjaWRlZF9hdF9tcxgJIAEoBEgAiAEBQhAKDl9kZWNpZGVkX2F0X21zItQCChRQcm92aWRlclNoYXJpbmdPd25lZBIQCghzaGFyZV9pZBgBIAEoCRISCgpnZW5lcmF0aW9uGAIgASgEEhIKCmJhY2tlbmRfaWQYAyABKAkSEwoLcHJvdmlkZXJfaWQYBCABKAkSFQoNcHJvdmlkZXJfbmFtZRgFIAEoCRItCgVvd25lchgGIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUGVyc29uEhAKCHJldmlzaW9uGAcgASgEEi8KB21lbWJlcnMYCCADKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ01lbWJlchIxCghyZXF1ZXN0cxgJIAMoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVxdWVzdBIxCghyZXNoYXJlcxgKIAMoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVzaGFyZSLsAQoWUHJvdmlkZXJTaGFyaW5nUHJldmlldxITCgtob3N0X29yaWdpbhgBIAEoCRIWCg5ob3N0X3NlcnZlcl9pZBgCIAEoCRIQCghzaGFyZV9pZBgDIAEoCRISCgpiYWNrZW5kX2lkGAQgASgJEhMKC3Byb3ZpZGVyX2lkGAUgASgJEhUKDXByb3ZpZGVyX25hbWUYBiABKAkSLQoFb3duZXIYByABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1BlcnNvbhINCgVzdGF0ZRgIIAEoCRIVCg1leHBpcmVzX2F0X21zGAkgASgEItMCChdQcm92aWRlclNoYXJpbmdSZWNlaXZlZBIPCgdqb2luX2lkGAEgASgJEhMKC2hvc3Rfb3JpZ2luGAIgASgJEhYKDmhvc3Rfc2VydmVyX2lkGAMgASgJEhAKCHNoYXJlX2lkGAQgASgJEhEKCW1lbWJlcl9pZBgFIAEoCRISCgpnZW5lcmF0aW9uGAYgASgEEhIKCmJhY2tlbmRfaWQYByABKAkSGQoRbmF0aXZlX2JhY2tlbmRfaWQYCCABKAkSEwoLcHJvdmlkZXJfaWQYCSABKAkSFQoNcHJvdmlkZXJfbmFtZRgKIAEoCRItCgVvd25lchgLIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUGVyc29uEg0KBXN0YXRlGAwgASgJEigKBm1vZGVscxgNIAMoCzIYLmpva28udjEuTW9kZWxEZXNjcmlwdG9yIsYBChVQcm92aWRlclNoYXJpbmdJbnRlbnQSFAoMb3BlcmF0aW9uX2lkGAEgASgJEg8KB2pvaW5faWQYAiABKAkSDgoGc3RhdHVzGAMgASgJEhIKCmVycm9yX2NvZGUYBCABKAkSMAoHcHJldmlldxgFIAEoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUHJldmlldxIwCgdyZXF1ZXN0GAYgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdSZXF1ZXN0IhsKGUxpc3RQcm92aWRlclNoYXJlc1JlcXVlc3QirwEKGkxpc3RQcm92aWRlclNoYXJlc1Jlc3BvbnNlEiwKBW93bmVkGAEgAygLMh0uam9rby52MS5Qcm92aWRlclNoYXJpbmdPd25lZBIyCghyZWNlaXZlZBgCIAMoCzIgLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVjZWl2ZWQSLwoHaW50ZW50cxgDIAMoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nSW50ZW50IqUBCh5DcmVhdGVQcm92aWRlclNoYXJlTGlua1JlcXVlc3QSFAoMb3BlcmF0aW9uX2lkGAEgASgJEhIKCmJhY2tlbmRfaWQYAiABKAkSEwoLcHJvdmlkZXJfaWQYAyABKAkSFQoNcHJvdmlkZXJfbmFtZRgEIAEoCRItCgVvd25lchgFIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUGVyc29uIoUBCh9DcmVhdGVQcm92aWRlclNoYXJlTGlua1Jlc3BvbnNlEgwKBGxpbmsYASABKAkSDwoHbGlua19pZBgCIAEoCRIVCg1leHBpcmVzX2F0X21zGAMgASgEEiwKBXNoYXJlGAQgASgLMh0uam9rby52MS5Qcm92aWRlclNoYXJpbmdPd25lZCJeCiFEZWNpZGVQcm92aWRlclNoYXJlUmVxdWVzdFJlcXVlc3QSFAoMb3BlcmF0aW9uX2lkGAEgASgJEhIKCnJlcXVlc3RfaWQYAiABKAkSDwoHYXBwcm92ZRgDIAEoCCJ+Ch1TZXRQcm92aWRlclNoYXJlTWVtYmVyUmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSEAoIc2hhcmVfaWQYAiABKAkSEQoJbWVtYmVyX2lkGAMgASgJEhIKCmdlbmVyYXRpb24YBCABKAQSDgoGYWN0aW9uGAUgASgJIlEKHERlY2lkZVByb3ZpZGVyUmVzaGFyZVJlcXVlc3QSFAoMb3BlcmF0aW9uX2lkGAEgASgJEgoKAmlkGAIgASgJEg8KB2FwcHJvdmUYAyABKAgiUgoiRGVjaWRlUHJvdmlkZXJTaGFyZVJlcXVlc3RSZXNwb25zZRIsCgVzaGFyZRgBIAEoCzIdLmpva28udjEuUHJvdmlkZXJTaGFyaW5nT3duZWQiTgoeU2V0UHJvdmlkZXJTaGFyZU1lbWJlclJlc3BvbnNlEiwKBXNoYXJlGAEgASgLMh0uam9rby52MS5Qcm92aWRlclNoYXJpbmdPd25lZCJNCh1EZWNpZGVQcm92aWRlclJlc2hhcmVSZXNwb25zZRIsCgVzaGFyZRgBIAEoCzIdLmpva28udjEuUHJvdmlkZXJTaGFyaW5nT3duZWQiKwobUHJldmlld1Byb3ZpZGVyU2hhcmVSZXF1ZXN0EgwKBGxpbmsYASABKAkiUAocUHJldmlld1Byb3ZpZGVyU2hhcmVSZXNwb25zZRIwCgdwcmV2aWV3GAEgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdQcmV2aWV3Im8KGUFwcGx5UHJvdmlkZXJTaGFyZVJlcXVlc3QSFAoMb3BlcmF0aW9uX2lkGAEgASgJEgwKBGxpbmsYAiABKAkSLgoGcGVyc29uGAMgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdQZXJzb24iTAoaQXBwbHlQcm92aWRlclNoYXJlUmVzcG9uc2USLgoGaW50ZW50GAEgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdJbnRlbnQiHwodUmVmcmVzaFByb3ZpZGVyU2hhcmluZ1JlcXVlc3QiswEKHlJlZnJlc2hQcm92aWRlclNoYXJpbmdSZXNwb25zZRIsCgVvd25lZBgBIAMoCzIdLmpva28udjEuUHJvdmlkZXJTaGFyaW5nT3duZWQSMgoIcmVjZWl2ZWQYAiADKAsyIC5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1JlY2VpdmVkEi8KB2ludGVudHMYAyADKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ0ludGVudCJMChxXaXRoZHJhd1Byb3ZpZGVyU2hhcmVSZXF1ZXN0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIWCg5hcHBsaWNhdGlvbl9pZBgCIAEoCSJPCh1XaXRoZHJhd1Byb3ZpZGVyU2hhcmVSZXNwb25zZRIuCgZpbnRlbnQYASABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ0ludGVudCJKCiFMZWF2ZVJlY2VpdmVkUHJvdmlkZXJTaGFyZVJlcXVlc3QSFAoMb3BlcmF0aW9uX2lkGAEgASgJEg8KB2pvaW5faWQYAiABKAkiWAoiTGVhdmVSZWNlaXZlZFByb3ZpZGVyU2hhcmVSZXNwb25zZRIyCghyZWNlaXZlZBgBIAEoCzIgLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVjZWl2ZWQiMQobSW5zcGVjdFByb3ZpZGVyU2hhcmVSZXF1ZXN0EhIKCmludml0YXRpb24YASABKAkiUAocSW5zcGVjdFByb3ZpZGVyU2hhcmVSZXNwb25zZRIwCgdwcmV2aWV3GAEgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdQcmV2aWV3IuEBCiFTdWJtaXRQcm92aWRlclNoYXJlUmVxdWVzdFJlcXVlc3QSEgoKcmVxdWVzdF9pZBgBIAEoCRISCgppbnZpdGF0aW9uGAIgASgJEhYKDmhvbWVfc2VydmVyX2lkGAMgASgJEhEKCWRldmljZV9pZBgEIAEoCRIuCgZwZXJzb24YBSABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1BlcnNvbhIaChJyZXF1ZXN0X3NoYTI1Nl9oZXgYBiABKAkSHQoVY3JlZGVudGlhbF9zaGEyNTZfaGV4GAcgASgJIrgBCiJTdWJtaXRQcm92aWRlclNoYXJlUmVxdWVzdFJlc3BvbnNlEjAKB3JlcXVlc3QYASABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1JlcXVlc3QSLgoGbWVtYmVyGAIgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdNZW1iZXISMAoHcHJldmlldxgDIAEoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUHJldmlldyI0Ch5HZXRQcm92aWRlclNoYXJlUmVxdWVzdFJlcXVlc3QSEgoKcmVxdWVzdF9pZBgBIAEoCSK1AQofR2V0UHJvdmlkZXJTaGFyZVJlcXVlc3RSZXNwb25zZRIwCgdyZXF1ZXN0GAEgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdSZXF1ZXN0Ei4KBm1lbWJlchgCIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nTWVtYmVyEjAKB3ByZXZpZXcYAyABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1ByZXZpZXciTwojV2l0aGRyYXdQcm92aWRlclNoYXJlUmVxdWVzdFJlcXVlc3QSFAoMb3BlcmF0aW9uX2lkGAEgASgJEhIKCnJlcXVlc3RfaWQYAiABKAkiugEKJFdpdGhkcmF3UHJvdmlkZXJTaGFyZVJlcXVlc3RSZXNwb25zZRIwCgdyZXF1ZXN0GAEgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdSZXF1ZXN0Ei4KBm1lbWJlchgCIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nTWVtYmVyEjAKB3ByZXZpZXcYAyABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1ByZXZpZXciLAoYUmVhZFByb3ZpZGVyU2hhcmVSZXF1ZXN0EhAKCHNoYXJlX2lkGAEgASgJIrQBChlSZWFkUHJvdmlkZXJTaGFyZVJlc3BvbnNlEi4KBXNoYXJlGAEgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdQcmV2aWV3Ei4KBm1lbWJlchgCIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nTWVtYmVyEjcKB2NhdGFsb2cYAyABKAsyJi5qb2tvLnYxLkdldEhvc3RlZEFnZW50Q2F0YWxvZ1Jlc3BvbnNlIkMKGUxlYXZlUHJvdmlkZXJTaGFyZVJlcXVlc3QSFAoMb3BlcmF0aW9uX2lkGAEgASgJEhAKCHNoYXJlX2lkGAIgASgJIrUBChpMZWF2ZVByb3ZpZGVyU2hhcmVSZXNwb25zZRIuCgVzaGFyZRgBIAEoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUHJldmlldxIuCgZtZW1iZXIYAiABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ01lbWJlchI3CgdjYXRhbG9nGAMgASgLMiYuam9rby52MS5HZXRIb3N0ZWRBZ2VudENhdGFsb2dSZXNwb25zZSJNCiNHZXRQcm92aWRlclNoYXJlTGVhdmVSZWNlaXB0UmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSEAoIc2hhcmVfaWQYAiABKAkivwEKJEdldFByb3ZpZGVyU2hhcmVMZWF2ZVJlY2VpcHRSZXNwb25zZRIuCgVzaGFyZRgBIAEoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUHJldmlldxIuCgZtZW1iZXIYAiABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ01lbWJlchI3CgdjYXRhbG9nGAMgASgLMiYuam9rby52MS5HZXRIb3N0ZWRBZ2VudENhdGFsb2dSZXNwb25zZSJaChtQcm92aWRlclNoYXJpbmdSZXNoYXJlRW50cnkSCwoDa2V5GAEgASgJEi4KBnBlcnNvbhgCIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUGVyc29uIkcKG1Byb3ZpZGVyU2hhcmluZ1Jlc2hhcmVCYXRjaBIKCgJpZBgBIAEoCRINCgVpbmRleBgCIAEoDRINCgVjb3VudBgDIAEoDSKJAQobU3luY1Byb3ZpZGVyUmVzaGFyZXNSZXF1ZXN0EjUKB2VudHJpZXMYASADKAsyJC5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1Jlc2hhcmVFbnRyeRIzCgViYXRjaBgCIAEoCzIkLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVzaGFyZUJhdGNoIjkKG1Byb3ZpZGVyU2hhcmluZ1Jlc2hhcmVTdGF0ZRILCgNrZXkYASABKAkSDQoFc3RhdGUYAiABKAkinAEKHFN5bmNQcm92aWRlclJlc2hhcmVzUmVzcG9uc2USNQoHZW50cmllcxgBIAMoCzIkLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVzaGFyZVN0YXRlEjMKBWJhdGNoGAIgASgLMiQuam9rby52MS5Qcm92aWRlclNoYXJpbmdSZXNoYXJlQmF0Y2gSEAoIY29tcGxldGUYAyABKAgiLgocQ2xvc2VQcm92aWRlclNoYXJlUnVuUmVxdWVzdBIOCgZydW5faWQYASABKAkiHwodQ2xvc2VQcm92aWRlclNoYXJlUnVuUmVzcG9uc2UyvQgKFlByb3ZpZGVyU2hhcmluZ1NlcnZpY2USXQoSTGlzdFByb3ZpZGVyU2hhcmVzEiIuam9rby52MS5MaXN0UHJvdmlkZXJTaGFyZXNSZXF1ZXN0GiMuam9rby52MS5MaXN0UHJvdmlkZXJTaGFyZXNSZXNwb25zZRJsChdDcmVhdGVQcm92aWRlclNoYXJlTGluaxInLmpva28udjEuQ3JlYXRlUHJvdmlkZXJTaGFyZUxpbmtSZXF1ZXN0Giguam9rby52MS5DcmVhdGVQcm92aWRlclNoYXJlTGlua1Jlc3BvbnNlEnUKGkRlY2lkZVByb3ZpZGVyU2hhcmVSZXF1ZXN0Eiouam9rby52MS5EZWNpZGVQcm92aWRlclNoYXJlUmVxdWVzdFJlcXVlc3QaKy5qb2tvLnYxLkRlY2lkZVByb3ZpZGVyU2hhcmVSZXF1ZXN0UmVzcG9uc2USaQoWU2V0UHJvdmlkZXJTaGFyZU1lbWJlchImLmpva28udjEuU2V0UHJvdmlkZXJTaGFyZU1lbWJlclJlcXVlc3QaJy5qb2tvLnYxLlNldFByb3ZpZGVyU2hhcmVNZW1iZXJSZXNwb25zZRJmChVEZWNpZGVQcm92aWRlclJlc2hhcmUSJS5qb2tvLnYxLkRlY2lkZVByb3ZpZGVyUmVzaGFyZVJlcXVlc3QaJi5qb2tvLnYxLkRlY2lkZVByb3ZpZGVyUmVzaGFyZVJlc3BvbnNlEmMKFFByZXZpZXdQcm92aWRlclNoYXJlEiQuam9rby52MS5QcmV2aWV3UHJvdmlkZXJTaGFyZVJlcXVlc3QaJS5qb2tvLnYxLlByZXZpZXdQcm92aWRlclNoYXJlUmVzcG9uc2USXQoSQXBwbHlQcm92aWRlclNoYXJlEiIuam9rby52MS5BcHBseVByb3ZpZGVyU2hhcmVSZXF1ZXN0GiMuam9rby52MS5BcHBseVByb3ZpZGVyU2hhcmVSZXNwb25zZRJpChZSZWZyZXNoUHJvdmlkZXJTaGFyaW5nEiYuam9rby52MS5SZWZyZXNoUHJvdmlkZXJTaGFyaW5nUmVxdWVzdBonLmpva28udjEuUmVmcmVzaFByb3ZpZGVyU2hhcmluZ1Jlc3BvbnNlEmYKFVdpdGhkcmF3UHJvdmlkZXJTaGFyZRIlLmpva28udjEuV2l0aGRyYXdQcm92aWRlclNoYXJlUmVxdWVzdBomLmpva28udjEuV2l0aGRyYXdQcm92aWRlclNoYXJlUmVzcG9uc2USdQoaTGVhdmVSZWNlaXZlZFByb3ZpZGVyU2hhcmUSKi5qb2tvLnYxLkxlYXZlUmVjZWl2ZWRQcm92aWRlclNoYXJlUmVxdWVzdBorLmpva28udjEuTGVhdmVSZWNlaXZlZFByb3ZpZGVyU2hhcmVSZXNwb25zZTLpBwobUHJvdmlkZXJTaGFyaW5nR3Vlc3RTZXJ2aWNlEmMKFEluc3BlY3RQcm92aWRlclNoYXJlEiQuam9rby52MS5JbnNwZWN0UHJvdmlkZXJTaGFyZVJlcXVlc3QaJS5qb2tvLnYxLkluc3BlY3RQcm92aWRlclNoYXJlUmVzcG9uc2USdQoaU3VibWl0UHJvdmlkZXJTaGFyZVJlcXVlc3QSKi5qb2tvLnYxLlN1Ym1pdFByb3ZpZGVyU2hhcmVSZXF1ZXN0UmVxdWVzdBorLmpva28udjEuU3VibWl0UHJvdmlkZXJTaGFyZVJlcXVlc3RSZXNwb25zZRJsChdHZXRQcm92aWRlclNoYXJlUmVxdWVzdBInLmpva28udjEuR2V0UHJvdmlkZXJTaGFyZVJlcXVlc3RSZXF1ZXN0Giguam9rby52MS5HZXRQcm92aWRlclNoYXJlUmVxdWVzdFJlc3BvbnNlEnsKHFdpdGhkcmF3UHJvdmlkZXJTaGFyZVJlcXVlc3QSLC5qb2tvLnYxLldpdGhkcmF3UHJvdmlkZXJTaGFyZVJlcXVlc3RSZXF1ZXN0Gi0uam9rby52MS5XaXRoZHJhd1Byb3ZpZGVyU2hhcmVSZXF1ZXN0UmVzcG9uc2USWgoRUmVhZFByb3ZpZGVyU2hhcmUSIS5qb2tvLnYxLlJlYWRQcm92aWRlclNoYXJlUmVxdWVzdBoiLmpva28udjEuUmVhZFByb3ZpZGVyU2hhcmVSZXNwb25zZRJdChJMZWF2ZVByb3ZpZGVyU2hhcmUSIi5qb2tvLnYxLkxlYXZlUHJvdmlkZXJTaGFyZVJlcXVlc3QaIy5qb2tvLnYxLkxlYXZlUHJvdmlkZXJTaGFyZVJlc3BvbnNlEnsKHEdldFByb3ZpZGVyU2hhcmVMZWF2ZVJlY2VpcHQSLC5qb2tvLnYxLkdldFByb3ZpZGVyU2hhcmVMZWF2ZVJlY2VpcHRSZXF1ZXN0Gi0uam9rby52MS5HZXRQcm92aWRlclNoYXJlTGVhdmVSZWNlaXB0UmVzcG9uc2USYwoUU3luY1Byb3ZpZGVyUmVzaGFyZXMSJC5qb2tvLnYxLlN5bmNQcm92aWRlclJlc2hhcmVzUmVxdWVzdBolLmpva28udjEuU3luY1Byb3ZpZGVyUmVzaGFyZXNSZXNwb25zZRJmChVDbG9zZVByb3ZpZGVyU2hhcmVSdW4SJS5qb2tvLnYxLkNsb3NlUHJvdmlkZXJTaGFyZVJ1blJlcXVlc3QaJi5qb2tvLnYxLkNsb3NlUHJvdmlkZXJTaGFyZVJ1blJlc3BvbnNlYgZwcm90bzM", [file_joko_v1_model, file_joko_v1_hosted_agent]);
+  fileDesc("Ch5qb2tvL3YxL3Byb3ZpZGVyX3NoYXJpbmcucHJvdG8SB2pva28udjEiTQoVUHJvdmlkZXJTaGFyaW5nUGVyc29uEgwKBG5hbWUYASABKAkSFwoKYXZhdGFyX3VybBgCIAEoCUgAiAEBQg0KC19hdmF0YXJfdXJsIuMBChVQcm92aWRlclNoYXJpbmdNZW1iZXISEQoJbWVtYmVyX2lkGAEgASgJEhIKCmdlbmVyYXRpb24YAiABKAQSLgoGcGVyc29uGAMgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdQZXJzb24SDgoGc3RhdHVzGAQgASgJEhQKDGpvaW5lZF9hdF9tcxgFIAEoBBIWCg5ob21lX3NlcnZlcl9pZBgGIAEoCRI1Cgxtb2RlbF9hY2Nlc3MYByABKAsyHy5qb2tvLnYxLkhvc3RlZEFnZW50TW9kZWxBY2Nlc3Mi+QEKFlByb3ZpZGVyU2hhcmluZ1JlcXVlc3QSEgoKcmVxdWVzdF9pZBgBIAEoCRIQCghzaGFyZV9pZBgCIAEoCRIPCgdsaW5rX2lkGAMgASgJEi4KBnBlcnNvbhgEIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUGVyc29uEhQKDHBhaXJpbmdfY29kZRgFIAEoCRIOCgZzdGF0dXMYBiABKAkSFQoNY3JlYXRlZF9hdF9tcxgHIAEoBBIVCg1leHBpcmVzX2F0X21zGAggASgEEhYKCW1lbWJlcl9pZBgJIAEoCUgAiAEBQgwKCl9tZW1iZXJfaWQi7wEKFlByb3ZpZGVyU2hhcmluZ1Jlc2hhcmUSCgoCaWQYASABKAkSEAoIc2hhcmVfaWQYAiABKAkSEQoJbWVtYmVyX2lkGAMgASgJEhEKCWRldmljZV9pZBgEIAEoCRILCgNrZXkYBSABKAkSLgoGcGVyc29uGAYgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdQZXJzb24SDQoFc3RhdGUYByABKAkSFwoPcmVxdWVzdGVkX2F0X21zGAggASgEEhoKDWRlY2lkZWRfYXRfbXMYCSABKARIAIgBAUIQCg5fZGVjaWRlZF9hdF9tcyKABAoUUHJvdmlkZXJTaGFyaW5nT3duZWQSEAoIc2hhcmVfaWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBBISCgpiYWNrZW5kX2lkGAMgASgJEhMKC3Byb3ZpZGVyX2lkGAQgASgJEhUKDXByb3ZpZGVyX25hbWUYBSABKAkSLQoFb3duZXIYBiABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1BlcnNvbhIQCghyZXZpc2lvbhgHIAEoBBIvCgdtZW1iZXJzGAggAygLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdNZW1iZXISMQoIcmVxdWVzdHMYCSADKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1JlcXVlc3QSMQoIcmVzaGFyZXMYCiADKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1Jlc2hhcmUSPgoVcHJvdmlkZXJfbW9kZWxfYWNjZXNzGAsgASgLMh8uam9rby52MS5Ib3N0ZWRBZ2VudE1vZGVsQWNjZXNzEjIKEGF2YWlsYWJsZV9tb2RlbHMYDCADKAsyGC5qb2tvLnYxLk1vZGVsRGVzY3JpcHRvchI2Cgp2aXNpYmlsaXR5GA0gASgLMiIuam9rby52MS5Qcm92aWRlclNoYXJpbmdWaXNpYmlsaXR5Ir0CChZQcm92aWRlclNoYXJpbmdQcmV2aWV3EhMKC2hvc3Rfb3JpZ2luGAEgASgJEhYKDmhvc3Rfc2VydmVyX2lkGAIgASgJEhAKCHNoYXJlX2lkGAMgASgJEhIKCmJhY2tlbmRfaWQYBCABKAkSEwoLcHJvdmlkZXJfaWQYBSABKAkSFQoNcHJvdmlkZXJfbmFtZRgGIAEoCRItCgVvd25lchgHIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUGVyc29uEg0KBXN0YXRlGAggASgJEhUKDWV4cGlyZXNfYXRfbXMYCSABKAQSNgoKdmlzaWJpbGl0eRgKIAEoCzIiLmpva28udjEuUHJvdmlkZXJTaGFyaW5nVmlzaWJpbGl0eRIXCg9hY2Nlc3NfcmV2aXNpb24YCyABKAQipAMKF1Byb3ZpZGVyU2hhcmluZ1JlY2VpdmVkEg8KB2pvaW5faWQYASABKAkSEwoLaG9zdF9vcmlnaW4YAiABKAkSFgoOaG9zdF9zZXJ2ZXJfaWQYAyABKAkSEAoIc2hhcmVfaWQYBCABKAkSEQoJbWVtYmVyX2lkGAUgASgJEhIKCmdlbmVyYXRpb24YBiABKAQSEgoKYmFja2VuZF9pZBgHIAEoCRIZChFuYXRpdmVfYmFja2VuZF9pZBgIIAEoCRITCgtwcm92aWRlcl9pZBgJIAEoCRIVCg1wcm92aWRlcl9uYW1lGAogASgJEi0KBW93bmVyGAsgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdQZXJzb24SDQoFc3RhdGUYDCABKAkSKAoGbW9kZWxzGA0gAygLMhguam9rby52MS5Nb2RlbERlc2NyaXB0b3ISNgoKdmlzaWJpbGl0eRgOIAEoCzIiLmpva28udjEuUHJvdmlkZXJTaGFyaW5nVmlzaWJpbGl0eRIXCg9hY2Nlc3NfcmV2aXNpb24YDyABKAQixgEKFVByb3ZpZGVyU2hhcmluZ0ludGVudBIUCgxvcGVyYXRpb25faWQYASABKAkSDwoHam9pbl9pZBgCIAEoCRIOCgZzdGF0dXMYAyABKAkSEgoKZXJyb3JfY29kZRgEIAEoCRIwCgdwcmV2aWV3GAUgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdQcmV2aWV3EjAKB3JlcXVlc3QYBiABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1JlcXVlc3QiGwoZTGlzdFByb3ZpZGVyU2hhcmVzUmVxdWVzdCKvAQoaTGlzdFByb3ZpZGVyU2hhcmVzUmVzcG9uc2USLAoFb3duZWQYASADKAsyHS5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ093bmVkEjIKCHJlY2VpdmVkGAIgAygLMiAuam9rby52MS5Qcm92aWRlclNoYXJpbmdSZWNlaXZlZBIvCgdpbnRlbnRzGAMgAygLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdJbnRlbnQipQEKHkNyZWF0ZVByb3ZpZGVyU2hhcmVMaW5rUmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSEgoKYmFja2VuZF9pZBgCIAEoCRITCgtwcm92aWRlcl9pZBgDIAEoCRIVCg1wcm92aWRlcl9uYW1lGAQgASgJEi0KBW93bmVyGAUgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdQZXJzb24ihQEKH0NyZWF0ZVByb3ZpZGVyU2hhcmVMaW5rUmVzcG9uc2USDAoEbGluaxgBIAEoCRIPCgdsaW5rX2lkGAIgASgJEhUKDWV4cGlyZXNfYXRfbXMYAyABKAQSLAoFc2hhcmUYBCABKAsyHS5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ093bmVkIl4KIURlY2lkZVByb3ZpZGVyU2hhcmVSZXF1ZXN0UmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSEgoKcmVxdWVzdF9pZBgCIAEoCRIPCgdhcHByb3ZlGAMgASgIIn4KHVNldFByb3ZpZGVyU2hhcmVNZW1iZXJSZXF1ZXN0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIQCghzaGFyZV9pZBgCIAEoCRIRCgltZW1iZXJfaWQYAyABKAkSEgoKZ2VuZXJhdGlvbhgEIAEoBBIOCgZhY3Rpb24YBSABKAkiUQocRGVjaWRlUHJvdmlkZXJSZXNoYXJlUmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSCgoCaWQYAiABKAkSDwoHYXBwcm92ZRgDIAEoCCJSCiJEZWNpZGVQcm92aWRlclNoYXJlUmVxdWVzdFJlc3BvbnNlEiwKBXNoYXJlGAEgASgLMh0uam9rby52MS5Qcm92aWRlclNoYXJpbmdPd25lZCJOCh5TZXRQcm92aWRlclNoYXJlTWVtYmVyUmVzcG9uc2USLAoFc2hhcmUYASABKAsyHS5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ093bmVkIk0KHURlY2lkZVByb3ZpZGVyUmVzaGFyZVJlc3BvbnNlEiwKBXNoYXJlGAEgASgLMh0uam9rby52MS5Qcm92aWRlclNoYXJpbmdPd25lZCIrChtQcmV2aWV3UHJvdmlkZXJTaGFyZVJlcXVlc3QSDAoEbGluaxgBIAEoCSJQChxQcmV2aWV3UHJvdmlkZXJTaGFyZVJlc3BvbnNlEjAKB3ByZXZpZXcYASABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1ByZXZpZXcibwoZQXBwbHlQcm92aWRlclNoYXJlUmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSDAoEbGluaxgCIAEoCRIuCgZwZXJzb24YAyABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1BlcnNvbiJMChpBcHBseVByb3ZpZGVyU2hhcmVSZXNwb25zZRIuCgZpbnRlbnQYASABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ0ludGVudCIfCh1SZWZyZXNoUHJvdmlkZXJTaGFyaW5nUmVxdWVzdCKzAQoeUmVmcmVzaFByb3ZpZGVyU2hhcmluZ1Jlc3BvbnNlEiwKBW93bmVkGAEgAygLMh0uam9rby52MS5Qcm92aWRlclNoYXJpbmdPd25lZBIyCghyZWNlaXZlZBgCIAMoCzIgLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVjZWl2ZWQSLwoHaW50ZW50cxgDIAMoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nSW50ZW50IkwKHFdpdGhkcmF3UHJvdmlkZXJTaGFyZVJlcXVlc3QSFAoMb3BlcmF0aW9uX2lkGAEgASgJEhYKDmFwcGxpY2F0aW9uX2lkGAIgASgJIk8KHVdpdGhkcmF3UHJvdmlkZXJTaGFyZVJlc3BvbnNlEi4KBmludGVudBgBIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nSW50ZW50IkoKIUxlYXZlUmVjZWl2ZWRQcm92aWRlclNoYXJlUmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSDwoHam9pbl9pZBgCIAEoCSJYCiJMZWF2ZVJlY2VpdmVkUHJvdmlkZXJTaGFyZVJlc3BvbnNlEjIKCHJlY2VpdmVkGAEgASgLMiAuam9rby52MS5Qcm92aWRlclNoYXJpbmdSZWNlaXZlZCIxChtJbnNwZWN0UHJvdmlkZXJTaGFyZVJlcXVlc3QSEgoKaW52aXRhdGlvbhgBIAEoCSJQChxJbnNwZWN0UHJvdmlkZXJTaGFyZVJlc3BvbnNlEjAKB3ByZXZpZXcYASABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1ByZXZpZXci4QEKIVN1Ym1pdFByb3ZpZGVyU2hhcmVSZXF1ZXN0UmVxdWVzdBISCgpyZXF1ZXN0X2lkGAEgASgJEhIKCmludml0YXRpb24YAiABKAkSFgoOaG9tZV9zZXJ2ZXJfaWQYAyABKAkSEQoJZGV2aWNlX2lkGAQgASgJEi4KBnBlcnNvbhgFIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUGVyc29uEhoKEnJlcXVlc3Rfc2hhMjU2X2hleBgGIAEoCRIdChVjcmVkZW50aWFsX3NoYTI1Nl9oZXgYByABKAkiuAEKIlN1Ym1pdFByb3ZpZGVyU2hhcmVSZXF1ZXN0UmVzcG9uc2USMAoHcmVxdWVzdBgBIAEoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVxdWVzdBIuCgZtZW1iZXIYAiABKAsyHi5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ01lbWJlchIwCgdwcmV2aWV3GAMgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdQcmV2aWV3IjQKHkdldFByb3ZpZGVyU2hhcmVSZXF1ZXN0UmVxdWVzdBISCgpyZXF1ZXN0X2lkGAEgASgJIrUBCh9HZXRQcm92aWRlclNoYXJlUmVxdWVzdFJlc3BvbnNlEjAKB3JlcXVlc3QYASABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1JlcXVlc3QSLgoGbWVtYmVyGAIgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdNZW1iZXISMAoHcHJldmlldxgDIAEoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUHJldmlldyJPCiNXaXRoZHJhd1Byb3ZpZGVyU2hhcmVSZXF1ZXN0UmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSEgoKcmVxdWVzdF9pZBgCIAEoCSK6AQokV2l0aGRyYXdQcm92aWRlclNoYXJlUmVxdWVzdFJlc3BvbnNlEjAKB3JlcXVlc3QYASABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1JlcXVlc3QSLgoGbWVtYmVyGAIgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdNZW1iZXISMAoHcHJldmlldxgDIAEoCzIfLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUHJldmlldyIsChhSZWFkUHJvdmlkZXJTaGFyZVJlcXVlc3QSEAoIc2hhcmVfaWQYASABKAkitAEKGVJlYWRQcm92aWRlclNoYXJlUmVzcG9uc2USLgoFc2hhcmUYASABKAsyHy5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1ByZXZpZXcSLgoGbWVtYmVyGAIgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdNZW1iZXISNwoHY2F0YWxvZxgDIAEoCzImLmpva28udjEuR2V0SG9zdGVkQWdlbnRDYXRhbG9nUmVzcG9uc2UiQwoZTGVhdmVQcm92aWRlclNoYXJlUmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSEAoIc2hhcmVfaWQYAiABKAkitQEKGkxlYXZlUHJvdmlkZXJTaGFyZVJlc3BvbnNlEi4KBXNoYXJlGAEgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdQcmV2aWV3Ei4KBm1lbWJlchgCIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nTWVtYmVyEjcKB2NhdGFsb2cYAyABKAsyJi5qb2tvLnYxLkdldEhvc3RlZEFnZW50Q2F0YWxvZ1Jlc3BvbnNlIk0KI0dldFByb3ZpZGVyU2hhcmVMZWF2ZVJlY2VpcHRSZXF1ZXN0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIQCghzaGFyZV9pZBgCIAEoCSK/AQokR2V0UHJvdmlkZXJTaGFyZUxlYXZlUmVjZWlwdFJlc3BvbnNlEi4KBXNoYXJlGAEgASgLMh8uam9rby52MS5Qcm92aWRlclNoYXJpbmdQcmV2aWV3Ei4KBm1lbWJlchgCIAEoCzIeLmpva28udjEuUHJvdmlkZXJTaGFyaW5nTWVtYmVyEjcKB2NhdGFsb2cYAyABKAsyJi5qb2tvLnYxLkdldEhvc3RlZEFnZW50Q2F0YWxvZ1Jlc3BvbnNlIloKG1Byb3ZpZGVyU2hhcmluZ1Jlc2hhcmVFbnRyeRILCgNrZXkYASABKAkSLgoGcGVyc29uGAIgASgLMh4uam9rby52MS5Qcm92aWRlclNoYXJpbmdQZXJzb24iRwobUHJvdmlkZXJTaGFyaW5nUmVzaGFyZUJhdGNoEgoKAmlkGAEgASgJEg0KBWluZGV4GAIgASgNEg0KBWNvdW50GAMgASgNIokBChtTeW5jUHJvdmlkZXJSZXNoYXJlc1JlcXVlc3QSNQoHZW50cmllcxgBIAMoCzIkLmpva28udjEuUHJvdmlkZXJTaGFyaW5nUmVzaGFyZUVudHJ5EjMKBWJhdGNoGAIgASgLMiQuam9rby52MS5Qcm92aWRlclNoYXJpbmdSZXNoYXJlQmF0Y2giOQobUHJvdmlkZXJTaGFyaW5nUmVzaGFyZVN0YXRlEgsKA2tleRgBIAEoCRINCgVzdGF0ZRgCIAEoCSKcAQocU3luY1Byb3ZpZGVyUmVzaGFyZXNSZXNwb25zZRI1CgdlbnRyaWVzGAEgAygLMiQuam9rby52MS5Qcm92aWRlclNoYXJpbmdSZXNoYXJlU3RhdGUSMwoFYmF0Y2gYAiABKAsyJC5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ1Jlc2hhcmVCYXRjaBIQCghjb21wbGV0ZRgDIAEoCCIuChxDbG9zZVByb3ZpZGVyU2hhcmVSdW5SZXF1ZXN0Eg4KBnJ1bl9pZBgBIAEoCSIfCh1DbG9zZVByb3ZpZGVyU2hhcmVSdW5SZXNwb25zZSLGAQoiU2V0UHJvdmlkZXJTaGFyZU1vZGVsQWNjZXNzUmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSEAoIc2hhcmVfaWQYAiABKAkSEQoJbWVtYmVyX2lkGAMgASgJEhkKEWV4cGVjdGVkX3JldmlzaW9uGAQgASgEEhkKEW1lbWJlcl9nZW5lcmF0aW9uGAUgASgEEi8KBmFjY2VzcxgGIAEoCzIfLmpva28udjEuSG9zdGVkQWdlbnRNb2RlbEFjY2VzcyJTCiNTZXRQcm92aWRlclNoYXJlTW9kZWxBY2Nlc3NSZXNwb25zZRIsCgVzaGFyZRgBIAEoCzIdLmpva28udjEuUHJvdmlkZXJTaGFyaW5nT3duZWQiOQoZUHJvdmlkZXJTaGFyaW5nVmlzaWJpbGl0eRINCgVxdW90YRgBIAEoCBINCgV1c2FnZRgCIAEoCCKeAQohU2V0UHJvdmlkZXJTaGFyZVZpc2liaWxpdHlSZXF1ZXN0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIQCghzaGFyZV9pZBgCIAEoCRIZChFleHBlY3RlZF9yZXZpc2lvbhgDIAEoBBI2Cgp2aXNpYmlsaXR5GAQgASgLMiIuam9rby52MS5Qcm92aWRlclNoYXJpbmdWaXNpYmlsaXR5IlIKIlNldFByb3ZpZGVyU2hhcmVWaXNpYmlsaXR5UmVzcG9uc2USLAoFc2hhcmUYASABKAsyHS5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ093bmVkImIKG1Byb3ZpZGVyU2hhcmluZ1F1b3RhQWNjb3VudBINCgVzdGF0ZRgBIAEoCRI0CgV1c2FnZRgCIAEoCzIlLmpva28udjEuUHJvdmlkZXJBY2NvdW50VXNhZ2VTbmFwc2hvdCKaAgoXUHJvdmlkZXJTaGFyaW5nVXNhZ2VEYXkSCwoDZGF5GAEgASgJEhAKCG1vZGVsX2lkGAIgASgJEg0KBXR1cm5zGAMgASgEEhQKDGlucHV0X3Rva2VucxgEIAEoBBIVCg1vdXRwdXRfdG9rZW5zGAUgASgEEhkKEWNhY2hlX3JlYWRfdG9rZW5zGAYgASgEEhoKEmNhY2hlX3dyaXRlX3Rva2VucxgHIAEoBBITCgtjb3N0X21pY3JvcxgIIAEoBBIVCg1jdXJyZW5jeV9jb2RlGAkgASgJEhcKD3Rva2Vuc19jb21wbGV0ZRgKIAEoCBIVCg1jb3N0X2NvbXBsZXRlGAsgASgIEhEKCWVzdGltYXRlZBgMIAEoCCKrAgoXUHJvdmlkZXJTaGFyaW5nSW5zaWdodHMSNgoKdmlzaWJpbGl0eRgBIAEoCzIiLmpva28udjEuUHJvdmlkZXJTaGFyaW5nVmlzaWJpbGl0eRIUCgxxdW90YV9zdGF0dXMYAiABKAkSFAoMdXNhZ2Vfc3RhdHVzGAMgASgJEjYKCGFjY291bnRzGAQgAygLMiQuam9rby52MS5Qcm92aWRlclNoYXJpbmdRdW90YUFjY291bnQSFQoNcXVvdGFfcGFydGlhbBgFIAEoCBIuCgRkYXlzGAYgAygLMiAuam9rby52MS5Qcm92aWRlclNoYXJpbmdVc2FnZURheRIVCg11c2FnZV9wYXJ0aWFsGAcgASgIEhYKDmNvdmVyYWdlX3N0YXJ0GAggASgJIksKIFJlYWRQcm92aWRlclNoYXJlSW5zaWdodHNSZXF1ZXN0EhAKCHNoYXJlX2lkGAEgASgJEhUKDWluY2x1ZGVfdXNhZ2UYAiABKAgiVwohUmVhZFByb3ZpZGVyU2hhcmVJbnNpZ2h0c1Jlc3BvbnNlEjIKCGluc2lnaHRzGAEgASgLMiAuam9rby52MS5Qcm92aWRlclNoYXJpbmdJbnNpZ2h0cyJRCidHZXRSZWNlaXZlZFByb3ZpZGVyU2hhcmVJbnNpZ2h0c1JlcXVlc3QSDwoHam9pbl9pZBgBIAEoCRIVCg1pbmNsdWRlX3VzYWdlGAIgASgIIl4KKEdldFJlY2VpdmVkUHJvdmlkZXJTaGFyZUluc2lnaHRzUmVzcG9uc2USMgoIaW5zaWdodHMYASABKAsyIC5qb2tvLnYxLlByb3ZpZGVyU2hhcmluZ0luc2lnaHRzMrgLChZQcm92aWRlclNoYXJpbmdTZXJ2aWNlEl0KEkxpc3RQcm92aWRlclNoYXJlcxIiLmpva28udjEuTGlzdFByb3ZpZGVyU2hhcmVzUmVxdWVzdBojLmpva28udjEuTGlzdFByb3ZpZGVyU2hhcmVzUmVzcG9uc2USbAoXQ3JlYXRlUHJvdmlkZXJTaGFyZUxpbmsSJy5qb2tvLnYxLkNyZWF0ZVByb3ZpZGVyU2hhcmVMaW5rUmVxdWVzdBooLmpva28udjEuQ3JlYXRlUHJvdmlkZXJTaGFyZUxpbmtSZXNwb25zZRJ1ChpEZWNpZGVQcm92aWRlclNoYXJlUmVxdWVzdBIqLmpva28udjEuRGVjaWRlUHJvdmlkZXJTaGFyZVJlcXVlc3RSZXF1ZXN0Gisuam9rby52MS5EZWNpZGVQcm92aWRlclNoYXJlUmVxdWVzdFJlc3BvbnNlEmkKFlNldFByb3ZpZGVyU2hhcmVNZW1iZXISJi5qb2tvLnYxLlNldFByb3ZpZGVyU2hhcmVNZW1iZXJSZXF1ZXN0Gicuam9rby52MS5TZXRQcm92aWRlclNoYXJlTWVtYmVyUmVzcG9uc2USZgoVRGVjaWRlUHJvdmlkZXJSZXNoYXJlEiUuam9rby52MS5EZWNpZGVQcm92aWRlclJlc2hhcmVSZXF1ZXN0GiYuam9rby52MS5EZWNpZGVQcm92aWRlclJlc2hhcmVSZXNwb25zZRJjChRQcmV2aWV3UHJvdmlkZXJTaGFyZRIkLmpva28udjEuUHJldmlld1Byb3ZpZGVyU2hhcmVSZXF1ZXN0GiUuam9rby52MS5QcmV2aWV3UHJvdmlkZXJTaGFyZVJlc3BvbnNlEl0KEkFwcGx5UHJvdmlkZXJTaGFyZRIiLmpva28udjEuQXBwbHlQcm92aWRlclNoYXJlUmVxdWVzdBojLmpva28udjEuQXBwbHlQcm92aWRlclNoYXJlUmVzcG9uc2USaQoWUmVmcmVzaFByb3ZpZGVyU2hhcmluZxImLmpva28udjEuUmVmcmVzaFByb3ZpZGVyU2hhcmluZ1JlcXVlc3QaJy5qb2tvLnYxLlJlZnJlc2hQcm92aWRlclNoYXJpbmdSZXNwb25zZRJmChVXaXRoZHJhd1Byb3ZpZGVyU2hhcmUSJS5qb2tvLnYxLldpdGhkcmF3UHJvdmlkZXJTaGFyZVJlcXVlc3QaJi5qb2tvLnYxLldpdGhkcmF3UHJvdmlkZXJTaGFyZVJlc3BvbnNlEnUKGkxlYXZlUmVjZWl2ZWRQcm92aWRlclNoYXJlEiouam9rby52MS5MZWF2ZVJlY2VpdmVkUHJvdmlkZXJTaGFyZVJlcXVlc3QaKy5qb2tvLnYxLkxlYXZlUmVjZWl2ZWRQcm92aWRlclNoYXJlUmVzcG9uc2USeAobU2V0UHJvdmlkZXJTaGFyZU1vZGVsQWNjZXNzEisuam9rby52MS5TZXRQcm92aWRlclNoYXJlTW9kZWxBY2Nlc3NSZXF1ZXN0Giwuam9rby52MS5TZXRQcm92aWRlclNoYXJlTW9kZWxBY2Nlc3NSZXNwb25zZRJ1ChpTZXRQcm92aWRlclNoYXJlVmlzaWJpbGl0eRIqLmpva28udjEuU2V0UHJvdmlkZXJTaGFyZVZpc2liaWxpdHlSZXF1ZXN0Gisuam9rby52MS5TZXRQcm92aWRlclNoYXJlVmlzaWJpbGl0eVJlc3BvbnNlEocBCiBHZXRSZWNlaXZlZFByb3ZpZGVyU2hhcmVJbnNpZ2h0cxIwLmpva28udjEuR2V0UmVjZWl2ZWRQcm92aWRlclNoYXJlSW5zaWdodHNSZXF1ZXN0GjEuam9rby52MS5HZXRSZWNlaXZlZFByb3ZpZGVyU2hhcmVJbnNpZ2h0c1Jlc3BvbnNlMt0IChtQcm92aWRlclNoYXJpbmdHdWVzdFNlcnZpY2USYwoUSW5zcGVjdFByb3ZpZGVyU2hhcmUSJC5qb2tvLnYxLkluc3BlY3RQcm92aWRlclNoYXJlUmVxdWVzdBolLmpva28udjEuSW5zcGVjdFByb3ZpZGVyU2hhcmVSZXNwb25zZRJ1ChpTdWJtaXRQcm92aWRlclNoYXJlUmVxdWVzdBIqLmpva28udjEuU3VibWl0UHJvdmlkZXJTaGFyZVJlcXVlc3RSZXF1ZXN0Gisuam9rby52MS5TdWJtaXRQcm92aWRlclNoYXJlUmVxdWVzdFJlc3BvbnNlEmwKF0dldFByb3ZpZGVyU2hhcmVSZXF1ZXN0Eicuam9rby52MS5HZXRQcm92aWRlclNoYXJlUmVxdWVzdFJlcXVlc3QaKC5qb2tvLnYxLkdldFByb3ZpZGVyU2hhcmVSZXF1ZXN0UmVzcG9uc2USewocV2l0aGRyYXdQcm92aWRlclNoYXJlUmVxdWVzdBIsLmpva28udjEuV2l0aGRyYXdQcm92aWRlclNoYXJlUmVxdWVzdFJlcXVlc3QaLS5qb2tvLnYxLldpdGhkcmF3UHJvdmlkZXJTaGFyZVJlcXVlc3RSZXNwb25zZRJaChFSZWFkUHJvdmlkZXJTaGFyZRIhLmpva28udjEuUmVhZFByb3ZpZGVyU2hhcmVSZXF1ZXN0GiIuam9rby52MS5SZWFkUHJvdmlkZXJTaGFyZVJlc3BvbnNlEl0KEkxlYXZlUHJvdmlkZXJTaGFyZRIiLmpva28udjEuTGVhdmVQcm92aWRlclNoYXJlUmVxdWVzdBojLmpva28udjEuTGVhdmVQcm92aWRlclNoYXJlUmVzcG9uc2USewocR2V0UHJvdmlkZXJTaGFyZUxlYXZlUmVjZWlwdBIsLmpva28udjEuR2V0UHJvdmlkZXJTaGFyZUxlYXZlUmVjZWlwdFJlcXVlc3QaLS5qb2tvLnYxLkdldFByb3ZpZGVyU2hhcmVMZWF2ZVJlY2VpcHRSZXNwb25zZRJjChRTeW5jUHJvdmlkZXJSZXNoYXJlcxIkLmpva28udjEuU3luY1Byb3ZpZGVyUmVzaGFyZXNSZXF1ZXN0GiUuam9rby52MS5TeW5jUHJvdmlkZXJSZXNoYXJlc1Jlc3BvbnNlEmYKFUNsb3NlUHJvdmlkZXJTaGFyZVJ1bhIlLmpva28udjEuQ2xvc2VQcm92aWRlclNoYXJlUnVuUmVxdWVzdBomLmpva28udjEuQ2xvc2VQcm92aWRlclNoYXJlUnVuUmVzcG9uc2UScgoZUmVhZFByb3ZpZGVyU2hhcmVJbnNpZ2h0cxIpLmpva28udjEuUmVhZFByb3ZpZGVyU2hhcmVJbnNpZ2h0c1JlcXVlc3QaKi5qb2tvLnYxLlJlYWRQcm92aWRlclNoYXJlSW5zaWdodHNSZXNwb25zZWIGcHJvdG8z", [file_joko_v1_model, file_joko_v1_hosted_agent]);
 
 /**
  * @generated from message joko.v1.ProviderSharingPerson
@@ -71,6 +71,11 @@ export type ProviderSharingMember = Message<"joko.v1.ProviderSharingMember"> & {
    * @generated from field: string home_server_id = 6;
    */
   homeServerId: string;
+
+  /**
+   * @generated from field: joko.v1.HostedAgentModelAccess model_access = 7;
+   */
+  modelAccess?: HostedAgentModelAccess | undefined;
 };
 
 /**
@@ -247,6 +252,21 @@ export type ProviderSharingOwned = Message<"joko.v1.ProviderSharingOwned"> & {
    * @generated from field: repeated joko.v1.ProviderSharingReshare reshares = 10;
    */
   reshares: ProviderSharingReshare[];
+
+  /**
+   * @generated from field: joko.v1.HostedAgentModelAccess provider_model_access = 11;
+   */
+  providerModelAccess?: HostedAgentModelAccess | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.ModelDescriptor available_models = 12;
+   */
+  availableModels: ModelDescriptor[];
+
+  /**
+   * @generated from field: joko.v1.ProviderSharingVisibility visibility = 13;
+   */
+  visibility?: ProviderSharingVisibility | undefined;
 };
 
 /**
@@ -304,6 +324,16 @@ export type ProviderSharingPreview = Message<"joko.v1.ProviderSharingPreview"> &
    * @generated from field: uint64 expires_at_ms = 9;
    */
   expiresAtMs: bigint;
+
+  /**
+   * @generated from field: joko.v1.ProviderSharingVisibility visibility = 10;
+   */
+  visibility?: ProviderSharingVisibility | undefined;
+
+  /**
+   * @generated from field: uint64 access_revision = 11;
+   */
+  accessRevision: bigint;
 };
 
 /**
@@ -381,6 +411,16 @@ export type ProviderSharingReceived = Message<"joko.v1.ProviderSharingReceived">
    * @generated from field: repeated joko.v1.ModelDescriptor models = 13;
    */
   models: ModelDescriptor[];
+
+  /**
+   * @generated from field: joko.v1.ProviderSharingVisibility visibility = 14;
+   */
+  visibility?: ProviderSharingVisibility | undefined;
+
+  /**
+   * @generated from field: uint64 access_revision = 15;
+   */
+  accessRevision: bigint;
 };
 
 /**
@@ -1373,6 +1413,363 @@ export const CloseProviderShareRunResponseSchema: GenMessage<CloseProviderShareR
   messageDesc(file_joko_v1_provider_sharing, 48);
 
 /**
+ * @generated from message joko.v1.SetProviderShareModelAccessRequest
+ */
+export type SetProviderShareModelAccessRequest = Message<"joko.v1.SetProviderShareModelAccessRequest"> & {
+  /**
+   * @generated from field: string operation_id = 1;
+   */
+  operationId: string;
+
+  /**
+   * @generated from field: string share_id = 2;
+   */
+  shareId: string;
+
+  /**
+   * @generated from field: string member_id = 3;
+   */
+  memberId: string;
+
+  /**
+   * @generated from field: uint64 expected_revision = 4;
+   */
+  expectedRevision: bigint;
+
+  /**
+   * @generated from field: uint64 member_generation = 5;
+   */
+  memberGeneration: bigint;
+
+  /**
+   * @generated from field: joko.v1.HostedAgentModelAccess access = 6;
+   */
+  access?: HostedAgentModelAccess | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SetProviderShareModelAccessRequest.
+ * Use `create(SetProviderShareModelAccessRequestSchema)` to create a new message.
+ */
+export const SetProviderShareModelAccessRequestSchema: GenMessage<SetProviderShareModelAccessRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 49);
+
+/**
+ * @generated from message joko.v1.SetProviderShareModelAccessResponse
+ */
+export type SetProviderShareModelAccessResponse = Message<"joko.v1.SetProviderShareModelAccessResponse"> & {
+  /**
+   * @generated from field: joko.v1.ProviderSharingOwned share = 1;
+   */
+  share?: ProviderSharingOwned | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SetProviderShareModelAccessResponse.
+ * Use `create(SetProviderShareModelAccessResponseSchema)` to create a new message.
+ */
+export const SetProviderShareModelAccessResponseSchema: GenMessage<SetProviderShareModelAccessResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 50);
+
+/**
+ * @generated from message joko.v1.ProviderSharingVisibility
+ */
+export type ProviderSharingVisibility = Message<"joko.v1.ProviderSharingVisibility"> & {
+  /**
+   * @generated from field: bool quota = 1;
+   */
+  quota: boolean;
+
+  /**
+   * @generated from field: bool usage = 2;
+   */
+  usage: boolean;
+};
+
+/**
+ * Describes the message joko.v1.ProviderSharingVisibility.
+ * Use `create(ProviderSharingVisibilitySchema)` to create a new message.
+ */
+export const ProviderSharingVisibilitySchema: GenMessage<ProviderSharingVisibility> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 51);
+
+/**
+ * @generated from message joko.v1.SetProviderShareVisibilityRequest
+ */
+export type SetProviderShareVisibilityRequest = Message<"joko.v1.SetProviderShareVisibilityRequest"> & {
+  /**
+   * @generated from field: string operation_id = 1;
+   */
+  operationId: string;
+
+  /**
+   * @generated from field: string share_id = 2;
+   */
+  shareId: string;
+
+  /**
+   * @generated from field: uint64 expected_revision = 3;
+   */
+  expectedRevision: bigint;
+
+  /**
+   * @generated from field: joko.v1.ProviderSharingVisibility visibility = 4;
+   */
+  visibility?: ProviderSharingVisibility | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SetProviderShareVisibilityRequest.
+ * Use `create(SetProviderShareVisibilityRequestSchema)` to create a new message.
+ */
+export const SetProviderShareVisibilityRequestSchema: GenMessage<SetProviderShareVisibilityRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 52);
+
+/**
+ * @generated from message joko.v1.SetProviderShareVisibilityResponse
+ */
+export type SetProviderShareVisibilityResponse = Message<"joko.v1.SetProviderShareVisibilityResponse"> & {
+  /**
+   * @generated from field: joko.v1.ProviderSharingOwned share = 1;
+   */
+  share?: ProviderSharingOwned | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SetProviderShareVisibilityResponse.
+ * Use `create(SetProviderShareVisibilityResponseSchema)` to create a new message.
+ */
+export const SetProviderShareVisibilityResponseSchema: GenMessage<SetProviderShareVisibilityResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 53);
+
+/**
+ * @generated from message joko.v1.ProviderSharingQuotaAccount
+ */
+export type ProviderSharingQuotaAccount = Message<"joko.v1.ProviderSharingQuotaAccount"> & {
+  /**
+   * @generated from field: string state = 1;
+   */
+  state: string;
+
+  /**
+   * @generated from field: joko.v1.ProviderAccountUsageSnapshot usage = 2;
+   */
+  usage?: ProviderAccountUsageSnapshot | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ProviderSharingQuotaAccount.
+ * Use `create(ProviderSharingQuotaAccountSchema)` to create a new message.
+ */
+export const ProviderSharingQuotaAccountSchema: GenMessage<ProviderSharingQuotaAccount> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 54);
+
+/**
+ * @generated from message joko.v1.ProviderSharingUsageDay
+ */
+export type ProviderSharingUsageDay = Message<"joko.v1.ProviderSharingUsageDay"> & {
+  /**
+   * @generated from field: string day = 1;
+   */
+  day: string;
+
+  /**
+   * @generated from field: string model_id = 2;
+   */
+  modelId: string;
+
+  /**
+   * @generated from field: uint64 turns = 3;
+   */
+  turns: bigint;
+
+  /**
+   * @generated from field: uint64 input_tokens = 4;
+   */
+  inputTokens: bigint;
+
+  /**
+   * @generated from field: uint64 output_tokens = 5;
+   */
+  outputTokens: bigint;
+
+  /**
+   * @generated from field: uint64 cache_read_tokens = 6;
+   */
+  cacheReadTokens: bigint;
+
+  /**
+   * @generated from field: uint64 cache_write_tokens = 7;
+   */
+  cacheWriteTokens: bigint;
+
+  /**
+   * @generated from field: uint64 cost_micros = 8;
+   */
+  costMicros: bigint;
+
+  /**
+   * @generated from field: string currency_code = 9;
+   */
+  currencyCode: string;
+
+  /**
+   * @generated from field: bool tokens_complete = 10;
+   */
+  tokensComplete: boolean;
+
+  /**
+   * @generated from field: bool cost_complete = 11;
+   */
+  costComplete: boolean;
+
+  /**
+   * @generated from field: bool estimated = 12;
+   */
+  estimated: boolean;
+};
+
+/**
+ * Describes the message joko.v1.ProviderSharingUsageDay.
+ * Use `create(ProviderSharingUsageDaySchema)` to create a new message.
+ */
+export const ProviderSharingUsageDaySchema: GenMessage<ProviderSharingUsageDay> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 55);
+
+/**
+ * Only the requesting member's bounded numeric usage is exposed. No native
+ * history, other members, routes, credentials or task identities cross this API.
+ *
+ * @generated from message joko.v1.ProviderSharingInsights
+ */
+export type ProviderSharingInsights = Message<"joko.v1.ProviderSharingInsights"> & {
+  /**
+   * @generated from field: joko.v1.ProviderSharingVisibility visibility = 1;
+   */
+  visibility?: ProviderSharingVisibility | undefined;
+
+  /**
+   * @generated from field: string quota_status = 2;
+   */
+  quotaStatus: string;
+
+  /**
+   * @generated from field: string usage_status = 3;
+   */
+  usageStatus: string;
+
+  /**
+   * @generated from field: repeated joko.v1.ProviderSharingQuotaAccount accounts = 4;
+   */
+  accounts: ProviderSharingQuotaAccount[];
+
+  /**
+   * @generated from field: bool quota_partial = 5;
+   */
+  quotaPartial: boolean;
+
+  /**
+   * @generated from field: repeated joko.v1.ProviderSharingUsageDay days = 6;
+   */
+  days: ProviderSharingUsageDay[];
+
+  /**
+   * @generated from field: bool usage_partial = 7;
+   */
+  usagePartial: boolean;
+
+  /**
+   * @generated from field: string coverage_start = 8;
+   */
+  coverageStart: string;
+};
+
+/**
+ * Describes the message joko.v1.ProviderSharingInsights.
+ * Use `create(ProviderSharingInsightsSchema)` to create a new message.
+ */
+export const ProviderSharingInsightsSchema: GenMessage<ProviderSharingInsights> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 56);
+
+/**
+ * @generated from message joko.v1.ReadProviderShareInsightsRequest
+ */
+export type ReadProviderShareInsightsRequest = Message<"joko.v1.ReadProviderShareInsightsRequest"> & {
+  /**
+   * @generated from field: string share_id = 1;
+   */
+  shareId: string;
+
+  /**
+   * @generated from field: bool include_usage = 2;
+   */
+  includeUsage: boolean;
+};
+
+/**
+ * Describes the message joko.v1.ReadProviderShareInsightsRequest.
+ * Use `create(ReadProviderShareInsightsRequestSchema)` to create a new message.
+ */
+export const ReadProviderShareInsightsRequestSchema: GenMessage<ReadProviderShareInsightsRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 57);
+
+/**
+ * @generated from message joko.v1.ReadProviderShareInsightsResponse
+ */
+export type ReadProviderShareInsightsResponse = Message<"joko.v1.ReadProviderShareInsightsResponse"> & {
+  /**
+   * @generated from field: joko.v1.ProviderSharingInsights insights = 1;
+   */
+  insights?: ProviderSharingInsights | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ReadProviderShareInsightsResponse.
+ * Use `create(ReadProviderShareInsightsResponseSchema)` to create a new message.
+ */
+export const ReadProviderShareInsightsResponseSchema: GenMessage<ReadProviderShareInsightsResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 58);
+
+/**
+ * @generated from message joko.v1.GetReceivedProviderShareInsightsRequest
+ */
+export type GetReceivedProviderShareInsightsRequest = Message<"joko.v1.GetReceivedProviderShareInsightsRequest"> & {
+  /**
+   * @generated from field: string join_id = 1;
+   */
+  joinId: string;
+
+  /**
+   * @generated from field: bool include_usage = 2;
+   */
+  includeUsage: boolean;
+};
+
+/**
+ * Describes the message joko.v1.GetReceivedProviderShareInsightsRequest.
+ * Use `create(GetReceivedProviderShareInsightsRequestSchema)` to create a new message.
+ */
+export const GetReceivedProviderShareInsightsRequestSchema: GenMessage<GetReceivedProviderShareInsightsRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 59);
+
+/**
+ * @generated from message joko.v1.GetReceivedProviderShareInsightsResponse
+ */
+export type GetReceivedProviderShareInsightsResponse = Message<"joko.v1.GetReceivedProviderShareInsightsResponse"> & {
+  /**
+   * @generated from field: joko.v1.ProviderSharingInsights insights = 1;
+   */
+  insights?: ProviderSharingInsights | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetReceivedProviderShareInsightsResponse.
+ * Use `create(GetReceivedProviderShareInsightsResponseSchema)` to create a new message.
+ */
+export const GetReceivedProviderShareInsightsResponseSchema: GenMessage<GetReceivedProviderShareInsightsResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_sharing, 60);
+
+/**
  * Owner management uses the ordinary Home Connection. Foreign credentials are
  * accepted only by ProviderSharingGuestService and the scoped native service.
  *
@@ -1459,6 +1856,30 @@ export const ProviderSharingService: GenService<{
     input: typeof LeaveReceivedProviderShareRequestSchema;
     output: typeof LeaveReceivedProviderShareResponseSchema;
   },
+  /**
+   * @generated from rpc joko.v1.ProviderSharingService.SetProviderShareModelAccess
+   */
+  setProviderShareModelAccess: {
+    methodKind: "unary";
+    input: typeof SetProviderShareModelAccessRequestSchema;
+    output: typeof SetProviderShareModelAccessResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.ProviderSharingService.SetProviderShareVisibility
+   */
+  setProviderShareVisibility: {
+    methodKind: "unary";
+    input: typeof SetProviderShareVisibilityRequestSchema;
+    output: typeof SetProviderShareVisibilityResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.ProviderSharingService.GetReceivedProviderShareInsights
+   */
+  getReceivedProviderShareInsights: {
+    methodKind: "unary";
+    input: typeof GetReceivedProviderShareInsightsRequestSchema;
+    output: typeof GetReceivedProviderShareInsightsResponseSchema;
+  },
 }> = /*@__PURE__*/
   serviceDesc(file_joko_v1_provider_sharing, 0);
 
@@ -1537,6 +1958,14 @@ export const ProviderSharingGuestService: GenService<{
     methodKind: "unary";
     input: typeof CloseProviderShareRunRequestSchema;
     output: typeof CloseProviderShareRunResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.ProviderSharingGuestService.ReadProviderShareInsights
+   */
+  readProviderShareInsights: {
+    methodKind: "unary";
+    input: typeof ReadProviderShareInsightsRequestSchema;
+    output: typeof ReadProviderShareInsightsResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_joko_v1_provider_sharing, 1);

@@ -10,11 +10,13 @@ export interface ProviderSharingMemberRecord {
   readonly id: string; readonly generation: number; readonly incarnation: number; readonly homeServerId: string;
   readonly person: ProviderSharingPerson; readonly status: "active" | "paused" | "removed" | "left";
   readonly credentialDigest: string; readonly devices: readonly string[]; readonly joinedAt: number;
+  readonly modelIds?: readonly string[];
 }
 export interface ProviderSharingShareRecord {
   readonly format: 1; readonly id: string; readonly generation: number; readonly backendId: string; readonly providerId: string;
   readonly providerName: string; readonly owner: ProviderSharingPerson; readonly createdAt: number; readonly revision: number;
   readonly members: readonly ProviderSharingMemberRecord[];
+  readonly visibility?: { readonly quota: boolean; readonly usage: boolean };
 }
 export interface ProviderSharingLinkRecord {
   readonly format: 1; readonly digest: string; readonly shareId: string; readonly createdAt: number; readonly expiresAt: number;
@@ -165,6 +167,26 @@ export class ProviderSharingStore {
   reshares(): readonly ProviderSharingReshareRecord[] {
     return this.store.listSettingsByKeyPrefix("service", SCOPE, "reshare:").map(row => parseReshare(row.value));
   }
+  setModelAccess(shareId: string, memberId: string, expectedRevision: number, generation: number, modelIds: readonly string[] | undefined): ProviderSharingShareRecord {
+    return this.store.transaction(() => {
+      const share = this.get(shareId), member = share.members.find(row => row.id === memberId);
+      if (share.revision !== expectedRevision || !member || member.generation !== generation) throw new ProviderSharingStoreError("STALE");
+      if (!["active", "paused"].includes(member.status)) throw new ProviderSharingStoreError("DENIED");
+      validateModelIds(modelIds);
+      if (JSON.stringify(member.modelIds) === JSON.stringify(modelIds)) return share;
+      if (!Number.isSafeInteger(member.generation + 1)) throw new ProviderSharingStoreError("INVALID");
+      const { modelIds: _old, ...base } = member;
+      const next = { ...base, generation: member.generation + 1, ...(modelIds === undefined ? {} : { modelIds: [...modelIds] }) };
+      return this.save({ ...share, members: share.members.map(row => row.id === memberId ? next : row) });
+    });
+  }
+  setVisibility(shareId: string, expectedRevision: number, visibility: { readonly quota: boolean; readonly usage: boolean }): ProviderSharingShareRecord {
+    return this.store.transaction(() => {
+      const share = this.get(shareId); if (share.revision !== expectedRevision) throw new ProviderSharingStoreError("STALE");
+      if (typeof visibility.quota !== "boolean" || typeof visibility.usage !== "boolean") throw new ProviderSharingStoreError("INVALID");
+      return this.save({ ...share, visibility: { quota: visibility.quota, usage: visibility.usage } });
+    });
+  }
   syncReshares(proof: ProviderSharingProof, deviceId: string, entries: readonly { readonly key: string; readonly person: ProviderSharingPerson }[]): readonly ProviderSharingReshareRecord[] {
     return this.store.transaction(() => {
       const { member } = this.authorize(proof), wanted = new Map(entries.map(entry => [opaque(entry.key), person(entry.person)])); identity(deviceId);
@@ -226,10 +248,17 @@ function parseShare(value: unknown): ProviderSharingShareRecord {
   const row = value as ProviderSharingShareRecord;
   if (!row || row.format !== 1 || !Array.isArray(row.members) || !Number.isSafeInteger(row.generation) || row.generation < 1 || !Number.isSafeInteger(row.revision)) throw new ProviderSharingStoreError("INVALID");
   identity(row.id); identity(row.backendId); identity(row.providerId); text(row.providerName); person(row.owner);
+  if (row.visibility !== undefined && (!row.visibility || typeof row.visibility.quota !== "boolean" || typeof row.visibility.usage !== "boolean"
+    || Object.keys(row.visibility).some(key => !["quota", "usage"].includes(key)))) throw new ProviderSharingStoreError("INVALID");
   for (const member of row.members) { identity(member.id); identity(member.homeServerId); validatedDigest(member.credentialDigest); person(member.person);
+    validateModelIds(member.modelIds);
     if (!Number.isSafeInteger(member.generation) || member.generation < 1 || !Number.isSafeInteger(member.incarnation) || member.incarnation < 1
       || !["active", "paused", "removed", "left"].includes(member.status) || !Array.isArray(member.devices) || member.devices.length > 64) throw new ProviderSharingStoreError("INVALID"); }
   return row;
+}
+function validateModelIds(value: readonly string[] | undefined): void {
+  if (value !== undefined && (!Array.isArray(value) || value.length > 4096 || new Set(value).size !== value.length
+    || value.some(id => typeof id !== "string" || !id || id.length > 512 || /[\0\r\n]/u.test(id)))) throw new ProviderSharingStoreError("INVALID");
 }
 function parseRequest(value: unknown): ProviderSharingRequestRecord {
   const row = value as ProviderSharingRequestRecord;

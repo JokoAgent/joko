@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
 import type { OperationalStore } from "@joko/store";
 import type { WorkspacePreviewAuthority, WorkspaceService } from "./workspace-service.js";
 import { WORKSPACE_TEXT_FILE_MAXIMUM_BYTES, WorkspaceFilePreviewError } from "./workspace-service.js";
@@ -24,7 +25,8 @@ export async function readWorkspaceHtmlSnapshot(input: {
   const session = store.getSession(input.sessionId).descriptor;
   const target = store.getTarget(session.targetId);
   const metadata = target.metadata as { workspaceId?: unknown };
-  const workspaceId = session.worktree?.workspaceId ?? (typeof metadata.workspaceId === "string" ? metadata.workspaceId : target.descriptor.id);
+  const workerWorkspace = readWorkerWorkspaceBinding(store, session.id);
+  const workspaceId = workerWorkspace?.workspaceId ?? session.worktree?.workspaceId ?? (typeof metadata.workspaceId === "string" ? metadata.workspaceId : target.descriptor.id);
   if (source.workspaceId !== workspaceId || !/\.html?$/iu.test(source.relativePath)) {
     throw new WorkspaceFilePreviewError("The HTML file does not belong to this task workspace.", "invalid");
   }
@@ -36,6 +38,7 @@ export async function readWorkspaceHtmlSnapshot(input: {
     const current = store.getSession(session.id).descriptor;
     if (current.targetId !== session.targetId || current.binding.generation !== session.binding.generation
       || current.binding.opaqueRef !== session.binding.opaqueRef || current.worktree?.workspaceId !== session.worktree?.workspaceId
+      || JSON.stringify(readWorkerWorkspaceBinding(store, current.id)) !== JSON.stringify(workerWorkspace)
       || current.archived || current.deletedAt !== undefined || store.findPendingSessionLifecycleCleanup(session.id) !== undefined
       || store.getTarget(session.targetId).revision !== target.revision) {
       throw new WorkspaceFilePreviewError("The HTML preview owner changed. Open the file again.", "stale");

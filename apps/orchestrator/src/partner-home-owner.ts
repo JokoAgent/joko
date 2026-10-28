@@ -273,7 +273,7 @@ function parseMove(value: unknown): PartnerHomeMoveRecord {
     || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(String(capabilities.permissionMode)) || typeof capabilities.planMode !== "boolean" || typeof capabilities.inputHandoff !== "boolean") invalid();
   for (const route of capabilities.modelChain) {
     const item = record(route); exact(item, ["backendId", "providerId", "modelId", "fastMode"], ["effort"]);
-    if (["backendId", "providerId", "modelId"].some(key => typeof item[key] !== "string") || typeof item.fastMode !== "boolean"
+    if (["backendId", "providerId", "modelId"].some(key => typeof item[key] !== "string") || (typeof item.fastMode !== "boolean" && item.fastMode !== "ultrafast")
       || item.effort !== undefined && typeof item.effort !== "string") invalid();
     for (const key of ["backendId", "providerId", "modelId"]) {
       const value = String(item[key]); if (!value.trim() || value.length > 512 || /[\u0000-\u001f\u007f]/u.test(value)) invalid();

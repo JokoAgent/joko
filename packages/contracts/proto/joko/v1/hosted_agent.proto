@@ -48,6 +48,8 @@ enum HostedAgentPeerMethod {
   HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_REPLY = 21;
   HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_READ_ARTIFACT = 22;
   HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CLOSE = 23;
+  // A separate capability gates this bounded encrypted plugin exchange.
+  HOSTED_AGENT_PEER_METHOD_EXTENSION_SYNC = 24;
 }
 
 // Only the authenticated private Device route accepts this envelope. The group
@@ -78,6 +80,9 @@ message HostedAgentProviderCatalog {
   string access_kind = 6;
   string access_product = 7;
   ProviderGroupSummary group = 8;
+  HostedAgentModelAccess model_access = 9;
+  // Only an authenticated management catalog includes selectable metadata.
+  repeated ModelDescriptor manageable_models = 10;
 }
 message HostedAgentBackendCatalog {
   string backend_id = 1;
@@ -91,6 +96,8 @@ message HostedAgentBackendCatalog {
   string node_id = 7;
   // Exact native process instance for isolated, task-free inference admission.
   uint64 instance_generation = 8;
+  // Current per-controller native-process capacity; zero means unavailable.
+  uint32 max_runs = 9;
 }
 message GetHostedAgentCatalogRequest { uint32 format = 1; }
 message GetHostedAgentCatalogResponse {
@@ -99,7 +106,16 @@ message GetHostedAgentCatalogResponse {
   repeated HostedAgentBackendCatalog backends = 3;
 }
 
-message HostedAgentProviderPermission { string backend_id = 1; string provider_id = 2; bool enabled = 3; }
+// An explicit empty selection denies every model. all_models also includes
+// future catalog entries; a member's selection is intersected with its Provider.
+message HostedAgentModelAccess { bool all_models = 1; repeated string model_ids = 2; }
+message HostedAgentProviderPermission {
+  string backend_id = 1; string provider_id = 2; bool enabled = 3;
+  HostedAgentModelAccess model_access = 4;
+}
+message HostedAgentProviderModelAccess {
+  string backend_id = 1; string provider_id = 2; HostedAgentModelAccess access = 3;
+}
 message HostedAgentLimits { uint32 per_device = 1; uint32 total = 2; }
 message HostedAgentLimitUsage { uint32 total = 1; uint32 devices = 2; uint32 maximum_device = 3; }
 message HostedAgentSettings {
@@ -109,6 +125,8 @@ message HostedAgentSettings {
   HostedAgentLimits limits = 4;
   bool limits_overridden = 5;
   HostedAgentLimitUsage usage = 6;
+  // Controller preference: zero disables pressure-based idle release.
+  uint32 idle_release_minutes = 7;
 }
 message GetHostedAgentSettingsRequest {}
 message GetHostedAgentSettingsResponse { HostedAgentSettings settings = 1; }
@@ -121,6 +139,8 @@ message UpdateHostedAgentSettingsRequest {
     HostedAgentProviderPermission provider = 3;
     HostedAgentLimits limits = 4;
     HostedAgentResetLimits reset_limits = 5;
+    HostedAgentProviderModelAccess model_access = 6;
+    uint32 idle_release_minutes = 7;
   }
 }
 message UpdateHostedAgentSettingsResponse { HostedAgentSettings settings = 1; }

@@ -26,6 +26,7 @@ export function devicePeerNativeAgentMethodEffect(method: HostedAgentPeerMethod)
     case HostedAgentPeerMethod.GUEST_RELAY_CALL:
     case HostedAgentPeerMethod.GUEST_RELAY_REPLY:
     case HostedAgentPeerMethod.GUEST_RELAY_CLOSE:
+    case HostedAgentPeerMethod.EXTENSION_SYNC:
     case HostedAgentPeerMethod.OPEN:
     case HostedAgentPeerMethod.CALL:
     case HostedAgentPeerMethod.REPLY:

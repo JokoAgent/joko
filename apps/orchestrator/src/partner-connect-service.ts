@@ -512,7 +512,7 @@ function toProtoProfile(
     homeTargetId: profile.homeTargetId,
     ...(profile.canonicalSessionId === undefined ? {} : { canonicalSessionId: profile.canonicalSessionId }),
     capabilities: toProtoCapabilities(profile.capabilities),
-    ...(profile.taskModelOverride === undefined ? {} : { taskModelOverride: create(contract.PartnerModelRouteSchema, profile.taskModelOverride) }),
+    ...(profile.taskModelOverride === undefined ? {} : { taskModelOverride: create(contract.PartnerModelRouteSchema, { ...profile.taskModelOverride, ...contract.encodeModelSpeed(profile.taskModelOverride.fastMode) }) }),
     createdAt: toProtoTimestamp(profile.createdAt),
     updatedAt: toProtoTimestamp(profile.updatedAt),
     usesDirectoryDefaults: profile.usesDirectoryDefaults,
@@ -662,7 +662,7 @@ function toProtoDelegationStatus(status: PartnerDelegationStatus): contract.Part
 
 function toProtoCapabilities(value: PartnerCapabilitiesRecord): contract.PartnerCapabilities {
   return create(contract.PartnerCapabilitiesSchema, {
-    modelChain: value.modelChain.map((route) => create(contract.PartnerModelRouteSchema, route)),
+    modelChain: value.modelChain.map((route) => create(contract.PartnerModelRouteSchema, { ...route, ...contract.encodeModelSpeed(route.fastMode) })),
     permissionMode: value.permissionMode === "ask"
       ? contract.PermissionMode.ASK
       : value.permissionMode === "acceptEdits" ? contract.PermissionMode.ACCEPT_EDITS : value.permissionMode === "auto" ? contract.PermissionMode.AUTO : contract.PermissionMode.BYPASS_PERMISSIONS,
@@ -686,7 +686,7 @@ function fromProtoRoute(value: contract.PartnerModelRoute): PartnerModelRouteRec
     providerId: value.providerId,
     modelId: value.modelId,
     ...(value.effort === undefined ? {} : { effort: value.effort }),
-    fastMode: value.fastMode
+    fastMode: contract.decodeModelSpeed(value)
   };
 }
 

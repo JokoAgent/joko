@@ -58,6 +58,7 @@ export async function createDesktopHostedAgentDelegate(options: DesktopHostedAge
   };
   try { await assertCurrent(); } catch (error) { await retire().catch(() => {}); throw error; }
   return {
+    supportsExtensionSync: opened.supportsExtensionSync,
     invoke: async (method, bytes, signal, authority) => {
       lifetime.signal.throwIfAborted(); signal.throwIfAborted(); await assertCurrent();
       if (devicePeerNativeAgentMethodEffect(method) === undefined || !(bytes instanceof Uint8Array) || bytes.byteLength > DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES ||

@@ -11,6 +11,24 @@ function setup() {
     person: { name: "Recipient", avatarUrl: null }, requestDigest: hash(`request-${key}`), credentialDigest: hash(`member-${key}`), pairingCode: "0123" }, "issuer-home");
   return { database, store, issue, apply, advance: (ms: number) => { now += ms; } };
 }
+it("persists member model selections without widening empty or malformed grants", () => {
+  const s = setup(); try {
+    const { share } = s.issue("models"), request = s.apply("models"); s.store.decide(request.id, "approve", "member");
+    const before = s.store.get(share.id), member = before.members[0]!;
+    const proof = { shareId: share.id, memberId: member.id, generation: member.generation, credentialDigest: member.credentialDigest };
+    const denied = s.store.setModelAccess(share.id, member.id, before.revision, member.generation, []);
+    expect(denied.members[0]!.modelIds).toEqual([]); expect(() => s.store.authorize(proof)).toThrow();
+    expect(() => s.store.setModelAccess(share.id, member.id, before.revision, member.generation, ["model"])).toThrow();
+    const selected = s.store.setModelAccess(share.id, member.id, denied.revision, denied.members[0]!.generation, ["model", "temporarily-missing"]);
+    expect(new ProviderSharingStore(s.database).get(share.id).members[0]!.modelIds).toEqual(["model", "temporarily-missing"]);
+    expect(() => s.store.setModelAccess(share.id, member.id, selected.revision, selected.members[0]!.generation, ["model", "model"])).toThrow();
+    const inherited = s.store.setModelAccess(share.id, member.id, selected.revision, selected.members[0]!.generation, undefined);
+    expect(inherited.members[0]!.modelIds).toBeUndefined(); expect(() => s.store.authorize(proof)).toThrow();
+    const bad = { ...inherited, members: [{ ...inherited.members[0]!, modelIds: "all" }] };
+    s.database.setSetting("service", "provider-sharing.host.v1", `share:${share.id}`, bad);
+    expect(() => s.store.get(share.id)).toThrow();
+  } finally { s.database.close(); }
+});
 it("retires member proofs, pending requests and unused links together during trusted node recovery", () => {
   const s = setup(); try {
     const first = s.issue("approved"), applied = s.apply("approved"); s.store.decide(applied.id, "approve", "member");

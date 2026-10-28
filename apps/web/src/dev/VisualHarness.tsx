@@ -1613,7 +1613,7 @@ export function VisualHarness(): JSX.Element {
       setPlanMode: async (sessionId: string, enabled: boolean): Promise<void> => {
         updateSession(sessionId, (session) => ({ ...session, planMode: enabled }));
       },
-      setModel: async (sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean): Promise<void> => {
+      setModel: async (sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean | "ultrafast"): Promise<void> => {
         updateSession(sessionId, (session) => ({ ...session, effort, fastMode, model: state.snapshot.models.find((model) => model.providerId === providerId && model.modelId === modelId) ?? session.model }));
       },
       updateBackendSettings: async (backendId: string, patch: Parameters<AppController["updateBackendSettings"]>[1]): Promise<void> => {

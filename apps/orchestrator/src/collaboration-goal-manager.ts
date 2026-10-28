@@ -25,10 +25,18 @@ import {
 } from "@joko/store";
 
 import type { EnqueueResult, SessionHost } from "./session-host.js";
+import {
+  assertWorkerWorkspacePlan, planWorkerWorkspace, readWorkerWorkspaceBinding,
+  WORKER_WORKSPACE_PLAN_KEY, type WorkerWorkspacePlan, type WorkerWorkspaceRequest, type WorkerWorkspaceView
+} from "./collaboration-worker-workspace.js";
+
+export interface CollaborationWorkerProjection extends CollaborationWorkerRecord {
+  readonly workspace?: WorkerWorkspaceView;
+}
 
 export interface CollaborationGoalTreeView {
   readonly goal: CollaborationGoalRecord;
-  readonly workers: readonly CollaborationWorkerRecord[];
+  readonly workers: readonly CollaborationWorkerProjection[];
   readonly queue: readonly {
     readonly dispatch: CollaborationDispatchRecord;
     readonly queueItem?: QueueItemRecord;
@@ -65,7 +73,7 @@ export interface CollaborationGoalManagerOptions {
     SessionHost,
     "createServiceSession" | "enqueueServiceInput" | "resume" | "abort" |
     "closeIfActive" | "isSessionActive"
-  >;
+  > & Partial<Pick<SessionHost, "captureToolWorkspace" | "supportsLocalWorkerWorkspace">>;
   readonly readSettings: () => CollaborationSettings;
   readonly now?: () => number;
   readonly idFactory?: () => string;
@@ -77,7 +85,7 @@ interface WorkerRouteInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
 }
@@ -306,6 +314,8 @@ export class CollaborationGoalManager {
     readonly role: string;
     readonly assignment: string;
     readonly route: WorkerRouteInput;
+    readonly workspace?: WorkerWorkspaceRequest;
+    readonly signal?: AbortSignal;
   }): Promise<{ readonly tree: CollaborationGoalTreeView; readonly worker: CollaborationWorkerRecord }> {
     return this.#withLock(`goal:${input.goalId}`, async () => {
       this.#assertOpen();
@@ -321,20 +331,40 @@ export class CollaborationGoalManager {
       }
 
       const goal = this.#store.getCollaborationGoal(input.goalId);
+      input.signal?.throwIfAborted();
       this.#assertWorkerAdmission?.(input.callerLeadSessionId);
       assertExtensionWorkerPlan(this.#store, input.callerLeadSessionId, input);
+      if (isExtensionTaskControlled(this.#store, input.callerLeadSessionId) && input.workspace !== undefined) {
+        throw new AuthorizationError("A plugin worker plan cannot expand its approved project directory.");
+      }
       const target = this.#store.getTarget(input.route.targetId);
+      const lead = this.#store.getSession(goal.leadSessionId).descriptor;
+      if (goal.leadSessionId !== input.callerLeadSessionId || lead.binding.generation !== goal.sessionGeneration) {
+        throw new AuthorizationError("The worker must be created by the current Goal lead.");
+      }
+      const workspace = await planWorkerWorkspace({ store: this.#store, lead, target: target.descriptor,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        ...(input.workspace === undefined ? {} : { request: input.workspace }),
+        ...(target.descriptor.id !== lead.targetId || this.#sessionHost.captureToolWorkspace === undefined
+          || this.#sessionHost.supportsLocalWorkerWorkspace?.() !== true ? {} : {
+          captureLead: () => this.#sessionHost.captureToolWorkspace!({ sessionId: lead.id, targetId: lead.targetId, generation: lead.binding.generation })
+        }) });
       const workerId = collaborationId("worker", this.#idFactory());
       const lease = await this.#capacity.acquire(goal.id, workerId);
       let reserved = false;
       try {
         const settings = this.#readSettings();
+        input.signal?.throwIfAborted();
         const body = createWorkerOperationBody(input);
         const claim = this.#store.claimDeferredEffectOperation<{ readonly workerId: string }>(
           { id: input.operationId, kind: "create_collaboration_worker", body },
           (store) => {
             this.#assertWorkerAdmission?.(input.callerLeadSessionId);
             assertExtensionWorkerPlan(store, input.callerLeadSessionId, input);
+            if (workspace) {
+              assertWorkerWorkspacePlan(store, workspace);
+              store.setSetting("service", workerId, WORKER_WORKSPACE_PLAN_KEY, workspace);
+            }
             store.reserveCollaborationWorker({
               id: workerId,
               goalId: goal.id,
@@ -1064,12 +1094,14 @@ export class CollaborationGoalManager {
       return this.#markWorkerFailed(worker.id, sessionOperation.error);
     }
     try {
+      const workspace = this.#store.findSetting<WorkerWorkspacePlan>("service", workerId, WORKER_WORKSPACE_PLAN_KEY)?.value;
       const created = await this.#sessionHost.createServiceSession({
         operationId: sessionOperationId,
         serviceKind: "collaboration",
         ...(isExtensionTaskControlled(this.#store, goal.leadSessionId) && this.#store.getSession(goal.leadSessionId).descriptor.hidden ? { hidden: true } : {}),
         assertServiceScope: () => { this.#assertWorkerAdmission?.(goal.leadSessionId);
           const current = this.#store.getCollaborationWorker(workerId);
+          if (workspace) assertWorkerWorkspacePlan(this.#store, workspace);
           assertExtensionWorkerPlan(this.#store, goal.leadSessionId, { ...current, existingWorkerId: current.id, route: current }); },
         targetId: worker.targetId,
         title: `${goal.title} · ${worker.label}`,
@@ -1079,6 +1111,8 @@ export class CollaborationGoalManager {
         fastMode: worker.fastMode,
         permissionMode: worker.permissionMode,
         planMode: worker.planMode,
+        ...(workspace === undefined ? {} : { workerWorkspace: workspace,
+          ...(workspace.createWorktree ? { worktree: { sourceRef: workspace.sourceCommit!, refreshRemote: false } } : {}) }),
         appendSystemPrompt: workerSystemPrompt(goal, worker)
       });
       const operation = this.#store.getOperation(worker.createOperationId);
@@ -1481,7 +1515,7 @@ export class CollaborationGoalManager {
 
   #tree(goalId: string): CollaborationGoalTreeView {
     const goal = this.#store.getCollaborationGoal(goalId);
-    const workers = this.#store.listCollaborationWorkers({ goalId, includeArchived: true });
+    const workers = this.#store.listCollaborationWorkers({ goalId, includeArchived: true }).map(worker => this.projectWorker(worker));
     const queue = this.#store.listCollaborationDispatches({ goalId }).map((dispatch) => {
       const queueItem = dispatch.queueItemId === undefined
         ? undefined
@@ -1497,6 +1531,16 @@ export class CollaborationGoalManager {
         return focused === undefined ? {} : { focusedWorkerId: focused.id };
       })()
     };
+  }
+
+  projectWorker(worker: CollaborationWorkerRecord): CollaborationWorkerProjection {
+    const session = worker.sessionId ? this.#store.findSession(worker.sessionId)?.descriptor : undefined;
+    const binding = session ? readWorkerWorkspaceBinding(this.#store, session.id) : undefined;
+    if (!binding) return worker;
+    const plan = this.#store.findSetting<WorkerWorkspacePlan>("service", worker.id, WORKER_WORKSPACE_PLAN_KEY)?.value;
+    return { ...worker, workspace: { workingDirectory: binding.path,
+      ...(session?.worktree === undefined ? {} : { worktreePath: session.worktree.path }),
+      ...(plan?.sourceRef === undefined ? {} : { sourceRef: plan.sourceRef }) } };
   }
 
   #restoreLease(worker: CollaborationWorkerRecord): WorkerCapacityLease {
@@ -1661,9 +1705,12 @@ function createWorkerOperationBody(input: {
   readonly role: string;
   readonly assignment: string;
   readonly route: WorkerRouteInput;
+  readonly workspace?: WorkerWorkspaceRequest;
+  readonly signal?: AbortSignal;
 }): unknown {
+  const { signal: _signal, ...logical } = input;
   return {
-    ...input,
+    ...logical,
     expectedGoalRevision: input.expectedGoalRevision.toString(10),
     parentWorkerId: input.parentWorkerId ?? null
   };

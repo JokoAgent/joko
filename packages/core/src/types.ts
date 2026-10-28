@@ -13,6 +13,7 @@ export type ToolLeaseId = string;
 export type ArtifactId = string;
 
 export type UnixMillis = number;
+export type FastMode = boolean | "ultrafast";
 
 export type CapabilityReason =
   | "upstream_missing"
@@ -417,6 +418,7 @@ export interface ProviderModel {
   readonly defaultVisible?: boolean;
   /** Explicit Backend support; absence is conservatively treated as false. */
   readonly supportsFastMode?: boolean;
+  readonly supportsUltrafastMode?: boolean;
   readonly thinkingLevels: readonly string[];
   readonly defaultEffort?: string;
   readonly displayThinkingLevels?: readonly string[];
@@ -425,6 +427,7 @@ export interface ProviderModel {
   readonly declaredOutputModalities?: readonly string[];
   readonly declaredSupportsImages?: boolean;
   readonly declaredSupportsFastMode?: boolean;
+  readonly declaredSupportsUltrafastMode?: boolean;
   readonly referenceApi?: string;
   readonly protocolMode?: "matching" | "compatibility" | "unknown";
   readonly cost: {
@@ -618,7 +621,7 @@ export interface UsageSnapshot {
   /** Observed request scope for reference pricing; never cumulative token totals. */
   readonly pricingContext?: {
     readonly inputTokens: number;
-    readonly fastMode?: boolean;
+    readonly fastMode?: boolean | "ultrafast";
   };
   readonly cost: number;
 }
@@ -750,7 +753,7 @@ export interface TurnExecutionOverrides {
   readonly modelId?: string;
   readonly effort?: string;
   /** Explicit false temporarily disables a fast session default for this turn. */
-  readonly fastMode?: boolean;
+  readonly fastMode?: boolean | "ultrafast";
   readonly permissionMode?: PermissionMode;
   readonly planMode?: boolean;
   readonly extraDirectoryIds?: readonly string[];
@@ -908,7 +911,7 @@ export interface SessionDescriptor {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly worktree?: SessionWorktreeBinding;
   /** Owner-scoped labels in catalog order. */
   readonly taskTags?: readonly TaskTagDescriptor[];

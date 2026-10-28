@@ -1,4 +1,6 @@
 import type { HandlerContext } from "@connectrpc/connect";
+import type { ProviderSharingQuotaAccount } from "@joko/contracts";
+import type { ProviderGroupUsageRow } from "@joko/store";
 import type { OperationalStore } from "@joko/store";
 import type { CredentialVault } from "./credential-vault.js";
 import type { ConnectionManager } from "./connection-manager.js";
@@ -13,6 +15,8 @@ export interface ProviderSharingRuntimeOptions {
   readonly vault: CredentialVault; readonly native: HostedAgentRuntime; readonly connections: ConnectionManager;
   readonly connect?: (options: ProviderSharingRemoteOptions) => ProviderSharingRemote;
   readonly closeNative?: (credentialDigest: string, runId: string) => Promise<void>;
+  readonly readQuota?: (backendId: string, providerId: string, signal: AbortSignal) => Promise<readonly ProviderSharingQuotaAccount[]>;
+  readonly readGroupUsage?: (backendId: string, providerId: string, memberId: string, fromDay: string) => readonly ProviderGroupUsageRow[];
 }
 /** The service owns foreign credentials for this Home independently of an
  * individual browser Connection. It refreshes authoritative state even while

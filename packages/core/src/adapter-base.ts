@@ -59,7 +59,7 @@ export abstract class CapabilityDrivenBackendAdapter implements BackendAdapter {
     return this.unsupported("model.effort");
   }
 
-  setFastMode(_enabled: boolean, _context: AdapterContext): Promise<void> {
+  setFastMode(_enabled: boolean | "ultrafast", _context: AdapterContext): Promise<void> {
     return this.unsupported("model.fast_mode");
   }
 

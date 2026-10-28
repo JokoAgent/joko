@@ -3,6 +3,7 @@ import { mobilePartnerPhotoValid, type MobilePartnerAvatarDraft } from "./mobile
 import { projectMobilePartnerCapabilities, projectMobilePartnerProfile,
   type MobilePartnerCapabilities, type MobilePartnerDirectoryProfile, type MobilePartnerModelRoute } from "./mobile-partner-directory";
 import type { MobileModelRoute } from "./mobile-runtime-controls";
+import { mobileModelSupportsSpeed } from "./mobile-runtime-controls";
 
 export interface MobilePartnerProfileOptions {
   readonly revision: bigint;
@@ -129,7 +130,7 @@ export function validateMobilePartnerDraftFields(snapshot: MobilePartnerDraftFie
       || chain.filter(candidate => candidate.backendId === route.backendId).length > 1 && !axes.canSwitchModel
       || route.effort !== undefined && !model.efforts.some((effort) => effort.id === route.effort)
       || (model.efforts.length > 0) !== (route.effort !== undefined) || route.effort !== undefined && !axes.canSetEffort
-      || route.fastMode && (!model.supportsFastMode || !axes.canSetFastMode)) {
+      || route.fastMode && (!mobileModelSupportsSpeed(model, route.fastMode) || !axes.canSetFastMode)) {
       throw new MobilePartnerProfileValidationError("modelUnavailable", "A selected Partner capability, model or option is no longer available.");
     }
   }
@@ -141,7 +142,7 @@ export function validateMobilePartnerDraftFields(snapshot: MobilePartnerDraftFie
     if (!original || !model || !model.permissionModes.includes(capabilities.permissionMode) || capabilities.planMode && !model.canSetPlanMode
       || (model.efforts.length > 0) !== (task.effort !== undefined)
       || task.effort !== undefined && (!model.canSetEffort || !model.efforts.some(effort => effort.id === task.effort))
-      || task.fastMode && (!model.canSetFastMode || !model.supportsFastMode)) {
+      || task.fastMode && (!model.canSetFastMode || !mobileModelSupportsSpeed(model, task.fastMode))) {
       throw new MobilePartnerProfileValidationError("modelUnavailable", "The selected task model or option is no longer available.");
     }
   }

@@ -24,6 +24,14 @@ afterEach(() => {
 });
 
 describe("purpose-isolated node encryption", () => {
+  it("isolates plugin exchange without opening a LAN discovery purpose", () => {
+    const a = generateNodeSyncIdentity(), b = generateNodeSyncIdentity();
+    const context = { sourceNodeId: "plugin-a", destinationNodeId: "plugin-b", transferId: "request", totalChunks: 1 };
+    const ciphertext = encryptNodeSyncBytes("plugin-data", Buffer.from("plugin-only"), a.privateKey, b.publicKey, context);
+    expect(decryptNodeSyncBytes("plugin-data", ciphertext, b.privateKey, a.publicKey, context).toString()).toBe("plugin-only");
+    for (const purpose of ["contacts", "voice-dictionary"] as const) expect(() => decryptNodeSyncBytes(purpose, ciphertext, b.privateKey, a.publicKey, context)).toThrow();
+    expect(() => nodeSyncDomain("plugin-data" as NodeSyncPurpose)).toThrow();
+  });
   it.each(["contacts", "voice-dictionary"] as const)("binds %s ciphertext and proofs to purpose, nodes and all frame fields", (purpose) => {
     const first = generateNodeSyncIdentity();
     const second = generateNodeSyncIdentity();

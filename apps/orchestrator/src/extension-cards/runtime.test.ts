@@ -11,7 +11,7 @@ import type { ExtensionCatalogDescriptor } from "../extension-catalog.js";
 import type { PiInstalledPackageLease, PiResourceDescriptor } from "../resource-manager.js";
 import type { BridgeToolProvider } from "../mcp-router.js";
 import { parseExtensionRuntime, type ExtensionRuntimeDescriptor } from "../extension-surface-manifest.js";
-import { ExtensionCardRuntime, validateExtensionEnvelope } from "./runtime.js";
+import { ExtensionCardRuntime, validateExtensionEnvelope, validateExtensionRuntimeRequest } from "./runtime.js";
 import { ExtensionCardsManager } from "./manager.js";
 import type { ExtensionTasks, ExtensionTaskOwner } from "../extension-tasks.js";
 import { ExtensionProjectPolicies, extensionProjectForTarget } from "../extension-project-policy.js";
@@ -21,6 +21,13 @@ it("bounds every plugin envelope before asynchronous admission", () => {
   validateExtensionEnvelope({ type: "card-update", html: "<p>Safe</p>" });
   const cyclic: Record<string, unknown> = {}; cyclic.self = cyclic;
   for (const value of [cyclic, new Date(), { value: 1n }, { value: "x".repeat(4 * 1024 * 1024) }, { ignored: new Array(65_536).fill(0) }]) expect(() => validateExtensionEnvelope(value)).toThrow();
+});
+it("allows the bounded image envelope only for plugin task and target sends", () => {
+  const attachments = [{ base64: "A".repeat(5 * 1024 * 1024) }];
+  expect(() => validateExtensionRuntimeRequest({ type: "targets-request", kind: "send", attachments })).not.toThrow();
+  expect(() => validateExtensionRuntimeRequest({ type: "tasks-request", kind: "send", attachments })).not.toThrow();
+  expect(() => validateExtensionRuntimeRequest({ type: "targets-request", kind: "resolve", attachments })).toThrow();
+  expect(() => validateExtensionRuntimeRequest({ type: "card-update", kind: "send", attachments })).toThrow();
 });
 browserIt("runs inspected tools in Chromium, preserves mail edits through sending and revokes a disabled source", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-card-runtime-")), store = new OperationalStore(join(root, "store.db"));
@@ -36,8 +43,8 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const projects = new ExtensionProjectPolicies(store);
   const id = "extension_0123456789abcdef0123456789abcdef", revision = `sha256:${"a".repeat(64)}`;
   let enabled = true, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
-  const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "text"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
-    card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, text: { oneshot: true }, showTaskPreferences: false,
+  const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "targets", "text", "sync"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
+    card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, targets: true, deviceSync: true, text: { oneshot: true }, showTaskPreferences: false,
     network: { hosts: ["api.example.test"], connections: [{ key: "service", label: "Service", inject: { header: "Authorization", format: "Bearer {value}" } }], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
   const extension = () => ({ id, revision: 1n, name: "Fixture mail", installed: true, enabled, owner: { kind: "resource", resourceId: "resource", resourceVersion: 1n, discoveredRevision: revision },
     setup: { state: "not_required" }, runtime: { ...declaration, extensionEntry: "extensions/main.js" } } as unknown as ExtensionCatalogDescriptor);
@@ -103,8 +110,13 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
           textOutcomes[key] = response;
           return { ok: true, result: response };
         });
+        joko.tools.register('targets', async message => ({ ok: true, result: {
+          listed: await joko.targets.list({ callId: message.callId, targetKind: 'task' }), methods: Object.keys(joko.targets)
+        } }));
+        joko.tools.register('sync', async () => ({ ok: true, result: { status: await joko.deviceSync.status(), nodeVisible: typeof process !== 'undefined' } }));
         joko.tools.register('read_mail', async message => ({ ok: true, result: { accountId: 'one', messageId: 'one', from: 'Sender', to: 'Owner', cc: '', bcc: '', date: 'Today', subject: message.arguments.markRead ? 'Opened' : 'Unread', bodyHtml: '<p>Hello</p>', bodyText: 'Hello', attachments: [] } }));
         joko.onHostMessage(async message => {
+          if (message.type === 'device-sync-request') await joko.deviceSync.reply(message.requestId, { received: message.data });
           if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
         });
         joko.tools.register('mail', async message => ({ ok: await compose.present(message, account, structuredClone(saved)), result: { shown: true } }));
@@ -132,12 +144,22 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const manager = new ExtensionCardsManager({ store, vault, assertProject: (extensionId, sessionId) => projects.assertEnabledForSession(extensionId, sessionId), authority: extensionId => runtime?.authority(extensionId), redact: value => value,
     dispatch: (scope, event, assertCurrent) => runtime!.dispatch(scope, event, assertCurrent) });
   const startupErrors: string[] = [];
+  const syncRequests: unknown[] = [], syncActive = vi.fn(), syncInvalidated = vi.fn();
   const openSurface = surfaces.open.bind(surfaces);
   vi.spyOn(surfaces, "open").mockImplementation(async input => {
     try { return await openSurface(input); } catch (error) { startupErrors.push(String(error)); throw error; }
   });
   const registration = { id: "target", root, displayName: "Workspace", trusted: true };
   runtime = new ExtensionCardRuntime({ store, vault, cards: manager, surfaces, projects, executablePath: process.env.JOKO_BROWSER_EXECUTABLE,
+    deviceSync: { setActive: syncActive, invalidatePlugin: syncInvalidated, request: async (extensionId, input, signal, current) => {
+      expect(extensionId).toBe(id); current(); signal.throwIfAborted(); syncRequests.push(input);
+      return { ok: true, peers: [] };
+    } },
+    targets: { drain: async () => {}, request: async (owner, input) => {
+      owner.assertCurrent(); expect(owner.sourceSessionId).toBe("task");
+      expect(input).toMatchObject({ type: "targets-request", kind: "list", targetKind: "task" });
+      return { targets: [{ kind: "task", id: "task", label: "Task", detail: "" }], nextCursor: null };
+    } },
     tasks, text: { oneshot: async (owner, input) => {
       owner.assertCurrent(); const key = (input as { prompt: string }).prompt; textCalls.push(key);
       if (key.startsWith("deferred-text-")) {
@@ -180,6 +202,12 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     expect(managed.structuredContent).toMatchObject({ task: { taskId: "managed-task", revision: "configuration", hidden: true, usage: "1" },
       text: { ok: true, text: '{"summary":"Done"}' }, failureCode: "TASK_NOT_FOUND", hasCredentials: false });
     expect((managed.structuredContent?.taskMethods as string[])).toHaveLength(17);
+    const targetMetadata = await provider.callTool("targets", {}, undefined, context);
+    expect(targetMetadata.structuredContent).toEqual({ listed: { targets: [{ kind: "task", id: "task", label: "Task", detail: "" }], nextCursor: null }, methods: ["list", "resolve", "send", "cancel"] });
+    expect((await provider.callTool("sync", {}, undefined, context)).structuredContent).toEqual({ status: { ok: true, peers: [] }, nodeVisible: false });
+    expect(syncActive).toHaveBeenCalledWith(true);
+    expect(await runtime.deliverDeviceSync(id, { type: "device-sync-request", requestId: "encrypted-request", data: { note: "opaque" } }, new AbortController().signal, () => {})).toBe(true);
+    await vi.waitFor(() => expect(syncRequests).toContainEqual({ type: "device-sync-request", op: "reply", requestId: "encrypted-request", data: { received: { note: "opaque" } } }));
     for (const reason of ["cancel", "generation", "bridge-authority", "resident"] as const) {
       const key = `deferred-${reason}`, source = new AbortController(); let bridgeCurrent = true;
       const failed = provider.callTool("tasks", { requestKey: key, ...(reason === "resident" ? { resident: true } : {}) }, source.signal,
@@ -289,6 +317,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     await expect(provider.callTool("network", {}, undefined, context)).rejects.toThrow();
     expect(manager.get("task", mailId).interactive).toBe(false);
     enabled = false; changed?.([id]); expect(provider.available).toBe(false);
+    expect(syncInvalidated).toHaveBeenCalledWith(id);
     expect(manager.get("task", mailId).interactive).toBe(false);
     await expect(provider.callTool("card", {}, undefined, context)).rejects.toThrow(); expect(publicCards()).toHaveLength(before);
   } finally { for (const task of [...delayedTasks.values(), ...delayedText.values()]) task.release(); await runtime.stop(); await manager.dispose(); await surfaces.close(); store.close(); await rm(root, { recursive: true, force: true }); }

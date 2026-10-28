@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
+import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import {
   ActorKind,
   ArtifactKind,
@@ -369,6 +370,7 @@ export interface RunMappingContext {
 }
 
 export interface SessionMappingContext {
+  readonly localWorkspace?: { readonly workspaceId: string; readonly path: string };
   readonly taskActivity?: import("./session-task-activity.js").SessionTaskActivityProjection;
   readonly activeRun?: StoredRun;
   readonly runtimeAttached?: boolean;
@@ -392,7 +394,7 @@ export interface SessionMappingContext {
     readonly providerId: string;
     readonly modelId: string;
     readonly effort?: string;
-    readonly fastMode: boolean;
+    readonly fastMode: boolean | "ultrafast";
   };
 }
 
@@ -659,6 +661,7 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
         }
   );
   return message<ProtoSession>("joko.v1.Session", {
+    ...(context.localWorkspace === undefined ? {} : { localWorkspace: context.localWorkspace }),
     sessionId: session.id,
     backendId: session.backendId,
     targetId: session.targetId,
@@ -878,7 +881,7 @@ export function fromProtoSession(session: ProtoSession): SessionDescriptor {
     ...(session.model?.effortId === undefined || session.model.effortId === ""
       ? {}
       : { effort: session.model.effortId }),
-    fastMode: session.model?.fastMode ?? false,
+    fastMode: decodeModelSpeed(session.model ?? {}),
     ...(session.attention === undefined ? {} : { attention: fromProtoSessionAttention(session.attention) }),
     taskTags: session.taskTags.map(fromProtoTaskTag),
     createdAt,
@@ -1841,12 +1844,12 @@ export function toProtoModelSelection(
   providerId: string,
   modelId: string,
   effortId: string | undefined,
-  fastMode: boolean
+  fastMode: boolean | "ultrafast"
 ): ModelSelection {
   return message<ModelSelection>("joko.v1.ModelSelection", {
     model: message<ModelKey>("joko.v1.ModelKey", { providerId, modelId }),
     effortId: effortId ?? "",
-    fastMode
+    ...encodeModelSpeed(fastMode)
   });
 }
 
@@ -1875,11 +1878,13 @@ export function toProtoModelDescriptor(backendId: string, model: ProviderModel):
       defaultLevel: level === model.defaultEffort
     })),
     supportsFastMode: model.supportsFastMode ?? false,
+    supportsUltrafastMode: model.supportsUltrafastMode ?? false,
     description: model.description,
     defaultEffort: model.defaultEffort !== undefined && model.thinkingLevels.includes(model.defaultEffort) ? model.defaultEffort : undefined,
     displayThinkingLevels: [...(model.displayThinkingLevels ?? [])],
     declaredSupportsImages: model.declaredSupportsImages,
     declaredSupportsFastMode: model.declaredSupportsFastMode,
+    declaredSupportsUltrafastMode: model.declaredSupportsUltrafastMode,
     declaredModalities: model.declaredInputModalities === undefined && model.declaredOutputModalities === undefined ? undefined
       : { $typeName: "joko.v1.ModelDeclaredModalities",
         input: model.declaredInputModalities === undefined ? undefined : { $typeName: "joko.v1.ModelModalityValues", values: [...model.declaredInputModalities] },
@@ -4784,7 +4789,8 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         switchDuringSession: true,
         supportsEffort: capability.key === "model.effort",
         supportsFastMode: capability.key === "model.fast_mode",
-        effortIds: [...(capability.options ?? [])]
+        supportsUltrafastMode: capability.key === "model.fast_mode" && capability.options?.includes("ultrafast") === true,
+        effortIds: capability.key === "model.effort" ? [...(capability.options ?? [])] : []
       }
     };
   } else if (capability.key.startsWith("permission.")) {
@@ -5355,7 +5361,7 @@ function toProtoScheduleExecution(value: unknown): ScheduleExecutionSnapshot {
   return message<ScheduleExecutionSnapshot>("joko.v1.ScheduleExecutionSnapshot", {
     model: providerId === undefined || modelId === undefined
       ? undefined
-      : toProtoModelSelection(providerId, modelId, stringField(record, "effort"), booleanField(record, "fastMode") ?? false),
+      : toProtoModelSelection(providerId, modelId, stringField(record, "effort"), record["fastMode"] === "ultrafast" ? "ultrafast" : booleanField(record, "fastMode") ?? false),
     permissionMode: toProtoPermissionMode(
       permission === "auto" || permission === "bypassPermissions" ? permission : "ask"
     ),
@@ -5402,7 +5408,7 @@ function fromProtoScheduleExecution(value: ScheduleExecutionSnapshot | undefined
     ...(value.model?.model?.providerId === undefined ? {} : { providerId: value.model.model.providerId }),
     ...(value.model?.model?.modelId === undefined ? {} : { modelId: value.model.model.modelId }),
     ...(value.model?.effortId === undefined || value.model.effortId === "" ? {} : { effort: value.model.effortId }),
-    fastMode: value.model?.fastMode ?? false,
+    fastMode: decodeModelSpeed(value.model ?? {}),
     permissionMode: fromProtoPermissionMode(value.permissionMode),
     planMode: value.planMode,
     useWorktree: value.useWorktree,

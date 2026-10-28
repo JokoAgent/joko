@@ -1,4 +1,6 @@
 import { realpath } from "node:fs/promises";
+import { readWorkerWorkspaceBinding, workerWorkspaceTarget, WORKER_WORKSPACE_PLAN_KEY,
+  type WorkerWorkspaceBinding, type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { SessionWorktreeBinding, TargetDescriptor } from "@joko/core";
@@ -114,6 +116,11 @@ export class SessionWorktreeCoordinator {
     if (this.#initialized) return;
     const sessions = this.#store.listSessions({ includeArchived: true, includeDeleted: false })
       .filter((session) => session.descriptor.worktree !== undefined);
+    for (const session of this.#store.listSessions({ includeArchived: false, includeDeleted: false })) {
+      const binding = readWorkerWorkspaceBinding(this.#store, session.descriptor.id);
+      if (binding) await this.registerWorkerWorkspace(binding, session.descriptor.title,
+        this.#store.getTarget(session.descriptor.targetId).descriptor.trusted);
+    }
     const localSessions = sessions.filter((session) => session.descriptor.worktree?.remote === undefined);
     const remoteSessions = sessions.filter((session) => session.descriptor.worktree?.remote !== undefined);
     const scheduledOwnerSessionIds = this.#store.listSettings("service")
@@ -464,7 +471,7 @@ export class SessionWorktreeCoordinator {
   effectiveTarget(session: StoredSession): TargetDescriptor {
     const target = this.#store.getTarget(session.descriptor.targetId).descriptor;
     const worktree = session.descriptor.worktree;
-    if (worktree === undefined) return target;
+    if (worktree === undefined) return workerWorkspaceTarget(this.#store, session.descriptor, target);
     if (worktree.state !== "active") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     if (worktree.remote !== undefined) {
       if (target.remoteWorkspace === undefined || worktree.remote.targetId !== target.id
@@ -477,7 +484,28 @@ export class SessionWorktreeCoordinator {
         remoteWorkspace: { ...target.remoteWorkspace, workspaceRoot: worktree.path }
       };
     }
-    return { ...target, workspaceRoot: worktree.path };
+    return workerWorkspaceTarget(this.#store, session.descriptor, { ...target, workspaceRoot: worktree.path });
+  }
+
+  async registerWorkerWorkspace(binding: WorkerWorkspaceBinding, displayName: string, trusted: boolean): Promise<void> {
+    await this.#workspaces.register({ id: binding.workspaceId, root: binding.path, displayName, trusted });
+  }
+
+  unregisterWorkerWorkspace(sessionId: string): void {
+    const binding = readWorkerWorkspaceBinding(this.#store, sessionId);
+    if (binding) this.#workspaces.unregister(binding.workspaceId);
+  }
+
+  #workerReferencesLease(leaseId: string): boolean {
+    return this.#store.listSettings("service").some(setting => {
+      if (setting.key !== WORKER_WORKSPACE_PLAN_KEY) return false;
+      const plan = setting.value as WorkerWorkspacePlan;
+      if (plan.format !== 1 || plan.createWorktree || plan.inherited?.worktreeLeaseId !== leaseId) return false;
+      const worker = this.#store.findCollaborationWorker(setting.scopeId);
+      if (!worker) return false;
+      if (worker.sessionId) { const session = this.#store.findSession(worker.sessionId); return session !== undefined && session.descriptor.deletedAt === undefined; }
+      return worker.status === "provisioning" || worker.status === "dispatch_unknown";
+    });
   }
 
   activeWorkspacePath(sessionId: string, expectedBinding: SessionWorktreeBinding): string | undefined {
@@ -589,6 +617,7 @@ export class SessionWorktreeCoordinator {
     const safeReferences = (): boolean => {
       const current = this.#recycleSession(record);
       if (current === undefined) return false;
+      if (this.#workerReferencesLease(lease.id)) return false;
       const cleanup = this.#store.findPendingSessionLifecycleCleanup(lease.sessionId);
       if (cleanup !== undefined && (!cleanup.closeCompleted || !cleanup.nativeCompleted)) return false;
       if (this.#store.listRuns({ sessionId: lease.sessionId, activeOnly: true, limit: 1 }).length > 0) return false;
@@ -604,7 +633,7 @@ export class SessionWorktreeCoordinator {
         if (otherBinding?.remote !== undefined) return false;
         const target = this.#store.getTarget(other.descriptor.targetId).descriptor;
         if (target.remoteWorkspace !== undefined) return false;
-        return localPathWithin(lease.path, otherBinding?.path ?? target.workspaceRoot);
+        return localPathWithin(lease.path, readWorkerWorkspaceBinding(this.#store, other.descriptor.id)?.path ?? otherBinding?.path ?? target.workspaceRoot);
       });
     };
     if (!safeReferences() || await this.#hasPhysicalLiveReference(lease)) return false;
@@ -621,7 +650,7 @@ export class SessionWorktreeCoordinator {
         if (other.descriptor.id === lease.sessionId || other.descriptor.worktree?.remote !== undefined) continue;
         const target = this.#store.getTarget(other.descriptor.targetId).descriptor;
         if (target.remoteWorkspace !== undefined) continue;
-        if (localPathWithin(root, await physicalPath(other.descriptor.worktree?.path ?? target.workspaceRoot))) return true;
+        if (localPathWithin(root, await physicalPath(readWorkerWorkspaceBinding(this.#store, other.descriptor.id)?.path ?? other.descriptor.worktree?.path ?? target.workspaceRoot))) return true;
       }
       return false;
     } catch { return true; }
@@ -689,6 +718,16 @@ export class SessionWorktreeCoordinator {
       .find((candidate) => candidate.descriptor.id === sessionId);
     const persistedBinding = session?.descriptor.worktree;
     const binding = expectedBinding ?? persistedBinding ?? this.#activeBindings.get(sessionId);
+    if (binding?.remote === undefined && binding && this.#workerReferencesLease(binding.leaseId)) {
+      if (expectedBinding) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      const retained = await this.#service.release(sessionId, { retainForRestore: true });
+      if (!retained.ok) throw new SessionWorktreeCoordinatorError(retained.error.code);
+      this.#activeBindings.delete(sessionId);
+      this.#workspaces.unregister(binding.workspaceId);
+      if (persistedBinding && persistedBinding.state !== "preserved") this.#store.updateSessionWorktreeState(sessionId, "preserved");
+      this.notifyRecycleOpportunity(sessionId);
+      return;
+    }
     if (binding?.remote !== undefined) {
       if (binding.state !== "active" || !this.#hasDurableRemoteBinding(sessionId, binding)
         || (persistedBinding !== undefined && !samePersistedBinding(persistedBinding, binding))) {
@@ -776,6 +815,7 @@ export class SessionWorktreeCoordinator {
     }
     this.#activeBindings.delete(sessionId);
     this.#workspaces.unregister(binding?.workspaceId ?? workspaceIdFor(sessionId));
+    this.unregisterWorkerWorkspace(sessionId);
     // Once a lease is released it must never remain projected as active.
     if (persistedBinding !== undefined && binding !== undefined
       && samePersistedBinding(persistedBinding, binding)
@@ -885,7 +925,7 @@ export class SessionWorktreeCoordinator {
     }
     await this.#workspaces.register({
       id: binding.workspaceId,
-      root: binding.path,
+      root: readWorkerWorkspaceBinding(this.#store, session.descriptor.id)?.path ?? binding.path,
       displayName: `${session.descriptor.title} · ${binding.branch}`,
       trusted: target.descriptor.trusted
     });

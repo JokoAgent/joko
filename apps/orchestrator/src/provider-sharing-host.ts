@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomInt, randomUUID } from "node:crypto";
-import { create } from "@bufbuild/protobuf";
+import { create, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { ProviderSharingStore, ProviderSharingStoreError, type OperationalStore, type ProviderSharingProof, type ProviderSharingPerson,
@@ -19,7 +19,9 @@ export class ProviderSharingHost {
   readonly #listeners = new Set<() => void>();
   #closed = false;
   constructor(readonly options: { readonly store: OperationalStore; readonly serverId: string; readonly origin: string | (() => string); readonly endpointPublicKey: string;
-    readonly native: HostedAgentRuntime; readonly now?: () => number; readonly closeNative?: (credentialDigest: string, runId: string) => Promise<void> }) {
+    readonly native: HostedAgentRuntime; readonly now?: () => number; readonly closeNative?: (credentialDigest: string, runId: string) => Promise<void>;
+    readonly readQuota?: (backendId: string, providerId: string, signal: AbortSignal) => Promise<readonly contract.ProviderSharingQuotaAccount[]>;
+    readonly readGroupUsage?: (backendId: string, providerId: string, memberId: string, fromDay: string) => readonly import("@joko/store").ProviderGroupUsageRow[] }) {
     this.records = new ProviderSharingStore(options.store, options.now);
   }
   subscribe(listener: () => void): () => void { this.#listeners.add(listener); return () => this.#listeners.delete(listener); }
@@ -74,6 +76,22 @@ export class ProviderSharingHost {
       this.records.setMember(input.shareId, input.memberId, generation, input.action === "pause" ? "paused" : input.action === "resume" ? "active" : "removed").id);
     this.#changed(); return this.owned(this.records.get(result.value));
   }
+  setModelAccess(input: contract.SetProviderShareModelAccessRequest): contract.ProviderSharingOwned {
+    this.#assertOpen(); if (!input.access) throw invalid();
+    const modelIds = contract.readRemoteModelAccess(input.access);
+    const body = { shareId: id(input.shareId), memberId: id(input.memberId), revision: integer(input.expectedRevision),
+      generation: integer(input.memberGeneration), modelIds: modelIds ?? null };
+    const result = this.options.store.runOperation({ id: id(input.operationId), kind: "provider_share_model_access", body }, () =>
+      this.records.setModelAccess(body.shareId, body.memberId, body.revision, body.generation, modelIds).id);
+    this.#changed(); return this.owned(this.records.get(result.value));
+  }
+  setVisibility(input: contract.SetProviderShareVisibilityRequest): contract.ProviderSharingOwned {
+    this.#assertOpen(); if (!input.visibility) throw invalid();
+    const body = { shareId: id(input.shareId), revision: integer(input.expectedRevision), quota: input.visibility.quota, usage: input.visibility.usage };
+    const result = this.options.store.runOperation({ id: id(input.operationId), kind: "provider_share_visibility", body }, () =>
+      this.records.setVisibility(body.shareId, body.revision, body).id);
+    this.#changed(); return this.owned(this.records.get(result.value));
+  }
   decideReshare(input: contract.DecideProviderReshareRequest): contract.ProviderSharingOwned {
     this.#assertOpen();
     const result = this.options.store.runOperation({ id: id(input.operationId), kind: "provider_reshare_decide", body: { id: id(input.id), approve: input.approve } }, () =>
@@ -85,9 +103,49 @@ export class ProviderSharingHost {
     if (share.id !== shareId) throw denied();
     let catalog: contract.GetHostedAgentCatalogResponse | undefined;
     if (member.status === "active") { try { const provider = this.options.native.shareableProvider(share.backendId, share.providerId);
-      catalog = create(contract.GetHostedAgentCatalogResponseSchema, { format: 1, remoteControlEnabled: true, backends: [provider.catalog] });
+      catalog = create(contract.GetHostedAgentCatalogResponseSchema, { format: 1, remoteControlEnabled: true,
+        backends: [{ ...provider.catalog, providers: provider.catalog.providers.map(item => ({ ...item,
+          manageableModels: [], models: item.models.filter(model => member.modelIds === undefined || member.modelIds.includes(model.key?.modelId ?? "")) })) }] });
     } catch {} }
     return { share: this.preview(share, member.status === "paused" ? "paused" : catalog ? "active" : "unavailable"), member: publicMember(member), catalog };
+  }
+  async readInsights(input: contract.ReadProviderShareInsightsRequest, authorization: string | undefined, signal: AbortSignal): Promise<contract.ProviderSharingInsights> {
+    this.#assertOpen(); signal.throwIfAborted();
+    const credentialDigest = guestCredential(authorization), { share, member } = this.records.lookupCredential(credentialDigest);
+    if (share.id !== input.shareId) throw denied();
+    const proof = { shareId: share.id, memberId: member.id, generation: member.generation, credentialDigest };
+    const assertProvider = this.options.native.settings.captureProvider(share.backendId, share.providerId), assertComputer = this.options.native.settings.captureComputer();
+    const assertCurrent = () => { this.#assertOpen(); signal.throwIfAborted(); assertComputer(); assertProvider(); this.records.authorize(proof);
+      if (this.records.get(share.id).revision !== share.revision) throw denied(); };
+    assertCurrent(); const visibility = share.visibility ?? { quota: false, usage: false };
+    const value = create(contract.ProviderSharingInsightsSchema, { visibility,
+      quotaStatus: visibility.quota ? "unavailable" : "disabled", usageStatus: visibility.usage ? input.includeUsage ? "unavailable" : "not_requested" : "disabled" });
+    if (visibility.quota && this.options.readQuota) {
+      try { value.accounts = [...await this.options.readQuota(share.backendId, share.providerId, signal)];
+        value.quotaStatus = value.accounts.length ? "ready" : "unavailable"; value.quotaPartial = value.accounts.some(account => !["ready", "unlimited"].includes(account.state));
+      } catch { value.quotaStatus = "unavailable"; }
+    }
+    assertCurrent();
+    if (visibility.usage && input.includeUsage) {
+      const fromDay = new Date(this.now() - 30 * 24 * 60 * 60_000).toISOString().slice(0, 10);
+      const rows = [...this.options.native.sharingUsage(share.backendId, share.providerId, member.id, fromDay),
+        ...(this.options.readGroupUsage?.(share.backendId, share.providerId, member.id, fromDay) ?? [])];
+      const merged = new Map<string, contract.ProviderSharingUsageDay>();
+      for (const row of rows) {
+        const key = JSON.stringify([row.day, row.modelId, row.currencyCode]);
+        const day = merged.get(key) ?? create(contract.ProviderSharingUsageDaySchema, { day: row.day, modelId: row.modelId, currencyCode: row.currencyCode, tokensComplete: true, costComplete: true });
+        for (const key of ["turns", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "costMicros"] as const) day[key] += BigInt(row[key]);
+        day.estimated ||= row.estimated; day.tokensComplete &&= row.tokensComplete; day.costComplete &&= row.costComplete; merged.set(key, day);
+      }
+      const days = [...merged.values()].sort((a, b) => b.day.localeCompare(a.day));
+      value.days = days.slice(0, 5000); value.usagePartial = days.length > value.days.length;
+      value.coverageStart = value.usagePartial ? value.days.at(-1)?.day ?? "" : fromDay; value.usageStatus = "ready";
+    }
+    if (toBinary(contract.ProviderSharingInsightsSchema, { ...value, days: [] }).byteLength > contract.PROVIDER_SHARING_INSIGHTS_MAX_BYTES) { value.accounts = []; value.quotaStatus = "unavailable"; value.quotaPartial = true; }
+    while (value.days.length && toBinary(contract.ProviderSharingInsightsSchema, value).byteLength > contract.PROVIDER_SHARING_INSIGHTS_MAX_BYTES) {
+      value.days.pop(); value.usagePartial = true; value.coverageStart = value.days.at(-1)?.day ?? "";
+    }
+    assertCurrent(); return contract.projectProviderSharingInsights(value);
   }
   leave(operationId: string, shareId: string, authorization: string | undefined): Pick<contract.LeaveProviderShareResponse, "share" | "member" | "catalog"> {
     this.#assertOpen();
@@ -124,7 +182,8 @@ export class ProviderSharingHost {
     assertCurrent();
     return { id: `provider-guest-${hash(JSON.stringify([this.options.serverId, proof.shareId, proof.memberId, deviceId, key])).slice(0, 48)}`,
       deviceId: `source-${hash(JSON.stringify([current.member.homeServerId, deviceId])).slice(0, 40)}`, trust: "guest", assertCurrent,
-      providerGrant: { backendId: current.share.backendId, providerId: current.share.providerId, modelIds: provider.models.map(model => model.modelId), cleanupKey: credentialDigest, assertCurrent,
+      providerGrant: { backendId: current.share.backendId, providerId: current.share.providerId,
+        modelIds: provider.models.filter(model => current.member.modelIds === undefined || current.member.modelIds.includes(model.modelId)).map(model => model.modelId), cleanupKey: credentialDigest, assertCurrent,
         ...(key === null ? {} : { groupMember: true as const }),
         cleanupOwner: { shareId: current.share.id, memberId: current.member.id, incarnation: current.member.incarnation, cleanupKey: credentialDigest },
         purgeRequested: () => this.isRemoved({ shareId: current.share.id, memberId: current.member.id, incarnation: current.member.incarnation, cleanupKey: credentialDigest }),
@@ -183,11 +242,15 @@ export class ProviderSharingHost {
     return create(contract.ProviderSharingOwnedSchema, { shareId: share.id, generation: BigInt(share.generation), backendId: share.backendId, providerId: share.providerId,
       providerName: share.providerName, owner: toPerson(share.owner), revision: BigInt(share.revision), members: share.members.filter(member => ["active", "paused"].includes(member.status)).map(publicMember),
       requests: this.records.requests(share.id).filter(row => row.status === "pending").map(publicRequest),
-      reshares: this.records.reshares().filter(row => row.shareId === share.id).map(publicReshare) });
+      reshares: this.records.reshares().filter(row => row.shareId === share.id).map(publicReshare),
+      providerModelAccess: contract.toRemoteModelAccess(this.options.native.settings.modelIds(share.backendId, share.providerId)),
+      availableModels: [...this.options.native.availableRemoteModels(share.backendId, share.providerId)],
+      visibility: share.visibility ?? { quota: false, usage: false } });
   }
   preview(share: ProviderSharingShareRecord, state: string, expiresAt = 0): contract.ProviderSharingPreview {
     return create(contract.ProviderSharingPreviewSchema, { hostOrigin: this.origin(), hostServerId: this.options.serverId, shareId: share.id,
-      backendId: share.backendId, providerId: share.providerId, providerName: share.providerName, owner: toPerson(share.owner), state, expiresAtMs: BigInt(expiresAt) });
+      backendId: share.backendId, providerId: share.providerId, providerName: share.providerName, owner: toPerson(share.owner), state, expiresAtMs: BigInt(expiresAt),
+      visibility: share.visibility ?? { quota: false, usage: false }, accessRevision: BigInt(share.revision) });
   }
   private requestResponse(request: ProviderSharingRequestRecord): Pick<contract.SubmitProviderShareRequestResponse, "request" | "member" | "preview"> {
     const share = this.records.get(request.shareId), member = request.memberId ? share.members.find(row => row.id === request.memberId) : undefined;
@@ -214,7 +277,8 @@ export function providerSharingPublicError(error: unknown): never {
 }
 export function fromPerson(value: contract.ProviderSharingPerson | undefined): ProviderSharingPerson { if (!value) throw invalid(); return { name: label(value.name), avatarUrl: value.avatarUrl ?? null }; }
 function toPerson(value: ProviderSharingPerson) { return create(contract.ProviderSharingPersonSchema, { name: value.name, ...(value.avatarUrl ? { avatarUrl: value.avatarUrl } : {}) }); }
-function publicMember(row: ProviderSharingMemberRecord) { return create(contract.ProviderSharingMemberSchema, { memberId: row.id, generation: BigInt(row.generation), person: toPerson(row.person), status: row.status, joinedAtMs: BigInt(row.joinedAt), homeServerId: row.homeServerId }); }
+function publicMember(row: ProviderSharingMemberRecord) { return create(contract.ProviderSharingMemberSchema, { memberId: row.id, generation: BigInt(row.generation), person: toPerson(row.person), status: row.status, joinedAtMs: BigInt(row.joinedAt), homeServerId: row.homeServerId,
+  modelAccess: contract.toRemoteModelAccess(row.modelIds) }); }
 function publicRequest(row: ProviderSharingRequestRecord) { return create(contract.ProviderSharingRequestSchema, { requestId: row.id, shareId: row.shareId, linkId: row.linkDigest,
   person: toPerson(row.person), pairingCode: row.pairingCode, status: row.status, createdAtMs: BigInt(row.createdAt), expiresAtMs: BigInt(row.expiresAt), ...(row.memberId ? { memberId: row.memberId } : {}) }); }
 function publicReshare(row: ProviderSharingReshareRecord) { return create(contract.ProviderSharingReshareSchema, { id: row.id, shareId: row.shareId, memberId: row.memberId, deviceId: row.deviceId,

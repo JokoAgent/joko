@@ -285,7 +285,7 @@ export const SESSION_HELPER_NESTED_TOOLS: readonly NestedToolDescriptor[] = Obje
       provider_id: { anyOf: [{ type: "string", minLength: 1, maxLength: 256 }, { type: "null" }] },
       model: { type: "string", minLength: 1, maxLength: 256 },
       effort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
-      fast: { type: "boolean" },
+      fast: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["ultrafast"] }] },
       expected_generation: { type: "integer", minimum: 0 }
     }, ["expected_generation"]),
     false
@@ -374,7 +374,7 @@ export const SESSION_HELPER_NESTED_TOOLS: readonly NestedToolDescriptor[] = Obje
       },
       model: { type: "string", minLength: 1, maxLength: 256 },
       effort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
-      fast: { type: "boolean" }
+      fast: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["ultrafast"] }] }
     }, ["message"]),
     false
   )
@@ -1253,7 +1253,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
       : optionalText(providerValue, "provider_id", 256)?.trim();
     const modelId = optionalText(input["model"], "model", 256)?.trim();
     const effort = optionalEffort(input["effort"]);
-    const fastMode = optionalBoolean(input["fast"], "fast");
+    const fastMode = input["fast"] === "ultrafast" ? "ultrafast" : optionalBoolean(input["fast"], "fast");
     if (backendId === undefined && providerId === undefined && modelId === undefined && effort === undefined && fastMode === undefined) {
       throw new SessionHelperError("INVALID_ARGS", "At least one runtime selection axis is required.");
     }
@@ -1796,7 +1796,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     const sameBackend = target.backendId === caller.backendId;
     const modelId = optionalText(input["model"], "model", 256) ?? (sameBackend ? caller.modelId : undefined);
     const effort = optionalEffort(input["effort"]) ?? (sameBackend ? caller.effort : undefined);
-    const fastMode = optionalBoolean(input["fast"], "fast") ?? (sameBackend ? caller.fastMode : false);
+    const fastMode = input["fast"] === "ultrafast" ? "ultrafast" : optionalBoolean(input["fast"], "fast") ?? (sameBackend ? caller.fastMode : false);
     const useWorktree = optionalBoolean(input["use_worktree"], "use_worktree") ?? false;
     const created = await host.createServiceSession({
       operationId: randomUUID(),

@@ -12,7 +12,7 @@ export interface ModelFavoriteConfiguration {
   readonly providerId: string;
   readonly modelId: string;
   readonly effortId?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 export interface ModelFavoriteSettingsSnapshot {
@@ -40,7 +40,7 @@ interface StoredModelFavoriteConfiguration {
   readonly providerId: string;
   readonly modelId: string;
   readonly effortId: string | null;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 interface StoredModelFavoriteSettings {
@@ -142,7 +142,7 @@ export class ModelFavoriteSettings {
     const effortId = input.effortId === undefined
       ? null
       : requiredId(input.effortId, 128, "Model effort identity");
-    if (typeof input.fastMode !== "boolean") throw new RangeError("Model favorite Fast Mode is invalid.");
+    if (typeof input.fastMode !== "boolean" && input.fastMode !== "ultrafast") throw new RangeError("Model favorite speed is invalid.");
     const backend = this.#store.listBackends().find(({ descriptor }) => descriptor.id === backendId)?.descriptor;
     const reason = this.#routeUnavailableReason(backend, providerId, modelId, effortId, input.fastMode);
     if (reason !== "") throw new RangeError(reason);
@@ -154,7 +154,7 @@ export class ModelFavoriteSettings {
     providerId: string,
     modelId: string,
     effortId: string | null,
-    fastMode: boolean
+    fastMode: boolean | "ultrafast"
   ): string {
     if (backend === undefined) return "Backend is no longer available.";
     const sourceReason = this.#sources?.unavailableReason(backend.id, providerId, modelId);
@@ -179,7 +179,7 @@ export class ModelFavoriteSettings {
     if (effortId !== null && !model.thinkingLevels.includes(effortId)) {
       return "Model effort is no longer available.";
     }
-    if (fastMode && model.supportsFastMode !== true) return "Fast Mode is not supported by this model.";
+    if (fastMode && (fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true)) return "The selected speed is not supported by this model.";
     return "";
   }
 }
@@ -216,7 +216,7 @@ function readFavorite(value: unknown): StoredModelFavoriteConfiguration | undefi
     || !validId(value["favoriteId"], 128) || !validId(value["backendId"], 128)
     || !validId(value["providerId"], 128) || !validId(value["modelId"], 256)
     || (value["effortId"] !== null && !validId(value["effortId"], 128))
-    || typeof value["fastMode"] !== "boolean") return undefined;
+    || (typeof value["fastMode"] !== "boolean" && value["fastMode"] !== "ultrafast")) return undefined;
   return {
     favoriteId: value["favoriteId"],
     backendId: value["backendId"],

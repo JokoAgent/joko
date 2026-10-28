@@ -15,7 +15,7 @@ export function validAppDefaultRoute(value: unknown): value is AppDefaultModelRo
   return Object.keys(route).sort().join(",") === "backendId,effort,fastMode,modelId,providerId"
     && [route["backendId"], route["providerId"], route["modelId"]].every(part => typeof part === "string" && part.length > 0 && part.length <= 512 && part === part.trim() && !/[\u0000-\u001f\u007f]/u.test(part))
     && typeof route["effort"] === "string" && route["effort"].length <= 64 && !/[\u0000-\u001f\u007f]/u.test(route["effort"])
-    && typeof route["fastMode"] === "boolean";
+    && (typeof route["fastMode"] === "boolean" || route["fastMode"] === "ultrafast");
 }
 export function readAppDefaultModelPreference(ownerId: string | undefined): Preference {
   const empty: Preference = { version: 1, tuning: [] };

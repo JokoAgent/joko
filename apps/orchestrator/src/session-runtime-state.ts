@@ -72,7 +72,7 @@ function usageSnapshot(value: unknown): UsageSnapshot | undefined {
     ...(contextWindow === undefined ? {} : { contextWindow }),
     ...(requestInputTokens === undefined ? {} : { pricingContext: {
       inputTokens: requestInputTokens,
-      ...(typeof pricing?.["fastMode"] === "boolean" ? { fastMode: pricing["fastMode"] } : {})
+      ...(typeof pricing?.["fastMode"] === "boolean" || pricing?.["fastMode"] === "ultrafast" ? { fastMode: pricing["fastMode"] } : {})
     } }),
     cost
   };

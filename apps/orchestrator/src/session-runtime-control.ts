@@ -7,7 +7,7 @@ export interface SessionRuntimeProfile {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 export interface SessionRuntimePatch {
@@ -15,13 +15,13 @@ export interface SessionRuntimePatch {
   readonly providerId?: string | null;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode?: boolean;
+  readonly fastMode?: boolean | "ultrafast";
 }
 
 export interface SessionRuntimeAxisPatch {
   /** Null is an internal owner selection for a fixed-effort model. */
   readonly effort?: string | null;
-  readonly fastMode?: boolean;
+  readonly fastMode?: boolean | "ultrafast";
 }
 
 export interface PendingSessionRuntimeMutation {
@@ -241,7 +241,7 @@ export function sessionRuntimeBaseline(input: {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }): SessionRuntimeProfile | undefined {
   return input.providerId === undefined || input.modelId === undefined
     ? undefined
@@ -282,13 +282,13 @@ export function resolveSessionRuntimeProfile(input: {
       ? input.current.effort
       : compatibleSessionRuntimeEffort(model.thinkingLevels, input.current.effort));
   const fastMode = input.patch.fastMode ?? input.current.fastMode;
-  if (input.patch.fastMode === true && (!input.fastModeSupported || model.supportsFastMode !== true)) return undefined;
+  if (input.patch.fastMode && (!input.fastModeSupported || !supportsSpeed(model, input.patch.fastMode))) return undefined;
   return {
     backendId: input.current.backendId,
     providerId,
     modelId,
     ...(effort === undefined ? {} : { effort }),
-    fastMode: fastMode && input.fastModeSupported && model.supportsFastMode === true
+    fastMode: input.fastModeSupported && supportsSpeed(model, fastMode) ? fastMode : false
   };
 }
 
@@ -311,7 +311,7 @@ export function resolveCompatibleSessionRuntimeAxisPatch(input: {
         : compatibleSessionRuntimeEffort(model.thinkingLevels, input.patch.effort ?? input.profile.effort);
   const fastMode = input.patch.fastMode === undefined
     ? undefined
-    : input.patch.fastMode && input.fastModeSupported && model.supportsFastMode === true;
+    : input.fastModeSupported && supportsSpeed(model, input.patch.fastMode) ? input.patch.fastMode : false;
   return {
     ...(effort === undefined ? {} : { effort }),
     ...(fastMode === undefined ? {} : { fastMode })
@@ -367,15 +367,17 @@ export function pickSessionRuntimeFallback(input: {
       providerId: candidate.providerId,
       modelId: candidate.modelId,
       ...(effort === undefined ? {} : { effort }),
-      fastMode: input.current.fastMode
-        && input.fastModeSupported
-        && candidate.supportsFastMode === true
+      fastMode: input.fastModeSupported && supportsSpeed(candidate, input.current.fastMode) ? input.current.fastMode : false
     };
   }
   return undefined;
 }
 
 const SESSION_RUNTIME_EFFORT_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+
+function supportsSpeed(model: ProviderModel, value: boolean | "ultrafast"): boolean {
+  return value === false || (value === "ultrafast" ? model.supportsUltrafastMode === true : value === true && model.supportsFastMode === true);
+}
 
 function compatibleSessionRuntimeEffort(
   levels: readonly string[],

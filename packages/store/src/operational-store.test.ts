@@ -37,6 +37,15 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("persists each exact model speed without turning Ultrafast into ordinary Fast", () => {
+    const f = createFixture();
+    for (const fastMode of ["ultrafast", true, false] as const) {
+      const original = f.store.getSession("session-1");
+      f.store.updateSession("session-1", { fastMode }, original.revision);
+      const path = f.store.filePath; f.store.close(); f.replaceStore(new OperationalStore(path));
+      expect(f.store.getSession("session-1").descriptor.fastMode).toBe(fastMode);
+    }
+  });
   it("commits the Home context receipt with its native binding and retains an unknown claim through cold restart", () => {
     const f = createFixture(), operation = { id: "home-context-once", kind: "restore_partner_home_context", body: { sessionId: "session-1" } };
     f.store.claimDeferredEffectOperation(operation); f.store.armManualContextRebuild({ sessionId: "session-1", operationId: operation.id });

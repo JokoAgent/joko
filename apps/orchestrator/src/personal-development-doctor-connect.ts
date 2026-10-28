@@ -43,7 +43,7 @@ export function createPersonalDevelopmentDoctorConnectMethods(options: {
       const report = await owner().start({ operationId: request.operationId, ...(request.sessionId ? { sessionId: request.sessionId } : {}),
         mode: request.mode, request: request.request, title: request.title, targetId: request.targetId,
         ...(request.providerId ? { providerId: request.providerId } : {}), ...(request.modelId ? { modelId: request.modelId } : {}), ...(request.effort ? { effort: request.effort } : {}),
-        fastMode: request.fastMode, permissionMode: request.permissionMode as "ask", planMode: request.planMode });
+        fastMode: contract.decodeModelSpeed(request), permissionMode: request.permissionMode as "ask", planMode: request.planMode });
       options.authenticateLocal(context); context.signal.throwIfAborted();
       return create(contract.StartPersonalDevelopmentDoctorResponseSchema, { operationId: request.operationId, report: toProtoPersonalDevelopmentDoctorRun(report) });
     }),

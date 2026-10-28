@@ -100,9 +100,13 @@ import { NativeInputHandoffHost } from "./input-handoff/native-host.js";
 import { InputHandoffNotifications } from "./input-handoff/notifications.js";
 import { InputHandoffTools, INPUT_HANDOFF_TOOL_PROVIDER_ID } from "./input-handoff-tools.js";
 import { createProviderSharingRuntime, type ProviderSharingRuntime } from "./provider-sharing-runtime.js";
+import { ExtensionDeviceSync } from "./extension-device-sync.js";
 import { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import { createProviderGroupHostedEndpoint } from "./provider-group-hosted.js";
 import { createHostedNativeTextInference } from "./hosted-native-text-inference.js";
+import { DesktopVoiceConversationManager } from "./voice-conversation/manager.js";
+import { SpeechModelCatalog } from "./voice-conversation/models.js";
+import { createSpeechFetch } from "./voice-conversation/fetch.js";
 import { createHostedAgentCodexAdapter } from "./hosted-agent-codex-factory.js";
 import { createHostedAgentClaudeAdapter } from "./hosted-agent-claude-factory.js";
 import { policySnapshotFor } from "./policy-settings.js";
@@ -241,6 +245,7 @@ import { AppDefaultModelTools } from "./app-default-model-tools.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { CollaborationManager } from "./collaboration-manager.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
+import { ExtensionTargets } from "./extension-targets.js";
 import { ObjectiveManager } from "./objective-manager.js";
 import { CollaborationToolBridgeProvider } from "./collaboration-tool-provider.js";
 import { ContactManager } from "./contact-manager.js";
@@ -470,6 +475,7 @@ export interface OrchestratorApplication {
   readonly sshKeys?: SshKeyManager;
   readonly terminals?: TerminalProvider;
   readonly voiceInput?: VoiceInputCoordinator;
+  readonly desktopVoiceConversation?: DesktopVoiceConversationManager;
   readonly voiceInputSettings?: VoiceInputSettingsController;
   /** Durable current-v1 convergence authority for the node's Voice dictionary replica. */
   readonly voiceDictionary?: VoiceDictionarySyncRepository;
@@ -1663,6 +1669,7 @@ export async function createOrchestratorApplication(
     throw error;
   });
   let startupSessionHost: SessionHost | undefined;
+  let desktopVoiceConversation: DesktopVoiceConversationManager | undefined;
   let startupSessionWorktrees: SessionWorktreeCoordinator | undefined;
   let startupHistoryMaintenance: HistoryMaintenance | undefined;
   let startupCleanupHandled = false;
@@ -1683,6 +1690,7 @@ export async function createOrchestratorApplication(
       await attempt(() => inputHandoff?.close());
       await attempt(() => inputHandoffNotifications?.close());
       await attempt(() => nativeInputHandoff?.close());
+      await attempt(() => desktopVoiceConversation?.close());
       if (startupSessionHost === undefined) {
         await attempt(() => backendInstances.dispose());
       } else {
@@ -1803,7 +1811,13 @@ export async function createOrchestratorApplication(
     }] });
   providerSharing = await createProviderSharingRuntime({ store, directory: join(config.dataDirectory, "provider-sharing"), serverId,
     origin: advertisedOrigin, endpointPublicKey: linkspanIdentity.publicKey, vault: credentialVault, native: hostedAgents, connections,
-    closeNative: (digest, runId) => hostedAgents.endpoint.closeProviderGrant(digest, runId) });
+    closeNative: (digest, runId) => hostedAgents.endpoint.closeProviderGrant(digest, runId),
+    readQuota: (backendId, providerId, signal) => {
+      if (!providerGroups) throw new Error("Provider groups are unavailable.");
+      return providerGroups.sharedQuota({ backendId, providerId }, signal);
+    },
+    readGroupUsage: (backendId, providerId, memberId, fromDay) => providerGroups?.usage.usage.rows({
+      group: { backendId, providerId }, partyId: memberId, fromDay }) ?? [] });
   const resolveSessionContextDefaults = composeSessionContextDefaultsResolver([{
     adapter: { id: piBackendId },
     resolve: () => {
@@ -1967,6 +1981,20 @@ export async function createOrchestratorApplication(
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
   let hostedAgentAutoReview: ReturnType<typeof createHostedAgentAutoReviewer> | undefined;
+  desktopVoiceConversation = new DesktopVoiceConversationManager({ store, host: sessionHost, models: new SpeechModelCatalog(store, modelRoutes),
+    dictationActive: connectionId => voiceInput.hasActiveSession(connectionId),
+    companion: sessionId => {
+      const link = partnerStore.getSessionLink(sessionId);
+      if (!link || link.role !== "canonical") throw new Error("Voice companion is unavailable.");
+      const profile = partnerStore.getPartner(link.partnerId);
+      if (profile.lifecycle !== "active" || profile.canonicalSessionId !== sessionId || profile.initializationState !== "ready") throw new Error("Voice companion is unavailable.");
+      return { identity: `${profile.displayName}\n${profile.identitySource}`, token: JSON.stringify([profile.id, profile.revision.toString(), profile.homeTargetId, sessionId]) };
+    },
+    infer: createHostedNativeTextInference({ store, registry: backendInstances, routes: modelRoutes }),
+    fetch: createSpeechFetch(async (url, signal) => {
+      const environment = environmentProxyForTarget(new URL(url), process.env);
+      return environment === undefined ? await dependencies.resolveOutboundProxy?.(url, { signal }) : environment;
+    }) });
   const readHostedAgentPolicy = (context: AdapterContext): import("./hosted-agent-executor.js").HostedAgentExecutorPolicy => {
     let session: ReturnType<OperationalStore["getSession"]>["descriptor"] | undefined;
     try { session = store.getSession(context.sessionId).descriptor; }
@@ -2478,13 +2506,18 @@ export async function createOrchestratorApplication(
     surfaces: extensionMainViews, engine: partnerRoutines.engine, ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
   startupRoutineRuntime = extensionRoutineRuntime;
   let extensionCardRuntime: ExtensionCardRuntime | undefined;
+  const extensionDeviceSync = new ExtensionDeviceSync({ store, vault: credentialVault, peers: devicePeers, catalog: extensionCatalog, resources: piResources,
+    deliver: async (...args) => extensionCardRuntime?.deliverDeviceSync(...args) ?? false });
+  hostedAgents.installExtensionSync(extensionDeviceSync);
   let extensionOAuthCards: ExtensionOAuthCards | undefined;
   let extensionText: ExtensionText | undefined;
-  const extensionTasks = new ExtensionTasks({ store, host: sessionHost, catalog: extensionCatalog, projects: extensionProjects,
+  const extensionTasks = new ExtensionTasks({ store, host: sessionHost, artifacts, catalog: extensionCatalog, projects: extensionProjects,
     defaults: { current: () => appDefaultModels?.current() }, rootDirectory: join(config.dataDirectory, "extension-tasks"), redact: value => credentials.redactText(value), teams: collaborationGoals,
     reviewNativeTool: createExtensionTaskNativeReviewer({ store, routes: modelRoutes, redact: value => credentials.redactText(value),
       adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter ? [adapter] : []; }) }) });
-  sessionHost.setExtensionTaskQueueGuard(item => extensionTasks.assertQueueCurrent(item));
+  const extensionTargets = new ExtensionTargets({ store, host: sessionHost, tasks: extensionTasks, catalog: extensionCatalog, projects: extensionProjects,
+    partners, artifacts, redact: value => credentials.redactText(value) });
+  sessionHost.setExtensionTaskQueueGuard(item => { if (!extensionTargets.assertQueueCurrent(item)) extensionTasks.assertQueueCurrent(item); });
   sessionHost.setExtensionNativeToolAuthorization(sessionId => partnerNetwork?.nativeToolAuthorization(sessionId) ?? extensionTasks.nativeToolAuthorization(sessionId));
   mcpRouter.setNativeToolAdmission((...args) => sessionHost.authorizeNativeBridgeTool(...args));
   piResources.setExtensionTaskRemoval((transaction, resourceId) => extensionTasks.uninstall(transaction, resourceId));
@@ -2504,7 +2537,8 @@ export async function createOrchestratorApplication(
     authority: id => extensionCardRuntime?.authority(id), locale: () => persistedLocale(store),
     continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard) });
   extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store, projects: extensionProjects,
-    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, tasks: extensionTasks, text: { oneshot: (...args) => extensionText!.oneshot(...args) }, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
+    deviceSync: extensionDeviceSync,
+    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, tasks: extensionTasks, targets: extensionTargets, text: { oneshot: (...args) => extensionText!.oneshot(...args) }, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
     locale: () => persistedLocale(store),
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
@@ -3408,6 +3442,7 @@ export async function createOrchestratorApplication(
     sshKeys,
     terminals,
     voiceInput,
+    desktopVoiceConversation,
     voiceInputSettings,
     voiceDictionary,
     voiceDictionaryPeers,

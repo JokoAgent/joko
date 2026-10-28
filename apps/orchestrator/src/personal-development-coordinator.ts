@@ -22,7 +22,7 @@ export interface PersonalDevelopmentAvailability { readonly available: boolean; 
 export interface PersonalDevelopmentStartInput {
   readonly operationId: string; readonly request: string; readonly title: string; readonly targetId: string;
   readonly originSessionId?: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string;
-  readonly fastMode: boolean; readonly permissionMode: PermissionMode; readonly planMode: boolean;
+  readonly fastMode: boolean | "ultrafast"; readonly permissionMode: PermissionMode; readonly planMode: boolean;
 }
 export interface PersonalTaskIntent {
   readonly format: 1; readonly ownerId: string; readonly taskId: string; readonly operationId: string;

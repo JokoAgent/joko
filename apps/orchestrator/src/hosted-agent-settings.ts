@@ -6,13 +6,15 @@ export const HOSTED_AGENT_SETTING_KEY = "settings.hosted_agents";
 const id = z.string().min(1).max(512).refine(value => !/[\0\r\n]/u.test(value));
 const epoch = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const schema = z.strictObject({ format: z.literal(1), remoteControlEnabled: z.boolean(), generation: epoch,
-  providers: z.array(z.strictObject({ backendId: id, providerId: id, enabled: z.boolean(), generation: epoch })).max(10_000),
+  providers: z.array(z.strictObject({ backendId: id, providerId: id, enabled: z.boolean(), generation: epoch,
+    modelIds: z.array(id).max(4096).refine(ids => new Set(ids).size === ids.length).optional() })).max(10_000),
   limits: z.strictObject({ perDevice: z.number(), total: z.number() }).optional() });
 type Value = z.infer<typeof schema>;
 export interface HostedAgentSettingsSnapshot { readonly revision: bigint; readonly value: Value }
 export type HostedAgentSettingsUpdate =
   | { readonly kind: "remote_control"; readonly enabled: boolean }
   | { readonly kind: "provider"; readonly backendId: string; readonly providerId: string; readonly enabled: boolean }
+  | { readonly kind: "model_access"; readonly backendId: string; readonly providerId: string; readonly modelIds: readonly string[] | undefined }
   | { readonly kind: "limits"; readonly value: HostedAgentLimits }
   | { readonly kind: "reset_limits" };
 
@@ -34,6 +36,12 @@ export class HostedAgentSettings {
   providerEnabled(backendId: string, providerId: string): boolean {
     const value = this.snapshot().value;
     return value.remoteControlEnabled && value.providers.some(provider => provider.backendId === backendId && provider.providerId === providerId && provider.enabled);
+  }
+  modelIds(backendId: string, providerId: string): readonly string[] | undefined {
+    return this.snapshot().value.providers.find(provider => provider.backendId === backendId && provider.providerId === providerId)?.modelIds;
+  }
+  allowsModel(backendId: string, providerId: string, modelId: string): boolean {
+    const selected = this.modelIds(backendId, providerId); return selected === undefined || selected.includes(modelId);
   }
   captureComputer(): () => void {
     const captured = this.snapshot().value; if (!captured.remoteControlEnabled) throw new Error("Remote Agent invocation is disabled on this computer.");
@@ -60,8 +68,20 @@ export class HostedAgentSettings {
           if (update.enabled && !value.remoteControlEnabled) throw new Error("Enable remote control on this computer first.");
           const index = value.providers.findIndex(provider => provider.backendId === update.backendId && provider.providerId === update.providerId), prior = value.providers[index];
           if (prior?.enabled === update.enabled) break;
-          const providers = [...value.providers], replacement = { backendId: update.backendId, providerId: update.providerId, enabled: update.enabled, generation: nextGeneration(prior?.generation ?? 0) };
+          const providers = [...value.providers], replacement = { ...prior, backendId: update.backendId, providerId: update.providerId, enabled: update.enabled, generation: nextGeneration(prior?.generation ?? 0) };
           if (index < 0) providers.push(replacement); else providers[index] = replacement;
+          value = { ...value, providers }; break;
+        }
+        case "model_access": {
+          if (!id.safeParse(update.backendId).success || !id.safeParse(update.providerId).success
+            || update.modelIds !== undefined && (!Array.isArray(update.modelIds) || update.modelIds.length > 4096
+              || update.modelIds.some(value => !id.safeParse(value).success) || new Set(update.modelIds).size !== update.modelIds.length)) throw new Error("Remote model selection is invalid.");
+          const index = value.providers.findIndex(provider => provider.backendId === update.backendId && provider.providerId === update.providerId), prior = value.providers[index];
+          if (JSON.stringify(prior?.modelIds) === JSON.stringify(update.modelIds)) break;
+          const previous: Value["providers"][number] = prior ?? { backendId: update.backendId, providerId: update.providerId, enabled: false, generation: 0 };
+          const { modelIds: _models, ...base } = previous;
+          const replacement = { ...base, generation: nextGeneration(base.generation), ...(update.modelIds === undefined ? {} : { modelIds: [...update.modelIds] }) };
+          const providers = [...value.providers]; if (index < 0) providers.push(replacement); else providers[index] = replacement;
           value = { ...value, providers }; break;
         }
         case "limits": value = { ...value, limits: validateHostedAgentLimits(update.value) }; break;

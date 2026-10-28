@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
-import { ModelSourceKind, type Snapshot } from "@joko/contracts";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ModelSourceKind, decodeModelSpeed, type Snapshot } from "@joko/contracts";
+import { resolveMobileModelSpeed } from "./mobile-runtime-controls";
+import { MobileModelSpeedControl } from "./MobileModelSpeedControl";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
@@ -33,7 +35,7 @@ export function MobileNewTaskModelSelector({ models, value, favorites, colors, l
     const configuredEffort = model.efforts.some(effort => effort.id === configuration?.effortId) ? configuration?.effortId : undefined;
     const effort = model.canSetEffort ? configuredEffort ?? model.efforts.find(item => item.default)?.id ?? model.efforts[0]?.id : undefined;
     setChoice({ backendId: model.backendId, providerId: model.providerId, modelId: model.modelId,
-      ...(effort ? { effortId: effort } : {}), fastMode: model.canSetFastMode === true && model.supportsFastMode && configuration?.fastMode === true });
+      ...(effort ? { effortId: effort } : {}), fastMode: resolveMobileModelSpeed(model, configuration?.fastMode, model.canSetFastMode === true) });
   };
   const run = async (action: (value: MobileNewTaskSourceSelection) => Promise<void>, close: boolean): Promise<void> => {
     if (!choice || busy || disabled) return; setBusy(true); setError("");
@@ -47,7 +49,7 @@ export function MobileNewTaskModelSelector({ models, value, favorites, colors, l
     const model = favorite.selection?.model;
     const entry = matching.find(route => route.backendId === favorite.backendId && route.providerId === model?.providerId && route.modelId === model?.modelId);
     return entry && model && entry.source?.kind !== ModelSourceKind.SHARE ? [{ entry, favorite, selection: { backendId: favorite.backendId, providerId: model.providerId, modelId: model.modelId,
-      ...(favorite.selection?.effortId ? { effortId: favorite.selection.effortId } : {}), fastMode: favorite.selection?.fastMode === true } }] : [];
+      ...(favorite.selection?.effortId ? { effortId: favorite.selection.effortId } : {}), fastMode: decodeModelSpeed(favorite.selection ?? {}) } }] : [];
   }) ?? [];
   return <View style={styles.stack}>
     <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "common.model")} accessibilityState={{ expanded: open, disabled }}
@@ -76,8 +78,8 @@ export function MobileNewTaskModelSelector({ models, value, favorites, colors, l
         {route.canSetEffort && <View style={styles.options}>{route.efforts.map(effort => <Pressable key={effort.id} disabled={busy || disabled}
           accessibilityRole="radio" accessibilityState={{ selected: choice.effortId === effort.id }} onPress={() => setChoice({ ...choice, effortId: effort.id })}
           style={[styles.option, { borderColor: choice.effortId === effort.id ? colors.accent : colors.border }]}><Text style={{ color: colors.ink }}>{effort.label}</Text></Pressable>)}</View>}
-        {route.canSetFastMode && route.supportsFastMode && <View style={styles.row}><Text style={{ color: colors.ink }}>Fast</Text>
-          <Switch value={choice.fastMode} disabled={busy || disabled} onValueChange={fastMode => setChoice({ ...choice, fastMode })} /></View>}
+        {route.canSetFastMode && <MobileModelSpeedControl value={choice.fastMode} supportsFast={route.supportsFastMode} supportsUltrafast={route.supportsUltrafastMode}
+          colors={colors} locale={locale} disabled={busy || disabled} onChange={fastMode => setChoice({ ...choice, fastMode })} />}
         <View style={styles.options}><Pressable disabled={busy || disabled} accessibilityRole="button" onPress={() => { void run(onSelect, true); }} style={[styles.option, { borderColor: colors.accent }]}>
           <Text style={{ color: colors.accent }}>{mobileMessage(locale, "controls.applyModel")}</Text></Pressable>
           {route.source?.kind !== ModelSourceKind.SHARE && <Pressable disabled={busy || disabled} accessibilityRole="button" onPress={() => { void run(onFavorite, false); }} style={[styles.option, { borderColor: colors.border }]}>

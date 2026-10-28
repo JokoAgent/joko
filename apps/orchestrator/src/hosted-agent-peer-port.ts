@@ -1,5 +1,5 @@
 import { fromBinary, toBinary, type Message, type DescMethodUnary } from "@bufbuild/protobuf";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createClient, createRouterTransport, type CallOptions } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES, devicePeerNativeAgentMethodEffect, type DevicePeerNativeAgentPort } from "@joko/device-peer";
@@ -12,18 +12,27 @@ import { createHostedAgentGuestPeerPort, hostedAgentGuestPeerDescriptor } from "
 /** The outbound service-node configuration already pins the authenticated
  * controller server. The command payload cannot supply its trust or identity.
  * Each route owns a fresh live authority over that stable controller scope. */
-export function createHostedAgentPeerPort(runtime: HostedAgentRuntime, controllerServerId: string, assertAuthorityCurrent: () => void = () => {}): DevicePeerNativeAgentPort {
+export function createHostedAgentPeerPort(runtime: HostedAgentRuntime, controllerServerId: string, assertAuthorityCurrent: () => void = () => {}, allowExtensionSync = false): DevicePeerNativeAgentPort {
   if (!controllerServerId || controllerServerId.length > 256 || /[\0\r\n]/u.test(controllerServerId)) throw new Error("The native controller identity is invalid.");
   const lifetime = new AbortController(), principals = new Map<string, { readonly principal: HostedAgentPrincipal; readonly client: ReturnType<typeof makeClient> }>();
   const options = runtime.connectOptions();
   const guestRelay = createHostedAgentGuestPeerPort(runtime, controllerServerId, assertAuthorityCurrent);
+  const syncScope = `${randomUUID()}:`;
   let retirement: Promise<void> | undefined;
   function makeClient(principal: HostedAgentPrincipal) { return createClient(contract.HostedAgentService, createRouterTransport(({ service }) => {
     service(contract.HostedAgentService, createHostedAgentConnectService({ ...options, authenticate: () => principal }),
       { readMaxBytes: DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES, writeMaxBytes: DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES });
   })); }
   return {
+    supportsExtensionSync: allowExtensionSync && runtime.extensionSync !== undefined,
     invoke: async (kind, bytes, signal, authority) => {
+      if (kind === contract.HostedAgentPeerMethod.EXTENSION_SYNC) {
+        assertAuthorityCurrent(); lifetime.signal.throwIfAborted(); signal.throwIfAborted();
+        if (!allowExtensionSync || !runtime.extensionSync || !authority.controllerDeviceId || authority.controllerDeviceId.length > 256
+          || /[\0\r\n]/u.test(authority.controllerDeviceId)) throw new HostedAgentWireError();
+        return runtime.extensionSync.invoke(syncScope + authority.controllerDeviceId, bytes, AbortSignal.any([lifetime.signal, signal]),
+          () => { assertAuthorityCurrent(); lifetime.signal.throwIfAborted(); });
+      }
       if (hostedAgentGuestPeerDescriptor(kind)) return guestRelay.invoke(kind, bytes, signal, authority);
       assertAuthorityCurrent();
       lifetime.signal.throwIfAborted(); signal.throwIfAborted();
@@ -47,6 +56,7 @@ export function createHostedAgentPeerPort(runtime: HostedAgentRuntime, controlle
     },
     retire: () => {
       lifetime.abort();
+      runtime.extensionSync?.retire(syncScope);
       return retirement ??= Promise.all([guestRelay.retire(), ...[...principals.values()].map(scope => runtime.endpoint.closePrincipal(scope.principal))]).then(() => {})
         .catch(error => { retirement = undefined; throw error; });
     }

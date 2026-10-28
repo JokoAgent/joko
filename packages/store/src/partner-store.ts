@@ -2312,7 +2312,7 @@ function modelRoute(value: PartnerModelRouteRecord): PartnerModelRouteRecord {
   const effort = rawEffort === undefined || rawEffort === ""
     ? undefined
     : routeText(rawEffort, "Partner route effort", 64);
-  if (typeof value.fastMode !== "boolean") {
+  if (typeof value.fastMode !== "boolean" && value.fastMode !== "ultrafast") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner route Fast mode must be boolean.");
   }
   return { backendId, providerId, modelId, ...(effort === undefined ? {} : { effort }), fastMode: value.fastMode };
@@ -2351,7 +2351,7 @@ function capabilitiesFromColumns(row: Row, prefix: string): PartnerCapabilitiesR
       providerId: stringValue(record["providerId"], "Partner route Provider ID"),
       modelId: stringValue(record["modelId"], "Partner route model ID"),
       ...(record["effort"] === undefined ? {} : { effort: stringValue(record["effort"], "Partner route effort") }),
-      fastMode: booleanInteger(record["fastMode"], "Partner route Fast mode")
+      fastMode: record["fastMode"] === "ultrafast" ? "ultrafast" : booleanInteger(record["fastMode"], "Partner route Fast mode")
     });
   });
   const permissionMode = stringValue(row[`${prefix}permission_mode`], "Partner permission mode");

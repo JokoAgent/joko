@@ -3554,7 +3554,7 @@ export class OperationalStore {
         descriptor.providerId ?? null,
         descriptor.modelId ?? null,
         descriptor.effort ?? null,
-        boolInt(descriptor.fastMode),
+        speedInt(descriptor.fastMode),
         descriptor.appendSystemPrompt ?? null,
         remoteWorkspace?.kind ?? null,
         remoteWorkspace?.kind === "ssh" ? remoteWorkspace.hostTargetId : null,
@@ -4608,7 +4608,7 @@ export class OperationalStore {
         providerId ?? null,
         modelId ?? null,
         effort ?? null,
-        boolInt(input.fastMode),
+        speedInt(input.fastMode),
         permissionMode,
         boolInt(input.planMode),
         input.createOperationId,
@@ -5853,7 +5853,7 @@ export class OperationalStore {
           route.providerId ?? null,
           route.modelId ?? null,
           route.effort ?? null,
-          route.fastMode ? 1 : 0,
+          speedInt(route.fastMode),
           route.permissionMode,
           route.planMode ? 1 : 0,
           at,
@@ -5872,7 +5872,7 @@ export class OperationalStore {
           route.providerId ?? null,
           route.modelId ?? null,
           route.effort ?? null,
-          route.fastMode ? 1 : 0,
+          speedInt(route.fastMode),
           route.permissionMode,
           route.planMode ? 1 : 0,
           at,
@@ -6085,7 +6085,7 @@ export class OperationalStore {
         session.descriptor.providerId ?? null,
         session.descriptor.modelId ?? null,
         session.descriptor.effort ?? null,
-        session.descriptor.fastMode ? 1 : 0,
+        speedInt(session.descriptor.fastMode),
         session.descriptor.permissionMode,
         session.descriptor.planMode ? 1 : 0,
         at,
@@ -6165,7 +6165,7 @@ export class OperationalStore {
         session.descriptor.providerId ?? null,
         session.descriptor.modelId ?? null,
         session.descriptor.effort ?? null,
-        session.descriptor.fastMode ? 1 : 0,
+        speedInt(session.descriptor.fastMode),
         permissionMode,
         session.descriptor.planMode ? 1 : 0,
         at,
@@ -8416,7 +8416,7 @@ export class OperationalStore {
         patch.providerId ?? descriptor.providerId ?? null,
         patch.modelId ?? descriptor.modelId ?? null,
         patch.effort === null ? null : patch.effort ?? descriptor.effort ?? null,
-        boolInt(patch.fastMode ?? descriptor.fastMode),
+        speedInt(patch.fastMode ?? descriptor.fastMode),
         clearSummary ? null : descriptor.summary ?? null,
         clearSummary || descriptor.summarySourceCursor === undefined
           ? null
@@ -19741,7 +19741,7 @@ function sessionFromRow(row: Row): StoredSession {
       ...optionalString("providerId", row["provider_id"]),
       ...optionalString("modelId", row["model_id"]),
       ...optionalString("effort", row["effort"]),
-      fastMode: booleanValue(row["fast_mode"]),
+      fastMode: speedValue(row["fast_mode"]),
       ...optionalString("appendSystemPrompt", row["append_system_prompt"]),
       ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
       createdAt: numberValue(row["created_at"]),
@@ -19835,7 +19835,7 @@ function collaborationWorkerFromRow(row: Row): CollaborationWorkerRecord {
     ...optionalString("providerId", row["provider_id"]),
     ...optionalString("modelId", row["model_id"]),
     ...optionalString("effort", row["effort"]),
-    fastMode: booleanValue(row["fast_mode"]),
+    fastMode: speedValue(row["fast_mode"]),
     permissionMode: enumValue(row["permission_mode"], ["ask", "acceptEdits", "auto", "bypassPermissions"] as const),
     planMode: booleanValue(row["plan_mode"]),
     ...optionalNumber("sessionGeneration", row["session_generation"]),
@@ -19905,7 +19905,7 @@ function messagingRouteFromRow(row: Row): MessagingRouteRecord {
     ...optionalString("providerId", row["provider_id"]),
     ...optionalString("modelId", row["model_id"]),
     ...optionalString("effort", row["effort"]),
-    fastMode: booleanValue(row["fast_mode"]),
+    fastMode: speedValue(row["fast_mode"]),
     permissionMode: enumValue(row["permission_mode"], ["ask", "acceptEdits", "auto", "bypassPermissions"] as const),
     planMode: booleanValue(row["plan_mode"]),
     createdAt: numberValue(row["created_at"]),
@@ -19933,7 +19933,7 @@ function messagingConversationFromRow(row: Row): MessagingConversationRecord {
     ...optionalString("effort", row["effort"]),
     ...(row["fast_mode"] === null || row["fast_mode"] === undefined
       ? {}
-      : { fastMode: booleanValue(row["fast_mode"]) }),
+      : { fastMode: speedValue(row["fast_mode"]) }),
     ...(row["permission_mode"] === null || row["permission_mode"] === undefined
       ? {}
       : { permissionMode: enumValue(row["permission_mode"], ["ask", "acceptEdits", "auto", "bypassPermissions"] as const) }),
@@ -23476,6 +23476,19 @@ function schedulerRuntimePhase(value: ScheduleRuntimeOccurrencePhase): ScheduleR
 
 function boolInt(value: boolean): number {
   return value ? 1 : 0;
+}
+
+function speedInt(value: boolean | "ultrafast"): number {
+  if (value === "ultrafast") return 2;
+  if (typeof value !== "boolean") throw new StoreError("Model speed is invalid.");
+  return value ? 1 : 0;
+}
+
+function speedValue(value: unknown): boolean | "ultrafast" {
+  const integer = numberValue(value);
+  if (integer === 2) return "ultrafast";
+  if (integer === 0 || integer === 1) return integer === 1;
+  throw new StoreError("Stored model speed is invalid.");
 }
 
 function localRuntimeScope(value: LocalRuntimeOwnerScope): LocalRuntimeOwnerScope {

@@ -12,12 +12,14 @@ message ExtensionTaskRoute {
   string model_id = 3;
   optional string effort = 4;
   bool fast_mode = 5;
+  bool ultrafast_mode = 6;
 }
 message ExtensionTaskModel {
   ExtensionTaskRoute route = 1;
   string name = 2;
   repeated string efforts = 3;
   bool supports_fast_mode = 4;
+  bool supports_ultrafast_mode = 5;
 }
 message ExtensionTaskDirectory {
   string target_id = 1;

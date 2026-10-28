@@ -6,6 +6,20 @@ const entries = ["extensions/review.ts", "extensions/search/index.js"];
 const files = [...entries, "ui/review/index.html", "ui/review/app.js", "ui/search.html"];
 
 describe("Extension surface manifest", () => {
+  it("requires an explicit device sync capability and supports its resident runtime without model tools", () => {
+    const manifest = (runtime: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime }] } } });
+    const runtime = { html: "ui/review/index.html", tools: [], deviceSync: true };
+    expect(parseExtensionSurfaceManifest(manifest(runtime), entries, files)[0]?.runtime).toEqual(runtime);
+    for (const deviceSync of [false, {}, "true"]) expect(() => parseExtensionSurfaceManifest(manifest({ ...runtime, deviceSync }), entries, files)).toThrow();
+  });
+  it("requires an explicit targets declaration together with managed tasks", () => {
+    const manifest = (runtime: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime }] } } });
+    const runtime = { html: "ui/review/index.html", tools: [], tasks: {}, targets: true };
+    expect(parseExtensionSurfaceManifest(manifest(runtime), entries, files)[0]?.runtime).toEqual(runtime);
+    for (const invalid of [{ ...runtime, tasks: undefined }, { ...runtime, targets: false }, { ...runtime, targets: {} }]) {
+      expect(() => parseExtensionSurfaceManifest(manifest(invalid), entries, files)).toThrow();
+    }
+  });
   it("admits task/text runtimes without tools and treats preferences visibility as presentation only", () => {
     const manifest = (runtime: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime }] } } });
     const runtime = { html: "ui/review/index.html", tools: [], card: {}, tasks: { hidden: true }, text: { oneshot: true }, showTaskPreferences: false };

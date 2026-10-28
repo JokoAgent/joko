@@ -995,6 +995,7 @@ export class PiBackendAdapter implements
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
+    if (input.fastMode === "ultrafast") throw piError("PI_ULTRAFAST_UNSUPPORTED", "Ultrafast requires the Codex runtime", "provision");
     await this.validateTarget(input.target);
     const runtimePolicy = input.runtimePolicy ?? "standard";
     if (runtimePolicy !== (context.runtimePolicy ?? "standard")) {
@@ -2176,7 +2177,8 @@ export class PiBackendAdapter implements
     });
   }
 
-  async setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
+  async setFastMode(enabled: boolean | "ultrafast", context: AdapterContext): Promise<void> {
+    if (enabled === "ultrafast") throw piError("PI_ULTRAFAST_UNSUPPORTED", "Ultrafast requires the Codex runtime", "dispatch");
     this.#assertReviewOperationAllowed(context, "change Fast Mode");
     const runtime = this.#runtime(context);
     await this.#runExclusiveSessionMutation(runtime, context, () => this.#setFastModeWithinMutation(enabled, context, runtime));

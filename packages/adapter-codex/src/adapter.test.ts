@@ -5740,6 +5740,32 @@ describe("CodexBackendAdapter", () => {
     expect(events).toContainEqual({ type: "done", outcome: "completed" });
   });
 
+  it("round-trips declared Ultrafast through native creation, turns, settings and capability withdrawal", async () => {
+    const setup = await createSetup();
+    setup.fake.modelList = setup.fake.modelList.map(model => ({ ...model, additionalSpeedTiers: ["ultrafast"] }));
+    const descriptor = await setup.adapter.describe();
+    expect(descriptor.models[0]).toMatchObject({ supportsUltrafastMode: true, declaredSupportsUltrafastMode: true });
+    expect(descriptor.capabilities.get("model.fast_mode")?.options).toContain("ultrafast");
+    const events: EventPayload[] = [], base = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession({ ...sessionInput(setup.target), fastMode: "ultrafast" }, base);
+    expect(setup.fake.transport?.requests.findLast(request => request.method === "thread/start")?.params).toMatchObject({ serviceTier: "ultrafast" });
+    const active = { ...base, binding, operationId: "ultrafast-send" };
+    await expect(setup.adapter.inspectSession(binding, active)).resolves.toMatchObject({ fastMode: "ultrafast" });
+    await setup.adapter.send(prompt("Keep the exact speed"), active);
+    expect(setup.fake.transport?.requests.findLast(request => request.method === "turn/start")?.params).toMatchObject({ serviceTier: "ultrafast" });
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    for (const speed of [true, "ultrafast", false] as const) {
+      await setup.adapter.setFastMode(speed, active);
+      expect(setup.fake.transport?.requests.findLast(request => request.method === "thread/settings/update")?.params)
+        .toMatchObject({ serviceTier: speed === "ultrafast" ? "ultrafast" : speed ? "fast" : null });
+      await expect(setup.adapter.inspectSession(binding, active)).resolves.toMatchObject({ fastMode: speed });
+    }
+    setup.fake.modelList = setup.fake.modelList.map(model => ({ ...model, serviceTiers: [], additionalSpeedTiers: [] }));
+    await setup.adapter.listModels();
+    expect((await setup.adapter.describe()).models[0]?.supportsUltrafastMode).toBe(false);
+    await expect(setup.adapter.setFastMode("ultrafast", active)).rejects.toMatchObject({ publicError: { code: "CODEX_FAST_MODE_UNAVAILABLE" } });
+  });
+
   it("applies advertised reasoning effort and Fast Mode to creation, turns, and live settings", async () => {
     const setup = await createSetup();
     await setup.adapter.describe();

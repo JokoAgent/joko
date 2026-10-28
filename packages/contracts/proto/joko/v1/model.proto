@@ -170,6 +170,8 @@ message ModelDescriptor {
   optional string context_window_source = 31;
   optional string max_output_tokens_source = 32;
   ModelSourceDescriptor source = 33;
+  bool supports_ultrafast_mode = 34;
+  optional bool declared_supports_ultrafast_mode = 35;
 }
 
 enum ModelSourceKind {
@@ -252,6 +254,8 @@ message ModelSelection {
   ModelKey model = 1;
   string effort_id = 2;
   bool fast_mode = 3;
+  // Distinct from Fast. Setting both speed flags is invalid.
+  bool ultrafast_mode = 4;
 }
 
 message ModelUsageSummary {

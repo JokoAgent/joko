@@ -1,4 +1,5 @@
 import "./protobuf-text-encoding.js";
+export * from "./model-speed.js";
 export * from "./remote-desktop-viewer.js";
 export * from "./desktop-remote-desktop.js";
 export * from "./remote-desktop-system-action.js";
@@ -6,6 +7,10 @@ export * from "./remote-desktop-clipboard-version.js";
 export * from "./partner-session-tasks.js";
 export * from "./session-handoff-messages.js";
 export * from "./question-references.js";
+export * from "./extension-targets.js";
+export * from "./remote-model-access.js";
+export * from "./provider-sharing-insights.js";
+export * from "./gen/joko/v1/extension_sync_pb.js";
 
 export * from "./gen/joko/v1/capability_pb.js";
 export * from "./gen/joko/v1/code_host_pb.js";
@@ -25,6 +30,8 @@ export * from "./gen/joko/v1/task_sharing_types_pb.js";
 export * from "./gen/joko/v1/task_sharing_pb.js";
 export * from "./task-sharing.js";
 export * from "./gen/joko/v1/desktop_personal_development_host_pb.js";
+export * from "./gen/joko/v1/desktop_voice_conversation_pb.js";
+export * from "./desktop-speech.js";
 export * from "./gen/joko/v1/managed_model_runtime_pb.js";
 export * from "./gen/joko/v1/messaging_pb.js";
 export * from "./gen/joko/v1/mobile_push_pb.js";

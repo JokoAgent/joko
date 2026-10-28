@@ -26,6 +26,7 @@ import {
   isRemoteDesktopClipboardVersion,
   DevicePeerAcknowledgementSchema,
   DevicePeerCapabilityKind,
+  HostedAgentPeerMethod,
   type DevicePeerCommand,
   DevicePeerDirectoriesResultSchema,
   DevicePeerDirectoryAvailability,
@@ -291,7 +292,8 @@ export class NodeDevicePeerAgentExecutor {
       ...(this.#terminals === undefined ? [] : [DevicePeerCapabilityKind.TERMINAL]),
       DevicePeerCapabilityKind.FORWARDING,
       ...(this.#remoteDesktop === undefined ? [] : [DevicePeerCapabilityKind.REMOTE_DESKTOP]),
-      ...(this.#nativeAgents === undefined ? [] : [DevicePeerCapabilityKind.NATIVE_AGENTS])
+      ...(this.#nativeAgents === undefined ? [] : [DevicePeerCapabilityKind.NATIVE_AGENTS]),
+      ...(this.#nativeAgents?.supportsExtensionSync === true ? [DevicePeerCapabilityKind.EXTENSION_SYNC] : [])
     ]);
   }
 
@@ -309,7 +311,8 @@ export class NodeDevicePeerAgentExecutor {
       command,
       this.#terminals !== undefined,
       this.#remoteDesktop !== undefined,
-      this.#nativeAgents !== undefined
+      this.#nativeAgents !== undefined,
+      this.#nativeAgents?.supportsExtensionSync === true
     );
     validateCommandInput(command);
 
@@ -410,7 +413,8 @@ export class NodeDevicePeerAgentExecutor {
         if (!this.#nativeAgents) throw agentError(DevicePeerFailureCode.CAPABILITY_UNAVAILABLE, false);
         const bytes = await this.#nativeAgents.invoke(command.action.value.method, command.action.value.requestBytes, signal,
           { controllerDeviceId: command.controllerDeviceId });
-        if (!(bytes instanceof Uint8Array) || bytes.byteLength > DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES) throw agentError(DevicePeerFailureCode.INTERNAL, false);
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength > DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES
+          || command.action.value.method === HostedAgentPeerMethod.EXTENSION_SYNC && bytes.byteLength > 96 * 1024) throw agentError(DevicePeerFailureCode.INTERNAL, false);
         return { case: "hostedAgent", value: { $typeName: "joko.v1.DevicePeerHostedAgentResult", responseBytes: bytes } };
       }
       case "listRecentDirectories":
@@ -1902,7 +1906,8 @@ function commandSpecification(
   command: DevicePeerCommand,
   terminalAvailable: boolean,
   remoteDesktopAvailable: boolean,
-  nativeAgentsAvailable: boolean
+  nativeAgentsAvailable: boolean,
+  extensionSyncAvailable: boolean
 ): CommandSpecification {
   const byAction: Partial<Record<NonNullable<DevicePeerCommand["action"]["case"]>, CommandSpecification>> = {
     listRecentDirectories: readOnly(DevicePeerCapabilityKind.FILES),
@@ -1962,14 +1967,16 @@ function commandSpecification(
   };
   const nativeEffect = command.action.case === "invokeHostedAgent" ? devicePeerNativeAgentMethodEffect(command.action.value.method) : undefined;
   const specification = command.action.case === "invokeHostedAgent"
-    ? nativeEffect === undefined ? undefined : nativeEffect === "read_only" ? readOnly(DevicePeerCapabilityKind.NATIVE_AGENTS) : effect(DevicePeerCapabilityKind.NATIVE_AGENTS)
+    ? nativeEffect === undefined ? undefined : command.action.value.method === HostedAgentPeerMethod.EXTENSION_SYNC ? effect(DevicePeerCapabilityKind.EXTENSION_SYNC)
+      : nativeEffect === "read_only" ? readOnly(DevicePeerCapabilityKind.NATIVE_AGENTS) : effect(DevicePeerCapabilityKind.NATIVE_AGENTS)
     : command.action.case === undefined ? undefined : byAction[command.action.case];
   const unavailable = specification?.capability === DevicePeerCapabilityKind.TERMINAL && !terminalAvailable
     || specification?.capability === DevicePeerCapabilityKind.REMOTE_DESKTOP && !remoteDesktopAvailable
     || specification?.capability === DevicePeerCapabilityKind.NATIVE_AGENTS && !nativeAgentsAvailable;
+  const extensionUnavailable = specification?.capability === DevicePeerCapabilityKind.EXTENSION_SYNC && !extensionSyncAvailable;
   if (specification === undefined || command.capability !== specification.capability
-    || command.effect !== specification.effect || unavailable) {
-    throw agentError(unavailable
+    || command.effect !== specification.effect || unavailable || extensionUnavailable) {
+    throw agentError(unavailable || extensionUnavailable
       ? DevicePeerFailureCode.CAPABILITY_UNAVAILABLE
       : DevicePeerFailureCode.INVALID_REQUEST, false);
   }
@@ -1980,6 +1987,7 @@ function validateCommandInput(command: DevicePeerCommand): void {
   switch (command.action.case) {
     case "invokeHostedAgent":
       remoteDesktopControllerId(command.controllerDeviceId);
+      if (command.action.value.method === HostedAgentPeerMethod.EXTENSION_SYNC && command.action.value.requestBytes.byteLength > 96 * 1024) throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
       if (!(command.action.value.requestBytes instanceof Uint8Array) || command.action.value.requestBytes.byteLength > DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES) {
         throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
       }

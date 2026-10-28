@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type JSX } from "react";
+import { ModelSpeedControl } from "./ModelSpeedControl.js";
+import { resolveModelSpeed } from "../model-speed.js";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
   Bot,
@@ -1480,7 +1482,7 @@ function MessagingRouteDialog({ open, connectionId, existing, fallback, snapshot
     readonly providerId?: string;
     readonly modelId?: string;
     readonly effort?: string;
-    readonly fastMode: boolean;
+    readonly fastMode: boolean | "ultrafast";
     readonly permissionMode: PermissionMode;
     readonly planMode: boolean;
   }) => void;
@@ -1516,7 +1518,7 @@ function MessagingRouteDialog({ open, connectionId, existing, fallback, snapshot
       targetId: target.id,
       ...(model === undefined ? {} : { providerId: model.providerId, modelId: model.modelId }),
       ...(model === undefined || effort === "" ? {} : { effort }),
-      fastMode: model?.supportsFast === true && fastMode,
+      fastMode: resolveModelSpeed(model, fastMode),
       permissionMode,
       planMode
     });
@@ -1527,7 +1529,8 @@ function MessagingRouteDialog({ open, connectionId, existing, fallback, snapshot
       <label className="messaging-form__wide"><span>{t("messaging.model")}</span><SelectControl value={modelKey} onChange={(event) => { setModelKey(event.target.value); setEffort(""); setFastMode(false); }}><option value="">{t("messaging.backendDefaultModel")}</option>{models.map((value) => <option key={modelSelectionKey(value.providerId, value.modelId)} value={modelSelectionKey(value.providerId, value.modelId)}>{value.providerName} · {value.name}</option>)}</SelectControl></label>
       <label><span>{t("messaging.effort")}</span><SelectControl value={effort} disabled={model === undefined || model.efforts.length === 0} onChange={(event) => setEffort(event.target.value)}><option value="">{t("common.none")}</option>{model?.efforts.map((value) => <option key={value} value={value}>{value}</option>)}</SelectControl></label>
       <label><span>{t("messaging.permission")}</span><SelectControl value={permissionMode} onChange={(event) => setPermissionMode(event.target.value as PermissionMode)}><option value="ask">{t("messaging.permissionAsk")}</option>{(permissionMode === "acceptEdits" || snapshot.backends.find(backend => backend.id === target?.backendId)?.capabilities.get("permission.modes")?.options.includes("acceptEdits")) && <option value="acceptEdits" disabled={snapshot.backends.find(backend => backend.id === target?.backendId)?.capabilities.get("permission.modes")?.options.includes("acceptEdits") !== true}>{t("permission.edits")}</option>}<option value="auto">{t("messaging.permissionAuto")}</option><option value="bypassPermissions">{t("messaging.permissionBypass")}</option></SelectControl></label>
-      <label className="messaging-choice-row"><CheckboxControl checked={fastMode} disabled={model?.supportsFast !== true} onChange={(event) => setFastMode(event.target.checked)} aria-label={t("messaging.fastMode")} /><span>{t("messaging.fastMode")}</span></label>
+      <ModelSpeedControl className="messaging-choice-row" value={fastMode} supportsFast={model?.supportsFast === true}
+        supportsUltrafast={model?.supportsUltrafast} onChange={setFastMode} disabled={busy} t={t} />
       <label className="messaging-choice-row"><CheckboxControl checked={planMode} onChange={(event) => setPlanMode(event.target.checked)} aria-label={t("messaging.planMode")} /><span>{t("messaging.planMode")}</span></label>
       {availableTargets.length === 0 && <p className="messaging-form__warning messaging-form__wide">{t("messaging.noTargets")}</p>}
       <p className="messaging-form__hint messaging-form__wide">{t("messaging.routeNewOnly")}</p>

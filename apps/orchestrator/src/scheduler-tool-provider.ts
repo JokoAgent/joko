@@ -138,7 +138,7 @@ const CREATE_PROPERTIES = {
   providerId: { type: "string", minLength: 1, maxLength: 256 },
   model: { type: "string", minLength: 1, maxLength: 256 },
   effort: { type: "string", minLength: 1, maxLength: 64 },
-  fastMode: { type: "boolean" },
+  fastMode: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["ultrafast"] }] },
   permissionMode: { type: "string", enum: ["ask", "acceptEdits", "auto", "bypassPermissions"] },
   planMode: { type: "boolean" },
   targetSessionId: { ...ID_SCHEMA, description: "Explicit existing task binding." },
@@ -872,8 +872,8 @@ function executionInput(
     ? optionalText(input["effort"], "effort", 64)
     : optionalRecordText(prior, "effort") ?? caller.effort;
   const fastMode = hasOwn(input, "fastMode")
-    ? optionalBoolean(input["fastMode"], "fastMode") ?? false
-    : typeof prior["fastMode"] === "boolean" ? prior["fastMode"] : caller.fastMode;
+    ? input["fastMode"] === "ultrafast" ? "ultrafast" : optionalBoolean(input["fastMode"], "fastMode") ?? false
+    : typeof prior["fastMode"] === "boolean" || prior["fastMode"] === "ultrafast" ? prior["fastMode"] : caller.fastMode;
   const permissionMode = hasOwn(input, "permissionMode")
     ? permissionModeValue(input["permissionMode"])
     : permissionModeValue(prior["permissionMode"] ?? caller.permissionMode);
@@ -1122,7 +1122,7 @@ function publicSchedule(schedule: ScheduleRecord): Readonly<Record<string, unkno
     ...(typeof execution["providerId"] === "string" ? { providerId: execution["providerId"] } : {}),
     ...(typeof execution["modelId"] === "string" ? { model: execution["modelId"] } : {}),
     ...(typeof execution["effort"] === "string" ? { effort: execution["effort"] } : {}),
-    fastMode: execution["fastMode"] === true,
+    fastMode: execution["fastMode"] === "ultrafast" ? "ultrafast" : execution["fastMode"] === true,
     permissionMode: publicPermissionMode(execution["permissionMode"]),
     planMode: execution["planMode"] === true,
     useWorktree: worktree.useWorktree,

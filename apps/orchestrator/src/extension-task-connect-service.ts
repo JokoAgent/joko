@@ -14,9 +14,9 @@ export function createExtensionTaskConnectService(tasks: ExtensionTasks | undefi
     assertCurrent(); return { tasks, assertCurrent };
   };
   const state = (id: string, value: ReturnType<ExtensionTasks["preferences"]>) => create(contract.ExtensionTaskPreferencesSchema, {
-    extensionId: id, revision: { value: value.revision }, model: value.config.model, targetId: value.config.targetId,
+    extensionId: id, revision: { value: value.revision }, model: value.config.model && { ...value.config.model, ...contract.encodeModelSpeed(value.config.model.fastMode) }, targetId: value.config.targetId,
     permissionMode: value.config.permissionMode === "auto" ? contract.PermissionMode.AUTO : value.config.permissionMode === "acceptEdits" ? contract.PermissionMode.ACCEPT_EDITS : contract.PermissionMode.ASK,
-    showPreferences: value.show, tasksAvailable: value.tasks, models: value.models.map(model => ({ ...model, efforts: [...model.efforts] })),
+    showPreferences: value.show, tasksAvailable: value.tasks, models: value.models.map(model => ({ ...model, route: { ...model.route, ...contract.encodeModelSpeed(model.route.fastMode) }, efforts: [...model.efforts] })),
     directories: value.targets.map(target => ({ targetId: target.id, name: target.displayName, backendId: target.backendId })),
     writeRequests: value.writeRequests.map(request => ({ ...request, mode: request.mode === "auto" ? contract.PermissionMode.AUTO : contract.PermissionMode.ACCEPT_EDITS }))
   });
@@ -26,7 +26,8 @@ export function createExtensionTaskConnectService(tasks: ExtensionTasks | undefi
       const owned = owner(context);
       if (!request.expectedRevision || ![contract.PermissionMode.ASK, contract.PermissionMode.ACCEPT_EDITS, contract.PermissionMode.AUTO].includes(request.permissionMode)) throw new ConnectError("A settings revision and supported permission mode are required.", Code.InvalidArgument);
       const result = owned.tasks.updatePreferences(request.extensionId, request.expectedRevision.value, {
-        ...(request.model ? { model: request.model } : {}), ...(request.targetId === undefined ? {} : { targetId: request.targetId }),
+        ...(request.model ? { model: { backendId: request.model.backendId, providerId: request.model.providerId, modelId: request.model.modelId,
+          ...(request.model.effort === undefined ? {} : { effort: request.model.effort }), fastMode: contract.decodeModelSpeed(request.model) } } : {}), ...(request.targetId === undefined ? {} : { targetId: request.targetId }),
         permissionMode: request.permissionMode === contract.PermissionMode.AUTO ? "auto" : request.permissionMode === contract.PermissionMode.ACCEPT_EDITS ? "acceptEdits" : "ask"
       }, owned.assertCurrent);
       return { preferences: state(request.extensionId, result) };

@@ -135,7 +135,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     return await this.#call(this.#active(context), { kind: "set_model", providerId, modelId }, context) as ProviderModel;
   }
   async setEffort(effort: string, context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "set_effort", effort }, context); }
-  async setFastMode(enabled: boolean, context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "set_fast", enabled }, context); }
+  async setFastMode(enabled: boolean | "ultrafast", context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "set_fast", enabled }, context); }
   async setPermissionMode(mode: NativeSessionState["permissionMode"], context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "set_permission", mode }, context); }
   async setPlanMode(enabled: boolean, context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "set_plan", enabled }, context); }
   async setName(name: string, context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "set_name", name }, context); }

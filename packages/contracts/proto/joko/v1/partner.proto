@@ -179,6 +179,7 @@ message PartnerModelRoute {
   string model_id = 3;
   optional string effort = 4;
   bool fast_mode = 5;
+  bool ultrafast_mode = 6;
 }
 
 message PartnerModelChain {

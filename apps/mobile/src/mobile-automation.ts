@@ -1,3 +1,4 @@
+import { decodeModelSpeed } from "@joko/contracts";
 import {
   PermissionMode,
   ScheduleExecutionMode,
@@ -91,7 +92,7 @@ export interface MobileAutomationSchedule {
     readonly providerId: string;
     readonly modelId: string;
     readonly effortId?: string;
-    readonly fastMode: boolean;
+    readonly fastMode: boolean | "ultrafast";
   };
   readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
@@ -464,7 +465,7 @@ function scheduleExecution(
     ...(execution.model!.effortId.length === 0
       ? {}
       : { effortId: requiredIdentifier(execution.model!.effortId, "Automation model effort") }),
-    fastMode: execution.model!.fastMode
+    fastMode: decodeModelSpeed(execution.model!)
   };
   let script: MobileAutomationSchedule["script"];
   if (executionMode === "script") {

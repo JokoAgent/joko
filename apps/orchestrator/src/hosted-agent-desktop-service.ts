@@ -88,7 +88,7 @@ export class HostedAgentDesktopDelegates {
         if (!entry) {
           if (this.#routes.size >= 4_096) throw new ConnectError("Native Desktop route capacity has been reached.", Code.ResourceExhausted);
           const id = randomBytes(32).toString("base64url");
-          const native = createHostedAgentPeerPort(this.options.runtime, this.options.serverId, () => this.#assertAuthority(authority));
+          const native = createHostedAgentPeerPort(this.options.runtime, this.options.serverId, () => this.#assertAuthority(authority), true);
           const port = this.options.groupOptions
             ? withProviderGroupPeerPort(native, this.options.groupOptions, () => this.#assertAuthority(authority)) : native;
           let captured!: Delegate;
@@ -98,7 +98,8 @@ export class HostedAgentDesktopDelegates {
           entry = captured = { id, instanceKey, authority, port, unsubscribe, retiring: false };
           this.#routes.set(id, entry); this.#instances.set(instanceKey, entry);
         }
-        return create(contract.OpenDesktopHostedAgentDelegateResponseSchema, { format: FORMAT, delegateId: entry.id, serverId: this.options.serverId });
+        return create(contract.OpenDesktopHostedAgentDelegateResponseSchema, { format: FORMAT, delegateId: entry.id, serverId: this.options.serverId,
+          supportsExtensionSync: entry.port.supportsExtensionSync === true });
       }),
       invokeDesktopHostedAgentDelegate: (request, context) => invoke(request.format, context, async authority => {
         const entry = this.#entry(authority, request.delegateId);

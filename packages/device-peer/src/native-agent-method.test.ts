@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { create } from "@bufbuild/protobuf";
+import { clone, create } from "@bufbuild/protobuf";
 import { DevicePeerCommandSchema, DevicePeerCapabilityKind, DevicePeerEffectKind, DevicePeerFailureCode, DevicePeerResponsePhase, HostedAgentPeerMethod } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { NodeDevicePeerAgentExecutor, type NodeDevicePeerAgentEmission } from "./node-agent-executor.js";
@@ -9,6 +9,25 @@ import { NodeDevicePeerAgentExecutor, type NodeDevicePeerAgentEmission } from ".
 const command = (method: HostedAgentPeerMethod, effect: DevicePeerEffectKind) => create(DevicePeerCommandSchema, {
   capability: DevicePeerCapabilityKind.NATIVE_AGENTS, effect, controllerDeviceId: "authenticated-controller",
   action: { case: "invokeHostedAgent", value: { method, requestBytes: new Uint8Array() } }
+});
+it("keeps encrypted plugin exchange behind its independent advertised capability", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-plugin-peer-capability-")), invoke = vi.fn(async () => new Uint8Array()), retire = async () => {};
+  const basic = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "basic.json"), nativeAgents: { invoke, retire } });
+  const enabled = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "enabled.json"), nativeAgents: { invoke, retire, supportsExtensionSync: true } });
+  try {
+    const signal = new AbortController().signal, emit = vi.fn();
+    const request = command(HostedAgentPeerMethod.EXTENSION_SYNC, DevicePeerEffectKind.SIDE_EFFECT);
+    request.capability = DevicePeerCapabilityKind.EXTENSION_SYNC;
+    expect(basic.capabilities).not.toContain(DevicePeerCapabilityKind.EXTENSION_SYNC);
+    await expect(basic.execute(request, signal, emit)).rejects.toMatchObject({ code: DevicePeerFailureCode.CAPABILITY_UNAVAILABLE });
+    expect(emit).not.toHaveBeenCalled();
+    expect(enabled.capabilities).toContain(DevicePeerCapabilityKind.EXTENSION_SYNC);
+    const wrong = command(HostedAgentPeerMethod.EXTENSION_SYNC, DevicePeerEffectKind.SIDE_EFFECT);
+    await expect(enabled.execute(wrong, signal, emit)).rejects.toMatchObject({ code: DevicePeerFailureCode.INVALID_REQUEST });
+    const large = clone(DevicePeerCommandSchema, request); large.action = { case: "invokeHostedAgent", value: { $typeName: "joko.v1.DevicePeerInvokeHostedAgentAction", method: HostedAgentPeerMethod.EXTENSION_SYNC, requestBytes: new Uint8Array(96 * 1024 + 1) } };
+    await expect(enabled.execute(large, signal, emit)).rejects.toMatchObject({ code: DevicePeerFailureCode.INVALID_REQUEST });
+    expect(invoke).not.toHaveBeenCalled(); await enabled.execute(request, signal, emit); expect(invoke).toHaveBeenCalledTimes(1);
+  } finally { await basic.retire(); await enabled.retire(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true }); }
 });
 it("does not advertise native Agent hosting or admit its commands on a generic file/process node", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-native-peer-absent-"));

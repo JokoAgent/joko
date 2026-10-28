@@ -23,8 +23,10 @@ import type { RemoteExecutionRouter } from "../remote-execution-router.js";
 import type { ExtensionOAuthCards } from "./oauth-cards.js";
 import type { ExtraDirectoryManager } from "../extra-directory-manager.js";
 import type { ExtensionTasks } from "../extension-tasks.js";
+import type { ExtensionTargets } from "../extension-targets.js";
 import type { ExtensionText } from "../extension-text.js";
 import type { ExtensionProjectPolicies } from "../extension-project-policy.js";
+import type { ExtensionDeviceSync } from "../extension-device-sync.js";
 
 interface Authority extends ExtensionCardAuthority { readonly surface: ExtensionMainViewAuthority; readonly installationKey: string }
 interface Instance {
@@ -50,6 +52,8 @@ interface Options {
   readonly remoteFiles?: RemoteExecutionRouter["files"];
   readonly oauthCards?: ExtensionOAuthCards;
   readonly tasks?: Pick<ExtensionTasks, "installation" | "request" | "drain">;
+  readonly targets?: Pick<ExtensionTargets, "request" | "drain">;
+  readonly deviceSync?: Pick<ExtensionDeviceSync, "request" | "setActive" | "invalidatePlugin">;
   readonly text?: Pick<ExtensionText, "oneshot">;
   readonly extraDirectories?: Pick<ExtraDirectoryManager, "resolveSelection" | "listForTarget">;
   readonly connections?: Pick<ExtensionNetworkConnections, "hosts" | "token" | "identity" | "list">;
@@ -125,6 +129,7 @@ export class ExtensionCardRuntime {
   async start(): Promise<void> {
     if (!this.#stopped) return;
     this.#stopped = false;
+    this.options.deviceSync?.setActive(true);
     this.#unsubscribe = this.options.catalog.onAuthorityChanged(ids => {
       for (const id of ids) { const instance = this.#instances.get(id); if (instance) this.#retire(instance); }
       void this.#reconcile();
@@ -135,6 +140,7 @@ export class ExtensionCardRuntime {
   #retire(instance: Instance): void {
     if (!instance.current) return;
     instance.current = false; instance.abort.abort(); instance.unregister(); instance.tickets.clear();
+    this.options.deviceSync?.invalidatePlugin(instance.authority.surface.extensionId);
     this.options.cards.revoke(instance.authority.surface.extensionId);
   }
   #reconcile(): Promise<void> {
@@ -164,7 +170,7 @@ export class ExtensionCardRuntime {
           callTool: (name, args, signal, context) => this.#call(instance, name, args, signal, context) };
         try {
           if (provider.tools.length) instance.unregister = this.options.registerProvider(provider);
-          if (authority.runtime.tasks || authority.runtime.text) await this.#ensure(instance);
+          if (authority.runtime.tasks || authority.runtime.text || authority.runtime.deviceSync) await this.#ensure(instance);
         }
         catch { this.#retire(instance); this.#instances.delete(id); }
       }
@@ -227,11 +233,11 @@ export class ExtensionCardRuntime {
     await page.exposeBinding("__jokoExtensionRequest", async ({ frame }, payload: unknown) => {
       if (frame !== page.mainFrame() || instance.pending >= 16) return { ok: false };
       instance.pending += 1;
-      try { this.#assert(instance); validateExtensionEnvelope(payload); return await this.#request(instance, payload); }
+      try { this.#assert(instance); validateExtensionRuntimeRequest(payload); return await this.#request(instance, payload); }
       catch { return { ok: false }; }
       finally { instance.pending -= 1; }
     });
-    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, text: !!instance.authority.runtime.text })})` });
+    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, targets: instance.authority.runtime.targets === true, text: !!instance.authority.runtime.text, deviceSync: instance.authority.runtime.deviceSync === true })})` });
     if (instance.authority.runtime.mail) await page.addInitScript({ content: `${MAIL_COMPOSE_RUNTIME_SOURCE}\nObject.defineProperty(window, "jokoMail", { value: jokoMail, writable: false, configurable: false });` });
     await page.goto(url.href, { waitUntil: "load", timeout: 15_000 }); this.#assert(instance);
     return page;
@@ -259,6 +265,11 @@ export class ExtensionCardRuntime {
     const request = payload as Record<string, unknown>, id = instance.authority.surface.extensionId;
     const current = () => { this.#assert(instance); };
     switch (request.type) {
+      case "device-sync-request": {
+        if (!instance.authority.runtime.deviceSync || !this.options.deviceSync) return { ok: false, errorCode: "SYNC_NOT_ALLOWED" };
+        const owner = this.#requestOwner(instance, request.callId);
+        return this.options.deviceSync.request(id, request, owner.signal, owner.assertCurrent);
+      }
       case "text-oneshot": {
         if (!instance.authority.runtime.text?.oneshot || !this.options.text) return { ok: false, errorCode: "PERMISSION_DENIED" };
         let signal = instance.abort.signal;
@@ -277,6 +288,16 @@ export class ExtensionCardRuntime {
             ...owner }, request);
           owner.assertCurrent(); return { ok: true, result: JSON.parse(JSON.stringify(result, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)) as unknown };
         } catch (error) { return { ok: false, errorCode: typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "INTERNAL", message: "Plugin task request failed. Inspect the original request before retrying." }; }
+      }
+      case "targets-request": {
+        if (!instance.authority.runtime.targets || !instance.authority.runtime.tasks || !this.options.targets || !this.options.tasks) return { ok: false, errorCode: "PERMISSION_DENIED" };
+        try {
+          const owner = this.#requestOwner(instance, request.callId);
+          const result = await this.options.targets.request({ extensionId: id, resourceId: instance.authority.surface.resourceId,
+            installation: this.options.tasks.installation(id, instance.authority.surface.resourceId), ...owner }, request);
+          owner.assertCurrent(); return { ok: true, result };
+        } catch (error) { return { ok: false, errorCode: typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "HOST_NOT_READY",
+          message: "Plugin target delivery failed. Inspect the original request before retrying." }; }
       }
       case "oauth-accounts": {
         const declaration = instance.authority.runtime.network?.secrets?.find(value => value.key === request.key && value.source === "oauth");
@@ -422,6 +443,13 @@ export class ExtensionCardRuntime {
     } catch (error) { if (token && !timedOut) instance.tickets.delete(token); throw error; }
     finally { clearTimeout(timer); }
   }
+  async deliverDeviceSync(extensionId: string, event: unknown, signal: AbortSignal, assertCaller: () => void): Promise<boolean> {
+    const instance = this.#instances.get(extensionId); if (!instance || !instance.authority.runtime.deviceSync) return false;
+    const current = () => { signal.throwIfAborted(); assertCaller(); this.#assert(instance); };
+    current(); const page = await this.#ensure(instance); current();
+    await page.evaluate(payload => (window as unknown as { __jokoRuntime: { event(payload: unknown): void } }).__jokoRuntime.event(payload), event);
+    current(); return true;
+  }
   async #close(instance: Instance): Promise<void> {
     this.#files.retire(instance.authority.key);
     this.#network?.retire(instance.authority.key); instance.callGuards.clear();
@@ -432,12 +460,20 @@ export class ExtensionCardRuntime {
   }
   async stop(): Promise<void> {
     this.#stopped = true; clearInterval(this.#timer); this.#unsubscribe?.();
+    this.options.deviceSync?.setActive(false);
     for (const instance of this.#instances.values()) this.#retire(instance);
     await this.#tail;
     await this.options.tasks?.drain();
+    await this.options.targets?.drain();
     await Promise.all([...this.#instances.values()].map(instance => this.#close(instance))); this.#instances.clear();
     await this.#browser?.close().catch(() => undefined); this.#browser = undefined;
   }
+}
+
+export function validateExtensionRuntimeRequest(value: unknown): void {
+  const request = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  const images = request?.kind === "send" && ["tasks-request", "targets-request"].includes(String(request.type)) && Array.isArray(request.attachments);
+  validateExtensionEnvelope(value, images ? Math.ceil(20 * 1024 * 1024 / 3) * 4 + 128 * 1024 : 4 * 1024 * 1024);
 }
 
 export function validateExtensionEnvelope(value: unknown, maximumBytes = 4 * 1024 * 1024): void {

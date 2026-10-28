@@ -52,6 +52,18 @@ const identity = {
 };
 
 describe("mobile runtime controls", () => {
+  it("keeps native Ultrafast readback distinct and rejects it when that exact capability is withdrawn", () => {
+    const current = create(ModelDescriptorSchema, { ...model("alpha", "a", "Alpha Model", { fast: true }), supportsUltrafastMode: true });
+    const { owner, detail } = snapshots({ models: [current] });
+    const live = create(SnapshotSchema, { ...detail, sessions: detail.sessions.map(session => ({ ...session,
+      model: { ...session.model!, fastMode: false, ultrafastMode: true } })) });
+    const controls = resolveMobileRuntimeControls(identity, owner, live, "session")!;
+    expect(controls.currentModel?.fastMode).toBe("ultrafast");
+    expect(assertMobileModelSelection(controls, { providerId: "alpha", modelId: "a", effortId: "low", fastMode: true }).fastMode).toBe(true);
+    const withdrawn = create(SnapshotSchema, { ...owner, models: [{ ...current, supportsUltrafastMode: false }] });
+    const next = resolveMobileRuntimeControls(identity, withdrawn, live, "session")!;
+    expect(() => assertMobileModelSelection(next, { providerId: "alpha", modelId: "a", effortId: "low", fastMode: "ultrafast" })).toThrow(/not available/);
+  });
   it("retains an already running grouped source and its trusted input capability while hiding its saved favorite", () => {
     const { owner, detail } = snapshots();
     const grouped = create(SnapshotSchema, { ...owner, models: owner.models.map(model => create(ModelDescriptorSchema, { ...model,

@@ -1,6 +1,7 @@
 import { useArtifactDownload } from "./use-artifact-download.js";
+import { resolveModelSpeed } from "../model-speed.js";
 import { McpAppTimelineProvider } from "./McpAppCard.js";
-import { richMediaWorkspacePath } from "@joko/contracts";
+import { richMediaWorkspacePath, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionCardTimelineProvider } from "./ExtensionCard.js";
 import { ExtensionMailReaderProvider } from "./ExtensionMailReader.js";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -1862,7 +1863,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         favoriteSettings={controller.state.snapshot.settings.modelFavorites}
         onMutateFavorite={guest ? undefined : controller.updateModelFavorites}
         value={runtimeSelection ? { backendId: runtimeSelection.backendId, providerId: runtimeSelection.providerId,
-          modelId: runtimeSelection.modelId, effort: runtimeSelection.effort, fastMode: runtimeSelection.fastMode }
+          modelId: runtimeSelection.modelId, effort: runtimeSelection.effort, fastMode: decodeModelSpeed(runtimeSelection) }
           : session.model === undefined ? undefined : {
           backendId: session.backendId,
           providerId: session.model.providerId,
@@ -1889,7 +1890,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           if (!model?.available) throw new Error("The model source is no longer available.");
           if (!guest && controller.setRuntimeModel) {
             await controller.setRuntimeModel(session.id, { backendId: model.backendId, providerId: model.providerId,
-              modelId: model.modelId, effort: selection.effort, fastMode: model.supportsFast && selection.fastMode });
+              modelId: model.modelId, effort: selection.effort, fastMode: resolveModelSpeed(model, selection.fastMode) });
             const control = await controller.getSessionRuntimeControl?.(session.id);
             if (control && providerGroupOwnerRef.current === providerGroupOwnerKey) setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
             return;
@@ -1901,7 +1902,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             canSetEffort && selection.effort !== undefined && model.efforts.includes(selection.effort)
               ? selection.effort
               : undefined,
-            canSetFast && model.supportsFast && selection.fastMode
+            resolveModelSpeed(model, selection.fastMode, canSetFast)
           );
         }}
       />}

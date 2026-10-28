@@ -30,6 +30,14 @@ const models = [
 ] as const;
 
 describe("session runtime control", () => {
+  it("retains Ultrafast only on a route that explicitly advertises that speed", () => {
+    const supported = { ...models[0], supportsUltrafastMode: true };
+    expect(resolveSessionRuntimeProfile({ baseline, current: baseline, patch: { fastMode: "ultrafast" }, models: [supported], fastModeSupported: true }))
+      .toMatchObject({ fastMode: "ultrafast" });
+    expect(resolveSessionRuntimeProfile({ baseline, current: baseline, patch: { fastMode: "ultrafast" }, models, fastModeSupported: true })).toBeUndefined();
+    expect(resolveSessionRuntimeProfile({ baseline, current: { ...baseline, fastMode: "ultrafast" }, patch: { providerId: "provider-b" }, models, fastModeSupported: true }))
+      .toMatchObject({ providerId: "provider-b", fastMode: false });
+  });
   it("keeps baseline, effective, pending, and generation as separate volatile layers", () => {
     const registry = new SessionRuntimeControlRegistry();
     expect(registry.snapshot("task", baseline)).toMatchObject({ generation: 0, baseline, effective: baseline });

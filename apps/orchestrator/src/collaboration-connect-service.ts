@@ -7,7 +7,6 @@ import type {
   CollaborationDispatchStatus,
   CollaborationGoalRecord,
   CollaborationGoalStatus,
-  CollaborationWorkerRecord,
   CollaborationWorkerStatus
 } from "@joko/store";
 import {
@@ -26,6 +25,7 @@ import {
   CollaborationGoalManager,
   CollaborationGoalManagerError,
   type CollaborationGoalTreeView,
+  type CollaborationWorkerProjection,
   type CollaborationInterruptStopOutcome
 } from "./collaboration-goal-manager.js";
 import {
@@ -110,19 +110,25 @@ export function createCollaborationConnectService(
           label: request.label,
           role: request.role,
           assignment: request.assignment,
+          signal: context.signal,
+          ...(request.workspace === undefined ? {} : { workspace: {
+            ...(request.workspace.workingDirectory === undefined ? {} : { workingDirectory: request.workspace.workingDirectory }),
+            createWorktree: request.workspace.createWorktree,
+            ...(request.workspace.sourceRef === undefined ? {} : { sourceRef: request.workspace.sourceRef })
+          } }),
           route: {
             targetId: request.targetId,
             ...(request.providerId === undefined ? {} : { providerId: request.providerId }),
             ...(request.modelId === undefined ? {} : { modelId: request.modelId }),
             ...(request.effort === undefined ? {} : { effort: request.effort }),
-            fastMode: request.fastMode,
+            fastMode: contract.decodeModelSpeed(request),
             permissionMode: fromProtoPermissionMode(request.permissionMode),
             planMode: request.planMode
           }
         });
         return create(contract.CreateCollaborationWorkerResponseSchema, {
           tree: toProtoTree(result.tree),
-          worker: toProtoWorker(result.worker)
+          worker: toProtoWorker(owner().projectWorker(result.worker))
         });
       });
     },
@@ -412,19 +418,20 @@ function toProtoGoal(goal: CollaborationGoalRecord): contract.CollaborationGoal 
   });
 }
 
-function toProtoWorker(worker: CollaborationWorkerRecord): contract.CollaborationWorker {
+function toProtoWorker(worker: CollaborationWorkerProjection): contract.CollaborationWorker {
   return create(contract.CollaborationWorkerSchema, {
     workerId: worker.id,
     goalId: worker.goalId,
     ...(worker.parentWorkerId === undefined ? {} : { parentWorkerId: worker.parentWorkerId }),
     ...(worker.sessionId === undefined ? {} : { sessionId: worker.sessionId }),
+    ...(worker.workspace === undefined ? {} : { workspace: worker.workspace }),
     route: create(contract.CollaborationWorkerRouteSchema, {
       backendId: worker.backendId,
       targetId: worker.targetId,
       ...(worker.providerId === undefined ? {} : { providerId: worker.providerId }),
       ...(worker.modelId === undefined ? {} : { modelId: worker.modelId }),
       ...(worker.effort === undefined ? {} : { effort: worker.effort }),
-      fastMode: worker.fastMode,
+      ...contract.encodeModelSpeed(worker.fastMode),
       permissionMode: toProtoPermissionMode(worker.permissionMode),
       planMode: worker.planMode
     }),

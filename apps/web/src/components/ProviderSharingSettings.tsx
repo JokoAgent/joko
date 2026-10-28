@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type JSX } from "react";
-import type { ProviderSharingApi, GetHostedAgentCatalogResponse, ListProviderSharesResponse, ProviderSharingPreview, ProviderSharingRequest,
-  ProviderSharingOwned, ProviderSharingMember } from "@joko/contracts";
+import { readRemoteModelAccess, toRemoteModelAccess, type ProviderSharingApi, type GetHostedAgentCatalogResponse, type ListProviderSharesResponse, type ProviderSharingPreview, type ProviderSharingRequest,
+  type ProviderSharingOwned, type ProviderSharingMember } from "@joko/contracts";
 import { Button, Pill } from "./ui.js";
 import { providerSharingText } from "../provider-sharing-text.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
+import { RemoteModelAccessEditor } from "./RemoteModelAccessEditor.js";
+import { ProviderSharingInsights } from "./ProviderSharingInsights.js";
 import "./provider-sharing.css";
 
 export interface ProviderSharingSettingsProps {
@@ -89,6 +91,11 @@ function ProviderSharingPanel({ api, nodeKey, nodeName, catalog, language, initi
           <div className="provider-sharing-person-heading"><strong>{row.person?.name}</strong><Pill>{text.state(row.status)}</Pill></div>
           <div className="settings-actions"><Button disabled={disabled} onClick={() => member(share, row, row.status === "paused" ? "resume" : "pause")}>{row.status === "paused" ? text.resume : text.pause}</Button>
             <Button disabled={disabled} onClick={() => member(share, row, "remove")}>{text.remove}</Button></div>
+          <RemoteModelAccessEditor key={`${row.memberId}:${row.generation}`} member disabled={disabled} language={language}
+            models={share.availableModels.flatMap(model => model.key ? [{ id: model.key.modelId, name: model.displayName || model.key.modelId }] : [])}
+            selected={readRemoteModelAccess(row.modelAccess)} providerSelected={readRemoteModelAccess(share.providerModelAccess)}
+            onSave={models => action(async signal => { await api.modelAccess({ operationId: crypto.randomUUID(), shareId: share.shareId, memberId: row.memberId,
+              expectedRevision: share.revision, memberGeneration: row.generation, access: toRemoteModelAccess(models) }, signal); })} />
         </div>)}
         {share.reshares.map(row => <div className="provider-sharing-person" key={row.id}>
           <p>{text.reshare(share.members.find(member => member.memberId === row.memberId)?.person?.name ?? "", row.person?.name ?? "")}</p><Pill>{text.state(row.state)}</Pill>
@@ -96,6 +103,16 @@ function ProviderSharingPanel({ api, nodeKey, nodeName, catalog, language, initi
             <Button disabled={disabled || row.state === "rejected"} onClick={() => void action(async signal => { await api.reshare(crypto.randomUUID(), row.id, false, signal); })}>{text.reject}</Button></div>
         </div>)}
         {!share.requests.length && !share.members.length && !share.reshares.length && <p>{text.noMembers}</p>}
+        <div className="provider-sharing-person">
+          <label><input type="checkbox" checked={share.visibility?.quota === true} disabled={disabled} onChange={event => {
+            const quota = event.target.checked; void action(async signal => { await api.visibility({ operationId: crypto.randomUUID(), shareId: share.shareId,
+              expectedRevision: share.revision, visibility: { quota, usage: share.visibility?.usage ?? false } }, signal); });
+          }} />{language?.startsWith("zh") ? "允许成员查看账户额度" : "Allow members to view account quota"}</label>
+          <label><input type="checkbox" checked={share.visibility?.usage === true} disabled={disabled} onChange={event => {
+            const usage = event.target.checked; void action(async signal => { await api.visibility({ operationId: crypto.randomUUID(), shareId: share.shareId,
+              expectedRevision: share.revision, visibility: { quota: share.visibility?.quota ?? false, usage } }, signal); });
+          }} />{language?.startsWith("zh") ? "允许成员查看自己的使用明细" : "Allow members to view their own usage details"}</label>
+        </div>
       </article>)}
     </div> : <div role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-received`} tabIndex={0}>
       <form onSubmit={inspect} className="settings-card"><label>{text.paste}<textarea value={link} onChange={event => { setLink(event.target.value); setPreview(undefined); }} disabled={busy} spellCheck={false} /></label>
@@ -115,6 +132,8 @@ function ProviderSharingPanel({ api, nodeKey, nodeName, catalog, language, initi
       </article>)}
       {value?.received.map(row => <article className="settings-card" key={row.joinId}><h4>{row.providerName}</h4><p>{text.from(row.owner?.name ?? "", row.hostServerId)}</p>
         <Pill>{text.state(row.state)}</Pill>{row.state === "active" && <p>{text.models(row.models.length)}</p>}
+        <ProviderSharingInsights key={`${row.joinId}:${row.generation}:${row.accessRevision}:${row.state}`} api={api} joinId={row.joinId} language={language}
+          disabled={row.state === "removed" || row.state === "paused"} />
         {row.state !== "removed" && <Button disabled={disabled} onClick={() => void action(async signal => { await api.leave(crypto.randomUUID(), row.joinId, signal); })}>{text.leave}</Button>}
       </article>)}
     </div>}

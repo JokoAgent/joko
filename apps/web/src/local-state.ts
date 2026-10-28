@@ -1163,7 +1163,7 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
     providerId: typeof record["providerId"] === "string" ? record["providerId"] : "",
     modelId: typeof record["modelId"] === "string" ? record["modelId"] : "",
     ...(typeof record["effort"] === "string" && record["effort"].length > 0 ? { effort: record["effort"] } : {}),
-    fastMode: record["fastMode"] === true,
+    fastMode: record["fastMode"] === "ultrafast" ? "ultrafast" : record["fastMode"] === true,
     permissionMode,
     planMode: record["planMode"] === true,
     ...(worktree === undefined ? {} : { worktree }),

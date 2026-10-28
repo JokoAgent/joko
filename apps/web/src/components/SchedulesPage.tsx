@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { resolveModelSpeed } from "../model-speed.js";
 import type { JSX, KeyboardEvent } from "react";
 import { ArrowUpToLine, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CirclePlus, Clock3, Copy, FolderGit2, FolderMinus, GitBranch, History, Menu, MoreHorizontal, Pause, Pencil, Play, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 import type { AppController } from "../controller.js";
@@ -869,7 +870,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
     ...(pickerBackendDefaults?.model?.effort !== undefined && pickerDefaultModel.efforts.includes(pickerBackendDefaults.model.effort)
       ? { effort: pickerBackendDefaults.model.effort }
       : pickerDefaultModel.efforts[0] === undefined ? {} : { effort: pickerDefaultModel.efforts[0] }),
-    fastMode: execution.fastModeSupported && pickerDefaultModel.supportsFast && (pickerBackendDefaults?.model?.fastMode ?? false)
+    fastMode: resolveModelSpeed(pickerDefaultModel, pickerBackendDefaults?.model?.fastMode, execution.fastModeSupported)
   };
   const targetOptions = targets.filter((target) => !target.archived && (target.id === draft.targetId || scheduleTargetAvailable(target, backends)));
   const selectedTarget = targets.find((target) => target.id === draft.targetId);
@@ -1055,7 +1056,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
                 effort: execution.effortSupported && selection.effort !== undefined && model.efforts.includes(selection.effort)
                   ? selection.effort
                   : undefined,
-                fastMode: execution.fastModeSupported && model.supportsFast && selection.fastMode
+                fastMode: resolveModelSpeed(model, selection.fastMode, execution.fastModeSupported)
               }));
             }}
           /></div>

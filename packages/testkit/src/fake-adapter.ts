@@ -42,7 +42,7 @@ interface FakeSession {
   providerId?: string;
   modelId?: string;
   effort?: string;
-  fastMode: boolean;
+  fastMode: boolean | "ultrafast";
   permissionMode: PermissionMode;
   planMode: boolean;
   streaming: boolean;
@@ -245,12 +245,12 @@ export class FakeBackendAdapter implements BackendAdapter {
     this.session(context.sessionId).effort = level;
   }
 
-  async setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
+  async setFastMode(enabled: boolean | "ultrafast", context: AdapterContext): Promise<void> {
     const session = this.session(context.sessionId);
     if (enabled) {
       const selected = this.profile.models.find((model) =>
         model.providerId === session.providerId && model.modelId === session.modelId);
-      if (selected?.supportsFastMode !== true || !supported(this.profile.capabilities, "model.fast_mode")) {
+      if ((enabled === "ultrafast" ? selected?.supportsUltrafastMode !== true : selected?.supportsFastMode !== true) || !supported(this.profile.capabilities, "model.fast_mode")) {
         throw unsupported("model.fast_mode");
       }
     }

@@ -78,7 +78,7 @@ export interface PartnerModelRouteRecord {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 export interface PartnerCapabilitiesRecord {

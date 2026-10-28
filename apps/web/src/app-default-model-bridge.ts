@@ -20,7 +20,7 @@ export function startAppDefaultModelBridge(port: AppDefaultModelUiPort, ownerId:
       const configuration = picker.configurations[modelPreferenceKey(model.backendId, model.providerId, model.modelId)];
       if (configuration) {
         const route = { backendId: model.backendId, providerId: model.providerId, modelId: model.modelId,
-          effort: configuration.effort ?? tuning.get(appDefaultModelRouteId(model))?.effort ?? model.efforts[0] ?? "", fastMode: configuration.fast === true };
+          effort: configuration.effort ?? tuning.get(appDefaultModelRouteId(model))?.effort ?? model.efforts[0] ?? "", fastMode: configuration.fast ?? false };
         tuning.set(appDefaultModelRouteId(route), route);
       }
     }
@@ -69,7 +69,8 @@ function routeAvailable(snapshot: AppSnapshot, ownerId: string, route: AppDefaul
   return backend !== undefined && backend.health !== "unavailable" && model?.available === true
     && isModelVisible(readModelPickerOwnerPreferences(ownerId), route.backendId, route.providerId, route.modelId, model.defaultVisible)
     && (!route.effort || backend.capabilities.get("model.effort")?.supported === true && model.efforts.includes(route.effort))
-    && (!route.fastMode || backend.capabilities.get("model.fast_mode")?.supported === true && model.supportsFast);
+    && (!route.fastMode || backend.capabilities.get("model.fast_mode")?.supported === true
+      && (route.fastMode === "ultrafast" ? model.supportsUltrafast === true : model.supportsFast));
 }
 export function useAppDefaultModelBridge(controller: AppController, enabled: boolean): void {
   const current = useRef(controller); current.current = controller;

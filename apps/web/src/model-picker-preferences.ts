@@ -13,7 +13,7 @@ export type ModelFavoriteConfiguration = ModelFavoriteConfigurationView;
 
 export interface ModelRowConfiguration {
   readonly effort?: string;
-  readonly fast?: true;
+  readonly fast?: true | "ultrafast";
 }
 
 export interface ModelPickerOwnerPreferences {
@@ -26,7 +26,7 @@ export interface ModelPickerOwnerPreferences {
 
 type PreferenceOperation =
   | { readonly id: string; readonly kind: "favorite-add"; readonly item: ModelFavoriteConfiguration }
-  | { readonly id: string; readonly kind: "favorite-update"; readonly uid: string; readonly effort?: string | null; readonly fast?: boolean }
+  | { readonly id: string; readonly kind: "favorite-update"; readonly uid: string; readonly effort?: string | null; readonly fast?: boolean | "ultrafast" }
   | { readonly id: string; readonly kind: "favorite-remove"; readonly uid: string }
   | { readonly id: string; readonly kind: "favorite-seed"; readonly item: ModelFavoriteConfiguration }
   | { readonly id: string; readonly kind: "visibility"; readonly modelKey: string; readonly visible: boolean | null }
@@ -128,7 +128,7 @@ export function preferredModelEffort(preferences: Pick<ModelPickerOwnerPreferenc
 
 export function clearModelEffort(ownerId: string | undefined, model: ModelView): void {
   const current = readModelConfiguration(readModelPickerOwnerPreferences(ownerId), model.backendId, model.providerId, model.modelId);
-  setModelConfiguration(ownerId, model.backendId, model.providerId, model.modelId, { fast: current?.fast === true });
+  setModelConfiguration(ownerId, model.backendId, model.providerId, model.modelId, { fast: current?.fast ?? false });
 }
 
 export function setModelConfiguration(
@@ -136,14 +136,14 @@ export function setModelConfiguration(
   backendId: string,
   providerId: string,
   modelId: string,
-  configuration: { readonly effort?: string; readonly fast?: boolean }
+  configuration: { readonly effort?: string; readonly fast?: boolean | "ultrafast" }
 ): void {
   if (ownerId === undefined) return;
   const effort = normalizeEffort(configuration.effort);
   if (configuration.effort !== undefined && effort === undefined) return;
-  const normalized: ModelRowConfiguration | null = effort === undefined && configuration.fast !== true
+  const normalized: ModelRowConfiguration | null = effort === undefined && !configuration.fast
     ? null
-    : { ...(effort === undefined ? {} : { effort }), ...(configuration.fast === true ? { fast: true } : {}) };
+    : { ...(effort === undefined ? {} : { effort }), ...(configuration.fast ? { fast: configuration.fast } : {}) };
   commit(ownerStorageKey(ownerId), {
     id: randomUuid(),
     kind: "configuration",
@@ -199,7 +199,7 @@ export function seedModelFavorite(
 export function updateModelFavorite(
   ownerId: string | undefined,
   uid: string,
-  patch: { readonly effort?: string | null; readonly fast?: boolean }
+  patch: { readonly effort?: string | null; readonly fast?: boolean | "ultrafast" }
 ): void {
   if (ownerId === undefined || !validBoundedText(uid, 128)) return;
   const effort = patch.effort === null ? null : normalizeEffort(patch.effort);
@@ -325,14 +325,14 @@ function applyOperation(
       favorites = favorites.map((candidate) => {
         if (candidate.uid !== operation.uid) return candidate;
         const effort = operation.effort === undefined ? candidate.effort : operation.effort ?? undefined;
-        const fast = operation.fast === undefined ? candidate.fast === true : operation.fast;
+        const fast = operation.fast === undefined ? candidate.fast ?? false : operation.fast;
         return {
           uid: candidate.uid,
           backendId: candidate.backendId,
           providerId: candidate.providerId,
           modelId: candidate.modelId,
           ...(effort === undefined ? {} : { effort }),
-          ...(fast ? { fast: true as const } : {})
+          ...(fast ? { fast } : {})
         };
       });
       break;
@@ -421,13 +421,13 @@ function sanitizeStoredOwner(value: unknown): StoredOwnerPreferences {
     const configuration = value as Record<string, unknown>;
     if (Object.keys(configuration).some((field) => field !== "effort" && field !== "fast")) return emptyOwnerPreferences();
     const effort = normalizeEffort(configuration["effort"]);
-    const fast = configuration["fast"] === true;
+    const fast = configuration["fast"] === "ultrafast" ? "ultrafast" : configuration["fast"] === true;
     if (
       (Object.hasOwn(configuration, "effort") && effort !== configuration["effort"])
-      || (Object.hasOwn(configuration, "fast") && configuration["fast"] !== true)
+      || (Object.hasOwn(configuration, "fast") && configuration["fast"] !== true && configuration["fast"] !== "ultrafast")
       || (effort === undefined && !fast)
     ) return emptyOwnerPreferences();
-    configurations[key] = { ...(effort === undefined ? {} : { effort }), ...(fast ? { fast: true } : {}) };
+    configurations[key] = { ...(effort === undefined ? {} : { effort }), ...(fast ? { fast } : {}) };
   }
   const rawProviderOrder = record["providerOrder"] as unknown[];
   const providerOrder = normalizeProviderDisplayOrder(rawProviderOrder);
@@ -457,7 +457,7 @@ function isCurrentFavoriteRecord(value: unknown, favorite: ModelFavoriteConfigur
     && record["providerId"] === favorite.providerId
     && record["modelId"] === favorite.modelId
     && (!Object.hasOwn(record, "effort") || record["effort"] === favorite.effort)
-    && (!Object.hasOwn(record, "fast") || (record["fast"] === true && favorite.fast === true));
+    && (!Object.hasOwn(record, "fast") || ((record["fast"] === true || record["fast"] === "ultrafast") && record["fast"] === favorite.fast));
 }
 
 function normalizeFavorite(value: unknown): ModelFavoriteConfiguration | undefined {
@@ -475,7 +475,7 @@ function normalizeFavorite(value: unknown): ModelFavoriteConfiguration | undefin
     providerId,
     modelId,
     ...(effort === undefined ? {} : { effort }),
-    ...(record["fast"] === true ? { fast: true } : {})
+    ...(record["fast"] === true || record["fast"] === "ultrafast" ? { fast: record["fast"] } : {})
   };
 }
 

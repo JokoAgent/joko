@@ -405,7 +405,7 @@ function validateCapabilities(values: readonly DevicePeerCapabilityKind[]): void
       && value !== DevicePeerCapabilityKind.TERMINAL
       && value !== DevicePeerCapabilityKind.FORWARDING
       && value !== DevicePeerCapabilityKind.REMOTE_DESKTOP
-      && value !== DevicePeerCapabilityKind.NATIVE_AGENTS)) throw routeFailure();
+      && value !== DevicePeerCapabilityKind.NATIVE_AGENTS && value !== DevicePeerCapabilityKind.EXTENSION_SYNC)) throw routeFailure();
 }
 
 function validateDeviceKind(value: DeviceKind): void {

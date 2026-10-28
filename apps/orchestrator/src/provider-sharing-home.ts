@@ -177,6 +177,22 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
     return { client: new HostedAgentConnectClient(remote.native, assertCurrent), assertCurrent,
       close: async (runId: string, signal: AbortSignal) => { await terminal.guest.closeProviderShareRun({ runId }, { signal }); } };
   }
+  async insights(joinId: string, includeUsage: boolean, auth: ProviderSharingHomeAuthority): Promise<contract.ProviderSharingInsights> {
+    this.check(auth); const row = this.get(id(joinId)), stored = this.#joins.get(joinId)!;
+    if (!stored.credential || ["paused", "removed"].includes(row.state)) throw denied();
+    const generation = row.generation, revision = row.accessRevision, credential = stored.credential;
+    const assertCurrent = () => {
+      this.check(auth); const current = this.get(joinId);
+      if (this.#joins.get(joinId) !== stored || stored.credential !== credential || current.generation !== generation
+        || current.accessRevision !== revision || ["paused", "removed"].includes(current.state)) throw denied();
+    };
+    assertCurrent(); const secret = this.options.vault.open(credential, this.reference(joinId, row));
+    const remote = this.remote({ origin: row.hostOrigin, endpointPublicKey: stored.endpointPublicKey, serverId: row.hostServerId,
+      authorization: () => `ProviderShareGuest ${secret}`, assertCurrent });
+    const response = await remote.guest.readProviderShareInsights({ shareId: row.shareId, includeUsage }, { signal: auth.signal }); assertCurrent();
+    if (!response.insights) throw invalid();
+    return contract.projectProviderSharingInsights(response.insights);
+  }
   close(): Promise<void> { this.#closed = true; this.#listeners.clear(); this.#reshareStates.clear(); return this.#saveFlight; }
   private async recover(intent: StoredIntent, auth: ProviderSharingHomeAuthority): Promise<contract.ProviderSharingIntent> {
     this.check(auth); if (!["pending", "unknown", "prepared", "sent"].includes(intent.status)) return this.publicIntent(intent);
@@ -217,7 +233,7 @@ export class ProviderSharingHome implements ProviderSharingDirectoryPort {
       if (catalog?.backends.some(backend => backend.backendId !== before.nativeBackendId || backend.providers.some(provider => provider.providerId !== before.providerId))) throw invalid();
       const state = member.status === "paused" ? "paused" : provider?.connected && provider.remoteInvocationEnabled && provider.models.length ? "active" : "unavailable";
       const value = create(contract.ProviderSharingReceivedSchema, { ...before, generation: member.generation, providerName: share.providerName, owner: share.owner,
-        state, models: provider?.models ?? before.models });
+        state, models: provider?.models ?? [], visibility: share.visibility, accessRevision: share.accessRevision });
       stored.value = toJsonString(contract.ProviderSharingReceivedSchema, value);
       if (value.generation !== before.generation || state !== "active") this.#reshareStates.delete(joinId);
     } catch (error) {
@@ -290,6 +306,7 @@ function fromModel(row: contract.ModelDescriptor): ProviderModel {
   return { providerId: row.key.providerId, modelId: row.key.modelId, displayName: row.displayName, logicalId: row.logicalId || row.key.modelId,
     api: row.api, contextWindow: number(row.contextWindowTokens), maxOutputTokens: number(row.maximumOutputTokens), supportsImages: row.inputModalities.includes(contract.ModelInputModality.IMAGE),
     thinkingLevels: row.effortLevels.map(level => level.effortId), ...(row.defaultEffort === undefined ? {} : { defaultEffort: row.defaultEffort }), supportsFastMode: row.supportsFastMode,
+    supportsUltrafastMode: row.supportsUltrafastMode,
     ...(row.description === undefined ? {} : { description: row.description }),
     ...(row.defaultVisible === undefined ? {} : { defaultVisible: row.defaultVisible }),
     ...(row.displayThinkingLevels.length ? { displayThinkingLevels: [...row.displayThinkingLevels] } : {}),
@@ -297,6 +314,7 @@ function fromModel(row: contract.ModelDescriptor): ProviderModel {
     ...(row.declaredModalities?.output === undefined ? {} : { declaredOutputModalities: [...row.declaredModalities.output.values] }),
     ...(row.declaredSupportsImages === undefined ? {} : { declaredSupportsImages: row.declaredSupportsImages }),
     ...(row.declaredSupportsFastMode === undefined ? {} : { declaredSupportsFastMode: row.declaredSupportsFastMode }),
+    ...(row.declaredSupportsUltrafastMode === undefined ? {} : { declaredSupportsUltrafastMode: row.declaredSupportsUltrafastMode }),
     ...(row.referenceApi === undefined ? {} : { referenceApi: row.referenceApi }),
     ...(["matching", "compatibility", "unknown"].includes(row.protocolMode ?? "") ? { protocolMode: row.protocolMode as ProviderModel["protocolMode"] } : {}),
     ...(["declared", "estimated"].includes(row.contextWindowSource ?? "") ? { contextWindowSource: row.contextWindowSource as "declared" | "estimated" } : {}),

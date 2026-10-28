@@ -1,8 +1,9 @@
+import { createHash } from "node:crypto";
 import type { BackendAdapter, BackendDescriptor, BlobRef, CapabilityManifest, ProviderModel, HostedExecution, NativeTextInferenceInput } from "@joko/core";
 import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
-import { HostedAgentStore, type HostedNativeProviderGrantOwner, type OperationalStore } from "@joko/store";
+import { HostedAgentStore, ProviderGroupUsageStore, type HostedNativeProviderGrantOwner, type OperationalStore } from "@joko/store";
 import { Code, ConnectError, type HandlerContext } from "@connectrpc/connect";
 import type { ConnectionManager } from "./connection-manager.js";
 import { HostedAgentHost, HostedAgentHostError, type HostedAgentHostOptions, type HostedAgentPrincipal, type HostedAgentOpen } from "./hosted-agent-host.js";
@@ -58,6 +59,14 @@ export class HostedAgentRuntime {
   readonly #factories: ReadonlyMap<string, HostedAgentBackendFactory>;
   readonly #options: HostedAgentRuntimeOptions;
   #endpoint?: HostedAgentLifecycleEndpointPort;
+  #extensionSync?: {
+    invoke(peerScope: string, bytes: Uint8Array, signal: AbortSignal, assertCurrent: () => void): Promise<Uint8Array>;
+    retire(peerScopePrefix: string): void;
+  };
+  get extensionSync() { return this.#extensionSync; }
+  installExtensionSync(handler: NonNullable<HostedAgentRuntime["extensionSync"]>): void {
+    if (this.#extensionSync && this.#extensionSync !== handler) throw new Error("The plugin sync owner is already installed."); this.#extensionSync = handler;
+  }
   get endpoint(): HostedAgentLifecycleEndpointPort { return this.#endpoint ?? this.host; }
   installEndpoint(endpoint: HostedAgentLifecycleEndpointPort): void {
     if (this.#endpoint && this.#endpoint !== endpoint) throw new Error("The native endpoint owner is already installed."); this.#endpoint = endpoint;
@@ -97,7 +106,12 @@ export class HostedAgentRuntime {
                 models: current.map(model => toProtoModelDescriptor(factory.backendId, model)) };
             }) };
         }) });
-      return this.#options.decorateCatalog?.(catalog) ?? catalog;
+      const decorated = this.#options.decorateCatalog?.(catalog) ?? catalog;
+      return create(contract.GetHostedAgentCatalogResponseSchema, { ...decorated, backends: decorated.backends.map(backend => ({ ...backend,
+        providers: backend.providers.map(provider => ({ ...provider,
+          manageableModels: provider.models,
+          modelAccess: contract.toRemoteModelAccess(this.settings.modelIds(backend.backendId, provider.providerId)),
+          models: provider.models.filter(model => this.settings.allowsModel(backend.backendId, provider.providerId, model.key?.modelId ?? "")) })) })) });
     },
       management: { settings: this.settings, slots: this.slots, assertProviderExists: (backendId, providerId) => {
         if (!this.#factories.get(backendId)?.providerIds().includes(providerId)) throw new HostedAgentHostError("UNAVAILABLE");
@@ -141,13 +155,17 @@ export class HostedAgentRuntime {
       assertCurrent();
       if (grouped.catalog.backendId !== backendId || grouped.catalog.providers.length !== 1 || grouped.catalog.providers[0]?.providerId !== providerId
         || !grouped.models.length || grouped.models.some(model => model.providerId !== providerId)) throw new HostedAgentHostError("UNAVAILABLE");
-      return { ...grouped, assertCurrent };
+      const models = grouped.models.filter(model => this.settings.allowsModel(backendId, providerId, model.modelId));
+      return { ...grouped, models, catalog: create(contract.HostedAgentBackendCatalogSchema, { ...grouped.catalog,
+        providers: grouped.catalog.providers.map(provider => ({ ...provider, manageableModels: [],
+          models: provider.models.filter(model => this.settings.allowsModel(backendId, providerId, model.key?.modelId ?? "")) })) }), assertCurrent };
     }
     const factory = this.#factories.get(backendId); if (!factory || factory.isolatedGuests?.() !== true || !factory.providerIds().includes(providerId)) throw new HostedAgentHostError("UNAVAILABLE");
     const assertComputer = this.settings.captureComputer(), assertProvider = this.settings.captureProvider(backendId, providerId);
     const assertCurrent = () => { assertComputer(); assertProvider(); if (factory.isolatedGuests?.() !== true || !factory.providerIds().includes(providerId)) throw new HostedAgentHostError("UNAVAILABLE"); };
-    assertCurrent(); const models = factory.models().filter(model => model.providerId === providerId);
-    if (!models.length) throw new HostedAgentHostError("UNAVAILABLE");
+    assertCurrent(); const available = factory.models().filter(model => model.providerId === providerId);
+    if (!available.length) throw new HostedAgentHostError("UNAVAILABLE");
+    const models = available.filter(model => this.settings.allowsModel(backendId, providerId, model.modelId));
     const descriptor = factory.describe?.(), provider = descriptor?.providers?.find(item => item.providerId === providerId);
     const catalog = create(contract.HostedAgentBackendCatalogSchema, { backendId, instanceGeneration: BigInt(this.#options.store.getBackend(backendId).descriptor.instanceGeneration), displayName: factory.displayName ?? backendId, nativeAdapterKind: descriptor?.adapterKind ?? "", nodeId: this.#options.nodeId ?? "",
       version: factory.version?.() ?? "", capabilities: [...(factory.capabilities?.().values() ?? [])].map(toProtoCapability),
@@ -155,7 +173,17 @@ export class HostedAgentRuntime {
         remoteInvocationEnabled: true, connected: true, models: models.map(model => toProtoModelDescriptor(backendId, model)) }] });
     return { models, catalog, assertCurrent };
   }
+  availableRemoteModels(backendId: string, providerId: string): readonly contract.ModelDescriptor[] {
+    const factory = this.#factories.get(backendId);
+    if (factory) return factory.models().filter(model => model.providerId === providerId).map(model => toProtoModelDescriptor(backendId, model));
+    return this.#options.resolveSharedProvider?.(backendId, providerId)?.catalog.providers.flatMap(provider => provider.models) ?? [];
+  }
+  sharingUsage(backendId: string, providerId: string, memberId: string, fromDay: string) {
+    return new ProviderGroupUsageStore(this.#options.store, `provider-sharing:${this.#options.nodeId ?? "node"}`)
+      .rows({ group: { backendId, providerId }, partyId: memberId, fromDay });
+  }
   assertGuestSelection(principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId" | "modelId">): void {
+    if (!this.settings.allowsModel(input.backendId, input.providerId, input.modelId)) throw new HostedAgentHostError("ACCESS_DENIED");
     if (principal.trust !== "guest") { principal.assertCurrent(); return; }
     const grant = principal.providerGrant; if (!grant || grant.backendId !== input.backendId || grant.providerId !== input.providerId
       || !grant.modelIds.includes(input.modelId)) throw new HostedAgentHostError("ACCESS_DENIED");
@@ -215,13 +243,26 @@ export class HostedAgentRuntime {
     const providerIds = principal.trust === "guest" ? [input.providerId] : factory.providerIds().filter(providerId => this.settings.providerEnabled(input.backendId, providerId));
     const permissions = new Map(providerIds.map(providerId => [providerId, this.settings.captureProvider(input.backendId, providerId)]));
     const assertModelAllowed = (providerId: string, modelId: string) => {
-      if (principal.trust === "guest") this.assertGuestSelection(principal, { backendId: input.backendId, providerId, modelId });
+      this.assertGuestSelection(principal, { backendId: input.backendId, providerId, modelId });
       assertComputer(); const assertProvider = permissions.get(providerId); if (!assertProvider) throw new HostedAgentHostError("ACCESS_DENIED"); assertProvider();
       if (!factory.models().some(model => model.providerId === providerId && model.modelId === modelId)) throw new HostedAgentHostError("UNAVAILABLE");
     };
     assertModelAllowed(input.providerId, input.modelId);
-    const modelIds = factory.models().filter(model => model.providerId === input.providerId).map(model => model.modelId);
+    const modelIds = factory.models().filter(model => model.providerId === input.providerId
+      && this.settings.allowsModel(input.backendId, input.providerId, model.modelId)
+      && (principal.trust !== "guest" || principal.providerGrant?.modelIds.includes(model.modelId))).map(model => model.modelId);
+    const recipient = principal.providerGrant?.recipient;
+    const ledger = recipient && !principal.providerGrant?.groupMember
+      ? new ProviderGroupUsageStore(this.#options.store, `provider-sharing:${this.#options.nodeId ?? "node"}`) : undefined;
+    const turnId = (callId: string) => createHash("sha256").update(JSON.stringify([principal.id, input.runId, callId])).digest("hex");
     return { root: this.#options.root, store: new HostedAgentStore(this.#options.store), slots: this.slots, artifactCapacityBytes: this.#options.artifactCapacityBytes,
+      ...(ledger && recipient ? { usage: {
+        begin: (callId: string, modelId: string, baseline: import("@joko/core").UsageSnapshot | undefined) => ledger.captureNative(turnId(callId), [{
+          group: { backendId: input.backendId, providerId: input.providerId }, memberKey: recipient.shareId,
+          nodeId: this.#options.nodeId ?? "node", nodeName: "Provider", partyId: recipient.memberId, partyName: recipient.name,
+          agentKind: factory.describe?.().adapterKind ?? "native", backendId: input.backendId, providerId: input.providerId, modelId }], baseline, false),
+        finish: (callId: string, observation: import("@joko/core").UsageSnapshot | undefined) => { ledger.finishNative(turnId(callId), observation, Date.now()); }
+      } } : {}),
       modelIds, assertCurrent: () => { principal.assertCurrent(); assertComputer(); }, assertModelAllowed,
       createAdapter: creation => { principal.assertCurrent(); assertModelAllowed(creation.providerId, input.modelId);
         return factory.create({ ...creation, providerIds, assertModelAllowed }); } };

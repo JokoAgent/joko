@@ -1504,7 +1504,7 @@ export class PartnerManager {
       if ((model.thinkingLevels.length > 0) !== (route.effort !== undefined)) throw modelUnavailable();
       if (route.fastMode && (
         backend.capabilities.get("model.fast_mode")?.supported !== true
-        || model.supportsFastMode !== true
+        || (route.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true)
       )) throw modelUnavailable();
       if (capabilities.modelChain.filter(candidate => candidate.backendId === backendId).length > 1
         && backend.capabilities.get("model.switch")?.supported !== true) throw modelUnavailable();

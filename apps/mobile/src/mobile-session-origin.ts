@@ -44,7 +44,8 @@ export function mobileSessionOriginSourceAvailable(session: Session): boolean {
 export function mobileSessionOriginSessionKey(session: Session | undefined): string {
   return session ? JSON.stringify([session.sessionId, session.backendId, session.targetId, session.nativeBinding?.backendId ?? "",
     session.nativeBinding?.opaqueReference ?? "", session.nativeBinding?.runtimeGeneration?.toString() ?? "",
-    session.worktree?.leaseId ?? "", session.worktree?.workspaceId ?? "", session.worktree?.state ?? 0]) : "";
+    session.worktree?.leaseId ?? "", session.worktree?.workspaceId ?? "", session.worktree?.state ?? 0,
+    session.localWorkspace?.workspaceId ?? "", session.localWorkspace?.path ?? ""]) : "";
 }
 
 function validIdentity(value: string): boolean {

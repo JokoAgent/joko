@@ -245,6 +245,11 @@ export class VoiceInputCoordinator {
     }
   }
 
+  hasActiveSession(ownerConnectionId: string): boolean {
+    const active = this.activeByOwner.get(ownerConnectionId);
+    return this.pendingByOwner.has(ownerConnectionId) || active !== undefined && this.sessions.get(active)?.outcome === undefined;
+  }
+
   async start(input: {
     readonly ownerConnectionId: string;
     readonly requestId: string;

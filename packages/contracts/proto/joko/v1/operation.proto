@@ -781,6 +781,7 @@ message SetSessionRuntimeMutation {
   optional string model_id = 5;
   optional string effort = 6;
   optional bool fast_mode = 7;
+  optional bool ultrafast_mode = 8;
 }
 
 message SendInputMutation {

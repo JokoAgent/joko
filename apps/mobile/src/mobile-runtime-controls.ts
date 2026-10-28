@@ -16,6 +16,7 @@ import {
   type Snapshot
 } from "@joko/contracts";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { decodeModelSpeed } from "@joko/contracts";
 import { mobileMessage } from "./mobile-messages";
 
 export interface MobileRuntimeOwnerIdentity {
@@ -45,6 +46,7 @@ export interface MobileModelRoute {
   readonly maximumOutputTokens: bigint;
   readonly efforts: readonly MobileEffortOption[];
   readonly supportsFastMode: boolean;
+  readonly supportsUltrafastMode?: boolean;
   readonly source?: ModelSourceDescriptor;
   readonly canSetEffort?: boolean;
   readonly canSetFastMode?: boolean;
@@ -56,7 +58,7 @@ export interface MobileCurrentModel {
   readonly modelId: string;
   readonly displayName: string;
   readonly effortId?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly route?: MobileModelRoute;
   readonly selectable: boolean;
 }
@@ -88,7 +90,7 @@ export interface MobileModelControlSelection {
   readonly providerId: string;
   readonly modelId: string;
   readonly effortId?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 export interface MobileModelFavoriteConfiguration extends MobileModelControlSelection {
@@ -236,7 +238,7 @@ export function resolveMobileRuntimeControls(
         modelId: currentModelId,
         displayName: currentRoute?.displayName ?? currentModelId,
         ...(strictText(session.model?.effortId) ? { effortId: session.model.effortId } : {}),
-        fastMode: session.model?.fastMode === true,
+        fastMode: decodeModelSpeed(session.model ?? {}),
         ...(currentRoute === undefined ? {} : { route: currentRoute }),
         selectable: selectableCurrent
       } satisfies MobileCurrentModel
@@ -318,7 +320,7 @@ export function resolveMobileSharedRuntimeControls(detail: Snapshot | undefined,
   return { authorityKey, surfaceOwnerKey: authorityKey, session, backend, models,
     currentModel: current?.model ? { providerId: current.model.providerId, providerName: route?.providerName ?? current.model.providerId,
       modelId: current.model.modelId, displayName: route?.displayName ?? current.model.modelId,
-      effortId: current.effortId || undefined, fastMode: current.fastMode, route, selectable: !!route } : undefined,
+      effortId: current.effortId || undefined, fastMode: decodeModelSpeed(current), route, selectable: !!route } : undefined,
     canListModels: typedModelCapability(backend, capabilityNames.modelList)?.providerAware === true,
     canSwitchModel: typedModelCapability(backend, capabilityNames.modelSwitch)?.switchDuringSession === true,
     canSetEffort: typedModelCapability(backend, capabilityNames.modelEffort)?.supportsEffort === true,
@@ -337,7 +339,7 @@ export function resolveMobileSessionModelAuthority(
     providerId: model.providerId,
     modelId: model.modelId,
     ...(strictText(session.model?.effortId) ? { effortId: session.model.effortId } : {}),
-    fastMode: session.model?.fastMode === true
+    fastMode: decodeModelSpeed(session.model ?? {})
   }, false);
 }
 
@@ -355,7 +357,7 @@ export function resolveMobileNewTaskDefaultModelAuthority(
     providerId: model.providerId,
     modelId: model.modelId,
     ...(strictText(selection.effortId) ? { effortId: selection.effortId } : {}),
-    fastMode: selection.fastMode
+    fastMode: decodeModelSpeed(selection)
   }, true);
 }
 
@@ -447,7 +449,7 @@ export function defaultMobileModelSelection(
     ...((route.canSetEffort ?? controls.canSetEffort) && (currentEffort ?? defaultEffort) !== undefined
       ? { effortId: currentEffort ?? defaultEffort }
       : {}),
-    fastMode: (route.canSetFastMode ?? controls.canSetFastMode) && route.supportsFastMode && sameRoute && current?.fastMode === true
+    fastMode: resolveMobileModelSpeed(route, sameRoute ? current?.fastMode : false, route.canSetFastMode ?? controls.canSetFastMode)
   };
 }
 
@@ -481,7 +483,7 @@ export function assertMobileModelSelection(
   if (routeChanged && effortId && !(route.canSetEffort ?? controls.canSetEffort)) {
     throw new Error("This Backend does not currently allow choosing an effort for the new model.");
   }
-  if (selection.fastMode && (!route.supportsFastMode || !(route.canSetFastMode ?? controls.canSetFastMode))) {
+  if (selection.fastMode && (!mobileModelSupportsSpeed(route, selection.fastMode) || !(route.canSetFastMode ?? controls.canSetFastMode))) {
     throw new Error("Fast Mode is not available for the selected model.");
   }
   const fastChanged = !routeChanged && selection.fastMode !== (current?.fastMode ?? false);
@@ -536,7 +538,7 @@ export function assertMobileModelFavoriteMutation(
     || !route.efforts.some((effort) => effort.id === item.effortId))) {
     throw new Error("This effort is not available for model favorites.");
   }
-  if (item.fastMode && (!(route.canSetFastMode ?? controls.canSetFastMode) || !route.supportsFastMode)) {
+  if (item.fastMode && (!(route.canSetFastMode ?? controls.canSetFastMode) || !mobileModelSupportsSpeed(route, item.fastMode))) {
     throw new Error("Fast Mode is not available for model favorites.");
   }
   const normalized: MobileModelFavoriteConfiguration = {
@@ -690,6 +692,7 @@ function mobileModelRoute(
     maximumOutputTokens: model.maximumOutputTokens,
     efforts,
     supportsFastMode: model.supportsFastMode,
+    supportsUltrafastMode: model.supportsUltrafastMode,
     ...(model.source ? { source: model.source } : {})
   };
 }
@@ -719,7 +722,7 @@ function resolveTrustedMobileModel(
   }
   if (selection.effortId !== undefined
     && !route.efforts.some((candidate) => candidate.id === selection.effortId)) return undefined;
-  if (selection.fastMode && !route.supportsFastMode) return undefined;
+  if (!mobileModelSupportsSpeed(route, selection.fastMode)) return undefined;
   const exactSelection: MobileModelControlSelection = {
     providerId: selection.providerId,
     modelId: selection.modelId,
@@ -802,7 +805,7 @@ function mobileModelFavorites(
       providerId: model.providerId,
       modelId: model.modelId,
       ...(value.selection!.effortId === "" ? {} : { effortId: value.selection!.effortId }),
-      fastMode: value.selection!.fastMode
+      fastMode: decodeModelSpeed(value.selection!)
     };
     if (result.some((candidate) => sameFavoriteConfiguration(candidate, item))) return undefined;
     ids.add(item.favoriteId);
@@ -817,6 +820,14 @@ function sameFavoriteConfiguration(
 ): boolean {
   return left.backendId === right.backendId && left.providerId === right.providerId
     && left.modelId === right.modelId && left.effortId === right.effortId && left.fastMode === right.fastMode;
+}
+
+export function mobileModelSupportsSpeed(route: Pick<MobileModelRoute, "supportsFastMode" | "supportsUltrafastMode">, value: boolean | "ultrafast"): boolean {
+  return value === false || (value === "ultrafast" ? route.supportsUltrafastMode === true : route.supportsFastMode);
+}
+
+export function resolveMobileModelSpeed(route: Pick<MobileModelRoute, "supportsFastMode" | "supportsUltrafastMode">, value: boolean | "ultrafast" | undefined, enabled = true): boolean | "ultrafast" {
+  return enabled && value !== undefined && mobileModelSupportsSpeed(route, value) ? value : false;
 }
 
 function compareModelRoutes(left: MobileModelRoute, right: MobileModelRoute): number {

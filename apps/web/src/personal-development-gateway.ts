@@ -1,5 +1,5 @@
 import { createClient, type Transport } from "@connectrpc/connect";
-import { PersonalDevelopmentService, type PersonalDevelopmentState, type GetPersonalDevelopmentStateResponse } from "@joko/contracts";
+import { PersonalDevelopmentService, decodeModelSpeed, encodeModelSpeed, type PersonalDevelopmentState, type GetPersonalDevelopmentStateResponse } from "@joko/contracts";
 import type { PersonalDevelopmentApi, PersonalDevelopmentSnapshot } from "./personal-development-api.js";
 
 const OBSERVATION_INTERVAL_MS = 1_000;
@@ -103,7 +103,7 @@ export function createPersonalDevelopmentGateway(transport: Transport, connectio
       const accepted = state(result.state); wakeObservations(transport, accepted); return accepted;
     },
     async startPersonalDevelopmentTask(draft, operationId, signal) {
-      const scope = signalFor(signal); const result = await client.startPersonalDevelopmentTask({ ...draft, operationId }, { signal: scope }); scope.throwIfAborted();
+      const scope = signalFor(signal); const result = await client.startPersonalDevelopmentTask({ ...draft, ...encodeModelSpeed(decodeModelSpeed(draft)), operationId }, { signal: scope }); scope.throwIfAborted();
       if (result.operationId !== operationId || !result.taskId) throw new Error("Personal development task receipt is incomplete.");
       const accepted = state(result.state); wakeObservations(transport, accepted);
       return { taskId: result.taskId, ...(result.sessionId === "" ? {} : { sessionId: result.sessionId }), state: accepted };
@@ -114,7 +114,7 @@ export function createPersonalDevelopmentGateway(transport: Transport, connectio
       const accepted = state(result.state); wakeObservations(transport, accepted); return accepted;
     },
     async startPersonalDevelopmentDoctor(draft, operationId, signal) {
-      const scope = signalFor(signal), result = await client.startPersonalDevelopmentDoctor({ ...draft, operationId }, { signal: scope }); scope.throwIfAborted();
+      const scope = signalFor(signal), result = await client.startPersonalDevelopmentDoctor({ ...draft, ...encodeModelSpeed(decodeModelSpeed(draft)), operationId }, { signal: scope }); scope.throwIfAborted();
       if (result.operationId !== operationId || result.report === undefined || !result.report.runId || result.report.mode !== draft.mode) throw new Error("Personal development report is incomplete.");
       wakeObservations(transport); return result.report;
     },

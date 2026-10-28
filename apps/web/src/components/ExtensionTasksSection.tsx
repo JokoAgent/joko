@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState, type JSX } from "react";
-import { PermissionMode, type ExtensionTaskPreferences, type ExtensionTaskRoute, type ExtensionBackgroundTask } from "@joko/contracts";
+import { PermissionMode, encodeModelSpeed, decodeModelSpeed, type ExtensionTaskPreferences, type ExtensionTaskRoute, type ExtensionBackgroundTask } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import type { ExtensionCatalogEntryView } from "../model.js";
 import type { Translator } from "./types.js";
 import { Button, CheckboxControl } from "./ui.js";
+import { ModelSpeedControl } from "./ModelSpeedControl.js";
 import "./extension-network.css";
 
 const routeKey = (route: Pick<ExtensionTaskRoute, "backendId" | "providerId" | "modelId">) => JSON.stringify([route.backendId, route.providerId, route.modelId]);
@@ -47,7 +48,8 @@ export function ExtensionTasksSection({ controller, extension, disabled, t }: {
       }}><option value="">{t("extensions.tasks.followDefault")}</option>{selected.models.map(item => item.route && <option key={routeKey(item.route)} value={routeKey(item.route)}>{item.name} · {item.route.backendId} · {item.route.providerId}</option>)}</select></label>
       {model && <><label><span>{t("extensions.tasks.effort")}</span><select disabled={disabled || busy || !chosen?.efforts.length} value={model.effort ?? ""} onChange={event => setModel({ ...model, effort: event.target.value || undefined })}>
         <option value="">{t("extensions.tasks.followDefault")}</option>{chosen?.efforts.map(value => <option key={value} value={value}>{value}</option>)}</select></label>
-        <label><CheckboxControl checked={model.fastMode} disabled={disabled || busy || !chosen?.supportsFastMode} onChange={event => setModel({ ...model, fastMode: event.target.checked })} /><span>{t("extensions.tasks.fast")}</span></label></>}
+        <ModelSpeedControl value={decodeModelSpeed(model)} supportsFast={chosen?.supportsFastMode === true} supportsUltrafast={chosen?.supportsUltrafastMode}
+          disabled={disabled || busy} t={t} onChange={speed => setModel({ ...model, ...encodeModelSpeed(speed) })} /></>}
       {selected.tasksAvailable && <><label><span>{t("extensions.tasks.directory")}</span><select value={targetId ?? ""} disabled={disabled || busy} onChange={event => setTargetId(event.target.value || undefined)}>
         <option value="">{t("extensions.tasks.privateDirectory")}</option>{selected.directories.filter(item => !model || item.backendId === model.backendId).map(item => <option key={item.targetId} value={item.targetId}>{item.name}</option>)}</select></label>
         <label><span>{t("extensions.tasks.permission")}</span><select value={permission} disabled={disabled || busy} onChange={event => setPermission(Number(event.target.value))}>

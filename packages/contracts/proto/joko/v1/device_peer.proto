@@ -32,6 +32,7 @@ enum DevicePeerCapabilityKind {
   DEVICE_PEER_CAPABILITY_KIND_FORWARDING = 4;
   DEVICE_PEER_CAPABILITY_KIND_REMOTE_DESKTOP = 5;
   DEVICE_PEER_CAPABILITY_KIND_NATIVE_AGENTS = 6;
+  DEVICE_PEER_CAPABILITY_KIND_EXTENSION_SYNC = 7;
 }
 
 // Exact authority snapshot selected by a controller. All unary peer requests

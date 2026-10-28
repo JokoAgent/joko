@@ -1,4 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
+import { resolveModelSpeed } from "../model-speed.js";
 import { builtinSkillIntentForText } from "../builtin-skill-intent.js";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent, JSX } from "react";
@@ -239,7 +240,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [nativeSelectionWarning, setNativeSelectionWarning] = useState<string>();
   const [modelKey, setModelKey] = useState("");
   const [effort, setEffort] = useState("");
-  const [fastMode, setFastMode] = useState(false);
+  const [fastMode, setFastMode] = useState<boolean | "ultrafast">(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("ask");
   const [fullAccessConfirmation, setFullAccessConfirmation] = useState<FullAccessConfirmation>();
   const [planMode, setPlanMode] = useState(false);
@@ -720,7 +721,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     ...(pickerBackendDefaults?.model?.effort !== undefined && pickerDefaultModel.efforts.includes(pickerBackendDefaults.model.effort)
       ? { effort: pickerBackendDefaults.model.effort }
       : defaultModelEffort(pickerDefaultModel) === undefined ? {} : { effort: defaultModelEffort(pickerDefaultModel) }),
-    fastMode: execution.fastModeSupported && pickerDefaultModel.supportsFast && (pickerBackendDefaults?.model?.fastMode ?? false)
+    fastMode: resolveModelSpeed(pickerDefaultModel, pickerBackendDefaults?.model?.fastMode, execution.fastModeSupported)
   };
   const attachmentPolicy = useMemo(
     () => resolveComposerAttachmentPolicy(backend, selectedModel?.supportsImages),
@@ -1195,7 +1196,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       const restoredEffort = restoredModel === undefined ? restored.effort ?? "" : restoredOptions.effortSupported && restored.effort !== undefined && restoredModel.efforts.includes(restored.effort)
         ? restored.effort
         : restoredOptions.effortSupported ? defaultModelEffort(restoredModel) ?? "" : "";
-      const restoredFast = restoredModel === undefined ? restored.fastMode : restoredOptions.fastModeSupported && restoredModel.supportsFast && restored.fastMode;
+      const restoredFast = restoredModel === undefined ? restored.fastMode : resolveModelSpeed(restoredModel, restored.fastMode, restoredOptions.fastModeSupported);
       setEffort(restoredEffort);
       setFastMode(restoredFast);
       if (!readAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId).current && restored.providerId && restored.modelId) {
@@ -1240,10 +1241,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const initialEffort = initialModelChoice === undefined ? "" : preferredModelEffort(readModelPickerOwnerPreferences(pickerOwnerId), initialModelChoice) ?? "";
     setEffort(options.effortSupported ? defaultRoute?.effort ?? initialEffort : "");
     setFastMode(initialModelChoice === undefined && defaultRoute !== undefined ? defaultRoute.fastMode
-      : options.fastModeSupported && initialModelChoice?.supportsFast === true && (defaultRoute?.fastMode ?? false));
+      : resolveModelSpeed(initialModelChoice, defaultRoute?.fastMode, options.fastModeSupported));
     if (!preference && initialModelChoice?.available) setAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId, {
       backendId: backend.id, providerId: initialModelChoice.providerId, modelId: initialModelChoice.modelId,
-      effort: options.effortSupported ? defaultRoute?.effort ?? initialEffort : "", fastMode: options.fastModeSupported && initialModelChoice.supportsFast && (defaultRoute?.fastMode ?? false)
+      effort: options.effortSupported ? defaultRoute?.effort ?? initialEffort : "", fastMode: resolveModelSpeed(initialModelChoice, defaultRoute?.fastMode, options.fastModeSupported)
     });
     const defaultPermission = defaults?.permissionMode ?? snapshot.settings.policy.defaultMode;
     setPermissionMode(options.permissionModes.includes(defaultPermission) ? defaultPermission : options.permissionModes[0] ?? "ask");
@@ -1396,8 +1397,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useEffect(() => {
     if (selectedModel === undefined) return;
     if (!selectedModel.efforts.includes(effort)) setEffort(defaultModelEffort(selectedModel) ?? "");
-    if (!selectedModel.supportsFast) setFastMode(false);
-  }, [modelKey, selectedModel?.modelId, selectedModel?.providerId]);
+    if (resolveModelSpeed(selectedModel, fastMode) !== fastMode) setFastMode(false);
+  }, [modelKey, selectedModel?.modelId, selectedModel?.providerId, selectedModel?.supportsFast, selectedModel?.supportsUltrafast, fastMode]);
 
   useEffect(() => {
     if (!hydrated || hydratedProfileScope !== profileScope || submitting) return;
@@ -1410,7 +1411,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       builtinSkillIntent: builtinSkillIntentForText(text, builtinSkillIntentRef.current),
       modelId: modelSelection?.modelId ?? "",
       ...((selectedModel === undefined ? effort.length > 0 : execution.effortSupported && selectedModel.efforts.includes(effort)) ? { effort } : {}),
-      fastMode: selectedModel === undefined ? fastMode : execution.fastModeSupported && selectedModel.supportsFast && fastMode,
+      fastMode: selectedModel === undefined ? fastMode : resolveModelSpeed(selectedModel, fastMode, execution.fastModeSupported),
       permissionMode: execution.permissionModes.includes(permissionMode) ? permissionMode : execution.permissionModes[0] ?? "ask",
       planMode: execution.planModeSupported && planMode,
       worktree: {
@@ -2927,7 +2928,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     const nextEffort = nextOptions.effortSupported
                       ? modelChoice.effort !== undefined && nextModel.efforts.includes(modelChoice.effort)
                         ? modelChoice.effort : defaultModelEffort(nextModel) ?? "" : "";
-                    const nextFast = nextOptions.fastModeSupported && nextModel.supportsFast && modelChoice.fastMode;
+                    const nextFast = resolveModelSpeed(nextModel, modelChoice.fastMode, nextOptions.fastModeSupported);
                     setEffort(nextEffort);
                     setFastMode(nextFast);
                     setAppDefaultModelPreference(pickerOwnerId, { backendId: nextBackend.id, providerId: nextModel.providerId,

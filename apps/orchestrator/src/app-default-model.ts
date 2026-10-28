@@ -7,8 +7,12 @@ export interface AppDefaultModelChoice extends AppDefaultModelRouteValue {
   readonly id: string;
   readonly efforts: readonly string[];
   readonly supportsFastMode: boolean;
+  readonly supportsUltrafastMode?: boolean;
   readonly instanceGeneration: number;
   readonly defaultVisible?: boolean;
+}
+function speedSupported(choice: AppDefaultModelChoice, value: boolean | "ultrafast"): boolean {
+  return value === false || (value === "ultrafast" ? choice.supportsUltrafastMode === true : choice.supportsFastMode);
 }
 interface UiOwner {
   readonly connectionId: string;
@@ -107,13 +111,13 @@ export class AppDefaultModelCoordinator {
     return this.catalog().filter(choice => this.#visible(choice)).map(choice => {
       const tuning = mirror?.tuning.get(choice.id);
       return { ...choice, effort: tuning !== undefined && (choice.efforts.length === 0 ? tuning.effort === "" : choice.efforts.includes(tuning.effort)) ? tuning.effort : choice.effort,
-        fastMode: choice.supportsFastMode && (tuning?.fastMode ?? choice.fastMode) };
+          fastMode: speedSupported(choice, tuning?.fastMode ?? choice.fastMode) ? tuning?.fastMode ?? choice.fastMode : false };
     });
   }
   #catalogStamp(): string { return JSON.stringify(this.catalog().filter(choice => this.#visible(choice))); }
   #assertAvailable(route: AppDefaultModelRouteValue): void {
     const choice = this.#choices().find(item => item.id === appDefaultModelRouteId(route));
-    if (!choice || (choice.efforts.length === 0 ? route.effort !== "" : !choice.efforts.includes(route.effort)) || route.fastMode && !choice.supportsFastMode) {
+    if (!choice || (choice.efforts.length === 0 ? route.effort !== "" : !choice.efforts.includes(route.effort)) || !speedSupported(choice, route.fastMode)) {
       throw new ConnectError("The requested application default model or tuning is unavailable. Read the enabled models again.", Code.InvalidArgument);
     }
   }
@@ -124,7 +128,7 @@ export class AppDefaultModelCoordinator {
     pending.assertCaller(); this.#assertAvailable(pending.requested); pending.claimed = true;
     return { remainingMs: Math.max(0, pending.expiresAt - this.now()), expected: pending.expected, requested: pending.requested };
   }
-  async select(input: { sessionId: string; id: string; effort?: string; fastMode?: boolean; assertCaller: () => void; signal?: AbortSignal }) {
+  async select(input: { sessionId: string; id: string; effort?: string; fastMode?: boolean | "ultrafast"; assertCaller: () => void; signal?: AbortSignal }) {
     input.signal?.throwIfAborted(); input.assertCaller();
     const mirror = this.#mirror; if (!mirror || mirror.owner !== this.#owners[0] || this.#pending) throw unavailable();
     mirror.owner.assertLive();

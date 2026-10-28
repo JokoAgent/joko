@@ -1,4 +1,5 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
 import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
@@ -1043,7 +1044,7 @@ export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage
   getSharedTaskRuntimeControl(sessionId: string): Promise<TaskShareRuntimeControl>;
   getSharedTaskBackends(): Promise<readonly BackendView[]>;
   recoverSharedTaskOperations(): Promise<void>;
-  setSharedTaskRuntime(sessionId: string, patch: { readonly backendId?: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode?: boolean }): Promise<void>;
+  setSharedTaskRuntime(sessionId: string, patch: { readonly backendId?: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode?: boolean | "ultrafast" }): Promise<void>;
   connect(options?: { readonly snapshotOnly?: boolean }): Promise<void>;
   disconnect(): void;
   pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome>;
@@ -1422,14 +1423,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
   }
   async syncAppDefaultModel(uiOwnerId: string, mirror: Parameters<AppDefaultModelUiPort["syncAppDefaultModel"]>[1], signal: AbortSignal) {
-    const response = await createClient(AppDefaultModelService, this.requireTransport()).syncAppDefaultModel({ uiOwnerId, ...mirror,
-      tuning: [...mirror.tuning], hiddenRouteIds: [...mirror.hiddenRouteIds], visibleRouteIds: [...mirror.visibleRouteIds ?? []] }, { signal });
+    const response = await createClient(AppDefaultModelService, this.requireTransport()).syncAppDefaultModel({ uiOwnerId,
+      ...(mirror.current === undefined ? {} : { current: { ...mirror.current, ...encodeModelSpeed(mirror.current.fastMode) } }),
+      confirmedRequestId: mirror.confirmedRequestId ?? "",
+      tuning: mirror.tuning.map(route => ({ ...route, ...encodeModelSpeed(route.fastMode) })), hiddenRouteIds: [...mirror.hiddenRouteIds], visibleRouteIds: [...mirror.visibleRouteIds ?? []] }, { signal });
     return response.accepted;
   }
   async claimAppDefaultModel(uiOwnerId: string, requestId: string, signal: AbortSignal) {
     const response = await createClient(AppDefaultModelService, this.requireTransport()).claimAppDefaultModel({ uiOwnerId, requestId }, { signal });
     if (response.requested === undefined || response.remainingMs < 1 || response.remainingMs > 5_000) throw new GatewayError("The application default-model request expired.");
-    return { remainingMs: response.remainingMs, ...(response.expected === undefined ? {} : { expected: response.expected }), requested: response.requested };
+    const route = (value: NonNullable<typeof response.requested>) => ({ backendId: value.backendId, providerId: value.providerId,
+      modelId: value.modelId, effort: value.effort, fastMode: decodeModelSpeed(value) });
+    return { remainingMs: response.remainingMs, ...(response.expected === undefined ? {} : { expected: route(response.expected) }), requested: route(response.requested) };
   }
 
   disconnect(): void {
@@ -2752,7 +2757,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         targetId,
         displayName: draft.name.trim() || "New task",
         nativeStart,
-        ...(draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", fastMode: draft.fastMode } } : {}),
+        ...(draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", ...encodeModelSpeed(draft.fastMode) } } : {}),
         permissionMode: protoPermission(draft.permissionMode),
         planMode: draft.planMode,
         initialPlacement: draft.initialPlacement === "dialogue"
@@ -2896,11 +2901,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return { adoption, inspection };
   }
 
-  async setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean): Promise<void> {
+  async setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean | "ultrafast"): Promise<void> {
     if (this.#taskSharing !== undefined) return this.setSharedTaskRuntime(sessionId, { providerId, modelId, effort, fastMode });
     await this.submit({
       case: "setSessionModel",
-      value: { sessionId, model: { model: { providerId, modelId }, effortId: effort ?? "", fastMode } }
+      value: { sessionId, model: { model: { providerId, modelId }, effortId: effort ?? "", ...encodeModelSpeed(fastMode) } }
     });
   }
 
@@ -2957,9 +2962,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     try { await flight; } finally { if (this.#sharedTaskRecovery === flight) this.#sharedTaskRecovery = undefined; }
   }
 
-  async setSharedTaskRuntime(sessionId: string, patch: { readonly backendId?: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode?: boolean }): Promise<void> {
+  async setSharedTaskRuntime(sessionId: string, patch: { readonly backendId?: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode?: boolean | "ultrafast" }): Promise<void> {
     const control = await this.getSharedTaskRuntimeControl(sessionId);
-    await this.submit({ case: "setSessionRuntime", value: { sessionId, expectedRuntimeGeneration: control.generation, ...patch } });
+    const { fastMode: _fastMode, ...route } = patch;
+    await this.submit({ case: "setSessionRuntime", value: { sessionId, expectedRuntimeGeneration: control.generation, ...route,
+      ...(patch.fastMode === undefined ? {} : encodeModelSpeed(patch.fastMode)) } });
   }
 
   async setPermission(sessionId: string, mode: PermissionMode): Promise<void> {
@@ -3288,7 +3295,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
               modelId: input.execution.modelId!
             },
             effortId: input.execution.effort ?? "",
-            fastMode: input.execution.fastMode
+            ...encodeModelSpeed(input.execution.fastMode)
           }
         } : {}),
         permissionMode: protoPermission(input.execution.permissionMode),
@@ -3647,7 +3654,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       timeZone: draft.timezone,
       input: { parts: draft.inputText.trim().length === 0 ? [] : [{ content: { case: "text", value: draft.inputText } }] },
       execution: {
-        ...(!scriptMode && draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", fastMode: draft.fastMode } } : {}),
+        ...(!scriptMode && draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", ...encodeModelSpeed(draft.fastMode) } } : {}),
         permissionMode: protoPermission(draft.permissionMode),
         planMode: !scriptMode && draft.planMode,
         useWorktree: draft.useWorktree,
@@ -7230,7 +7237,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
                 modelId: patch.defaultModel.modelId
               },
               effortId: patch.defaultModel.effort ?? "",
-              fastMode: patch.defaultModel.fastMode
+              ...encodeModelSpeed(patch.defaultModel.fastMode)
             }
           }),
           clearDefaultModel: patch.clearDefaultModel === true,
@@ -8119,7 +8126,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       ...(draft.providerId === undefined ? {} : { providerId: draft.providerId }),
       ...(draft.modelId === undefined ? {} : { modelId: draft.modelId }),
       ...(draft.effort === undefined ? {} : { effort: draft.effort }),
-      fastMode: draft.fastMode,
+      ...encodeModelSpeed(draft.fastMode),
       permissionMode: protoPermission(draft.permissionMode),
       planMode: draft.planMode
     }, { signal: scope.signal });
@@ -8725,9 +8732,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       ...(draft.providerId === undefined ? {} : { providerId: draft.providerId }),
       ...(draft.modelId === undefined ? {} : { modelId: draft.modelId }),
       ...(draft.effort === undefined ? {} : { effort: draft.effort }),
-      fastMode: draft.fastMode,
+      ...encodeModelSpeed(draft.fastMode),
       permissionMode: protoPermission(draft.permissionMode),
-      planMode: draft.planMode
+      planMode: draft.planMode,
+      ...(draft.workspace === undefined ? {} : { workspace: draft.workspace })
     }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     const tree = mapOwnedCollaborationTree(response.tree, goal.id, goal.leadSessionId);
@@ -10262,7 +10270,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             selection: {
               model: { providerId: change.item.providerId, modelId: change.item.modelId },
               effortId: change.item.effort ?? "",
-              fastMode: change.item.fast === true
+              ...encodeModelSpeed(change.item.fast ?? false)
             }
           }
         };
@@ -13938,10 +13946,13 @@ function mapSession(
       ? { model: mapModel(descriptor, selectedProvider) }
       : selected === undefined ? {} : { model: unavailableSessionModel(session.backendId, selected.providerId, selected.modelId, selectedProvider) }),
     ...(session.model?.effortId ? { effort: session.model.effortId } : {}),
-    fastMode: session.model?.fastMode ?? false,
+    fastMode: decodeModelSpeed(session.model ?? {}),
     permissionMode: uiPermission(session.permissionMode),
     planMode: session.planMode,
     ...(session.worktree === undefined ? {} : { worktree: mapSessionWorktree(session.worktree) }),
+    ...(session.localWorkspace === undefined ? {} : { localWorkspace: {
+      workspaceId: session.localWorkspace.workspaceId, path: session.localWorkspace.path
+    } }),
     taskTags: session.taskTags.map(mapTaskTag),
     ...(attention === undefined || attentionKind === undefined || attention.attentionCursor === undefined
       ? {}
@@ -14268,6 +14279,7 @@ function mapModel(
     inputModalities: model.inputModalities.map(inputModality),
     outputModalities: model.outputModalities.map(outputModality),
     supportsFast: model.supportsFastMode,
+    supportsUltrafast: model.supportsUltrafastMode,
     efforts: model.effortLevels.sort((left, right) => left.order - right.order).map((effort) => effort.effortId),
     contextWindow: numberValue(model.contextWindowTokens),
     maximumOutputTokens: numberValue(model.maximumOutputTokens),
@@ -14284,6 +14296,7 @@ function mapModel(
       ...(model.declaredModalities?.output === undefined ? {} : { outputModalities: [...model.declaredModalities.output.values] }),
       ...(model.declaredSupportsImages === undefined ? {} : { imageInput: model.declaredSupportsImages }),
       ...(model.declaredSupportsFastMode === undefined ? {} : { fastMode: model.declaredSupportsFastMode }),
+      ...(model.declaredSupportsUltrafastMode === undefined ? {} : { ultrafastMode: model.declaredSupportsUltrafastMode }),
       ...(model.referenceApi === undefined ? {} : { referenceProtocol: model.referenceApi }),
       ...(model.api ? { outboundProtocol: model.api } : {}),
       ...(model.protocolMode === "matching" || model.protocolMode === "compatibility" || model.protocolMode === "unknown" ? { protocolMode: model.protocolMode } : {}),
@@ -14804,6 +14817,7 @@ export function mapInteraction(interaction: Interaction): InteractionView {
   const base = {
     id: interaction.interactionId,
     sessionId: interaction.sessionId,
+    ...(interaction.runId ? { runId: interaction.runId } : {}),
     generation: interaction.generation,
     createdAt: timestampMs(interaction.createdAt),
     ...(interaction.expiresAt === undefined ? {} : { expiresAt: timestampMs(interaction.expiresAt) }),
@@ -15490,7 +15504,7 @@ function mapSchedule(schedule: Schedule): ScheduleView {
         providerId: schedule.execution.model.model.providerId,
         modelId: schedule.execution.model.model.modelId,
         ...(schedule.execution.model.effortId.length > 0 ? { effort: schedule.execution.model.effortId } : {}),
-        fastMode: schedule.execution.model.fastMode
+        fastMode: decodeModelSpeed(schedule.execution.model)
       }
     }),
     permissionMode: uiPermission(schedule.execution?.permissionMode ?? ProtoPermissionMode.ASK),
@@ -18979,7 +18993,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
           modelId: model.modelId
         }))
       },
-      ...(backend.defaultModel?.model === undefined ? {} : { model: { providerId: backend.defaultModel.model.providerId, modelId: backend.defaultModel.model.modelId, ...(backend.defaultModel.effortId.length === 0 ? {} : { effort: backend.defaultModel.effortId }), fastMode: backend.defaultModel.fastMode } })
+      ...(backend.defaultModel?.model === undefined ? {} : { model: { providerId: backend.defaultModel.model.providerId, modelId: backend.defaultModel.model.modelId, ...(backend.defaultModel.effortId.length === 0 ? {} : { effort: backend.defaultModel.effortId }), fastMode: decodeModelSpeed(backend.defaultModel) } })
     })),
     pi: (settings?.pi ?? []).map((pi) => ({
       backendId: pi.backendId,
@@ -19080,7 +19094,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
           providerId: favorite.selection.model.providerId,
           modelId: favorite.selection.model.modelId,
           ...(favorite.selection.effortId === "" ? {} : { effort: favorite.selection.effortId }),
-          ...(favorite.selection.fastMode ? { fast: true as const } : {})
+          ...(decodeModelSpeed(favorite.selection) ? { fast: decodeModelSpeed(favorite.selection) as true | "ultrafast" } : {})
         };
       }),
       seeded: settings.modelFavorites.seeded,
@@ -21289,6 +21303,11 @@ function mapCollaborationWorker(value: ProtoCollaborationWorker | undefined): Co
   }
   return {
     id: value.workerId,
+    ...(value.workspace === undefined ? {} : { workspace: {
+      workingDirectory: value.workspace.workingDirectory,
+      ...(value.workspace.worktreePath === undefined ? {} : { worktreePath: value.workspace.worktreePath }),
+      ...(value.workspace.sourceRef === undefined ? {} : { sourceRef: value.workspace.sourceRef })
+    } }),
     revision,
     goalId: value.goalId,
     ...(value.parentWorkerId === undefined ? {} : { parentWorkerId: value.parentWorkerId }),
@@ -21299,7 +21318,7 @@ function mapCollaborationWorker(value: ProtoCollaborationWorker | undefined): Co
       ...(route.providerId === undefined ? {} : { providerId: route.providerId }),
       ...(route.modelId === undefined ? {} : { modelId: route.modelId }),
       ...(route.effort === undefined ? {} : { effort: route.effort }),
-      fastMode: route.fastMode,
+      fastMode: decodeModelSpeed(route),
       permissionMode: collaborationPermission(route.permissionMode),
       planMode: route.planMode
     },
@@ -21511,7 +21530,7 @@ function protoPartnerRoute(value: PartnerModelRouteView) {
     providerId: value.providerId,
     modelId: value.modelId,
     ...(value.effort === undefined ? {} : { effort: value.effort }),
-    fastMode: value.fastMode
+    ...encodeModelSpeed(value.fastMode)
   };
 }
 
@@ -21560,7 +21579,7 @@ function mapPartnerRoute(route: ProtoPartnerCapabilities["modelChain"][number]):
       providerId: route.providerId,
       modelId: route.modelId,
       ...(route.effort === undefined ? {} : { effort: route.effort }),
-      fastMode: route.fastMode
+      fastMode: decodeModelSpeed(route)
     };
 }
 
@@ -22377,7 +22396,7 @@ function mapMessagingRoute(value: ProtoMessagingRoute | undefined): MessagingRou
     ...(value.providerId === undefined ? {} : { providerId: value.providerId }),
     ...(value.modelId === undefined ? {} : { modelId: value.modelId }),
     ...(value.effort === undefined ? {} : { effort: value.effort }),
-    fastMode: value.fastMode,
+    fastMode: decodeModelSpeed(value),
     permissionMode: uiPermission(value.permissionMode),
     planMode: value.planMode,
     createdAt: requiredMessagingTimestamp(value.createdAt, "route.created_at"),

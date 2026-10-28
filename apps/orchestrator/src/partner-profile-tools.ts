@@ -34,7 +34,7 @@ export class PartnerProfileTools implements BridgeToolProvider {
       name: { type: "string", minLength: 1, maxLength: 200 }, description: { type: "string", maxLength: 12_000 },
       identity_source: { type: "string", minLength: 1, maxLength: 8_000 },
       model_chain: { anyOf: [{ type: "null" }, { type: "array", minItems: 1, maxItems: 5, items: { type: "object", additionalProperties: false,
-        properties: { id: { type: "string", minLength: 1, maxLength: 2_048 }, effort: { type: "string", maxLength: 64 }, fast_mode: { type: "boolean" } }, required: ["id"] } }] }
+        properties: { id: { type: "string", minLength: 1, maxLength: 2_048 }, effort: { type: "string", maxLength: 64 }, fast_mode: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["ultrafast"] }] } }, required: ["id"] } }] }
     }, ["expected_version"], true)
   ];
   constructor(readonly partners: PartnerManager, readonly tasks: PartnerSessionTaskManager,
@@ -111,10 +111,11 @@ export class PartnerProfileTools implements BridgeToolProvider {
       const previous = configured.find(route => route.backendId === choice?.backendId && route.providerId === choice.providerId && route.modelId === choice.modelId);
       const effort = selection["effort"] === undefined ? previous?.effort ?? choice?.effort : text(selection["effort"], 64);
       if (!choice || seen.has(id) || effort !== undefined && effort !== "" && !choice.efforts.includes(effort)
-        || selection["fast_mode"] !== undefined && typeof selection["fast_mode"] !== "boolean"
-        || selection["fast_mode"] === true && !choice.supportsFastMode) invalid();
+        || selection["fast_mode"] !== undefined && typeof selection["fast_mode"] !== "boolean" && selection["fast_mode"] !== "ultrafast"
+        || selection["fast_mode"] === true && !choice.supportsFastMode
+        || selection["fast_mode"] === "ultrafast" && !choice.supportsUltrafastMode) invalid();
       seen.add(id); return { backendId: choice.backendId, providerId: choice.providerId, modelId: choice.modelId,
-        ...(effort ? { effort } : {}), fastMode: selection["fast_mode"] as boolean | undefined ?? previous?.fastMode ?? choice.fastMode };
+        ...(effort ? { effort } : {}), fastMode: selection["fast_mode"] as boolean | "ultrafast" | undefined ?? previous?.fastMode ?? choice.fastMode };
     });
   }
 }

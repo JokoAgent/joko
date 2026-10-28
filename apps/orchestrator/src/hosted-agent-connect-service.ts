@@ -50,7 +50,8 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
   const settings = (principal: HostedAgentPrincipal) => {
     const owner = management(principal), snapshot = owner.settings.snapshot();
     return create(contract.HostedAgentSettingsSchema, { revision: snapshot.revision, remoteControlEnabled: snapshot.value.remoteControlEnabled,
-      providers: snapshot.value.providers.map(provider => ({ backendId: provider.backendId, providerId: provider.providerId, enabled: provider.enabled })),
+      providers: snapshot.value.providers.map(provider => ({ backendId: provider.backendId, providerId: provider.providerId, enabled: provider.enabled,
+        modelAccess: contract.toRemoteModelAccess(provider.modelIds) })),
       limits: owner.settings.limits(), limitsOverridden: snapshot.value.limits !== undefined, usage: owner.slots.summary() });
   };
   return {
@@ -69,6 +70,13 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
           update = { kind: "provider", backendId: provider.backendId, providerId: provider.providerId, enabled: provider.enabled }; break;
         }
         case "limits": update = { kind: "limits", value: request.update.value }; break;
+        case "modelAccess": {
+          const provider = request.update.value; identity(provider.backendId); identity(provider.providerId);
+          if (!provider.access) throw new HostedAgentWireError();
+          owner.assertProviderExists(provider.backendId, provider.providerId);
+          update = { kind: "model_access", backendId: provider.backendId, providerId: provider.providerId,
+            modelIds: contract.readRemoteModelAccess(provider.access) }; break;
+        }
         case "resetLimits": update = { kind: "reset_limits" }; break;
         default: throw new HostedAgentWireError();
       }

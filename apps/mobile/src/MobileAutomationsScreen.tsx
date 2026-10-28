@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { MobileModelSpeedControl } from "./MobileModelSpeedControl";
 import {
   ActivityIndicator,
   Alert,
@@ -669,9 +670,9 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
             selected={draft.model?.effortId === effort.id} colors={colors} disabled={!editable || execution?.canSetEffort !== true}
             onPress={() => set("model", { ...draft.model!, effortId: effort.id })} />)}</View>
         </>}
-        {selectedModel?.supportsFastMode && <Choice label={mobileMessage(locale, "controls.fastMode")} selected={draft.model?.fastMode === true} colors={colors}
-          disabled={!editable || execution?.canSetFastMode !== true}
-          onPress={() => set("model", { ...draft.model!, fastMode: !draft.model!.fastMode })} />}
+        {selectedModel && draft.model && <MobileModelSpeedControl value={draft.model.fastMode} supportsFast={selectedModel.supportsFastMode}
+          supportsUltrafast={selectedModel.supportsUltrafastMode} disabled={!editable || execution?.canSetFastMode !== true}
+          colors={colors} locale={locale} onChange={fastMode => set("model", { ...draft.model!, fastMode })} />}
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "controls.permissionMode")}</Text>
         <View style={styles.optionRow}>{permissions.map((value) => <Choice key={value} label={mobileAutomationPermissionLabel(locale, value)}
           selected={draft.permissionMode === value} colors={colors}

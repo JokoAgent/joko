@@ -12,7 +12,7 @@ export interface RuntimeCreationAdmission {
 }
 export interface RuntimeHandoffProfile {
   readonly backendId: string; readonly providerId: string; readonly modelId: string;
-  readonly effort?: string; readonly fastMode: boolean;
+  readonly effort?: string; readonly fastMode: boolean | "ultrafast";
 }
 export interface ParkedRuntimeBinding {
   readonly backendId: string; readonly binding: NativeSessionBinding;
@@ -208,7 +208,7 @@ function binding(value: unknown): value is NativeSessionBinding {
 function profile(value: unknown): value is RuntimeHandoffProfile {
   return object(value) && keys(value, ["backendId", "providerId", "modelId", "effort", "fastMode"])
     && ["backendId", "providerId", "modelId"].every(key => boundedText(value[key], 512))
-    && typeof value["fastMode"] === "boolean" && (value["effort"] === undefined || boundedText(value["effort"], 64));
+    && (typeof value["fastMode"] === "boolean" || value["fastMode"] === "ultrafast") && (value["effort"] === undefined || boundedText(value["effort"], 64));
 }
 function parked(value: unknown): value is ParkedRuntimeBinding {
   return object(value) && keys(value, ["backendId", "binding", "backendInstanceGeneration", "cursor"])

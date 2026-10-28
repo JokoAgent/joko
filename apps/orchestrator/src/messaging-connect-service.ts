@@ -508,7 +508,7 @@ export function createMessagingConnectService(
         ...(request.providerId === undefined ? {} : { providerId: request.providerId }),
         ...(request.modelId === undefined ? {} : { modelId: request.modelId }),
         ...(request.effort === undefined ? {} : { effort: request.effort }),
-        fastMode: request.fastMode,
+        fastMode: contract.decodeModelSpeed(request),
         permissionMode: fromProtoPermissionMode(request.permissionMode),
         planMode: request.planMode
       });
@@ -984,7 +984,7 @@ function toProtoRoute(value: MessagingRouteRecord): contract.MessagingRoute {
     ...(value.providerId === undefined ? {} : { providerId: value.providerId }),
     ...(value.modelId === undefined ? {} : { modelId: value.modelId }),
     ...(value.effort === undefined ? {} : { effort: value.effort }),
-    fastMode: value.fastMode,
+    ...contract.encodeModelSpeed(value.fastMode),
     permissionMode: toProtoPermissionMode(value.permissionMode),
     planMode: value.planMode,
     createdAt: toProtoTimestamp(value.createdAt),

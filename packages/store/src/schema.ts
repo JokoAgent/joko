@@ -761,7 +761,7 @@ CREATE TABLE product_sessions (
         provider_id TEXT,
         model_id TEXT,
         effort TEXT,
-        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
+        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1, 2)),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         revision INTEGER NOT NULL CHECK (revision >= 1), append_system_prompt TEXT
@@ -1466,7 +1466,7 @@ CREATE TABLE collaboration_workers (
         provider_id TEXT,
         model_id TEXT,
         effort TEXT,
-        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
+        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1, 2)),
         permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
         plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
         session_generation INTEGER CHECK (
@@ -1624,7 +1624,7 @@ CREATE TABLE messaging_routes (
         effort TEXT CHECK (
           effort IS NULL OR (length(effort) BETWEEN 1 AND 128 AND instr(effort, char(0)) = 0)
         ),
-        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
+        fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1, 2)),
         permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
         plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
         created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -1658,7 +1658,7 @@ CREATE TABLE messaging_conversations (
         provider_id TEXT,
         model_id TEXT,
         effort TEXT,
-        fast_mode INTEGER CHECK (fast_mode IS NULL OR fast_mode IN (0, 1)),
+        fast_mode INTEGER CHECK (fast_mode IS NULL OR fast_mode IN (0, 1, 2)),
         permission_mode TEXT CHECK (
           permission_mode IS NULL OR permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')
         ),

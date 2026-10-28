@@ -25,7 +25,7 @@ export interface MobileNewTaskModelSelection {
   readonly providerId: string;
   readonly modelId: string;
   readonly effortId?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 interface MobileNewTaskSubmissionBase {
@@ -754,7 +754,7 @@ function normalizeNewTaskModelSelection(
   assertIdentity(value.providerId, "model Provider");
   assertIdentity(value.modelId, "model");
   if (value.effortId !== undefined) assertIdentity(value.effortId, "model effort");
-  if (typeof value.fastMode !== "boolean") {
+  if (typeof value.fastMode !== "boolean" && value.fastMode !== "ultrafast") {
     throw new Error("The retained Joko new-task model selection is invalid.");
   }
   return {

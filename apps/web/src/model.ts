@@ -358,6 +358,7 @@ export interface ModelView {
   readonly inputModalities: readonly ModelInputModalityView[];
   readonly outputModalities: readonly ModelOutputModalityView[];
   readonly supportsFast: boolean;
+  readonly supportsUltrafast?: boolean;
   readonly efforts: readonly string[];
   readonly contextWindow: number;
   readonly maximumOutputTokens: number;
@@ -389,6 +390,7 @@ export interface ModelAdvancedMetadataView {
   readonly displayEfforts?: readonly string[];
   readonly imageInput?: boolean;
   readonly fastMode?: boolean;
+  readonly ultrafastMode?: boolean;
   readonly inputModalities?: readonly string[];
   readonly outputModalities?: readonly string[];
   readonly referenceProtocol?: string;
@@ -569,7 +571,7 @@ export interface PartnerModelRouteView {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 export interface PartnerCapabilitiesView {
@@ -871,12 +873,13 @@ export interface CollaborationWorkerRouteView {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
 }
 
 export interface CollaborationWorkerView {
+  readonly workspace?: { readonly workingDirectory: string; readonly worktreePath?: string; readonly sourceRef?: string };
   readonly id: string;
   readonly revision: bigint;
   readonly goalId: string;
@@ -926,6 +929,7 @@ export interface CollaborationGoalTreeView {
 }
 
 export interface CollaborationWorkerDraftView {
+  readonly workspace?: { readonly workingDirectory?: string; readonly createWorktree: boolean; readonly sourceRef?: string };
   readonly parentWorkerId?: string;
   readonly label: string;
   readonly role: string;
@@ -934,7 +938,7 @@ export interface CollaborationWorkerDraftView {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
 }
@@ -1424,6 +1428,7 @@ export interface TaskTagDeletePreviewView {
 }
 
 export interface SessionView {
+  readonly localWorkspace?: { readonly workspaceId: string; readonly path: string };
   readonly taskActivity?: {
     readonly runId: string;
     readonly completedReplySummary: string;
@@ -1446,7 +1451,7 @@ export interface SessionView {
   readonly generation: bigint;
   readonly model?: ModelView;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly worktree?: SessionWorktreeView;
@@ -2011,6 +2016,7 @@ export interface QueueControlView {
 export interface InteractionView {
   readonly id: string;
   readonly sessionId: string;
+  readonly runId?: string;
   readonly generation: bigint;
   readonly kind: "permission" | "question" | "plan" | "select" | "confirm" | "input" | "editor";
   readonly title: string;
@@ -2675,7 +2681,7 @@ export interface ScheduleView {
     readonly timeoutMs?: number;
     readonly capabilities: readonly "sessions.dispatch"[];
   };
-  readonly model?: { readonly providerId: string; readonly modelId: string; readonly effort?: string; readonly fastMode: boolean };
+  readonly model?: { readonly providerId: string; readonly modelId: string; readonly effort?: string; readonly fastMode: boolean | "ultrafast" };
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly useWorktree: boolean;
@@ -2852,7 +2858,7 @@ export interface ScheduleDraft {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly useWorktree: boolean;
@@ -4982,7 +4988,7 @@ export interface MessagingRouteView {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly createdAt: number;
@@ -4997,7 +5003,7 @@ export interface MessagingRouteDraftView {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
 }
@@ -5034,7 +5040,7 @@ export interface ModelFavoriteConfigurationView {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fast?: true;
+  readonly fast?: true | "ultrafast";
 }
 
 export interface ModelFavoriteSettingsView {
@@ -5066,7 +5072,7 @@ export interface SettingsView {
     readonly enabled: boolean;
     readonly permissionMode: PermissionMode;
     readonly planMode: boolean;
-    readonly model?: { readonly providerId: string; readonly modelId: string; readonly effort?: string; readonly fastMode: boolean };
+    readonly model?: { readonly providerId: string; readonly modelId: string; readonly effort?: string; readonly fastMode: boolean | "ultrafast" };
     readonly modelAccess?: {
       readonly disabledProviderIds: readonly string[];
       readonly disabledModels: readonly { readonly providerId: string; readonly modelId: string }[];
@@ -5242,7 +5248,7 @@ export interface BackendSettingsUpdate {
     readonly providerId: string;
     readonly modelId: string;
     readonly effort?: string;
-    readonly fastMode: boolean;
+    readonly fastMode: boolean | "ultrafast";
   };
   readonly clearDefaultModel?: boolean;
   readonly modelAccessUpdate?: {
@@ -5444,7 +5450,7 @@ export interface NewSessionDraft {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly worktree?: {
@@ -5503,7 +5509,7 @@ export interface NewSessionLocalDraft {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
   readonly worktree?: {
@@ -5813,7 +5819,7 @@ export interface PortableSessionExecutionSelection {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;
 }
@@ -6123,7 +6129,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   setWorkspaceTrust(workspaceId: string, trusted: boolean): Promise<void>;
   addExtraDirectory(workspaceId: string, serverPath: string, access: ExtraDirectoryView["access"]): Promise<void>;
   removeExtraDirectory(extraDirectoryId: string): Promise<void>;
-  setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean): Promise<void>;
+  setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean | "ultrafast"): Promise<void>;
   getSessionRuntimeControl?(sessionId: string): Promise<import("@joko/contracts").TaskShareRuntimeControl>;
   setRuntimeModel?(sessionId: string, selection: import("./session-runtime-gateway.js").SessionRuntimeModelSelection): Promise<void>;
   setPermission(sessionId: string, mode: PermissionMode): Promise<void>;

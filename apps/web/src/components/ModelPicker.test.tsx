@@ -42,6 +42,16 @@ afterEach(async () => {
 });
 
 describe("ModelPicker", () => {
+  it("saves and selects an advertised Ultrafast configuration as a distinct value", async () => {
+    const declared = { ...models[0]!, supportsUltrafast: true }, onSelect = vi.fn();
+    await renderPicker(onSelect, "owner-one", undefined, false, undefined, [declared]); await openPicker();
+    await act(async () => required(findRow("Small").querySelector<HTMLButtonElement>(".model-picker__configure")).click());
+    const speed = required(document.querySelector<HTMLSelectElement>('.model-picker__config-flyout select[aria-label="Speed"]'));
+    await act(async () => { speed.value = "ultrafast"; speed.dispatchEvent(new Event("change", { bubbles: true })); });
+    expect(Object.values(readModelPickerOwnerPreferences("owner-one").configurations)[0]?.fast).toBe("ultrafast");
+    await act(async () => findRow("Small").click());
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ fastMode: "ultrafast" }));
+  });
   it("aggregates exact-source favorites and filters both rows and favorites by the selected source while hiding grouped members", async () => {
     const source = { kind: "local" as const, displayName: "Account", nodeId: "owner", nodeName: "Desk", nativeAdapterKind: "engine", groupMemberCount: 0, grouped: false };
     const local = { ...models[0]!, source };

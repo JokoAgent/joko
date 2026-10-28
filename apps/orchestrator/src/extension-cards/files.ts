@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readWorkerWorkspaceBinding } from "../collaboration-worker-workspace.js";
 import { constants } from "node:fs";
 import { lstat, open, readdir, realpath, stat, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -38,7 +39,8 @@ export async function captureExtensionFileWorkspace(store: OperationalStore, wor
   extraDirectories?: Pick<ExtraDirectoryManager, "resolveSelection" | "listForTarget">): Promise<ExtensionFileWorkspace> {
   const session = store.getSession(context.sessionId).descriptor, target = store.getTarget(context.targetId);
   const metadata = target.metadata as { workspaceId?: unknown } | undefined;
-  const workspaceId = session.worktree?.workspaceId ?? (typeof metadata?.workspaceId === "string" ? metadata.workspaceId : context.targetId);
+  const workerWorkspace = readWorkerWorkspaceBinding(store, session.id);
+  const workspaceId = workerWorkspace?.workspaceId ?? session.worktree?.workspaceId ?? (typeof metadata?.workspaceId === "string" ? metadata.workspaceId : context.targetId);
   const registration = workspaces.listRegistrations().find(value => value.id === workspaceId);
   if (!registration || !registration.trusted || !target.descriptor.trusted) throw new Error("A trusted task workspace is required for file transfer.");
   const binding = JSON.stringify(target.descriptor.remoteWorkspace);
@@ -60,6 +62,7 @@ export async function captureExtensionFileWorkspace(store: OperationalStore, wor
     if (!workspaces.listRegistrations().includes(registration) || !registration.trusted || !selected.trusted || JSON.stringify(selected.remoteWorkspace) !== binding
       || current.createdAt !== session.createdAt || current.targetId !== context.targetId || current.binding.generation !== context.generation
       || current.archived || current.deletedAt !== undefined || current.worktree?.workspaceId !== session.worktree?.workspaceId
+      || JSON.stringify(readWorkerWorkspaceBinding(store, current.id)) !== JSON.stringify(workerWorkspace)
       || store.findPendingSessionLifecycleCleanup(context.sessionId) || store.findSessionRuntimePolicy(context.sessionId)?.policy === "review_read_only") throw new Error("Extension file authority changed.");
     if (JSON.stringify(selectedExtras(), (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value) !== extraIdentity) throw new Error("Approved extension file directories changed.");
   };

@@ -1388,6 +1388,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     input: CreateNativeSessionInput,
     context: AdapterContext
   ): Promise<NativeSessionBinding> {
+    if (input.fastMode === "ultrafast") throw claudeCodeError("ULTRAFAST_UNSUPPORTED", "Ultrafast requires the Codex runtime", "provision");
     this.#assertUsable();
     this.#assertBackendInstance(context);
     const runtimePolicy = reviewRuntimePolicy(input, context);
@@ -3323,7 +3324,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     });
   }
 
-  override async setFastMode(enabled: boolean, context: AdapterContext): Promise<void> {
+  override async setFastMode(enabled: boolean | "ultrafast", context: AdapterContext): Promise<void> {
+    if (enabled === "ultrafast") throw claudeCodeError("ULTRAFAST_UNSUPPORTED", "Ultrafast requires the Codex runtime", "dispatch");
     const runtime = this.#requireIdleRuntime(context);
     this.#assertStandardRuntime(runtime, "change Fast mode");
     if (enabled) assertFastModeSupported(runtime);

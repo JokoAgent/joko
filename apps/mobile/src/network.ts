@@ -1,4 +1,5 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
+import { encodeModelSpeed } from "@joko/contracts";
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
 import { readMobileExtensionMainViewResource } from "./mobile-extension-main-view-resource";
 import type { MobileConnectionProfile } from "./connection-storage";
@@ -2090,7 +2091,7 @@ export const mobileNetwork: MobileNetwork = {
           description: draft.description,
           avatar: protoMobilePartnerAvatar(draft.avatar), identitySource: draft.identitySource, templateId: draft.templateId,
           usesDirectoryDefaults: draft.usesDirectoryDefaults, ...(draft.usesDirectoryDefaults ? {} : { capabilities: {
-            modelChain: [...capabilities.modelChain], permissionMode: mobilePartnerPermissionToProto(capabilities.permissionMode),
+            modelChain: capabilities.modelChain.map(route => ({ ...route, ...encodeModelSpeed(route.fastMode) })), permissionMode: mobilePartnerPermissionToProto(capabilities.permissionMode),
             planMode: capabilities.planMode, inputHandoff: capabilities.inputHandoff ?? true } }) } }, options(signal));
       signal?.throwIfAborted();
       projectMobilePartnerCreationOptions(response.directory);
@@ -2203,10 +2204,10 @@ export const mobileNetwork: MobileNetwork = {
       .updatePartner({ partnerId, expectedRevision: { value: expectedRevision }, patch: {
         displayName: draft.displayName, description: draft.description, identitySource: draft.identitySource,
         taskModelPreference: draft.taskModelOverride === undefined ? { case: "inheritTaskModel", value: true }
-          : { case: "taskModelOverride", value: draft.taskModelOverride },
+          : { case: "taskModelOverride", value: { ...draft.taskModelOverride, ...encodeModelSpeed(draft.taskModelOverride.fastMode) } },
         ...(typeof draft.avatar === "string" || "base64" in draft.avatar ? { avatar: protoMobilePartnerAvatar(draft.avatar) } : {}),
         usesDirectoryDefaults: draft.usesDirectoryDefaults,
-        ...(draft.usesDirectoryDefaults ? {} : { modelChain: { routes: [...draft.capabilities.modelChain] },
+        ...(draft.usesDirectoryDefaults ? {} : { modelChain: { routes: draft.capabilities.modelChain.map(route => ({ ...route, ...encodeModelSpeed(route.fastMode) })) },
           permissionMode: mobilePartnerPermissionToProto(draft.capabilities.permissionMode),
           planMode: draft.capabilities.planMode, inputHandoff: draft.capabilities.inputHandoff ?? true })
       } }, options(signal));

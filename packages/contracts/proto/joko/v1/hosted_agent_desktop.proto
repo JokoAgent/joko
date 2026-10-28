@@ -36,6 +36,7 @@ message OpenDesktopHostedAgentDelegateResponse {
   string delegate_id = 2;
   // Supplied by the service; the caller cannot override the Source Hub.
   string server_id = 3;
+  bool supports_extension_sync = 4;
 }
 message InvokeDesktopHostedAgentDelegateRequest {
   uint32 format = 1;

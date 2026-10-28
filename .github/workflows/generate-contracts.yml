@@ -1,0 +1,45 @@
+name: Generate contracts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+      - name: Install the repository's pinned generators
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/contract-tools"
+          printf '{"private":true,"type":"module"}\n' > "$RUNNER_TEMP/contract-tools/package.json"
+          printf 'allowBuilds:\n  "@bufbuild/buf": true\n' > "$RUNNER_TEMP/contract-tools/pnpm-workspace.yaml"
+          pnpm --dir "$RUNNER_TEMP/contract-tools" add --save-exact @bufbuild/buf@1.72.0 @bufbuild/protoc-gen-es@2.14.0
+          echo "$RUNNER_TEMP/contract-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Generate from the exact checked out inputs
+        shell: bash
+        run: |
+          buf lint
+          buf generate --clean
+          git rev-parse HEAD 'HEAD^{tree}' > contract-source.txt
+          git diff -- packages/contracts/src/gen > contract-generation.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: generated-contracts-${{ github.sha }}
+          path: |
+            contract-source.txt
+            contract-generation.patch
+            packages/contracts/src/gen/
+          if-no-files-found: error
+          retention-days: 7

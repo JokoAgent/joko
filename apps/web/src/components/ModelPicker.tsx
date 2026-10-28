@@ -44,6 +44,7 @@ import type {
   ModelView
 } from "../model.js";
 import { randomUuid } from "../web-crypto.js";
+import { resolveModelSpeed } from "../model-speed.js";
 import { isConversationModel, isRoutableConversationModel } from "../model-capabilities.js";
 import { applyProviderDisplayOrder } from "../provider-display-order.js";
 import { modelSourceLabel, modelSourceSelectable } from "../model-source-catalog.js";
@@ -57,7 +58,7 @@ export interface ModelPickerSelection {
   readonly providerId: string;
   readonly modelId: string;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
   readonly favoriteUid?: string;
 }
 
@@ -100,12 +101,12 @@ interface PickerRow {
   readonly model: ModelView;
   readonly favorite?: ModelFavoriteConfiguration;
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 interface RowConfiguration {
   readonly effort?: string;
-  readonly fastMode: boolean;
+  readonly fastMode: boolean | "ultrafast";
 }
 
 interface BinaryThinkingEfforts {
@@ -198,7 +199,7 @@ export function ModelPicker({
     if (seedDefault === undefined || favoritesSeeded || favoriteBusy) return;
     const model = modelsByKey.get(modelKey(seedDefault));
     if (model === undefined || !model.available) return;
-    const item = favoriteItem(model, seedDefault.effort, seedDefault.fastMode && model.supportsFast);
+    const item = favoriteItem(model, seedDefault.effort, resolveModelSpeed(model, seedDefault.fastMode, fastEnabled));
     if (remoteFavorites) {
       const attempt = JSON.stringify([
         ownerId ?? "",
@@ -207,7 +208,7 @@ export function ModelPicker({
         item.providerId,
         item.modelId,
         item.effort ?? "",
-        item.fast === true
+        item.fast ?? false
       ]);
       if (favoriteSeedAttemptRef.current === attempt) return;
       favoriteSeedAttemptRef.current = attempt;
@@ -219,7 +220,7 @@ export function ModelPicker({
       providerId: model.providerId,
       modelId: model.modelId,
       ...(!effortEnabled || seedDefault.effort === undefined ? {} : { effort: seedDefault.effort }),
-      ...(fastEnabled && seedDefault.fastMode && model.supportsFast ? { fast: true } : {})
+      ...(item.fast ? { fast: item.fast } : {})
     });
   }, [favoriteBusy, favoritesSeeded, modelsByKey, ownerId, remoteFavorites, seedDefault]);
 
@@ -238,7 +239,7 @@ export function ModelPicker({
       model,
       favorite,
       ...(effort === undefined ? {} : { effort }),
-      fastMode: fastEnabled && favorite.fast === true && model.supportsFast
+      fastMode: resolveModelSpeed(model, favorite.fast, fastEnabled)
     }];
   }), [favorites, modelsByKey, preferences]);
 
@@ -250,7 +251,7 @@ export function ModelPicker({
       ? undefined
       : (storedConfiguration === undefined ? undefined : {
           ...(storedConfiguration.effort === undefined ? {} : { effort: storedConfiguration.effort }),
-          fastMode: storedConfiguration.fast === true
+          fastMode: storedConfiguration.fast ?? false
         });
     const effort = effortEnabled
       ? selected ? validEffort(model, value.effort) : preferredModelEffort(preferences, model)
@@ -259,7 +260,7 @@ export function ModelPicker({
       key,
       model,
       ...(effort === undefined ? {} : { effort }),
-      fastMode: fastEnabled && (configured?.fastMode ?? (selected && value.fastMode && model.supportsFast))
+      fastMode: resolveModelSpeed(model, configured?.fastMode ?? (selected ? value.fastMode : false), fastEnabled)
     };
   }), [orderedVisibleModels, preferences, value, effortEnabled, fastEnabled]);
 
@@ -272,7 +273,7 @@ export function ModelPicker({
       modelSourceLabel(row.model),
       row.model.providerId,
       row.effort ?? "",
-      row.fastMode ? "fast" : ""
+      row.fastMode === "ultrafast" ? "ultrafast" : row.fastMode ? "fast" : ""
     ].some((field) => field.toLocaleLowerCase().includes(normalizedQuery));
     if (rail === "favorites") return favoriteRows.filter(matches);
     if (rail.startsWith("provider:")) {
@@ -408,7 +409,7 @@ export function ModelPicker({
       providerId: row.model.providerId,
       modelId: row.model.modelId,
       ...(row.effort === undefined ? {} : { effort: row.effort }),
-      fastMode: fastEnabled && row.fastMode && row.model.supportsFast,
+      fastMode: resolveModelSpeed(row.model, row.fastMode, fastEnabled),
       ...(row.favorite === undefined ? {} : { favoriteUid: row.favorite.uid })
     });
   };
@@ -416,7 +417,7 @@ export function ModelPicker({
   const configureRow = (row: PickerRow, patch: Partial<RowConfiguration>): void => {
     if (favoriteBusy && row.favorite !== undefined) return;
     const effort = effortEnabled && patch.effort === undefined ? row.effort : effortEnabled ? validEffort(row.model, patch.effort) : undefined;
-    const fastMode = fastEnabled && (patch.fastMode === undefined ? row.fastMode : patch.fastMode && row.model.supportsFast);
+    const fastMode = resolveModelSpeed(row.model, patch.fastMode ?? row.fastMode, fastEnabled);
     if (row.favorite !== undefined) {
       if (remoteFavorites) {
         void mutateRemoteFavorite({
@@ -434,7 +435,7 @@ export function ModelPicker({
     const storedConfiguration = readModelConfiguration(preferences, row.model.backendId, row.model.providerId, row.model.modelId);
     const saveConfiguration = (): void => setModelConfiguration(ownerId, row.model.backendId, row.model.providerId, row.model.modelId, {
       ...(effortEnabled ? { effort } : storedConfiguration?.effort === undefined ? {} : { effort: storedConfiguration.effort }),
-      fast: fastEnabled ? fastMode : storedConfiguration?.fast === true
+      fast: fastEnabled ? fastMode : storedConfiguration?.fast ?? false
     });
     if (!isSelectedRow(row, value)) { saveConfiguration(); return; }
     if (selectionBusyRef.current) return;
@@ -477,7 +478,7 @@ export function ModelPicker({
       providerId: row.model.providerId,
       modelId: row.model.modelId,
       ...(row.effort === undefined ? {} : { effort: row.effort }),
-      ...(row.fastMode ? { fast: true } : {})
+      ...(row.fastMode ? { fast: row.fastMode } : {})
     });
     if (added === undefined) return;
     setJustFavoritedKey(row.key);
@@ -672,7 +673,7 @@ export function ModelPicker({
       <span className={cx("model-picker-trigger__label", selectedModelUnavailable && "is-unavailable")}><strong>{selectedLabel}</strong>{value !== undefined && <small>{selectedModel?.providerName ?? value.providerId}{selectedGroupUsage === undefined ? "" : ` · ${selectedGroupUsage}`}{selectedModelUnavailable ? ` · ${t("modelPicker.sourceDisconnected")}` : ""}</small>}</span>
       <span className="model-picker-trigger__configuration">
         {selectedEffortLabel !== undefined && <small>{selectedEffortLabel}</small>}
-        {fastEnabled && selectedModel !== undefined && value !== undefined && value.fastMode && selectedModel.supportsFast && <Zap aria-label={t("controls.fast")} />}
+        {fastEnabled && selectedModel !== undefined && value !== undefined && resolveModelSpeed(selectedModel, value.fastMode) && <Zap aria-label={t(value.fastMode === "ultrafast" ? "controls.ultrafast" : "controls.fast")} />}
       </span>
       <ChevronDown aria-hidden="true" />
     </button>;
@@ -794,7 +795,7 @@ function ModelRows({
         <PriceMark model={row.model} tier={tier} t={t} />
         <span className="model-picker__row-config-summary">
           {rowEffortLabel !== undefined && <span>{rowEffortLabel}</span>}
-          {row.fastMode && <Zap aria-label={t("controls.fast")} />}
+          {row.fastMode && <Zap aria-label={t(row.fastMode === "ultrafast" ? "controls.ultrafast" : "controls.fast")} />}
           {layout === "badge" && <small>{row.model.providerName}</small>}
         </span>
         <IconButton
@@ -913,11 +914,19 @@ function RowConfigurationFlyout({ row, anchorElement, panelElement, flyoutRef, t
       key={effort}
       onClick={() => onChange({ effort })}
     >{effort}</button>)}</div></fieldset>}
-    {fastEnabled && <label className={cx(!row.model.supportsFast && "is-disabled")}>
+    {fastEnabled && row.model.supportsUltrafast === true ? <label>
+      <span><Zap aria-hidden="true" />{t("controls.speed")}</span>
+      <select aria-label={t("controls.speed")} value={row.fastMode === "ultrafast" ? "ultrafast" : row.fastMode ? "fast" : "standard"}
+        disabled={disabled} onChange={event => onChange({ fastMode: event.target.value === "ultrafast" ? "ultrafast" : event.target.value === "fast" })}>
+        <option value="standard">{t("controls.standard")}</option>
+        {row.model.supportsFast && <option value="fast">{t("controls.fast")}</option>}
+        <option value="ultrafast">{t("controls.ultrafast")}</option>
+      </select>
+    </label> : fastEnabled && <label className={cx(!row.model.supportsFast && "is-disabled")}>
       <span><Zap aria-hidden="true" />{t("controls.fast")}</span>
       <CheckboxControl
         disabled={disabled || !row.model.supportsFast}
-        checked={row.fastMode}
+        checked={row.fastMode === true}
         onChange={(event) => onChange({ fastMode: event.target.checked })}
       />
     </label>}
@@ -1040,7 +1049,7 @@ function isSelectedRow(row: PickerRow, value: ModelPickerSelection | undefined):
 function favoriteItem(
   model: ModelView,
   effort: string | undefined,
-  fastMode: boolean,
+  fastMode: boolean | "ultrafast",
   uid = `favorite-${randomUuid()}`
 ): ModelFavoriteConfiguration {
   return {
@@ -1049,7 +1058,7 @@ function favoriteItem(
     providerId: model.providerId,
     modelId: model.modelId,
     ...(effort === undefined ? {} : { effort }),
-    ...(fastMode ? { fast: true } : {})
+    ...(fastMode ? { fast: fastMode } : {})
   };
 }
 

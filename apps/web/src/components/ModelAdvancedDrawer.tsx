@@ -116,6 +116,7 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
           <Fact label={t("settings.inputModalities")}>{metadata?.inputModalities?.length ? metadata.inputModalities.join(" · ") : t("settings.modelAdvanced.undeclared")}</Fact>
           <Fact label={t("settings.modelAdvanced.outputModalities")}>{metadata?.outputModalities?.length ? metadata.outputModalities.join(" · ") : t("settings.modelAdvanced.undeclared")}</Fact>
           <Fact label="Fast"><Capability value={metadata?.fastMode} t={t} /></Fact>
+          <Fact label="Ultrafast"><Capability value={metadata?.ultrafastMode} t={t} /></Fact>
         </Section>
         <ModelPricing controller={controller} model={primary} ownerKey={ownerKey} refreshRevision={priceRevision} disabled={!connected || pending} onEdit={() => onEditPrice(primary)} t={t} />
         <Section title={t("settings.modelAdvanced.identity")}>
