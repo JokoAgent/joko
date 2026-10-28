@@ -13,6 +13,10 @@ import { ProviderGroupRuntime, providerGroupDefaultMember } from "./provider-gro
 import { SessionHost } from "./session-host.js";
 import { ProviderGroupService } from "./provider-group-service.js";
 import { providerGroupQuota } from "./provider-group-quota.js";
+import { createClient, createRouterTransport } from "@connectrpc/connect";
+import * as contract from "@joko/contracts";
+import { createProviderGroupConnectService } from "./provider-group-connect-service.js";
+import { ProviderGroupRemoteRouter } from "./provider-group-remote.js";
 import { mkdtemp } from "./test-paths.js";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -26,6 +30,7 @@ async function fixture() {
   const host = new SessionHost(store, artifacts, registry.availableAdapters(), { backendDescriptors: registry.descriptors(), backendDescriptorsAlreadyPublished: true }); await host.initialize();
   const sources = { groupCatalog: () => [], installGroupSwitch: () => {}, installGroupStore: () => {}, sourceKind: () => undefined } as unknown as HostedAgentSources;
   const groups = new ProviderGroupRuntime({ store, registry, sources, nodeId: "group-node", nodeName: () => "This node", ownerGeneration: () => "owner-1",
+    now: () => Date.now(),
     sessions: host.providerGroupSessionPort(), readAccountUsage: async () => undefined, activeTurns: (backend, provider) => host.activeProviderTurns(backend, provider), assertRemoteAllowed: () => {} }); host.installProviderGroupRuntime(groups);
   await host.registerTarget({ id: "target", backendId: first.id, displayName: "Workspace", workspaceRoot: root, managed: false, trusted: true });
   const connection = store.createConnection({ id: "controller", name: "Owner", authKeyDigest: "digest" });
@@ -33,10 +38,156 @@ async function fixture() {
   const key = { backendId: first.id, providerId: "test" }, members = groups.sources().filter(row => row.providerId === "test").map(providerGroupDefaultMember);
   const create = (id: string) => host.createSession({ operationId: id, connection, targetId: "target", title: "Grouped task", providerId: "test", modelId: "text", effort: "medium", permissionMode: "ask", planMode: false, fastMode: false });
   const send = (sessionId: string, id: string) => host.enqueueInput({ operationId: id, connection, sessionId, prompt: prompt(id) }).value;
-  return { root, store, host, groups, registry, first, second, key, members, create, send };
+  return { root, store, host, groups, registry, first, second, key, members, create, send, connection };
 }
 const prompt = (text: string): PromptInput => ({ text, images: [], files: [], mentions: [], disposition: "prompt" });
 async function until(predicate: () => boolean): Promise<void> { await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 8000, interval: 10 }); }
+
+function quotaBoundary(f: Pick<Awaited<ReturnType<typeof fixture>>, "groups" | "registry">, resetAt: number) {
+  return vi.spyOn(f.groups.directory, "read").mockImplementation(async member => {
+    const limited = Date.now() < resetAt, model = f.registry.get(member.backendId).descriptor.models.find(model => model.providerId === member.providerId)!;
+    return { member, available: !limited, reachable: true, model, running: 0, assertCurrent: () => {}, quota: { limited, ...(limited ? { resetAt } : {}) },
+      ...(limited ? { reason: "quota" as const } : {}) };
+  });
+}
+
+async function reopenGroupHost(f: Awaited<ReturnType<typeof fixture>>, resetAt: number) {
+  await f.host.dispose(); await f.groups.close(); f.store.close();
+  const store = new OperationalStore(join(f.root, "store.db"));
+  const artifacts = new ArtifactStore({ rootDirectory: join(f.root, "restarted-artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [f.root] }); await artifacts.initialize();
+  const first = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, id: f.first.id }), second = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, id: f.second.id });
+  const registry = new BackendInstanceRegistry(store); await registry.provision([first, second].map(adapter => ({ instanceId: adapter.id, adapterKind: "fake", displayName: adapter.id, create: () => adapter })));
+  const host = new SessionHost(store, artifacts, registry.availableAdapters(), { backendDescriptors: registry.descriptors(), backendDescriptorsAlreadyPublished: true });
+  await host.initialize();
+  const sources = { groupCatalog: () => [], installGroupSwitch: () => {}, installGroupStore: () => {}, sourceKind: () => undefined } as unknown as HostedAgentSources;
+  const groups = new ProviderGroupRuntime({ store, registry, sources, nodeId: "group-node", nodeName: () => "This node", ownerGeneration: () => "owner-1",
+    now: () => Date.now(),
+    sessions: host.providerGroupSessionPort(), readAccountUsage: async () => undefined, activeTurns: (backend, provider) => host.activeProviderTurns(backend, provider), assertRemoteAllowed: () => {} });
+  quotaBoundary({ groups, registry }, resetAt);
+  host.installProviderGroupRuntime(groups);
+  cleanups.unshift(async () => { await host.dispose(); await groups.close(); store.close(); });
+  return { store, host, groups, first, second, registry };
+}
+
+it("durably wakes the same undispatched input after a quota reset and a real Store reopen", async () => {
+  const f = await fixture(); f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
+  const sessionId = (await f.create("quota-wait-source")).value.sessionId, resetAt = Date.now() + 60_000;
+  quotaBoundary(f, resetAt); const send = vi.spyOn(f.first, "send"), queued = f.send(sessionId, "quota-wait-original");
+  await until(() => f.store.findSetting("session", sessionId, `provider.group-error:${queued.runId}`)?.value !== undefined);
+  expect(f.store.getQueueItem(queued.queueItemId).state).toBe("accepted"); expect(send).not.toHaveBeenCalled();
+  const restored = await reopenGroupHost(f, resetAt), resumedSend = vi.spyOn(restored.first, "send");
+  expect(restored.store.getSetting("session", sessionId, `provider.group-error:${queued.runId}`).value).toMatchObject({ kind: "queue-head", queueItemId: queued.queueItemId, operationId: "quota-wait-original", resumeAt: resetAt });
+  expect(resumedSend).not.toHaveBeenCalled();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(resetAt + 1);
+  try {
+    restored.host.requestQueueDrain(sessionId); await until(() => restored.store.getQueueItem(queued.queueItemId).state === "completed");
+    restored.host.requestQueueDrain(sessionId); expect(resumedSend).toHaveBeenCalledOnce();
+    expect(restored.store.listRuns({ sessionId })).toHaveLength(1); expect(restored.store.getOperation("quota-wait-original").status).toBe("completed");
+    expect(restored.store.findSetting("session", sessionId, `provider.group-error:${queued.runId}`)).toBeUndefined();
+  } finally { clock.mockRestore(); }
+});
+
+it("restores a positively settled failed turn once without replaying completed assistant work", async () => {
+  const f = await fixture(); f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
+  const sessionId = (await f.create("quota-failed-source")).value.sessionId, resetAt = Date.now() + 60_000;
+  vi.spyOn(f.first, "send").mockImplementationOnce(async (_input: PromptInput, context: AdapterContext) => {
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Already completed work" }] });
+    quotaBoundary(f, resetAt);
+    await context.emit({ type: "error", terminal: true, error: { code: "USAGE_LIMIT", message: "Account quota exhausted", phase: "turn", retryable: true, stateMayHaveChanged: false, recovery: "Wait for quota." } });
+    await context.emit({ type: "done", outcome: "failed" });
+  });
+  const queued = f.send(sessionId, "quota-interrupted-original");
+  await until(() => Boolean((f.store.findSetting("session", sessionId, `provider.group-error:${queued.runId}`)?.value as { resumeAt?: number } | undefined)?.resumeAt));
+  expect(f.store.getRun(queued.runId).descriptor.state).toBe("failed");
+  const restored = await reopenGroupHost(f, resetAt), resumedSend = vi.spyOn(restored.first, "send");
+  const clock = vi.spyOn(Date, "now").mockReturnValue(resetAt + 1);
+  try {
+    expect(restored.groups.router.now()).toBe(resetAt + 1);
+    restored.host.requestQueueDrain(sessionId);
+    await until(() => restored.store.listRuns({ sessionId }).some(run => run.descriptor.parentRunId === queued.runId && run.descriptor.state === "completed"));
+    restored.host.requestQueueDrain(sessionId); expect(resumedSend).toHaveBeenCalledOnce();
+    expect(resumedSend.mock.calls[0]![0].text).toContain("Do not repeat completed work");
+    expect(restored.store.listRuns({ sessionId })).toHaveLength(2);
+    expect(restored.store.listEvents({ sessionId }).filter(event => event.payload.type === "error" && event.payload.terminal)).toEqual([]);
+    expect(restored.store.listEvents({ sessionId }).some(event => event.runId === queued.runId && event.payload.type === "done" && event.payload.outcome === "failed")).toBe(true);
+  } finally { clock.mockRestore(); }
+});
+
+it("does not promote a held error into a cold retry without a settled original native turn", async () => {
+  const f = await fixture(); f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
+  const sessionId = (await f.create("quota-unknown-source")).value.sessionId, resetAt = Date.now() + 60_000;
+  vi.spyOn(f.first, "send").mockImplementationOnce(async (_input: PromptInput, context: AdapterContext) => {
+    quotaBoundary(f, resetAt);
+    await context.emit({ type: "error", terminal: true, error: { code: "USAGE_LIMIT", message: "Account quota exhausted", phase: "turn", retryable: true, stateMayHaveChanged: false, recovery: "Inspect native state." } });
+    throw new JokoError({ code: "DISPATCH_UNKNOWN", message: "Lost the native completion receipt", phase: "dispatch", retryable: false, stateMayHaveChanged: true, recovery: "Inspect the original native turn." });
+  });
+  const queued = f.send(sessionId, "quota-unknown-original"); await until(() => f.store.getRun(queued.runId).descriptor.state === "dispatch_unknown");
+  const restored = await reopenGroupHost(f, resetAt), send = vi.spyOn(restored.first, "send"), second = vi.spyOn(restored.second, "send");
+  const clock = vi.spyOn(Date, "now").mockReturnValue(resetAt + 1);
+  try {
+    restored.host.requestQueueDrain(sessionId); await new Promise(resolve => setTimeout(resolve, 30));
+    expect(send).not.toHaveBeenCalled(); expect(second).not.toHaveBeenCalled(); expect(restored.store.listRuns({ sessionId })).toHaveLength(1);
+    expect(restored.store.getRun(queued.runId).descriptor.state).toBe("dispatch_unknown");
+  } finally { clock.mockRestore(); }
+});
+
+it("continues one authenticated guest offer after its exact native handoff commits", async () => {
+  const f = await fixture(), sessionId = (await f.create("guest-offer-source")).value.sessionId;
+  const original = f.store.getSession(sessionId).descriptor.binding, nativeSend = f.first.send.bind(f.first);
+  const send = vi.spyOn(f.first, "send").mockImplementationOnce(async (_input, context) => {
+    f.groups.guestSwitch.offer(sessionId, f.first.id, context.generation, "a".repeat(64));
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Retained completed work" }] });
+    await context.emit({ type: "error", terminal: true, error: { code: "UPSTREAM_OVERLOAD", message: "Provider member overloaded", phase: "turn", retryable: true,
+      stateMayHaveChanged: false, recovery: "Use the original authenticated offer." } });
+    await context.emit({ type: "done", outcome: "failed" });
+  });
+  send.mockImplementation(nativeSend);
+  const queued = f.send(sessionId, "guest-offer-original");
+  await until(() => f.store.listRuns({ sessionId }).some(run => run.descriptor.parentRunId === queued.runId && run.descriptor.state === "completed"));
+  expect(send).toHaveBeenCalledTimes(2); expect(send.mock.calls[1]![0].text).toContain("Do not repeat completed work");
+  expect(f.store.getSession(sessionId).descriptor.binding.nativeSessionId).not.toBe(original.nativeSessionId);
+  expect(f.store.listEvents({ sessionId }).filter(event => event.payload.type === "runtime_handoff")).toHaveLength(1);
+  expect(f.store.getOperation("guest-offer-original").status).toBe("completed"); expect(f.store.listRuns({ sessionId })).toHaveLength(2);
+  expect(f.store.findSetting("session", sessionId, `provider.group-error:${queued.runId}`)).toBeUndefined();
+});
+
+it("retains an unknown guest-offer native journal through Store reopen without another creation or send", async () => {
+  const f = await fixture(), sessionId = (await f.create("guest-unknown-source")).value.sessionId;
+  const create = vi.spyOn(f.first, "createSession").mockRejectedValueOnce(new JokoError({ code: "NATIVE_START_UNKNOWN", message: "The native startup response was lost.",
+    phase: "session_start", retryable: false, stateMayHaveChanged: true, recovery: "Inspect the original native creation." }));
+  vi.spyOn(f.first, "send").mockImplementationOnce(async (_input, context) => {
+    f.groups.guestSwitch.offer(sessionId, f.first.id, context.generation, "b".repeat(64));
+    await context.emit({ type: "error", terminal: true, error: { code: "UPSTREAM_OVERLOAD", message: "Provider member overloaded", phase: "turn", retryable: true,
+      stateMayHaveChanged: false, recovery: "Use the original authenticated offer." } });
+    await context.emit({ type: "done", outcome: "failed" });
+  });
+  const queued = f.send(sessionId, "guest-unknown-original");
+  await until(() => new SessionRuntimeHandoffStore(f.store).read(sessionId)?.pending?.phase === "unknown");
+  const journal = new SessionRuntimeHandoffStore(f.store).read(sessionId)!;
+  expect(create).toHaveBeenCalledOnce();
+  expect(f.store.getSetting("session", sessionId, `provider.group-error:${queued.runId}`).value)
+    .toMatchObject({ runId: queued.runId, operationId: "guest-unknown-original", guestHandoff: { generation: journal.generation } });
+  const restored = await reopenGroupHost(f, Date.now()), creation = vi.spyOn(restored.first, "createSession"), send = vi.spyOn(restored.first, "send");
+  restored.host.requestQueueDrain(sessionId); await new Promise(resolve => setTimeout(resolve, 30));
+  expect(creation).not.toHaveBeenCalled(); expect(send).not.toHaveBeenCalled(); expect(restored.store.listRuns({ sessionId })).toHaveLength(1);
+  expect(new SessionRuntimeHandoffStore(restored.store).read(sessionId)?.pending).toEqual(journal.pending);
+  expect(restored.store.getSetting("session", sessionId, `provider.group-error:${queued.runId}`).value)
+    .toMatchObject({ runId: queued.runId, guestHandoff: { generation: journal.generation } });
+});
+
+it("carries an exact quota wait through the generated owner RPC without inventing a new selection", async () => {
+  const f = await fixture(), resetAt = Date.now() + 60_000;
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n); quotaBoundary(f, resetAt);
+  const transport = createRouterTransport(router => router.service(contract.ProviderGroupService, createProviderGroupConnectService({ service: f.groups.service, usage: f.groups.usage,
+    schedulingState: async () => ({ activeTurns: 0 }), authenticate: async () => ({ id: "peer-owner", trust: "owner", management: false, assertCurrent: () => {} }), assertRemoteAllowed: () => {} })));
+  const peer = { captureGroupPeer: () => ({ transport, nativeBackendId: f.first.id, ownerNodeId: "group-node", assertCurrent: () => {} }) } as unknown as HostedAgentSources;
+  const remote = new ProviderGroupRemoteRouter({ store: f.groups.store, sources: peer, directory: f.groups.directory, leases: f.groups.leases, localNodeId: "receiver", ownerGeneration: () => "receiver-owner" });
+  await expect(remote.pick({ sessionId: "original-remote-task", group: f.key, agentKind: "pi", modelId: "text", ownTask: true,
+    profile: { backendId: f.first.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false } }, new AbortController().signal))
+    .rejects.toMatchObject({ code: "PROVIDER_GROUP_UNAVAILABLE", retryAt: expect.any(Number) });
+  const client = createClient(contract.ProviderGroupService, transport);
+  await expect(client.pickProviderGroupMember({ key: f.key, sessionId: "original-remote-task", agentKind: "pi", modelId: "text" })).rejects.toMatchObject({ code: 14 });
+});
 
 async function rebalanceFixture() {
   const f = await fixture(), members = [f.members[0]!, { ...f.members[1]!, nodeId: "other-execution-node", displayName: "Other computer" }];

@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -23,7 +24,10 @@ async function fixture() {
   const artifacts = new ArtifactStore({ rootDirectory: join(root, 'artifacts'), repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
   await artifacts.initialize(); const vault = await CredentialVault.open(join(root, 'vault.key'));
   const credentials = new CredentialManager({ vault, storagePath: join(root, 'credentials.json') }); await credentials.initialize();
-  const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE); let runtime: PartnerMessagingRuntime | undefined, activeMessaging: MessagingManager | undefined;
+  const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE,
+    capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === 'permission.modes'
+      ? { ...capability, options: PI_LIKE_PROFILE.permissionModes } : capability) });
+  let runtime: PartnerMessagingRuntime | undefined, activeMessaging: MessagingManager | undefined;
   const host = new SessionHost(store, artifacts, [adapter], { partnerSessionRestarting: id => runtime?.isRestarting(id) === true,
     onServiceRunSettled: input => activeMessaging?.onRunSettled(input) }); await host.initialize();
   const partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host, homesRoot: join(root, 'homes'),
@@ -31,6 +35,7 @@ async function fixture() {
   const created = await partners.createPartner({ requestId: 'im-partner-create', expectedDirectoryRevision: profiles.directoryState().revision,
     displayName: 'Ada', avatar: 'orbit', identitySource: 'Full personal identity for every real channel lane.', templateId: 'general', usesDirectoryDefaults: false,
     capabilities: { modelChain: [{ backendId: adapter.id, providerId: 'test', modelId: 'text', effort: 'medium', fastMode: false }], permissionMode: 'ask', planMode: false } });
+  expect(created.initializationState).toBe('ready'); expect(created.canonicalSessionId).toBeTypeOf('string');
   const partner = partners.getPartner(created.id), owner = store.createConnection({ id: 'im-ui-owner', name: 'Owner', authKeyDigest: 'im-ui-owner-auth' });
   const messaging = new MessagingManager({ store, credentials, contextVault: vault, sessionHost: host, artifacts }); await messaging.initialize();
   activeMessaging = messaging;
@@ -42,7 +47,7 @@ async function fixture() {
       expectedConnectionGeneration: initial.generation, expectedBindingRevision: 0, partnerId: partner.id, expectedPartnerRevision: partner.revision };
     const saved = await runtime!.setBinding(input);
     const enabled = store.replaceMessagingCredential({ connectionId: initial.id, expectedRevision: saved.connection.revision,
-      expectedGeneration: saved.connection.generation, credentialReferenceId: `im-credential:${initial.id}`, credentialGeneration: 'a'.repeat(64), enable: true });
+      expectedGeneration: saved.connection.generation, credentialReferenceId: `cred_${randomUUID()}`, credentialGeneration: 'a'.repeat(64), enable: true });
     return { connection: enabled, input, saved };
   };
   const event = (connectionId: string, address = '123456', thread: string | null = null, kind: 'direct' | 'group' = 'direct', isOwner = true): MessagingInboundMessage => ({
@@ -90,6 +95,7 @@ describe('Partner message routing', () => {
   it('keeps the binding save receipt and rejects source work after exact credential or binding retirement', async () => {
     const f = await fixture(), source = await f.connect();
     expect(await f.runtime!.setBinding(source.input)).toEqual(source.saved);
+    expect(f.store.getMessagingConnection(source.connection.id)).toEqual(source.connection);
     const message = f.event(source.connection.id), conversation = await f.resolve(message);
     const inbound = f.store.createMessagingInboundRequest({ connectionId: source.connection.id, expectedChannelGeneration: source.connection.generation,
       conversationId: conversation.id, providerRequestIds: message.providerRequestIds, providerMessageId: message.messageId,
@@ -104,9 +110,30 @@ describe('Partner message routing', () => {
     expect(queue.body.messagingOrigin?.userText).toBe(message.text);
     const current = f.store.getMessagingConnection(source.connection.id);
     f.store.replaceMessagingCredential({ connectionId: current.id, expectedRevision: current.revision, expectedGeneration: current.generation,
-      credentialReferenceId: `im-credential:${current.id}`, credentialGeneration: 'b'.repeat(64), enable: true });
+      credentialReferenceId: current.credentialReferenceId!, credentialGeneration: 'b'.repeat(64), enable: true });
     expect(() => f.runtime!.assertQueueCurrent(queue)).toThrow('no longer authorized');
     expect(f.runtime!.binding(current.id).partnerId).toBe(f.partner.id);
+  });
+  it('rejects malformed original binding receipts without replacing them with the current connection', async () => {
+    const f = await fixture(), source = await f.connect();
+    const findOperation = f.store.findOperation.bind(f.store);
+    let invalidReceipt: unknown;
+    const lookup = vi.spyOn(f.store, 'findOperation').mockImplementation(id => {
+      const operation = findOperation(id);
+      return id === source.input.operationId && operation ? { ...operation, response: invalidReceipt } : operation;
+    });
+    const replace = (receipt: unknown) => { invalidReceipt = JSON.parse(JSON.stringify(receipt,
+      (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value)); };
+    try {
+      for (const revision of [undefined, null, 0, '', '0', '-1', '1.5', '0x10', '01', 'not-a-revision']) {
+        replace({ ...source.saved, connection: { ...source.saved.connection, revision } });
+        await expect(f.runtime!.setBinding(source.input)).rejects.toThrow('original message destination receipt is invalid');
+        expect(f.store.getMessagingConnection(source.connection.id)).toEqual(source.connection);
+      }
+      replace({ ...source.saved, binding: { ...source.saved.binding, partnerId: 'another-partner' } });
+      await expect(f.runtime!.setBinding(source.input)).rejects.toThrow('original message destination receipt is invalid');
+      expect(f.store.getMessagingConnection(source.connection.id)).toEqual(source.connection);
+    } finally { lookup.mockRestore(); }
   });
   it('uses the original Host close/rebuild, keeps native-close failure visible, and retries the same owner', async () => {
     const f = await fixture(), source = await f.connect(), conversation = await f.resolve(f.event(source.connection.id, '-100', '9', 'group'));
@@ -157,8 +184,10 @@ describe('Partner message routing', () => {
         operationId: 'explicit-send-input', disposition: 'prompt', body: { text: 'Send this report.', images: [], files: [], mentions: [], disposition: 'prompt' } }); return {};
     });
     f.store.claimNextQueueItem({ sessionId: session.id, backendInstanceGeneration: 0, traceId: 'explicit-send-dispatch' });
-    const staged = await f.artifacts.ingestBytes(new Uint8Array([1, 2, 3]), { fileName: 'report.txt', mimeType: 'text/plain' });
-    const owned = f.store.adoptSessionArtifact({ blob: staged, sessionId: session.id, runId: 'explicit-send-run' });
+    const staged = await f.artifacts.ingestBytes(new Uint8Array([1, 2, 3]), { fileName: 'report.txt', mimeType: 'text/plain', expiresAt: Date.now() + 60_000 });
+    const blob = { id: staged.id, sha256: staged.sha256, byteLength: staged.byteLength, mimeType: staged.mimeType,
+      ...(staged.fileName === undefined ? {} : { fileName: staged.fileName }) };
+    const owned = f.store.transaction(store => store.adoptSessionArtifact({ blob, sessionId: session.id, runId: 'explicit-send-run' }));
     const caller = { sessionId: session.id, targetId: session.targetId, generation: session.binding.generation,
       effectIdentity: 'e'.repeat(64), assertNativeRoot: () => undefined, assertCurrent: () => undefined };
     const input = { connection_id: a.connection.id, conversation_id: direct.id, text: 'The requested report.', artifact_ids: [owned.blob.id] };

@@ -4,10 +4,10 @@ import { partnerTaskContextUsage, suggestPartnerTaskRoute } from "./partner-task
 const wide = { backendId: "runtime", providerId: "account", modelId: "wide", fastMode: false };
 const small = { ...wide, modelId: "small" }, backup = { ...wide, modelId: "backup" };
 const windows: Record<string, number> = { wide: 1_000_000, small: 272_000, backup: 1_000_000 };
-const input = (patch: Partial<Parameters<typeof suggestPartnerTaskRoute>[0]> = {}) => ({
+const input = (patch: Partial<Parameters<typeof suggestPartnerTaskRoute>[0]> = {}): Parameters<typeof suggestPartnerTaskRoute>[0] => ({
   chain: [wide, small, backup], current: wide, failure: { code: "QUOTA_EXCEEDED", message: "Account quota exhausted." },
   visitedRoutes: [], contextTokens: 40_000, currentContextWindow: 1_000_000,
-  available: () => true, windowOf: (route: typeof wide) => windows[route.modelId], ...patch
+  available: () => true, windowOf: route => windows[route.modelId], ...patch
 });
 
 it("suggests only exact unvisited configured routes for a failure another route can address", () => {

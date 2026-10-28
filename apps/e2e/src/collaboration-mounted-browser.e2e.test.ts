@@ -127,6 +127,34 @@ describe("mounted Collaboration Goal product chain", () => {
     await pauseUsageCapture();
     await settleBrowserErrors();
     browserErrors.splice(0);
+    const project = required((await paired.clients.workspace.getWorkspace({
+      workspaceId: "workspace-real-pi"
+    })).workspace, "mounted worker project");
+    expect(project).toMatchObject({
+      workspaceId: "workspace-real-pi",
+      targetId: "workspace-real-pi",
+      serverPathDisplay: fixture.workspaceDirectory,
+      trusted: false
+    });
+    await page.locator(".sidebar__utility").getByRole("button", { name: /^Projects(?:\s*\d+)?$/u }).click();
+    const projectCard = page.locator(".project-card").filter({
+      has: page.getByRole("heading", { name: project.displayName, exact: true })
+    });
+    await projectCard.getByText(project.serverPathDisplay, { exact: true }).waitFor({ state: "visible" });
+    expect(await projectCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    await projectCard.getByRole("button", { name: "Review trust", exact: true }).click();
+    const trustDialog = page.getByRole("dialog", { name: "Trust this workspace?", exact: true });
+    await trustDialog.getByText(project.serverPathDisplay, { exact: true }).waitFor({ state: "visible" });
+    await trustDialog.getByRole("button", { name: "Trust workspace", exact: true }).click();
+    await projectCard.getByRole("button", { name: "Revoke trust", exact: true }).waitFor({ state: "visible" });
+    expect((await paired.clients.workspace.getWorkspace({ workspaceId: project.workspaceId })).workspace).toMatchObject({
+      workspaceId: project.workspaceId,
+      targetId: project.targetId,
+      serverPathDisplay: project.serverPathDisplay,
+      trusted: true
+    });
+    await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
+    await collaborationTrigger.waitFor({ state: "visible", timeout: 30_000 });
     usagePhase = "active";
     await resumeUsageCapture();
     await collaborationTrigger.click();
@@ -177,6 +205,10 @@ describe("mounted Collaboration Goal product chain", () => {
       60_000
     )).tree, "settled mounted collaboration tree");
     const mountedWorker = required(tree.workers.find((worker) => worker.label === WORKER_LABEL), "mounted worker");
+    expect(mountedWorker).toMatchObject({
+      route: { targetId: project.targetId },
+      workspace: { workingDirectory: project.serverPathDisplay }
+    });
     // The initial assignment must settle in the actual Web projection too.
     // A backend-only read can otherwise race the next poll and submit stale CAS.
     await panel.locator(".collaboration-panel__worker-header").getByText("Completed", { exact: true })
@@ -321,6 +353,12 @@ describe("mounted Collaboration Goal product chain", () => {
       })
     });
     const restarted = fixture.clients(authKey);
+    expect((await restarted.workspace.getWorkspace({ workspaceId: project.workspaceId })).workspace).toMatchObject({
+      workspaceId: project.workspaceId,
+      targetId: project.targetId,
+      serverPathDisplay: project.serverPathDisplay,
+      trusted: true
+    });
     tree = required((await restarted.collaboration.getCollaborationGoal({
       goalId,
       viewerSessionId: leadSessionId

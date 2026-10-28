@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes, X509Certificate } from "node:crypto";
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -24,7 +24,40 @@ function summary(value) {
 }
 
 function build() {
-  if (capture("git", ["status", "--porcelain"])) throw new Error("The CI APK requires a clean source checkout.");
+  const sourceStatus = run("git", ["-c", "core.quotePath=true", "status", "--porcelain=v1"], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000, maxBuffer: 256 * 1024
+  });
+  if (sourceStatus.trim()) {
+    // Report only bounded, quoted status paths. Dependency preparation never
+    // exempts tracked lockfiles or other source changes from the clean gate.
+    const entries = sourceStatus.trimEnd().split(/\r?\n/u);
+    process.stderr.write(`[android-source-status] ${JSON.stringify({
+      totalEntries: entries.length,
+      entries: entries.slice(0, 40).map((entry) => entry.slice(0, 1024)),
+      truncated: entries.length > 40 || entries.some((entry) => entry.length > 1024)
+    })}\n`);
+    const lockDiff = spawnSync("git", ["--no-pager", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--unified=2", "HEAD", "--", "pnpm-lock.yaml"], {
+      cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000, maxBuffer: 1024 * 1024
+    });
+    if (lockDiff.error || lockDiff.status !== 0) {
+      process.stderr.write(`[android-lockfile-diff] ${JSON.stringify({ available: false, reason: lockDiff.error?.code === "ENOBUFS" ? "diff_limit" : "git_unavailable" })}\n`);
+    } else {
+      const lines = lockDiff.stdout.trimEnd().split(/\r?\n/u).filter((line, index, all) => line || all.length > 1);
+      const safe = line => line
+        .replace(/(:\/\/)[^/\s]*@/gu, "$1[redacted]@")
+        .replace(/(https?:\/\/[^\s'"?#]*)(?:[?#][^\s'"]*)/gu, "$1?[redacted]")
+        .replace(/((?:_authToken|_auth|authorization|password|secret|access_token|refresh_token|api_key|token)\s*:\s*).*/giu, "$1[redacted]");
+      const output = []; let characters = 0, truncated = lines.length > 160;
+      for (const line of lines.slice(0, 160)) {
+        const redacted = safe(line), bounded = redacted.slice(0, 1024);
+        if (characters + bounded.length > 32 * 1024) { truncated = true; break; }
+        if (redacted.length !== bounded.length) truncated = true;
+        output.push(bounded); characters += bounded.length;
+      }
+      process.stderr.write(`[android-lockfile-diff] ${JSON.stringify({ available: true, totalLines: lines.length, lines: output, truncated })}\n`);
+    }
+    throw new Error("The CI APK requires a clean source checkout.");
+  }
   const temporary = mkdtempSync(join(resolve(process.env.RUNNER_TEMP), "joko-android-ci-"));
   const signerDirectory = join(temporary, "private-signer");
   mkdirSync(signerDirectory, { mode: 0o700 });
@@ -46,6 +79,14 @@ function build() {
   };
   const keytool = join(process.env.JAVA_HOME, "bin", "keytool");
   const output = join(temporary, "artifacts");
+  // A separate, parent-bound reader can observe the live build while the
+  // official builder owns its synchronous Gradle child. It never stops it.
+  const observer = spawn(process.execPath, [fileURLToPath(new URL("./android-build-observer.mjs", import.meta.url))], {
+    cwd: root, stdio: ["pipe", "inherit", "inherit"], windowsHide: true,
+    env: { JAVA_HOME: process.env.JAVA_HOME ?? "" }
+  });
+  observer.on("error", () => process.stderr.write('[android-native-build-observation] {"available":false}\n'));
+  observer.stdin.on("error", () => {});
   try {
     capture(keytool, ["-genkeypair", "-noprompt", "-storetype", "PKCS12", "-keystore", keystore,
       "-alias", environment.JOKO_ANDROID_KEY_ALIAS, "-storepass:env", "JOKO_ANDROID_KEYSTORE_PASSWORD",
@@ -85,7 +126,11 @@ function build() {
       + `The official builder verified its package, version, runtime fingerprint and signature, and emitted the original manifest `
       + `with source.productionGate=bypassed at ${manifest.source.commit}. This is a non-release test artifact; `
       + `the private test key is deleted and is never uploaded.`);
+  } catch (error) {
+    observer.stdin.end("failed");
+    throw error;
   } finally {
+    if (!observer.stdin.writableEnded) observer.stdin.end();
     rmSync(signerDirectory, { recursive: true, force: true });
   }
 }

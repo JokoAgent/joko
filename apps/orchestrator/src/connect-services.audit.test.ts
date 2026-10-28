@@ -48,6 +48,7 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
     ...overrides,
     connections: { fence: () => undefined, ...(overrides.connections as object ?? {}) },
     sessionHost: {
+      sideChatSourceAllowed: () => false,
       getSessionRuntimeControl: () => ({
         generation: 0,
         fallbackHop: 0,
@@ -3759,6 +3760,7 @@ describe("Connect security and protocol audit", () => {
         findOperation: () => undefined,
         findPendingSessionLifecycleCleanup: () => undefined,
         getTarget: () => ({ descriptor: { id: "target-browser-open" }, metadata: { workspaceId: "workspace-html" }, revision: 1n }),
+        findSetting: () => undefined,
         getSession: () => ({ descriptor: {
           id: "session-browser-open",
           targetId: "target-browser-open",
@@ -4036,6 +4038,7 @@ describe("Connect security and protocol audit", () => {
         findOperation: () => undefined,
         findPendingSessionLifecycleCleanup: () => undefined,
         getTarget: () => ({ descriptor: { id: "target-browser" }, metadata: { workspaceId: "workspace-html" }, revision: 1n }),
+        findSetting: () => undefined,
         getSession: () => ({ descriptor: { id: "session-browser-target-race", targetId: "target-browser", binding: { generation: 0 }, archived: false } })
       },
       sessionHost: { mutate },
@@ -4197,6 +4200,7 @@ describe("Connect security and protocol audit", () => {
           findOperation: () => undefined,
           findPendingSessionLifecycleCleanup: () => undefined,
           getTarget: () => ({ descriptor: { id: sourceOwner.targetId }, metadata: { workspaceId: "workspace-html" }, revision: 1n }),
+          findSetting: () => undefined,
           getSession: () => ({ descriptor: {
             id: sourceOwner.sessionId,
             targetId: sourceOwner.targetId,
@@ -4338,6 +4342,7 @@ describe("Connect security and protocol audit", () => {
       connections,
       store: {
         findPendingSessionLifecycleCleanup: () => undefined,
+        findSetting: () => undefined,
         getSession: () => ({ descriptor: { id: "session-html", targetId: "target-html", binding: { generation: 1 }, archived: false } }),
         getTarget: () => ({ descriptor: { id: "target-html" }, metadata: { workspaceId: "workspace-html" }, revision: 1n })
       },

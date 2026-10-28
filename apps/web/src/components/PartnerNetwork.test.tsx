@@ -21,9 +21,9 @@ const t = ((key: string) => key) as Translator;
 function setup() {
   const rows: wire.PartnerNetworkMessage[] = [];
   const api = { listPartnerNetwork: vi.fn(async () => create(wire.ListPartnerNetworkResponseSchema, { rooms: [room] })),
-    getPartnerNetwork: vi.fn(async () => create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room, messages: rows } })),
+    getPartnerNetwork: vi.fn(async (_request: Partial<wire.GetPartnerNetworkRequest>) => create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room, messages: rows } })),
     sendPartnerNetwork: vi.fn(async (request: wire.SendPartnerNetworkRequest) => { const message = create(wire.PartnerNetworkMessageSchema, { id: "accepted-once", text: request.text, authorId: "human", authorName: "Owner", sequence: 1n, createdAtMs: 1n }); rows.push(message); return create(wire.SendPartnerNetworkResponseSchema, { message }); }),
-    managePartnerNetwork: vi.fn(async () => create(wire.ManagePartnerNetworkResponseSchema, { room })),
+    managePartnerNetwork: vi.fn(async (_request: Partial<wire.ManagePartnerNetworkRequest>) => create(wire.ManagePartnerNetworkResponseSchema, { room })),
     getPartnerNetworkOwnerControls: vi.fn(async () => create(wire.GetPartnerNetworkOwnerControlsResponseSchema)),
     readPartnerNetworkFailures: vi.fn(async (_request: Partial<wire.ReadPartnerNetworkFailuresRequest>) => create(wire.ReadPartnerNetworkFailuresResponseSchema)),
     configurePartnerNetworkProject: vi.fn(async () => create(wire.ConfigurePartnerNetworkProjectResponseSchema)),
@@ -40,6 +40,51 @@ function button(text: string, parent: ParentNode = document.body) { const value 
 async function fill(input: HTMLTextAreaElement | HTMLInputElement, value: string) { await act(async () => { const type = input.tagName === "TEXTAREA" ? HTMLTextAreaElement : HTMLInputElement; Object.getOwnPropertyDescriptor(type.prototype, "value")!.set!.call(input, value); input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); await settle(); }); }
 
 describe("Shared conversation UI receipts", () => {
+  it("keeps the main chat mounted beside a resizable thread and advances only that reader at the visible bottom", async () => {
+    const f = setup(), root = create(wire.PartnerNetworkMessageSchema, { id: "root", authorId: "partner", authorName: "Nova", text: "Thread source", sequence: 1n,
+      threadPreview: { rootId: "root", replyCount: 2n, authorName: "Other", text: "New reply" } });
+    const replies = [2n, 3n].map(sequence => create(wire.PartnerNetworkMessageSchema, { id: `reply-${sequence}`, threadRootId: root.id, text: `Reply ${sequence}`, authorId: "other", authorName: "Other", sequence }));
+    let read = 2n, following = false; vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    f.api.getPartnerNetwork.mockImplementation(async request => create(wire.GetPartnerNetworkResponseSchema, { snapshot: {
+      room: { ...room, singleSpeaker: true }, messages: request.threadRootId ? [root, ...replies] : [root], readerStateSupported: true,
+      threadReadSequence: request.threadRootId ? read : 0n, threadFollowing: request.threadRootId ? following : false,
+      threads: [{ rootId: root.id, rootText: root.text, replyCount: BigInt(replies.length), readSequence: read, unreadCount: BigInt(replies.filter(reply => reply.sequence > read).length), latestUnreadSequence: replies.at(-1)!.sequence, mentioned: true, following }] } }));
+    f.api.managePartnerNetwork.mockImplementation(async request => { if (request.threadRootId === root.id) {
+      if (request.action === "mark-read") read = request.throughSequence ?? read;
+      if (request.action === "follow-thread") following = request.following ?? false;
+    } return create(wire.ManagePartnerNetworkResponseSchema, { room }); });
+    const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
+    await fill(view.element.querySelector("textarea")!, "Main stays here"); await act(async () => { button("Create thread", view.element).click(); await settle(); });
+    const main = view.element.querySelector(".partner-network-main")!, thread = view.element.querySelector(".partner-network-thread")!, timeline = thread.querySelector<HTMLElement>(".partner-group-timeline")!;
+    expect(main.querySelector("textarea")!.value).toBe("Main stays here"); expect(thread.querySelector("textarea")!.value).toBe("");
+    expect(thread.textContent).toContain("New replies"); expect(read).toBe(3n);
+    const separator = view.element.querySelector<HTMLElement>('[role="separator"][aria-orientation="vertical"]')!;
+    await act(async () => { separator.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })); }); expect(separator.getAttribute("aria-valuenow")).toBe("45");
+    await act(async () => { button("Follow", thread).click(); await settle(); }); expect(following).toBe(true);
+    expect(f.api.managePartnerNetwork.mock.calls.some(([request]) => request.action === "mark-read" && request.threadRootId === root.id && request.throughSequence === 3n)).toBe(true);
+    expect(f.api.managePartnerNetwork.mock.calls.some(([request]) => request.action === "follow-thread" && request.threadRootId === root.id && request.following === true && request.throughSequence === 2n)).toBe(true);
+    expect(read).toBe(3n);
+    Object.defineProperties(timeline, { scrollHeight: { configurable: true, value: 1000 }, clientHeight: { configurable: true, value: 200 } }); timeline.scrollTop = 0;
+    await act(async () => { timeline.dispatchEvent(new Event("scroll", { bubbles: true })); });
+    replies.push(create(wire.PartnerNetworkMessageSchema, { id: "reply-4", threadRootId: root.id, text: "Unread while looking back", authorId: "other", sequence: 4n }));
+    await act(async () => { document.dispatchEvent(new Event("visibilitychange")); await settle(); });
+    expect(read).toBe(3n); expect(thread.textContent).toContain("Unread while looking back");
+    timeline.scrollTop = 800; await act(async () => { timeline.dispatchEvent(new Event("scroll", { bubbles: true })); await settle(); }); expect(read).toBe(4n);
+  });
+  it("folds a long talk queue and retries the immutable continue request after a lost receipt", async () => {
+    const f = setup(); let revision = 1n;
+    const plan = create(wire.PartnerNetworkPlanSchema, { id: "talk", roomId: room.id, requesterId: room.selfId, kind: "talk", status: "waiting", currentStep: 4, revision,
+      steps: Array.from({ length: 6 }, (_, position) => ({ position, actorId: "partner", status: position < 5 ? "completed" : "pending" })) });
+    const planMessage = create(wire.PartnerNetworkMessageSchema, { id: "card", sequence: 1n, kind: "plan", planId: plan.id });
+    f.api.getPartnerNetwork.mockImplementation(async () => create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room: { ...room, singleSpeaker: true }, messages: [planMessage], plans: [{ ...plan, revision }] } }));
+    const actPlan = vi.fn(async (_request: Partial<wire.PlanPartnerNetworkRequest>) => { throw new ConnectError("Lost continue receipt", Code.Unavailable); }); Object.assign(f.api, { planPartnerNetwork: actPlan });
+    const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
+    expect(view.element.querySelectorAll(".partner-group-plan-card li")).toHaveLength(3);
+    await act(async () => { button("6 speakers", view.element).click(); await settle(); }); expect(view.element.querySelectorAll(".partner-group-plan-card li")).toHaveLength(6);
+    await act(async () => { button("Continue", view.element).click(); await settle(); }); const original = actPlan.mock.calls[0]![0];
+    revision = 2n; await act(async () => { document.dispatchEvent(new Event("visibilitychange")); await settle(); button("Continue", view.element).click(); await settle(); });
+    expect(actPlan.mock.calls[1]![0]).toEqual(original); expect(original).toMatchObject({ action: "continue", expectedRevision: 1n, planId: "talk" });
+  });
   it("keeps the original send across a lost reply, remount and explicit retry without resending on entry", async () => {
     const f = setup(); f.api.sendPartnerNetwork.mockRejectedValueOnce(new ConnectError("reply lost", Code.Unavailable));
     const page = () => <PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />;
@@ -70,8 +115,9 @@ describe("Shared conversation UI receipts", () => {
     const f = setup(); f.rows.push(create(wire.PartnerNetworkMessageSchema, { id: "root", text: "Topic source", authorId: "partner", authorName: "Nova", sequence: 1n, createdAtMs: 1n }));
     const page = () => <PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />, first = await mount(page());
     await fill(first.element.querySelector("textarea")!, "Main draft @Nova"); await act(async () => { button("Quote reply", first.element).click(); button(wire.partnerGroupMessages("en").divide, first.element).click(); await settle(); });
-    await act(async () => { button("Create thread", first.element).click(); await settle(); }); expect(first.element.querySelector("textarea")!.value).toBe("");
-    await fill(first.element.querySelector("textarea")!, "Thread draft"); await act(async () => { button("Back to group", first.element).click(); await settle(); });
+    await act(async () => { button("Create thread", first.element).click(); await settle(); }); const thread = first.element.querySelector(".partner-network-thread")!;
+    expect(first.element.querySelector(".partner-network-main textarea")!.getAttribute("disabled")).toBeNull(); expect(thread.querySelector("textarea")!.value).toBe("");
+    await fill(thread.querySelector("textarea")!, "Thread draft"); await act(async () => { button("Close", thread).click(); await settle(); });
     expect(first.element.querySelector("textarea")!.value).toBe("Main draft @Nova"); expect(first.element.textContent).toContain(wire.partnerGroupMessages("en").divisionTag); expect(first.element.textContent).toContain("Quote reply: Topic source");
     await act(async () => { first.root.unmount(); }); roots.splice(roots.indexOf(first.root), 1); first.element.remove();
     const next = await mount(page()); expect(next.element.querySelector("textarea")!.value).toBe("Main draft @Nova"); expect(f.api.sendPartnerNetwork).not.toHaveBeenCalled();
@@ -98,11 +144,11 @@ describe("Shared conversation UI receipts", () => {
       written.push(Uint8Array.from(request.data)); return create(wire.MediaPartnerNetworkResponseSchema, { offset: request.offset + BigInt(request.data.length), complete: true }); }) });
     Object.defineProperty(URL, "createObjectURL", { configurable: true, value: () => "blob:local-image" }); Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: () => {} });
     const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
-    await act(async () => { button("Create thread", view.element).click(); await settle(); }); const picker = view.element.querySelector<HTMLInputElement>('input[type="file"]')!; expect(picker).toBeTruthy();
+    await act(async () => { button("Create thread", view.element).click(); await settle(); }); const thread = view.element.querySelector(".partner-network-thread")!, picker = thread.querySelector<HTMLInputElement>('input[type="file"]')!; expect(picker).toBeTruthy();
     const bytes = new Uint8Array([137, 80, 78, 71]), file = new File([bytes], "annotated.png", { type: "image/png" }); Object.defineProperty(file, "arrayBuffer", { value: async () => bytes.buffer });
     await act(async () => { Object.defineProperty(picker, "files", { configurable: true, value: [file] }); picker.dispatchEvent(new Event("change", { bubbles: true })); await settle(); });
     expect(written).toEqual([bytes]); expect(view.element.querySelector('img[src="blob:local-image"]')).toBeTruthy();
-    await act(async () => { button("Send", view.element).click(); await settle(); }); expect(f.api.sendPartnerNetwork.mock.calls[0]![0]).toMatchObject({ text: "", threadRootId: "thread-root", attachments: [{ id: "media-image", name: "annotated.png", mediaType: "image/png", sizeBytes: 4n }] });
+    await act(async () => { button("Send", thread).click(); await settle(); }); expect(f.api.sendPartnerNetwork.mock.calls[0]![0]).toMatchObject({ text: "", threadRootId: "thread-root", attachments: [{ id: "media-image", name: "annotated.png", mediaType: "image/png", sizeBytes: 4n }] });
     expect(JSON.stringify(Object.values(localStorage))).not.toContain("blob:local-image");
   });
   it("reads failures for every loaded old source and removes notices when authority clears them", async () => {

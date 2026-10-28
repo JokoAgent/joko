@@ -24,6 +24,7 @@ import {
   type ResourceView
 } from "../model.js";
 import { ToolsPage } from "./ToolsPage.js";
+import { drainInspectorExtensionRequests, INSPECTOR_EXTENSION_OPEN_EVENT } from "./inspector-layout.js";
 
 const roots: Root[] = [];
 
@@ -107,29 +108,43 @@ describe("Extension catalog interactions", () => {
     expect(view.actionErrors).toHaveLength(1);
   });
 
-  it("opens a ready declared main view in place or through the trusted Desktop window host", async () => {
+  it("delivers a ready declared main view and its window placement to the original Inspector owner", async () => {
     const extension = { ...readyExtension(), mainView: { title: "Review view", icon: "layout" as const } };
     const view = catalog(extension);
-    const navigate = vi.fn();
-    const open = vi.fn(async () => ({ focusedExisting: false }));
-    Object.defineProperty(window, "jokoDesktop", {
-      configurable: true,
-      value: { capabilities: ["extension.windows"], extensionWindows: { open } }
-    });
-    const { container } = await renderExtensions({
-      extension,
-      controller: {
-        listExtensions: vi.fn(async () => view),
-        getExtension: vi.fn(async () => view),
-        navigate
-      }
-    });
+    const owner = JSON.stringify(["profile", "server", "http://node", null]);
+    const requests: unknown[] = [], accept = vi.fn();
+    const observe = (event: Event): void => { requests.push((event as CustomEvent<unknown>).detail); };
+    window.addEventListener(INSPECTOR_EXTENSION_OPEN_EVENT, observe);
+    try {
+      const { container } = await renderExtensions({
+        extension,
+        controller: {
+          listExtensions: vi.fn(async () => view),
+          getExtension: vi.fn(async () => view)
+        }
+      });
 
-    await act(async () => buttonWithText(container, "Open view").click());
-    expect(navigate).toHaveBeenCalledWith({ kind: "extensionMainView", extensionId: extension.id, profileId: "profile", serverId: "server" });
-    await act(async () => buttonWithText(container, "Open in new window").click());
-    await settle();
-    expect(open).toHaveBeenCalledWith({ extensionId: extension.id, profileId: "profile", serverId: "server" });
+      await act(async () => buttonWithText(container, "Open view").click());
+      expect(requests).toEqual([{ extensionId: extension.id, owner, mode: undefined, id: expect.any(Number) }]);
+      drainInspectorExtensionRequests("another-node-owner", accept);
+      expect(accept).not.toHaveBeenCalled();
+      drainInspectorExtensionRequests(owner, accept);
+      expect(accept).toHaveBeenCalledExactlyOnceWith(extension.id, undefined);
+
+      await act(async () => buttonWithText(container, "Open in new window").click());
+      await settle();
+      expect(requests).toEqual([
+        { extensionId: extension.id, owner, mode: undefined, id: expect.any(Number) },
+        { extensionId: extension.id, owner, mode: "window", id: expect.any(Number) }
+      ]);
+      drainInspectorExtensionRequests(owner, accept);
+      expect(accept.mock.calls).toEqual([[extension.id, undefined], [extension.id, "window"]]);
+      drainInspectorExtensionRequests(owner, accept);
+      expect(accept).toHaveBeenCalledTimes(2);
+    } finally {
+      window.removeEventListener(INSPECTOR_EXTENSION_OPEN_EVENT, observe);
+      drainInspectorExtensionRequests(owner, () => undefined);
+    }
   });
 
   it("shows a Source main-view declaration without allowing it to open before installation", async () => {

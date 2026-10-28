@@ -28,6 +28,14 @@ export interface ProviderGroupSession {
 }
 export interface ProviderGroupRecoveryLease {
   isCurrent(): boolean;
+  /** Reinspect the original native binding after its persisted quota wait. */
+  readonly retryAfterQuota?: boolean;
+  readonly handoff?: ProviderGroupRecoveryHandoff;
+  readonly onHandoffPrepared?: (handoff: ProviderGroupRecoveryHandoff) => void;
+}
+export interface ProviderGroupRecoveryHandoff {
+  readonly generation: number; readonly group: ProviderGroupKey; readonly groupRevision: string;
+  readonly memberKey: string; readonly profile: SessionRuntimeProfile;
 }
 export interface ProviderGroupSessionPort {
   read(sessionId: string): ProviderGroupSession | undefined;
@@ -73,7 +81,7 @@ export class ProviderGroupService {
     const targetKey = providerGroupRebalanceTarget(context.current.quota, context.candidates.map(candidate => ({ key: candidate.member.key, quota: candidate.quota })), this.router.now());
     const target = context.candidates.find(candidate => candidate.member.key === targetKey); if (!target) return undefined;
     return { suggestionKey: this.#rebalanceKey(sessionId, context.session.profile, context.snapshot, context.current.member.key, target.member.key),
-      group: context.snapshot.key, fromMemberKey: context.current.member.key, toMemberKey: target.member.key,
+      group: { backendId: context.snapshot.backendId, providerId: context.snapshot.providerId }, fromMemberKey: context.current.member.key, toMemberKey: target.member.key,
       fromLabel: context.current.member.displayName, toLabel: target.member.displayName, currentQuota: context.current.quota, targetQuota: target.quota,
       automatic: this.router.store.store.findSetting("service", sessionId, REBALANCE_REMEMBER_KEY)?.value === true, generation };
   }
@@ -128,6 +136,11 @@ export class ProviderGroupService {
     this.options.log?.(describeProviderGroupFailure(signals, decision)); previous.release();
     if (decision.action !== "switch" || !this.snapshot(previous.group).config?.autoSwitch) return undefined;
     this.router.markTried(input.sessionId, previous.member.key); this.router.cool(previous.group, previous.member, previous.profile.modelId, signals, decision);
+    if (signals.code === "HOSTED_AGENT_CAPACITY_REJECTED" && signals.stateMayHaveChanged === false) {
+      for (const member of this.snapshot(previous.group).config?.members ?? []) {
+        if (member.nodeId === previous.member.nodeId) this.router.markTried(input.sessionId, member.key);
+      }
+    }
     if (decision.connection && await this.#recoverConnection(input.sessionId, previous.group, previous.member, input, decision.connection, () => true, this.#signal(signal))) {
       // A failed start has no committed native effect; use a new exact selection
       // of this same recovered member, without widening the attempted set.
@@ -167,7 +180,11 @@ export class ProviderGroupService {
         if (queueItemId) await this.#rebalanceBeforeSend(sessionId, queueItemId, this.#signal(signal));
         return;
       }
-      if (!group.config.autoSwitch) throw new ProviderGroupUnavailableError();
+      if (!group.config.autoSwitch) {
+        const quotaCooling = this.router.store.cooling(binding.group, this.router.now()).filter(row => row.memberKey === member.key && row.cause === "usage-limit"
+          && (row.modelId === undefined || row.modelId === status.model?.modelId)).map(row => row.until);
+        throw new ProviderGroupUnavailableError(status.quota.limited ? status.quota.resetAt : quotaCooling.length ? Math.max(...quotaCooling) : undefined);
+      }
       const current = this.#current(sessionId);
       if (!status.reachable && await this.#recoverConnection(sessionId, binding.group, member, session, "check", current, this.#signal(signal))) return;
       this.router.markTried(sessionId, member.key);
@@ -177,7 +194,7 @@ export class ProviderGroupService {
   #rebalanceKey(sessionId: string, profile: SessionRuntimeProfile, snapshot: ProviderGroupSnapshot, from: string, to: string, bucket = Math.floor(this.router.now() / (5 * 60_000))): string {
     const source = this.router.store.store.getSession(sessionId).descriptor;
     return "rebalance_" + createHash("sha256").update(JSON.stringify([1, sessionId, source.targetId, source.binding.generation,
-      fingerprint(source.binding.opaqueRef), [profile.backendId, profile.providerId, profile.modelId, profile.effort ?? null, profile.fastMode], groupKey(snapshot.key), snapshot.revision.toString(), from, to, bucket])).digest("hex");
+      fingerprint(source.binding.opaqueRef), [profile.backendId, profile.providerId, profile.modelId, profile.effort ?? null, profile.fastMode], groupKey(snapshot), snapshot.revision.toString(), from, to, bucket])).digest("hex");
   }
   #matchesRebalanceKey(key: string, sessionId: string, profile: SessionRuntimeProfile, snapshot: ProviderGroupSnapshot, from: string, to: string): boolean {
     const bucket = Math.floor(this.router.now() / (5 * 60_000));
@@ -239,7 +256,11 @@ export class ProviderGroupService {
     const recovering = record.phase === "started";
     if (!recovering) {
       if (this.router.now() - record.at > 5 * 60_000) { settled(); return; }
-      const context = await this.#rebalanceContext(sessionId, signal); current();
+      const context = await this.#rebalanceContext(sessionId, signal).catch((error: unknown) => {
+        current(); if (providerGroupFailureSignals(error).stateMayHaveChanged) throw error;
+        backoff(); settled(); return undefined;
+      });
+      current();
       const target = context?.candidates.find(candidate => candidate.member.key === record.to);
       const source = store.getSession(sessionId).descriptor;
       if (!context || !target || context.snapshot.revision.toString() !== record.groupRevision || context.current.member.key !== record.from
@@ -283,7 +304,8 @@ export class ProviderGroupService {
       }
       assignment.assertCurrent(); assignment.commit(); settled();
     } catch (error) {
-      if (record.phase === "started" || record.phase === "restoring" || providerGroupFailureSignals(error).stateMayHaveChanged) throw error;
+      const persisted = store.findSetting<AcceptedRebalance>("service", queueItemId, REBALANCE_CHOICE_KEY)?.value;
+      if (persisted?.phase === "started" || persisted?.phase === "restoring" || providerGroupFailureSignals(error).stateMayHaveChanged) throw error;
       backoff(); settled();
     } finally { assignment.release(); if (isCurrent(current)) this.options.sessions.status(sessionId, "idle"); }
   }
@@ -294,6 +316,7 @@ export class ProviderGroupService {
   }
   onTurnError(sessionId: string, signals: ProviderGroupFailureSignals, lease: ProviderGroupRecoveryLease, signal: AbortSignal): Promise<boolean> {
     return this.#serialize(sessionId, async () => {
+      if (lease.handoff) return this.#recoverTurnHandoff(sessionId, lease, this.#signal(signal));
       if (!this.mayHandleTurnError(sessionId, signals)) return false;
       const session = this.options.sessions.read(sessionId)!, binding = this.router.store.binding(sessionId)!;
       const group = this.snapshot(binding.group), member = group.config?.members.find(row => row.key === binding.memberKey);
@@ -301,17 +324,35 @@ export class ProviderGroupService {
       const decision = decideProviderGroupFailure(signals, "run"); if (decision.action !== "switch") return false;
       const current = this.#current(sessionId, lease), combined = this.#signal(signal); current();
       this.options.log?.(describeProviderGroupFailure(signals, decision)); this.options.sessions.status(sessionId, "switching");
-      this.router.cool(binding.group, member, session.profile.modelId, signals, decision);
+      if (!lease.retryAfterQuota) {
+        let coolingSignals = signals;
+        if (decision.cause === "usage-limit" && signals.usageResetAt === undefined) {
+          try {
+            const quota = (await this.router.readMember(binding.group, member, this.#request(session, true), combined)).quota; current();
+            if (quota.limited && quota.resetAt !== undefined && quota.resetAt > this.router.now()) coolingSignals = { ...signals, usageResetAt: quota.resetAt };
+          } catch { current(); }
+        }
+        this.router.cool(binding.group, member, session.profile.modelId, coolingSignals, decision);
+      }
       try {
+        if (lease.retryAfterQuota) {
+          this.router.clearTurn(sessionId);
+          const status = await this.router.readMember(binding.group, member, this.#request(session, true), combined); current();
+          const cooling = this.router.store.cooling(binding.group, this.router.now()).some(row => row.memberKey === member.key
+            && (row.modelId === undefined || row.modelId === status.model?.modelId));
+          if (status.available && !cooling) {
+            status.assertCurrent(); await this.options.sessions.continue(sessionId, lease, { cause: "quota-reset", switched: false, isCurrent: () => isCurrent(current) }); return true;
+          }
+        }
         if (decision.connection && await this.#recoverConnection(sessionId, binding.group, member, session, decision.connection, current, combined)) {
           current(); await this.options.sessions.continue(sessionId, lease, { cause: "reconnected", switched: false, isCurrent: () => isCurrent(current) }); return true;
         }
         current(); this.router.markTried(sessionId, member.key);
-        await this.#switchCandidates(session, binding.group, current, false, combined);
+        await this.#switchCandidates(session, binding.group, current, false, combined, lease);
         current(); await this.options.sessions.continue(sessionId, lease, { cause: decision.cause, switched: true, isCurrent: () => isCurrent(current) }); return true;
       } catch (error) {
         if (!isCurrent(current)) return true;
-        if (providerGroupFailureSignals(error).stateMayHaveChanged) throw error;
+        if (providerGroupFailureSignals(error).stateMayHaveChanged || error instanceof ProviderGroupUnavailableError && error.retryAt !== undefined) throw error;
         this.options.sessions.status(sessionId, "unavailable"); return false;
       } finally { if (isCurrent(current)) this.options.sessions.status(sessionId, "idle"); }
     });
@@ -327,7 +368,31 @@ export class ProviderGroupService {
   turnSettled(sessionId: string, succeeded: boolean): void { this.router.leases.ended(sessionId); if (succeeded) this.noteProgress(sessionId); }
   release(sessionId: string): void { this.noteUserAction(sessionId); this.router.leases.ended(sessionId); this.router.store.release(sessionId); }
   async close(): Promise<void> { this.#closed.abort(); await Promise.allSettled(this.#locks.values()); this.router.leases.clear(); }
-  async #switchCandidates(session: ProviderGroupSession, group: ProviderGroupKey, current: () => void, beforeSend: boolean, signal: AbortSignal): Promise<void> {
+  async #recoverTurnHandoff(sessionId: string, lease: ProviderGroupRecoveryLease, signal: AbortSignal): Promise<boolean> {
+    const handoff = lease.handoff!, current = this.#current(sessionId, lease), session = this.options.sessions.read(sessionId);
+    if (!session?.eligible) throw new Error(PROVIDER_GROUP_SUPERSEDED_ERROR);
+    current();
+    const native = new SessionRuntimeHandoffStore(this.router.store.store).read(sessionId);
+    if (native?.generation !== handoff.generation || native.pending && (native.pending.generation !== handoff.generation
+      || !sameRoute(native.pending.profile, handoff.profile) || native.pending.phase === "effect" || native.pending.phase === "unknown")) throw unknownEffect();
+    await this.router.prepare(handoff.group, signal); current();
+    const snapshot = this.snapshot(handoff.group), member = snapshot.config?.members.find(row => row.key === handoff.memberKey);
+    if (!member || snapshot.revision.toString() !== handoff.groupRevision || !snapshot.config?.autoSwitch
+      || member.backendId !== handoff.profile.backendId || member.providerId !== handoff.profile.providerId) throw unknownEffect();
+    const status = await this.router.readMember(handoff.group, member, { ...this.#request({ ...session, profile: handoff.profile }, true), fresh: true }, signal); current();
+    if (!status.reachable || !status.model || status.model.modelId !== handoff.profile.modelId
+      || handoff.profile.fastMode === "ultrafast" && status.model.supportsUltrafastMode !== true
+      || handoff.profile.fastMode === true && status.model.supportsFastMode !== true
+      || handoff.profile.effort !== undefined && !status.model.thinkingLevels.includes(handoff.profile.effort)) throw unknownEffect();
+    status.assertCurrent();
+    if (status.quota.limited) throw new ProviderGroupUnavailableError(status.quota.resetAt);
+    const result = await this.options.sessions.handoff(sessionId, handoff.profile, { beforeSend: false, isCurrent: () => isCurrent(current), recoverGeneration: handoff.generation });
+    current(); status.assertCurrent(); if (result !== "committed") throw unknownEffect();
+    this.router.store.commitBinding(sessionId, { group: handoff.group, groupRevision: handoff.groupRevision, memberKey: member.key,
+      backendId: handoff.profile.backendId, providerId: handoff.profile.providerId, modelId: handoff.profile.modelId }, snapshot.revision);
+    await this.options.sessions.continue(sessionId, lease, { cause: "native-handoff-recovered", switched: true, isCurrent: () => isCurrent(current) }); return true;
+  }
+  async #switchCandidates(session: ProviderGroupSession, group: ProviderGroupKey, current: () => void, beforeSend: boolean, signal: AbortSignal, recovery?: ProviderGroupRecoveryLease): Promise<void> {
     const unreachable: ProviderGroupAssignment[] = [];
     for (;;) {
       current(); signal.throwIfAborted();
@@ -337,12 +402,12 @@ export class ProviderGroupService {
         if (!(error instanceof ProviderGroupUnavailableError)) throw error;
         for (const pending of unreachable.splice(0)) {
           if (!await this.#recoverConnection(session.sessionId, group, pending.member, session, "lost", current, signal)) continue;
-          try { await this.#adopt(session.sessionId, pending, beforeSend, current, signal); return; }
+          try { await this.#adopt(session.sessionId, pending, beforeSend, current, signal, recovery); return; }
           catch (targetError) { current(); if (decideProviderGroupFailure(providerGroupFailureSignals(targetError), "target").action !== "switch") throw targetError; }
         }
         throw error;
       }
-      try { current(); await this.#adopt(session.sessionId, assignment, beforeSend, current, signal); return; }
+      try { current(); await this.#adopt(session.sessionId, assignment, beforeSend, current, signal, recovery); return; }
       catch (error) {
         current(); const signals = providerGroupFailureSignals(error), decision = decideProviderGroupFailure(signals, "target");
         this.options.log?.(describeProviderGroupFailure(signals, decision));
@@ -352,13 +417,15 @@ export class ProviderGroupService {
       } finally { assignment.release(); }
     }
   }
-  async #adopt(sessionId: string, assignment: ProviderGroupAssignment, beforeSend: boolean, current: () => void, signal: AbortSignal): Promise<void> {
+  async #adopt(sessionId: string, assignment: ProviderGroupAssignment, beforeSend: boolean, current: () => void, signal: AbortSignal, recovery?: ProviderGroupRecoveryLease): Promise<void> {
     current(); signal.throwIfAborted(); assignment.assertCurrent();
     const session = this.options.sessions.read(sessionId); if (!session || session.dispatchUnknown) throw unknownEffect();
     let nativeCommitted = false;
     const binding = this.router.store.binding(sessionId), fresh = binding !== undefined && binding.memberKey !== assignment.member.key && sameRoute(session.profile, assignment.profile);
     if (fresh || !sameRoute(session.profile, assignment.profile)) {
-      const result = await this.options.sessions.handoff(sessionId, assignment.profile, { beforeSend, ...(fresh ? { fresh: true } : {}), isCurrent: () => isCurrent(current) && isCurrent(assignment.assertCurrent) });
+      const result = await this.options.sessions.handoff(sessionId, assignment.profile, { beforeSend, ...(fresh ? { fresh: true } : {}), isCurrent: () => isCurrent(current) && isCurrent(assignment.assertCurrent),
+        ...(recovery?.onHandoffPrepared === undefined ? {} : { onPrepared: (generation: number) => recovery.onHandoffPrepared!({ generation,
+          group: assignment.group, groupRevision: assignment.snapshot.revision.toString(), memberKey: assignment.member.key, profile: assignment.profile }) }) });
       if (result === "unknown") throw unknownEffect();
       nativeCommitted = true;
     }

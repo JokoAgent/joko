@@ -5,7 +5,7 @@ import { create } from "@bufbuild/protobuf";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
   GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, PartnerHomeMovePhase, PermissionMode,
-  PartnerHomeBusyAction, partnerHomeMessages, type PartnerHomeApi } from "@joko/contracts";
+  PartnerHomeBusyAction, partnerHomeMessages, type PartnerHomeApi, type PartnerHomeDestination } from "@joko/contracts";
 import { PartnerHomeDialog } from "./PartnerHomeDialog.js";
 
 const roots: Root[] = [], text = partnerHomeMessages("en");
@@ -25,10 +25,22 @@ function fixture(pending = false) {
     retry: vi.fn(async () => create(RetryPartnerHomeMoveResponseSchema, { move: { ...receipt, phase: PartnerHomeMovePhase.READY, canonicalSessionId: "recovered-session" } })) };
   return { api, changed: vi.fn(), close: vi.fn() };
 }
-async function mount(f: ReturnType<typeof fixture>, inputHandoff = true) {
+async function mount(f: ReturnType<typeof fixture>, inputHandoff = true, initialDestination?: PartnerHomeDestination) {
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host); roots.push(root);
-  await act(async () => { root.render(<PartnerHomeDialog api={f.api} partnerId="partner" revision={9n} inputHandoff={inputHandoff} locale="en" onChanged={f.changed} onClose={f.close} />); });
+  await act(async () => { root.render(<PartnerHomeDialog api={f.api} partnerId="partner" revision={9n} inputHandoff={inputHandoff} initialDestination={initialDestination} locale="en" onChanged={f.changed} onClose={f.close} />); });
 }
+it("preselects the exact glance target and still requires explicit model and permission confirmation", async () => {
+  const f = fixture(), catalog = await f.api.list("partner", new AbortController().signal), destination = catalog.targets[1]!.destination!;
+  await mount(f, true, destination);
+  expect(f.api.inspect).toHaveBeenCalledWith("partner", destination, expect.any(AbortSignal)); expect(f.api.move).not.toHaveBeenCalled();
+  expect([...document.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === text.change)?.disabled).toBe(true);
+});
+it("does not substitute a reconnected target for an expired route chosen in the glance", async () => {
+  const f = fixture(), catalog = await f.api.list("partner", new AbortController().signal), destination = catalog.targets[1]!.destination!;
+  const peer = destination.location.case === "peer" ? destination.location.value : undefined; expect(peer).toBeDefined();
+  await mount(f, true, { ...destination, location: { case: "peer", value: { ...peer!, routeGeneration: 2n } } });
+  expect(f.api.inspect).not.toHaveBeenCalled(); expect(f.api.move).not.toHaveBeenCalled(); expect(document.body.textContent).toContain(text.error);
+});
 async function select(label: string, value: string) {
   const field = [...document.querySelectorAll("label")].find(item => item.textContent?.startsWith(label))?.querySelector("select");
   if (!field) throw new Error(`Missing select: ${label}`);

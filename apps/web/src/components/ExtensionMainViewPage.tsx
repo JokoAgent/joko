@@ -4,6 +4,7 @@ import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide
 import { createConnectionFetch } from "@joko/connection-transport";
 import { parseExtensionSettingsBridgeRequest, type ExtensionSettingsDirectoryChoice } from "@joko/contracts";
 import { ExtensionSettingsDirectoryDialog } from "./ExtensionSettingsDirectoryDialog.js";
+import type { PendingExtensionSettingsOperation } from "../extension-settings-operation.js";
 import { mountIsolatedSurface } from "../isolated-surface.js";
 import { bindExtensionSurfaceResources } from "../extension-main-view-resource-bridge.js";
 import { bindExtensionViewClose, registerExtensionPageClose } from "../extension-view-lifecycle.js";
@@ -81,6 +82,33 @@ export function ExtensionMainViewPage({
   const confirmationRef = useRef(confirmation); confirmationRef.current = confirmation;
   const [directoryChoice, setDirectoryChoice] = useState<{ readonly choice: ExtensionSettingsDirectoryChoice; readonly signal: AbortSignal; readonly finish: (entryId?: string) => void }>();
   const directoryChoiceRef = useRef(directoryChoice); directoryChoiceRef.current = directoryChoice;
+  const [settingsOperation, setSettingsOperation] = useState<PendingExtensionSettingsOperation>();
+  const [checkingSettingsOperation, setCheckingSettingsOperation] = useState(false);
+  const settingsChecking = useRef<symbol | undefined>(undefined);
+  const [settingsOperationNotice, setSettingsOperationNotice] = useState<"succeeded" | "failed" | "pending" | "unavailable">();
+  const [completedDirectoryOperation, setCompletedDirectoryOperation] = useState(false);
+  const settingsRecovery = useRef<{ readonly api: ExtensionSettingsApi; readonly owner: string; readonly extensionId: string;
+    readonly signal: AbortSignal; readonly refresh: () => Promise<void> } | undefined>(undefined);
+
+  useEffect(() => {
+    setSettingsOperation(undefined); setSettingsOperationNotice(undefined); setCheckingSettingsOperation(false); setCompletedDirectoryOperation(false); settingsChecking.current = undefined;
+    if (!settings) return;
+    const abort = new AbortController(); let active = true;
+    let api: ExtensionSettingsApi | undefined;
+    try { api = controller.extensionSettingsApi?.(); } catch { setSettingsOperationNotice("unavailable"); return; }
+    if (!api?.pending) return;
+    const refresh = async () => {
+      try {
+        const original = await api!.pending!(extensionId, abort.signal);
+        if (active && !abort.signal.aborted && liveOwnerRef.current === controllerOwner) setSettingsOperation(original);
+      } catch { if (active && !abort.signal.aborted && liveOwnerRef.current === controllerOwner) setSettingsOperationNotice("unavailable"); }
+    };
+    const recovery = { api, owner: controllerOwner, extensionId, signal: abort.signal, refresh }; settingsRecovery.current = recovery;
+    void refresh();
+    const retire = () => abort.abort(); ownerDocument.defaultView?.addEventListener("pagehide", retire);
+    return () => { active = false; abort.abort(); ownerDocument.defaultView?.removeEventListener("pagehide", retire);
+      if (settingsRecovery.current === recovery) settingsRecovery.current = undefined; };
+  }, [controller, controllerOwner, extensionId, ownerDocument, settings]);
 
   const closeLibrary = useCallback((): void => {
     const current = libraryRef.current;
@@ -92,7 +120,7 @@ export function ExtensionMainViewPage({
 
   const releaseSurface = useCallback((surface: ExtensionMainViewSurfaceView | undefined): void => {
     if (surface === undefined) return;
-    closeLibrary();
+    if (surfaceRef.current === surface || surfaceRef.current === undefined) closeLibrary();
     if (surfaceRef.current === surface) surfaceRef.current = undefined;
     if (settings) {
       const close = settingsSurfaceClosers.current.get(surface); settingsSurfaceClosers.current.delete(surface);
@@ -119,7 +147,7 @@ export function ExtensionMainViewPage({
         return;
       }
       if (!disposed && request === requestRevision.current) setState({ phase: "opening" });
-      const api = settings ? controller.extensionSettingsApi() : undefined;
+      const api = settings ? controller.extensionSettingsApi?.() : undefined;
       if (settings && !api) throw new Error("Plugin author settings are unavailable.");
       settingsApi.current = api;
       const surface = settings ? await api!.open(extension.id, extension.revision, abort.signal)
@@ -463,7 +491,11 @@ export function ExtensionMainViewPage({
       void completion.then(result => respond(true, result), () => {
         if (dispatched && !["context.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(request.command.kind)) faulted = true;
         respond(false);
-      }).catch(() => { faulted = true; }).finally(() => { clearTimeout(timer); abort.abort(); pending.delete(abort); });
+      }).catch(() => { faulted = true; }).finally(() => {
+        clearTimeout(timer); abort.abort(); pending.delete(abort);
+        const recovery = settingsRecovery.current;
+        if (recovery?.owner === controllerOwner && recovery.owner === liveOwnerRef.current && recovery.extensionId === extensionId && !recovery.signal.aborted) void recovery.refresh();
+      });
     };
     sourceWindow.addEventListener("message", listener);
     return () => { closed = true; sourceWindow.removeEventListener("message", listener); for (const abort of pending) abort.abort(); };
@@ -475,6 +507,22 @@ export function ExtensionMainViewPage({
     : extension?.mainView?.title ?? extension?.name ?? t("extensions.mainView.title");
   const back = (): void => controller.navigate({ kind: "tools", extensionId });
   const retry = (): void => setRetryRevision((value) => value + 1);
+  const checkSettingsOperation = (): void => {
+    const original = settingsOperation, recovery = settingsRecovery.current;
+    if (!original || !recovery?.api.checkOriginal || settingsChecking.current || recovery.signal.aborted
+      || recovery.owner !== liveOwnerRef.current || recovery.extensionId !== extensionId || ownerDocument.visibilityState === "hidden") return;
+    const attempt = Symbol("original-settings-receipt"); settingsChecking.current = attempt; setCheckingSettingsOperation(true);
+    void recovery.api.checkOriginal(original, recovery.signal).then(async receipt => {
+      if (settingsRecovery.current !== recovery || recovery.signal.aborted || recovery.owner !== liveOwnerRef.current) return;
+      setSettingsOperationNotice(receipt.state); setCompletedDirectoryOperation(receipt.state === "succeeded" && original.kind === "pickExtensionDirectory"); await recovery.refresh();
+    }).catch(() => {
+      if (settingsRecovery.current === recovery && !recovery.signal.aborted && recovery.owner === liveOwnerRef.current) setSettingsOperationNotice("unavailable");
+    }).finally(() => {
+      if (settingsChecking.current === attempt && settingsRecovery.current === recovery && !recovery.signal.aborted && recovery.owner === liveOwnerRef.current) {
+        settingsChecking.current = undefined; setCheckingSettingsOperation(false);
+      }
+    });
+  };
   const reload = (): void => {
     if (state.phase !== "ready") return;
     const expected = state.surface;
@@ -503,6 +551,12 @@ export function ExtensionMainViewPage({
         {extensionMainViewReady(extension) && <Button tone="ghost" onClick={() => onOpenIndependent(extension.id)}><ExternalLink aria-hidden="true" />{t("extensions.mainView.openWindow")}</Button>}
       </div>
     </header>}
+    {settings && (settingsOperation || settingsOperationNotice) && <div className="extension-main-view-page__status" role="status">
+      <p>{settingsOperation ? t(settingsOperationNotice === "unavailable" ? "extensions.settingsOperationUnavailable" : "extensions.settingsOperationPending") : settingsOperationNotice === "succeeded" ? t(completedDirectoryOperation ? "extensions.settingsDirectoryCompleted" : "extensions.settingsOperationSucceeded")
+        : settingsOperationNotice === "failed" ? t("extensions.settingsOperationFailed") : t("extensions.settingsOperationUnavailable")}</p>
+      {settingsOperation && <Button tone="ghost" disabled={checkingSettingsOperation} onClick={checkSettingsOperation}>
+        {checkingSettingsOperation ? t("common.loading") : t("extensions.settingsOperationCheck")}</Button>}
+    </div>}
     <section className="extension-main-view-page__surface" aria-busy={state.phase === "loading" || state.phase === "opening" || !frameLoaded}>
       {(state.phase === "loading" || state.phase === "opening") && <div className="extension-main-view-page__status"><Spinner /><p>{state.phase === "loading" ? t("extensions.mainView.loading") : t("extensions.mainView.opening")}</p></div>}
       {(state.phase === "error" || state.phase === "revoked") && <div className="extension-main-view-page__status extension-main-view-page__status--error"><AlertTriangle aria-hidden="true" /><h2>{state.phase === "revoked" ? t("extensions.mainView.revoked") : t("extensions.mainView.unavailable")}</h2><p>{state.phase === "revoked" ? t("extensions.mainView.revokedBody") : t("extensions.mainView.unavailableBody")}</p><div><Button tone="primary" onClick={retry}>{t("common.retry")}</Button><Button tone="ghost" onClick={back}>{t("extensions.mainView.back")}</Button></div></div>}

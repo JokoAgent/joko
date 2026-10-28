@@ -56,6 +56,7 @@ function application(input: {
   ];
   const store = {
     findOperation: () => undefined,
+    findSetting: () => undefined,
     listTargets: () => [{ descriptor: { id: "target-review", backendId: "backend-review" }, metadata: { workspaceId: "workspace-review" } }],
     getBackend: () => ({ descriptor: { capabilities: new Map(capabilities.map((key) => [key, { key, supported: true }])) } }),
     listSessions: () => input.sessions ?? [],

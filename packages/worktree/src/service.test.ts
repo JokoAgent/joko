@@ -59,6 +59,41 @@ describe("EphemeralWorktreeService", () => {
     service.dispose();
   });
 
+  test("retains the exact checkout behind a Product reference guard across reopen until its last reference retires", { timeout: 40_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    unwrap(await service.initialize());
+    const checkout = unwrap(await service.acquire({ sessionId: "guarded-source", cwd: fixture.repositoryRoot }));
+    let referenced = true;
+    const guard = async (lease: { readonly id: string }): Promise<boolean> => {
+      expect(lease.id).toBe(checkout.lease.id); return !referenced;
+    };
+    expect(unwrap(await service.release("guarded-source", { retainForRestore: true }, guard)))
+      .toMatchObject({ status: "preserved", reason: "in_use", pathRemoved: false });
+    const pending = service.listRecycleStatus()[0]!;
+    expect(pending).toMatchObject({ id: checkout.lease.id, state: "waiting", reason: "in_use", retainForRestore: true });
+    expect((await lstat(checkout.lease.path)).isDirectory()).toBe(true);
+    // A rejected Product guard has not captured an archive, so the original
+    // physical lease must remain active rather than claim a preserved snapshot.
+    expect(service.snapshot().active).toEqual([checkout.lease]);
+    service.dispose();
+    const reopened = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    try {
+      unwrap(await reopened.initialize({ deferRecycle: true, preserveSessionIds: ["guarded-source"] }));
+      expect(reopened.snapshot().active).toEqual([checkout.lease]);
+      const unknown = await reopened.retryRecycle(pending, async () => { throw new Error("Reference owner is unavailable"); });
+      expect(unknown.ok).toBe(false);
+      expect((await lstat(checkout.lease.path)).isDirectory()).toBe(true);
+      expect(unwrap(await reopened.retryRecycle(pending, guard))).toMatchObject({ reason: "in_use", pathRemoved: false });
+      expect((await lstat(checkout.lease.path)).isDirectory()).toBe(true);
+      referenced = false;
+      expect(unwrap(await reopened.retryRecycle(pending, guard))).toMatchObject({ status: "preserved", reason: "restorable", pathRemoved: true });
+      await expect(lstat(checkout.lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(reopened.snapshot().active).toEqual([]);
+      expect(reopened.listRecycleStatus()).toEqual([]);
+    } finally { reopened.dispose(); }
+  });
+
   test("persists exact recycle controls without charging native and source writer waits", { timeout: 40_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });

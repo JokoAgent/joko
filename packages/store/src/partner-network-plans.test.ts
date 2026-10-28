@@ -8,7 +8,7 @@ afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 function fixture() {
   const db = new OperationalStore(":memory:"); stores.push(db); let clock = 100_000, operation = 0;
   const store = new PartnerNetworkStore(db, () => clock), ownerId = networkHumanId("home"), a = networkPartnerId("home", "writer"), b = networkPartnerId("home", "reviewer");
-  const room = store.create({ operationId: "create", serverId: "home", origin: "https://home.test", name: "Group", displayName: "Owner",
+  const room = store.create({ operationId: "create", singleSpeaker: false, serverId: "home", origin: "https://home.test", name: "Group", displayName: "Owner",
     partners: [{ id: "writer", name: "Writer", description: "Write" }, { id: "reviewer", name: "Reviewer", description: "Review" }] });
   const send = (text: string, options: { forcePlan?: boolean; mentionAll?: boolean; mentions?: string[]; actorId?: string } = {}) => store.send({ operationId: `send:${++operation}`,
     roomId: room.id, actorId: ownerId, text, mentions: [], mentionAll: false, attachments: [], threadRootId: "", quoteId: "", ...options });

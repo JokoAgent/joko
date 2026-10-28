@@ -21,7 +21,7 @@ afterEach(async ({ task }) => {
   await browser?.close(); browser = undefined; await fixture?.close({ removeRoot: true }); fixture = undefined;
 });
 
-mountedIt("recovers a created group in mounted Web, delivers an attachment and decision to its hidden real Pi lane, then completes shared work across service restart", async () => {
+mountedIt("recovers a new single-speaker group, delivers an attachment and decision to its hidden real Pi lane, then retains an existing work arrangement across service restart", async () => {
   let members: string[] = [];
   const responder: RealPiProviderResponder = ({ request }) => {
     const serialized = JSON.stringify(request.body), messages = Array.isArray(request.body["messages"]) ? request.body["messages"] : [];
@@ -79,11 +79,15 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   expect((await manager.clients.partnerNetwork.listPartnerNetwork({})).rooms).toHaveLength(1);
   expect(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith("joko.conversation-entry.v1:"))
     .every(key => JSON.parse(localStorage.getItem(key)!).confirmed === true))).toBe(true);
+  expect(receipt.rooms[0]!.singleSpeaker).toBe(true);
   await page.getByRole("button", { name: "Group settings", exact: true }).click();
   const settings = page.getByRole("dialog", { name: "Group settings", exact: true });
-  await settings.getByRole("combobox", { name: /^Reply mode/ }).selectOption("mentioned");
-  await waitFor(() => manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId }), value => value.snapshot?.room?.replyMode === "mentioned", "the shared reply setting");
+  expect(await settings.getByRole("combobox", { name: /^Reply mode/ }).count()).toBe(0);
+  await settings.getByLabel("Group name", { exact: true }).fill("Shared conversation");
+  await settings.locator(".partner-group-form > button").filter({ hasText: /^Save$/u }).click();
+  await waitFor(() => manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId }), value => value.snapshot?.room?.name === "Shared conversation", "the shared group name setting");
   await settings.getByRole("button", { name: "Close", exact: true }).click();
+  expect(await page.getByRole("button", { name: "Arrange work", exact: true }).count()).toBe(0);
   const composer = page.getByRole("textbox", { name: "Message", exact: true });
   await page.locator(".partner-network-composer summary").click();
   await page.getByRole("button", { name: "@Aster (Group owner)", exact: true }).click();
@@ -103,6 +107,21 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   const downloadPromise = page.waitForEvent("download");
   await page.locator(".partner-network-media").getByRole("button", { name: "group-notes.txt · Download", exact: true }).click();
   const download = await downloadPromise; expect(await readFile((await download.path())!, "utf8")).toBe("Group attachment bytes");
+
+  // New groups use talk queues. A retained current-v1 work arrangement still
+  // owns its original settings, approval, shared folder and restart recovery.
+  const retained = fixture.application.partnerNetwork!.options.host.storage.create({ operationId: "retained-work-group", singleSpeaker: false,
+    serverId: receipt.rooms[0]!.hostServerId, origin: receipt.rooms[0]!.hostOrigin, name: "Retained shared work", displayName: "Group owner",
+    partners: profiles.map(profile => ({ id: profile.partnerId, name: profile.displayName, description: profile.description })) });
+  members = profiles.map(profile => retained.members.find(actor => actor.kind === "partner" && actor.state === "joined" && actor.partnerId === profile.partnerId)!.id);
+  const workGroupId = retained.id;
+  await page.goto(`${fixture.baseUrl}/#/partners/groups/${encodeURIComponent(`network:host:${workGroupId}`)}`, { waitUntil: "domcontentloaded" });
+  await page.locator(".partner-group-header h1").filter({ hasText: "Retained shared work" }).waitFor();
+  expect((await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: workGroupId })).snapshot!.room!.singleSpeaker).toBe(false);
+  await page.getByRole("button", { name: "Group settings", exact: true }).click();
+  await settings.getByRole("combobox", { name: /^Reply mode/ }).selectOption("mentioned");
+  await waitFor(() => manager.clients.partnerNetwork.getPartnerNetwork({ roomId: workGroupId }), value => value.snapshot?.room?.replyMode === "mentioned", "the retained work group's reply setting");
+  await settings.getByRole("button", { name: "Close", exact: true }).click();
   await composer.fill("GROUP_WORK_REQUEST"); await page.getByRole("button", { name: "Arrange work", exact: true }).click();
   await page.locator(".partner-network-composer").getByRole("button", { name: "Send", exact: true }).click();
   await page.locator(".partner-group-plan").getByRole("button", { name: "Start", exact: true }).waitFor({ timeout: 30_000 });
@@ -112,11 +131,11 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   await captureGroupEvidence(page, "groups-web-proposed-narrow-dark"); await page.setViewportSize({ width: 1440, height: 960 });
   await page.locator(".partner-group-plan").getByRole("button", { name: "Start", exact: true }).click();
   await page.getByRole("button", { name: "Continue to next partner", exact: true }).waitFor({ timeout: 30_000 });
-  const firstStep = await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId }), plan = firstStep.snapshot!.plans.at(-1)!;
+  const firstStep = await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: workGroupId }), plan = firstStep.snapshot!.plans.at(-1)!;
   expect(plan.steps[0]!.status).toBe("completed");
   const workDirectory = planWorkDirectory(fixture, firstStep.snapshot!.room!, plan);
   const handoff = firstStep.snapshot!.messages.find(message => message.id === plan.steps[0]!.resultMessageId)!;
-  const file = await manager.clients.partnerNetwork.mediaPartnerNetwork({ roomId: groupId, action: "read", mediaId: handoff.attachments.find(file => file.name === "group-result-1.txt")!.id });
+  const file = await manager.clients.partnerNetwork.mediaPartnerNetwork({ roomId: workGroupId, action: "read", mediaId: handoff.attachments.find(file => file.name === "group-result-1.txt")!.id });
   expect(new TextDecoder().decode(file.data)).toBe("Group step 1 completed.\n");
   await captureGroupEvidence(page, "groups-web-wide-dark");
   await page.setViewportSize({ width: 390, height: 844 }); await page.emulateMedia({ colorScheme: "dark" });
@@ -127,7 +146,7 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   await page.goto(`${fixture.baseUrl}/#/settings`, { waitUntil: "domcontentloaded" });
   await page.getByRole("radio", { name: "Light", exact: true }).click();
   await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
-  await page.goto(`${fixture.baseUrl}/#/partners/groups/${encodeURIComponent(`network:host:${groupId}`)}`, { waitUntil: "domcontentloaded" });
+  await page.goto(`${fixture.baseUrl}/#/partners/groups/${encodeURIComponent(`network:host:${workGroupId}`)}`, { waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Continue to next partner", exact: true }).waitFor();
   await captureGroupEvidence(page, "groups-web-wide-light");
   await page.setViewportSize({ width: 390, height: 844 });
@@ -138,13 +157,17 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   await fixture.close({ removeRoot: false }); fixture = undefined;
   fixture = await RealPiSystemFixture.start({ rootDirectory, webDirectory: webDirectory!, port, internalPort, providerResponder: responder, enableInternalServer: true });
   manager = { authKey, connectionId, deviceId, clients: fixture.clients(authKey) };
-  const restored = await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId });
+  const restored = await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: workGroupId });
   expect(planWorkDirectory(fixture, restored.snapshot!.room!, restored.snapshot!.plans.at(-1)!)).toBe(workDirectory);
-  await manager.clients.partnerNetwork.planPartnerNetwork({ roomId: groupId, operationId: crypto.randomUUID(), planId: plan.id, expectedRevision: restored.snapshot!.plans.at(-1)!.revision, action: "continue" });
-  const done = await waitFor(() => manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId }), value => value.snapshot!.plans.at(-1)?.status === "completed", "the second group's shared work step", 30_000);
+  await manager.clients.partnerNetwork.planPartnerNetwork({ roomId: workGroupId, operationId: crypto.randomUUID(), planId: plan.id, expectedRevision: restored.snapshot!.plans.at(-1)!.revision, action: "continue" });
+  const done = await waitFor(() => manager.clients.partnerNetwork.getPartnerNetwork({ roomId: workGroupId }), value => value.snapshot!.plans.at(-1)?.status === "completed", "the second group's shared work step", 30_000);
   expect(done.snapshot!.plans.at(-1)!.steps.every(step => step.status === "completed")).toBe(true);
   expect(await readFile(resolve(workDirectory, "group-result-2.txt"), "utf8")).toBe("Group step 2 completed.\n");
-  const final = done.snapshot!.room!; await manager.clients.partnerNetwork.managePartnerNetwork({ roomId: groupId, operationId: crypto.randomUUID(), expectedRevision: final.revision, action: "dissolve" });
+  const final = done.snapshot!.room!; await manager.clients.partnerNetwork.managePartnerNetwork({ roomId: workGroupId, operationId: crypto.randomUUID(), expectedRevision: final.revision, action: "dissolve" });
+  expect((await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: workGroupId })).snapshot!.room!.state).toBe("dissolved");
+  const currentGroup = (await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId })).snapshot!.room!;
+  expect(currentGroup.singleSpeaker).toBe(true);
+  await manager.clients.partnerNetwork.managePartnerNetwork({ roomId: groupId, operationId: crypto.randomUUID(), expectedRevision: currentGroup.revision, action: "dissolve" });
   expect((await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId })).snapshot!.room!.state).toBe("dissolved");
   for (const profile of profiles) expect(fixture.application.store.getSession(profile.canonicalSessionId!).descriptor.archived).toBe(false);
   expect(errors).toEqual([]);

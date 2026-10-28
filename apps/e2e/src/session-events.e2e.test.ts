@@ -699,7 +699,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     const scrollbarDiagnostics = JSON.stringify({ beforeHold, scrollbarX, scrollbarY, scrollbarHits, overlayGeometry });
     expect(scrollbarHits.slice(0, 2).map((hit) => hit.isTimeline), scrollbarDiagnostics).toEqual([true, true]);
     // The Inspector's resize grip owns the pane's outer edge.
-    if (scrollbarHits[2]?.isTimeline !== true) expect(scrollbarHits[2]?.className, scrollbarDiagnostics).toBe("inspector__resize");
+    if (scrollbarHits[2]?.isTimeline !== true) expect(scrollbarHits[2]?.className, scrollbarDiagnostics).toBe("inspector-dock-resize");
     for (const surface of overlayGeometry) {
       expect(surface.right, scrollbarDiagnostics).toBeLessThanOrEqual(beforeHold.left + beforeHold.width);
     }
@@ -733,7 +733,9 @@ describe("session host, durable events, and reconnect semantics", () => {
       (value) => value.run?.state === RunState.SUCCEEDED, "the held scrollbar Run to settle");
     await page.locator(".jump-latest").click();
     await waitFor(() => viewportGeometry(page), (value) => value.distanceFromEnd <= 2, "the explicit latest jump");
-    await page.getByRole("button", { name: "Close details", exact: true }).click();
+    await page.getByRole("button", { name: "Close Context tab", exact: true }).click();
+    await page.getByRole("button", { name: "Open details", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    expect(await page.locator(".inspector-dock-group[data-edge]").count()).toBe(0);
     await settledViewportGeometry(page);
 
     const requestEntered = browserGate();

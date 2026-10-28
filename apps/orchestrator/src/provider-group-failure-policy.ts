@@ -11,7 +11,7 @@ export type ProviderGroupFailureDecision = { readonly action: "stay"; readonly w
 export const PROVIDER_GROUP_SUPERSEDED_ERROR = "Provider group was superseded by user action.";
 export class ProviderGroupUnavailableError extends Error {
   readonly code = "PROVIDER_GROUP_UNAVAILABLE";
-  constructor() { super("No computer in this Provider group can run the task right now."); this.name = "ProviderGroupUnavailableError"; }
+  constructor(readonly retryAt?: number) { super("No computer in this Provider group can run the task right now."); this.name = "ProviderGroupUnavailableError"; }
 }
 const TASK_STATE = new Set(["SESSION_RUNNING", "NOT_FOUND", "INVALID_PARAMS", "INVALID_ARGUMENT", "UNSUPPORTED_CAPABILITY", "PRECONDITION_FAILED",
   "FAILED_PRECONDITION", "SEND_CANCELLED_BEFORE_DISPATCH", "OWNER_CHANGED", "ACCOUNT_BOUNDARY", "WORKDIR_MISSING", "TARGET_CHANGED"]);
@@ -39,6 +39,7 @@ export function decideProviderGroupFailure(signals: ProviderGroupFailureSignals 
   // An uncertain native effect must be inspected; switching must never replay it.
   if (phase !== "run" && signals.stateMayHaveChanged || code === "DISPATCH_UNKNOWN" || code === "NATIVE_DISPATCH_UNKNOWN" || code === "RUNTIME_HANDOFF_UNKNOWN") return stay("unknown-effect");
   if (code === "PROVIDER_GROUP_UNAVAILABLE") return stay("group-unavailable");
+  if (code === "HOSTED_AGENT_CAPACITY_REJECTED" && signals.stateMayHaveChanged === false) return phase === "start" ? change("unavailable") : stay("local");
   if (code === "SESSION_CLOSED_MID_TURN" || code === "HOSTED_AGENT_LOCAL_ADMISSION") return stay("local");
   if (phase !== "run" && code && TASK_STATE.has(code)) return stay("task-state");
   const known = STAY.get(reason) ?? CODEX_STAY.get(signals.codexErrorInfo ?? "") ?? PUBLIC_STAY.get(code ?? ""); if (known) return stay(known);

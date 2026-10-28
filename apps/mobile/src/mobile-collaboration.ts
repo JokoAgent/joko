@@ -1,6 +1,6 @@
 import { clone, equals } from "@bufbuild/protobuf";
 import type { Client } from "@connectrpc/connect";
-import { CollaborationGoalStatus, CollaborationGoalTreeSchema, CollaborationWorkerSchema, CollaborationSessionRole, CollaborationWorkerStatus, PermissionMode,
+import { CollaborationGoalStatus, CollaborationGoalTreeSchema, CollaborationWorkerSchema, CollaborationSessionRole, CollaborationWorkerStatus, PermissionMode, encodeModelSpeed, decodeModelSpeed,
   type CollaborationGoal, type CollaborationGoalAccess, type CollaborationGoalTree, type CollaborationSettings, type CollaborationService,
   type CollaborationWorker, type CollaborationReportOrigin } from "@joko/contracts";
 import type { MobileModelControlSelection, MobileModelRoute } from "./mobile-runtime-controls";
@@ -88,7 +88,8 @@ export function normalizeMobileWorkerForm(value: MobileWorkerForm): MobileWorker
   }
   if (value.sourceScope !== undefined && (typeof value.sourceScope !== "string" || !value.sourceScope || value.sourceScope.length > 64_000 || value.sourceScope.includes("\0"))) throw new Error("The confirmed collaboration source is invalid.");
   if (value.model && (!identity(value.model.providerId) || !identity(value.model.modelId)
-    || value.model.effortId !== undefined && !identity(value.model.effortId) || typeof value.model.fastMode !== "boolean")) {
+    || value.model.effortId !== undefined && !identity(value.model.effortId)
+    || typeof value.model.fastMode !== "boolean" && value.model.fastMode !== "ultrafast")) {
     throw new Error("The selected worker model is invalid.");
   }
   return { role: value.role.trim(), targetId: value.targetId, permissionMode: value.permissionMode,
@@ -203,12 +204,12 @@ export function createMobileCollaborationRpc(rpc: Client<typeof CollaborationSer
       const response = await rpc.createCollaborationWorker({ ...scope, operationId: id, expectedGoalRevision: goal.revision,
         label, role: exact.role, assignment: exact.initialTask, targetId: exact.targetId, permissionMode: exact.permissionMode, planMode: false,
         ...(exact.model === undefined ? {} : { providerId: exact.model.providerId, modelId: exact.model.modelId,
-          effort: exact.model.effortId, fastMode: exact.model.fastMode }) }, { signal });
+          effort: exact.model.effortId, ...encodeModelSpeed(exact.model.fastMode) }) }, { signal });
       const result = tree(response.tree, goal.goalId, signal), worker = response.worker;
       if (!worker || worker.goalId !== goal.goalId || worker.label !== label || worker.role !== exact.role || worker.assignment !== exact.initialTask
         || worker.route?.targetId !== exact.targetId || worker.route.permissionMode !== exact.permissionMode || worker.route.planMode
         || exact.model !== undefined && (worker.route.providerId !== exact.model.providerId || worker.route.modelId !== exact.model.modelId
-          || worker.route.effort !== exact.model.effortId || worker.route.fastMode !== exact.model.fastMode)
+          || worker.route.effort !== exact.model.effortId || decodeModelSpeed(worker.route) !== exact.model.fastMode)
         || !result.workers.some(candidate => candidate.workerId === worker.workerId && equals(CollaborationWorkerSchema, candidate, worker))) throw new Error("The created worker does not match the requested role and route.");
       return result;
     },

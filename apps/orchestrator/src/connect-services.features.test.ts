@@ -46,6 +46,7 @@ function context(): unknown {
 function stubApplication(overrides: Record<string, unknown>): OrchestratorApplication {
   const overriddenSessionHost = overrides["sessionHost"];
   const sessionHost = {
+    sideChatSourceAllowed: () => false,
     getSessionRuntimeControl: () => ({ effective: undefined }),
     recordUserSessionRuntimeSelection: () => 0,
     ...(typeof overriddenSessionHost === "object" && overriddenSessionHost !== null

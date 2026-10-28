@@ -62,6 +62,12 @@ describe("mounted Partner collaboration product chain", () => {
             dialogs: await page.getByRole("dialog").count(),
             alerts: await page.getByRole("alert").allTextContents(),
             workspaceStates: await page.locator(".partner-workspace-state").allTextContents(),
+            reading: await page.evaluate(() => ({ visibility: document.visibilityState, focused: document.hasFocus(),
+              activeElement: document.activeElement?.tagName, timelines: [...document.querySelectorAll<HTMLElement>(".timeline")].slice(0, 4).map(element => ({
+                sessionId: element.dataset.timelineSessionId, height: element.clientHeight,
+                distanceFromEnd: element.scrollHeight - element.scrollTop - element.clientHeight,
+                focused: document.activeElement === element || element.contains(document.activeElement)
+              })) })),
             pageText: (await page.locator("body").innerText({ timeout: 5_000 })).slice(-6_000)
           }, null, 2));
           await page.screenshot({ path: join(directory, "product-chain-failed.png"),
@@ -123,7 +129,8 @@ describe("mounted Partner collaboration product chain", () => {
     expect(installedProfile.displayName).toBe(firstName); expect(installedProfile.canonicalSessionId).toBeUndefined();
     expect(installedProfile.capabilities?.modelChain).toEqual([]);
     expect(fixture.application.store.listSessions({ targetId: installedProfile.homeTargetId })).toHaveLength(0);
-    expect(fixture.application.partnerRoutines!.engine.list(installedProfile.partnerId)[0]!.enabled).toBe(false);
+    const installedRoutines = fixture.application.partnerRoutines!.engine.list(installedProfile.partnerId).filter(routine => !routine.builtin);
+    expect(installedRoutines).toHaveLength(1); expect(installedRoutines[0]!.enabled).toBe(false);
     if (evidence) await page.screenshot({ path: join(evidence, "discovery-installed-model-pending-800.png"), fullPage: true, animations: "disabled" });
     const modelSaved = page.waitForResponse(response => response.url().endsWith("/joko.v1.PartnerService/UpdatePartner") && response.status() === 200);
     await primary.click(); await page.getByRole("option", { name: /Joko real Pi E2E model/u }).click(); await modelSaved;
@@ -134,8 +141,15 @@ describe("mounted Partner collaboration product chain", () => {
       "the original package receipt runtime projection");
     const saved = required(packages.find(entry => entry.packageId === "engineer-bot")?.installation, "the durable installation receipt");
     expect(saved).toMatchObject({ saved: true, status: "complete", partnerId: row.partnerId });
-    const routines = fixture.application.partnerRoutines!.list(row.partnerId);
-    expect(routines).toHaveLength(1); expect(routines[0]!.enabled).toBe(false);
+    const routines = await waitFor(async () => fixture!.application.partnerRoutines!.list(row.partnerId),
+      entries => entries.some(routine => routine.builtin === "follow-up"), "the Partner's host-owned follow-up routine");
+    const importedRoutines = routines.filter(routine => !routine.builtin), builtin = routines.filter(routine => routine.builtin === "follow-up");
+    expect(importedRoutines).toEqual(installedRoutines);
+    expect(builtin).toHaveLength(1); expect(builtin[0]).toMatchObject({
+      id: `builtin-follow-up-${createHash("sha256").update(row.partnerId).digest("hex").slice(0, 40)}`,
+      partnerId: row.partnerId, builtinVersion: 5, enabled: true
+    });
+    expect(routines).toHaveLength(importedRoutines.length + builtin.length);
     expect(fixture.application.store.listRuns({ sessionId: row.canonicalSessionId! })).toHaveLength(0);
     const welcomeId = `import-message-${createHash("sha256").update(JSON.stringify([row.canonicalSessionId, `package-welcome-${saved.requestId}`])).digest("hex")}`;
     await waitFor(async () => fixture!.application.store.findEvent(welcomeId), event => event !== undefined, "the once-only package opening");
@@ -165,8 +179,11 @@ describe("mounted Partner collaboration product chain", () => {
     expect(fixture.application.store.listEvents({ sessionId: row.canonicalSessionId!, limit: 100 }).filter(event => event.id === welcomeId)).toHaveLength(1);
     const recovered = await fixture.application.partnerImports!.packages("en", { ownerKey: "evidence-restart", assertCurrent() {} });
     expect(recovered.find(entry => entry.packageId === "engineer-bot")?.installation).toMatchObject({ requestId: saved.requestId, canonicalSessionId: row.canonicalSessionId });
+    const restoredRoutines = fixture.application.partnerRoutines!.list(row.partnerId);
+    expect(restoredRoutines.filter(routine => !routine.builtin)).toEqual(importedRoutines);
+    expect(restoredRoutines.filter(routine => routine.builtin === "follow-up")).toEqual(builtin);
     expect(errors).toEqual([]);
-    if (evidence) await writeFile(join(evidence, "discovery-result.json"), JSON.stringify({ packages: packages.length, saved: saved.status, disabledRoutines: routines.length, providersCalled: fixture.providerRequests.length, errors }, null, 2));
+    if (evidence) await writeFile(join(evidence, "discovery-result.json"), JSON.stringify({ packages: packages.length, saved: saved.status, disabledRoutines: importedRoutines.length, builtinFollowUps: builtin.length, providersCalled: fixture.providerRequests.length, errors }, null, 2));
   }, 120_000);
 
   mountedIt("recovers a user-photo Partner after lost creation receipt, edits, service restart and narrow Web reload without duplicate initialization", async () => {
@@ -318,12 +335,14 @@ describe("mounted Partner collaboration product chain", () => {
 
     await sendPartnerPrompt(fixture, manager, first.canonicalSessionId, PRIVATE_COMMAND);
     try {
-      await waitFor(
+      const unread = await waitFor(
         () => manager.clients.partner.getPartner({ partnerId: second.partnerId }),
         (value) => (value.partner?.activity?.unreadReplyCount ?? 0n) > 0n,
         "the recipient Partner unread reply",
         30_000
       );
+      expect(unread.partner?.activity?.readThroughCursor?.value ?? 0n).toBe(0n);
+      expect(unread.partner?.activity?.latestReplyCursor?.value ?? 0n).toBeGreaterThan(0n);
     } catch (error) {
       throw new Error(
         `${error instanceof Error ? error.message : String(error)} Recipient runs: ${JSON.stringify(fixture.application.store.listRuns({ sessionId: second.canonicalSessionId }), bigintJson)} Provider trace: ${JSON.stringify(fixture.providerRequests.map(providerRequestSummary))}`,
@@ -334,12 +353,32 @@ describe("mounted Partner collaboration product chain", () => {
     const secondCard = page.locator(partnerCard(second.partnerId));
     await waitFor(() => secondCard.textContent(), (value) => value?.includes("unread replies") === true, "the unread Partner card");
     await secondCard.getByRole("button", { name: "Open task" }).click();
-    await page.getByText(PRIVATE_REPLY, { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
-    await waitFor(
+    const recipientTimeline = page.locator(`.timeline[data-timeline-session-id="${second.canonicalSessionId}"]`);
+    const recipientReply = recipientTimeline.getByText(PRIVATE_REPLY, { exact: true }).first();
+    await recipientReply.waitFor({ state: "visible", timeout: 30_000 });
+    // Visibility alone is not a read: the actual page must be foregrounded and
+    // the reader must reach the tail of this original conversation viewport.
+    await page.bringToFront(); await recipientTimeline.focus(); await recipientTimeline.hover(); await page.mouse.wheel(0, 960);
+    const recipientLatest = recipientTimeline.locator("..").locator(".jump-latest");
+    if (await recipientLatest.isVisible()) await recipientLatest.click();
+    await waitFor(() => recipientReply.evaluate(element => {
+      const timeline = element.closest<HTMLElement>(".timeline"), bounds = timeline?.getBoundingClientRect(), reply = element.getBoundingClientRect();
+      return { focused: element.ownerDocument.hasFocus(), visibility: element.ownerDocument.visibilityState,
+        height: timeline?.clientHeight ?? 0, distanceFromEnd: timeline ? timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight : -1,
+        replyVisible: bounds !== undefined && reply.height > 0 && reply.bottom > bounds.top && reply.top < bounds.bottom };
+    }), value => value.focused && value.visibility === "visible" && value.height > 0 && value.distanceFromEnd >= -2
+      && value.distanceFromEnd <= 2 && value.replyVisible, "the focused visible Partner reply at the actual timeline tail");
+    const read = await waitFor(
       () => manager.clients.partner.getPartner({ partnerId: second.partnerId }),
-      (value) => value.partner?.activity?.unreadReplyCount === 0n,
+      (value) => {
+        const activity = value.partner?.activity;
+        return activity !== undefined && activity.unreadReplyCount === 0n && (activity.latestReplyCursor?.value ?? 0n) > 0n
+          && activity.readThroughCursor?.value === activity.latestReplyCursor?.value;
+      },
       "the durable Partner read cursor"
     );
+    expect(read.partner!.activity!.readThroughCursor!.value).toBe(read.partner!.activity!.latestReplyCursor!.value);
+    expect(read.partner!.activity!.readThroughCursor!.value).toBeGreaterThan(0n);
 
     await page.goto(`${fixture.baseUrl}/#/partners/${encodeURIComponent(second.partnerId)}`);
     const secondWorkspace = page.getByRole("dialog", { name: "Beryl workspace" });

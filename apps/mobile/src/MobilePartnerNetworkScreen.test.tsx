@@ -40,6 +40,19 @@ async function mount(f: ReturnType<typeof fixture>, api = f.api) { const contain
 async function pause() { await new Promise(resolve => setTimeout(resolve, 10)); }
 async function click(label: string, parent: ParentNode = document.body) { const target = Array.from(parent.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent === label || button.textContent?.startsWith(label)); expect(target).toBeDefined(); await act(async () => { target!.click(); await pause(); }); }
 async function fill(value: string, label = "Message") { const input = document.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!; await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value); input.dispatchEvent(new Event("input", { bubbles: true })); await pause(); }); }
+it("uses the original native group plan controls for a long talk queue and retains an unknown continue request", async () => {
+  const f = fixture(); f.room.singleSpeaker = true;
+  const plan = create(contract.PartnerNetworkPlanSchema, { id: "talk", roomId: f.room.id, revision: 1n, kind: "talk", status: "waiting", currentStep: 4, requesterId: f.room.selfId,
+    steps: Array.from({ length: 6 }, (_, position) => ({ position, actorId: "partner", status: position < 5 ? "completed" : "pending" })) });
+  f.rows.push(create(contract.PartnerNetworkMessageSchema, { id: "queue-card", sequence: 1n, kind: "plan", planId: plan.id }));
+  const send = vi.fn(async (_request: Partial<contract.PlanPartnerNetworkRequest>) => { throw new ConnectError("Lost continue", Code.Unavailable); });
+  Object.assign(f.api, { getPartnerNetwork: async () => create(contract.GetPartnerNetworkResponseSchema, { snapshot: { room: f.room, messages: f.rows, plans: [plan] } }), planPartnerNetwork: send });
+  const view = await mount(f); await click("Shared room"); expect(view.container.textContent).toContain("6 speakers");
+  await click("6 speakers"); expect(view.container.textContent).toContain("Collapse");
+  await click("Continue"); const original = send.mock.calls[0]![0]; await click("Continue");
+  expect(send.mock.calls[1]![0]).toEqual(original); expect(original).toMatchObject({ action: "continue", planId: plan.id, expectedRevision: 1n });
+  await click("Group settings"); expect(view.container.textContent).not.toContain("Reply mode"); expect(view.container.textContent).not.toContain("Speaking mode");
+});
 it("restores an unknown native send after reconnect and explicitly retries its original complete request", async () => {
   const f = fixture(); f.send.mockRejectedValueOnce(new ConnectError("reply lost", Code.Unavailable)); const first = await mount(f); await click("Shared room"); await fill("Keep the same send"); await click("Send");
   expect(f.send).toHaveBeenCalledTimes(1); const original = f.send.mock.calls[0]![0];
@@ -58,7 +71,8 @@ it("opens files using only a current short-lived download URL and never hands a 
   expect(native.openURL).toHaveBeenCalledExactlyOnceWith("https://authority.test/v1/blobs/download/ticket/short-secret");
 });
 it("shows read-only plans, welcome events and localized task cards without exposing plan controls", async () => {
-  const f = fixture(), plan = create(contract.PartnerNetworkPlanSchema, { id: "plan", status: "proposed", steps: [{ position: 0, actorId: "partner", task: "Write the result", status: "pending" }] });
+  const f = fixture(), plan = create(contract.PartnerNetworkPlanSchema, { id: "plan", roomId: "room", requesterId: "owner", status: "proposed", steps: [{ position: 0, actorId: "partner", task: "Write the result", status: "pending" }] });
+  f.room.selfId = "reader"; f.room.members.push(create(contract.PartnerNetworkActorSchema, { id: "reader", kind: "human", role: "member", state: "joined", name: "Reader" }));
   f.rows.push(create(contract.PartnerNetworkMessageSchema, { id: "plan-card", kind: "plan", planId: plan.id, sequence: 1n }), create(contract.PartnerNetworkMessageSchema, { id: "join", kind: "member-joined", eventActorId: "owner", authorName: "Owner", sequence: 2n }));
   await mount(f, { ...f.api, getPartnerNetwork: async () => create(contract.GetPartnerNetworkResponseSchema, { snapshot: { room: f.room, messages: f.rows, plans: [plan] } }) }); await click("Shared room");
   expect(document.body.textContent).toContain("Write the result"); expect(document.body.textContent).toContain("joined the group");

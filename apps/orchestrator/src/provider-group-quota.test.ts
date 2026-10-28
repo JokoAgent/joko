@@ -39,3 +39,15 @@ it("never borrows an unrelated native bucket's remaining quota or exhausted stat
   expect(quota(input)).toMatchObject({ limited: false, urgency: 0.75 });
   expect(quota({ ...input, buckets: input.buckets.slice(0, 1) })).toEqual({ limited: false });
 });
+it("matches the longest native model bucket and prefers the stable generic ID over unnamed or stale promotional buckets", () => {
+  const window = { usedPercent: 25, windowMinutes: 10_080, resetAt: now + week };
+  const buckets = [{ id: "__default__", secondaryWindow: { ...window, usedPercent: 80 } },
+    { id: "codex", secondaryWindow: window },
+    { id: "bengalfox", displayName: "GPT-5.3-Codex-Spark", secondaryWindow: { ...window, usedPercent: 50 } },
+    { id: "short-name", displayName: "Codex", secondaryWindow: { ...window, usedPercent: 60 } }];
+  const read = (model: string, input = buckets) => providerGroupQuota({ providerId: "openai", observedAt: now, buckets: input }, "openai", model, now);
+  expect(read("gpt-5.3-codex-spark").usagePercent).toBe(50);
+  expect(read("gpt-6", buckets.filter(bucket => bucket.id !== "short-name")).usagePercent).toBe(25);
+  expect(read("gpt-5.3-codex-spark", buckets.map(bucket => bucket.id === "bengalfox" ? { ...bucket, secondaryWindow: { ...window, resetAt: now - 86_400_001 } } : bucket)).usagePercent).toBe(60);
+  expect(read("gpt-5.3-codex-spark", [{ id: "bengalfox", secondaryWindow: window }])).toEqual({ limited: false });
+});

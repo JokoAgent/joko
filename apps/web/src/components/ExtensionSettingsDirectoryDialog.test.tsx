@@ -44,3 +44,14 @@ it("retires a pending browse when the original native owner aborts and rejects i
   expect(button("extensions.directoryPicker.select").disabled).toBe(true);
   expect(f.finish.mock.calls.every(call => call.length === 0)).toBe(true);
 });
+
+it("cannot confirm an older directory after the user's next directory navigation failed", async () => {
+  const selected = page(true); selected.entries = [{ $typeName: "joko.v1.ExtensionDirectoryPickerEntry", entryId: "next-directory", name: "Next", displayPath: "/node/private/reports/next" }];
+  const browse = vi.fn<ExtensionSettingsDirectoryChoice["browse"]>().mockResolvedValueOnce(selected).mockRejectedValueOnce(new Error("Directory retired"));
+  const f = await mount(browse);
+  await act(async () => button("/node/private/reports").click());
+  expect(button("extensions.directoryPicker.select").disabled).toBe(false);
+  await act(async () => button("Next").click());
+  expect(button("extensions.directoryPicker.select").disabled).toBe(true);
+  expect(document.querySelector('[role="alert"]')).not.toBeNull(); expect(f.finish).not.toHaveBeenCalled();
+});

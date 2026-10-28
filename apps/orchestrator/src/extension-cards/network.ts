@@ -152,7 +152,7 @@ export class ExtensionNetwork {
         for (const [name, value] of Object.entries(uploadDir.fields)) parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value.replace("{bytes}", () => String(declaredBytes))}\r\n`));
         let total = 0;
         for (let index = 0; index < transfer.files.length; index++) {
-          current(); const file = transfer.files[index]!, bytes = await file.read(); current();
+          current(); const file = transfer.files[index]!, bytes = await file.read(signal); current();
           if (bytes.byteLength > EXTENSION_DIRECTORY_FILE_MAXIMUM || (total += bytes.byteLength) > EXTENSION_DIRECTORY_MAXIMUM) throw new Error();
           const name = (uploadDir.field ? file.relPath.split("/").at(-1)! : file.relPath).replace(/"/gu, "%22").replace(/[\r\n]/gu, "");
           parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${uploadDir.field ?? `${uploadDir.prefix}${index}`}"; filename="${name}"\r\nContent-Type: application/octet-stream\r\n\r\n`), bytes, encoder.encode("\r\n"));

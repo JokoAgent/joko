@@ -125,6 +125,7 @@ describe("Feishu Messaging production product chain", () => {
     await waitFor(
       async () => {
         const inbound = fixture?.application.store.listMessagingInboundRequests().map((request) => ({
+          id: request.id,
           status: request.status,
           messageId: request.providerMessageId,
           errorCode: request.errorCode
@@ -145,6 +146,11 @@ describe("Feishu Messaging production product chain", () => {
         }
         return {
           messages: feishu?.outboundMessages ?? [],
+          progress: feishu?.replyProgress ?? [],
+          deliveries: fixture?.application.store.listMessagingDeliveries().map(delivery => ({
+            id: delivery.id, status: delivery.status, kind: delivery.kind, dedupeKey: delivery.dedupeKey,
+            errorCode: delivery.errorCode, attempts: delivery.attempts
+          })) ?? [],
           inbound,
           diagnostics: fixture?.application.store.listDiagnostics({ limit: 20 }).map((diagnostic) => ({
             code: diagnostic.code,
@@ -153,7 +159,10 @@ describe("Feishu Messaging production product chain", () => {
           providerRequests: fixture?.providerRequests.length ?? 0
         };
       },
-      (value) => value.messages.some((message) => message.text === DIRECT_REPLY),
+      (value) => value.messages.some((message) => message.format === "rich" && message.text === DIRECT_REPLY)
+        && value.deliveries.some(delivery => delivery.status === "sent"
+          && delivery.dedupeKey === `request:${value.inbound.find(request => request.messageId === DIRECT_MESSAGE_ID)?.id}:answer-card`)
+        && value.progress.some(progress => progress.phase === "close" && progress.sourceMessageId === DIRECT_MESSAGE_ID),
       "the real Pi reply to leave through Feishu",
       30_000
     );
@@ -190,8 +199,15 @@ describe("Feishu Messaging production product chain", () => {
         providerConversationId: FEISHU_SYSTEM_OWNER_ID,
         providerThreadId: null
       }),
-      text: DIRECT_REPLY
+      text: DIRECT_REPLY, format: "rich", replyToMessageId: DIRECT_MESSAGE_ID
     }));
+    const directAnswer = required(fixture.application.store.findMessagingDeliveryByDedupe({ connectionId: created.connectionId,
+      channelGeneration: claimed.generation, dedupeKey: `request:${directRequest.id}:answer-card` }), "original direct final-card receipt");
+    expect(directAnswer).toMatchObject({ status: "sent", attempts: 1, partIndex: 0, partCount: 1, conversationId: directConversation.id });
+    const progress = required(feishu.replyProgress.find(record => record.phase === "open" && record.sourceMessageId === DIRECT_MESSAGE_ID), "original progress source");
+    expect(progress.address).toEqual(feishu.outboundMessages.find(message => message.text === DIRECT_REPLY)?.address);
+    expect(progress.messageId).not.toBe(directAnswer.providerMessageId);
+    expect(feishu.replyProgress.filter(record => record.phase === "close" && record.messageId === progress.messageId)).toHaveLength(1);
 
     feishu.enqueueGroupText({
       messageId: GROUP_MESSAGE_ID,
@@ -220,7 +236,7 @@ describe("Feishu Messaging production product chain", () => {
         providerConversationId: FEISHU_SYSTEM_GROUP_ID,
         providerThreadId: FEISHU_SYSTEM_TOPIC_ID
       }),
-      text: GROUP_REPLY
+      text: GROUP_REPLY, format: "rich", replyToMessageId: GROUP_MESSAGE_ID
     }));
     const groupProviderRequest = JSON.stringify(fixture.providerRequests[1]?.body ?? {});
     expect(groupProviderRequest).toContain("release status is green");
@@ -263,6 +279,11 @@ describe("Feishu Messaging production product chain", () => {
     expect((await restartedClients.session.getSession({ sessionId: directSessionId })).session?.sessionId)
       .toBe(directSessionId);
     expect(fixture.providerRequests).toHaveLength(1);
+    const restoredAnswer = fixture.application.store.getMessagingDelivery(directAnswer.id);
+    expect(restoredAnswer).toMatchObject({ status: "sent", attempts: 1, providerMessageId: directAnswer.providerMessageId, conversationId: directConversation.id });
+    expect(feishu.outboundMessages.filter(message => message.format === "rich" && message.text === DIRECT_REPLY)).toHaveLength(1);
+    expect(feishu.outboundMessages.filter(message => message.format === "rich" && message.text === GROUP_REPLY)).toHaveLength(1);
+    expect(feishu.outboundMessages.filter(message => message.format === "rich" && message.text === RESTART_REPLY)).toHaveLength(1);
 
     const requests = fixture.application.store.listMessagingInboundRequests();
     expect(requests).toHaveLength(3);

@@ -16,10 +16,13 @@ const graph = JSON.parse(raw);
 const matches = graph.modules?.filter(module => module.packageName === "joko-plugin-oauth") ?? [];
 if (matches.length !== 1) throw new Error("The phone callback receiver is missing or duplicated in the actual Expo module graph.");
 const module = matches[0], expected = join(mobileRoot, "modules/joko-plugin-oauth");
+console.log(JSON.stringify({ platform, packageName: module.packageName,
+  ...(platform === "android" ? { projects: module.projects?.map(({ name, sourceDir, modules }) => ({ name, sourceDir, modules })) }
+    : { pods: module.pods, swiftModuleNames: module.swiftModuleNames, modules: module.modules }) }));
 if (platform === "android") {
   const projects = module.projects?.filter(project => project.name === "joko-plugin-oauth") ?? [];
   if (projects.length !== 1 || realpathSync(projects[0].sourceDir) !== realpathSync(join(expected, "android"))
-    || !projects[0].modules?.includes("app.joko.pluginoauth.JokoPluginOauthModule")) {
+    || !projects[0].modules?.some(value => value.classifier === "app.joko.pluginoauth.JokoPluginOauthModule")) {
     throw new Error("The Android callback receiver is not registered through its original Gradle project and native class.");
   }
 } else {

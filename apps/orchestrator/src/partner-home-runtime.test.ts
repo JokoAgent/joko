@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
-import { PartnerHomeService, PartnerHomeBusyAction, PartnerHomeMovePhase, PermissionMode } from "@joko/contracts";
+import { PartnerHomeService, PartnerHomeBusyAction, PartnerHomeMovePhase, PermissionMode, encodeModelSpeed } from "@joko/contracts";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { OperationalStore, PartnerStore, PartnerWorkbenchStore, type PartnerCapabilitiesRecord } from "@joko/store";
 import { ArtifactStore } from "./artifact-store.js";
@@ -104,7 +104,7 @@ describe("Partner home native integration", () => {
     const inspected = await f.homeRpc.inspectPartnerHomeTarget({ partnerId: f.profile.id, destination });
     expect(inspected.models).toEqual(expect.arrayContaining([expect.objectContaining({ route: expect.objectContaining({ backendId: original.backendId, providerId: "test", modelId: "text" }) })]));
     const moved = (await f.homeRpc.movePartnerHome({ requestId: "move-complete-function", expectedHome: catalog.home!.identity!, expectedPartnerRevision: { value: f.profile.revision },
-      destination, capabilities: { modelChain: f.capabilities.modelChain.map(route => ({ ...route })), permissionMode: PermissionMode.ASK, planMode: false },
+      destination, capabilities: { modelChain: f.capabilities.modelChain.map(route => ({ ...route, ...encodeModelSpeed(route.fastMode) })), permissionMode: PermissionMode.ASK, planMode: false },
       busyAction: PartnerHomeBusyAction.WAIT, continueWhenSourceOffline: false })).move!;
     expect(moved.phase).toBe(PartnerHomeMovePhase.WAITING);
     await vi.waitFor(() => expect(["ready", "needs-attention"]).toContain(f.owner.get(moved.requestId)?.phase));

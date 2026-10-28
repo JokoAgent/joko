@@ -15,6 +15,45 @@ export const EXTENSION_FILE_MAXIMUM = 256 * 1024 * 1024;
 export const EXTENSION_DIRECTORY_FILE_MAXIMUM = 50 * 1024 * 1024;
 export const EXTENSION_DIRECTORY_MAXIMUM = 500 * 1024 * 1024;
 const TTL = 10 * 60_000, MAX_FILES = 500, MAX_SAVE_USES = 16, MAX_SAVE_BYTES = 512 * 1024 * 1024;
+const PICKED_IO_TIMEOUT = 10_000, PICKED_CLOSE_TIMEOUT = 1_000, PICKED_READ_CHUNK = 256 * 1024;
+const pickedClosures = new WeakMap<object, Promise<void>>();
+
+/** Closing an original handle may itself wait for an OS read. Keep ownership of
+ * that exact close, without making cancellation wait for the filesystem. */
+async function closePickedHandle(handle: { close(): Promise<void> }): Promise<void> {
+  let closing = pickedClosures.get(handle);
+  if (!closing) {
+    closing = Promise.resolve().then(() => handle.close()).catch(error => { pickedClosures.delete(handle); throw error; });
+    pickedClosures.set(handle, closing);
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([closing.catch(() => undefined), new Promise<void>(resolve => {
+      timer = setTimeout(resolve, PICKED_CLOSE_TIMEOUT); timer.unref();
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
+/** A timeout abandons only this call. Any late resource still closes through
+ * its original owner, and late data cannot continue a retired collection. */
+async function pickedIo<T>(work: () => Promise<T>, signal?: AbortSignal,
+  closeLate?: (value: T | undefined) => Promise<void>, assertCurrent?: () => void): Promise<T> {
+  const current = () => { signal?.throwIfAborted(); assertCurrent?.(); };
+  current();
+  let timer: ReturnType<typeof setTimeout> | undefined, cancel: (() => void) | undefined;
+  const pending = Promise.resolve().then(() => { current(); return work(); });
+  const stopped = new Promise<never>((_resolve, reject) => {
+    cancel = () => reject(new Error("The picked directory I/O was cancelled."));
+    signal?.addEventListener("abort", cancel, { once: true });
+    timer = setTimeout(() => reject(new Error("The picked directory I/O timed out.")), PICKED_IO_TIMEOUT); timer.unref();
+    if (signal?.aborted) cancel();
+  });
+  try { const value = await Promise.race([pending, stopped]); current(); return value; }
+  catch (error) {
+    if (closeLate) void pending.then(value => closeLate(value), () => closeLate(undefined)).catch(() => undefined);
+    throw error;
+  } finally { if (timer) clearTimeout(timer); if (cancel) signal?.removeEventListener("abort", cancel); }
+}
 const EXCLUDED_DIRECTORIES = new Set(["node_modules", ".git", ".svn", ".hg", ".idea", ".vscode", ".DS_Store", "__pycache__", ".next", ".turbo", ".cache"]);
 const EXCLUDED_FILES = new Set([".DS_Store", "Thumbs.db", ".gitignore", ".gitattributes", ".npmrc"]);
 const excludedFile = (name: string) => EXCLUDED_FILES.has(name) || name === ".env" || name.startsWith(".env.");
@@ -24,11 +63,11 @@ export interface ExtensionFileWorkspace { readonly root: string; readonly assert
   readonly extraRoots?: readonly { readonly path: string; readonly access: "read_only" | "read_write" }[] }
 interface PickedDirectoryScope { readonly kind: "user_pick"; readonly extensionId: string; readonly authorityKey: string; readonly selectionId: string }
 type FileScope = ExtensionCardScope | PickedDirectoryScope;
-interface File { readonly absolute: string; readonly relative: string; readonly size: number; readonly read?: () => Promise<Uint8Array> }
+interface File { readonly absolute: string; readonly relative: string; readonly size: number; readonly read?: (signal?: AbortSignal) => Promise<Uint8Array> }
 interface Deposit { readonly owner: string; readonly expiresAt: number; readonly current: () => void; readonly root: string; readonly workspace: ExtensionFileWorkspace }
-interface DirectoryDeposit extends Deposit { readonly files: readonly File[] }
+interface DirectoryDeposit extends Deposit { readonly files: readonly File[]; readonly picked?: true }
 interface SaveDeposit extends Deposit { uses: number; bytes: number }
-export interface ExtensionDirectoryTransfer { readonly files: readonly { readonly relPath: string; readonly size: number; read(): Promise<Uint8Array> }[] }
+export interface ExtensionDirectoryTransfer { readonly files: readonly { readonly relPath: string; readonly size: number; read(signal?: AbortSignal): Promise<Uint8Array> }[] }
 const owner = (scope: FileScope) => "kind" in scope
   ? JSON.stringify([scope.extensionId, scope.authorityKey, "user_pick", scope.selectionId])
   : JSON.stringify([scope.extensionId, scope.authorityKey, scope.sessionId, scope.sessionCreatedAt, scope.targetId]);
@@ -92,16 +131,20 @@ export class ExtensionFileDeposits {
   retire(authorityKey: string): void {
     for (const records of [this.#directories, this.#saves]) for (const [token, value] of records) if ((JSON.parse(value.owner) as string[])[1] === authorityKey) records.delete(token);
   }
-  async prepare(scope: FileScope, arguments_: Readonly<Record<string, unknown>>, workspace: ExtensionFileWorkspace, assertCurrent: () => void): Promise<Readonly<Record<string, unknown>>> {
+  async prepare(scope: FileScope, arguments_: Readonly<Record<string, unknown>>, workspace: ExtensionFileWorkspace, assertCurrent: () => void,
+    preparationSignal?: AbortSignal): Promise<Readonly<Record<string, unknown>>> {
     if (arguments_.dir_deposit !== undefined || arguments_.save_deposit !== undefined) throw new Error("File receipts are issued by the host.");
     const { dir, save_dir, ...rest } = arguments_;
     if ("kind" in scope && save_dir !== undefined) throw new Error("A picked directory grants only a bounded read deposit.");
     const args: Record<string, unknown> = { ...rest };
+    const picked = "kind" in scope && !workspace.remote;
     const current = () => { workspace.assertCurrent(); assertCurrent(); };
-    current(); await workspace.assertBytesCurrent?.(); current(); this.#sweep();
+    const io = <T>(work: () => Promise<T>, closeLate?: (value: T | undefined) => Promise<void>) =>
+      picked ? pickedIo(work, preparationSignal, closeLate, current) : work();
+    current(); await io(() => workspace.assertBytesCurrent?.() ?? Promise.resolve()); current(); this.#sweep();
     if (this.#directories.size + this.#saves.size >= 256) throw new Error("Extension file capacity reached. Retry after current transfers finish.");
     const remote = workspace.remote, api = remote?.pathStyle === "posix" ? path.posix : remote?.pathStyle === "win32" ? path.win32 : path;
-    const canonical = (value: string) => remote ? remote.files.realpath(value, workspace.signal) : realpath(value);
+    const canonical = (value: string) => io(() => remote ? remote.files.realpath(value, workspace.signal) : realpath(value));
     const isWithin = (parent: string, child: string) => {
       const fold = (value: string) => api === path.win32 || !remote && process.platform === "win32" ? value.toLowerCase() : value;
       const relative = api.relative(fold(parent), fold(child));
@@ -138,22 +181,22 @@ export class ExtensionFileDeposits {
           } : undefined;
           files.push({ absolute, relative, size, ...(read ? { read } : {}) });
         };
-        const info = remote ? await remote.files.stat(directory, workspace.signal) : await lstat(directory); current();
+        const info = remote ? await remote.files.stat(directory, workspace.signal) : await io(() => lstat(directory)); current();
         let visited = 0;
         const walk = async (absolute: string, depth = 0): Promise<void> => {
           current();
           if ("kind" in scope && (++visited > 100_000 || depth > 128)) throw new Error("The selected directory exceeds its scan budget.");
           if (await canonical(directory) !== directory || !isWithin(directory, await canonical(absolute))) throw new Error("The transfer directory changed.");
           const boundedEntries = async () => {
-            const handle = await opendir(absolute), entries = [];
+            const handle = await io(() => opendir(absolute), late => late ? closePickedHandle(late) : Promise.resolve()), entries = [];
             try {
               while (true) {
-                current(); const entry = await handle.read(); current(); if (!entry) break;
+                current(); const entry = await io(() => handle.read(), () => closePickedHandle(handle)); current(); if (!entry) break;
                 if (entries.length + visited >= 100_000) throw new Error("The selected directory exceeds its scan budget.");
                 entries.push(entry);
               }
               return entries;
-            } finally { await handle.close().catch(() => undefined); }
+            } finally { await closePickedHandle(handle); }
           };
           const entries = remote ? await remote.files.list(absolute, workspace.signal)
             : "kind" in scope ? await boundedEntries() : await readdir(absolute, { withFileTypes: true }); current();
@@ -164,7 +207,7 @@ export class ExtensionFileDeposits {
             const directoryEntry = "kind" in entry ? entry.kind === "directory" : entry.isDirectory(), fileEntry = "kind" in entry ? entry.kind === "file" : entry.isFile();
             if (directoryEntry && !EXCLUDED_DIRECTORIES.has(entry.name)) await walk(file, depth + 1);
             else if (fileEntry && !excludedFile(entry.name)) {
-              const info = remote ? await remote.files.stat(file, workspace.signal) : await lstat(file); current();
+              const info = remote ? await remote.files.stat(file, workspace.signal) : await io(() => lstat(file)); current();
               if ("kind" in info ? info.kind === "file" : info.isFile()) add(file, api.relative(directory, file).split(api.sep).join("/"), info.size);
             }
           }
@@ -173,8 +216,13 @@ export class ExtensionFileDeposits {
         else if ("kind" in info ? info.kind === "directory" : info.isDirectory()) await walk(directory);
         else throw new Error("The transfer path must be a file or directory.");
         if (!files.length) throw new Error("No transferable files were found.");
-        await workspace.assertBytesCurrent?.(); current(); const token = randomUUID(); issued.push(token);
-        this.#directories.set(token, { owner: owner(scope), expiresAt: this.now() + TTL, current, root: directory, workspace, files });
+        if ("kind" in scope && (files.some(file => Buffer.byteLength(file.relative) > 4096)
+          || Buffer.byteLength(JSON.stringify(files.map(file => file.relative))) > 4 * 1024 * 1024 - 16_384)) {
+          throw new Error("The selected directory exceeds its receipt metadata budget. Select a smaller directory.");
+        }
+        await io(() => workspace.assertBytesCurrent?.() ?? Promise.resolve()); current(); const token = randomUUID(); issued.push(token);
+        if (picked) preparationSignal?.throwIfAborted();
+        this.#directories.set(token, { owner: owner(scope), expiresAt: this.now() + TTL, current, root: directory, workspace, files, ...(picked ? { picked: true } : {}) });
         args.dir_deposit = { token, file_count: files.length, total_bytes: total, rel_paths: files.map(file => file.relative) };
       }
       if (save_dir !== undefined) {
@@ -191,36 +239,44 @@ export class ExtensionFileDeposits {
     this.#sweep(); const entry = this.#directories.get(token);
     if (!entry || !matchesDirectoryOwner(entry.owner, scope)) return;
     entry.current(); this.#directories.delete(token);
-    return { files: entry.files.map(file => ({ relPath: file.relative, size: file.size, read: async () => {
-      entry.current();
-      await entry.workspace.assertBytesCurrent?.(); entry.current();
-      if (file.read) return file.read();
-      if (!samePath(await realpath(entry.root), entry.root) || !within(entry.root, await realpath(file.absolute))) throw new Error("The transferred file changed.");
-      const handle = await open(file.absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    return { files: entry.files.map(file => ({ relPath: file.relative, size: file.size, read: async (signal?: AbortSignal) => {
+      const current = () => { entry.current(); if (entry.picked) signal?.throwIfAborted(); };
+      const io = <T>(work: () => Promise<T>, closeLate?: (value: T | undefined) => Promise<void>) =>
+        entry.picked ? pickedIo(work, signal, closeLate, current) : work();
+      current();
+      await io(() => entry.workspace.assertBytesCurrent?.() ?? Promise.resolve()); current();
+      if (file.read) return file.read(signal);
+      if (!samePath(await io(() => realpath(entry.root)), entry.root) || !within(entry.root, await io(() => realpath(file.absolute)))) throw new Error("The transferred file changed.");
+      const handle = await io(() => open(file.absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)), late => late ? closePickedHandle(late) : Promise.resolve());
       try {
-        const before = await handle.stat(), actual = await stat(file.absolute); entry.current();
+        const before = await io(() => handle.stat(), () => closePickedHandle(handle)), actual = await io(() => stat(file.absolute)); current();
         if (!before.isFile() || before.size > EXTENSION_DIRECTORY_FILE_MAXIMUM || actual.dev !== before.dev || actual.ino !== before.ino
-          || !samePath(await realpath(entry.root), entry.root) || !within(entry.root, await realpath(file.absolute))) throw new Error("The transferred file changed.");
+          || !samePath(await io(() => realpath(entry.root)), entry.root) || !within(entry.root, await io(() => realpath(file.absolute)))) throw new Error("The transferred file changed.");
         const bytes = Buffer.alloc(before.size); let offset = 0;
-        while (offset < bytes.byteLength) { entry.current(); const read = await handle.read(bytes, offset, bytes.byteLength - offset, offset); if (!read.bytesRead) break; offset += read.bytesRead; }
-        const after = await handle.stat(), current = await stat(file.absolute); entry.current();
-        if (offset !== before.size || before.size !== after.size || before.mtimeMs !== after.mtimeMs || current.dev !== before.dev || current.ino !== before.ino
-          || !samePath(await realpath(entry.root), entry.root) || !within(entry.root, await realpath(file.absolute))) throw new Error("The transferred file changed.");
-        await entry.workspace.assertBytesCurrent?.(); entry.current();
+        while (offset < bytes.byteLength) {
+          current(); const length = entry.picked ? Math.min(PICKED_READ_CHUNK, bytes.byteLength - offset) : bytes.byteLength - offset;
+          const read = await io(() => handle.read(bytes, offset, length, offset), () => closePickedHandle(handle));
+          if (!read.bytesRead) break; offset += read.bytesRead;
+        }
+        const after = await io(() => handle.stat(), () => closePickedHandle(handle)), actualAfter = await io(() => stat(file.absolute)); current();
+        if (offset !== before.size || before.size !== after.size || before.mtimeMs !== after.mtimeMs || actualAfter.dev !== before.dev || actualAfter.ino !== before.ino
+          || !samePath(await io(() => realpath(entry.root)), entry.root) || !within(entry.root, await io(() => realpath(file.absolute)))) throw new Error("The transferred file changed.");
+        await io(() => entry.workspace.assertBytesCurrent?.() ?? Promise.resolve()); current();
         return bytes;
-      } finally { await handle.close(); }
+      } finally { if (entry.picked) await closePickedHandle(handle); else await handle.close(); }
     } })) };
   }
 
   async preparePickedDirectory(input: { readonly extensionId: string; readonly authorityKey: string; readonly selectionId: string;
-    readonly directory: string; readonly assertCurrent: () => void; readonly assertDirectoryCurrent: () => Promise<void>; readonly assertSelectionCurrent?: () => void }) {
-    let selecting = true;
-    const current = () => { input.assertCurrent(); if (selecting) input.assertSelectionCurrent?.(); };
+    readonly directory: string; readonly assertCurrent: () => void; readonly assertDirectoryCurrent: () => Promise<void>; readonly assertSelectionCurrent?: () => void; readonly signal?: AbortSignal }) {
+    const { extensionId, authorityKey, selectionId, directory, assertCurrent, assertDirectoryCurrent } = input;
+    let selectionCurrent = input.assertSelectionCurrent;
+    const current = () => { assertCurrent(); selectionCurrent?.(); };
     let result: Readonly<Record<string, unknown>>;
     try {
-      result = await this.prepare({ kind: "user_pick", extensionId: input.extensionId, authorityKey: input.authorityKey, selectionId: input.selectionId },
-        { dir: input.directory }, { root: input.directory, assertCurrent: current, assertBytesCurrent: input.assertDirectoryCurrent }, current);
-    } finally { selecting = false; }
+      result = await this.prepare({ kind: "user_pick", extensionId, authorityKey, selectionId },
+        { dir: directory }, { root: directory, assertCurrent: current, assertBytesCurrent: assertDirectoryCurrent }, current, input.signal);
+    } finally { selectionCurrent = undefined; }
     const receipt = result.dir_deposit as { token: string; file_count: number; total_bytes: number; rel_paths: string[] };
     return { token: receipt.token, fileCount: receipt.file_count, totalBytes: receipt.total_bytes, relativePaths: receipt.rel_paths, expiresAt: this.now() + TTL };
   }

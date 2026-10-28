@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { PartnerDirectorySchema, PartnerModelRouteSchema, UpdatePartnerResponseSchema } from "@joko/contracts";
+import { PartnerDirectorySchema, PartnerModelRouteSchema, UpdatePartnerResponseSchema, encodeModelSpeed } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { mobilePartnerProfileDraft, projectMobilePartnerProfileOptions, projectMobilePartnerProfileUpdate,
   validateMobilePartnerProfileDraft, mobilePartnerDraftCatalogIdentity } from "./mobile-partner-profile";
@@ -97,7 +97,8 @@ describe("mobile Partner profile validation", () => {
     expect(projectMobilePartnerProfileUpdate(partner.partnerId, 1n, response).capabilities.modelChain).toEqual(partner.capabilities.modelChain);
     expect(() => validateMobilePartnerProfileDraft(snapshot, { ...mobilePartnerProfileDraft(partner),
       capabilities: { ...partner.capabilities, modelChain } })).toThrow(/1–5/u);
-    response.partner!.capabilities!.modelChain.push(create(PartnerModelRouteSchema, modelChain[5]!));
+    const overflow = modelChain[5]!;
+    response.partner!.capabilities!.modelChain.push(create(PartnerModelRouteSchema, { ...overflow, ...encodeModelSpeed(overflow.fastMode) }));
     expect(() => projectMobilePartnerProfileUpdate(partner.partnerId, 1n, response)).toThrow(/model chain/u);
   });
 

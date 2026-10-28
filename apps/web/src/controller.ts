@@ -12,6 +12,7 @@ import type { NativeTaskStatusCompletionSource } from "./native-task-status-comp
 import { nativeTaskStatusAvatar } from "./native-task-status-avatar.js";
 import { readDesktopMenuBarUsage, type DesktopMenuBarSource, type DesktopMenuBarUsage } from "./desktop-menu-bar.js";
 import { bindPortableSessionImportApi } from "./portable-session-import-connection.js";
+import { bindExtensionSettingsOperationJournal, extensionSettingsProfileKey } from "./extension-settings-operation.js";
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import type { SessionAccess, TaskSource } from "./task-sharing.js";
 import type { TaskSharingApi } from "@joko/contracts";
@@ -3848,7 +3849,15 @@ export function useAppController(): AppController {
     terminateRuntimeProcess: (process) => gateway().terminateRuntimeProcess(process),
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
     listExtensions: async (options) => catalogGateway().listExtensions(options),
-    extensionSettingsApi: () => catalogGateway().extensionSettingsApi?.(),
+    extensionSettingsApi: () => {
+      const original = catalogGateway(), profile = activeProfileRef.current, api = original.extensionSettingsApi?.();
+      if (!api || !profile) return;
+      const pin = extensionSettingsProfileKey(profile);
+      return bindExtensionSettingsOperationJournal(api, requireLocal(localRef.current), profile, () => {
+        const liveProfile = activeProfileRef.current;
+        if (catalogGateway() !== original || !liveProfile || extensionSettingsProfileKey(liveProfile) !== pin) throw new Error("The plugin settings node connection changed.");
+      });
+    },
     getExtension: async (extensionId, sessionId, signal, includeProjectDisabled) => catalogGateway().getExtension(extensionId, sessionId, signal, includeProjectDisabled),
     openExtensionMainView: async (extensionId, expectedRevision, signal) =>
       catalogGateway().openExtensionMainView(extensionId, expectedRevision, signal),
@@ -3997,8 +4006,16 @@ export function useAppController(): AppController {
     getPartnerDirectory: (signal) => gateway().getPartnerDirectory(signal),
     listPartners: (lifecycle, signal) => gateway().listPartners(lifecycle, signal),
     partnerRoutineApi: (partnerId, ownerKey) => gateway().partnerRoutineApi(partnerId, ownerKey),
-    partnerAutonomyApi: ownerKey => gateway().partnerAutonomyApi(ownerKey),
-    partnerMessagingApi: ownerKey => gateway().partnerMessagingApi(ownerKey),
+    partnerAutonomyApi: ownerKey => {
+      const api = gateway().partnerAutonomyApi?.(ownerKey);
+      if (api === undefined) throw new Error("Task observations are unavailable for this connection.");
+      return api;
+    },
+    partnerMessagingApi: ownerKey => {
+      const api = gateway().partnerMessagingApi?.(ownerKey);
+      if (api === undefined) throw new Error("Partner messaging is unavailable for this connection.");
+      return api;
+    },
     partnerGroupApi: ownerKey => gateway().partnerGroupApi(ownerKey),
     mcpAppApi: () => gateway().mcpAppApi(),
     extensionCardApi: () => gateway().extensionCardApi(),
@@ -4036,8 +4053,16 @@ export function useAppController(): AppController {
     updatePartnerDefaults: (expectedDirectoryRevision, capabilities, signal) =>
       gateway().updatePartnerDefaults(expectedDirectoryRevision, capabilities, signal),
     listPartnerSessions: (partnerId, signal) => gateway().listPartnerSessions(partnerId, signal),
-    getPartnerTopic: (sessionId, signal) => gateway().getPartnerTopic(sessionId, signal),
-    ensurePartnerTopic: (operationId, partnerId, revision, root, signal) => gateway().ensurePartnerTopic(operationId, partnerId, revision, root, signal),
+    getPartnerTopic: (sessionId, signal) => {
+      const original = gateway();
+      if (!original.getPartnerTopic) return Promise.reject(new Error("Partner topics are unavailable on this connection."));
+      return original.getPartnerTopic(sessionId, signal);
+    },
+    ensurePartnerTopic: (operationId, partnerId, revision, root, signal) => {
+      const original = gateway();
+      if (!original.ensurePartnerTopic) return Promise.reject(new Error("Partner topics are unavailable on this connection."));
+      return original.ensurePartnerTopic(operationId, partnerId, revision, root, signal);
+    },
     listPartnerSessionTasks: (partnerId, signal) => gateway().listPartnerSessionTasks(partnerId, signal),
     controlPartnerSessionTask: (partnerId, revision, task, action, signal) => gateway().controlPartnerSessionTask(partnerId, revision, task, action, signal),
     markPartnerRead: (partnerId, throughCursor, signal) => gateway().markPartnerRead(partnerId, throughCursor, signal),

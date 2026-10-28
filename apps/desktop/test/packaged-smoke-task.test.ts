@@ -1,4 +1,5 @@
 import type { Transport } from "@connectrpc/connect";
+import { initialConnectionEntries } from "@joko/connection-transport/entries";
 import {
   AuthenticationState,
   AttemptState,
@@ -21,6 +22,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { DesktopManagedOrchestratorConnection } from "../src/channels.js";
 import {
   createPackagedSmokeTask,
+  findPackagedSmokeTaskVisibilityKey,
   PACKAGED_SMOKE_TIMELINE_PROMPT,
   runPackagedSmokeTimelineTurn,
   verifyPackagedSmokeTask,
@@ -47,6 +49,66 @@ const TASK: PackagedSmokeTask = {
 };
 
 describe("packaged Desktop durable Task acceptance fixture", () => {
+  it("retains the current seven-part visible route through the original Task-window occurrence", () => {
+    const profileKey = JSON.stringify([CONNECTION.profileId, CONNECTION.serverId, CONNECTION.deviceId,
+      CONNECTION.origin, "", "https", ""]);
+    const fields = [CONNECTION.profileId, CONNECTION.serverId, TASK.sourceGeneration.toString(),
+      TASK.generation.toString(), TASK.sessionId, profileKey, 2];
+    const key = JSON.stringify(fields);
+    expect(findPackagedSmokeTaskVisibilityKey(CONNECTION, TASK, ["unrelated", key])).toBe(key);
+    const captured = findPackagedSmokeTaskVisibilityKey(CONNECTION, TASK, [key]);
+    const nextOccurrence = JSON.stringify([...fields.slice(0, 6), 3]);
+    expect(findPackagedSmokeTaskVisibilityKey(CONNECTION, TASK, [nextOccurrence])).not.toBe(captured);
+    expect(findPackagedSmokeTaskVisibilityKey(CONNECTION, TASK, [key, nextOccurrence])).toBeUndefined();
+  });
+
+  it("retains the managed direct entry restored from the real initial directory without accepting another route", () => {
+    const connection = { ...CONNECTION, endpointPublicKey: `ed25519:${"ab".repeat(32)}` };
+    const directory = initialConnectionEntries(connection, connection);
+    const entry = directory.entries.find(value => value.id === directory.preferredId)!;
+    const profile = [connection.profileId, connection.serverId, connection.deviceId,
+      entry.origin, connection.endpointPublicKey, entry.kind, entry.id];
+    const fields = [connection.profileId, connection.serverId, TASK.sourceGeneration.toString(),
+      TASK.generation.toString(), TASK.sessionId, JSON.stringify(profile), 2];
+    const key = JSON.stringify(fields);
+    expect(findPackagedSmokeTaskVisibilityKey(connection, TASK, [key])).toBe(key);
+    const initialKey = JSON.stringify([...fields.slice(0, 5), JSON.stringify([...profile.slice(0, 6), ""]), 2]);
+    expect(findPackagedSmokeTaskVisibilityKey(connection, TASK, [initialKey])).toBe(initialKey);
+    const nextOccurrence = JSON.stringify([...fields.slice(0, 6), 3]);
+    expect(findPackagedSmokeTaskVisibilityKey(connection, TASK, [nextOccurrence])).not.toBe(key);
+    for (const keys of [[key, key], [initialKey, key], [key, nextOccurrence]]) {
+      expect(findPackagedSmokeTaskVisibilityKey(connection, TASK, keys)).toBeUndefined();
+    }
+    const invalid = [
+      ...profile.map((_part, index) => [...fields.slice(0, 5),
+        JSON.stringify(profile.map((part, offset) => offset === index ? "different" : part)), 2]),
+      ...["direct", "saved:other", "other-prepared-entry"].map(entryId => [...fields.slice(0, 5),
+        JSON.stringify([...profile.slice(0, 6), entryId]), 2]),
+      ...fields.slice(0, 5).map((_part, index) => fields.map((part, offset) => offset === index ? "different" : part)),
+      ...[null, 0, -1, 1.5, "2"].map(generation => [...fields.slice(0, 6), generation])
+    ];
+    for (const value of invalid) {
+      expect(findPackagedSmokeTaskVisibilityKey(connection, TASK, [JSON.stringify(value)])).toBeUndefined();
+    }
+  });
+
+  it("rejects obsolete visibility keys and mismatched source pins or task generations", () => {
+    const connection = { ...CONNECTION, endpointPublicKey: `ed25519:${"ab".repeat(32)}` };
+    const profile = [connection.profileId, connection.serverId, connection.deviceId,
+      connection.origin, connection.endpointPublicKey, "https", ""];
+    const fields = [connection.profileId, connection.serverId, TASK.sourceGeneration.toString(),
+      TASK.generation.toString(), TASK.sessionId, JSON.stringify(profile), 2];
+    const invalid = [fields.slice(0, 5), [...fields.slice(0, 5), "", 2],
+      ...[null, 0, -1, 1.5, "2"].map(generation => [...fields.slice(0, 6), generation]),
+      ...fields.slice(0, 5).map((_part, index) => fields.map((part, offset) => offset === index ? "different" : part)),
+      ...profile.map((_part, index) => [...fields.slice(0, 5),
+        JSON.stringify(profile.map((part, offset) => offset === index ? "different" : part)), 2])];
+    expect(findPackagedSmokeTaskVisibilityKey(connection, TASK, [JSON.stringify(fields)])).toBe(JSON.stringify(fields));
+    for (const value of invalid) {
+      expect(findPackagedSmokeTaskVisibilityKey(connection, TASK, [JSON.stringify(value)])).toBeUndefined();
+    }
+  });
+
   it("proves anonymous identity before auth, selects by capabilities, and uses the prepared Target revision", async () => {
     const calls: Array<{ readonly method: string; readonly input: any }> = [];
     let snapshots = 0;

@@ -11,6 +11,7 @@ import {
   OperationState,
   PermissionMode,
   QueueItemState,
+  SetWorkspaceTrustMutationSchema,
   UpdateCollaborationSettingsMutationSchema,
   type CollaborationGoalTree,
   type CollaborationQueueEntry,
@@ -93,6 +94,40 @@ describe("Collaboration Goal production chain", () => {
     const goalId = required(createdGoal.tree?.goal?.goalId, "Goal ID");
 
     let tree = required(createdGoal.tree, "created Goal tree");
+    const project = required((await paired.clients.workspace.getWorkspace({
+      workspaceId: "workspace-real-pi"
+    })).workspace, "worker project");
+    expect(project).toMatchObject({
+      workspaceId: "workspace-real-pi",
+      targetId: "workspace-real-pi",
+      serverPathDisplay: fixture.workspaceDirectory,
+      trusted: false
+    });
+    const sessionCountBeforeTrust = fixture.application.store.listSessions({ includeArchived: true }).length;
+    await expect(createWorker(paired, tree, "untrusted-worker", "Blocked", "This unapproved project must not execute."))
+      .rejects.toMatchObject({ code: Code.Unauthenticated, rawMessage: "The worker project must be trusted." });
+    const rejectedTree = required((await paired.clients.collaboration.getCollaborationGoal({
+      goalId,
+      viewerSessionId: leadSessionId
+    })).tree, "untrusted project Goal tree");
+    expect(rejectedTree.goal?.revision).toEqual(tree.goal!.revision);
+    expect(rejectedTree.workers).toEqual([]);
+    expect(rejectedTree.queue).toEqual([]);
+    expect(fixture.application.store.listSessions({ includeArchived: true })).toHaveLength(sessionCountBeforeTrust);
+
+    const trust = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: {
+        case: "setWorkspaceTrust",
+        value: create(SetWorkspaceTrustMutationSchema, { workspaceId: project.workspaceId, trusted: true })
+      }
+    }), "collaboration-e2e-trust-project");
+    expect(trust.state).toBe(OperationState.SUCCEEDED);
+    expect((await paired.clients.workspace.getWorkspace({ workspaceId: project.workspaceId })).workspace).toMatchObject({
+      workspaceId: project.workspaceId,
+      targetId: project.targetId,
+      serverPathDisplay: project.serverPathDisplay,
+      trusted: true
+    });
     const first = await createWorker(paired, tree, "worker-one", "Builder", "Build and report the first durable result.");
     tree = required(first.tree, "first worker tree");
     expect(first.worker).toMatchObject({
@@ -104,7 +139,8 @@ describe("Collaboration Goal production chain", () => {
         modelId: REAL_PI_MODEL_ID,
         effort: "off",
         permissionMode: PermissionMode.AUTO
-      }
+      },
+      workspace: { workingDirectory: project.serverPathDisplay }
     });
     const second = await createWorker(paired, tree, "worker-two", "Verifier", "");
     tree = required(second.tree, "second worker tree");
@@ -237,6 +273,12 @@ describe("Collaboration Goal production chain", () => {
       })
     });
     const restarted = fixture.clients(authKey);
+    expect((await restarted.workspace.getWorkspace({ workspaceId: project.workspaceId })).workspace).toMatchObject({
+      workspaceId: project.workspaceId,
+      targetId: project.targetId,
+      serverPathDisplay: project.serverPathDisplay,
+      trusted: true
+    });
     tree = required((await restarted.collaboration.getCollaborationGoal({
       goalId,
       viewerSessionId: leadSessionId

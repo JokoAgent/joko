@@ -97,7 +97,8 @@ export function MessagingSettings({ controller, snapshot, t }: {
   readonly snapshot: AppSnapshot;
   readonly t: Translator;
 }): JSX.Element {
-  const ownerKey = controller.state.activeProfile?.id ?? "disconnected";
+  const ownerKey = JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId,
+    controller.state.activeProfile?.deviceId, controller.state.activeProfile?.endpointPublicKey]);
   const getMessagingSettings = controller.getMessagingSettings;
   const [settings, setSettings] = useState<MessagingSettingsView>();
   const [loading, setLoading] = useState(true);

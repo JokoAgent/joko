@@ -89,7 +89,7 @@ it("adopts a verified catalog node and keeps identical plugin, resource and mark
     // A stale public Promise operation must reject without a synchronous throw.
     await expect(call()).rejects.toThrow("catalog node connection is no longer current");
   }
-  for (const call of [() => old.extensionTaskApi?.(), () => old.extensionOAuthApi()]) {
+  for (const call of [() => old.extensionTaskApi?.(), () => old.extensionOAuthApi(), () => old.extensionSettingsApi?.()]) {
     expect(call).toThrow("catalog node connection is no longer current");
   }
   expect(view.actions).toHaveLength(3);

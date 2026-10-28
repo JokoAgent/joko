@@ -157,6 +157,7 @@ const DESKTOP_CHANNELS = {
   inspectorWindowMinimize: "joko:inspector-window:minimize",
   inspectorWindowToggleMaximize: "joko:inspector-window:toggle-maximize",
   inspectorWindowClose: "joko:inspector-window:close",
+  inspectorWindowCloseRequested: "joko:inspector-window:close-requested",
   inspectorWindowClosed: "joko:inspector-window:closed",
   traySetIcon: "joko:tray:set-icon",
   notify: "joko:notify",
@@ -1702,7 +1703,7 @@ function parseNativeTaskStatusVisibleSessionIds(value: unknown): readonly string
   }
   const seen = new Set<string>();
   const sessionIds = value.map((sessionId) => {
-    if (!nativeIdentity(sessionId) || seen.has(sessionId)) {
+    if (!nativeIdentity(sessionId, 1024) || seen.has(sessionId)) {
       throw new TypeError("Native task-status visible task identities are invalid.");
     }
     seen.add(sessionId);

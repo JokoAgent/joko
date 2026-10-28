@@ -396,6 +396,7 @@ describe("Messaging gateway", () => {
       modelId: "model-one",
       effort: "high",
       fastMode: true,
+      ultrafastMode: false,
       permissionMode: PermissionMode.BYPASS_PERMISSIONS,
       planMode: true
     });

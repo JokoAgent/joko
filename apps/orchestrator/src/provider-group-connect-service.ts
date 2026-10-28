@@ -36,6 +36,18 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
     } catch (error) {
       if (error instanceof ConnectError) throw error;
       if (error instanceof ConnectionAuthenticationError) throw new ConnectError("Owner authentication is required.", Code.Unauthenticated);
+      if (error instanceof ProviderGroupUnavailableError && error.retryAt !== undefined) {
+        const delay = Math.ceil(error.retryAt - (options.now?.() ?? Date.now()));
+        if (Number.isSafeInteger(delay) && delay > 0 && delay <= 8 * 24 * 60 * 60_000) {
+          throw new ConnectError("Provider group quota is waiting for its next available window.", Code.Unavailable, undefined, [{
+            desc: contract.ErrorInfoSchema,
+            value: create(contract.ErrorInfoSchema, { code: error.code, phase: "provider_group", retryable: true,
+              severity: contract.ErrorSeverity.WAITING, queueImpact: contract.StateImpact.UNCHANGED,
+              workspaceImpact: contract.StateImpact.UNCHANGED, nativeSessionImpact: contract.StateImpact.UNCHANGED,
+              recoveryActions: [{ kind: contract.RecoveryActionKind.WAIT, retryAfter: { seconds: BigInt(Math.floor(delay / 1000)), nanos: delay % 1000 * 1_000_000 } }] })
+          }]);
+        }
+      }
       throw new ConnectError("Provider group request could not be completed.", context.signal.aborted ? Code.Canceled : error instanceof RevisionConflictError ? Code.Aborted
         : error instanceof ProviderGroupUnavailableError ? Code.Unavailable : Code.FailedPrecondition);
     }

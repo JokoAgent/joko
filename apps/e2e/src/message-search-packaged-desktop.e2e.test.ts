@@ -272,8 +272,9 @@ packagedIt("searches completed and paged older messages through packaged Desktop
   await alphaResult.waitFor({ state: "visible", timeout: 30_000 });
   await searchInput.fill("mosaicneedle");
   await betaResult.waitFor({ state: "visible", timeout: 30_000 });
-  const closeInspector = page.locator('.inspector.is-open button[aria-label="Close details"]');
-  if (await closeInspector.isVisible()) await closeInspector.click();
+  await page.getByRole("button", { name: "Close Context tab", exact: true }).click({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Open details", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+  expect(await page.locator(".inspector-dock-group[data-edge]").count()).toBe(0);
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
   await betaResult.locator(".conversation-search-result__hit").first().click();

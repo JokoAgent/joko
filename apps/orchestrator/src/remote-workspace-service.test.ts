@@ -344,7 +344,8 @@ describe("RemoteWorkspaceService", () => {
       remote: { targetId: "target", binding: { kind: "ssh" as const, hostTargetId: "target", hostId: "host", workspaceRoot: "/workspace" } } };
     await workspaces.register(registration);
     const store = { getSession: () => ({ descriptor: { id: "session", targetId: "target", binding: { generation: 1, opaqueRef: "native" } } }),
-      getTarget: () => ({ descriptor: { id: "target" }, metadata: { workspaceId: "workspace" }, revision: 1n }), findPendingSessionLifecycleCleanup: () => undefined } as unknown as OperationalStore;
+      getTarget: () => ({ descriptor: { id: "target" }, metadata: { workspaceId: "workspace" }, revision: 1n }),
+      findSetting: () => undefined, findPendingSessionLifecycleCleanup: () => undefined } as unknown as OperationalStore;
     const input = { store, workspaces, sessionId: "session", source: { workspaceId: "workspace", relativePath: "page.html", expectedRevision: "" }, assertConnection: () => undefined };
     const snapshot = await readWorkspaceHtmlSnapshot(input);
     expect(snapshot.html).toBe("<p>First</p>");

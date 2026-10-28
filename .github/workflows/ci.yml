@@ -17,6 +17,7 @@ on:
           - desktop-product
           - browser-regressions
           - device-authorization
+          - orchestrator-regressions
       platform:
         description: Platform for manual verification
         type: choice
@@ -32,10 +33,88 @@ permissions:
   actions: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'browser-regressions' && format('-browser-regressions-{0}', github.sha) || inputs.scope == 'device-authorization' && format('-device-authorization-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'browser-regressions' && format('-browser-regressions-{0}', github.sha) || inputs.scope == 'device-authorization' && format('-device-authorization-{0}', github.sha) || inputs.scope == 'orchestrator-regressions' && format('-orchestrator-regressions-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
   cancel-in-progress: false
 
 jobs:
+  orchestrator-regressions:
+    if: ${{ inputs.scope == 'orchestrator-regressions' }}
+    name: Orchestrator reproduced regressions
+    runs-on: ${{ inputs.platform == 'windows' && 'windows-latest' || inputs.platform == 'macos' && 'macos-15' || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: pnpm
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          cache: false
+      - name: Use the canonical temporary directory for service fixtures
+        run: |
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync.native(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV,['TMPDIR='+canonical,'TMP='+canonical,'TEMP='+canonical,''].join('\n'));"
+      - name: Prepare Linkspan from remote main
+        run: node scripts/prepare-linkspan.mjs
+      - name: Build the actual service dependency closure
+        id: regression_inputs
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/orchestrator-regressions"
+          pnpm install --frozen-lockfile
+          pnpm codegen:check
+          pnpm --filter @joko/orchestrator... -r --if-present build
+      - name: Check the formal Partner surface and exact retained todo receipts
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/contracts exec node --test test/contract-surface.test.mjs test/partner-glance-todos.test.mjs 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/contracts.log"
+      - name: Check service and dependency types
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/orchestrator... -r --workspace-concurrency=2 --no-bail --if-present typecheck 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/types.log"
+      - name: Check original Worktree lifecycle and retained references
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/worktree test 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/worktree.log"
+      - name: Check persisted native binding ownership and replay
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/store exec vitest run src/hosted-agent-store.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/hosted-store.log"
+      - name: Check immutable Side Chat activation and reconnection
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run src/session-host.test.ts -t "confirms immutable Side Chat resume state without replaying runtime setters" 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/session-host-readonly.log"
+      - name: Check the reproduced service boundaries and recovery failures
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        working-directory: apps/orchestrator
+        shell: bash
+        run: >-
+          pnpm exec vitest run
+          src/browser-automation-node.test.ts src/collaboration-worker-workspace.test.ts
+          src/connect-services.audit.test.ts src/connect-services.extension-catalog.test.ts
+          src/connect-services.features.test.ts src/connect-services.git-review.test.ts src/connect-services.test.ts
+          src/extension-catalog.test.ts src/extension-device-sync.test.ts
+          src/hosted-agent-executor.test.ts src/hosted-agent-host.test.ts src/hosted-agent-peer-port.test.ts src/model-favorite-settings.test.ts
+          src/partner-autonomy.test.ts src/partner-messaging.test.ts src/partner-network-plan-runtime.test.ts
+          src/provider-group-hosted-lifecycle.test.ts src/provider-group-session-host.test.ts src/provider-group-source-native.test.ts src/provider-sharing-service.test.ts
+          src/remote-workspace-service.test.ts src/scheduler.test.ts
+          src/voice-conversation/dashscope-voices.test.ts src/voice-conversation/manager.test.ts
+          src/workspace-html-snapshot.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/service.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orchestrator-regressions-${{ runner.os }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/orchestrator-regressions/
+            .runtime/linkspan-packages/manifest.json
+            .runtime/linkspan-packages/*/dist/source-build.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 3
   device-authorization:
     if: ${{ inputs.scope == 'device-authorization' }}
     name: Device authorization and affected client boundaries
@@ -99,7 +178,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
   verify:
-    if: ${{ inputs.scope != 'windows-runtime-diagnostics' }}
+    if: ${{ inputs.scope != 'windows-runtime-diagnostics' && inputs.scope != 'orchestrator-regressions' }}
     name: ${{ matrix.os }} / Node 24.19 / ${{ matrix.workload }}${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -390,6 +469,16 @@ jobs:
           path: ${{ runner.temp }}/joko-ci-logs/tests-orchestrator.log
           if-no-files-found: error
           retention-days: 3
+
+      - name: Check live native task state across owner snapshot refreshes
+        if: ${{ matrix.workload == 'product' && inputs.scope == 'desktop-product' && !cancelled() && steps.source_check.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/web exec vitest run src/gateway.native-task-status-live.test.ts src/gateway.compaction.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/native-task-event-state.log"
+
+      - name: Check complete native task identities through the real preload
+        if: ${{ matrix.workload == 'product' && inputs.scope == 'desktop-product' && !cancelled() && steps.source_check.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/desktop exec vitest run test/preload-deep-link.test.ts test/packaged-smoke-task.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/native-task-preload.log"
 
       - name: Run Connect end-to-end tests and Browser chains (Linux)
         id: workspace_e2e_linux

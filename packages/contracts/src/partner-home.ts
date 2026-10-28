@@ -19,6 +19,11 @@ export interface PartnerHomeApi {
   status(requestId: string, signal: AbortSignal): Promise<GetPartnerHomeMoveResponse>;
   retry(requestId: string, signal: AbortSignal): Promise<RetryPartnerHomeMoveResponse>;
 }
+export function partnerHomeDestinationKey(destination: PartnerHomeDestination | undefined): string | undefined {
+  if (destination?.location.case === "serviceNode") return destination.location.value ? "service-node" : undefined;
+  if (destination?.location.case === "peer") { const route = destination.location.value; return `peer:${route.targetDeviceId}:${route.routeGeneration}`; }
+  return undefined;
+}
 export function createPartnerHomeApi(options: { readonly ownerKey: string; readonly rpc: PartnerHomeRpc; readonly assertCurrent: () => void }): PartnerHomeApi {
   const call = async <T>(signal: AbortSignal, action: () => Promise<T>) => { signal.throwIfAborted(); options.assertCurrent();
     const value = await action(); signal.throwIfAborted(); options.assertCurrent(); return value; };

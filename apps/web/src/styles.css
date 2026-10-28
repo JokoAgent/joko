@@ -4027,7 +4027,7 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .route-loading { display: grid; place-items: center; align-content: center; gap: 10px; min-height: 40vh; color: var(--text-soft); }
 .projects-toolbar { display: flex; justify-content: flex-end; padding: 0 24px 14px; }
 .project-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); gap: 14px; padding: 0 24px 24px; }
-.project-card { display: grid; align-content: start; gap: 14px; min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-sm); }
+.project-card { display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: 14px; min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-sm); }
 .project-card.is-focused, .project-card:focus-visible { border-color: var(--accent-edge); outline: 2px solid color-mix(in srgb, var(--accent-edge) 48%, transparent); outline-offset: 2px; }
 .project-card.is-archived { opacity: .78; }
 .project-card > header { display: flex; align-items: center; gap: 11px; }

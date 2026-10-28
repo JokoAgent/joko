@@ -67,6 +67,7 @@ describe("Connect service composition", () => {
     registerConnectServices(router, stubApplication());
 
     const expectedServices = [
+      contract.DesktopVoiceConversationService,
       contract.ServerAccessService,
       contract.ConnectionService,
       contract.AppDefaultModelService,

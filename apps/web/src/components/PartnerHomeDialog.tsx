@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { PermissionMode, PartnerHomeBusyAction, PartnerHomeMovePhase, partnerHomeMessages,
-  type ListPartnerHomeTargetsResponse, type PartnerHomeApi, type PartnerHomeMove, type PartnerHomeModelChoice } from "@joko/contracts";
+import { PermissionMode, PartnerHomeBusyAction, PartnerHomeMovePhase, partnerHomeMessages, partnerHomeDestinationKey,
+  type ListPartnerHomeTargetsResponse, type PartnerHomeApi, type PartnerHomeDestination, type PartnerHomeMove, type PartnerHomeModelChoice } from "@joko/contracts";
 import { Modal, Button } from "./ui.js";
 
-export function PartnerHomeDialog({ api, partnerId, revision, inputHandoff = true, locale, onClose, onChanged }: {
+export function PartnerHomeDialog({ api, partnerId, revision, inputHandoff = true, initialDestination, locale, onClose, onChanged }: {
   readonly api: PartnerHomeApi; readonly partnerId: string; readonly revision: bigint; readonly locale: string;
   readonly inputHandoff?: boolean;
+  readonly initialDestination?: PartnerHomeDestination;
   readonly onClose: () => void; readonly onChanged: (sessionId: string) => void;
 }) {
   const text = partnerHomeMessages(locale), [catalog, setCatalog] = useState<ListPartnerHomeTargetsResponse>();
@@ -14,11 +15,17 @@ export function PartnerHomeDialog({ api, partnerId, revision, inputHandoff = tru
   const [busyAction, setBusyAction] = useState(PartnerHomeBusyAction.WAIT), [offline, setOffline] = useState(false);
   const [move, setMove] = useState<PartnerHomeMove>(), [busy, setBusy] = useState(false), [error, setError] = useState(false);
   const alive = useRef(true), sent = useRef<string | undefined>(undefined), notified = useRef<string | undefined>(undefined);
+  const initializedDestination = useRef(false);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   const target = catalog?.targets[Number(selected)], choice = models[Number(model)];
   const running = !!move && move.phase !== PartnerHomeMovePhase.READY && move.phase !== PartnerHomeMovePhase.NEEDS_ATTENTION;
   const load = async (signal: AbortSignal) => { setError(false); const value = await api.list(partnerId, signal);
-    if (alive.current && !signal.aborted) { setCatalog(value); if (value.pendingMove) setMove(value.pendingMove); } };
+    if (alive.current && !signal.aborted) { setCatalog(value); if (value.pendingMove) setMove(value.pendingMove);
+      if (initialDestination && !initializedDestination.current) {
+        initializedDestination.current = true; const key = partnerHomeDestinationKey(initialDestination), index = value.targets.findIndex(item => partnerHomeDestinationKey(item.destination) === key);
+        if (key && index >= 0) setSelected(String(index)); else setError(true);
+      }
+    } };
   useEffect(() => { const request = new AbortController(); void load(request.signal).catch(() => { if (!request.signal.aborted) setError(true); }); return () => request.abort(); }, [api, partnerId]);
   useEffect(() => {
     setModels([]); setModel(""); setPlan(false); setPermission(PermissionMode.ASK);

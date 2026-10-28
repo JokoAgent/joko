@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
@@ -32,11 +32,13 @@ class ConversationAdapter extends FakeBackendAdapter {
   readonly infer = vi.fn(async (_input: NativeTextInferenceInput) => "A public group answer.");
   readonly groupContexts: AdapterContext[] = [];
   beforeGroupSend?: (context: AdapterContext) => Promise<void>;
+  groupReply?: (context: AdapterContext) => Promise<void>;
   constructor(readonly profiles: PartnerStore) { super(profile); }
   inferNativeText(input: NativeTextInferenceInput): Promise<string> { return this.infer(input); }
   override async send(input: PromptInput, context: AdapterContext) {
     if (this.profiles.getSessionLink(context.sessionId)?.role === "group") {
       this.groupContexts.push(context);
+      if (this.groupReply) { queueMicrotask(() => void this.groupReply!(context).catch(() => {})); return; }
       if (this.beforeGroupSend) { void this.beforeGroupSend(context).then(() => super.send(input, context)).catch(() => {}); return; }
     }
     return super.send(input, context);
@@ -95,6 +97,63 @@ async function upload(f: Awaited<ReturnType<typeof fixture>>, data: Uint8Array, 
 async function finished(f: Awaited<ReturnType<typeof fixture>>) { await vi.waitFor(() => expect(f.host.storage.executions(f.room.id).every(job => !["queued", "running"].includes(job.status))).toBe(true), { timeout: 6_000 }); }
 
 describe("Built-in conversation authority and execution", () => {
+  it("delivers the completed native task's generated image through the existing room media owner without forwarding private tool observations", async () => {
+    const f = await fixture(), actor = f.room.members.find(member => member.kind === "partner")!, bytes = new Uint8Array([137, 80, 78, 71, 1, 2, 3]);
+    f.adapter.groupReply = async context => {
+      const path = join(context.target.workspaceRoot, "generated.png"); await writeFile(path, bytes);
+      const generated = await context.storeArtifact(path, { fileName: "generated.png", mimeType: "image/png" });
+      const privatePath = join(context.target.workspaceRoot, "private-screen.png"); await writeFile(privatePath, new Uint8Array([4, 5, 6]));
+      const privateImage = await context.storeArtifact(privatePath, { fileName: "private-screen.png", mimeType: "image/png" });
+      await context.emit({ type: "tool_result", callId: "private-screen", name: "screenshot", output: "Private observation", isError: false, parts: [{ kind: "image", blob: privateImage }] });
+      await context.emit({ type: "tool_result", callId: "generated", name: "image_generate", output: "Generated", isError: false, parts: [{ kind: "image", blob: generated }, { kind: "image", blob: generated }] });
+      await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The generated image is ready." }, { kind: "image", blob: generated }] });
+      await context.emit({ type: "done", outcome: "completed" });
+    };
+    await f.owner.sendPartnerNetwork({ operationId: "generated-owner-reply", roomId: f.room.id, text: "Make an image", mentions: [actor.id] });
+    await f.network.tick(); await finished(f);
+    const reply = f.host.storage.messages(f.room.id).find(message => message.authorId === actor.id && message.text === "The generated image is ready.")!;
+    expect(reply.attachments).toHaveLength(1); expect(reply.attachments[0]?.name).toBe("generated.png");
+    const read = await f.foreign.media(create(contract.MediaPartnerNetworkRequestSchema, { roomId: f.room.id, joinId: f.joined.joinId, action: "read", mediaId: reply.attachments[0]!.id }), authority());
+    expect(read.data).toEqual(bytes); await f.network.tick(); expect(f.host.storage.messages(f.room.id).filter(message => message.id === reply.id)).toHaveLength(1);
+  }, 15_000);
+  it("keeps two live Threads of the same companion in distinct native Sessions and stops only the selected conversation", async () => {
+    const f = await fixture(), actor = f.room.members.find(member => member.kind === "partner")!;
+    const rootA = (await f.owner.sendPartnerNetwork({ operationId: "native-root-a", roomId: f.room.id, text: "Topic A", mentions: [actor.id] })).message!;
+    await f.network.tick(); await finished(f);
+    const rootB = (await f.owner.sendPartnerNetwork({ operationId: "native-root-b", roomId: f.room.id, text: "Topic B", mentions: [actor.id] })).message!;
+    await f.network.tick(); await finished(f);
+    const contexts: AdapterContext[] = [], release: (() => void)[] = [];
+    f.adapter.beforeGroupSend = async context => { contexts.push(context); await new Promise<void>(resolve => { release.push(resolve); context.signal.addEventListener("abort", () => resolve(), { once: true }); }); };
+    await f.owner.sendPartnerNetwork({ operationId: "native-thread-a", roomId: f.room.id, threadRootId: rootA.id, text: "Work in A", mentions: [actor.id] });
+    await f.network.tick(); await vi.waitFor(() => expect(contexts).toHaveLength(1));
+    await f.owner.sendPartnerNetwork({ operationId: "native-thread-b", roomId: f.room.id, threadRootId: rootB.id, text: "Work in B", mentions: [actor.id] });
+    await f.network.tick(); await vi.waitFor(() => expect(contexts).toHaveLength(2));
+    const a = contexts[0]!, b = contexts[1]!;
+    expect(a.sessionId).not.toBe(b.sessionId); expect(f.store.getSession(a.sessionId).descriptor.binding.opaqueRef).not.toBe(f.store.getSession(b.sessionId).descriptor.binding.opaqueRef);
+    expect(f.network.ownerTaskScope(a.sessionId)?.sourceMessageId).not.toBe(f.network.ownerTaskScope(b.sessionId)?.sourceMessageId);
+    await f.owner.managePartnerNetwork({ operationId: "stop-only-a", roomId: f.room.id, expectedRevision: BigInt(f.host.storage.get(f.room.id).revision), action: "stop", threadRootId: rootA.id });
+    expect(f.network.ownerTaskScope(a.sessionId)).toBeUndefined(); expect(() => f.network.ownerTaskScope(b.sessionId)!.assertCurrent()).not.toThrow();
+    for (const done of release) done(); await finished(f);
+    const replies = f.host.storage.messages(f.room.id).filter(message => message.authorId === actor.id && message.threadRootId);
+    expect(replies.every(message => message.threadRootId === rootB.id)).toBe(true);
+  }, 20_000);
+  it("reads and follows a Thread as the original human across paired readers without changing the main read position", async () => {
+    const f = await fixture(), actor = f.room.members.find(member => member.kind === "partner")!;
+    const root = (await f.owner.sendPartnerNetwork({ operationId: "read-root", roomId: f.room.id, text: "Read source", mentions: [actor.id] })).message!;
+    const reply = (await f.owner.sendPartnerNetwork({ operationId: "read-reply", roomId: f.room.id, text: "Mention guest", mentions: [f.joined.selfId], threadRootId: root.id })).message!;
+    const target = { roomId: f.room.id, joinId: f.joined.joinId };
+    const before = await f.foreign.snapshot(create(contract.GetPartnerNetworkRequestSchema, { ...target, threadRootId: root.id }), authority());
+    expect(before.readerStateSupported).toBe(true); expect(before.threads[0]).toMatchObject({ rootId: root.id, mentioned: true, unreadCount: 1n, following: false });
+    await f.foreign.manage(create(contract.ManagePartnerNetworkRequestSchema, { ...target, operationId: "follow-once", action: "follow-thread", threadRootId: root.id, throughSequence: reply.sequence, following: true }), authority());
+    const pairedAgain = new PartnerNetworkHome(f.foreignOptions); await pairedAgain.initialize(); cleanups.push(() => pairedAgain.close());
+    const followed = await pairedAgain.snapshot(create(contract.GetPartnerNetworkRequestSchema, { ...target, threadRootId: root.id }), authority());
+    expect(followed.threadReadSequence).toBe(0n); expect(followed.threadFollowing).toBe(true);
+    await pairedAgain.manage(create(contract.ManagePartnerNetworkRequestSchema, { ...target, operationId: "read-thread", action: "mark-read", threadRootId: root.id, throughSequence: reply.sequence }), authority());
+    const after = await f.foreign.snapshot(create(contract.GetPartnerNetworkRequestSchema, target), authority());
+    expect(after.threads[0]?.unreadCount).toBe(0n); expect(after.room?.readSequence).toBe(before.room?.readSequence);
+    await f.manage("remove-member", f.joined.selfId);
+    await expect(pairedAgain.snapshot(create(contract.GetPartnerNetworkRequestSchema, { ...target, threadRootId: root.id }), authority())).rejects.toMatchObject({ code: Code.PermissionDenied });
+  });
   it("keeps a sealed foreign membership on its original pinned locator when the authority publishes a new entrance", async () => {
     const f = await fixture();
     f.host.options.origin = () => "https://current.trycloudflare.com";
@@ -123,6 +182,7 @@ describe("Built-in conversation authority and execution", () => {
   });
   it("reads loaded old-page and Thread failures through the authoritative RPC and clears replaced rounds, tombstones and revoked readers", async () => {
     const f = await fixture(), actor = f.room.members.find(member => member.kind === "partner")!, sources: contract.PartnerNetworkMessage[] = [];
+    f.store.setSetting("service", "partner-network.v1:host", `room:${f.room.id}`, { ...f.host.storage.get(f.room.id), singleSpeaker: false });
     const fail = () => { const job = f.host.claim(create(contract.ClaimPartnerNetworkRequestSchema, { roomId: f.room.id, actorId: actor.id }), actor.ownerId).execution!;
       f.host.settle(create(contract.SettlePartnerNetworkRequestSchema, { roomId: f.room.id, executionId: job.id, lease: job.lease, action: "fail", failureCode: "AUTH_REQUIRED" }), actor.ownerId); return job; };
     for (let index = 0; index < 105; index++) { sources.push(f.host.send(create(contract.SendPartnerNetworkRequestSchema, { operationId: `history-${index}`, roomId: f.room.id, text: `Loaded ${index}`, mentions: [actor.id] }), actor.ownerId)); fail(); }
@@ -143,6 +203,7 @@ describe("Built-in conversation authority and execution", () => {
   }, 20_000);
   it("reads only the exact current failed plan step and decision head after retries or plan stop", async () => {
     const f = await fixture(), actor = f.room.members.find(member => member.kind === "partner")!;
+    f.store.setSetting("service", "partner-network.v1:host", `room:${f.room.id}`, { ...f.host.storage.get(f.room.id), singleSpeaker: false });
     const source = f.host.send(create(contract.SendPartnerNetworkRequestSchema, { operationId: "planned-source", roomId: f.room.id, text: "Plan this work", forcePlan: true }), actor.ownerId);
     const claim = () => f.host.claim(create(contract.ClaimPartnerNetworkRequestSchema, { roomId: f.room.id, actorId: actor.id }), actor.ownerId).execution!;
     const decision = claim(); f.host.settle(create(contract.SettlePartnerNetworkRequestSchema, { roomId: f.room.id, executionId: decision.id, lease: decision.lease, action: "complete",

@@ -34,6 +34,20 @@ message PartnerNetworkThreadPreview {
   string author_name = 4;
   string text = 5;
 }
+// Reader state belongs to the room authority and is shared by the reader's devices.
+message PartnerNetworkThread {
+  string root_id = 1;
+  string root_text = 2;
+  uint64 reply_count = 3;
+  uint64 read_sequence = 4;
+  uint64 unread_count = 5;
+  uint64 latest_unread_sequence = 6;
+  bool mentioned = 7;
+  bool following = 8;
+  string author_name = 9;
+  string text = 10;
+  uint64 updated_at_ms = 11;
+}
 message PartnerNetworkTaskCard {
   string task_id = 1;
   string home_server_id = 2;
@@ -87,6 +101,7 @@ message PartnerNetworkRoom {
   uint64 updated_at_ms = 16;
   bool unread = 17;
   string organizer_id = 18;
+  bool single_speaker = 19;
 }
 message PartnerNetworkSnapshot {
   PartnerNetworkRoom room = 1;
@@ -95,6 +110,10 @@ message PartnerNetworkSnapshot {
   repeated PartnerNetworkExecution executions = 4;
   repeated PartnerNetworkPlan plans = 5;
   bool can_continue = 6;
+  repeated PartnerNetworkThread threads = 7;
+  uint64 thread_read_sequence = 8;
+  bool thread_following = 9;
+  bool reader_state_supported = 10;
 }
 message PartnerNetworkExecution {
   string id = 1;
@@ -160,6 +179,8 @@ message ManagePartnerNetworkRequest {
   string value = 7;
   uint64 through_sequence = 8;
   PartnerNetworkActor partner = 9;
+  string thread_root_id = 10;
+  optional bool following = 11;
 }
 message ManagePartnerNetworkResponse { PartnerNetworkRoom room = 1; }
 message ReactPartnerNetworkRequest { string operation_id = 1; string room_id = 2; string join_id = 3; string message_id = 4; string emoji = 5; bool add = 6; }
@@ -229,6 +250,8 @@ message PartnerNetworkGuestServiceManagePartnerNetworkRequest {
   string value = 7;
   uint64 through_sequence = 8;
   PartnerNetworkActor partner = 9;
+  string thread_root_id = 10;
+  optional bool following = 11;
 }
 message PartnerNetworkGuestServiceManagePartnerNetworkResponse { PartnerNetworkRoom room = 1; }
 message PartnerNetworkGuestServiceReactPartnerNetworkRequest { string operation_id = 1; string room_id = 2; string join_id = 3; string message_id = 4; string emoji = 5; bool add = 6; }

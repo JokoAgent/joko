@@ -23,6 +23,7 @@ interface Picker {
   readonly authorityKey: string; readonly expiresAt: number; readonly assertOwner: () => void;
   readonly assertRuntime: () => void; readonly entries: Map<string, Entry>; readonly paths: Map<string, Entry>;
   readonly pages: Map<string, { readonly listing: Listing; readonly offset: number }>;
+  readonly lifetime: AbortController;
   busy: boolean; claimed: boolean;
 }
 const samePath = (a: string, b: string) => process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
@@ -42,16 +43,20 @@ export class ExtensionDirectoryPicker {
   }) {}
   #now() { return this.options.now?.() ?? Date.now(); }
   #assert(picker: Picker) {
-    if (this.#active !== picker || picker.expiresAt <= this.#now()) throw new Error("Directory selection expired or closed.");
+    if (this.#active !== picker || picker.lifetime.signal.aborted || picker.expiresAt <= this.#now()) throw new Error("Directory selection expired or closed.");
     picker.assertOwner(); picker.assertRuntime();
   }
-  async #io<T>(picker: Picker, promise: Promise<T>): Promise<T> {
+  async #io<T>(picker: Picker, promise: Promise<T>, maximumWait = 10_000): Promise<T> {
     this.#assert(picker); let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancel = () => {};
     try {
       const result = await Promise.race([promise, new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error("Directory selection timed out.")), Math.max(1, Math.min(10_000, picker.expiresAt - this.#now())));
+        cancel = () => reject(new Error("Directory selection expired or closed."));
+        picker.lifetime.signal.addEventListener("abort", cancel, { once: true });
+        if (picker.lifetime.signal.aborted) cancel();
+        timer = setTimeout(() => reject(new Error("Directory selection timed out.")), Math.max(1, Math.min(maximumWait, picker.expiresAt - this.#now())));
       })]); this.#assert(picker); return result;
-    } finally { if (timer) clearTimeout(timer); }
+    } finally { if (timer) clearTimeout(timer); picker.lifetime.signal.removeEventListener("abort", cancel); }
   }
   async #entry(picker: Picker, candidate: string, parentEntryId?: string): Promise<Entry> {
     if (!candidate || candidate.length > 4096 || candidate.includes("\0") || !path.isAbsolute(candidate)) throw new Error("Enter an absolute directory on this Joko node.");
@@ -94,11 +99,12 @@ export class ExtensionDirectoryPicker {
     const last = this.#lastAttempt.get(surface.extensionId); this.#lastAttempt.set(surface.extensionId, now);
     if (last !== undefined && now - last < 3_000) throw new Error("Wait three seconds before opening another directory selection.");
     if (this.#active) {
-      try { this.#assert(this.#active); } catch { this.#active = undefined; }
+      const previous = this.#active;
+      try { this.#assert(previous); } catch { if (this.#active === previous) this.#active = undefined; previous.lifetime.abort(); }
       if (this.#active) throw new Error("A directory selection is already open. Finish or cancel it first.");
     }
     const picker: Picker = { id: randomUUID(), connectionId, surface, authorityKey: captured.authorityKey, expiresAt: now + TTL,
-      assertOwner, assertRuntime: captured.assertCurrent, entries: new Map(), paths: new Map(), pages: new Map(), busy: true, claimed: false };
+      assertOwner, assertRuntime: captured.assertCurrent, entries: new Map(), paths: new Map(), pages: new Map(), lifetime: new AbortController(), busy: true, claimed: false };
     this.#active = picker;
     try {
       const roots = [...new Set([homedir(), process.cwd(), ...this.options.roots?.() ?? []].flatMap(root => [root, path.parse(root).root]))];
@@ -107,7 +113,7 @@ export class ExtensionDirectoryPicker {
         try { entries.push(await this.#entry(picker, root)); } catch (error) { this.#assert(picker); if (root === homedir()) throw error; }
       }
       return this.#page(picker, { entries: [...new Set(entries)].sort((a, b) => a.displayPath.localeCompare(b.displayPath)), fingerprint: "roots" }, 0);
-    } catch (error) { if (this.#active === picker) this.#active = undefined; throw error; }
+    } catch (error) { if (this.#active === picker) this.#active = undefined; picker.lifetime.abort(); throw error; }
     finally { picker.busy = false; }
   }
   #get(id: string, connectionId: string): Picker {
@@ -123,7 +129,7 @@ export class ExtensionDirectoryPicker {
       if (input.pageToken) {
         if (input.directoryPath) throw new Error("A page cannot change its directory.");
         const cursor = picker.pages.get(input.pageToken);
-        if (!cursor || cursor.listing.directory?.entryId !== input.entryId) throw new Error("This directory page expired.");
+        if (!cursor || (cursor.listing.directory?.entryId ?? "") !== (input.entryId ?? "")) throw new Error("This directory page expired.");
         if (cursor.listing.directory && fingerprint(await this.#verify(picker, cursor.listing.directory)) !== cursor.listing.fingerprint) throw new Error("Directory contents changed. Reload the directory.");
         return this.#page(picker, cursor.listing, cursor.offset);
       }
@@ -156,7 +162,7 @@ export class ExtensionDirectoryPicker {
   }
   close(id: string, connectionId: string): boolean {
     if (!this.#active || this.#active.id !== id || this.#active.connectionId !== connectionId) return false;
-    this.#active = undefined; return true;
+    const picker = this.#active; this.#active = undefined; picker.lifetime.abort(); return true;
   }
   async pick(id: string, entryId: string, extensionId: string, connectionId: string, assertCurrent: () => void): Promise<PickedExtensionDirectory> {
     const picker = this.#get(id, connectionId), entry = picker.entries.get(entryId);
@@ -170,10 +176,10 @@ export class ExtensionDirectoryPicker {
         const actual = await realpath(entry.directoryPath), info = await lstat(entry.directoryPath);
         if (!samePath(actual, entry.directoryPath) || !info.isDirectory() || info.isSymbolicLink() || identity(info) !== entry.identity) throw new Error("The selected directory was replaced.");
       };
-      const result = await this.options.runtime.preparePickedDirectory({ extensionId, authorityKey: picker.authorityKey,
+      const result = await this.#io(picker, this.options.runtime.preparePickedDirectory({ extensionId, authorityKey: picker.authorityKey,
         selectionId: picker.id, directory: entry.directoryPath, assertDirectoryCurrent,
-        assertSelectionCurrent: () => { this.#assert(picker); assertCurrent(); } });
+        signal: picker.lifetime.signal, assertSelectionCurrent: () => { this.#assert(picker); assertCurrent(); } }), TTL);
       this.#assert(picker); assertCurrent(); return result;
-    } finally { if (this.#active === picker) this.#active = undefined; }
+    } finally { if (this.#active === picker) this.#active = undefined; picker.lifetime.abort(); }
   }
 }

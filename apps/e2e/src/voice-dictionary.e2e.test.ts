@@ -1,6 +1,8 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import dgram, { type Socket as DgramSocket } from "node:dgram";
+import { errorMonitor, EventEmitter } from "node:events";
 import net from "node:net";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 
@@ -24,18 +26,25 @@ import {
   type VoiceDictionaryReadOnlyView
 } from "@joko/contracts";
 import { createOrchestratorApplication, createPublicServer, type OrchestratorApplication, type OrchestratorConfig } from "@joko/orchestrator";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createE2eClients, type E2eClients, type PairedClient } from "./connect-clients.js";
 import { OrchestratorE2eFixture } from "./fixture.js";
 
 describe("durable voice dictionary through authenticated generated RPCs", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   let peerFixture: OrchestratorE2eFixture | undefined;
+  let discovery: ReturnType<typeof observeDictionaryDiscoveryStartup> | undefined;
   const streamCleanups: Array<() => Promise<void>> = [];
-  afterEach(async () => {
-    for (const close of streamCleanups.splice(0).reverse()) await close();
-    await peerFixture?.close({ removeRoot: true }); peerFixture = undefined;
-    await fixture?.close({ removeRoot: true }); fixture = undefined;
+  beforeEach(() => { discovery = observeDictionaryDiscoveryStartup(); });
+  afterEach(async ({ task }) => {
+    try {
+      for (const close of streamCleanups.splice(0).reverse()) await close();
+      await peerFixture?.close({ removeRoot: true }); peerFixture = undefined;
+      await fixture?.close({ removeRoot: true }); fixture = undefined;
+    } finally {
+      if (task.result?.state === "fail") console.error("Dictionary discovery startup:", JSON.stringify(discovery?.snapshot()));
+      discovery?.stop(); discovery = undefined;
+    }
   });
 
   it("shares one service revision between clients, rejects late learning and restores the same projection after restart", async () => {
@@ -835,7 +844,58 @@ async function dictionaryDeadline<T>(operation: Promise<T>, milliseconds: number
   } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
-/** Starts the actual application composition; dictionary timing, codec and transport are never substituted. */
+/** Records only fixed native startup phases and standard errno for the dictionary discovery port. */
+function observeDictionaryDiscoveryStartup() {
+  type Phase = "bind" | "discovery_socket" | "membership" | "multicast_interface" | "multicast_ttl" | "multicast_loopback";
+  const entries: Array<{ readonly socket: number; readonly phase: Phase; readonly event: "start" | "complete" | "error"; readonly code?: string }> = [];
+  const restore: Array<() => void> = [];
+  let nextSocket = 0;
+  const errno = (error: unknown): string => {
+    try {
+      const code: unknown = error !== null && typeof error === "object" ? Reflect.get(error, "code") : undefined;
+      return typeof code === "string" && Object.hasOwn(constants.errno, code) ? code : "unavailable";
+    } catch { return "unavailable"; }
+  };
+  // Production NodeSyncLanTransport also calls this default-export method.
+  // Every Socket, argument, receiver, callback and event remains native.
+  const createSocket = dgram.createSocket.bind(dgram);
+  const create = vi.spyOn(dgram, "createSocket").mockImplementation((options, listener) => {
+    const socket = createSocket(options, listener), id = ++nextSocket;
+    let requestedPort: number | undefined, currentPhase: Phase = "bind";
+    const record = (phase: Phase, event: "start" | "complete" | "error", error?: unknown) => {
+      if (requestedPort === 53_548 && entries.length < 64) entries.push({ socket: id, phase, event, ...(event === "error" ? { code: errno(error) } : {}) });
+    };
+    const step = <T,>(phase: Phase, invoke: () => T): T => {
+      record(phase, "start");
+      try { const result = invoke(); record(phase, "complete"); return result; }
+      catch (error) { record(phase, "error", error); throw error; }
+    };
+    const bind = socket.bind;
+    const bindSpy = vi.spyOn(socket, "bind").mockImplementation((...args: Parameters<DgramSocket["bind"]>) => {
+      requestedPort = typeof args[0] === "number" ? args[0] : args[0]?.port;
+      currentPhase = "bind"; record("bind", "start");
+      try { return Reflect.apply(bind, socket, args); }
+      catch (error) { record("bind", "error", error); throw error; }
+    });
+    const listening = () => { record("bind", "complete"); currentPhase = "discovery_socket"; };
+    const failed = (error: Error) => record(currentPhase, "error", error);
+    socket.on("listening", listening); EventEmitter.prototype.on.call(socket, errorMonitor, failed);
+    const membership = socket.addMembership.bind(socket), multicastInterface = socket.setMulticastInterface.bind(socket);
+    const ttl = socket.setMulticastTTL.bind(socket), loopback = socket.setMulticastLoopback.bind(socket);
+    const membershipSpy = vi.spyOn(socket, "addMembership").mockImplementation((...args) => step("membership", () => membership(...args)));
+    const interfaceSpy = vi.spyOn(socket, "setMulticastInterface").mockImplementation((...args) => step("multicast_interface", () => multicastInterface(...args)));
+    const ttlSpy = vi.spyOn(socket, "setMulticastTTL").mockImplementation((...args) => step("multicast_ttl", () => ttl(...args)));
+    const loopbackSpy = vi.spyOn(socket, "setMulticastLoopback").mockImplementation((...args) => step("multicast_loopback", () => loopback(...args)));
+    restore.push(() => {
+      socket.off("listening", listening); EventEmitter.prototype.off.call(socket, errorMonitor, failed);
+      loopbackSpy.mockRestore(); ttlSpy.mockRestore(); interfaceSpy.mockRestore(); membershipSpy.mockRestore(); bindSpy.mockRestore();
+    });
+    return socket;
+  });
+  return { snapshot: () => ({ phase: "native_lan_startup", socketsCreated: nextSocket, entries: [...entries] }),
+    stop: () => { create.mockRestore(); for (const undo of restore.reverse()) undo(); } };
+}
+
 function observeDictionaryConnectionTiming() {
   const loop = monitorEventLoopDelay({ resolution: 20 }); loop.enable();
   const connections: Array<{ completedAt: number; connected: boolean; connectMs?: number; elapsedMs: number;
@@ -889,6 +949,7 @@ function observeDictionaryConnectionTiming() {
   };
 }
 
+/** Starts the actual application composition; dictionary timing, codec and transport are never substituted. */
 class ProductionDictionaryNode {
   readonly application: OrchestratorApplication;
   readonly baseUrl: string;

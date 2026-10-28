@@ -1,6 +1,8 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { executeExtensionSettingsCall } from "@joko/connection-transport";
+import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
+  parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationKind } from "./extension-settings-operation.js";
 import { readSessionArchivePreview } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { projectProviderGroupRebalance } from "@joko/contracts";
@@ -5555,9 +5557,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       const detail = await api.getExtension({ extensionId: surface.extensionId }, { signal }); current(); signal.throwIfAborted();
       if (!detail.extension) throw new GatewayError("Plugin settings installation is unavailable.");
       const extension = mapExtensionCatalogEntry(detail.extension);
-      if (!extension.installed || !extension.settings || extension.owner.kind !== "resource" || extension.owner.resourceId !== surface.owner.resourceId
+      if (extension.id !== surface.extensionId || !extension.installed || !extension.settings || extension.owner.kind !== "resource" || extension.owner.resourceId !== surface.owner.resourceId
         || extension.owner.resourceRevision !== surface.owner.resourceRevision || extension.owner.discoveredRevision !== surface.owner.discoveredRevision) throw new GatewayError("Plugin settings installation changed.");
       return { ...extension, extensionId: extension.id, setup: { ...extension.setup, fields: extension.setup.fields.map(field => ({ ...field, fieldId: field.id })) } };
+    };
+    const originalResource = async (record: import("./extension-settings-operation.js").PendingExtensionSettingsOperation, signal: AbortSignal) => {
+      current(); signal.throwIfAborted();
+      if (JSON.stringify(record.profile) !== extensionSettingsProfileKey(profile)) throw new GatewayError("The plugin settings operation belongs to another node connection.");
+      const response = await api.getExtension({ extensionId: record.extensionId }, { signal }); current(); signal.throwIfAborted();
+      const owner = response.extension ? mapExtensionCatalogEntry(response.extension).owner : undefined;
+      if (response.extension?.extensionId !== record.extensionId || !response.extension.installed || !response.extension.settings || owner?.kind !== "resource" || owner.resourceId !== record.resourceId
+        || owner.resourceRevision.toString() !== record.resourceRevision || owner.discoveredRevision !== record.discoveredRevision) {
+        throw new GatewayError("The original plugin settings Resource installation changed.");
+      }
     };
     return {
       open: async (extensionId, expectedRevision, signal) => {
@@ -5569,8 +5581,40 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         catch (error) { void api.closeExtensionMainView({ surfaceId: surface.id }, { timeoutMs: 5_000 }).catch(() => undefined); throw error; }
       },
       close: async surfaceId => (await api.closeExtensionMainView({ surfaceId }, { timeoutMs: 5_000 })).closed,
-      call: async (surface, call, host, signal) => {
+      readOperation: async (input, signal) => {
+        const record = parsePendingExtensionSettingsOperation(input), active = combined(signal); current();
+        if (JSON.stringify(record.profile) !== extensionSettingsProfileKey(profile)) throw new GatewayError("The original plugin settings operation belongs to another node connection.");
+        let operation: Operation | undefined;
+        try { operation = (await createClient(OperationService, scope.transport).getOperation({ operationId: record.operationId }, { signal: active })).operation; }
+        catch (error) { current(); active.throwIfAborted(); if (ConnectError.from(error).code === Code.NotFound) return { state: "pending" }; throw error; }
+        current(); active.throwIfAborted();
+        if (!operation) return { state: "pending" };
+        // The installed Resource may have advanced since this immutable receipt.
+        // Recovery reports its state only; it never adopts data into the new form.
+        return extensionSettingsOperationReceipt(record, operation, profile);
+      },
+      call: async (surface, call, host, signal, observeReceipt) => {
         const active = combined(signal); current(); const original = await fresh(surface, active);
+        const observe = (extension: ExtensionCatalogEntryView, kind: ExtensionSettingsOperationKind) => {
+          let terminalConfirmed = false;
+          return async (operationId: string, operation?: Operation) => {
+            current(); active.throwIfAborted();
+            if (!observeReceipt) throw new GatewayError("The original plugin settings operation journal is unavailable.");
+            const record = pendingExtensionSettingsOperation(profile, extension, kind, operationId);
+            const receipt = operation === undefined ? undefined : extensionSettingsOperationReceipt(record, operation, profile);
+            if (terminalConfirmed) {
+              if (!receipt || receipt.state === "pending") throw new GatewayError("The plugin settings operation regressed after its terminal receipt.");
+              return;
+            }
+            if (receipt !== undefined) await originalResource(record, active);
+            await observeReceipt(record, receipt); terminalConfirmed = receipt !== undefined && receipt.state !== "pending";
+            current(); active.throwIfAborted();
+          };
+        };
+        const submitSettings = async (extension: ExtensionCatalogEntryView, payload: MutationPayload, requestSignal = active) => {
+          const kind = payload.case as ExtensionSettingsOperationKind;
+          return this.submit(payload, true, [], requestSignal, observe(extension, kind), undefined, true);
+        };
         if (call.kind === "oauth.connect") {
           const authorization = this.extensionOAuthApi();
           if (!authorization?.canAuthorize) throw new GatewayError("Open Joko Desktop to connect a plugin account.");
@@ -5583,19 +5627,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         return executeExtensionSettingsCall({ surface: { surfaceId: surface.id }, api, oauth: createClient(ExtensionOAuthService, scope.transport),
           connections: createClient(ExtensionNetworkService, scope.transport), fresh: signal => fresh(surface, signal), current,
           upload: (ticket, value, signal) => this.uploadCredentialTicket(value, ticket, { ...scope, signal }),
-          submit: async (_extension, mutation, _kind, signal) => { current(); await this.submit(mutation.payload, true, [], signal); current(); },
-          pickDirectory: async (_extension, mutation, signal) => {
-            current(); const operation = await this.submit(mutation.payload, true, [], signal); current();
+          submit: async (extension, mutation, _kind, signal) => { current(); await submitSettings(extension, mutation.payload, signal); current(); },
+          pickDirectory: async (extension, mutation, signal) => {
+            current(); const operation = await submitSettings(extension, mutation.payload, signal); current();
             if (operation.state !== OperationState.SUCCEEDED || operation.result?.payload.case !== "pickedDirectory") throw new GatewayError("Check the original directory selection operation before retrying.");
             return operation.result.payload.value;
           },
-          begin: extension => after(() => this.submit({ case: "beginExtensionSetup", value: { extensionId: extension.id, expectedRevision: { value: extension.revision } } }, true, [], active).then(() => undefined)),
-          field: (extension, fieldId, value) => after(() => this.submit({ case: "submitExtensionSetupInteraction", value: {
+          begin: extension => after(() => submitSettings(extension, { case: "beginExtensionSetup", value: { extensionId: extension.id, expectedRevision: { value: extension.revision } } }).then(() => undefined)),
+          field: (extension, fieldId, value) => after(() => submitSettings(extension, { case: "submitExtensionSetupInteraction", value: {
             extensionId: extension.id, expectedRevision: { value: extension.revision }, attemptId: extension.setup.attemptId ?? "", fieldId,
             value: typeof value === "boolean" ? { case: "confirmed", value } : { case: "text", value }
-          } }, true, [], active).then(() => undefined)),
-          secret: (extension, fieldId, value) => after(() => this.saveExtensionSetupCredential(extension.id, extension.setup.attemptId ?? "", fieldId, "headerSecret", value, extension.revision, active)),
-          complete: extension => after(() => this.submit({ case: "completeExtensionSetup", value: { extensionId: extension.id, expectedRevision: { value: extension.revision }, attemptId: extension.setup.attemptId ?? "" } }, true, [], active).then(() => undefined))
+          } }).then(() => undefined)),
+          secret: (extension, fieldId, value) => after(() => this.saveExtensionSetupCredential(extension.id, extension.setup.attemptId ?? "", fieldId, "headerSecret", value, extension.revision, active, observe(extension, "commitExtensionSetupCredential"), true)),
+          complete: extension => after(() => submitSettings(extension, { case: "completeExtensionSetup", value: { extensionId: extension.id, expectedRevision: { value: extension.revision }, attemptId: extension.setup.attemptId ?? "" } }).then(() => undefined))
         }, call, host, active);
       }
     };
@@ -6533,7 +6577,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     kind: "apiKey" | "oauth" | "headerSecret",
     secret: string,
     expectedRevision: bigint,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    observeReceipt?: (operationId: string, operation?: Operation) => void | Promise<void>,
+    readUncertainOnly = false
   ): Promise<void> {
     if (secret.length === 0) throw new GatewayError("Extension credential value is required.");
     const scope = this.captureActionScope(signal);
@@ -6554,7 +6600,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         credentialUploadTicketId: ticketId,
         expectedRevision: { value: expectedRevision }
       }
-    }, true, [], scope.signal);
+    }, true, [], scope.signal, observeReceipt, undefined, readUncertainOnly);
   }
 
   async completeExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void> {
@@ -10784,6 +10830,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         const cursor = this.#rawSnapshot?.resumeCursor;
         let lastGeneration = this.#snapshot?.generation;
         let lastSequence = this.#snapshot?.cursor;
+        let consumedGeneration = lastGeneration;
+        let consumedSequence = lastSequence;
+        let continuousCompactionStream = true;
+        let compactionRefreshSource: Snapshot | undefined;
         const profile = this.#profile;
         const stream = this.#taskSharing !== undefined ? this.finiteTaskEvents(signal, onAccepted)
           : this.#transportFactory === transportFor && profile !== undefined && this.#authKey !== undefined
@@ -10802,7 +10852,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           const invalidated = payloadCase(event) === "projectionInvalidated";
           const continuity = classifyEventContinuity(lastGeneration, lastSequence, event);
           const duplicate = continuity === "duplicate";
-          if (duplicate && !invalidated) continue;
+          const consumedContinuity = classifyEventContinuity(consumedGeneration, consumedSequence, event);
+          if (consumedContinuity === "contiguous") {
+            consumedGeneration = event.cursor?.generation;
+            consumedSequence = event.cursor?.sequence;
+          } else if (consumedContinuity !== "duplicate") {
+            continuousCompactionStream = false;
+            compactionRefreshSource = undefined;
+          }
+          if (duplicate && !invalidated) {
+            if (continuousCompactionStream && consumedContinuity === "contiguous" && compactionRefreshSource !== undefined) {
+              this.projectBufferedCompaction(event, compactionRefreshSource);
+            }
+            continue;
+          }
           // Transient renderer effects are valid only on a proven contiguous
           // stream edge. A gap/generation refresh restores durable status and
           // widget projections, but must never replay one-shot UI requests.
@@ -10813,6 +10876,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             if (visionEffect !== undefined) this.#callbacks.onVisionBridgeUiEffect?.(visionEffect);
           }
           if (continuity === "gap" || continuity === "generationChanged" || continuity === "missingCursor" || invalidated) {
+            compactionRefreshSource = undefined;
             this.publishLiveSnapshot(false);
             if (this.#rawSnapshot !== undefined && this.#snapshot !== undefined) {
               const retired = retireTimelineHistory(this.#rawSnapshot, this.#snapshot, undefined, event.cursor?.sequence);
@@ -10847,6 +10911,15 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             lastGeneration = projected.snapshot.generation;
             lastSequence = projected.snapshot.cursor;
             if (projected.refresh === "authoritative" || activityRefresh) {
+              // A catalog refresh may advance past buffered stream events,
+              // but owner snapshots deliberately omit their lifecycle rows.
+              const marker = event.payload?.kind;
+              const markerSession = marker?.case === "nativeSessionChanged" ? projected.rawSnapshot.sessions.find(session =>
+                session.sessionId === (marker.value.productSessionId || event.identity?.sessionId)) : undefined;
+              const sameNativeHistory = marker?.case === "nativeSessionChanged" && event.identity?.backendId === markerSession?.backendId
+                && event.identity?.targetId === markerSession?.targetId && event.identity?.generation === markerSession?.nativeBinding?.runtimeGeneration
+                && marker.value.opaqueNativeReference === markerSession?.nativeBinding?.opaqueReference;
+              compactionRefreshSource = (activityRefresh && projected.refresh !== "authoritative") || sameNativeHistory ? projected.rawSnapshot : undefined;
               await this.flushEventRefresh(event.cursor);
               lastGeneration = this.#snapshot?.generation;
               lastSequence = this.#snapshot?.cursor;
@@ -10925,6 +10998,36 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
   }
 
+  private projectBufferedCompaction(event: Event, source: Snapshot): void {
+    const raw = this.#rawSnapshot, snapshot = this.#snapshot, identity = event.identity, cursor = event.cursor;
+    const kind = event.payload?.kind;
+    if (this.#taskSharing !== undefined || raw === undefined || snapshot === undefined || identity === undefined || cursor === undefined
+      || kind?.case !== "compactionChanged" || event.eventId === "" || kind.value.compactionId === ""
+      || ![CompactionState.STARTED, CompactionState.COMPLETED, CompactionState.NO_OP, CompactionState.ABORTED, CompactionState.FAILED].includes(kind.value.state)
+      || cursor.generation !== source.generation || cursor.generation !== snapshot.generation || cursor.sequence > snapshot.cursor
+      || raw.timeline.some(item => item.eventId === event.eventId)
+      || (snapshot.timelineHistoryRevisionBySession.get(identity.sessionId) ?? -1n) >= cursor.sequence) return;
+    const original = source.sessions.find(session => session.sessionId === identity.sessionId), binding = original?.nativeBinding;
+    const current = raw.sessions.find(session => session.sessionId === identity.sessionId), currentBinding = current?.nativeBinding;
+    if (original === undefined || current === undefined || binding === undefined || currentBinding === undefined
+      || identity.backendId !== original.backendId || identity.targetId !== original.targetId || identity.generation !== binding.runtimeGeneration
+      || current.backendId !== original.backendId || current.targetId !== original.targetId || current.archived
+      || [SessionState.CLOSING, SessionState.CLOSED, SessionState.DETACHED].includes(current.state)
+      || currentBinding.backendId !== binding.backendId || currentBinding.opaqueReference !== binding.opaqueReference
+      || currentBinding.runtimeGeneration !== binding.runtimeGeneration) return;
+    const projected = projectSnapshotEvent(raw, snapshot, event, this.isLocalUserInput);
+    // The newer catalog observation has no compaction identity. Retain the
+    // real historical row without letting an older lifecycle overwrite an
+    // explicit observation that may already belong to another compaction.
+    const compacting = current.contextState?.compacting;
+    this.#rawSnapshot = { ...projected.rawSnapshot, generation: raw.generation, resumeCursor: raw.resumeCursor };
+    this.#snapshot = { ...projected.snapshot, generation: snapshot.generation, cursor: snapshot.cursor,
+      sessions: compacting === undefined ? projected.snapshot.sessions : projected.snapshot.sessions.map(session =>
+        session.id === identity.sessionId ? { ...session, compacting } : session) };
+    this.#callbacks.onSnapshot?.(this.#snapshot);
+    if (this.#liveSnapshotConnected) this.#callbacks.onLiveSnapshot?.(this.#snapshot);
+  }
+
   private scheduleEventRefresh(): void {
     this.#eventRefreshQueued = true;
     this.armEventRefresh();
@@ -10961,7 +11064,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     preconditions: readonly MutationPrecondition[] = [],
     callerSignal?: AbortSignal,
     observeReceipt?: (operationId: string, operation?: Operation) => void | Promise<void>,
-    suppliedOperationId?: string
+    suppliedOperationId?: string,
+    readUncertainOnly = false
   ): Promise<Operation> {
     callerSignal?.throwIfAborted();
     if (this.#taskSharing !== undefined && (!this.#sharedTaskReady || this.#sharedTaskUnknownOperations.size > 0)) throw new GatewayError("Check the previous shared task operation before starting another action.", { code: "RESULT_UNKNOWN" });
@@ -11008,10 +11112,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       }
       response = await submitOnce();
     } catch (error) {
-      // A dropped response leaves admission uncertain. Guests only read the exact
-      // receipt; the ordinary connection retains its existing idempotent retry.
+      // A dropped response leaves admission uncertain. Guests and settings only
+      // read the exact receipt; other ordinary actions retain their idempotent retry.
       if (signal?.aborted === true || !isUncertainOperationSubmissionError(error)) throw error;
-      response = this.#taskSharing === undefined ? await submitOnce() : await client.getOperation({ operationId }, options);
+      response = this.#taskSharing === undefined && !readUncertainOnly ? await submitOnce() : await client.getOperation({ operationId }, options);
     } finally { this.#sharedTaskSubmitting.delete(operationId); }
     callerSignal?.throwIfAborted();
     if (response.operation === undefined) throw new GatewayError("Orchestrator accepted no operation.");

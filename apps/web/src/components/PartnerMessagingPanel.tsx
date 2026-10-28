@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type JSX } from 'react';
+import { useEffect, useMemo, useRef, useState, type JSX } from 'react';
 import { Code, ConnectError } from '@connectrpc/connect';
 import { PartnerMessagingLaneKind, PartnerMessagingRestartPhase, partnerMessagingMessages, partnerMutationWasRejected,
   type GetMessagingSettingsResponse, type ListPartnerMessagingLanesResponse,
@@ -11,43 +11,62 @@ import { Button, Modal, SelectControl, Spinner } from './ui.js';
 export function PartnerMessagingPanel({ controller, ownerKey, connectionId, partner }: {
   readonly controller: AppController; readonly ownerKey: string; readonly connectionId?: string; readonly partner?: PartnerProfileView;
 }): JSX.Element | null {
-  const [api] = useState(() => controller.partnerMessagingApi?.(ownerKey));
+  const controllerRef = useRef(controller); controllerRef.current = controller;
+  const connected = controller.state.ready && controller.state.connectionState === 'connected';
+  const [apiRetry, setApiRetry] = useState(0);
+  const apiBinding = useMemo(() => {
+    if (!connected) return { api: undefined, failed: false };
+    try { const api = controllerRef.current.partnerMessagingApi?.(ownerKey); return { api, failed: api === undefined }; }
+    catch { return { api: undefined, failed: true }; }
+  }, [ownerKey, connected, controller.state.connectionGeneration, apiRetry]);
+  const api = apiBinding.api, bindingRef = useRef(apiBinding); bindingRef.current = apiBinding;
   const m = partnerMessagingMessages(controller.state.effectiveLocale), alive = useRef(true), flights = useRef(new Set<AbortController>());
   const [settings, setSettings] = useState<GetMessagingSettingsResponse>(), [partners, setPartners] = useState<readonly PartnerProfileView[]>([]);
   const [failed, setFailed] = useState(false), [busy, setBusy] = useState<string>(), [choices, setChoices] = useState<Record<string, string>>({});
   const [expanded, setExpanded] = useState<string>(), [lanes, setLanes] = useState<ListPartnerMessagingLanesResponse>();
   const [confirmation, setConfirmation] = useState<PartnerMessagingLane>(), [notice, setNotice] = useState<string>();
   const saves = useRef(new Map<string, PartnerMessagingBindingRequest>()), restarts = useRef(new Map<string, PartnerMessagingRestartRequest>());
+  const retainedOwner = useRef(ownerKey);
+  const isCurrent = () => alive.current && bindingRef.current === apiBinding;
   const invoke = async <T,>(action: (signal: AbortSignal) => Promise<T>) => {
+    if (!api || !isCurrent()) return undefined;
     const abort = new AbortController(); flights.current.add(abort);
-    try { const value = await action(abort.signal); return alive.current && !abort.signal.aborted ? value : undefined; }
+    try { const value = await action(abort.signal); return isCurrent() && !abort.signal.aborted ? value : undefined; }
+    catch (error) { if (!isCurrent() || abort.signal.aborted) return undefined; throw error; }
     finally { flights.current.delete(abort); }
   };
   const refresh = async () => {
     if (!api) return;
     try {
       const result = await invoke(signal => Promise.all([api.settings(signal), controller.listPartners(undefined, signal)]));
-      if (result) { setSettings(result[0]); setPartners(result[1].partners); setFailed(false); }
-    } catch { if (alive.current) setFailed(true); }
+      if (result && isCurrent()) { setSettings(result[0]); setPartners(result[1].partners); setFailed(false); }
+    } catch { if (isCurrent()) setFailed(true); }
   };
   useEffect(() => {
-    alive.current = true; void refresh();
+    alive.current = true; setBusy(undefined); setConfirmation(undefined);
+    if (retainedOwner.current !== ownerKey) {
+      retainedOwner.current = ownerKey; saves.current.clear(); restarts.current.clear();
+      setSettings(undefined); setPartners([]); setChoices({}); setExpanded(undefined); setLanes(undefined); setConfirmation(undefined); setNotice(undefined);
+    }
+    void refresh();
     return () => { alive.current = false; for (const flight of flights.current) flight.abort(); flights.current.clear(); };
-  }, [api]);
+  }, [apiBinding]);
   useEffect(() => {
     if (!api || !expanded) return;
     const abort = new AbortController(); let reading = false;
     const load = async () => {
       if (reading || abort.signal.aborted || document.hidden) return;
       reading = true;
-      try { const value = await api.lanes(expanded, abort.signal); if (!abort.signal.aborted) { setLanes(value); setFailed(false); } }
-      catch { if (!abort.signal.aborted) setFailed(true); } finally { reading = false; }
+      try { const value = await api.lanes(expanded, abort.signal); if (!abort.signal.aborted && isCurrent()) { setLanes(value); setFailed(false); } }
+      catch { if (!abort.signal.aborted && isCurrent()) setFailed(true); } finally { reading = false; }
     };
     void load(); const timer = window.setInterval(() => void load(), 5000);
     document.addEventListener('visibilitychange', load);
     return () => { abort.abort(); window.clearInterval(timer); document.removeEventListener('visibilitychange', load); };
-  }, [api, expanded]);
-  if (!api) return null;
+  }, [apiBinding, expanded]);
+  if (!api) return apiBinding.failed ? <section className="partner-messaging-panel" aria-label={m.title}>
+    <p role="alert">{m.failed} <Button onClick={() => setApiRetry(value => value + 1)}>{m.refresh}</Button></p>
+  </section> : null;
   const save = async (id: string, value: string) => {
     if (busy) return;
     const connection = settings?.connections.find(row => row.connectionId === id), binding = settings?.partnerBindings.find(row => row.connectionId === id);
@@ -64,14 +83,14 @@ export function PartnerMessagingPanel({ controller, ownerKey, connectionId, part
     setBusy(id); setNotice(undefined);
     try {
       const result = await invoke(signal => api.save(request!, signal));
-      if (!result) return;
+      if (!result || !isCurrent()) return;
       saves.current.delete(id); setChoices(current => { const next = { ...current }; delete next[id]; return next; });
-      await refresh(); setNotice(undefined);
+      await refresh(); if (isCurrent()) setNotice(undefined);
     } catch (error) {
-      if (!alive.current) return;
-      if (partnerMutationWasRejected(error)) { saves.current.delete(id); await refresh(); setNotice(m.failed); }
+      if (!isCurrent()) return;
+      if (partnerMutationWasRejected(error)) { saves.current.delete(id); await refresh(); if (isCurrent()) setNotice(m.failed); }
       else setNotice(m.unknown);
-    } finally { if (alive.current) setBusy(undefined); }
+    } finally { if (isCurrent()) setBusy(undefined); }
   };
   const restart = async (lane: PartnerMessagingLane, confirmed = false) => {
     if (busy || !expanded || !lanes?.binding) return;
@@ -91,15 +110,15 @@ export function PartnerMessagingPanel({ controller, ownerKey, connectionId, part
           return receipt.phase === PartnerMessagingRestartPhase.READY ? receipt : api.retry(receipt.operationId, signal);
         } catch (error) { if (error instanceof ConnectError && error.code === Code.NotFound) return api.restart(request!, signal); throw error; }
       });
-      if (!value) return;
+      if (!value || !isCurrent()) return;
       if (value.phase === PartnerMessagingRestartPhase.READY) { restarts.current.delete(lane.conversationId); setNotice(m.ready); }
       else setNotice(m.closing);
-      const next = await invoke(signal => api.lanes(expanded, signal)); if (next) setLanes(next);
+      const next = await invoke(signal => api.lanes(expanded, signal)); if (next && isCurrent()) setLanes(next);
     } catch (error) {
-      if (!alive.current) return;
+      if (!isCurrent()) return;
       if (partnerMutationWasRejected(error)) restarts.current.delete(lane.conversationId);
       setNotice(m.unknown);
-    } finally { if (alive.current) setBusy(undefined); }
+    } finally { if (isCurrent()) setBusy(undefined); }
   };
   const connections = settings?.connections.filter(row => {
     if (connectionId && row.connectionId !== connectionId) return false;

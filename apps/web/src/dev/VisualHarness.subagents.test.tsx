@@ -50,8 +50,9 @@ describe("Managed subagent visual harness", () => {
 
     expect(document.documentElement.dataset.visualHarness).toBe("subagents");
     expect(document.documentElement.dataset.theme).toBe("light");
-    expect(container.querySelector(".inspector.is-open")).not.toBeNull();
-    expect(container.querySelector<HTMLButtonElement>("#inspector-tab-subagents")?.getAttribute("aria-selected")).toBe("true");
+    expect(container.querySelector('.inspector-dock-group[data-edge="right"]')).not.toBeNull();
+    const subagentsTab = [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find(tab => tab.textContent === "Subagents");
+    expect(subagentsTab?.getAttribute("aria-selected")).toBe("true");
     expect(container.querySelectorAll(".subagents-run-row")).toHaveLength(2);
     expect(container.querySelector(".subagents-panel__header")?.textContent).toContain("2 of 7");
     await loadEveryRunPage(container);

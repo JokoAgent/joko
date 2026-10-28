@@ -11,13 +11,15 @@ import type {
   ExtensionCatalogEntryView,
   ExtensionLibraryOverviewView,
   ExtensionLibrarySessionView,
-  ExtensionMainViewSurfaceView
+  ExtensionMainViewSurfaceView,
+  ExtensionSettingsApi
 } from "../model.js";
 import {
   EXTENSION_LIBRARY_BRIDGE_REQUEST,
   EXTENSION_LIBRARY_BRIDGE_RESPONSE
 } from "../extension-library-bridge.js";
 import { ExtensionMainViewPage, sameExtensionMainViewSurface } from "./ExtensionMainViewPage.js";
+import { extensionSettingsProfilePin, parsePendingExtensionSettingsOperation } from "../extension-settings-operation.js";
 
 const EXTENSION_A = "extension_0123456789abcdef0123456789abcdef";
 const EXTENSION_B = "extension_11111111111111111111111111111111";
@@ -104,6 +106,76 @@ describe("Extension main view", () => {
     const rendered = await renderMainView(controller, EXTENSION_A, true);
     await rendered.rerender(EXTENSION_B); pending.resolve(catalog(extensionA)); await settle();
     expect(open).toHaveBeenCalledTimes(1); expect(open).toHaveBeenCalledWith(extensionB.id, extensionB.revision, expect.any(AbortSignal));
+  });
+
+  it("opens the cold original-result control and reports a completed directory operation without delivering another deposit to the frame", async () => {
+    const extension = { ...readyExtension(EXTENSION_A, "Settings"), settings: { height: 480, mobileCustom: false } };
+    const surface = { ...mainViewSurface(extension), purpose: "settings" as const };
+    const profile = { id: "profile", serverId: "node", deviceId: "device", name: "Original", origin: "https://orchestrator.example/" };
+    const original = parsePendingExtensionSettingsOperation({ operationId: "11111111-1111-4111-8111-111111111111", kind: "pickExtensionDirectory",
+      extensionId: extension.id, resourceId: "resource-original", resourceRevision: "4", expectedRevision: "7", discoveredRevision: `sha256:${"a".repeat(64)}`,
+      profile: extensionSettingsProfilePin(profile) });
+    let retained: typeof original | undefined = original;
+    const pending = vi.fn(async () => retained), checkOriginal = vi.fn<NonNullable<ExtensionSettingsApi["checkOriginal"]>>(async () => ({ state: "pending" })), call = vi.fn();
+    const api = { open: vi.fn(async () => surface), close: vi.fn(async () => true), call, pending, checkOriginal };
+    const controller = controllerFor({ state: { activeProfile: profile, connectionGeneration: 1 } as AppController["state"],
+      getExtension: vi.fn(async () => catalog(extension)), extensionSettingsApi: () => api, getExtensionMainViewSurface: vi.fn(async () => surface) });
+    const rendered = await renderMainView(controller, EXTENSION_A, true), frame = required(rendered.container.querySelector<HTMLIFrameElement>("iframe"));
+    expect(rendered.container.textContent).toContain("extensions.settingsOperationPending"); expect(call).not.toHaveBeenCalled();
+    const sent = vi.spyOn(required(frame.contentWindow), "postMessage");
+    const check = () => required([...rendered.container.querySelectorAll("button")].find(button => button.textContent === "extensions.settingsOperationCheck"));
+    await act(async () => { check().click(); check().click(); }); await settle();
+    expect(checkOriginal).toHaveBeenCalledExactlyOnceWith(original, expect.any(AbortSignal)); expect(rendered.container.textContent).toContain("extensions.settingsOperationPending");
+    checkOriginal.mockImplementationOnce(async () => { retained = undefined; return { state: "succeeded" }; });
+    await act(async () => check().click()); await settle();
+    expect(rendered.container.textContent).toContain("extensions.settingsDirectoryCompleted"); expect(rendered.container.textContent).not.toContain("extensions.settingsOperationPending");
+    expect(call).not.toHaveBeenCalled(); expect(sent).not.toHaveBeenCalled();
+  });
+
+  it("does not let a late original-result read update the settings page on a replacement connection", async () => {
+    const extension = { ...readyExtension(EXTENSION_A, "Settings"), settings: { height: 480, mobileCustom: false } };
+    const surface = { ...mainViewSurface(extension), purpose: "settings" as const };
+    const profile = { id: "profile", serverId: "node", deviceId: "device", name: "Original", origin: "https://orchestrator.example/" };
+    const original = parsePendingExtensionSettingsOperation({ operationId: "11111111-1111-4111-8111-111111111111", kind: "setExtensionSettingsRoutingData",
+      extensionId: extension.id, resourceId: "resource-original", resourceRevision: "4", expectedRevision: "7", discoveredRevision: `sha256:${"a".repeat(64)}`,
+      profile: extensionSettingsProfilePin(profile) });
+    const receipt = deferred<{ state: "succeeded" }>();
+    const api = { open: vi.fn(async () => surface), close: vi.fn(async () => true), call: vi.fn(), pending: vi.fn(async () => original),
+      checkOriginal: vi.fn<NonNullable<ExtensionSettingsApi["checkOriginal"]>>(() => receipt.promise) };
+    const controller = controllerFor({ state: { activeProfile: profile, connectionGeneration: 1 } as AppController["state"],
+      getExtension: vi.fn(async () => catalog(extension)), extensionSettingsApi: () => api, getExtensionMainViewSurface: vi.fn(async () => surface) });
+    const rendered = await renderMainView(controller, EXTENSION_A, true);
+    await act(async () => required([...rendered.container.querySelectorAll("button")].find(button => button.textContent === "extensions.settingsOperationCheck")).click());
+    expect(api.checkOriginal).toHaveBeenCalledOnce(); const signal = api.checkOriginal.mock.calls[0]![1];
+    const replacement = { ...controller, state: { ...controller.state, connectionGeneration: 2 },
+      extensionSettingsApi: () => ({ ...api, pending: vi.fn(async () => undefined) }) };
+    await rendered.rerender(EXTENSION_A, replacement); expect(signal.aborted).toBe(true);
+    await act(async () => receipt.resolve({ state: "succeeded" })); await settle();
+    expect(rendered.container.textContent).not.toContain("extensions.settingsOperationSucceeded"); expect(rendered.container.textContent).not.toContain("extensions.settingsOperationPending");
+    expect(api.call).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the native receipt control when reloading retires a settings document with an in-flight effect", async () => {
+    const extension = { ...readyExtension(EXTENSION_A, "Settings"), settings: { height: 480, mobileCustom: false } };
+    const surface = { ...mainViewSurface(extension), purpose: "settings" as const };
+    const profile = { id: "profile", serverId: "node", deviceId: "device", name: "Original", origin: "https://orchestrator.example/" };
+    const original = parsePendingExtensionSettingsOperation({ operationId: "11111111-1111-4111-8111-111111111111", kind: "setExtensionSettingsRoutingData",
+      extensionId: extension.id, resourceId: "resource-original", resourceRevision: "4", expectedRevision: "7", discoveredRevision: `sha256:${"a".repeat(64)}`,
+      profile: extensionSettingsProfilePin(profile) });
+    let retained: typeof original | undefined;
+    const call = vi.fn<ExtensionSettingsApi["call"]>(async () => { retained = original; return new Promise(() => undefined); });
+    const api = { open: vi.fn(async () => surface), close: vi.fn(async () => true), call, pending: vi.fn(async () => retained),
+      checkOriginal: vi.fn<NonNullable<ExtensionSettingsApi["checkOriginal"]>>(async () => ({ state: "pending" })) };
+    const controller = controllerFor({ state: { activeProfile: profile, connectionGeneration: 1 } as AppController["state"],
+      getExtension: vi.fn(async () => catalog(extension)), extensionSettingsApi: () => api, getExtensionMainViewSurface: vi.fn(async () => surface) });
+    const rendered = await renderMainView(controller, EXTENSION_A, true), frame = required(rendered.container.querySelector<HTMLIFrameElement>("iframe"));
+    dispatchSettings(frame, "original-effect", { kind: "routing.set", revision: "0", dataJson: "{}" }); await settle();
+    expect(call).toHaveBeenCalledOnce();
+    await act(async () => buttonWithLabel(rendered.container, "extensions.mainView.reload").click()); await settle();
+    expect(call.mock.calls[0]![3].aborted).toBe(true); expect(rendered.container.querySelector("iframe")).not.toBe(frame);
+    expect(rendered.container.textContent).toContain("extensions.settingsOperationPending");
+    await act(async () => required([...rendered.container.querySelectorAll("button")].find(button => button.textContent === "extensions.settingsOperationCheck")).click());
+    expect(api.checkOriginal).toHaveBeenCalledExactlyOnceWith(original, expect.any(AbortSignal)); expect(call).toHaveBeenCalledOnce();
   });
 
   it("opens an exact surface in a script-only sandbox, reloads, and fails closed when revoked", async () => {

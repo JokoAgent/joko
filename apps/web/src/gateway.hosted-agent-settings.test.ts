@@ -4,7 +4,7 @@ import { GetSnapshotResponseSchema, SnapshotSchema, type HostedAgentSettings, ty
 import { expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
-const settings = { revision: 4n, remoteControlEnabled: false, providers: [{ backendId: "native-a", providerId: "account-a", enabled: true }],
+const settings = { revision: 4n, remoteControlEnabled: false, idleReleaseMinutes: 0, providers: [{ backendId: "native-a", providerId: "account-a", enabled: true }],
   limits: { perDevice: 16, total: 64 }, limitsOverridden: false, usage: { total: 3, devices: 2, maximumDevice: 2 } };
 function fixture(handler: (method: string, input: any, signal?: AbortSignal) => unknown | Promise<unknown>) {
   const transport = { unary: vi.fn(async (method: any, signal: AbortSignal | undefined, _timeout: unknown, _headers: unknown, input: any) => {
@@ -24,7 +24,7 @@ it("uses the generated owner service with exact Provider identities, CAS and tru
   try {
     expect(await gateway.getHostedAgentSettings()).toEqual(settings);
     expect(await gateway.getHostedAgentCatalog()).toEqual({ backends: [{ backendId: "native-a", displayName: "Native A", providers: [
-      { providerId: "account-a", displayName: "Account", connected: true, modelCount: 1 }] }] });
+      { providerId: "account-a", displayName: "Account", connected: true, modelCount: 1, models: [{ id: "model-a", name: "model-a" }] }] }] });
     await gateway.updateHostedAgentSettings({ kind: "provider", backendId: "native-a", providerId: "account-a", enabled: false }, 4n);
     await gateway.updateHostedAgentSettings({ kind: "limits", perDevice: 1, total: 2 }, 5n);
     await gateway.updateHostedAgentSettings({ kind: "resetLimits" }, 5n);

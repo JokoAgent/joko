@@ -64,7 +64,9 @@ describe("mounted message navigation rail", () => {
     await page.locator("form.pair-form button[type=submit]").click();
     const timeline = page.locator(`.timeline[data-timeline-session-id="${sessionId}"]`);
     await timeline.waitFor({ state: "visible", timeout: 20_000 });
-    await page.getByRole("button", { name: "Close details", exact: true }).click();
+    await page.getByRole("button", { name: "Close Context tab", exact: true }).click();
+    await page.getByRole("button", { name: "Open details", exact: true }).waitFor({ state: "visible" });
+    expect(await page.locator(".inspector-dock-group[data-edge]").count()).toBe(0);
     const rail = page.locator(".message-nav-rail");
     try {
       await rail.waitFor({ state: "visible", timeout: 20_000 });
@@ -200,9 +202,9 @@ describe("mounted message navigation rail", () => {
       await savedProfile.getByText(fixture.baseUrl, { exact: true }).waitFor({ state: "visible" });
       await savedProfile.getByRole("button", { name: "Connect", exact: true }).click();
       await timeline.waitFor({ state: "visible", timeout: 20_000 });
-      const closeDetails = page.getByRole("button", { name: "Close details", exact: true });
-      if (await closeDetails.isVisible()) await closeDetails.click();
     }
+    await page.getByRole("button", { name: "Open details", exact: true }).waitFor({ state: "visible" });
+    expect(await page.locator(".inspector-dock-group[data-edge]").count()).toBe(0);
     await page.mouse.move(1450, 100);
     try {
       await tick(3).click();

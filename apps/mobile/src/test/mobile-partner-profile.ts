@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { PartnerProfileSchema, PartnerLifecycle, PartnerInitializationState, PartnerInvitationStage, PermissionMode } from "@joko/contracts";
+import { PartnerProfileSchema, PartnerLifecycle, PartnerInitializationState, PartnerInvitationStage, PermissionMode, encodeModelSpeed } from "@joko/contracts";
 import type { MobilePartnerDirectoryProfile } from "../mobile-partner-directory";
 import type { MobilePartnerProfileSnapshot } from "../mobile-partner-profile";
 
@@ -31,8 +31,8 @@ export function profilePartnerWire(partner = profilePartner) {
     identitySource: partner.identitySource, templateId: partner.templateId,
     lifecycle: PartnerLifecycle.ACTIVE, initializationState: PartnerInitializationState.READY, invitationStage: PartnerInvitationStage.READY,
     homeTargetId: partner.homeTargetId, canonicalSessionId: partner.canonicalSessionId, usesDirectoryDefaults: partner.usesDirectoryDefaults,
-    capabilities: { modelChain: [...partner.capabilities.modelChain], permissionMode: PermissionMode.ASK, planMode: false, inputHandoff: partner.capabilities.inputHandoff ?? true },
-    ...(partner.taskModelOverride === undefined ? {} : { taskModelOverride: partner.taskModelOverride }),
+    capabilities: { modelChain: partner.capabilities.modelChain.map(route => ({ ...route, ...encodeModelSpeed(route.fastMode) })), permissionMode: PermissionMode.ASK, planMode: false, inputHandoff: partner.capabilities.inputHandoff ?? true },
+    ...(partner.taskModelOverride === undefined ? {} : { taskModelOverride: { ...partner.taskModelOverride, ...encodeModelSpeed(partner.taskModelOverride.fastMode) } }),
     createdAt: { seconds: 1n }, updatedAt: { seconds: 2n }, activity: {
       partnerId: partner.partnerId, readThroughCursor: { value: 0n }, readUpdatedAt: { seconds: 1n }
     }

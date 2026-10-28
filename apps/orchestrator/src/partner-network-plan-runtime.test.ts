@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
-import { createClient } from "@connectrpc/connect";
+import { Code, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as contract from "@joko/contracts";
@@ -49,7 +49,7 @@ class PlanAdapter extends FakeBackendAdapter {
   }
 }
 const auth = () => ({ deviceId: "foreign-owner", signal: new AbortController().signal, assertCurrent() {} });
-async function fixture() {
+async function fixture(singleSpeaker = false) {
   const endpointIdentity = await createIdentity();
   const root = await mkdtemp(join(tmpdir(), "joko-network-plan-")), store = new OperationalStore(join(root, "operations.db")), profiles = new PartnerStore(join(root, "profiles.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
@@ -81,6 +81,8 @@ async function fixture() {
   const retireTransport = attachTestLinkspanTransport(server.server, origin, endpointIdentity);
   const owner = createClient(contract.PartnerNetworkService, createConnectTransport({ baseUrl: origin, httpVersion: "1.1", interceptors: [next => request => { request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request); }] }));
   const room = (await owner.createPartnerNetwork({ operationId: "create-room", name: "Plan room", displayName: "Owner", partnerIds: members.map(member => member.id) })).room!;
+  // Existing work arrangements remain executable after the authority adopts talk queues.
+  if (!singleSpeaker) store.setSetting("service", "partner-network.v1:host", `room:${room.id}`, { ...host.storage.get(room.id), singleSpeaker: false });
   cleanups.push(async () => { await retireTransport(); await server.close(); await network.close(); work.dispose(); await sessions.dispose(); profiles.close(); store.close(); await rm(root, { recursive: true, force: true }); });
   const current = () => host.storage.plans.current(room.id)!;
   const act = (action: string) => owner.planPartnerNetwork({ roomId: room.id, operationId: crypto.randomUUID(), planId: current().id, expectedRevision: BigInt(current().revision), action });
@@ -90,6 +92,23 @@ async function fixture() {
 }
 
 describe("network work-plan integration", () => {
+  it("runs a talk queue in separate original native lanes without the auxiliary planner, main history or worktree preparation", async () => {
+    const f = await fixture(true), prepare = vi.spyOn(f.planWorkspaces, "prepare"), actors = f.room.members.filter(member => member.kind === "partner");
+    await f.owner.sendPartnerNetwork({ operationId: "ordinary-before-queue", roomId: f.room.id, text: "UNRELATED_MAIN_HISTORY", mentions: [actors[0]!.id] });
+    await f.network.tick(); await vi.waitFor(() => expect(f.adapter.inputs).toHaveLength(1));
+    await vi.waitFor(() => expect(f.host.storage.executions(f.room.id).every(job => job.status === "completed")).toBe(true));
+    await f.owner.sendPartnerNetwork({ operationId: "talk-request", roomId: f.room.id, text: "ORIGINAL_QUEUE_QUESTION" });
+    const plan = f.current(); expect(plan.kind).toBe("talk");
+    await vi.waitFor(async () => { await f.network.tick(); expect(f.host.storage.plans.get(f.room.id, plan.id).status).toBe("completed"); }, { timeout: 12_000 });
+    expect(f.decidePlan).not.toHaveBeenCalled(); expect(prepare).not.toHaveBeenCalled(); expect(f.adapter.inputs).toHaveLength(3);
+    const [main, first, second] = f.adapter.inputs;
+    expect(new Set([main!.context.sessionId, first!.context.sessionId, second!.context.sessionId]).size).toBe(3);
+    for (const turn of [first!, second!]) { expect(turn.input.text).toContain("ORIGINAL_QUEUE_QUESTION"); expect(turn.input.text).not.toContain("UNRELATED_MAIN_HISTORY"); }
+    expect(second!.input.text).toContain("handoffs");
+    for (const turn of [first!, second!]) expect(f.store.getSession(turn.context.sessionId).descriptor.worktree).toBeUndefined();
+    expect(f.host.snapshot(create(contract.GetPartnerNetworkRequestSchema, { roomId: f.room.id }), f.host.selfId).plans[0]?.kind).toBe("talk");
+    expect(f.host.storage.messages(f.room.id).every(message => message.attachments.length === 0)).toBe(true);
+  }, 30_000);
   it("rejects delayed tools and owner tasks from a previous actor or previous execution while reusing the correct plan session", async () => {
     const f = await fixture(); f.decidePlan.mockImplementationOnce(async input => ({ needsPlan: true,
       steps: [{ partnerId: input.members[0]!.partnerId, task: "Write" }, { partnerId: input.members[1]!.partnerId, task: "Review" }, { partnerId: input.members[0]!.partnerId, task: "Revise" }] }));
@@ -140,13 +159,46 @@ describe("network work-plan integration", () => {
     const invitation = (await f.owner.invitePartnerNetwork({ roomId: f.room.id, operationId: "invite", expectedRevision: BigInt(f.host.storage.get(f.room.id).revision), lifetimeMs: 60_000n })).invitation;
     const foreign = new PartnerNetworkHome({ directory: join(f.root, "foreign"), serverId: "foreign", vault: f.vault, partner: f.partner }); await foreign.initialize(); cleanups.push(() => foreign.close());
     const joined = await foreign.join(create(contract.JoinPartnerNetworkRequestSchema, { invitation, operationId: "join", displayName: "Guest" }), auth());
-    await foreign.plan(create(contract.PlanPartnerNetworkRequestSchema, { roomId: f.room.id, joinId: joined.joinId, operationId: "continue", action: "continue", planId: plan.id,
-      expectedRevision: BigInt(f.current().revision) }), auth());
+    const continueRequest = create(contract.PlanPartnerNetworkRequestSchema, { roomId: f.room.id, joinId: joined.joinId, operationId: "unprivileged-continue", action: "continue", planId: plan.id,
+      expectedRevision: BigInt(f.current().revision) });
+    await expect(foreign.plan(continueRequest, auth())).rejects.toMatchObject({ code: Code.PermissionDenied });
+    expect(f.current()).toMatchObject({ status: "waiting", currentStep: 0 }); expect(f.adapter.infer).not.toHaveBeenCalled();
+    const authorized = await f.owner.managePartnerNetwork({ roomId: f.room.id, operationId: "authorize-guest-plan-admin", expectedRevision: BigInt(f.host.storage.get(f.room.id).revision),
+      action: "set-role", actorId: joined.selfId, value: "admin" });
+    expect(authorized.room?.members.find(member => member.id === joined.selfId)?.role).toBe("admin");
+    await foreign.plan(create(contract.PlanPartnerNetworkRequestSchema, { ...continueRequest, operationId: "continue" }), auth());
     await f.network.tick(); await vi.waitFor(() => expect(f.host.storage.plans.get(f.room.id, plan.id).status).toBe("completed"), { timeout: 8_000 });
-    expect(f.adapter.inputs).toHaveLength(1); expect(f.adapter.infer).toHaveBeenCalledOnce(); const inferred = f.adapter.infer.mock.calls[0]![0];
+    // An administrator can continue the original owner's arrangement without
+    // changing that request's owner access or private native workspace.
+    expect(f.adapter.inputs).toHaveLength(2); expect(f.adapter.infer).not.toHaveBeenCalled();
+    expect(f.adapter.inputs[1]!.context.target.workspaceRoot).toBe(corePlan.workDir);
+    const privateLanes = f.laneStore.lanes(); expect(privateLanes).toHaveLength(2);
+
+    // A separate request actually owned by the foreign member gets chat access.
+    // Carry the published handoff bytes through that member's own upload receipt.
+    const target = { roomId: f.room.id, joinId: joined.joinId };
+    const delivered = await foreign.media(create(contract.MediaPartnerNetworkRequestSchema, { ...target, action: "read", mediaId: handoff.attachments[0]!.id }), auth());
+    expect(new TextDecoder().decode(delivered.data)).toBe("ACTUAL_DELIVERED_PLAN_RESULT");
+    const upload = await foreign.media(create(contract.MediaPartnerNetworkRequestSchema, { ...target, operationId: "foreign-public-handoff", action: "begin",
+      name: "result.txt", mediaType: "text/plain", sizeBytes: BigInt(delivered.data.byteLength) }), auth());
+    const written = await foreign.media(create(contract.MediaPartnerNetworkRequestSchema, { ...target, action: "write", mediaId: upload.attachment!.id, data: delivered.data }), auth());
+    expect(written.complete).toBe(true);
+    await foreign.send(create(contract.SendPartnerNetworkRequestSchema, { ...target, operationId: "foreign-public-plan", text: "Review this delivered result using public group context.",
+      forcePlan: true, attachments: [upload.attachment!] }), auth());
+    await f.network.tick(); await vi.waitFor(() => expect(f.current().status).toBe("proposed"), { timeout: 8_000 });
+    const publicPlan = f.current(); expect(publicPlan.requesterId).toBe(joined.selfId);
+    const ensure = vi.spyOn(f.lanes, "ensureLane");
+    await foreign.plan(create(contract.PlanPartnerNetworkRequestSchema, { ...target, operationId: "start-foreign-public-plan", action: "start", planId: publicPlan.id,
+      expectedRevision: BigInt(publicPlan.revision) }), auth());
+    await f.network.tick(); await vi.waitFor(() => expect(f.current().status).toBe("waiting"), { timeout: 8_000 });
+    expect(f.adapter.inputs).toHaveLength(2); expect(f.adapter.infer).toHaveBeenCalledOnce(); const inferred = f.adapter.infer.mock.calls[0]![0];
     expect(inferred.user).toContain("ACTUAL_DELIVERED_PLAN_RESULT"); expect(inferred.user).toContain("Write result");
     expect(`${inferred.system}${inferred.user}`).not.toContain("PRIVATE_"); expect(`${inferred.system}${inferred.user}`).not.toContain(corePlan.workDir);
-    expect(f.laneStore.lanes()).toHaveLength(1); expect(JSON.stringify(f.host.storage.plans.get(f.room.id, plan.id))).not.toContain(f.root);
+    expect(ensure).not.toHaveBeenCalled(); expect(f.laneStore.lanes()).toEqual(privateLanes);
+    expect(JSON.stringify(f.host.storage.plans.get(f.room.id, plan.id))).not.toContain(f.root);
+    expect(JSON.stringify(f.current())).not.toContain(f.root);
+    await foreign.plan(create(contract.PlanPartnerNetworkRequestSchema, { ...target, operationId: "stop-foreign-public-plan", action: "stop", planId: publicPlan.id,
+      expectedRevision: BigInt(f.current().revision) }), auth());
   }, 30_000);
 
   it("finishes running notes in the same hidden session and publishes one final handoff with all produced files", async () => {

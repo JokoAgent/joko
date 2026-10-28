@@ -89,14 +89,14 @@ function validateState(state: TodoState): void {
 const text = (maximum: number) => ({ type: "string", maxLength: maximum });
 const object = (properties: Record<string, unknown>, required: readonly string[] = []) => ({ type: "object", additionalProperties: false, properties, required });
 const nullable = (schema: object) => ({ anyOf: [{ type: "null" }, schema] });
-const deadline = object({ kind: { enum: ["date", "instant"] }, date: text(10), timeZone: text(100), at: text(64), sourceId: text(512),
+const deadline = object({ kind: { type: "string", enum: ["date", "instant"] }, date: text(10), timeZone: text(100), at: text(64), sourceId: text(512),
   sourceVersion: { type: "integer", minimum: 0 }, quote: text(2000), observedAt: text(64) }, ["kind", "date", "timeZone"]);
-const patchSchema = object({ id: text(256), expectedRevision: { type: "integer", minimum: 1 }, key: text(512), origin: { enum: ["assigned", "discovered"] },
-  title: text(300), progress: text(4000), outcome: text(4000), value: text(4000), next: nullable(object({ label: text(100), instruction: text(4000), kind: { enum: ["advance", "view", "decide"] } , ["label", "instruction", "kind"])),
-  sources: { type: "array", maxItems: 100, items: object({ kind: { enum: ["conversation", "mail", "feishu", "github", "community", "task"] }, id: text(512), label: text(300), ref: text(2000), project: text(4096), version: { type: "integer", minimum: 0 }, observedAt: text(64) }, ["kind", "id", "label"]) },
-  associations: { type: "array", maxItems: 100, items: object({ kind: { enum: ["task", "pr"] }, id: text(512), label: text(300) }, ["kind", "id", "label"]) },
+const patchSchema = object({ id: text(256), expectedRevision: { type: "integer", minimum: 1 }, key: text(512), origin: { type: "string", enum: ["assigned", "discovered"] },
+  title: text(300), progress: text(4000), outcome: text(4000), value: text(4000), next: nullable(object({ label: text(100), instruction: text(4000), kind: { type: "string", enum: ["advance", "view", "decide"] } }, ["label", "instruction", "kind"])),
+  sources: { type: "array", maxItems: 100, items: object({ kind: { type: "string", enum: ["conversation", "mail", "feishu", "github", "community", "task"] }, id: text(512), label: text(300), ref: text(2000), project: text(4096), version: { type: "integer", minimum: 0 }, observedAt: text(64) }, ["kind", "id", "label"]) },
+  associations: { type: "array", maxItems: 100, items: object({ kind: { type: "string", enum: ["task", "pr"] }, id: text(512), label: text(300) }, ["kind", "id", "label"]) },
   sourceDeadline: nullable(deadline), deadlineOverride: object({ value: nullable(deadline) }, ["value"]), deadlineCandidate: nullable(object({ value: deadline, reason: text(2000) }, ["value", "reason"])),
-  suggestedDate: nullable(text(10)), operation: { enum: ["complete", "reopen", "delete", "mute", "later", "restore", "confirm-deadline"] }, until: text(64),
+  suggestedDate: nullable(text(10)), operation: { type: "string", enum: ["complete", "reopen", "delete", "mute", "later", "restore", "confirm-deadline"] }, until: text(64),
   completion: object({ summary: text(4000), ref: text(2000) }, ["summary"]), resolvedActionRequestId: text(256) });
 
 /** Todo writes use the existing tool permission pipeline and exact durable effect identity. */
@@ -104,7 +104,7 @@ export class PartnerTodoTools implements BridgeToolProvider {
   readonly id = "joko_partner_todos"; readonly generation = 1; readonly available = true; readonly canonicalPartnerOnly = true;
   readonly tools: readonly McpToolDescriptor[] = [
     { serverId: this.id, name: "todo_list", description: "Read your own affair ledger. Open affairs belong to the owner, independently of task runtime state. Use offset to read all pages; deleted, muted or deferred affairs never become new work automatically.",
-      inputSchema: object({ view: { enum: ["open", "done", "hidden"] }, order: { enum: ["due", "created"] }, offset: { type: "integer", minimum: 0 }, query: text(300) }), requiresPermission: false },
+      inputSchema: object({ view: { type: "string", enum: ["open", "done", "hidden"] }, order: { type: "string", enum: ["due", "created"] }, offset: { type: "integer", minimum: 0 }, query: text(300) }), requiresPermission: false },
     { serverId: this.id, name: "todo_update", description: "Save or update an owner-assigned affair, or a concrete discovery the owner may need to handle. Read first; updates require the exact expectedRevision. Preserve the stable key and source evidence. Completion requires actual evidence. A source deadline is not an owner date override; uncertain dates are candidates. Do not run a stored next instruction without the owner's request.", inputSchema: patchSchema, requiresPermission: true }
   ];
   constructor(readonly manager: PartnerTodoManager) {}

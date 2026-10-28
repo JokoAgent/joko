@@ -96,16 +96,34 @@ function NetworkEntry({ api, m, kind, partners, owner, onClose, onJoined }: { ap
 export function PartnerNetworkPage({ controller, route, t, onOpenNavigation }: { controller: AppController; route: string; t: Translator; onOpenNavigation(): void }): JSX.Element {
   const api = controller.partnerNetwork, m = wire.partnerNetworkMessages(controller.state.effectiveLocale), target = routeKey(route);
   if (!api) return <div className="partner-group-empty">{m.unavailable}</div>;
-  return <NetworkConversation key={`${route}:${controller.state.activeProfile?.id}:${controller.state.connectionGeneration}`} api={api} target={target} controller={controller} m={m} t={t} onOpenNavigation={onOpenNavigation} />;
+  return <NetworkWorkspace key={`${route}:${controller.state.activeProfile?.id}:${controller.state.connectionGeneration}`} api={api} target={target} controller={controller} m={m} t={t} onOpenNavigation={onOpenNavigation} />;
+}
+interface NetworkConversationProps { api: PartnerNetworkApi; target: { roomId: string; joinId: string }; controller: AppController; m: Copy; t: Translator; onOpenNavigation(): void; }
+function NetworkWorkspace(props: NetworkConversationProps): JSX.Element {
+  const [thread, setThread] = useState(""), [focusId, setFocusId] = useState<string>(), [width, setWidth] = useState(50), layout = useRef<HTMLDivElement>(null), drag = useRef<{ start: number; width: number } | undefined>(undefined);
+  const open = (id: string, messageId?: string) => { setThread(id); setFocusId(messageId); };
+  useEffect(() => {
+    const move = (event: PointerEvent) => { if (drag.current && layout.current) setWidth(Math.max(25, Math.min(75, drag.current.width + (drag.current.start - event.clientX) / layout.current.clientWidth * 100))); };
+    const end = () => { drag.current = undefined; };
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", end); window.addEventListener("pointercancel", end);
+    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); window.removeEventListener("pointercancel", end); };
+  }, []);
+  return <div className={`partner-network-workspace${thread ? " has-thread" : ""}`} ref={layout}>
+    <div className="partner-network-main"><NetworkConversation {...props} thread="" openThread={thread} setThread={open} /></div>
+    {thread && <><div className="partner-network-thread-resize" role="separator" aria-label={props.m.resizeThread} aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={Math.round(width)} tabIndex={0}
+      onPointerDown={event => { event.preventDefault(); drag.current = { start: event.clientX, width }; }} onDoubleClick={() => setWidth(50)}
+      onKeyDown={event => { if (["ArrowLeft", "ArrowRight", "Home"].includes(event.key)) { event.preventDefault(); setWidth(value => event.key === "Home" ? 50 : Math.max(25, Math.min(75, value + (event.key === "ArrowLeft" ? 5 : -5)))); } }} />
+      <div className="partner-network-thread" style={{ flexBasis: `${width}%` }}><NetworkConversation key={thread} {...props} thread={thread} openThread={thread} focusId={focusId} setThread={open} /></div></>}
+  </div>;
 }
 interface Pending { readonly request: wire.SendPartnerNetworkRequest; readonly createdAt: number; status: "queued" | "sending" | "failed"; messageId?: string; }
-function NetworkConversation({ api, target, controller, m, t, onOpenNavigation }: { api: PartnerNetworkApi; target: { roomId: string; joinId: string }; controller: AppController; m: Copy; t: Translator; onOpenNavigation(): void }) {
-  const draftScope = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, controller.state.activeProfile?.deviceId, target.roomId, target.joinId]), initialDraft = useMemo(() => readNetworkDraft(draftScope, ""), []);
-  const [snapshot, setSnapshot] = useState<wire.PartnerNetworkSnapshot>(), [messages, setMessages] = useState<wire.PartnerNetworkMessage[]>([]), [error, setError] = useState<string>(), [busy, setBusy] = useState(false), [settings, setSettings] = useState(false), [thread, setThread] = useState("");
+function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, thread, openThread, focusId, setThread }: NetworkConversationProps & { thread: string; openThread: string; focusId?: string; setThread(id: string, messageId?: string): void }) {
+  const draftScope = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, controller.state.activeProfile?.deviceId, target.roomId, target.joinId]), initialDraft = useMemo(() => readNetworkDraft(draftScope, thread), []);
+  const [snapshot, setSnapshot] = useState<wire.PartnerNetworkSnapshot>(), [messages, setMessages] = useState<wire.PartnerNetworkMessage[]>([]), [error, setError] = useState<string>(), [busy, setBusy] = useState(false), [settings, setSettings] = useState(false);
   const [draft, setDraft] = useState(initialDraft.text), [mentions, setMentions] = useState<string[]>([...initialDraft.mentions]), [quote, setQuote] = useState(initialDraft.quoteId), [attachments, setAttachments] = useState<wire.PartnerNetworkAttachment[]>([...initialDraft.attachments]), [pending, setPending] = useState<Pending[]>([]), [partners, setPartners] = useState<PartnerProfileView[]>([]);
   const [journalReady, setJournalReady] = useState(false);
   const [division, setDivision] = useState(initialDraft.forcePlan), [mentionAll, setMentionAll] = useState(initialDraft.mentionAll);
-  const tracked = useRef<wire.NetworkTrackedMention[]>([...initialDraft.tracked]), activeThread = useRef(""), currentDraft = useRef<NetworkComposerDraft>(initialDraft), selection = useRef({ start: 0, end: 0 });
+  const tracked = useRef<wire.NetworkTrackedMention[]>([...initialDraft.tracked]), activeThread = useRef(thread), currentDraft = useRef<NetworkComposerDraft>(initialDraft), selection = useRef({ start: 0, end: 0 });
   currentDraft.current = { text: draft, mentions, mentionAll, forcePlan: division, quoteId: quote, attachments, tracked: tracked.current };
   useEffect(() => { if (activeThread.current === thread) return; writeNetworkDraft(draftScope, activeThread.current, currentDraft.current); const restored = readNetworkDraft(draftScope, thread); activeThread.current = thread;
     setDraft(restored.text); setMentions([...restored.mentions]); setMentionAll(restored.mentionAll); setDivision(restored.forcePlan); setQuote(restored.quoteId); setAttachments([...restored.attachments]); tracked.current = [...restored.tracked]; setPicked([]); attempt.current = undefined; }, [thread]);
@@ -126,23 +144,29 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation }
   const pickMention = (actorId?: string) => { const label = actorId ? mentionMembers.find(member => member.actorId === actorId)?.name : m.everyone; if (!label) return;
     const prefix = draft && !/\s$/u.test(draft) ? `${draft} ` : draft, value = `${prefix}@${label} `;
     if (actorId) tracked.current.push({ actorId, label, start: prefix.length }); const resolved = wire.resolveNetworkMentions(value, { ...mentionInput, tracked: tracked.current }); setDraft(value); setMentions(resolved.actorIds); setMentionAll(resolved.all); };
-  const planCopy = wire.partnerGroupMessages(controller.state.effectiveLocale), planAttempt = useRef<{ fingerprint: string; id: string } | undefined>(undefined);
+  const planCopy = wire.partnerGroupMessages(controller.state.effectiveLocale), planAttempt = useRef<{ fingerprint: string; request: wire.PlanPartnerNetworkRequest } | undefined>(undefined);
   const actPlan = async (action: string, plan: wire.PartnerNetworkPlan, position = 0, actorId = "") => {
     if (busy || !allowed) return; const fingerprint = JSON.stringify([action, plan.id, plan.revision.toString(), position, actorId]);
-    if (planAttempt.current?.fingerprint !== fingerprint) planAttempt.current = { fingerprint, id: crypto.randomUUID() };
+    if (!planAttempt.current) planAttempt.current = { fingerprint, request: create(wire.PlanPartnerNetworkRequestSchema, { ...target, operationId: crypto.randomUUID(), action, planId: plan.id, expectedRevision: plan.revision, position, actorId }) };
+    else if (planAttempt.current.request.planId !== plan.id || planAttempt.current.request.action !== action || planAttempt.current.request.position !== position || planAttempt.current.request.actorId !== actorId) return;
     setBusy(true); setError(undefined); try {
-      await api.planPartnerNetwork({ ...target, operationId: planAttempt.current.id, action, planId: plan.id, expectedRevision: plan.revision, position, actorId }, { signal: lifetime.current.signal });
+      await api.planPartnerNetwork(planAttempt.current.request, { signal: lifetime.current.signal });
       if (!lifetime.current.signal.aborted) { planAttempt.current = undefined; await read(); }
-    } catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
+    } catch (reason) { if (!lifetime.current.signal.aborted) { if (wire.partnerMutationWasRejected(reason)) planAttempt.current = undefined; setError(errorText(reason, m)); } } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
   };
   const readVersion = useRef(0), lastRead = useRef(0n);
+  const [dismissedThreads, setDismissedThreads] = useState(0n), [threadList, setThreadList] = useState(false);
+  const followAttempt = useRef<{ id: string; following: boolean; through: bigint } | undefined>(undefined);
+  const following = useRef(!focusId), olderAnchor = useRef<{ top: number; height: number } | undefined>(undefined), openedRead = useRef<bigint | undefined>(undefined);
   const loadedBefore = useRef<bigint[]>([]);
   const read = async (older = false, signal = lifetime.current.signal) => {
     const requestVersion = ++readVersion.current;
     try {
-      const beforeSequence = older ? messages[0]?.sequence : undefined;
+      const beforeSequence = older ? (thread ? messages.find(message => message.threadRootId === thread)?.sequence : messages[0]?.sequence) : undefined;
+      if (older && list.current) { following.current = false; olderAnchor.current = { top: list.current.scrollTop, height: list.current.scrollHeight }; }
       const result = await api.getPartnerNetwork({ ...target, threadRootId: thread, ...(beforeSequence ? { beforeSequence } : {}) }, { signal });
       if (signal.aborted || requestVersion !== readVersion.current || !result.snapshot?.room) return;
+      if (openedRead.current === undefined) openedRead.current = result.snapshot.threadReadSequence;
       if (beforeSequence && !loadedBefore.current.includes(beforeSequence)) loadedBefore.current.push(beforeSequence);
       const pages = older ? [] : await Promise.all(loadedBefore.current.map(before => api.getPartnerNetwork({ ...target, threadRootId: thread, beforeSequence: before }, { signal })));
       if (signal.aborted || requestVersion !== readVersion.current) return;
@@ -163,12 +187,37 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation }
   const markVisible = () => {
     const element = list.current, through = messages.at(-1)?.sequence;
     if (!element || document.visibilityState === "hidden" || !document.hasFocus() || element.scrollHeight - element.scrollTop - element.clientHeight > 48 || !through || through <= lastRead.current || !room) return;
-    lastRead.current = through; void api.managePartnerNetwork({ ...target, operationId: crypto.randomUUID(), action: "mark-read", throughSequence: through }, { signal: lifetime.current.signal }).catch(() => { lastRead.current = 0n; });
+    lastRead.current = through; void api.managePartnerNetwork({ ...target, operationId: crypto.randomUUID(), action: "mark-read", threadRootId: thread, throughSequence: through }, { signal: lifetime.current.signal }).catch(() => { lastRead.current = 0n; });
   };
-  useEffect(() => { markVisible(); }, [messages]);
+  const markRef = useRef(markVisible); markRef.current = markVisible;
+  useEffect(() => {
+    if (list.current && olderAnchor.current) { list.current.scrollTop = olderAnchor.current.top + list.current.scrollHeight - olderAnchor.current.height; olderAnchor.current = undefined; }
+    else if (list.current && following.current) list.current.scrollTop = list.current.scrollHeight;
+    markVisible();
+  }, [messages]);
+  useEffect(() => {
+    const refresh = () => { markRef.current(); }, resize = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(() => { if (list.current && following.current) { list.current.scrollTop = list.current.scrollHeight; markRef.current(); } });
+    const content = list.current?.firstElementChild; if (content) resize?.observe(content);
+    window.addEventListener("focus", refresh); document.addEventListener("visibilitychange", refresh);
+    return () => { resize?.disconnect(); window.removeEventListener("focus", refresh); document.removeEventListener("visibilitychange", refresh); };
+  }, []);
+  const focusSearch = useRef<{ id: string; pages: number; reading: boolean; done?: boolean }>({ id: "", pages: 0, reading: false });
+  useEffect(() => {
+    if (!thread || !focusId || !snapshot) return;
+    if (focusSearch.current.id !== focusId) focusSearch.current = { id: focusId, pages: 0, reading: false };
+    const search = focusSearch.current; if (search.done) return;
+    const element = [...list.current?.querySelectorAll<HTMLElement>("[data-rendered-share-message-id]") ?? []].find(node => node.dataset.renderedShareMessageId === focusId);
+    if (element) {
+      search.done = true; following.current = false; element.scrollIntoView?.({ block: "center", behavior: "auto" }); element.classList.add("partner-network-thread-target");
+      const timer = setTimeout(() => element.classList.remove("partner-network-thread-target"), 2000); return () => { clearTimeout(timer); element.classList.remove("partner-network-thread-target"); };
+    }
+    if (search.reading) return;
+    if (!snapshot.hasMore || search.pages >= 5) { setError(m.sourceUnavailable); return; }
+    search.pages++; search.reading = true; void read(true).finally(() => { search.reading = false; });
+  }, [focusId, messages, snapshot]);
   const manage = async (action: string, actorId = "", value = "") => {
     if (!room || busy) return; setBusy(true); setError(undefined);
-    try { const result = await api.managePartnerNetwork({ ...target, operationId: crypto.randomUUID(), expectedRevision: room.revision, action, actorId, value }, { signal: lifetime.current.signal });
+    try { const result = await api.managePartnerNetwork({ ...target, operationId: action === "share-thread" ? `thread-share:${value}` : crypto.randomUUID(), expectedRevision: action === "share-thread" ? 0n : room.revision, action, actorId, value, ...(action === "stop" ? { threadRootId: thread } : {}) }, { signal: lifetime.current.signal });
       if (!lifetime.current.signal.aborted && result.room) { setSnapshot(previous => create(wire.PartnerNetworkSnapshotSchema, { ...(previous ?? create(wire.PartnerNetworkSnapshotSchema)), room: result.room })); if (action === "leave" || action === "remove-list") controller.navigate({ kind: "partners" }); else await read(); } }
     catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
   };
@@ -215,21 +264,37 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation }
       const url = URL.createObjectURL(new Blob(chunks, { type: attachment.mediaType })), link = document.createElement("a"); link.href = url; link.download = attachment.name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1_000);
     } catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); }
   };
-  return <section className="partner-group-page partner-network-page"><header className="partner-group-header"><IconButton label={m.back} onClick={() => thread ? setThread("") : onOpenNavigation()}><ArrowLeft /></IconButton><div><h1>{room?.name || m.title}</h1><small>{thread ? m.replies : room?.members.filter(member => member.state === "joined").length} {m.members}</small></div><IconButton label={m.settings} onClick={() => setSettings(true)} disabled={!room}><Settings /></IconButton></header>
+  const followThread = async () => {
+    if (!snapshot?.readerStateSupported || !thread || busy) return;
+    followAttempt.current ??= { id: crypto.randomUUID(), following: !snapshot.threadFollowing, through: snapshot.threadReadSequence };
+    const original = followAttempt.current; setBusy(true);
+    try { await api.managePartnerNetwork({ ...target, operationId: original.id, action: "follow-thread", threadRootId: thread, following: original.following, throughSequence: original.through }, { signal: lifetime.current.signal });
+      if (!lifetime.current.signal.aborted) { followAttempt.current = undefined; await read(); } }
+    catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
+  };
+  const interestingThreads = snapshot?.threads.filter(value => value.rootId !== openThread && value.unreadCount > 0n && (value.mentioned || value.following)) ?? [];
+  const newestUnread = interestingThreads.reduce((latest, value) => value.latestUnreadSequence > latest ? value.latestUnreadSequence : latest, 0n);
+  const unreadStart = thread && openedRead.current !== undefined ? messages.findIndex(message => message.threadRootId === thread && message.authorId !== room?.selfId && message.sequence > openedRead.current!) : -1;
+  const firstReply = messages.findIndex(message => message.threadRootId === thread), showUnreadDivider = unreadStart > firstReply;
+  const speaking = snapshot?.plans.find(plan => plan.kind === "talk" && plan.status === "running")?.steps.find(step => step.status === "running");
+  const speakingName = room?.members.find(actor => actor.id === speaking?.actorId)?.name;
+  return <section className="partner-group-page partner-network-page"><header className="partner-group-header"><IconButton label={thread ? m.close : m.back} onClick={() => thread ? setThread("") : onOpenNavigation()}><ArrowLeft /></IconButton><div><h1>{thread ? m.replies : room?.name || m.title}</h1><small>{speakingName ? `${speakingName} · ${m.speaking}` : thread ? room?.name : `${room?.members.filter(member => member.state === "joined").length ?? 0} ${m.members}`}</small></div>{thread && snapshot?.readerStateSupported ? <Button tone="ghost" aria-pressed={snapshot.threadFollowing} disabled={busy || !allowed} onClick={() => { void followThread(); }}>{snapshot.threadFollowing ? m.following : m.follow}</Button> : <IconButton label={m.settings} onClick={() => setSettings(true)} disabled={!room}><Settings /></IconButton>}</header>
     {error && <p className="partner-group-error" role="alert">{error}<Button onClick={() => { void read(); }}>{m.refresh}</Button></p>}
     {failures.error && !error && <p role="status">{m.unavailable}</p>}
     {room?.state !== "active" && room && <p className="partner-group-error">{room.state === "archived" ? m.archived : m.dissolved}</p>}
     {!snapshot && !error && <Spinner />}
-    <div className={`partner-group-timeline${shareMode ? " is-share-selecting" : ""}`} ref={list} data-timeline-session-id={timelineId} onScroll={markVisible}><div className="partner-group-timeline-content">
+    <div className={`partner-group-timeline${shareMode ? " is-share-selecting" : ""}`} ref={list} data-timeline-session-id={timelineId} onScroll={() => { if (list.current) following.current = list.current.scrollHeight - list.current.scrollTop - list.current.clientHeight <= 48; markVisible(); }}><div className="partner-group-timeline-content">
       {snapshot?.hasMore && <Button onClick={() => { void read(true); }}>{m.older}</Button>}
-      {messages.map(message => message.kind === "member-joined" ? <div key={message.id}><p className="partner-group-divider">{message.authorName} {m.joinedEvent}</p><NetworkFailureNotice jobs={failures.bySource.get(message.id)} room={room} locale={controller.state.effectiveLocale} /></div> : <article data-rendered-share-message-id={message.id} className={`partner-group-message${message.authorId === room?.selfId ? " is-user" : ""}`} key={message.id}><div className="partner-group-message-body"><header><strong>{message.authorName}</strong><time dateTime={new Date(Number(message.createdAtMs)).toISOString()}>{new Date(Number(message.createdAtMs)).toLocaleTimeString(controller.state.effectiveLocale, { hour: "2-digit", minute: "2-digit" })}</time></header>
+      {messages.map((message, index) => message.kind === "member-joined" ? <div key={message.id}><p className="partner-group-divider">{message.authorName} {m.joinedEvent}</p><NetworkFailureNotice jobs={failures.bySource.get(message.id)} room={room} locale={controller.state.effectiveLocale} /></div> : <article data-rendered-share-message-id={message.id} className={`partner-group-message${message.kind === "plan" && snapshot?.plans.some(plan => plan.id === message.planId && plan.kind === "talk") ? " is-queue" : message.authorId === room?.selfId ? " is-user" : ""}`} key={message.id}>
+        {showUnreadDivider && index === unreadStart && <p className="partner-network-unread-divider" role="separator">{m.newRepliesDivider}</p>}
+        <div className="partner-group-message-body">{!(message.kind === "plan" && snapshot?.plans.some(plan => plan.id === message.planId && plan.kind === "talk")) && <header><strong>{message.authorName}</strong><time dateTime={new Date(Number(message.createdAtMs)).toISOString()}>{new Date(Number(message.createdAtMs)).toLocaleTimeString(controller.state.effectiveLocale, { hour: "2-digit", minute: "2-digit" })}</time></header>}
         {shareMode && <label data-rendered-share-exclude=""><input type="checkbox" aria-label={m.selectMessage} checked={shareIds.has(message.id)} onChange={() => toggleShare(message.id)} />{m.selectMessage}</label>}
         {message.quoteId && <blockquote>{messages.find(original => original.id === message.quoteId)?.text.slice(0, 240) || m.quote}</blockquote>}
-        {message.kind === "plan" && room && snapshot?.plans.find(plan => plan.id === message.planId) ? <NetworkPlanCard plan={snapshot.plans.find(plan => plan.id === message.planId)!} room={room} locale={controller.state.effectiveLocale} busy={busy || !allowed} action={(...args) => { void actPlan(...args); }} /> : message.kind === "thread-share" ? <blockquote><strong>{message.sharedReply?.authorName ?? m.sourceUnavailable}</strong>{message.sharedReply ? <><StreamingMarkdown text={message.sharedReply.text} streaming={false} t={t} /><Button data-rendered-share-exclude="" onClick={() => setThread(message.sharedReply!.threadRootId)}>{m.replies}</Button></> : null}</blockquote> : <StreamingMarkdown text={wire.partnerNetworkMessageBody(message, controller.state.effectiveLocale)} streaming={false} t={t} />}
+        {message.kind === "plan" && room && snapshot?.plans.find(plan => plan.id === message.planId) ? <NetworkPlanCard plan={snapshot.plans.find(plan => plan.id === message.planId)!} room={room} locale={controller.state.effectiveLocale} busy={busy || !allowed} action={(...args) => { void actPlan(...args); }} /> : message.kind === "thread-share" ? <blockquote><strong>{message.sharedReply?.authorName ?? m.sourceUnavailable}</strong>{message.sharedReply ? <><StreamingMarkdown text={message.sharedReply.text} streaming={false} t={t} />{message.sharedReply.attachments.map(attachment => <NetworkMedia key={attachment.id} api={api} target={target} attachment={attachment} m={m} t={t} owner={journal.scope} download={() => { void download(attachment); }} />)}<Button data-rendered-share-exclude="" onClick={() => setThread(message.sharedReply!.threadRootId, message.sharedReply!.id)}>{m.replies}</Button></> : null}</blockquote> : <StreamingMarkdown text={wire.partnerNetworkMessageBody(message, controller.state.effectiveLocale)} streaming={false} t={t} />}
         {message.task && <section className="partner-network-task"><strong>{message.task.title}</strong><span>{wire.partnerNetworkTaskStatus(message.task.status, controller.state.effectiveLocale)}</span>{message.task.question && <p>{message.task.question}</p>}{message.task.ownerId === room?.selfId && message.task.homeServerId === profile?.serverId && message.task.sessionId && <Button data-rendered-share-exclude="" onClick={() => controller.navigate({ kind: "session", sessionId: message.task!.sessionId })}>{m.openTask}</Button>}</section>}
         {message.attachments.map(attachment => <NetworkMedia key={attachment.id} api={api} target={target} attachment={attachment} m={m} t={t} owner={journal.scope} download={() => { void download(attachment); }} />)}
         <NetworkFailureNotice jobs={failures.bySource.get(message.id)} room={room} locale={controller.state.effectiveLocale} />
-        {message.threadPreview && !thread && <Button data-rendered-share-exclude="" tone="ghost" onClick={() => setThread(message.id)}>{message.threadPreview.replyCount.toString()} {m.replies} · {message.threadPreview.authorName}: {message.threadPreview.text}</Button>}
+        {message.threadPreview && !thread && <Button data-rendered-share-exclude="" tone="ghost" onClick={() => setThread(message.id)}>{message.threadPreview.replyCount.toString()} {m.replies} · {message.threadPreview.authorName}: {message.threadPreview.text}{snapshot?.readerStateSupported && snapshot.threads.find(value => value.rootId === message.id && value.unreadCount > 0n) && <span className="partner-network-thread-unread"> · {m.newReplies.replace("{count}", snapshot.threads.find(value => value.rootId === message.id)!.unreadCount.toString())}{snapshot.threads.find(value => value.rootId === message.id)?.mentioned ? ` · ${m.mentionedYou}` : ""}</span>}</Button>}
         <div className="partner-network-message-actions message-actions" data-rendered-share-exclude=""><Button tone="ghost" onClick={() => { void navigator.clipboard.writeText(message.kind === "thread-share" ? message.sharedReply?.text ?? m.sourceUnavailable : message.text); }}>{m.copy}</Button><Button tone="ghost" onClick={() => setSharing(previous => ({ ...previous, [thread]: [message.id] }))}>{m.share}</Button>{!thread && <Button tone="ghost" disabled={!allowed} onClick={() => setQuote(message.id)}>{m.quote}</Button>}<Button tone="ghost" onClick={() => setThread(message.threadRootId || message.id)}>{m.thread}</Button>
           {!!thread && message.threadRootId && <Button tone="ghost" disabled={!allowed} onClick={() => { void manage("share-thread", "", message.id); }}>{m.shareToMain}</Button>}
           <details><summary>{m.reaction}</summary>{["👍", "❤️", "😂", "🎉", "🤔", "🙏"].map(emoji => <Button key={emoji} tone="ghost" disabled={!allowed} onClick={() => { void api.reactPartnerNetwork({ ...target, operationId: crypto.randomUUID(), messageId: message.id, emoji, add: !message.reactions.some(reaction => reaction.emoji === emoji && reaction.actorIds.includes(room!.selfId)) }, { signal: lifetime.current.signal }).then(() => read()).catch(reason => setError(errorText(reason, m))); }}>{emoji}</Button>)}</details>
@@ -242,18 +307,20 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation }
         setBusy(true); void api.planPartnerNetwork({ ...target, operationId: `plan-retry:${job.id}`, action: "retry-decision", sourceMessageId: job.sourceMessageId }, { signal: lifetime.current.signal })
           .then(() => read()).catch(reason => { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); }).finally(() => { if (!lifetime.current.signal.aborted) setBusy(false); });
       }}>{planCopy.planFailed} · {m.retry}</Button>)}
-      {allowed && <NetworkOwnerControls api={api} target={target} controller={controller} t={t} />}
+      {allowed && <NetworkOwnerControls api={api} target={{ ...target, threadRootId: thread }} controller={controller} t={t} />}
     </div></div>
+    {!thread && newestUnread > dismissedThreads && <div className="partner-network-thread-hint"><Button onClick={() => interestingThreads.length === 1 ? setThread(interestingThreads[0]!.rootId) : setThreadList(true)}>{m.threadUpdates} · {interestingThreads.length}</Button><IconButton label={m.close} onClick={() => setDismissedThreads(newestUnread)}>×</IconButton></div>}
+    {!thread && threadList && <Modal open showClose closeLabel={m.close} title={m.threadList} onClose={() => setThreadList(false)}><div className="partner-group-form">{snapshot?.threads.map(value => <Button key={value.rootId} tone="ghost" onClick={() => { setThreadList(false); setThread(value.rootId); }}>{value.rootText || value.text} · {value.unreadCount > 0n ? m.newReplies.replace("{count}", value.unreadCount.toString()) : value.replyCount.toString()}{value.mentioned ? ` · ${m.mentionedYou}` : ""}</Button>)}</div></Modal>}
     {shareMode && <ShareSelectionBar ownerKey={`${journal.scope}:${thread}`} sessionId={timelineId} sessionName={room?.name ?? m.title} messages={shareable} selectedIds={shareIds} locale={controller.state.effectiveLocale} t={t} getTimelineRoot={() => list.current} onToggleAll={() => setSharing(previous => ({ ...previous, [thread]: shareIds.size === shareable.length ? [] : shareable.map(message => message.id) }))} onCancel={() => setSharing(previous => { const value = { ...previous }; delete value[thread]; return value; })} />}
     <form className="partner-network-composer" onDrop={event => { event.preventDefault(); void upload(Array.from(event.dataTransfer.files)); }} onDragOver={event => event.preventDefault()} onSubmit={event => { event.preventDefault(); void send(); }}>
       {quote && <p>{m.quote}: {messages.find(message => message.id === quote)?.text.slice(0, 120)} <Button type="button" onClick={() => setQuote("")}>{m.clearQuote}</Button></p>}
       {division && <p>{planCopy.divisionTag}<Button type="button" onClick={() => setDivision(false)}>{planCopy.removeDivision}</Button></p>}
       <ComposerAttachmentTray ownerKey={journal.scope} attachments={previews} t={t} removeDisabled={busy} onRemove={item => { setAttachments(previous => previous.filter(value => value.id !== item.id)); setPicked(previous => previous.filter(value => value.id !== item.id)); }} onReplaceImage={(item, file) => upload([file], item.id)} />
       {attachments.filter(attachment => !picked.some(item => item.id === attachment.id)).map(attachment => <span key={attachment.id}>{attachment.name} <Button type="button" onClick={() => setAttachments(previous => previous.filter(item => item.id !== attachment.id))}>×</Button></span>)}
-      <textarea aria-label={m.message} value={draft} maxLength={8000} disabled={!allowed} onBeforeInput={event => { selection.current = { start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd }; }} onSelect={event => { selection.current = { start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd }; }} onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(Array.from(event.clipboardData.files)); } }} onChange={event => editDraft(event.target.value)} />
+      <textarea aria-label={m.message} placeholder={speakingName ? m.notesForSpeaker : m.message} value={draft} maxLength={8000} disabled={!allowed} onBeforeInput={event => { selection.current = { start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd }; }} onSelect={event => { selection.current = { start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd }; }} onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(Array.from(event.clipboardData.files)); } }} onChange={event => editDraft(event.target.value)} />
       <details><summary>{m.mentions}</summary>{room?.members.filter(member => member.state === "joined" && member.id !== room.selfId).map(member => <Button type="button" key={member.id} onClick={() => pickMention(member.id)}>{`@${wire.partnerNetworkActorName(member, room)}`}</Button>)}<Button type="button" onClick={() => pickMention()}>{m.everyone}</Button></details>
-      {!thread && <Button type="button" disabled={!allowed || busy || snapshot?.plans.some(plan => ["running", "waiting"].includes(plan.status))} onClick={() => setDivision(value => !value)}>{planCopy.divide}</Button>}
-      <div><label className="button">{m.upload}<input type="file" multiple disabled={!allowed || busy} onChange={event => { void upload(Array.from(event.target.files ?? [])); event.target.value = ""; }} /></label>{snapshot?.canContinue && <Button type="button" disabled={!allowed || busy} onClick={() => { void manage("continue", "", thread); }}>{m.continue}</Button>}<IconButton type="button" label={m.stop} disabled={!allowed || busy} onClick={() => { void manage("stop"); }}><Square /></IconButton><Button type="submit" tone="primary" disabled={!allowed || !journalReady || busy || !draft.trim() && !attachments.length}><Send aria-hidden="true" />{m.send}</Button></div>
+      {!thread && !room?.singleSpeaker && <Button type="button" disabled={!allowed || busy || snapshot?.plans.some(plan => ["running", "waiting"].includes(plan.status))} onClick={() => setDivision(value => !value)}>{planCopy.divide}</Button>}
+      <div><label className="button">{m.upload}<input type="file" multiple disabled={!allowed || busy} onChange={event => { void upload(Array.from(event.target.files ?? [])); event.target.value = ""; }} /></label>{snapshot?.canContinue && <Button type="button" disabled={!allowed || busy} onClick={() => { void manage("continue", "", thread); }}>{m.continue}</Button>}<IconButton type="button" label={m.stop} disabled={!allowed || busy} onClick={() => { void manage("stop"); }}><Square /></IconButton>{room?.singleSpeaker && ["owner", "admin"].includes(self?.role ?? "") && snapshot?.executions.some(job => ["queued", "running"].includes(job.status) && job.requesterId !== room.selfId && !room.members.some(actor => actor.id === job.actorId && actor.ownerId === room.selfId)) && <Button type="button" disabled={!allowed || busy} onClick={() => { if (window.confirm(m.destructive)) void manage("stop", "", "all"); }}>{m.stopAll}</Button>}<Button type="submit" tone="primary" disabled={!allowed || !journalReady || busy || !draft.trim() && !attachments.length}><Send aria-hidden="true" />{m.send}</Button></div>
     </form>
     {settings && room && <NetworkSettings api={api} target={target} room={room} partners={partners} m={m} locale={controller.state.effectiveLocale} busy={busy} manage={manage} onClose={() => setSettings(false)} />}
   </section>;
@@ -303,9 +370,9 @@ function NetworkSettings({ api, target, room, partners, m, locale, busy, manage,
   const confirm = (action: string, actorId = "", value = "", warning = m.destructive) => { if (window.confirm(warning)) void manage(action, actorId, value); };
   return <Modal open showClose closeLabel={m.close} title={m.settings} onClose={onClose}><div className="partner-group-form">
     <label>{m.name}<input value={name} disabled={!admin || room.state === "dissolved" || busy} onChange={event => setName(event.target.value)} /></label><Button disabled={!admin || busy || name === room.name} onClick={() => { void manage("rename", "", name); }}>{m.save}</Button>
-    {admin && <><label>{m.replyMode}<select value={room.replyMode} disabled={busy} onChange={event => { void manage("reply-mode", "", event.target.value); }}><option value="all">{m.all}</option><option value="mentioned">{m.mentioned}</option></select></label><label>{m.speakingMode}<select value={room.speakingMode} disabled={busy} onChange={event => { void manage("speaking-mode", "", event.target.value); }}><option value="auto">{m.auto}</option><option value="sequential">{m.sequential}</option></select></label></>}
-    {admin && <label>{wire.partnerGroupMessages(locale).organizer}<select value={room.organizerId} disabled={busy} onChange={event => { void manage("organizer", "", event.target.value); }}><option value="">{wire.partnerGroupMessages(locale).automatic}</option>{room.members.filter(actor => actor.kind === "partner" && actor.state === "joined").map(actor => <option key={actor.id} value={actor.id}>{wire.partnerNetworkActorName(actor, room)}</option>)}</select></label>}
-    {self?.state === "joined" && <NetworkProjectSetting api={api} target={target} locale={locale} room={room} />}
+    {admin && !room.singleSpeaker && <><label>{m.replyMode}<select value={room.replyMode} disabled={busy} onChange={event => { void manage("reply-mode", "", event.target.value); }}><option value="all">{m.all}</option><option value="mentioned">{m.mentioned}</option></select></label><label>{m.speakingMode}<select value={room.speakingMode} disabled={busy} onChange={event => { void manage("speaking-mode", "", event.target.value); }}><option value="auto">{m.auto}</option><option value="sequential">{m.sequential}</option></select></label></>}
+    {admin && !room.singleSpeaker && <label>{wire.partnerGroupMessages(locale).organizer}<select value={room.organizerId} disabled={busy} onChange={event => { void manage("organizer", "", event.target.value); }}><option value="">{wire.partnerGroupMessages(locale).automatic}</option>{room.members.filter(actor => actor.kind === "partner" && actor.state === "joined").map(actor => <option key={actor.id} value={actor.id}>{wire.partnerNetworkActorName(actor, room)}</option>)}</select></label>}
+    {self?.state === "joined" && !room.singleSpeaker && <NetworkProjectSetting api={api} target={target} locale={locale} room={room} />}
     <h3>{m.members}</h3>{room.members.filter(actor => actor.state === "joined").map(actor => <div className="partner-network-member" key={actor.id}><strong>{wire.partnerNetworkActorName(actor, room)}</strong><small>{actor.role === "owner" ? m.owner : actor.role === "admin" ? m.admin : m.member}</small>
       {(actor.id === room.selfId || actor.ownerId === room.selfId) && <><label>{m.nickname}<input aria-label={`${m.nickname}: ${actor.name}`} maxLength={128} value={nicknames[actor.id] ?? actor.nickname} onChange={event => setNicknames(previous => ({ ...previous, [actor.id]: event.target.value }))} /></label><Button disabled={busy || (nicknames[actor.id] ?? actor.nickname) === actor.nickname} onClick={() => { void manage("nickname", actor.id, nicknames[actor.id] ?? actor.nickname); }}>{m.save}</Button></>}
       {actor.kind === "partner" && <label>{m.access}<select disabled={busy || actor.ownerId !== room.selfId} value={actor.guestAccess} onChange={event => event.target.value === "tools" ? confirm("set-access", actor.id, "tools", m.accessWarning) : void manage("set-access", actor.id, event.target.value)}><option value="none">{m.accessNone}</option><option value="chat">{m.accessChat}</option><option value="tools">{m.accessTools}</option></select></label>}

@@ -530,7 +530,7 @@ export class EphemeralWorktreeService {
     });
   }
 
-  release(sessionId: string, options?: WorktreeReleaseOptions): Promise<WorktreeResult<WorktreeRelease>> {
+  release(sessionId: string, options?: WorktreeReleaseOptions, canRecycle?: WorktreeRecycleGuard): Promise<WorktreeResult<WorktreeRelease>> {
     return this.#serialize(options, true, async (control) => {
       if (options?.retainForRestore !== undefined && typeof options.retainForRestore !== "boolean") {
         throw invalidArgument("retainForRestore", "retainForRestore must be a boolean.");
@@ -544,7 +544,7 @@ export class EphemeralWorktreeService {
       if (entry.status === "creating") {
         throw new WorktreeServiceError("SESSION_CONFLICT", "The Session worktree is changing ownership.");
       }
-      return this.#releaseEntry(entry, options?.retainForRestore === true, control);
+      return this.#releaseEntry(entry, options?.retainForRestore === true, control, canRecycle);
     });
   }
 
@@ -746,11 +746,14 @@ export class EphemeralWorktreeService {
         return result;
       } catch (error) {
         const latest = store.get(current.id);
-        if (latest?.recycle !== undefined) {
-          await store.set({ ...latest,
-            recycle: deferRecycle(latest.recycle, error instanceof RecycleInUseError ? "in_use" : recycleFailureReason(error),
+        const retained = error instanceof RecycleInUseError && latest !== undefined ? preservedEntry(latest, this.#now()) : latest;
+        if (retained?.recycle !== undefined) {
+          await store.set({ ...retained,
+            recycle: deferRecycle(retained.recycle, error instanceof RecycleInUseError ? "in_use" : recycleFailureReason(error),
               this.#now() - startedAt, this.#now()), updatedAt: this.#now()
           }, control);
+        } else if (error instanceof RecycleInUseError && retained !== undefined) {
+          await store.set(retained, control);
         }
         if (error instanceof RecycleInUseError) {
           return { status: "preserved", reason: "in_use", pathRemoved: false, branchPreserved: true };

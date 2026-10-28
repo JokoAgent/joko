@@ -1,38 +1,41 @@
 import { useEffect, useRef, useState } from "react";
-import { partnerGroupMessages, partnerNetworkActorName, type PartnerNetworkPlan, type PartnerNetworkRoom } from "@joko/contracts";
+import { partnerGroupMessages, partnerNetworkMessages, partnerNetworkQueueWindow, partnerNetworkActorName, type PartnerNetworkPlan, type PartnerNetworkRoom } from "@joko/contracts";
 import type { PartnerNetworkApi } from "../partner-network-api.js";
 import { Button } from "./ui.js";
 
 export function NetworkPlanCard({ plan, room, locale, busy, action }: { plan: PartnerNetworkPlan; room: PartnerNetworkRoom; locale: string; busy: boolean;
   action(action: string, plan: PartnerNetworkPlan, position?: number, actorId?: string): void }) {
   const m = partnerGroupMessages(locale), [now, setNow] = useState(Date.now());
+  const n = partnerNetworkMessages(locale), talk = plan.kind === "talk", [expanded, setExpanded] = useState(false), window = partnerNetworkQueueWindow(plan.steps);
+  const folded = talk && !expanded && window.end - window.start < plan.steps.length, shown = folded ? plan.steps.slice(window.start, window.end) : plan.steps;
   useEffect(() => { if (plan.status !== "running") return; const timer = setInterval(() => setNow(Date.now()), 1_000); return () => clearInterval(timer); }, [plan.status]);
-  const editable = plan.status === "proposed" || plan.status === "waiting", proposed = plan.status === "proposed";
+  const manager = room.selfId === plan.requesterId || room.members.some(actor => actor.id === room.selfId && actor.state === "joined" && ["owner", "admin"].includes(actor.role));
+  const editable = !talk && manager && (plan.status === "proposed" || plan.status === "waiting"), proposed = plan.status === "proposed";
   const candidates = room.members.filter(actor => actor.kind === "partner" && actor.state === "joined" && (actor.ownerId === room.selfId || actor.guestAccess !== "none"));
   const actorName = (id: string) => { const actor = room.members.find(actor => actor.id === id); return actor ? partnerNetworkActorName(actor, room) : m.memberUnavailable; };
-  const label = (status: string) => ({ pending: m.pending, running: m.running, completed: m.done, failed: m.failed, proposed: m.proposed, waiting: m.waiting,
+  const label = (status: string) => ({ pending: m.pending, running: talk ? n.speaking : m.running, completed: talk ? n.spoken : m.done, failed: m.failed, proposed: m.proposed, waiting: m.waiting,
     stopped: m.stopped, dismissed: m.dismissed, superseded: m.superseded })[status] ?? status;
   return <section className={`partner-group-plan${["dismissed", "superseded", "stopped"].includes(plan.status) ? " is-muted" : ""}`} aria-label={m.plan}>
-    <p className="partner-group-plan-intro">{m.planIntro.replace("{count}", String(plan.steps.length))}</p>
-    <div className="partner-group-plan-card"><ol>{plan.steps.map(step => <li key={step.position} className={step.status === "running" ? "is-running" : step.status === "failed" ? "is-failed" : ""}>
-      <span className="partner-group-step-lead">{step.position + 1}</span><span className="partner-group-step-task"><strong>{actorName(step.actorId)}</strong> {step.task}</span>
+    {!talk && <p className="partner-group-plan-intro">{m.planIntro.replace("{count}", String(plan.steps.length))}</p>}
+    <div className="partner-group-plan-card" aria-label={talk ? n.queue : m.plan}><ol>{shown.map(step => <li key={step.position} className={step.status === "running" ? "is-running" : step.status === "failed" ? "is-failed" : ""}>
+      <span className="partner-group-step-lead">{step.position + 1}</span><span className="partner-group-step-task"><strong>{actorName(step.actorId)}</strong> {step.task || (talk ? n.talkTurn : "")}</span>
       <small>{label(step.status)}{step.status === "running" && step.startedAtMs > 0n ? ` · ${Math.max(0, Math.floor((now - Number(step.startedAtMs)) / 1_000))}s` : step.finishedAtMs > 0n ? ` · ${new Date(Number(step.finishedAtMs)).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })}` : ""}</small>
       {editable && (proposed || step.status !== "completed") && <select aria-label={`${m.reassign} ${step.position + 1}`} value={step.actorId} disabled={busy} onChange={event => action("reassign", plan, step.position, event.target.value)}>
         {!candidates.some(actor => actor.id === step.actorId) && <option value={step.actorId}>{m.memberUnavailable}</option>}{candidates.map(actor => <option key={actor.id} value={actor.id}>{partnerNetworkActorName(actor, room)}</option>)}</select>}
-      {proposed && <Button disabled={busy || plan.steps.length < 2} onClick={() => action("remove-step", plan, step.position)}>{m.remove}</Button>}
-    </li>)}</ol></div><small>{m.pauseNote}</small>
-    <div className="partner-group-plan-actions">{proposed ? <><Button disabled={busy} onClick={() => action("start", plan)}>{m.start}</Button><Button disabled={busy} tone="ghost" onClick={() => action("dismiss", plan)}>{m.dismiss}</Button></> : <span>{label(plan.status)}</span>}</div>
+      {proposed && editable && <Button disabled={busy || plan.steps.length < 2} onClick={() => action("remove-step", plan, step.position)}>{m.remove}</Button>}
+    </li>)}</ol>{talk && window.end - window.start < plan.steps.length && <Button tone="ghost" onClick={() => setExpanded(value => !value)}>{expanded ? n.collapse : n.queueCount.replace("{count}", String(plan.steps.length))}</Button>}</div>{!talk && <small>{m.pauseNote}</small>}
+    <div className="partner-group-plan-actions">{proposed && editable ? <><Button disabled={busy} onClick={() => action("start", plan)}>{m.start}</Button><Button disabled={busy} tone="ghost" onClick={() => action("dismiss", plan)}>{m.dismiss}</Button></> : <span>{label(plan.status)}</span>}</div>
   </section>;
 }
 
 export function NetworkPlanFollowUp({ plan, room, locale, busy, action }: { plan: PartnerNetworkPlan; room: PartnerNetworkRoom; locale: string; busy: boolean;
   action(action: string, plan: PartnerNetworkPlan): void }) {
-  const m = partnerGroupMessages(locale); if (plan.status !== "waiting") return null;
+  const m = partnerGroupMessages(locale), n = partnerNetworkMessages(locale); if (plan.status !== "waiting" || room.selfId !== plan.requesterId && !room.members.some(actor => actor.id === room.selfId && actor.state === "joined" && ["owner", "admin"].includes(actor.role))) return null;
   const failed = plan.steps[plan.currentStep]?.status === "failed", next = plan.steps[failed ? plan.currentStep : plan.currentStep + 1];
   if (!next) return null;
   const actor = room.members.find(actor => actor.id === next.actorId);
   return <div className="partner-group-follow-up" role="status"><span>{failed ? m.failed : m.nextStep}: {actor ? partnerNetworkActorName(actor, room) : m.memberUnavailable} · {next.task}</span>
-    <Button disabled={busy} onClick={() => action(failed ? "retry" : "continue", plan)}>{failed ? m.retry : m.next}</Button><Button tone="ghost" disabled={busy} onClick={() => action("stop", plan)}>{m.stop}</Button></div>;
+    <Button disabled={busy} onClick={() => action(failed ? "retry" : "continue", plan)}>{failed ? m.retry : plan.kind === "talk" ? n.nextSpeaker : m.next}</Button><Button tone="ghost" disabled={busy} onClick={() => action("stop", plan)}>{plan.kind === "talk" ? n.endQueue : m.stop}</Button></div>;
 }
 
 export function NetworkProjectSetting({ api, target, locale, room }: { api: PartnerNetworkApi; target: { roomId: string; joinId: string }; locale: string; room: PartnerNetworkRoom }) {

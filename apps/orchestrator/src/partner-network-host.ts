@@ -19,7 +19,7 @@ export function networkRoom(room: NetworkRoom, selfId: string, joinId = ""): con
     revision: BigInt(room.revision), state: room.state, members: room.members.map(networkActor), latestSequence: BigInt(room.latestSequence),
     readSequence: BigInt(self?.readSequence ?? 0), selfId, joinId, replyMode: room.replyMode, speakingMode: room.speakingMode,
     removedFromList: self?.removedFromList ?? false, availability: self?.state === "joined" ? "available" : "denied", updatedAtMs: BigInt(room.updatedAt), unread: self !== undefined && self.unreadSequence > self.readSequence,
-    organizerId: room.organizerId ?? "" });
+    organizerId: room.organizerId ?? "", singleSpeaker: room.singleSpeaker === true });
 }
 function networkActor(actor: NetworkActor): contract.PartnerNetworkActor {
   return create(contract.PartnerNetworkActorSchema, { id: actor.id, kind: actor.kind, name: actor.name, ownerId: actor.ownerId,
@@ -61,7 +61,9 @@ export class PartnerNetworkHost {
     partner: (id: string) => { id: string; name: string; description: string }; artifacts?: ArtifactStore }) {}
   #origin(): string { return contract.taskShareOrigin(typeof this.options.origin === "string" ? this.options.origin : this.options.origin()); }
   #room(room: NetworkRoom, selfId: string, joinId = ""): contract.PartnerNetworkRoom {
-    return networkRoom({ ...room, hostOrigin: this.#origin() }, selfId, joinId);
+    const result = networkRoom({ ...room, hostOrigin: this.#origin() }, selfId, joinId);
+    if (room.members.some(actor => actor.id === selfId && actor.state === "joined")) result.unread = this.storage.hasUnread(room.id, selfId);
+    return result;
   }
   get storage(): PartnerNetworkStore { return this.options.storage; }
   get selfId(): string { return networkHumanId(this.options.serverId); }
@@ -111,9 +113,25 @@ export class PartnerNetworkHost {
       const root = this.storage.message(room.id, request.threadRootId); if (root.deleted || root.threadRootId) throw new PartnerNetworkStoreError("not_found");
       messages = messages.filter(message => message.id === root.id || message.threadRootId === root.id);
     } else messages = messages.filter(message => !message.threadRootId);
-    return create(contract.PartnerNetworkSnapshotSchema, { room: this.#room(room, actorId), messages: this.#projectMessages(room.id, messages.slice(-100), actorId), hasMore: messages.length > 100, canContinue: this.storage.canContinue(room.id, request.threadRootId),
-      executions: this.storage.executions(room.id).filter(job => ["queued", "running", "failed", "unknown"].includes(job.status)).slice(-100).map(networkExecution),
-      plans: this.storage.plans.list(room.id).filter(plan => messages.slice(-100).some(message => message.planId === plan.id) || ["proposed", "running", "waiting"].includes(plan.status)).map(networkPlan) });
+    const reader = this.storage.reader(room.id, actorId, request.threadRootId);
+    const page = messages.slice(-100);
+    if (request.threadRootId && !page.some(message => message.id === request.threadRootId)) page.unshift(this.storage.message(room.id, request.threadRootId));
+    return create(contract.PartnerNetworkSnapshotSchema, { room: this.#room(room, actorId), messages: this.#projectMessages(room.id, page, actorId), hasMore: messages.filter(message => !request.threadRootId || message.id !== request.threadRootId).length > 100, canContinue: this.storage.canContinue(room.id, request.threadRootId),
+      readerStateSupported: true, threadReadSequence: BigInt(reader.readSequence), threadFollowing: reader.following, threads: this.#threads(room.id, actorId),
+      executions: this.storage.executions(room.id).filter(job => ["queued", "running", "failed", "unknown"].includes(job.status) && this.storage.message(room.id, job.sourceMessageId).threadRootId === request.threadRootId).slice(-100).map(networkExecution),
+      plans: request.threadRootId ? [] : this.storage.plans.list(room.id).filter(plan => messages.slice(-100).some(message => message.planId === plan.id) || ["proposed", "running", "waiting"].includes(plan.status)).map(networkPlan) });
+  }
+  #threads(roomId: string, actorId: string): contract.PartnerNetworkThread[] {
+    const messages = this.storage.messages(roomId), newest = messages.slice(-100);
+    return messages.filter(root => !root.deleted && !root.threadRootId).flatMap(root => {
+      const replies = messages.filter(message => message.threadRootId === root.id && !message.deleted && message.kind !== "member-joined"), last = replies.at(-1);
+      if (!last) return [];
+      const reader = this.storage.reader(roomId, actorId, root.id), unread = newest.filter(message => message.threadRootId === root.id && !message.deleted && message.kind !== "member-joined" && message.authorId !== actorId && message.sequence > reader.readSequence);
+      return [create(contract.PartnerNetworkThreadSchema, { rootId: root.id, rootText: root.text.slice(0, 160) || root.attachments.map(file => file.name).join(", ").slice(0, 160),
+        replyCount: BigInt(replies.length), readSequence: BigInt(reader.readSequence), unreadCount: BigInt(unread.length), latestUnreadSequence: BigInt(unread.at(-1)?.sequence ?? 0),
+        mentioned: unread.some(message => message.mentions.includes(actorId)), following: reader.following, authorName: last.authorName,
+        text: last.text.slice(0, 160) || last.attachments.map(file => file.name).join(", ").slice(0, 160), updatedAtMs: BigInt(last.createdAt) })];
+    }).sort((a, b) => Number(b.unreadCount > 0n) - Number(a.unreadCount > 0n) || Number(b.updatedAtMs - a.updatedAtMs)).slice(0, 50);
   }
   failures(request: contract.ReadPartnerNetworkFailuresRequest, actorId: string): contract.ReadPartnerNetworkFailuresResponse {
     return create(contract.ReadPartnerNetworkFailuresResponseSchema, { executions: readCurrentPartnerNetworkFailures(this.storage, request.roomId, actorId, request.sourceMessageIds).map(networkExecution) });
@@ -145,7 +163,8 @@ export class PartnerNetworkHost {
       else { if (!request.partner) throw new PartnerNetworkStoreError("invalid"); partner = { id: request.partner.partnerId, name: request.partner.name, description: request.partner.description }; }
     }
     return this.#room(this.storage.manage({ operationId: request.operationId, roomId: request.roomId, actorId, expectedRevision: networkInteger(request.expectedRevision),
-      action: request.action, targetId: request.actorId, value: request.value, throughSequence: networkInteger(request.throughSequence), ...(partner ? { partner } : {}) }), actorId);
+      action: request.action, targetId: request.actorId, value: request.value, throughSequence: networkInteger(request.throughSequence), threadRootId: request.threadRootId,
+      ...(request.following !== undefined ? { following: request.following } : {}), ...(partner ? { partner } : {}) }), actorId);
   }
   react(request: contract.ReactPartnerNetworkRequest, actorId: string): contract.PartnerNetworkMessage {
     return networkMessage(this.storage.react({ operationId: request.operationId, roomId: request.roomId, actorId, messageId: request.messageId, emoji: request.emoji, add: request.add }));
@@ -157,12 +176,13 @@ export class PartnerNetworkHost {
   executionSnapshot(roomId: string, executionId: string, lease: number, actorId: string): contract.PartnerNetworkSnapshot {
     const { room, job } = this.storage.validateExecution(roomId, executionId, lease, actorId), source = this.storage.message(roomId, job.sourceMessageId);
     const available = this.storage.messages(roomId).filter(message => message.sequence <= (job.contextThroughSequence ?? room.latestSequence));
-    const groupBackground = available.filter(message => !message.threadRootId).slice(-30);
+    const plan = job.planId ? this.storage.plans.get(roomId, job.planId) : undefined;
+    const groupBackground = plan?.kind === "talk" ? [] : available.filter(message => !message.threadRootId).slice(room.singleSpeaker ? -12 : -30).map(message =>
+      room.singleSpeaker && message.id !== source.id ? { ...message, text: message.text.slice(0, 600) } : message);
     const messages = source.threadRootId ? [...groupBackground, this.storage.message(roomId, source.threadRootId), ...available.filter(message => message.threadRootId === source.threadRootId).slice(-100)] : groupBackground;
     if (!messages.some(message => message.id === source.id)) messages.push(source);
     if (source.quoteId && !messages.some(message => message.id === source.quoteId)) messages.push(this.storage.message(roomId, source.quoteId));
-    const plan = job.planId ? this.storage.plans.get(roomId, job.planId) : undefined;
-    if (plan) for (const id of [plan.sourceMessageId, ...plan.requestMessageIds, ...plan.noteMessageIds, ...plan.steps.flatMap(step => step.resultMessageId ? [step.resultMessageId] : [])]) {
+    if (plan) for (const id of [plan.sourceMessageId, ...plan.requestMessageIds, ...plan.noteMessageIds, ...plan.steps.filter(step => plan.kind !== "talk" || step.position < job.planPosition!).flatMap(step => step.resultMessageId ? [step.resultMessageId] : [])]) {
       if (!messages.some(message => message.id === id)) messages.push(this.storage.message(roomId, id));
     }
     return create(contract.PartnerNetworkSnapshotSchema, { room: this.#room(room, actorId), messages: [...new Map(messages.map(message => [message.id, message])).values()].map(message => networkMessage(message, actorId)),

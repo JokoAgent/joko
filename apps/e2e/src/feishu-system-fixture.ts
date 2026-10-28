@@ -133,7 +133,13 @@ export interface FeishuSystemOutboundMessage {
   readonly service: FeishuService;
   readonly address: MessagingAddress;
   readonly text: string;
+  readonly format: "text" | "rich";
+  readonly providerMessageId: string;
   readonly replyToMessageId?: string;
+}
+interface ReplyProgressLease {
+  readonly appId: string; readonly address: MessagingAddress; readonly messageId: string; readonly sourceMessageId: string;
+  closed: boolean;
 }
 
 interface StoredAttachment {
@@ -159,10 +165,13 @@ export class FeishuSystemFixture {
     readonly fileNames: readonly string[];
   }> = [];
   readonly reactions: Array<{ readonly appId: string; readonly messageId: string; readonly emoji: string | null }> = [];
+  readonly replyProgress: Array<{ readonly phase: "open" | "update" | "close"; readonly appId: string; readonly address: MessagingAddress;
+    readonly messageId: string; readonly sourceMessageId: string; readonly text?: string }> = [];
   readonly createTransport: FeishuTransportFactory;
   readonly #updates: QueuedUpdate[] = [];
   readonly #attachments = new Map<string, StoredAttachment>();
   readonly #waiters = new Set<() => void>();
+  readonly #progress = new Map<string, ReplyProgressLease>();
 
   constructor() {
     this.createTransport = (options) => new FeishuSystemTransport(this, options);
@@ -282,6 +291,17 @@ export class FeishuSystemFixture {
 
   attachment(providerKey: string): StoredAttachment | undefined {
     return this.#attachments.get(providerKey);
+  }
+  openProgress(appIdValue: string, address: MessagingAddress, sourceMessageId: string): string {
+    const messageId = `om_progress_${this.#progress.size + 1}`, lease = { appId: appIdValue, address: { ...address }, messageId, sourceMessageId, closed: false };
+    this.#progress.set(messageId, lease); this.replyProgress.push({ ...lease, phase: "open" }); return messageId;
+  }
+  progressLease(appIdValue: string, address: MessagingAddress, messageId: string): ReplyProgressLease {
+    const lease = this.#progress.get(messageId);
+    if (!lease || lease.appId !== appIdValue || lease.address.channel !== address.channel || lease.address.connectionId !== address.connectionId
+      || lease.address.providerConversationId !== address.providerConversationId || lease.address.providerThreadId !== address.providerThreadId
+      || lease.address.conversationKind !== address.conversationKind) throw new Error("Feishu progress belongs to another original recipient.");
+    return lease;
   }
 
   async wait(signal: AbortSignal | undefined, timeoutMs: number): Promise<void> {
@@ -437,14 +457,47 @@ class FeishuSystemTransport {
   }): Promise<MessagingSendReceipt> {
     this.#assertAddress(input.address);
     input.signal?.throwIfAborted();
+    const providerMessageId = `om_outbound_${this.#fixture.outboundMessages.length + 1}`;
     this.#fixture.outboundMessages.push({
       appId: this.#options.appId,
       service: this.channel,
       address: input.address,
       text: input.text,
+      format: "text", providerMessageId,
       ...(input.replyToMessageId === undefined ? {} : { replyToMessageId: input.replyToMessageId })
     });
-    return { providerMessageId: `om_outbound_${this.#fixture.outboundMessages.length}`, address: input.address };
+    return { providerMessageId, address: input.address };
+  }
+  async sendRichReply(input: { readonly address: MessagingAddress; readonly text: string;
+    readonly attachments: readonly { readonly kind: "image" | "file"; readonly bytes: Uint8Array; readonly fileName: string; readonly mimeType: string }[];
+    readonly replyToMessageId?: string; readonly fallbackProgressMessageId?: string; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    this.#assertOpen(); this.#assertAddress(input.address); input.signal?.throwIfAborted();
+    if (!input.text.trim() && !input.attachments.length || input.attachments.some(file => file.kind !== "image" || !file.bytes.length)) throw new Error("Feishu rich reply is invalid.");
+    if (input.fallbackProgressMessageId) {
+      const lease = this.#fixture.progressLease(this.#options.appId, input.address, input.fallbackProgressMessageId);
+      if (lease.closed) throw new Error("Feishu final reply cannot fall back to a retired progress message.");
+    }
+    const providerMessageId = `om_outbound_${this.#fixture.outboundMessages.length + 1}`;
+    this.#fixture.outboundMessages.push({ appId: this.#options.appId, service: this.channel, address: { ...input.address }, text: input.text,
+      format: "rich", providerMessageId, ...(input.replyToMessageId ? { replyToMessageId: input.replyToMessageId } : {}) });
+    if (input.attachments.length) this.#fixture.outboundAttachments.push({ appId: this.#options.appId, address: { ...input.address }, fileNames: input.attachments.map(file => file.fileName) });
+    return { providerMessageId, address: input.address };
+  }
+  async openReplyProgress(input: { readonly address: MessagingAddress; readonly messageId: string; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    this.#assertOpen(); this.#assertAddress(input.address); input.signal?.throwIfAborted();
+    return { providerMessageId: this.#fixture.openProgress(this.#options.appId, input.address, input.messageId), address: input.address };
+  }
+  async updateReplyProgress(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text: string; readonly signal?: AbortSignal }): Promise<void> {
+    this.#assertOpen(); this.#assertAddress(input.address); input.signal?.throwIfAborted();
+    const lease = this.#fixture.progressLease(this.#options.appId, input.address, input.messageId);
+    if (lease.closed) throw new Error("Feishu progress message was already recalled.");
+    this.#fixture.replyProgress.push({ ...lease, phase: "update", text: input.text });
+  }
+  async closeReplyProgress(input: { readonly address: MessagingAddress; readonly messageId: string; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    this.#assertOpen(); this.#assertAddress(input.address); input.signal?.throwIfAborted();
+    const lease = this.#fixture.progressLease(this.#options.appId, input.address, input.messageId);
+    if (!lease.closed) { lease.closed = true; this.#fixture.replyProgress.push({ ...lease, phase: "close" }); }
+    return { providerMessageId: lease.messageId, address: input.address };
   }
 
   async sendAttachments(input: {

@@ -4,7 +4,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionMainView } from "./MobileExtensionMainView";
 import { create } from "@bufbuild/protobuf";
-import { ExtensionOAuthAuthorizationSchema } from "@joko/contracts";
+import { ExtensionDirectoryPickerPageSchema, ExtensionOAuthAuthorizationSchema } from "@joko/contracts";
+import type { MobileExtensionDirectoryPickerViewProps } from "./MobileExtensionDirectoryPickerView";
 import { decodeMobileLibraryMessage, encodeMobileLibraryMessage } from "./mobile-extension-library-bridge";
 import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type {
@@ -17,10 +18,12 @@ import type {
 
 const native = vi.hoisted(() => ({
   web: undefined as undefined | Record<string, unknown>, messages: [] as string[], prepare: vi.fn(),
+  directory: undefined as MobileExtensionDirectoryPickerViewProps | undefined,
   state: "active", listeners: new Set<(value: string) => void>(), alert: vi.fn(), authorize: vi.fn(),
   documents: [] as Array<{ documentId: string; source: { uri: string }; documentUrl: string; documentUrls: string[]; close: ReturnType<typeof vi.fn> }>
 }));
 vi.mock("./mobile-extension-oauth", () => ({ authorizeMobileExtensionAccount: native.authorize }));
+vi.mock("./MobileExtensionDirectoryPickerView", () => ({ MobileExtensionDirectoryPickerView: (props: MobileExtensionDirectoryPickerViewProps) => { native.directory = props; return null; } }));
 
 vi.mock("./mobile-extension-main-view-document", () => ({
   prepareExtensionMainViewDocument: native.prepare,
@@ -118,6 +121,7 @@ afterEach(() => {
   container?.remove();
   root = undefined as unknown as Root;
   native.web = undefined;
+  native.directory = undefined;
   native.messages = [];
   native.documents = [];
   native.prepare.mockReset();
@@ -233,9 +237,10 @@ describe("MobileExtensionMainView", () => {
     const surface: MobileExtensionMainViewSurface = { ...fixtureSurface(extension), purpose: "settings", mobileSettings: true };
     const active = fixtureTransport(surface);
     let finish!: (surface: MobileExtensionMainViewSurface) => void;
-    active.openSettings = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+    const openSettings = vi.fn<NonNullable<MobileExtensionTransport["openSettings"]>>(() => new Promise<MobileExtensionMainViewSurface>(resolve => { finish = resolve; }));
+    active.openSettings = openSettings;
     await render(active, extension, true);
-    const opening = vi.mocked(active.openSettings).mock.calls[0]![1];
+    const opening = openSettings.mock.calls[0]![1];
     await act(async () => { native.state = "background"; native.listeners.forEach(listener => listener("background")); });
     expect(opening.aborted).toBe(true);
     await act(async () => finish(surface));
@@ -322,6 +327,50 @@ describe("MobileExtensionMainView", () => {
     expect(pending[1]!.signal.aborted).toBe(false); expect(replacement.closeMainView).not.toHaveBeenCalled();
     await act(async () => { native.state = "active"; native.listeners.forEach(listener => listener("active")); pending[1]!.finish({ state: authorization.state, code: "current-code" }); });
     expect(native.messages.some(message => message.includes("retired-code"))).toBe(false);
+  });
+
+  it("keeps node directory metadata in the native picker and returns only the original deposit to its settings document", async () => {
+    const extension = { ...fixtureExtension(), settings: { height: 400, mobileCustom: true } };
+    const surface: MobileExtensionMainViewSurface = { ...fixtureSurface(extension), purpose: "settings", mobileSettings: true };
+    const active = fixtureTransport(surface), selected = vi.fn();
+    const initialPage = create(ExtensionDirectoryPickerPageSchema, { picker: { pickerId: "original-picker", extensionId: extension.extensionId,
+      expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + 120) } },
+      directory: { entryId: "private-entry", name: "Reports", displayPath: "D:\\Private\\Reports" } });
+    active.openSettings = vi.fn(async () => surface);
+    active.callSettings = vi.fn(async (_surface, _call, host, signal) => {
+      const entryId = await host.chooseDirectory!({ name: extension.name, title: "Import reports", initialPage,
+        browse: vi.fn(async () => initialPage) }, signal);
+      selected(entryId); return entryId ? { name: "Reports", dir_deposit: { token: "opaque-deposit", file_count: 0, total_bytes: 0, rel_paths: [] } } : { cancelled: true };
+    });
+    await render(active, extension, true);
+    const deliver = () => (native.web!.onMessage as (event: unknown) => void)({ nativeEvent: { url: native.documents[0]!.documentUrl,
+      data: JSON.stringify({ frameId: `${surface.surfaceId}:0`, surfaceId: surface.surfaceId,
+        request: { type: "joko:extension-settings-request", version: 1, id: "choose-original", command: { kind: "directory.pick", title: "Import reports" } } }) } });
+    await act(async () => deliver());
+    expect(native.directory?.directory?.displayPath).toBe("D:\\Private\\Reports"); expect(native.messages).toEqual([]);
+    await act(async () => native.directory!.onChoose());
+    expect(selected).toHaveBeenCalledExactlyOnceWith("private-entry");
+    expect(native.messages).toHaveLength(1); expect(JSON.parse(native.messages[0]!).response.result.dir_deposit.token).toBe("opaque-deposit");
+    expect(native.messages[0]).not.toContain("Private"); expect(native.messages[0]).not.toContain("private-entry");
+  });
+
+  it("retires a directory choice with its original frame before a late native choose can affect a replacement", async () => {
+    const extension = { ...fixtureExtension(), settings: { height: 400, mobileCustom: true } };
+    const surface: MobileExtensionMainViewSurface = { ...fixtureSurface(extension), purpose: "settings", mobileSettings: true };
+    const active = fixtureTransport(surface), selected = vi.fn(); active.openSettings = vi.fn(async () => surface);
+    const initialPage = create(ExtensionDirectoryPickerPageSchema, { picker: { pickerId: "original-picker", extensionId: extension.extensionId,
+      expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + 120) } }, directory: { entryId: "private-entry", name: "Reports", displayPath: "D:\\Reports" } });
+    active.callSettings = vi.fn(async (_surface, _call, host, signal) => {
+      selected(await host.chooseDirectory!({ name: extension.name, initialPage, browse: vi.fn(async () => initialPage) }, signal)); return { cancelled: true };
+    });
+    await render(active, extension, true);
+    await act(async () => (native.web!.onMessage as (event: unknown) => void)({ nativeEvent: { url: native.documents[0]!.documentUrl,
+      data: JSON.stringify({ frameId: `${surface.surfaceId}:0`, surfaceId: surface.surfaceId,
+        request: { type: "joko:extension-settings-request", version: 1, id: "choose-original", command: { kind: "directory.pick" } } }) } }));
+    const original = native.directory!;
+    await render({ ...active, ownerKey: "replacement-node" }, extension, true);
+    await act(async () => original.onChoose());
+    expect(selected).toHaveBeenCalledExactlyOnceWith(undefined); expect(native.messages).toEqual([]);
   });
 
   it("closes a lease that arrives after the surface has been unmounted", async () => {

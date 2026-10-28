@@ -13,6 +13,7 @@ import {
 } from "./navigation-layout.js";
 import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
 import type { PendingTaskSharingAction } from "./task-sharing.js";
+import { extensionSettingsProfileKey, parsePendingExtensionSettingsOperation, sameExtensionSettingsOperation, type PendingExtensionSettingsOperation } from "./extension-settings-operation.js";
 import { composerDocumentPlainText, normalizeComposerDocument } from "./composer-quote-document.js";
 import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
 import { normalizeSelectionQuoteDrafts } from "./selection-quote.js";
@@ -616,6 +617,33 @@ export class LocalState {
         || !["create", "invite", "remove", "end", "endAll", "leave", "join"].includes(row["kind"])) throw new Error("The saved sharing action is invalid.");
       return row as unknown as PendingTaskSharingAction;
     });
+  }
+  async readExtensionSettingsOperation(profile: ConnectionProfile, extensionId: string): Promise<PendingExtensionSettingsOperation | undefined> {
+    const value = await this.get<unknown>(DRAFT_STORE, extensionSettingsOperationKey(profile, extensionId));
+    if (value === undefined) return;
+    const record = parsePendingExtensionSettingsOperation(value);
+    if (JSON.stringify(record.profile) !== extensionSettingsProfileKey(profile) || record.extensionId !== extensionId) throw new Error("The saved plugin settings operation belongs to another source.");
+    return record;
+  }
+  async claimExtensionSettingsOperation(profile: ConnectionProfile, input: PendingExtensionSettingsOperation): Promise<void> {
+    const record = parsePendingExtensionSettingsOperation(input);
+    if (JSON.stringify(record.profile) !== extensionSettingsProfileKey(profile)) throw new Error("The plugin settings operation belongs to another connection.");
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite"), store = transaction.objectStore(DRAFT_STORE), done = transactionDone(transaction);
+    try {
+      const key = extensionSettingsOperationKey(profile, record.extensionId), previous: unknown = await requestResult(store.get(key));
+      if (previous !== undefined && !sameExtensionSettingsOperation(parsePendingExtensionSettingsOperation(previous), record)) throw new Error("Check the original plugin settings operation before starting another change.");
+      store.put(record, key); await done;
+    } catch (error) { try { transaction.abort(); } catch { /* The original transaction may have completed. */ } await done.catch(() => undefined); throw error; }
+  }
+  async finishExtensionSettingsOperation(profile: ConnectionProfile, input: PendingExtensionSettingsOperation): Promise<void> {
+    const record = parsePendingExtensionSettingsOperation(input);
+    if (JSON.stringify(record.profile) !== extensionSettingsProfileKey(profile)) throw new Error("The plugin settings receipt belongs to another connection.");
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite"), store = transaction.objectStore(DRAFT_STORE), done = transactionDone(transaction);
+    try {
+      const key = extensionSettingsOperationKey(profile, record.extensionId), previous: unknown = await requestResult(store.get(key));
+      if (previous !== undefined && !sameExtensionSettingsOperation(parsePendingExtensionSettingsOperation(previous), record)) throw new Error("The original plugin settings operation changed before its receipt was confirmed.");
+      if (previous !== undefined) store.delete(key); await done;
+    } catch (error) { try { transaction.abort(); } catch { /* The original transaction may have completed. */ } await done.catch(() => undefined); throw error; }
   }
   async saveTaskSharingAction(owner: string, action: PendingTaskSharingAction): Promise<void> {
     await this.put(DRAFT_STORE, `task-sharing-actions\u0000${owner}\u0000${action.operationId}`, action);
@@ -1878,6 +1906,11 @@ function pendingExtensionSuggestionKey(scope: string): string {
 function recentExtensionSuggestionsKey(scope: string): string {
   if (scope.length === 0) throw new Error("A new-task draft scope is required.");
   return `${RECENT_EXTENSION_SUGGESTIONS_PREFIX}${scope}`;
+}
+
+function extensionSettingsOperationKey(profile: ConnectionProfile, extensionId: string): string {
+  if (!extensionId || extensionId.length > 128 || /[\u0000-\u001f\u007f]/u.test(extensionId)) throw new Error("The plugin settings installation identity is invalid.");
+  return `extension-settings-operation\u0000${extensionSettingsProfileKey(profile)}\u0000${extensionId}`;
 }
 
 function openCurrentDatabase(): Promise<IDBDatabase> {

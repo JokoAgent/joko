@@ -24,6 +24,7 @@ import type { OrchestratorApplication } from "./application.js";
 import { PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-publisher.js";
 import { PartnerNetworkHost } from "./partner-network-host.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
+import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -437,7 +438,7 @@ describe("Partner independent Session tasks", () => {
       const transport = createConnectTransport({ baseUrl, httpVersion: "1.1", interceptors: [next => request => { request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request); }] });
       const client = createClient(contract.PartnerService, transport);
       const changed = await client.updatePartner({ partnerId: f.partner.id, expectedRevision: { value: f.partner.revision },
-        patch: { description: "Profile configured through authenticated HTTP", modelChain: { routes: [f.route, ...f.partner.capabilities.modelChain] }, permissionMode: contract.PermissionMode.ASK, planMode: false } });
+        patch: { description: "Profile configured through authenticated HTTP", modelChain: { routes: [f.route, ...f.partner.capabilities.modelChain].map(route => ({ ...route, ...contract.encodeModelSpeed(route.fastMode) })) }, permissionMode: contract.PermissionMode.ASK, planMode: false } });
       expect(changed.partner?.canonicalSessionId).toBe(f.parent);
       expect(changed.partner?.description).toBe("Profile configured through authenticated HTTP");
       expect(f.store.getSession(f.parent).descriptor.backendId).toBe(f.primary.id);
@@ -469,8 +470,9 @@ describe("Partner independent Session tasks", () => {
       expect((await watch.next()).value?.ready).toBe(true);
       const primary = defaults.read().available.find(item => item.backendId === f.primary.id && item.modelId === "text")!;
       const secondary = defaults.read().available.find(item => item.backendId === f.secondary.id && item.modelId === "text")!;
+      const primaryWire = create(contract.AppDefaultModelRouteSchema, { ...primary, ...contract.encodeModelSpeed(primary.fastMode) });
       expect(primary).toBeDefined(); expect(secondary).toBeDefined();
-      expect((await ui.syncAppDefaultModel({ uiOwnerId: owner, current: primary })).accepted).toBe(true);
+      expect((await ui.syncAppDefaultModel({ uiOwnerId: owner, current: primaryWire })).accepted).toBe(true);
       const capabilities = f.partners.directory().state.defaultCapabilities!;
       const following = await f.partners.createPartner({ requestId: "following-create", expectedDirectoryRevision: f.partnerStore.directoryState().revision,
         displayName: "Following default", avatar: "orbit", identitySource: "Keep the configured modes.", templateId: "general", capabilities, usesDirectoryDefaults: true });
@@ -488,12 +490,12 @@ describe("Partner independent Session tasks", () => {
       expect(f.partners.getPartner(f.partner.id)).toEqual(f.partner); expect(f.store.getSession(f.parent).descriptor.backendId).toBe(f.primary.id);
       await f.partners.updateDirectoryDefaults(f.partnerStore.directoryState().revision, capabilities);
       const frozen = f.partners.getPartner(following.id);
-      await ui.syncAppDefaultModel({ uiOwnerId: owner, current: primary });
+      await ui.syncAppDefaultModel({ uiOwnerId: owner, current: primaryWire });
       await vi.waitFor(() => expect(defaults!.read().current?.backendId).toBe(f.primary.id));
       expect(f.partners.getPartner(following.id)).toEqual(frozen); expect(f.partnerStore.directoryState().defaultCapabilities).toEqual(capabilities);
-      await ui.syncAppDefaultModel({ uiOwnerId: owner, current: primary, hiddenRouteIds: [secondary.id] });
+      await ui.syncAppDefaultModel({ uiOwnerId: owner, current: primaryWire, hiddenRouteIds: [secondary.id] });
       await expect(defaults.select({ sessionId: f.parent, id: secondary.id, assertCaller: () => undefined })).rejects.toThrow("enabled model");
-      await ui.syncAppDefaultModel({ uiOwnerId: owner, current: primary });
+      await ui.syncAppDefaultModel({ uiOwnerId: owner, current: primaryWire });
       const lateAbort = new AbortController(), expired = defaults.select({ sessionId: f.parent, id: secondary.id, assertCaller: () => undefined, signal: lateAbort.signal }).catch(error => error);
       const lateId = (await watch.next()).value!.requestId; f.advance(5_001);
       await expect(ui.claimAppDefaultModel({ uiOwnerId: owner, requestId: lateId })).rejects.toThrow(); lateAbort.abort();
@@ -506,11 +508,11 @@ describe("Partner independent Session tasks", () => {
       expect(new AppDefaultModelCoordinator(f.store, () => f.host.appDefaultModelChoices(), async () => undefined).read().current).toBeNull();
       await expect(ui.claimAppDefaultModel({ uiOwnerId: owner, requestId: requested })).rejects.toThrow();
       const anonymous = createClient(contract.AppDefaultModelService, createConnectTransport({ baseUrl, httpVersion: "1.1" }));
-      await expect(anonymous.syncAppDefaultModel({ uiOwnerId: owner, current: primary })).rejects.toThrow();
+      await expect(anonymous.syncAppDefaultModel({ uiOwnerId: owner, current: primaryWire })).rejects.toThrow();
     } finally { abort.abort(); await server.close(); }
   });
 });
-async function fixture(streamDelayMs = 30_000, appDefaultModel?: () => { backendId: string; providerId: string; modelId: string; effort?: string; fastMode: boolean } | undefined) {
+async function fixture(streamDelayMs = 30_000, appDefaultModel?: () => SessionRuntimeProfile | undefined) {
   const root = mkdtempSync(join(tmpdir(), "joko-session-task-")), managed = join(root, "managed"), project = join(root, "project"); mkdirSync(managed); mkdirSync(project);
   const store = new OperationalStore(join(managed, "operational.db")), partnerStore = new PartnerStore(join(managed, "partners.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(managed, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();

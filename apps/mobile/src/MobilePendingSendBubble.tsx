@@ -62,7 +62,7 @@ function PendingImage({ files, profileId, attachment }: { readonly files: Pick<M
     }).catch(() => undefined);
     return () => { retired = true; listener.remove(); };
   }, [attachment.attachmentId, attachment.byteSize, attachment.kind, attachment.sha256Hex, files, key, profileId]);
-  return source?.key === key ? <Image source={{ uri: source.uri }} accessibilityLabel={attachment.fileName} style={styles.image} resizeMode="contain" /> : null;
+  return source?.key === key ? <Image source={{ uri: source.uri }} accessibilityLabel={attachment.fileName} style={styles.image} resizeMode="contain" onError={() => setSource(undefined)} /> : null;
 }
 const styles = StyleSheet.create({ root: { alignSelf: "flex-end", maxWidth: "100%", gap: 4 }, line: { flexDirection: "row", alignItems: "center", gap: 8 },
   indicator: { width: 20, alignItems: "center" }, bubble: { padding: 12, borderWidth: StyleSheet.hairlineWidth, borderRadius: 16, maxWidth: "90%", gap: 8 },

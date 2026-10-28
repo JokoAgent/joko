@@ -96,7 +96,7 @@ import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.
 import { activeNativeTimeline } from "./snapshot-projector.js";
 import { taskShareEventAuthor } from "./task-sharing-author.js";
 import { toProtoEvent } from "./proto-mapper.js";
-import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD } from "./native-history.js";
+import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, projectNativeHistory } from "./native-history.js";
 import {
   materializedNativeStateObservation,
   nativeBindingFingerprint,
@@ -116,7 +116,7 @@ it("adopts an approved draft's original native task on first send and rejects an
   class PrewarmAdapter extends FakeBackendAdapter {
     creations = 0;
     override async describe() { const value = await super.describe(); return { ...value, adapterKind: "pi", capabilities: new Map(value.capabilities)
-      .set("session.prewarm", { name: "session.prewarm", supported: true }) }; }
+      .set("session.prewarm", { key: "session.prewarm", supported: true }) }; }
     override async createSession(input: CreateNativeSessionInput, context: AdapterContext) { this.creations++; return super.createSession(input, context); }
   }
   const adapter = new PrewarmAdapter(PI_LIKE_PROFILE), f = await createFixture(adapter, { assertPrewarmResources: () => "approved-resources" });
@@ -144,7 +144,7 @@ it("does not start a draft Agent when Project Trust or resource approval is miss
   class PrewarmAdapter extends FakeBackendAdapter {
     creations = 0;
     override async describe() { const value = await super.describe(); return { ...value, adapterKind: "pi", capabilities: new Map(value.capabilities)
-      .set("session.prewarm", { name: "session.prewarm", supported: true }) }; }
+      .set("session.prewarm", { key: "session.prewarm", supported: true }) }; }
     override async createSession(input: CreateNativeSessionInput, context: AdapterContext) { this.creations++; return super.createSession(input, context); }
   }
   let approved = false;
@@ -11514,6 +11514,78 @@ describe("SessionHost", () => {
     expect(fixture.host.sideChatSourceAllowed(sourceId)).toBe(false);
   });
 
+  it.each(["unchanged", "binding", "generation", "provider", "model", "effort", "fast", "permission", "plan", "missing-model", "missing-plan"] as const)("confirms immutable Side Chat resume state without replaying runtime setters (%s)", async change => {
+    class ImmutableSideChatAdapter extends FakeBackendAdapter {
+      readonly nativeForkProfiles = new Map<string, NativeSessionState>();
+      override async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
+        // This profile comes from the native source at fork, independently of
+        // the later resume request and the Product's stored configuration.
+        this.nativeForkProfiles.set(derivation.sessionId, await super.inspectSession(context.binding!, context));
+        return super.fork(entryId, context, derivation);
+      }
+      override async resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+        await super.resumeSession(binding, context);
+        const native = this.nativeForkProfiles.get(context.sessionId);
+        if (native && context.persistentReadOnly === "side_chat") {
+          await super.setModel(native.providerId!, native.modelId!, context);
+          if (native.effort !== undefined) await super.setEffort(native.effort, context);
+          await super.setPermissionMode("ask", context); await super.setFastMode(false, context); await super.setPlanMode(false, context);
+        }
+        return this.inspectSession(binding, context);
+      }
+      override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+        const observed = await super.inspectSession(binding, context);
+        if (context.persistentReadOnly !== "side_chat") return observed;
+        const state = { ...observed, planMode: false };
+        switch (change) {
+          case "binding": return { ...state, binding: { ...state.binding, nativeSessionId: "another-native-child" } };
+          case "generation": return { ...state, binding: { ...state.binding, generation: state.binding.generation + 1 } };
+          case "provider": return { ...state, providerId: "another-provider" };
+          case "model": return { ...state, modelId: "another-model" };
+          case "effort": return { ...state, effort: "medium" };
+          case "fast": return { ...state, fastMode: true };
+          case "permission": return { ...state, permissionMode: "auto" };
+          case "plan": return { ...state, planMode: true };
+          case "missing-model": { const { modelId: _modelId, ...withoutModel } = state; return withoutModel; }
+          case "missing-plan": { const { planMode: _planMode, ...withoutPlan } = state; return withoutPlan; }
+          default: return state;
+        }
+      }
+    }
+    const adapter = new ImmutableSideChatAdapter({ ...PI_LIKE_PROFILE, capabilities: [
+      ...PI_LIKE_PROFILE.capabilities.filter(capability => capability.key !== "model.fast_mode"),
+      { key: "model.fast_mode", supported: true }, { key: "permission.change", supported: true }, { key: "session.side_chat", supported: true }
+    ] });
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({ operationId: "immutable-sidechat-source", connection: fixture.connection,
+      targetId: "target-one", title: "Source", providerId: "test", modelId: "text", effort: "off", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+    const source = fixture.store.getSession(sourceId).descriptor;
+    const anchor = projectNativeHistory(sourceId, source.binding.opaqueRef, { events: [{ nativeEntryId: "completed-native-reply",
+      projectionKind: "message", contentIndex: 0, payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Completed source" }] }
+    }], activeEntryId: "completed-native-reply" })[0]!;
+    fixture.store.appendEvent({ ...anchor, backendId: source.backendId, targetId: source.targetId, sessionId: sourceId,
+      generation: source.binding.generation, traceId: "immutable-sidechat-anchor" });
+    const childId = (await fixture.host.openSideChat({ operationId: "immutable-sidechat-open", sourceSessionId: sourceId,
+      connection: fixture.connection, title: "Side Chat", expectedGeneration: source.binding.generation })).value.sessionId;
+    const child = fixture.store.getSession(childId).descriptor;
+    const error = new Error("An immutable native runtime cannot accept configuration writes.");
+    const setters = [vi.spyOn(adapter, "setModel").mockRejectedValue(error), vi.spyOn(adapter, "setEffort").mockRejectedValue(error),
+      vi.spyOn(adapter, "setFastMode").mockRejectedValue(error), vi.spyOn(adapter, "setPermissionMode").mockRejectedValue(error),
+      vi.spyOn(adapter, "setPlanMode").mockRejectedValue(error)];
+    if (change === "unchanged") {
+      await fixture.host.resume(childId); await fixture.host.detach(childId); await fixture.host.resume(childId);
+      expect(fixture.store.getSession(childId).descriptor.binding).toMatchObject({ opaqueRef: child.binding.opaqueRef, nativeSessionId: child.binding.nativeSessionId });
+      expect(fixture.store.getSession(childId).descriptor.binding.generation).toBeGreaterThan(child.binding.generation);
+    } else {
+      await expect(fixture.host.resume(childId)).rejects.toThrow(change === "binding" || change === "generation"
+        ? "original runtime binding" : "immutable runtime profile");
+    }
+    for (const setter of setters) expect(setter).not.toHaveBeenCalled();
+    expect(fixture.store.getSession(sourceId).descriptor.binding).toEqual(source.binding);
+    expect(fixture.store.getSession(childId).descriptor).toMatchObject({ derivationOrigin: { sideChat: true }, permissionMode: "ask", planMode: false, fastMode: false });
+    expect(fixture.store.getSession(childId).descriptor.worktree).toBeUndefined();
+  });
+
   it("claims native derivation before fork and replays the completed product task without a second fork", async () => {
     const adapter = new GatedFakeAdapter();
     adapter.forkEditorText = `  restore this draft sk-abcdefghijklmnop ${"x".repeat(65_537)}\n`;
@@ -18837,7 +18909,8 @@ class ToolImageHistoryFakeAdapter extends FakeBackendAdapter {
 }
 
 class PolicyFakeAdapter extends FakeBackendAdapter {
-  currentPolicy = {
+  currentPolicy: { providerId: string; modelId: string; effort: string; fastMode: CreateNativeSessionInput["fastMode"];
+    permissionMode: PermissionMode; planMode: boolean; extraDirectoryIds: string[] } = {
     providerId: "test",
     modelId: "text",
     effort: "medium",

@@ -684,15 +684,58 @@ describe("workspace, artifact, and capability boundaries", () => {
       expect(Buffer.from(await imageDownload.arrayBuffer())).toEqual(imageBytes);
 
       const freshListing = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" });
-      const metadataRevision = freshListing.entries.find((entry) => entry.relativePath === file!.relativePath)!.revision!.opaqueRevision;
+      const beforeMove = freshListing.entries.find((entry) => entry.relativePath === file!.relativePath);
+      if (beforeMove?.revision === undefined) throw new Error("The original workspace file lost its revision before move.");
+      const metadataRevision = beforeMove.revision.opaqueRevision;
       const move = create(OperationMutationSchema, { payload: {
         case: "moveWorkspaceEntry", value: create(MoveWorkspaceEntryMutationSchema, {
           workspaceId, sourceRelativePath: file!.relativePath, destinationRelativePath: "notes/moved.txt",
           expectedRevision: metadataRevision
         })
       } });
-      expect((await submit(paired.clients.operation, paired.connectionId, move)).state).toBe(OperationState.SUCCEEDED);
-      await nextWorkspacePath(watcher, "notes/moved.txt");
+      const moveOperationId = randomUUID();
+      const moveReceipt = await submit(paired.clients.operation, paired.connectionId, move, moveOperationId);
+      expect(moveReceipt).toMatchObject({
+        operationId: moveOperationId,
+        connectionId: paired.connectionId,
+        state: OperationState.SUCCEEDED,
+        mutation: { payload: { case: "moveWorkspaceEntry", value: {
+          workspaceId, sourceRelativePath: beforeMove.relativePath, destinationRelativePath: "notes/moved.txt",
+          expectedRevision: metadataRevision
+        } } }
+      });
+      await nextWorkspacePath(watcher, "notes/moved.txt", "moveWorkspaceEntry", {
+        workspaceId,
+        verify: async (signal) => {
+          expect((await paired.clients.operation.getOperation({ operationId: moveOperationId }, { signal })).operation)
+            .toEqual(moveReceipt);
+          const refreshed = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" }, { signal });
+          expect(refreshed.entries.map((entry) => entry.relativePath).sort()).toEqual([imagePath, "notes/moved.txt"].sort());
+          expect(refreshed.entries.filter((entry) => entry.relativePath === beforeMove.relativePath)).toEqual([]);
+          const destinations = refreshed.entries.filter((entry) => entry.relativePath === "notes/moved.txt");
+          expect(destinations).toHaveLength(1);
+          const destination = destinations[0]!;
+          expect(destination).toMatchObject({
+            workspaceId, relativePath: "notes/moved.txt", kind: beforeMove.kind,
+            revision: { byteSize: beforeMove.revision!.byteSize }
+          });
+          expect(destination.revision?.opaqueRevision).not.toBe("");
+          if (destination.revision === undefined) throw new Error("The moved workspace file has no revision fence.");
+          const read = await paired.clients.workspace.readWorkspaceFile({
+            workspaceId, relativePath: destination.relativePath, expectedRevision: destination.revision
+          }, { signal });
+          expect(read.preview?.entry).toMatchObject({
+            workspaceId, relativePath: destination.relativePath, kind: beforeMove.kind,
+            revision: {
+              opaqueRevision: saved.newRevision!.opaqueRevision,
+              sha256Hex: sha256(Buffer.from(contents)),
+              byteSize: beforeMove.revision!.byteSize
+            }
+          });
+          expect(read.preview?.content).toMatchObject({ case: "text", value: { utf8Text: contents } });
+          expect(read.preview?.truncated).toBe(false);
+        }
+      });
       await expect(paired.clients.workspace.readWorkspaceFile({
         workspaceId, relativePath: "notes/moved.txt", expectedRevision: initialRevision
       })).rejects.toMatchObject({ code: Code.Aborted });
@@ -706,8 +749,29 @@ describe("workspace, artifact, and capability boundaries", () => {
       const staleDelete = await submit(paired.clients.operation, paired.connectionId, deleteFile(metadataRevision));
       expect(staleDelete.state).toBe(OperationState.FAILED);
       expect(staleDelete.error?.code).toBe("WORKSPACE_ENTRY_STALE");
-      expect((await submit(paired.clients.operation, paired.connectionId, deleteFile(movedRevision))).state).toBe(OperationState.SUCCEEDED);
-      await nextWorkspacePath(watcher, "notes/moved.txt");
+      const deleteOperationId = randomUUID();
+      const deleteReceipt = await submit(paired.clients.operation, paired.connectionId, deleteFile(movedRevision), deleteOperationId);
+      expect(deleteReceipt).toMatchObject({
+        operationId: deleteOperationId,
+        connectionId: paired.connectionId,
+        state: OperationState.SUCCEEDED,
+        mutation: { payload: { case: "deleteWorkspaceEntry", value: {
+          workspaceId, relativePath: "notes/moved.txt", expectedRevision: movedRevision, confirmRecursive: false
+        } } }
+      });
+      await nextWorkspacePath(watcher, "notes/moved.txt", "deleteWorkspaceEntry", {
+        workspaceId,
+        verify: async (signal) => {
+          expect((await paired.clients.operation.getOperation({ operationId: deleteOperationId }, { signal })).operation)
+            .toEqual(deleteReceipt);
+          expect((await paired.clients.operation.getOperation({ operationId: staleDelete.operationId }, { signal })).operation)
+            .toEqual(staleDelete);
+          const refreshed = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" }, { signal });
+          expect(refreshed.entries.map((entry) => entry.relativePath)).toEqual([imagePath]);
+          expect(refreshed.entries.filter((entry) => entry.relativePath === "notes/moved.txt")).toEqual([]);
+          expect(refreshed.entries.filter((entry) => entry.relativePath === beforeMove.relativePath)).toEqual([]);
+        }
+      });
       const directory = (await paired.clients.workspace.listWorkspaceEntries({ workspaceId })).entries
         .find((entry) => entry.relativePath === "notes")!;
       const deleteDirectory = (confirmRecursive: boolean) => create(OperationMutationSchema, { payload: {
@@ -857,12 +921,65 @@ function controlledHtmlBrowser() {
 }
 
 async function nextWorkspacePath<T extends {
-  readonly change?: { readonly relativePath?: string };
-}>(iterator: AsyncIterator<T>, relativePath: string): Promise<T> {
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    const next = await nextWithin(iterator, `workspace change for ${relativePath}`);
-    if (next.done) throw new Error(`Workspace change stream ended before ${relativePath}.`);
-    if (next.value.change?.relativePath === relativePath) return next.value;
+  readonly change?: {
+    readonly workspaceId?: string;
+    readonly kind?: WorkspaceFileChangeKind;
+    readonly relativePath?: string;
+    readonly previousRelativePath?: string;
+    readonly sequence?: bigint;
+  };
+}>(iterator: AsyncIterator<T>, relativePath: string, stage = "workspace mutation", resync?: {
+  readonly workspaceId: string;
+  readonly verify: (signal: AbortSignal) => Promise<void>;
+}): Promise<T> {
+  const observed: Array<{
+    readonly kind: WorkspaceFileChangeKind | undefined;
+    readonly relativePath: string;
+    readonly previousRelativePath: string;
+    readonly sequence: string;
+  }> = [];
+  const deadline = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      deadline.abort();
+      reject(new Error("The original workspace watch deadline expired."));
+    }, 5_000);
+  });
+  const consume = async (): Promise<T> => {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      deadline.signal.throwIfAborted();
+      const next = await iterator.next();
+      deadline.signal.throwIfAborted();
+      if (next.done) throw new Error("The original workspace change stream ended.");
+      const change = next.value.change;
+      observed.push({
+        kind: change?.kind,
+        relativePath: (change?.relativePath ?? "").slice(0, 160),
+        previousRelativePath: (change?.previousRelativePath ?? "").slice(0, 160),
+        sequence: change?.sequence?.toString(10) ?? ""
+      });
+      if (change !== undefined && resync !== undefined && (change.kind === WorkspaceFileChangeKind.RESYNC
+        || change.kind === WorkspaceFileChangeKind.OVERFLOW)) {
+        if (change.workspaceId !== resync.workspaceId) throw new Error("Workspace resync does not belong to the original workspace.");
+        if ((change.relativePath ?? "") !== "" || (change.previousRelativePath ?? "") !== "") {
+          throw new Error("Workspace resync unexpectedly contains a path.");
+        }
+        // A real invalidation requires fresh authorized proof of this exact effect.
+        await resync.verify(deadline.signal);
+        deadline.signal.throwIfAborted();
+        return next.value;
+      }
+      if (change?.relativePath === relativePath) return next.value;
+    }
+    throw new Error("The original workspace change stream exceeded the event budget.");
+  };
+  try {
+    return await Promise.race([consume(), timeout]);
+  } catch (error) {
+    throw new Error(`Workspace watch did not reach ${relativePath} after ${stage}; observed=${JSON.stringify(observed)}.`, { cause: error });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    deadline.abort();
   }
-  throw new Error(`Workspace change stream did not publish ${relativePath}.`);
 }

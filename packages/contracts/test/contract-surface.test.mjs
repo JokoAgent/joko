@@ -855,6 +855,7 @@ test("Partner task output metadata preserves execution, ordered Runs, typed stat
 
 test("Partners exposes revision-fenced durable profiles without private home or runtime authority", () => {
   assert.deepEqual([...methodNames(contract.PartnerService)], [
+    "getPartnerAutonomySettings", "updatePartnerAutonomySettings", "getPartnerGlance", "listPartnerTodos", "updatePartnerTodo",
     "listPartnerMemories", "readPartnerMemory", "updatePartnerMemory", "deletePartnerMemory", "getPartnerMemoryPreferences", "updatePartnerMemoryPreferences",
     "getPartnerConnections", "updatePartnerConnections",
     "listPartnerSkills", "readPartnerSkill", "updatePartnerSkill", "deletePartnerSkill",
@@ -876,6 +877,8 @@ test("Partners exposes revision-fenced durable profiles without private home or 
     "retryPartnerInitialization",
     "updatePartnerDefaults",
     "listPartnerSessions",
+    "ensurePartnerTopic",
+    "getPartnerTopic",
     "listPartnerTaskOutputs",
     "controlPartnerSessionTask",
     "markPartnerRead",

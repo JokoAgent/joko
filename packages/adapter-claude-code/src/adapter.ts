@@ -4029,7 +4029,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
                   "no-chrome": null
                 },
                 settings: {
-                  allowedMcpServers: context.persistentReadOnly === "side_chat" && context.hostedExecution ? [claudeMcpServerName(CLAUDE_HOSTED_EXECUTOR_SERVER)] : [],
+                  allowedMcpServers: context.persistentReadOnly === "side_chat" && context.hostedExecution
+                    ? [{ serverName: claudeMcpServerName(CLAUDE_HOSTED_EXECUTOR_SERVER) }]
+                    : [],
                   autoMemoryEnabled: false,
                   autoDreamEnabled: false,
                   disableAgentView: true,

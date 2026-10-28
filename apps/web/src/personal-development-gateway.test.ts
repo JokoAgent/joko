@@ -1,13 +1,34 @@
 import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import { RunPersonalDevelopmentActionResponseSchema, GetPersonalDevelopmentStateResponseSchema,
-  ControlPersonalDevelopmentTaskResponseSchema, StartPersonalDevelopmentDoctorResponseSchema, ControlPersonalDevelopmentDoctorResponseSchema,
+  ControlPersonalDevelopmentTaskResponseSchema, StartPersonalDevelopmentTaskResponseSchema, StartPersonalDevelopmentDoctorResponseSchema, ControlPersonalDevelopmentDoctorResponseSchema,
   PersonalDevelopmentStateSchema, PersonalDevelopmentDoctorRunSchema } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPersonalDevelopmentGateway } from "./personal-development-gateway.js";
 
 describe("personal development generated gateway", () => {
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it.each([
+    [{}, false, false], [{ fastMode: true }, true, false], [{ ultrafastMode: true }, false, true]
+  ] as const)("preserves optional generated speed flags on both task and doctor requests: %s", async (speed, fastMode, ultrafastMode) => {
+    const requests: Array<{ method: string; input: unknown }> = [];
+    const transport = { unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+      requests.push({ method: method.name, input });
+      return method.name === "StartPersonalDevelopmentTask"
+        ? response(method, create(StartPersonalDevelopmentTaskResponseSchema, { operationId: input.operationId, taskId: "task" }))
+        : response(method, create(StartPersonalDevelopmentDoctorResponseSchema, { operationId: input.operationId, report: { runId: "doctor", mode: input.mode } }));
+    }) } as unknown as Transport;
+    const gateway = createPersonalDevelopmentGateway(transport, new AbortController().signal);
+    await gateway.startPersonalDevelopmentTask(speed, "original-task-request");
+    await gateway.startPersonalDevelopmentDoctor({ ...speed, mode: "check" }, "original-doctor-request");
+    expect(requests).toEqual([
+      { method: "StartPersonalDevelopmentTask", input: expect.objectContaining({ operationId: "original-task-request", fastMode, ultrafastMode }) },
+      { method: "StartPersonalDevelopmentDoctor", input: expect.objectContaining({ operationId: "original-doctor-request", fastMode, ultrafastMode }) }
+    ]);
+    await expect(gateway.startPersonalDevelopmentDoctor({ mode: "check", fastMode: true, ultrafastMode: true }, "conflicting-request")).rejects.toThrow("Conflicting");
+    expect(requests).toHaveLength(2);
+  });
 
   it("consumes concrete generated replies and observes through finite Get requests", async () => {
     const methods: string[] = [];

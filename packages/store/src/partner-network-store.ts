@@ -14,6 +14,7 @@ export interface NetworkRoom {
   format: 1; id: string; name: string; hostServerId: string; hostOrigin: string; revision: number;
   state: "active" | "archived" | "dissolved"; members: NetworkActor[]; latestSequence: number;
   replyMode: "all" | "mentioned"; speakingMode: "auto" | "sequential"; updatedAt: number; organizerId?: string;
+  singleSpeaker?: boolean;
 }
 export interface NetworkAttachment { id: string; name: string; mediaType: string; sizeBytes: number; }
 export interface NetworkTaskCard {
@@ -28,6 +29,7 @@ export interface NetworkMessage {
   planId?: string; mentionAll?: boolean;
 }
 export interface NetworkLink { id: string; roomId: string; state: "active" | "revoked" | "consumed"; digest: string; expiresAt: number | null; reusable: boolean; }
+export interface NetworkReader { format: 1; actorId: string; threadRootId: string; readSequence: number; following: boolean; }
 export interface NetworkExecution {
   id: string; roomId: string; actorId: string; requesterId: string; sourceMessageId: string;
   accessMode: "owner" | "chat" | "tools"; accessRevision: number;
@@ -61,7 +63,7 @@ export class PartnerNetworkStore {
     this.plans = new PartnerNetworkPlans({ store, now, room: id => this.get(id), save: room => { this.#save(room); },
       message: (roomId, id) => this.message(roomId, id), jobs: roomId => this.executions(roomId), append: (room, message) => this.#append(room, message),
       enqueue: job => { this.#put(job.roomId, `execution:${job.id}`, job); }, end: (job, status, code) => this.#end(job, status, code),
-      cancel: roomId => this.#cancel(roomId), ordinary: (room, requesterId, message, roundId) => this.#queue(room, requesterId, message, roundId) });
+      cancel: roomId => this.#cancel(roomId, undefined, true, ""), ordinary: (room, requesterId, message, roundId) => this.#queue(room, requesterId, message, roundId) });
   }
   #get<T>(owner: string, key: string): T | undefined { return this.store.findSetting<T>("service", `${SCOPE}:${owner}`, key)?.value; }
   #put<T>(owner: string, key: string, value: T): T { this.store.setSetting("service", `${SCOPE}:${owner}`, key, value); return clone(value); }
@@ -120,11 +122,11 @@ export class PartnerNetworkStore {
       const value = action(); this.#put(roomId, key, { bodyHash, value }); return value;
     });
   }
-  create(input: { operationId: string; serverId: string; origin: string; name: string; displayName: string; partners: readonly { id: string; name: string; description: string }[] }): NetworkRoom {
+  create(input: { operationId: string; serverId: string; origin: string; name: string; displayName: string; partners: readonly { id: string; name: string; description: string }[]; singleSpeaker?: boolean }): NetworkRoom {
     const actorId = networkHumanId(input.serverId);
     return this.operation("host", actorId, input.operationId, input, () => {
       const room: NetworkRoom = { format: 1, id: randomUUID(), name: networkText(input.name.trim(), 120), hostServerId: networkIdentity(input.serverId),
-        hostOrigin: input.origin, revision: 1, state: "active", latestSequence: 0, replyMode: "all", speakingMode: "auto", updatedAt: this.now(),
+        hostOrigin: input.origin, revision: 1, state: "active", latestSequence: 0, replyMode: "all", speakingMode: "auto", singleSpeaker: input.singleSpeaker !== false, updatedAt: this.now(),
         members: [{ id: actorId, kind: "human", name: networkText(input.displayName.trim(), 128), ownerId: actorId, homeServerId: input.serverId, partnerId: "",
           role: "owner", state: "joined", guestAccess: "none", accessRevision: 1, description: "", nickname: "", credentialDigest: "", readSequence: 0, unreadSequence: 0, removedFromList: false }] };
       for (const partner of input.partners) this.#addPartner(room, actorId, partner);
@@ -175,14 +177,15 @@ export class PartnerNetworkStore {
       nickname: "", credentialDigest: "", readSequence: 0, unreadSequence: 0, removedFromList: false }); this.#capacity(room);
   }
   manage(input: { operationId: string; roomId: string; actorId: string; expectedRevision: number; action: string; targetId: string; value: string; throughSequence: number;
-    partner?: { id: string; name: string; description: string } }): NetworkRoom {
+    partner?: { id: string; name: string; description: string }; threadRootId?: string; following?: boolean }): NetworkRoom {
     this.member(this.get(input.roomId), input.actorId, !["remove-list", "restore-list"].includes(input.action));
     return this.operation(input.roomId, input.actorId, input.operationId, input, () => {
       const room = this.get(input.roomId), actor = this.member(room, input.actorId, !["remove-list", "restore-list"].includes(input.action));
       const target = room.members.find(member => member.id === input.targetId);
       if (["remove-list", "restore-list"].includes(input.action)) { actor.removedFromList = input.action === "remove-list"; return this.#save(room); }
-      if (input.action === "mark-read") { if (!Number.isSafeInteger(input.throughSequence) || input.throughSequence < 0 || input.throughSequence > room.latestSequence) throw new PartnerNetworkStoreError("invalid");
-        actor.readSequence = Math.max(actor.readSequence, input.throughSequence); return this.#save(room); }
+      if (["mark-read", "follow-thread"].includes(input.action)) {
+        this.#writeReader(room, actor, input); return this.#save(room);
+      }
       this.#revision(room, input.expectedRevision);
       if (["rename", "archive", "restore", "dissolve", "remove-member", "set-role", "revoke-link", "reply-mode", "speaking-mode", "organizer"].includes(input.action)) this.#admin(actor);
       if (room.state === "dissolved" && input.action !== "leave") throw new PartnerNetworkStoreError("denied");
@@ -203,10 +206,17 @@ export class PartnerNetworkStore {
           target.guestAccess = input.value as NetworkActor["guestAccess"]; target.accessRevision++; this.#cancel(room.id, target.id); break;
         case "revoke-link": { const link = this.#rows<NetworkLink>("host", "link:").find(item => item.roomId === room.id && item.id === input.value);
           if (!link) throw new PartnerNetworkStoreError("not_found"); this.#put("host", `link:${link.digest}`, { ...link, state: "revoked" }); break; }
-        case "reply-mode": if (!["all", "mentioned"].includes(input.value)) throw new PartnerNetworkStoreError("invalid"); room.replyMode = input.value as NetworkRoom["replyMode"]; break;
-        case "speaking-mode": if (!["auto", "sequential"].includes(input.value)) throw new PartnerNetworkStoreError("invalid"); room.speakingMode = input.value as NetworkRoom["speakingMode"]; break;
-        case "organizer": if (input.value && !room.members.some(member => member.id === input.value && member.kind === "partner" && member.state === "joined")) throw new PartnerNetworkStoreError("denied"); room.organizerId = input.value; break;
-        case "stop": this.plans.stop(room.id); this.#cancel(room.id); break;
+        case "reply-mode": if (room.singleSpeaker || !["all", "mentioned"].includes(input.value)) throw new PartnerNetworkStoreError("invalid"); room.replyMode = input.value as NetworkRoom["replyMode"]; break;
+        case "speaking-mode": if (room.singleSpeaker || !["auto", "sequential"].includes(input.value)) throw new PartnerNetworkStoreError("invalid"); room.speakingMode = input.value as NetworkRoom["speakingMode"]; break;
+        case "organizer": if (room.singleSpeaker || input.value && !room.members.some(member => member.id === input.value && member.kind === "partner" && member.state === "joined")) throw new PartnerNetworkStoreError("denied"); room.organizerId = input.value; break;
+        case "stop": {
+          if (!room.singleSpeaker) { this.plans.stop(room.id); this.#cancel(room.id); break; }
+          const all = input.value === "all"; if (all) this.#admin(actor);
+          for (const job of this.executions(room.id)) if ((input.threadRootId === undefined || this.message(room.id, job.sourceMessageId).threadRootId === input.threadRootId)
+            && (all || job.requesterId === actor.id || room.members.some(member => member.id === job.actorId && member.ownerId === actor.id))) this.#end(job, "cancelled");
+          if (!input.threadRootId) for (const plan of this.plans.list(room.id)) if (["running", "waiting", "proposed"].includes(plan.status) && (all || plan.requesterId === actor.id)) this.plans.stop(room.id, plan.id);
+          break;
+        }
         case "continue": { this.#active(room); const source = this.messages(room.id).findLast(message => room.members.some(member => member.id === message.authorId && member.kind === "human") && !message.deleted
           && (!message.kind || message.kind === "message") && message.threadRootId === input.value);
           if (!source || !this.canContinue(room.id, input.value)) throw new PartnerNetworkStoreError("not_found"); this.#cancel(room.id); this.#queue(room, actor.id, source, randomUUID()); break; }
@@ -222,6 +232,36 @@ export class PartnerNetworkStore {
     for (const job of this.executions(room.id)) if (job.requesterId === actor.id || room.members.some(member => member.id === job.actorId && member.ownerId === actor.id)) this.#end(job, "cancelled");
   }
   messages(roomId: string): NetworkMessage[] { this.get(roomId); return this.#rows<NetworkMessage>(roomId, "message:").sort((a, b) => a.sequence - b.sequence); }
+  reader(roomId: string, actorId: string, threadRootId: string): NetworkReader {
+    const { actor } = this.assertJoined(roomId, actorId);
+    if (!threadRootId) return { format: 1, actorId, threadRootId, readSequence: actor.readSequence, following: false };
+    const value = this.#get<NetworkReader>(roomId, `read:${networkHash([actorId, threadRootId])}`);
+    if (value && (value.format !== 1 || value.actorId !== actorId || value.threadRootId !== threadRootId || !Number.isSafeInteger(value.readSequence)
+      || value.readSequence < 0 || typeof value.following !== "boolean")) throw new PartnerNetworkStoreError("invalid");
+    return value ?? { format: 1, actorId, threadRootId, readSequence: 0, following: false };
+  }
+  #writeReader(room: NetworkRoom, actor: NetworkActor, input: { action: string; threadRootId?: string; throughSequence: number; following?: boolean }): void {
+    const rootId = input.threadRootId ?? "", through = input.throughSequence;
+    if (!Number.isSafeInteger(through) || through < 0 || through > room.latestSequence) throw new PartnerNetworkStoreError("invalid");
+    if (!rootId) {
+      if (input.action !== "mark-read" || input.following !== undefined) throw new PartnerNetworkStoreError("invalid");
+      actor.readSequence = Math.max(actor.readSequence, through); return;
+    }
+    const root = this.message(room.id, rootId); if (root.deleted || root.threadRootId) throw new PartnerNetworkStoreError("not_found");
+    const reader = this.reader(room.id, actor.id, rootId);
+    if (input.action === "follow-thread") {
+      if (typeof input.following !== "boolean") throw new PartnerNetworkStoreError("invalid");
+      // A follow toggle restates the reader position; it never marks unseen replies read.
+      this.#put(room.id, `read:${networkHash([actor.id, rootId])}`, { ...reader, following: input.following }); return;
+    }
+    if (through > 0 && !this.messages(room.id).some(message => message.sequence === through && (message.id === rootId || message.threadRootId === rootId))) throw new PartnerNetworkStoreError("invalid");
+    this.#put(room.id, `read:${networkHash([actor.id, rootId])}`, { ...reader, readSequence: Math.max(reader.readSequence, through) });
+  }
+  hasUnread(roomId: string, actorId: string): boolean {
+    this.assertJoined(roomId, actorId);
+    return this.messages(roomId).some(message => !message.deleted && message.authorId !== actorId && message.kind !== "member-joined"
+      && message.sequence > this.reader(roomId, actorId, message.threadRootId).readSequence);
+  }
   message(roomId: string, messageId: string): NetworkMessage { const value = this.#get<NetworkMessage>(roomId, `message:${networkIdentity(messageId)}`); if (!value) throw new PartnerNetworkStoreError("not_found"); return clone(value); }
   #append(room: NetworkRoom, message: Omit<NetworkMessage, "id" | "sequence" | "createdAt" | "reactions" | "deleted">): NetworkMessage {
     const value: NetworkMessage = { ...message, id: randomUUID(), sequence: ++room.latestSequence, createdAt: this.now(), deleted: false, reactions: [] };
@@ -244,17 +284,26 @@ export class PartnerNetworkStore {
       const message = this.#append(room, { authorId: actor.id, authorName: actor.nickname || actor.name, text, mentions, mentionAll: input.mentionAll,
         threadRootId: input.threadRootId, quoteId: input.quoteId, attachments: [...input.attachments] });
       const specific = input.mentions.some(id => room.members.some(member => member.id === id && member.kind === "partner"));
-      if (!this.plans.onSend(room, actor.id, message, input.forcePlan === true, specific)) {
-        this.#cancel(room.id, undefined, false); this.#queue(room, actor.id, message, message.id);
+      if (room.singleSpeaker) this.#singleSpeakerSend(room, actor, message);
+      else if (!this.plans.onSend(room, actor.id, message, input.forcePlan === true, specific)) {
+        this.#cancel(room.id, undefined, false, message.threadRootId); this.#queue(room, actor.id, message, message.id);
       }
       this.#save(room); return message;
     });
   }
-  #queue(room: NetworkRoom, requesterId: string, message: NetworkMessage, roundId: string): void {
+  #singleSpeakerSend(room: NetworkRoom, requester: NetworkActor, message: NetworkMessage): void {
+    const eligible = this.plans.eligible(room, requester.id), explicit = message.mentions.length > 0;
+    const responders = explicit ? message.mentions.flatMap(id => eligible.filter(actor => actor.id === id)) : eligible;
+    if (!message.threadRootId && this.plans.onTalkSend(room, requester, message, responders, explicit)) return;
+    // A Thread and an interruption of an active queue are ordinary, sequential replies.
+    if (!message.threadRootId) this.#cancel(room.id, undefined, false, "");
+    this.#queue(room, requester.id, message, message.id, explicit ? responders.map(actor => actor.id) : responders.slice(0, 1).map(actor => actor.id));
+  }
+  #queue(room: NetworkRoom, requesterId: string, message: NetworkMessage, roundId: string, selected?: readonly string[]): void {
     if (message.kind === "thread-share" || message.kind === "task") return;
     const original = roundId === message.id ? undefined : this.rounds.continuation(room.id, message.id);
     const responders = room.members.filter(actor => actor.kind === "partner" && actor.state === "joined" && (actor.ownerId === requesterId || actor.guestAccess !== "none")
-      && (original ? original.includes(actor.id) : message.kind === "member-joined" || (message.mentions.length ? message.mentions.includes(actor.id) : room.replyMode === "all")));
+      && (selected ? selected.includes(actor.id) : original ? original.includes(actor.id) : message.kind === "member-joined" || (message.mentions.length ? message.mentions.includes(actor.id) : room.replyMode === "all")));
     const ordered = message.mentions.length ? [...responders].sort((a, b) => message.mentions.indexOf(a.id) - message.mentions.indexOf(b.id)) : responders;
     const turns = this.rounds.start({ room, requesterId, message, roundId, responders: original ? original.filter(id => responders.some(actor => actor.id === id)) : ordered.map(actor => actor.id), mentionAll: message.mentionAll === true, continued: roundId !== message.id });
     this.#queueTurns(room, requesterId, message, roundId, turns.filter(turn => responders.some(actor => actor.id === turn.actorId)));
@@ -313,7 +362,7 @@ export class PartnerNetworkStore {
   }
   executions(roomId: string): NetworkExecution[] { return this.#rows<NetworkExecution>(roomId, "execution:"); }
   canContinue(roomId: string, threadRootId = ""): boolean {
-    const room = this.get(roomId); if (room.state !== "active" || this.executions(roomId).some(job => ["queued", "running"].includes(job.status))) return false;
+    const room = this.get(roomId); if (room.singleSpeaker || room.state !== "active" || this.executions(roomId).some(job => ["queued", "running"].includes(job.status))) return false;
     const source = this.messages(roomId).findLast(message => !message.deleted && (!message.kind || message.kind === "message") && message.threadRootId === threadRootId && room.members.some(actor => actor.kind === "human" && actor.id === message.authorId));
     return !!source && this.rounds.canContinue(roomId, source.id);
   }
@@ -323,7 +372,8 @@ export class PartnerNetworkStore {
     if (["unknown", "failed", "cancelled"].includes(status)) this.plans.interrupted(job, failureCode || "outcome-unknown");
     return ended;
   }
-  #cancel(roomId: string, actorId?: string, includePlans = true): void { if (!actorId) this.rounds.stopRoom(roomId); for (const job of this.executions(roomId)) if ((!actorId || job.actorId === actorId)
+  #cancel(roomId: string, actorId?: string, includePlans = true, threadRootId?: string): void { if (!actorId) this.rounds.stopRoom(roomId, threadRootId === undefined ? undefined : this.messages(roomId).filter(message => message.threadRootId === threadRootId).map(message => message.id)); for (const job of this.executions(roomId)) if ((!actorId || job.actorId === actorId)
+    && (threadRootId === undefined || this.message(roomId, job.sourceMessageId).threadRootId === threadRootId)
     && (includePlans || job.kind !== "plan-step")) this.#end(job, "cancelled"); }
   validateExecution(roomId: string, executionId: string, lease: number, ownerId: string): { room: NetworkRoom; actor: NetworkActor; job: NetworkExecution } {
     const { room } = this.assertJoined(roomId, ownerId); this.#active(room); const job = this.#get<NetworkExecution>(room.id, `execution:${networkIdentity(executionId)}`);
@@ -341,10 +391,12 @@ export class PartnerNetworkStore {
       jobs = this.executions(room.id);
       for (const ended of jobs.filter(job => ["completed", "failed", "cancelled", "unknown"].includes(job.status) && !["plan-decision", "plan-step"].includes(job.kind ?? ""))) this.#settleRound(room, ended, false);
       jobs = this.executions(room.id);
-      const scope = (job: NetworkExecution) => this.message(room.id, job.sourceMessageId).threadRootId;
+      const scope = (job: NetworkExecution) => job.planId ? `plan:${job.planId}` : this.message(room.id, job.sourceMessageId).threadRootId;
       const busy = new Set(jobs.filter(job => job.actorId === actorId && job.status === 'running' && job.leaseExpiresAt > this.now()).map(scope));
-      const job = jobs.find(item => item.actorId === actorId && item.status === "queued" && item.accessRevision === actor.accessRevision
-        && !busy.has(scope(item)) && this.rounds.canClaim(item, jobs));
+      const job = jobs.filter(item => item.actorId === actorId && item.status === "queued" && item.accessRevision === actor.accessRevision
+        && !busy.has(scope(item)) && this.rounds.canClaim(item, jobs))
+        .sort((left, right) => this.message(room.id, left.sourceMessageId).sequence - this.message(room.id, right.sourceMessageId).sequence
+          || (left.circle ?? 0) - (right.circle ?? 0) || left.ordinal - right.ordinal)[0];
       if (!job) return undefined;
       const next = { ...job, status: "running" as const, lease: job.lease + 1, leaseExpiresAt: this.now() + 30_000,
         ...(["plan-decision", "plan-step"].includes(job.kind ?? "") ? {} : { contextThroughSequence: this.rounds.contextThrough(room, job) }) };
@@ -374,11 +426,11 @@ export class PartnerNetworkStore {
       if (["plan-decision", "plan-step"].includes(job.kind ?? "")) {
         const ended = this.plans.settle(room, actor, job, input, failureCode); this.#save(room); return ended;
       }
-      const published = input.action === "complete" && !!text.trim() && text.trim() !== "NO_REPLY" && this.rounds.mayPublish(job);
+      const published = input.action === "complete" && (!!text.trim() || !!input.attachments?.length) && text.trim() !== "NO_REPLY" && this.rounds.mayPublish(job);
       if (published) {
         const source = this.message(room.id, job.sourceMessageId), owner = this.member(room, actor.ownerId);
         this.#append(room, { authorId: actor.id, authorName: `${actor.nickname || actor.name} (${owner.nickname || owner.name})`, text, mentions: [], threadRootId: source.threadRootId,
-          quoteId: "", attachments: [] });
+          quoteId: "", attachments: [...input.attachments ?? []] });
       }
       this.#put(room.id, `settlement:${job.id}:${job.lease}`, { inputHash: networkHash(input) }); this.#save(room);
       const ended = this.#end(job, input.action === "complete" ? "completed" : "failed", failureCode); this.#settleRound(room, ended, published); return ended;

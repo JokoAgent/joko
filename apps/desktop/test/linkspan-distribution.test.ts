@@ -20,7 +20,7 @@ const config = JSON.parse(await readFile(new URL('../electron-builder.json', imp
   extraResources: Array<{ from: string; to: string; filter?: readonly string[] }>;
 };
 
-it('excludes Mobile native build inputs from the automatic Desktop dependency collector', () => {
+it('leaves the Desktop carrier closure to its filtered extraResources instead of the automatic dependency collector', () => {
   const { getNodeModuleFileMatcher } = createRequire(require.resolve('electron-builder'))('app-builder-lib/out/fileMatcher.js') as {
     getNodeModuleFileMatcher(root: string, destination: string, expand: (value: string) => string, platform: object,
       packager: object): { createFilter(): (path: string, stat: { isDirectory(): boolean }) => boolean };
@@ -30,10 +30,24 @@ it('excludes Mobile native build inputs from the automatic Desktop dependency co
     config, debugLogger: { isEnabled: false }
   }).createFilter();
   const file = { isDirectory: () => false };
-  expect(filter(join(root, 'node_modules/@jokoagent/linkspan-iroh/native/sources.json'), file)).toBe(false);
-  expect(filter(join(root, 'node_modules/@jokoagent/linkspan-iroh/dist/node.js'), file)).toBe(true);
-  expect(filter(join(root, 'node_modules/@jokoagent/linkspan-iroh/dist/bridge.js'), file)).toBe(true);
-  expect(filter(join(root, 'node_modules/@jokoagent/linkspan-iroh/dist/source-build.json'), file)).toBe(true);
+  // The collector copies independently of extraResources. Its broad package copy
+  // must not leave Mobile/prepare files beside the exact staged carrier mirror.
+  const carriers = config.extraResources.filter(item => item.to.startsWith('app/node_modules/@jokoagent/'));
+  expect(carriers).toHaveLength(11);
+  for (const resource of carriers) {
+    const name = resource.to.split('/').at(-1)!;
+    for (const path of ['package.json', 'dist/index.js', 'dist/source-build.json', 'scripts/prepare.mjs', 'mobile-inputs.json']) {
+      expect(filter(join(root, 'node_modules/@jokoagent', name, path), file), `${name}/${path}`).toBe(false);
+    }
+  }
+  for (const path of [
+    'linkspan-iroh/native/sources.json', 'linkspan-iroh-node/rust-dependencies.json',
+    'linkspan-iroh-node/scripts/mobile-files.mjs', 'linkspan-iroh-node/scripts/prepare-mobile.mjs',
+    'linkspan-iroh-node/scripts/prepare-native-source.mjs', 'linkspan-iroh-node/scripts/test-native-kotlin.mjs',
+    'linkspan-iroh-node/upstream.json', 'linkspan-tailcat-node/scripts/prepare.mjs'
+  ]) expect(filter(join(root, 'node_modules/@jokoagent', path), file), path).toBe(false);
+  expect(filter(join(root, 'node_modules/@bufbuild/protobuf/dist/esm/index.js'), file)).toBe(true);
+  expect(filter(join(root, 'node_modules/@jokoagent/other-runtime/dist/index.js'), file)).toBe(true);
 });
 
 it('delivers and resolves the exact Desktop carrier closure even when the builder collector omits it', async () => {

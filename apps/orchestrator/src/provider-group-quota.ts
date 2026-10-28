@@ -1,4 +1,4 @@
-import type { ProviderAccountUsageSnapshot, ProviderAccountUsageWindow } from "@joko/core";
+import type { ProviderAccountUsageBucket, ProviderAccountUsageSnapshot, ProviderAccountUsageWindow } from "@joko/core";
 import type { ProviderGroupMember } from "@joko/store";
 
 export interface ProviderGroupQuota {
@@ -16,7 +16,7 @@ export function providerGroupQuota(snapshot: ProviderAccountUsageSnapshot | unde
     || now - snapshot.observedAt > PROVIDER_GROUP_QUOTA_MAX_AGE_MS || snapshot.observedAt - now > 60_000) return { limited: false };
   const current = (window: ProviderAccountUsageWindow | undefined): ProviderAccountUsageWindow | undefined => window && Number.isFinite(window.usedPercent) && window.usedPercent >= 0
     && (window.resetAt === undefined || Number.isFinite(window.resetAt) && window.resetAt > now) ? { ...window, usedPercent: Math.min(window.usedPercent, 100) } : undefined;
-  const exactBucket = snapshot.buckets?.find(bucket => bucket.id === modelId);
+  const exactBucket = selectedModelBucket(snapshot.buckets, modelId, now);
   // A model-specific native bucket must not be replaced by another model's
   // apparently fresh quota. Unmapped buckets remain unknown for scheduling.
   if (snapshot.buckets?.length && !exactBucket) return { limited: false };
@@ -53,6 +53,23 @@ export function providerGroupQuota(snapshot: ProviderAccountUsageSnapshot | unde
     fiveHourTight: five !== undefined && five.usedPercent >= 85 && (five.resetAt === undefined || five.resetAt - now > 60 * 60_000),
     ...(weekly?.resetAt !== undefined && weekly.usedPercent < 100 ? { weeklyResetAt: weekly.resetAt } : {}),
     ...(five?.resetAt !== undefined && five.usedPercent < 100 ? { fiveHourResetAt: five.resetAt } : {}) };
+}
+function selectedModelBucket(buckets: readonly ProviderAccountUsageBucket[] | undefined, modelId: string, now: number): ProviderAccountUsageBucket | undefined {
+  const token = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/gu, "");
+  const candidates = (buckets ?? []).filter(bucket => {
+    const windows = [bucket.primaryWindow, bucket.secondaryWindow].filter((window): window is ProviderAccountUsageWindow => window !== undefined);
+    return !["__proto__", "constructor", "prototype"].includes(bucket.id) && !(windows.length > 0 && windows.every(window => window.resetAt !== undefined
+      && Number.isFinite(window.resetAt) && window.resetAt > 0 && window.resetAt + 24 * 60 * 60_000 < now));
+  });
+  const exact = candidates.find(bucket => bucket.id === modelId); if (exact) return exact;
+  const model = token(modelId);
+  let best: ProviderAccountUsageBucket | undefined, length = 0;
+  for (const candidate of candidates) {
+    const name = token(candidate.displayName ?? "");
+    if (name && name === model) return candidate;
+    if (name && model.includes(name) && name.length > length) { best = candidate; length = name.length; }
+  }
+  return best ?? candidates.find(bucket => bucket.id === "codex") ?? candidates.find(bucket => bucket.id === "__default__");
 }
 export function quotaTimeLeftPercent(window: NonNullable<ProviderGroupQuota["pacingWindow"]>, now: number): number | undefined {
   if (!Number.isFinite(window.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100 || !Number.isFinite(window.windowMs) || window.windowMs <= 0) return undefined;

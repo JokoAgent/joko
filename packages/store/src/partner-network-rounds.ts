@@ -30,7 +30,7 @@ export class PartnerNetworkRounds {
     const welcome = input.message.kind === "member-joined", responders = [...new Set(input.responders)];
     const specific = !input.mentionAll && input.message.mentions.length > 0;
     const round = this.#save({ format: 1, id: input.roundId, roomId: input.room.id, requesterId: input.requesterId, sourceMessageId: input.message.id,
-      responders, circle: 0, replies: 0, circleReplies: 0, settledIds: [], parallel: !input.continued && !specific && input.room.speakingMode === "auto" && responders.length >= 2,
+      responders, circle: 0, replies: 0, circleReplies: 0, settledIds: [], parallel: !input.room.singleSpeaker && !input.continued && !specific && input.room.speakingMode === "auto" && responders.length >= 2,
       welcome, throughSequence: input.room.latestSequence, state: responders.length ? "active" : "completed" });
     this.store.setSetting("service", `partner-network-round-head.v1:${input.room.id}`, input.message.id, { roundId: round.id });
     return this.#turns(round, responders);
@@ -54,13 +54,13 @@ export class PartnerNetworkRounds {
     let current = this.#save({ ...round, replies: Math.min(10, round.replies + Number(input.published)), circleReplies: round.circleReplies + Number(input.published), settledIds: [...round.settledIds, input.job.id] });
     if (current.replies >= 10) { this.#save({ ...current, state: "completed" }); return []; }
     if (input.jobs.some(job => job.roundId === current.id && (job.circle ?? 0) === current.circle && ["queued", "running"].includes(job.status))) return [];
-    if (!current.circleReplies || current.welcome || current.responders.length < 2 || current.circle >= 2) { this.#save({ ...current, state: "completed" }); return []; }
+    if (input.room.singleSpeaker || !current.circleReplies || current.welcome || current.responders.length < 2 || current.circle >= 2) { this.#save({ ...current, state: "completed" }); return []; }
     current = this.#save({ ...current, circle: current.circle + 1, circleReplies: 0, throughSequence: input.room.latestSequence });
     const dropped = new Set(input.jobs.filter(job => job.roundId === current.id && ["failed", "unknown", "cancelled"].includes(job.status)).map(job => job.actorId));
     const turns = this.#turns(current, input.eligible.filter(actorId => !dropped.has(actorId))); if (!turns.length) this.#save({ ...current, state: "completed" }); return turns;
   }
-  stopRoom(roomId: string): void { for (const row of this.store.listSettings("service", scope(roomId))) {
-    const round = row.value as NetworkRound; if (round.state === "active") this.#save({ ...round, state: "stopped" });
+  stopRoom(roomId: string, sourceIds?: readonly string[]): void { for (const row of this.store.listSettings("service", scope(roomId))) {
+    const round = row.value as NetworkRound; if (round.state === "active" && (!sourceIds || sourceIds.includes(round.sourceMessageId))) this.#save({ ...round, state: "stopped" });
   } }
   continuation(roomId: string, sourceId: string): readonly string[] | undefined {
     const rounds = this.store.listSettings("service", scope(roomId)).map(row => row.value as NetworkRound).filter(round => round.sourceMessageId === sourceId && !round.welcome);

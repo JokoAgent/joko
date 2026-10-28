@@ -82,9 +82,20 @@ mountedIt("keeps question references read-only and answers explicit in the produ
   const webReference = question.getByRole("link", { name: "web evidence", exact: true });
   await webReference.focus(); await webReference.press("1");
   expect(await question.locator('input[type="radio"]:checked').count()).toBe(0);
+  expect(await question.getByRole("radio", { checked: true }).count()).toBe(0);
   expect(resolutions).toHaveLength(0);
-  await question.locator('[data-question-other-toggle="delivery"]').check();
-  await question.getByLabel("Other", { exact: true }).fill("Deliver the final answer here");
+  const otherToggle = question.locator('[data-question-other-toggle="delivery"]');
+  expect(await otherToggle.getAttribute("role")).toBe("radio"); expect(await otherToggle.getAttribute("aria-checked")).toBe("false");
+  // Other opens its editor without choosing an answer until text is supplied.
+  await otherToggle.click();
+  const other = question.getByLabel("Other", { exact: true });
+  await other.waitFor({ state: "visible" });
+  expect(await other.getAttribute("data-question-other-input")).toBe("delivery");
+  await waitFor(() => other.evaluate(element => element === element.ownerDocument.activeElement), focused => focused, "the Other answer editor focus");
+  expect(await other.inputValue()).toBe(""); expect(resolutions).toHaveLength(0);
+  await other.fill("Deliver the final answer here");
+  expect(await question.locator('input[type="radio"]:checked').count()).toBe(0);
+  expect(resolutions).toHaveLength(0);
   await question.getByRole("button", { name: "Submit answers", exact: true }).click();
   await waitFor(async () => resolutions, rows => rows.length === 1, "one explicit question answer");
   expect(JSON.stringify(resolutions)).toContain("The original answer");

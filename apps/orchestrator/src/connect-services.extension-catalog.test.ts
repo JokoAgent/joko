@@ -122,6 +122,30 @@ function replayingHost(
 }
 
 describe("Connect Extension catalog boundary", () => {
+  it("keeps a native directory choice in its original operation and returns the same typed receipt after a cold service read", async () => {
+    let entry = extensionEntry();
+    const operations = new Map<string, OperationRecord<unknown>>();
+    const store = { findOperation: (id: string) => operations.get(id), getOperation: (id: string) => operations.get(id) };
+    const pick = vi.fn(async () => ({ token: "original-directory-receipt", fileCount: 1, totalBytes: 12, relativePaths: ["report.txt"], expiresAt: Date.now() + 600_000 }));
+    const application = stubApplication({ store, connections: { authenticate: () => connection, fence: vi.fn() },
+      extensionCatalog: { get: () => entry, reconcile: () => catalog(entry) }, extensionDirectoryPicker: { pick }, sessionHost: replayingHost(store, operations) });
+    const services = createConnectServices(application);
+    const mutation = create(contract.OperationMutationSchema, { payload: { case: "pickExtensionDirectory", value: {
+      extensionId: entry.id, expectedRevision: { value: entry.revision }, pickerId: "original-picker", entryId: "opaque-selection"
+    } } });
+    const request = { operationId: "original-native-pick", connectionId: connection.id, mutation };
+    const first = await invoke<contract.SubmitOperationResponse>(services.operation.submitOperation, request);
+    expect(first.operation?.result?.payload).toMatchObject({ case: "pickedDirectory", value: { token: "original-directory-receipt", fileCount: 1, totalBytes: 12n, relativePaths: ["report.txt"] } });
+    expect(pick).toHaveBeenCalledOnce();
+    const cold = createConnectServices(application);
+    const recovered = await invoke<contract.GetOperationResponse>(cold.operation.getOperation, { operationId: request.operationId });
+    expect(recovered.operation?.result?.payload).toEqual(first.operation?.result?.payload);
+    entry = { ...entry, revision: entry.revision + 1n, enabled: false };
+    const replayed = await invoke<contract.SubmitOperationResponse>(cold.operation.submitOperation, request);
+    expect(replayed.operation?.result?.payload).toEqual(first.operation?.result?.payload); expect(pick).toHaveBeenCalledOnce();
+    await expect(invoke(cold.operation.submitOperation, { ...request, operationId: "another-selection" })).rejects.toMatchObject({ code: Code.Aborted });
+    expect(pick).toHaveBeenCalledOnce();
+  });
   it("maps a filtered runtime-backed catalog and preserves its owner and revision identity", async () => {
     const base = extensionEntry({
       recommendations: [{

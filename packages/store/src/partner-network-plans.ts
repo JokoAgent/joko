@@ -12,6 +12,7 @@ export interface NetworkPlan {
   sourceMessageId: string; requestText: string; requesterId: string; organizerId: string; steps: NetworkPlanStep[];
   currentStep: number; noteMessageIds: string[]; createdAt: number; updatedAt: number;
   requestMessageIds: string[];
+  kind?: "work" | "talk";
 }
 export interface NetworkPlanDecision { needsPlan: boolean; steps: readonly { actorId: string; task: string }[]; }
 export interface NetworkPlanAction {
@@ -70,6 +71,23 @@ export class PartnerNetworkPlans {
     this.#decision(room, requesterId, organizer, message, plan?.status === "proposed" ? "revise" : force ? "forced" : "auto", plan?.id ?? "");
     return true;
   }
+  onTalkSend(room: NetworkRoom, requester: NetworkActor, message: NetworkMessage, responders: readonly NetworkActor[], explicit: boolean): boolean {
+    const current = this.current(room.id);
+    if (current?.kind === "talk" && current.status === "running") {
+      if (explicit || requester.id !== current.requesterId && !["owner", "admin"].includes(requester.role)) return false;
+      if (current.noteMessageIds.length >= 100) throw new PartnerNetworkStoreError("invalid", "Finish the current turn before adding more notes.");
+      current.noteMessageIds.push(message.id); this.#put(current); return true;
+    }
+    if (current?.kind === "talk" && current.status === "waiting") this.stop(room.id, current.id);
+    if (responders.length < 2) return false;
+    this.port.cancel(room.id);
+    const now = this.port.now(), plan = this.#put({ id: randomUUID(), roomId: room.id, revision: 0, kind: "talk", status: "running",
+      sourceMessageId: message.id, requestText: message.text, requestMessageIds: [message.id], requesterId: requester.id, organizerId: "",
+      steps: responders.map((actor, position) => ({ position, actorId: actor.id, task: "", status: "pending", resultMessageId: "", startedAt: 0, finishedAt: 0, failureCode: "", executionId: "" })),
+      currentStep: 0, noteMessageIds: [], createdAt: now, updatedAt: now });
+    this.port.append(room, { authorId: requester.id, authorName: requester.nickname || requester.name, text: "", mentions: [], threadRootId: "", quoteId: "", attachments: [], kind: "plan", planId: plan.id });
+    this.#begin(room, plan, 0, requester.id, true); return true;
+  }
   #job(room: NetworkRoom, requesterId: string, actor: NetworkActor, sourceMessageId: string, kind: "plan-decision" | "plan-step"): NetworkExecution {
     return { id: randomUUID(), roomId: room.id, actorId: actor.id, requesterId, sourceMessageId, kind,
       accessMode: actor.ownerId === requesterId ? "owner" : actor.guestAccess as "chat" | "tools", accessRevision: actor.accessRevision,
@@ -86,7 +104,8 @@ export class PartnerNetworkPlans {
   #begin(room: NetworkRoom, plan: NetworkPlan, position: number, requesterId: string, clearNotes: boolean): NetworkPlan {
     const step = plan.steps[position]; if (!step) throw new PartnerNetworkStoreError("invalid");
     const actor = this.eligible(room, requesterId).find(actor => actor.id === step.actorId);
-    this.port.cancel(room.id); plan.currentStep = position; if (clearNotes) plan.noteMessageIds = [];
+    if (plan.kind !== "talk") this.port.cancel(room.id);
+    plan.currentStep = position; if (clearNotes) plan.noteMessageIds = [];
     if (!actor) {
       step.status = "failed"; step.failureCode = "runtime-unavailable"; step.finishedAt = this.port.now(); plan.status = "waiting";
     } else {
@@ -113,13 +132,15 @@ export class PartnerNetworkPlans {
       } else {
         const plan = this.get(room.id, input.planId);
         if (plan.revision !== input.expectedRevision || !open(plan)) throw new PartnerNetworkStoreError("changed", "Refresh the plan before changing it.");
+        if (plan.requesterId !== member.id && !["owner", "admin"].includes(member.role)) throw new PartnerNetworkStoreError("denied");
+        if (plan.kind === "talk" && !["continue", "retry", "stop"].includes(input.action)) throw new PartnerNetworkStoreError("denied");
         const step = plan.steps[input.position];
         switch (input.action) {
           case "start": if (plan.status !== "proposed") throw new PartnerNetworkStoreError("denied"); result = this.#begin(room, plan, 0, input.actorId, true); break;
           case "continue": if (plan.status !== "waiting" || plan.steps[plan.currentStep]?.status !== "completed") throw new PartnerNetworkStoreError("denied");
-            result = this.#begin(room, plan, plan.currentStep + 1, input.actorId, true); break;
+            result = this.#begin(room, plan, plan.currentStep + 1, plan.requesterId, true); break;
           case "retry": if (plan.status !== "waiting" || plan.steps[plan.currentStep]?.status !== "failed") throw new PartnerNetworkStoreError("denied");
-            result = this.#begin(room, plan, plan.currentStep, input.actorId, false); break;
+            result = this.#begin(room, plan, plan.currentStep, plan.requesterId, false); break;
           case "dismiss": if (plan.status !== "proposed") throw new PartnerNetworkStoreError("denied"); plan.status = "dismissed"; result = this.#put(plan); break;
           case "stop": this.stop(room.id, plan.id); result = this.get(room.id, plan.id); break;
           case "reassign": if (!step || !["proposed", "waiting"].includes(plan.status) || plan.status === "waiting" && step.status === "completed"
@@ -157,14 +178,16 @@ export class PartnerNetworkPlans {
         this.#receipt(key, input, job); return job;
       }
       const owner = room.members.find(member => member.id === actor.ownerId)!;
-      const message = this.port.append(room, { authorId: actor.id, authorName: `${actor.nickname || actor.name} (${owner.nickname || owner.name})`,
-        text: networkText(input.text, 24_000, true), mentions: [], threadRootId: "", quoteId: "", attachments: [...input.attachments ?? []], planId: plan.id });
-      step.status = "completed"; step.resultMessageId = message.id; step.failureCode = ""; step.finishedAt = this.port.now();
+      const text = networkText(input.text, 24_000, true), publish = plan.kind !== "talk" || text.trim() !== "NO_REPLY" && (!!text.trim() || !!input.attachments?.length);
+      const message = publish ? this.port.append(room, { authorId: actor.id, authorName: `${actor.nickname || actor.name} (${owner.nickname || owner.name})`,
+        text, mentions: [], threadRootId: "", quoteId: "", attachments: [...input.attachments ?? []], planId: plan.id }) : undefined;
+      step.status = "completed"; step.resultMessageId = message?.id ?? ""; step.failureCode = ""; step.finishedAt = this.port.now();
       plan.status = step.position === plan.steps.length - 1 ? "completed" : "waiting";
     } else {
       step.status = "failed"; step.failureCode = failureCode; step.finishedAt = this.port.now(); plan.status = "waiting";
     }
-    this.#put(plan); const ended = this.port.end(job, input.action === "complete" ? "completed" : "failed", failureCode);
+    const saved = this.#put(plan), ended = this.port.end(job, input.action === "complete" ? "completed" : "failed", failureCode);
+    if (plan.kind === "talk" && input.action === "complete" && plan.status === "waiting" && step.position < 4) this.#begin(room, saved, step.position + 1, plan.requesterId, true);
     this.#receipt(key, input, ended); return ended;
   }
   #receipt(key: string, input: NetworkExecutionSettlement, job: NetworkExecution): void {
@@ -191,7 +214,7 @@ export class PartnerNetworkPlans {
       const requestMessageIds = [...previous?.requestMessageIds ?? [], source.id];
       if (requestMessageIds.length > 20) throw new PartnerNetworkStoreError("invalid", "Start a new arrangement after this many revisions.");
       const now = this.port.now(), plan = this.#put({ id: randomUUID(), roomId: room.id, revision: 0, status: "proposed", sourceMessageId: source.id,
-        requestText, requestMessageIds, requesterId: job.requesterId, organizerId: actor.id, steps: steps.map((step, position) => ({ ...step, position,
+        requestText, requestMessageIds, kind: "work", requesterId: job.requesterId, organizerId: actor.id, steps: steps.map((step, position) => ({ ...step, position,
           status: "pending", resultMessageId: "", startedAt: 0, finishedAt: 0, failureCode: "", executionId: "" })), currentStep: 0, noteMessageIds: [], createdAt: now, updatedAt: now });
       const owner = room.members.find(member => member.id === actor.ownerId)!;
       this.port.append(room, { authorId: actor.id, authorName: `${actor.nickname || actor.name} (${owner.nickname || owner.name})`, text: "", mentions: [], threadRootId: "", quoteId: "", attachments: [], kind: "plan", planId: plan.id });

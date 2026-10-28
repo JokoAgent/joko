@@ -66,7 +66,29 @@ export class ProviderGroupRouter {
     // No await between current load, selection and the provisional reservation.
     const selected = selectProviderGroupMember(candidates, snapshot.config.strategy, { now: this.now(), random: this.random, exclude: excluded,
       ...(this.#lastPicked.has(groupKey(input.group)) ? { lastPicked: this.#lastPicked.get(groupKey(input.group))! } : {}) });
-    const status = members.find(member => member.member.key === selected); if (!status?.model || !status.available) throw new ProviderGroupUnavailableError();
+    const status = members.find(member => member.member.key === selected);
+    if (!status?.model || !status.available) {
+      // A tried member becomes eligible again after its actual quota/cooling
+      // boundary. The original Queue/Run owns the wait; this does not reserve
+      // another member or authorize another native dispatch.
+      const retryAt = members.flatMap(candidate => {
+        const member = candidate.member, model = candidate.model;
+        if (!candidate.reachable || !model || member.paused && !(member.kind === "local" && input.ownTask)
+          || input.exclude?.has(member.key) || candidate.reason && candidate.reason !== "quota" && candidate.reason !== "cooling"
+          || input.profile.fastMode === "ultrafast" && model.supportsUltrafastMode !== true
+          || input.profile.fastMode === true && model.supportsFastMode !== true
+          || input.profile.effort !== undefined && !model.thinkingLevels.includes(input.profile.effort)) return [];
+        const boundaries = cooling.filter(row => row.memberKey === member.key && row.cause === "usage-limit"
+          && (row.modelId === undefined || row.modelId === model.modelId)).map(row => row.until);
+        if (candidate.quota.limited) {
+          if (candidate.quota.resetAt === undefined) return [];
+          boundaries.push(candidate.quota.resetAt);
+        }
+        if (!boundaries.length || boundaries.some(at => !Number.isFinite(at) || at <= this.now())) return [];
+        candidate.assertCurrent(); return [Math.max(...boundaries)];
+      });
+      throw new ProviderGroupUnavailableError(retryAt.length ? Math.min(...retryAt) : undefined);
+    }
     if (input.quotaRebalanceFrom !== undefined) {
       const from = members.find(candidate => candidate.member.key === input.quotaRebalanceFrom), member = status.member;
       if (!from?.available || from.member.nodeId === member.nodeId || member.paused || this.leases.count(member.key, status.running) >= member.capacity

@@ -54,7 +54,7 @@ export class PartnerMessagingRuntime {
     this.options.store.authorizeConnection(owner.id, owner.authKeyDigest); return owner;
   }
 
-  async lifecycle(partnerId: string, state: 'active' | 'paused' | 'deleted'): Promise<void> {
+  async lifecycle(partnerId: string, state: 'active' | 'paused' | 'archived' | 'deleted'): Promise<void> {
     for (const binding of this.listBindings().filter(row => row.partnerId === partnerId)) {
       const key = `paused:${partnerId}:${binding.connectionId}`, connection = this.options.store.getMessagingConnection(binding.connectionId);
       if (state === 'deleted') {
@@ -64,7 +64,7 @@ export class PartnerMessagingRuntime {
           store.setSetting('service', SCOPE, `binding:${connection.id}`, { version: 1, revision: current.revision + 1 });
           store.deleteSetting('service', SCOPE, key);
         });
-      } else if (state === 'paused' && connection.enabled) {
+      } else if ((state === 'paused' || state === 'archived') && connection.enabled) {
         // The existing Partner pause owner already closes all linked native
         // tasks. Stop this one provider worker without a second reply effect.
         const stopped = await this.options.messaging.retirePartnerConnection(connection.id, () => undefined, false);
@@ -160,8 +160,13 @@ export class PartnerMessagingRuntime {
       || link?.partnerId !== profile.id || !['canonical', 'channel'].includes(link.role)
       || link.role === 'canonical' && profile.canonicalSessionId !== session.id
       || origin.isOwner && connection.ownerProviderUserId !== origin.providerUserId) throw new StoreError('The originating Partner message channel is no longer authorized.');
-    if (conversation.sessionGeneration !== session.binding.generation) this.options.store.refreshMessagingConversationGeneration({
-      conversationId: conversation.id, requestId: request.id, runId: item.runId });
+    if (conversation.sessionGeneration !== session.binding.generation) {
+      const current = this.options.store.getQueueItem(item.id), attempt = current.attemptId ? this.options.store.getAttempt(current.attemptId).descriptor : undefined;
+      // A held source is checked both before and after an authorized native handoff.
+      // Only its real dispatched descendant can advance the recipient's generation.
+      if (attempt?.runId === item.runId && attempt.generation === session.binding.generation) this.options.store.refreshMessagingConversationGeneration({
+        conversationId: conversation.id, requestId: request.id, runId: item.runId });
+    }
   }
   reviewTool(item: QueueItemRecord, request: import('@joko/core').NativeToolAuthorizationRequest): import('@joko/core').NativeToolAuthorizationDecision {
     request.signal.throwIfAborted(); this.assertQueueCurrent(item);
@@ -432,7 +437,7 @@ export class PartnerMessagingTools implements BridgeToolProvider {
           const artifact = store.getArtifact(field(id));
           if (artifact.sessionId !== session.id || artifact.metadata && typeof artifact.metadata === 'object' && 'expiresAt' in artifact.metadata) throw new StoreError('Only committed artifacts owned by this task can be sent.');
           return { kind: artifact.blob.mimeType.startsWith('image/') ? 'image' as const : 'file' as const, blob: artifact.blob,
-            fileName: artifact.blob.fileName ?? `attachment-${artifact.id}` };
+            fileName: artifact.blob.fileName ?? `attachment-${artifact.blob.id}` };
         });
         const origin: PartnerMessageDeliveryOrigin = { partnerId: profile.id, profileRevision: profile.revision.toString(), sessionId: session.id,
           queueItemId: queue.id, generation: session.binding.generation, bindingFingerprint, bindingRevision: binding.revision };

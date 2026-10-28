@@ -42,7 +42,8 @@ describe("real latest Pi auto-review smoke", () => {
       for (const scenario of ["allow", "block", "ask", "failure"] as const) {
         const sink = new SmokeSink();
         const interactions: InteractionPayload[] = [];
-        const base = smokeContext(target, `auto-review-${scenario}`, sink, interactions);
+        const userInstructions = `gray-${scenario}: inspect the current Node version`;
+        const base = smokeContext(target, `auto-review-${scenario}`, sink, interactions, [userInstructions]);
         const binding = await adapter.createSession({
           target,
           providerId: "review-smoke",
@@ -53,7 +54,7 @@ describe("real latest Pi auto-review smoke", () => {
         }, base);
         const context = { ...base, binding };
         await adapter.send({
-          text: `gray-${scenario}: inspect the current Node version`,
+          text: userInstructions,
           images: [],
           files: [],
           mentions: [],
@@ -70,10 +71,11 @@ describe("real latest Pi auto-review smoke", () => {
         const reviewText = Array.isArray(reviewUser?.content)
           ? reviewUser.content.filter((part) => part.type === "text").map((part) => part.text ?? "").join("")
           : reviewUser?.content ?? "";
-        const reviewPayload = JSON.parse(reviewText) as { workspace?: string };
+        const reviewPayload = JSON.parse(reviewText) as { workspace?: string; userInstructions?: readonly string[] };
         expect(reviewBody).toContain("permission reviewer");
         expect(reviewBody).toContain("node --version");
         expect(reviewPayload.workspace).toBe(workspace);
+        expect(reviewPayload.userInstructions).toEqual([userInstructions]);
         expect(reviewBody).not.toContain("tool_result");
 
         if (scenario === "allow" || scenario === "block") expect(interactions).toHaveLength(0);
@@ -190,7 +192,9 @@ function smokeContext(
   sessionId: string,
   sink: SmokeSink,
   interactions: InteractionPayload[],
+  ownerUserInstructions: readonly string[] = [],
 ): AdapterContext {
+  const authorizationRevision = `owner:${sessionId}`;
   return {
     sessionId,
     generation: 1,
@@ -200,6 +204,15 @@ function smokeContext(
     requestInteraction: async (interaction) => {
       interactions.push(interaction);
       return { kind: "confirmed", confirmed: true };
+    },
+    nativeToolAuthorization: {
+      required: false,
+      capture: () => authorizationRevision,
+      assertCurrent: expected => {
+        if (expected !== undefined && expected !== authorizationRevision) throw new Error("The original smoke owner retired.");
+      },
+      readOwnerUserInstructions: () => ownerUserInstructions,
+      review: async () => ({ verdict: "default", authorizationRevision }),
     },
     artifactCapacityBytes: 256 * 1024 * 1024,
     storeArtifact: async (sourcePath, options) => blob(Buffer.from(sourcePath), options?.mimeType, options?.fileName),

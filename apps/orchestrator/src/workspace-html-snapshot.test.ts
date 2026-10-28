@@ -10,7 +10,8 @@ import { rm } from "node:fs/promises";
 function authority() {
   let generation = 1;
   const store = { getSession: () => ({ descriptor: { id: "session", targetId: "target", binding: { generation, opaqueRef: "native" }, archived: false } }),
-    getTarget: () => ({ descriptor: { id: "target" }, metadata: { workspaceId: "workspace" }, revision: 1n }), findPendingSessionLifecycleCleanup: () => undefined } as unknown as OperationalStore;
+    getTarget: () => ({ descriptor: { id: "target" }, metadata: { workspaceId: "workspace" }, revision: 1n }),
+    findSetting: () => undefined, findPendingSessionLifecycleCleanup: () => undefined } as unknown as OperationalStore;
   return { store, retire: () => { generation += 1; } };
 }
 

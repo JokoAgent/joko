@@ -4,10 +4,10 @@ import { PartnerNetworkStore, networkHash, networkHumanId, networkPartnerId, typ
 
 const databases: OperationalStore[] = [];
 afterEach(() => { for (const database of databases.splice(0)) database.close(); });
-function fixture() {
+function fixture(singleSpeaker = false) {
   const database = new OperationalStore(":memory:"); databases.push(database); let now = 1_000_000;
   const store = new PartnerNetworkStore(database, () => now), ownerId = networkHumanId("home-a"), guestId = networkHumanId("home-b");
-  const room = store.create({ operationId: "create", name: "Group", displayName: "Owner", serverId: "home-a", origin: "https://home-a.example", partners: [{ id: "helper", name: "Helper", description: "Public helper" }] });
+  const room = store.create({ operationId: "create", singleSpeaker, name: "Group", displayName: "Owner", serverId: "home-a", origin: "https://home-a.example", partners: [{ id: "helper", name: "Helper", description: "Public helper" }] });
   const current = () => store.get(room.id);
   const manage = (action: string, actorId = ownerId, targetId = "", value = "") => store.manage({ operationId: `${action}-${Math.random()}`, roomId: room.id, actorId,
     expectedRevision: current().revision, action, targetId, value, throughSequence: 0 });
@@ -20,8 +20,9 @@ function fixture() {
 }
 describe("conversation authority and foreign membership", () => {
   it('allows one companion to work in separate topics concurrently while serializing each original topic', () => {
-    const f = fixture(), companion = networkPartnerId('home-a', 'helper');
+    const f = fixture(true), companion = networkPartnerId('home-a', 'helper');
     const rootA = f.send('Topic A', f.ownerId, 'root-a', []), rootB = f.send('Topic B', f.ownerId, 'root-b', []);
+    f.manage('stop');
     const topic = (operationId: string, root: string) => f.store.send({ operationId, roomId: f.room.id, actorId: f.ownerId,
       text: operationId, mentions: [companion], mentionAll: false, threadRootId: root, quoteId: '', attachments: [] });
     const a = topic('topic-a-one', rootA.id), same = topic('topic-a-two', rootA.id), b = topic('topic-b-one', rootB.id);
@@ -115,7 +116,7 @@ describe("conversation authority and foreign membership", () => {
     f.manage("revoke-link", f.ownerId, "", link.id); expect(() => f.store.link(link.digest)).toThrow();
   });
   it("dispatches automatic circles against one snapshot, rotates sequentially, caps actual replies and continues original responders only", () => {
-    const f = fixture(), room = f.store.create({ operationId: "four", serverId: "home-a", origin: "https://home-a.example", name: "Four", displayName: "Owner", partners: ["a", "b", "c", "d"].map(id => ({ id, name: id, description: "" })) }), ids = room.members.filter(actor => actor.kind === "partner").map(actor => actor.id);
+    const f = fixture(), room = f.store.create({ operationId: "four", singleSpeaker: false, serverId: "home-a", origin: "https://home-a.example", name: "Four", displayName: "Owner", partners: ["a", "b", "c", "d"].map(id => ({ id, name: id, description: "" })) }), ids = room.members.filter(actor => actor.kind === "partner").map(actor => actor.id);
     const send = (id: string, text: string, mentions: string[], threadRootId = "") => f.store.send({ operationId: id, roomId: room.id, actorId: f.ownerId, text, mentions, mentionAll: false, attachments: [], quoteId: "", threadRootId });
     const complete = (job: NonNullable<ReturnType<typeof f.store.claim>>) => f.store.settle({ roomId: room.id, ownerId: f.ownerId, executionId: job.id, lease: job.lease, action: "complete", text: `Reply ${job.id}`, failureCode: "" });
     const root = send("root", "Topic", [ids[0]!]); complete(f.store.claim(room.id, f.ownerId, ids[0]!)!);

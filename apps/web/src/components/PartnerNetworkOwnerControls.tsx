@@ -7,7 +7,7 @@ import { interactionDecision, mapInteraction } from "../gateway.js";
 import { InteractionDialog } from "./InteractionDialog.js";
 import type { Translator } from "./types.js";
 
-export function NetworkOwnerControls({ api, target, controller, t }: { api: PartnerNetworkApi; target: { roomId: string; joinId: string }; controller: AppController; t: Translator }) {
+export function NetworkOwnerControls({ api, target, controller, t }: { api: PartnerNetworkApi; target: { roomId: string; joinId: string; threadRootId?: string }; controller: AppController; t: Translator }) {
   const [controls, setControls] = useState<wire.PartnerNetworkOwnerControl[]>([]), [failed, setFailed] = useState(false);
   const lifetime = useRef(new AbortController()), request = useRef<{ body: string; id: string } | undefined>(undefined);
   const read = async () => { if (lifetime.current.signal.aborted || document.visibilityState === "hidden") return;

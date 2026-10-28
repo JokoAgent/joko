@@ -63,6 +63,36 @@ export interface PackagedSmokeTaskOptions {
   readonly transportFactory?: (origin: string, authKey: string | undefined, timeoutMs: number) => Transport;
 }
 
+/** Match the renderer's current route key without dropping its source pin or
+ * connection occurrence. The managed direct route starts without an entry ID;
+ * a later Task window restores its exact `saved` entry from the owner directory. */
+export function findPackagedSmokeTaskVisibilityKey(
+  connection: DesktopManagedOrchestratorConnection,
+  task: PackagedSmokeTask,
+  visibleKeys: readonly string[]
+): string | undefined {
+  const profileKeys = new Set(["", "saved"].map(entryId => JSON.stringify([
+    connection.profileId, connection.serverId, connection.deviceId,
+    connection.origin, connection.endpointPublicKey ?? "", "https", entryId
+  ])));
+  const identity = [connection.profileId, connection.serverId, task.sourceGeneration.toString(),
+    task.generation.toString(), task.sessionId];
+  let matchingKey: string | undefined;
+  for (const key of visibleKeys) {
+    if (key.length > 1024) continue;
+    let fields: unknown;
+    try { fields = JSON.parse(key); } catch { continue; }
+    if (!Array.isArray(fields) || fields.length !== 7
+      || !identity.every((part, index) => fields[index] === part)
+      || !profileKeys.has(fields[5])
+      || typeof fields[6] !== "number" || !Number.isSafeInteger(fields[6]) || fields[6] < 1
+      || JSON.stringify(fields) !== key) continue;
+    if (matchingKey !== undefined) return undefined;
+    matchingKey = key;
+  }
+  return matchingKey;
+}
+
 /** Creates an invitation on the second real service used by the packaged UI
  * journey. The value remains in Main memory and the private invitation bridge. */
 export async function createPackagedSmokeTaskInvitation(

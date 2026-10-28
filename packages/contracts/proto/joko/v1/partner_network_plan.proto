@@ -29,6 +29,8 @@ message PartnerNetworkPlan {
   uint64 created_at_ms = 12;
   uint64 updated_at_ms = 13;
   repeated string request_message_ids = 15;
+  // talk: deterministic speaker queue; work: an existing division of work.
+  string kind = 16;
 }
 message PartnerNetworkPlanDraft { string actor_id = 1; string task = 2; }
 message PartnerNetworkPlanDecision { bool needs_plan = 1; repeated PartnerNetworkPlanDraft steps = 2; }

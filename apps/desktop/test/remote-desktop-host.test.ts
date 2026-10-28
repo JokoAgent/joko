@@ -1125,8 +1125,15 @@ describe("Desktop Remote Desktop host", () => {
     expect(value.media.stop).not.toHaveBeenCalled();
     await expect(value.host.setHostMute({ ...request, enabled: true })).resolves.toMatchObject({ enabled: true });
     expect(value.output.muted).toBe(true);
+    const owner = value.hostMute.set.mock.calls[1]![0];
+    const restoresBeforePresentation = value.hostMute.release.mock.calls.length;
     await value.host.setPresentation({ ...REQUEST, leaseId: request.leaseId, enabled: true });
+    expect(value.output.muted).toBe(true);
+    expect(value.hostMute.release).toHaveBeenCalledTimes(restoresBeforePresentation);
+    expect(value.host.state).toMatchObject({ leaseId: request.leaseId, controlling: false });
+    await value.host.setControl({ ...REQUEST, leaseId: request.leaseId, enabled: false });
     expect(value.output.muted).toBe(false);
+    expect(value.hostMute.release).toHaveBeenLastCalledWith(owner);
     expect(value.host.state).toMatchObject({ leaseId: request.leaseId, controlling: false });
   });
 

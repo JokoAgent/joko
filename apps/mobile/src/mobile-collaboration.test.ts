@@ -1,8 +1,8 @@
 import { clone, create } from "@bufbuild/protobuf";
-import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationWorkerStatus, PermissionMode, type CollaborationService } from "@joko/contracts";
+import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationWorkerStatus, PermissionMode, encodeModelSpeed, type CollaborationService } from "@joko/contracts";
 import type { Client } from "@connectrpc/connect";
 import { describe, expect, it, vi } from "vitest";
-import { createMobileCollaborationRpc, mobileWorkerInitialTask, mobileWorkerLabel, normalizeMobileWorkerForm, projectMobileCollaborationTree, type MobileWorkerTarget } from "./mobile-collaboration";
+import { createMobileCollaborationRpc, mobileWorkerInitialTask, mobileWorkerLabel, normalizeMobileWorkerForm, projectMobileCollaborationTree, type MobileWorkerForm, type MobileWorkerTarget } from "./mobile-collaboration";
 import { MobileWorkerStorage } from "./mobile-worker-storage";
 
 const tree = () => create(CollaborationGoalTreeSchema, {
@@ -29,13 +29,17 @@ describe("mobile collaboration contract and local recovery", () => {
     const duplicate = tree(); duplicate.workers.push({ ...duplicate.workers[0]!, workerId: "duplicate" });
     expect(() => projectMobileCollaborationTree(duplicate, "goal", "task")).toThrow("worker");
   });
-  it("sends empty initial work and exact model controls while rejecting altered results or retired writes", async () => {
-    const result = tree(); result.workers[0]!.route = { ...result.workers[0]!.route!, providerId: "provider", modelId: "model", effort: "high", fastMode: true };
+  it.each(["fast", "ULTRAFAST", 0, null, undefined])("rejects an unknown worker model speed %s", speed => {
+    expect(() => normalizeMobileWorkerForm({ ...form, model: { providerId: "provider", modelId: "model",
+      fastMode: speed as unknown as NonNullable<MobileWorkerForm["model"]>["fastMode"] } })).toThrow("selected worker model");
+  });
+  it.each([false, true, "ultrafast"] as const)("sends empty initial work and exact speed %s while rejecting altered results or retired writes", async speed => {
+    const result = tree(); result.workers[0]!.route = { ...result.workers[0]!.route!, providerId: "provider", modelId: "model", effort: "high", ...encodeModelSpeed(speed) };
     const createWorker = vi.fn(async () => ({ tree: result, worker: result.workers[0] }));
     const rpc = createMobileCollaborationRpc({ createCollaborationWorker: createWorker } as unknown as Client<typeof CollaborationService>, "task", 7n, signal => signal.throwIfAborted());
-    const exact = { ...form, model: { providerId: "provider", modelId: "model", effortId: "high", fastMode: true } }, signal = new AbortController().signal;
+    const exact = { ...form, model: { providerId: "provider", modelId: "model", effortId: "high", fastMode: speed } }, signal = new AbortController().signal;
     await rpc.createWorker(result.goal!, exact, "developer", "request", signal);
-    expect(createWorker).toHaveBeenCalledWith(expect.objectContaining({ operationId: "request", callerLeadSessionId: "task", assignment: "", providerId: "provider", effort: "high", fastMode: true }), { signal });
+    expect(createWorker).toHaveBeenCalledWith(expect.objectContaining({ operationId: "request", callerLeadSessionId: "task", assignment: "", providerId: "provider", effort: "high", ...encodeModelSpeed(speed) }), { signal });
     result.workers[0]!.route!.modelId = "foreign";
     await expect(rpc.createWorker(result.goal!, exact, "developer", "other", signal)).rejects.toThrow("requested role and route");
     const retired = new AbortController(); retired.abort(); await expect(rpc.createWorker(result.goal!, exact, "developer", "retired", retired.signal)).rejects.toThrow();

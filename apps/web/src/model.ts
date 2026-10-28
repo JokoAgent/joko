@@ -4312,7 +4312,11 @@ export interface ExtensionSettingsApi {
   open(extensionId: string, expectedRevision: bigint, signal: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
   close(surfaceId: string): Promise<boolean>;
   call(surface: ExtensionMainViewSurfaceView, call: import("@joko/contracts").ExtensionSettingsCall,
-    host: import("@joko/contracts").ExtensionSettingsHost, signal: AbortSignal): Promise<unknown>;
+    host: import("@joko/contracts").ExtensionSettingsHost, signal: AbortSignal,
+    observeReceipt?: import("./extension-settings-operation.js").ExtensionSettingsOperationObserver): Promise<unknown>;
+  readOperation?(record: import("./extension-settings-operation.js").PendingExtensionSettingsOperation, signal: AbortSignal): Promise<import("./extension-settings-operation.js").ExtensionSettingsOperationReceipt>;
+  pending?(extensionId: string, signal: AbortSignal): Promise<import("./extension-settings-operation.js").PendingExtensionSettingsOperation | undefined>;
+  checkOriginal?(record: import("./extension-settings-operation.js").PendingExtensionSettingsOperation, signal: AbortSignal): Promise<import("./extension-settings-operation.js").ExtensionSettingsOperationReceipt>;
 }
 
 export type ExtensionLibraryStateView = "ready" | "readOnly" | "unavailable";

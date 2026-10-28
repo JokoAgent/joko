@@ -46,7 +46,10 @@ it("pins native route trust to the configured controller and retiring an old rou
     await old.invoke(contract.HostedAgentPeerMethod.OPEN, open(input), signal, authority);
     await replacement.invoke(contract.HostedAgentPeerMethod.OPEN, open({ ...input, runId: "replacement-route", nativeSessionId: "native-second" }), signal, authority);
     expect(runtime.slots.usage(authority.controllerDeviceId).device).toBe(2);
-    await expect(old.invoke(contract.HostedAgentPeerMethod.OPEN, open({ ...input, runId: "over-device-limit", nativeSessionId: "excess-native" }), signal, authority)).rejects.toBeDefined();
+    const rejected = fromBinary(contract.OpenHostedAgentResponseSchema,
+      await old.invoke(contract.HostedAgentPeerMethod.OPEN, open({ ...input, runId: "over-device-limit", nativeSessionId: "excess-native" }), signal, authority));
+    expect(rejected).toMatchObject({ format: 1, runId: "over-device-limit", virtualRoot: "", capacityRejection: contract.HostedAgentCapacityRejection.DEVICE_LIMIT });
+    expect(runtime.slots.usage(authority.controllerDeviceId).device).toBe(2);
     await old.invoke(contract.HostedAgentPeerMethod.OPEN, open({ ...input, runId: "other-device", nativeSessionId: "other-native" }), signal, otherDevice);
     await vi.waitFor(() => expect(created).toBe(3));
     expect(runtime.slots.usage(otherDevice.controllerDeviceId).device).toBe(1); expect(runtime.slots.summary()).toEqual({ total: 3, devices: 2, maximumDevice: 2 });

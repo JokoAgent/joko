@@ -26,6 +26,8 @@ export interface PartnerGroupSession {
 export interface PartnerGroupTurnResult {
   readonly status: "completed" | "failed" | "cancelled" | "unknown";
   readonly text: string;
+  /** The original completed Run, for task-owned output delivery only. */
+  readonly runId?: string;
   readonly failure?: "workdir-unavailable";
   /** Local-only terminal signals. The room receives a fixed public category. */
   readonly error?: unknown;

@@ -50,7 +50,9 @@ describe("mounted Timeline Markdown documents", () => {
     await page.getByLabel("Device name").fill("Markdown browser");
     await page.locator("form.pair-form button[type=submit]").click();
     await page.locator(`.timeline[data-timeline-session-id="${sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
-    await page.getByRole("button", { name: "Close details", exact: true }).click();
+    await page.getByRole("button", { name: "Close Context tab", exact: true }).click();
+    await page.getByRole("button", { name: "Open details", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    expect(await page.locator(".inspector-dock-group[data-edge]").count()).toBe(0);
 
     const operation = await submit(manager.clients.operation, manager.connectionId,
       sendInputMutation(sessionId, BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation), "Stream a Markdown document"));

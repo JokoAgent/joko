@@ -344,7 +344,8 @@ describe("PartnerService", () => {
   it("round-trips a single task preference through authenticated generated patches and rejects stale or false inheritance", async () => {
     const f = await createFixture(), profile = await f.manager.createPartner(partnerInput(f.partnerStore, "Task preference"));
     const service = createPartnerConnectService(f.manager, () => ({ connectionId: "connection-1" }));
-    const task = create(contract.PartnerModelRouteSchema, profile.capabilities.modelChain[0]!);
+    const route = profile.capabilities.modelChain[0]!;
+    const task = create(contract.PartnerModelRouteSchema, { ...route, ...contract.encodeModelSpeed(route.fastMode) });
     const selected = await service.updatePartner(create(contract.UpdatePartnerRequestSchema, { partnerId: profile.id,
       expectedRevision: { value: profile.revision }, patch: { taskModelPreference: { case: "taskModelOverride", value: task } } }), context());
     expect(selected.partner!.taskModelOverride).toMatchObject(task); expect(selected.partner!.capabilities!.modelChain).toHaveLength(1);

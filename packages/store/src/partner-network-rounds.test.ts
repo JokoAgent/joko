@@ -10,7 +10,7 @@ afterEach(async () => { for (const run of cleanup.splice(0)) await run(); });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "joko-network-rounds-")), store = new OperationalStore(join(root, "state.db"));
   cleanup.push(async () => { store.close(); await rm(root, { recursive: true, force: true }); });
-  const room = new PartnerNetworkStore(store).create({ operationId: "create", serverId: "host", origin: "https://host.test", name: "Group", displayName: "Owner", partners: [] });
+  const room = new PartnerNetworkStore(store).create({ operationId: "create", singleSpeaker: false, serverId: "host", origin: "https://host.test", name: "Group", displayName: "Owner", partners: [] });
   const message: NetworkMessage = { id: "source", sequence: 1, createdAt: 1, authorId: room.members[0]!.id, authorName: "Owner", text: "Discuss", mentions: [], threadRootId: "", quoteId: "", deleted: false, attachments: [], reactions: [] };
   room.latestSequence = 1; const rounds = new PartnerNetworkRounds(store);
   const job = (actorId: string, ordinal: number, circle = 0, parallel = false): NetworkRoundExecution => ({ id: `${circle}-${actorId}`, actorId, ordinal, circle, parallel,

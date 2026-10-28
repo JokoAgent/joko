@@ -69,9 +69,11 @@ describe("ModelFavoriteSettings", () => {
     expect(() => store.transaction(() => settings.mutate({
       kind: "add", item: { ...favorite(), effortId: "extreme" }
     }, 0n))).toThrow("effort");
-    expect(() => store.transaction(() => settings.mutate({
-      kind: "add", item: { ...favorite(), modelId: "model-b", effortId: undefined, fastMode: true }
-    }, 0n))).toThrow("Fast Mode");
+    for (const fastMode of [true, "ultrafast"] as const) {
+      expect(() => store.transaction(() => settings.mutate({
+        kind: "add", item: { ...favorite(), modelId: "model-b", effortId: undefined, fastMode }
+      }, 0n))).toThrow("The selected speed is not supported by this model.");
+    }
     expect(settings.snapshot()).toEqual({ favorites: [], seeded: false, revision: 0n });
 
     expect(() => store.transaction(() => {

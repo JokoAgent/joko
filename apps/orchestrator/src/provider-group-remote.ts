@@ -1,4 +1,4 @@
-import { createClient, type Client } from "@connectrpc/connect";
+import { Code, ConnectError, createClient, type Client } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { type ProviderGroupStore, type ProviderGroupKey, type ProviderGroupMember, type ProviderGroupSnapshot } from "@joko/store";
 import type { HostedAgentSources } from "./hosted-agent-sources.js";
@@ -34,10 +34,23 @@ export class ProviderGroupRemoteRouter implements ProviderGroupRemoteRouterPort 
   }
   async pick(input: ProviderGroupPick, signal: AbortSignal): Promise<ProviderGroupAssignment> {
     const owner = this.capture(input.group); let picked: contract.PickProviderGroupMemberResponse;
-    picked = await owner.client.pickProviderGroupMember({ key: { backendId: owner.nativeBackendId, providerId: input.group.providerId }, sessionId: input.sessionId,
+    try { picked = await owner.client.pickProviderGroupMember({ key: { backendId: owner.nativeBackendId, providerId: input.group.providerId }, sessionId: input.sessionId,
       agentKind: input.agentKind, modelId: input.modelId, ...(input.logicalModelId === undefined ? {} : { logicalModelId: input.logicalModelId }), excludeMemberKeys: [...(input.exclude ?? [])],
       ...(input.quotaRebalanceFrom === undefined ? {} : { quotaRebalanceFromMemberKey: input.quotaRebalanceFrom }),
-      ...(input.profile.effort === undefined ? {} : { effortId: input.profile.effort }), fastMode: input.profile.fastMode === true, ultrafastMode: input.profile.fastMode === "ultrafast" }, { signal });
+      ...(input.profile.effort === undefined ? {} : { effortId: input.profile.effort }), fastMode: input.profile.fastMode === true, ultrafastMode: input.profile.fastMode === "ultrafast" }, { signal }); }
+    catch (error) {
+      owner.assertCurrent(); signal.throwIfAborted();
+      if (error instanceof ConnectError && error.code === Code.Unavailable) {
+        const detail = error.findDetails(contract.ErrorInfoSchema).find(value => value.code === "PROVIDER_GROUP_UNAVAILABLE" && value.phase === "provider_group"
+          && value.queueImpact === contract.StateImpact.UNCHANGED && value.nativeSessionImpact === contract.StateImpact.UNCHANGED);
+        const duration = detail?.recoveryActions.find(action => action.kind === contract.RecoveryActionKind.WAIT)?.retryAfter;
+        if (duration && duration.seconds >= 0n && duration.seconds <= 8n * 24n * 60n * 60n && duration.nanos >= 0 && duration.nanos < 1_000_000_000) {
+          const delay = Number(duration.seconds) * 1000 + Math.ceil(duration.nanos / 1_000_000);
+          if (delay > 0 && delay <= 8 * 24 * 60 * 60_000) throw new ProviderGroupUnavailableError(Date.now() + delay);
+        }
+      }
+      throw error;
+    }
     owner.assertCurrent(); signal.throwIfAborted(); const snapshot = this.#observe(input.group, owner, picked.group);
     if (!picked.member || !picked.modelId || !snapshot.config) throw new ProviderGroupUnavailableError();
     const original = fromGroupMember(picked.member), member = this.#map(input.group, original);
@@ -50,7 +63,9 @@ export class ProviderGroupRemoteRouter implements ProviderGroupRemoteRouterPort 
     const status: ProviderGroupMemberStatus = { member, model, available: true, reachable: true, running: picked.running, quota: picked.quota ? { ...picked.quota } : { limited: false },
       assertCurrent: () => { owner.assertCurrent(); source.assertCurrent(); signal.throwIfAborted(); } };
     const profile = { ...input.profile, backendId: member.backendId, providerId: member.providerId, modelId: member.backendId === input.group.backendId ? input.modelId : model.modelId };
-    this.options.sources.prepareGroupMember(input.sessionId, profile.backendId === input.group.backendId && original.kind === "share" ? "" : profile.backendId);
+    const directMember = profile.backendId !== input.group.backendId || original.kind === "local" && original.nodeId === owner.ownerNodeId
+      && original.nativeBackendId === owner.nativeBackendId && original.providerId === input.group.providerId;
+    this.options.sources.prepareGroupMember(input.sessionId, directMember ? profile.backendId : "");
     const reservation = this.options.leases.reserve({ sessionId: input.sessionId, memberKey: member.key, backendId: profile.backendId, providerId: profile.providerId }); let committed = false;
     const assertCurrent = () => { status.assertCurrent(); const current = this.options.store.snapshot(input.group); if (current.revision !== snapshot.revision || current.ownerNodeId !== owner.ownerNodeId) throw new ProviderGroupUnavailableError(); };
     return { group: input.group, snapshot, member, status, profile, assertCurrent, release: reservation.release, commit: () => {

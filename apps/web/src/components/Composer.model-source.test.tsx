@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
+import type { ProviderGroupRebalanceView } from "@joko/contracts";
 import { composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { dispatchGamepadOwnedAction } from "../gamepad-actions.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
@@ -202,9 +203,59 @@ describe("Composer model authorization", () => {
   });
 });
 
-async function mount(partnerProfile?: PartnerProfileView) {
+describe("Composer quota balancing confirmation", () => {
+  const suggestion: ProviderGroupRebalanceView = { suggestionKey: `rebalance_${"a".repeat(64)}`, fromLabel: "Current computer", toLabel: "Other computer", generation: 1n, automatic: false };
+  const action = (label: string) => [...document.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === label)!;
+
+  it("keeps the original draft until explicit consent and submits the fixed choice with the original send", async () => {
+    const read = vi.fn(async () => suggestion), view = await mount(undefined, read);
+    await act(async () => view.send().click());
+    expect(document.querySelector('[role="alertdialog"]')?.textContent).toContain("Other computer");
+    expect(view.draft()).toBe("Keep this draft"); expect(view.api.send).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledWith(session.id, 1n, expect.any(AbortSignal));
+    await act(async () => document.querySelector<HTMLButtonElement>('button[role="checkbox"]')!.click());
+    await act(async () => { action("Switch and send").click(); await Promise.all(view.actions); await Promise.all(view.actions); });
+    expect(view.api.send).toHaveBeenCalledExactlyOnceWith(session.id, expect.objectContaining({ text: "Keep this draft" }),
+      { expectedGeneration: 1n, providerGroupRebalance: { suggestionKey: suggestion.suggestionKey, remember: true } });
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+  });
+
+  it.each(["Cancel", "Keep this account"])("preserves the original draft/route choice on %s", async label => {
+    const view = await mount(undefined, vi.fn(async () => suggestion));
+    await act(async () => view.send().click()); expect(view.draft()).toBe("Keep this draft");
+    await act(async () => { action(label).click(); await Promise.all(view.actions); await Promise.all(view.actions); });
+    if (label === "Cancel") {
+      expect(view.api.send).not.toHaveBeenCalled(); expect(view.draft()).toBe("Keep this draft"); expect(view.send().disabled).toBe(false);
+    } else expect(view.api.send).toHaveBeenCalledExactlyOnceWith(session.id, expect.objectContaining({ text: "Keep this draft" }), { expectedGeneration: 1n });
+  });
+
+  it("retires delayed quota results when the original native generation changes without clearing or sending", async () => {
+    let release!: (value: ProviderGroupRebalanceView) => void;
+    const read = vi.fn(() => new Promise<ProviderGroupRebalanceView>(resolve => { release = resolve; })), view = await mount(undefined, read);
+    await act(async () => view.send().click()); expect(read).toHaveBeenCalledOnce();
+    await view.render([provider], { ...session, generation: 2n });
+    await act(async () => { release(suggestion); await Promise.all(view.actions); });
+    expect(view.api.send).not.toHaveBeenCalled(); expect(view.draft()).toBe("Keep this draft");
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull(); expect(view.send().disabled).toBe(false);
+  });
+
+  it("uses the original send when a read-only suggestion is unavailable and honors a remembered fixed proposal", async () => {
+    const read = vi.fn().mockRejectedValueOnce(new Error("quota read unavailable")).mockResolvedValueOnce({ ...suggestion, automatic: true });
+    const view = await mount(undefined, read);
+    await act(async () => { view.send().click(); await Promise.all(view.actions); await Promise.all(view.actions); });
+    expect(view.api.send).toHaveBeenCalledExactlyOnceWith(session.id, expect.objectContaining({ text: "Keep this draft" }), { expectedGeneration: 1n });
+    await view.render([provider], { ...session, id: "remembered-task" });
+    await act(async () => { view.send().click(); await Promise.all(view.actions); await Promise.all(view.actions); });
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(view.api.send).toHaveBeenLastCalledWith("remembered-task", expect.objectContaining({ text: "Keep this draft" }),
+      { expectedGeneration: 1n, providerGroupRebalance: { suggestionKey: suggestion.suggestionKey, remember: false } });
+  });
+});
+
+async function mount(partnerProfile?: PartnerProfileView, readRebalance?: AppController["readTaskProviderGroupRebalance"]) {
   const initial = emptySnapshot();
-  const api = { state: { connectionState: "connected", snapshot: { ...initial, providers: [provider] }, preferences: DEFAULT_UI_PREFERENCES },
+  const api = { state: { connectionState: "connected", effectiveLocale: "en", snapshot: { ...initial, sessions: [session], providers: [provider] }, preferences: DEFAULT_UI_PREFERENCES },
+    ...(readRebalance === undefined ? {} : { readTaskProviderGroupRebalance: readRebalance }),
     readDraft: vi.fn(async () => ({ text: "Keep this draft" })),
     readDraftSnapshot: vi.fn(async () => ({ revision: 1, draft: { text: "Keep this draft", attachments: [], mentions: [], deliveryMode: "prompt" as const } })),
     saveDraft: vi.fn(async () => undefined), send: vi.fn(async () => undefined),
@@ -216,7 +267,7 @@ async function mount(partnerProfile?: PartnerProfileView) {
   const root = createRoot(host); roots.push(root);
   const actions: Promise<unknown>[] = []; const stop = vi.fn();
   const render = async (providers: readonly ProviderRuntimeView[], currentSession = session, currentBackend = backend, readOnly = false, rejectedFirstInputRecovery?: AppController["state"]["rejectedFirstInputRecovery"], connectionState: AppController["state"]["connectionState"] = "connected") => act(async () => {
-    const controller: AppController = { ...api, state: { ...api.state, ready: true, connectionState, snapshot: { ...api.state.snapshot, providers }, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) } };
+    const controller: AppController = { ...api, state: { ...api.state, ready: true, connectionState, snapshot: { ...api.state.snapshot, sessions: [currentSession], providers }, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) } };
     const content = <Composer controller={controller} session={currentSession} backend={currentBackend}
     readOnly={readOnly}
     autoFocus={false} queue={[]} extraDirectories={[]} resources={[]} commands={[]} messageHistory={[]}

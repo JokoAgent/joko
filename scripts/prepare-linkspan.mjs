@@ -59,6 +59,14 @@ export async function verifySourcePackages(directory, identity) {
   return manifest;
 }
 
+export async function refreshSourceDependencies(root, pnpm) {
+  await pnpm(['update', '--recursive', '--no-save', '@jokoagent/linkspan-*'], root);
+  // Selected updates can leave optional peers in a partial importer context.
+  // Resolve the declared workspace graph exactly as the lockfile workflow does,
+  // without running lifecycle effects or discarding any source changes.
+  await pnpm(['install', '--lockfile-only', '--ignore-scripts'], root);
+}
+
 export async function prepareLinkspan(root = repositoryRoot, { sourceDirectory } = {}) {
   const source = JSON.parse(await readFile(join(root, 'linkspan.json'), 'utf8'));
   const runtime = join(root, '.runtime');
@@ -87,7 +95,7 @@ export async function prepareLinkspan(root = repositoryRoot, { sourceDirectory }
   }
   // Only these source dependencies are re-resolved. The other dependency
   // requirements remain those of the workspace and its ordinary lockfile.
-  await pnpm(['update', '--recursive', '--no-save', '@jokoagent/linkspan-*'], root);
+  await refreshSourceDependencies(root, pnpm);
   await writeFile(join(runtime, 'linkspan-source.json'), JSON.stringify({ directory: checkout }, null, 2) + '\n');
   console.log(`Prepared Linkspan from ${sourceDirectory ? checkout : `remote ${source.ref}`} (${identity.sourceCommit}).`);
 }

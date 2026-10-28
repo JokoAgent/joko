@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ExtensionDirectoryPickerPage, ExtensionSettingsDirectoryChoice } from "@joko/contracts";
+import type { ExtensionSettingsDirectoryChoice } from "@joko/contracts";
 import type { Translator } from "./types.js";
 import { Button, Modal, Spinner } from "./ui.js";
 
@@ -9,7 +9,7 @@ export function ExtensionSettingsDirectoryDialog({ choice, signal, finish, t, ow
 }) {
   const [page, setPage] = useState(choice.initialPage), [directoryPath, setDirectoryPath] = useState("");
   const [busy, setBusy] = useState(false), [error, setError] = useState(false);
-  const live = useRef(true), occurrence = useRef(0);
+  const live = useRef(true), occurrence = useRef(0), lock = useRef(false);
   useEffect(() => {
     live.current = true;
     const cancel = () => finish();
@@ -21,15 +21,18 @@ export function ExtensionSettingsDirectoryDialog({ choice, signal, finish, t, ow
     return () => { live.current = false; occurrence.current++; clearTimeout(timer); signal.removeEventListener("abort", cancel); ownerDocument.removeEventListener("visibilitychange", hidden); };
   }, [choice, signal, finish, ownerDocument]);
   const browse = async (input: Parameters<ExtensionSettingsDirectoryChoice["browse"]>[0], append = false) => {
-    if (busy || signal.aborted) return;
-    const request = ++occurrence.current; setBusy(true); setError(false);
+    if (lock.current || signal.aborted) return;
+    lock.current = true; const request = ++occurrence.current; setBusy(true); setError(false);
     try {
       const next = await choice.browse(input);
       if (!live.current || signal.aborted || request !== occurrence.current) return;
-      setPage((previous: ExtensionDirectoryPickerPage) => append ? { ...next, entries: [...previous.entries, ...next.entries] } : next);
+      const entries = append ? [...page.entries, ...next.entries] : next.entries;
+      if (entries.length > 10_000 || new Set(entries.map(entry => entry.entryId)).size !== entries.length
+        || append && next.directory?.entryId !== page.directory?.entryId) throw new Error("Directory listing changed.");
+      setPage({ ...next, entries });
       setDirectoryPath(next.directory?.displayPath ?? "");
     } catch { if (live.current && !signal.aborted && request === occurrence.current) setError(true); }
-    finally { if (live.current && request === occurrence.current) setBusy(false); }
+    finally { if (live.current && request === occurrence.current) { lock.current = false; setBusy(false); } }
   };
   return <Modal open ownerDocument={ownerDocument} title={t("extensions.directoryPicker.title")}
     description={choice.name} onClose={() => finish()} closeLabel={t("common.cancel")} size="medium">
@@ -52,6 +55,6 @@ export function ExtensionSettingsDirectoryDialog({ choice, signal, finish, t, ow
       {page.nextPageToken && <Button tone="ghost" disabled={busy} onClick={() => void browse({ entryId: page.directory?.entryId, pageToken: page.nextPageToken }, true)}>{t("common.more")}</Button>}
     </div>
     <div className="modal-actions"><Button tone="ghost" onClick={() => finish()}>{t("common.cancel")}</Button>
-      <Button tone="primary" disabled={busy || !page.directory || signal.aborted} onClick={() => finish(page.directory?.entryId)}>{t("extensions.directoryPicker.select")}</Button></div>
+      <Button tone="primary" disabled={busy || error || !page.directory || signal.aborted} onClick={() => { if (!lock.current && !error && !signal.aborted) finish(page.directory?.entryId); }}>{t("extensions.directoryPicker.select")}</Button></div>
   </Modal>;
 }
