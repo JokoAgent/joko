@@ -15,6 +15,7 @@ describe("materialized session runtime state", () => {
       totalTokens: 18,
       contextTokens: 12,
       contextWindow: 32_000,
+      pricingContext: { inputTokens: 13, requestedAt: 1_793_000_000_000, cacheWriteTtl: "1h" as const, cacheWrite1hTokens: 1 },
       nativeAccounting: { sourceId: "query-one", tokensComplete: false, costComplete: false, costEstimated: true },
       cost: 0.02
     };
@@ -24,6 +25,10 @@ describe("materialized session runtime state", () => {
     }, 10);
     expect(materializedSessionRuntimeState(withLeaf)).toEqual({ usage, activeNativeEntryId: "leaf-a", updatedAt: 10 });
     expect(mergeMaterializedSessionRuntimeState(withLeaf, { activeNativeEntryId: null }, 20)).toEqual({ usage, updatedAt: 20 });
+    for (const pricingContext of [{ ...usage.pricingContext, cacheWrite1hTokens: 2 }, { ...usage.pricingContext, requestedAt: -1 },
+      { ...usage.pricingContext, cacheWriteTtl: "one hour" }]) {
+      expect(materializedSessionRuntimeState({ ...withLeaf, usage: { ...usage, pricingContext } })).toEqual({ activeNativeEntryId: "leaf-a", updatedAt: 10 });
+    }
   });
 
   it("rejects malformed, negative, and unbounded durable values", () => {

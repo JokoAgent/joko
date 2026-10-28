@@ -978,6 +978,8 @@ function groupUsageText(route: { readonly backendId: string; readonly providerId
 function PriceMark({ model, tier, t }: { readonly model: ModelView; readonly tier: 0 | 1 | 2 | 3; readonly t: Translator }): JSX.Element | null {
   const pricingUnavailable = model.pricingSource === undefined
     || model.pricingKnown === false
+    || model.inputCostMicrosPerMillion === undefined
+    || model.outputCostMicrosPerMillion === undefined
     || model.inputCostMicrosPerMillion < 0
     || model.outputCostMicrosPerMillion < 0;
   if (model.providerAccessKind === "subscription"
@@ -995,11 +997,12 @@ function PriceMark({ model, tier, t }: { readonly model: ModelView; readonly tie
 }
 
 function priceTierMap(models: readonly ModelView[]): ReadonlyMap<string, 0 | 1 | 2 | 3> {
-  const totals = models.map((model) => ({ key: modelKey(model), total: model.inputCostMicrosPerMillion + model.outputCostMicrosPerMillion }))
+  const totals = models.flatMap((model) => model.inputCostMicrosPerMillion === undefined || model.outputCostMicrosPerMillion === undefined ? [] : [{ key: modelKey(model), total: model.inputCostMicrosPerMillion + model.outputCostMicrosPerMillion }])
     .filter((item) => item.total > 0)
     .sort((left, right) => left.total - right.total);
   const result = new Map<string, 0 | 1 | 2 | 3>();
   for (const model of models) {
+    if (model.inputCostMicrosPerMillion === undefined || model.outputCostMicrosPerMillion === undefined) continue;
     const total = model.inputCostMicrosPerMillion + model.outputCostMicrosPerMillion;
     if (total === 0) result.set(modelKey(model), 0);
   }

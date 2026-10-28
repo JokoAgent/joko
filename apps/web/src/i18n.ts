@@ -5,6 +5,16 @@ import { connectionEntriesEnglish, connectionEntriesChinese } from './i18n/conne
 import { serverAccessEnglish, serverAccessChinese } from '@joko/contracts/server-access';
 
 const en = {
+  "settings.modelPrice.tariffs": "Reference tariffs",
+  "settings.modelPrice.standard": "Standard",
+  "settings.modelPrice.fast": "Fast",
+  "settings.modelPrice.priority": "Priority",
+  "settings.modelPrice.batch": "Batch",
+  "settings.modelPrice.cacheWrite1h": "Cache write · 1 hour",
+  "settings.modelPrice.interval": "From {from} (inclusive) to {until} (exclusive)",
+  "settings.modelPrice.tokens": "Input tokens: {min} ≤ tokens < {max}",
+  "settings.modelPrice.source": "Provider source · verified {date}",
+  "settings.modelPrice.openEnd": "no upper limit",
   ...serverAccessEnglish,
   ...connectionEntriesEnglish,
   ...deviceAuthorizationEnglish,
@@ -6509,6 +6519,16 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  "settings.modelPrice.tariffs": "参考价目表",
+  "settings.modelPrice.standard": "标准",
+  "settings.modelPrice.fast": "Fast",
+  "settings.modelPrice.priority": "优先",
+  "settings.modelPrice.batch": "批处理",
+  "settings.modelPrice.cacheWrite1h": "缓存写入 · 1 小时",
+  "settings.modelPrice.interval": "从 {from}（包含）到 {until}（不包含）",
+  "settings.modelPrice.tokens": "输入 token：{min} ≤ token < {max}",
+  "settings.modelPrice.source": "供应商来源 · 核对于 {date}",
+  "settings.modelPrice.openEnd": "无上限",
   "session.archiveSchedulesWarning": "这些任务仍有 {count} 个启用的绑定自动化。归档后它们仍可能继续执行，请先检查这些自动化。",
   "session.archiveSchedulesUnavailable": "无法确认启用的绑定自动化。请重试后再归档。",
   "session.sideChat": "在侧边追问",

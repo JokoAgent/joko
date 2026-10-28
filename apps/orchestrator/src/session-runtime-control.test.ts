@@ -117,7 +117,7 @@ describe("session runtime control", () => {
     })).toEqual({ effort: "low", fastMode: false });
   });
 
-  it("orders fallback by the same model, then the explicit Backend default, without loops", () => {
+  it("retries another connected source of the same model without selecting a different saved default", () => {
     const allModels = [...models, {
       providerId: "provider-c", modelId: "default", displayName: "Default", api: "test",
       contextWindow: 1, maxOutputTokens: 1, supportsImages: false, supportsFastMode: true,
@@ -127,7 +127,6 @@ describe("session runtime control", () => {
       current: baseline,
       models: allModels,
       availableProviderIds: new Set(["provider-b", "provider-c"]),
-      explicitDefault: { providerId: "provider-c", modelId: "default" },
       visitedRoutes: [],
       currentHop: 0,
       maxHops: 2,
@@ -137,21 +136,25 @@ describe("session runtime control", () => {
       current: baseline,
       models: allModels,
       availableProviderIds: new Set(["provider-b", "provider-c"]),
-      explicitDefault: { providerId: "provider-c", modelId: "default" },
       visitedRoutes: ["pi\0provider-b\0reasoner"],
       currentHop: 1,
       maxHops: 2,
       fastModeSupported: true
-    })).toMatchObject({ providerId: "provider-c", modelId: "default" });
+    })).toBeUndefined();
     expect(pickSessionRuntimeFallback({
       current: baseline,
       models: allModels,
       availableProviderIds: new Set(["provider-b", "provider-c"]),
-      explicitDefault: { providerId: "provider-c", modelId: "default" },
       visitedRoutes: [],
       currentHop: 2,
       maxHops: 2,
       fastModeSupported: true
     })).toBeUndefined();
+  });
+  it("keeps Codex on its current wire protocol even when another route has the same model ID", () => {
+    const input = { current: baseline, availableProviderIds: new Set(["provider-b"]), visitedRoutes: [], currentHop: 0, maxHops: 2, fastModeSupported: true, requireMatchingApi: true };
+    expect(pickSessionRuntimeFallback({ ...input, models: [{ ...models[0], api: "openai-responses" }, { ...models[1], api: "anthropic-messages" }] })).toBeUndefined();
+    expect(pickSessionRuntimeFallback({ ...input, models: [{ ...models[1], api: "openai-responses" }] })).toBeUndefined();
+    expect(pickSessionRuntimeFallback({ ...input, models: models.map(model => ({ ...model, api: "openai-responses" })) })).toMatchObject({ providerId: "provider-b" });
   });
 });

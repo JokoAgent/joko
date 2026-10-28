@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   redactSecrets,
+  catalogModelReferencePricing,
   type MessageBlock,
   type ProviderModel,
   type PublicError,
@@ -281,6 +282,7 @@ export class PartialMessageBuffer {
 export function providerModel(model: ClaudeSdkModelInfo, projection: SafeProjection): ProviderModel {
   const modelId = projection.identifier(model.value, "unknown-model");
   const estimate = claudeModelEstimate(modelId);
+  const pricing = catalogModelReferencePricing(modelId.startsWith("anthropic/") ? modelId : `anthropic/${modelId}`);
   const thinkingLevels = estimate?.thinkingLevels
     ?? (model.supportsEffort ? [...(model.supportedEffortLevels ?? ["low", "medium", "high"])] : []);
   return {
@@ -301,15 +303,15 @@ export function providerModel(model: ClaudeSdkModelInfo, projection: SafeProject
     supportsFastMode: model.supportsFastMode === true || estimate?.fastModeMultiplier !== undefined,
     thinkingLevels,
     ...(estimate?.defaultEffort !== undefined && thinkingLevels.includes(estimate.defaultEffort) ? { defaultEffort: estimate.defaultEffort } : {}),
-    cost: estimate?.price ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    ...(estimate?.price === undefined ? {} : {
-      pricing: {
+    cost: estimate?.price ?? {},
+    ...(estimate?.price === undefined && pricing === undefined ? {} : {
+      pricing: pricing ?? {
         source: "providerReference" as const,
         currencyCode: "USD",
-        updatedAt: estimate.updatedAt,
+        updatedAt: estimate?.updatedAt,
         cacheReadAvailable: true,
         cacheWriteAvailable: true,
-        ...(estimate.fastModeMultiplier === undefined ? {} : { fastModeMultiplier: estimate.fastModeMultiplier })
+        ...(estimate?.fastModeMultiplier === undefined ? {} : { fastModeMultiplier: estimate.fastModeMultiplier })
       }
     })
   };

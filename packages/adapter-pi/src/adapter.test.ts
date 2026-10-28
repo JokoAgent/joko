@@ -6664,6 +6664,11 @@ describe("PiBackendAdapter", () => {
         maxOutputTokens: 32_000,
         supportsImages: true,
         defaultVisible: false,
+        defaultEffort: "medium",
+        declaredInputModalities: ["text", "image"],
+        pricing: { source: "providerReference", currencyCode: "USD", tariffs: [{ variant: "standard", currencyCode: "USD",
+          cost: { input: 1, output: 2, cacheWrite1h: 3 }, effectiveFrom: "2026-01-01", verifiedAt: "2026-01-01",
+          sourceUrl: "https://example.test/pricing" }] },
         thinkingLevels: ["low", "medium", "high"],
         cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0 }
       }],
@@ -6700,7 +6705,10 @@ describe("PiBackendAdapter", () => {
           providerId: "openai-codex",
           modelId: "gpt-native",
           logicalId: "gpt-shared",
-          defaultVisible: false
+          defaultVisible: false,
+          defaultEffort: "medium",
+          declaredInputModalities: ["text", "image"],
+          pricing: { tariffs: [expect.objectContaining({ cost: { input: 1, output: 2, cacheWrite1h: 3 } })] }
         })
       ])
     });

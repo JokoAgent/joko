@@ -5121,6 +5121,27 @@ describe("SessionHost", () => {
   });
 
   it.each([
+    { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, costMicros: 890_000, complete: true },
+    { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: true, cacheWrite1hTokens: 1_000, costMicros: 1_780_000, complete: true },
+    { model: "google/gemini-3.8-flash", at: Date.UTC(2026, 11, 31, 23, 59, 59), fastMode: false, costMicros: 169_500, complete: false },
+    { model: "google/gemini-3.8-flash", at: Date.UTC(2027, 0, 1), fastMode: false, costMicros: 339_000, complete: false }
+  ])("records $model tariffs using request time $at and observed cache duration", async testCase => {
+    const { catalogModelReferencePricing } = await import("@joko/core");
+    const fixture = await createFixture(new TieredUsageFakeAdapter({ requestInput: 200_000, fastMode: testCase.fastMode,
+      requestedAt: testCase.at, cacheWrite1hTokens: testCase.cacheWrite1hTokens, pricing: catalogModelReferencePricing(testCase.model) }),
+    { usageMoneyKind: () => "reference-value" });
+    const sessionId = (await fixture.host.createSession({ operationId: "create-tariff-usage", connection: fixture.connection,
+      targetId: "target-one", title: "Tariff usage", providerId: "test", modelId: "text", fastMode: testCase.fastMode,
+      permissionMode: "ask", planMode: false })).value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: "send-tariff-usage", connection: fixture.connection, sessionId,
+      prompt: { text: "measure", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual([
+      expect.objectContaining({ costMicros: testCase.costMicros, currencyCode: "USD", costComplete: testCase.complete, estimated: true })
+    ]);
+  });
+
+  it.each([
     { name: "standard below its boundary", requestInput: 199_999, fastMode: false, costMicros: 503_996 },
     { name: "standard at its long band", requestInput: 200_000, fastMode: false, costMicros: 1_008_000 },
     { name: "Fast at its separate boundary", requestInput: 200_000, fastMode: true, costMicros: 1_008_000 },
@@ -5163,7 +5184,7 @@ describe("SessionHost", () => {
       pricing: { source: "providerReference", currencyCode: "CNY", cacheReadAvailable: true, cacheWriteAvailable: false },
       costMicros: 204_000,
       currencyCode: "CNY",
-      costComplete: true
+      costComplete: false
     },
     {
       name: "keeps an unknown subscription price incomplete",
@@ -17371,6 +17392,8 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
   constructor(readonly observation: {
     readonly requestInput: number;
     readonly fastMode: boolean | undefined;
+    readonly requestedAt?: number;
+    readonly cacheWrite1hTokens?: number;
     readonly omitPricingContext?: boolean;
     readonly reportedCost?: boolean;
     readonly substitutedModelId?: string;
@@ -17412,6 +17435,8 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
         totalTokens: (this.observation.requestInput + 1_000) * count,
         ...(this.observation.omitPricingContext ? {} : { pricingContext: {
           inputTokens: this.observation.requestInput,
+          ...(this.observation.requestedAt === undefined ? {} : { requestedAt: this.observation.requestedAt }),
+          ...(this.observation.cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens: this.observation.cacheWrite1hTokens * count }),
           ...(this.observation.fastMode === undefined ? {} : { fastMode: this.observation.fastMode })
         } }),
         cost: this.observation.reportedCost ? 0.25 * count : 0

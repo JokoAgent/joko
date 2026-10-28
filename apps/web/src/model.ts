@@ -362,11 +362,12 @@ export interface ModelView {
   readonly efforts: readonly string[];
   readonly contextWindow: number;
   readonly maximumOutputTokens: number;
-  readonly inputCostMicrosPerMillion: number;
-  readonly outputCostMicrosPerMillion: number;
+  readonly inputCostMicrosPerMillion?: number;
+  readonly outputCostMicrosPerMillion?: number;
   readonly cacheReadCostMicrosPerMillion?: number;
   readonly cacheWriteCostMicrosPerMillion?: number;
   readonly currencyCode: string;
+  readonly referenceTariffs?: readonly ModelReferenceTariffView[];
   /** Declared display facts are separate from the effective admission flags. */
   readonly metadata?: ModelAdvancedMetadataView;
   readonly source?: ModelSourceView;
@@ -1378,13 +1379,29 @@ export type ModelPriceCurrencyView = "USD" | "CNY";
 export interface ModelPriceQuoteView {
   readonly currency: ModelPriceCurrencyView;
   /** Currency units per one million tokens. */
-  readonly inputPerMillion: number;
+  readonly inputPerMillion?: number;
   /** Currency units per one million tokens. */
-  readonly outputPerMillion: number;
+  readonly outputPerMillion?: number;
   /** Currency units per one million tokens. */
   readonly cacheReadPerMillion?: number;
   /** Currency units per one million tokens. */
   readonly cacheWritePerMillion?: number;
+}
+
+export interface ModelReferenceTariffView {
+  readonly currencyCode: string;
+  readonly variant: "standard" | "priority" | "batch" | "fast";
+  readonly inputPerMillion?: number;
+  readonly outputPerMillion?: number;
+  readonly cacheReadPerMillion?: number;
+  readonly cacheWritePerMillion?: number;
+  readonly cacheWrite1hPerMillion?: number;
+  readonly minInputTokens?: number;
+  readonly maxInputTokens?: number;
+  readonly effectiveFrom: string;
+  readonly effectiveUntil?: string;
+  readonly sourceUrl: string;
+  readonly verifiedAt: string;
 }
 
 export interface ModelPriceOverrideView {

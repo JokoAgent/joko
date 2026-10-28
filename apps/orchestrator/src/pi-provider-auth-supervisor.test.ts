@@ -350,7 +350,7 @@ describe("PiProviderAuthSupervisor", () => {
     ]));
     expect(nativeModels.some((model) => model.supportsImages)).toBe(true);
     expect(nativeModels.some((model) => model.thinkingLevels.length > 0)).toBe(true);
-    expect(nativeModels.some((model) => model.cost.input > 0 && model.cost.output > 0)).toBe(true);
+    expect(nativeModels.some((model) => (model.cost.input ?? -1) > 0 && (model.cost.output ?? -1) > 0)).toBe(true);
     expect(nativeModels.some((model) => model.supportsFastMode === true)).toBe(true);
     expect(nativeModels.filter((model) => model.supportsFastMode === true).every((model) =>
       model.api === "openai-codex-responses"
@@ -370,7 +370,8 @@ describe("PiProviderAuthSupervisor", () => {
     }
     expect(nativeModels.find((model) => model.providerId === "kimi-coding" && model.modelId === "kimi-for-coding"))
       .toMatchObject({ displayName: "Kimi K2.8 Preview", contextWindow: 1_048_576, supportsImages: true,
-        thinkingLevels: ["low", "high", "max"], defaultEffort: "max", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+        thinkingLevels: ["low", "high", "max"], defaultEffort: "max", cost: {} });
+    expect(nativeModels.find((model) => model.providerId === "kimi-coding" && model.modelId === "kimi-for-coding")?.pricing).toBeUndefined();
     expect(nativeModels.some((model) => model.providerId === "deepseek" && model.modelId === "deepseek-v4-flash"))
       .toBe(false);
     expect(nativeModels.find((model) => model.providerId === "deepseek" && model.modelId === "deepseek-flash"))

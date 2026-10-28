@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { modelTokenPricesAt } from "@joko/core";
 import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY, createSideChatWorkspaceReference,
   type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import type { McpAppMessageGuard } from "./mcp-apps/message.js";
@@ -6554,7 +6555,8 @@ export class SessionHost {
         models: backend.models.filter((model) =>
           this.#modelRoutingEnabled(backend.id, model.providerId, model.modelId)),
         availableProviderIds: context.availableProviderIds,
-        ...(context.explicitDefault === undefined ? {} : { explicitDefault: context.explicitDefault }),
+        requireMatchingApi: (this.#providerGroups?.directory.sources().find(source =>
+          source.backendId === backend.id && source.providerId === snapshot.effective!.providerId)?.agentKind ?? backend.adapterKind) === "codex",
         visitedRoutes: snapshot.visitedRoutes,
         currentHop: snapshot.fallbackHop,
         maxHops: 2,
@@ -15619,7 +15621,8 @@ export class SessionHost {
       ? Math.round(usage.cost * 1_000_000)
       : undefined;
     const costRates = !canPriceReference ? undefined : priceOverride === undefined
-      ? model === undefined ? undefined : modelUsageCostRates(model, usage)
+      ? model === undefined ? undefined : modelUsageCostRates(model, usage,
+        usage.pricingContext?.requestedAt ?? (runUsageId === undefined ? measuredAt : store.getRun(runUsageId).descriptor.startedAt ?? measuredAt))
       : {
           inputMicrosPerMillion: priceOverride.inputCostMicrosPerMillion,
           outputMicrosPerMillion: priceOverride.outputCostMicrosPerMillion,
@@ -15628,7 +15631,8 @@ export class SessionHost {
             : { cacheReadMicrosPerMillion: priceOverride.cacheReadCostMicrosPerMillion }),
           ...(priceOverride.cacheWriteCostMicrosPerMillion === undefined
             ? {}
-            : { cacheWriteMicrosPerMillion: priceOverride.cacheWriteCostMicrosPerMillion })
+            : { cacheWriteMicrosPerMillion: priceOverride.cacheWriteCostMicrosPerMillion,
+              cacheWrite1hMicrosPerMillion: priceOverride.cacheWriteCostMicrosPerMillion })
         };
     const currencyCode = reportedCostMicros === undefined
       ? priceOverride?.currencyCode ?? model?.pricing?.currencyCode ?? "USD"
@@ -15652,6 +15656,8 @@ export class SessionHost {
       outputTokens: usage.outputTokens,
       cacheReadTokens: usage.cacheReadTokens,
       cacheWriteTokens: usage.cacheWriteTokens,
+      cacheWrite1hTokens: usage.pricingContext?.cacheWrite1hTokens
+        ?? (usage.pricingContext?.cacheWriteTtl === "1h" ? usage.cacheWriteTokens : undefined),
       totalTokens: usage.totalTokens,
       ...(reportedCostMicros === undefined ? {} : { reportedCostMicros }),
       ...(reportedCostMicros === undefined || usageMoneyKind === "actual-cost" && native?.costEstimated !== true && childAccounting?.costEstimated !== true
@@ -18660,6 +18666,9 @@ function sameUsageSnapshot(left: UsageSnapshot | undefined, right: UsageSnapshot
     left.contextWindow === right.contextWindow &&
     left.pricingContext?.inputTokens === right.pricingContext?.inputTokens &&
     left.pricingContext?.fastMode === right.pricingContext?.fastMode &&
+    left.pricingContext?.requestedAt === right.pricingContext?.requestedAt &&
+    left.pricingContext?.cacheWriteTtl === right.pricingContext?.cacheWriteTtl &&
+    left.pricingContext?.cacheWrite1hTokens === right.pricingContext?.cacheWrite1hTokens &&
     left.cost === right.cost &&
     left.nativeAccounting?.sourceId === right.nativeAccounting?.sourceId &&
     left.nativeAccounting?.tokensComplete === right.nativeAccounting?.tokensComplete &&
@@ -18869,30 +18878,20 @@ function backendAuthenticationRequiredFailure(backend: BackendDescriptor): Publi
   };
 }
 
-function modelUsageCostRates(model: ProviderModel, usage: UsageSnapshot) {
-  // Ultrafast is a separate upstream price tier; ordinary Fast rates cannot price it.
-  if (usage.pricingContext?.fastMode === "ultrafast") return undefined;
-  if (model.pricing === undefined
-    && model.cost.input === 0
-    && model.cost.output === 0
-    && model.cost.cacheRead === 0
-    && model.cost.cacheWrite === 0) return undefined;
-  const pricingContext = usage.pricingContext;
-  const longContext = model.pricing?.longContext;
-  const fastMode = pricingContext?.fastMode === true;
-  const inputTokenThreshold = fastMode
-    ? longContext?.fastInputTokenThreshold ?? longContext?.inputTokenThreshold
-    : longContext?.inputTokenThreshold;
-  const tier = longContext !== undefined && pricingContext !== undefined
-    && inputTokenThreshold !== undefined && pricingContext.inputTokens > inputTokenThreshold ? longContext : undefined;
-  const fastMultiplier = fastMode
-    ? tier?.fastModeMultiplier ?? model.pricing?.fastModeMultiplier ?? 1
-    : 1;
+function modelUsageCostRates(model: ProviderModel, usage: UsageSnapshot, at: number) {
+  const selected = modelTokenPricesAt(model, { at, inputTokens: usage.pricingContext?.inputTokens,
+    fastMode: usage.pricingContext?.fastMode,
+    cacheWriteTtl: "5m" });
+  if (selected === undefined || Object.values(selected.cost).every(value => value === undefined)) return undefined;
+  const cost = selected.cost;
+  const oneHourPrice = modelTokenPricesAt(model, { at, inputTokens: usage.pricingContext?.inputTokens,
+    fastMode: usage.pricingContext?.fastMode, cacheWriteTtl: "1h" })?.cost.cacheWrite;
   return {
-    inputMicrosPerMillion: modelCostMicros(model.cost.input * fastMultiplier * (tier?.inputMultiplier ?? 1)),
-    outputMicrosPerMillion: modelCostMicros(model.cost.output * fastMultiplier * (tier?.outputMultiplier ?? 1)),
-    cacheReadMicrosPerMillion: modelCostMicros(model.cost.cacheRead * fastMultiplier * (tier?.cacheReadMultiplier ?? 1)),
-    cacheWriteMicrosPerMillion: modelCostMicros(model.cost.cacheWrite * fastMultiplier * (tier?.cacheWriteMultiplier ?? 1))
+    ...(cost.input === undefined ? {} : { inputMicrosPerMillion: modelCostMicros(cost.input) }),
+    ...(cost.output === undefined ? {} : { outputMicrosPerMillion: modelCostMicros(cost.output) }),
+    ...(cost.cacheRead === undefined ? {} : { cacheReadMicrosPerMillion: modelCostMicros(cost.cacheRead) }),
+    ...(cost.cacheWrite === undefined ? {} : { cacheWriteMicrosPerMillion: modelCostMicros(cost.cacheWrite) }),
+    ...(oneHourPrice === undefined ? {} : { cacheWrite1hMicrosPerMillion: modelCostMicros(oneHourPrice) })
   };
 }
 

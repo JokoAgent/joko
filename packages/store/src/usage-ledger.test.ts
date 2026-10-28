@@ -13,6 +13,38 @@ afterEach(() => {
 });
 
 describe("durable usage ledger", () => {
+  it("prices only new one-hour and short cache writes when their cumulative mix changes across restart", () => {
+    const fixture = createFixture();
+    const rates = { cacheWriteMicrosPerMillion: 5_000_000, cacheWrite1hMicrosPerMillion: 8_000_000 };
+    const record = (minute: number, total: number, oneHour?: number) => fixture.store.recordUsageObservation(observation({
+      measuredAt: Date.UTC(2026, 9, 29, 1, minute), cacheWriteTokens: total, cacheWrite1hTokens: oneHour, totalTokens: total, costRates: rates
+    }));
+    expect(record(0, 2_000, 1_000)).toMatchObject({ costMicros: 13_000, costComplete: true });
+    fixture.reopen();
+    expect(record(1, 4_000, 1_000)).toMatchObject({ costMicros: 10_000, costComplete: true });
+    fixture.reopen();
+    expect(record(2, 6_000, 3_000)).toMatchObject({ costMicros: 16_000, costComplete: true });
+    expect(record(3, 6_000, 3_000).changed).toBe(false);
+    expect(fixture.store.listUsageLedger({ ownerId: "owner-a" })[0]).toMatchObject({ cacheWriteTokens: 6_000, costMicros: 39_000, costComplete: true });
+    expect(record(4, 7_000)).toMatchObject({ cacheWriteTokens: 1_000, costMicros: 0, costComplete: false });
+    expect(record(5, 8_000, 4_000)).toMatchObject({ cacheWriteTokens: 1_000, costMicros: 0, costComplete: false });
+    expect(record(6, 1_000, 1_000)).toMatchObject({ cacheWriteTokens: 1_000, costMicros: 8_000, costComplete: true });
+    expect(() => record(7, 1_000, 1_001)).toThrow("exceed");
+  });
+
+  it("keeps a missing input price incomplete across restart and preserves the recorded estimate", () => {
+    const fixture = createFixture();
+    const result = fixture.store.recordUsageObservation(observation({ inputTokens: 100, outputTokens: 100, totalTokens: 200,
+      costRates: { outputMicrosPerMillion: 2_000_000 } }));
+    expect(result).toMatchObject({ costMicros: 200, costComplete: false, estimated: true });
+    fixture.reopen();
+    const report = fixture.store.getUsageReport({ ownerId: "owner-a", group: "model" });
+    expect(report.totals[0]).toMatchObject({ costMicros: 200 });
+    const duplicate = fixture.store.recordUsageObservation(observation({ inputTokens: 100, outputTokens: 100, totalTokens: 200,
+      costRates: { inputMicrosPerMillion: 9_000_000, outputMicrosPerMillion: 9_000_000 } }));
+    expect(duplicate.changed).toBe(false);
+    expect(fixture.store.getUsageReport({ ownerId: "owner-a", group: "model" }).totals).toEqual(report.totals);
+  });
   it("pages historical route totals without repricing or borrowing the current task model", () => {
     const fixture = createFixture();
     const record = (sourceId: string, providerId: string, modelId: string, tokens: number, day: number, currencyCode = "USD") => fixture.store.recordUsageObservation(observation({

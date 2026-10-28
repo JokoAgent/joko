@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { OperationalStore } from "@joko/store";
-import type { ProviderModel } from "@joko/core";
+import { knownModelTokenPrices, type ProviderModel } from "@joko/core";
 import { createPiModelCatalogAdditions, type PiSupportedApi } from "@joko/adapter-pi";
 
 import {
@@ -1100,15 +1100,13 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
       if (input.length === 0 || input.some((modality) => modality !== "text" && modality !== "image")) {
         throw new Error("Pi native model registry contains an unsupported input modality.");
       }
-      const nativeCost = {
-        input: nonNegativeNativeModelNumber(model.cost?.input ?? 0, "input cost"),
-        output: nonNegativeNativeModelNumber(model.cost?.output ?? 0, "output cost"),
-        cacheRead: nonNegativeNativeModelNumber(model.cost?.cacheRead ?? 0, "cache-read cost"),
-        cacheWrite: nonNegativeNativeModelNumber(model.cost?.cacheWrite ?? 0, "cache-write cost")
-      };
+      const nativeCost = knownModelTokenPrices(model.cost);
       const metadata = additions.referenceCatalogMetadata(model);
       const cost = metadata?.cost ?? nativeCost;
-      const pricing = metadata?.pricing;
+      const pricing = metadata?.pricing ?? (metadata?.cost !== undefined || Object.keys(nativeCost).length === 0 ? undefined : {
+        source: "upstream" as const, currencyCode: "USD",
+        cacheReadAvailable: nativeCost.cacheRead !== undefined, cacheWriteAvailable: nativeCost.cacheWrite !== undefined
+      });
       const thinkingLevels = nativeThinkingLevels(model.reasoning === true, model.thinkingLevelMap);
       const defaultEffort = metadata?.defaultEffort ?? "medium";
       models.push({
@@ -1154,16 +1152,6 @@ function positiveSafeNativeModelInteger(value: unknown, label: string): number {
     throw new Error(`Pi native model registry ${label} is invalid.`);
   }
   return value as number;
-}
-
-function nonNegativeNativeModelNumber(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`Pi native model registry ${label} is invalid.`);
-  }
-  // Pi uses negative sentinels for dynamically routed/unknown pricing (for
-  // example OpenRouter auto). The public catalog has no unknown-cost scalar,
-  // so expose zero rather than treating a valid built-in model as malformed.
-  return value < 0 ? 0 : value;
 }
 
 export function nativeThinkingLevels(

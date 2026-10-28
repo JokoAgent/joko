@@ -24,7 +24,7 @@ describe("Pi model catalog additions", () => {
     });
     const build = models('xai').find(model => model.id === 'grok-build-0.1')!;
     expect(build).toMatchObject({ api: 'openai-responses', contextWindow: 256_000, maxTokens: 256_000 });
-    expect(additions.referenceCatalogMetadata(build)).toEqual({ defaultVisible: false });
+    expect(additions.referenceCatalogMetadata(build)).toMatchObject({ defaultVisible: false, pricing: { source: "providerReference" } });
     expect(models('openrouter').find(model => model.id === 'deepseek/deepseek-v4-flash')?.cost)
       .toEqual({ input: 0.08498, output: 0.16996, cacheRead: 0.016996, cacheWrite: 0 });
     expect(models('openrouter').find(model => model.id === 'deepseek/deepseek-v4-pro')?.cost)
@@ -86,7 +86,7 @@ describe("Pi model catalog additions", () => {
       thinkingLevelMap: { low: "low", high: "high", max: "max" }
     });
     expect(additions.referenceCatalogMetadata(models("kimi-coding").find((model) => model.id === "kimi-for-coding")!))
-      .toEqual({ cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, defaultEffort: "max" });
+      .toEqual({ cost: {}, defaultEffort: "max" });
 
     const deepSeek = models("deepseek");
     expect(deepSeek.some((model) => model.id === "deepseek-v4-flash")).toBe(false);
@@ -117,7 +117,7 @@ describe("Pi model catalog additions", () => {
         pricing: { currencyCode: "CNY" }
       });
     expect(additions.referenceCatalogMetadata(xiaomi.find((model) => model.id === "mimo-v2.5")!))
-      .toEqual({ defaultVisible: false });
+      .toMatchObject({ defaultVisible: false });
 
     const xiaomiTokenPlan = models("xiaomi-token-plan-cn");
     expect(xiaomiTokenPlan.filter((model) => model.id.startsWith("mimo-v2.6")).map((model) => model.id)).toEqual([
@@ -142,6 +142,9 @@ describe("Pi model catalog additions", () => {
 
     const custom = { ...runtime.getProvider("xiaomi")!, baseUrl: "https://gateway.example.test/v1" };
     expect(additions.extendProvider(custom)).toBe(custom);
+    expect(additions.referenceCatalogMetadata({ ...xiaomi.find(model => model.id === "mimo-v2.6-pro")!, baseUrl: custom.baseUrl })).toBeUndefined();
+    expect(additions.referenceCatalogMetadata(xiaomi.find(model => model.id === "mimo-v2.6-pro")!)?.pricing?.tariffs)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ currencyCode: "CNY", variant: "standard" })]));
   });
 
   it("exposes the fixed xAI Fast target and rewrites that exact route without a service tier", async () => {

@@ -1,7 +1,7 @@
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { clampThinkingLevel } from "@earendil-works/pi-ai";
 import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
-import type { ProviderModel } from "@joko/core";
+import { catalogModelReferencePricing, type ProviderModel } from "@joko/core";
 
 type NativeProvider = ReturnType<ModelRuntime["getProviders"]>[number];
 type NativeModel = ReturnType<NativeProvider["getModels"]>[number];
@@ -19,8 +19,31 @@ type CatalogMetadata = Readonly<{
  * same exact Provider routes. Unlisted Providers and models remain native.
  */
 export function createPiModelCatalogAdditions() {
-  return createPiModelCatalogAdditionsFactory({ buildBaseOptions, clampThinkingLevel });
+  const additions = createPiModelCatalogAdditionsFactory({ buildBaseOptions, clampThinkingLevel });
+  return { ...additions, referenceCatalogMetadata(model: Parameters<typeof additions.referenceCatalogMetadata>[0]): CatalogMetadata | undefined {
+    const metadata = additions.referenceCatalogMetadata(model);
+    const route = referencePriceRoutes[model.provider ?? ""];
+    if (route === undefined || model.baseUrl?.replace(/\/+$/, "") !== route.baseUrl) return metadata;
+    const id = route.family === "anthropic" ? model.id.replace(/-\d{8}$/, "")
+      : route.family === "deepseek" && model.id === "deepseek-v4-flash" ? "deepseek-v4.1-flash" : model.id;
+    const pricing = id.includes("/") && !id.startsWith(`${route.family}/`) ? undefined
+      : catalogModelReferencePricing(id.includes("/") ? id : `${route.family}/${id}`, route.group);
+    return pricing === undefined ? metadata : { ...metadata, pricing: { ...metadata?.pricing, ...pricing } };
+  } };
 }
+
+const referencePriceRoutes: Readonly<Record<string, { readonly baseUrl: string; readonly family: string; readonly group: string }>> = {
+  openai: { baseUrl: "https://api.openai.com/v1", family: "openai", group: "global" },
+  "openai-codex": { baseUrl: "https://chatgpt.com/backend-api", family: "openai", group: "global" },
+  anthropic: { baseUrl: "https://api.anthropic.com", family: "anthropic", group: "global" },
+  google: { baseUrl: "https://generativelanguage.googleapis.com/v1beta", family: "google", group: "global" },
+  xai: { baseUrl: "https://api.x.ai/v1", family: "xai", group: "global" },
+  deepseek: { baseUrl: "https://api.deepseek.com", family: "deepseek", group: "global" },
+  moonshotai: { baseUrl: "https://api.moonshot.ai/v1", family: "moonshotai", group: "global" },
+  "moonshotai-cn": { baseUrl: "https://api.moonshot.cn/v1", family: "moonshotai", group: "cn" },
+  xiaomi: { baseUrl: "https://api.xiaomimimo.com/v1", family: "xiaomi", group: "cn" },
+  "xiaomi-token-plan-cn": { baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", family: "xiaomi", group: "cn" }
+};
 
 /** Explicit helpers keep the provisioned factory independent of module closures. */
 export function createPiModelCatalogAdditionsFactory(nativeOptions: {
@@ -328,7 +351,7 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
         { cacheReadAvailable: true, cacheWriteAvailable: false }
       ) };
     }
-    if (provider === "kimi-coding" && model.id === "kimi-for-coding") return { cost: zeroCost(), defaultEffort: "max" };
+    if (provider === "kimi-coding" && model.id === "kimi-for-coding") return { cost: {}, defaultEffort: "max" };
     if (provider === "opencode-go" && model.id === "deepseek-v4.1-flash") return { defaultEffort: "high" };
     if (provider === "openrouter" && ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"].includes(model.id)) return { defaultEffort: "high" };
     if (provider === "xai" && model.id === "grok-build-0.1") return { defaultVisible: false };

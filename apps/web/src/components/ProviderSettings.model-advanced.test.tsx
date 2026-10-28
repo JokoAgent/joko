@@ -13,6 +13,18 @@ beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); window.local
 afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); resetModelPickerPreferencesForTests(); });
 
 describe("ProviderSettings model advanced journey", () => {
+  it("opens published tariffs with date/token boundaries and distinct one-hour cache prices", async () => {
+    await mount({}, undefined, { referenceTariffs: [{ currencyCode: "USD", variant: "fast", inputPerMillion: 8,
+      outputPerMillion: 40, cacheWritePerMillion: 10, cacheWrite1hPerMillion: 16, minInputTokens: 272001,
+      effectiveFrom: "2026-09-22", effectiveUntil: "2027-01-01", sourceUrl: "https://platform.claude.com/docs/en/about-claude/pricing", verifiedAt: "2026-09-23" }] });
+    await open();
+    const details = required([...document.querySelectorAll(".model-advanced-drawer details")].find(element => element.textContent?.includes("Reference tariffs")));
+    await act(async () => details.querySelector("summary")?.click());
+    expect(details.textContent).toContain("2027-01-01 (exclusive)");
+    expect(details.textContent).toContain("272001 ≤ tokens");
+    expect(details.textContent).toContain("16 USD / 1M");
+    expect(details.querySelector("a")?.getAttribute("rel")).toBe("noopener noreferrer");
+  });
   it("opens the actual row into complete declared facts, route differences and keyboard close", async () => {
     const mounted = await mount(); await open();
     const dialog = required(document.querySelector<HTMLElement>(".model-advanced-drawer"));

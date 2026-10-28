@@ -57,6 +57,13 @@ function usageSnapshot(value: unknown): UsageSnapshot | undefined {
   const contextWindow = optionalNonnegative(value["contextWindow"]);
   const pricing = isRecord(value["pricingContext"]) ? value["pricingContext"] : undefined;
   const requestInputTokens = nonnegativeInteger(pricing?.["inputTokens"]);
+  const requestedAt = optionalNonnegative(pricing?.["requestedAt"]);
+  const cacheWrite1hTokens = optionalNonnegative(pricing?.["cacheWrite1hTokens"]);
+  const cacheWriteTtl = pricing?.["cacheWriteTtl"];
+  if (pricing !== undefined && (requestInputTokens === undefined
+    || pricing["requestedAt"] !== undefined && (requestedAt === undefined || requestedAt > 8_640_000_000_000_000)
+    || pricing["cacheWrite1hTokens"] !== undefined && (cacheWrite1hTokens === undefined || cacheWrite1hTokens > cacheWriteTokens)
+    || cacheWriteTtl !== undefined && cacheWriteTtl !== "5m" && cacheWriteTtl !== "1h")) return undefined;
   const native = value["nativeAccounting"];
   if (native !== undefined && (!isRecord(native) || Object.keys(native).length !== 4
     || typeof native["sourceId"] !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(native["sourceId"])
@@ -72,6 +79,9 @@ function usageSnapshot(value: unknown): UsageSnapshot | undefined {
     ...(contextWindow === undefined ? {} : { contextWindow }),
     ...(requestInputTokens === undefined ? {} : { pricingContext: {
       inputTokens: requestInputTokens,
+      ...(requestedAt === undefined ? {} : { requestedAt }),
+      ...(cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens }),
+      ...(cacheWriteTtl === "5m" || cacheWriteTtl === "1h" ? { cacheWriteTtl } : {}),
       ...(typeof pricing?.["fastMode"] === "boolean" || pricing?.["fastMode"] === "ultrafast" ? { fastMode: pricing["fastMode"] } : {})
     } }),
     cost

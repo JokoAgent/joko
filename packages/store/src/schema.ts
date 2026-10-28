@@ -2186,6 +2186,9 @@ CREATE TABLE usage_session_cursors (
         reported_cost_micros INTEGER CHECK (
           reported_cost_micros IS NULL OR reported_cost_micros >= 0
         ),
+        cache_write_1h_tokens INTEGER CHECK (
+          cache_write_1h_tokens IS NULL OR (cache_write_1h_tokens >= 0 AND cache_write_1h_tokens <= cache_write_tokens)
+        ),
         measured_at INTEGER NOT NULL CHECK (measured_at >= 0),
         revision INTEGER NOT NULL CHECK (revision >= 1),
         PRIMARY KEY(owner_id, session_id, source_id)

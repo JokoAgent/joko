@@ -338,7 +338,7 @@ export function pickSessionRuntimeFallback(input: {
   readonly current: SessionRuntimeProfile;
   readonly models: readonly ProviderModel[];
   readonly availableProviderIds: ReadonlySet<string>;
-  readonly explicitDefault?: { readonly providerId: string; readonly modelId: string };
+  readonly requireMatchingApi?: boolean;
   readonly visitedRoutes: readonly string[];
   readonly currentHop: number;
   readonly maxHops: number;
@@ -347,17 +347,12 @@ export function pickSessionRuntimeFallback(input: {
   if (input.currentHop >= input.maxHops) return undefined;
   const visited = new Set(input.visitedRoutes);
   visited.add(sessionRuntimeRouteKey(input.current));
-  const candidates = [
-    ...input.models.filter((model) =>
+  const current = input.models.find(model => model.providerId === input.current.providerId && model.modelId === input.current.modelId);
+  const candidates = input.models.filter((model) =>
       model.modelId === input.current.modelId
       && model.providerId !== input.current.providerId
-      && input.availableProviderIds.has(model.providerId)),
-    ...input.models.filter((model) =>
-      input.explicitDefault !== undefined
-      && model.providerId === input.explicitDefault.providerId
-      && model.modelId === input.explicitDefault.modelId
-      && input.availableProviderIds.has(model.providerId))
-  ];
+      && input.availableProviderIds.has(model.providerId)
+      && (!input.requireMatchingApi || current !== undefined && current.api !== "unknown" && current.api !== "" && model.api === current.api));
   for (const candidate of candidates) {
     const route = { backendId: input.current.backendId, providerId: candidate.providerId, modelId: candidate.modelId };
     if (visited.has(sessionRuntimeRouteKey(route))) continue;

@@ -375,7 +375,7 @@ function projectAssistantEntry(
   message: Readonly<Record<string, unknown>>
 ): readonly PiNativeEntryProjection[] {
   const blocks = messageBlocks(message["content"], entry.id);
-  const usage = projectMessageUsage(message["usage"]);
+  const usage = projectMessageUsage(message["usage"], undefined, message["timestamp"]);
   const generationTiming = usage === undefined
     ? undefined
     : projectMessageGenerationTiming(message["duration"]);
@@ -509,7 +509,7 @@ function projectMessageEntry(entry: PiNativeHistoryEntry): PiNativeEntryProjecti
   const message = record(entry.data["message"]) ?? {};
   const role = message["role"];
   if (role === "user" || role === "assistant") {
-    const usage = role === "assistant" ? projectMessageUsage(message["usage"]) : undefined;
+    const usage = role === "assistant" ? projectMessageUsage(message["usage"], undefined, message["timestamp"]) : undefined;
     const generationTiming = usage === undefined
       ? undefined
       : projectMessageGenerationTiming(message["duration"]);

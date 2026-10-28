@@ -36,4 +36,14 @@ describe("message usage projection", () => {
     expect(projectMessageGenerationTiming(Number.NaN)).toEqual({ generationReliable: false });
     expect(projectMessageGenerationTiming(Number.POSITIVE_INFINITY)).toEqual({ generationReliable: false });
   });
+
+  it("preserves native request time and the one-hour subset without inferring absent facts", () => {
+    const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 10, cacheWrite1h: 6 };
+    expect(projectMessageUsage(usage, false, 1_793_000_000_000)?.pricingContext)
+      .toEqual({ inputTokens: 16, fastMode: false, requestedAt: 1_793_000_000_000, cacheWrite1hTokens: 6 });
+    expect(projectMessageUsage({ ...usage, cacheWrite1h: 11 })).toBeUndefined();
+    expect(projectMessageUsage({ ...usage, cacheWrite1h: -1 })).toBeUndefined();
+    expect(projectMessageUsage({ ...usage, cacheWrite1h: undefined }, undefined, "yesterday")?.pricingContext)
+      .toEqual({ inputTokens: 16 });
+  });
 });

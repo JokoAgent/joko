@@ -517,7 +517,7 @@ function compareCandidates(left: SmartCandidate, right: SmartCandidate): number 
 function candidateRank(candidate: SmartCandidate): readonly (number | string)[] {
   const id = candidate.model.modelId.toLowerCase();
   const family = id.includes("luna") ? 0 : /(?:mini|flash|haiku|small|budget)/u.test(id) ? 1 : /(?:qwen|glm|deepseek|kimi)/u.test(id) ? 2 : 3;
-  const cost = candidate.model.cost.input > 0 || candidate.model.cost.output > 0
+  const cost = candidate.model.cost.input !== undefined && candidate.model.cost.output !== undefined
     ? candidate.model.cost.input + candidate.model.cost.output
     : Number.POSITIVE_INFINITY;
   return [family, cost, candidate.native ? 0 : 1, id, candidate.revision];

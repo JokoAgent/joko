@@ -1441,7 +1441,9 @@ describe("CodexBackendAdapter", () => {
       declaredSupportsFastMode: false,
       defaultVisible: true,
       cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
-      pricing: { currencyCode: "USD", fastModeMultiplier: 2, longContext: { inputTokenThreshold: 272_000 } }
+      pricing: { currencyCode: "USD", source: "providerReference", tariffs: expect.arrayContaining([
+        expect.objectContaining({ variant: "standard" }), expect.objectContaining({ variant: "fast" })
+      ]) }
     });
     expect(descriptor.models.find((model) => model.modelId === "gpt-6-sol")?.cost)
       .toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });

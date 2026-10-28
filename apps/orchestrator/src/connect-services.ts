@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { modelTokenPricesAt } from "@joko/core";
+import { priceMicros } from "./model-pricing-projection.js";
 import type { ExtensionSettingsManager } from "./extension-settings.js";
 import type { ExtensionDirectoryPicker, ExtensionDirectoryPage, PickedExtensionDirectory } from "./extension-directory-picker.js";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
@@ -2391,6 +2393,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
       authenticate(context);
       const desired = request.desired;
       if (desired === undefined) throw invalidArgument("A model price is required.");
+      if (desired.inputCostMicrosPerMillion === undefined || desired.outputCostMicrosPerMillion === undefined) {
+        throw invalidArgument("Input and output prices are required for a model price override.");
+      }
       const reference = modelPriceReference(dependencies, request.backendId, request.providerId, request.modelId);
       const currencyCode = modelPriceCurrencyCode(desired.currency);
       const quote = {
@@ -9718,8 +9723,8 @@ interface ModelPriceReference {
   readonly modelId: string;
   readonly quote: {
     readonly currencyCode: "USD" | "CNY";
-    readonly inputCostMicrosPerMillion: number;
-    readonly outputCostMicrosPerMillion: number;
+    readonly inputCostMicrosPerMillion?: number;
+    readonly outputCostMicrosPerMillion?: number;
     readonly cacheReadCostMicrosPerMillion?: number;
     readonly cacheWriteCostMicrosPerMillion?: number;
   };
@@ -9750,25 +9755,19 @@ function modelPriceReference(
     candidate.providerId === providerId && candidate.modelId === modelId
   );
   if (model === undefined) throw new NotFoundError("Model", `${backendId}/${providerId}/${modelId}`);
-  const available = model.pricing !== undefined
-    || model.cost.input > 0
-    || model.cost.output > 0
-    || model.cost.cacheRead > 0
-    || model.cost.cacheWrite > 0;
+  const selected = modelTokenPricesAt(model, { at: Date.now() });
+  const cost = selected?.cost ?? {};
+  const available = Object.values(cost).some(value => value !== undefined);
   return {
     backendId,
     providerId,
     modelId,
     quote: {
       currencyCode: model.pricing?.currencyCode === "CNY" ? "CNY" : "USD",
-      inputCostMicrosPerMillion: priceMicros(model.cost.input),
-      outputCostMicrosPerMillion: priceMicros(model.cost.output),
-      ...((model.pricing?.cacheReadAvailable ?? model.cost.cacheRead > 0) ? {
-        cacheReadCostMicrosPerMillion: priceMicros(model.cost.cacheRead)
-      } : {}),
-      ...((model.pricing?.cacheWriteAvailable ?? model.cost.cacheWrite > 0) ? {
-        cacheWriteCostMicrosPerMillion: priceMicros(model.cost.cacheWrite)
-      } : {})
+      inputCostMicrosPerMillion: priceMicros(cost.input),
+      outputCostMicrosPerMillion: priceMicros(cost.output),
+      cacheReadCostMicrosPerMillion: priceMicros(cost.cacheRead),
+      cacheWriteCostMicrosPerMillion: priceMicros(cost.cacheWrite)
     },
     available,
     ...(model.pricing?.updatedAt === undefined ? {} : { registryUpdatedAt: model.pricing.updatedAt }),
@@ -9807,15 +9806,15 @@ function modelPriceOverrideView(
 
 function protoModelPriceQuote(value: {
   readonly currencyCode: "USD" | "CNY";
-  readonly inputCostMicrosPerMillion: number;
-  readonly outputCostMicrosPerMillion: number;
+  readonly inputCostMicrosPerMillion?: number;
+  readonly outputCostMicrosPerMillion?: number;
   readonly cacheReadCostMicrosPerMillion?: number;
   readonly cacheWriteCostMicrosPerMillion?: number;
 }): contract.ModelPriceQuote {
   return create(contract.ModelPriceQuoteSchema, {
     currency: value.currencyCode === "CNY" ? contract.ModelPriceCurrency.CNY : contract.ModelPriceCurrency.USD,
-    inputCostMicrosPerMillion: BigInt(value.inputCostMicrosPerMillion),
-    outputCostMicrosPerMillion: BigInt(value.outputCostMicrosPerMillion),
+    inputCostMicrosPerMillion: value.inputCostMicrosPerMillion === undefined ? undefined : BigInt(value.inputCostMicrosPerMillion),
+    outputCostMicrosPerMillion: value.outputCostMicrosPerMillion === undefined ? undefined : BigInt(value.outputCostMicrosPerMillion),
     ...(value.cacheReadCostMicrosPerMillion === undefined ? {} : {
       cacheReadCostMicrosPerMillion: BigInt(value.cacheReadCostMicrosPerMillion)
     }),
@@ -9840,13 +9839,6 @@ function sameModelPrice(
     && left.outputCostMicrosPerMillion === right.outputCostMicrosPerMillion
     && left.cacheReadCostMicrosPerMillion === right.cacheReadCostMicrosPerMillion
     && left.cacheWriteCostMicrosPerMillion === right.cacheWriteCostMicrosPerMillion;
-}
-
-function priceMicros(value: number): number {
-  if (!Number.isFinite(value) || value < 0 || value * 1_000_000 > Number.MAX_SAFE_INTEGER) {
-    throw new StoreError("Model reference price is outside the supported range.");
-  }
-  return Math.round(value * 1_000_000);
 }
 
 export { providerRateLimitSettingKey } from "./provider-rate-limit.js";

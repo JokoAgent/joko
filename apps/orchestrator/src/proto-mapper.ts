@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { modelTokenPricesAt } from "@joko/core";
+import { protoModelPrice, toProtoModelReferenceTariff } from "./model-pricing-projection.js";
 import { posix } from "node:path";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import {
@@ -1879,8 +1881,10 @@ export function toProtoModelSelection(
 
 export function toProtoModelDescriptor(backendId: string, model: ProviderModel): ModelDescriptor {
   requireText(backendId, "model.backend_id");
+  const selected = modelTokenPricesAt(model, { at: Date.now() });
+  const cost = selected?.cost ?? {};
   const inferredPriceSource = model.pricing?.source
-    ?? (model.cost.input > 0 || model.cost.output > 0 || model.cost.cacheRead > 0 || model.cost.cacheWrite > 0
+    ?? (Object.values(cost).some(value => value !== undefined)
       ? "upstream"
       : undefined);
   return message<ModelDescriptor>("joko.v1.ModelDescriptor", {
@@ -1920,10 +1924,13 @@ export function toProtoModelDescriptor(backendId: string, model: ProviderModel):
     maxOutputTokensSource: model.maxOutputTokensSource,
     defaultVisible: model.defaultVisible,
     available: true,
-    inputCostMicrosPerMillion: costMicros(model.cost.input),
-    outputCostMicrosPerMillion: costMicros(model.cost.output),
-    cacheReadCostMicrosPerMillion: costMicros(model.cost.cacheRead),
-    cacheWriteCostMicrosPerMillion: costMicros(model.cost.cacheWrite),
+    inputCostMicrosPerMillion: protoModelPrice(cost.input),
+    outputCostMicrosPerMillion: protoModelPrice(cost.output),
+    cacheReadCostMicrosPerMillion: protoModelPrice(cost.cacheRead),
+    cacheWriteCostMicrosPerMillion: protoModelPrice(cost.cacheWrite),
+    referenceTariffs: model.pricing?.tariffs === undefined ? undefined : {
+      $typeName: "joko.v1.ModelReferenceTariffs", values: model.pricing.tariffs.map(toProtoModelReferenceTariff)
+    },
     currencyCode: model.pricing?.currencyCode ?? "USD",
     priceSource: inferredPriceSource === "providerReference"
       ? ModelPriceSource.PROVIDER_REFERENCE
@@ -6925,7 +6932,16 @@ export function toProtoUsage(value: UsageSnapshot): Usage {
     cacheWriteTokens: unsignedBigInt(value.cacheWriteTokens, "usage.cache_write_tokens"),
     totalTokens: unsignedBigInt(value.totalTokens, "usage.total_tokens"),
     costMicros: costMicros(value.cost),
-    currencyCode: "USD"
+    currencyCode: "USD",
+    pricingContext: value.pricingContext === undefined ? undefined : {
+      $typeName: "joko.v1.UsagePricingContext",
+      inputTokens: unsignedBigInt(value.pricingContext.inputTokens, "usage.pricing_context.input_tokens"),
+      speed: value.pricingContext.fastMode === undefined ? undefined : value.pricingContext.fastMode === "ultrafast" ? "ultrafast" : value.pricingContext.fastMode ? "fast" : "standard",
+      requestedAt: value.pricingContext.requestedAt === undefined ? undefined : toProtoTimestamp(value.pricingContext.requestedAt),
+      cacheWriteTtl: value.pricingContext.cacheWriteTtl,
+      cacheWrite1hTokens: value.pricingContext.cacheWrite1hTokens === undefined ? undefined
+        : unsignedBigInt(value.pricingContext.cacheWrite1hTokens, "usage.pricing_context.cache_write_1h_tokens")
+    }
   });
 }
 
@@ -7030,6 +7046,12 @@ export function toProtoContextUsage(value: UsageSnapshot, measuredAt: number): C
 }
 
 function fromProtoUsage(value: Usage, context?: ContextUsage): UsageSnapshot {
+  const pricing = value.pricingContext;
+  if (pricing !== undefined && (pricing.speed !== undefined && !["standard", "fast", "ultrafast"].includes(pricing.speed)
+    || pricing.cacheWriteTtl !== undefined && pricing.cacheWriteTtl !== "5m" && pricing.cacheWriteTtl !== "1h"
+    || pricing.cacheWrite1hTokens !== undefined && pricing.cacheWrite1hTokens > value.cacheWriteTokens)) {
+    throw new ProtoMappingError("invalid_argument", "usage.pricing_context", "Invalid request pricing context.");
+  }
   const used = context === undefined ? undefined : safeNumber(context.usedTokens, "context.used_tokens");
   const window = context === undefined ? undefined : safeNumber(context.contextWindowTokens, "context.context_window_tokens");
   const cost = safeNumber(value.costMicros, "usage.cost_micros") / 1_000_000;
@@ -7041,6 +7063,13 @@ function fromProtoUsage(value: Usage, context?: ContextUsage): UsageSnapshot {
     totalTokens: safeNumber(value.totalTokens, "usage.total_tokens"),
     ...(used === undefined ? {} : { contextTokens: used }),
     ...(window === undefined ? {} : { contextWindow: window }),
+    ...(pricing === undefined ? {} : { pricingContext: {
+      inputTokens: safeNumber(pricing.inputTokens, "usage.pricing_context.input_tokens"),
+      ...(pricing.speed === undefined ? {} : { fastMode: pricing.speed === "ultrafast" ? "ultrafast" as const : pricing.speed === "fast" }),
+      ...(pricing.requestedAt === undefined ? {} : { requestedAt: fromProtoTimestamp(pricing.requestedAt)! }),
+      ...(pricing.cacheWriteTtl === undefined ? {} : { cacheWriteTtl: pricing.cacheWriteTtl as "5m" | "1h" }),
+      ...(pricing.cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens: safeNumber(pricing.cacheWrite1hTokens, "usage.pricing_context.cache_write_1h_tokens") })
+    } }),
     cost
   };
 }

@@ -2272,14 +2272,17 @@ export interface UsageTokenTotals {
 }
 
 export interface UsageCostRates {
-  /** USD micros charged for one million tokens in the corresponding class. */
-  readonly inputMicrosPerMillion: number;
-  readonly outputMicrosPerMillion: number;
+  /** Micros of the observation's currency for one million tokens in the corresponding class. */
+  readonly inputMicrosPerMillion?: number;
+  readonly outputMicrosPerMillion?: number;
   readonly cacheReadMicrosPerMillion?: number;
   readonly cacheWriteMicrosPerMillion?: number;
+  readonly cacheWrite1hMicrosPerMillion?: number;
 }
 
 export interface RecordUsageObservationInput extends UsageTokenTotals {
+  /** Cumulative one-hour subset of cacheWriteTokens, when reported by the source. */
+  readonly cacheWrite1hTokens?: number;
   readonly ownerId: string;
   readonly sessionId: SessionId;
   /** Stable capability-neutral identity for one cumulative usage stream. */

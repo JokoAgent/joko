@@ -17987,14 +17987,26 @@ export class OperationalStore {
     const reportedCostMicros = input.reportedCostMicros === undefined
       ? undefined
       : safeUsageInteger(input.reportedCostMicros, "reported usage cost");
+    const cacheWrite1hTokens = input.cacheWrite1hTokens === undefined ? undefined
+      : safeUsageInteger(input.cacheWrite1hTokens, "one-hour cache-write tokens");
+    if (cacheWrite1hTokens !== undefined && cacheWrite1hTokens > current.cacheWriteTokens) {
+      throw new StoreError("One-hour cache-write tokens exceed total cache-write tokens.");
+    }
     const rates = input.costRates === undefined ? undefined : {
-      inputMicrosPerMillion: safeUsageInteger(input.costRates.inputMicrosPerMillion, "input usage rate"),
-      outputMicrosPerMillion: safeUsageInteger(input.costRates.outputMicrosPerMillion, "output usage rate"),
+      ...(input.costRates.inputMicrosPerMillion === undefined ? {} : {
+        inputMicrosPerMillion: safeUsageInteger(input.costRates.inputMicrosPerMillion, "input usage rate")
+      }),
+      ...(input.costRates.outputMicrosPerMillion === undefined ? {} : {
+        outputMicrosPerMillion: safeUsageInteger(input.costRates.outputMicrosPerMillion, "output usage rate")
+      }),
       ...(input.costRates.cacheReadMicrosPerMillion === undefined ? {} : {
         cacheReadMicrosPerMillion: safeUsageInteger(input.costRates.cacheReadMicrosPerMillion, "cache-read usage rate")
       }),
       ...(input.costRates.cacheWriteMicrosPerMillion === undefined ? {} : {
         cacheWriteMicrosPerMillion: safeUsageInteger(input.costRates.cacheWriteMicrosPerMillion, "cache-write usage rate")
+      }),
+      ...(input.costRates.cacheWrite1hMicrosPerMillion === undefined ? {} : {
+        cacheWrite1hMicrosPerMillion: safeUsageInteger(input.costRates.cacheWrite1hMicrosPerMillion, "one-hour cache-write usage rate")
       })
     };
     const currencyCode = usageCurrency(input.currencyCode ?? "USD");
@@ -18044,6 +18056,8 @@ export class OperationalStore {
             && numberValue(prior["output_tokens"]) === current.outputTokens
             && numberValue(prior["cache_read_tokens"]) === current.cacheReadTokens
             && numberValue(prior["cache_write_tokens"]) === current.cacheWriteTokens
+            && (prior["cache_write_1h_tokens"] === null || prior["cache_write_1h_tokens"] === undefined
+              ? cacheWrite1hTokens === undefined : numberValue(prior["cache_write_1h_tokens"]) === cacheWrite1hTokens)
             && numberValue(prior["total_tokens"]) === current.totalTokens
             && (priorReported === null || priorReported === undefined
               ? reportedCostMicros === undefined
@@ -18062,6 +18076,17 @@ export class OperationalStore {
         totalTokens: usageCounterDelta(current.totalTokens, prior?.["total_tokens"])
       };
       const priorReported = prior?.["reported_cost_micros"];
+      const priorCacheWrite = prior === undefined ? 0 : numberValue(prior["cache_write_tokens"]);
+      const priorOneHour = prior?.["cache_write_1h_tokens"];
+      const cacheEpochReset = current.cacheWriteTokens < priorCacheWrite;
+      const oneHourDelta = cacheWrite1hTokens === undefined
+        ? priorOneHour == null || cacheEpochReset ? 0 : undefined
+        : prior === undefined || cacheEpochReset || priorCacheWrite === 0 ? cacheWrite1hTokens
+        : priorOneHour == null || cacheWrite1hTokens < numberValue(priorOneHour) ? undefined
+        : cacheWrite1hTokens - numberValue(priorOneHour);
+      // Missing or inconsistent subset history cannot price the newly observed
+      // cache writes. Keep token accounting and the known non-cache prices.
+      const knownOneHourDelta = oneHourDelta !== undefined && oneHourDelta <= delta.cacheWriteTokens ? oneHourDelta : undefined;
       let costMicros = 0;
       let costComplete = true;
       let estimated = false;
@@ -18078,7 +18103,7 @@ export class OperationalStore {
         costComplete = false;
         estimated = input.reportedCostEstimated === true;
       } else if (rates !== undefined) {
-        const estimate = usageEstimatedCost(delta, rates);
+        const estimate = usageEstimatedCost(delta, rates, knownOneHourDelta);
         costMicros = estimate.costMicros;
         costComplete = estimate.complete;
         estimated = true;
@@ -18099,8 +18124,8 @@ export class OperationalStore {
         INSERT INTO usage_session_cursors(
           owner_id, session_id, source_id, generation, backend_id, provider_id, model_id,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-          total_tokens, reported_cost_micros, measured_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          total_tokens, reported_cost_micros, measured_at, revision, cache_write_1h_tokens
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(owner_id, session_id, source_id) DO UPDATE SET
           generation = excluded.generation,
           backend_id = excluded.backend_id,
@@ -18110,6 +18135,7 @@ export class OperationalStore {
           output_tokens = excluded.output_tokens,
           cache_read_tokens = excluded.cache_read_tokens,
           cache_write_tokens = excluded.cache_write_tokens,
+          cache_write_1h_tokens = excluded.cache_write_1h_tokens,
           total_tokens = excluded.total_tokens,
           reported_cost_micros = excluded.reported_cost_micros,
           measured_at = MAX(usage_session_cursors.measured_at, excluded.measured_at),
@@ -18118,7 +18144,7 @@ export class OperationalStore {
         ownerId, sessionId, sourceId, generation, backendId, providerId, modelId,
         current.inputTokens, current.outputTokens, current.cacheReadTokens,
         current.cacheWriteTokens, current.totalTokens, reportedCostMicros ?? null,
-        measuredAt, asSqlInteger(revision)
+        measuredAt, asSqlInteger(revision), cacheWrite1hTokens ?? null
       );
 
       if (changed) {
@@ -23787,25 +23813,33 @@ function usageEstimatedCost(
     readonly cacheWriteTokens: number;
   },
   rates: {
-    readonly inputMicrosPerMillion: number;
-    readonly outputMicrosPerMillion: number;
+    readonly inputMicrosPerMillion?: number;
+    readonly outputMicrosPerMillion?: number;
     readonly cacheReadMicrosPerMillion?: number;
     readonly cacheWriteMicrosPerMillion?: number;
-  }
+    readonly cacheWrite1hMicrosPerMillion?: number;
+  },
+  oneHourTokens: number | undefined
 ): { readonly costMicros: number; readonly complete: boolean } {
+  const shortTokens = oneHourTokens === undefined ? 0 : delta.cacheWriteTokens - oneHourTokens;
   const value = (
-    delta.inputTokens * rates.inputMicrosPerMillion
-    + delta.outputTokens * rates.outputMicrosPerMillion
+    delta.inputTokens * (rates.inputMicrosPerMillion ?? 0)
+    + delta.outputTokens * (rates.outputMicrosPerMillion ?? 0)
     + delta.cacheReadTokens * (rates.cacheReadMicrosPerMillion ?? 0)
-    + delta.cacheWriteTokens * (rates.cacheWriteMicrosPerMillion ?? 0)
+    + shortTokens * (rates.cacheWriteMicrosPerMillion ?? 0)
+    + (oneHourTokens ?? 0) * (rates.cacheWrite1hMicrosPerMillion ?? 0)
   ) / 1_000_000;
   if (!Number.isFinite(value) || value > Number.MAX_SAFE_INTEGER) {
     throw new StoreError("Estimated usage cost exceeds the safe integer range.");
   }
   return {
     costMicros: Math.round(value),
-    complete: (delta.cacheReadTokens === 0 || rates.cacheReadMicrosPerMillion !== undefined)
-      && (delta.cacheWriteTokens === 0 || rates.cacheWriteMicrosPerMillion !== undefined)
+    complete: (delta.inputTokens === 0 || rates.inputMicrosPerMillion !== undefined)
+      && (delta.outputTokens === 0 || rates.outputMicrosPerMillion !== undefined)
+      && (delta.cacheReadTokens === 0 || rates.cacheReadMicrosPerMillion !== undefined)
+      && (delta.cacheWriteTokens === 0 || oneHourTokens !== undefined
+        && (shortTokens === 0 || rates.cacheWriteMicrosPerMillion !== undefined)
+        && (oneHourTokens === 0 || rates.cacheWrite1hMicrosPerMillion !== undefined))
   };
 }
 

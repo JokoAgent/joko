@@ -9,6 +9,7 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   CAPABILITIES,
+  knownModelTokenPrices,
   SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
   evaluateOrderedPolicyRules,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
@@ -7332,6 +7333,7 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
     ? canonicalPiThinkingLevels(authoritativeLevels)
     : supportedPiThinkingLevels(model.reasoning, thinkingLevelMap);
   const contextWindow = numeric(model.contextWindow, 128_000);
+  const nativeCost = knownModelTokenPrices(model.cost);
   return {
     providerId: model.provider,
     modelId: model.id,
@@ -7347,18 +7349,13 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
     supportsImages: Array.isArray(model.input) && model.input.includes("image"),
     supportsFastMode,
     thinkingLevels,
-    cost: {
-      input: numeric(model.cost?.input),
-      output: numeric(model.cost?.output),
-      cacheRead: numeric(model.cost?.cacheRead),
-      cacheWrite: numeric(model.cost?.cacheWrite)
-    },
-    ...(model.cost === undefined ? {} : {
-      pricing: {
+    cost: metadata?.cost ?? nativeCost,
+    ...(metadata?.pricing === undefined && (metadata?.cost !== undefined || Object.keys(nativeCost).length === 0) ? {} : {
+      pricing: metadata?.pricing ?? {
         source: "upstream" as const,
         currencyCode: "USD",
-        cacheReadAvailable: model.cost.cacheRead !== undefined,
-        cacheWriteAvailable: model.cost.cacheWrite !== undefined
+        cacheReadAvailable: nativeCost.cacheRead !== undefined,
+        cacheWriteAvailable: nativeCost.cacheWrite !== undefined
       }
     })
   };
@@ -8528,22 +8525,7 @@ function mergeProviderModels(managed: readonly ProviderModel[], native: readonly
 }
 
 function cloneProviderModel(model: ProviderModel): ProviderModel {
-  return {
-    ...model,
-    providerId: model.providerId,
-    modelId: model.modelId,
-    ...(model.logicalId === undefined ? {} : { logicalId: model.logicalId }),
-    displayName: model.displayName,
-    api: model.api,
-    contextWindow: model.contextWindow,
-    maxOutputTokens: model.maxOutputTokens,
-    supportsImages: model.supportsImages,
-    supportsFastMode: model.supportsFastMode ?? false,
-    ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible }),
-    thinkingLevels: [...model.thinkingLevels],
-    cost: { ...model.cost },
-    ...(model.pricing === undefined ? {} : { pricing: { ...model.pricing } })
-  };
+  return { ...structuredClone(model), supportsFastMode: model.supportsFastMode ?? false };
 }
 
 function validateNativeAuthOptions(options: PiAdapterOptions): void {

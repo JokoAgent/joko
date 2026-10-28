@@ -553,7 +553,7 @@ export class PiEventTranslator {
     }
     const blocks = await this.#messageBlocks(record.message);
     const usage = role === "assistant"
-      ? projectMessageUsage(record.message.usage, this.#isFastMode?.())
+      ? projectMessageUsage(record.message.usage, this.#isFastMode?.(), record.message.timestamp)
       : undefined;
     const generationTiming = usage === undefined
       ? undefined

@@ -204,8 +204,8 @@ function modelPriceInitialQuote(price: ModelPriceOverrideView): ModelPriceQuoteV
 function modelPriceDraft(quote: ModelPriceQuoteView | undefined, fallbackCurrency: ModelPriceQuoteView["currency"] = "USD"): ModelPriceDraft {
   return {
     currency: quote?.currency ?? fallbackCurrency,
-    input: quote === undefined ? "" : String(quote.inputPerMillion),
-    output: quote === undefined ? "" : String(quote.outputPerMillion),
+    input: quote?.inputPerMillion === undefined ? "" : String(quote.inputPerMillion),
+    output: quote?.outputPerMillion === undefined ? "" : String(quote.outputPerMillion),
     cacheRead: quote?.cacheReadPerMillion === undefined ? "" : String(quote.cacheReadPerMillion),
     cacheWrite: quote?.cacheWritePerMillion === undefined ? "" : String(quote.cacheWritePerMillion)
   };

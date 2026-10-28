@@ -147,12 +147,12 @@ message ModelDescriptor {
   repeated EffortLevel effort_levels = 9;
   bool supports_fast_mode = 10;
   bool available = 11;
-  int64 input_cost_micros_per_million = 12;
-  int64 output_cost_micros_per_million = 13;
+  optional int64 input_cost_micros_per_million = 12;
+  optional int64 output_cost_micros_per_million = 13;
   string currency_code = 14;
   ErrorInfo error = 15;
-  int64 cache_read_cost_micros_per_million = 16;
-  int64 cache_write_cost_micros_per_million = 17;
+  optional int64 cache_read_cost_micros_per_million = 16;
+  optional int64 cache_write_cost_micros_per_million = 17;
   optional bool default_visible = 18;
   ModelPriceSource price_source = 19;
   google.protobuf.Timestamp price_updated_at = 20;
@@ -172,6 +172,27 @@ message ModelDescriptor {
   ModelSourceDescriptor source = 33;
   bool supports_ultrafast_mode = 34;
   optional bool declared_supports_ultrafast_mode = 35;
+  ModelReferenceTariffs reference_tariffs = 36;
+}
+
+// Absence means no tariff metadata; a present empty list withdraws all tariffs.
+message ModelReferenceTariffs { repeated ModelReferenceTariff values = 1; }
+
+// Display/reference data only. These records never grant model membership.
+message ModelReferenceTariff {
+  string currency_code = 1;
+  string variant = 2;
+  optional int64 input_cost_micros_per_million = 3;
+  optional int64 output_cost_micros_per_million = 4;
+  optional int64 cache_read_cost_micros_per_million = 5;
+  optional int64 cache_write_cost_micros_per_million = 6;
+  optional int64 cache_write_1h_cost_micros_per_million = 7;
+  optional uint64 min_input_tokens = 8;
+  optional uint64 max_input_tokens = 9;
+  string effective_from = 10;
+  optional string effective_until = 11;
+  string source_url = 12;
+  string verified_at = 13;
 }
 
 enum ModelSourceKind {
@@ -344,8 +365,8 @@ enum ModelPriceCurrency {
 
 message ModelPriceQuote {
   ModelPriceCurrency currency = 1;
-  int64 input_cost_micros_per_million = 2;
-  int64 output_cost_micros_per_million = 3;
+  optional int64 input_cost_micros_per_million = 2;
+  optional int64 output_cost_micros_per_million = 3;
   optional int64 cache_read_cost_micros_per_million = 4;
   optional int64 cache_write_cost_micros_per_million = 5;
 }

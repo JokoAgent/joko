@@ -212,6 +212,17 @@ function ModelPricing({ controller, model, ownerKey, refreshRevision, disabled, 
   const priced = quote !== undefined && (price?.referenceAvailable || price?.override !== undefined);
   return <Section title={t("settings.modelAdvanced.pricing")}>
     {model.providerAccessKind === "subscription" && !priced ? <p>{t("modelPicker.subscription")}</p> : priced ? fields.map((field, i) => quote[field] === undefined ? null : <Fact key={field} label={t(labels[i]!)}>{quote[field]} {quote.currency} / 1M {price?.override !== undefined && price.reference[field] !== quote[field] && <del>{price.reference[field]} {price.reference.currency}</del>}</Fact>) : model.pricingKnown === true && model.pricingSource !== undefined && model.inputCostMicrosPerMillion === 0 && model.outputCostMicrosPerMillion === 0 ? <p>{t("modelPicker.free")}</p> : <p>{t("settings.modelAdvanced.noPricing")}</p>}
+    {(model.referenceTariffs?.length ?? 0) > 0 && <details>
+      <summary>{t("settings.modelPrice.tariffs")}</summary>
+      {model.referenceTariffs!.map((tariff, index) => <section key={index} className="model-advanced-section">
+        <h4>{t(`settings.modelPrice.${tariff.variant}`)} · {tariff.currencyCode}</h4>
+        <p>{t("settings.modelPrice.interval", { from: tariff.effectiveFrom, until: tariff.effectiveUntil ?? t("settings.modelPrice.openEnd") })}</p>
+        {(tariff.minInputTokens !== undefined || tariff.maxInputTokens !== undefined) && <p>{t("settings.modelPrice.tokens", { min: tariff.minInputTokens ?? 0, max: tariff.maxInputTokens ?? t("settings.modelPrice.openEnd") })}</p>}
+        {fields.map((field, i) => tariff[field] === undefined ? null : <Fact key={field} label={t(labels[i]!)}>{tariff[field]} {tariff.currencyCode} / 1M</Fact>)}
+        {tariff.cacheWrite1hPerMillion !== undefined && <Fact label={t("settings.modelPrice.cacheWrite1h")}>{tariff.cacheWrite1hPerMillion} {tariff.currencyCode} / 1M</Fact>}
+        <a href={tariff.sourceUrl} target="_blank" rel="noopener noreferrer">{t("settings.modelPrice.source", { date: tariff.verifiedAt })}</a>
+      </section>)}
+    </details>}
     {failed && <p role="alert">{t("settings.modelPrice.loadFailed")} <Button disabled={disabled} onClick={() => setRevision(value => value + 1)}>{t("common.retry")}</Button></p>}
     <Button tone="ghost" disabled={disabled} onClick={onEdit}>{t("settings.modelPrice.menu")}</Button>
   </Section>;
