@@ -10,7 +10,7 @@ export interface ClaudeSdkMcpModelServer {
 
 class ModelEndpointServer extends McpServer {
   #transport: Transport | undefined;
-  constructor(name: string, private readonly endpoint: ClaudeSdkMcpModelServer) { super({ name, version: "1.0.0" }); }
+  constructor(name: string, private readonly endpoint: ClaudeSdkMcpModelServer) { super({ name, version: "0.1.0" }); }
   override async connect(transport: Transport): Promise<void> {
     await this.#transport?.close(); this.#transport = transport;
     const closed = transport.onclose;

@@ -238,7 +238,7 @@ describe("mobile composer draft store", () => {
 
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).resolves.toEqual(attached);
     const raw = memory.values.get(mobileComposerDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":9');
+    expect(raw).toContain('"version":1');
     expect(raw).toContain('"slashCommands":[{"text":"/review"');
     expect(raw).toContain('"routeKind":"path"');
     expect(raw).toContain('"serialized":"@src/main.ts"');
@@ -281,7 +281,7 @@ describe("mobile composer draft store", () => {
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 9,
+      version: 1,
       identity: first,
       draft: {
         text: "@Task",
@@ -294,7 +294,7 @@ describe("mobile composer draft store", () => {
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
     memory.values.set(key, JSON.stringify({
-      version: 9,
+      version: 1,
       identity: second,
       draft: plainTextMobileComposerDraft("cross owner")
     }));

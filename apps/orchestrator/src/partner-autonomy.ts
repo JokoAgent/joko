@@ -10,7 +10,7 @@ const TYPES = ["stuck", "waiting", "errored", "usage-limit", "finished", "sweep"
 type EventType = typeof TYPES[number];
 const DAY = 24 * 60 * 60_000, FALLBACK = 2 * 60 * 60_000;
 const SETTINGS_SCOPE = "partner.autonomy.v1", SETTINGS_KEY = "settings";
-const FOLLOW_UP_VERSION = 5;
+const FOLLOW_UP_VERSION = 1;
 export interface PartnerAutonomySettings {
   readonly revision: number; readonly customized: boolean; readonly schedulerPartnerId?: string;
   readonly schedulerFallbackPartnerIds: readonly string[];

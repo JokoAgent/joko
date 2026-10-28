@@ -118,7 +118,7 @@ export async function snapshotNativeSkills(seeds: readonly ApprovedSkillSeed[], 
       skills = [...originals.filter(mount => !mount.seed.personal), Object.freeze({ seed: personal[0]!.seed, path, filePath, discovery: true })];
     }
     await mkdir(join(root, ".claude-plugin"));
-    const manifestPath = join(root, ".claude-plugin", "plugin.json"), manifest = JSON.stringify({ name: "joko-approved-skills", version: "1.0.0" });
+    const manifestPath = join(root, ".claude-plugin", "plugin.json"), manifest = JSON.stringify({ name: "joko-approved-skills", version: "0.1.0" });
     await writeFile(manifestPath, manifest, { flag: "wx", mode: 0o600 });
     derivedFiles.set(manifestPath, createHash("sha256").update(manifest).digest("hex"));
     const assertFilesCurrent = async (inputSignal: AbortSignal) => {

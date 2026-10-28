@@ -272,8 +272,8 @@ describe("remote Claude manager protocol", () => {
     cleanups.push(() => first.close());
     const hello = await first.request("hello", {}) as Record<string, unknown>;
     expect(hello).toMatchObject({
-      protocolVersion: 2,
-      managerVersion: "2.0.0",
+      protocolVersion: 1,
+      managerVersion: "0.1.0",
       managerGeneration: managerState.generation
     });
 
@@ -606,7 +606,7 @@ async function freshManagerFixture(module: typeof freshContextModule = freshCont
         freshContextClaim: claim, freshContextAuthority: authority }
     }),
     restartedRequest: async (method: string, params: Record<string, unknown>): Promise<unknown> => {
-      await restarted.handle({ v: 2, kind: "request", id: randomUUID(), method, params });
+      await restarted.handle({ v: 1, kind: "request", id: randomUUID(), method, params });
       const frame = frames.at(-1)!;
       if (frame["ok"] !== true) throw Object.assign(new Error("Manager request failed."), frame["error"]);
       return frame["value"];
@@ -856,7 +856,7 @@ class FrameClient {
     if (this.#closed) return Promise.reject(new Error("Manager test client is closed."));
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
-      this.#socket.write(`${JSON.stringify({ v: 2, kind: "request", id, method, params })}\n`);
+      this.#socket.write(`${JSON.stringify({ v: 1, kind: "request", id, method, params })}\n`);
     });
   }
 
@@ -914,8 +914,8 @@ class FrameClient {
       } else if (frame["kind"] === "callback") {
         if (this.modelCallback && ["productMcpConnect", "productMcpMessage", "productMcpClose"].includes(String(frame["callback"]))) {
           void this.modelCallback(String(frame["callback"]), frame["value"] as Record<string, unknown>).then(
-            value => this.#socket.write(`${JSON.stringify({ v: 2, kind: "callback_result", callbackId: frame["callbackId"], ok: true, value })}\n`),
-            () => this.#socket.write(`${JSON.stringify({ v: 2, kind: "callback_result", callbackId: frame["callbackId"], ok: false })}\n`),
+            value => this.#socket.write(`${JSON.stringify({ v: 1, kind: "callback_result", callbackId: frame["callbackId"], ok: true, value })}\n`),
+            () => this.#socket.write(`${JSON.stringify({ v: 1, kind: "callback_result", callbackId: frame["callbackId"], ok: false })}\n`),
           );
           continue;
         }
@@ -940,7 +940,7 @@ class FrameClient {
                 ? { accepted: true }
                 : { value: CALLBACK_TOKEN, declined: false };
         this.#socket.write(`${JSON.stringify({
-          v: 2,
+          v: 1,
           kind: "callback_result",
           callbackId: frame["callbackId"],
           ok: true,

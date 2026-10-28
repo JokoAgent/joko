@@ -1075,7 +1075,7 @@ function createManagedAgentServer(
 ): NativeMcpSdkServerConfig {
   return loaded.createSdkMcpServer({
     name: CLAUDE_MANAGED_AGENT_SERVER,
-    version: "1.0.0",
+    version: "0.1.0",
     tools: [{
       name: CLAUDE_MANAGED_AGENT_TOOL,
       description: "Run an exactly configured Joko-managed Claude subagent.",
@@ -1144,7 +1144,7 @@ export function createProductMcpServers(tools: readonly ClaudeSdkMcpTool[]): Rec
     if (name === CLAUDE_MANAGED_AGENT_SERVER || Object.hasOwn(servers, name)) {
       throw new Error("The product MCP server identity is ambiguous.");
     }
-    const instance = new McpServer({ name, version: "1.0.0" });
+    const instance = new McpServer({ name, version: "0.1.0" });
     for (const tool of entries) {
       const validate = jsonSchema.getValidator<Readonly<Record<string, unknown>>>(
         tool.inputSchema as Parameters<typeof jsonSchema.getValidator>[0]

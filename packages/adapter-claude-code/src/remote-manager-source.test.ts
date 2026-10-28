@@ -50,8 +50,8 @@ describe("remote Claude manager bundle", () => {
         executeBundle(root, "source-manager.mjs", source),
         executeBundle(root, "built-manager.mjs", built)
       ]);
-      expect(sourceIdentity).toMatchObject({ managerVersion: "2.0.0", protocolVersion: 2 });
-      expect(builtIdentity).toMatchObject({ managerVersion: "2.0.0", protocolVersion: 2 });
+      expect(sourceIdentity).toMatchObject({ managerVersion: "0.1.0", protocolVersion: 1 });
+      expect(builtIdentity).toMatchObject({ managerVersion: "0.1.0", protocolVersion: 1 });
       expect(sourceIdentity.managerSha256).toBe(createHash("sha256").update(source).digest("hex"));
       expect(builtIdentity.managerSha256).toBe(createHash("sha256").update(built).digest("hex"));
       await unlink(join(root, "fresh-context-owner.js"));
@@ -118,7 +118,7 @@ async function exerciseEmbeddedStore(modulePath: string, storeRoot: string): Pro
   });
   const connection = new manager.ManagerConnection(socket, state);
   await connection.handle({
-    v: 2,
+    v: 1,
     kind: "request",
     id: "embedded-store",
     method: "store.prepareImport",
@@ -133,7 +133,7 @@ async function exerciseEmbeddedStore(modulePath: string, storeRoot: string): Pro
     }
   });
   expect(frames).toEqual([expect.objectContaining({
-    v: 2,
+    v: 1,
     kind: "response",
     id: "embedded-store",
     ok: true,
@@ -149,9 +149,9 @@ async function exerciseEmbeddedStore(modulePath: string, storeRoot: string): Pro
       nativeSessionId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", generation: 2
     }, targetId: "target.embedded", workspaceAuthority: "workspace.embedded", workspaceRoot: storeRoot
   };
-  await connection.handle({ v: 2, kind: "request", id: "fresh-reserve", method: "fresh.reserve", params: { authority, identity } });
+  await connection.handle({ v: 1, kind: "request", id: "fresh-reserve", method: "fresh.reserve", params: { authority, identity } });
   expect(frames.at(-1)).toMatchObject({ ok: true, value: { lifecycle: "reserved", dispatch: "never_dispatched" } });
-  await connection.handle({ v: 2, kind: "request", id: "fresh-adopt", method: "fresh.adopt", params: {
+  await connection.handle({ v: 1, kind: "request", id: "fresh-adopt", method: "fresh.adopt", params: {
     authority, identity, proof: { retirementConfirmed: true }
   } });
   expect(frames.at(-1)).toMatchObject({ ok: true, value: { lifecycle: "adopted", sourceRetired: true } });
@@ -160,13 +160,13 @@ async function exerciseEmbeddedStore(modulePath: string, storeRoot: string): Pro
   });
   const restarted = new manager.ManagerConnection(socket, restartedState);
   const nextBinding = { ...identity, binding: { ...identity.binding, generation: 3 } };
-  await restarted.handle({ v: 2, kind: "request", id: "fresh-reclaim", method: "fresh.claim", params: {
+  await restarted.handle({ v: 1, kind: "request", id: "fresh-reclaim", method: "fresh.claim", params: {
     authority: { ...authority, generation: 2 }, input: nextBinding, proof: { retirementConfirmed: true }
   } });
   expect(frames.at(-1)).toMatchObject({ ok: true, value: {
     lifecycle: "adopted", backendGeneration: 2, binding: { generation: 3 }, dispatch: "never_dispatched"
   } });
-  await restarted.handle({ v: 2, kind: "request", id: "fresh-delete", method: "fresh.deleteEmptyBinding", params: {
+  await restarted.handle({ v: 1, kind: "request", id: "fresh-delete", method: "fresh.deleteEmptyBinding", params: {
     authority: { ...authority, generation: 2 }, input: nextBinding, proof: { retirementConfirmed: true }
   } });
   expect(frames.at(-1)).toMatchObject({ ok: true, value: { lifecycle: "cleaned", dispatch: "never_dispatched" } });

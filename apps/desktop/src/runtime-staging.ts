@@ -362,7 +362,7 @@ export function extensionLibraryElectronSmokeSource(): string {
     'const surfaceAuthority = {',
     '  ...authority,',
     '  packageName: "@joko/runtime-smoke",',
-    '  packageVersion: "1.0.0",',
+    '  packageVersion: "0.1.0",',
     '  extensionEntry: authority.library.extensionEntry,',
     '  mainView: { html: "ui/index.html" },',
     '  library: { schemaVersion: authority.library.schemaVersion }',
