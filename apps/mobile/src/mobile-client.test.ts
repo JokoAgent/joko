@@ -5,9 +5,6 @@ import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSess
 import { SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
 import type { MobileCollaborationRpc } from "./mobile-collaboration";
 import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
-import { createPartnerRoutineApi, newRoutineDefinition, ListPartnerRoutinesResponseSchema, PartnerRoutineSchema,
-  SavePartnerRoutineResponseSchema, RunPartnerRoutineResponseSchema, DeletePartnerRoutineResponseSchema,
-  ListPartnerRoutineRunsResponseSchema, GetPartnerRoutineCreationResponseSchema, RetirePartnerRoutineCreationResponseSchema } from "@joko/contracts";
 import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemoryKind, ReadPartnerMemoryResponseSchema, UpdatePartnerMemoryResponseSchema, DeletePartnerMemoryResponseSchema,
   GetPartnerMemoryPreferencesResponseSchema, UpdatePartnerMemoryPreferencesResponseSchema } from "@joko/contracts";
 import { Code } from "@connectrpc/connect";
@@ -3958,53 +3955,6 @@ describe("mobile Partner private authority", () => {
     expect(rpc.getPartnerConnections).toHaveBeenCalledOnce(); editor.dispose();
   });
 
-  it.each(["task", "background"] as const)("binds profile routines to the canonical Task and keeps an unknown creation receipt after %s retirement", async (retirement) => {
-    const network = fakeNetwork();
-    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
-    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
-    network.getPartnerProfileOptions = vi.fn(async () => profileSnapshot.options); network.updatePartnerProfile = vi.fn();
-    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [profilePartner] }));
-    const routine = create(PartnerRoutineSchema, { id: "scoped-routine", partnerId: profilePartner.partnerId, revision: { value: 1n },
-      definition: { ...newRoutineDefinition(), name: "Scoped routine", prompt: "Check the project." } });
-    let finish!: () => void; const gate = new Promise<void>(resolve => { finish = resolve; });
-    const rpc: Parameters<typeof createPartnerRoutineApi>[0]["rpc"] = {
-      listPartnerRoutines: vi.fn(async () => create(ListPartnerRoutinesResponseSchema, { partnerId: profilePartner.partnerId,
-        partnerRevision: { value: profilePartner.revision }, writable: true })),
-      savePartnerRoutine: vi.fn(async () => { await gate; return create(SavePartnerRoutineResponseSchema, { routine }); }),
-      runPartnerRoutine: vi.fn(async () => create(RunPartnerRoutineResponseSchema)),
-      deletePartnerRoutine: vi.fn(async () => create(DeletePartnerRoutineResponseSchema)),
-      listPartnerRoutineRuns: vi.fn(async () => create(ListPartnerRoutineRunsResponseSchema)),
-      getPartnerRoutineCreation: vi.fn(async () => create(GetPartnerRoutineCreationResponseSchema, { routine })),
-      retirePartnerRoutineCreation: vi.fn(async () => create(RetirePartnerRoutineCreationResponseSchema))
-    };
-    network.partnerRoutineApi = vi.fn((_credential, partnerId, ownerKey, newRequestId, assertCurrent) =>
-      createPartnerRoutineApi({ rpc, partnerId, ownerKey, newRequestId, assertCurrent }));
-    const requestId = "routine-creation-owned-001"; const app = client(network, memoryStorage(credential).storage, undefined, () => 2000, () => requestId);
-    await app.start(); await app.select("session");
-    const ownerKey = app.partnerProfileTransport()!.ownerKey;
-    const values = new Map<string, string>(); const receipts = { getItem: (key: string) => values.get(key) ?? null,
-      setItem: (key: string, value: string) => { values.set(key, value); }, removeItem: (key: string) => { values.delete(key); } };
-    const home = app.partnerRoutineEditor(profilePartner.partnerId, receipts)!;
-    const editor = app.partnerRoutineEditor(profilePartner.partnerId, receipts, ownerKey)!;
-    expect(editor.api.ownerKey).toBe(ownerKey); expect(home.api.ownerKey).toBe(app.partnerDirectoryTransport()!.ownerKey);
-    expect(home.api.ownerKey).not.toBe(ownerKey); expect(app.partnerRoutineEditor(profilePartner.partnerId, receipts, "retired-task")).toBeUndefined();
-    await editor.refresh(); editor.edit({ name: "Scoped routine", prompt: "Check the project." });
-    const pending = editor.save(); await vi.waitFor(() => expect(rpc.savePartnerRoutine).toHaveBeenCalledOnce());
-    expect([...values.values()]).toEqual([requestId]);
-    if (retirement === "task") { await app.select(undefined); await home.api.list(new AbortController().signal); }
-    else app.setForeground(false);
-    const reads = vi.mocked(rpc.listPartnerRoutines).mock.calls.length;
-    await expect(editor.api.list(new AbortController().signal)).rejects.toThrow(/owner changed/u);
-    expect(rpc.listPartnerRoutines).toHaveBeenCalledTimes(reads); finish(); await pending;
-    expect(editor.state).toMatchObject({ requiresRefresh: true, pendingId: requestId }); expect(editor.state.selected).toBeUndefined();
-    expect([...values.values()]).toEqual([requestId]); await editor.save(); expect(rpc.savePartnerRoutine).toHaveBeenCalledOnce();
-    if (retirement === "background") app.setForeground(true); await app.select("session");
-    const recovered = app.partnerRoutineEditor(profilePartner.partnerId, receipts, app.partnerProfileTransport()!.ownerKey)!;
-    await recovered.refresh(); expect(recovered.state.selected?.id).toBe(routine.id); expect(recovered.state.pendingId).toBeUndefined();
-    expect(rpc.getPartnerRoutineCreation).toHaveBeenCalledWith({ partnerId: profilePartner.partnerId, requestId }, expect.anything());
-    expect(values.size).toBe(0); expect(rpc.savePartnerRoutine).toHaveBeenCalledOnce();
-    editor.dispose(); recovered.dispose(); home.dispose();
-  });
 
   it("requires the exact fresh catalog before saving a confirmed full-access Partner profile", async () => {
     const network = fakeNetwork(); let currentPartner = profilePartner;

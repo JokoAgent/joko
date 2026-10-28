@@ -39,8 +39,7 @@ import { MobilePartnerRestartPanel } from "./MobilePartnerRestartPanel";
 import { MobilePartnerRestartSheet } from "./MobilePartnerRestartSheet";
 import type { MobilePartnerRestartTransport } from "./mobile-partner-restart";
 import type { MobilePartnerDeletionTransport } from "./mobile-partner-deletion";
-import { partnerResumeMessages, routineMessages, type PartnerRoutineEditor, type PartnerResumeEditor } from "@joko/contracts";
-import { MobilePartnerRoutineSheet } from "./MobilePartnerRoutineSheet";
+import { partnerResumeMessages, type PartnerResumeEditor } from "@joko/contracts";
 import { MobilePartnerResumeSheet } from "./MobilePartnerResumeSheet";
 import { MobilePartnerMemorySheet } from "./MobilePartnerMemorySheet";
 import { partnerMemoryMessages, type PartnerMemoryEditor } from "@joko/contracts";
@@ -63,7 +62,6 @@ export interface MobilePartnerDirectoryScreenProps {
   readonly importFactory?: () => PartnerImportEditor | undefined;
   readonly deletionTransport?: MobilePartnerDeletionTransport;
   readonly restartTransport?: MobilePartnerRestartTransport;
-  readonly routineFactory?: (partnerId: string) => PartnerRoutineEditor | undefined;
   readonly resumeFactory?: (partner: MobilePartnerDirectoryProfile) => PartnerResumeEditor | undefined;
   readonly memoryFactory?: (partner: MobilePartnerDirectoryProfile) => PartnerMemoryEditor | undefined;
   readonly groupApi?: PartnerGroupApi;
@@ -199,7 +197,7 @@ function PartnerRow({ partner, colors, locale, opening, recoverable, online, obs
   </Pressable>;
 }
 
-export function MobilePartnerDirectoryScreen({ colors, locale, transport, observation, workingTransport, initializationTransport, creationTransport, importFactory, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory,
+export function MobilePartnerDirectoryScreen({ colors, locale, transport, observation, workingTransport, initializationTransport, creationTransport, importFactory, deletionTransport, restartTransport, resumeFactory, memoryFactory,
   groupApi, groupAttachments, groupCreationStorage, groupReceiptScope, groupSourceKey, initialGroupSelection, groupRoster, groupSourceClaimCurrent, groupSourceClaimRetained, onOpenGroupSource, onGroupOpened, onOpenConversations, onOpenIdentities, onBack, onOpenTask,
   roster, rosterActive = true, onOpenSource, onOpenSourceInitialization, readOfflineConversation }:
   MobilePartnerDirectoryScreenProps) {
@@ -229,7 +227,6 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   useEffect(() => () => importEditor?.dispose(), [importEditor]);
   const [deletion, setDeletion] = useState<{ readonly ownerKey: string; readonly partner: MobilePartnerDirectoryProfile }>();
   const [restart, setRestart] = useState<{ readonly ownerKey: string; readonly partner: MobilePartnerDirectoryProfile }>();
-  const [routine, setRoutine] = useState<PartnerRoutineEditor>();
   const [resume, setResume] = useState<PartnerResumeEditor>();
   const [memory, setMemory] = useState<PartnerMemoryEditor>();
   const [groupEntry, setGroupEntry] = useState<{ readonly selection: MobilePartnerGroupSelection; readonly groupId?: string }>();
@@ -245,7 +242,6 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
     setGroupEntry({ selection: initialGroupSelection, groupId: initialGroupSelection.groupId }); onGroupOpened?.();
   } }, [initialGroupSelection, groupApi?.ownerKey, groupReceiptScope, groupSourceKey]);
   useEffect(() => () => memory?.dispose(), [memory]);
-  useEffect(() => () => routine?.dispose(), [routine]);
   useEffect(() => () => resume?.dispose(), [resume]);
   const transportRef = useRef(transport);
   const requestRef = useRef<AbortController | undefined>(undefined);
@@ -289,7 +285,6 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
     setActionError(undefined);
     setDeletion(undefined);
     setRestart(undefined);
-    setRoutine(undefined);
     setResume(undefined);
     setMemory(undefined);
     requestRef.current?.abort(); requestRef.current = undefined;
@@ -643,9 +638,6 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
           {memoryFactory && item.initializationState === "ready" && item.canonicalSessionId && <View style={styles.deleteAction}>
             <Action label={partnerMemoryMessages(locale).title} colors={colors} disabled={openingId !== undefined || !transport}
               testID={`partnerDirectory.memory.${item.partnerId}`} onPress={() => setMemory(memoryFactory(item))} /></View>}
-          {routineFactory && item.initializationState === "ready" && item.canonicalSessionId && <View style={styles.deleteAction}>
-            <Action label={routineMessages(locale).title} colors={colors} disabled={openingId !== undefined || !transport}
-              testID={`partnerDirectory.routines.${item.partnerId}`} onPress={() => setRoutine(routineFactory(item.partnerId))} /></View>}
           {restartTransport && restartTransport.ownerKey === ownerKey && restartTransport.ownerKey === transport?.ownerKey
             && item.lifecycle === "active" && item.canonicalSessionId !== undefined
             && <View style={styles.deleteAction}><Action label={mobileMessage(locale, "partnerRestart.action")} colors={colors}
@@ -656,7 +648,6 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
               testID={`partnerDirectory.resume.${item.partnerId}`} onPress={() => setResume(resumeFactory(item))} /></View>}</View>;
       }} />}
     {memory && memory.api.ownerKey === ownerKey && <MobilePartnerMemorySheet editor={memory} colors={colors} locale={locale} onClose={() => setMemory(undefined)} />}
-    {routine && routine.api.ownerKey === ownerKey && <MobilePartnerRoutineSheet editor={routine} colors={colors} locale={locale} onClose={() => { setRoutine(undefined); load(); }} />}
     {resume && transport && resume.api.ownerKey === ownerKey && <MobilePartnerResumeSheet editor={resume} colors={colors} locale={locale}
       onClose={() => { setResume(undefined); load(); }} onChanged={load} />}
     {restart && restartTransport && restart.ownerKey === ownerKey && restart.ownerKey === restartTransport.ownerKey

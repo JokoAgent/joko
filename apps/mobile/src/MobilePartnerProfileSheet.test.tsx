@@ -5,9 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
 import type { MobilePartnerProfileSnapshot, MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import { profilePartner, profileSnapshot } from "./test/mobile-partner-profile";
-import { PartnerRoutineEditor, RoutineCreationReceipts, ListPartnerRoutinesResponseSchema,
-  ListPartnerRoutineRunsResponseSchema, GetPartnerRoutineCreationResponseSchema, RetirePartnerRoutineCreationResponseSchema,
-  type PartnerRoutineApi, type PartnerResumeEditor, PartnerMemoryEditor, type PartnerMemoryApi, type MemoryCatalog, type MemoryDetail } from "@joko/contracts";
+import { type PartnerResumeEditor, PartnerMemoryEditor, type PartnerMemoryApi, type MemoryCatalog, type MemoryDetail } from "@joko/contracts";
 import { create } from "@bufbuild/protobuf";
 import { PartnerConnectionsEditor, type PartnerConnectionsApi, type ConnectionsDetail } from "@joko/contracts";
 import { PartnerSkillsEditor, type PartnerSkillsApi, type PersonalSkillDetail } from "@joko/contracts";
@@ -72,17 +70,17 @@ it("edits and saves the independent input handoff switch while disabling edits f
   expect(active.save).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ capabilities: expect.objectContaining({ inputHandoff: false }) }), expect.any(AbortSignal));
   const inherited = { ...profilePartner, usesDirectoryDefaults: true };
   const inheritedTransport = transport("inherited-owner"); inheritedTransport.load = vi.fn(async () => ({ ...profileSnapshot, partner: inherited, ownerKey: inheritedTransport.ownerKey }));
-  await render(inheritedTransport, undefined, undefined, inherited);
+  await render(inheritedTransport, undefined, inherited);
   expect(container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!.disabled).toBe(true);
 });
 async function render(active?: MobilePartnerProfileTransport, resumeFactory?: (partner: typeof profilePartner) => PartnerResumeEditor | undefined,
-  routineFactory?: (partnerId: string, ownerKey: string) => PartnerRoutineEditor | undefined, partner = profilePartner,
+  partner = profilePartner,
   memoryFactory?: (partner: typeof profilePartner, ownerKey: string) => PartnerMemoryEditor | undefined,
   connectionsFactory?: (partner: typeof profilePartner, ownerKey: string) => PartnerConnectionsEditor | undefined,
   skillsFactory?: (partner: typeof profilePartner, ownerKey: string) => PartnerSkillsEditor | undefined) {
   if (!root) { container = document.createElement("div"); document.body.append(container); root = createRoot(container); }
   await act(async () => root.render(createElement(MobilePartnerProfileSheet, { visible: true, partner,
-    transport: active, resumeFactory, routineFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale: "en", onClose: close, onSaved: saved })));
+    transport: active, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale: "en", onClose: close, onSaved: saved })));
 }
 
 it.each(["memory", "skills"] as const)("opens the original %s destination after the learning request obtains a fresh profile", async destination => {
@@ -292,7 +290,7 @@ describe("MobilePartnerProfileSheet", () => {
     const active = transport();
     active.load = vi.fn(async () => ({ ...profileSnapshot, partner: current, models: [...axes, other], taskModels: [...axes, other] }));
     active.save = vi.fn(async (_snapshot, draft) => current = { ...current, ...draft, revision: current.revision + 1n, profileVersion: current.profileVersion + 1n });
-    await render(active, undefined, undefined, current);
+    await render(active, undefined, current);
     await press("backend · Alpha · Alpha Provider");
     await press("Other runtime · Alpha · Alpha Provider");
     await press("Save Partner");
@@ -322,7 +320,7 @@ describe("MobilePartnerProfileSheet", () => {
     await press("Save Partner"); expect(active.save).toHaveBeenCalledOnce();
     expect(current.capabilities).toEqual(profilePartner.capabilities);
     expect(current.taskModelOverride).toMatchObject({ backendId: "task-backend", modelId: "task-model", effort: "low", fastMode: false });
-    await act(async () => root.render(null)); await render(active, undefined, undefined, current);
+    await act(async () => root.render(null)); await render(active, undefined, current);
     await press("Use primary model"); await press("Save Partner");
     expect(active.save).toHaveBeenCalledTimes(2); expect(current.taskModelOverride).toBeUndefined();
   });
@@ -336,7 +334,7 @@ describe("MobilePartnerProfileSheet", () => {
       read: vi.fn(async () => entry), save: vi.fn(async (base, draft) => entry = { ...base, ...draft, summary: { ...base.summary, revision: base.summary.revision + 1n } }),
       remove: vi.fn(async () => { entry = undefined; }) };
     let editor!: PartnerSkillsEditor; const factory = vi.fn(() => editor = new PartnerSkillsEditor(api, owner));
-    await render(active, undefined, undefined, profilePartner, undefined, undefined, factory); await press("Personal skills");
+    await render(active, undefined, profilePartner, undefined, undefined, factory); await press("Personal skills");
     expect(factory).toHaveBeenCalledWith(profilePartner, active.ownerKey);
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="Save Partner"]')!.disabled).toBe(true);
     await press("Reports"); await press("Edit"); const body = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Instructions"]')!;
@@ -347,7 +345,7 @@ describe("MobilePartnerProfileSheet", () => {
     await press("Back"); await press("Reports"); await press("Delete"); expect(api.remove).not.toHaveBeenCalled();
     await act(async () => alerts.alert.mock.calls.at(-1)![2][1].onPress()); expect(api.remove).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("No matching skills.");
-    await render(transport("next-task"), undefined, undefined, profilePartner, undefined, undefined, factory);
+    await render(transport("next-task"), undefined, profilePartner, undefined, undefined, factory);
     await editor.refresh(); expect(api.save).toHaveBeenCalledOnce(); expect(api.remove).toHaveBeenCalledOnce();
   });
 
@@ -356,7 +354,7 @@ describe("MobilePartnerProfileSheet", () => {
     const modelChain = models.slice(0, 3).map(model => ({ ...profilePartner.capabilities.modelChain[0]!, modelId: model.modelId }));
     const partner = { ...profilePartner, capabilities: { ...profilePartner.capabilities, modelChain } };
     const active = transport(); vi.mocked(active.load).mockResolvedValue({ ...profileSnapshot, partner, models });
-    await render(active, undefined, undefined, partner);
+    await render(active, undefined, partner);
     await press("Add fallback model"); await press("Add fallback model");
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="Add fallback model"]')!.disabled).toBe(true);
     await press("Save Partner");
@@ -378,7 +376,7 @@ describe("MobilePartnerProfileSheet", () => {
     const api: PartnerConnectionsApi = { ownerKey: active.ownerKey, read: vi.fn(async () => current),
       save: vi.fn(async (_base, draft) => current = { ...current, ...draft, revision: (current.revision ?? 0n) + 1n }) };
     let editor!: PartnerConnectionsEditor; const factory = vi.fn(() => editor = new PartnerConnectionsEditor(api, owner));
-    await render(active, undefined, undefined, profilePartner, undefined, factory); await press("Skills & Connections");
+    await render(active, undefined, profilePartner, undefined, factory); await press("Skills & Connections");
     expect(factory).toHaveBeenCalledWith(profilePartner, active.ownerKey); expect(container.querySelector<HTMLButtonElement>('button[aria-label="Save Partner"]')!.disabled).toBe(true);
     await act(async () => container.querySelector<HTMLInputElement>('input[aria-label="Server"]')!.click()); await press("Save");
     expect(current.mcp).toEqual({ mode: "allowlist", ids: [] }); expect(api.save).toHaveBeenCalledOnce();
@@ -389,7 +387,7 @@ describe("MobilePartnerProfileSheet", () => {
     await act(async () => { native.state = "background"; for (const listener of native.listeners) listener(native.state); }); expect(editor.editable).toBe(false);
     await act(async () => { native.state = "active"; for (const listener of native.listeners) listener(native.state); }); expect(editor.state.requiresRefresh).toBe(true);
     await press("Refresh"); expect(editor.editable).toBe(true);
-    await render(transport("next-task"), undefined, undefined, profilePartner, undefined, factory); expect(container.querySelector('input[aria-label="Server"]')).toBeNull();
+    await render(transport("next-task"), undefined, profilePartner, undefined, factory); expect(container.querySelector('input[aria-label="Server"]')).toBeNull();
     await editor.refresh(); expect(api.save).toHaveBeenCalledTimes(2);
   });
   it("opens actual saved memories, edits and confirms deletion while protecting the parent profile", async () => {
@@ -403,7 +401,7 @@ describe("MobilePartnerProfileSheet", () => {
       remove: vi.fn(async () => { entry = undefined; }), preferences: vi.fn(async () => ({ owner, enabled: owner.memoryEnabled, userContext: "", revision: 5n })),
       savePreferences: vi.fn(async (base, patch) => { owner.memoryEnabled = patch.enabled ?? base.enabled; return { ...base, ...patch, owner, revision: 6n }; }) };
     const factory = vi.fn(() => editor = new PartnerMemoryEditor(api, owner));
-    await render(active, undefined, undefined, profilePartner, factory);
+    await render(active, undefined, profilePartner, factory);
     const parentListenerCount = native.listeners.size;
     await press("Saved memories");
     expect(factory).toHaveBeenCalledWith(profilePartner, active.ownerKey);
@@ -421,34 +419,14 @@ describe("MobilePartnerProfileSheet", () => {
     await act(async () => { user.value = "Complete personal context."; user.dispatchEvent(new Event("input", { bubbles: true })); });
     await act(async () => container.querySelector<HTMLInputElement>('input[aria-label="Remember things about me"]')!.click());
     await press("Done"); expect(api.savePreferences).toHaveBeenCalledWith(expect.any(Object), { enabled: false, userContext: "Complete personal context." }, expect.any(AbortSignal));
-    await render(transport("next-task"), undefined, undefined, profilePartner, factory);
+    await render(transport("next-task"), undefined, profilePartner, factory);
     await editor.refresh(); expect(native.listeners.size).toBe(parentListenerCount); expect(container.querySelector('input[aria-label="Search memories"]')).toBeNull();
     act(() => root.unmount()); root = undefined as unknown as Root; expect(native.listeners.size).toBe(0);
   });
-  it.each(["task", "partner"] as const)("opens the actual routine sheet under the Task owner, protects the parent and retires it on %s change", async (change) => {
-    const active = transport("node\u001ftask-session"); let editor!: PartnerRoutineEditor; let api!: PartnerRoutineApi;
-    const factory = vi.fn((partnerId: string, ownerKey: string) => {
-      api = { ownerKey, newRequestId: () => "routine-mounted-request-001", list: vi.fn(async () => create(ListPartnerRoutinesResponseSchema,
-        { partnerId, partnerRevision: { value: 2n }, writable: true })), save: vi.fn(), run: vi.fn(), remove: vi.fn(),
-        history: vi.fn(async () => create(ListPartnerRoutineRunsResponseSchema)), lookup: vi.fn(async () => create(GetPartnerRoutineCreationResponseSchema)),
-        retire: vi.fn(async () => create(RetirePartnerRoutineCreationResponseSchema)) };
-      return editor = new PartnerRoutineEditor(api, new RoutineCreationReceipts({ getItem: () => null, setItem: () => undefined, removeItem: () => undefined }, "node"), partnerId);
-    });
-    await render(active, undefined, factory);
-    const parentListenerCount = native.listeners.size;
-    await press("Routines");
-    expect(factory).toHaveBeenCalledWith(profilePartner.partnerId, active.ownerKey); expect(api.list).toHaveBeenCalledOnce();
-    expect(container.querySelector('button[aria-label="New routine"]')).toBeTruthy();
-    const parentClose = Array.from(container.querySelectorAll<HTMLButtonElement>('button[aria-label="Close"]')).at(-1)!;
-    expect(parentClose.disabled).toBe(true); await act(async () => parentClose.click()); expect(close).not.toHaveBeenCalled();
-    expect(container.querySelector<HTMLButtonElement>('button[aria-label="Save Partner"]')?.disabled).toBe(true);
-    expect(Array.from(container.querySelectorAll<HTMLInputElement>('input[aria-label="Name"]')).at(-1)?.disabled).toBe(true);
-    const nextPartner = change === "partner" ? { ...profilePartner, partnerId: "partner-b" } : profilePartner;
-    const next = transport(change === "task" ? "node\u001ftask-next" : active.ownerKey);
-    vi.mocked(next.load).mockResolvedValue({ ...profileSnapshot, ownerKey: next.ownerKey, partner: nextPartner });
-    await render(next, undefined, factory, nextPartner); expect(container.querySelector('button[aria-label="New routine"]')).toBeNull();
-    await editor.refresh(); expect(api.list).toHaveBeenCalledOnce(); expect(native.listeners.size).toBe(parentListenerCount);
-    act(() => root.unmount()); root = undefined as unknown as Root; expect(native.listeners.size).toBe(0);
+  it("keeps Partner profile editing available without exposing routine management on Mobile", async () => {
+    await render(transport());
+    expect(container.querySelector('button[aria-label="Routines"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="Save Partner"]')).toBeTruthy();
   });
   it("offers resume from paused settings and blocks its confirmation while a profile draft is dirty", async () => {
     const active = transport(); const paused = { ...profilePartner, lifecycle: "paused" as const, pauseCleanupPending: false };
