@@ -11,6 +11,8 @@ import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import type { HostedAgentSources } from "./hosted-agent-sources.js";
 import { ProviderGroupRuntime, providerGroupDefaultMember } from "./provider-group-runtime.js";
 import { SessionHost } from "./session-host.js";
+import { ProviderGroupService } from "./provider-group-service.js";
+import { providerGroupQuota } from "./provider-group-quota.js";
 import { mkdtemp } from "./test-paths.js";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -35,6 +37,71 @@ async function fixture() {
 }
 const prompt = (text: string): PromptInput => ({ text, images: [], files: [], mentions: [], disposition: "prompt" });
 async function until(predicate: () => boolean): Promise<void> { await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 8000, interval: 10 }); }
+
+async function rebalanceFixture() {
+  const f = await fixture(), members = [f.members[0]!, { ...f.members[1]!, nodeId: "other-execution-node", displayName: "Other computer" }];
+  const percentages = [70, 70];
+  vi.spyOn(f.groups.directory, "read").mockImplementation(async member => {
+    const index = members.findIndex(candidate => candidate.key === member.key), now = Date.now();
+    const model = f.registry.get(member.backendId).descriptor.models.find(model => model.providerId === member.providerId)!;
+    return { member, available: true, reachable: true, model, running: 0, assertCurrent: () => {}, quota: providerGroupQuota({ providerId: "test", observedAt: now,
+      primaryWindow: { usedPercent: 10, windowMinutes: 300, resetAt: now + 3_600_000 },
+      secondaryWindow: { usedPercent: percentages[index]!, windowMinutes: 10_080, resetAt: now + 7 * 86_400_000 } }, "test", "text", now) };
+  });
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: false, members }, 0n);
+  const sessionId = (await f.create("rebalance-original-source")).value.sessionId;
+  percentages[1] = 20;
+  const source = f.store.getSession(sessionId).descriptor;
+  const suggestion = await f.groups.service.rebalanceSuggestion(sessionId, BigInt(source.binding.generation), new AbortController().signal);
+  expect(suggestion?.toMemberKey).toBe(members[1]!.key);
+  const enqueue = () => f.host.enqueueInput({ operationId: "rebalance-original-send", connection: f.connection, sessionId, prompt: prompt("Exact queued owner input"),
+    providerGroupRebalance: { suggestionKey: suggestion!.suggestionKey, remember: true } }).value;
+  return { ...f, sessionId, source, suggestion: suggestion!, members, percentages, enqueue };
+}
+
+it("recovers quota consent from the original queued send after the service restarts and switches only once", async () => {
+  const f = await rebalanceFixture(), send = vi.spyOn(f.second, "send");
+  f.store.setQueuePaused({ sessionId: f.sessionId, paused: true, traceId: "hold-original" }); const queued = f.enqueue();
+  expect(f.store.getSetting("service", queued.queueItemId, "provider.group-rebalance-choice.v1").value).toMatchObject({ phase: "accepted", operationId: "rebalance-original-send", to: f.members[1]!.key });
+  expect(f.store.getSetting("service", f.sessionId, "provider.group-rebalance-auto.v1").value).toBe(true);
+  const restarted = new ProviderGroupService({ router: f.groups.router, sessions: f.host.providerGroupSessionPort() });
+  f.store.setQueuePaused({ sessionId: f.sessionId, paused: false, traceId: "resume-original" });
+  await restarted.beforeSend(f.sessionId, new AbortController().signal, queued.queueItemId);
+  expect(f.store.getSession(f.sessionId).descriptor.backendId).toBe(f.second.id);
+  expect(f.groups.store.binding(f.sessionId)?.memberKey).toBe(f.members[1]!.key);
+  await restarted.beforeSend(f.sessionId, new AbortController().signal, queued.queueItemId);
+  f.host.requestQueueDrain(f.sessionId); await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+  expect(send).toHaveBeenCalledOnce(); expect(f.store.getOperation("rebalance-original-send").status).toBe("completed"); await restarted.close();
+});
+
+it("restores the original native account and backs off after a positively failed balancing handoff", async () => {
+  const f = await rebalanceFixture(), originalSend = vi.spyOn(f.first, "send");
+  vi.spyOn(f.second, "createSession").mockRejectedValueOnce(new JokoError({ code: "START_FAILED", message: "Native process exited before creation", phase: "session_start",
+    retryable: true, stateMayHaveChanged: false, recovery: "Use the original account." }));
+  const queued = f.enqueue(); await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+  expect(f.store.getSession(f.sessionId).descriptor.backendId).toBe(f.first.id); expect(originalSend).toHaveBeenCalledOnce();
+  expect(f.groups.store.binding(f.sessionId)?.memberKey).toBe(f.members[0]!.key);
+  expect(await f.groups.service.rebalanceSuggestion(f.sessionId, BigInt(f.store.getSession(f.sessionId).descriptor.binding.generation), new AbortController().signal)).toBeUndefined();
+});
+
+it("retains the original balancing handoff after a native outcome is unknown without trying another effect", async () => {
+  const f = await rebalanceFixture(), create = vi.spyOn(f.second, "createSession").mockRejectedValueOnce(new JokoError({ code: "START_UNKNOWN", message: "Lost the original native response",
+    phase: "session_start", retryable: false, stateMayHaveChanged: true, recovery: "Inspect the original handoff." }));
+  const queued = f.enqueue(); await until(() => new SessionRuntimeHandoffStore(f.store).read(f.sessionId)?.pending?.phase === "unknown");
+  f.host.requestQueueDrain(f.sessionId); await new Promise(resolve => setTimeout(resolve, 25));
+  expect(create).toHaveBeenCalledOnce(); expect(f.store.getQueueItem(queued.queueItemId)).toMatchObject({ state: "accepted", body: { text: "Exact queued owner input" } });
+  expect(f.store.getSetting("service", queued.queueItemId, "provider.group-rebalance-choice.v1").value).toMatchObject({ phase: "started", operationId: "rebalance-original-send" });
+});
+
+it("keeps an admitted ask-only permission override while switching an unavailable group member", async () => {
+  const f = await fixture(); f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
+  const sessionId = (await f.create("ask-only-route")).value.sessionId;
+  f.groups.store.cool(f.key, { memberKey: f.members[0]!.key, cause: "usage-limit", until: Date.now() + 60_000 }, Date.now());
+  const queued = f.host.enqueueInput({ operationId: "ask-only-send", connection: f.connection, sessionId, prompt: prompt("Original ask-only input"), overrides: { permissionMode: "ask" } }).value;
+  await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+  expect(f.store.getSession(sessionId).descriptor.backendId).toBe(f.second.id);
+  expect(f.store.getQueueItem(queued.queueItemId).executionOverrides?.permissionMode).toBe("ask");
+});
 
 it("selects members by the exact requested speed without substituting ordinary Fast for Ultrafast", async () => {
   const f = await fixture(); f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);

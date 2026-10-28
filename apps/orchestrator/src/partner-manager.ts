@@ -494,7 +494,7 @@ export class PartnerManager {
       operationId = `partner-channel:${createHash('sha256').update(operationId).digest('hex')}`;
     }
     const primary = profile.capabilities.modelChain[0]!;
-    const result = await this.#sessionHost.createServiceSession({ operationId, serviceKind: 'partner', targetId: profile.homeTargetId,
+    const result = await this.#sessionHost.createServiceSession({ operationId, serviceKind: 'partner', targetId: profile.homeTargetId, hidden: true,
       runtimeBackendId: primary.backendId, title: `${profile.displayName}: ${input.title}`.slice(0, 200),
       providerId: primary.providerId, modelId: primary.modelId, ...(primary.effort === undefined ? {} : { effort: primary.effort }),
       fastMode: primary.fastMode, permissionMode: 'ask', planMode: profile.capabilities.planMode,

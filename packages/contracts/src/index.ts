@@ -146,3 +146,4 @@ export * from "./desktop-menu-bar-projection.js";
 export * from "./desktop-menu-bar-messages.js";
 export * from './remote-desktop-ice-limits.js';
 export * from "./gen/joko/v1/server_access_pb.js";
+export * from "./provider-group-rebalance.js";

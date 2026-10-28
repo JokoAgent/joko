@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { Code, ConnectError } from "@connectrpc/connect";
+import type { ExtensionSettingsCall, ExtensionSettingsHost } from "@joko/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -38,6 +39,73 @@ afterEach(async () => {
 });
 
 describe("Extension main view", () => {
+  it("opens disabled author settings before setup and confirms through an asynchronous host dialog", async () => {
+    const extension = { ...readyExtension(EXTENSION_A, "Settings"), enabled: false,
+      settings: { height: 480, mobileCustom: false }, setup: { state: "required" as const, revision: 1n, fields: [] } };
+    const surface = { ...mainViewSurface(extension), purpose: "settings" as const };
+    const apply = vi.fn();
+    const call = vi.fn(async (_surface: ExtensionMainViewSurfaceView, _call: ExtensionSettingsCall, host: ExtensionSettingsHost, signal: AbortSignal) => {
+      if (await host.confirm("Permission requested", "Use the declared workspace", signal)) apply();
+      return { configured: true };
+    });
+    const api = { open: vi.fn(async () => surface), close: vi.fn(async () => true), call };
+    const controller = controllerFor({ getExtension: vi.fn(async () => catalog(extension)), extensionSettingsApi: () => api,
+      getExtensionMainViewSurface: vi.fn(async () => surface) });
+    const rendered = await renderMainView(controller, EXTENSION_A, true);
+    const frame = required(rendered.container.querySelector<HTMLIFrameElement>("iframe"));
+    expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(api.open).toHaveBeenCalledWith(extension.id, extension.revision, expect.any(AbortSignal));
+    dispatchSettings(frame, "permission", { kind: "setup.complete" }, "https://foreign.example");
+    window.dispatchEvent(new MessageEvent("message", { source: window, origin: "null", data: settingsRequest("foreign", { kind: "setup.complete" }) }));
+    await settle(); expect(call).not.toHaveBeenCalled();
+    dispatchSettings(frame, "permission", { kind: "setup.complete" });
+    dispatchSettings(frame, "permission", { kind: "setup.complete" });
+    await settle();
+    expect(call).toHaveBeenCalledTimes(1); expect(apply).not.toHaveBeenCalled();
+    const dialog = required(document.querySelector('[role="alertdialog"]'));
+    expect(dialog.textContent).toContain("Use the declared workspace");
+    await act(async () => required(Array.from(dialog.querySelectorAll("button")).find(button => button.textContent === "common.confirm")).click());
+    await settle(); expect(apply).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+  });
+
+  it("preserves a settings document across fact refreshes and retires pending consent on a transport change", async () => {
+    const extension = { ...readyExtension(EXTENSION_A, "Settings"), settings: { height: 480, mobileCustom: false } };
+    const surface = { ...mainViewSurface(extension), purpose: "settings" as const };
+    const apply = vi.fn(), closed = vi.fn(async () => true), nextClosed = vi.fn(async () => true);
+    const api = { open: vi.fn(async () => surface), close: closed,
+      call: vi.fn(async (_surface: ExtensionMainViewSurfaceView, _call: ExtensionSettingsCall, host: ExtensionSettingsHost, signal: AbortSignal) => {
+        if (await host.confirm("Confirm", "Original owner only", signal)) apply(); return {};
+      }) };
+    const controller = controllerFor({ getExtension: vi.fn(async () => catalog(extension)), extensionSettingsApi: () => api,
+      getExtensionMainViewSurface: vi.fn(async () => surface) });
+    const rendered = await renderMainView(controller, EXTENSION_A, true);
+    const frame = required(rendered.container.querySelector<HTMLIFrameElement>("iframe"));
+    const refresh = { ...controller, state: { ...controller.state } };
+    await rendered.rerender(EXTENSION_A, refresh);
+    expect(rendered.container.querySelector("iframe")).toBe(frame);
+    expect(api.open).toHaveBeenCalledTimes(1); expect(closed).not.toHaveBeenCalled();
+    dispatchSettings(frame, "pending", { kind: "setup.complete" }); await settle();
+    expect(document.querySelector('[role="alertdialog"]')).not.toBeNull();
+    const next = { ...controller, state: { ...controller.state, connectionGeneration: (controller.state.connectionGeneration ?? 0) + 1 },
+      extensionSettingsApi: () => ({ ...api, close: nextClosed }) };
+    await rendered.rerender(EXTENSION_A, next);
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull(); expect(apply).not.toHaveBeenCalled();
+    expect(closed).toHaveBeenCalledWith(surface.id); expect(nextClosed).not.toHaveBeenCalled();
+  });
+
+  it("never opens an author surface from a catalog lookup completed after navigation", async () => {
+    const extensionA = { ...readyExtension(EXTENSION_A, "A"), settings: { height: 480, mobileCustom: false } };
+    const extensionB = { ...readyExtension(EXTENSION_B, "B"), settings: { height: 480, mobileCustom: false } };
+    const pending = deferred<ReturnType<typeof catalog>>();
+    const open = vi.fn(async () => ({ ...mainViewSurface(extensionB), purpose: "settings" as const }));
+    const controller = controllerFor({ getExtension: vi.fn(async (id: string) => id === extensionA.id ? pending.promise : catalog(extensionB)),
+      extensionSettingsApi: () => ({ open, close: vi.fn(async () => true), call: vi.fn() }) });
+    const rendered = await renderMainView(controller, EXTENSION_A, true);
+    await rendered.rerender(EXTENSION_B); pending.resolve(catalog(extensionA)); await settle();
+    expect(open).toHaveBeenCalledTimes(1); expect(open).toHaveBeenCalledWith(extensionB.id, extensionB.revision, expect.any(AbortSignal));
+  });
+
   it("opens an exact surface in a script-only sandbox, reloads, and fails closed when revoked", async () => {
     const extension = readyExtension(EXTENSION_A, "Review");
     const surface = mainViewSurface(extension);
@@ -324,22 +392,23 @@ function controllerFor(methods: Partial<AppController>): AppController {
   } as unknown as AppController;
 }
 
-async function renderMainView(controller: AppController, extensionId: string): Promise<{
+async function renderMainView(controller: AppController, extensionId: string, settings = false): Promise<{
   readonly container: HTMLDivElement;
-  readonly rerender: (nextExtensionId: string) => Promise<void>;
+  readonly rerender: (nextExtensionId: string, nextController?: AppController) => Promise<void>;
 }> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  const render = async (nextExtensionId: string): Promise<void> => {
+  const render = async (nextExtensionId: string, nextController = controller): Promise<void> => {
     await act(async () => root.render(<ExtensionMainViewPage
-      controller={controller}
+      controller={nextController}
       extensionId={nextExtensionId}
       t={(key) => key}
       navigationOpen
       onOpenNavigation={() => undefined}
       onOpenIndependent={() => undefined}
+      settings={settings}
     />));
     await settle();
   };
@@ -412,6 +481,11 @@ function librarySession(extensionId: string): ExtensionLibrarySessionView {
 
 function bridgeRequest(id: string, operation: unknown) {
   return { type: EXTENSION_LIBRARY_BRIDGE_REQUEST, version: 1, id, operation };
+}
+
+function settingsRequest(id: string, command: unknown) { return { type: "joko:extension-settings-request", version: 1, id, command }; }
+function dispatchSettings(frame: HTMLIFrameElement, id: string, command: unknown, origin = "null"): void {
+  window.dispatchEvent(new MessageEvent("message", { data: settingsRequest(id, command), origin, source: required(frame.contentWindow) }));
 }
 
 function dispatchBridge(frame: HTMLIFrameElement, id: string, operation: unknown, origin = "null"): void {

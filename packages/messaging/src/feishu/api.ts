@@ -12,6 +12,7 @@ import {
 import { parseFeishuContent } from "./content.js";
 import { requiredFeishuIdentifier } from "./codec.js";
 import type { FeishuHistoryMessage, FeishuService } from "./model.js";
+import { buildFeishuMarkdownCard } from './cards.js';
 
 export const FEISHU_MAXIMUM_FILE_BYTES = 30 * 1024 * 1024;
 export const FEISHU_MAXIMUM_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -49,7 +50,9 @@ export interface FeishuApiPort {
   listHistory(address: MessagingAddress, limit: number, signal?: AbortSignal): Promise<readonly FeishuHistoryMessage[]>;
   sendText(address: MessagingAddress, text: string, replyToMessageId?: string, signal?: AbortSignal): Promise<string>;
   sendAttachment(address: MessagingAddress, attachment: FeishuOutboundAttachment, replyToMessageId?: string, signal?: AbortSignal): Promise<string>;
-  sendCard(address: MessagingAddress, card: unknown, signal?: AbortSignal): Promise<string>;
+  sendCard(address: MessagingAddress, card: unknown, signal?: AbortSignal, replyToMessageId?: string): Promise<string>;
+  sendRichReply(address: MessagingAddress, text: string, images: readonly FeishuOutboundAttachment[], replyToMessageId?: string, signal?: AbortSignal, fallbackProgressMessageId?: string): Promise<string>;
+  recallMessage(messageId: string, signal?: AbortSignal): Promise<void>;
   patchCard(messageId: string, card: unknown, signal?: AbortSignal): Promise<void>;
   addReaction(messageId: string, emojiType: string, signal?: AbortSignal): Promise<void>;
 }
@@ -232,8 +235,38 @@ export class FeishuApi implements FeishuApiPort {
     });
   }
 
-  async sendCard(address: MessagingAddress, card: unknown, signal?: AbortSignal): Promise<string> {
-    return this.#effect(async () => this.#sendMessage(address, "interactive", JSON.stringify(card), undefined, signal));
+  async sendCard(address: MessagingAddress, card: unknown, signal?: AbortSignal, replyToMessageId?: string): Promise<string> {
+    return this.#effect(async () => this.#sendMessage(address, "interactive", JSON.stringify(card), replyToMessageId, signal));
+  }
+
+  async sendRichReply(address: MessagingAddress, text: string, images: readonly FeishuOutboundAttachment[], replyToMessageId?: string, signal?: AbortSignal, fallbackProgressMessageId?: string): Promise<string> {
+    return this.#effect(async () => {
+      const prepared: Array<{ key: string; alt: string }> = [];
+      for (const image of images) {
+        signal?.throwIfAborted();
+        if (image.kind !== 'image' || image.bytes.byteLength < 1 || image.bytes.byteLength > FEISHU_MAXIMUM_IMAGE_BYTES) throw payloadTooLarge('Feishu reply image exceeds its limit.');
+        const result = await this.#client.im.v1.image.create({ data: { image_type: 'message', image: Buffer.from(image.bytes) } });
+        signal?.throwIfAborted();
+        if (!result?.image_key) throw providerRejected('Feishu image upload returned no resource identity.');
+        prepared.push({ key: result.image_key, alt: image.fileName });
+      }
+      const card = buildFeishuMarkdownCard(text, prepared);
+      try { return await this.#sendMessage(address, 'interactive', JSON.stringify(card), replyToMessageId, signal); }
+      catch (error) {
+        // Updating the known progress lease is idempotent and does not replay
+        // the uncertain new-message effect or select a different recipient.
+        if (fallbackProgressMessageId) await this.patchCard(fallbackProgressMessageId, card, signal).catch(() => undefined);
+        throw error;
+      }
+    });
+  }
+
+  async recallMessage(messageId: string, signal?: AbortSignal): Promise<void> {
+    await this.#effect(async () => {
+      signal?.throwIfAborted();
+      const result = await this.#client.im.v1.message.delete({ path: { message_id: requiredFeishuIdentifier(messageId, 'message') } });
+      assertBusinessSuccess(result, 'progress recall'); signal?.throwIfAborted();
+    });
   }
 
   async patchCard(messageId: string, card: unknown, signal?: AbortSignal): Promise<void> {

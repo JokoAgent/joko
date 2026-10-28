@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import type { AppController } from "../controller.js";
 import { taskSourceKey } from "../task-sharing.js";
-import { partnerResumeMessages } from "@joko/contracts";
+import { partnerResumeMessages, providerGroupRebalanceMessages, type ProviderGroupRebalanceView } from "@joko/contracts";
 import type { ComposerSendShortcutPreference } from "../local-state.js";
 import { modelSourceAccess } from "../model-source-access.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
@@ -528,8 +528,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     enabled: voice.supported && !readOnly && submissionKind === undefined && !effectiveBashMode && hydratedSession === session.id,
     isActive: voice.isActive, getCaptureIdentity: voice.getCaptureIdentity, start: voice.start, finish: voice.finish, cancel: voice.cancel
   });
-  const sendRouteKey = JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId]);
-  const sendOwner = useMemo(() => ({}), [voiceDictionaryOwnerKey, controller.getArtifactUrl, controller.state.snapshot.generation, sendRouteKey]);
+  const sendRouteKey = JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId, session.effort, session.fastMode]);
+  const sendOwner = useMemo(() => ({}), [voiceDictionaryOwnerKey, controller.getArtifactUrl, controller.state.snapshot.generation, controller.state.connectionGeneration, session.generation, sendRouteKey]);
+  const [rebalanceConfirmation, setRebalanceConfirmation] = useState<{ readonly owner: object; readonly suggestion: ProviderGroupRebalanceView; readonly remember: boolean;
+    readonly finish: (choice: "switch" | "stay" | "cancel", remember?: boolean) => void }>();
   const applicationCommandFlightRef = useRef<{ readonly owner: object; readonly controller: AbortController } | undefined>(undefined);
   useLayoutEffect(() => () => {
     const flight = applicationCommandFlightRef.current;
@@ -1308,7 +1310,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     modeOverride?: DeliveryMode,
     completedDocument?: JSONContent,
     runtimeApplicationCommand?: "learn" | "goal" | "joko-make" | "joko-make-doctor",
-    pinnedController?: AppController
+    pinnedController?: AppController,
+    quotaChoice?: { readonly suggestionKey: string; readonly remember: boolean } | null
   ): void => {
     if (readOnly) return;
     const sourceController = pinnedController ?? controllerRef.current;
@@ -1901,6 +1904,51 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     if (modelRouteUnavailable || !(browserComments.length > 0 || canSend(draftText, attachments, mentions, composerDocumentQuotes(draftDocument), supportedModes, sourceDeliveryMode)) || !attachmentsAllowed(draftMedia, attachmentPolicy) || !composerMentionsAllowed(sourceMentions, mentionPolicy, resources)) return;
     const sourceSessionId = session.id;
     const owner = operationGuardRef.current.capture(sourceSessionId);
+    if (quotaChoice === undefined && sourceDeliveryMode === "prompt" && !session.activeRunId && sourceController.readTaskProviderGroupRebalance) {
+      if (!sourceGuard.beginSubmission(sourceSessionId, "send")) return;
+      setSubmissionKind("send");
+      const request = new AbortController(), sourceDocument = composerStackRef.current?.ownerDocument;
+      const flight = { owner: sourceSendOwner, controller: request }; applicationCommandFlightRef.current = flight;
+      const current = () => !request.signal.aborted && composerMountedRef.current && sourceEpoch !== undefined && sendEpochRef.current === sourceEpoch
+        && operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(owner) && sourceGuard.draftUnchanged(owner)
+        && sendStateRef.current.owner === sourceSendOwner && sendStateRef.current.connected && !sendStateRef.current.readOnly
+        && sendStateRef.current.route === sourceRoute && controllerRef.current.state.snapshot.sessions.find(item => item.id === sourceSessionId)?.generation === sourceGeneration;
+      const timer = setTimeout(() => request.abort(), 120_000);
+      runAction(`quota-rebalance:${sourceSessionId}`, async () => {
+        let delegated = false;
+        try {
+          let suggestion: ProviderGroupRebalanceView | undefined;
+          try { suggestion = await sourceController.readTaskProviderGroupRebalance!(sourceSessionId, sourceGeneration,
+            AbortSignal.any([request.signal, AbortSignal.timeout(3500)])); } catch { /* Unavailable quota never blocks ordinary sending. */ }
+          if (!current()) return;
+          let choice: { readonly suggestionKey: string; readonly remember: boolean } | null | undefined = null;
+          if (suggestion?.automatic) choice = { suggestionKey: suggestion.suggestionKey, remember: false };
+          else if (suggestion && sourceDocument) {
+            const original = suggestion;
+            choice = await new Promise<{ readonly suggestionKey: string; readonly remember: boolean } | null | undefined>(resolve => {
+              let finished = false;
+              const finish = (action: "switch" | "stay" | "cancel", remember = false) => {
+                if (finished) return; finished = true; request.signal.removeEventListener("abort", cancel);
+                setRebalanceConfirmation(value => value?.finish === finish ? undefined : value);
+                resolve(action === "cancel" || !current() ? undefined : action === "stay" ? null : { suggestionKey: original.suggestionKey, remember });
+              };
+              const cancel = () => finish("cancel");
+              setRebalanceConfirmation({ owner: sourceSendOwner, suggestion: original, remember: false, finish });
+              request.signal.addEventListener("abort", cancel, { once: true }); if (!current()) cancel();
+            });
+          }
+          if (choice === undefined || !current()) return;
+          finishSubmission(sourceSessionId, "send", sourceGuard);
+          delegated = true;
+          sendDraft(sourceDeliveryMode, draftDocument, runtimeApplicationCommand, sourceController, choice);
+        } finally {
+          clearTimeout(timer); request.abort();
+          if (applicationCommandFlightRef.current === flight) applicationCommandFlightRef.current = undefined;
+          if (!delegated) finishSubmission(sourceSessionId, "send", sourceGuard);
+        }
+      });
+      return;
+    }
     if (!operationGuardRef.current.beginSubmission(sourceSessionId, "send")) return;
     if (!operationGuardRef.current.consumeUnchangedDraft(owner)) {
       operationGuardRef.current.finishSubmission(sourceSessionId, "send");
@@ -2026,7 +2074,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           inlineMentionRanges: sourceMentionRanges,
           deliveryMode: sourceDeliveryMode,
           ...(sourceExtraDirectoryIds === undefined ? {} : { extraDirectoryIds: sourceExtraDirectoryIds })
-        }, { expectedGeneration: sourceGeneration });
+        }, { expectedGeneration: sourceGeneration, ...(quotaChoice ? { providerGroupRebalance: quotaChoice } : {}) });
         if (sourceReplyQuote) clearSentReplyQuote?.(sourceReplyQuote);
         if (sourceTodoQuote) clearSentTodoQuote?.(sourceTodoQuote);
         partnerConversation?.userSent?.();
@@ -3020,6 +3068,17 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       }}
     />
     {personalDevelopmentLaunch !== undefined && personalDevelopmentLaunch.sessionId === session.id && personalDevelopmentLaunch.owner === sendOwner && commandOptions.personalDevelopmentSupported && <PersonalDevelopmentSettings controller={controller} snapshot={controller.state.snapshot} t={t} launch={personalDevelopmentLaunch} />}
+    {rebalanceConfirmation?.owner === sendOwner && (() => {
+      const message = providerGroupRebalanceMessages(controller.state.effectiveLocale, rebalanceConfirmation.suggestion.fromLabel, rebalanceConfirmation.suggestion.toLabel);
+      return <Modal open title={message.title} ownerDocument={composerStackRef.current?.ownerDocument} dialogRole="alertdialog"
+        onClose={() => rebalanceConfirmation.finish("cancel")} closeLabel={message.cancel} size="small">
+        <p>{message.body}</p><label><CheckboxControl checked={rebalanceConfirmation.remember}
+          onChange={event => setRebalanceConfirmation(value => value ? { ...value, remember: event.target.checked } : value)} />{message.remember}</label>
+        <div className="modal-actions"><Button tone="ghost" onClick={() => rebalanceConfirmation.finish("cancel")}>{message.cancel}</Button>
+          <Button tone="ghost" onClick={() => rebalanceConfirmation.finish("stay")}>{message.keep}</Button>
+          <Button tone="primary" onClick={() => rebalanceConfirmation.finish("switch", rebalanceConfirmation.remember)}>{message.switchAndSend}</Button></div>
+      </Modal>;
+    })()}
     <Modal
       open={commandHelpOpen}
       title={t("composer.commands")}

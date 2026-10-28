@@ -13,12 +13,29 @@ import {
   reconcileMobileOptimisticUserRows,
   retireMobileOptimisticUserRow,
   retireMobileOptimisticUserRowsForSession,
+  updateMobileOptimisticUserRow,
   type MobileOptimisticUserRow
 } from "./mobile-optimistic-user-row";
 import type { TimelineRow } from "./timeline";
 
 describe("mobile optimistic user rows", () => {
   const ownerKey = "owner-one";
+
+  it("keeps the actual send time and original observed slot through upload progress and a later host echo", () => {
+    const input = plainTextMobileComposerDraft("Original send");
+    const progress = { phase: "preparing" as const, input, sentAt: 1_000 };
+    const original = appendMobileOptimisticUserRow([], [timelineRow("before")], ownerKey, "session-one", "op", input, progress);
+    const progressed = updateMobileOptimisticUserRow(original, ownerKey, "session-one", "op", { ...progress, phase: "sending" });
+    const echo = timelineRow("host-message", { kind: "user", operationId: "op", startedAtMs: 99_000 });
+    const submitted = markMobileOptimisticUserRowSubmitted(progressed, "session-one", "op");
+    const retained = reconcileMobileOptimisticUserRows(submitted, [timelineRow("before"), timelineRow("later"), echo], ownerKey, "session-one", new Set());
+    const projected = projectMobileOptimisticUserRows([timelineRow("before"), timelineRow("later"), echo], retained, ownerKey, "session-one");
+    expect(projected.map(row => row.id)).toEqual(["before", "host-message", "later"]);
+    expect(projected[1]).toMatchObject({ operationId: "op", startedAtMs: 1_000 });
+    expect(projected[1]?.pendingSend).toBeUndefined(); expect(projected[1]?.optimistic).not.toBe(true);
+    const foreign = updateMobileOptimisticUserRow(original, "another-owner", "session-one", "op", { ...progress, phase: "failed" });
+    expect(foreign[0]?.row.pendingSend?.phase).toBe("preparing");
+  });
 
   it("reserves one body-only slot from the structured draft and deduplicates exact sends", () => {
     const observed = [timelineRow("assistant-one")];

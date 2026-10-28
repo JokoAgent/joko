@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/provider_group.proto.
  */
 export const file_joko_v1_provider_group: GenFile = /*@__PURE__*/
-  fileDesc("Chxqb2tvL3YxL3Byb3ZpZGVyX2dyb3VwLnByb3RvEgdqb2tvLnYxIjsKEFByb3ZpZGVyR3JvdXBLZXkSEgoKYmFja2VuZF9pZBgBIAEoCRITCgtwcm92aWRlcl9pZBgCIAEoCSJzChRQcm92aWRlckdyb3VwU3VtbWFyeRIwCghzdHJhdGVneRgBIAEoDjIeLmpva28udjEuUHJvdmlkZXJHcm91cFN0cmF0ZWd5EhMKC2F1dG9fc3dpdGNoGAIgASgIEhQKDG1lbWJlcl9jb3VudBgDIAEoDSKxAQodUHJvdmlkZXJHcm91cFJlY2VpdmVkSWRlbnRpdHkSDwoHam9pbl9pZBgBIAEoCRIQCghzaGFyZV9pZBgCIAEoCRIRCgltZW1iZXJfaWQYAyABKAkSEgoKZ2VuZXJhdGlvbhgEIAEoBBIWCg5ob3N0X3NlcnZlcl9pZBgFIAEoCRIZChFuYXRpdmVfYmFja2VuZF9pZBgGIAEoCRITCgtwcm92aWRlcl9pZBgHIAEoCSKpAgoTUHJvdmlkZXJHcm91cE1lbWJlchILCgNrZXkYASABKAkSLgoEa2luZBgCIAEoDjIgLmpva28udjEuUHJvdmlkZXJHcm91cE1lbWJlcktpbmQSEgoKYmFja2VuZF9pZBgDIAEoCRITCgtwcm92aWRlcl9pZBgEIAEoCRIPCgdub2RlX2lkGAUgASgJEhQKDGRpc3BsYXlfbmFtZRgGIAEoCRIQCghjYXBhY2l0eRgHIAEoDRIOCgZ3ZWlnaHQYCCABKA0SDgoGcGF1c2VkGAkgASgIEjgKCHJlY2VpdmVkGAogASgLMiYuam9rby52MS5Qcm92aWRlckdyb3VwUmVjZWl2ZWRJZGVudGl0eRIZChFuYXRpdmVfYmFja2VuZF9pZBgLIAEoCSKLAQoTUHJvdmlkZXJHcm91cENvbmZpZxIwCghzdHJhdGVneRgBIAEoDjIeLmpva28udjEuUHJvdmlkZXJHcm91cFN0cmF0ZWd5EhMKC2F1dG9fc3dpdGNoGAIgASgIEi0KB21lbWJlcnMYAyADKAsyHC5qb2tvLnYxLlByb3ZpZGVyR3JvdXBNZW1iZXIifwoVUHJvdmlkZXJHcm91cFNuYXBzaG90EiYKA2tleRgBIAEoCzIZLmpva28udjEuUHJvdmlkZXJHcm91cEtleRIQCghyZXZpc2lvbhgCIAEoBBIsCgZjb25maWcYAyABKAsyHC5qb2tvLnYxLlByb3ZpZGVyR3JvdXBDb25maWciyAEKFlByb3ZpZGVyR3JvdXBDYW5kaWRhdGUSLAoGbWVtYmVyGAEgASgLMhwuam9rby52MS5Qcm92aWRlckdyb3VwTWVtYmVyEhUKDXByb3ZpZGVyX25hbWUYAiABKAkSEgoKYWdlbnRfa2luZBgDIAEoCRIRCglhdmFpbGFibGUYBCABKAgSGAoQcmVtb3RlbHlfZW5hYmxlZBgFIAEoCBIoCgZtb2RlbHMYBiADKAsyGC5qb2tvLnYxLk1vZGVsRGVzY3JpcHRvciIbChlMaXN0UHJvdmlkZXJHcm91cHNSZXF1ZXN0IkwKGkxpc3RQcm92aWRlckdyb3Vwc1Jlc3BvbnNlEi4KBmdyb3VwcxgBIAMoCzIeLmpva28udjEuUHJvdmlkZXJHcm91cFNuYXBzaG90IsEBChdHZXRQcm92aWRlckdyb3VwUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSFwoKYWdlbnRfa2luZBgCIAEoCUgAiAEBEhUKCG1vZGVsX2lkGAMgASgJSAGIAQESHQoQbG9naWNhbF9tb2RlbF9pZBgEIAEoCUgCiAEBQg0KC19hZ2VudF9raW5kQgsKCV9tb2RlbF9pZEITChFfbG9naWNhbF9tb2RlbF9pZCJ9ChhHZXRQcm92aWRlckdyb3VwUmVzcG9uc2USLQoFZ3JvdXAYASABKAsyHi5qb2tvLnYxLlByb3ZpZGVyR3JvdXBTbmFwc2hvdBIyCgdtZW1iZXJzGAIgAygLMiEuam9rby52MS5Qcm92aWRlckdyb3VwTWVtYmVyU3RhdGUiTAoiTGlzdFByb3ZpZGVyR3JvdXBDYW5kaWRhdGVzUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkiWgojTGlzdFByb3ZpZGVyR3JvdXBDYW5kaWRhdGVzUmVzcG9uc2USMwoKY2FuZGlkYXRlcxgBIAMoCzIfLmpva28udjEuUHJvdmlkZXJHcm91cENhbmRpZGF0ZSIVChNEZWxldGVQcm92aWRlckdyb3VwIskBChpVcGRhdGVQcm92aWRlckdyb3VwUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSGQoRZXhwZWN0ZWRfcmV2aXNpb24YAiABKAQSLgoGY29uZmlnGAMgASgLMhwuam9rby52MS5Qcm92aWRlckdyb3VwQ29uZmlnSAASLgoGZGVsZXRlGAQgASgLMhwuam9rby52MS5EZWxldGVQcm92aWRlckdyb3VwSABCCAoGdXBkYXRlIkwKG1VwZGF0ZVByb3ZpZGVyR3JvdXBSZXNwb25zZRItCgVncm91cBgBIAEoCzIeLmpva28udjEuUHJvdmlkZXJHcm91cFNuYXBzaG90IuEBChJQcm92aWRlckdyb3VwUXVvdGESDwoHbGltaXRlZBgBIAEoCBIaCg11c2FnZV9wZXJjZW50GAIgASgBSACIAQESFQoIcmVzZXRfYXQYAyABKAFIAYgBARIcCg93ZWVrbHlfcmVzZXRfYXQYBCABKAFIAogBARIfChJmaXZlX2hvdXJfcmVzZXRfYXQYBSABKAFIA4gBAUIQCg5fdXNhZ2VfcGVyY2VudEILCglfcmVzZXRfYXRCEgoQX3dlZWtseV9yZXNldF9hdEIVChNfZml2ZV9ob3VyX3Jlc2V0X2F0IrMBChhQcm92aWRlckdyb3VwTWVtYmVyU3RhdGUSEgoKbWVtYmVyX2tleRgBIAEoCRIRCglhdmFpbGFibGUYAiABKAgSEQoJcmVhY2hhYmxlGAMgASgIEhAKCG1vZGVsX2lkGAQgASgJEioKBXF1b3RhGAUgASgLMhsuam9rby52MS5Qcm92aWRlckdyb3VwUXVvdGESDwoHcnVubmluZxgGIAEoDRIOCgZyZWFzb24YByABKAki0wEKHlBpY2tQcm92aWRlckdyb3VwTWVtYmVyUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSEgoKc2Vzc2lvbl9pZBgCIAEoCRISCgphZ2VudF9raW5kGAMgASgJEhAKCG1vZGVsX2lkGAQgASgJEh0KEGxvZ2ljYWxfbW9kZWxfaWQYBSABKAlIAIgBARIbChNleGNsdWRlX21lbWJlcl9rZXlzGAYgAygJQhMKEV9sb2dpY2FsX21vZGVsX2lkIs0BCh9QaWNrUHJvdmlkZXJHcm91cE1lbWJlclJlc3BvbnNlEi0KBWdyb3VwGAEgASgLMh4uam9rby52MS5Qcm92aWRlckdyb3VwU25hcHNob3QSLAoGbWVtYmVyGAIgASgLMhwuam9rby52MS5Qcm92aWRlckdyb3VwTWVtYmVyEhAKCG1vZGVsX2lkGAMgASgJEioKBXF1b3RhGAQgASgLMhsuam9rby52MS5Qcm92aWRlckdyb3VwUXVvdGESDwoHcnVubmluZxgFIAEoDSK3AQoeQ29vbFByb3ZpZGVyR3JvdXBNZW1iZXJSZXF1ZXN0EiYKA2tleRgBIAEoCzIZLmpva28udjEuUHJvdmlkZXJHcm91cEtleRISCgptZW1iZXJfa2V5GAIgASgJEhAKCG1vZGVsX2lkGAMgASgJEg0KBWNhdXNlGAQgASgJEhUKCHJlc2V0X2F0GAUgASgBSACIAQESFAoMbW9kZWxfc2NvcGVkGAYgASgIQgsKCV9yZXNldF9hdCIhCh9Db29sUHJvdmlkZXJHcm91cE1lbWJlclJlc3BvbnNlImsKGFByb3ZpZGVyR3JvdXBBY3RpdmVMZWFzZRISCgpzZXNzaW9uX2lkGAEgASgJEhIKCm1lbWJlcl9rZXkYAiABKAkSEgoKYmFja2VuZF9pZBgDIAEoCRITCgtwcm92aWRlcl9pZBgEIAEoCSJnCiBSZXBvcnRQcm92aWRlckdyb3VwTGVhc2VzUmVxdWVzdBIQCghzZXF1ZW5jZRgBIAEoBBIxCgZsZWFzZXMYAiADKAsyIS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBBY3RpdmVMZWFzZSI1CiFSZXBvcnRQcm92aWRlckdyb3VwTGVhc2VzUmVzcG9uc2USEAoIYWNjZXB0ZWQYASABKAgihAQKFVByb3ZpZGVyR3JvdXBVc2FnZVJvdxIoCgVncm91cBgBIAEoCzIZLmpva28udjEuUHJvdmlkZXJHcm91cEtleRISCgptZW1iZXJfa2V5GAIgASgJEg8KB25vZGVfaWQYAyABKAkSEQoJbm9kZV9uYW1lGAQgASgJEhAKCHBhcnR5X2lkGAUgASgJEhIKCnBhcnR5X25hbWUYBiABKAkSEgoKYWdlbnRfa2luZBgHIAEoCRISCgpiYWNrZW5kX2lkGAggASgJEhMKC3Byb3ZpZGVyX2lkGAkgASgJEhAKCG1vZGVsX2lkGAogASgJEgsKA2RheRgLIAEoCRINCgV0dXJucxgMIAEoBBIUCgxpbnB1dF90b2tlbnMYDSABKAQSFQoNb3V0cHV0X3Rva2VucxgOIAEoBBIZChFjYWNoZV9yZWFkX3Rva2VucxgPIAEoBBIaChJjYWNoZV93cml0ZV90b2tlbnMYECABKAQSFAoMdG90YWxfdG9rZW5zGBEgASgEEhMKC2Nvc3RfbWljcm9zGBIgASgEEhUKDWN1cnJlbmN5X2NvZGUYEyABKAkSEQoJZXN0aW1hdGVkGBQgASgIEhcKD3Rva2Vuc19jb21wbGV0ZRgVIAEoCBIVCg1jb3N0X2NvbXBsZXRlGBYgASgIEg8KB2xhc3RfYXQYFyABKAEi/gEKHEdldFByb3ZpZGVyR3JvdXBVc2FnZVJlcXVlc3QSJgoDa2V5GAEgASgLMhkuam9rby52MS5Qcm92aWRlckdyb3VwS2V5EhUKCGZyb21fZGF5GAIgASgJSACIAQESGAoLdGhyb3VnaF9kYXkYAyABKAlIAYgBARIVCghwYXJ0eV9pZBgEIAEoCUgCiAEBEhQKB25vZGVfaWQYBSABKAlIA4gBARIVCghtb2RlbF9pZBgGIAEoCUgEiAEBQgsKCV9mcm9tX2RheUIOCgxfdGhyb3VnaF9kYXlCCwoJX3BhcnR5X2lkQgoKCF9ub2RlX2lkQgsKCV9tb2RlbF9pZCJNCh1HZXRQcm92aWRlckdyb3VwVXNhZ2VSZXNwb25zZRIsCgRyb3dzGAEgAygLMh4uam9rby52MS5Qcm92aWRlckdyb3VwVXNhZ2VSb3ciSgogR2V0VGFza1Byb3ZpZGVyR3JvdXBVc2FnZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRISCgpnZW5lcmF0aW9uGAIgASgEIr0BChdUYXNrUHJvdmlkZXJHcm91cE1lbWJlchIoCgVncm91cBgBIAEoCzIZLmpva28udjEuUHJvdmlkZXJHcm91cEtleRISCgptZW1iZXJfa2V5GAIgASgJEhEKCW5vZGVfbmFtZRgDIAEoCRISCgpiYWNrZW5kX2lkGAQgASgJEhMKC3Byb3ZpZGVyX2lkGAUgASgJEhAKCG1vZGVsX2lkGAYgASgJEhYKDnF1b3RhX3JlYWRhYmxlGAcgASgIIr8BCiFHZXRUYXNrUHJvdmlkZXJHcm91cFVzYWdlUmVzcG9uc2USMAoGbWVtYmVyGAEgASgLMiAuam9rby52MS5UYXNrUHJvdmlkZXJHcm91cE1lbWJlchI8Cg1hY2NvdW50X3VzYWdlGAIgASgLMiUuam9rby52MS5Qcm92aWRlckFjY291bnRVc2FnZVNuYXBzaG90EioKBXF1b3RhGAMgASgLMhsuam9rby52MS5Qcm92aWRlckdyb3VwUXVvdGEinAEKH1JlcG9ydFByb3ZpZGVyR3JvdXBVc2FnZVJlcXVlc3QSEAoIc2VxdWVuY2UYASABKAQSEQoJc2luY2VfZGF5GAIgASgJEhIKCnBhcnRfaW5kZXgYAyABKA0SEgoKcGFydF9jb3VudBgEIAEoDRIsCgRyb3dzGAUgAygLMh4uam9rby52MS5Qcm92aWRlckdyb3VwVXNhZ2VSb3ciRgogUmVwb3J0UHJvdmlkZXJHcm91cFVzYWdlUmVzcG9uc2USEAoIYWNjZXB0ZWQYASABKAgSEAoIY29tcGxldGUYAiABKAgiXQohR2V0UHJvdmlkZXJTY2hlZHVsaW5nU3RhdGVSZXF1ZXN0EiYKA2tleRgBIAEoCzIZLmpva28udjEuUHJvdmlkZXJHcm91cEtleRIQCghtb2RlbF9pZBgCIAEoCSJ4CiJHZXRQcm92aWRlclNjaGVkdWxpbmdTdGF0ZVJlc3BvbnNlEhQKDGFjdGl2ZV90dXJucxgBIAEoDRI8Cg1hY2NvdW50X3VzYWdlGAIgASgLMiUuam9rby52MS5Qcm92aWRlckFjY291bnRVc2FnZVNuYXBzaG90KtwBChVQcm92aWRlckdyb3VwU3RyYXRlZ3kSJwojUFJPVklERVJfR1JPVVBfU1RSQVRFR1lfVU5TUEVDSUZJRUQQABImCiJQUk9WSURFUl9HUk9VUF9TVFJBVEVHWV9MRUFTVF9CVVNZEAESJwojUFJPVklERVJfR1JPVVBfU1RSQVRFR1lfUk9VTkRfUk9CSU4QAhIjCh9QUk9WSURFUl9HUk9VUF9TVFJBVEVHWV9PUkRFUkVEEAMSJAogUFJPVklERVJfR1JPVVBfU1RSQVRFR1lfV0VJR0hURUQQBCq4AQoXUHJvdmlkZXJHcm91cE1lbWJlcktpbmQSKgomUFJPVklERVJfR1JPVVBfTUVNQkVSX0tJTkRfVU5TUEVDSUZJRUQQABIkCiBQUk9WSURFUl9HUk9VUF9NRU1CRVJfS0lORF9MT0NBTBABEiUKIVBST1ZJREVSX0dST1VQX01FTUJFUl9LSU5EX0RFVklDRRACEiQKIFBST1ZJREVSX0dST1VQX01FTUJFUl9LSU5EX1NIQVJFEAMyvgkKFFByb3ZpZGVyR3JvdXBTZXJ2aWNlEl0KEkxpc3RQcm92aWRlckdyb3VwcxIiLmpva28udjEuTGlzdFByb3ZpZGVyR3JvdXBzUmVxdWVzdBojLmpva28udjEuTGlzdFByb3ZpZGVyR3JvdXBzUmVzcG9uc2USVwoQR2V0UHJvdmlkZXJHcm91cBIgLmpva28udjEuR2V0UHJvdmlkZXJHcm91cFJlcXVlc3QaIS5qb2tvLnYxLkdldFByb3ZpZGVyR3JvdXBSZXNwb25zZRJ4ChtMaXN0UHJvdmlkZXJHcm91cENhbmRpZGF0ZXMSKy5qb2tvLnYxLkxpc3RQcm92aWRlckdyb3VwQ2FuZGlkYXRlc1JlcXVlc3QaLC5qb2tvLnYxLkxpc3RQcm92aWRlckdyb3VwQ2FuZGlkYXRlc1Jlc3BvbnNlEmAKE1VwZGF0ZVByb3ZpZGVyR3JvdXASIy5qb2tvLnYxLlVwZGF0ZVByb3ZpZGVyR3JvdXBSZXF1ZXN0GiQuam9rby52MS5VcGRhdGVQcm92aWRlckdyb3VwUmVzcG9uc2USZgoVR2V0UHJvdmlkZXJHcm91cFVzYWdlEiUuam9rby52MS5HZXRQcm92aWRlckdyb3VwVXNhZ2VSZXF1ZXN0GiYuam9rby52MS5HZXRQcm92aWRlckdyb3VwVXNhZ2VSZXNwb25zZRJyChlHZXRUYXNrUHJvdmlkZXJHcm91cFVzYWdlEikuam9rby52MS5HZXRUYXNrUHJvdmlkZXJHcm91cFVzYWdlUmVxdWVzdBoqLmpva28udjEuR2V0VGFza1Byb3ZpZGVyR3JvdXBVc2FnZVJlc3BvbnNlEmwKF1BpY2tQcm92aWRlckdyb3VwTWVtYmVyEicuam9rby52MS5QaWNrUHJvdmlkZXJHcm91cE1lbWJlclJlcXVlc3QaKC5qb2tvLnYxLlBpY2tQcm92aWRlckdyb3VwTWVtYmVyUmVzcG9uc2USbAoXQ29vbFByb3ZpZGVyR3JvdXBNZW1iZXISJy5qb2tvLnYxLkNvb2xQcm92aWRlckdyb3VwTWVtYmVyUmVxdWVzdBooLmpva28udjEuQ29vbFByb3ZpZGVyR3JvdXBNZW1iZXJSZXNwb25zZRJyChlSZXBvcnRQcm92aWRlckdyb3VwTGVhc2VzEikuam9rby52MS5SZXBvcnRQcm92aWRlckdyb3VwTGVhc2VzUmVxdWVzdBoqLmpva28udjEuUmVwb3J0UHJvdmlkZXJHcm91cExlYXNlc1Jlc3BvbnNlEm8KGFJlcG9ydFByb3ZpZGVyR3JvdXBVc2FnZRIoLmpva28udjEuUmVwb3J0UHJvdmlkZXJHcm91cFVzYWdlUmVxdWVzdBopLmpva28udjEuUmVwb3J0UHJvdmlkZXJHcm91cFVzYWdlUmVzcG9uc2USdQoaR2V0UHJvdmlkZXJTY2hlZHVsaW5nU3RhdGUSKi5qb2tvLnYxLkdldFByb3ZpZGVyU2NoZWR1bGluZ1N0YXRlUmVxdWVzdBorLmpva28udjEuR2V0UHJvdmlkZXJTY2hlZHVsaW5nU3RhdGVSZXNwb25zZWIGcHJvdG8z", [file_joko_v1_model]);
+  fileDesc("Chxqb2tvL3YxL3Byb3ZpZGVyX2dyb3VwLnByb3RvEgdqb2tvLnYxIjsKEFByb3ZpZGVyR3JvdXBLZXkSEgoKYmFja2VuZF9pZBgBIAEoCRITCgtwcm92aWRlcl9pZBgCIAEoCSJzChRQcm92aWRlckdyb3VwU3VtbWFyeRIwCghzdHJhdGVneRgBIAEoDjIeLmpva28udjEuUHJvdmlkZXJHcm91cFN0cmF0ZWd5EhMKC2F1dG9fc3dpdGNoGAIgASgIEhQKDG1lbWJlcl9jb3VudBgDIAEoDSKxAQodUHJvdmlkZXJHcm91cFJlY2VpdmVkSWRlbnRpdHkSDwoHam9pbl9pZBgBIAEoCRIQCghzaGFyZV9pZBgCIAEoCRIRCgltZW1iZXJfaWQYAyABKAkSEgoKZ2VuZXJhdGlvbhgEIAEoBBIWCg5ob3N0X3NlcnZlcl9pZBgFIAEoCRIZChFuYXRpdmVfYmFja2VuZF9pZBgGIAEoCRITCgtwcm92aWRlcl9pZBgHIAEoCSKpAgoTUHJvdmlkZXJHcm91cE1lbWJlchILCgNrZXkYASABKAkSLgoEa2luZBgCIAEoDjIgLmpva28udjEuUHJvdmlkZXJHcm91cE1lbWJlcktpbmQSEgoKYmFja2VuZF9pZBgDIAEoCRITCgtwcm92aWRlcl9pZBgEIAEoCRIPCgdub2RlX2lkGAUgASgJEhQKDGRpc3BsYXlfbmFtZRgGIAEoCRIQCghjYXBhY2l0eRgHIAEoDRIOCgZ3ZWlnaHQYCCABKA0SDgoGcGF1c2VkGAkgASgIEjgKCHJlY2VpdmVkGAogASgLMiYuam9rby52MS5Qcm92aWRlckdyb3VwUmVjZWl2ZWRJZGVudGl0eRIZChFuYXRpdmVfYmFja2VuZF9pZBgLIAEoCSKLAQoTUHJvdmlkZXJHcm91cENvbmZpZxIwCghzdHJhdGVneRgBIAEoDjIeLmpva28udjEuUHJvdmlkZXJHcm91cFN0cmF0ZWd5EhMKC2F1dG9fc3dpdGNoGAIgASgIEi0KB21lbWJlcnMYAyADKAsyHC5qb2tvLnYxLlByb3ZpZGVyR3JvdXBNZW1iZXIifwoVUHJvdmlkZXJHcm91cFNuYXBzaG90EiYKA2tleRgBIAEoCzIZLmpva28udjEuUHJvdmlkZXJHcm91cEtleRIQCghyZXZpc2lvbhgCIAEoBBIsCgZjb25maWcYAyABKAsyHC5qb2tvLnYxLlByb3ZpZGVyR3JvdXBDb25maWciyAEKFlByb3ZpZGVyR3JvdXBDYW5kaWRhdGUSLAoGbWVtYmVyGAEgASgLMhwuam9rby52MS5Qcm92aWRlckdyb3VwTWVtYmVyEhUKDXByb3ZpZGVyX25hbWUYAiABKAkSEgoKYWdlbnRfa2luZBgDIAEoCRIRCglhdmFpbGFibGUYBCABKAgSGAoQcmVtb3RlbHlfZW5hYmxlZBgFIAEoCBIoCgZtb2RlbHMYBiADKAsyGC5qb2tvLnYxLk1vZGVsRGVzY3JpcHRvciIbChlMaXN0UHJvdmlkZXJHcm91cHNSZXF1ZXN0IkwKGkxpc3RQcm92aWRlckdyb3Vwc1Jlc3BvbnNlEi4KBmdyb3VwcxgBIAMoCzIeLmpva28udjEuUHJvdmlkZXJHcm91cFNuYXBzaG90IsEBChdHZXRQcm92aWRlckdyb3VwUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSFwoKYWdlbnRfa2luZBgCIAEoCUgAiAEBEhUKCG1vZGVsX2lkGAMgASgJSAGIAQESHQoQbG9naWNhbF9tb2RlbF9pZBgEIAEoCUgCiAEBQg0KC19hZ2VudF9raW5kQgsKCV9tb2RlbF9pZEITChFfbG9naWNhbF9tb2RlbF9pZCJ9ChhHZXRQcm92aWRlckdyb3VwUmVzcG9uc2USLQoFZ3JvdXAYASABKAsyHi5qb2tvLnYxLlByb3ZpZGVyR3JvdXBTbmFwc2hvdBIyCgdtZW1iZXJzGAIgAygLMiEuam9rby52MS5Qcm92aWRlckdyb3VwTWVtYmVyU3RhdGUiTAoiTGlzdFByb3ZpZGVyR3JvdXBDYW5kaWRhdGVzUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkiWgojTGlzdFByb3ZpZGVyR3JvdXBDYW5kaWRhdGVzUmVzcG9uc2USMwoKY2FuZGlkYXRlcxgBIAMoCzIfLmpva28udjEuUHJvdmlkZXJHcm91cENhbmRpZGF0ZSIVChNEZWxldGVQcm92aWRlckdyb3VwIskBChpVcGRhdGVQcm92aWRlckdyb3VwUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSGQoRZXhwZWN0ZWRfcmV2aXNpb24YAiABKAQSLgoGY29uZmlnGAMgASgLMhwuam9rby52MS5Qcm92aWRlckdyb3VwQ29uZmlnSAASLgoGZGVsZXRlGAQgASgLMhwuam9rby52MS5EZWxldGVQcm92aWRlckdyb3VwSABCCAoGdXBkYXRlIkwKG1VwZGF0ZVByb3ZpZGVyR3JvdXBSZXNwb25zZRItCgVncm91cBgBIAEoCzIeLmpva28udjEuUHJvdmlkZXJHcm91cFNuYXBzaG90Iu0CChJQcm92aWRlckdyb3VwUXVvdGESDwoHbGltaXRlZBgBIAEoCBIaCg11c2FnZV9wZXJjZW50GAIgASgBSACIAQESFQoIcmVzZXRfYXQYAyABKAFIAYgBARIcCg93ZWVrbHlfcmVzZXRfYXQYBCABKAFIAogBARIfChJmaXZlX2hvdXJfcmVzZXRfYXQYBSABKAFIA4gBARIUCgd1cmdlbmN5GAYgASgBSASIAQESFwoPZml2ZV9ob3VyX3RpZ2h0GAcgASgIEj0KDXBhY2luZ193aW5kb3cYCCABKAsyIS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBRdW90YVdpbmRvd0gFiAEBQhAKDl91c2FnZV9wZXJjZW50QgsKCV9yZXNldF9hdEISChBfd2Vla2x5X3Jlc2V0X2F0QhUKE19maXZlX2hvdXJfcmVzZXRfYXRCCgoIX3VyZ2VuY3lCEAoOX3BhY2luZ193aW5kb3ciZwoYUHJvdmlkZXJHcm91cFF1b3RhV2luZG93EhQKDHVzZWRfcGVyY2VudBgBIAEoARIRCgl3aW5kb3dfbXMYAiABKAESFQoIcmVzZXRfYXQYAyABKAFIAIgBAUILCglfcmVzZXRfYXQiTgokR2V0VGFza1Byb3ZpZGVyR3JvdXBSZWJhbGFuY2VSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBCJ6CiVHZXRUYXNrUHJvdmlkZXJHcm91cFJlYmFsYW5jZVJlc3BvbnNlEkIKCnN1Z2dlc3Rpb24YASABKAsyKS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBSZWJhbGFuY2VTdWdnZXN0aW9uSACIAQFCDQoLX3N1Z2dlc3Rpb24iyAIKIFByb3ZpZGVyR3JvdXBSZWJhbGFuY2VTdWdnZXN0aW9uEhYKDnN1Z2dlc3Rpb25fa2V5GAEgASgJEigKBWdyb3VwGAIgASgLMhkuam9rby52MS5Qcm92aWRlckdyb3VwS2V5EhcKD2Zyb21fbWVtYmVyX2tleRgDIAEoCRIVCg10b19tZW1iZXJfa2V5GAQgASgJEhIKCmZyb21fbGFiZWwYBSABKAkSEAoIdG9fbGFiZWwYBiABKAkSMgoNY3VycmVudF9xdW90YRgHIAEoCzIbLmpva28udjEuUHJvdmlkZXJHcm91cFF1b3RhEjEKDHRhcmdldF9xdW90YRgIIAEoCzIbLmpva28udjEuUHJvdmlkZXJHcm91cFF1b3RhEhEKCWF1dG9tYXRpYxgJIAEoCBISCgpnZW5lcmF0aW9uGAogASgEIrMBChhQcm92aWRlckdyb3VwTWVtYmVyU3RhdGUSEgoKbWVtYmVyX2tleRgBIAEoCRIRCglhdmFpbGFibGUYAiABKAgSEQoJcmVhY2hhYmxlGAMgASgIEhAKCG1vZGVsX2lkGAQgASgJEioKBXF1b3RhGAUgASgLMhsuam9rby52MS5Qcm92aWRlckdyb3VwUXVvdGESDwoHcnVubmluZxgGIAEoDRIOCgZyZWFzb24YByABKAki9gIKHlBpY2tQcm92aWRlckdyb3VwTWVtYmVyUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSEgoKc2Vzc2lvbl9pZBgCIAEoCRISCgphZ2VudF9raW5kGAMgASgJEhAKCG1vZGVsX2lkGAQgASgJEh0KEGxvZ2ljYWxfbW9kZWxfaWQYBSABKAlIAIgBARIbChNleGNsdWRlX21lbWJlcl9rZXlzGAYgAygJEiwKH3F1b3RhX3JlYmFsYW5jZV9mcm9tX21lbWJlcl9rZXkYByABKAlIAYgBARIWCgllZmZvcnRfaWQYCCABKAlIAogBARIRCglmYXN0X21vZGUYCSABKAgSFgoOdWx0cmFmYXN0X21vZGUYCiABKAhCEwoRX2xvZ2ljYWxfbW9kZWxfaWRCIgogX3F1b3RhX3JlYmFsYW5jZV9mcm9tX21lbWJlcl9rZXlCDAoKX2VmZm9ydF9pZCLNAQofUGlja1Byb3ZpZGVyR3JvdXBNZW1iZXJSZXNwb25zZRItCgVncm91cBgBIAEoCzIeLmpva28udjEuUHJvdmlkZXJHcm91cFNuYXBzaG90EiwKBm1lbWJlchgCIAEoCzIcLmpva28udjEuUHJvdmlkZXJHcm91cE1lbWJlchIQCghtb2RlbF9pZBgDIAEoCRIqCgVxdW90YRgEIAEoCzIbLmpva28udjEuUHJvdmlkZXJHcm91cFF1b3RhEg8KB3J1bm5pbmcYBSABKA0itwEKHkNvb2xQcm92aWRlckdyb3VwTWVtYmVyUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSEgoKbWVtYmVyX2tleRgCIAEoCRIQCghtb2RlbF9pZBgDIAEoCRINCgVjYXVzZRgEIAEoCRIVCghyZXNldF9hdBgFIAEoAUgAiAEBEhQKDG1vZGVsX3Njb3BlZBgGIAEoCEILCglfcmVzZXRfYXQiIQofQ29vbFByb3ZpZGVyR3JvdXBNZW1iZXJSZXNwb25zZSJrChhQcm92aWRlckdyb3VwQWN0aXZlTGVhc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRISCgptZW1iZXJfa2V5GAIgASgJEhIKCmJhY2tlbmRfaWQYAyABKAkSEwoLcHJvdmlkZXJfaWQYBCABKAkiZwogUmVwb3J0UHJvdmlkZXJHcm91cExlYXNlc1JlcXVlc3QSEAoIc2VxdWVuY2UYASABKAQSMQoGbGVhc2VzGAIgAygLMiEuam9rby52MS5Qcm92aWRlckdyb3VwQWN0aXZlTGVhc2UiNQohUmVwb3J0UHJvdmlkZXJHcm91cExlYXNlc1Jlc3BvbnNlEhAKCGFjY2VwdGVkGAEgASgIIoQEChVQcm92aWRlckdyb3VwVXNhZ2VSb3cSKAoFZ3JvdXAYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSEgoKbWVtYmVyX2tleRgCIAEoCRIPCgdub2RlX2lkGAMgASgJEhEKCW5vZGVfbmFtZRgEIAEoCRIQCghwYXJ0eV9pZBgFIAEoCRISCgpwYXJ0eV9uYW1lGAYgASgJEhIKCmFnZW50X2tpbmQYByABKAkSEgoKYmFja2VuZF9pZBgIIAEoCRITCgtwcm92aWRlcl9pZBgJIAEoCRIQCghtb2RlbF9pZBgKIAEoCRILCgNkYXkYCyABKAkSDQoFdHVybnMYDCABKAQSFAoMaW5wdXRfdG9rZW5zGA0gASgEEhUKDW91dHB1dF90b2tlbnMYDiABKAQSGQoRY2FjaGVfcmVhZF90b2tlbnMYDyABKAQSGgoSY2FjaGVfd3JpdGVfdG9rZW5zGBAgASgEEhQKDHRvdGFsX3Rva2VucxgRIAEoBBITCgtjb3N0X21pY3JvcxgSIAEoBBIVCg1jdXJyZW5jeV9jb2RlGBMgASgJEhEKCWVzdGltYXRlZBgUIAEoCBIXCg90b2tlbnNfY29tcGxldGUYFSABKAgSFQoNY29zdF9jb21wbGV0ZRgWIAEoCBIPCgdsYXN0X2F0GBcgASgBIv4BChxHZXRQcm92aWRlckdyb3VwVXNhZ2VSZXF1ZXN0EiYKA2tleRgBIAEoCzIZLmpva28udjEuUHJvdmlkZXJHcm91cEtleRIVCghmcm9tX2RheRgCIAEoCUgAiAEBEhgKC3Rocm91Z2hfZGF5GAMgASgJSAGIAQESFQoIcGFydHlfaWQYBCABKAlIAogBARIUCgdub2RlX2lkGAUgASgJSAOIAQESFQoIbW9kZWxfaWQYBiABKAlIBIgBAUILCglfZnJvbV9kYXlCDgoMX3Rocm91Z2hfZGF5QgsKCV9wYXJ0eV9pZEIKCghfbm9kZV9pZEILCglfbW9kZWxfaWQiTQodR2V0UHJvdmlkZXJHcm91cFVzYWdlUmVzcG9uc2USLAoEcm93cxgBIAMoCzIeLmpva28udjEuUHJvdmlkZXJHcm91cFVzYWdlUm93IkoKIEdldFRhc2tQcm92aWRlckdyb3VwVXNhZ2VSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEgoKZ2VuZXJhdGlvbhgCIAEoBCK9AQoXVGFza1Byb3ZpZGVyR3JvdXBNZW1iZXISKAoFZ3JvdXAYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSEgoKbWVtYmVyX2tleRgCIAEoCRIRCglub2RlX25hbWUYAyABKAkSEgoKYmFja2VuZF9pZBgEIAEoCRITCgtwcm92aWRlcl9pZBgFIAEoCRIQCghtb2RlbF9pZBgGIAEoCRIWCg5xdW90YV9yZWFkYWJsZRgHIAEoCCK/AQohR2V0VGFza1Byb3ZpZGVyR3JvdXBVc2FnZVJlc3BvbnNlEjAKBm1lbWJlchgBIAEoCzIgLmpva28udjEuVGFza1Byb3ZpZGVyR3JvdXBNZW1iZXISPAoNYWNjb3VudF91c2FnZRgCIAEoCzIlLmpva28udjEuUHJvdmlkZXJBY2NvdW50VXNhZ2VTbmFwc2hvdBIqCgVxdW90YRgDIAEoCzIbLmpva28udjEuUHJvdmlkZXJHcm91cFF1b3RhIpwBCh9SZXBvcnRQcm92aWRlckdyb3VwVXNhZ2VSZXF1ZXN0EhAKCHNlcXVlbmNlGAEgASgEEhEKCXNpbmNlX2RheRgCIAEoCRISCgpwYXJ0X2luZGV4GAMgASgNEhIKCnBhcnRfY291bnQYBCABKA0SLAoEcm93cxgFIAMoCzIeLmpva28udjEuUHJvdmlkZXJHcm91cFVzYWdlUm93IkYKIFJlcG9ydFByb3ZpZGVyR3JvdXBVc2FnZVJlc3BvbnNlEhAKCGFjY2VwdGVkGAEgASgIEhAKCGNvbXBsZXRlGAIgASgIIl0KIUdldFByb3ZpZGVyU2NoZWR1bGluZ1N0YXRlUmVxdWVzdBImCgNrZXkYASABKAsyGS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBLZXkSEAoIbW9kZWxfaWQYAiABKAkieAoiR2V0UHJvdmlkZXJTY2hlZHVsaW5nU3RhdGVSZXNwb25zZRIUCgxhY3RpdmVfdHVybnMYASABKA0SPAoNYWNjb3VudF91c2FnZRgCIAEoCzIlLmpva28udjEuUHJvdmlkZXJBY2NvdW50VXNhZ2VTbmFwc2hvdCrcAQoVUHJvdmlkZXJHcm91cFN0cmF0ZWd5EicKI1BST1ZJREVSX0dST1VQX1NUUkFURUdZX1VOU1BFQ0lGSUVEEAASJgoiUFJPVklERVJfR1JPVVBfU1RSQVRFR1lfTEVBU1RfQlVTWRABEicKI1BST1ZJREVSX0dST1VQX1NUUkFURUdZX1JPVU5EX1JPQklOEAISIwofUFJPVklERVJfR1JPVVBfU1RSQVRFR1lfT1JERVJFRBADEiQKIFBST1ZJREVSX0dST1VQX1NUUkFURUdZX1dFSUdIVEVEEAQquAEKF1Byb3ZpZGVyR3JvdXBNZW1iZXJLaW5kEioKJlBST1ZJREVSX0dST1VQX01FTUJFUl9LSU5EX1VOU1BFQ0lGSUVEEAASJAogUFJPVklERVJfR1JPVVBfTUVNQkVSX0tJTkRfTE9DQUwQARIlCiFQUk9WSURFUl9HUk9VUF9NRU1CRVJfS0lORF9ERVZJQ0UQAhIkCiBQUk9WSURFUl9HUk9VUF9NRU1CRVJfS0lORF9TSEFSRRADMr4KChRQcm92aWRlckdyb3VwU2VydmljZRJdChJMaXN0UHJvdmlkZXJHcm91cHMSIi5qb2tvLnYxLkxpc3RQcm92aWRlckdyb3Vwc1JlcXVlc3QaIy5qb2tvLnYxLkxpc3RQcm92aWRlckdyb3Vwc1Jlc3BvbnNlElcKEEdldFByb3ZpZGVyR3JvdXASIC5qb2tvLnYxLkdldFByb3ZpZGVyR3JvdXBSZXF1ZXN0GiEuam9rby52MS5HZXRQcm92aWRlckdyb3VwUmVzcG9uc2USeAobTGlzdFByb3ZpZGVyR3JvdXBDYW5kaWRhdGVzEisuam9rby52MS5MaXN0UHJvdmlkZXJHcm91cENhbmRpZGF0ZXNSZXF1ZXN0Giwuam9rby52MS5MaXN0UHJvdmlkZXJHcm91cENhbmRpZGF0ZXNSZXNwb25zZRJgChNVcGRhdGVQcm92aWRlckdyb3VwEiMuam9rby52MS5VcGRhdGVQcm92aWRlckdyb3VwUmVxdWVzdBokLmpva28udjEuVXBkYXRlUHJvdmlkZXJHcm91cFJlc3BvbnNlEmYKFUdldFByb3ZpZGVyR3JvdXBVc2FnZRIlLmpva28udjEuR2V0UHJvdmlkZXJHcm91cFVzYWdlUmVxdWVzdBomLmpva28udjEuR2V0UHJvdmlkZXJHcm91cFVzYWdlUmVzcG9uc2UScgoZR2V0VGFza1Byb3ZpZGVyR3JvdXBVc2FnZRIpLmpva28udjEuR2V0VGFza1Byb3ZpZGVyR3JvdXBVc2FnZVJlcXVlc3QaKi5qb2tvLnYxLkdldFRhc2tQcm92aWRlckdyb3VwVXNhZ2VSZXNwb25zZRJ+Ch1HZXRUYXNrUHJvdmlkZXJHcm91cFJlYmFsYW5jZRItLmpva28udjEuR2V0VGFza1Byb3ZpZGVyR3JvdXBSZWJhbGFuY2VSZXF1ZXN0Gi4uam9rby52MS5HZXRUYXNrUHJvdmlkZXJHcm91cFJlYmFsYW5jZVJlc3BvbnNlEmwKF1BpY2tQcm92aWRlckdyb3VwTWVtYmVyEicuam9rby52MS5QaWNrUHJvdmlkZXJHcm91cE1lbWJlclJlcXVlc3QaKC5qb2tvLnYxLlBpY2tQcm92aWRlckdyb3VwTWVtYmVyUmVzcG9uc2USbAoXQ29vbFByb3ZpZGVyR3JvdXBNZW1iZXISJy5qb2tvLnYxLkNvb2xQcm92aWRlckdyb3VwTWVtYmVyUmVxdWVzdBooLmpva28udjEuQ29vbFByb3ZpZGVyR3JvdXBNZW1iZXJSZXNwb25zZRJyChlSZXBvcnRQcm92aWRlckdyb3VwTGVhc2VzEikuam9rby52MS5SZXBvcnRQcm92aWRlckdyb3VwTGVhc2VzUmVxdWVzdBoqLmpva28udjEuUmVwb3J0UHJvdmlkZXJHcm91cExlYXNlc1Jlc3BvbnNlEm8KGFJlcG9ydFByb3ZpZGVyR3JvdXBVc2FnZRIoLmpva28udjEuUmVwb3J0UHJvdmlkZXJHcm91cFVzYWdlUmVxdWVzdBopLmpva28udjEuUmVwb3J0UHJvdmlkZXJHcm91cFVzYWdlUmVzcG9uc2USdQoaR2V0UHJvdmlkZXJTY2hlZHVsaW5nU3RhdGUSKi5qb2tvLnYxLkdldFByb3ZpZGVyU2NoZWR1bGluZ1N0YXRlUmVxdWVzdBorLmpva28udjEuR2V0UHJvdmlkZXJTY2hlZHVsaW5nU3RhdGVSZXNwb25zZWIGcHJvdG8z", [file_joko_v1_model]);
 
 /**
  * @generated from message joko.v1.ProviderGroupKey
@@ -488,6 +488,21 @@ export type ProviderGroupQuota = Message<"joko.v1.ProviderGroupQuota"> & {
    * @generated from field: optional double five_hour_reset_at = 5;
    */
   fiveHourResetAt?: number | undefined;
+
+  /**
+   * @generated from field: optional double urgency = 6;
+   */
+  urgency?: number | undefined;
+
+  /**
+   * @generated from field: bool five_hour_tight = 7;
+   */
+  fiveHourTight: boolean;
+
+  /**
+   * @generated from field: optional joko.v1.ProviderGroupQuotaWindow pacing_window = 8;
+   */
+  pacingWindow?: ProviderGroupQuotaWindow | undefined;
 };
 
 /**
@@ -496,6 +511,134 @@ export type ProviderGroupQuota = Message<"joko.v1.ProviderGroupQuota"> & {
  */
 export const ProviderGroupQuotaSchema: GenMessage<ProviderGroupQuota> = /*@__PURE__*/
   messageDesc(file_joko_v1_provider_group, 16);
+
+/**
+ * @generated from message joko.v1.ProviderGroupQuotaWindow
+ */
+export type ProviderGroupQuotaWindow = Message<"joko.v1.ProviderGroupQuotaWindow"> & {
+  /**
+   * @generated from field: double used_percent = 1;
+   */
+  usedPercent: number;
+
+  /**
+   * @generated from field: double window_ms = 2;
+   */
+  windowMs: number;
+
+  /**
+   * @generated from field: optional double reset_at = 3;
+   */
+  resetAt?: number | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ProviderGroupQuotaWindow.
+ * Use `create(ProviderGroupQuotaWindowSchema)` to create a new message.
+ */
+export const ProviderGroupQuotaWindowSchema: GenMessage<ProviderGroupQuotaWindow> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_group, 17);
+
+/**
+ * @generated from message joko.v1.GetTaskProviderGroupRebalanceRequest
+ */
+export type GetTaskProviderGroupRebalanceRequest = Message<"joko.v1.GetTaskProviderGroupRebalanceRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: uint64 generation = 2;
+   */
+  generation: bigint;
+};
+
+/**
+ * Describes the message joko.v1.GetTaskProviderGroupRebalanceRequest.
+ * Use `create(GetTaskProviderGroupRebalanceRequestSchema)` to create a new message.
+ */
+export const GetTaskProviderGroupRebalanceRequestSchema: GenMessage<GetTaskProviderGroupRebalanceRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_group, 18);
+
+/**
+ * @generated from message joko.v1.GetTaskProviderGroupRebalanceResponse
+ */
+export type GetTaskProviderGroupRebalanceResponse = Message<"joko.v1.GetTaskProviderGroupRebalanceResponse"> & {
+  /**
+   * @generated from field: optional joko.v1.ProviderGroupRebalanceSuggestion suggestion = 1;
+   */
+  suggestion?: ProviderGroupRebalanceSuggestion | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetTaskProviderGroupRebalanceResponse.
+ * Use `create(GetTaskProviderGroupRebalanceResponseSchema)` to create a new message.
+ */
+export const GetTaskProviderGroupRebalanceResponseSchema: GenMessage<GetTaskProviderGroupRebalanceResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_group, 19);
+
+/**
+ * @generated from message joko.v1.ProviderGroupRebalanceSuggestion
+ */
+export type ProviderGroupRebalanceSuggestion = Message<"joko.v1.ProviderGroupRebalanceSuggestion"> & {
+  /**
+   * @generated from field: string suggestion_key = 1;
+   */
+  suggestionKey: string;
+
+  /**
+   * @generated from field: joko.v1.ProviderGroupKey group = 2;
+   */
+  group?: ProviderGroupKey | undefined;
+
+  /**
+   * @generated from field: string from_member_key = 3;
+   */
+  fromMemberKey: string;
+
+  /**
+   * @generated from field: string to_member_key = 4;
+   */
+  toMemberKey: string;
+
+  /**
+   * @generated from field: string from_label = 5;
+   */
+  fromLabel: string;
+
+  /**
+   * @generated from field: string to_label = 6;
+   */
+  toLabel: string;
+
+  /**
+   * @generated from field: joko.v1.ProviderGroupQuota current_quota = 7;
+   */
+  currentQuota?: ProviderGroupQuota | undefined;
+
+  /**
+   * @generated from field: joko.v1.ProviderGroupQuota target_quota = 8;
+   */
+  targetQuota?: ProviderGroupQuota | undefined;
+
+  /**
+   * @generated from field: bool automatic = 9;
+   */
+  automatic: boolean;
+
+  /**
+   * @generated from field: uint64 generation = 10;
+   */
+  generation: bigint;
+};
+
+/**
+ * Describes the message joko.v1.ProviderGroupRebalanceSuggestion.
+ * Use `create(ProviderGroupRebalanceSuggestionSchema)` to create a new message.
+ */
+export const ProviderGroupRebalanceSuggestionSchema: GenMessage<ProviderGroupRebalanceSuggestion> = /*@__PURE__*/
+  messageDesc(file_joko_v1_provider_group, 20);
 
 /**
  * @generated from message joko.v1.ProviderGroupMemberState
@@ -542,7 +685,7 @@ export type ProviderGroupMemberState = Message<"joko.v1.ProviderGroupMemberState
  * Use `create(ProviderGroupMemberStateSchema)` to create a new message.
  */
 export const ProviderGroupMemberStateSchema: GenMessage<ProviderGroupMemberState> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 17);
+  messageDesc(file_joko_v1_provider_group, 21);
 
 /**
  * @generated from message joko.v1.PickProviderGroupMemberRequest
@@ -577,6 +720,26 @@ export type PickProviderGroupMemberRequest = Message<"joko.v1.PickProviderGroupM
    * @generated from field: repeated string exclude_member_keys = 6;
    */
   excludeMemberKeys: string[];
+
+  /**
+   * @generated from field: optional string quota_rebalance_from_member_key = 7;
+   */
+  quotaRebalanceFromMemberKey?: string | undefined;
+
+  /**
+   * @generated from field: optional string effort_id = 8;
+   */
+  effortId?: string | undefined;
+
+  /**
+   * @generated from field: bool fast_mode = 9;
+   */
+  fastMode: boolean;
+
+  /**
+   * @generated from field: bool ultrafast_mode = 10;
+   */
+  ultrafastMode: boolean;
 };
 
 /**
@@ -584,7 +747,7 @@ export type PickProviderGroupMemberRequest = Message<"joko.v1.PickProviderGroupM
  * Use `create(PickProviderGroupMemberRequestSchema)` to create a new message.
  */
 export const PickProviderGroupMemberRequestSchema: GenMessage<PickProviderGroupMemberRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 18);
+  messageDesc(file_joko_v1_provider_group, 22);
 
 /**
  * @generated from message joko.v1.PickProviderGroupMemberResponse
@@ -621,7 +784,7 @@ export type PickProviderGroupMemberResponse = Message<"joko.v1.PickProviderGroup
  * Use `create(PickProviderGroupMemberResponseSchema)` to create a new message.
  */
 export const PickProviderGroupMemberResponseSchema: GenMessage<PickProviderGroupMemberResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 19);
+  messageDesc(file_joko_v1_provider_group, 23);
 
 /**
  * @generated from message joko.v1.CoolProviderGroupMemberRequest
@@ -663,7 +826,7 @@ export type CoolProviderGroupMemberRequest = Message<"joko.v1.CoolProviderGroupM
  * Use `create(CoolProviderGroupMemberRequestSchema)` to create a new message.
  */
 export const CoolProviderGroupMemberRequestSchema: GenMessage<CoolProviderGroupMemberRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 20);
+  messageDesc(file_joko_v1_provider_group, 24);
 
 /**
  * @generated from message joko.v1.CoolProviderGroupMemberResponse
@@ -676,7 +839,7 @@ export type CoolProviderGroupMemberResponse = Message<"joko.v1.CoolProviderGroup
  * Use `create(CoolProviderGroupMemberResponseSchema)` to create a new message.
  */
 export const CoolProviderGroupMemberResponseSchema: GenMessage<CoolProviderGroupMemberResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 21);
+  messageDesc(file_joko_v1_provider_group, 25);
 
 /**
  * @generated from message joko.v1.ProviderGroupActiveLease
@@ -708,7 +871,7 @@ export type ProviderGroupActiveLease = Message<"joko.v1.ProviderGroupActiveLease
  * Use `create(ProviderGroupActiveLeaseSchema)` to create a new message.
  */
 export const ProviderGroupActiveLeaseSchema: GenMessage<ProviderGroupActiveLease> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 22);
+  messageDesc(file_joko_v1_provider_group, 26);
 
 /**
  * @generated from message joko.v1.ReportProviderGroupLeasesRequest
@@ -730,7 +893,7 @@ export type ReportProviderGroupLeasesRequest = Message<"joko.v1.ReportProviderGr
  * Use `create(ReportProviderGroupLeasesRequestSchema)` to create a new message.
  */
 export const ReportProviderGroupLeasesRequestSchema: GenMessage<ReportProviderGroupLeasesRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 23);
+  messageDesc(file_joko_v1_provider_group, 27);
 
 /**
  * @generated from message joko.v1.ReportProviderGroupLeasesResponse
@@ -747,7 +910,7 @@ export type ReportProviderGroupLeasesResponse = Message<"joko.v1.ReportProviderG
  * Use `create(ReportProviderGroupLeasesResponseSchema)` to create a new message.
  */
 export const ReportProviderGroupLeasesResponseSchema: GenMessage<ReportProviderGroupLeasesResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 24);
+  messageDesc(file_joko_v1_provider_group, 28);
 
 /**
  * @generated from message joko.v1.ProviderGroupUsageRow
@@ -874,7 +1037,7 @@ export type ProviderGroupUsageRow = Message<"joko.v1.ProviderGroupUsageRow"> & {
  * Use `create(ProviderGroupUsageRowSchema)` to create a new message.
  */
 export const ProviderGroupUsageRowSchema: GenMessage<ProviderGroupUsageRow> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 25);
+  messageDesc(file_joko_v1_provider_group, 29);
 
 /**
  * @generated from message joko.v1.GetProviderGroupUsageRequest
@@ -916,7 +1079,7 @@ export type GetProviderGroupUsageRequest = Message<"joko.v1.GetProviderGroupUsag
  * Use `create(GetProviderGroupUsageRequestSchema)` to create a new message.
  */
 export const GetProviderGroupUsageRequestSchema: GenMessage<GetProviderGroupUsageRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 26);
+  messageDesc(file_joko_v1_provider_group, 30);
 
 /**
  * @generated from message joko.v1.GetProviderGroupUsageResponse
@@ -933,7 +1096,7 @@ export type GetProviderGroupUsageResponse = Message<"joko.v1.GetProviderGroupUsa
  * Use `create(GetProviderGroupUsageResponseSchema)` to create a new message.
  */
 export const GetProviderGroupUsageResponseSchema: GenMessage<GetProviderGroupUsageResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 27);
+  messageDesc(file_joko_v1_provider_group, 31);
 
 /**
  * @generated from message joko.v1.GetTaskProviderGroupUsageRequest
@@ -955,7 +1118,7 @@ export type GetTaskProviderGroupUsageRequest = Message<"joko.v1.GetTaskProviderG
  * Use `create(GetTaskProviderGroupUsageRequestSchema)` to create a new message.
  */
 export const GetTaskProviderGroupUsageRequestSchema: GenMessage<GetTaskProviderGroupUsageRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 28);
+  messageDesc(file_joko_v1_provider_group, 32);
 
 /**
  * @generated from message joko.v1.TaskProviderGroupMember
@@ -1002,7 +1165,7 @@ export type TaskProviderGroupMember = Message<"joko.v1.TaskProviderGroupMember">
  * Use `create(TaskProviderGroupMemberSchema)` to create a new message.
  */
 export const TaskProviderGroupMemberSchema: GenMessage<TaskProviderGroupMember> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 29);
+  messageDesc(file_joko_v1_provider_group, 33);
 
 /**
  * @generated from message joko.v1.GetTaskProviderGroupUsageResponse
@@ -1029,7 +1192,7 @@ export type GetTaskProviderGroupUsageResponse = Message<"joko.v1.GetTaskProvider
  * Use `create(GetTaskProviderGroupUsageResponseSchema)` to create a new message.
  */
 export const GetTaskProviderGroupUsageResponseSchema: GenMessage<GetTaskProviderGroupUsageResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 30);
+  messageDesc(file_joko_v1_provider_group, 34);
 
 /**
  * A bounded part of one complete replacement report. It is applied only once
@@ -1069,7 +1232,7 @@ export type ReportProviderGroupUsageRequest = Message<"joko.v1.ReportProviderGro
  * Use `create(ReportProviderGroupUsageRequestSchema)` to create a new message.
  */
 export const ReportProviderGroupUsageRequestSchema: GenMessage<ReportProviderGroupUsageRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 31);
+  messageDesc(file_joko_v1_provider_group, 35);
 
 /**
  * @generated from message joko.v1.ReportProviderGroupUsageResponse
@@ -1091,7 +1254,7 @@ export type ReportProviderGroupUsageResponse = Message<"joko.v1.ReportProviderGr
  * Use `create(ReportProviderGroupUsageResponseSchema)` to create a new message.
  */
 export const ReportProviderGroupUsageResponseSchema: GenMessage<ReportProviderGroupUsageResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 32);
+  messageDesc(file_joko_v1_provider_group, 36);
 
 /**
  * @generated from message joko.v1.GetProviderSchedulingStateRequest
@@ -1113,7 +1276,7 @@ export type GetProviderSchedulingStateRequest = Message<"joko.v1.GetProviderSche
  * Use `create(GetProviderSchedulingStateRequestSchema)` to create a new message.
  */
 export const GetProviderSchedulingStateRequestSchema: GenMessage<GetProviderSchedulingStateRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 33);
+  messageDesc(file_joko_v1_provider_group, 37);
 
 /**
  * @generated from message joko.v1.GetProviderSchedulingStateResponse
@@ -1135,7 +1298,7 @@ export type GetProviderSchedulingStateResponse = Message<"joko.v1.GetProviderSch
  * Use `create(GetProviderSchedulingStateResponseSchema)` to create a new message.
  */
 export const GetProviderSchedulingStateResponseSchema: GenMessage<GetProviderSchedulingStateResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_provider_group, 34);
+  messageDesc(file_joko_v1_provider_group, 38);
 
 /**
  * @generated from enum joko.v1.ProviderGroupStrategy
@@ -1259,6 +1422,14 @@ export const ProviderGroupService: GenService<{
     methodKind: "unary";
     input: typeof GetTaskProviderGroupUsageRequestSchema;
     output: typeof GetTaskProviderGroupUsageResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.ProviderGroupService.GetTaskProviderGroupRebalance
+   */
+  getTaskProviderGroupRebalance: {
+    methodKind: "unary";
+    input: typeof GetTaskProviderGroupRebalanceRequestSchema;
+    output: typeof GetTaskProviderGroupRebalanceResponseSchema;
   },
   /**
    * @generated from rpc joko.v1.ProviderGroupService.PickProviderGroupMember

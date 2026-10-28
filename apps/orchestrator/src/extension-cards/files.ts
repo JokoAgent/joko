@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readWorkerWorkspaceBinding } from "../collaboration-worker-workspace.js";
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath, stat, unlink } from "node:fs/promises";
+import { lstat, open, opendir, readdir, realpath, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { OperationalStore } from "@joko/store";
 import type { BridgeToolCallContext } from "../mcp-router.js";
@@ -19,13 +19,24 @@ const EXCLUDED_DIRECTORIES = new Set(["node_modules", ".git", ".svn", ".hg", ".i
 const EXCLUDED_FILES = new Set([".DS_Store", "Thumbs.db", ".gitignore", ".gitattributes", ".npmrc"]);
 const excludedFile = (name: string) => EXCLUDED_FILES.has(name) || name === ".env" || name.startsWith(".env.");
 export interface ExtensionFileWorkspace { readonly root: string; readonly assertCurrent: () => void; readonly remote?: RemoteFileAuthority; readonly signal?: AbortSignal;
+  /** A native user selection retains its actual directory identity. */
+  readonly assertBytesCurrent?: () => Promise<void>;
   readonly extraRoots?: readonly { readonly path: string; readonly access: "read_only" | "read_write" }[] }
+interface PickedDirectoryScope { readonly kind: "user_pick"; readonly extensionId: string; readonly authorityKey: string; readonly selectionId: string }
+type FileScope = ExtensionCardScope | PickedDirectoryScope;
 interface File { readonly absolute: string; readonly relative: string; readonly size: number; readonly read?: () => Promise<Uint8Array> }
 interface Deposit { readonly owner: string; readonly expiresAt: number; readonly current: () => void; readonly root: string; readonly workspace: ExtensionFileWorkspace }
 interface DirectoryDeposit extends Deposit { readonly files: readonly File[] }
 interface SaveDeposit extends Deposit { uses: number; bytes: number }
 export interface ExtensionDirectoryTransfer { readonly files: readonly { readonly relPath: string; readonly size: number; read(): Promise<Uint8Array> }[] }
-const owner = (scope: ExtensionCardScope) => JSON.stringify([scope.extensionId, scope.authorityKey, scope.sessionId, scope.sessionCreatedAt, scope.targetId]);
+const owner = (scope: FileScope) => "kind" in scope
+  ? JSON.stringify([scope.extensionId, scope.authorityKey, "user_pick", scope.selectionId])
+  : JSON.stringify([scope.extensionId, scope.authorityKey, scope.sessionId, scope.sessionCreatedAt, scope.targetId]);
+const matchesDirectoryOwner = (stored: string, scope: ExtensionCardScope) => {
+  if (stored === owner(scope)) return true;
+  const selected = JSON.parse(stored) as unknown[];
+  return selected.length === 4 && selected[2] === "user_pick" && selected[0] === scope.extensionId && selected[1] === scope.authorityKey;
+};
 const samePath = (left: string, right: string) => process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
 function within(root: string, file: string): boolean {
   const relative = path.relative(process.platform === "win32" ? root.toLowerCase() : root, process.platform === "win32" ? file.toLowerCase() : file);
@@ -81,12 +92,13 @@ export class ExtensionFileDeposits {
   retire(authorityKey: string): void {
     for (const records of [this.#directories, this.#saves]) for (const [token, value] of records) if ((JSON.parse(value.owner) as string[])[1] === authorityKey) records.delete(token);
   }
-  async prepare(scope: ExtensionCardScope, arguments_: Readonly<Record<string, unknown>>, workspace: ExtensionFileWorkspace, assertCurrent: () => void): Promise<Readonly<Record<string, unknown>>> {
+  async prepare(scope: FileScope, arguments_: Readonly<Record<string, unknown>>, workspace: ExtensionFileWorkspace, assertCurrent: () => void): Promise<Readonly<Record<string, unknown>>> {
     if (arguments_.dir_deposit !== undefined || arguments_.save_deposit !== undefined) throw new Error("File receipts are issued by the host.");
     const { dir, save_dir, ...rest } = arguments_;
+    if ("kind" in scope && save_dir !== undefined) throw new Error("A picked directory grants only a bounded read deposit.");
     const args: Record<string, unknown> = { ...rest };
     const current = () => { workspace.assertCurrent(); assertCurrent(); };
-    current(); this.#sweep();
+    current(); await workspace.assertBytesCurrent?.(); current(); this.#sweep();
     if (this.#directories.size + this.#saves.size >= 256) throw new Error("Extension file capacity reached. Retry after current transfers finish.");
     const remote = workspace.remote, api = remote?.pathStyle === "posix" ? path.posix : remote?.pathStyle === "win32" ? path.win32 : path;
     const canonical = (value: string) => remote ? remote.files.realpath(value, workspace.signal) : realpath(value);
@@ -127,15 +139,30 @@ export class ExtensionFileDeposits {
           files.push({ absolute, relative, size, ...(read ? { read } : {}) });
         };
         const info = remote ? await remote.files.stat(directory, workspace.signal) : await lstat(directory); current();
-        const walk = async (absolute: string): Promise<void> => {
+        let visited = 0;
+        const walk = async (absolute: string, depth = 0): Promise<void> => {
           current();
+          if ("kind" in scope && (++visited > 100_000 || depth > 128)) throw new Error("The selected directory exceeds its scan budget.");
           if (await canonical(directory) !== directory || !isWithin(directory, await canonical(absolute))) throw new Error("The transfer directory changed.");
-          const entries = remote ? await remote.files.list(absolute, workspace.signal) : await readdir(absolute, { withFileTypes: true }); current();
+          const boundedEntries = async () => {
+            const handle = await opendir(absolute), entries = [];
+            try {
+              while (true) {
+                current(); const entry = await handle.read(); current(); if (!entry) break;
+                if (entries.length + visited >= 100_000) throw new Error("The selected directory exceeds its scan budget.");
+                entries.push(entry);
+              }
+              return entries;
+            } finally { await handle.close().catch(() => undefined); }
+          };
+          const entries = remote ? await remote.files.list(absolute, workspace.signal)
+            : "kind" in scope ? await boundedEntries() : await readdir(absolute, { withFileTypes: true }); current();
           for (const entry of entries) {
+            if ("kind" in scope && ++visited > 100_000) throw new Error("The selected directory exceeds its scan budget.");
             if (!entry.name || entry.name === "." || entry.name === ".." || entry.name.includes("/") || entry.name.includes("\\")) throw new Error("The transfer directory entry is invalid.");
             const file = api.join(absolute, entry.name);
             const directoryEntry = "kind" in entry ? entry.kind === "directory" : entry.isDirectory(), fileEntry = "kind" in entry ? entry.kind === "file" : entry.isFile();
-            if (directoryEntry && !EXCLUDED_DIRECTORIES.has(entry.name)) await walk(file);
+            if (directoryEntry && !EXCLUDED_DIRECTORIES.has(entry.name)) await walk(file, depth + 1);
             else if (fileEntry && !excludedFile(entry.name)) {
               const info = remote ? await remote.files.stat(file, workspace.signal) : await lstat(file); current();
               if ("kind" in info ? info.kind === "file" : info.isFile()) add(file, api.relative(directory, file).split(api.sep).join("/"), info.size);
@@ -146,7 +173,7 @@ export class ExtensionFileDeposits {
         else if ("kind" in info ? info.kind === "directory" : info.isDirectory()) await walk(directory);
         else throw new Error("The transfer path must be a file or directory.");
         if (!files.length) throw new Error("No transferable files were found.");
-        current(); const token = randomUUID(); issued.push(token);
+        await workspace.assertBytesCurrent?.(); current(); const token = randomUUID(); issued.push(token);
         this.#directories.set(token, { owner: owner(scope), expiresAt: this.now() + TTL, current, root: directory, workspace, files });
         args.dir_deposit = { token, file_count: files.length, total_bytes: total, rel_paths: files.map(file => file.relative) };
       }
@@ -162,10 +189,11 @@ export class ExtensionFileDeposits {
   }
   take(scope: ExtensionCardScope, token: string): ExtensionDirectoryTransfer | undefined {
     this.#sweep(); const entry = this.#directories.get(token);
-    if (!entry || entry.owner !== owner(scope)) return;
+    if (!entry || !matchesDirectoryOwner(entry.owner, scope)) return;
     entry.current(); this.#directories.delete(token);
     return { files: entry.files.map(file => ({ relPath: file.relative, size: file.size, read: async () => {
       entry.current();
+      await entry.workspace.assertBytesCurrent?.(); entry.current();
       if (file.read) return file.read();
       if (!samePath(await realpath(entry.root), entry.root) || !within(entry.root, await realpath(file.absolute))) throw new Error("The transferred file changed.");
       const handle = await open(file.absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -178,9 +206,23 @@ export class ExtensionFileDeposits {
         const after = await handle.stat(), current = await stat(file.absolute); entry.current();
         if (offset !== before.size || before.size !== after.size || before.mtimeMs !== after.mtimeMs || current.dev !== before.dev || current.ino !== before.ino
           || !samePath(await realpath(entry.root), entry.root) || !within(entry.root, await realpath(file.absolute))) throw new Error("The transferred file changed.");
+        await entry.workspace.assertBytesCurrent?.(); entry.current();
         return bytes;
       } finally { await handle.close(); }
     } })) };
+  }
+
+  async preparePickedDirectory(input: { readonly extensionId: string; readonly authorityKey: string; readonly selectionId: string;
+    readonly directory: string; readonly assertCurrent: () => void; readonly assertDirectoryCurrent: () => Promise<void>; readonly assertSelectionCurrent?: () => void }) {
+    let selecting = true;
+    const current = () => { input.assertCurrent(); if (selecting) input.assertSelectionCurrent?.(); };
+    let result: Readonly<Record<string, unknown>>;
+    try {
+      result = await this.prepare({ kind: "user_pick", extensionId: input.extensionId, authorityKey: input.authorityKey, selectionId: input.selectionId },
+        { dir: input.directory }, { root: input.directory, assertCurrent: current, assertBytesCurrent: input.assertDirectoryCurrent }, current);
+    } finally { selecting = false; }
+    const receipt = result.dir_deposit as { token: string; file_count: number; total_bytes: number; rel_paths: string[] };
+    return { token: receipt.token, fileCount: receipt.file_count, totalBytes: receipt.total_bytes, relativePaths: receipt.rel_paths, expiresAt: this.now() + TTL };
   }
   async write(scope: ExtensionCardScope, token: string, suggested: string, bytes: Uint8Array, current: () => void): Promise<string | undefined> {
     this.#sweep(); const entry = this.#saves.get(token);

@@ -782,6 +782,7 @@ function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): re
     ...(runtime.tasks ? [{ id: "runtime-managed-tasks", label: "Managed tasks", description: "Creates and controls its own ordinary tasks using your selected model and task permissions.", required: true }] : []),
     ...(runtime.targets ? [{ id: "runtime-targets", label: "Deliver to projects, tasks and partners", description: "Lists local target names and sends plugin text or images to a selected target. This does not grant access to its message history.", required: true }] : []),
     ...(runtime.deviceSync ? [{ id: "runtime-device-sync", label: "Encrypted plugin data exchange", description: "Exchanges bounded plugin data with the same approved plugin on authorized Desktop devices. It cannot read their files or task history.", required: true }] : []),
+    ...(runtime.pick ? [{ id: "runtime-pick", label: "Choose directories", description: "Requests a trusted host directory chooser. Only a bounded read deposit for your explicit selection reaches this plugin; it receives no absolute path or general filesystem access.", required: true }] : []),
     ...(runtime.tasks?.hidden ? [{ id: "runtime-hidden-tasks", label: "Background tasks", description: "May hide its own tasks from normal lists, search and notifications. You can open or reveal them in plugin details.", required: true }] : []),
     ...(runtime.text?.oneshot ? [{ id: "runtime-text", label: "Text inference", description: "Runs bounded one-shot text requests using your plugin model or auxiliary models.", required: true }] : [])
   ];
@@ -789,12 +790,13 @@ function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): re
 
 function runtimeSetup(extensionId: string, runtime: ExtensionRuntimeDescriptor | undefined): readonly SetupRequirement[] {
   const network = runtime?.network;
-  if (!network) return [];
+  const pick: readonly SetupRequirement[] = runtime?.pick ? [{ id: "directory-confirmation", label: "Allow directory selection", description: "The plugin can request a native chooser and receive a bounded read deposit only for a directory you explicitly select.", kind: "confirmation", required: true }] : [];
+  if (!network) return pick;
   return [...(network.secrets ?? []).filter(secret => secret.source !== "oauth").map(secret => ({ id: `network-secret:${secret.key}`, label: secret.label,
     description: secret.hint ?? `Protected ${secret.inject.header} credential for ${(secret.inject.hosts ?? network.hosts).join(", ")}.`,
     kind: "secret" as const, required: true, credentialReferenceId: extensionNetworkCredentialReference(extensionId, network, secret),
     credentialKinds: ["header_secret" as const, "api_key" as const] })),
-    { id: "permission-confirmation", label: "Allow extension network access", description: `Allow HTTPS requests to ${[...network.hosts, ...(network.connections?.length ? ["addresses explicitly configured in connection settings"] : [])].join(", ")}.`, kind: "confirmation", required: true }];
+    { id: "permission-confirmation", label: "Allow extension network access", description: `Allow HTTPS requests to ${[...network.hosts, ...(network.connections?.length ? ["addresses explicitly configured in connection settings"] : [])].join(", ")}.`, kind: "confirmation", required: true }, ...pick];
 }
 
 function projectDefinitions(

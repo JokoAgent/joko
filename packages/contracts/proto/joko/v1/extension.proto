@@ -338,6 +338,35 @@ message ExtensionSettingsRoutingData {
   string data_json = 2;
 }
 
+message ExtensionDirectoryPicker {
+  string picker_id = 1;
+  string extension_id = 2;
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message ExtensionDirectoryPickerEntry {
+  string entry_id = 1;
+  string name = 2;
+  // Private host UI only. The author page only receives a deposit receipt.
+  string display_path = 3;
+  optional string parent_entry_id = 4;
+}
+
+message ExtensionDirectoryPickerPage {
+  ExtensionDirectoryPicker picker = 1;
+  optional ExtensionDirectoryPickerEntry directory = 2;
+  repeated ExtensionDirectoryPickerEntry entries = 3;
+  string next_page_token = 4;
+}
+
+message ExtensionPickedDirectoryDeposit {
+  string token = 1;
+  uint32 file_count = 2;
+  uint64 total_bytes = 3;
+  repeated string relative_paths = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
 message ExtensionLibraryDescriptor {
   uint32 schema_version = 1;
 }

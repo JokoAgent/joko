@@ -75,10 +75,18 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
       return create(contract.GetTaskProviderGroupUsageResponseSchema, { member,
         ...(snapshot ? { accountUsage: toGroupAccountUsage(snapshot), quota: providerGroupQuota(snapshot, member.providerId, member.modelId, options.now?.() ?? Date.now()) } : {}) });
     }),
+    getTaskProviderGroupRebalance: (request, context) => invoke(context, true, async () => {
+      identity(request.sessionId);
+      const suggestion = await service.rebalanceSuggestion(request.sessionId, request.generation, context.signal);
+      return create(contract.GetTaskProviderGroupRebalanceResponseSchema, suggestion ? { suggestion } : {});
+    }),
     pickProviderGroupMember: (request, context) => invoke(context, false, async principal => {
       const group = key(request.key, principal); identity(request.sessionId); identity(request.agentKind); identity(request.modelId);
       if (request.excludeMemberKeys.length > 512) throw new ConnectError("Too many excluded group members.", Code.InvalidArgument);
-      const assignment = await service.router.pick({ sessionId: remoteSession(principal, request.sessionId), group, profile: { ...group, modelId: request.modelId, fastMode: false }, agentKind: request.agentKind,
+      if (request.fastMode && request.ultrafastMode) throw new ConnectError("Conflicting group speed modes.", Code.InvalidArgument);
+      const assignment = await service.router.pick({ sessionId: remoteSession(principal, request.sessionId), group, profile: { ...group, modelId: request.modelId,
+        ...(request.effortId === undefined ? {} : { effort: request.effortId }), fastMode: request.ultrafastMode ? "ultrafast" : request.fastMode }, agentKind: request.agentKind,
+        ...(request.quotaRebalanceFromMemberKey === undefined ? {} : { quotaRebalanceFrom: request.quotaRebalanceFromMemberKey }),
         modelId: request.modelId, ...(request.logicalModelId === undefined ? {} : { logicalModelId: request.logicalModelId }), ownTask: false, fresh: request.excludeMemberKeys.length > 0,
         exclude: new Set(request.excludeMemberKeys) }, context.signal);
       assignment.assertCurrent(); principal.assertCurrent(); service.router.rememberRemoteSelection(principal.id, request.sessionId, assignment);

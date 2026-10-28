@@ -9,8 +9,8 @@ export interface ExtensionNetworkSecret {
   readonly oauth?: ExtensionOAuthDeclaration;
   readonly inject: { readonly hosts?: readonly string[]; readonly header: string; readonly format: string };
   readonly exchange?: { readonly url: string; readonly bodyFormat: string; readonly contentType?: "application/json" | "application/x-www-form-urlencoded"; readonly tokenPath: string; readonly ttlSeconds?: number };
-  readonly check?: { readonly url: string; readonly bodyFormat: string; readonly validPath: string; readonly validValue: string | number | boolean;
-    readonly expiresAtPath?: string; readonly expiresAtFormat?: "iso" | "unix-seconds" | "unix-milliseconds" };
+  readonly check?: { readonly url: string; readonly bodyFormat: string; readonly validPath: string; readonly validValue: string | boolean;
+    readonly expiresAtPath?: string; readonly expiresAtFormat?: "iso" | "unix-seconds" | "unix-ms" };
 }
 export interface ExtensionNetworkDeclaration {
   readonly hosts: readonly string[];
@@ -106,16 +106,17 @@ export function parseExtensionNetwork(value: unknown): ExtensionNetworkDeclarati
     if (secret.check !== undefined) {
       if (oauth) throw new Error("Only user-provided credentials can declare candidate validation.");
       const value = object(secret.check, ["url", "bodyFormat", "validPath", "validValue", "expiresAtPath", "expiresAtFormat"], ["url", "bodyFormat", "validPath", "validValue"]);
-      const url = extensionNetworkUrl(value.url, hosts).href, bodyFormat = text(value.bodyFormat, 2048), validPath = text(value.validPath, 256);
-      const path = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/u;
-      if (!path.test(validPath) || bodyFormat.split("{value}").length !== 2
-        || !["string", "number", "boolean"].includes(typeof value.validValue)
-        || typeof value.validValue === "number" && !Number.isFinite(value.validValue)
-        || typeof value.validValue === "string" && value.validValue.length > 1024
-        || value.expiresAtPath !== undefined && (typeof value.expiresAtPath !== "string" || !path.test(value.expiresAtPath) || value.expiresAtPath.length > 256)
-        || value.expiresAtFormat !== undefined && !["iso", "unix-seconds", "unix-milliseconds"].includes(String(value.expiresAtFormat))) throw new Error("Extension credential check is invalid.");
-      try { JSON.parse(bodyFormat.replace("{value}", "example")); } catch { throw new Error("Extension credential check body must be JSON."); }
-      check = { url, bodyFormat, validPath, validValue: value.validValue as string | number | boolean,
+      const destination = extensionNetworkUrl(value.url, injectionHosts ?? hosts), url = destination.href;
+      const bodyFormat = text(value.bodyFormat, 4096), validPath = text(value.validPath, 128);
+      const path = (value: unknown): value is string => typeof value === "string" && value.length <= 128
+        && /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/u.test(value) && !value.split(".").some(key => ["__proto__", "prototype", "constructor"].includes(key));
+      if (destination.hash || !path(validPath) || bodyFormat.split("{value}").length !== 2
+        || typeof value.validValue !== "boolean" && !(typeof value.validValue === "string" && value.validValue.length > 0 && value.validValue.length <= 64)
+        || value.expiresAtPath !== undefined && !path(value.expiresAtPath)
+        || value.expiresAtFormat !== undefined && (value.expiresAtPath === undefined || !["iso", "unix-seconds", "unix-ms"].includes(String(value.expiresAtFormat)))) throw new Error("Extension credential check is invalid.");
+      try { const body = JSON.parse(bodyFormat.replace("{value}", "example")) as unknown; if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error(); }
+      catch { throw new Error("Extension credential check body must be a JSON object."); }
+      check = { url, bodyFormat, validPath, validValue: value.validValue as string | boolean,
         ...(value.expiresAtPath === undefined ? {} : { expiresAtPath: value.expiresAtPath as string }),
         ...(value.expiresAtFormat === undefined ? {} : { expiresAtFormat: value.expiresAtFormat as NonNullable<ExtensionNetworkSecret["check"]>["expiresAtFormat"] }) };
     }

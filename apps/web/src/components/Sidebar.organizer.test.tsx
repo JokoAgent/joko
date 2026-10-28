@@ -7,7 +7,7 @@ import { afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type ExtensionCatalogEntryView, type ScheduleView, type SessionTitleSuggestionView, type SessionView } from "../model.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT, SIDEBAR_DIALOGUE_FILTER_ID, type SidebarDisplayPreferences } from "../sidebar-layout.js";
-import { Sidebar, type SidebarProps, visibleSidebarSessionIds } from "./Sidebar.js";
+import { Sidebar, type SidebarProps, visibleSidebarSessionIds, sessionsForSidebarStatus } from "./Sidebar.js";
 import { SIDEBAR_HOVER_CARD_CLOSE_DELAY_MS, SIDEBAR_HOVER_CARD_OPEN_DELAY_MS } from "./SidebarHoverCard.js";
 import type { Translator } from "./types.js";
 
@@ -27,6 +27,14 @@ afterEach(async () => {
 });
 
 describe("Sidebar organizer display controls", () => {
+  it("does not promote Side Chat children into an ordinary task list or search result", () => {
+    const parent = { id: "parent", archived: false } as SessionView;
+    const child = { ...parent, id: "aside", pinned: true, derivationOrigin: { kind: "fork" as const, sideChat: true as const,
+      sourceSessionId: parent.id, sourceSessionAvailable: true, sourceMessageAvailable: true } };
+    expect(sessionsForSidebarStatus([parent, child], "all").map(session => session.id)).toEqual([parent.id]);
+    expect(sessionsForSidebarStatus([parent, child], "active").map(session => session.id)).toEqual([parent.id]);
+    expect(child.hidden).toBeUndefined();
+  });
   it("shows only ready enabled Extension shortcuts and opens their exact main view", async () => {
     const onNavigate = vi.fn();
     const onClose = vi.fn();

@@ -11491,6 +11491,29 @@ describe("SessionHost", () => {
     expect(adapter.createCalls).toBe(2);
   });
 
+  it("uses the same service-owned ordinary-source admission before any completed-history native fork", async () => {
+    const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities,
+      { key: "session.side_chat", supported: true }] });
+    let ordinary = true;
+    const fixture = await createFixture(adapter, { sideChatSourceAllowed: () => ordinary });
+    const sourceId = (await fixture.host.createSession({ operationId: "sidechat-source-admission", connection: fixture.connection,
+      targetId: "target-one", title: "Source", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+    const source = fixture.store.getSession(sourceId).descriptor;
+    appendSessionEvent(fixture.store, sourceId, "sidechat-source-completed", Date.now(), { type: "message_complete", role: "assistant",
+      blocks: [{ kind: "text", text: "Completed" }], nativeHistory: { identity: { entryId: "completed-native" } } });
+    const fork = vi.spyOn(adapter, "fork");
+    expect(fixture.host.sideChatSourceAllowed(sourceId)).toBe(true);
+    ordinary = false; expect(fixture.host.sideChatSourceAllowed(sourceId)).toBe(false);
+    await expect(fixture.host.deriveSession({ operationId: "sidechat-source-denied", connection: fixture.connection, sourceSessionId: sourceId,
+      kind: "fork", sideChat: true, entryId: "completed-native", sourceMessage: { messageId: "completed-native", eventId: "sidechat-source-completed" },
+      expectedGeneration: source.binding.generation, title: "Must not exist" })).rejects.toThrow("ordinary main task");
+    expect(fork).not.toHaveBeenCalled(); expect(fixture.store.listSessions()).toHaveLength(1);
+    ordinary = true;
+    const current = fixture.store.getSession(sourceId);
+    fixture.store.updateSession(sourceId, { archived: true }, current.revision);
+    expect(fixture.host.sideChatSourceAllowed(sourceId)).toBe(false);
+  });
+
   it("claims native derivation before fork and replays the completed product task without a second fork", async () => {
     const adapter = new GatedFakeAdapter();
     adapter.forkEditorText = `  restore this draft sk-abcdefghijklmnop ${"x".repeat(65_537)}\n`;
@@ -16496,6 +16519,7 @@ async function createFixture(
     readonly workspaceCapture?: WorkspaceRunCapture;
     readonly prepareProjectGit?: NonNullable<ConstructorParameters<typeof SessionHost>[3]>["prepareProjectGit"];
     readonly assertPrewarmResources?: NonNullable<ConstructorParameters<typeof SessionHost>[3]>["assertPrewarmResources"];
+    readonly sideChatSourceAllowed?: (sessionId: string) => boolean;
     readonly partnerLearning?: PartnerLearningHostPort;
     readonly registerPartnerLearningToolAuthority?: (authority: PartnerLearningToolAuthority) => string;
     readonly worktrees?: SessionWorktreeCoordinator;

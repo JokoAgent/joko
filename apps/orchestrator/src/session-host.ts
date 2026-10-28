@@ -63,6 +63,7 @@ import type {
 import { JokoError, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
 import {
   AuthorizationError,
+  ensureSideChatHistoryBoundary,
   InvalidStateTransitionError,
   OperationConflictError,
   OperationInProgressError,
@@ -592,6 +593,7 @@ export interface CreateServiceSessionInput {
 type SessionCreationInput = CreateSessionInput | CreateScheduledSessionInput | CreateServiceSessionInput;
 
 interface QueuedInput {
+  readonly providerGroupRebalance?: import("./provider-group-service.js").ProviderGroupRebalanceChoice;
   readonly operationId: string;
   readonly sessionId: string;
   readonly prompt: PromptInput;
@@ -897,6 +899,7 @@ export class SessionHost {
   readonly #inputHandoffAdmissions = new WeakSet<PromptInput>();
   #partnerHomeInputGuard: ((sessionId: string) => void) | undefined;
   #messagingQueueGuard: ((item: QueueItemRecord) => void) | undefined;
+  #messagingToolReview: ((item: QueueItemRecord, request: import('@joko/core').NativeToolAuthorizationRequest) => import('@joko/core').NativeToolAuthorizationDecision) | undefined;
   #extensionTaskQueueGuard?: (item: QueueItemRecord) => void;
   #extensionNativeToolAuthorization?: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined;
   readonly #resolveMcpAppModelContext: ((sessionId: string) => Promise<McpAppModelContext>) | undefined;
@@ -994,6 +997,7 @@ export class SessionHost {
   readonly #partnerSessionRestarting: (sessionId: string) => boolean;
   readonly #partnerSessionPaused: (sessionId: string) => boolean;
   readonly #partnerSessionPolicy: (sessionId: string) => PartnerSessionPolicyObservation | undefined;
+  readonly #sideChatSourceAllowed: (sessionId: string) => boolean;
   readonly #partnerPolicyRetirements = new Map<string, {
     readonly active: ActiveSession; readonly stored: StoredSession; readonly assertOwner: () => void;
   }>();
@@ -1031,6 +1035,7 @@ export class SessionHost {
     readonly sessionId: string;
     readonly runId: string;
     readonly outcome: "completed" | "aborted" | "failed";
+    readonly recovering?: boolean;
   }) => Promise<void> | void) | undefined;
   readonly #onServiceInteractionOpened: ((input: {
     readonly sessionId: string;
@@ -1063,6 +1068,7 @@ export class SessionHost {
           return { sessionId, profile, agentKind: source?.agentKind ?? backend.adapterKind,
             ...(model?.logicalId === undefined ? {} : { logicalModelId: model.logicalId }),
             eligible: !session.archived && session.deletedAt === undefined && session.remoteWorkspace === undefined && !this.isReviewReadOnlySession(sessionId)
+              && !(session.derivationOrigin?.sideChat && session.worktree === undefined) && this.#sideChatSourceAllowed(sessionId)
               && this.#store.getTarget(session.targetId).descriptor.trusted,
             dispatchUnknown: this.#store.listRuns({ sessionId, states: ["dispatch_unknown"], limit: 1 }).length > 0
               || ["effect", "unknown"].includes(this.#runtimeHandoffs.read(sessionId)?.pending?.phase ?? "") };
@@ -1071,9 +1077,20 @@ export class SessionHost {
       handoff: async (sessionId, profile, options) => {
         const assertCurrent = () => { if (!options.isCurrent()) throw new StoreError("The Provider group handoff was superseded."); };
         assertCurrent(); const current = this.getSessionRuntimeControl(sessionId);
-        if (options.fresh) this.#stageSessionRuntimeHandoff({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", fresh: true }, this.#store.getSession(sessionId), current);
+        if (options.recoverGeneration !== undefined) {
+          const original = this.#runtimeHandoffs.read(sessionId), pending = original?.pending;
+          const sameProfile = (value: SessionRuntimeProfile | undefined) => value !== undefined && value.backendId === profile.backendId && value.providerId === profile.providerId
+            && value.modelId === profile.modelId && value.effort === profile.effort && value.fastMode === profile.fastMode;
+          if (original?.generation !== options.recoverGeneration || pending && (!sameProfile(pending.profile) || pending.generation !== options.recoverGeneration)) return "unknown";
+          if (!pending) {
+            const session = this.#store.getSession(sessionId).descriptor, injection = original.injection;
+            return injection?.generation === options.recoverGeneration && injection.binding.opaqueRef === session.binding.opaqueRef
+              && injection.binding.nativeSessionId === session.binding.nativeSessionId && sameProfile(current.effective) ? "committed" : "unknown";
+          }
+        } else if (options.fresh) this.#stageSessionRuntimeHandoff({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", fresh: true }, this.#store.getSession(sessionId), current);
         else await this.setSessionRuntimeControl({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", assertAuthority: assertCurrent });
         assertCurrent(); const pending = this.#runtimeHandoffs.read(sessionId)?.pending;
+        if (pending) options.onPrepared?.(pending.generation);
         const applied = pending ? await this.#performSessionRuntimeHandoff(sessionId, assertCurrent) : await this.#applyPendingSessionRuntimeControl(sessionId, true, assertCurrent);
         assertCurrent(); if (!applied) return "unknown";
         const effective = this.getSessionRuntimeControl(sessionId).effective;
@@ -1135,6 +1152,7 @@ export class SessionHost {
       readonly partnerSessionRestarting?: (sessionId: string) => boolean;
       readonly partnerSessionPaused?: (sessionId: string) => boolean;
       readonly partnerSessionPolicy?: (sessionId: string) => PartnerSessionPolicyObservation | undefined;
+      readonly sideChatSourceAllowed?: (sessionId: string) => boolean;
       readonly partnerTargetRetired?: (targetId: string) => boolean;
       /** Private service identity resolved at native activation, never supplied through RPC or persisted in Session data. */
       readonly resolveServiceRuntimePrompt?: (session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>;
@@ -1182,6 +1200,7 @@ export class SessionHost {
         readonly sessionId: string;
         readonly runId: string;
         readonly outcome: "completed" | "aborted" | "failed";
+        readonly recovering?: boolean;
       }) => Promise<void> | void;
       /** Post-commit notification for service-owned interaction projections. */
       readonly onServiceInteractionOpened?: (input: {
@@ -1223,6 +1242,7 @@ export class SessionHost {
     this.#partnerSessionRestarting = options.partnerSessionRestarting ?? (() => false);
     this.#partnerSessionPaused = options.partnerSessionPaused ?? (() => false);
     this.#partnerSessionPolicy = options.partnerSessionPolicy ?? (() => undefined);
+    this.#sideChatSourceAllowed = options.sideChatSourceAllowed ?? (() => true);
     this.#partnerTargetRetired = options.partnerTargetRetired ?? (() => false);
     this.#resolveServiceRuntimePrompt = options.resolveServiceRuntimePrompt;
     this.#resolvePartnerReplyQuote = options.resolvePartnerReplyQuote;
@@ -2086,7 +2106,8 @@ export class SessionHost {
       && (input.serviceKind !== "extension" || !input.assertServiceScope || !input.onExtensionAdmitted)) {
       throw new StoreError("Plugin task creation requires its exact installation owner.");
     }
-    if (input.hidden !== undefined && (!input.assertServiceScope || !["extension", "collaboration"].includes(input.serviceKind))) throw new StoreError("Hidden service tasks require their exact installation or team owner.");
+    if (input.hidden !== undefined && (!input.assertServiceScope || !["extension", "collaboration", "partner"].includes(input.serviceKind)
+      || input.serviceKind === 'partner' && input.preparePrivateSession === undefined)) throw new StoreError("Hidden service tasks require their exact installation, team or private Partner owner.");
     if (input.catalogImport !== undefined && (input.serviceKind !== "partner" || input.originSessionId === undefined
       || input.originSessionGeneration === undefined || input.assertServiceScope === undefined)) throw new StoreError("A service catalog import requires its exact Partner scope.");
     if (input.workerWorkspace !== undefined && (input.serviceKind !== "collaboration" || input.assertServiceScope === undefined
@@ -2792,6 +2813,7 @@ export class SessionHost {
         body: {
           sessionId: input.sessionId, prompt: input.prompt, source: input.source ?? "user",
           ...(input.overrides === undefined ? {} : { overrides: input.overrides }),
+          ...(input.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: input.providerGroupRebalance }),
           ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId })
         }
       },
@@ -3033,6 +3055,12 @@ export class SessionHost {
     const runId = stableId("run", input.operationId);
     const attemptId = stableId("attempt", input.operationId);
     const queueItemId = stableId("queue", input.operationId);
+    if (input.providerGroupRebalance) {
+      if (!this.#providerGroups || (input.source ?? "user") !== "user" || acceptedPrompt.disposition !== "prompt" || hasTurnRouteOverrides(input.overrides)) {
+        throw new StoreError("Quota balancing requires this ordinary owner's original prompt.");
+      }
+      this.#providerGroups.service.acceptRebalance(input.sessionId, queueItemId, input.operationId, input.providerGroupRebalance);
+    }
     store.createRun({
       id: runId, sessionId: input.sessionId, source: input.source ?? "user", state: "queued",
       ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
@@ -4797,6 +4825,15 @@ export class SessionHost {
     }
   }
 
+  sideChatSourceAllowed(sessionId: string): boolean {
+    try {
+      const source = this.#store.getSession(sessionId);
+      if (this.#store.getBackend(source.descriptor.backendId).descriptor.capabilities.get("session.side_chat")?.supported !== true) return false;
+      this.assertSessionDerivationSource(source, true);
+      return true;
+    } catch { return false; }
+  }
+
   async openSideChat(input: { readonly operationId: string; readonly connection: ConnectionRecord; readonly sourceSessionId: string;
     readonly title: string; readonly expectedGeneration: number }): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
@@ -5128,6 +5165,11 @@ export class SessionHost {
   }
 
   private assertSessionDerivationSource(source: StoredSession, completedSnapshot = false): void {
+    if (completedSnapshot && (source.descriptor.archived || source.descriptor.hidden || source.descriptor.derivationOrigin?.sideChat
+      || this.#store.sessionCreationServiceKind(source.descriptor.id) !== undefined || this.#partnerSessionPolicy(source.descriptor.id) !== undefined
+      || !this.#sideChatSourceAllowed(source.descriptor.id))) {
+      throw new StoreError("Only an ordinary main task can open a Side Chat.");
+    }
     if (this.isReviewReadOnlySession(source.descriptor.id)) {
       throw new StoreError("Reviewer Sessions cannot be attached, forked, or cloned.");
     }
@@ -5975,7 +6017,8 @@ export class SessionHost {
       this.#providerGroups?.service.noteUserAction(sessionId);
       this.#providerGroups?.guestSwitch.drop(sessionId);
       const group = this.#providerGroupRecoveries.get(sessionId);
-      if (group) { group.controller.abort(); this.#providerGroupRecoveries.delete(sessionId); this.providerGroupSessionPort().status(sessionId, "idle"); }
+      if (group) { group.controller.abort(); this.#providerGroupRecoveries.delete(sessionId); this.providerGroupSessionPort().status(sessionId, "idle");
+        if (this.#store.findQueueItemByRunId(sessionId, group.runId, { includeCleared: true })?.body.messagingOrigin) void this.notifyServiceRunSettled(sessionId, group.runId, 'aborted'); }
     }
     const state = this.#sessionRuntimeRecoveries.get(sessionId);
     if (state?.timer !== undefined) clearTimeout(state.timer);
@@ -5983,6 +6026,10 @@ export class SessionHost {
       this.#publishSessionRuntimeRecovery(sessionId, state, terminalState, terminalError);
     }
     this.#sessionRuntimeRecoveries.delete(sessionId);
+    if (terminalState !== 'succeeded' && state?.current?.sourceRunId
+      && this.#store.findQueueItemByRunId(sessionId, state.current.sourceRunId, { includeCleared: true })?.body.messagingOrigin) {
+      void this.notifyServiceRunSettled(sessionId, state.current.sourceRunId, terminalState === 'cancelled' ? 'aborted' : 'failed');
+    }
   }
 
   #publishSessionRuntimeRecovery(
@@ -6037,7 +6084,7 @@ export class SessionHost {
 
   #providerGroupApplies(item: QueueItemRecord): boolean {
     const groups = this.#providerGroups;
-    if (!groups || hasTurnOverrides(item.executionOverrides) || item.body.inputHandoffContinuation !== undefined || this.isReviewReadOnlySession(item.sessionId)
+    if (!groups || hasTurnRouteOverrides(item.executionOverrides) || item.body.inputHandoffContinuation !== undefined || this.isReviewReadOnlySession(item.sessionId)
       || new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId === item.sessionId) return false;
     const session = this.providerGroupSessionPort().read(item.sessionId); if (!session?.eligible || session.dispatchUnknown) return false;
     const binding = groups.store.binding(item.sessionId);
@@ -6046,7 +6093,7 @@ export class SessionHost {
   }
   #providerGroupMayHandleRun(sessionId: string, runId: string, error: PublicError): boolean {
     const item = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
-    return item !== undefined && !hasTurnOverrides(item.executionOverrides)
+    return item !== undefined && !hasTurnRouteOverrides(item.executionOverrides)
       && new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId !== sessionId
       && !contextRecoveryEvidence(this.#store, sessionId, runId).hasExternalDispatchOwner
       && (this.#providerGroups?.service.mayHandleTurnError(sessionId, providerGroupFailureSignals(error)) === true || this.#hasProviderGroupGuestOffer(sessionId));
@@ -6093,6 +6140,7 @@ export class SessionHost {
     } finally {
       if (this.#providerGroupRecoveries.get(sessionId) === entry) this.#providerGroupRecoveries.delete(sessionId);
       this.#store.deleteSetting("session", sessionId, `provider.group-error:${runId}`);
+      if (this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true })?.body.messagingOrigin) void this.notifyServiceRunSettled(sessionId, runId, 'failed');
       void this.drain(sessionId);
     }
   }
@@ -6102,7 +6150,7 @@ export class SessionHost {
     const source = this.#store.findQueueItemByRunId(sessionId, recovery.runId, { includeCleared: true }); if (!source) throw new StoreError("The interrupted input is unavailable.");
     const evidence = contextRecoveryEvidence(this.#store, sessionId, recovery.runId);
     const prompt: PromptInput = evidence.hasAssistantOrToolEffects ? { text: "Continue from the interrupted response. Do not repeat completed work or side effects.",
-      images: [], files: [], mentions: [], disposition: "prompt" } : { ...source.body, disposition: "prompt" };
+      images: [], files: [], mentions: [], disposition: "prompt", ...(source.body.messagingOrigin ? { messagingOrigin: source.body.messagingOrigin } : {}) } : { ...source.body, disposition: "prompt" };
     if (!lease.isCurrent() || !options.isCurrent()) throw new StoreError("The Provider group continuation was superseded.");
     this.enqueueServiceInput({ operationId: stableId("provider-group-continue", `${sessionId}:${recovery.runId}`), sessionId, source: "system", parentRunId: recovery.runId,
       prompt: { ...prompt, automaticContinuation: { recoveryId: stableId("provider-group-recovery", recovery.runId), sourceRunId: recovery.runId, attempt: 1, maximumAttempts: 5, sessionTotal: 1 } } });
@@ -6130,10 +6178,11 @@ export class SessionHost {
     const item = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
     const current = this.#sessionRuntimeRecoveries.get(sessionId);
     const ownedContinuation = run.source === "system" && current?.currentRunId === runId;
+    const messageInput = item !== undefined && this.#trustedMessageInput(item);
     if (
       item === undefined
-      || (run.source !== "user" && !ownedContinuation)
-      || (run.source === "user" && item.disposition !== "prompt")
+      || (run.source !== "user" && !messageInput && !ownedContinuation)
+      || (!ownedContinuation && (run.source === "user" || messageInput) && item.disposition !== "prompt")
       || contextRecoveryEvidence(this.#store, sessionId, runId).hasExternalDispatchOwner
     ) {
       if (ownedContinuation) this.#clearSessionRuntimeRecovery(sessionId, "exhausted", error);
@@ -6232,7 +6281,8 @@ export class SessionHost {
           files: [],
           mentions: [],
           disposition: "follow_up",
-          automaticContinuation
+          automaticContinuation,
+          ...(source.body.messagingOrigin ? { messagingOrigin: source.body.messagingOrigin } : {})
         }
       : { ...source.body, automaticContinuation };
     const operationId = stableId(
@@ -13026,7 +13076,7 @@ export class SessionHost {
     const replaySafe = reason === "context_overflow"
       && sourceInputPending
       && queueItem.disposition === "prompt"
-      && run.descriptor.source === "user"
+      && (run.descriptor.source === "user" || this.#trustedMessageInput(queueItem))
       && !evidence.hasExternalDispatchOwner;
     return {
       reason,
@@ -13426,7 +13476,7 @@ export class SessionHost {
         }
         if (this.#providerGroupApplies(pending)) {
           if (listAllRuns(this.#store, { sessionId, activeOnly: true }).some(run => run.descriptor.id !== pending!.runId && run.descriptor.state !== "queued")) return;
-          try { await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal); }
+          try { await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal, pending.id); }
           catch (error) {
             this.providerGroupSessionPort().status(sessionId, "unavailable");
             this.recordFailure("provider_group_before_send", error); return;
@@ -13921,8 +13971,9 @@ export class SessionHost {
           });
           if (!uncertain) {
             removeNativeDispatchRecoveryEntry(this.#store, sessionId, run.descriptor.id);
+            if (groupRecovery && item.body.messagingOrigin) void this.#recoverProviderGroup(sessionId, run.descriptor.id, failure);
             await this.notifyServiceRunSettled(sessionId, run.descriptor.id, "failed");
-            if (groupRecovery) void this.#recoverProviderGroup(sessionId, run.descriptor.id, failure);
+            if (groupRecovery && !item.body.messagingOrigin) void this.#recoverProviderGroup(sessionId, run.descriptor.id, failure);
           }
           if (recoveryTrigger?.reason === "context_overflow") this.ensureContextOverflowReplay(sessionId);
           if (this.isReviewReadOnlySession(sessionId)) {
@@ -14171,9 +14222,11 @@ export class SessionHost {
             });
             if (local.verdict === "block") return { ...local, authorizationRevision: revision };
             const delegated: import("@joko/core").NativeToolAuthorizationDecision = await this.#extensionNativeToolAuthorization?.(sessionId)?.review(request) ?? { verdict: "default" as const };
+            const sourceQueue = runId === undefined ? undefined : this.#store.findQueueItemByRunId(sessionId, runId);
+            const messaging = sourceQueue?.body.messagingOrigin ? this.#messagingToolReview?.(sourceQueue, request) : undefined;
             context.nativeToolAuthorization!.assertCurrent(revision);
             const result = delegated.verdict === "block" || delegated.unavailable ? delegated
-              : local.verdict === "ask" || delegated.verdict === "ask" ? { verdict: "ask" as const, reason: local.reason ?? delegated.reason }
+              : local.verdict === "ask" || delegated.verdict === "ask" || messaging?.verdict === 'ask' ? { verdict: "ask" as const, reason: local.reason ?? delegated.reason ?? messaging?.reason }
                 : local.verdict === "allow" ? local : delegated;
             return { ...result, authorizationRevision: revision };
           } catch { return { verdict: "block" as const, reason: "The originating native task authorization changed." }; }
@@ -14730,26 +14783,38 @@ export class SessionHost {
     const policy = policySnapshotFor(this.#store, target);
     const ordered = evaluateOrderedPolicyRules(policy, { subjectKind: "mcp", risk: policyRiskForToolRisk("ambiguous"), toolProviderId: serverId, toolName });
     const authority = this.#extensionNativeToolAuthorization?.(sessionId);
+    const currentQueues = nativeBridge ? this.#store.listQueueItems({ sessionId, states: ['dispatching', 'backend_accepted'], limit: 2 }) : [];
+    const currentQueue = currentQueues.length === 1 ? currentQueues[0] : undefined;
+    const messageQueue = currentQueue?.body.messagingOrigin ? currentQueue : undefined;
     const decision = ordered
-      ?? (nativeBridge && !authority ? { action: "allow" as const } : decideToolCall({ name: `mcp__${serverId}__${toolName}`, args }, {
-      mode: stored.descriptor.permissionMode, workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
+      ?? (nativeBridge && !authority && !messageQueue ? { action: "allow" as const } : decideToolCall({ name: `mcp__${serverId}__${toolName}`, args }, {
+      mode: messageQueue ? 'ask' : stored.descriptor.permissionMode, workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
       explicitAllowTools: new Set(), explicitDenyTools: new Set()
     }));
     if (decision.action === "deny") throw new StoreError("MCP App tool was denied by target policy.");
     let revision = authority?.capture();
     const guard = () => {
       signal.throwIfAborted(); authority?.assertCurrent(revision);
+      if (messageQueue) {
+        if (!this.#messagingQueueGuard) throw new StoreError('The originating message channel is unavailable.');
+        const source = this.#store.getQueueItem(messageQueue.id), run = this.#store.getRun(messageQueue.runId).descriptor;
+        if (!['dispatching', 'backend_accepted'].includes(source.state) || !['queued', 'running', 'waiting', 'retrying'].includes(run.state)
+          || source.attemptId !== messageQueue.attemptId || source.operationId !== messageQueue.operationId) throw new StoreError('The originating message turn is no longer active.');
+        this.#messagingQueueGuard(messageQueue);
+      }
       const current = this.#store.getSession(sessionId);
       if (current.descriptor.archived || current.descriptor.deletedAt !== undefined || current.descriptor.binding.generation !== stored.descriptor.binding.generation
         || policySnapshotFor(this.#store, this.targetForSession(current)).generation !== policy.generation) throw new StoreError("MCP tool permission owner changed.");
     };
     guard();
     const delegated = await authority?.review({ toolName: `mcp__${serverId}__${toolName}`, input: args, signal });
+    const messaging = messageQueue ? this.#messagingToolReview?.(messageQueue, { toolName: `mcp__${serverId}__${toolName}`, input: args, signal }) : undefined;
     if (delegated?.authorizationRevision !== undefined) revision = delegated.authorizationRevision;
     guard();
     if (delegated?.verdict === "block") throw new StoreError(delegated.reason ?? "The delegated task denied this MCP action.");
-    if (delegated?.verdict === "allow" && ordered?.action !== "ask" || delegated?.verdict !== "ask" && delegated?.verdict !== "allow" && decision.action === "allow") return guard;
-    const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding);
+    if (messaging?.verdict !== 'ask' && (delegated?.verdict === "allow" && ordered?.action !== "ask" || delegated?.verdict !== "ask" && delegated?.verdict !== "allow" && decision.action === "allow")) return guard;
+    const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding,
+      messageQueue?.runId, messageQueue?.attemptId, messageQueue?.operationId);
     const answer = await context.requestInteraction({ id: `mcp-app-permission-${randomUUID()}`, kind: "permission",
       title: "Allow this application tool?", toolName: `${serverId}/${toolName}`,
       summary: redactSecrets(JSON.stringify(args)).slice(0, 8000), risk: "medium", choices: ["allow_once", "deny_once"] }, { signal });
@@ -14795,7 +14860,10 @@ export class SessionHost {
   setExtensionTaskQueueGuard(guard: (item: QueueItemRecord) => void): void { this.#extensionTaskQueueGuard = guard; }
   setExtensionNativeToolAuthorization(factory: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined): void { this.#extensionNativeToolAuthorization = factory; }
   setPartnerHomeInputGuard(guard: (sessionId: string) => void): void { this.#partnerHomeInputGuard = guard; }
-  setMessagingQueueGuard(guard: (item: QueueItemRecord) => void): void { this.#messagingQueueGuard = guard; }
+  setMessagingQueueGuard(guard: (item: QueueItemRecord) => void,
+    review?: (item: QueueItemRecord, request: import('@joko/core').NativeToolAuthorizationRequest) => import('@joko/core').NativeToolAuthorizationDecision): void {
+    this.#messagingQueueGuard = guard; this.#messagingToolReview = review;
+  }
 
   async #assertApplicationQueueCurrent(item: QueueItemRecord): Promise<void> {
     if (item.body.messagingOrigin) {
@@ -14951,9 +15019,25 @@ export class SessionHost {
     outcome: "completed" | "aborted" | "failed"
   ): Promise<void> {
     if (this.#onServiceRunSettled === undefined) return;
+    const queue = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
+    const pending = this.#store.findPendingContextRebuild(sessionId);
+    const originalRequest = queue?.body.messagingOrigin ? this.#store.findMessagingInboundRequestByRunId(runId) : undefined;
+    const recovering = outcome === 'failed' && originalRequest !== undefined && (
+      pending?.reason === 'context_overflow' && pending.replaySafe && pending.sourceRunId === runId
+      || this.#providerGroupRecoveries.get(sessionId)?.runId === runId
+      || this.#sessionRuntimeRecoveries.get(sessionId)?.current?.sourceRunId === runId
+      || this.#store.listRuns({ sessionId, limit: 1000 }).some(row => row.descriptor.parentRunId === runId
+        && ['queued', 'running', 'waiting', 'retrying'].includes(row.descriptor.state)
+        && this.#store.findMessagingInboundRequestByRunId(row.descriptor.id)?.id === originalRequest.id)
+    );
     await Promise.resolve()
-      .then(() => this.#onServiceRunSettled?.({ sessionId, runId, outcome }))
+      .then(() => this.#onServiceRunSettled?.({ sessionId, runId, outcome, ...(recovering ? { recovering: true } : {}) }))
       .catch((error: unknown) => this.recordFailure("service-run-settled", error));
+  }
+
+  #trustedMessageInput(item: QueueItemRecord): boolean {
+    if (!item.body.messagingOrigin || !this.#messagingQueueGuard) return false;
+    try { this.#messagingQueueGuard(item); return true; } catch { return false; }
   }
 
   private cancelPendingInteractionFromAdapter(id: string, generation: number): void {
@@ -15034,6 +15118,7 @@ export class SessionHost {
       .filter((run) => run.descriptor.state !== "queued" && run.descriptor.state !== "dispatch_unknown")
       .filter((run) => settledRunId === undefined || run.descriptor.id === settledRunId);
     const runtimeRecoveryFailures: Array<{ readonly runId: string; readonly error: PublicError }> = [];
+    const messageSettlements: string[] = [];
     for (const run of runs) {
       const state = outcome === "completed" ? "completed" : outcome === "aborted" ? "aborted" : "failed";
       const error: PublicError | undefined = state === "failed"
@@ -15084,7 +15169,8 @@ export class SessionHost {
       else if (this.#sessionRuntimeRecoveries.get(sessionId)?.currentRunId === run.descriptor.id) {
         this.#clearSessionRuntimeRecovery(sessionId, "succeeded");
       }
-      await this.notifyServiceRunSettled(sessionId, run.descriptor.id, outcome);
+      if (this.#store.findQueueItemByRunId(sessionId, run.descriptor.id, { includeCleared: true })?.body.messagingOrigin) messageSettlements.push(run.descriptor.id);
+      else await this.notifyServiceRunSettled(sessionId, run.descriptor.id, outcome);
     }
     await this.settlePartnerLearningTurn(learningTurn, outcome);
     if (outcome === "failed") this.ensureContextOverflowReplay(sessionId);
@@ -15094,6 +15180,7 @@ export class SessionHost {
       if (this.#providerGroupMayHandleRun(sessionId, failure.runId, failure.error)) void this.#recoverProviderGroup(sessionId, failure.runId, failure.error);
       else this.#scheduleSessionRuntimeRecovery(sessionId, failure.runId, failure.error);
     }
+    for (const runId of messageSettlements) await this.notifyServiceRunSettled(sessionId, runId, outcome);
     this.refreshRunSilenceWatchdog(sessionId);
     void this.reconcileScheduledWorktrees();
     void this.drain(sessionId);
@@ -15833,8 +15920,10 @@ export class SessionHost {
         }
       }
     });
+    const inheritedSideChatEntries = ensureSideChatHistoryBoundary(store, session, history);
     const projections = projectNativeHistory(session.id, session.binding.opaqueRef, history);
     for (const incomingProjection of projections) {
+      if (inheritedSideChatEntries?.has(nativeHistoryEventContext(incomingProjection.payload)?.identity?.entryId ?? "")) continue;
       const projection = incomingProjection.payload.type !== "message_complete" ? incomingProjection : (() => {
         const { inputHandoffContinuation: _untrustedInputHandoffContinuation, ...payload } = incomingProjection.payload;
         return { ...incomingProjection, payload };
@@ -18242,6 +18331,9 @@ function hasTurnOverrides(value: TurnExecutionOverrides | undefined): value is T
     value.planMode !== undefined ||
     value.extraDirectoryIds !== undefined
   );
+}
+function hasTurnRouteOverrides(value: TurnExecutionOverrides | undefined): boolean {
+  return value !== undefined && (value.providerId !== undefined || value.modelId !== undefined || value.effort !== undefined || value.fastMode !== undefined);
 }
 
 function scheduledWorktreeOwner(value: unknown): ScheduledWorktreeOwner | undefined {

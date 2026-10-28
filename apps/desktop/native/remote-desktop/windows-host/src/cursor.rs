@@ -240,9 +240,13 @@ pub fn read(rect: [i32; 4]) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // GetGuiResources counts the entire process. Native cursor tests must not
+    // allocate/drop another raster's bitmaps inside the leak test's baseline.
+    static NATIVE_CURSOR_GDI: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn identifies_standard_native_shapes() {
+        let _exclusive = NATIVE_CURSOR_GDI.lock().expect("native cursor test owner");
         for (id, expected) in [(IDC_ARROW, "default"), (IDC_IBEAM, "text"),
             (IDC_HAND, "pointer"), (IDC_SIZEWE, "ew-resize")] {
             let handle = unsafe { LoadCursorW(ptr::null_mut(), id) };
@@ -277,6 +281,7 @@ mod tests {
 
     #[test]
     fn rasterizes_system_shapes_without_moving_the_pointer() {
+        let _exclusive = NATIVE_CURSOR_GDI.lock().expect("native cursor test owner");
         unsafe {
             for name in [IDC_ARROW, IDC_IBEAM, IDC_HAND, IDC_WAIT, IDC_SIZEWE] {
                 let handle = LoadCursorW(ptr::null_mut(), name);
@@ -291,6 +296,7 @@ mod tests {
 
     #[test]
     fn repeated_cursor_reads_release_gdi_bitmaps_and_contexts() {
+        let _exclusive = NATIVE_CURSOR_GDI.lock().expect("native cursor test owner");
         use windows_sys::Win32::System::Threading::{GetGuiResources, GR_GDIOBJECTS};
         unsafe {
             let handle = LoadCursorW(ptr::null_mut(), IDC_ARROW);

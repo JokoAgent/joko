@@ -36,7 +36,7 @@ export interface PendingOperation {
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
     | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings" | "model-favorite" | "model-source-target"
-    | "extension-enabled" | "extension-sidebar" | "extension-package-adopt" | "extension-package-remove" | "extension-settings-routing" | "extension-settings-credential-clear"
+    | "extension-enabled" | "extension-sidebar" | "extension-package-adopt" | "extension-package-remove" | "extension-settings-routing" | "extension-settings-credential-clear" | "extension-settings-directory"
     | "extension-setup-begin" | "extension-setup-interaction" | "extension-setup-credential"
     | "extension-setup-complete" | "extension-setup-cancel" | "extension-setup-revoke";
   readonly sessionId?: string;
@@ -529,7 +529,7 @@ function isPending(value: unknown): value is PendingOperation {
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
       "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite", "model-source-target",
-      "extension-enabled", "extension-sidebar", "extension-package-adopt", "extension-package-remove", "extension-settings-routing", "extension-settings-credential-clear", "extension-setup-begin", "extension-setup-interaction",
+      "extension-enabled", "extension-sidebar", "extension-package-adopt", "extension-package-remove", "extension-settings-routing", "extension-settings-credential-clear", "extension-settings-directory", "extension-setup-begin", "extension-setup-interaction",
       "extension-setup-credential", "extension-setup-complete", "extension-setup-cancel",
       "extension-setup-revoke"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
@@ -643,6 +643,7 @@ function isExtensionReceiptKind(value: unknown): boolean {
     "extension-package-remove",
     "extension-settings-routing",
     "extension-settings-credential-clear",
+    "extension-settings-directory",
     "extension-setup-begin",
     "extension-setup-interaction",
     "extension-setup-credential",

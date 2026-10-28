@@ -120,6 +120,7 @@ export type MobileExtensionPendingMutationKind =
   | "packageRemove"
   | "settingsRouting"
   | "settingsCredentialClear"
+  | "settingsDirectory"
   | "setupBegin"
   | "setupInteraction"
   | "setupCredential"

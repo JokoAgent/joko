@@ -4127,7 +4127,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           ...(launch.title === undefined || launch.resume ? {} : { title: launch.title }),
           tools: launch.runtimePolicy === "review_read_only"
             ? context.persistentReadOnly === "side_chat" && context.hostedExecution ? [] : [...REVIEW_READ_TOOLS]
-            : context.hostedExecution?.trust === "guest" ? [...CLAUDE_HOSTED_GUEST_TOOLS] : { type: "preset", preset: "claude_code" }
+            : context.hostedExecution?.trust === "guest" ? [...CLAUDE_HOSTED_GUEST_TOOLS] : { type: "preset" as const, preset: "claude_code" as const }
         }
       });
       scoped.assertCurrent();
@@ -7242,7 +7242,8 @@ function assertReviewInitEnvelope(
   for (const key of ["mcp_servers", "slash_commands", "skills", "plugins"] as const) {
     const value = envelope[key];
     if (key === "mcp_servers" && context?.persistentReadOnly === "side_chat" && context.hostedExecution) {
-      if (!Array.isArray(value) || value.length !== 1 || !isRecord(value[0]) || value[0]["name"] !== claudeMcpServerName(CLAUDE_HOSTED_EXECUTOR_SERVER)) throw invalidReviewProfile();
+      if (!Array.isArray(value) || value.length !== 1 || typeof value[0] !== "object" || value[0] === null || Array.isArray(value[0])
+        || (value[0] as Record<string, unknown>)["name"] !== claudeMcpServerName(CLAUDE_HOSTED_EXECUTOR_SERVER)) throw invalidReviewProfile();
       continue;
     }
     if (!Array.isArray(value) || value.length !== 0) throw invalidReviewProfile();

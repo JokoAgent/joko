@@ -27,6 +27,9 @@ export interface MobileTaskOutboxRecord {
   readonly attempted: boolean;
   readonly failureKind?: "preparation" | "not-admitted" | "rejected";
   readonly error?: string;
+  /** The actual current upload slot, retained on a preparation failure. */
+  readonly uploadAttachmentId?: string;
+  readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean };
 }
 
 const storageKey = "joko.mobile.task-outbox.v1";
@@ -76,7 +79,7 @@ export class MobileTaskOutboxStore {
   }
 
   update(record: MobileTaskOutboxRecord, patch: Partial<Pick<MobileTaskOutboxRecord,
-    "operationId" | "input" | "sourceDraft" | "state" | "attempted" | "failureKind" | "error">>): Promise<MobileTaskOutboxRecord> {
+    "operationId" | "input" | "sourceDraft" | "state" | "attempted" | "failureKind" | "error" | "uploadAttachmentId">>): Promise<MobileTaskOutboxRecord> {
     return this.#mutate((records) => {
       if (!records.includes(record)) throw new Error("The retained task input changed.");
       const next = readRecord({ ...record, ...patch });
@@ -153,7 +156,16 @@ function readRecord(value: unknown): MobileTaskOutboxRecord {
     throw new Error("The retained task input contains invalid delivery state.");
   }
   if (record.modelJson !== undefined) fromJsonString(ModelSelectionSchema, record.modelJson);
+  const rebalance = record.providerGroupRebalance;
+  if (rebalance !== undefined && (!rebalance || typeof rebalance !== "object" || Array.isArray(rebalance)
+    || Object.keys(rebalance).sort().join(",") !== "remember,suggestionKey" || !/^rebalance_[a-f0-9]{64}$/u.test(rebalance.suggestionKey)
+    || typeof rebalance.remember !== "boolean")) throw new Error("The retained account switch does not match its original confirmation.");
   const input = normalizeMobileComposerDraft(record.input);
+  if (record.uploadAttachmentId !== undefined && (typeof record.uploadAttachmentId !== "string" || record.attempted
+    || !["queued", "failed"].includes(record.state) || record.state === "failed" && record.failureKind !== "preparation"
+    || input.attachments.filter(item => item.attachmentId === record.uploadAttachmentId && item.state === "local").length !== 1)) {
+    throw new Error("The retained task input has an invalid upload slot.");
+  }
   if (!input.text.trim() && input.attachments.length === 0) throw new Error("The retained task input is empty.");
   if (record.attempted && input.attachments.some((attachment) => attachment.state !== "uploaded")) {
     throw new Error("A dispatched task input must retain its exact committed attachments.");
@@ -167,6 +179,8 @@ function readRecord(value: unknown): MobileTaskOutboxRecord {
     ...(record.sourceDraft === undefined ? {} : { sourceDraft: normalizeMobileComposerDraft(record.sourceDraft) }),
     state: record.state, attempted: record.attempted,
     ...(record.failureKind === undefined ? {} : { failureKind: record.failureKind }),
-    ...(record.error === undefined ? {} : { error: record.error })
+    ...(record.error === undefined ? {} : { error: record.error }),
+    ...(rebalance ? { providerGroupRebalance: { suggestionKey: rebalance.suggestionKey, remember: rebalance.remember } } : {}),
+    ...(record.uploadAttachmentId === undefined ? {} : { uploadAttachmentId: record.uploadAttachmentId })
   };
 }

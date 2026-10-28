@@ -338,6 +338,8 @@ export class ProtoMappingError extends Error {
 }
 
 export interface EventMappingContext {
+  /** An inherited native record still advances stream cursors without becoming child-visible history. */
+  readonly hideSideChatHistoryPrefix?: true;
   readonly sharedTaskAuthor?: import("@joko/store").SharedTaskAuthor;
   readonly learning?: import("@joko/core").PartnerLearningFeedback;
   readonly queueItem?: QueueItemRecord;
@@ -370,6 +372,7 @@ export interface RunMappingContext {
 }
 
 export interface SessionMappingContext {
+  readonly sideChatSourceAllowed?: boolean;
   readonly provisionalDraftId?: string;
   readonly localWorkspace?: { readonly workspaceId: string; readonly path: string };
   readonly taskActivity?: import("./session-task-activity.js").SessionTaskActivityProjection;
@@ -662,8 +665,9 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
         }
   );
   return message<ProtoSession>("joko.v1.Session", {
+    sideChatSourceAllowed: context.sideChatSourceAllowed,
     provisionalDraftId: context.provisionalDraftId ?? "",
-    ...(context.localWorkspace === undefined ? {} : { localWorkspace: context.localWorkspace }),
+    ...(context.localWorkspace === undefined ? {} : { localWorkspace: message<contract.SessionLocalWorkspace>("joko.v1.SessionLocalWorkspace", context.localWorkspace) }),
     sessionId: session.id,
     backendId: session.backendId,
     targetId: session.targetId,
@@ -2957,8 +2961,8 @@ export function toProtoEvent(event: PersistedEvent, context: EventMappingContext
       id: "orchestrator",
       displayName: "Orchestrator"
     }),
-    payload: toProtoEventPayload(event, context),
-    pi: event.pi === undefined ? undefined : toProtoPiMetadata(event.pi)
+    payload: context.hideSideChatHistoryPrefix ? undefined : toProtoEventPayload(event, context),
+    pi: context.hideSideChatHistoryPrefix || event.pi === undefined ? undefined : toProtoPiMetadata(event.pi)
   });
 }
 

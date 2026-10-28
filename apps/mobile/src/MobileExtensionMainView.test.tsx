@@ -3,6 +3,8 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionMainView } from "./MobileExtensionMainView";
+import { create } from "@bufbuild/protobuf";
+import { ExtensionOAuthAuthorizationSchema } from "@joko/contracts";
 import { decodeMobileLibraryMessage, encodeMobileLibraryMessage } from "./mobile-extension-library-bridge";
 import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type {
@@ -15,8 +17,10 @@ import type {
 
 const native = vi.hoisted(() => ({
   web: undefined as undefined | Record<string, unknown>, messages: [] as string[], prepare: vi.fn(),
+  state: "active", listeners: new Set<(value: string) => void>(), alert: vi.fn(), authorize: vi.fn(),
   documents: [] as Array<{ documentId: string; source: { uri: string }; documentUrl: string; documentUrls: string[]; close: ReturnType<typeof vi.fn> }>
 }));
+vi.mock("./mobile-extension-oauth", () => ({ authorizeMobileExtensionAccount: native.authorize }));
 
 vi.mock("./mobile-extension-main-view-document", () => ({
   prepareExtensionMainViewDocument: native.prepare,
@@ -58,6 +62,10 @@ vi.mock("react-native", async () => {
     }, props.children);
   return {
     Platform: { OS: "android" },
+    Alert: { alert: native.alert },
+    AppState: { get currentState() { return native.state; }, addEventListener: (_name: string, listener: (state: string) => void) => {
+      native.listeners.add(listener); return { remove: () => native.listeners.delete(listener) };
+    } },
     ActivityIndicator: () => React.createElement("span", { "data-loading": true }),
     Pressable: element("button"),
     StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 },
@@ -87,7 +95,7 @@ const colors = {
 let container: HTMLDivElement;
 let root: Root;
 
-async function render(transport: MobileExtensionTransport, extension = fixtureExtension()) {
+async function render(transport: MobileExtensionTransport, extension = fixtureExtension(), settings = false) {
   if (!root) {
     container = document.createElement("div");
     document.body.append(container);
@@ -99,7 +107,8 @@ async function render(transport: MobileExtensionTransport, extension = fixtureEx
       extension,
       locale: "en",
       onBack: vi.fn(),
-      transport
+      transport,
+      settings
     }));
   });
 }
@@ -112,6 +121,7 @@ afterEach(() => {
   native.messages = [];
   native.documents = [];
   native.prepare.mockReset();
+  native.state = "active"; native.listeners.clear(); native.alert.mockReset(); native.authorize.mockReset(); vi.useRealTimers();
 });
 
 describe("MobileExtensionMainView", () => {
@@ -216,6 +226,102 @@ describe("MobileExtensionMainView", () => {
     expect(active.callLibrary).toHaveBeenCalledTimes(1);
     expect(container.textContent).not.toContain("unavailable");
     expect(native.web!.injectedJavaScriptBeforeContentLoaded).toContain(`${surface.surfaceId}:1`);
+  });
+
+  it("retires settings that are still opening when the app enters background", async () => {
+    const extension = { ...fixtureExtension(), settings: { height: 400, mobileCustom: true } };
+    const surface: MobileExtensionMainViewSurface = { ...fixtureSurface(extension), purpose: "settings", mobileSettings: true };
+    const active = fixtureTransport(surface);
+    let finish!: (surface: MobileExtensionMainViewSurface) => void;
+    active.openSettings = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+    await render(active, extension, true);
+    const opening = vi.mocked(active.openSettings).mock.calls[0]![1];
+    await act(async () => { native.state = "background"; native.listeners.forEach(listener => listener("background")); });
+    expect(opening.aborted).toBe(true);
+    await act(async () => finish(surface));
+    expect(active.closeMainView).toHaveBeenCalledWith(surface);
+    expect(active.readMainViewResource).not.toHaveBeenCalled(); expect(native.prepare).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("changed, expired, or lost its owner");
+  });
+
+  it.each(["owner", "background", "expired"])("does not accept an old settings confirmation after %s retirement", async reason => {
+    const extension = { ...fixtureExtension(), settings: { height: 400, mobileCustom: true } };
+    const surface: MobileExtensionMainViewSurface = { ...fixtureSurface(extension), purpose: "settings", mobileSettings: true };
+    const active = fixtureTransport(surface), effect = vi.fn();
+    active.openSettings = vi.fn(async () => surface);
+    active.callSettings = vi.fn(async (_surface, _call, host, signal) => {
+      if (await host.confirm("Clear credential", "Private token", signal)) effect();
+      return { accepted: true };
+    });
+    if (reason === "expired") vi.useFakeTimers();
+    await render(active, extension, true);
+    const frame = native.web!;
+    const receive = frame.onMessage as (event: { nativeEvent: { data: string; url: string } }) => void;
+    await act(async () => receive({ nativeEvent: { url: native.documents[0]!.documentUrl,
+      data: JSON.stringify({ frameId: `${surface.surfaceId}:0`, surfaceId: surface.surfaceId,
+        request: { type: "joko:extension-settings-request", version: 1, id: "clear-original", command: { kind: "secret.clear", fieldId: "token" } } }) } }));
+    expect(native.alert).toHaveBeenCalledOnce();
+    const buttons = native.alert.mock.calls[0]![2] as Array<{ onPress?: () => void }>;
+    if (reason === "owner") await render({ ...active, ownerKey: "owner-next" }, extension, true);
+    else if (reason === "background") await act(async () => {
+      native.state = "background"; native.listeners.forEach(listener => listener("background"));
+      native.state = "active"; native.listeners.forEach(listener => listener("active"));
+    });
+    else await act(async () => vi.advanceTimersByTimeAsync(60_001));
+    await act(async () => buttons[1]!.onPress?.());
+    expect(effect).not.toHaveBeenCalled();
+  });
+
+  it("accepts settings SDK messages only from the current exact frame and document", async () => {
+    const extension = { ...fixtureExtension(), library: { schemaVersion: 1 as const }, settings: { height: 400, mobileCustom: true } };
+    const surface: MobileExtensionMainViewSurface = { ...fixtureSurface(extension), purpose: "settings", mobileSettings: true };
+    const active = fixtureTransport(surface); active.openSettings = vi.fn(async () => surface);
+    active.callSettings = vi.fn(async () => ({ context: { locale: "en" } }));
+    await render(active, extension, true);
+    const old = native.web!;
+    const deliver = (web: Record<string, unknown>, id: string, frameId: string, url: string) => (web.onMessage as (event: unknown) => void)({
+      nativeEvent: { url, data: JSON.stringify({ surfaceId: surface.surfaceId, frameId,
+        request: { type: "joko:extension-settings-request", version: 1, id, command: { kind: "context.get" } } }) }
+    });
+    await act(async () => deliver(old, "first", `${surface.surfaceId}:0`, native.documents[0]!.documentUrl));
+    expect(active.callSettings).toHaveBeenCalledOnce();
+    const reload = container.querySelector('button[aria-label="Reload main view"]') as HTMLButtonElement;
+    await act(async () => reload.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    await act(async () => {
+      deliver(old, "retired", `${surface.surfaceId}:0`, native.documents[0]!.documentUrl);
+      deliver(native.web!, "wrong-frame", `${surface.surfaceId}:0`, native.documents[1]!.documentUrl);
+      deliver(native.web!, "wrong-document", `${surface.surfaceId}:1`, native.documents[0]!.documentUrl);
+      deliver(native.web!, "wrong-origin", `${surface.surfaceId}:1`, "https://attacker.example/index.html");
+    });
+    expect(active.callSettings).toHaveBeenCalledOnce();
+    await act(async () => deliver(native.web!, "second", `${surface.surfaceId}:1`, native.documents[1]!.documentUrl));
+    expect(active.callSettings).toHaveBeenCalledTimes(2); expect(active.callLibrary).not.toHaveBeenCalled();
+  });
+
+  it("keeps a replacement native authorization owned when the retired authorization finishes late", async () => {
+    const extension = { ...fixtureExtension(), settings: { height: 400, mobileCustom: true } };
+    const first: MobileExtensionMainViewSurface = { ...fixtureSurface(extension), purpose: "settings", mobileSettings: true };
+    const second = { ...first, surfaceId: `extension_surface_${"2".repeat(32)}`, url: first.url.replace(first.surfaceId, `extension_surface_${"2".repeat(32)}`) };
+    const authorization = create(ExtensionOAuthAuthorizationSchema, { authorizeUrl: "https://accounts.example/authorize", callbackUrl: "http://127.0.0.1:4411/callback", state: "original-state-123456" });
+    const pending: Array<{ finish: (value: { state: string; code: string }) => void; signal: AbortSignal }> = [];
+    native.authorize.mockImplementation((_authorization, _expiry, signal: AbortSignal) => new Promise(resolve => pending.push({ finish: resolve, signal })));
+    const active = fixtureTransport(first);
+    active.openSettings = vi.fn(async () => first);
+    active.callSettings = vi.fn(async (_surface, _call, host, signal) => { await host.authorize(authorization, Date.now() + 60_000, signal); return { connected: true }; });
+    const deliver = (surface: MobileExtensionMainViewSurface, documentUrl: string) => (native.web!.onMessage as (event: unknown) => void)({ nativeEvent: {
+      url: documentUrl, data: JSON.stringify({ surfaceId: surface.surfaceId, frameId: `${surface.surfaceId}:0`,
+        request: { type: "joko:extension-settings-request", version: 1, id: "authorize-original", command: { kind: "oauth.connect", key: "mail" } } })
+    } });
+    await render(active, extension, true); await act(async () => deliver(first, native.documents[0]!.documentUrl));
+    expect(pending).toHaveLength(1);
+    const replacement = { ...fixtureTransport(second), ownerKey: "owner-next", openSettings: vi.fn(async () => second), callSettings: active.callSettings };
+    await render(replacement, extension, true); await act(async () => deliver(second, native.documents[1]!.documentUrl));
+    expect(pending).toHaveLength(2); expect(pending[0]!.signal.aborted).toBe(true);
+    await act(async () => pending[0]!.finish({ state: authorization.state, code: "retired-code" }));
+    await act(async () => { native.state = "background"; native.listeners.forEach(listener => listener("background")); });
+    expect(pending[1]!.signal.aborted).toBe(false); expect(replacement.closeMainView).not.toHaveBeenCalled();
+    await act(async () => { native.state = "active"; native.listeners.forEach(listener => listener("active")); pending[1]!.finish({ state: authorization.state, code: "current-code" }); });
+    expect(native.messages.some(message => message.includes("retired-code"))).toBe(false);
   });
 
   it("closes a lease that arrives after the surface has been unmounted", async () => {

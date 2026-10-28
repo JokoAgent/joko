@@ -21,6 +21,8 @@ import {
   OperationConflictError,
   OperationInProgressError,
   OperationPreviouslyFailedError,
+  ensureSideChatHistoryBoundary,
+  readSideChatHistoryBoundary,
   RevisionConflictError,
   SCHEMA_BASELINE_ID,
   SCHEMA_VERSION,
@@ -37,6 +39,52 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("keeps a Side Chat's native prefix private across pagination, search, quotes and a cold restart", () => {
+    const f = createFixture(), source = f.store.getSession("session-1").descriptor;
+    const fingerprint = (reference: string) => `sha256:${createHash("sha256").update(reference).digest("hex")}`;
+    const nativeEvent = (session: typeof source, id: string, entryId: string, parentEntryId: string | undefined, text: string) => f.store.appendEvent({
+      id, backendId: session.backendId, targetId: session.targetId, sessionId: session.id, generation: session.binding.generation,
+      emittedAt: 100, traceId: id, payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }],
+        nativeHistory: { identity: { entryId, ...(parentEntryId === undefined ? {} : { parentEntryId }) } } },
+      metadata: { namespace: "native-history", fields: { nativeHydration: true, nativeBindingFingerprint: fingerprint(session.binding.opaqueRef) } }
+    });
+    // This is deliberately timestamp-free on the native side, as with Codex.
+    const projection = (entryId: string, parentEntryId: string | undefined, text: string, turnId: string) => ({
+      nativeEntryId: entryId, ...(parentEntryId === undefined ? {} : { nativeParentEntryId: parentEntryId }), projectionKind: "message", contentIndex: 0,
+      payload: { type: "message_complete" as const, role: "assistant" as const, blocks: [{ kind: "text" as const, text }] },
+      metadata: { namespace: "codex.native_history", fields: { turnId } }
+    });
+    nativeEvent(source, "source-root", "root", undefined, "Inherited root");
+    nativeEvent(source, "source-answer", "answer", "root", "Inherited answer");
+    const child = f.store.createSession({ ...source, id: "aside", title: "Side Chat", binding: { opaqueRef: "native/aside", generation: 0 },
+      derivationOrigin: { kind: "fork", sideChat: true, sourceSessionId: source.id, sourceMessageId: "answer", sourceEventId: "source-answer" },
+      createdAt: 200, updatedAt: 200 }).descriptor;
+    // An older implementation may already have projected inherited records.
+    nativeEvent(child, "aside-root", "root", undefined, "Inherited root");
+    nativeEvent(child, "aside-answer", "answer", "root", "Inherited answer");
+    expect(f.store.listEvents({ sessionId: child.id, activeNativeTimeline: true })).toEqual([]);
+    const history = { events: [projection("root", undefined, "Inherited root", "first"), projection("answer", "root", "Inherited answer", "last"),
+      projection("turn-tail", "answer", "Inherited turn footer", "last")], activeEntryId: "turn-tail" };
+    expect([...ensureSideChatHistoryBoundary(f.store, child, history)!].sort()).toEqual(["answer", "root", "turn-tail"]);
+    nativeEvent(child, "aside-footer", "turn-tail", "answer", "Inherited turn footer");
+    nativeEvent(child, "aside-new", "new", "turn-tail", "Fresh followup");
+    expect(f.store.listEvents({ sessionId: child.id, activeNativeTimeline: true }).map(event => event.id)).toEqual(["aside-new"]);
+    expect(() => f.store.listEventsAround(child.id, "aside-answer", 5)).toThrow();
+    expect(f.store.listEventsAround(child.id, "aside-new", 5).map(event => event.id)).toEqual(["aside-new"]);
+    expect(f.store.findVisibleSessionMessageOrigin({ sessionId: child.id, eventId: "aside-answer" })).toBeUndefined();
+    expect(f.store.findVisibleSessionMessageOrigin({ sessionId: source.id, eventId: "source-answer" })).toEqual({ messageId: "answer", eventId: "source-answer" });
+    expect(f.store.searchSessionMessages({ scope: { sessionId: child.id }, query: "Inherited" }).matches).toEqual([]);
+    expect(f.store.searchSessionMessages({ scope: { sessionId: child.id }, query: "Fresh followup" }).matches).toHaveLength(1);
+    const latestSource = f.store.getSession(source.id);
+    f.store.updateSession(source.id, { title: "Parent still running" }, latestSource.revision);
+    const filePath = f.store.filePath; f.store.close(); f.replaceStore(new OperationalStore(filePath));
+    const restored = f.store.getSession(child.id).descriptor;
+    expect([...readSideChatHistoryBoundary(f.store, restored)!].sort()).toEqual(["answer", "root", "turn-tail"]);
+    const advanced = { events: [...history.events, projection("new", "turn-tail", "Fresh followup", "new-turn")], activeEntryId: "new" };
+    expect([...ensureSideChatHistoryBoundary(f.store, restored, advanced)!].sort()).toEqual(["answer", "root", "turn-tail"]);
+    expect(f.store.listEvents({ sessionId: child.id, activeNativeTimeline: true }).map(event => event.id)).toEqual(["aside-new"]);
+  });
+
   it("projects only enabled bound automations and changes the confirmation on replacement", () => {
     const { store, prompt } = createFixture();
     const initial = store.readSessionArchiveSchedules("session-1");

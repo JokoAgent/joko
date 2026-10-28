@@ -77,6 +77,22 @@ export class ExtensionCardRuntime {
   authority(id: string): ExtensionCardAuthority | undefined {
     try { return this.#capture(id); } catch { return; }
   }
+
+  captureDirectorySelection(extensionId: string) {
+    const authority = this.#capture(extensionId);
+    if (!authority.runtime.pick) throw new Error("This plugin has not declared directory selection.");
+    const assertCurrent = () => {
+      if (this.#capture(extensionId).key !== authority.key) throw new Error("Directory selection plugin authority changed.");
+    };
+    return { authorityKey: authority.key, assertCurrent };
+  }
+
+  preparePickedDirectory(input: { readonly extensionId: string; readonly authorityKey: string; readonly selectionId: string;
+    readonly directory: string; readonly assertDirectoryCurrent: () => Promise<void>; readonly assertSelectionCurrent?: () => void; readonly signal?: AbortSignal }) {
+    const captured = this.captureDirectorySelection(input.extensionId);
+    if (captured.authorityKey !== input.authorityKey) throw new Error("Directory selection plugin authority changed.");
+    return this.#files.preparePickedDirectory({ ...input, assertCurrent: captured.assertCurrent });
+  }
   async previewMail(sessionId: string, url: string, read: boolean, opened: boolean, signal: AbortSignal, assertCaller: () => void): Promise<ExtensionMailPreview> {
     const task = this.options.store.getSession(sessionId).descriptor;
     const current = () => {

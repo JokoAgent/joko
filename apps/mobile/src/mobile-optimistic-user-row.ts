@@ -5,6 +5,7 @@ import {
   type MobileComposerDraft
 } from "./mobile-composer-document";
 import type { TimelineRow } from "./timeline";
+import { mobilePendingSendText, type MobilePendingSendProgress } from "./mobile-pending-send";
 
 type OptimisticQueueItem = Pick<QueueItem, "sessionId" | "sourceId" | "state">;
 
@@ -51,7 +52,8 @@ export function appendMobileOptimisticUserRow(
   ownerKey: string,
   sessionId: string,
   operationId: string,
-  draft: MobileComposerDraft
+  draft: MobileComposerDraft,
+  progress?: MobilePendingSendProgress
 ): readonly MobileOptimisticUserRow[] {
   if (current.some((entry) => entry.sessionId === sessionId && entry.operationId === operationId)
     || observedRows.some((row) => durableUserEcho(row, operationId))) return current;
@@ -60,13 +62,14 @@ export function appendMobileOptimisticUserRow(
   const row: TimelineRow = {
     id: rowId,
     label: "You",
-    text: mobileInputSummary(mobileComposerInput(draft)),
+    text: progress ? mobilePendingSendText(draft) : mobileInputSummary(mobileComposerInput(draft)),
     sequence: 0n,
     eventId: operationId,
     kind: "user",
     completed: false,
     operationId,
     optimistic: true,
+    ...(progress ? { pendingSend: progress, startedAtMs: progress.sentAt } : {}),
     ...(draft.replyQuote ? { replyQuote: draft.replyQuote } : {}),
     ...(draft.todoQuote ? { todoQuote: draft.todoQuote } : {})
   };
@@ -81,6 +84,12 @@ export function appendMobileOptimisticUserRow(
       ...current.filter((entry) => entry.sessionId === sessionId).map((entry) => entry.row.id)
     ])
   }];
+}
+
+export function updateMobileOptimisticUserRow(current: readonly MobileOptimisticUserRow[], ownerKey: string,
+  sessionId: string, operationId: string, progress: MobilePendingSendProgress): readonly MobileOptimisticUserRow[] {
+  return current.map(entry => entry.ownerKey !== ownerKey || entry.sessionId !== sessionId || entry.operationId !== operationId ? entry
+    : { ...entry, row: { ...entry.row, pendingSend: progress, startedAtMs: progress.sentAt } });
 }
 
 /** The initial request returned accepted; later activity must now come from exact durable identity. */
@@ -114,7 +123,8 @@ export function projectMobileOptimisticUserRows(
   const projected = observedRows.map((row) => ({ row, optimisticSlotId: undefined as string | undefined }));
   for (const entry of entries) {
     const echoIndex = projected.findIndex(({ row }) => durableUserEcho(row, entry.operationId));
-    const row = echoIndex < 0 ? entry.row : projected.splice(echoIndex, 1)[0]!.row;
+    const echo = echoIndex < 0 ? undefined : projected.splice(echoIndex, 1)[0]!.row;
+    const row = !echo ? entry.row : entry.row.startedAtMs === undefined ? echo : { ...echo, startedAtMs: entry.row.startedAtMs };
     let after = -1;
     for (let index = 0; index < projected.length; index += 1) {
       const candidate = projected[index]!;
@@ -146,8 +156,8 @@ export function reconcileMobileOptimisticUserRows(
   const remaining = current.filter((entry) => {
     if (entry.ownerKey !== ownerKey) return false;
     if (entry.sessionId !== sessionId) return true;
-    if (echoedRows.has(entry.operationId)) return requiredAnchorIds.has(entry.row.id);
-    return entry.phase === "dispatching" || activeOperationIds.has(entry.operationId);
+    if (echoedRows.has(entry.operationId)) return entry.row.startedAtMs !== undefined || requiredAnchorIds.has(entry.row.id);
+    return entry.phase === "dispatching" || entry.row.pendingSend?.phase === "failed" || activeOperationIds.has(entry.operationId);
   });
   return remaining.length === current.length ? current : remaining;
 }

@@ -282,7 +282,7 @@ export function preflightTodoEvents(
     decision:
       e.project && !projects.includes(e.project)
         ? 'outside-scope'
-        : e.sequence <= (Object.hasOwn(state.cursors, e.source) ? state.cursors[e.source] : -1) ||
+        : e.sequence <= (Object.hasOwn(state.cursors, e.source) ? state.cursors[e.source] ?? -1 : -1) ||
             Object.hasOwn(state.receipts, e.source + ':' + e.sequence)
           ? 'duplicate'
           : state.items.some((t) => t.key === normalizeTodoKey(e.key) && !todoVisible(t))

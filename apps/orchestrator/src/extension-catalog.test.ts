@@ -58,9 +58,18 @@ it("keeps original runtime parameters in the Vault owner, fences ABA writes and 
       current = await catalog.commitSetupCredential({ extensionId: extension.id, attemptId: current.setup.attemptId!, fieldId: field,
         credentialUploadTicketId: ticket.credentialUploadTicketId, connectionId: "connection-one", expectedRevision: current.revision });
     }
-    expect(credentials.list()).toHaveLength(2);
+    const network = runtime.network!;
+    const installedSecrets = network.secrets ?? [];
+    expect(installedSecrets).toHaveLength(2);
+    const references = ["token", "secondary"].map(key => extensionNetworkCredentialReference(extension.id, network,
+      installedSecrets.find(secret => secret.key === key)!));
+    expect(references.filter(reference => credentials.find(reference) !== undefined)).toHaveLength(2);
+    expect(credentials.list()).toHaveLength(0);
     current = await catalog.clearSetupCredential(extension.id, "network-secret:token", current.revision, () => undefined);
-    expect(credentials.list()).toHaveLength(1);
+    expect(references.filter(reference => credentials.find(reference) !== undefined)).toHaveLength(1);
+    expect(credentials.find(references[0]!)).toBeUndefined();
+    expect(credentials.resolve(references[1]!)).toBe("installed-second");
+    expect(credentials.list()).toHaveLength(0);
     expect(current.setup.fields.find(field => field.id === "network-secret:token")?.configured).toBe(false);
     expect(current.setup.fields.find(field => field.id === "network-secret:secondary")?.configured).toBe(true);
     expect(() => manager.write(surface, manager.read(surface).revision, '{"value":"installed-second"}')).toThrow(/credentials/u);

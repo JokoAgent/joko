@@ -116,6 +116,19 @@ describe("durable mobile task outbox storage", () => {
     expect(saved.input.attachments[0]).toMatchObject({ state: "uploaded", blobId: "blob-one" });
   });
 
+  it("cold-restores only the exact original typed account choice and keeps credentials outside the record", async () => {
+    const f = memory(), store = new MobileTaskOutboxStore(f.driver);
+    const choice = { suggestionKey: `rebalance_${"a".repeat(64)}`, remember: true };
+    const record = await store.add({ ...input(), providerGroupRebalance: choice });
+    const restarted = new MobileTaskOutboxStore(f.driver); await restarted.load();
+    expect(restarted.records[0]?.providerGroupRebalance).toEqual(choice);
+    for (const invalid of [{ suggestionKey: "other", remember: true }, { ...choice, authKey: "private" },
+      { suggestionKey: choice.suggestionKey, remember: "true" }]) {
+      await expect(store.add({ ...input("invalid-choice"), providerGroupRebalance: invalid as typeof choice })).rejects.toThrow(/original confirmation/u);
+    }
+    expect(store.records).toEqual([record]);
+  });
+
   it("rejects damaged current data without silently deleting retained input", async () => {
     const f = memory(), store = new MobileTaskOutboxStore(f.driver); await store.add(input());
     const key = [...f.values.keys()][0]!, original = f.values.get(key)!;

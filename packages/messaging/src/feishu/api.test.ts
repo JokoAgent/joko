@@ -137,6 +137,18 @@ describe("FeishuApi", () => {
     });
   });
 
+  it('uses one original topic for mixed final delivery and only updates its known progress lease after a lost ACK', async () => {
+    const reply = vi.fn(async (_input: unknown) => { throw new TypeError('Reply ACK lost'); }), patch = vi.fn(async (_input: unknown) => ({ code: 0 }));
+    const api = new FeishuApi({ appId: 'cli_app', appSecret: APP_SECRET, service: 'feishu', client: {
+      im: { v1: { image: { create: vi.fn(async () => ({ image_key: 'owned-image-key' })) }, message: { reply, patch } } }
+    } as unknown as Lark.Client });
+    await expect(api.sendRichReply(topicAddress, '**Actual answer**', [{ kind: 'image', bytes: new Uint8Array([1, 2]),
+      fileName: 'actual.png', mimeType: 'image/png' }], 'om_original_source', undefined, 'om_known_progress')).rejects.toMatchObject({ options: { effect: 'unknown' } });
+    expect(reply).toHaveBeenCalledOnce(); expect(reply.mock.calls[0]![0]).toMatchObject({ path: { message_id: 'om_original_source' }, data: { reply_in_thread: true, msg_type: 'interactive' } });
+    expect(patch).toHaveBeenCalledOnce(); expect(patch.mock.calls[0]![0]).toMatchObject({ path: { message_id: 'om_known_progress' } });
+    expect(JSON.stringify(patch.mock.calls[0]![0])).toContain('owned-image-key'); expect(JSON.stringify(patch.mock.calls[0]![0])).toContain('actual.png');
+  });
+
   it("classifies credential and uncertain write failures without reflecting the App Secret", async () => {
     const rejected = new FeishuApi({
       appId: "cli_app",

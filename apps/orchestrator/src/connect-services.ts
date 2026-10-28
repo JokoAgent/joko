@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionSettingsManager } from "./extension-settings.js";
+import type { ExtensionDirectoryPicker, ExtensionDirectoryPage, PickedExtensionDirectory } from "./extension-directory-picker.js";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
 import { createServerAccessConnectService } from './server-access-connect-service.js';
 import { TaskShareStore } from "@joko/store";
@@ -81,6 +82,7 @@ import {
   normalizeDeviceName,
   operationBodyHash
 } from "@joko/store";
+import { readSideChatHistoryBoundary, sideChatHistoryEventVisible } from "@joko/store";
 import type {
   ConnectionRecord,
   DeviceControlRelationRecord,
@@ -569,6 +571,7 @@ export interface ConnectServiceDependencies {
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionSettings?: ExtensionSettingsManager;
+  readonly extensionDirectoryPicker?: ExtensionDirectoryPicker;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly piBackendIds?: ReadonlySet<string>;
@@ -1005,6 +1008,7 @@ function jokoConnectCode(error: import("@joko/core").PublicError): Code {
 
 interface OperationOutcome {
   readonly accepted: boolean;
+  readonly pickedDirectory?: PickedExtensionDirectory;
   readonly resultCase?: contract.OperationResult["payload"]["case"];
   readonly entityId?: string;
   readonly unsupportedReason?: string;
@@ -1176,7 +1180,7 @@ const RUNTIME_GENERATION = BigInt(Date.now());
 
 /** Register all public v1 services. Every descriptor method receives a concrete handler. */
 export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
-  router.service(contract.DesktopVoiceConversationService, createDesktopVoiceConversationService(application.desktopVoiceConversation, application.connections),
+  router.service(contract.DesktopVoiceConversationService, withConnectErrors(createDesktopVoiceConversationService(application.desktopVoiceConversation, application.connections)),
     { readMaxBytes: 128 * 1024, writeMaxBytes: 8 * 1024 * 1024 });
   router.service(contract.ServerAccessService, withConnectErrors(createServerAccessConnectService(application)), { readMaxBytes: 65536 });
   const services = createConnectServices(application, projectionShutdownSignal);
@@ -1359,6 +1363,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
     ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
     ...(application.extensionSettings === undefined ? {} : { extensionSettings: application.extensionSettings }),
+    ...(application.extensionDirectoryPicker === undefined ? {} : { extensionDirectoryPicker: application.extensionDirectoryPicker }),
     ...(application.extensionPackagePublisher === undefined ? {} : { extensionPackagePublisher: application.extensionPackagePublisher }),
     ...(application.extensionSources === undefined ? {} : { extensionSources: application.extensionSources }),
     piBackendIds: new Set(application.adapters
@@ -1846,6 +1851,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         hideSessionFromCatalog: sessionId => dependencies.partnerGroupRuntime?.isGroupSession(sessionId) === true,
         hideTargetFromCatalog: targetId => dependencies.partnerGroupRuntime?.isGroupTarget(targetId) === true,
         resolveSessionContextDefaults: dependencies.resolveSessionContextDefaults,
+        resolveSideChatSourceAllowed: sessionId => dependencies.sessionHost.sideChatSourceAllowed(sessionId),
         resolveSessionRuntimeModel: ({ sessionId }) =>
           dependencies.sessionHost.getSessionRuntimeControl(sessionId).effective
       });
@@ -4646,6 +4652,30 @@ export function createConnectServices(application: OrchestratorApplication, proj
       context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       return { surface: mapExtensionMainViewSurface(surface) };
     },
+    openExtensionDirectoryPicker: async (request, context) => {
+      const connection = authenticate(context);
+      if (!dependencies.extensionDirectoryPicker) throw new ConnectError("Plugin directory selection is unavailable.", Code.Unimplemented);
+      const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
+      const assertOwner = () => {
+        dependencies.connections.fence(connection);
+        if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) throw new Error("Plugin settings document retired.");
+        assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
+      };
+      const page = await dependencies.extensionDirectoryPicker.open(surface, connection.id, assertOwner);
+      if (context.signal.aborted) { dependencies.extensionDirectoryPicker.close(page.picker.pickerId, connection.id); context.signal.throwIfAborted(); }
+      assertOwner(); return { page: mapExtensionDirectoryPage(page) };
+    },
+    browseExtensionDirectoryPicker: async (request, context) => {
+      const connection = authenticate(context);
+      if (!dependencies.extensionDirectoryPicker) throw new ConnectError("Plugin directory selection is unavailable.", Code.Unimplemented);
+      const page = await dependencies.extensionDirectoryPicker.browse(request.pickerId, connection.id, {
+        entryId: request.entryId, pageToken: request.pageToken, ...(request.directoryPath === undefined ? {} : { directoryPath: request.directoryPath }) });
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection); return { page: mapExtensionDirectoryPage(page) };
+    },
+    closeExtensionDirectoryPicker: (request, context) => {
+      const connection = authenticate(context);
+      return { closed: dependencies.extensionDirectoryPicker?.close(request.pickerId, connection.id) ?? false };
+    },
     getExtensionSettingsRoutingData: async (request, context) => {
       const connection = authenticate(context);
       const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
@@ -6516,6 +6546,12 @@ function operationResult(
     case: "acknowledgement",
     value: create(contract.AcknowledgementSchema, { accepted: outcome.accepted })
   };
+  if (outcome.accepted && outcome.pickedDirectory) {
+    const value = outcome.pickedDirectory;
+    return create(contract.OperationResultSchema, { payload: { case: "pickedDirectory", value: create(contract.ExtensionPickedDirectoryDepositSchema, {
+      token: value.token, fileCount: value.fileCount, totalBytes: BigInt(value.totalBytes), relativePaths: [...value.relativePaths], expiresAt: toProtoTimestamp(value.expiresAt)
+    }) } });
+  }
   if (outcome.accepted && outcome.compactSessionOutcome !== undefined) {
     let compactOutcome: contract.CompactSessionOutcome;
     switch (outcome.compactSessionOutcome) {
@@ -6970,6 +7006,8 @@ export function mutationFromRecord(store: OperationalStore, record: OperationRec
         planMode: booleanValue(body["planMode"]) ?? false,
         useWorktree: false,
         refreshWorktreeRemote: false,
+        provisionalDraftId: stringValue(body["provisionalDraftId"]) ?? "",
+        reuseProvisionalSessionId: stringValue(body["reuseProvisionalSessionId"]) ?? "",
         initialPlacement: stringValue(body["initialPlacement"]) === "dialogue"
           ? contract.NativeSessionPlacement.DIALOGUE
           : contract.NativeSessionPlacement.PROJECT
@@ -7057,6 +7095,7 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
     const scheduleDeletion = asRecord(response["scheduleDeletion"]);
     return {
       accepted: response["accepted"],
+      ...(response["pickedDirectory"] === undefined ? {} : { pickedDirectory: pickedExtensionDirectoryFromRecord(response["pickedDirectory"]) }),
       resultCase: stringValue(response["resultCase"]) as OperationOutcome["resultCase"],
       entityId: stringValue(response["entityId"]),
       unsupportedReason: stringValue(response["unsupportedReason"]),
@@ -7456,6 +7495,7 @@ function eventContext(
     : undefined;
   const sessionContext = item.payload.type === "session_changed" && session !== undefined
     ? sessionProjectionContext(store, session, {
+        sideChatSourceAllowed: dependencies.sessionHost.sideChatSourceAllowed(session.descriptor.id),
         ...(sessionActiveRun === undefined ? {} : { activeRun: sessionActiveRun }),
         runtimeAttached: sessionActiveRun !== undefined,
         resolveContextDefaults: dependencies.resolveSessionContextDefaults,
@@ -7463,6 +7503,8 @@ function eventContext(
       })
     : undefined;
   return {
+    ...(session?.descriptor.derivationOrigin?.sideChat === true && !sideChatHistoryEventVisible(session.descriptor, item,
+      readSideChatHistoryBoundary(store, session.descriptor)) ? { hideSideChatHistoryPrefix: true as const } : {}),
     sharedTaskAuthor: dependencies.taskShares === undefined ? undefined : taskShareEventAuthor(store, item),
     ...(item.payload.type !== "message_complete" || item.payload.role !== "assistant" ? {} : {
       learning: store.getPartnerLearningFeedback(item.id)
@@ -7613,6 +7655,7 @@ export function mapSession(
 ): contract.Session {
   const sessionActiveRun = activeRun(dependencies.store, session.descriptor.id);
   return toProtoSession(session, sessionProjectionContext(dependencies.store, session, {
+    sideChatSourceAllowed: dependencies.sessionHost.sideChatSourceAllowed(session.descriptor.id),
     ...(sessionActiveRun === undefined ? {} : { activeRun: sessionActiveRun }),
     runtimeAttached: sessionActiveRun !== undefined,
     resolveContextDefaults: dependencies.resolveSessionContextDefaults,
@@ -11095,6 +11138,22 @@ async function requireExtensionSettingsSurface(dependencies: ConnectServiceDepen
   const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.getSurface(surfaceId, connectionId));
   if (!surface.authority.settings) throw new ConnectError("This document does not own plugin settings.", Code.PermissionDenied);
   return surface;
+}
+
+function mapExtensionDirectoryPage(page: ExtensionDirectoryPage): contract.ExtensionDirectoryPickerPage {
+  const entry = (value: ExtensionDirectoryPage["entries"][number]) => create(contract.ExtensionDirectoryPickerEntrySchema, { ...value });
+  return create(contract.ExtensionDirectoryPickerPageSchema, { picker: create(contract.ExtensionDirectoryPickerSchema, {
+    pickerId: page.picker.pickerId, extensionId: page.picker.extensionId, expiresAt: toProtoTimestamp(page.picker.expiresAt) }),
+    ...(page.directory ? { directory: entry(page.directory) } : {}), entries: page.entries.map(entry), nextPageToken: page.nextPageToken });
+}
+
+function pickedExtensionDirectoryFromRecord(value: unknown): PickedExtensionDirectory {
+  const record = asRecord(value), token = record["token"], fileCount = record["fileCount"], totalBytes = record["totalBytes"], paths = record["relativePaths"], expiresAt = record["expiresAt"];
+  if (typeof token !== "string" || !token || typeof fileCount !== "number" || !Number.isInteger(fileCount) || fileCount < 1 || fileCount > 500
+    || typeof totalBytes !== "number" || !Number.isSafeInteger(totalBytes) || totalBytes < 0 || totalBytes > 524_288_000
+    || !Array.isArray(paths) || paths.length !== fileCount || !paths.every((value): value is string => typeof value === "string" && value.length > 0 && value.length <= 4096)
+    || typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt)) throw new Error("The stored directory selection receipt is invalid.");
+  return { token, fileCount, totalBytes, relativePaths: paths, expiresAt };
 }
 
 function requireExtensionMainViewAuthority(
@@ -17540,6 +17599,7 @@ async function dispatchMutation(
             sessionId: payload.value.sessionId,
             prompt,
             restoreArchived: true,
+            ...(payload.value.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: payload.value.providerGroupRebalance }),
             ...(overrides === undefined ? {} : { overrides })
           });
           return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId } satisfies OperationOutcome;
@@ -19116,11 +19176,12 @@ async function dispatchMutation(
         )) {
           return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The selected effort is not supported by this Backend model.");
         }
-        if (patch.defaultModel.fastMode && (
+        const speed = contract.decodeModelSpeed(patch.defaultModel);
+        if (speed && (
           backend.capabilities.get("model.fast_mode")?.supported !== true
-          || (patch.defaultModel.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true)
+          || (speed === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true)
         )) {
-          return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The selected Backend model does not support Fast Mode.");
+          return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The selected Backend model does not support this speed.");
         }
       }
       if (patch.defaultPermissionMode !== undefined) {
@@ -21721,6 +21782,19 @@ async function dispatchMutation(
         ),
         async () => { dependencies.extensionPackagePublisher!.abort(exportId); }
       );
+    }
+    case "pickExtensionDirectory": {
+      if (!dependencies.extensionDirectoryPicker || !payload.value.expectedRevision) throw invalidArgument("Current plugin directory selection and expected_revision are required.");
+      const extensionId = payload.value.extensionId, expectedRevision = fromProtoRevision(payload.value.expectedRevision, "pick_extension_directory.expected_revision");
+      const assertCurrent = () => { dependencies.connections.fence(connection); requireCurrentExtensionMutation(dependencies, extensionId, expectedRevision); };
+      let receipt: PickedExtensionDirectory | undefined;
+      return presented(await host.mutate({ operationId, connection, kind: payload.case, body: mutation,
+        precondition: assertCurrent,
+        effect: async () => { assertCurrent(); receipt = await dependencies.extensionDirectoryPicker!.pick(payload.value.pickerId, payload.value.entryId, extensionId, connection.id, assertCurrent); },
+        commit: () => {
+          if (!receipt) throw new Error("The original directory selection has no receipt.");
+          return { accepted: true, resultCase: "pickedDirectory", pickedDirectory: receipt } satisfies OperationOutcome;
+        } }));
     }
     case "setExtensionSettingsRoutingData": {
       if (!payload.value.expectedRevision) throw invalidArgument("expected_revision is required");

@@ -1429,6 +1429,7 @@ export interface TaskTagDeletePreviewView {
 }
 
 export interface SessionView {
+  readonly sideChatSourceAllowed?: boolean;
   readonly provisionalDraftId?: string;
   readonly localWorkspace?: { readonly workspaceId: string; readonly path: string };
   readonly taskActivity?: {
@@ -6099,6 +6100,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   refresh(): Promise<void>;
   refreshProviderAccountUsage(backendId: string, providerId: string): Promise<void>;
   readTaskProviderGroupUsage?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("./provider-group-task-usage.js").TaskProviderGroupUsageView | undefined>;
+  readTaskProviderGroupRebalance?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderGroupRebalanceView | undefined>;
   getArtifactStorageStats(protectedSha256?: readonly string[]): Promise<ArtifactStorageMaintenanceView>;
   listSessionArtifacts(sessionId: string, signal?: AbortSignal): Promise<readonly ArtifactView[]>;
   listArtifactReferenceCatalog(targetSessionId: string, targetGeneration: bigint, signal?: AbortSignal): Promise<readonly ArtifactReferenceCatalogItemView[]>;
@@ -6134,7 +6136,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   stopVoiceInput(voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   cancelVoiceInput(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   getVoiceInputSession(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
-  send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void>;
+  send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint; readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean } }): Promise<void>;
   startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string>;
   reobserveReview(reviewRunId: string): Promise<void>;
   abort(runId: string): Promise<void>;

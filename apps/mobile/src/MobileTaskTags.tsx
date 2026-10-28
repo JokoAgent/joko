@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Modal,
   Pressable,
   ScrollView,
@@ -15,6 +16,7 @@ import { TaskTagColor, type Session, type TaskTag, type TaskTagCatalog } from "@
 import type { MobileClient } from "./mobile-client";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import { MobileTaskTagsNative, mobileTaskTagsNativeAvailable } from "./MobileTaskTagsNative";
 
 export interface MobileTaskTagColors {
   readonly background: string;
@@ -101,6 +103,19 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
   const palette = colors.dark ? DARK_COLOR_VALUE : LIGHT_COLOR_VALUE;
   const editing = tags.find((tag) => tag.taskTagId === editingId);
   const attached = new Set(session?.taskTags.map((tag) => tag.taskTagId) ?? []);
+  const sourceOwner = client.taskHeaderSourceKey();
+  const scope = JSON.stringify([sourceOwner, client.state.activeProfileId, client.state.node?.serverId, client.state.origin,
+    session?.sessionId, session?.nativeBinding?.runtimeGeneration.toString()]);
+  const live = useRef({ scope, visible }); live.current = { scope, visible };
+  const mounted = useRef(true), confirmationEpoch = useRef(0);
+  const operation = useRef<symbol | undefined>(undefined);
+  const current = () => mounted.current && live.current.visible && live.current.scope === scope && AppState.currentState === "active"
+    && client.state.status === "connected" && client.state.selectedId === session?.sessionId && client.taskHeaderSourceKey() === sourceOwner;
+  useEffect(() => {
+    mounted.current = true;
+    const listener = AppState.addEventListener("change", value => { if (value !== "active") confirmationEpoch.current++; });
+    return () => { mounted.current = false; confirmationEpoch.current++; listener.remove(); };
+  }, []);
 
   useEffect(() => {
     setBusy(false);
@@ -108,7 +123,10 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
     setCreateName("");
     setCreateColor(TaskTagColor.BLUE);
     setEditingId(undefined);
-  }, [session?.sessionId, visible]);
+    operation.current = undefined;
+    confirmationEpoch.current++;
+    return () => { operation.current = undefined; };
+  }, [scope, visible]);
   useEffect(() => {
     if (!editing) return;
     setEditName(editing.name);
@@ -116,15 +134,16 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
   }, [editing?.taskTagId, editing?.revision?.value]);
 
   const run = async (action: () => Promise<boolean>, success?: () => void): Promise<void> => {
-    if (busy || !session) return;
+    if (operation.current || !session || !current()) return;
+    const actionOwner = Symbol("task-tags-mutation"); operation.current = actionOwner;
     setBusy(true);
     setError("");
     try {
       if (!await action()) throw new Error("Task-tag operation was not confirmed.");
-      success?.();
+      if (current() && operation.current === actionOwner) success?.();
     } catch {
-      setError(mobileMessage(locale, "taskTags.changeFailed"));
-    } finally { setBusy(false); }
+      if (current() && operation.current === actionOwner) setError(mobileMessage(locale, "taskTags.changeFailed"));
+    } finally { if (operation.current === actionOwner) { operation.current = undefined; setBusy(false); } }
   };
   const reorder = (tagId: string, direction: -1 | 1): void => {
     if (!session) return;
@@ -136,25 +155,46 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
     void run(() => client.reorderTaskTags(session.sessionId, ids, catalog?.revision?.value ?? 0n));
   };
   const previewDelete = async (tag: TaskTag): Promise<void> => {
-    if (busy || !session) return;
+    if (operation.current || !session || !current()) return;
+    const actionOwner = Symbol("task-tags-delete-preview"); operation.current = actionOwner;
+    const promptEpoch = confirmationEpoch.current;
     setBusy(true);
     setError("");
     try {
       const preview = await client.previewTaskTagDeletion(tag.taskTagId);
+      if (!current() || operation.current !== actionOwner || confirmationEpoch.current !== promptEpoch) return;
+      const expiresAt = Date.now() + 60_000;
+      let answered = false;
       Alert.alert(
         mobileMessage(locale, "taskTags.delete"),
         `${mobileMessage(locale, "taskTags.affected", { count: Number(preview.affectedSessionCount) })}\n\n${mobileMessage(locale, "taskTags.deleteBody")}`,
         [
-          { text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+          { text: mobileMessage(locale, "common.cancel"), style: "cancel", onPress: () => { answered = true; } },
           { text: mobileMessage(locale, "taskTags.delete"), style: "destructive", onPress: () => {
+            if (answered || !current() || Date.now() >= expiresAt || confirmationEpoch.current !== promptEpoch) return;
+            answered = true;
             void run(() => client.deleteTaskTag(session.sessionId, preview), () => setEditingId(undefined));
           } }
         ]
       );
     } catch {
-      setError(mobileMessage(locale, "taskTags.previewFailed"));
-    } finally { setBusy(false); }
+      if (current() && operation.current === actionOwner) setError(mobileMessage(locale, "taskTags.previewFailed"));
+    } finally { if (operation.current === actionOwner) { operation.current = undefined; setBusy(false); } }
   };
+
+  if (mobileTaskTagsNativeAvailable) return <MobileTaskTagsNative key={scope} visible={visible && session !== undefined} busy={busy} error={error}
+    colors={colors} locale={locale} subtitle={session?.displayName} onClose={onClose} onBack={() => setEditingId(undefined)}
+    items={tags.map((tag, index) => ({ id: tag.taskTagId, name: mobileTaskTagName(tag, locale), color: palette[tag.color] ?? palette[TaskTagColor.GRAY]!,
+      attached: attached.has(tag.taskTagId), onToggle: () => { if (session) void run(() => client.setSessionTaskTag(session.sessionId, tag.taskTagId, !attached.has(tag.taskTagId))); },
+      onEdit: () => setEditingId(tag.taskTagId), ...(index > 0 ? { onUp: () => reorder(tag.taskTagId, -1) } : {}),
+      ...(index < tags.length - 1 ? { onDown: () => reorder(tag.taskTagId, 1) } : {}) }))}
+    palette={COLORS.map(value => ({ value, name: mobileMessage(locale, colorMessageKey(value)), hex: palette[value]! }))}
+    create={{ name: createName, color: createColor, canSave: !!createName.trim() && tags.length < 256, onName: setCreateName, onColor: setCreateColor,
+      onSave: () => { if (session) void run(() => client.createTaskTag(session.sessionId, createName, createColor, catalog?.revision?.value ?? 0n), () => { setCreateName(""); setCreateColor(TaskTagColor.BLUE); }); } }}
+    {...(editing ? { edit: { name: editName, color: editColor, canSave: !!editName.trim() && (editName.trim() !== editing.name || editColor !== editing.color),
+      onName: setEditName, onColor: setEditColor, onSave: () => { if (session) void run(() => client.updateTaskTag(session.sessionId, editing.taskTagId, editing.revision?.value ?? 0n,
+        { ...(editName.trim() === editing.name ? {} : { name: editName.trim() }), ...(editColor === editing.color ? {} : { color: editColor }) }), () => setEditingId(undefined)); } } } : {})}
+    onDelete={() => { if (editing) void previewDelete(editing); }} />;
 
   return <>
     <Modal visible={visible && session !== undefined} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => { if (!busy) onClose(); }}>

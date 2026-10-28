@@ -3,6 +3,7 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionsScreen, type MobileExtensionsScreenProps } from "./MobileExtensionsScreen";
+import { MobileExtensionPackages } from "./MobileExtensionPackages";
 import type {
   MobileExtension,
   MobileExtensionCatalog,
@@ -13,6 +14,8 @@ import type {
 
 const native = vi.hoisted(() => ({
   width: 390,
+  state: "active",
+  listeners: new Set<(state: string) => void>(),
   back: undefined as undefined | (() => boolean),
   alert: vi.fn()
 }));
@@ -44,6 +47,9 @@ vi.mock("react-native", async () => {
   return {
     ActivityIndicator: () => React.createElement("span", { "data-loading": true }),
     Alert: { alert: native.alert },
+    AppState: { get currentState() { return native.state; }, addEventListener: (_name: string, listener: (state: string) => void) => {
+      native.listeners.add(listener); return { remove: () => native.listeners.delete(listener) };
+    } },
     BackHandler: { addEventListener: (_name: string, handler: () => boolean) => {
       native.back = handler;
       return { remove: () => { if (native.back === handler) native.back = undefined; } };
@@ -211,6 +217,7 @@ afterEach(() => {
   native.width = 390;
   native.back = undefined;
   native.alert.mockReset();
+  native.state = "active"; native.listeners.clear(); vi.useRealTimers();
   onBack.mockReset();
   onOpenNewTask.mockReset();
   onOpenTask.mockReset();
@@ -606,6 +613,41 @@ describe("MobileExtensionsScreen", () => {
   it("shows a bounded offline state", async () => {
     await render(undefined);
     expect(container.textContent).toContain("Reconnect to browse Extensions");
+  });
+});
+
+describe("MobileExtensionPackages native confirmation ownership", () => {
+  it.each(["disabled", "owner", "revision", "background", "expired"])("rejects a native dialog after %s retirement", async reason => {
+    const active = transport(), changed = vi.fn(), extension = extensionFixture();
+    active.removePackage = vi.fn(async () => catalog());
+    const show = async (next = active, value = extension, disabled = false) => {
+      if (!root) { container = document.createElement("div"); document.body.append(container); root = createRoot(container); }
+      await act(async () => root.render(createElement(MobileExtensionPackages, { extension: value, transport: next, colors, locale: "en", disabled, onChanged: changed })));
+    };
+    if (reason === "expired") vi.useFakeTimers();
+    await show(); await press("Remove package");
+    const buttons = native.alert.mock.calls[0]![2] as Array<{ onPress?: () => void }>;
+    if (reason === "disabled") await show(active, extension, true);
+    else if (reason === "owner") await show({ ...active, ownerKey: "owner-other" });
+    else if (reason === "revision") await show(active, { ...extension, revision: extension.revision + 1n });
+    else if (reason === "background") {
+      await act(async () => { native.state = "background"; native.listeners.forEach(listener => listener("background")); });
+      await act(async () => { native.state = "active"; native.listeners.forEach(listener => listener("active")); });
+    } else vi.setSystemTime(Date.now() + 60_001);
+    await act(async () => buttons[1]!.onPress?.());
+    expect(active.removePackage).not.toHaveBeenCalled(); expect(changed).not.toHaveBeenCalled();
+  });
+
+  it("submits one original confirmation and ignores repeated native callbacks", async () => {
+    const active = transport(), changed = vi.fn(), extension = extensionFixture();
+    active.removePackage = vi.fn(async () => catalog([]));
+    container = document.createElement("div"); document.body.append(container); root = createRoot(container);
+    await act(async () => root.render(createElement(MobileExtensionPackages, { extension, transport: active, colors, locale: "en", disabled: false, onChanged: changed })));
+    await press("Remove package");
+    const buttons = native.alert.mock.calls[0]![2] as Array<{ onPress?: () => void }>;
+    await act(async () => { buttons[1]!.onPress?.(); buttons[1]!.onPress?.(); });
+    expect(active.removePackage).toHaveBeenCalledExactlyOnceWith(extension, expect.any(AbortSignal));
+    expect(changed).toHaveBeenCalledExactlyOnceWith(catalog([]));
   });
 });
 

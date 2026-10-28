@@ -15,7 +15,7 @@ import {
   type FeishuApiPort,
   type FeishuOutboundAttachment
 } from "./api.js";
-import { buildFeishuClosedCard, buildFeishuInteractionCard } from "./cards.js";
+import { buildFeishuClosedCard, buildFeishuInteractionCard, buildFeishuMarkdownCard } from "./cards.js";
 import { feishuAddress, requiredFeishuIdentifier } from "./codec.js";
 import { parseFeishuContent } from "./content.js";
 import type { FeishuCallbackUpdate, FeishuService } from "./model.js";
@@ -262,6 +262,27 @@ export class FeishuTransport {
       input.signal
     );
     return { providerMessageId, address: input.address };
+  }
+
+  async sendRichReply(input: { readonly address: MessagingAddress; readonly text: string; readonly attachments: readonly FeishuOutboundAttachment[];
+    readonly replyToMessageId?: string; readonly signal?: AbortSignal; readonly fallbackProgressMessageId?: string }): Promise<MessagingSendReceipt> {
+    this.#assertAddress(input.address);
+    if (input.attachments.length > 100 || input.attachments.some(image => image.kind !== 'image') || !input.text.trim() && !input.attachments.length) throw invalidInput('The Feishu answer image list is invalid.');
+    const providerMessageId = await this.#api.sendRichReply(input.address, input.text, input.attachments, input.replyToMessageId, input.signal, input.fallbackProgressMessageId);
+    return { providerMessageId, address: input.address };
+  }
+  async openReplyProgress(input: { readonly address: MessagingAddress; readonly messageId: string; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    this.#assertAddress(input.address);
+    const providerMessageId = await this.#api.sendCard(input.address, buildFeishuMarkdownCard('Working on this task…'), input.signal, input.messageId);
+    return { providerMessageId, address: input.address };
+  }
+  async updateReplyProgress(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text: string; readonly signal?: AbortSignal }): Promise<void> {
+    this.#assertAddress(input.address);
+    await this.#api.patchCard(input.messageId, buildFeishuMarkdownCard(input.text), input.signal);
+  }
+  async closeReplyProgress(input: { readonly address: MessagingAddress; readonly messageId: string; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    this.#assertAddress(input.address); await this.#api.recallMessage(input.messageId, input.signal);
+    return { providerMessageId: input.messageId, address: input.address };
   }
 
   async sendInteractionCard(input: {

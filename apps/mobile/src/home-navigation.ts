@@ -37,6 +37,7 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
   const targets = new Map(snapshot.targets.map((target) => [target.targetId, target]));
   const workspaces = new Map(snapshot.workspaces.map((workspace) => [workspace.targetId, workspace]));
   const visible = snapshot.sessions.filter((session) => {
+    if (session.hidden || session.derivationOrigin?.sideChat) return false;
     if (options.statusFilter === "active" && session.archived) return false;
     if (options.statusFilter === "archived" && !session.archived) return false;
     if (!normalizedQuery) return true;

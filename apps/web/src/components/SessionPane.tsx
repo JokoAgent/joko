@@ -517,7 +517,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const canAddMessageReference = !reviewReadOnly && backend?.capabilities.get("input.text")?.supported === true;
   const canForkMessage = !reviewReadOnly && !sideChatRuntimeReadOnly && canDeriveWorkspace
     && backend?.capabilities.get("session.fork")?.supported === true;
-  const canOpenSideChat = !guest && !reviewReadOnly && !session.archived && session.derivationOrigin?.sideChat !== true
+  const canOpenSideChat = session.sideChatSourceAllowed === true && !guest && !reviewReadOnly && !session.archived && session.derivationOrigin?.sideChat !== true
     && (partnerConversation === undefined || partnerConversation.kind === "task")
     && backend?.capabilities.get("session.side_chat")?.supported === true;
   const visionBridgeRouted = controller.state.snapshot.settings.visionBridge.enabled && session.model !== undefined
@@ -2130,7 +2130,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             onSplitSession={onSplitSession}
             onStartSideChat={canOpenSideChat ? () => openSideChat() : undefined}
             sideChats={controller.state.snapshot.sessions.filter((child) => child.derivationOrigin?.sideChat
-              && child.derivationOrigin.sourceSessionId === session.id).slice(0, 20)}
+              && child.derivationOrigin.sourceSessionId === session.id)}
             onSelectSideChat={(childId) => onSideChatOpened === undefined
               ? controller.navigate({ kind: "session", sessionId: childId }) : onSideChatOpened(session.id, childId)}
             onOpenSessionWindow={onOpenSessionWindow}

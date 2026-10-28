@@ -77,6 +77,7 @@ message OperationMutation {
     PrewarmSessionMutation prewarm_session = 226;
     SetExtensionSettingsRoutingDataMutation set_extension_settings_routing_data = 227;
     ClearExtensionSetupCredentialMutation clear_extension_setup_credential = 228;
+    PickExtensionDirectoryMutation pick_extension_directory = 229;
     CloneSessionMutation clone_session = 29;
     NavigateSessionBranchMutation navigate_session_branch = 30;
     CompactSessionMutation compact_session = 31;
@@ -668,6 +669,13 @@ message ClearExtensionSetupCredentialMutation {
   string field_id = 4;
 }
 
+message PickExtensionDirectoryMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string picker_id = 3;
+  string entry_id = 4;
+}
+
 message DetachSessionMutation {
   string session_id = 1;
 }
@@ -830,7 +838,10 @@ message SendInputMutation {
   InputContent input = 2;
   QueueDeliveryMode delivery_mode = 3;
   PerTurnOverrides overrides = 4;
+  optional ProviderGroupRebalanceChoice provider_group_rebalance = 5;
 }
+// Consent belongs only to this original send; it is revalidated before handoff.
+message ProviderGroupRebalanceChoice { string suggestion_key = 1; bool remember = 2; }
 
 message PerTurnOverrides {
   optional ModelSelection model = 1;
@@ -1658,6 +1669,7 @@ message OperationResult {
     ScheduleRunsReadResult schedule_runs_read = 33;
     ScheduleDeletionResult schedule_deletion = 34;
     SkillMutationResult skill = 35;
+    ExtensionPickedDirectoryDeposit picked_directory = 36;
   }
 }
 

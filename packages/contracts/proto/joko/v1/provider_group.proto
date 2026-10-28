@@ -13,6 +13,7 @@ service ProviderGroupService {
   rpc UpdateProviderGroup(UpdateProviderGroupRequest) returns (UpdateProviderGroupResponse);
   rpc GetProviderGroupUsage(GetProviderGroupUsageRequest) returns (GetProviderGroupUsageResponse);
   rpc GetTaskProviderGroupUsage(GetTaskProviderGroupUsageRequest) returns (GetTaskProviderGroupUsageResponse);
+  rpc GetTaskProviderGroupRebalance(GetTaskProviderGroupRebalanceRequest) returns (GetTaskProviderGroupRebalanceResponse);
   rpc PickProviderGroupMember(PickProviderGroupMemberRequest) returns (PickProviderGroupMemberResponse);
   rpc CoolProviderGroupMember(CoolProviderGroupMemberRequest) returns (CoolProviderGroupMemberResponse);
   rpc ReportProviderGroupLeases(ReportProviderGroupLeasesRequest) returns (ReportProviderGroupLeasesResponse);
@@ -64,6 +65,20 @@ message UpdateProviderGroupResponse { ProviderGroupSnapshot group = 1; }
 message ProviderGroupQuota {
   bool limited = 1; optional double usage_percent = 2; optional double reset_at = 3;
   optional double weekly_reset_at = 4; optional double five_hour_reset_at = 5;
+  optional double urgency = 6; bool five_hour_tight = 7;
+  optional ProviderGroupQuotaWindow pacing_window = 8;
+}
+message ProviderGroupQuotaWindow {
+  double used_percent = 1; double window_ms = 2; optional double reset_at = 3;
+}
+message GetTaskProviderGroupRebalanceRequest { string session_id = 1; uint64 generation = 2; }
+message GetTaskProviderGroupRebalanceResponse { optional ProviderGroupRebalanceSuggestion suggestion = 1; }
+message ProviderGroupRebalanceSuggestion {
+  string suggestion_key = 1; ProviderGroupKey group = 2;
+  string from_member_key = 3; string to_member_key = 4;
+  string from_label = 5; string to_label = 6;
+  ProviderGroupQuota current_quota = 7; ProviderGroupQuota target_quota = 8;
+  bool automatic = 9; uint64 generation = 10;
 }
 message ProviderGroupMemberState {
   string member_key = 1; bool available = 2; bool reachable = 3; string model_id = 4;
@@ -72,6 +87,8 @@ message ProviderGroupMemberState {
 message PickProviderGroupMemberRequest {
   ProviderGroupKey key = 1; string session_id = 2; string agent_kind = 3; string model_id = 4;
   optional string logical_model_id = 5; repeated string exclude_member_keys = 6;
+  optional string quota_rebalance_from_member_key = 7;
+  optional string effort_id = 8; bool fast_mode = 9; bool ultrafast_mode = 10;
 }
 message PickProviderGroupMemberResponse {
   ProviderGroupSnapshot group = 1; ProviderGroupMember member = 2; string model_id = 3;

@@ -5,19 +5,19 @@ const now = 1_700_000_000_000;
 const member = (id: string, patch: Partial<ProviderGroupCandidate> = {}): ProviderGroupCandidate => ({ id, available: true, paused: false, running: 0, capacity: 4, weight: 1, ...patch });
 const strategies: ProviderGroupStrategy[] = ["least_busy", "round_robin", "ordered", "weighted"];
 
-it("uses expiring weekly quota before five-hour quota and low usage for every strategy", () => {
-  const candidates = [member("unknown"), member("low", { usagePercent: 1 }), member("five-hour", { usagePercent: 20, fiveHourResetAt: now + 10_000 }),
-    member("weekly", { usagePercent: 90, weeklyResetAt: now + 4 * 60 * 60_000 })];
-  for (const strategy of strategies) expect(selectProviderGroupMember(candidates, strategy, { now, random: () => 0 })).toBe("weekly");
+it("uses the highest credible remaining-quota pace for every strategy", () => {
+  const candidates = [member("unknown"), member("fresh", { urgency: 1 }), member("nearly-full", { urgency: 12, fiveHourTight: true }),
+    member("expiring", { urgency: 4 })];
+  for (const strategy of strategies) expect(selectProviderGroupMember(candidates, strategy, { now, random: () => 0 })).toBe("expiring");
 });
 
-it("handles reset boundaries, similar reset times and the five percentage-point usage band", () => {
-  const candidates = [member("expired", { usagePercent: 80, weeklyResetAt: now }), member("later", { usagePercent: 6, weeklyResetAt: now + 61 * 60_000 }),
-    member("first", { usagePercent: 2, weeklyResetAt: now + 60 * 60_000 }), member("next-tier", { usagePercent: 0, fiveHourResetAt: now + 5_000 })];
-  expect(selectProviderGroupMember(candidates, "ordered", { now })).toBe("later");
-  expect(selectProviderGroupMember([member("outside", { usagePercent: 7.01 }), member("lowest", { usagePercent: 2 })], "ordered", { now })).toBe("lowest");
-  expect(selectProviderGroupMember([member("at-edge", { usagePercent: 7 }), member("lowest", { usagePercent: 2 })], "ordered", { now })).toBe("at-edge");
-  expect(selectProviderGroupMember([member("unknown"), member("known", { usagePercent: 99 })], "ordered", { now })).toBe("known");
+it("uses the ten-percent urgency band and avoids tight short windows only when another account can accept", () => {
+  expect(selectProviderGroupMember([member("outside", { urgency: 1.79 }), member("highest", { urgency: 2 })], "ordered", { now })).toBe("highest");
+  expect(selectProviderGroupMember([member("at-edge", { urgency: 1.8 }), member("highest", { urgency: 2 })], "ordered", { now })).toBe("at-edge");
+  expect(selectProviderGroupMember([member("unknown"), member("known", { urgency: 0.01 })], "ordered", { now })).toBe("known");
+  expect(selectProviderGroupMember([member("tight", { urgency: 5, fiveHourTight: true }), member("unknown")], "ordered", { now })).toBe("unknown");
+  expect(selectProviderGroupMember([member("tight", { urgency: 5, fiveHourTight: true })], "ordered", { now })).toBe("tight");
+  expect(selectProviderGroupMember([member("invalid", { urgency: Number.NaN }), member("unobserved")], "ordered", { now })).toBe("invalid");
 });
 
 it("keeps the original member order for rotation and applies weights only after quota selection", () => {

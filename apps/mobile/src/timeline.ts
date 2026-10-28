@@ -52,6 +52,7 @@ export interface TimelineRow {
   readonly operationId?: string;
   /** Page-local presentation only; never sourced from or written to durable events. */
   readonly optimistic?: boolean;
+  readonly pendingSend?: import("./mobile-pending-send").MobilePendingSendProgress;
   readonly quoteSource?: {
     readonly sourceMessageId: string;
     readonly sourceEventId: string;

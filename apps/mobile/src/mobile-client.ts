@@ -2,6 +2,7 @@ import { isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrus
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionPackageAction } from "@joko/contracts";
+import { projectProviderGroupRebalance, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
 import { executeExtensionSettingsCall } from "@joko/connection-transport";
 import type { SessionArchivePreview } from "@joko/contracts";
@@ -555,6 +556,9 @@ export interface MobileTaskSendObserver {
   /** Caller-owned durable Operation identity, allocated before dispatch. */
   readonly operationId?: string;
   readonly deliveryMode?: QueueDeliveryMode;
+  /** Presentation of the original input, before any disk/upload wait. */
+  readonly onProgress?: (progress: import("./mobile-pending-send").MobilePendingSendProgress) => void;
+  readonly confirmRebalance?: (suggestion: ProviderGroupRebalanceSuggestion, signal: AbortSignal) => Promise<"keep" | "cancel" | { readonly remember: boolean }>;
   /** Presentation-only notification after validation/upload and immediately before durable submit. */
   readonly onDispatch?: (draft: MobileComposerDraft) => void;
 }
@@ -757,6 +761,7 @@ type MobileExtensionReceiptKind = Extract<PendingOperation["kind"],
   | "extension-package-remove"
   | "extension-settings-routing"
   | "extension-settings-credential-clear"
+  | "extension-settings-directory"
   | "extension-setup-begin"
   | "extension-setup-interaction"
   | "extension-setup-credential"
@@ -767,7 +772,7 @@ type MobileExtensionReceiptKind = Extract<PendingOperation["kind"],
 function isMobileExtensionReceiptKind(kind: PendingOperation["kind"]): kind is MobileExtensionReceiptKind {
   return kind === "extension-enabled" || kind === "extension-sidebar"
     || kind === "extension-package-adopt" || kind === "extension-package-remove"
-    || kind === "extension-settings-routing" || kind === "extension-settings-credential-clear"
+    || kind === "extension-settings-routing" || kind === "extension-settings-credential-clear" || kind === "extension-settings-directory"
     || kind === "extension-setup-begin" || kind === "extension-setup-interaction"
     || kind === "extension-setup-credential" || kind === "extension-setup-complete"
     || kind === "extension-setup-cancel" || kind === "extension-setup-revoke";
@@ -781,6 +786,7 @@ function mobileExtensionPendingMutationKind(kind: MobileExtensionReceiptKind): M
     case "extension-package-remove": return "packageRemove";
     case "extension-settings-routing": return "settingsRouting";
     case "extension-settings-credential-clear": return "settingsCredentialClear";
+    case "extension-settings-directory": return "settingsDirectory";
     case "extension-setup-begin": return "setupBegin";
     case "extension-setup-interaction": return "setupInteraction";
     case "extension-setup-credential": return "setupCredential";
@@ -989,6 +995,7 @@ export class MobileClient {
   #streamGeneration?: bigint;
   #foreground = true;
   #extensionOAuthRetention?: { readonly transport: MobileExtensionTransport; readonly current: () => boolean };
+  #providerRebalanceConfirmation?: { readonly sourceKey: string };
   #partnerRosterEpoch = 0;
   #partnerRosterNavigation?: { readonly sourceKey: string; readonly profileId: string; readonly sessionId: string; readonly partnerId: string; readonly homeTargetId: string };
   #partnerProfileSave?: { readonly action: symbol; readonly epoch: number; readonly credential: PairedCredential;
@@ -2634,7 +2641,7 @@ export class MobileClient {
     };
     const setupMutation = (
       expected: MobileExtension,
-      receiptKind: Exclude<MobileExtensionReceiptKind, "extension-enabled" | "extension-sidebar" | "extension-package-adopt" | "extension-package-remove" | "extension-settings-routing" | "extension-settings-credential-clear">,
+      receiptKind: Exclude<MobileExtensionReceiptKind, "extension-enabled" | "extension-sidebar" | "extension-package-adopt" | "extension-package-remove" | "extension-settings-routing" | "extension-settings-credential-clear" | "extension-settings-directory">,
       prepare: (
         extension: MobileExtension,
         signal: AbortSignal
@@ -3308,7 +3315,8 @@ export class MobileClient {
     });
     const packageBackends = () => isCurrent() ? (this.#state.owner?.backends ?? []).filter(backend =>
       backend.capabilities?.capabilities.some(capability => capability.name === "runtime.resources"
-        && capability.support === CapabilitySupport.SUPPORTED && capability.options.includes("package")))
+        && capability.support === CapabilitySupport.SUPPORTED && capability.options?.kind.case === "runtime"
+        && capability.options.kind.value.resourceKinds.includes("package")))
       .map(backend => ({ backendId: backend.backendId, name: backend.displayName })) : [];
     const browse = (signal: AbortSignal) => owned(signal, current =>
       (this.network.browseExtensions ?? this.network.listExtensions)(context.credential, current));
@@ -3372,10 +3380,12 @@ export class MobileClient {
       if (!api || !upload || pendingForExtension(surface.extensionId)) throw new Error("Check the original plugin operation before another settings change.");
       const authorization = call.kind === "oauth.connect";
       const retention = authorization ? { transport, current: settingsOwnerCurrent } : undefined;
-      if (retention) {
+      const settingsHost = retention ? { ...host, authorize: async (...args: Parameters<typeof host.authorize>) => {
+        requireCurrent(args[2]);
         if (this.#extensionOAuthRetention) throw new Error("Another plugin authorization is in progress.");
         this.#extensionOAuthRetention = retention;
-      }
+        return host.authorize(...args);
+      } } : host;
       const execute = (current: AbortSignal) => executeExtensionSettingsCall({ surface, api,
         ...(this.network.extensionOAuthApi ? { oauth: this.network.extensionOAuthApi(context.credential) } : {}),
         ...(this.network.extensionConnectionsApi ? { connections: this.network.extensionConnectionsApi(context.credential) } : {}),
@@ -3395,11 +3405,28 @@ export class MobileClient {
             if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) throw new Error(result.operation?.error?.message || "Plugin settings change was rejected.");
           } finally { this.#releaseMutation(action); }
         },
+        pickDirectory: async (extension, mutation, signal) => {
+          const action = this.#claimMutation();
+          try {
+            const result = await this.#submitTerminal(mutation, { kind: "extension-settings-directory", extensionId: extension.extensionId,
+              extensionRevision: extension.revision.toString(10) }, undefined, false, false,
+              { signal, isCurrent, beforeTerminalReceipt: async operation => {
+                if (operation.state === OperationState.SUCCEEDED) this.#assertExtensionDirectoryReceipt(operation);
+              } });
+            requireCurrent(signal);
+            if (!result.definitive) throw new Error("Directory selection result is unknown. Check the original operation before choosing again.");
+            if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) throw new Error(result.operation?.error?.message || "Directory selection was rejected.");
+            await freshSettings(surface, signal); requireCurrent(signal);
+            return this.#assertExtensionDirectoryReceipt(result.operation);
+          } finally { this.#releaseMutation(action); }
+        },
         begin: beginSetup, field: submitSetupInteraction,
         secret: (extension, fieldId, value, signal) => saveSetupCredential(extension, fieldId, "headerSecret", value, signal), complete: completeSetup
-      }, call, host, current);
+      }, call, settingsHost, current);
       const request = authorization ? new AbortController() : undefined;
-      const unsubscribe = request ? this.subscribe(() => { if (!settingsOwnerCurrent()) request.abort(); }) : undefined;
+      const unsubscribe = request ? this.subscribe(() => {
+        if (!settingsOwnerCurrent() || !this.#foreground && this.#extensionOAuthRetention !== retention) request.abort();
+      }) : undefined;
       try {
         return request ? await execute(AbortSignal.any([signal, request.signal])) : await owned(signal, execute);
       } finally {
@@ -3503,6 +3530,18 @@ export class MobileClient {
       })
     };
     return transport;
+  }
+
+  #assertExtensionDirectoryReceipt(operation: Operation) {
+    const payload = operation.result?.payload;
+    if (payload?.case !== "pickedDirectory" || !payload.value.token || payload.value.fileCount < 1 || payload.value.fileCount > 500
+      || payload.value.fileCount !== payload.value.relativePaths.length || payload.value.totalBytes > 524_288_000n
+      || payload.value.totalBytes < 0n || !payload.value.expiresAt
+      || payload.value.relativePaths.some(value => !value || value.length > 4096 || value.startsWith("/") || value.includes("\\")
+        || value.includes("\0") || value.split("/").some(part => part === ".."))) {
+      throw new Error("The original directory selection has no valid read deposit receipt.");
+    }
+    return payload.value;
   }
 
   #assertExtensionMutationAcknowledgement(operation: Operation): void {
@@ -10278,6 +10317,7 @@ export class MobileClient {
     if (!this.#joinedTask && this.#taskOutbox && (this.#state.status === "offline"
       || this.taskOutboxItems().length > 0)) return this.#enqueueTaskOutbox(draft, observer);
     const exactDraft = normalizeMobileComposerDraft(draft);
+    const sentAt = this.now();
     const sessionId = this.#state.selectedId;
     const session = this.#state.detail?.sessions.find((item) => item.sessionId === sessionId);
     const backend = this.#selectedBackend(session);
@@ -10327,9 +10367,12 @@ export class MobileClient {
       assertMobileAttachmentPolicy(sendDraft.attachments, attachmentControls.policy);
     }
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+    observer.onProgress?.({ phase: "preparing", input: sendDraft, sentAt });
     const draftIdentity = { profileId: this.taskDraftProfileId()!, sessionId };
     this.composerDrafts.save(draftIdentity, sendDraft);
     await this.composerDrafts.flush(draftIdentity);
+    if (!isCurrent()) return false;
+    const providerGroupRebalance = await this.#confirmTaskProviderRebalance(session, observer, signal, isCurrent);
     if (!isCurrent()) return false;
     const cardEdits = pendingExtensionCardFormDelivery(extensionCardFormDeliveryScope(credential, sessionId));
     if (cardEdits && !await cardEdits) throw new Error("The card edits could not be saved. Retry the card edit before sending.");
@@ -10405,10 +10448,13 @@ export class MobileClient {
         authorityKey,
         attachmentOwnerKey,
         credential,
-        generation
+        generation,
+        (input, attachmentId, error) => observer.onProgress?.({ input, sentAt, phase: error ? "failed" : attachmentId ? "uploading" : "preparing",
+          ...(attachmentId ? { attachmentId } : {}), ...(error ? { error } : {}) })
       );
       if (!isCurrent()) return false;
       observer.onDispatch?.(sendDraft);
+      observer.onProgress?.({ phase: "sending", input: sendDraft, sentAt });
       if (!isCurrent()) return false;
       const receipt = await this.#submitTracked(create(OperationMutationSchema, {
         preconditions: [create(OperationPreconditionSchema, {
@@ -10417,7 +10463,8 @@ export class MobileClient {
         payload: { case: "sendInput", value: create(SendInputMutationSchema, {
           sessionId,
           input: mobileComposerInput(sendDraft),
-          deliveryMode: observer.deliveryMode ?? QueueDeliveryMode.PROMPT
+          deliveryMode: observer.deliveryMode ?? QueueDeliveryMode.PROMPT,
+          ...(providerGroupRebalance ? { providerGroupRebalance } : {})
         }) }
       }), { kind: "send", sessionId }, false, observer.operationId, true, true,
         { signal, isCurrent: connectionCurrent, beforeDispatch: isCurrent });
@@ -10444,8 +10491,31 @@ export class MobileClient {
       && this.#taskAuthorityKey(true) !== undefined;
   }
 
+  async #confirmTaskProviderRebalance(session: Session, observer: MobileTaskSendObserver, signal: AbortSignal | undefined, current: () => boolean) {
+    if (this.#joinedTask || this.#state.status !== "connected" || !this.network.getTaskProviderGroupRebalance || !this.#credential || !signal) return undefined;
+    let suggestion: ProviderGroupRebalanceSuggestion | undefined;
+    try { suggestion = await this.network.getTaskProviderGroupRebalance(this.#credential, session.sessionId, session.nativeBinding!.runtimeGeneration, signal); }
+    catch { if (!current()) throw new Error("The account switch source changed."); return undefined; }
+    if (!current()) throw new Error("The account switch source changed.");
+    try { if (!projectProviderGroupRebalance(suggestion, session.nativeBinding!.runtimeGeneration)) return undefined; }
+    catch { return undefined; }
+    if (!suggestion) return undefined;
+    if (suggestion.automatic) return { suggestionKey: suggestion.suggestionKey, remember: false };
+    if (!observer.confirmRebalance) return undefined;
+    const confirmation = { sourceKey: this.taskHeaderSourceKey()! };
+    if (this.#providerRebalanceConfirmation?.sourceKey === confirmation.sourceKey) throw new Error("Finish the original account switch confirmation before sending another input.");
+    this.#providerRebalanceConfirmation = confirmation;
+    try {
+      const answer = await observer.confirmRebalance(suggestion, signal);
+      if (!current()) throw new Error("The account switch source changed.");
+      if (answer === "cancel") throw new Error("The account switch confirmation was cancelled. The draft is retained.");
+      return answer === "keep" ? undefined : { suggestionKey: suggestion.suggestionKey, remember: answer.remember };
+    } finally { if (this.#providerRebalanceConfirmation === confirmation) this.#providerRebalanceConfirmation = undefined; }
+  }
+
   taskOutboxItems(): readonly MobileTaskOutboxRecord[] {
-    return (this.#taskOutbox?.records ?? []).filter((record) => record.owner.profileId === this.#activeProfileId
+    const profile = this.#profiles.find(profile => profile.profileId === this.#activeProfileId);
+    return (this.#taskOutbox?.records ?? []).filter((record) => profile && mobileTaskOutboxOwnerMatches(record.owner, profile)
       && record.sessionId === this.#state.selectedId && record.state !== "settled");
   }
 
@@ -10457,7 +10527,7 @@ export class MobileClient {
     const operationId = record.failureKind === "rejected" ? this.newId() : record.operationId;
     if (record.failureKind === "rejected" && operationId === record.operationId) throw new Error("A new operation identity is required to retry a rejected input.");
     await store.update(record, { state: "queued", attempted: record.failureKind === "rejected" ? false : record.attempted,
-      error: undefined, failureKind: undefined,
+      error: undefined, failureKind: undefined, uploadAttachmentId: undefined,
       operationId });
     this.#publishTaskOutbox();
     if (this.#state.status === "connected") await this.reconcile();
@@ -10477,7 +10547,7 @@ export class MobileClient {
     if (!store || !record || !["staging", "queued", "failed"].includes(record.state)) throw new Error("Check the original operation before removing an input with an unknown result.");
     if (record.attempted && record.failureKind !== "rejected") throw new Error("Retry or query the original operation before removing an input that may have been accepted.");
     if (this.#state.busy) throw new Error("Finish the current operation before removing this input.");
-    const settled = await store.update(record, { state: "settled", sourceDraft: undefined, failureKind: undefined });
+    const settled = await store.update(record, { state: "settled", sourceDraft: undefined, failureKind: undefined, uploadAttachmentId: undefined });
     await this.#cleanupTaskOutbox(settled);
     this.#publishTaskOutbox();
   }
@@ -10489,7 +10559,7 @@ export class MobileClient {
       || !["queued", "failed"].includes(record.state) || record.attempted && record.failureKind !== "rejected" || this.#state.busy) {
       throw new Error("Only an unsent or rejected input from this connection can return to its composer.");
     }
-    const restoring = await store.update(record, { state: "restoring", sourceDraft: undefined, failureKind: undefined });
+    const restoring = await store.update(record, { state: "restoring", sourceDraft: undefined, failureKind: undefined, uploadAttachmentId: undefined });
     await this.#restoreTaskOutboxDraft(restoring);
     this.#publishTaskOutbox();
   }
@@ -10520,6 +10590,7 @@ export class MobileClient {
   #publishTaskOutbox(): void { this.#set({ taskOutbox: this.#taskOutbox?.records }); }
 
   async #enqueueTaskOutbox(draft: MobileComposerDraft, observer: MobileTaskSendObserver): Promise<boolean> {
+    const sentAt = this.now();
     const store = this.#taskOutbox!, drafts = this.composerDrafts!;
     const session = this.#selectedSession(), profile = this.#profiles.find((item) => item.profileId === this.#activeProfileId);
     const authority = this.#taskAuthorityKey(this.#state.status === "offline");
@@ -10534,6 +10605,7 @@ export class MobileClient {
     const storageIds: string[] = [];
     let committed = false;
     try {
+      observer.onProgress?.({ phase: this.#state.status === "offline" ? "waiting" : "preparing", input, sentAt });
       const identity = { profileId: profile.profileId, sessionId: session.sessionId };
       drafts.save(identity, input); await drafts.flush(identity);
       const assert = () => {
@@ -10543,6 +10615,9 @@ export class MobileClient {
           throw new Error("The task owner changed before its input could be retained.");
         }
       };
+      assert();
+      const providerGroupRebalance = await this.#confirmTaskProviderRebalance(session, observer, this.#abort?.signal,
+        () => this.#current(epoch) && this.#state.selectedId === session.sessionId && this.#selectedSession()?.nativeBinding?.runtimeGeneration === generation);
       assert();
       const model = resolveMobileSessionModelAuthority(this.#state.owner, session);
       const policy = resolveMobileAttachmentPolicy(backend, model?.supportsImages === true);
@@ -10573,9 +10648,9 @@ export class MobileClient {
       const modelJson = mobileTaskOutboxModel(session);
       let record = await store.add({ id: operationId, operationId, owner: profile,
         sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
-        runtimeGeneration: generation.toString(), createdAt: this.now(), deliveryMode: observer.deliveryMode ?? QueueDeliveryMode.PROMPT,
+        runtimeGeneration: generation.toString(), createdAt: sentAt, deliveryMode: observer.deliveryMode ?? QueueDeliveryMode.PROMPT,
         permissionMode: session.permissionMode, planMode: session.planMode,
-        ...(modelJson === undefined ? {} : { modelJson }),
+        ...(modelJson === undefined ? {} : { modelJson }), ...(providerGroupRebalance ? { providerGroupRebalance } : {}),
         input: normalizeMobileComposerDraft({ ...input, attachments }), storageIds, sourceDraft: input, state: "staging", attempted: false });
       committed = true;
       record = await this.#finishTaskOutboxHandoff(record);
@@ -10646,7 +10721,9 @@ export class MobileClient {
             }
             // An uncertain earlier request can still arrive. A retry must keep
             // its exact mutation, including Blob identities and preconditions.
-            const input = record.attempted ? record.input : await this.#prepareTaskOutbox(record, credential, signal, assert);
+            const input = record.attempted ? record.input : await this.#prepareTaskOutbox(record, credential, signal, assert, async (input, uploadAttachmentId) => {
+              assert(); record = await store.update(record, { input, uploadAttachmentId }); this.#publishTaskOutbox(); assert();
+            });
             assert();
             const cardEdits = pendingExtensionCardFormDelivery(extensionCardFormDeliveryScope(credential, record.sessionId));
             if (cardEdits && !await cardEdits) throw new Error("The card edits could not be saved. Retry the card edit before sending.");
@@ -10654,7 +10731,7 @@ export class MobileClient {
             record = await store.update(record, { input });
             assert();
             preparingDispatch = true;
-            record = await store.update(record, { state: "confirming", attempted: true });
+            record = await store.update(record, { state: "confirming", attempted: true, uploadAttachmentId: undefined });
             this.#publishTaskOutbox();
             assert();
             submitInvoked = true;
@@ -10663,6 +10740,7 @@ export class MobileClient {
                 expectedGeneration: BigInt(record.runtimeGeneration) })],
               payload: { case: "sendInput", value: create(SendInputMutationSchema, { sessionId: record.sessionId,
                 input: mobileComposerInput(record.input), deliveryMode: record.deliveryMode,
+                ...(record.providerGroupRebalance ? { providerGroupRebalance: record.providerGroupRebalance } : {}),
                 overrides: create(PerTurnOverridesSchema, { planMode: record.planMode,
                   ...([PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS].includes(record.permissionMode)
                     ? { permissionMode: record.permissionMode } : {}),
@@ -10705,7 +10783,8 @@ export class MobileClient {
     record: MobileTaskOutboxRecord,
     credential: PairedCredential,
     signal: AbortSignal,
-    assertCurrent: () => void
+    assertCurrent: () => void,
+    uploaded: (input: MobileComposerDraft, attachmentId: string | undefined) => Promise<void>
   ): Promise<MobileComposerDraft> {
     const read = async () => {
       assertCurrent();
@@ -10790,6 +10869,7 @@ export class MobileClient {
     }
     for (const candidate of [...input.attachments]) {
       if (candidate.state === "uploaded") continue;
+      await uploaded(input, candidate.attachmentId);
       if (!this.attachmentFiles) throw new Error("The retained attachment bytes are unavailable.");
       const source = await this.attachmentFiles.verifyForUpload(record.owner.profileId, candidate, signal);
       assertCurrent();
@@ -10797,6 +10877,7 @@ export class MobileClient {
       assertCurrent();
       input = normalizeMobileComposerDraft({ ...input,
         attachments: replaceMobileComposerAttachment(input.attachments, candidate.attachmentId, this.#uploadedAttachment(candidate, blob)) });
+      await uploaded(input, undefined);
     }
     const final = await read(), after = controls(final);
     if (final.key !== initial.key
@@ -10816,7 +10897,8 @@ export class MobileClient {
     authorityKey: string,
     attachmentOwnerKey: string | undefined,
     credential: PairedCredential,
-    generation: bigint
+    generation: bigint,
+    progress?: (input: MobileComposerDraft, attachmentId?: string, error?: string) => void
   ): Promise<MobileComposerDraft> {
     const epoch = this.#epoch, signal = this.#abort?.signal;
     const check = (): void => {
@@ -10839,6 +10921,8 @@ export class MobileClient {
     for (const candidate of current.attachments) {
       if (candidate.state === "uploaded") continue;
       const attachment = candidate as MobileLocalComposerAttachment;
+      progress?.(current, attachment.attachmentId);
+      try {
       this.#assertTaskAttachmentUploadOwner(
         identity.sessionId,
         authorityKey,
@@ -10883,8 +10967,10 @@ export class MobileClient {
         throw new Error("The committed attachment could not be confirmed in the retained task draft.");
       }
       current = next;
+      progress?.(current);
       await this.#removeCommittedAttachmentFile(identity.profileId, attachment);
       check();
+      } catch (error) { progress?.(current, attachment.attachmentId, message(error).slice(0, 4_096)); throw error; }
     }
     return current;
   }
@@ -11018,7 +11104,7 @@ export class MobileClient {
   }
 
   /** Stable page-local owner occurrence; excludes normal entity revision advancement. */
-  taskPresentationOwnerKey(): string | undefined {
+  taskPresentationOwnerKey(allowOffline = false): string | undefined {
     if (this.#joinedTask) return this.#taskAuthorityKey();
     const saving = this.#partnerProfileSave;
     if (saving) {
@@ -11039,7 +11125,7 @@ export class MobileClient {
       // Effect authority continues to require the ordinary exact Snapshot boundary.
       return saving.presentationKey;
     }
-    if (!this.#taskAuthorityKey()) return undefined;
+    if (!this.#taskAuthorityKey(allowOffline)) return undefined;
     const credential = this.#credential!;
     const owner = this.#state.owner!;
     const session = this.#selectedSession()!;
@@ -11116,6 +11202,28 @@ export class MobileClient {
       if (matches.length !== 1 || backendId !== session.backendId) throw new Error("The account usage Provider is unavailable.");
       const result = await this.network.getProviderUsage!(credential, backendId, providerId, signal);
       current();
+      if (result && result.providerId !== providerId) throw new Error("The account usage Provider changed.");
+      return result;
+    } };
+  }
+
+  newTaskProviderUsageTransport(targetId: string): MobileProviderUsageTransport | undefined {
+    const credential = this.#credential;
+    const key = () => {
+      const authority = this.#newTaskAuthorityKey(targetId), owner = this.#state.owner;
+      if (!authority || !owner || this.#credential !== credential) return undefined;
+      const backends = new Set(this.newTaskModels(targetId).map(model => model.backendId));
+      const providers = owner.providers.filter(provider => backends.has(provider.backendId) && mobileProviderUsageSupported(provider));
+      if (!providers.length || providers.length > 256) return undefined;
+      return { ownerKey: JSON.stringify([authority, providers.map(mobileProviderUsageIdentity).sort()]), providers };
+    };
+    const captured = key();
+    if (!credential || !captured || !this.network.getProviderUsage) return undefined;
+    return { ...captured, read: async (backendId, providerId, signal) => {
+      const current = () => { signal.throwIfAborted(); if (this.#disposed || key()?.ownerKey !== captured.ownerKey) throw new Error("The account usage draft owner changed."); };
+      current();
+      if (captured.providers.filter(provider => provider.backendId === backendId && provider.providerId === providerId).length !== 1) throw new Error("The account usage Provider is unavailable.");
+      const result = await this.network.getProviderUsage!(credential, backendId, providerId, signal); current();
       if (result && result.providerId !== providerId) throw new Error("The account usage Provider changed.");
       return result;
     } };
@@ -13204,10 +13312,10 @@ export class MobileClient {
   taskSideChatControls() {
     if (this.#joinedTask) return undefined;
     const context = this.#taskDerivationContext(capabilityNames.sessionSideChat);
-    if (!context || context.runtime.session.derivationOrigin?.sideChat) return undefined;
+    if (!context || context.runtime.session.sideChatSourceAllowed !== true || context.runtime.session.derivationOrigin?.sideChat) return undefined;
     return { ...context.controls, canOpen: context.canDerive && !context.runtime.session.archived,
       children: (this.#state.owner?.sessions ?? []).filter((child) => child.derivationOrigin?.sideChat
-        && child.derivationOrigin.sourceSessionId === context.runtime.session.sessionId).slice(0, 50) };
+        && child.derivationOrigin.sourceSessionId === context.runtime.session.sessionId) };
   }
 
   async openSideChat(authorityKey: string, draft?: MobileComposerDraft): Promise<
@@ -16491,6 +16599,7 @@ export class MobileClient {
           if (isMobileExtensionReceiptKind(pending.kind)
             && exactOperation && operation.state === OperationState.SUCCEEDED) {
             if (pending.kind === "extension-package-adopt" || pending.kind === "extension-package-remove") this.#assertExtensionPackageResult(operation, pending.extensionResourceId);
+            else if (pending.kind === "extension-settings-directory") this.#assertExtensionDirectoryReceipt(operation);
             else this.#assertExtensionMutationAcknowledgement(operation);
           }
           if (messageRewind && exactOperation && operation.state === OperationState.SUCCEEDED) {

@@ -491,9 +491,10 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const searchContextAvailable = messageSearchOwnerId === props.sidebarOwnerId
     && (lockedSearchTargetId === undefined || (lockedSearchTarget !== undefined && currentMachineIncluded));
   const normalizedQuery = searchContextAvailable ? query.trim().toLocaleLowerCase() : "";
+  const navigationSessions = useMemo(() => snapshot.sessions.filter(session => !session.hidden && !session.derivationOrigin?.sideChat), [snapshot.sessions]);
   // Navigation membership can change independently of the execution target.
   // A stable membership key avoids restarting searches for unrelated task updates.
-  const messageSearchSessionScopeKey = messageSearchTargetIds === "all" ? undefined : JSON.stringify(snapshot.sessions
+  const messageSearchSessionScopeKey = messageSearchTargetIds === "all" ? undefined : JSON.stringify(navigationSessions
     .filter((session) => session.projectId !== undefined && messageSearchTargetIds.includes(session.projectId))
     .map((session) => session.id).sort());
   const sessions = useMemo(() => currentMachineIncluded
@@ -623,7 +624,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       : t("nav.searchProjectsSelected", { count: messageSearchTargetIds.length })
   });
   const localSearchCandidates = useMemo(() => normalizedQuery === "" ? [] : projectConversationSearchResults(
-    currentMachineIncluded ? snapshot.sessions : [],
+    currentMachineIncluded ? navigationSessions : [],
     visibleTargets,
     messageMatches,
     query.trim(),
@@ -637,7 +638,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       lastActivity: messageSearchLastActivity,
       projectIds: messageSearchTargetIds
     }
-  ), [currentMachineIncluded, messageMatches, messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, props.messageSearchSort, query, snapshot.sessions, visibleTargets]);
+  ), [currentMachineIncluded, messageMatches, messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, props.messageSearchSort, query, navigationSessions, visibleTargets]);
   const remoteSearchCandidates = useMemo(() => messageSearchTargetIds !== "all" ? [] : projectRemoteMachineSearchResults(
     remoteMachineCaches,
     props.machineControl?.presenceByProfile ?? {},
@@ -674,13 +675,13 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     [remoteSearchOptions, searchOptions]
   );
   const pinnedProjectTargets = useMemo(() => currentMachineIncluded ? snapshot.targets.filter((target) =>
-    target.pinned && !target.archived && snapshot.sessions.some((session) => session.projectId === target.id)
-  ) : [], [currentMachineIncluded, snapshot.sessions, snapshot.targets]);
+    target.pinned && !target.archived && navigationSessions.some((session) => session.projectId === target.id)
+  ) : [], [currentMachineIncluded, navigationSessions, snapshot.targets]);
   const pinnedProjectIds = useMemo(() => new Set(pinnedProjectTargets.map((target) => target.id)), [pinnedProjectTargets]);
   const pinnedSessions = useMemo(() => currentMachineIncluded ? sortSidebarSessions(
-    snapshot.sessions.filter((session) => session.pinned),
+    navigationSessions.filter((session) => session.pinned),
     "recency"
-  ) : [], [currentMachineIncluded, snapshot.sessions]);
+  ) : [], [currentMachineIncluded, navigationSessions]);
   const pinnedSessionEntries = useMemo<readonly SidebarPinnedEntry[]>(() => [
     ...pinnedSessions.map((session) => ({ kind: "session" as const, id: session.id, session })),
     ...remoteMachineCaches.flatMap((cache) => cache.sessions
@@ -711,9 +712,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       kind: "project" as const,
       id: `${SIDEBAR_PINNED_PROJECT_PREFIX}${target.id}`,
       target,
-      sessions: sortSidebarSessions(snapshot.sessions.filter((session) => session.projectId === target.id && !session.pinned), sidebarLayout.sortBy, priorityContext)
+      sessions: sortSidebarSessions(navigationSessions.filter((session) => session.projectId === target.id && !session.pinned), sidebarLayout.sortBy, priorityContext)
     }))
-  ].sort((left, right) => (pinnedRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (pinnedRank.get(right.id) ?? Number.MAX_SAFE_INTEGER)), [pinnedProjectTargets, pinnedRank, pinnedSessionEntries, priorityContext, sidebarLayout.sortBy, snapshot.sessions]);
+  ].sort((left, right) => (pinnedRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (pinnedRank.get(right.id) ?? Number.MAX_SAFE_INTEGER)), [pinnedProjectTargets, pinnedRank, pinnedSessionEntries, priorityContext, sidebarLayout.sortBy, navigationSessions]);
   const recent = sortSidebarSessions(filterSidebarSessions(
     sessions.filter((session) => !session.pinned && (session.projectId === undefined || !pinnedProjectIds.has(session.projectId))),
     sidebarLayout,
@@ -724,14 +725,14 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const activeContentFilterCount = sidebarContentFilterCount(sidebarLayout);
   const allTargetsInBaselineOrder = sortSidebarTargets(
     snapshot.targets,
-    snapshot.sessions,
+    navigationSessions,
     sidebarLayout.sortBy,
     "activity",
     [],
     priorityContext
   );
   const allTargetIds = allTargetsInBaselineOrder
-    .filter((target) => snapshot.sessions.some((session) => session.projectId === target.id))
+    .filter((target) => navigationSessions.some((session) => session.projectId === target.id))
     .map((target) => target.id);
   const orderedTargets = sortSidebarTargets(
     snapshot.targets,
@@ -750,7 +751,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const railLocalProjectEntries = orderedTargets.flatMap<SidebarRailProjectEntry>((target) => {
     if (target.archived) return [];
     const targetSessions = railLocalPanelSessions.filter((session) => session.projectId === target.id);
-    const pinnedProjectReachable = target.pinned && snapshot.sessions.some((session) => session.projectId === target.id);
+    const pinnedProjectReachable = target.pinned && navigationSessions.some((session) => session.projectId === target.id);
     if (targetSessions.length === 0 && !pinnedProjectReachable) return [];
     return [{ kind: "local", id: target.id, name: target.name, target, sessions: targetSessions }];
   });
@@ -878,13 +879,13 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   useEffect(() => {
     if (sidebarLayout.projectFilter === "all") return;
     const activeProjectIds = new Set(visibleTargets.map((target) => target.id));
-    if (snapshot.sessions.some((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined)) {
+    if (navigationSessions.some((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined)) {
       activeProjectIds.add(SIDEBAR_DIALOGUE_FILTER_ID);
     }
     const next = sidebarLayout.projectFilter.filter((projectId) => activeProjectIds.has(projectId));
     if (next.length === sidebarLayout.projectFilter.length) return;
     props.onSidebarOwnerLayoutChange({ projectFilter: next.length === 0 ? "all" : next });
-  }, [hiddenProjectIds, sidebarLayout.projectFilter, snapshot.sessions, visibleTargets]);
+  }, [hiddenProjectIds, sidebarLayout.projectFilter, navigationSessions, visibleTargets]);
 
   useEffect(() => {
     if (sidebarLayout.backendId === "all"
@@ -1509,7 +1510,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   ]);
   const railDialogueBackend = dialogueBackends(snapshot.backends, snapshot.settings.backendSettings)[0];
   const projectActions: SidebarProjectActions = {
-    allSessions: snapshot.sessions,
+    allSessions: navigationSessions,
     onEditTarget: (target) => navigateAndClose({ kind: "projects", projectId: target.id }),
     onNewTaskInTarget: props.onNewTaskInTarget,
     onRenameTarget: props.onRenameTarget,
@@ -1718,7 +1719,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
                       onChange={() => toggleMessageSearchTarget(target.id)}
                     />
                     <span title={target.name}>{target.name}</span>
-                    <small>{snapshot.sessions.filter((session) => session.projectId === target.id).length}</small>
+                    <small>{navigationSessions.filter((session) => session.projectId === target.id).length}</small>
                   </label>)}
                 </div>
               </fieldset>
@@ -1760,7 +1761,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           targets={visibleTargets}
           hiddenProjectIds={hiddenProjectIds}
           backends={snapshot.backends}
-          sessions={snapshot.sessions}
+          sessions={navigationSessions}
           activeContentFilterCount={activeContentFilterCount}
           deviceGroupingAvailable={remoteMachineCaches.length > 0}
           foldAction={foldAction}
@@ -2310,7 +2311,7 @@ export function sessionsForArchiveView(sessions: readonly SessionView[], showArc
 }
 
 export function sessionsForSidebarStatus(sessions: readonly SessionView[], status: SidebarLayout["status"]): readonly SessionView[] {
-  return sessions.filter(session => !session.hidden && (status === "all" || session.archived === (status === "archived")));
+  return sessions.filter(session => !session.hidden && !session.derivationOrigin?.sideChat && (status === "all" || session.archived === (status === "archived")));
 }
 
 interface RemoteMachineSearchFilters {

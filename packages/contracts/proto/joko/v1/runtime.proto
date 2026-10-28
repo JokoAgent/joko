@@ -409,6 +409,8 @@ message Session {
   SessionLocalWorkspace local_workspace = 31;
   // Non-empty only while this task belongs to an unsent client draft.
   string provisional_draft_id = 32;
+  // Service-proven ordinary source admission, independent of client routes.
+  optional bool side_chat_source_allowed = 33;
 }
 
 message SessionLocalWorkspace {

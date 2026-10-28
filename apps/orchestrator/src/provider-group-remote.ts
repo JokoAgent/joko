@@ -14,6 +14,7 @@ interface CapturedOwner { readonly client: Client<typeof contract.ProviderGroupS
  * its own existing Sources. It never imports B's Backend IDs as local routes
  * or creates a Device relation from a group response. */
 export class ProviderGroupRemoteRouter implements ProviderGroupRemoteRouterPort {
+  readonly #reads = new WeakMap<AbortSignal, Map<string, Promise<contract.GetProviderGroupResponse>>>();
   constructor(readonly options: { readonly store: ProviderGroupStore; readonly sources: HostedAgentSources; readonly directory: ProviderGroupDirectory;
     readonly leases: ProviderGroupLeases; readonly localNodeId: string; readonly ownerGeneration: () => string }) {}
   owns(group: ProviderGroupKey): boolean {
@@ -34,7 +35,9 @@ export class ProviderGroupRemoteRouter implements ProviderGroupRemoteRouterPort 
   async pick(input: ProviderGroupPick, signal: AbortSignal): Promise<ProviderGroupAssignment> {
     const owner = this.capture(input.group); let picked: contract.PickProviderGroupMemberResponse;
     picked = await owner.client.pickProviderGroupMember({ key: { backendId: owner.nativeBackendId, providerId: input.group.providerId }, sessionId: input.sessionId,
-      agentKind: input.agentKind, modelId: input.modelId, ...(input.logicalModelId === undefined ? {} : { logicalModelId: input.logicalModelId }), excludeMemberKeys: [...(input.exclude ?? [])] }, { signal });
+      agentKind: input.agentKind, modelId: input.modelId, ...(input.logicalModelId === undefined ? {} : { logicalModelId: input.logicalModelId }), excludeMemberKeys: [...(input.exclude ?? [])],
+      ...(input.quotaRebalanceFrom === undefined ? {} : { quotaRebalanceFromMemberKey: input.quotaRebalanceFrom }),
+      ...(input.profile.effort === undefined ? {} : { effortId: input.profile.effort }), fastMode: input.profile.fastMode === true, ultrafastMode: input.profile.fastMode === "ultrafast" }, { signal });
     owner.assertCurrent(); signal.throwIfAborted(); const snapshot = this.#observe(input.group, owner, picked.group);
     if (!picked.member || !picked.modelId || !snapshot.config) throw new ProviderGroupUnavailableError();
     const original = fromGroupMember(picked.member), member = this.#map(input.group, original);
@@ -42,6 +45,8 @@ export class ProviderGroupRemoteRouter implements ProviderGroupRemoteRouterPort 
     const source = this.options.directory.sources().find(source => source.backendId === member.backendId && source.providerId === member.providerId);
     const model = source?.models.find(model => model.modelId === picked.modelId || (model.logicalId ?? model.modelId) === input.logicalModelId || model.modelId === input.modelId);
     if (!source?.available || !model) throw new ProviderGroupUnavailableError(); source.assertCurrent();
+    if (input.profile.fastMode === "ultrafast" && !model.supportsUltrafastMode || input.profile.fastMode === true && !model.supportsFastMode
+      || input.profile.effort !== undefined && !model.thinkingLevels.includes(input.profile.effort)) throw new ProviderGroupUnavailableError();
     const status: ProviderGroupMemberStatus = { member, model, available: true, reachable: true, running: picked.running, quota: picked.quota ? { ...picked.quota } : { limited: false },
       assertCurrent: () => { owner.assertCurrent(); source.assertCurrent(); signal.throwIfAborted(); } };
     const profile = { ...input.profile, backendId: member.backendId, providerId: member.providerId, modelId: member.backendId === input.group.backendId ? input.modelId : model.modelId };
@@ -54,8 +59,17 @@ export class ProviderGroupRemoteRouter implements ProviderGroupRemoteRouterPort 
     } };
   }
   async read(group: ProviderGroupKey, member: ProviderGroupMember, request: ProviderGroupDirectoryRequest, signal: AbortSignal): Promise<ProviderGroupMemberStatus> {
-    const owner = this.capture(group), response = await owner.client.getProviderGroup({ key: { backendId: owner.nativeBackendId, providerId: group.providerId }, agentKind: request.agentKind,
-      modelId: request.modelId, ...(request.logicalModelId === undefined ? {} : { logicalModelId: request.logicalModelId }) }, { signal });
+    const owner = this.capture(group), reads = this.#reads.get(signal) ?? new Map<string, Promise<contract.GetProviderGroupResponse>>();
+    this.#reads.set(signal, reads);
+    const readKey = JSON.stringify([group.backendId, group.providerId, owner.ownerNodeId, owner.nativeBackendId, request.agentKind, request.modelId, request.logicalModelId]);
+    let pending = reads.get(readKey);
+    if (!pending) {
+      pending = owner.client.getProviderGroup({ key: { backendId: owner.nativeBackendId, providerId: group.providerId }, agentKind: request.agentKind,
+        modelId: request.modelId, ...(request.logicalModelId === undefined ? {} : { logicalModelId: request.logicalModelId }) }, { signal });
+      reads.set(readKey, pending); const original = pending;
+      void pending.finally(() => { if (reads.get(readKey) === original) reads.delete(readKey); }).catch(() => {});
+    }
+    const response = await pending;
     owner.assertCurrent(); signal.throwIfAborted(); const snapshot = this.#observe(group, owner, response.group), state = response.members.find(state => state.memberKey === member.key);
     const current = snapshot.config?.members.find(row => row.key === member.key);
     const source = current && this.options.directory.sources().find(source => source.backendId === current.backendId && source.providerId === current.providerId);

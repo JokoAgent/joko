@@ -15,6 +15,7 @@ import * as sqliteVec from "sqlite-vec";
 import { SessionRuntimeHandoffStore, type RuntimeHandoffSource } from "./session-runtime-handoff-store.js";
 import { TaskShareStore, taskShareQueueLockOwner, type TaskShareGuestProof } from "./task-share-store.js";
 import { validModelSubstitution } from "@joko/core";
+import { SIDE_CHAT_HISTORY_BOUNDARY_KEY } from "./side-chat-history.js";
 import { parseCurrentRunUsageEventPayload, parseRunUsageSummary, runUsageSettingKey } from "./run-usage-shape.js";
 
 import type {
@@ -3757,6 +3758,11 @@ export class OperationalStore {
     });
   }
 
+  findSession(id: string): StoredSession | undefined {
+    try { return this.getSession(id); }
+    catch (error) { if (error instanceof NotFoundError && error.resource === "Session" && error.id === id) return undefined; throw error; }
+  }
+
   getSession(id: string): StoredSession {
     this.assertOpen();
     const row = this.database.prepare("SELECT * FROM product_sessions WHERE id = ?").get(id) as Row | undefined;
@@ -6667,10 +6673,48 @@ export class OperationalStore {
 
   findMessagingInboundRequestByRunId(runId: string): MessagingInboundRequestRecord | undefined {
     this.assertOpen();
-    const row = this.database.prepare(`
-      SELECT id FROM messaging_inbound_requests WHERE run_id = ? LIMIT 1
-    `).get(nonBlank(runId, "Messaging Run ID")) as Row | undefined;
-    return row === undefined ? undefined : this.getMessagingInboundRequest(stringValue(row["id"]));
+    let current = nonBlank(runId, 'Messaging Run ID'); const visited = new Set<string>();
+    for (let depth = 0; depth < 16 && !visited.has(current); depth++) {
+      visited.add(current);
+      const row = this.database.prepare('SELECT id FROM messaging_inbound_requests WHERE run_id = ? LIMIT 1').get(current) as Row | undefined;
+      if (row) return this.getMessagingInboundRequest(stringValue(row['id']));
+      const run = this.findRun(current)?.descriptor;
+      if (!run?.parentRunId) return undefined;
+      const queue = this.findQueueItemByRunId(run.sessionId, current, { includeCleared: true });
+      const operation = queue ? this.findOperation(queue.operationId) : undefined;
+      if (!queue || !operation || operation.connectionId !== undefined || !isRecord(operation.body) || operation.body['sessionId'] !== run.sessionId) return undefined;
+      let source: QueueItemRecord | undefined;
+      if (operation.kind === 'context_overflow_replay' && operation.body['sourceRunId'] === run.parentRunId && typeof operation.body['sourceQueueItemId'] === 'string') {
+        try { source = this.getQueueItem(operation.body['sourceQueueItemId']); } catch (error) { if (!(error instanceof NotFoundError)) throw error; }
+      } else if (operation.kind === 'service_send_input' && operation.body['parentRunId'] === run.parentRunId
+        && queue.body.automaticContinuation?.sourceRunId === run.parentRunId && isRecord(operation.body['prompt'])
+        && isRecord(operation.body['prompt']['automaticContinuation']) && operation.body['prompt']['automaticContinuation']['sourceRunId'] === run.parentRunId) {
+        source = this.findQueueItemByRunId(run.sessionId, run.parentRunId, { includeCleared: true });
+      }
+      if (!source || source.sessionId !== run.sessionId || source.runId !== run.parentRunId
+        || serializeJson(source.body.messagingOrigin ?? null) !== serializeJson(queue.body.messagingOrigin ?? null)) return undefined;
+      current = source.runId;
+    }
+    return undefined;
+  }
+
+  /** The original Host may renew its accepted Queue after a native rebuild.
+   * Sender, credential, address and input admission remain the same. */
+  refreshMessagingConversationGeneration(input: { readonly conversationId: string; readonly requestId: string; readonly runId: string }): MessagingConversationRecord {
+    return this.write(() => {
+      const request = this.findMessagingInboundRequestByRunId(input.runId), conversation = this.getMessagingConversation(input.conversationId);
+      const run = this.getRun(input.runId).descriptor, session = this.getSession(run.sessionId).descriptor;
+      const queue = this.findQueueItemByRunId(session.id, run.id, { includeCleared: true });
+      const attempt = queue?.attemptId ? this.getAttempt(queue.attemptId).descriptor : undefined;
+      if (!request || request.id !== input.requestId || request.conversationId !== conversation.id || conversation.status !== 'active'
+        || conversation.sessionId !== session.id || conversation.connectionId !== request.connectionId || conversation.channelGeneration !== request.channelGeneration
+        || session.archived || session.deletedAt !== undefined || !attempt || attempt.runId !== run.id || attempt.generation !== session.binding.generation
+        || (conversation.sessionGeneration ?? 0) > session.binding.generation) throw new StoreError('The original message recovery generation changed.');
+      this.database.prepare(`UPDATE messaging_conversations SET session_generation=?,target_id=?,backend_id=?,provider_id=?,model_id=?,effort=?,fast_mode=?,permission_mode=?,plan_mode=?,updated_at=?,revision=? WHERE id=? AND revision=?`)
+        .run(session.binding.generation, session.targetId, session.backendId, session.providerId ?? null, session.modelId ?? null, session.effort ?? null,
+          speedInt(session.fastMode), session.permissionMode, session.planMode ? 1 : 0, Math.max(conversation.createdAt, this.now()), asSqlInteger(this.requireActiveRevision()), conversation.id, asSqlInteger(conversation.revision));
+      return this.getMessagingConversation(conversation.id);
+    });
   }
 
   listMessagingInboundRequests(input: {
@@ -12404,6 +12448,14 @@ export class OperationalStore {
           WHERE marker_tombstone.event_id IS NULL
             AND marker.event_cursor <= ?${scopeClause}
         ),
+        side_chat_inherited_entries AS MATERIALIZED (
+          SELECT native_session.id AS session_id, entry.value AS entry_id
+          FROM product_sessions AS native_session
+          JOIN settings AS boundary ON boundary.scope_type = 'service' AND boundary.scope_id = native_session.id
+            AND boundary.key = '${SIDE_CHAT_HISTORY_BOUNDARY_KEY}'
+          JOIN json_each(boundary.value_json, '$.entryIds') AS entry
+          WHERE native_session.derivation_kind = 'side_chat'${scopeClause}
+        ),
         confirmed_native_hydration AS (
           SELECT
             canonical.session_id,
@@ -12433,8 +12485,22 @@ export class OperationalStore {
               )
             )
         )`,
-      params: [asSqlInteger(highWater), ...scopeParams, asSqlInteger(highWater), ...scopeParams],
-      clause: (eventAlias) => ` AND (
+      params: [asSqlInteger(highWater), ...scopeParams, ...scopeParams, asSqlInteger(highWater), ...scopeParams],
+      clause: (eventAlias) => ` AND NOT EXISTS (
+        SELECT 1 FROM product_sessions AS side_chat
+        WHERE side_chat.id = ${eventAlias}.session_id AND side_chat.derivation_kind = 'side_chat'
+          AND NULLIF(json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'), '') IS NOT NULL
+          AND (
+            NOT EXISTS (SELECT 1 FROM settings AS boundary
+              WHERE boundary.scope_type = 'service' AND boundary.scope_id = side_chat.id AND boundary.key = '${SIDE_CHAT_HISTORY_BOUNDARY_KEY}'
+                AND json_extract(boundary.value_json, '$.format') = 1
+                AND json_extract(boundary.value_json, '$.sourceSessionId') = side_chat.derivation_source_session_id
+                AND json_extract(boundary.value_json, '$.sourceEventId') = side_chat.derivation_source_event_id
+                AND json_type(boundary.value_json, '$.entryIds') = 'array')
+            OR EXISTS (SELECT 1 FROM side_chat_inherited_entries AS inherited
+              WHERE inherited.session_id = side_chat.id AND inherited.entry_id = json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'))
+          )
+      ) AND (
         (
           NULLIF(json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'), '') IS NOT NULL
           AND (

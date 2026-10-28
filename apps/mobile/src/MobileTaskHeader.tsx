@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { ActivityIndicator, AppState, Platform, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { MobileActionSheet } from "./MobileActionSheet";
+import { MobileTaskOptionsSheet } from "./MobileTaskOptionsSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import { mobileRemoteDesktopCopy } from "./remote-desktop-presentation";
@@ -12,7 +12,7 @@ import { useMobileNavigationHeader, type MobileNavigationButton } from "./mobile
 import { mobileTaskHeaderLayout, mobileTaskHeaderTitleWidth } from "./mobile-task-header-layout";
 
 export interface MobileTaskHeaderAction {
-  readonly id: "rename" | "pin" | "archive" | "delete" | "task-sharing" | "search" | "clone" | "side-chat" | "side-chats" | "side-chat-parent" | "branches" | "context" | "collaboration" | "controls" | "remote-desktop" | "copy-link" | "files" | "refresh" | "tags" | `tag:${string}`;
+  readonly id: "rename" | "pin" | "archive" | "delete" | "task-sharing" | "search" | "clone" | "side-chat" | "side-chats" | "side-chat-parent" | "branches" | "context" | "collaboration" | "controls" | "remote-desktop" | "copy-link" | "files" | "refresh" | "tags" | "partner-glance" | "reply-quotes" | `tag:${string}`;
   readonly label: string;
   readonly disabled: boolean;
   readonly onPress: () => void;
@@ -153,7 +153,7 @@ export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationR
       {(layout !== "rail" || !port.native) && right}
     </View>
     }
-    <MobileActionSheet key={menuGeneration} visible={menuVisible && !disabled && !selection} items={actions.filter(action =>
+    <MobileTaskOptionsSheet key={menuGeneration} visible={menuVisible && !disabled && !selection} items={actions.filter(action =>
       detailsOnly ? ["collaboration", "search", "copy-link", "refresh"].includes(action.id) : (action.id !== "files" && action.id !== "remote-desktop") || primaryActionsReady)} colors={colors} locale={locale}
       maximumContentHeight={Math.max(54, height - insets.top - insets.bottom - 100)}
       header={menuHeader}

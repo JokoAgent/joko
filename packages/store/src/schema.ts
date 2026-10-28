@@ -11,6 +11,8 @@ export const SCHEMA_VERSION = 1;
 const DURABLE_JSON_SHAPE_BASELINE = [
   "model-speed:boolean|ultrafast;native-hosted:lineage+derivation;hosted-settings:idle-release-v1",
   "provisional-session:exact-owner+configuration+target-revision-v1",
+  "side-chat-history:bounded-native-prefix-identities+source-generation+cursor-v1",
+  "provider-group-rebalance:original-send-queue+native-handoff-generation+confirmed-restore-v1",
   "device-authorization:invitation/request/digests/approval/claim-v1",
   "interaction-question-request:single/multiple.allowOther=required",
   "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",

@@ -6,6 +6,13 @@ const entries = ["extensions/review.ts", "extensions/search/index.js"];
 const files = [...entries, "ui/review/index.html", "ui/review/app.js", "ui/search.html"];
 
 describe("Extension surface manifest", () => {
+  it("requires an explicit native directory choice declaration without granting Node or Library access", () => {
+    const manifest = (runtime: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime }] } } });
+    const runtime = { html: "ui/review/index.html", tools: [], pick: true };
+    expect(parseExtensionSurfaceManifest(manifest(runtime), entries, files)[0]?.runtime).toEqual(runtime);
+    for (const invalid of [false, "true", {}, { path: "/private" }]) expect(() => parseExtensionSurfaceManifest(manifest({ ...runtime, pick: invalid }), entries, files)).toThrow();
+    expect(() => parseExtensionSurfaceManifest(manifest({ ...runtime, node: true }), entries, files)).toThrow();
+  });
   it("keeps original author settings separate from main-view and runtime authority", () => {
     const manifest = (settings: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], settings }] } } });
     const settings = { html: "ui/review/index.html", mobileHtml: "ui/search.html", title: "Configure", height: 320 };

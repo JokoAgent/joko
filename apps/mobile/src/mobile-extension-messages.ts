@@ -5,6 +5,13 @@ type Row = readonly [key: string, en: string, zhCN: string, zhTW: string, ja: st
 const rows = [
   ["extension.settings", "Plugin settings", "插件配置", "外掛設定", "プラグイン設定", "플러그인 설정"],
   ["extension.settingsConfirm", "Confirm", "确认", "確認", "確認", "확인"],
+  ["extension.directory.title", "Choose a folder on this node", "选择此节点上的文件夹", "選取此節點上的資料夾", "このノードのフォルダーを選択", "이 노드의 폴더 선택"],
+  ["extension.directory.path", "Node folder path", "节点文件夹路径", "節點資料夾路徑", "ノードのフォルダーパス", "노드 폴더 경로"],
+  ["extension.directory.go", "Open path", "打开路径", "開啟路徑", "パスを開く", "경로 열기"],
+  ["extension.directory.parent", "Parent folder", "上级文件夹", "上層資料夾", "親フォルダー", "상위 폴더"],
+  ["extension.directory.more", "More folders", "更多文件夹", "更多資料夾", "さらに読み込む", "폴더 더 보기"],
+  ["extension.directory.choose", "Choose this folder", "选择此文件夹", "選取此資料夾", "このフォルダーを選択", "이 폴더 선택"],
+  ["extension.directory.failed", "The folder could not be read. Retry on the original node.", "无法读取文件夹，请在原节点重试。", "無法讀取資料夾，請在原節點重試。", "フォルダーを読み込めません。元のノードで再試行してください。", "폴더를 읽을 수 없습니다. 원래 노드에서 다시 시도하세요."],
   ["extension.package.title", "Package", "安装包", "安裝套件", "パッケージ", "패키지"],
   ["extension.package.install", "Install", "安装", "安裝", "インストール", "설치"],
   ["extension.package.update", "Update", "更新", "更新", "更新", "업데이트"],

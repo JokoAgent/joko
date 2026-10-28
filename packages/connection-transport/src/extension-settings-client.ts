@@ -2,7 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import type { Client } from "@connectrpc/connect";
 import { ExtensionAuthorizationPhase, OperationMutationSchema, type ExtensionOAuthFlow, type ExtensionOAuthService,
   type CredentialUploadTicket, type OperationMutation, type ExtensionNetworkService, type ExtensionService,
-  type ExtensionSettingsCall, type ExtensionSettingsHost } from "@joko/contracts";
+  type ExtensionSettingsCall, type ExtensionSettingsHost, type ExtensionPickedDirectoryDeposit } from "@joko/contracts";
 
 export interface ExtensionSettingsProjection {
   readonly extensionId: string; readonly revision: bigint; readonly name: string;
@@ -21,6 +21,7 @@ export interface ExtensionSettingsClient<E extends ExtensionSettingsProjection> 
   readonly fresh: (signal: AbortSignal) => Promise<E>;
   readonly current: () => void;
   readonly submit: (extension: E, mutation: OperationMutation, kind: "routing" | "clear", signal: AbortSignal) => Promise<void>;
+  readonly pickDirectory?: (extension: E, mutation: OperationMutation, signal: AbortSignal) => Promise<ExtensionPickedDirectoryDeposit>;
   readonly begin: (extension: E, signal: AbortSignal) => Promise<{ readonly extension: E }>;
   readonly field: (extension: E, id: string, value: string | boolean, signal: AbortSignal) => Promise<{ readonly extension: E }>;
   readonly secret: (extension: E, id: string, value: string, signal: AbortSignal) => Promise<{ readonly extension: E }>;
@@ -55,6 +56,41 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
     current();
   };
   switch (call.kind) {
+    case "directory.pick": {
+      if (!host.chooseDirectory || !client.pickDirectory) throw new Error("Native directory selection is unavailable.");
+      const opened = await client.api.openExtensionDirectoryPicker({ surfaceId: client.surface.surfaceId }, rpc);
+      const original = opened.page?.picker;
+      if (!original?.pickerId || original.extensionId !== extension.extensionId || !original.expiresAt) throw new Error("The directory picker response is invalid.");
+      const pickerId = original.pickerId, expiry = Number(original.expiresAt.seconds) * 1000 + Math.floor(original.expiresAt.nanos / 1_000_000);
+      const names = new Map<string, string>();
+      const validate = (page: typeof opened.page) => {
+        current();
+        if (!page?.picker || page.picker.pickerId !== pickerId || page.picker.extensionId !== extension.extensionId
+          || !page.picker.expiresAt || Number(page.picker.expiresAt.seconds) * 1000 + Math.floor(page.picker.expiresAt.nanos / 1_000_000) !== expiry
+          || !Number.isSafeInteger(expiry) || expiry <= Date.now() || expiry > Date.now() + 125_000 || page.entries.length > 100) throw new Error("The directory picker owner changed or expired.");
+        for (const entry of [...page.entries, ...(page.directory ? [page.directory] : [])]) names.set(entry.entryId, entry.name);
+        return page;
+      };
+      try {
+        const entryId = await host.chooseDirectory({ name: extension.name, ...(call.title ? { title: call.title } : {}), initialPage: validate(opened.page),
+          browse: async input => {
+            current();
+            const result = await client.api.browseExtensionDirectoryPicker({ pickerId, entryId: input.entryId ?? "", pageToken: input.pageToken ?? "",
+              ...(input.directoryPath === undefined ? {} : { directoryPath: input.directoryPath }) }, rpc);
+            return validate(result.page);
+          } }, signal);
+        current(); if (!entryId) return { cancelled: true };
+        extension = await client.fresh(signal); current();
+        const receipt = await client.pickDirectory(extension, create(OperationMutationSchema, { payload: { case: "pickExtensionDirectory", value: {
+          extensionId: extension.extensionId, expectedRevision: { value: extension.revision }, pickerId, entryId
+        } } }), signal); current();
+        const at = receipt.expiresAt ? Number(receipt.expiresAt.seconds) * 1000 + Math.floor(receipt.expiresAt.nanos / 1_000_000) : 0;
+        if (!receipt.token || receipt.fileCount < 1 || receipt.fileCount > 500 || receipt.fileCount !== receipt.relativePaths.length
+          || receipt.totalBytes < 0n || receipt.totalBytes > 524_288_000n || at <= Date.now() || at > Date.now() + 610_000
+          || receipt.relativePaths.some(value => !value || value.length > 4096 || value.startsWith("/") || value.split("/").some(part => part === "..") || value.includes("\\") || value.includes("\0"))) throw new Error("The original directory deposit receipt is invalid or expired.");
+        return { ok: true, ...(names.has(entryId) ? { name: names.get(entryId) } : {}), dir_deposit: { token: receipt.token, file_count: receipt.fileCount, total_bytes: Number(receipt.totalBytes), rel_paths: receipt.relativePaths }, expiresAt: new Date(at).toISOString() };
+      } finally { void client.api.closeExtensionDirectoryPicker({ pickerId }, { timeoutMs: 5_000 }).catch(() => undefined); }
+    }
     case "context.get": return { context: { locale: host.locale ?? "en" } };
     case "routing.get": return readRouting();
     case "routing.set": {
@@ -117,11 +153,13 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
     }
     case "oauth.connect": {
       if (!client.oauth) throw new Error("Plugin account authorization is unavailable.");
-      const api = client.oauth; let flow: ExtensionOAuthFlow | undefined;
+      const api = client.oauth; let flow: ExtensionOAuthFlow | undefined, originalFlowId: string | undefined;
       try {
         const response = await api.start({ extensionId: extension.extensionId, expectedRevision: { value: extension.revision }, slotKey: call.key, scopes: [...(call.scopes ?? [])] }, rpc);
-        current(); flow = response.flow;
-        const originalFlowId = flow?.flowId, originalExpiry = flow?.expiresAt === undefined ? undefined : `${flow.expiresAt.seconds}:${flow.expiresAt.nanos}`;
+        flow = response.flow;
+        originalFlowId = flow?.flowId;
+        current();
+        const originalExpiry = flow?.expiresAt === undefined ? undefined : `${flow.expiresAt.seconds}:${flow.expiresAt.nanos}`;
         const matches = () => {
           if (!flow || !flow.flowId || flow.flowId !== originalFlowId || flow.extensionId !== extension.extensionId || flow.slotKey !== call.key || !flow.expiresAt
             || `${flow.expiresAt.seconds}:${flow.expiresAt.nanos}` !== originalExpiry) throw new Error("Plugin authorization owner changed.");
@@ -147,7 +185,7 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
         if (flow!.phase !== ExtensionAuthorizationPhase.COMPLETE) throw new Error("Plugin authorization could not be completed.");
         const result = await api.get({ extensionId: extension.extensionId }, rpc); current(); return result.state;
       } catch (error) {
-        if (flow?.flowId) void api.cancelFlow({ flowId: flow.flowId }, { timeoutMs: 5_000 }).catch(() => undefined);
+        if (originalFlowId) void api.cancelFlow({ flowId: originalFlowId }, { timeoutMs: 5_000 }).catch(() => undefined);
         throw error;
       }
     }

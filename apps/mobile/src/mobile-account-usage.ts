@@ -42,7 +42,8 @@ export function mobileUsageTimestamp(value: { readonly seconds: bigint; readonly
 }
 
 /** Overall limits and exact model windows remain separate facts from task tokens. */
-export function mobileAccountUsageWindows(snapshot: ProviderAccountUsageSnapshot, modelId: string | undefined, now: number): readonly MobileAccountUsageWindow[] {
+export function mobileAccountUsageWindows(snapshot: ProviderAccountUsageSnapshot | undefined, modelId: string | undefined, now: number): readonly MobileAccountUsageWindow[] {
+  if (!snapshot) return [];
   const rows: MobileAccountUsageWindow[] = [];
   const add = (id: string, window: ProviderAccountUsageWindow | undefined, label?: string, model = false): void => {
     if (!window || !Number.isFinite(window.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100) return;

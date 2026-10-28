@@ -13,6 +13,7 @@ import {
 } from "./mobile-extensions";
 import { MobileExtensionLibraryBridge, mobileExtensionLibraryBootstrap } from "./mobile-extension-library-bridge";
 import { MobileExtensionSettingsBridge, mobileExtensionSettingsBootstrap } from "./mobile-extension-settings";
+import { MobileExtensionDirectoryPicker, type MobileExtensionDirectoryRequest } from "./MobileExtensionDirectoryPicker";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
@@ -40,11 +41,14 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
   const surfaceRef = useRef<MobileExtensionMainViewSurface | undefined>(undefined);
   const documentRef = useRef<PreparedExtensionMainViewDocument | undefined>(undefined);
   const occurrence = useRef<symbol | undefined>(undefined);
+  const openingAbort = useRef<AbortController | undefined>(undefined);
   const reloadAbort = useRef<AbortController | undefined>(undefined);
   const webRef = useRef<WebView>(null);
   const bridgeRef = useRef<MobileExtensionLibraryBridge | undefined>(undefined);
   const settingsBridge = useRef<MobileExtensionSettingsBridge | undefined>(undefined);
-  const authorizing = useRef(false);
+  const authorizing = useRef<symbol | undefined>(undefined);
+  const directoryOwner = useRef<MobileExtensionDirectoryRequest | undefined>(undefined), directorySequence = useRef(0);
+  const [directory, setDirectory] = useState<MobileExtensionDirectoryRequest>();
   const frameOwner = useRef<{ readonly id: string; readonly url: string; started: boolean; resources: Set<AbortController> } | undefined>(undefined);
   const [attempt, setAttempt] = useState(0);
   const [frameRevision, setFrameRevision] = useState(0);
@@ -53,9 +57,11 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
   const [state, setState] = useState<SurfaceState>({ phase: "opening" });
 
   const release = useCallback((surface: MobileExtensionMainViewSurface | undefined): void => {
+    directoryOwner.current?.finish(undefined);
     bridgeRef.current?.dispose();
     bridgeRef.current = undefined;
     settingsBridge.current?.dispose(); settingsBridge.current = undefined;
+    authorizing.current = undefined;
     for (const request of frameOwner.current?.resources ?? []) request.abort();
     frameOwner.current = undefined;
     const document = documentRef.current; documentRef.current = undefined;
@@ -73,9 +79,21 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     const request = Symbol("extension-main-view-open");
     occurrence.current = request;
     release(surfaceRef.current);
+    openingAbort.current = controller;
     setFrameLoaded(false);
     setReloading(false);
     setState({ phase: "opening" });
+    const cleanup = () => {
+      controller.abort();
+      if (openingAbort.current === controller) openingAbort.current = undefined;
+      reloadAbort.current?.abort();
+      if (occurrence.current === request) occurrence.current = undefined;
+      release(surfaceRef.current);
+    };
+    if (settings && AppState.currentState !== "active") {
+      controller.abort(); occurrence.current = undefined; setState({ phase: "revoked" });
+      return cleanup;
+    }
     const opening = settings ? currentTransport.openSettings?.(extension, controller.signal)
       ?? Promise.reject(new Error("Plugin author settings are unavailable.")) : currentTransport.openMainView(extension, controller.signal);
     void opening.then(async (surface) => {
@@ -100,17 +118,13 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
       if (!controller.signal.aborted && occurrence.current === request
         && transportRef.current.ownerKey === currentTransport.ownerKey) { release(surfaceRef.current); setState({ phase: "error" }); }
     });
-    return () => {
-      controller.abort();
-      reloadAbort.current?.abort();
-      if (occurrence.current === request) occurrence.current = undefined;
-      release(surfaceRef.current);
-    };
+    return cleanup;
   }, [attempt, extension.extensionId, extension.revision, release, settings, transport.ownerKey]);
 
   const revoke = useCallback((surface: MobileExtensionMainViewSurface, phase: "error" | "revoked") => {
     if (surfaceRef.current?.surfaceId !== surface.surfaceId) return;
     occurrence.current = undefined;
+    openingAbort.current?.abort();
     reloadAbort.current?.abort();
     setFrameLoaded(false);
     setReloading(false);
@@ -122,10 +136,16 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     if (!settings) return;
     const listener = AppState.addEventListener("change", value => {
       const surface = surfaceRef.current;
-      if (value !== "active" && !authorizing.current && surface) revoke(surface, "revoked");
+      if (value === "active" || authorizing.current) return;
+      openingAbort.current?.abort();
+      if (surface) revoke(surface, "revoked");
+      else {
+        occurrence.current = undefined; reloadAbort.current?.abort(); release(undefined);
+        setFrameLoaded(false); setReloading(false); setState({ phase: "revoked" });
+      }
     });
     return () => listener.remove();
-  }, [revoke, settings]);
+  }, [release, revoke, settings]);
 
   useEffect(() => {
     if (state.phase !== "ready") return undefined;
@@ -231,6 +251,20 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
         if (!webRef.current) throw new Error("Settings document retired."); webRef.current.postMessage(message);
       }, host: {
         locale,
+        chooseDirectory: (choice, signal) => new Promise<string | undefined>((resolve, reject) => {
+          signal.throwIfAborted();
+          if (!current() || AppState.currentState !== "active" || directoryOwner.current
+            || choice.initialPage.picker?.extensionId !== readySurface.extensionId) { reject(new Error("Plugin directory selection is unavailable.")); return; }
+          let settled = false;
+          const cancel = () => pending.finish(undefined);
+          const pending: MobileExtensionDirectoryRequest = { id: `${readySurface.surfaceId}:directory:${++directorySequence.current}`, choice, signal, current,
+            finish: entryId => {
+              if (settled) return; settled = true; signal.removeEventListener("abort", cancel);
+              if (directoryOwner.current === pending) { directoryOwner.current = undefined; setDirectory(undefined); }
+              resolve(!signal.aborted && current() && AppState.currentState === "active" ? entryId : undefined);
+            } };
+          directoryOwner.current = pending; signal.addEventListener("abort", cancel, { once: true }); setDirectory(pending);
+        }),
         confirm: (title, body, signal) => new Promise<boolean>(resolve => {
           let settled = false;
           const finish = (accepted: boolean) => {
@@ -244,19 +278,27 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
             { text: mobileMessage(locale, "extension.settingsConfirm"), onPress: () => finish(true) }], { cancelable: true, onDismiss: cancel });
         }),
         authorize: async (authorization, expiresAt, signal) => {
-          authorizing.current = true;
+          signal.throwIfAborted();
+          if (!current() || AppState.currentState !== "active") throw new Error("Plugin settings owner changed.");
+          const authorizationOwner = Symbol("extension-settings-authorization");
+          authorizing.current = authorizationOwner;
           try {
             const driver = await import("./mobile-extension-oauth");
             return await driver.authorizeMobileExtensionAccount(authorization, expiresAt, signal, () => {
               signal.throwIfAborted(); if (!current()) throw new Error("Plugin settings owner changed.");
             });
-          } finally { authorizing.current = false; }
+          } finally {
+            if (authorizing.current === authorizationOwner) {
+              authorizing.current = undefined;
+              if (current() && AppState.currentState !== "active") revoke(readySurface, "revoked");
+            }
+          }
         },
         openLibrary: async signal => { signal.throwIfAborted(); if (!current() || !openLibraryRef.current) throw new Error("Plugin Library is unavailable."); openLibraryRef.current(); }
       } });
     settingsBridge.current = bridge;
     return () => { bridge.dispose(); if (settingsBridge.current === bridge) settingsBridge.current = undefined; };
-  }, [extensionKey, frame, locale, readySurface, settings, transport.ownerKey]);
+  }, [extensionKey, frame, locale, readySurface, revoke, settings, transport.ownerKey]);
   const currentFrame = (): boolean => frame !== undefined && frameOwner.current === frame
     && surfaceRef.current?.surfaceId === readySurface?.surfaceId;
   const receiveResource = (data: string, documentUrl: string): boolean => {
@@ -385,6 +427,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
             onContentProcessDidTerminate={() => { if (currentFrame()) revoke(readySurface, "revoked"); }}
             onRenderProcessGone={() => { if (currentFrame()) revoke(readySurface, "revoked"); }} />
         </View>}
+    {directory && <MobileExtensionDirectoryPicker request={directory} colors={colors} locale={locale} />}
   </View>;
 }
 

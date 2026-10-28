@@ -31,12 +31,13 @@ export class MobileExtensionSettingsBridge {
         response: { type: "joko:extension-settings-response", version: 1, id: request.id, ok,
           ...(ok ? { result } : { message: "Settings request could not be confirmed. Check its original operation before retrying." }) } },
       (_key, item: unknown) => typeof item === "bigint" ? item.toString(10) : item);
-      if (reply.length > 192 * 1024) throw new Error("Settings response exceeds its limit.");
+      if (new TextEncoder().encode(reply).byteLength > (request.command.kind === "directory.pick" ? 4 * 1024 ** 2 : 192 * 1024)) throw new Error("Settings response exceeds its limit.");
       this.options.send(reply);
     };
     if (this.#faulted) { send(undefined, false); return; }
     const abort = new AbortController(); this.#pending.add(abort);
-    const timer = setTimeout(() => abort.abort(), request.command.kind === "oauth.connect" ? 310_000 : 60_000);
+    const timer = setTimeout(() => abort.abort(), request.command.kind === "oauth.connect" ? 310_000
+      : request.command.kind === "directory.pick" ? 150_000 : 60_000);
     let dispatched = false;
     const work = this.#queue.then(async () => {
       abort.signal.throwIfAborted();
@@ -48,7 +49,7 @@ export class MobileExtensionSettingsBridge {
     const completion = Promise.race([work, stopped]); this.#queue = completion.catch(() => undefined);
     void completion.then(result => send(result, true), () => {
       // Reads and validation have no product effects and remain retryable.
-      if (dispatched && !["routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(request.command.kind)) this.#faulted = true;
+      if (dispatched && !["context.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(request.command.kind)) this.#faulted = true;
       send(undefined, false);
     }).catch(() => { this.#faulted = true; }).finally(() => { clearTimeout(timer); abort.abort(); this.#pending.delete(abort); });
   }
@@ -59,13 +60,15 @@ const BOOTSTRAP = String.raw`function(frameId, surfaceId) {
   var marker = Symbol.for("joko.extension-settings-mobile.transport");
   if (window !== window.top || !window.ReactNativeWebView || window[marker]) return;
   Object.defineProperty(window, marker, { value: true });
-  var seen = new Set(), closed = false;
+  var seen = new Set(), kinds = new Map(), closed = false;
   function receive(event) {
-    if (closed || typeof event.data !== "string" || event.data.length > 196608) return;
+    if (closed || typeof event.data !== "string" || event.data.length > 4194304) return;
     var value; try { value = JSON.parse(event.data); } catch (_) { return; }
     if (!value || value.frameId !== frameId || value.surfaceId !== surfaceId || !value.response
       || value.response.type !== "joko:extension-settings-response" || value.response.version !== 1 || typeof value.response.id !== "string" || seen.has(value.response.id)) return;
-    seen.add(value.response.id);
+    var kind = kinds.get(value.response.id);
+    if (!kind || new TextEncoder().encode(event.data).byteLength > (kind === "directory.pick" ? 4194304 : 196608)) return;
+    kinds.delete(value.response.id); seen.add(value.response.id);
     window.dispatchEvent(new MessageEvent("message", { data: value.response, source: window, origin: location.origin }));
   }
   function forward(event) {
@@ -73,10 +76,13 @@ const BOOTSTRAP = String.raw`function(frameId, surfaceId) {
     if (closed || event.source !== window || event.origin !== location.origin || !request
       || request.type !== "joko:extension-settings-request" || request.version !== 1) return;
     var json = JSON.stringify({ frameId: frameId, surfaceId: surfaceId, request: request });
-    if (json.length <= 98304) window.ReactNativeWebView.postMessage(json);
+    if (json.length <= 98304 && typeof request.id === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(request.id)
+      && request.command && typeof request.command.kind === "string" && kinds.size < 4096 && !kinds.has(request.id) && !seen.has(request.id)) {
+      kinds.set(request.id, request.command.kind); window.ReactNativeWebView.postMessage(json);
+    }
   }
   addEventListener("message", receive); document.addEventListener("message", receive); addEventListener("message", forward);
-  addEventListener("pagehide", function() { closed = true; seen.clear(); removeEventListener("message", receive); document.removeEventListener("message", receive); removeEventListener("message", forward); }, { once: true });
+  addEventListener("pagehide", function() { closed = true; seen.clear(); kinds.clear(); removeEventListener("message", receive); document.removeEventListener("message", receive); removeEventListener("message", forward); }, { once: true });
   dispatchEvent(new Event("joko:extension-settings-ready"));
 }`;
 export function mobileExtensionSettingsBootstrap(frameId: string, surfaceId: string): string {

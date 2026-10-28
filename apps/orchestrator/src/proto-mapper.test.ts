@@ -43,6 +43,15 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it("advances the original inherited-history stream cursor without publishing its child-visible body", () => {
+    const inherited = { id: "inherited", backendId: "codex", targetId: "target", sessionId: "aside", generation: 1,
+      sequence: 3n, globalCursor: 7n, revision: 4n, emittedAt: 100, traceId: "original-prefix",
+      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Inherited native context" }] } } satisfies PersistedEvent;
+    const projected = toProtoEvent(inherited, { hideSideChatHistoryPrefix: true });
+    expect(projected.eventId).toBe("inherited"); expect(projected.cursor?.sequence).toBe(7n);
+    expect(projected.identity?.sessionId).toBe("aside"); expect(projected.payload).toBeUndefined(); expect(projected.pi).toBeUndefined();
+    expect(toProtoEvent(inherited).payload?.kind.case).toBe("messageCompleted");
+  });
   it('round trips a typed private reply quote without treating its display snapshot as input text', () => {
     const prompt: PromptInput = { text: 'Explain', disposition: 'prompt', images: [], files: [], mentions: [],
       replyQuote: { generation: 7, eventId: 'original-event', messageId: 'original-message', role: 'assistant', excerpt: 'Display snapshot' } };

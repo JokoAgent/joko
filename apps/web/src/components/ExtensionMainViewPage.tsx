@@ -2,7 +2,8 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide-react";
 import { createConnectionFetch } from "@joko/connection-transport";
-import { parseExtensionSettingsBridgeRequest } from "@joko/contracts";
+import { parseExtensionSettingsBridgeRequest, type ExtensionSettingsDirectoryChoice } from "@joko/contracts";
+import { ExtensionSettingsDirectoryDialog } from "./ExtensionSettingsDirectoryDialog.js";
 import { mountIsolatedSurface } from "../isolated-surface.js";
 import { bindExtensionSurfaceResources } from "../extension-main-view-resource-bridge.js";
 import { bindExtensionViewClose, registerExtensionPageClose } from "../extension-view-lifecycle.js";
@@ -23,7 +24,7 @@ import {
   parseExtensionLibraryBridgeRequest
 } from "../extension-library-bridge.js";
 import type { Translator } from "./types.js";
-import { Button, IconButton, Spinner } from "./ui.js";
+import { Button, IconButton, Modal, Spinner } from "./ui.js";
 
 type MainViewState =
   | { readonly phase: "loading" | "opening" }
@@ -74,8 +75,12 @@ export function ExtensionMainViewPage({
   const bridgeEpoch = useRef(0);
   const closeGuard = useRef<() => Promise<boolean>>(async () => true);
   const settingsApi = useRef<ExtensionSettingsApi | undefined>(undefined);
-  const settingsSurfaceClosers = useRef(new Map<string, (surfaceId: string) => Promise<boolean>>());
+  const settingsSurfaceClosers = useRef(new WeakMap<ExtensionMainViewSurfaceView, (surfaceId: string) => Promise<boolean>>());
   const settingsLibrary = useRef(onOpenLibrary); settingsLibrary.current = onOpenLibrary;
+  const [confirmation, setConfirmation] = useState<{ readonly title: string; readonly body: string; readonly finish: (accepted: boolean) => void }>();
+  const confirmationRef = useRef(confirmation); confirmationRef.current = confirmation;
+  const [directoryChoice, setDirectoryChoice] = useState<{ readonly choice: ExtensionSettingsDirectoryChoice; readonly signal: AbortSignal; readonly finish: (entryId?: string) => void }>();
+  const directoryChoiceRef = useRef(directoryChoice); directoryChoiceRef.current = directoryChoice;
 
   const closeLibrary = useCallback((): void => {
     const current = libraryRef.current;
@@ -88,9 +93,9 @@ export function ExtensionMainViewPage({
   const releaseSurface = useCallback((surface: ExtensionMainViewSurfaceView | undefined): void => {
     if (surface === undefined) return;
     closeLibrary();
-    if (surfaceRef.current?.id === surface.id) surfaceRef.current = undefined;
+    if (surfaceRef.current === surface) surfaceRef.current = undefined;
     if (settings) {
-      const close = settingsSurfaceClosers.current.get(surface.id); settingsSurfaceClosers.current.delete(surface.id);
+      const close = settingsSurfaceClosers.current.get(surface); settingsSurfaceClosers.current.delete(surface);
       if (close) void close(surface.id).catch(() => undefined);
     }
     else void controller.closeExtensionMainView(surface.id).catch(() => undefined);
@@ -119,8 +124,8 @@ export function ExtensionMainViewPage({
       settingsApi.current = api;
       const surface = settings ? await api!.open(extension.id, extension.revision, abort.signal)
         : await controller.openExtensionMainView(extension.id, extension.revision, abort.signal);
-      if (settings) settingsSurfaceClosers.current.set(surface.id, api!.close);
-      if (disposed || request !== requestRevision.current || surface.extensionId !== extension.id) {
+      if (settings) settingsSurfaceClosers.current.set(surface, id => api!.close(id));
+      if (disposed || request !== requestRevision.current || liveOwnerRef.current !== controllerOwner || abort.signal.aborted || surface.extensionId !== extension.id) {
         releaseSurface(surface);
         return;
       }
@@ -405,21 +410,49 @@ export function ExtensionMainViewPage({
         if (!current()) return;
         const data = { type: "joko:extension-settings-response", version: 1, id: request.id, ok,
           ...(ok ? { result } : { message: "Settings request could not be confirmed. Check its original operation before retrying." }) };
-        if (JSON.stringify(data, (_key, value: unknown) => typeof value === "bigint" ? value.toString(10) : value).length > 192 * 1024) throw new Error("Settings response exceeds its limit.");
+        if (JSON.stringify(data, (_key, value: unknown) => typeof value === "bigint" ? value.toString(10) : value).length > (request.command.kind === "directory.pick" ? 4 * 1024 * 1024 : 192 * 1024)) throw new Error("Settings response exceeds its limit.");
         frame.contentWindow?.postMessage(data, "*");
       };
       if (faulted) { respond(false); return; }
       const abort = new AbortController(); pending.add(abort);
-      const timer = setTimeout(() => abort.abort(), request.command.kind === "oauth.connect" ? 310_000 : 60_000);
+      const timer = setTimeout(() => abort.abort(), request.command.kind === "oauth.connect" ? 310_000 : request.command.kind === "directory.pick" ? 150_000 : 60_000);
       let dispatched = false;
       const work = queue.then(async () => {
         abort.signal.throwIfAborted(); if (!current() || faulted) throw new Error("Settings document retired."); dispatched = true;
         return api.call(state.surface, request.command, {
           locale: ownerDocument.documentElement.lang || "en",
+          chooseDirectory: (choice, signal) => new Promise<string | undefined>(resolve => {
+            directoryChoiceRef.current?.finish();
+            let settled = false;
+            const finish = (entryId?: string) => {
+              if (settled) return; settled = true; signal.removeEventListener("abort", cancel);
+              if (directoryChoiceRef.current?.finish === finish) directoryChoiceRef.current = undefined;
+              setDirectoryChoice(value => value?.finish === finish ? undefined : value);
+              resolve(current() && !signal.aborted && ownerDocument.visibilityState !== "hidden" ? entryId : undefined);
+            };
+            const cancel = () => finish();
+            const next = { choice, signal, finish }; directoryChoiceRef.current = next; setDirectoryChoice(next);
+            signal.addEventListener("abort", cancel, { once: true });
+            if (!current() || signal.aborted || ownerDocument.visibilityState === "hidden") cancel();
+          }),
           confirm: async (title, body, signal) => {
             if (!current() || signal.aborted || ownerDocument.visibilityState === "hidden") return false;
-            const accepted = sourceWindow.confirm(`${title}\n\n${body}`);
-            return accepted && current() && !signal.aborted;
+            return new Promise<boolean>(resolve => {
+              confirmationRef.current?.finish(false);
+              let settled = false;
+              const finish = (accepted: boolean) => {
+                if (settled) return; settled = true;
+                signal.removeEventListener("abort", cancel);
+                if (confirmationRef.current?.finish === finish) confirmationRef.current = undefined;
+                setConfirmation(value => value?.finish === finish ? undefined : value);
+                resolve(accepted && current() && !signal.aborted && ownerDocument.visibilityState !== "hidden");
+              };
+              const cancel = () => finish(false);
+              const next = { title, body, finish };
+              confirmationRef.current = next; setConfirmation(next);
+              signal.addEventListener("abort", cancel, { once: true });
+              if (signal.aborted || !current()) cancel();
+            });
           },
           authorize: async () => { throw new Error("Use the installed native account authorization flow."); },
           openLibrary: async signal => { signal.throwIfAborted(); if (!current() || !settingsLibrary.current) throw new Error("Plugin Library is unavailable."); settingsLibrary.current(); }
@@ -428,7 +461,7 @@ export function ExtensionMainViewPage({
       const stopped = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(new Error("Settings request retired.")), { once: true }));
       const completion = Promise.race([work, stopped]); queue = completion.catch(() => undefined);
       void completion.then(result => respond(true, result), () => {
-        if (dispatched && !["routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(request.command.kind)) faulted = true;
+        if (dispatched && !["context.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(request.command.kind)) faulted = true;
         respond(false);
       }).catch(() => { faulted = true; }).finally(() => { clearTimeout(timer); abort.abort(); pending.delete(abort); });
     };
@@ -492,6 +525,13 @@ export function ExtensionMainViewPage({
         />
       </>}
     </section>
+    {confirmation && <Modal open title={confirmation.title} ownerDocument={ownerDocument} dialogRole="alertdialog"
+      onClose={() => confirmation.finish(false)} closeLabel={t("common.cancel")} size="small">
+      <p style={{ whiteSpace: "pre-wrap" }}>{confirmation.body}</p>
+      <div className="modal-actions"><Button tone="ghost" onClick={() => confirmation.finish(false)}>{t("common.cancel")}</Button>
+        <Button tone="primary" onClick={() => confirmation.finish(true)}>{t("common.confirm")}</Button></div>
+    </Modal>}
+    {directoryChoice && <ExtensionSettingsDirectoryDialog choice={directoryChoice.choice} signal={directoryChoice.signal} finish={directoryChoice.finish} t={t} ownerDocument={ownerDocument} />}
   </main>;
 }
 

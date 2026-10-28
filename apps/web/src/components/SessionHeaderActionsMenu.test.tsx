@@ -31,6 +31,13 @@ afterEach(async () => {
 });
 
 describe("SessionHeaderActionsMenu", () => {
+  it("opens every retained Side Chat, including children beyond the old display limits", async () => {
+    const children = Array.from({ length: 61 }, (_, index) => ({ ...session, id: `aside-${index}`, name: `Aside ${index}` }));
+    const onSelectSideChat = vi.fn();
+    const container = await renderMenu({ ...callbackProps(), sideChats: children, onSelectSideChat });
+    expect(labels(container)).toContain("Aside 60");
+    await click(button(container, "Aside 60")); expect(onSelectSideChat).toHaveBeenCalledExactlyOnceWith("aside-60");
+  });
   it("offers host sharing management and restricts the guest task menu to leaving", async () => {
     const onSharing = vi.fn(), onLeaveSharing = vi.fn();
     const host = await renderMenu({ ...callbackProps(), onSharing });

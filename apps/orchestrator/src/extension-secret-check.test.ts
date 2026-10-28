@@ -42,4 +42,11 @@ it("rejects a changed owner, redirects, oversized responses and a string pretend
 it("does not let a check declaration expand its approved destinations", () => {
   expect(() => parseExtensionNetwork({ hosts: ["api.example.com"], secrets: [{ key: "token", label: "Token", inject: { header: "X-Key", format: "{value}" },
     check: { url: "https://foreign.example/check", bodyFormat: '{"value":"{value}"}', validPath: "active", validValue: true } }] })).toThrow(/not approved/u);
+  const check = { url: "https://api.example.com/check", bodyFormat: '{"value":"{value}"}', validPath: "active", validValue: true };
+  const manifest = (patch: Record<string, unknown>) => ({ hosts: ["api.example.com", "other.example.com"], secrets: [{ key: "token", label: "Token",
+    inject: { header: "X-Key", format: "{value}", hosts: ["api.example.com"] }, check: { ...check, ...patch } }] });
+  for (const patch of [{ url: "https://other.example.com/check" }, { url: "https://api.example.com/check#fragment" },
+    { bodyFormat: '{"value":{value}}' }, { bodyFormat: '["{value}"]' }, { validPath: "__proto__.active" }, { validValue: 1 },
+    { expiresAtFormat: "unix-ms" }, { validValue: "" }]) expect(() => parseExtensionNetwork(manifest(patch))).toThrow();
+  expect(parseExtensionNetwork(manifest({ expiresAtPath: "expires", expiresAtFormat: "unix-ms" })).secrets![0]!.check).toMatchObject({ expiresAtFormat: "unix-ms" });
 });

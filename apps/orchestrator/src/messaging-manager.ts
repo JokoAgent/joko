@@ -11,7 +11,6 @@ import {
   WeChatTransport,
   splitDingTalkText,
   splitDiscordText,
-  splitFeishuText,
   splitSlackText,
   splitTelegramText,
   splitWeComText,
@@ -66,8 +65,9 @@ import {
   type OperationalStore,
   type PutMessagingRouteInput
 } from "@joko/store";
+import type { PersistedEvent } from '@joko/store';
 import type { ConnectionRecord } from '@joko/store';
-import type { PartnerMessagingRuntime, PartnerMessagingBinding } from './partner-messaging.js';
+import type { PartnerMessagingRuntime, PartnerMessagingBinding, PartnerMessageDeliveryOrigin } from './partner-messaging.js';
 import type { ArtifactStore } from "./artifact-store.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
@@ -288,6 +288,12 @@ interface MessagingTransportEffectsPort {
     readonly messageId: string;
     readonly signal?: AbortSignal;
   }): Promise<void>;
+  openReplyProgress?(input: { readonly address: MessagingAddress; readonly messageId: string; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt>;
+  updateReplyProgress?(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text: string; readonly signal?: AbortSignal }): Promise<void>;
+  closeReplyProgress?(input: { readonly address: MessagingAddress; readonly messageId: string; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt>;
+  sendRichReply?(input: { readonly address: MessagingAddress; readonly text: string;
+    readonly attachments: readonly { readonly kind: 'image' | 'file'; readonly bytes: Uint8Array; readonly fileName: string; readonly mimeType: string }[];
+    readonly replyToMessageId?: string; readonly signal?: AbortSignal; readonly fallbackProgressMessageId?: string }): Promise<MessagingSendReceipt>;
   loadGroupHistory?(address: MessagingAddress, signal?: AbortSignal): Promise<readonly MessagingGroupObservation[]>;
   close?(): Promise<void>;
 }
@@ -326,6 +332,10 @@ interface DingTalkTransportPort extends MessagingTransportEffectsPort {
 
 interface FeishuTransportPort extends MessagingTransportEffectsPort {
   readonly channel: "feishu" | "lark";
+  readonly sendRichReply: NonNullable<MessagingTransportEffectsPort['sendRichReply']>;
+  readonly openReplyProgress: NonNullable<MessagingTransportEffectsPort['openReplyProgress']>;
+  readonly updateReplyProgress: NonNullable<MessagingTransportEffectsPort['updateReplyProgress']>;
+  readonly closeReplyProgress: NonNullable<MessagingTransportEffectsPort['closeReplyProgress']>;
   poll(input: {
     readonly cursor: string | null;
     readonly timeoutSeconds?: number;
@@ -513,6 +523,9 @@ export class MessagingManager {
   #initialized = false;
   #closed = false;
   #partnerRuntime: PartnerMessagingRuntime | undefined;
+  #unsubscribeProgress: (() => void) | undefined;
+  readonly #feishuProgress = new Map<string, { readonly connectionId: string; readonly generation: number; readonly controller: AbortController;
+    readonly blocks: Map<string, string>; flushed: string; timer?: ReturnType<typeof setTimeout>; inFlight: boolean }>();
 
   constructor(options: MessagingManagerOptions) {
     this.#store = options.store;
@@ -572,6 +585,7 @@ export class MessagingManager {
     }
     this.#store.recoverClaimedMessagingDeliveries(this.#now());
     this.#store.recoverClaimedMessagingInteractions(this.#now());
+    this.#unsubscribeProgress = this.#store.subscribe(event => this.#observeFeishuProgress(event));
     await this.#cleanupCredentials();
     for (const connection of this.#store.listMessagingConnections()) {
       if (connection.enabled) this.#startWorker(connection.id);
@@ -602,6 +616,48 @@ export class MessagingManager {
   }
 
   setPartnerRuntime(runtime: PartnerMessagingRuntime): void { this.#partnerRuntime = runtime; }
+  wakeDeliveries(connectionId: string): void { this.#assertReady(); this.#scheduleDeliveryDrain(connectionId); }
+
+  enqueuePartnerMessage(input: { readonly operationId: string; readonly partnerId: string; readonly connectionId: string; readonly conversationId: string;
+    readonly expectedConnectionGeneration: number; readonly text: string; readonly attachments: readonly MessagingOutboundFile[];
+    readonly origin: PartnerMessageDeliveryOrigin; readonly assertCurrent: () => void }): { readonly operationId: string; readonly deliveryIds: readonly string[] } {
+    this.#assertReady(); input.assertCurrent();
+    const result = this.#store.runOperation({ id: input.operationId, kind: 'partner_messaging_send', body: {
+      partnerId: input.partnerId, connectionId: input.connectionId, conversationId: input.conversationId,
+      expectedConnectionGeneration: input.expectedConnectionGeneration, text: input.text, attachments: input.attachments, origin: input.origin
+    } }, store => {
+      input.assertCurrent(); const connection = store.getMessagingConnection(input.connectionId), conversation = store.getMessagingConversation(input.conversationId);
+      if (!connection.enabled || connection.generation !== input.expectedConnectionGeneration || conversation.connectionId !== connection.id
+        || conversation.channelGeneration !== connection.generation || conversation.status !== 'active' || conversation.partnerId !== input.partnerId) throw invalid('The original Partner message recipient is unavailable.');
+      const channel = requiredSupportedMessagingChannel(connection.channel), now = this.#now();
+      const images = input.attachments.filter(file => file.kind === 'image'), files = input.attachments.filter(file => file.kind === 'file');
+      const payloads: Array<{ kind: 'text' | 'file'; payload: unknown }> = [];
+      const base = { format: 1, address: addressFor(connection, conversation), partnerDeliveryOrigin: input.origin };
+      const feishu = channel === 'feishu' || channel === 'lark';
+      if (feishu) {
+        for (const file of files) payloads.push({ kind: 'file', payload: { ...base, files: [file] } });
+        if (input.text.trim() || images.length || files.length) payloads.push({ kind: 'text', payload: { ...base,
+          text: input.text || (images.length ? '' : 'Files delivered.'), files: images, feishuAnswer: true } });
+      } else {
+        const split = channel === 'telegram' ? splitTelegramText : channel === 'discord' ? splitDiscordText : channel === 'dingtalk' ? splitDingTalkText
+          : channel === 'slack' ? splitSlackText : channel === 'wechat' ? splitWeChatText : splitWeComText;
+        for (const text of split(input.text)) payloads.push({ kind: 'text', payload: { ...base, text } });
+        const batch = channel === 'telegram' || channel === 'discord' ? 10 : 1;
+        for (let index = 0; index < images.length; index += batch) payloads.push({ kind: 'file', payload: { ...base, files: images.slice(index, index + batch) } });
+        for (const file of files) payloads.push({ kind: 'file', payload: { ...base, files: [file] } });
+      }
+      if (!payloads.length) throw invalid('A Partner message needs text or an owned artifact.');
+      const deliveryIds = payloads.map((value, index) => store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
+        conversationId: conversation.id, dedupeKey: `partner-send:${input.operationId}`, kind: value.kind, partIndex: index, partCount: payloads.length,
+        payloadHash: operationBodyHash(value.payload), payload: value.payload, availableAt: now + index, createdAt: now }).id);
+      return { operationId: input.operationId, deliveryIds };
+    });
+    if (!result.replayed) {
+      this.#scheduleDeliveryDrain(input.connectionId);
+      const wake = setTimeout(() => this.#scheduleDeliveryDrain(input.connectionId), 10); wake.unref?.();
+    }
+    return result.value;
+  }
 
   retirePartnerConnection(connectionId: string, commit: (store: OperationalStore) => void, retireConversations = true): Promise<MessagingConnectionRecord> {
     return this.#mutate(async () => {
@@ -638,6 +694,17 @@ export class MessagingManager {
           return { binding: { connectionId: connection.id, ...(value.partnerId ? { partnerId: value.partnerId } : {}),
             revision: value.revision, connectionGeneration: connection.generation }, connection };
         });
+      if (result.replayed) {
+        const receipt = result.value, revision: unknown = receipt?.connection?.revision;
+        if (typeof revision !== 'string' || !/^[1-9][0-9]*$/u.test(revision)
+          || receipt.connection.id !== input.connectionId || receipt.binding?.connectionId !== input.connectionId
+          || receipt.binding.partnerId !== input.partnerId || receipt.binding.revision !== input.expectedBindingRevision + 1
+          || receipt.connection.generation !== input.expectedConnectionGeneration + 1
+          || receipt.binding.connectionGeneration !== receipt.connection.generation || BigInt(revision) <= input.expectedConnectionRevision) {
+          throw new Error('The original message destination receipt is invalid.');
+        }
+        return { ...receipt, connection: { ...receipt.connection, revision: BigInt(revision) } };
+      }
       // Stop only an old IM Run on a shared canonical task. A local turn on the
       // same task does not belong to this channel destination change.
       for (const conversation of this.#store.listMessagingConversations({ connectionId: input.connectionId, statuses: ['retired'] })) {
@@ -1204,11 +1271,15 @@ export class MessagingManager {
     readonly sessionId: string;
     readonly runId: string;
     readonly outcome: "completed" | "aborted" | "failed";
+    readonly recovering?: boolean;
   }): Promise<void> {
     if (!this.#initialized || this.#closed) return;
+    const recovery = this.#store.findPendingContextRebuild(input.sessionId);
+    if (input.recovering || input.outcome === 'failed' && recovery?.reason === 'context_overflow' && recovery.replaySafe && recovery.sourceRunId === input.runId) return;
     const request = this.#store.findMessagingInboundRequestByRunId(input.runId);
     if (request !== undefined) this.#stopWeChatPresence(request);
     if (request !== undefined) this.#stopSlackPresence(request);
+    if (request !== undefined) this.#stopFeishuProgress(request.id);
     if (request === undefined || request.status !== "queued") return;
     const conversation = request.conversationId === undefined
       ? undefined
@@ -1232,16 +1303,15 @@ export class MessagingManager {
             : output.attachments.length > 0 ? WECHAT_ATTACHMENT_REPLY_TEXT : WECHAT_EMPTY_REPLY_TEXT
           : text;
         const deliveries: Array<{ readonly kind: "text" | "file"; readonly payload: unknown }> = [];
-        if (text.trim() !== "NO_REPLY" && (text !== "" || channel === "wecom" || channel === "wechat")) {
+        const feishu = channel === 'feishu' || channel === 'lark';
+        if (!feishu && text.trim() !== "NO_REPLY" && (text !== "" || channel === "wecom" || channel === "wechat")) {
           const parts = channel === "slack"
             ? splitSlackText(text)
             : channel === "discord"
             ? splitDiscordText(text)
             : channel === "dingtalk"
               ? splitDingTalkText(text)
-              : channel === "feishu" || channel === "lark"
-                ? splitFeishuText(text)
-                : channel === "wecom"
+              : channel === "wecom"
                   ? splitWeComText(deliveryText)
                   : channel === "wechat"
                     ? splitWeChatText(deliveryText)
@@ -1268,7 +1338,7 @@ export class MessagingManager {
         const files = output.attachments.filter((attachment) => attachment.kind === "file");
         const imageBatchSize = channel === "dingtalk" || channel === "feishu" || channel === "lark"
           || channel === "wecom" || channel === "wechat" || channel === "slack" ? 1 : 10;
-        for (let index = 0; index < images.length; index += imageBatchSize) {
+        for (let index = 0; !feishu && index < images.length; index += imageBatchSize) {
           const partIndex = deliveries.length;
           deliveries.push({
             kind: "file",
@@ -1296,18 +1366,25 @@ export class MessagingManager {
             }
           });
         }
+        if (feishu && (text.trim() !== '' && text.trim() !== 'NO_REPLY' || images.length > 0 || files.length > 0)) {
+          deliveries.push({ kind: 'text', payload: { format: 1, address: addressFor(connection, conversation),
+            text: text.trim() === 'NO_REPLY' ? '' : text || (images.length ? '' : 'Files delivered.'), files: images,
+            feishuAnswer: true, requestId: current.id,
+            ...(shouldQuote(configuration, conversation, 0) && current.providerMessageId ? { replyToMessageId: current.providerMessageId } : {}) } });
+        }
         deliveries.forEach((delivery, partIndex) => {
+          const card = isRecord(delivery.payload) && delivery.payload['feishuAnswer'] === true;
           store.enqueueMessagingDelivery({
             connectionId: connection.id,
             expectedChannelGeneration: connection.generation,
             conversationId: conversation.id,
-            dedupeKey: `run:${input.runId}:answer`,
+            dedupeKey: card ? `request:${current.id}:answer-card` : `run:${input.runId}:answer`,
             kind: delivery.kind,
-            partIndex,
-            partCount: deliveries.length,
+            partIndex: card ? 0 : partIndex,
+            partCount: card ? 1 : deliveries.length - (feishu ? 1 : 0),
             payloadHash: operationBodyHash(delivery.payload),
             payload: delivery.payload,
-            availableAt: now + partIndex,
+            availableAt: now + partIndex + (feishu ? 1 : 0),
             createdAt: now
           });
         });
@@ -1365,8 +1442,9 @@ export class MessagingManager {
     if (connection.channel === "slack") {
       this.#finishSlackProgress(this.#store.getMessagingInboundRequest(request.id));
     }
+    if (connection.channel === 'feishu' || connection.channel === 'lark') this.#finishFeishuProgress(request.id);
     this.#scheduleDeliveryDrain(connection.id);
-    if (connection.channel === "slack") {
+    if (connection.channel === "slack" || connection.channel === 'feishu' || connection.channel === 'lark') {
       // Terminal reactions are ordered after the accepted reaction even when
       // admission and settlement share one millisecond. Wake the outbox once
       // they become due instead of waiting for the next Socket poll.
@@ -1377,6 +1455,8 @@ export class MessagingManager {
 
   async close(): Promise<void> {
     if (this.#closed) return;
+    this.#unsubscribeProgress?.(); this.#unsubscribeProgress = undefined;
+    for (const requestId of this.#feishuProgress.keys()) this.#stopFeishuProgress(requestId);
     for (const state of this.#weChatPresence.values()) clearTimeout(state.timer);
     this.#weChatPresence.clear();
     for (const state of this.#slackPresence.values()) clearTimeout(state.timer);
@@ -2415,6 +2495,13 @@ export class MessagingManager {
           queueItemId: admitted.queueItemId,
           updatedAt: this.#now()
         });
+        if ((connection.channel === 'feishu' || connection.channel === 'lark') && transport.openReplyProgress) {
+          const payload = { format: 1, address: addressFor(connection, activeConversation), text: 'Working on this task…',
+            feishuProgress: 'open', requestId: admittedRequest.id, sourceMessageId: event.messageId };
+          store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
+            conversationId: activeConversation.id, dedupeKey: `request:${request.id}:progress:start`, kind: 'notice', partIndex: 0, partCount: 1,
+            payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
+        }
         if (connection.channel === "slack") {
           const progressPayload = {
             format: 1,
@@ -2954,6 +3041,79 @@ export class MessagingManager {
     };
   }
 
+  #observeFeishuProgress(event: PersistedEvent): void {
+    if (this.#closed || event.payload.type !== 'text_delta' || !event.runId) return;
+    const request = this.#store.findMessagingInboundRequestByRunId(event.runId);
+    if (!request?.conversationId || request.status !== 'queued') return;
+    const connection = this.#store.findMessagingConnection(request.connectionId), worker = this.#workers.get(request.connectionId);
+    if (!connection || !['feishu', 'lark'].includes(connection.channel) || !connection.enabled || connection.generation !== request.channelGeneration
+      || worker?.generation !== connection.generation || !worker.transport?.updateReplyProgress) return;
+    let state = this.#feishuProgress.get(request.id);
+    if (!state) {
+      if (this.#feishuProgress.size >= 512) this.#stopFeishuProgress(this.#feishuProgress.keys().next().value!);
+      state = { connectionId: connection.id, generation: connection.generation, controller: new AbortController(), blocks: new Map(), flushed: '', inFlight: false };
+      this.#feishuProgress.set(request.id, state);
+    }
+    if (state.blocks.size >= 128 && !state.blocks.has(event.payload.blockId)) return;
+    const text = state.blocks.get(event.payload.blockId) ?? '';
+    const remaining = MAXIMUM_OUTBOUND_CHARACTERS - [...state.blocks.values()].reduce((sum, block) => sum + block.length, 0);
+    if (remaining <= 0) return;
+    state.blocks.set(event.payload.blockId, text + event.payload.delta.slice(0, remaining));
+    if (!state.timer && !state.inFlight) state.timer = setTimeout(() => { if (state) delete state.timer; void this.#flushFeishuProgress(request.id); }, 1500);
+  }
+
+  async #flushFeishuProgress(requestId: string): Promise<void> {
+    const state = this.#feishuProgress.get(requestId); if (!state || state.inFlight) return;
+    const request = this.#store.findMessagingInboundRequest(requestId), connection = this.#store.findMessagingConnection(state.connectionId), worker = this.#workers.get(state.connectionId);
+    if (!request?.conversationId || request.status !== 'queued' || !connection?.enabled || connection.generation !== state.generation
+      || worker?.generation !== state.generation || !worker.transport?.updateReplyProgress) { this.#stopFeishuProgress(requestId); return; }
+    const progress = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${requestId}:progress:start` });
+    if (progress?.status === 'unknown' || progress?.status === 'cancelled') { this.#stopFeishuProgress(requestId); return; }
+    const retry = () => { if (this.#feishuProgress.get(requestId) === state && !state.timer) state.timer = setTimeout(() => { delete state.timer; void this.#flushFeishuProgress(requestId); }, 1500); };
+    if (progress?.status !== 'sent' || !progress.providerMessageId) { retry(); return; }
+    const conversation = this.#store.getMessagingConversation(request.conversationId);
+    if (conversation.status !== 'active' || conversation.channelGeneration !== connection.generation) { this.#stopFeishuProgress(requestId); return; }
+    // Local/private media coordinates must not be exposed in intermediate
+    // Markdown. The independently durable final resolves only owned blobs.
+    const text = [...state.blocks.values()].join('\n\n').slice(0, MAXIMUM_OUTBOUND_CHARACTERS)
+      .replace(/!?\[([^\]\r\n]*)\]\((?:file:|artifact:|blob:|joko-[\w-]+:)[^\r\n)]*\)/giu, '$1');
+    if (!text.trim() || text === state.flushed) return;
+    state.inFlight = true;
+    try {
+      const signal = AbortSignal.any([state.controller.signal, worker.controller.signal]); signal.throwIfAborted();
+      await worker.transport.updateReplyProgress({ address: addressFor(connection, conversation), messageId: progress.providerMessageId, text, signal });
+      signal.throwIfAborted(); state.flushed = text;
+    } catch (error) { if (!state.controller.signal.aborted) this.#recordFailure('FEISHU_PROGRESS_PATCH_FAILED', connection.id, error); }
+    finally { state.inFlight = false; if (this.#feishuProgress.get(requestId) === state && [...state.blocks.values()].join('\n\n') !== state.flushed) retry(); }
+  }
+
+  #stopFeishuProgress(requestId: string): void {
+    const state = this.#feishuProgress.get(requestId); if (!state) return;
+    clearTimeout(state.timer); state.controller.abort(); this.#feishuProgress.delete(requestId);
+  }
+
+  #finishFeishuProgress(requestId: string): void {
+    const request = this.#store.findMessagingInboundRequest(requestId);
+    if (!request?.conversationId || request.status === 'queued' || request.status === 'preparing') return;
+    const connection = this.#store.findMessagingConnection(request.connectionId);
+    if (!connection?.enabled || connection.generation !== request.channelGeneration || !['feishu', 'lark'].includes(connection.channel)) return;
+    const start = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${requestId}:progress:start` });
+    if (start?.status !== 'sent' || !start.providerMessageId) return;
+    const answer = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation,
+      dedupeKey: `request:${request.id}:answer-card` });
+    // An opener's unknown ACK never changes final certainty or recipient.
+    // A final's unknown ACK keeps the progress answer and is never re-sent.
+    if (answer && answer.status !== 'sent') return;
+    const conversation = this.#store.getMessagingConversation(request.conversationId);
+    if (conversation.status !== 'active') return;
+    const payload = { format: 1, address: addressFor(connection, conversation), text: 'Done.', feishuProgress: 'close',
+      requestId, messageId: start.providerMessageId };
+    this.#store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: conversation.id,
+      dedupeKey: `request:${requestId}:progress:close`, kind: 'notice', partIndex: 0, partCount: 1,
+      payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
+    this.#scheduleDeliveryDrain(connection.id);
+  }
+
   #startWeChatPresence(request: MessagingInboundRequestRecord): void {
     if (this.#closed || request.status !== "queued" || request.conversationId === undefined
       || this.#weChatPresence.has(request.id)) return;
@@ -3314,7 +3474,23 @@ export class MessagingManager {
           continue;
         }
         const context = transport.channel === "wechat" ? this.#weChatSendContext(connection, delivery) : undefined;
-        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, signal, context);
+        const assertDeliveryCurrent = () => {
+          signal.throwIfAborted(); this.#requireWorkerConnection(connection.id, connection.generation); this.#partnerRuntime?.assertOutboundCurrent(delivery);
+        };
+        assertDeliveryCurrent();
+        const sourceConnection = this.#partnerRuntime?.outboundSourceConnection(delivery);
+        const sourceWorker = sourceConnection ? this.#workers.get(sourceConnection.connectionId) : undefined;
+        if (sourceConnection && sourceWorker?.generation !== sourceConnection.generation) throw new MessagingTransportError('cancelled', 'The original message source worker retired.', { retryable: false, effect: 'none' });
+        const deliverySignal = sourceWorker ? AbortSignal.any([signal, sourceWorker.controller.signal]) : signal;
+        let fallbackProgressMessageId: string | undefined;
+        if ((transport.channel === 'feishu' || transport.channel === 'lark') && isRecord(delivery.payload) && delivery.payload['feishuAnswer'] === true
+          && typeof delivery.payload['requestId'] === 'string') {
+          const source = this.#store.getMessagingInboundRequest(delivery.payload['requestId']);
+          if (source.connectionId !== connection.id || source.channelGeneration !== connection.generation || source.conversationId !== delivery.conversationId) throw invalid('The Feishu final lost its original request.');
+          const progress = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${source.id}:progress:start` });
+          if (progress?.status === 'sent' && progress.conversationId === delivery.conversationId) fallbackProgressMessageId = progress.providerMessageId;
+        }
+        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, deliverySignal, context, fallbackProgressMessageId, assertDeliveryCurrent);
         const settled = this.#store.settleMessagingDelivery({
           deliveryId: delivery.id,
           expectedRevision: delivery.revision,
@@ -3324,6 +3500,10 @@ export class MessagingManager {
           settledAt: this.#now()
         });
         if (settled.kind === "interaction") this.#retireSentInteractionIfSettled(connection, settled);
+        if ((connection.channel === 'feishu' || connection.channel === 'lark') && isRecord(settled.payload)
+          && typeof settled.payload['requestId'] === 'string' && (settled.payload['feishuAnswer'] === true || settled.payload['feishuProgress'] === 'open')) {
+          this.#finishFeishuProgress(settled.payload['requestId']);
+        }
         if (connection.channel === "slack" && settled.kind === "notice"
           && settled.dedupeKey.startsWith("request:")
           && settled.dedupeKey.endsWith(":progress:start")) {
@@ -3581,8 +3761,51 @@ async function dispatchMessagingDelivery(
   delivery: MessagingDeliveryRecord,
   artifacts: Pick<ArtifactStore, "readBlob">,
   signal: AbortSignal,
-  context?: { readonly contextToken: string; readonly clientId: string }
+  context?: { readonly contextToken: string; readonly clientId: string },
+  fallbackProgressMessageId?: string,
+  assertCurrent: () => void = () => signal.throwIfAborted()
 ): Promise<string> {
+  assertCurrent();
+  if ((transport.channel === 'feishu' || transport.channel === 'lark') && isRecord(delivery.payload)) {
+    const value = delivery.payload;
+    if (value['feishuProgress'] !== undefined || value['feishuAnswer'] === true) {
+      if (!validAddress(value['address']) || value['address'].connectionId !== transport.connectionId
+        || value['address'].channel !== transport.channel) throw invalid('The Feishu delivery address is invalid.');
+      const address = value['address'];
+      if (value['feishuProgress'] === 'open') {
+        if (!transport.openReplyProgress || typeof value['sourceMessageId'] !== 'string' || !value['sourceMessageId']) throw invalid('The Feishu progress source is invalid.');
+        return (await transport.openReplyProgress({ address, messageId: value['sourceMessageId'], signal })).providerMessageId;
+      }
+      if (value['feishuProgress'] === 'close') {
+        if (!transport.closeReplyProgress || typeof value['messageId'] !== 'string' || !value['messageId']) throw invalid('The Feishu progress lease is invalid.');
+        return (await transport.closeReplyProgress({ address, messageId: value['messageId'], signal })).providerMessageId;
+      }
+      if (value['feishuAnswer'] !== true || !transport.sendRichReply || typeof value['text'] !== 'string'
+        || !Array.isArray(value['files']) || value['files'].length > MAXIMUM_OUTBOUND_ATTACHMENTS
+        || value['replyToMessageId'] !== undefined && typeof value['replyToMessageId'] !== 'string') throw invalid('The Feishu answer payload is invalid.');
+      const images: Array<{ kind: 'image'; bytes: Uint8Array; fileName: string; mimeType: string }> = [];
+      const sources: Array<{ readonly blob: BlobRef; readonly fileName: string }> = [];
+      let totalBytes = 0;
+      for (const image of value['files']) {
+        if (!isRecord(image) || image['kind'] !== 'image' || !validBlobRef(image['blob']) || typeof image['fileName'] !== 'string'
+          || !image['fileName'] || image['fileName'].length > 256 || /[\u0000-\u001f\u007f]/u.test(image['fileName'])
+          || !/^image\/(png|jpeg|gif|webp)$/u.test(image['blob'].mimeType) || image['blob'].byteLength > 10 * 1024 * 1024) throw invalid('The Feishu answer image is invalid.');
+        totalBytes += image['blob'].byteLength;
+        if (totalBytes > 100 * 1024 * 1024) throw invalid('Feishu answer images exceed the 100 MiB budget.');
+        sources.push({ blob: { ...image['blob'] }, fileName: image['fileName'] });
+      }
+      for (const source of sources) {
+        signal.throwIfAborted();
+        const blob = await artifacts.readBlob(source.blob);
+        images.push({ kind: 'image', bytes: blob.data, fileName: source.fileName, mimeType: blob.mimeType });
+      }
+      signal.throwIfAborted();
+      assertCurrent();
+      return (await transport.sendRichReply({ address, text: value['text'], attachments: images,
+        ...(typeof value['replyToMessageId'] === 'string' ? { replyToMessageId: value['replyToMessageId'] } : {}),
+        ...(fallbackProgressMessageId ? { fallbackProgressMessageId } : {}), signal })).providerMessageId;
+    }
+  }
   if (delivery.kind === "interaction") {
     const interaction = interactionDeliveryPayload(delivery.payload);
     if (interaction.action === "clear") {
@@ -3655,6 +3878,7 @@ async function dispatchMessagingDelivery(
         retryable: false, effect: "none"
       });
     }
+    assertCurrent();
     const receipt = await transport.sendAttachments({
       address: payload.address,
       attachments,

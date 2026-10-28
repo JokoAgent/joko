@@ -1,4 +1,5 @@
 export * from "./errors.js";
+export * from "./side-chat-history.js";
 export * from "./device-authorization-store.js";
 export * from "./task-share-store.js";
 export * from "./hosted-agent-store.js";

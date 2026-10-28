@@ -1,5 +1,6 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { encodeModelSpeed } from "@joko/contracts";
+import { ProviderGroupService, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { readSessionArchivePreview, type SessionArchivePreview } from "@joko/contracts";
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
 import { readMobileExtensionMainViewResource } from "./mobile-extension-main-view-resource";
@@ -218,6 +219,8 @@ export interface MobileNetwork {
   extensionCardApi?(credential: PairedCredential): import("./mobile-extension-card-api").MobileExtensionCardApi;
   getProviderUsage?(credential: PairedCredential, backendId: string, providerId: string,
     signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountUsageSnapshot | undefined>;
+  getTaskProviderGroupRebalance?(credential: PairedCredential, sessionId: string, generation: bigint,
+    signal: AbortSignal): Promise<ProviderGroupRebalanceSuggestion | undefined>;
   objectiveRpc?(credential: PairedCredential, sessionId: string, generation: bigint,
     assertCurrent: (signal: AbortSignal) => void): MobileObjectiveRpc;
   getServiceOperation?(credential: PairedCredential, operationId: string, signal?: AbortSignal): Promise<Operation | undefined>;
@@ -1724,6 +1727,10 @@ export const mobileNetwork: MobileNetwork = {
       tokens.add(next); pageToken = next;
     }
     throw new Error("The model source task computer catalog exceeded its page limit.");
+  },
+  async getTaskProviderGroupRebalance(credential, sessionId, generation, signal) {
+    const result = await createClient(ProviderGroupService, credentialTransport(credential)).getTaskProviderGroupRebalance({ sessionId, generation }, options(signal));
+    signal.throwIfAborted(); return result.suggestion;
   },
   async getProviderUsage(credential, backendId, providerId, signal) {
     signal?.throwIfAborted();

@@ -1,4 +1,10 @@
 import type { ExtensionOAuthAuthorization } from "./gen/joko/v1/extension_oauth_pb.js";
+import type { ExtensionDirectoryPickerPage } from "./gen/joko/v1/extension_pb.js";
+
+export interface ExtensionSettingsDirectoryChoice {
+  readonly name: string; readonly title?: string; readonly initialPage: ExtensionDirectoryPickerPage;
+  browse(input: { readonly entryId?: string; readonly pageToken?: string; readonly directoryPath?: string }): Promise<ExtensionDirectoryPickerPage>;
+}
 
 export interface ExtensionSettingsHost {
   readonly locale?: string;
@@ -7,11 +13,13 @@ export interface ExtensionSettingsHost {
     readonly state: string; readonly code?: string; readonly error?: string;
   }>;
   openLibrary(signal: AbortSignal): Promise<void>;
+  chooseDirectory?(choice: ExtensionSettingsDirectoryChoice, signal: AbortSignal): Promise<string | undefined>;
 }
 
 export type ExtensionSettingsCall =
   | { readonly kind: "context.get" | "routing.get" | "setup.get" | "setup.begin" | "setup.complete" | "oauth.get" | "connections.get" | "library.open" }
   | { readonly kind: "routing.set"; readonly revision: string; readonly dataJson: string }
+  | { readonly kind: "directory.pick"; readonly title?: string }
   | { readonly kind: "setup.field"; readonly fieldId: string; readonly value: string | boolean }
   | { readonly kind: "secret.set"; readonly fieldId: string; readonly value: string }
   | { readonly kind: "secret.clear"; readonly fieldId: string }
@@ -38,6 +46,7 @@ export function parseExtensionSettingsBridgeRequest(value: unknown): ExtensionSe
   const call = value.command;
   let valid = false;
   switch (call.kind) {
+    case "directory.pick": valid = keys(call, ["kind", "title"]) && (call.title === undefined || typeof call.title === "string" && call.title.length <= 160 && !/[\u0000-\u001f]/u.test(call.title)); break;
     case "context.get": case "routing.get": case "setup.get": case "setup.begin": case "setup.complete": case "oauth.get": case "connections.get": case "library.open":
       valid = keys(call, ["kind"]); break;
     case "routing.set": valid = keys(call, ["kind", "revision", "dataJson"]) && typeof call.revision === "string" && /^(?:0|[1-9][0-9]{0,19})$/u.test(call.revision)
@@ -80,7 +89,7 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
     const random = new Uint8Array(16); crypto.getRandomValues(random);
     const id = "settings_" + (++sequence) + "_" + Array.from(random, byte => byte.toString(16).padStart(2, "0")).join("");
     const send = () => parent.postMessage({ type: "joko:extension-settings-request", version: 1, id, command }, "*");
-    const timer = setTimeout(() => { const item = pending.get(id); if (!item) return; pending.delete(id); removeEventListener(ready, send); reject(new Error("Settings result is unknown. Inspect the original operation before retrying.")); }, command.kind === "oauth.connect" ? 310000 : 60000);
+    const timer = setTimeout(() => { const item = pending.get(id); if (!item) return; pending.delete(id); removeEventListener(ready, send); reject(new Error("Settings result is unknown. Inspect the original operation before retrying.")); }, command.kind === "oauth.connect" ? 310000 : command.kind === "directory.pick" ? 150000 : 60000);
     pending.set(id, { resolve, reject, timer, send });
     if (window.ReactNativeWebView && !window[marker]) addEventListener(ready, send, { once: true }); else send();
   });
@@ -99,7 +108,7 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
     if (typeof target !== "string" || target.startsWith("//")) return originalFetch(input, init);
     const base = globalThis[Symbol.for("joko.extension.surface.base")] || "https://settings.joko.invalid/";
     const url = new URL(target, base);
-    if ((url.origin !== new URL(base).origin && url.origin !== location.origin) || !/^\/(kv|app-context|secrets|permissions|oauth|connections)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
+    if ((url.origin !== new URL(base).origin && url.origin !== location.origin) || !/^\/(kv|app-context|secrets|permissions|oauth|connections|pick)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
     if (url.username || url.password) throw new Error("Settings URL credentials are not allowed.");
     const method = String(init && init.method || input && input.method || "GET").toUpperCase();
     let body = init && init.body, command;
@@ -108,6 +117,11 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
     const json = () => typeof body === "string" ? JSON.parse(body || "{}") : {};
     if (url.search || url.hash) throw new Error("Settings query is not supported.");
     if (url.pathname === "/app-context" && method === "GET") command = { kind: "context.get" };
+    else if (url.pathname === "/pick" && method === "POST") {
+      const request = json();
+      if (request.mode !== "directory" || request.deposit !== true || Object.keys(request).some(key => !["mode", "deposit", "title"].includes(key))) throw new Error("Only an explicitly chosen directory read deposit is supported.");
+      command = { kind: "directory.pick", ...(request.title === undefined ? {} : { title: request.title }) };
+    }
     else if (url.pathname === "/kv") {
       if (method === "GET") { const result = await call({ kind: "routing.get" }); revision = result.revision; return new Response(result.dataJson, { headers: { "content-type": "application/json" } }); }
       if (method === "PUT") { if (revision === undefined) revision = (await call({ kind: "routing.get" })).revision; command = { kind: "routing.set", revision, dataJson: JSON.stringify(json()) }; }

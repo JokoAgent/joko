@@ -3654,6 +3654,7 @@ export function useAppController(): AppController {
     ...inputApi,
     refreshProviderAccountUsage: (backendId, providerId) => gateway().refreshProviderAccountUsage(backendId, providerId),
     readTaskProviderGroupUsage: (sessionId, generation, signal) => gateway().readTaskProviderGroupUsage?.(sessionId, generation, signal) ?? Promise.resolve(undefined),
+    readTaskProviderGroupRebalance: (sessionId, generation, signal) => gateway().readTaskProviderGroupRebalance?.(sessionId, generation, signal) ?? Promise.resolve(undefined),
     getArtifactStorageStats: (protectedSha256) => gateway().getArtifactStorageStats(protectedSha256),
     scanArtifactStorage: (protectedSha256) => gateway().scanArtifactStorage(protectedSha256),
     reconcileArtifactStorage: (protectedSha256) => gateway().reconcileArtifactStorage(protectedSha256),

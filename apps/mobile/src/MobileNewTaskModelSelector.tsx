@@ -8,10 +8,14 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { MobileModelRoute } from "./mobile-runtime-controls";
 import type { MobileNewTaskSourceSelection } from "./mobile-new-task-model-memory";
+import { useMobileAccountUsage } from "./use-mobile-account-usage";
+import { mobileAccountUsageWindows, mobileUsageProviderKey, type MobileProviderUsageTransport } from "./mobile-account-usage";
+import { MobileAccountUsageSummary, mobileModelAccountQuotaLabel } from "./MobileAccountUsageSummary";
+import { MobileModelQuotaBar } from "./MobileModelQuotaBar";
 
 /** The new-task entry consumes the same authoritative source routes as the
  * task picker, while its selected configuration stays a draft until send. */
-export function MobileNewTaskModelSelector({ models, value, favorites, colors, locale, disabled, onSelect, onFavorite }: {
+export function MobileNewTaskModelSelector({ models, value, favorites, colors, locale, disabled, onSelect, onFavorite, providerUsageTransport }: {
   readonly models: readonly MobileModelRoute[];
   readonly value?: MobileNewTaskSourceSelection;
   readonly favorites: NonNullable<Snapshot["settings"]>["modelFavorites"];
@@ -20,8 +24,10 @@ export function MobileNewTaskModelSelector({ models, value, favorites, colors, l
   readonly disabled: boolean;
   readonly onSelect: (selection: MobileNewTaskSourceSelection) => Promise<void>;
   readonly onFavorite: (selection: MobileNewTaskSourceSelection) => Promise<void>;
+  readonly providerUsageTransport?: MobileProviderUsageTransport;
 }) {
   const [open, setOpen] = useState(false), [query, setQuery] = useState("");
+  const accountUsage = useMobileAccountUsage(providerUsageTransport, open, models.map(model => model.providerId));
   const [choice, setChoice] = useState<MobileNewTaskSourceSelection>(), [busy, setBusy] = useState(false), [error, setError] = useState("");
   const route = models.find(model => model.backendId === choice?.backendId && model.providerId === choice.providerId && model.modelId === choice.modelId);
   const selected = models.find(model => model.backendId === value?.backendId && model.providerId === value.providerId && model.modelId === value.modelId);
@@ -70,11 +76,18 @@ export function MobileNewTaskModelSelector({ models, value, favorites, colors, l
         {matching.map(model => <Pressable key={model.key} disabled={busy || disabled} accessibilityRole="radio"
           accessibilityState={{ selected: route?.key === model.key }} accessibilityLabel={`${model.displayName}, ${label(model)}`}
           onPress={() => choose(model)} style={styles.model}><Text style={{ color: colors.ink }}>{model.displayName}</Text>
-          <Text style={{ color: colors.muted }}>{label(model)}</Text></Pressable>)}
+          <Text style={{ color: colors.muted }}>{label(model)}</Text>
+          {mobileAccountUsageWindows(accountUsage.snapshots[mobileUsageProviderKey(model)], model.modelId, accountUsage.now).filter(window => window.model)
+            .map(window => <MobileModelQuotaBar key={window.id} remaining={window.remainingPercent}
+              label={mobileModelAccountQuotaLabel(accountUsage.snapshots[mobileUsageProviderKey(model)], model.modelId, accountUsage.now, locale, accountUsage.failed) ?? model.displayName} colors={colors} />)}
+        </Pressable>)}
         {!matching.length && <Text style={{ color: colors.muted }}>{mobileMessage(locale, "controls.noModelMatch")}</Text>}
       </ScrollView>
       {route && choice && <>
         <Text style={{ color: colors.ink }}>{route.displayName}</Text>
+        {providerUsageTransport?.providers.some(provider => provider.backendId === route.backendId && provider.providerId === route.providerId)
+          && <MobileAccountUsageSummary snapshot={accountUsage.snapshots[mobileUsageProviderKey(route)]} modelId={route.modelId} providerName={route.providerName}
+            loading={accountUsage.loading} failed={accountUsage.failed} now={accountUsage.now} colors={colors} locale={locale} />}
         {route.canSetEffort && <View style={styles.options}>{route.efforts.map(effort => <Pressable key={effort.id} disabled={busy || disabled}
           accessibilityRole="radio" accessibilityState={{ selected: choice.effortId === effort.id }} onPress={() => setChoice({ ...choice, effortId: effort.id })}
           style={[styles.option, { borderColor: choice.effortId === effort.id ? colors.accent : colors.border }]}><Text style={{ color: colors.ink }}>{effort.label}</Text></Pressable>)}</View>}

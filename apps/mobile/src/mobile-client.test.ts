@@ -1,5 +1,5 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema } from "@joko/contracts";
+import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema } from "@joko/contracts";
 import { RemoteHostSchema } from "@joko/contracts";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
 import { SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
@@ -18,6 +18,8 @@ import { PartnerGroupSummarySchema, PartnerGroupMemberSchema, ListPartnerGroupsR
   GetPartnerGroupCreationResponseSchema, RetirePartnerGroupCreationResponseSchema, PartnerGroupMemberStatus, type PartnerGroupApi } from "@joko/contracts";
 import { DevicePeerDescriptorSchema, RemoteDesktopControlStateSchema, type RemoteDesktopControlState } from "@joko/contracts";
 import { ExtensionTaskPreferencesSchema, ExtensionTaskServiceGetPreferencesResponseSchema, ExtensionTaskServiceUpdatePreferencesResponseSchema, ExtensionTaskServiceRetryWriteAccessResponseSchema } from "@joko/contracts";
+import { ExtensionAuthorizationPhase, ExtensionOAuthFlowSchema, type ExtensionSettingsHost } from "@joko/contracts";
+import { rebalanceSuggestionFixture } from "./test/provider-group-rebalance";
 import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
 import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
 import { createHash } from "node:crypto";
@@ -2997,6 +2999,113 @@ describe("mobile Extension catalog authority", () => {
     expect(app.state.error).toMatch(/accepted acknowledgement/u);
   });
 
+  it("offers package backends only through the declared supported runtime capability on the current owner", async () => {
+    const network = fakeNetwork(), owner = clone(SnapshotSchema, snapshot);
+    owner.backends.push(...[
+      { backendId: "packages", support: CapabilitySupport.SUPPORTED, options: create(CapabilityOptionsSchema, { kind: { case: "runtime", value: { resourceKinds: ["skill", "package"] } } }) },
+      { backendId: "skills", support: CapabilitySupport.SUPPORTED, options: create(CapabilityOptionsSchema, { kind: { case: "runtime", value: { resourceKinds: ["skill"] } } }) },
+      { backendId: "wrong-options", support: CapabilitySupport.SUPPORTED, options: create(CapabilityOptionsSchema, { kind: { case: "input", value: { mediaTypes: ["package"] } } }) },
+      { backendId: "disabled", support: CapabilitySupport.DISABLED_BY_POLICY, options: create(CapabilityOptionsSchema, { kind: { case: "runtime", value: { resourceKinds: ["package"] } } }) },
+      { backendId: "missing-options", support: CapabilitySupport.SUPPORTED, options: undefined }
+    ].map(backend => create(BackendDescriptorSchema, { backendId: backend.backendId, displayName: backend.backendId,
+      capabilities: create(CapabilityManifestSchema, { capabilities: [create(CapabilitySchema, { name: "runtime.resources", support: backend.support, options: backend.options })] }) })));
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const transport = app.extensionCatalogTransport()!;
+    expect(transport.packageBackends!()).toEqual([{ backendId: "packages", name: "packages" }]);
+    app.setForeground(false); expect(transport.packageBackends!()).toEqual([]); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "foreign-resource"])("retains a package receipt before accepting an invalid Resource result %s", async resourceId => {
+    const network = fakeNetwork(), saved = memoryStorage(credential), extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    network.submit = vi.fn(async (_credential, operationId) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      ...(resourceId ? { result: { payload: { case: "resource" as const, value: create(ManagedResourceSchema, { resourceId }) } } } : {})
+    }));
+    const app = client(network, saved.storage, undefined, undefined, () => "package-malformed"); await app.start();
+    await expect(app.extensionCatalogTransport()!.removePackage!(extension, new AbortController().signal)).rejects.toThrow(/original Resource/u);
+    expect(saved.pending()).toEqual([expect.objectContaining({ operationId: "package-malformed", kind: "extension-package-remove",
+      extensionId: extension.extensionId, extensionResourceId: "resource-1", state: "unknown" })]);
+    await expect(app.extensionCatalogTransport()!.removePackage!(extension, new AbortController().signal)).rejects.toThrow(/original Extension operation/u);
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(network.listExtensions).not.toHaveBeenCalled();
+  });
+
+  it("cold-recovers an unknown package operation only through its exact original Resource result without resending", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential), extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    network.submit = vi.fn(async () => { throw new Error("transport closed after dispatch"); });
+    const app = client(network, saved.storage, undefined, undefined, () => "package-original"); await app.start();
+    await expect(app.extensionCatalogTransport()!.removePackage!(extension, new AbortController().signal)).rejects.toThrow(/unknown/u);
+    expect(saved.pending()[0]).toMatchObject({ operationId: "package-original", extensionResourceId: "resource-1" }); app.dispose();
+    let resultId = "foreign-resource";
+    network.getOperation = vi.fn(async (_credential, operationId) => create(OperationSchema, { operationId,
+      connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "resource", value: create(ManagedResourceSchema, { resourceId: resultId }) } } }));
+    const restored = client(network, saved.storage); await restored.start();
+    expect(saved.pending()).toHaveLength(1);
+    expect(restored.state.error).toMatch(/original Resource/u);
+    await expect(restored.extensionCatalogTransport()!.removePackage!(extension, new AbortController().signal)).rejects.toThrow(/original Extension operation/u);
+    resultId = "resource-1";
+    await restored.extensionCatalogTransport()!.reconcile("package-original", new AbortController().signal);
+    expect(saved.pending()).toEqual([]);
+    expect(network.getOperation).toHaveBeenCalledWith(credential, "package-original", expect.any(AbortSignal));
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retires a late package operation on source retirement and keeps the original receipt", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential), extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    let finish!: (operation: Operation) => void;
+    network.submit = vi.fn(() => new Promise<Operation>(resolve => { finish = resolve; }));
+    const app = client(network, saved.storage, undefined, undefined, () => "package-late"); await app.start();
+    const pending = app.extensionCatalogTransport()!.removePackage!(extension, new AbortController().signal);
+    await vi.waitFor(() => expect(network.submit).toHaveBeenCalledOnce());
+    const dispatched = vi.mocked(network.submit).mock.calls[0]![3];
+    app.setForeground(false); expect(dispatched?.aborted).toBe(true);
+    finish(create(OperationSchema, { operationId: "package-late", connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "resource", value: create(ManagedResourceSchema, { resourceId: "resource-1" }) } } }));
+    await expect(pending).rejects.toThrow(/owner changed|cancelled/u);
+    expect(saved.pending()).toEqual([expect.objectContaining({ operationId: "package-late", extensionResourceId: "resource-1", state: "unknown" })]);
+    expect(network.listExtensions).not.toHaveBeenCalled();
+  });
+
+  it("retires an unconfirmed OAuth dialog on background without retaining its transport", async () => {
+    const fixture = mobileSettingsOAuthFixture(), app = client(fixture.network, memoryStorage(credential).storage); await app.start();
+    let confirm!: (value: boolean) => void;
+    fixture.host.confirm.mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
+    const pending = app.extensionCatalogTransport()!.callSettings!(fixture.surface, { kind: "oauth.connect", key: "mail" }, fixture.host, new AbortController().signal);
+    await vi.waitFor(() => expect(fixture.host.confirm).toHaveBeenCalledOnce());
+    const promptSignal = fixture.host.confirm.mock.calls[0]![2];
+    app.setForeground(false);
+    expect(promptSignal.aborted).toBe(true); expect(app.extensionCatalogTransport()).toBeUndefined();
+    confirm(true); await expect(pending).rejects.toThrow();
+    expect(fixture.host.authorize).not.toHaveBeenCalled();
+    expect(fixture.oauth.cancelFlow).toHaveBeenCalledWith({ flowId: fixture.flow.flowId }, { timeoutMs: 5_000 });
+    expect(fixture.network.uploadPrivateExtensionInput).not.toHaveBeenCalled();
+  });
+
+  it("retains only a confirmed OAuth browser across background and cancels it when its saved node retires", async () => {
+    const fixture = mobileSettingsOAuthFixture(), app = client(fixture.network, memoryStorage(credential).storage); await app.start();
+    fixture.host.authorize.mockImplementationOnce((_authorization, _expiry, signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("native receiver cancelled")), { once: true });
+    }));
+    const transport = app.extensionCatalogTransport()!;
+    const pending = transport.callSettings!(fixture.surface, { kind: "oauth.connect", key: "mail" }, fixture.host, new AbortController().signal);
+    const rejected = expect(pending).rejects.toThrow(/cancelled/u);
+    await vi.waitFor(() => expect(fixture.host.authorize).toHaveBeenCalledOnce());
+    const authorizationSignal = fixture.host.authorize.mock.calls[0]![2];
+    app.setForeground(false);
+    expect(authorizationSignal.aborted).toBe(false); expect(app.extensionCatalogTransport()).toBe(transport);
+    await expect(transport.list(new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    await app.forgetConnection(credential.profileId);
+    expect(authorizationSignal.aborted).toBe(true); await rejected;
+    expect(app.extensionCatalogTransport()).toBeUndefined();
+    expect(fixture.oauth.beginCallback).not.toHaveBeenCalled();
+    expect(fixture.network.uploadPrivateExtensionInput).not.toHaveBeenCalled();
+  });
+
   it("retires a late Extension mutation result with its authenticated owner", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
@@ -4240,6 +4349,25 @@ describe("mobile Partner private authority", () => {
     expect(app.state.partnerPrivate.status).toBe("offline");
   });
 });
+
+function mobileSettingsOAuthFixture() {
+  const network = fakeNetwork();
+  const extension: MobileExtension = { ...mobileExtensionFixture(), settings: { title: "Mail settings", height: 400, mobileCustom: true } };
+  const surface: MobileExtensionMainViewSurface = { ...mobileExtensionMainViewSurface(extension), purpose: "settings", mobileSettings: true };
+  const flow = create(ExtensionOAuthFlowSchema, { flowId: "oauth-original", extensionId: extension.extensionId, slotKey: "mail",
+    phase: ExtensionAuthorizationPhase.AUTHORIZING, expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + 60) },
+    authorization: { authorizeUrl: "https://accounts.example/authorize", callbackUrl: "http://127.0.0.1:4411/callback", state: "original-state-123456" } });
+  const oauth = { start: vi.fn(async () => ({ flow })), cancelFlow: vi.fn(async () => ({})), beginCallback: vi.fn() };
+  network.getExtension = vi.fn(async () => extension);
+  network.getExtensionMainViewSurface = vi.fn(async () => surface);
+  network.extensionSettingsApi = vi.fn(() => ({}) as ReturnType<NonNullable<MobileNetwork["extensionSettingsApi"]>>);
+  network.extensionOAuthApi = vi.fn(() => oauth as unknown as ReturnType<NonNullable<MobileNetwork["extensionOAuthApi"]>>);
+  network.uploadPrivateExtensionInput = vi.fn(async () => "private-ticket");
+  const host = { confirm: vi.fn<ExtensionSettingsHost["confirm"]>(async () => true),
+    authorize: vi.fn<ExtensionSettingsHost["authorize"]>(async () => ({ state: "original-state-123456", code: "private-code" })),
+    openLibrary: vi.fn<ExtensionSettingsHost["openLibrary"]>(async () => undefined) };
+  return { network, extension, surface, flow, oauth, host };
+}
 
 function mobileExtensionFixture(): MobileExtension {
   return {
@@ -7960,6 +8088,31 @@ describe("native current-task message and Queue actions", () => {
     expect(fixture.bytes.has("image-source")).toBe(false);
   });
 
+  it("presents a send before the first durable wait and reports the actual failed attachment without changing its send time", async () => {
+    const network = projectedNetwork(attachmentSnapshot), drafts = memoryDraftStores(), fixture = attachmentFileFixture();
+    const draft = localAttachmentDraft("Original send"); let now = 2_000;
+    const write = drafts.composer.driver.setItem.bind(drafts.composer.driver);
+    let release!: () => void, writing!: () => void;
+    const reached = new Promise<void>(resolve => { writing = resolve; });
+    let held = false;
+    drafts.composer.driver.setItem = async (key, body) => {
+      if (!held) { held = true; writing(); await new Promise<void>(resolve => { release = resolve; }); }
+      return write(key, body);
+    };
+    vi.mocked(network.uploadBlob).mockImplementationOnce(async () => committedAttachment(draft.attachments[0] as MobileLocalComposerAttachment))
+      .mockRejectedValueOnce(new Error("Only the second attachment failed"));
+    const app = client(network, memoryStorage(credential).storage, undefined, () => now, ids(), undefined, drafts, fixture.files); await app.start();
+    const progress = vi.fn(), sending = app.send(draft, { onProgress: progress });
+    const rejected = expect(sending).rejects.toThrow(/second attachment/u);
+    expect(progress).toHaveBeenCalledWith(expect.objectContaining({ phase: "preparing", input: draft, sentAt: 2_000 }));
+    await reached; expect(network.uploadBlob).not.toHaveBeenCalled(); now = 9_000; release(); await rejected;
+    expect(progress.mock.calls.at(-1)?.[0]).toMatchObject({ phase: "failed", attachmentId: "file-one", sentAt: 2_000,
+      input: { attachments: [{ attachmentId: "image-one", state: "uploaded" }, { attachmentId: "file-one", state: "local" }] } });
+    expect(progress.mock.calls.every(([value]) => value.sentAt === 2_000)).toBe(true);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.attachments.map(item => item.state)).toEqual(["uploaded", "local"]);
+  });
+
   it("retains an uploaded annotation source while the task send result is unknown", async () => {
     const network = projectedNetwork(attachmentSnapshot);
     const drafts = memoryDraftStores();
@@ -10172,6 +10325,40 @@ describe("native current-task runtime controls", () => {
     expect(network.submit).not.toHaveBeenCalled();
   });
 
+  it.each(["keep", "once", "remember", "automatic", "read-failed"])("uses the current task's %s rebalance decision only on its original send", async action => {
+    const network = fakeNetwork(), drafts = memoryDraftStores(), saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    const suggestionKey = `rebalance_${"a".repeat(64)}`;
+    const suggestion = rebalanceSuggestionFixture(runtimeSession.nativeBinding!.runtimeGeneration, { suggestionKey, automatic: action === "automatic" });
+    network.getTaskProviderGroupRebalance = vi.fn(async () => { if (action === "read-failed") throw new Error("Quota unavailable"); return suggestion; });
+    const app = client(network, saved.storage, undefined, undefined, () => "rebalance-original", undefined, drafts); await app.start();
+    const confirm = vi.fn<NonNullable<import("./mobile-client").MobileTaskSendObserver["confirmRebalance"]>>(async () => action === "keep" ? "keep" : { remember: action === "remember" });
+    await expect(app.send(plainTextMobileComposerDraft("Original user input"), { operationId: "rebalance-original", confirmRebalance: confirm })).resolves.toBe(true);
+    expect(network.getTaskProviderGroupRebalance).toHaveBeenCalledWith(credential, "session", runtimeSession.nativeBinding!.runtimeGeneration, expect.any(AbortSignal));
+    const mutation = vi.mocked(network.submit).mock.calls[0]![2];
+    if (mutation.payload.case !== "sendInput") throw new Error("Expected original send operation");
+    expect(mutation.payload.value.providerGroupRebalance).toEqual(action === "keep" || action === "read-failed" ? undefined : expect.objectContaining({ suggestionKey, remember: action === "remember" }));
+    expect(confirm).toHaveBeenCalledTimes(action === "automatic" || action === "read-failed" ? 0 : 1);
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the draft and never submits after the original rebalance prompt's owner retires", async () => {
+    const network = fakeNetwork(), drafts = memoryDraftStores(), saved = memoryStorage(credential);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.getTaskProviderGroupRebalance = vi.fn(async () => rebalanceSuggestionFixture(runtimeSession.nativeBinding!.runtimeGeneration, { suggestionKey: `rebalance_${"b".repeat(64)}` }));
+    const app = client(network, saved.storage, undefined, undefined, () => "rebalance-retired", undefined, drafts); await app.start();
+    let finish!: (value: { remember: boolean }) => void;
+    const confirm = vi.fn(() => new Promise<{ remember: boolean }>(resolve => { finish = resolve; }));
+    const pending = app.send(plainTextMobileComposerDraft("Keep exact input"), { confirmRebalance: confirm });
+    const rejected = expect(pending).rejects.toThrow(/source changed/u);
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    app.setForeground(false); finish({ remember: true }); await rejected;
+    expect(network.submit).not.toHaveBeenCalled(); expect(saved.pending()).toEqual([]);
+    expect((await drafts.composer.readDurable({ profileId: credential.profileId, sessionId: "session" }))?.text).toBe("Keep exact input");
+  });
+
   const ids = () => {
     let value = 0;
     return () => `runtime-control-${++value}`;
@@ -10664,7 +10851,7 @@ describe("native composer task-link resolution", () => {
 describe("native current-task cloning", () => {
   function fixture(sideChat = false) {
     const state = {
-      session: runtimeSession,
+      session: sideChat ? create(SessionSchema, { ...runtimeSession, sideChatSourceAllowed: true }) : runtimeSession,
       backend: create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
         ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
           create(CapabilitySchema, { name: capabilityNames.sessionClone, support: CapabilitySupport.SUPPORTED }),
@@ -10707,6 +10894,23 @@ describe("native current-task cloning", () => {
     expect(saved.pending()).toEqual([]);
     expect(f.network.submit).toHaveBeenCalledOnce();
     expect((await drafts.composer.read({ profileId: credential.profileId, sessionId: "cloned-task" }))?.text).toBe("Follow up");
+  });
+
+  it.each([undefined, false])("requires a service-proven ordinary Side Chat source: %s", async allowed => {
+    const f = fixture(true);
+    f.state.session = create(SessionSchema, { ...f.state.session, sideChatSourceAllowed: allowed });
+    const app = client(f.network, memoryStorage(credential).storage, undefined, undefined, () => "must-not-dispatch", undefined, memoryDraftStores());
+    await app.start(); expect(app.taskSideChatControls()).toBeUndefined(); expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("keeps all Side Chat children reachable through their parent without promoting them to ordinary sources", async () => {
+    const f = fixture(true), children = Array.from({ length: 61 }, (_, index) => ({ ...f.child(), sessionId: `aside-${index}` }));
+    f.network.readOwner = vi.fn(async () => ({ connection, device, snapshot: create(SnapshotSchema, {
+      ...runtimeControlProjection(f.state.session, false), backends: [f.state.backend], sessions: [f.state.session, ...children]
+    }) }));
+    const app = client(f.network, memoryStorage(credential).storage);
+    await app.start(); expect(app.taskSideChatControls()?.children.map(child => child.sessionId)).toContain("aside-60");
+    expect(app.state.owner?.sessions.find(child => child.sessionId === "aside-60")?.hidden).toBe(false);
   });
 
   it("reconciles a lost side chat response without creating another child or dropping its retained draft", async () => {
@@ -12033,10 +12237,10 @@ describe("native current-task Files ownership", () => {
   });
 
   it("opens only references authored in the current question and preserves the original Workspace authority", async () => {
-    const question = create(InteractionSchema, { ...questionInteraction, request: { case: "question", value: {
+    const question = create(InteractionSchema, { ...questionInteraction, request: { case: "question", value: create(QuestionRequestSchema, {
       title: "Choose", prompt: "Read `README.md:1` and https://example.com/evidence（说明）",
       fields: [{ fieldId: "answer", label: "Answer", input: { case: "text", value: {} } }]
-    } } });
+    }) } });
     const projected = create(SnapshotSchema, { ...filesSnapshot, interactions: [question],
       workspaces: [create(WorkspaceDescriptorSchema, { ...filesSnapshot.workspaces[0]!, serverPathDisplay: "D:\\repo" })] });
     const network = fakeNetwork(); configureFiles(network, projected);
@@ -12051,9 +12255,9 @@ describe("native current-task Files ownership", () => {
   });
 
   it("rejects server-retired question references before reading their files", async () => {
-    const question = create(InteractionSchema, { ...questionInteraction, request: { case: "question", value: {
+    const question = create(InteractionSchema, { ...questionInteraction, request: { case: "question", value: create(QuestionRequestSchema, {
       title: "Choose", prompt: "Read `README.md:1`", fields: questionInteraction.request.case === "question" ? questionInteraction.request.value.fields : []
-    } } });
+    }) } });
     const projected = create(SnapshotSchema, { ...filesSnapshot, interactions: [question],
       workspaces: [create(WorkspaceDescriptorSchema, { ...filesSnapshot.workspaces[0]!, serverPathDisplay: "D:\\repo" })] });
     const network = fakeNetwork(); configureFiles(network, projected);

@@ -11,6 +11,14 @@ type MobileTaskMessageRow = readonly [
 
 const mobileTaskMessageRows = [
   ["task.outbox", "On this device", "本机待发", "此裝置待傳送", "この端末の送信待ち", "이 기기의 전송 대기"],
+  ["task.pendingPreparing", "Preparing to send", "正在准备发送", "正在準備傳送", "送信を準備中", "전송 준비 중"],
+  ["task.pendingUploading", "Uploading", "正在上传", "正在上傳", "アップロード中", "업로드 중"],
+  ["task.pendingAttachmentFailed", "Upload failed", "上传失败", "上傳失敗", "アップロードに失敗", "업로드 실패"],
+  ["task.rebalanceTitle", "Switch the account for this turn?", "为本轮切换账号？", "為此回合切換帳號？", "このターンのアカウントを切り替えますか？", "이번 차례의 계정을 전환할까요?"],
+  ["task.rebalanceBody", "{current} · {currentQuota} remaining\n→ {target} · {targetQuota} remaining", "{current} · 剩余 {currentQuota}\n→ {target} · 剩余 {targetQuota}", "{current} · 剩餘 {currentQuota}\n→ {target} · 剩餘 {targetQuota}", "{current} · 残り {currentQuota}\n→ {target} · 残り {targetQuota}", "{current} · {currentQuota} 남음\n→ {target} · {targetQuota} 남음"],
+  ["task.rebalanceKeep", "Keep current account", "保留当前账号", "保留目前帳號", "現在のアカウントを維持", "현재 계정 유지"],
+  ["task.rebalanceOnce", "Switch once", "本次切换", "僅此次切換", "今回のみ切り替え", "이번만 전환"],
+  ["task.rebalanceRemember", "Switch and remember", "切换并记住", "切換並記住", "切り替えて保存", "전환하고 기억"],
   ["task.outboxQueued", "Waiting to send", "等待发送", "等待傳送", "送信待ち", "전송 대기 중"],
   ["task.outboxFailed", "Send failed", "发送失败", "傳送失敗", "送信に失敗", "전송 실패"],
   ["task.outboxRestoring", "Returning to draft", "正在恢复草稿", "正在恢復草稿", "下書きに戻しています", "초안으로 복원 중"],

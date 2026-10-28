@@ -483,6 +483,28 @@ describe("current-v1 mobile connection storage", () => {
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
 
+  it("cold-restores package changes only with their original Resource result identity", async () => {
+    const memory = drivers(), storage = createMobileStorage(memory.plain, memory.secure);
+    const receipts = (["extension-package-adopt", "extension-package-remove"] as const).map((kind, index) => ({
+      operationId: `original-package-${index}`, connectionId: first.connectionId, kind,
+      extensionId: "extension_0123456789abcdef0123456789abcdef", extensionRevision: "7",
+      extensionResourceId: `resource-${index}`, state: "unknown" as const
+    }));
+    await storage.savePending(receipts);
+    const restarted = createMobileStorage(memory.plain, memory.secure);
+    await expect(restarted.loadPending()).resolves.toEqual(receipts);
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      ...receipts,
+      { ...receipts[0], operationId: "missing-resource", extensionResourceId: undefined },
+      { ...receipts[0], operationId: "blank-resource", extensionResourceId: " " },
+      { ...receipts[0], operationId: "control-resource", extensionResourceId: "resource\nother" },
+      { ...receipts[0], operationId: "resource-on-enabled", kind: "extension-enabled" },
+      { ...receipts[0], operationId: "target-is-not-resource", extensionResourceId: undefined, targetId: "resource-0" },
+      { ...receipts[0], operationId: "no-package-body", packageSource: "https://example.invalid/private-source" }
+    ]));
+    await expect(restarted.loadPending()).resolves.toEqual(receipts);
+  });
+
   it("cold-restores a side chat's exact source receipt without carrying input or workspace authority", async () => {
     const memory = drivers(), storage = createMobileStorage(memory.plain, memory.secure);
     const receipt = { operationId: "side-chat-original", connectionId: first.connectionId, kind: "session-side-chat" as const,

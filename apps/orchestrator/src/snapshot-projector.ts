@@ -19,6 +19,8 @@ import type {
 import { NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, nativeHistoryEventContext } from "@joko/core";
 import {
   NotFoundError,
+  readSideChatHistoryBoundary,
+  sideChatHistoryEventVisible,
   type OperationRecord,
   type OperationalSnapshot,
   type OperationalStore,
@@ -98,6 +100,7 @@ export interface SnapshotProviderCatalogEntry {
 }
 
 export interface SnapshotProjectorOptions {
+  readonly resolveSideChatSourceAllowed?: (sessionId: string) => boolean;
   /** Server identity placed in every snapshot. A factory can refresh server_time per request. */
   readonly server: ServerInfo | (() => ServerInfo);
   readonly now?: () => number;
@@ -127,6 +130,7 @@ export interface SnapshotProjectorOptions {
 }
 
 export interface SessionProjectionContextOptions {
+  readonly sideChatSourceAllowed?: boolean;
   readonly activeRun?: StoredRun;
   readonly runtimeAttached?: boolean;
   readonly resolveContextDefaults?: SnapshotProjectorOptions["resolveSessionContextDefaults"];
@@ -175,6 +179,7 @@ export function sessionProjectionContext(
   const lastUserInputAt = store.findLatestVisibleUserMessageAt(session.descriptor.id);
   const localWorkspace = readWorkerWorkspaceBinding(store, session.descriptor.id);
   return {
+    ...(options.sideChatSourceAllowed === undefined ? {} : { sideChatSourceAllowed: options.sideChatSourceAllowed }),
     ...(session.descriptor.deletedAt !== undefined ? {} : { provisionalDraftId: readProvisionalSession(store, session.descriptor.id)?.draftId }),
     ...(localWorkspace === undefined ? {} : { localWorkspace: { workspaceId: localWorkspace.workspaceId, path: localWorkspace.path } }),
     ...(options.activeRun === undefined ? {} : { activeRun: options.activeRun }),
@@ -484,11 +489,13 @@ export class SnapshotProjector {
       ]);
       const operations = scanStorePages((offset, limit) => store.listOperations({ limit, offset }))
         .filter((operation) => operationIds.has(operation.id) || operationMatches(operation, references));
+      const inheritedSideChatEntries = readSideChatHistoryBoundary(store, base.session.descriptor);
       const timeline = timelineLimit === 0
         ? []
         : activeNativeTimeline(
             this.readTimeline(store, normalized.sessionId, base.globalCursor)
-              .filter((event) => event.payload.type !== "task_tag_catalog_changed"),
+              .filter((event) => event.payload.type !== "task_tag_catalog_changed"
+                && sideChatHistoryEventVisible(base.session.descriptor, event, inheritedSideChatEntries)),
             base.session.descriptor.binding
           ).slice(-timelineLimit);
       const scope = proto<SnapshotScope>("joko.v1.SnapshotScope", {
@@ -635,6 +642,7 @@ export class SnapshotProjector {
     const sessionContexts = new Map(input.sessions.map((session) => {
       const activeRun = activeRuns.get(session.descriptor.id);
       return [session.descriptor.id, sessionProjectionContext(this.store, session, {
+        sideChatSourceAllowed: this.options.resolveSideChatSourceAllowed?.(session.descriptor.id),
         ...(activeRun === undefined ? {} : { activeRun }),
         runtimeAttached: activeRun !== undefined,
         resolveContextDefaults: this.options.resolveSessionContextDefaults,

@@ -1,9 +1,26 @@
-import { assertProviderGroupConfig, groupKey, type ProviderGroupConfig, type ProviderGroupKey, type ProviderGroupMember, type ProviderGroupSnapshot } from "@joko/store";
+import { createHash } from "node:crypto";
+import { assertProviderGroupConfig, groupKey, SessionRuntimeHandoffStore, type ProviderGroupConfig, type ProviderGroupKey, type ProviderGroupMember, type ProviderGroupSnapshot } from "@joko/store";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import { ProviderGroupRouter, type ProviderGroupAssignment, type ProviderGroupPick } from "./provider-group-router.js";
 import { decideProviderGroupFailure, describeProviderGroupFailure, providerGroupFailureSignals, PROVIDER_GROUP_SUPERSEDED_ERROR,
   ProviderGroupUnavailableError, type ProviderGroupFailureSignals } from "./provider-group-failure-policy.js";
 import type { ProviderSharingDirectoryPort, ProviderSharingRecipient } from "./provider-sharing-ports.js";
+import { providerGroupRebalanceTarget, type ProviderGroupQuota } from "./provider-group-quota.js";
+import type { ProviderGroupMemberStatus } from "./provider-group-directory.js";
+
+const REBALANCE_CHOICE_KEY = "provider.group-rebalance-choice.v1", REBALANCE_REMEMBER_KEY = "provider.group-rebalance-auto.v1", REBALANCE_BACKOFF_KEY = "provider.group-rebalance-backoff.v1";
+export interface ProviderGroupRebalanceChoice { readonly suggestionKey: string; readonly remember: boolean; }
+export interface ProviderGroupRebalanceSuggestion {
+  readonly suggestionKey: string; readonly group: ProviderGroupKey; readonly fromMemberKey: string; readonly toMemberKey: string;
+  readonly fromLabel: string; readonly toLabel: string; readonly currentQuota: ProviderGroupQuota; readonly targetQuota: ProviderGroupQuota;
+  readonly automatic: boolean; readonly generation: bigint;
+}
+interface AcceptedRebalance {
+  readonly format: 1; readonly sessionId: string; readonly queueItemId: string; readonly operationId: string; readonly at: number;
+  readonly key: string; readonly group: ProviderGroupKey; readonly groupRevision: string; readonly from: string; readonly to: string;
+  readonly sourceProfile: SessionRuntimeProfile; readonly sourceGeneration: number; readonly nativeFingerprint: string;
+  readonly phase: "accepted" | "started" | "restoring" | "settled"; readonly handoffGeneration?: number;
+}
 
 export interface ProviderGroupSession {
   readonly sessionId: string; readonly profile: SessionRuntimeProfile; readonly agentKind: string;
@@ -18,6 +35,7 @@ export interface ProviderGroupSessionPort {
    * intent alone is not a successful switch and must not commit the binding. */
   handoff(sessionId: string, profile: SessionRuntimeProfile, options: {
     readonly isCurrent: () => boolean; readonly beforeSend: boolean; readonly fresh?: boolean;
+    readonly recoverGeneration?: number; readonly onPrepared?: (generation: number) => void;
   }): Promise<"committed" | "unknown">;
   continue(sessionId: string, lease: ProviderGroupRecoveryLease, options: {
     readonly cause: string; readonly switched: boolean; readonly isCurrent: () => boolean;
@@ -46,6 +64,33 @@ export class ProviderGroupService {
   get router(): ProviderGroupRouter { return this.options.router; }
   snapshot(group: ProviderGroupKey): ProviderGroupSnapshot { return this.router.store.snapshot(group); }
   list(): readonly ProviderGroupSnapshot[] { return this.router.store.list(); }
+  async rebalanceSuggestion(sessionId: string, generation: bigint, signal: AbortSignal): Promise<ProviderGroupRebalanceSuggestion | undefined> {
+    const original = this.router.store.store.getSession(sessionId).descriptor;
+    if (BigInt(original.binding.generation) !== generation) throw new Error("The task generation changed.");
+    if (this.router.store.store.listRuns({ sessionId, activeOnly: true, limit: 1 }).length) return undefined;
+    const context = await this.#rebalanceContext(sessionId, signal);
+    if (!context || BigInt(context.sourceGeneration) !== generation) return undefined;
+    const targetKey = providerGroupRebalanceTarget(context.current.quota, context.candidates.map(candidate => ({ key: candidate.member.key, quota: candidate.quota })), this.router.now());
+    const target = context.candidates.find(candidate => candidate.member.key === targetKey); if (!target) return undefined;
+    return { suggestionKey: this.#rebalanceKey(sessionId, context.session.profile, context.snapshot, context.current.member.key, target.member.key),
+      group: context.snapshot.key, fromMemberKey: context.current.member.key, toMemberKey: target.member.key,
+      fromLabel: context.current.member.displayName, toLabel: target.member.displayName, currentQuota: context.current.quota, targetQuota: target.quota,
+      automatic: this.router.store.store.findSetting("service", sessionId, REBALANCE_REMEMBER_KEY)?.value === true, generation };
+  }
+  /** Called only inside the original send/Queue transaction, before runtime work. */
+  acceptRebalance(sessionId: string, queueItemId: string, operationId: string, choice: ProviderGroupRebalanceChoice): void {
+    if (!/^rebalance_[a-f0-9]{64}$/u.test(choice.suggestionKey) || typeof choice.remember !== "boolean") throw new Error("The quota balancing choice is invalid.");
+    const session = this.options.sessions.read(sessionId), binding = this.router.store.binding(sessionId), source = this.router.store.store.getSession(sessionId).descriptor;
+    const snapshot = binding && this.snapshot(binding.group);
+    if (!session?.eligible || session.dispatchUnknown || !binding || !snapshot?.config) throw new Error("The original quota balancing source is unavailable.");
+    const target = snapshot.config.members.find(member => this.#matchesRebalanceKey(choice.suggestionKey, sessionId, session.profile, snapshot, binding.memberKey, member.key));
+    if (!target || target.key === binding.memberKey) throw new Error("The original quota balancing proposal expired or changed.");
+    const record: AcceptedRebalance = { format: 1, sessionId, queueItemId, operationId, at: this.router.now(), key: choice.suggestionKey,
+      group: binding.group, groupRevision: snapshot.revision.toString(), from: binding.memberKey, to: target.key, sourceProfile: session.profile,
+      sourceGeneration: source.binding.generation, nativeFingerprint: fingerprint(source.binding.opaqueRef), phase: "accepted" };
+    this.router.store.store.setSetting("service", queueItemId, REBALANCE_CHOICE_KEY, record);
+    if (choice.remember) this.router.store.store.setSetting("service", sessionId, REBALANCE_REMEMBER_KEY, true);
+  }
   async reconcileSharing(signal: AbortSignal): Promise<void> {
     const groups = new Map([...this.router.store.pendingCleanup(), ...this.router.store.list()].map(group => [groupKey(group), group]));
     for (const group of groups.values()) await this.#syncReshares(group, [], group.config?.members ?? [], signal);
@@ -95,10 +140,14 @@ export class ProviderGroupService {
     return this.router.pick({ sessionId, group, profile, agentKind: session.agentKind, modelId: profile.modelId, ownTask: true,
       ...(session.logicalModelId === undefined ? {} : { logicalModelId: session.logicalModelId }), fresh: true }, this.#signal(signal));
   }
-  beforeSend(sessionId: string, signal: AbortSignal): Promise<void> {
+  beforeSend(sessionId: string, signal: AbortSignal, queueItemId?: string): Promise<void> {
     return this.#serialize(sessionId, async () => {
       const session = this.options.sessions.read(sessionId); if (!session?.eligible) return;
       if (session.dispatchUnknown) throw unknownEffect();
+      const priorChoice = queueItemId === undefined ? undefined : this.router.store.store.findSetting<AcceptedRebalance>("service", queueItemId, REBALANCE_CHOICE_KEY)?.value;
+      if (queueItemId && (priorChoice?.phase === "started" || priorChoice?.phase === "restoring")) {
+        await this.#rebalanceBeforeSend(sessionId, queueItemId, this.#signal(signal)); return;
+      }
       const existing = this.router.store.binding(sessionId);
       if (existing) await this.router.prepare(existing.group, this.#signal(signal));
       const binding = this.router.store.binding(sessionId);
@@ -114,7 +163,9 @@ export class ProviderGroupService {
       const request = this.#request(session, true), status = await this.router.readMember(binding.group, member, request, this.#signal(signal));
       const cooling = this.router.store.cooling(binding.group, this.router.now()).some(row => row.memberKey === member.key && (row.modelId === undefined || row.modelId === status.model?.modelId));
       if (status.available && !cooling) {
-        status.assertCurrent(); return;
+        status.assertCurrent();
+        if (queueItemId) await this.#rebalanceBeforeSend(sessionId, queueItemId, this.#signal(signal));
+        return;
       }
       if (!group.config.autoSwitch) throw new ProviderGroupUnavailableError();
       const current = this.#current(sessionId);
@@ -122,6 +173,119 @@ export class ProviderGroupService {
       this.router.markTried(sessionId, member.key);
       await this.#switchCandidates(session, binding.group, current, true, this.#signal(signal));
     });
+  }
+  #rebalanceKey(sessionId: string, profile: SessionRuntimeProfile, snapshot: ProviderGroupSnapshot, from: string, to: string, bucket = Math.floor(this.router.now() / (5 * 60_000))): string {
+    const source = this.router.store.store.getSession(sessionId).descriptor;
+    return "rebalance_" + createHash("sha256").update(JSON.stringify([1, sessionId, source.targetId, source.binding.generation,
+      fingerprint(source.binding.opaqueRef), [profile.backendId, profile.providerId, profile.modelId, profile.effort ?? null, profile.fastMode], groupKey(snapshot.key), snapshot.revision.toString(), from, to, bucket])).digest("hex");
+  }
+  #matchesRebalanceKey(key: string, sessionId: string, profile: SessionRuntimeProfile, snapshot: ProviderGroupSnapshot, from: string, to: string): boolean {
+    const bucket = Math.floor(this.router.now() / (5 * 60_000));
+    return [bucket, bucket - 1].some(value => this.#rebalanceKey(sessionId, profile, snapshot, from, to, value) === key);
+  }
+  async #rebalanceContext(sessionId: string, signal: AbortSignal) {
+    const session = this.options.sessions.read(sessionId), binding = this.router.store.binding(sessionId), native = new SessionRuntimeHandoffStore(this.router.store.store);
+    if (!session?.eligible || session.dispatchUnknown || !binding || native.read(sessionId)?.pending) return undefined;
+    const originalSource = this.router.store.store.getSession(sessionId).descriptor, originalFingerprint = fingerprint(originalSource.binding.opaqueRef);
+    await this.router.prepare(binding.group, signal);
+    const snapshot = this.snapshot(binding.group), member = snapshot.config?.members.find(member => member.key === binding.memberKey); if (!snapshot.config || !member) return undefined;
+    const request = this.#request(session, true);
+    const statuses = await Promise.all(snapshot.config.members.map(candidate => this.router.readMember(binding.group, candidate, request, signal)));
+    signal.throwIfAborted(); const actualSession = this.options.sessions.read(sessionId), actual = this.router.store.store.getSession(sessionId).descriptor;
+    if (!actualSession?.eligible || actualSession.dispatchUnknown || !sameRoute(session.profile, actualSession.profile)
+      || actual.binding.generation !== originalSource.binding.generation || fingerprint(actual.binding.opaqueRef) !== originalFingerprint
+      || this.snapshot(binding.group).revision !== snapshot.revision || this.router.store.binding(sessionId)?.memberKey !== member.key) return undefined;
+    const cooling = this.router.store.cooling(binding.group, this.router.now());
+    const supports = (status: ProviderGroupMemberStatus) => status.available && status.model
+      && (session.profile.effort === undefined || status.model.thinkingLevels.includes(session.profile.effort))
+      && (session.profile.fastMode === false || (session.profile.fastMode === "ultrafast" ? status.model.supportsUltrafastMode : status.model.supportsFastMode))
+      && !cooling.some(row => row.memberKey === status.member.key && (row.modelId === undefined || row.modelId === status.model?.modelId));
+    const current = statuses.find(status => status.member.key === member.key);
+    if (!current || !supports(current)) return undefined; current.assertCurrent();
+    const candidates = statuses.filter(status => status.member.nodeId !== member.nodeId && supports(status)
+      && !status.member.paused && this.router.leases.count(status.member.key, status.running) < status.member.capacity
+      && !this.#rebalanceBackoff(binding.group, status.member.key));
+    for (const candidate of candidates) candidate.assertCurrent();
+    return { session, snapshot, current, candidates, sourceGeneration: actual.binding.generation };
+  }
+  #rebalanceBackoff(group: ProviderGroupKey, memberKey: string): boolean {
+    const id = JSON.stringify([this.router.store.ownerKey, groupKey(group), memberKey]);
+    const value = this.router.store.store.findSetting<{ readonly until: number }>("service", id, REBALANCE_BACKOFF_KEY)?.value;
+    if (value && Number.isFinite(value.until) && value.until > this.router.now()) return true;
+    return false;
+  }
+  async #rebalanceBeforeSend(sessionId: string, queueItemId: string, signal: AbortSignal): Promise<void> {
+    const store = this.router.store.store, setting = store.findSetting<AcceptedRebalance>("service", queueItemId, REBALANCE_CHOICE_KEY);
+    if (!setting) return;
+    let record = setting.value;
+    if (!record || record.format !== 1 || record.sessionId !== sessionId || record.queueItemId !== queueItemId || !["accepted", "started", "restoring", "settled"].includes(record.phase)
+      || record.operationId !== store.getQueueItem(queueItemId).operationId || !/^rebalance_[a-f0-9]{64}$/u.test(record.key)) throw unknownEffect();
+    if (record.phase === "settled") return;
+    const save = (patch: Partial<AcceptedRebalance>) => { record = { ...record, ...patch }; store.setSetting("service", queueItemId, REBALANCE_CHOICE_KEY, record); };
+    const sessionCurrent = this.#current(sessionId);
+    const current = () => {
+      sessionCurrent(); signal.throwIfAborted();
+      const item = store.getQueueItem(queueItemId), operation = store.getOperation(record.operationId);
+      if (item.sessionId !== sessionId || item.state !== "accepted" || item.operationId !== record.operationId || operation.status !== "completed"
+        || store.getQueueControl(sessionId).paused) throw new Error(PROVIDER_GROUP_SUPERSEDED_ERROR);
+    }; current();
+    const settled = () => save({ phase: "settled" });
+    const backoff = () => store.setSetting("service", JSON.stringify([this.router.store.ownerKey, groupKey(record.group), record.to]), REBALANCE_BACKOFF_KEY, { format: 1, until: this.router.now() + 30 * 60_000 });
+    if (record.phase === "restoring") {
+      const result = await this.options.sessions.handoff(sessionId, record.sourceProfile, { beforeSend: true, isCurrent: () => isCurrent(current),
+        recoverGeneration: record.handoffGeneration, onPrepared: generation => save({ handoffGeneration: generation }) });
+      if (result !== "committed") throw unknownEffect(); settled(); return;
+    }
+    const recovering = record.phase === "started";
+    if (!recovering) {
+      if (this.router.now() - record.at > 5 * 60_000) { settled(); return; }
+      const context = await this.#rebalanceContext(sessionId, signal); current();
+      const target = context?.candidates.find(candidate => candidate.member.key === record.to);
+      const source = store.getSession(sessionId).descriptor;
+      if (!context || !target || context.snapshot.revision.toString() !== record.groupRevision || context.current.member.key !== record.from
+        || source.binding.generation !== record.sourceGeneration || fingerprint(source.binding.opaqueRef) !== record.nativeFingerprint || !sameRoute(record.sourceProfile, context.session.profile)
+        || !this.#matchesRebalanceKey(record.key, sessionId, context.session.profile, context.snapshot, record.from, record.to)
+        || providerGroupRebalanceTarget(context.current.quota, [{ key: record.to, quota: target.quota }], this.router.now()) !== record.to) { settled(); return; }
+    }
+    const session = this.options.sessions.read(sessionId); if (!session?.eligible || session.dispatchUnknown) throw unknownEffect();
+    const snapshot = this.snapshot(record.group); if (!snapshot.config || snapshot.revision.toString() !== record.groupRevision) { if (recovering) throw unknownEffect(); settled(); return; }
+    let assignment: ProviderGroupAssignment;
+    try {
+      assignment = await this.router.pick({ ...session, group: record.group, modelId: session.profile.modelId, ownTask: true, fresh: true,
+        exclude: new Set(snapshot.config.members.filter(member => member.key !== record.to).map(member => member.key)),
+        ...(!recovering ? { quotaRebalanceFrom: record.from } : {}) }, signal);
+    } catch (error) {
+      if (recovering || providerGroupFailureSignals(error).stateMayHaveChanged) throw error;
+      current(); backoff(); settled(); return;
+    }
+    try {
+      current(); assignment.assertCurrent();
+      if (assignment.member.key !== record.to) throw new ProviderGroupUnavailableError();
+      if (recovering && record.handoffGeneration === undefined) {
+        const pending = new SessionRuntimeHandoffStore(store).read(sessionId)?.pending, source = store.getSession(sessionId).descriptor;
+        if (!pending && source.binding.generation === record.sourceGeneration && fingerprint(source.binding.opaqueRef) === record.nativeFingerprint) { backoff(); settled(); return; }
+        if (!pending || pending.phase !== "pending" || !sameRoute(pending.profile, assignment.profile)
+          || source.binding.generation !== record.sourceGeneration || fingerprint(source.binding.opaqueRef) !== record.nativeFingerprint) throw unknownEffect();
+        save({ handoffGeneration: pending.generation });
+      }
+      this.options.sessions.status(sessionId, "switching"); save({ phase: "started" });
+      const result = await this.options.sessions.handoff(sessionId, assignment.profile, { beforeSend: true, fresh: true, isCurrent: () => isCurrent(current) && isCurrent(assignment.assertCurrent),
+        ...(recovering ? { recoverGeneration: record.handoffGeneration } : {}), onPrepared: generation => save({ handoffGeneration: generation }) });
+      current();
+      if (result !== "committed") {
+        const pending = new SessionRuntimeHandoffStore(store).read(sessionId)?.pending;
+        if (!pending || !["pending", "closed"].includes(pending.phase) || pending.generation !== record.handoffGeneration) throw unknownEffect();
+        // No uncertain native effect is discarded. A confirmed close/create
+        // failure restores the original native route through the same journal.
+        backoff(); save({ phase: "restoring", handoffGeneration: undefined });
+        const restored = await this.options.sessions.handoff(sessionId, record.sourceProfile, { beforeSend: true, isCurrent: () => isCurrent(current), onPrepared: generation => save({ handoffGeneration: generation }) });
+        if (restored !== "committed") throw unknownEffect(); settled(); return;
+      }
+      assignment.assertCurrent(); assignment.commit(); settled();
+    } catch (error) {
+      if (record.phase === "started" || record.phase === "restoring" || providerGroupFailureSignals(error).stateMayHaveChanged) throw error;
+      backoff(); settled();
+    } finally { assignment.release(); if (isCurrent(current)) this.options.sessions.status(sessionId, "idle"); }
   }
   mayHandleTurnError(sessionId: string, signals: ProviderGroupFailureSignals): boolean {
     const session = this.options.sessions.read(sessionId), binding = this.router.store.binding(sessionId);
@@ -249,6 +413,7 @@ export class ProviderGroupService {
     for (const intent of cleanup) this.router.store.acknowledgeCleanup(group, intent.id);
   }
 }
+function fingerprint(reference: string): string { return createHash("sha256").update(reference).digest("hex"); }
 function isCurrent(assertCurrent: () => void): boolean { try { assertCurrent(); return true; } catch { return false; } }
 function sameRoute(a: SessionRuntimeProfile, b: SessionRuntimeProfile): boolean { return a.backendId === b.backendId && a.providerId === b.providerId && a.modelId === b.modelId && a.effort === b.effort && a.fastMode === b.fastMode; }
 function unknownEffect(): Error & { stateMayHaveChanged: boolean } { return Object.assign(new Error("The native handoff effect needs inspection before continuing."), { stateMayHaveChanged: true }); }

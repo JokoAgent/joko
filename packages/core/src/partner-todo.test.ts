@@ -194,7 +194,7 @@ describe('Partner affairs contract', () => {
     ).toEqual(['suppressed', 'suppressed', 'outside-scope']);
     s.cursors.mail = 2;
     expect(
-      preflightTodoEvents(s, [{ source: 'mail', sequence: 2, key: 'another' }], [])[0].decision,
+      preflightTodoEvents(s, [{ source: 'mail', sequence: 2, key: 'another' }], [])[0]?.decision,
     ).toBe('duplicate');
     expect(t.decision?.kind).toBe('muted');
   });
@@ -356,7 +356,7 @@ it('orders exact instants and source-local date ends, retaining creation/ID tie 
     'next-local-date',
     'date-utc',
   ]);
-  expect(queryTodoItems(s.items, { order: 'created' }).items[0].id).toBe('late');
+  expect(queryTodoItems(s.items, { order: 'created' }).items[0]?.id).toBe('late');
   const compare = createTodoDueComparator();
   const dst = add('dst-date', {
     kind: 'date',
@@ -423,7 +423,7 @@ it('normalizes problem keys before lookup and preflight rather than creating dup
   expect(() => applyTodoPatch(s, { ...patch, key: ' quote:1 ' }, 'two', now)).toThrow('CONFLICT');
   const ignored = applyTodoPatch(s, { id: t.id, expectedRevision: 1, operation: 'mute' }, '', now);
   expect(
-    preflightTodoEvents(s, [{ source: 'mail', sequence: 1, key: ' quote:1 ' }], [])[0].decision,
+    preflightTodoEvents(s, [{ source: 'mail', sequence: 1, key: ' quote:1 ' }], [])[0]?.decision,
   ).toBe('suppressed');
   expect(s.items).toHaveLength(1);
   expect(ignored.key).toBe('quote:1');
@@ -452,7 +452,7 @@ it('returns the next deferral boundary even outside a page and makes expired ent
   expect(queryTodoItems(state.items, {}, after).total).toBe(35);
   expect(queryTodoItems(state.items, { view: 'hidden' }, after).total).toBe(1);
   expect(queryTodoItems(state.items, {}, after).nextDeferredAt).toBe('2026-10-10T12:03:00Z');
-  expect(effectiveTodoDeadline(later)).toEqual(effectiveTodoDeadline(state.items[0]));
+  expect(effectiveTodoDeadline(later)).toEqual(effectiveTodoDeadline(state.items[0]!));
 });
 
 it('refreshes once at a long deferral boundary and cancels without polling or executing', async () => {

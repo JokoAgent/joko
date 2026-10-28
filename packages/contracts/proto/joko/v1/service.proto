@@ -492,6 +492,9 @@ service ExtensionService {
   rpc GetExtensionSettingsRoutingData(GetExtensionSettingsRoutingDataRequest) returns (GetExtensionSettingsRoutingDataResponse);
   rpc BeginExtensionSecretCheck(BeginExtensionSecretCheckRequest) returns (BeginExtensionSecretCheckResponse);
   rpc CheckExtensionSecret(CheckExtensionSecretRequest) returns (CheckExtensionSecretResponse);
+  rpc OpenExtensionDirectoryPicker(OpenExtensionDirectoryPickerRequest) returns (OpenExtensionDirectoryPickerResponse);
+  rpc BrowseExtensionDirectoryPicker(BrowseExtensionDirectoryPickerRequest) returns (BrowseExtensionDirectoryPickerResponse);
+  rpc CloseExtensionDirectoryPicker(CloseExtensionDirectoryPickerRequest) returns (CloseExtensionDirectoryPickerResponse);
   rpc GetExtensionMainViewSurface(GetExtensionMainViewSurfaceRequest) returns (GetExtensionMainViewSurfaceResponse);
   rpc CloseExtensionMainView(CloseExtensionMainViewRequest) returns (CloseExtensionMainViewResponse);
   rpc GetExtensionLibraryOverview(GetExtensionLibraryOverviewRequest) returns (GetExtensionLibraryOverviewResponse);
@@ -2638,6 +2641,29 @@ message CheckExtensionSecretRequest {
 message CheckExtensionSecretResponse {
   bool valid = 1;
   optional google.protobuf.Timestamp expires_at = 2;
+}
+
+message OpenExtensionDirectoryPickerRequest {
+  string surface_id = 1;
+}
+message OpenExtensionDirectoryPickerResponse {
+  ExtensionDirectoryPickerPage page = 1;
+}
+message BrowseExtensionDirectoryPickerRequest {
+  string picker_id = 1;
+  string entry_id = 2;
+  string page_token = 3;
+  // Only the trusted settings host presents this input, never author HTML.
+  optional string directory_path = 4;
+}
+message BrowseExtensionDirectoryPickerResponse {
+  ExtensionDirectoryPickerPage page = 1;
+}
+message CloseExtensionDirectoryPickerRequest {
+  string picker_id = 1;
+}
+message CloseExtensionDirectoryPickerResponse {
+  bool closed = 1;
 }
 
 message GetExtensionMainViewSurfaceRequest {

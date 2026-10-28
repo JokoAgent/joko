@@ -157,6 +157,8 @@ function fakeApi(): FeishuApiPort {
       occurredAt: NOW - 1_000
     }]),
     sendText: vi.fn(async () => "om_text"),
+    sendRichReply: vi.fn(async () => 'om_rich'),
+    recallMessage: vi.fn(async () => undefined),
     sendAttachment: vi.fn(async () => "om_attachment"),
     sendCard: vi.fn(async () => "om_card"),
     patchCard: vi.fn(async () => undefined),

@@ -4,6 +4,7 @@ import { ProviderGroupDirectory, type ProviderGroupDirectoryRequest, type Provid
 import { ProviderGroupLeases } from "./provider-group-leases.js";
 import { selectProviderGroupMember } from "./provider-group-scheduler.js";
 import { ProviderGroupUnavailableError, type ProviderGroupFailureDecision, type ProviderGroupFailureSignals } from "./provider-group-failure-policy.js";
+import { providerGroupRebalanceTarget } from "./provider-group-quota.js";
 
 export interface ProviderGroupAssignment {
   readonly group: ProviderGroupKey; readonly snapshot: ProviderGroupSnapshot; readonly member: ProviderGroupMember;
@@ -19,6 +20,7 @@ export interface ProviderGroupRemoteRouterPort {
   cool(group: ProviderGroupKey, member: ProviderGroupMember, modelId: string, signals: ProviderGroupFailureSignals, decision: ProviderGroupFailureDecision): void;
 }
 export interface ProviderGroupPick extends ProviderGroupDirectoryRequest {
+  readonly quotaRebalanceFrom?: string;
   readonly sessionId: string; readonly group: ProviderGroupKey; readonly profile: SessionRuntimeProfile;
   readonly exclude?: ReadonlySet<string>;
 }
@@ -55,6 +57,7 @@ export class ProviderGroupRouter {
       const effortSupported = input.profile.effort === undefined || status?.model?.thinkingLevels.includes(input.profile.effort) === true;
       return { id: member.key, available: status?.available === true && speedSupported && effortSupported && !cooling.some(row => row.memberKey === member.key && (row.modelId === undefined || row.modelId === status?.model?.modelId)),
         paused: member.paused && !(member.kind === "local" && input.ownTask), running: this.leases.count(member.key, status?.running), capacity: member.capacity, weight: member.weight,
+        ...(status?.quota.urgency === undefined ? {} : { urgency: status.quota.urgency }), fiveHourTight: status?.quota.fiveHourTight === true,
         ...(status?.quota.usagePercent === undefined ? {} : { usagePercent: status.quota.usagePercent }),
         ...(status?.quota.weeklyResetAt === undefined ? {} : { weeklyResetAt: status.quota.weeklyResetAt }),
         ...(status?.quota.fiveHourResetAt === undefined ? {} : { fiveHourResetAt: status.quota.fiveHourResetAt }) };
@@ -64,6 +67,11 @@ export class ProviderGroupRouter {
     const selected = selectProviderGroupMember(candidates, snapshot.config.strategy, { now: this.now(), random: this.random, exclude: excluded,
       ...(this.#lastPicked.has(groupKey(input.group)) ? { lastPicked: this.#lastPicked.get(groupKey(input.group))! } : {}) });
     const status = members.find(member => member.member.key === selected); if (!status?.model || !status.available) throw new ProviderGroupUnavailableError();
+    if (input.quotaRebalanceFrom !== undefined) {
+      const from = members.find(candidate => candidate.member.key === input.quotaRebalanceFrom), member = status.member;
+      if (!from?.available || from.member.nodeId === member.nodeId || member.paused || this.leases.count(member.key, status.running) >= member.capacity
+        || status.quota.fiveHourTight || providerGroupRebalanceTarget(from.quota, [{ key: member.key, quota: status.quota }], this.now()) !== member.key) throw new ProviderGroupUnavailableError();
+    }
     status.assertCurrent(); const member = status.member;
     const reservation = this.leases.reserve({ sessionId: input.sessionId, memberKey: member.key, backendId: member.backendId, providerId: member.providerId });
     this.#lastPicked.set(groupKey(input.group), member.key);

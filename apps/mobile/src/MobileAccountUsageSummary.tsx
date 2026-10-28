@@ -3,6 +3,7 @@ import type { ProviderAccountUsageSnapshot } from "@joko/contracts";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileAccountUsageStale, mobileAccountUsageWindows, mobileUsageTimestamp } from "./mobile-account-usage";
 import { mobileAccountUsageCopy } from "./mobile-account-usage-messages";
+import { MobileModelQuotaBar } from "./MobileModelQuotaBar";
 
 export function mobileModelAccountQuotaLabel(snapshot: ProviderAccountUsageSnapshot | undefined, modelId: string, now: number, locale: MobileSupportedLocale, failed = false): string | undefined {
   if (!snapshot) return undefined;
@@ -46,6 +47,7 @@ export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loa
       <Text style={[styles.value, { color: row.remainingPercent === 0 ? colors.negative ?? colors.ink : colors.ink }]}>
         {copy.remaining.replace("{percent}", number.format(row.remainingPercent))}
       </Text>
+      <MobileModelQuotaBar remaining={row.remainingPercent} label={copy.remaining.replace("{percent}", number.format(row.remainingPercent))} colors={colors} />
       {row.resetAt !== undefined && <Text style={[styles.note, { color: colors.muted }]}>{copy.reset.replace("{time}", time(row.resetAt))}</Text>}
     </View>)}
     {snapshot?.limitReached === true && <Text style={[styles.note, { color: colors.negative ?? colors.ink }]}>{copy.exhausted}</Text>}

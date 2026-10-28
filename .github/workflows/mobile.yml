@@ -170,6 +170,9 @@ jobs:
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
 
+      - name: Confirm the phone OAuth receiver in the actual Android autolinking graph
+        run: node apps/mobile/scripts/assert-plugin-oauth-autolinking.mjs android
+
       - name: Prepare the fixture's Workspace file index
         run: |
           sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update
@@ -378,7 +381,9 @@ jobs:
         run: node apps/mobile/scripts/test-remote-desktop-native.mjs
 
       - name: Check the exact phone OAuth callback receiver and cancellation
-        run: node apps/mobile/scripts/test-plugin-oauth-native.mjs
+        run: |
+          node apps/mobile/scripts/assert-plugin-oauth-autolinking.mjs apple
+          node apps/mobile/scripts/test-plugin-oauth-native.mjs
 
       - name: Check the selected native CONNECT engine
         if: inputs.sdk_runtime == 'http-connect-native'

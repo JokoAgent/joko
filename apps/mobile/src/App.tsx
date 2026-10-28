@@ -189,12 +189,15 @@ import {
   appendMobileOptimisticUserRow,
   markMobileOptimisticUserRowSubmitted,
   mobileOptimisticActiveOperationIds,
-  mobileQueueBlocksOptimisticUserRow,
   projectMobileOptimisticUserRows,
   reconcileMobileOptimisticUserRows,
   retireMobileOptimisticUserRow,
+  updateMobileOptimisticUserRow,
   type MobileOptimisticUserRow
 } from "./mobile-optimistic-user-row";
+import { projectMobilePendingOutboxRows, type MobilePendingSendProgress } from "./mobile-pending-send";
+import { MobilePendingSendBubble } from "./MobilePendingSendBubble";
+import { confirmMobileProviderRebalance } from "./mobile-provider-rebalance-confirmation";
 import type { MobileTimelineArtifact } from "./mobile-timeline-artifacts";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
@@ -3376,6 +3379,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
         }} />
     </View>
     {ownerReady && targetAvailable && client.newTaskModels && <MobileNewTaskModelSelector models={client.newTaskModels(draft.targetId)}
+      providerUsageTransport={client.newTaskProviderUsageTransport?.(draft.targetId)}
       value={client.newTaskModelSelection(draft.targetId)} favorites={state.owner?.settings?.modelFavorites}
       colors={colors} locale={locale} disabled={state.busy || attachmentBusy || voice.busy || retained !== undefined || pendingCreate}
       onSelect={async selection => {
@@ -3650,6 +3654,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const partnerIdentity = useMobilePartnerIdentity(partnerConversationTransport);
   const partnerGlanceApi = useMemo(() => partnerConversationTransport ? client.partnerAutonomyApi?.(partnerConversationTransport.ownerKey) : undefined,
     [client, partnerConversationTransport?.ownerKey, state.status]);
+  const partnerGlanceHomeApi = useMemo(() => partnerConversationTransport ? client.partnerHomeApi() : undefined, [client, partnerConversationTransport?.ownerKey, state.status]);
   const [visiblePartnerRows, setVisiblePartnerRows] = useState<{
     readonly ownerKey?: string; readonly ids: ReadonlySet<string>;
   }>({ ids: new Set() });
@@ -3834,7 +3839,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ? latestObservedRows
     : timelineRows([...state.window, ...taskTimelineEvents.filter(event => event.payload?.kind.case === "runChanged")], false, state.detail?.runs),
   [latestObservedRows, state.detail?.runs, state.window, taskTimelineEvents]);
-  const optimisticOwnerKey = state.status === "connected" ? client.taskPresentationOwnerKey() : undefined;
+  const localOutbox = client.taskOutboxItems?.() ?? [];
+  const optimisticOwnerKey = state.status === "connected" || state.status === "offline" ? client.taskPresentationOwnerKey(state.status === "offline") : undefined;
   const ownerOptimisticRows = useMemo(() => state.status === "connecting"
     ? optimisticUserRows
     : optimisticOwnerKey === undefined
@@ -3845,12 +3851,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ? observedRows
     : optimisticOwnerKey === undefined && state.status !== "connecting"
       ? observedRows
-    : projectMobileOptimisticUserRows(
+    : projectMobilePendingOutboxRows(projectMobileOptimisticUserRows(
         observedRows,
         ownerOptimisticRows,
         optimisticOwnerKey ?? ownerOptimisticRows[0]?.ownerKey ?? "",
         state.selectedId ?? ""
-      ), [observedRows, optimisticOwnerKey, ownerOptimisticRows, state.selectedId, state.status, state.window]);
+      ), localOutbox, state.status === "connected"), [localOutbox, observedRows, optimisticOwnerKey, ownerOptimisticRows, state.selectedId, state.status, state.window]);
   const rows = useMemo(() => {
     const rawRows = mobilePublicConversationInputs(messageRows, partnerIdentity.partner?.partnerId).flatMap((row) => {
       const attached = delegatedAffinity.byEventId.get(row.eventId);
@@ -3989,7 +3995,6 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   }, [messageFocusIndex, messageFocusKey]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
-  const localOutbox = client.taskOutboxItems?.() ?? [];
   const composerAvailable = state.status === "connected" || client.canQueueTaskInput?.() === true;
   const advertisedQueueCapabilities = client.taskQueueCapabilities();
   const queueCapabilities = workerReadOnly ? { ...advertisedQueueCapabilities, edit: false, cancel: false, reorder: false } : advertisedQueueCapabilities;
@@ -5946,7 +5951,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     setLocalError("");
     const active = queueEditRef.current;
     let appCommandStarted = false;
-    let optimisticLease: { readonly sessionId: string; readonly operationId: string } | undefined;
+    let optimisticLease: { readonly sessionId: string; readonly operationId: string; readonly ownerKey: string; progress: MobilePendingSendProgress } | undefined;
     const retireOptimisticLease = (): void => {
       const lease = optimisticLease;
       if (!lease) return;
@@ -6007,40 +6012,51 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           return;
         }
         const operationId = randomUUID();
+        const rebalanceSource = client.taskHeaderSourceKey();
         const accepted = await client.send(sourceDraft, {
           operationId,
           deliveryMode,
-          onDispatch: (dispatchDraft) => {
+          confirmRebalance: (suggestion, signal) => confirmMobileProviderRebalance(suggestion, { signal, locale,
+            current: () => taskMountedRef.current && !!rebalanceSource && client.taskHeaderSourceKey() === rebalanceSource
+              && composerDraftRef.current === sourceDraft && identity !== undefined && draftIdentityRef.current !== undefined
+              && mobileComposerDraftIdentityKey(draftIdentityRef.current) === mobileComposerDraftIdentityKey(identity),
+            subscribe: listener => client.subscribe(() => listener()) }),
+          onProgress: (progress) => {
             const current = client.state;
-            if (!taskMountedRef.current || !identity || current.status !== "connected"
+            if (!taskMountedRef.current || !identity || current.status !== "connected" && current.status !== "offline"
               || client.taskDraftProfileId() !== identity.profileId || current.selectedId !== identity.sessionId
-              || current.window !== undefined
-              || current.pending.some((item) => item.kind === "send" && item.sessionId === identity.sessionId)) return;
-            const currentSession = current.detail?.sessions.find((item) => item.sessionId === identity.sessionId)
-              || current.owner?.sessions.find((item) => item.sessionId === identity.sessionId);
-            const ownerKey = client.taskPresentationOwnerKey();
+              || current.window !== undefined) return;
+            const ownerKey = client.taskPresentationOwnerKey(current.status === "offline");
             if (!ownerKey) return;
+            if (optimisticLease) {
+              if (optimisticLease.ownerKey !== ownerKey) return;
+              optimisticLease.progress = progress;
+              setOptimisticUserRows(rows => updateMobileOptimisticUserRow(rows, ownerKey, identity.sessionId, operationId, progress));
+              return;
+            }
             const currentObservedRows = timelineRows(
               current.window ?? [...current.older, ...(current.detail?.timeline ?? []), ...current.live]
             );
-            const busy = currentSession?.state !== SessionState.IDLE
-              || mobileQueueBlocksOptimisticUserRow(current.detail?.queueItems ?? [], identity.sessionId)
-              || client.taskInteractions().length > 0
-              || currentObservedRows.some((row) => row.kind === "assistant" && !row.completed);
-            if (busy) return;
-            optimisticLease = { sessionId: identity.sessionId, operationId };
+            optimisticLease = { sessionId: identity.sessionId, operationId, ownerKey, progress };
             setOptimisticUserRows((currentRows) => appendMobileOptimisticUserRow(
-              currentRows,
+              currentRows.filter(row => row.row.pendingSend?.phase !== "failed"),
               currentObservedRows,
               ownerKey,
               identity.sessionId,
               operationId,
-              dispatchDraft
+              progress.input,
+              progress
             ));
           }
         });
         if (!accepted) {
-          retireOptimisticLease();
+          if (optimisticLease && identity && client.state.activeProfileId === identity.profileId && client.state.selectedId === identity.sessionId) {
+            const lease = optimisticLease;
+            const unknown = client.state.pending.some(item => item.operationId === operationId && item.state === "unknown");
+            const progress: MobilePendingSendProgress = { ...lease.progress, phase: unknown ? "unknown" : "failed" };
+            setOptimisticUserRows(rows => updateMobileOptimisticUserRow(rows, lease.ownerKey, lease.sessionId, operationId, progress));
+            optimisticLease = undefined;
+          } else retireOptimisticLease();
           if (identity && draftIdentityRef.current
             && mobileComposerDraftIdentityKey(draftIdentityRef.current) === mobileComposerDraftIdentityKey(identity)) {
             const retainedDraft = mobileComposerDrafts.readSync(identity);
@@ -6051,7 +6067,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (optimisticLease) {
           const lease = optimisticLease;
           setOptimisticUserRows((current) => markMobileOptimisticUserRowSubmitted(
-            current,
+            updateMobileOptimisticUserRow(current, lease.ownerKey, lease.sessionId, operationId,
+              { ...lease.progress, phase: "queued" }),
             lease.sessionId,
             lease.operationId
           ));
@@ -6077,7 +6094,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       setDraft(active.stashedDraft);
       setComposerSelection({ start: active.stashedDraft.text.length, end: active.stashedDraft.text.length });
     } catch (error) {
-      retireOptimisticLease();
+      const failed = optimisticLease;
+      if (failed && taskMountedRef.current && client.taskPresentationOwnerKey(client.state.status === "offline") === failed.ownerKey) {
+        setOptimisticUserRows(rows => updateMobileOptimisticUserRow(rows, failed.ownerKey, failed.sessionId, failed.operationId,
+          { ...failed.progress, phase: "failed", error: errorText(error).slice(0, 4_096) }));
+        optimisticLease = undefined;
+      } else retireOptimisticLease();
       if (taskMountedRef.current) {
         const identity = draftIdentityRef.current;
         if (identity && !queueEditRef.current) {
@@ -6220,6 +6242,26 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       enabled={state.status === "connected" || state.status === "offline"} colors={colors} locale={locale}>
       {item.children.map((child) => <Fragment key={child.id}>{renderTimelineItem(child, true)}</Fragment>)}
     </MobileWorkGroupCard>;
+    if (item.pendingSend && state.activeProfileId) {
+      const record = item.pendingSend.outboxId ? localOutbox.find(record => record.id === item.pendingSend!.outboxId) : undefined;
+      return <MobilePendingSendBubble progress={item.pendingSend} colors={colors} locale={locale} files={mobileAttachmentFiles} profileId={state.activeProfileId}>
+        {record ? <View style={styles.queueActions}>
+          {record.state === "confirming" || record.attempted && record.failureKind !== "rejected" ? <Action label={mobileMessage(locale, "receipt.check")} colors={colors} compact
+            disabled={state.status !== "connected" || state.busy} onPress={() => void (record.state === "confirming" ? client.reconcile() : client.checkTaskOutbox(record.id)).catch(error => setLocalError(errorText(error)))} /> : <>
+            {record.state === "failed" && <Action label={mobileMessage(locale, "common.retry")} colors={colors} compact disabled={state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}
+              onPress={() => void client.retryTaskOutbox(record.id).catch(error => setLocalError(errorText(error)))} />}
+            {(record.state === "queued" || record.state === "failed") && <Action label={mobileMessage(locale, "common.edit")} colors={colors} compact disabled={state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}
+              onPress={() => void client.editTaskOutbox(record.id).catch(error => setLocalError(errorText(error)))} />}
+            {record.state !== "restoring" && <Action label={mobileMessage(locale, "common.remove")} colors={colors} compact disabled={state.busy || voice.busy || attachmentBusy}
+              onPress={() => void client.cancelTaskOutbox(record.id).catch(error => setLocalError(errorText(error)))} />}
+          </>}
+        </View> : item.pendingSend.phase === "unknown" ? <Action label={mobileMessage(locale, "receipt.check")} colors={colors} compact disabled={state.status !== "connected" || state.busy}
+          onPress={() => void client.reconcile().catch(error => setLocalError(errorText(error)))} /> : item.pendingSend.phase === "failed" ? <View style={styles.queueActions}>
+          <Action label={mobileMessage(locale, "common.edit")} colors={colors} compact onPress={() => composerInputRef.current?.focus()} />
+          <Action label={mobileMessage(locale, "common.close")} colors={colors} compact onPress={() => setOptimisticUserRows(rows => retireMobileOptimisticUserRow(rows, state.selectedId!, item.operationId!))} />
+        </View> : undefined}
+      </MobilePendingSendBubble>;
+    }
     if (item.plan) return <View style={[styles.message, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <MobilePlanCard plan={item.plan} ownerKey={blockOwnerKey} colors={colors} locale={locale}
         enabled={state.status === "connected" || state.status === "offline"} />
@@ -6423,9 +6465,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         modelId={session?.model?.model?.modelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
         failed={taskAccountUsage.failed} now={taskAccountUsage.now} colors={colors} locale={locale} />}
       actions={([
-        ...(partnerIdentity.partner && partnerGlanceApi ? [{ id: 'partner-glance', label: locale === 'zh-CN' ? '近况' : 'At a glance',
+        ...(partnerIdentity.partner && partnerGlanceApi ? [{ id: 'partner-glance' as const, label: locale === 'zh-CN' ? '近况' : 'At a glance',
           onPress: () => setPartnerGlanceOwner(partnerConversationTransport?.ownerKey), disabled: state.status !== 'connected' || state.busy || voice.busy }] : []),
-        ...(partnerIdentity.partner ? [{ id: 'reply-quotes', label: locale === 'zh-CN' ? `${quoteDisplay.visible ? '隐藏' : '显示'}引用` : `${quoteDisplay.visible ? 'Hide' : 'Show'} reply quotes`,
+        ...(partnerIdentity.partner ? [{ id: 'reply-quotes' as const, label: locale === 'zh-CN' ? `${quoteDisplay.visible ? '隐藏' : '显示'}引用` : `${quoteDisplay.visible ? 'Hide' : 'Show'} reply quotes`,
           onPress: () => { void mobileReplyQuotePreferences.save(!quoteDisplay.visible).catch(failure => setLocalError(errorText(failure))); }, disabled: !quoteDisplay.ready || quoteDisplay.saving }] : []),
         ...(sideChatControls?.canOpen ? [{ id: "side-chat" as const, label: mobileSideChatCopy(locale).create,
           onPress: () => askInSideChat(), disabled: state.busy || voice.busy || attachmentBusy }] : []),
@@ -6455,7 +6497,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         ] : []),
         ...(onTaskSharing ? [{ id: "task-sharing" as const, label: state.taskSource?.kind === "joined" ? mobileTaskSharingCopy(locale).leave : mobileTaskSharingCopy(locale).title,
           disabled: state.busy || attachmentBusy || voice.busy, onPress: onTaskSharing }] : []),
-        { id: "search", label: mobileMessage(locale, "conversationSearch.title"), onPress: openConversationSearch,
+        { id: "search" as const, label: mobileMessage(locale, "conversationSearch.title"), onPress: openConversationSearch,
           disabled: !partnerIdentity.ready || state.detail === undefined || state.busy || attachmentBusy || voice.busy },
         ...(state.owner?.taskTagCatalog?.taskTags ?? []).slice(0, 7).map((tag) => ({
           id: `tag:${tag.taskTagId}` as const,
@@ -6467,34 +6509,34 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           },
           disabled: state.status !== "connected" || state.busy || attachmentBusy || voice.busy
         })),
-        { id: "tags", label: mobileMessage(locale, "taskTags.manage"),
+        { id: "tags" as const, label: mobileMessage(locale, "taskTags.manage"),
           onPress: () => setTaskTagsVisible(true),
           disabled: state.status !== "connected" || session === undefined || state.busy || attachmentBusy || voice.busy },
-        { id: "clone", label: mobileMessage(locale, "clone.title"),
+        { id: "clone" as const, label: mobileMessage(locale, "clone.title"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(false); setForkEventId(undefined); setRewindEventId(undefined); setCloneVisible(true); },
           disabled: !cloneControls?.canClone || state.busy || attachmentBusy || voice.busy },
-        { id: "branches", label: mobileMessage(locale, "task.branches"),
+        { id: "branches" as const, label: mobileMessage(locale, "task.branches"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setContextVisible(false); setRuntimeControlsVisible(false); setNativeTreeVisible(true); },
           disabled: state.status !== "connected" || nativeTreeControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
-        { id: "context", label: contextControls?.usage ? mobileMessage(locale, "task.contextPercent", { percent: contextControls.usage.percent }) : mobileMessage(locale, "task.context"),
+        { id: "context" as const, label: contextControls?.usage ? mobileMessage(locale, "task.contextPercent", { percent: contextControls.usage.percent }) : mobileMessage(locale, "task.context"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); },
           disabled: state.status !== "connected" || contextControls === undefined && objectiveApi === undefined && collaborationApi === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
         ...(collaborationApi ? [{ id: "collaboration" as const, label: mobileCollaborationCopy(locale).title,
           onPress: () => { setContextVisible(false); setRuntimeControlsVisible(false); setCollaborationVisible(true); },
           disabled: state.busy || attachmentBusy || voice.busy }] : []),
-        { id: "controls", label: mobileMessage(locale, partnerRead.partner ? "partnerProfile.title" : "task.controls"),
+        { id: "controls" as const, label: mobileMessage(locale, partnerRead.partner ? "partnerProfile.title" : "task.controls"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); openRuntimeControls(); },
           disabled: state.status !== "connected" || !partnerRead.ready || (partnerRead.partner ? !partnerProfileTransport : !runtimeControlsAvailable)
             || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
         ...(remoteDesktopDeviceId ? [{ id: "remote-desktop" as const, label: mobileRemoteDesktopCopy(locale).title,
           onPress: () => onRemoteDesktop(remoteDesktopDeviceId),
           disabled: state.status !== "connected" || state.busy || attachmentBusy || voice.busy }] : []),
-        { id: "copy-link", label: mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink"),
+        { id: "copy-link" as const, label: mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink"),
           onPress: () => void copyPublicTaskLink(),
           disabled: copyBusy || session === undefined || (state.status !== "connected" && state.status !== "offline") },
         ...(client.canOpenFiles() ? [{ id: "files" as const, label: mobileMessage(locale, "task.files"),
           onPress: () => onFiles(), disabled: state.status !== "connected" || attachmentBusy }] : []),
-        { id: "refresh", label: mobileMessage(locale, "common.refresh"), onPress: () => { headerRole.retry(); void client.refresh(); }, disabled: attachmentBusy }
+        { id: "refresh" as const, label: mobileMessage(locale, "common.refresh"), onPress: () => { headerRole.retry(); void client.refresh(); }, disabled: attachmentBusy }
       ] satisfies readonly MobileTaskHeaderAction[]).filter(action => state.taskSource?.kind !== "joined"
         || ["task-sharing", "search", "context", "controls", "refresh"].includes(action.id))} />
     {state.taskSource?.kind === "joined" && <View style={[styles.queue, { gap: 8 }]}>
@@ -6539,7 +6581,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
     <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={() => setImageViewportPulse((value) => value + 1)}>
     <FlatList key={`${draftIdentityKey ?? ""}\u001f${partnerConversationTransport?.ownerKey ?? ""}`} ref={timelineListRef} data={displayRows}
-      extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+      extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => !isWorkGroup(row) && row.kind === "user" && row.operationId ? `local-send:${row.operationId}` : row.id} style={styles.fill} contentContainerStyle={styles.list}
       viewabilityConfig={imageViewability} onViewableItemsChanged={onImageRowsVisible}
       scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}
       onScrollToIndexFailed={({ averageItemLength, index }) => {
@@ -6601,7 +6643,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       </MobilePartnerConversationRow> : renderTimelineItem(item)}</View>} />
     </View>
     <View testID="task.controls-viewport" pointerEvents="box-none" style={controlsRegion}>
-    {localOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
+    {state.window !== undefined && localOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.outbox")}</Text>
       <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList} keyboardShouldPersistTaps="handled">
         {localOutbox.map((item, index) => <View key={item.id}
@@ -7101,9 +7143,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         void client.refresh().then(() => client.select(sessionId)).then(() => setPartnerHome(undefined)).catch(() => setLocalError(mobileMessage(locale, "partnerProfile.failed")));
       }} />}
     {partnerGlanceApi && partnerIdentity.partner && <MobilePartnerGlanceSheet key={partnerGlanceApi.ownerKey} api={partnerGlanceApi} partnerId={partnerIdentity.partner.partnerId}
+      homeApi={partnerGlanceHomeApi}
       name={partnerIdentity.partner.displayName} visible={partnerGlanceOwner === partnerConversationTransport?.ownerKey} engaged={messageRows.some(row => row.kind === 'user' && !!row.operationId)}
       colors={colors} locale={locale} onClose={() => setPartnerGlanceOwner(undefined)}
-      onHomeSettings={() => { if (client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey) setPartnerSettingsOwner(partnerGlanceApi.ownerKey); }}
+      onHomeSettings={() => { const partner = partnerIdentity.partner, api = client.partnerHomeApi(); if (api && partner && client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey)
+        setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision, inputHandoff: partner.capabilities.inputHandoff ?? true }); }}
       onOpenTask={sessionId => { if (client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey) void client.select(sessionId).catch(failure => setLocalError(errorText(failure))); }}
       onQuote={todo => {
         const identity = draftIdentityRef.current, active = queueEditRef.current;

@@ -16,6 +16,8 @@ import { emptyMobileComposerDraft, insertMobilePastedText, plainTextMobileCompos
 import { mobileIncomingShareStorageId, parseMobileIncomingSharePartIdentity } from "./mobile-incoming-share-order";
 import { MobileOfflineCache } from "./mobile-offline-cache";
 import { MobileTaskOutboxStore, type MobileTaskOutboxRecord } from "./mobile-task-outbox";
+import { projectMobilePendingOutboxRows } from "./mobile-pending-send";
+import { rebalanceSuggestionFixture } from "./test/provider-group-rebalance";
 import type { MobileNetwork, NodeIdentity, PairedCredential } from "./network";
 
 const credential: PairedCredential = { profileId: "phone", origin: "http://192.168.1.20:4318", serverId: "node",
@@ -72,7 +74,7 @@ async function fixture() {
   detail.scope = create(SnapshotScopeSchema, {
     kind: { case: "session", value: { sessionId: "session", recentTimelineItems: 120 } }
   });
-  let sequence = 0, online = false;
+  let sequence = 0, online = false, clock = 2_000;
   const cache = new MobileOfflineCache({ ...plain, async getAllKeys() { return [...values.keys()]; },
     async multiRemove(keys) { for (const key of keys) values.delete(key); } }, () => 1_500, () => `cache-${++sequence}`);
   await cache.save(profileFromCredential(credential), node, owner, detail);
@@ -109,12 +111,12 @@ async function fixture() {
   const makeClient = () => {
     const drafts = new MobileComposerDraftStore(plain);
     const client = new MobileClient(network as unknown as MobileNetwork, storage, { async scan() { return []; } },
-      () => `00000000-0000-4000-8000-${(++sequence).toString(16).padStart(12, "0")}`, "android", () => 2_000, undefined, undefined, drafts, files,
+      () => `00000000-0000-4000-8000-${(++sequence).toString(16).padStart(12, "0")}`, "android", () => clock, undefined, undefined, drafts, files,
       undefined, undefined, undefined, undefined, cache);
     clients.push(client); return { client, drafts };
   };
   return { makeClient, storage, plain, values, owner, detail, network, files, blobs, fileKey,
-    online() { online = true; }, failWrite(value: boolean) { rejectOutboxWrite = value; },
+    online() { online = true; }, setClock(value: number) { clock = value; }, failWrite(value: boolean) { rejectOutboxWrite = value; },
     interceptWrite(value?: (body: string) => Promise<void>) { beforeOutboxWrite = value; } };
 }
 
@@ -372,7 +374,9 @@ describe("durable ordinary mobile task inputs", () => {
       deliveryMode: QueueDeliveryMode.PROMPT, permissionMode: PermissionMode.ASK, planMode: false,
       input: { ...input, text: "Previous owner's input" }, sourceDraft: input, storageIds: [], state: "staging", attempted: false });
     const recovered = f.makeClient(); await recovered.client.start();
-    expect(recovered.client.taskOutboxItems()[0]?.state).toBe("staging");
+    expect(recovered.client.taskOutboxItems()).toEqual([]);
+    const retained = new MobileTaskOutboxStore(f.plain); await retained.load();
+    expect(retained.records[0]).toMatchObject({ state: "staging", owner: { connectionId: "old-connection" } });
     expect((await recovered.drafts.readDurable({ profileId: credential.profileId, sessionId: "session" }))?.text).toBe(input.text);
   });
 
@@ -389,5 +393,60 @@ describe("durable ordinary mobile task inputs", () => {
     expect(restarted.client.taskOutboxItems()).toEqual([]);
     expect((await restarted.drafts.readDurable({ profileId: credential.profileId, sessionId: "session" }))?.text).toBe(restored.text);
     expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("keeps the actual first-send time across slow staging and identifies only the failed upload slot after restart", async () => {
+    const f = await fixture(), { client } = f.makeClient(); await client.start();
+    const inputs = await Promise.all(["first", "second"].map(async (id, index) => {
+      const bytes = new TextEncoder().encode(`Content ${index}`), hash = createHash("sha256").update(bytes).digest("hex");
+      await f.files.stageOwnedBytes(credential.profileId, id, bytes, hash);
+      return { state: "local" as const, attachmentId: id, kind: "file" as const, fileName: `${id}.txt`, mediaType: "text/plain",
+        byteSize: bytes.byteLength, sha256Hex: hash, capturedAtUnixMs: 1_000 };
+    }));
+    const read = f.files.readOwnedBytes.bind(f.files);
+    vi.spyOn(f.files, "readOwnedBytes").mockImplementation(async (...args) => { const result = await read(...args); f.setClock(9_000); return result; });
+    const progress = vi.fn();
+    await client.send({ ...plainTextMobileComposerDraft("Original input"), attachments: inputs }, { operationId: "partial-upload", onProgress: progress });
+    const original = client.taskOutboxItems()[0]!;
+    expect(original.createdAt).toBe(2_000); expect(progress).toHaveBeenCalledWith(expect.objectContaining({ phase: "waiting", sentAt: 2_000 }));
+    expect(projectMobilePendingOutboxRows([], [original], false)[0]?.pendingSend?.phase).toBe("waiting");
+    expect(projectMobilePendingOutboxRows([], [original], true)[0]?.pendingSend?.phase).toBe("preparing");
+    const upload = f.network.uploadBlob.getMockImplementation()!;
+    f.network.uploadBlob.mockImplementationOnce(upload).mockRejectedValueOnce(new Error("Second file upload failed"));
+    f.online(); await client.refresh();
+    const failed = client.taskOutboxItems()[0]!;
+    expect(failed).toMatchObject({ state: "failed", failureKind: "preparation", attempted: false, createdAt: 2_000,
+      uploadAttachmentId: failed.input.attachments[1]!.attachmentId });
+    expect(failed.input.attachments.map(item => item.state)).toEqual(["uploaded", "local"]);
+    expect(projectMobilePendingOutboxRows([], [failed], true)[0]).toMatchObject({ startedAtMs: 2_000, pendingSend: {
+      phase: "failed", attachmentId: failed.input.attachments[1]!.attachmentId } });
+    expect(f.network.submit).not.toHaveBeenCalled(); client.dispose();
+    const restored = f.makeClient(); await restored.client.start();
+    expect(restored.client.taskOutboxItems()[0]).toMatchObject({ state: "failed", uploadAttachmentId: failed.input.attachments[1]!.attachmentId, createdAt: 2_000 });
+    expect(f.network.uploadBlob).toHaveBeenCalledTimes(2);
+    await restored.client.retryTaskOutbox("partial-upload");
+    expect(f.network.uploadBlob.mock.calls.map(call => call[1].fileName)).toEqual(["first.txt", "second.txt", "second.txt"]);
+    expect(f.network.submit.mock.calls.map(call => call[1])).toEqual(["partial-upload"]);
+    expect(restored.client.taskOutboxItems()).toEqual([]);
+  });
+
+  it("persists the confirmed account choice with its queued input and never asks again while recovering original operations", async () => {
+    const f = await fixture(), { client } = f.makeClient(); await client.start();
+    await client.send(plainTextMobileComposerDraft("First input"), { operationId: "first-unknown" });
+    f.network.submit.mockRejectedValueOnce(new Error("Original result lost")); f.network.getOperation.mockRejectedValue(new Error("Query temporarily unavailable"));
+    f.online(); await client.refresh();
+    const suggestionKey = `rebalance_${"c".repeat(64)}`;
+    const read = vi.fn(async () => rebalanceSuggestionFixture(nativeGeneration, { suggestionKey }));
+    (f.network as unknown as MobileNetwork).getTaskProviderGroupRebalance = read;
+    const confirm = vi.fn(async () => ({ remember: true }));
+    await client.send(plainTextMobileComposerDraft("Confirmed input"), { operationId: "second-confirmed", confirmRebalance: confirm });
+    expect(client.taskOutboxItems()[1]?.providerGroupRebalance).toEqual({ suggestionKey, remember: true }); client.dispose();
+    const restarted = f.makeClient(); await restarted.client.start();
+    expect(restarted.client.taskOutboxItems()[1]?.providerGroupRebalance).toEqual({ suggestionKey, remember: true });
+    f.network.getOperation.mockResolvedValue(receipt("first-unknown")); await restarted.client.reconcile();
+    const sent = f.network.submit.mock.calls.find(call => call[1] === "second-confirmed")?.[2];
+    expect(sent).toMatchObject({ payload: { case: "sendInput", value: { providerGroupRebalance: { suggestionKey, remember: true } } } });
+    expect(read).toHaveBeenCalledOnce(); expect(confirm).toHaveBeenCalledOnce();
+    expect(f.network.submit.mock.calls.map(call => call[1])).toEqual(["first-unknown", "second-confirmed"]);
   });
 });

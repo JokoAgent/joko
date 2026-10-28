@@ -3,6 +3,7 @@ import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { executeExtensionSettingsCall } from "@joko/connection-transport";
 import { readSessionArchivePreview } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
+import { projectProviderGroupRebalance } from "@joko/contracts";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
 import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
@@ -1515,6 +1516,21 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return projectTaskProviderGroupUsage(response);
   }
 
+  async readTaskProviderGroupRebalance(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderGroupRebalanceView | undefined> {
+    if (this.#taskSharing) return undefined;
+    const scope = this.captureActionScope(signal), profile = this.#profile, lifetime = this.#abort;
+    const identity = () => {
+      scope.signal.throwIfAborted();
+      const session = this.#snapshot?.sessions.find(item => item.id === sessionId);
+      if (this.#transport !== scope.transport || this.#profile !== profile || this.#abort !== lifetime || !session || session.generation !== generation || session.archived) throw new GatewayError("The original quota balancing task changed.");
+      return JSON.stringify([session.backendId, session.targetId, session.model?.providerId, session.model?.modelId, session.effort, session.fastMode]);
+    };
+    const original = identity();
+    const response = await createClient(ProviderGroupService, scope.transport).getTaskProviderGroupRebalance({ sessionId, generation }, { signal: scope.signal });
+    if (identity() !== original) throw new GatewayError("The original quota balancing route changed.");
+    return projectProviderGroupRebalance(response.suggestion, generation);
+  }
+
   async readSessionArtifact(sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView> {
     if (!sessionId || !artifactId) throw new GatewayError("An Artifact reference requires its original task and object identity.");
     const scope = this.captureActionScope(signal);
@@ -2165,7 +2181,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return source;
   }
 
-  async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void> {
+  async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint; readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean } }): Promise<void> {
     const scope = this.captureActionScope();
     const expectedGeneration = admission.expectedGeneration;
     if (expectedGeneration < 1n || expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -2276,6 +2292,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           mentionRanges
         },
         deliveryMode: deliveryMode(draft.deliveryMode),
+        ...(admission.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: admission.providerGroupRebalance }),
         ...(draft.extraDirectoryIds === undefined
           ? {}
           : { overrides: { extraDirectoryIds: [...new Set(draft.extraDirectoryIds)] } })
@@ -5567,6 +5584,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           connections: createClient(ExtensionNetworkService, scope.transport), fresh: signal => fresh(surface, signal), current,
           upload: (ticket, value, signal) => this.uploadCredentialTicket(value, ticket, { ...scope, signal }),
           submit: async (_extension, mutation, _kind, signal) => { current(); await this.submit(mutation.payload, true, [], signal); current(); },
+          pickDirectory: async (_extension, mutation, signal) => {
+            current(); const operation = await this.submit(mutation.payload, true, [], signal); current();
+            if (operation.state !== OperationState.SUCCEEDED || operation.result?.payload.case !== "pickedDirectory") throw new GatewayError("Check the original directory selection operation before retrying.");
+            return operation.result.payload.value;
+          },
           begin: extension => after(() => this.submit({ case: "beginExtensionSetup", value: { extensionId: extension.id, expectedRevision: { value: extension.revision } } }, true, [], active).then(() => undefined)),
           field: (extension, fieldId, value) => after(() => this.submit({ case: "submitExtensionSetupInteraction", value: {
             extensionId: extension.id, expectedRevision: { value: extension.revision }, attemptId: extension.setup.attemptId ?? "", fieldId,
@@ -14122,6 +14144,7 @@ function mapSession(
     archived: session.archived,
     generation: session.nativeBinding?.runtimeGeneration ?? 0n,
     ...(session.provisionalDraftId ? { provisionalDraftId: session.provisionalDraftId } : {}),
+    ...(session.sideChatSourceAllowed === undefined ? {} : { sideChatSourceAllowed: session.sideChatSourceAllowed }),
     ...(descriptor !== undefined
       ? { model: mapModel(descriptor, selectedProvider) }
       : selected === undefined ? {} : { model: unavailableSessionModel(session.backendId, selected.providerId, selected.modelId, selectedProvider) }),

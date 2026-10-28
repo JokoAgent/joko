@@ -1294,6 +1294,36 @@ describe("MessagingManager", () => {
     expect(transport.sentText.some((entry) => entry.text === "Joko's Feishu connection is being disabled.")).toBe(true);
   });
 
+  it('delivers a Feishu topic Markdown/image final independently of an unknown progress ACK', async () => {
+    const transport = new FakeFeishuTransport(feishuInitialBatch()); transport.progressUnknown = true;
+    const adapter = new AttachmentFakeAdapter(), fixture = await createFixture(undefined, () => adapter, undefined, undefined, () => transport);
+    const image = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: 'topic-result.png', mimeType: 'image/png' });
+    adapter.events = [generatedImageResult(image)]; adapter.blocks = [{ kind: 'text', text: '**Topic result** with its image.' }];
+    await enableFeishuReply(fixture);
+    await vi.waitFor(() => expect(transport.richReplies).toEqual([{ address: expect.objectContaining({ providerConversationId: 'oc_group', providerThreadId: 'omt_topic' }),
+      text: '**Topic result** with its image.', fileNames: ['topic-result.png'] }]), { timeout: 5000 });
+    const progress = fixture.store.listMessagingDeliveries({ statuses: ['unknown'] }).find(row => row.dedupeKey.endsWith(':progress:start'))!;
+    const answer = fixture.store.listMessagingDeliveries({ statuses: ['sent'] }).find(row => row.dedupeKey.endsWith(':answer-card'))!;
+    expect(progress).toBeDefined(); expect(answer).toBeDefined(); expect(transport.progressCloses).toEqual([]);
+    await fixture.restartManager();
+    expect(fixture.store.getMessagingDelivery(progress.id)).toMatchObject({ status: 'unknown', attempts: 1 });
+    expect(transport.progressAttempts).toBe(1); expect(transport.richReplies).toHaveLength(1);
+    expect(fixture.store.getMessagingDelivery(answer.id).payload).toMatchObject({ address: { providerConversationId: 'oc_group', providerThreadId: 'omt_topic' } });
+  });
+
+  it('keeps a Feishu final with a lost ACK under the original recipient and never recalls its known progress lease', async () => {
+    const transport = new FakeFeishuTransport(feishuInitialBatch()); transport.answerUnknown = true;
+    const adapter = new AttachmentFakeAdapter(), fixture = await createFixture(undefined, () => adapter, undefined, undefined, () => transport);
+    adapter.blocks = [{ kind: 'text', text: 'Final answer for the original topic.' }];
+    await enableFeishuReply(fixture);
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ['unknown'] }).some(row => row.dedupeKey.endsWith(':answer-card'))).toBe(true), { timeout: 5000 });
+    const final = fixture.store.listMessagingDeliveries({ statuses: ['unknown'] }).find(row => row.dedupeKey.endsWith(':answer-card'))!;
+    expect(transport.richReplies[0]).toMatchObject({ address: { providerConversationId: 'oc_group', providerThreadId: 'omt_topic' }, fallbackProgressMessageId: 'feishu-progress-1' });
+    await fixture.restartManager();
+    expect(fixture.store.getMessagingDelivery(final.id)).toMatchObject({ status: 'unknown', attempts: 1 });
+    expect(transport.richReplies).toHaveLength(1); expect(transport.progressCloses).toEqual([]);
+  });
+
   it("claims a WeCom owner, starts callback replies after admission, and keeps media effects single-part", async () => {
     const transport = new FakeWeComTransport(weComInitialBatch(true));
     const adapter = new AttachmentFakeAdapter(true);
@@ -2435,6 +2465,12 @@ class FakeFeishuTransport {
   readonly sentAttachments: Array<{ readonly address: MessagingAddress; readonly fileNames: readonly string[] }> = [];
   readonly historyLoads: MessagingAddress[] = [];
   readonly reactions: Array<{ readonly messageId: string; readonly emoji: string | null }> = [];
+  readonly richReplies: Array<{ readonly address: MessagingAddress; readonly text: string; readonly fileNames: readonly string[]; readonly fallbackProgressMessageId?: string }> = [];
+  progressAttempts = 0;
+  readonly progressUpdates: Array<{ readonly address: MessagingAddress; readonly messageId: string; readonly text: string }> = [];
+  readonly progressCloses: string[] = [];
+  progressUnknown = false;
+  answerUnknown = false;
   #boundConnectionId = "";
   #boundGeneration = 0;
   #ownerUserId: string | null = null;
@@ -2545,6 +2581,23 @@ class FakeFeishuTransport {
 
   async sendInteractionCard(input: { readonly address: MessagingAddress }) {
     return { providerMessageId: "feishu-card", address: input.address };
+  }
+
+  async sendRichReply(input: { readonly address: MessagingAddress; readonly text: string; readonly attachments: readonly { readonly fileName: string }[];
+    readonly fallbackProgressMessageId?: string }) {
+    this.richReplies.push({ address: input.address, text: input.text, fileNames: input.attachments.map(file => file.fileName),
+      ...(input.fallbackProgressMessageId ? { fallbackProgressMessageId: input.fallbackProgressMessageId } : {}) });
+    if (this.answerUnknown) throw new MessagingTransportError('network', 'Final ACK lost', { retryable: true, effect: 'unknown' });
+    return { providerMessageId: `feishu-rich-${this.richReplies.length}`, address: input.address };
+  }
+  async openReplyProgress(input: { readonly address: MessagingAddress }) {
+    this.progressAttempts++;
+    if (this.progressUnknown) throw new MessagingTransportError('network', 'Progress ACK lost', { retryable: true, effect: 'unknown' });
+    return { providerMessageId: `feishu-progress-${this.progressAttempts}`, address: input.address };
+  }
+  async updateReplyProgress(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text: string }) { this.progressUpdates.push(input); }
+  async closeReplyProgress(input: { readonly address: MessagingAddress; readonly messageId: string }) {
+    this.progressCloses.push(input.messageId); return { providerMessageId: input.messageId, address: input.address };
   }
 
   async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
@@ -3068,9 +3121,15 @@ function generatedImageResult(blob: BlobRef): Extract<EventPayload, { readonly t
 async function enableTelegramReply(fixture: Awaited<ReturnType<typeof createFixture>>, suffix: string) {
   fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
   const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42", configuration: {
-    ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off", lifecycleAnnouncements: false
+    ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off"
   } });
   return replaceCredential(fixture, created, suffix, true);
+}
+
+async function enableFeishuReply(fixture: Awaited<ReturnType<typeof createFixture>>) {
+  fixture.manager.putRoute({ targetId: 'target-one', fastMode: false, permissionMode: 'ask', planMode: false });
+  const connection = fixture.manager.createFeishuConnection({ channel: 'feishu', configuration: feishuConfiguration({ lifecycleAnnouncements: false, emojiReactions: 'off' }) });
+  return replaceCredential(fixture, connection, 'feishu-rich-reply', true);
 }
 
 class CaptureFakeAdapter extends FakeBackendAdapter {

@@ -19,6 +19,8 @@ import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileUsageProviderKey, type MobileProviderUsageTransport } from "./mobile-account-usage";
 import { MobileAccountUsageSummary, mobileModelAccountQuotaLabel } from "./MobileAccountUsageSummary";
+import { MobileModelQuotaBar } from "./MobileModelQuotaBar";
+import { mobileAccountUsageWindows } from "./mobile-account-usage";
 import { useMobileAccountUsage } from "./use-mobile-account-usage";
 import { mobileMessage } from "./mobile-messages";
 import {
@@ -348,6 +350,8 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
               {route.source && <Text style={[styles.caption, { color: colors.muted }]}>{mobileModelSourceLabel(route)}</Text>}
               <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens, locale)} · {route.modelId}</Text>
               {modelQuota && <Text style={[styles.caption, { color: colors.muted }]}>{modelQuota}</Text>}
+              {mobileAccountUsageWindows(accountUsage.snapshots[mobileUsageProviderKey(route)], route.modelId, accountUsage.now).filter(window => window.model)
+                .map(window => <MobileModelQuotaBar key={window.id} remaining={window.remainingPercent} label={modelQuota ?? route.displayName} colors={colors} />)}
             </View>
             <Text style={[styles.disclosure, { color: selected ? colors.accent : colors.muted }]}>{selected ? "✓" : "›"}</Text>
           </Pressable>

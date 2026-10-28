@@ -156,6 +156,7 @@ import { ExtensionProjectPolicies } from "./extension-project-policy.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
 import { ExtensionSettingsManager } from "./extension-settings.js";
+import { ExtensionDirectoryPicker } from "./extension-directory-picker.js";
 import { ExtensionPackagePublisher } from "./extension-package-publisher.js";
 import { ExtensionTasks } from "./extension-tasks.js";
 import { createExtensionTaskNativeReviewer } from "./extension-task-native-reviewer.js";
@@ -268,7 +269,7 @@ import { PartnerRoutineStore } from "@joko/store";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerAutonomyManager } from "./partner-autonomy.js";
 import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
-import { PartnerMessagingRuntime } from './partner-messaging.js';
+import { PartnerMessagingRuntime, PartnerMessagingTools } from './partner-messaging.js';
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
 import { partnerPackageOpening } from "./partner-package-opening.js";
@@ -559,6 +560,7 @@ export interface OrchestratorApplication {
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionSettings?: ExtensionSettingsManager;
+  readonly extensionDirectoryPicker?: ExtensionDirectoryPicker;
   readonly extensionCards?: ExtensionCardsManager;
   readonly extensionNetwork?: ExtensionNetworkSettings;
   readonly extensionOAuth?: ExtensionOAuthSettings;
@@ -701,7 +703,7 @@ export async function createOrchestratorApplication(
   const partnerHomeStorage = new PartnerHomeStorage(store);
   let partnerHomeInference: PartnerHomeInference | undefined;
   let partnerHomeRuntime: PartnerHomeRuntimeAdapter | undefined;
-  suppressPrivateSessionNotifications = sessionId => partnerStore.getSessionLink(sessionId)?.role === "group";
+  suppressPrivateSessionNotifications = sessionId => ['group', 'channel'].includes(partnerStore.getSessionLink(sessionId)?.role ?? '');
   let partnerGroupStore: PartnerGroupStore;
   try { partnerGroupStore = new PartnerGroupStore(join(config.dataDirectory, "partner-groups.db")); }
   catch (error) { contacts.close(); contactStore.close(); partnerStore.close(); store.close(); throw error; }
@@ -1953,6 +1955,7 @@ export async function createOrchestratorApplication(
         status: profile.initializationState
       };
     },
+    sideChatSourceAllowed: sessionId => partnerStore.getSessionLink(sessionId) === undefined,
     decorateRuntimePrompt: answerDeliveryPrompt,
     resolveServiceRuntimePrompt: async (session, assertCurrent) => {
       const resolved = await partnerRuntimePrompt.resolve(session, assertCurrent);
@@ -2237,7 +2240,7 @@ export async function createOrchestratorApplication(
         expectedRevision: goal.revision, expectedOwnerGeneration: goal.ownerGeneration, reason: 'Message lane restarted by user.' });
     } });
   messaging.setPartnerRuntime(partnerMessaging);
-  sessionHost.setMessagingQueueGuard(item => partnerMessaging!.assertQueueCurrent(item));
+  sessionHost.setMessagingQueueGuard(item => partnerMessaging!.assertQueueCurrent(item), (item, request) => partnerMessaging!.reviewTool(item, request));
   const inputHandoffDisabled = (sessionId: string): boolean => {
     const session = store.getSession(sessionId).descriptor, link = partnerStore.getSessionLink(sessionId);
     const policy = toolPolicies.snapshot().find(value => value.toolProviderId === INPUT_HANDOFF_TOOL_PROVIDER_ID);
@@ -2310,6 +2313,8 @@ export async function createOrchestratorApplication(
   const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches }));
   partnerTodos = new PartnerTodoManager(store, partnerStore, partners);
   const unregisterPartnerTodoTools = mcpRouter.registerBridgeToolProvider(new PartnerTodoTools(partnerTodos));
+  const unregisterPartnerMessagingTools = ['telegram', 'discord', 'dingtalk', 'feishu', 'lark', 'wecom', 'wechat', 'slack']
+    .map(channel => mcpRouter.registerBridgeToolProvider(new PartnerMessagingTools(partnerMessaging!, channel)));
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
     const result = backendLifecycleTail.catch(() => undefined).then(action);
@@ -2595,6 +2600,8 @@ export async function createOrchestratorApplication(
     continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard),
     ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
   startupCardRuntime = extensionCardRuntime;
+  const extensionDirectoryPicker = new ExtensionDirectoryPicker({ runtime: extensionCardRuntime,
+    roots: () => workspaces.listRegistrations().filter(value => !value.remote).map(value => value.root) });
   const diagnosticsBundles = new DiagnosticsBundleService({
     store,
     artifacts,
@@ -3398,6 +3405,7 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterPartnerTools());
     await attempt(() => unregisterPartnerWorkbenchTools());
     await attempt(() => unregisterPartnerTodoTools());
+    for (const unregister of unregisterPartnerMessagingTools) await attempt(() => unregister());
     await attempt(() => unregisterPartnerSessionTaskTools());
     await attempt(() => unregisterPartnerProfileTools());
     await attempt(() => unregisterPartnerRoutineTools());
@@ -3558,6 +3566,7 @@ export async function createOrchestratorApplication(
     extensionLibraries,
     extensionMainViews,
     extensionSettings,
+    extensionDirectoryPicker,
     extensionCards,
     extensionNetwork,
     extensionOAuth,
@@ -3711,6 +3720,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterPartnerTools());
         await attempt(() => unregisterPartnerWorkbenchTools());
         await attempt(() => unregisterPartnerTodoTools());
+        for (const unregister of unregisterPartnerMessagingTools) await attempt(() => unregister());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => unregisterDocumentTools());

@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { SessionState, SnapshotSchema, TargetState, WorkspaceKind } from "@joko/contracts";
+import { SessionDerivationKind, SessionDerivationOriginSchema, SessionState, SnapshotSchema, TargetState, WorkspaceKind } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import type { MobileWindowGeometry } from "./mobile-window-geometry";
 import {
@@ -43,6 +43,17 @@ const snapshot = create(SnapshotSchema, {
 const labels = { dialogue: "Dialogue", project: "Project", pinned: "Pinned" } as const;
 
 describe("mobile Home presentation", () => {
+  it("leaves Side Chats in the authoritative snapshot while excluding them from every ordinary navigation filter", () => {
+    const input = create(SnapshotSchema, { ...snapshot, sessions: [...snapshot.sessions, {
+      ...snapshot.sessions[0]!, sessionId: "aside", displayName: "Aside", pinned: true,
+      derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.FORK, sideChat: true, sourceSessionId: "pinned" })
+    }] });
+    for (const statusFilter of ["active", "archived", "all"] as const) {
+      expect(buildMobileHomeSections({ snapshot: input, statusFilter, query: "aside", messageSessionIds: new Set(["aside"]), labels })
+        .flatMap(section => section.items.map(item => item.session.sessionId))).not.toContain("aside");
+    }
+    expect(input.sessions.find(session => session.sessionId === "aside")?.hidden).toBe(false);
+  });
   it("keeps pinned tasks separate and groups active Dialogue and project tasks in stable recent order", () => {
     const sections = buildMobileHomeSections({ snapshot, statusFilter: "active", query: "", labels });
     expect(sections.map((section) => [section.key, section.items.map((item) => item.session.sessionId)])).toEqual([

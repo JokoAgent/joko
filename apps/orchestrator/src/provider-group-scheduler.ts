@@ -11,12 +11,9 @@ export interface ProviderGroupCandidate {
   /** Only a not-yet-exhausted quota window supplies a future reset time. */
   readonly weeklyResetAt?: number | null;
   readonly fiveHourResetAt?: number | null;
+  readonly urgency?: number | null;
+  readonly fiveHourTight?: boolean;
 }
-
-const WEEKLY_EXPIRING_MS = 5 * 60 * 60_000;
-const FIVE_HOUR_EXPIRING_MS = 60 * 60_000;
-const SAME_RESET_MS = 10 * 60_000;
-const SIMILAR_USAGE_PERCENT = 5;
 
 /** Quota order applies to every strategy. Capacity distributes work but does
  * not itself reject a task when all eligible members are occupied. */
@@ -50,21 +47,12 @@ export function selectProviderGroupMember(
   }
 }
 
-function byQuota(candidates: readonly ProviderGroupCandidate[], now: number): readonly ProviderGroupCandidate[] {
-  const known = candidates.filter(member => typeof member.usagePercent === "number" && Number.isFinite(member.usagePercent));
-  if (!known.length) return candidates;
-  const pool = expiringFirst(known, now) ?? known;
-  const lowest = Math.min(...pool.map(member => member.usagePercent!));
-  return pool.filter(member => member.usagePercent! <= lowest + SIMILAR_USAGE_PERCENT);
-}
-
-function expiringFirst(candidates: readonly ProviderGroupCandidate[], now: number): readonly ProviderGroupCandidate[] | undefined {
-  for (const [window, within] of [["weeklyResetAt", WEEKLY_EXPIRING_MS], ["fiveHourResetAt", FIVE_HOUR_EXPIRING_MS]] as const) {
-    const soon = candidates.filter(member => { const reset = member[window]; return typeof reset === "number" && reset > now && reset - now <= within; });
-    if (!soon.length) continue;
-    const earliest = Math.min(...soon.map(member => member[window]!));
-    return soon.filter(member => member[window]! - earliest <= SAME_RESET_MS);
-  }
+function byQuota(candidates: readonly ProviderGroupCandidate[], _now: number): readonly ProviderGroupCandidate[] {
+  const roomy = candidates.filter(member => !member.fiveHourTight), pool = roomy.length ? roomy : candidates;
+  const known = pool.filter(member => typeof member.urgency === "number" && Number.isFinite(member.urgency) && member.urgency >= 0);
+  if (!known.length) return pool;
+  const highest = Math.max(...known.map(member => member.urgency!));
+  return known.filter(member => member.urgency! >= highest * 0.9);
 }
 
 function leastBusy(candidates: readonly ProviderGroupCandidate[]): ProviderGroupCandidate {
