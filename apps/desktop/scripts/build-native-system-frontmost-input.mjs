@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import nativeArtifacts from "./native-helper-artifacts.cjs";
+import { downloadPinnedInput } from "./native-build-input.mjs";
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputRoot = join(desktopRoot, "dist", "native-system-frontmost-input");
@@ -101,20 +102,7 @@ function createCacheDirectory(path) {
 async function cachedInput(directory, cacheName, officialName, expectedDigest, maximumBytes) {
   const path = join(directory, cacheName);
   if (existsSync(path)) return verifiedCache(path, expectedDigest, maximumBytes);
-  const response = await fetch(new URL(officialName, officialBase), {
-    redirect: "error", signal: AbortSignal.timeout(30_000)
-  });
-  if (!response.ok || response.body === null) throw new Error("An official Electron native build input could not be downloaded.");
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of response.body) {
-    size += chunk.length;
-    if (size > maximumBytes) {
-      throw new Error("An official Electron native build input exceeds its size limit.");
-    }
-    chunks.push(chunk);
-  }
-  const bytes = Buffer.concat(chunks);
+  const bytes = await downloadPinnedInput(new URL(officialName, officialBase), expectedDigest, maximumBytes);
   cacheVerifiedBytes(path, bytes, expectedDigest);
   return verifiedCache(path, expectedDigest, maximumBytes);
 }
