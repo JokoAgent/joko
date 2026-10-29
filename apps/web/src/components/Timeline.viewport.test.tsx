@@ -116,6 +116,21 @@ afterEach(async () => {
 });
 
 describe("Timeline viewport journeys", () => {
+  it("routes only a clicked assistant answer through the current timeline host", async () => {
+    const send = vi.fn(async () => true);
+    const text = '```joko-ui\n' + JSON.stringify({ seq: 1, op: "create", id: "continue", kind: "button",
+      props: { label: "Continue answer", send: "Please continue this task" } }) + '\n```';
+    await render({ answerStateOwnerKey: "timeline/send-owner", onSendRichAnswer: send,
+      items: [{ ...item("rich-answer", 1, "assistant"), text, streaming: false }] });
+    await flushFrames();
+    expect(send).not.toHaveBeenCalled();
+    const button = host.querySelector<HTMLButtonElement>('[data-rich-answer] button');
+    expect(button).not.toBeNull();
+    await act(async () => button!.click());
+    expect(send).toHaveBeenCalledExactlyOnceWith("Please continue this task", expect.stringContaining(":sent:continue"));
+    await render({ onSendRichAnswer: undefined, answerStateOwnerKey: "timeline/read-only" });
+    expect(host.querySelector<HTMLButtonElement>('[data-rich-answer] button')?.disabled).toBe(true);
+  });
   it("reloads failed attachments and images after the same task connection recovers", async () => {
     const artifact: ArtifactView = { id: "recover-image", blobId: "same-blob", kind: "image", fileName: "image.png", title: "Recover image", mediaType: "image/png", byteSize: 8, sourceRevealAvailable: false };
     const load = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue("blob:recovered-image");

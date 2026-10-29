@@ -2064,6 +2064,20 @@ describe("shared task source on the native task client", () => {
     expect(value.invoke.mock.calls.map(call => call[1])).toEqual([TaskShareMethod.SUBMIT_OPERATION, TaskShareMethod.GET_OPERATION]);
     expect(network.submit).not.toHaveBeenCalled(); expect(network.getOperation).not.toHaveBeenCalled();
   });
+  it("recovers rich-answer receipts on the exact joined task without using the same-id Home task", async () => {
+    const value = sharedFixture(), network = fakeNetwork(), saved = memoryStorage(credential), instance = client(network, saved.storage);
+    await instance.start(); vi.spyOn(instance, "taskSharingApi").mockReturnValue(value.api);
+    await instance.openJoinedTask(value.joined);
+    value.invoke.mockRejectedValueOnce(new ConnectError("Not found", Code.NotFound));
+    const key = instance.taskHeaderSourceKey()!;
+    expect(await instance.sendRichAnswer(key, "Guest answer", "answer:button")).toBe(false);
+    expect(saved.pending()[0]?.taskJoinId).toBe("joined-one");
+    expect(await instance.sendRichAnswer(key, "Guest answer", "answer:button")).toBe(true);
+    expect(instance.state.pending).toHaveLength(0);
+    expect(value.invoke.mock.calls.map(call => call[1])).toEqual([TaskShareMethod.GET_OPERATION, TaskShareMethod.SUBMIT_OPERATION, TaskShareMethod.GET_OPERATION]);
+    expect(value.invoke.mock.calls[2]?.[2].operationId).toBe(value.invoke.mock.calls[1]?.[2].operationId);
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.getOperation).not.toHaveBeenCalled();
+  });
   it("retires a late finite event read when returning to the owned directory", async () => {
     const value = sharedFixture(), instance = client(fakeNetwork(), memoryStorage(credential).storage);
     await instance.start(); vi.spyOn(instance, "taskSharingApi").mockReturnValue(value.api);
@@ -5948,6 +5962,53 @@ describe("native mobile connection and operation ownership", () => {
     expect(saved.storage.saveAutomaticProfile).toHaveBeenCalledWith(undefined);
     expect(app.state.status).toBe("connected");
     expect(app.state.saved[0]?.automatic).toBe(false);
+  });
+
+  it("preserves composer drafts while rich-answer sends recover one durable operation across restart", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential), drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("My unfinished draft"));
+    await drafts.composer.flush(identity);
+    const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+    let receipt: Operation | undefined;
+    vi.mocked(network.getOperation).mockImplementation(async (_credential, id) => receipt?.operationId === id ? receipt : undefined);
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId) => {
+      receipt = create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED });
+      throw new Error("response lost");
+    });
+    expect(await app.sendRichAnswer(app.taskHeaderSourceKey()!, "/review literal answer", "answer:button")).toBe(false);
+    expect(saved.pending()).toMatchObject([{ kind: "send", state: "unknown", operationId: receipt!.operationId }]);
+    expect(drafts.composer.readSync(identity)?.text).toBe("My unfinished draft");
+    app.dispose();
+    const restored = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
+    await restored.start();
+    expect(await restored.sendRichAnswer(restored.taskHeaderSourceKey()!, "/review literal answer", "answer:button")).toBe(true);
+    expect(saved.pending()).toHaveLength(0);
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" }, expectedGeneration: 8n }],
+      payload: { case: "sendInput", value: { sessionId: "session", input: { parts: [{ content: { case: "text", value: "/review literal answer" } }] } } }
+    });
+    expect(drafts.composer.readSync(identity)?.text).toBe("My unfinished draft");
+  });
+
+  it("retires rich-answer callbacks on task navigation and checks ownership again after receipt lookup", async () => {
+    const network = fakeNetwork(), app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const oldKey = app.taskHeaderSourceKey()!;
+    await app.select(); await app.select("session");
+    expect(await app.sendRichAnswer(oldKey, "Continue", "answer:button")).toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
+    let release!: () => void, entered!: () => void;
+    const reached = new Promise<void>(resolve => { entered = resolve; });
+    vi.mocked(network.getOperation).mockImplementationOnce(async () => {
+      entered(); await new Promise<void>(resolve => { release = resolve; }); return undefined;
+    });
+    const pending = app.sendRichAnswer(app.taskHeaderSourceKey()!, "Continue", "answer:button");
+    await reached; await app.select(); release();
+    expect(await pending).toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
   });
 
   it("keeps an unknown send receipt across restart and never repeats the mutation under another ID", async () => {

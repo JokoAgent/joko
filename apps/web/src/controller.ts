@@ -3140,6 +3140,7 @@ export function useAppController(): AppController {
       listArtifactReferenceCatalog: async (...args: Parameters<OperationApi["listArtifactReferenceCatalog"]>) => original().listArtifactReferenceCatalog(...args),
       readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
+      sendRichAnswer: async (...args: Parameters<OperationApi["sendRichAnswer"]>) => original().sendRichAnswer(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
       createRemoteTarget: async (...args: Parameters<OperationApi["createRemoteTarget"]>) => original().createRemoteTarget(...args),
       createDevicePeerTarget: async (...args: Parameters<OperationApi["createDevicePeerTarget"]>) => original().createDevicePeerTarget(...args),

@@ -49,6 +49,34 @@ vi.mock("react-native", () => {
 });
 
 describe("native message Markdown", () => {
+  it("sends a previewed rich answer only on click and retains acceptance across native row remounts", async () => {
+    const container = document.createElement("div"), root = createRoot(container);
+    let finish!: (accepted: boolean) => void;
+    const send = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
+    const body = JSON.stringify({ seq: 1, op: "create", id: "go", kind: "button", props: { label: "Continue", send: "Literal /review text" } }) + "\n";
+    const props = { text: '```joko-ui\n' + body, streaming: true, answerStateKey: "mobile/rich-send", ownerKey: "runtime-one",
+      colors: { background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#ff9800", negative: "#cc634e" }, locale: "en" as const,
+      onSendRichAnswer: send };
+    try {
+      await act(async () => root.render(createElement(MobileMarkdownMessage, props)));
+      expect(container.querySelector('button')?.disabled).toBe(true);
+      const complete = { ...props, text: props.text + '```', streaming: false };
+      await act(async () => root.render(createElement(MobileMarkdownMessage, complete)));
+      expect(container.textContent).toContain("Literal /review text");
+      expect(send).not.toHaveBeenCalled();
+      await act(async () => { container.querySelector('button')!.click(); container.querySelector('button')!.click(); });
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]).toEqual(["Literal /review text", expect.stringContaining(":sent:go")]);
+      await act(async () => root.render(null));
+      await act(async () => root.render(createElement(MobileMarkdownMessage, complete)));
+      expect(container.querySelector('button')?.disabled).toBe(true);
+      await act(async () => finish(true));
+      expect(container.querySelector('button')?.textContent).toBe("Sent");
+      await act(async () => root.render(createElement(MobileMarkdownMessage, { ...complete, answerStateKey: "mobile/other-task", onSendRichAnswer: undefined })));
+      expect(container.querySelector('button')?.disabled).toBe(true);
+      expect(send).toHaveBeenCalledTimes(1);
+    } finally { await act(async () => root.unmount()); }
+  });
   it("mounts rich answer controls, retains local edits across streamed patches and isolates another owner", async () => {
     const container = document.createElement("div"); const root = createRoot(container);
     const body = '{"seq":1,"op":"create","id":"flag","kind":"check","props":{"label":"Enabled","default":false}}\n'

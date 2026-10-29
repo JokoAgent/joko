@@ -17,7 +17,10 @@ import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
 import { emptySnapshot, type BackendView, type ComposerDraft, type SessionView } from "../model.js";
 import { SessionPane } from "./SessionPane.js";
 
-vi.mock("./Timeline.js", () => ({ Timeline: () => null }));
+const timelineHost = vi.hoisted(() => ({ send: undefined as undefined | ((text: string, key: string) => Promise<boolean>) }));
+vi.mock("./Timeline.js", () => ({ Timeline: (props: { onSendRichAnswer?: (text: string, key: string) => Promise<boolean> }) => {
+  timelineHost.send = props.onSendRichAnswer; return null;
+} }));
 const editorState = vi.hoisted(() => ({ caret: 0 }));
 vi.mock("./composer-inline-mention.js", async importOriginal => ({
   ...await importOriginal<typeof import("./composer-inline-mention.js")>(),
@@ -45,6 +48,22 @@ beforeEach(() => { editorState.caret = 0; vi.stubGlobal("IS_REACT_ACT_ENVIRONMEN
 afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); for (const disconnect of disconnects.splice(0)) disconnect(); document.body.replaceChildren(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe("SessionPane loaded Skill input composition", () => {
+  it("preserves the composer and retires the original rich-answer sender when the task generation changes", async () => {
+    const view = await mount(false, { initial: { text: "Unfinished draft", mentions: [], inlineMentionRanges: [], attachments: [], deliveryMode: "prompt" } });
+    const send = required(timelineHost.send);
+    expect(await send("Answer text", "answer:button")).toBe(true);
+    expect(view.api.sendRichAnswer).toHaveBeenCalledExactlyOnceWith("task", 1n, "answer:button", "Answer text", expect.any(AbortSignal));
+    const signal = view.api.sendRichAnswer.mock.calls[0]![4]!;
+    expect(signal.aborted).toBe(false);
+    expect(view.text()).toBe("Unfinished draft");
+    expect(view.api.send).not.toHaveBeenCalled();
+    await view.render(session(2n));
+    expect(signal.aborted).toBe(true);
+    expect(await send("Late answer", "answer:button")).toBe(false);
+    expect(view.api.sendRichAnswer).toHaveBeenCalledOnce();
+    expect(await required(timelineHost.send)("Current answer", "answer:button")).toBe(true);
+    expect(view.api.sendRichAnswer.mock.calls[1]?.[1]).toBe(2n);
+  });
   it("selects the loaded Skill from the actual mention catalog and sends its exact draft through the generated Gateway", async () => {
     const view = await mount();
     await selectSkill(view);
@@ -197,6 +216,7 @@ async function mount(deferCatalog = false, options: { initial?: ComposerDraft; c
     readDraft: vi.fn(async () => storedDraft), readDraftSnapshot: vi.fn(async () => ({ revision: draftRevision, draft: storedDraft })), saveDraft: vi.fn(async (_sessionId: string, draft: ComposerDraft) => { storedDraft = draft; draftRevision++; }),
     saveDraftIfRevision: vi.fn(async (_sessionId: string, draft: ComposerDraft, expected: number) => { if (expected !== draftRevision) return undefined; storedDraft = draft; return ++draftRevision; }),
     send: vi.fn((...args: Parameters<AppController["send"]>) => gateway.send(...args)), getVoiceInputCapabilities: vi.fn(async () => ({})), getObjective: vi.fn(async () => undefined), watchObjective: vi.fn(() => idleStream()),
+    sendRichAnswer: vi.fn(async (..._args: Parameters<AppController["sendRichAnswer"]>) => true),
     getPortableReplacementCleanup: vi.fn(async () => undefined), listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } }))
   };
   const controller = api as unknown as AppController;
