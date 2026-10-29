@@ -39,7 +39,7 @@ import { readMobilePartnerOfflineConversation } from "./mobile-partner-offline-c
 import type { MobilePartnerGroupSourceTransport, MobilePartnerGroupSelection } from "./mobile-partner-group-roster";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { Code } from "@connectrpc/connect";
+import { Code, ConnectError } from "@connectrpc/connect";
 import {
   PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor,
   PartnerGroupAttachmentSchema, PartnerGroupAttachmentCategory,
