@@ -53,6 +53,9 @@ export function createTaskSharingController(input: {
       voices.delete(args[0]); return homeVoice.cancelVoiceInput(...args);
     },
     getPersonalizationPrompt: () => "",
+    sendRichAnswer: async (...args: Parameters<AppController["sendRichAnswer"]>) => {
+      assertSession(args[0]); return input.gateway.sendRichAnswer(...args);
+    },
     readDraft: async (sessionId: string) => { assertSession(sessionId); return local.readDraft(source.remoteServerId, draftProfile, sessionId); },
     readDraftSnapshot: async (sessionId: string) => { assertSession(sessionId); return local.readDraftSnapshot(source.remoteServerId, draftProfile, sessionId); },
     saveDraft: async (sessionId: string, draft: ComposerDraft) => { assertSession(sessionId); await local.saveDraft(source.remoteServerId, draftProfile, sessionId, draft); assertCurrent(); },

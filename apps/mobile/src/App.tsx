@@ -6236,6 +6236,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ? <MobileDelegatedTaskCard key={entry.key} entry={entry} entries={delegatedEntries} readClient={client}
       controls={delegatedControls} colors={colors} locale={locale} enabled={state.status === "connected"} />
     : undefined;
+  const richAnswerSourceKey = state.status === "connected" && !workerReadOnly && !session?.archived
+    && !conversationShare.active ? headerSourceKey : undefined;
+  const sendRichAnswer = richAnswerSourceKey === undefined ? undefined : async (text: string, receiptKey: string) => {
+    if (!taskMountedRef.current || AppState.currentState !== "active" || client.state.taskSource !== state.taskSource) return false;
+    return client.sendRichAnswer(richAnswerSourceKey, text, receiptKey);
+  };
   const renderTimelineItem = (item: MobileWorkItem<TimelineRow>, compactThinking = false): ReactElement => {
     if (isWorkGroup(item)) return <MobileWorkGroupCard blockKey={item.id} ownerKey={blockOwnerKey} streaming={item.streaming}
       enabled={state.status === "connected" || state.status === "offline"} colors={colors} locale={locale}>
@@ -6360,6 +6366,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           return <MobileMarkdownMessage key={`${markdownOwnerKey}/part/${part.contentIndex}`} text={part.text}
             colors={colors} locale={locale} ownerKey={`${markdownOwnerKey}/part/${part.contentIndex}`}
             answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id, part.contentIndex])} streaming={!item.completed}
+            onSendRichAnswer={item.kind === "assistant" ? sendRichAnswer : undefined}
             resourceText={item.text}
             resourceClient={client} messageId={item.id}
             resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
@@ -6368,6 +6375,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
           answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id])} streaming={!item.completed}
+          onSendRichAnswer={sendRichAnswer}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />

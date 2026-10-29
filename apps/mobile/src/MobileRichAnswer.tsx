@@ -63,6 +63,8 @@ import {
   richVector,
   RichAnswerStream,
   RichInteractionMemory,
+  RichSubmissionController,
+  richSendText,
   richAction,
   richChart,
   richLinePlot,
@@ -113,6 +115,28 @@ const memory = new RichInteractionMemory({
     await AsyncStorage.setItem("joko.richAnswer.viewState.v1", value);
   },
 });
+const submissions = new RichSubmissionController(memory);
+
+function RichSendAction({ node, text, receiptKey, ready, onSend }: {
+  readonly node: RichNode; readonly text?: string; readonly receiptKey: string; readonly ready: boolean;
+  readonly onSend?: (text: string, receiptKey: string) => Promise<boolean>;
+}) {
+  const { locale } = useTheme();
+  const styles = useThemedStyles(makeStyles);
+  const status = useSyncExternalStore(submissions.subscribe, () => submissions.status(receiptKey, text));
+  const disabled = !ready || !onSend || !text || status === "sending" || status === "sent";
+  const zh = locale.startsWith("zh");
+  return <View style={styles.stack}>
+    {text ? <Text style={styles.caption}>{text}</Text> : null}
+    <Pressable accessibilityRole="button" accessibilityState={{ disabled, busy: status === "sending" }} disabled={disabled}
+      style={styles.button} onPress={() => { if (!disabled) void submissions.submit(receiptKey, text, value => onSend(value, receiptKey)); }}>
+      <Text style={styles.buttonText}>{status === "sending" ? zh ? "发送中…" : "Sending…" : status === "sent" ? zh ? "已发送" : "Sent"
+        : richString(node, "label", richString(node, "text")) || (zh ? "发送" : "Send")}</Text>
+    </Pressable>
+    {status === "failed" ? <Text accessibilityRole="alert" style={styles.caption}>{zh ? "未确认发送成功。可重试核对原操作，输入已保留。" : "The send was not confirmed. Retry to check the original operation. Your input is preserved."}</Text> : null}
+  </View>;
+}
+
 type Props = {
   source: string;
   complete: boolean;
@@ -120,6 +144,7 @@ type Props = {
   colors: MobileMarkdownColors;
   locale: string;
   renderMedia?: (node: RichNode) => ReactNode;
+  onSend?: (text: string, receiptKey: string) => Promise<boolean>;
   renderMarkdown: (source: string, id: string) => ReactNode;
 };
 export function MobileRichAnswer(props: Props) {
@@ -131,6 +156,7 @@ function RichDocumentView({
   stateKey,
   renderMarkdown,
   renderMedia,
+  onSend,
 }: Props) {
   const { t } = useTranslation();
   const { colors } = useTheme();
@@ -399,8 +425,13 @@ function RichDocumentView({
           </View>
         );
       case "button":
+        if (node.props.send !== undefined) return <RichSendAction node={node} text={richSendText(node, values)}
+          receiptKey={`${stateKey}:sent:${id}`} ready={complete && !doc.issues} onSend={onSend} />;
         return button(label || richString(node, "text"), () => apply(node));
       case "form":
+        if (node.props.send !== undefined) return <View style={styles.stack}>{children}
+          <RichSendAction node={node} text={richSendText(node, values)} receiptKey={`${stateKey}:sent:${id}`}
+            ready={complete && !doc.issues} onSend={onSend} /></View>;
         return (
           <View style={styles.stack}>
             {children}

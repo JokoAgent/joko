@@ -10294,6 +10294,58 @@ export class MobileClient {
     }
   }
 
+  async sendRichAnswer(sourceKey: string, text: string, receiptKey: string): Promise<boolean> {
+    if (!text.trim() || text.length > 16_000 || !receiptKey || receiptKey.length > 8192) throw new Error("A bounded answer is required.");
+    const credential = this.#ready(), epoch = this.#epoch, signal = this.#abort!.signal;
+    const session = this.#selectedSession(), generation = session?.nativeBinding?.runtimeGeneration;
+    const backend = this.#selectedBackend(session);
+    if (!sourceKey || !session || !generation || generation < 1n || !backend || !supportsText(backend)) throw new Error("The answer's task is unavailable.");
+    const sessionId = session.sessionId;
+    const current = () => !signal.aborted && this.#current(epoch) && this.#foreground && this.#credential === credential
+      && this.#state.status === "connected" && this.taskHeaderSourceKey() === sourceKey
+      && !this.#selectedSession()?.archived && ![SessionState.CLOSED, SessionState.ARCHIVED].includes(this.#selectedSession()?.state ?? SessionState.CLOSED);
+    if (!current()) return false;
+    const intent = ["rich-answer", credential.serverId, credential.connectionId, this.taskDraftProfileId(), sessionId, receiptKey, text];
+    const action = this.#claimMutation();
+    try {
+      for (let attempt = 0; attempt < 32; attempt++) {
+        const operationId = `rich-${bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([...intent, attempt]))))}`;
+        let previous: Operation | undefined;
+        try { previous = await this.network.getOperation(credential, operationId, signal); }
+        catch (error) { if (!(error instanceof ConnectError && error.code === Code.NotFound)) throw error; }
+        if (!current()) return false;
+        if (previous) {
+          const pending = this.#state.pending.find(value => value.operationId === operationId);
+          const identity: PendingOperation = pending ?? { operationId, connectionId: credential.connectionId, kind: "send", sessionId, state: "unknown",
+            ...(this.#joinedTask ? { taskJoinId: this.#joinedTask.source.joined.joinId } : {}) };
+          if (!this.#operationReceiptMatches(previous, identity)) throw new Error("The answer operation receipt does not match its owner.");
+          if (previous.state === OperationState.UNSPECIFIED) throw new Error("The answer operation result is unknown.");
+          if (pending) await this.#receipt(previous, pending, epoch);
+          if (!current()) return false;
+          if ([OperationState.FAILED, OperationState.CONFLICT, OperationState.CANCELLED].includes(previous.state)) continue;
+          return true;
+        }
+        if (this.#state.pending.some(value => value.kind === "send" && value.sessionId === sessionId && value.state === "unknown" && value.operationId !== operationId)) {
+          throw new Error("Check the original input operation before sending another message.");
+        }
+        // The authenticated lookup proved absence. Retire this local pending row
+        // before explicitly trying the same ID; never invent a replacement ID.
+        if (this.#state.pending.some(value => value.operationId === operationId)) {
+          const rest = this.#state.pending.filter(value => value.operationId !== operationId);
+          if (!await this.#persistPending(rest, epoch) || !current()) return false;
+          this.#set({ pending: rest });
+        }
+        const result = await this.#submitTracked(create(OperationMutationSchema, {
+          preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: generation }],
+          payload: { case: "sendInput", value: { sessionId, deliveryMode: QueueDeliveryMode.PROMPT,
+            input: { parts: [{ content: { case: "text", value: text } }] } } }
+        }), { kind: "send", sessionId }, false, operationId, true, true, { signal, isCurrent: current, beforeDispatch: current });
+        return result.accepted;
+      }
+      throw new Error("The answer has too many rejected attempts. Send the text from the composer.");
+    } finally { this.#releaseMutation(action); }
+  }
+
   async send(draft: MobileComposerDraft, observer: MobileTaskSendObserver = {}): Promise<boolean> {
     if (!this.#joinedTask && this.#taskOutbox && (this.#state.status === "offline"
       || this.taskOutboxItems().length > 0)) return this.#enqueueTaskOutbox(draft, observer);

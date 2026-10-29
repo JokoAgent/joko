@@ -2302,6 +2302,64 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, false, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }], scope.signal);
   }
 
+  async sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, callerSignal?: AbortSignal): Promise<boolean> {
+    if (!text.trim() || text.length > 16_000 || !receiptKey || receiptKey.length > 8192 || expectedGeneration < 1n) {
+      throw new GatewayError("A bounded answer and its original task generation are required.");
+    }
+    const scope = this.captureActionScope(callerSignal);
+    const snapshotGeneration = this.#snapshot?.generation;
+    const current = () => {
+      scope.signal.throwIfAborted();
+      const session = this.#snapshot?.sessions.find(value => value.id === sessionId);
+      const backend = this.#snapshot?.backends.find(value => value.id === session?.backendId);
+      if (this.#transport !== scope.transport || this.#snapshot?.generation !== snapshotGeneration
+        || !session || session.generation !== expectedGeneration || session.archived || session.state === "closed"
+        || backend?.capabilities.get("input.text")?.supported !== true) {
+        throw new GatewayError("The answer's task is no longer current.");
+      }
+    };
+    current();
+    const client = createClient(OperationService, scope.transport);
+    const intent = ["rich-answer", this.#profile?.serverId, this.#profile?.id, this.#taskSharing?.scopeKey, sessionId, receiptKey, text];
+    const confirmReceipt = async (operationId: string, operation: Operation) => {
+      if (operation.operationId !== operationId || this.#taskSharing === undefined && operation.connectionId !== this.#profile?.id) {
+        throw new GatewayError("The answer operation receipt does not match its owner.");
+      }
+      if (operation.state === OperationState.UNSPECIFIED) throw new GatewayError("The answer operation result is unknown.");
+      if (this.#taskSharing !== undefined) {
+        await this.#taskSharing.operations.finish(operationId);
+        this.#sharedTaskUnknownOperations.delete(operationId);
+      }
+    };
+    // A stable ID survives view-state loss. Only a confirmed rejection permits a
+    // new attempt; an unknown result keeps the original durable operation.
+    for (let attempt = 0; attempt < 32; attempt++) {
+      const digest = await sha256Hex(new TextEncoder().encode(JSON.stringify([...intent, attempt])).buffer as ArrayBuffer);
+      const operationId = `rich-${digest}`;
+      current();
+      let previous: Operation | undefined;
+      try { previous = (await client.getOperation({ operationId }, { signal: scope.signal })).operation; }
+      catch (error) { if (!(error instanceof ConnectError && error.code === Code.NotFound)) throw error; }
+      current();
+      if (previous) {
+        await confirmReceipt(operationId, previous);
+        if ([OperationState.FAILED, OperationState.CONFLICT, OperationState.CANCELLED].includes(previous.state)) continue;
+        return true;
+      }
+      if (this.#taskSharing !== undefined && this.#sharedTaskUnknownOperations.has(operationId)) {
+        await this.#taskSharing.operations.finish(operationId);
+        this.#sharedTaskUnknownOperations.delete(operationId);
+        current();
+      }
+      const operation = await this.submit({ case: "sendInput", value: { sessionId, deliveryMode: QueueDeliveryMode.PROMPT,
+        input: { parts: [{ content: { case: "text", value: text } }] } } }, false,
+      [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }], scope.signal, undefined, operationId, true);
+      await confirmReceipt(operationId, operation);
+      return true;
+    }
+    throw new GatewayError("The answer has too many rejected attempts. Send the text from the composer.");
+  }
+
   async startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string> {
     const scope = this.captureActionScope();
     // Snapshot this invocation before the first await. A later edit or file

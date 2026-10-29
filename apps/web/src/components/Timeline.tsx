@@ -168,6 +168,7 @@ const TimelineSubagentContext = createContext<TimelineSubagentContextValue>({ ru
 const TimelinePartnerDelegationContext = createContext<PartnerDelegationCardActions>({});
 
 interface TimelinePersonalizationContextValue {
+  readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
   readonly ownerKey: string;
   readonly answerStateOwnerKey?: string;
   readonly locale?: string;
@@ -199,7 +200,8 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
-export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
+export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
+  readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
   readonly ownerKey: string;
   readonly viewportOwnerKey: string;
   readonly answerStateOwnerKey?: string;
@@ -372,6 +374,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, sess
   const personalizationContext = useMemo<TimelinePersonalizationContextValue>(() => ({
     ownerKey,
     answerStateOwnerKey,
+    onSendRichAnswer,
     locale,
     streamFadeEnabled,
     reducedMotion,
@@ -383,7 +386,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, sess
     ...(onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml }),
     ...(onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset }),
     ...(onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer })
-  }), [items, onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, answerStateOwnerKey, locale, reducedMotion, sessionId, streamFadeEnabled]);
+  }), [items, onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, answerStateOwnerKey, onSendRichAnswer, locale, reducedMotion, sessionId, streamFadeEnabled]);
   const subagentContext = useMemo<TimelineSubagentContextValue>(() => ({
     runs: subagentRuns ?? new Map(),
     details: subagentRunDetails ?? new Map(),
@@ -1915,6 +1918,7 @@ export function StreamingMarkdown({ text, streaming, streamFadeKey, t }: { reado
     ? <RichAnswer key={part.key} source={part.source} complete={part.complete || !streaming}
       stateKey={JSON.stringify([personalization.answerStateOwnerKey ?? personalization.ownerKey, streamFadeKey, part.key])}
       locale={personalization.locale ?? "en"}
+      onSend={personalization.onSendRichAnswer}
       renderMedia={node => <RichAnswerMedia node={node} actions={{ ownerKey: personalization.ownerKey, sessionId: personalization.sessionId, t,
         onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset, onOpenHttpLink: personalization.onOpenHttpLink }} />}
       renderMarkdown={(value, id) => <ParsedMarkdown key={id} text={value} t={t} onWordFadeSettled={settleWord} />} />

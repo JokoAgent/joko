@@ -1,9 +1,48 @@
 import { youtubeVideo } from '@joko/contracts';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { richSendText, RichSubmissionController } from '@joko/contracts';
 import { RichAnswerStream, RichInteractionMemory, hasRichAnswer, splitRichAnswer, richDefaults, richEvaluate, richLabel, richResolvedValues, richChart, richCalculationUnavailable, richVisualStyle, richVector, richLinePlot, type RichPalette } from '@joko/contracts';
 // Tier 1: actual stream reducer. Regression targets are partial transport, edits,
 // replay and preservation of user input; no DOM/source-string contracts.
 const line = (seq: number, op: Record<string, unknown>) => JSON.stringify({ seq, ...op }) + '\n';
+describe('explicit answer submissions', () => {
+  it('evaluates only bounded button/form text and keeps routing data out of the send', () => {
+    const node = (kind: string, send: unknown) => new RichAnswerStream().update(line(1, {
+      op: 'create', id: 'go', kind, props: { send, recipient: 'another-task', tool: 'shell' }
+    }), true).nodes.get('go')!;
+    expect(richSendText(node('form', { op: 'concat', args: ['  Answer: ', { ref: 'choice' }, '  '] }), { choice: 'A' })).toBe('Answer: A');
+    expect(richSendText(node('button', '/review as plain text'), {})).toBe('/review as plain text');
+    for (const value of ['', '  ', 1, true, { ref: 'missing' }, 'x'.repeat(16_001)]) {
+      expect(richSendText(node('button', value), {})).toBeUndefined();
+    }
+    expect(richSendText(node('button', 'x'.repeat(16_000)), {})).toHaveLength(16_000);
+    expect(richSendText(node('text', 'do something'), {})).toBeUndefined();
+  });
+
+  it('waits for stored receipts, deduplicates pending clicks, and retries without clearing controls', async () => {
+    let restore!: (value: string | null) => void;
+    const memory = new RichInteractionMemory({ read: () => new Promise(resolve => { restore = resolve; }), write: async () => {} });
+    const submissions = new RichSubmissionController(memory), send = vi.fn(async () => true);
+    const pending = submissions.submit('sent:known', 'Already sent', send);
+    await submissions.submit('sent:known', 'Already sent', send);
+    expect(submissions.status('sent:known', 'Already sent')).toBe('sending');
+    expect(send).not.toHaveBeenCalled();
+    restore(JSON.stringify({ version: 1, entries: [['sent:known', { text: 'Already sent' }]] }));
+    await pending;
+    expect(submissions.status('sent:known', 'Already sent')).toBe('sent');
+    expect(send).not.toHaveBeenCalled();
+    memory.set('controls', { choice: 'B' });
+    send.mockResolvedValueOnce(false);
+    await submissions.submit('sent:new', 'Answer B', send);
+    expect(submissions.status('sent:new', 'Answer B')).toBe('failed');
+    expect(memory.get('controls')).toEqual({ choice: 'B' });
+    await submissions.submit('sent:new', 'Answer B', send);
+    await submissions.submit('sent:new', 'Answer B', send);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(submissions.status('sent:new', 'Answer B')).toBe('sent');
+    expect(submissions.status('other-owner:sent:new', 'Answer B')).toBe('idle');
+  });
+});
 describe('streaming answer documents', () => {
   it('commits complete operations before the closing fence without exposing partial protocol', () => {
     const first = line(1, { op: 'create', id: 'title', kind: 'heading', props: { text: '你好' } });

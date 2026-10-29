@@ -38,6 +38,7 @@ interface Props {
   readonly resourceOwnerKey?: string;
   readonly messageId?: string;
   readonly answerStateKey?: string;
+  readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
   readonly streaming?: boolean;
   readonly resourceText?: string;
   readonly onOpenImage?: (leaseId: string, key: string) => void;
@@ -52,6 +53,7 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: 
   return <View style={styles.document}>{parts.map(part => part.kind === "rich"
     ? <MobileRichAnswer key={part.key} source={part.source} complete={part.complete || !props.streaming}
       stateKey={JSON.stringify([props.answerStateKey, part.key])} colors={props.colors} locale={props.locale}
+      onSend={props.onSendRichAnswer}
       renderMedia={node => <MobileRichAnswerMedia key={JSON.stringify([part.key, node.id, node.props["src"]])} node={node} colors={props.colors} locale={props.locale} resources={resources}
         fallback={text => <MobilePlainMarkdownMessage {...props} text={text} preparedResources={resources} />} />}
       renderMarkdown={(text, id) => <MobilePlainMarkdownMessage {...props} key={id} text={text} preparedResources={resources} />} />

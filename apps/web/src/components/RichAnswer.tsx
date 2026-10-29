@@ -32,6 +32,8 @@ import {
   richVector,
   RichAnswerStream,
   RichInteractionMemory,
+  RichSubmissionController,
+  richSendText,
   richAction,
   richChart,
   richLinePlot,
@@ -86,14 +88,33 @@ const memory = new RichInteractionMemory({
     localStorage.setItem('joko.richAnswer.viewState.v1', value);
   },
 });
+const submissions = new RichSubmissionController(memory);
+
+function RichSendAction({ node, text, receiptKey, ready, locale, onSend }: {
+  readonly node: RichNode; readonly text?: string; readonly receiptKey: string; readonly ready: boolean;
+  readonly locale: string; readonly onSend?: (text: string, receiptKey: string) => Promise<boolean>;
+}) {
+  const status = useSyncExternalStore(submissions.subscribe, () => submissions.status(receiptKey, text));
+  const disabled = !ready || !onSend || !text || status === 'sending' || status === 'sent';
+  const zh = locale.startsWith('zh');
+  return <div className="rich-answer-layout rich-answer-stack">
+    {text && <p className="rich-answer-caption" style={{ whiteSpace: 'pre-wrap' }}>{text}</p>}
+    <Button type="button" tone="ghost" disabled={disabled} onClick={() => {
+      if (!disabled) void submissions.submit(receiptKey, text, value => onSend(value, receiptKey));
+    }}>{status === 'sending' ? zh ? '发送中…' : 'Sending…' : status === 'sent' ? zh ? '已发送' : 'Sent'
+      : richString(node, 'label', richString(node, 'text')) || (zh ? '发送' : 'Send')}</Button>
+    {status === 'failed' && <p className="rich-answer-caption" role="alert">{zh ? '未确认发送成功。可重试核对原操作，输入已保留。' : 'The send was not confirmed. Retry to check the original operation. Your input is preserved.'}</p>}
+  </div>;
+}
 interface RichAnswerProps {
   readonly source: string; readonly complete: boolean; readonly stateKey: string; readonly locale: string;
   readonly renderMedia?: (node: RichNode) => ReactNode;
+  readonly onSend?: (text: string, receiptKey: string) => Promise<boolean>;
   readonly renderMarkdown: (source: string, id: string) => ReactNode;
 }
-/** The caller supplies the durable node/task/message identity. Controls never dispatch work. */
+/** The host supplies the exact task; generated content can only request a text send. */
 export function RichAnswer(props: RichAnswerProps) { return <RichAnswerDocument key={props.stateKey} {...props} />; }
-function RichAnswerDocument({ source, complete, stateKey, locale, renderMarkdown, renderMedia }: RichAnswerProps) {
+function RichAnswerDocument({ source, complete, stateKey, locale, renderMarkdown, renderMedia, onSend }: RichAnswerProps) {
   const t = (key: string) => key === 'richAnswer.calculationUnavailable'
     ? locale.startsWith('zh') ? '此计算暂不可用。' : 'This calculation is unavailable.'
     : locale.startsWith('zh') ? '内容尚未完整，已保留收到的部分。' : 'The answer is incomplete. Received content is preserved.';
@@ -314,12 +335,17 @@ function RichAnswerDocument({ source, complete, stateKey, locale, renderMarkdown
           </label>
         );
       case 'button':
+        if (node.props.send !== undefined) return <RichSendAction node={node} text={richSendText(node, values)}
+          receiptKey={`${stateKey}:sent:${id}`} ready={complete && !doc.issues} locale={locale} onSend={onSend} />;
         return (
-          <Button  tone="ghost" onClick={() => apply(node)}>
+          <Button type="button" tone="ghost" onClick={() => apply(node)}>
             {label || richString(node, 'text')}
           </Button>
         );
       case 'form':
+        if (node.props.send !== undefined) return <div className="rich-answer-layout rich-answer-stack">{children}
+          <RichSendAction node={node} text={richSendText(node, values)} receiptKey={`${stateKey}:sent:${id}`}
+            ready={complete && !doc.issues} locale={locale} onSend={onSend} /></div>;
         return (
           <form
             className="rich-answer-layout rich-answer-stack"

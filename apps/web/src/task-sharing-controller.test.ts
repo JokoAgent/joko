@@ -15,7 +15,7 @@ function fixture() {
   let current = true;
   const snapshot = emptySnapshot(), homeSnapshot = emptySnapshot();
   const home = { state: { snapshot: homeSnapshot, route: { kind: "session", sessionId: "same-task" } },
-    send: vi.fn(), deleteSession: vi.fn(), saveDraft: vi.fn(),
+    send: vi.fn(), sendRichAnswer: vi.fn(), deleteSession: vi.fn(), saveDraft: vi.fn(),
     getVoiceInputCapabilities: vi.fn().mockResolvedValue({ available: true }),
     startVoiceInput: vi.fn().mockResolvedValue({ id: "recording" }),
     appendVoiceAudio: vi.fn().mockResolvedValue({ id: "recording" }),
@@ -23,7 +23,7 @@ function fixture() {
     stopVoiceInput: vi.fn().mockResolvedValue({ id: "recording" }),
     cancelVoiceInput: vi.fn().mockResolvedValue({ id: "recording" })
   } as unknown as AppController;
-  const gateway = { send: vi.fn().mockResolvedValue(undefined), getArtifactUrl: vi.fn() } as unknown as OrchestratorGateway;
+  const gateway = { send: vi.fn().mockResolvedValue(undefined), sendRichAnswer: vi.fn().mockResolvedValue(true), getArtifactUrl: vi.fn() } as unknown as OrchestratorGateway;
   const local = { readDraft: vi.fn().mockResolvedValue(undefined), saveDraft: vi.fn().mockResolvedValue(undefined) } as unknown as LocalState;
   const access = { role: "guest" as const, memberId: "member", editableQueueItemIds: new Set(["mine"]) };
   const controller = createTaskSharingController({ home: () => home, gateway, source, snapshot: () => snapshot,
@@ -31,6 +31,16 @@ function fixture() {
   return { controller, home, gateway, local, snapshot, retire: () => { current = false; }, access };
 }
 describe("shared task controller authority", () => {
+  it("keeps rich-answer sends on the exact shared task and never falls through to Home", async () => {
+    const f = fixture();
+    expect(await f.controller.sendRichAnswer("same-task", 8n, "answer:button", "Continue")).toBe(true);
+    expect(f.gateway.sendRichAnswer).toHaveBeenCalledExactlyOnceWith("same-task", 8n, "answer:button", "Continue");
+    expect(f.home.sendRichAnswer).not.toHaveBeenCalled();
+    await expect(f.controller.sendRichAnswer("other-task", 8n, "answer:button", "Continue")).rejects.toThrow("outside");
+    f.retire();
+    await expect(f.controller.sendRichAnswer("same-task", 8n, "answer:button", "Continue")).rejects.toThrow("changed");
+    expect(f.gateway.sendRichAnswer).toHaveBeenCalledOnce();
+  });
   it("keeps a same-id Home task outside the closed facade and isolates drafts by complete source", async () => {
     const f = fixture();
     await expect(f.controller.deleteSession("same-task", false)).rejects.toThrow("unavailable");

@@ -6166,6 +6166,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   cancelVoiceInput(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   getVoiceInputSession(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint; readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean } }): Promise<void>;
+  sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, signal?: AbortSignal): Promise<boolean>;
   startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string>;
   reobserveReview(reviewRunId: string): Promise<void>;
   abort(runId: string): Promise<void>;

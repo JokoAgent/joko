@@ -1,4 +1,5 @@
 import { useArtifactDownload } from "./use-artifact-download.js";
+import { taskSourceKey } from "../task-sharing.js";
 import { resolveModelSpeed } from "../model-speed.js";
 import { McpAppTimelineProvider } from "./McpAppCard.js";
 import { richMediaWorkspacePath, decodeModelSpeed } from "@joko/contracts";
@@ -515,6 +516,39 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     (candidate) => !candidate.archived && candidate.remoteWorkspace === undefined
   );
   const canAddMessageReference = !reviewReadOnly && backend?.capabilities.get("input.text")?.supported === true;
+  const canSendRichAnswer = canAddMessageReference && !session.archived && session.state !== "closed"
+    && controller.state.connectionState === "connected" && artifactCatalogDocumentOwner !== undefined;
+  const richAnswerSourceKey = taskSourceKey(controller.state.taskSource ?? { kind: "own" });
+  const richAnswerSendOwnerKey = JSON.stringify([timelineResourceOwnerKey, richAnswerSourceKey, controller.state.activeProfile?.id,
+    controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, controller.state.connectionGeneration,
+    String(controller.state.snapshot.generation), controller.state.navigationRevision, session.id, String(session.generation), canSendRichAnswer]);
+  const [richAnswerDocumentEpoch, setRichAnswerDocumentEpoch] = useState(0);
+  const richAnswerSendScope = useMemo(() => ({ key: richAnswerSendOwnerKey, abort: new AbortController() }),
+    [richAnswerSendOwnerKey, richAnswerDocumentEpoch, artifactCatalogDocumentOwner]);
+  const richAnswerSendScopeRef = useRef(richAnswerSendScope);
+  richAnswerSendScopeRef.current = richAnswerSendScope;
+  useLayoutEffect(() => {
+    if (richAnswerSendScope.abort.signal.aborted) richAnswerSendScope.abort = new AbortController();
+    const document = paneRef.current?.ownerDocument;
+    const retire = () => richAnswerSendScope.abort.abort();
+    const restore = () => setRichAnswerDocumentEpoch(value => value + 1);
+    const visibility = () => { if (document?.hidden) retire(); else restore(); };
+    document?.addEventListener("visibilitychange", visibility);
+    document?.defaultView?.addEventListener("pagehide", retire);
+    document?.defaultView?.addEventListener("pageshow", restore);
+    return () => {
+      retire();
+      document?.removeEventListener("visibilitychange", visibility);
+      document?.defaultView?.removeEventListener("pagehide", retire);
+      document?.defaultView?.removeEventListener("pageshow", restore);
+    };
+  }, [richAnswerSendScope]);
+  const sendRichAnswer = async (text: string, receiptKey: string): Promise<boolean> => {
+    if (!canSendRichAnswer || richAnswerSendScopeRef.current !== richAnswerSendScope || richAnswerSendScope.abort.signal.aborted
+      || paneRef.current?.ownerDocument !== artifactCatalogDocumentOwner?.document || paneRef.current?.ownerDocument.hidden
+      || !sessionRouteIsCurrent(controllerRef.current.state.route, session.id)) return false;
+    return controller.sendRichAnswer(session.id, session.generation, receiptKey, text, richAnswerSendScope.abort.signal);
+  };
   const canForkMessage = !reviewReadOnly && !sideChatRuntimeReadOnly && canDeriveWorkspace
     && backend?.capabilities.get("session.fork")?.supported === true;
   const canOpenSideChat = session.sideChatSourceAllowed === true && !guest && !reviewReadOnly && !session.archived && session.derivationOrigin?.sideChat !== true
@@ -2192,7 +2226,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
         viewportOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, String(session.generation)])}
-        answerStateOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, session.createdAt])}
+        answerStateOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, richAnswerSourceKey, session.id, session.createdAt])}
+        onSendRichAnswer={canSendRichAnswer ? sendRichAnswer : undefined}
         sessionId={session.id}
         sessionName={session.name}
         workspaceId={canOpenWorkspaceReferences && controller.state.connectionState === "connected" ? workspace?.id : undefined}
