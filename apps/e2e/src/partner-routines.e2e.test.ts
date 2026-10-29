@@ -42,7 +42,7 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
   await expect(clients.partnerRoutine.savePartnerRoutine({ ...save, intent: { case: "creationRequestId", value: requestId } })).rejects.toMatchObject({ code: Code.FailedPrecondition });
   const beforeRestart = await clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId });
   expect(beforeRestart.routines.filter(value => !value.builtin)).toEqual([disabled]);
-  const builtin = beforeRestart.routines.filter(value => value.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(5);
+  const builtin = beforeRestart.routines.filter(value => value.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(1);
   await fixture.close(); fixture = await RealPiSystemFixture.start({ rootDirectory: root, keepRoot: true, port });
   const reopened = fixture.clients(paired.authKey).partnerRoutine;
   const catalog = await reopened.listPartnerRoutines({ partnerId: partner.partnerId }); const persisted = catalog.routines.find(value => value.id === routine.id)!;

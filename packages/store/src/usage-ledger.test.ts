@@ -39,12 +39,13 @@ describe("durable usage ledger", () => {
       costRates: { outputMicrosPerMillion: 2_000_000 } }));
     expect(result).toMatchObject({ costMicros: 200, costComplete: false, estimated: true });
     fixture.reopen();
-    const report = fixture.store.getUsageReport({ ownerId: "owner-a", group: "model" });
+    const query = { ownerId: "owner-a", group: "model" as const, pageSize: 1 };
+    const report = fixture.store.getUsageReport(query);
     expect(report.totals[0]).toMatchObject({ costMicros: 200 });
     const duplicate = fixture.store.recordUsageObservation(observation({ inputTokens: 100, outputTokens: 100, totalTokens: 200,
       costRates: { inputMicrosPerMillion: 9_000_000, outputMicrosPerMillion: 9_000_000 } }));
     expect(duplicate.changed).toBe(false);
-    expect(fixture.store.getUsageReport({ ownerId: "owner-a", group: "model" }).totals).toEqual(report.totals);
+    expect(fixture.store.getUsageReport(query).totals).toEqual(report.totals);
   });
   it("pages historical route totals without repricing or borrowing the current task model", () => {
     const fixture = createFixture();

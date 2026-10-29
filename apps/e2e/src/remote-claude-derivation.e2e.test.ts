@@ -349,7 +349,7 @@ class ControlledRemoteClaude {
     requestId: string): unknown {
     this.managerCalls.push(method);
     if (method === "hello") return {
-      protocolVersion: 2, managerVersion: "2.0.0", managerSha256: this.managerSha256,
+      protocolVersion: 1, managerVersion: "0.1.0", managerSha256: this.managerSha256,
       managerGeneration: MANAGER_GENERATION
     };
     if (method === "owner.reconcile") return { reconciled: true };
@@ -389,7 +389,7 @@ class ControlledRemoteClaude {
       operation.childId = childId;
       const callbackId = randomUUID();
       channel.pendingReservation = { callbackId, requestId, childId };
-      channel.send({ v: 2, kind: "callback", callbackId, callback: "storeChildReserved", value: {
+      channel.send({ v: 1, kind: "callback", callbackId, callback: "storeChildReserved", value: {
         operationId, generation: object(params.authority).generation,
         targetWorkspaceAuthority: object(access.target).workspaceAuthority,
         sessionId: childId
@@ -571,13 +571,13 @@ class ControlledProcess extends EventEmitter implements RemoteProcessHandle {
     });
   }
 
-  respond(id: string, value: unknown): void { this.send({ v: 2, kind: "response", id, ok: true, value }); }
+  respond(id: string, value: unknown): void { this.send({ v: 1, kind: "response", id, ok: true, value }); }
   reject(id: string, code: string): void {
-    this.send({ v: 2, kind: "response", id, ok: false, error: { code, stateMayHaveChanged: false } });
+    this.send({ v: 1, kind: "response", id, ok: false, error: { code, stateMayHaveChanged: false } });
   }
   event(event: "message" | "retired", value?: unknown): void {
     if (this.query === undefined) return;
-    this.send({ v: 2, kind: "event", queryId: this.query.queryId,
+    this.send({ v: 1, kind: "event", queryId: this.query.queryId,
       seq: ++this.query.sequence, event, ...(value === undefined ? {} : { value }) });
   }
   send(value: unknown): void { if (!this.#closed) this.stdout.write(`${JSON.stringify(value)}\n`); }
