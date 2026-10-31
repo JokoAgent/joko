@@ -8739,7 +8739,7 @@ function validManagedModelIdentity(value: string): boolean {
   return value.length > 0 && value.length <= 512 && !/[\s\x00-\x1f\x7f]/u.test(value);
 }
 
-/** Mirrors the deterministic identity spelling used by the fixed CLI 2.1.280
+/** Mirrors the deterministic identity spelling used by the fixed CLI 2.1.292
  * for settings keys. Native tier aliases depend on account configuration and
  * therefore deliberately fall back to a Query-global effort. */
 function fixedManagedModelSettingsKey(value: string): string | undefined {
@@ -8818,7 +8818,7 @@ function managedQueryLimitEnvironment(
     environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = String(contextWindow);
   }
   if (parent.contextWindow !== undefined) {
-    // Claude 2.1.280 resolves known model capacity before MAX_CONTEXT_TOKENS.
+    // Claude 2.1.292 resolves known model capacity before MAX_CONTEXT_TOKENS.
     // AUTO_COMPACT_WINDOW is the native working-window control. Its 100K floor
     // is compensated with the native percentage override for smaller budgets.
     environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = String(parent.contextWindow);

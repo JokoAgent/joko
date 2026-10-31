@@ -10,7 +10,7 @@ import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type { RemoteProcessHandle, RemoteProcessTransportPort } from "@joko/remote-ssh";
 
 export const REMOTE_CLAUDE_NODE_VERSION = "22.13.0";
-export const REMOTE_CLAUDE_CLI_VERSION = "2.1.280";
+export const REMOTE_CLAUDE_CLI_VERSION = "2.1.292";
 export const REMOTE_CLAUDE_MANAGER_VERSION = "0.1.0";
 export const REMOTE_CLAUDE_PROTOCOL_VERSION = 1;
 export const REMOTE_CLAUDE_EXPECTED_VERSION =

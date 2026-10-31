@@ -96,7 +96,7 @@ describe("Claude native Source product Session", () => {
     const capabilities: Capability[] = ["session.resume", "session.detach", "session.rewind", "session.rewind_to_start", "turn.stream", "turn.abort", "turn.follow_up", "input.text", "input.image", "model.list", "model.switch",
       "permission.change", "context.usage", "runtime.tools", "tool.mcp"].map(key => ({ key, supported: true }));
     capabilities.push({ key: "permission.modes", supported: true, options: ["ask", "bypassPermissions"] });
-    const descriptor: BackendDescriptor = { id: sourceId, adapterKind: "hosted", instanceGeneration: 1, displayName: "Claude on paired device", version: "0.3.280",
+    const descriptor: BackendDescriptor = { id: sourceId, adapterKind: "hosted", instanceGeneration: 1, displayName: "Claude on paired device", version: "0.3.292",
       installationState: "installed", health: "healthy", authenticationState: "authenticated", capabilities: new Map(capabilities.map(capability => [capability.key, capability])),
       models: [selectedModel], tools: [], diagnostics: [] };
     const assertContext = (context: AdapterContext) => { if (context.target.id !== "original-target" || context.target.workspaceRoot !== workspace) throw new Error("Wrong task Source."); };
