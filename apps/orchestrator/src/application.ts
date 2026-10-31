@@ -1883,7 +1883,7 @@ export async function createOrchestratorApplication(
   let partnerTodos: PartnerTodoManager | undefined;
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
   let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
-  const sessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
+  const sessionHost: SessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
     partnerLearning: {
       captureSource: source => partnerLearning?.captureSource(source) ?? false,
       accepted: occurrenceId => partnerLearning?.accepted(occurrenceId),
@@ -2204,7 +2204,7 @@ export async function createOrchestratorApplication(
   let partnerImports: PartnerImportManager | undefined;
   const assertImportService = () => { if (closed) throw new Error("Import service is closed."); };
   let appDefaultModels: AppDefaultModelCoordinator | undefined;
-  const partners = new PartnerManager({
+  const partners: PartnerManager = new PartnerManager({
     store: partnerStore,
     operationalStore: store,
     homeChanging: partnerId => partnerHomeStorage.changing(partnerId),
