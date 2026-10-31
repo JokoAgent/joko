@@ -1039,7 +1039,8 @@ export interface PairingOutcome {
   readonly authKey: string;
 }
 
-export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage">, AppDefaultModelUiPort {
+export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage" | "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">,
+  Required<Pick<OperationApi, "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">>, AppDefaultModelUiPort {
   deviceAuthorizationOwner?(): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
   serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
   inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi;
@@ -1227,7 +1228,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return { getProviderGroup: (key, signal) => invoke(signal, active => api.getProviderGroup(key, active)),
       listProviderGroupCandidates: (key, signal) => invoke(signal, active => api.listProviderGroupCandidates(key, active)),
       updateProviderGroup: (key, revision, config, signal) => invoke(signal, active => api.updateProviderGroup(key, revision, config, active)),
-      getProviderGroupUsage: (query, signal) => invoke(signal, active => api.getProviderGroupUsage(query, active)) };
+      getProviderGroupUsage: (query, signal) => invoke(signal, active => api.getProviderGroupUsage(query, active)),
+      getProviderGroupMemberAccountUsage: (query, signal) => invoke(signal, active => api.getProviderGroupMemberAccountUsage(query, active)) };
   }
 
   constructor(
