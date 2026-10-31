@@ -10,6 +10,10 @@ virtualStoreDirMaxLength: 32
 
 # Development packages are built from the remote branch in linkspan.json.
 overrides:
+  # Fix custom logger redaction for nested sensitive data (aws/aws-sdk-js-v3#8393).
+  '@smithy/core': 3.38.1
+  # Use the SDK 57 fix for Swift 6.2 constructor ownership and actor isolation (expo/expo#51040).
+  expo-modules-jsi: 57.1.2
   '@jokoagent/linkspan-core': file:.runtime/linkspan-packages/core
   '@jokoagent/linkspan-noise': file:.runtime/linkspan-packages/noise
   '@jokoagent/linkspan-http': file:.runtime/linkspan-packages/http
@@ -39,6 +43,8 @@ minimumReleaseAge: 10080
 minimumReleaseAgeExclude:
   - '@earendil-works/*'
   - '@joko/*'
+  # Apply the upstream redaction fix without waiting seven days.
+  - '@smithy/core@3.38.1'
   # Integrity-audited decoder fixes valid HEVC conformance-window and crop failures in 1.23.2.
   - 'libheif-js@1.23.5'
   # Audited SDK release paired with native CLI 2.1.280.
