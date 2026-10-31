@@ -239,6 +239,7 @@ import {
   type ProviderAccountUsageProvider,
   type ProviderAccountUsageSnapshot as NativeProviderAccountUsageSnapshot
 } from "./provider-account-usage.js";
+import type { ProviderAccountBalanceProvider, AccountBalanceResult } from "./provider-account-balance.js";
 import type {
   McpCredentialBinding as NativeMcpCredentialBinding,
   McpRouter,
@@ -580,6 +581,7 @@ export interface ConnectServiceDependencies {
   readonly diagnosticsBundles?: DiagnosticsBundleService;
   readonly providerAuth?: PiProviderAuthSupervisor;
   readonly providerAccountUsage?: ProviderAccountUsageProvider;
+  readonly providerAccountBalance?: ProviderAccountBalanceProvider;
   readonly messageSearch?: MessageSearchEmbeddingCoordinator;
   readonly makerMemory?: MakerMemoryController;
   readonly partnerGroupRuntime?: OrchestratorApplication["partnerGroupRuntime"];
@@ -1374,6 +1376,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.diagnosticsBundles === undefined ? {} : { diagnosticsBundles: application.diagnosticsBundles }),
     ...(application.providerAuth === undefined ? {} : { providerAuth: application.providerAuth }),
     ...(application.providerAccountUsage === undefined ? {} : { providerAccountUsage: application.providerAccountUsage }),
+    ...(application.providerAccountBalance === undefined ? {} : { providerAccountBalance: application.providerAccountBalance }),
     ...(application.messageSearch === undefined ? {} : { messageSearch: application.messageSearch }),
     ...(application.makerMemory === undefined ? {} : { makerMemory: application.makerMemory }),
     ...(application.partnerGroupRuntime === undefined ? {} : { partnerGroupRuntime: application.partnerGroupRuntime }),
@@ -2312,6 +2315,23 @@ export function createConnectServices(application: OrchestratorApplication, proj
           rateLimit: providerRateLimit(dependencies, record.descriptor.id, request.providerId)
         }
       };
+    },
+    getProviderAccountBalance: async (request, context) => {
+      const auth = authenticate(context);
+      const backend = dependencies.store.getBackend(request.backendId);
+      if (!managedProviderCatalogApplies(dependencies, backend.descriptor.id, request.providerId)) {
+        return { result: { status: "unsupported" } };
+      }
+      dependencies.providers.get(request.backendId, request.providerId);
+      const revoked = new AbortController(), stop = dependencies.connections.onRevoked(auth.id, () => revoked.abort());
+      try {
+        const signal = AbortSignal.any([context.signal, revoked.signal]);
+        const result = await dependencies.providerAccountBalance?.get(request.backendId, request.providerId, request.forceRefresh, signal) ?? { status: "unsupported" as const };
+        signal.throwIfAborted();
+        const current = authenticate(context);
+        if (current.id !== auth.id || current.authKeyDigest !== auth.authKeyDigest) throw new ConnectError("The original connection changed.", Code.PermissionDenied);
+        return { result: mapAccountBalance(result) };
+      } finally { stop(); }
     },
     getProviderUsage: async (request, context) => {
       authenticate(context);
@@ -9241,6 +9261,17 @@ async function logoutManagedNativeProvider(
   dependencies.messageSearch?.reconcileAvailability();
 }
 
+function mapAccountBalance(result: AccountBalanceResult): contract.ProviderAccountBalanceResult {
+  const snapshot = result.snapshot;
+  const window = (value: import("./provider-account-balance.js").AccountBalanceWindow | undefined, minutes: number) => value === undefined ? undefined
+    : { usedPercent: value.usedPercent, windowMinutes: minutes, ...(value.resetAt === undefined ? {} : { resetAt: toProtoTimestamp(value.resetAt) }) };
+  return create(contract.ProviderAccountBalanceResultSchema, { status: result.status, error: result.error, stale: result.stale,
+    dashboardUrl: result.dashboardUrl, retryAt: result.retryAt === undefined ? undefined : toProtoTimestamp(result.retryAt),
+    observedAt: result.observedAt === undefined ? undefined : toProtoTimestamp(result.observedAt),
+    snapshot: snapshot?.kind === "deepseek" ? { case: "deepseek", value: { isAvailable: snapshot.isAvailable, balances: [...snapshot.balances] } }
+      : snapshot?.kind === "zhipu" ? { case: "zhipu", value: { noPlan: snapshot.noPlan, level: snapshot.level, fiveHour: window(snapshot.fiveHour, 300), weekly: window(snapshot.weekly, 10_080) } } : undefined });
+}
+
 function mapProviderDescriptor(
   backendId: string,
   item: NativeProviderDescriptor,
@@ -9272,6 +9303,7 @@ function mapProviderDescriptor(
       : [],
     supportsModelRefresh: item.supportsModelRefresh === true,
     credentialSurfaces: [],
+    accountBalanceRevision: item.accountBalanceRevision,
     credentialExpiresAt: item.credentialExpiresAt === undefined ? undefined : toProtoTimestamp(item.credentialExpiresAt),
     rateLimit,
     usage,

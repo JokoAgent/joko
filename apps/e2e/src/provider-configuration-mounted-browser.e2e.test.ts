@@ -4,7 +4,7 @@ import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { BackendDescriptor } from "@joko/core";
-import { CredentialManager, CredentialVault, ProviderCatalogManager } from "@joko/orchestrator";
+import { CredentialManager, CredentialVault, ProviderCatalogManager, ProviderAccountBalanceProvider } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture } from "./fixture.js";
@@ -31,6 +31,43 @@ describe("mounted Provider configuration", () => {
     browser = undefined;
     await fixture?.close();
     fixture = undefined;
+  });
+
+  mountedIt("reads the selected official account, keeps exact decimal balances, and retires the expanded view", { timeout: 90_000 }, async () => {
+    const backendId = PI_LIKE_PROFILE.id; let fetches = 0;
+    fixture = await OrchestratorE2eFixture.start({ webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!), profiles: [PI_LIKE_PROFILE], createAdapter: profile => new ManagedProviderAdapter(profile),
+      createAuxiliaryServices: async (store, directory) => {
+        const vault = await CredentialVault.open(join(directory, "balance-vault.key")), credentials = new CredentialManager({ vault, storagePath: join(directory, "balance-credentials.json") });
+        await credentials.initialize(); const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: backendId }); providers.initialize();
+        const ticket = credentials.createUploadTicket({ kind: "api_key" }); credentials.upload(ticket.credentialUploadTicketId, "mounted-balance-secret");
+        await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "balance-key", displayName: "Balance key", kind: "api_key" });
+        await providers.upsert({ backendId, credentialOrigin: "https://api.deepseek.com", provider: { id: "deepseek", baseUrl: "https://api.deepseek.com/v1", api: "openai-completions", apiKeyEnv: "BALANCE_KEY", models: [] },
+          displayName: "Official balance", kind: "api_key", credentialBindings: { BALANCE_KEY: "balance-key" }, enabled: true, supportsLogin: false, supportsLogout: true, supportsRefresh: false });
+        const providerAccountBalance = new ProviderAccountBalanceProvider(providers, (async (url, init) => {
+          expect(url).toBe("https://api.deepseek.com/user/balance"); expect(new Headers(init?.headers).get("authorization")).toBe("Bearer mounted-balance-secret"); fetches++;
+          return Response.json({ is_available: true, balance_infos: [{ currency: "CNY", total_balance: "7.123456789", granted_balance: "1", topped_up_balance: "6.123456789" }] });
+        }) as typeof fetch); return { credentials, providers, providerAccountBalance };
+      } });
+    const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Balance Web" })).challenge!;
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const context = await browser.newContext({ viewport: { width: 1440, height: 960 }, reducedMotion: "reduce" }), page = await context.newPage();
+    const errors = browserErrors(page);
+    await page.goto(`${fixture.baseUrl}/#/settings/providers`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click(); await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl); await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId)); await page.getByLabel("Device name").fill("Balance Web");
+    await page.locator("form.pair-form button[type=submit]").click();
+    await page.locator(".provider-master-row", { hasText: "Official balance" }).click();
+    const toggle = page.getByRole("button", { name: "Account balance / plan usage", exact: true });
+    await toggle.waitFor({ state: "visible", timeout: 20_000 }); expect(fetches).toBe(0);
+    await toggle.focus(); await page.keyboard.press("Enter");
+    const region = page.getByRole("region", { name: "Account balance / plan usage" });
+    await region.getByText("Total balance: 7.123456789", { exact: true }).waitFor({ state: "visible" });
+    expect(await region.getByRole("link", { name: "Open official usage dashboard" }).getAttribute("href")).toBe("https://platform.deepseek.com/usage");
+    expect(await region.textContent()).not.toContain("mounted-balance-secret"); expect(fetches).toBe(1);
+    await region.getByRole("button", { name: "Refresh", exact: true }).click(); expect(fetches).toBe(1);
+    await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" }); await page.setViewportSize({ width: 390, height: 844 });
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+    await toggle.click(); expect(await region.count()).toBe(0); expect(errors).toEqual([]);
   });
 
   mountedIt("creates independent runtimes, reviews an overwrite, and fences a stale window after credential upload", { timeout: 150_000 }, async () => {

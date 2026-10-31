@@ -1501,6 +1501,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.refresh();
   }
 
+  async readProviderAccountBalance(backendId: string, providerId: string, forceRefresh: boolean, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountBalanceResult> {
+    if (this.#taskSharing) throw new GatewayError("The task owner must read Provider account balances.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope(signal);
+    const provider = this.#snapshot?.providers.find(value => value.backendId === backendId && value.id === providerId);
+    const identity = provider?.accountBalanceRevision;
+    if (!provider?.capabilities.has("provider.account_balance")) throw new GatewayError("Provider account balances are unavailable.");
+    const response = await createClient(BackendService, scope.transport).getProviderAccountBalance({ backendId, providerId, forceRefresh }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (this.#transport !== scope.transport || this.#snapshot?.providers.find(value => value.backendId === backendId && value.id === providerId)?.accountBalanceRevision !== identity
+      || !response.result) throw new GatewayError("The original Provider changed.");
+    return response.result;
+  }
+
   async readTaskProviderGroupUsage(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<TaskProviderGroupUsageView | undefined> {
     if (this.#taskSharing) throw new GatewayError("The task owner must read Provider group usage.", { code: "ACCESS_DENIED" });
     const scope = this.captureActionScope(signal);
@@ -15033,6 +15046,7 @@ function mapProviderRuntime(provider: ProviderDescriptor, routingEnabled = true)
   const usage = provider.usage;
   const accountUsage = provider.accountUsage;
   return {
+    ...(provider.accountBalanceRevision === undefined ? {} : { accountBalanceRevision: provider.accountBalanceRevision }),
     backendId: provider.backendId,
     id: provider.providerId,
     name: provider.displayName,

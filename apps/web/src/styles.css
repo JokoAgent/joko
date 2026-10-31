@@ -3634,6 +3634,11 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .provider-master-row > .provider-master-row__copy { flex-direction: row; align-items: center; gap: 7px; }
 .provider-master-row__copy > strong { min-width: 0; flex: 1; }
 .provider-master-row__copy > small { flex: 0 0 auto; }
+.provider-account-balance { position: relative; min-width: 0; }
+.provider-account-balance [role="region"] { overflow-wrap: anywhere; }
+.provider-account-balance dl { display: grid; gap: 8px; margin: 8px 0; }
+.provider-account-balance dd { margin: 2px 0; }
+.composer-statusbar .provider-account-balance [role="region"] { position: absolute; bottom: 100%; right: 0; z-index: 20; width: min(320px, calc(100vw - 32px)); max-height: 65vh; overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-raised); color: var(--text); box-shadow: 0 4px 16px #0002; }
 .provider-detail { min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; background: var(--surface-raised); }
 .provider-detail__mobile-back { display: none; }
 .provider-detail__header { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 10px 16px; flex: 0 0 auto; padding: 16px 18px 13px; }

@@ -11,6 +11,7 @@ import type { OperationalStore } from "@joko/store";
 
 import { CredentialVault, type EncryptedCredential } from "./credential-vault.js";
 import { isOwnedGgufProvider } from "./managed-gguf-provider.js";
+import { accountBalanceIntegration, PROVIDER_ACCOUNT_BALANCE_CAPABILITY, type AccountBalanceIdentity } from "./provider-account-balance.js";
 import {
   ProviderModelDiscoveryError,
   fetchProviderModels,
@@ -991,6 +992,7 @@ export interface ProviderDescriptor extends Omit<ManagedProviderEntry, "credenti
   readonly credentialExpiresAt?: number;
   readonly supportsModelRefresh?: boolean;
   readonly capabilities?: ReadonlySet<string>;
+  readonly accountBalanceRevision?: string;
   readonly loginMethods?: readonly ProviderLoginMethod[];
 }
 
@@ -2001,6 +2003,37 @@ export class ProviderCatalogManager {
     return this.generation;
   }
 
+  describeAccountBalance(backendId: string, providerId: string): AccountBalanceIdentity | undefined {
+    this.#assertInitialized();
+    const entry = this.#entries.get(managedProviderKey(backendId, providerId));
+    const native = backendId === this.#nativeBackendId ? this.#nativeEntries.get(providerId) : undefined;
+    const provider = entry?.provider ?? native?.runtimeProvider;
+    if (!provider || provider.keyless || native && native.kind !== "api_key" || !native && entry?.kind !== "api_key" && entry?.kind !== "custom_endpoint") return undefined;
+    const integration = accountBalanceIntegration(provider.baseUrl);
+    if (!integration) return undefined;
+    const nativeKey = native?.credentialReferenceId;
+    const reference = nativeKey ?? (entry && provider.apiKeyEnv ? entry.credentialBindings[provider.apiKeyEnv] : undefined);
+    const credential = reference ? this.#credentials.find(reference) : undefined;
+    const usable = credential?.configured === true && credential.kind === "api_key";
+    return { backendId, providerId, integration, native: nativeKey !== undefined,
+      ...(usable ? { reference } : {}),
+      key: JSON.stringify([backendId, providerId, this.#generation, entry?.version.toString(), native?.version.toString(), integration.endpoint, reference, credential?.generation, usable]) };
+  }
+
+  async useAccountBalanceCredential<T>(identity: AccountBalanceIdentity, operation: (key: string) => Promise<T>): Promise<T> {
+    const assertCurrent = () => {
+      if (!identity.reference || this.describeAccountBalance(identity.backendId, identity.providerId)?.key !== identity.key) throw new Error("The original Provider credential changed.");
+    };
+    assertCurrent();
+    let key = this.#credentials.resolve(identity.reference!);
+    if (identity.native) {
+      const credential = parseNativePiCredential(key);
+      if (credential.type !== "api_key" || !credential.key) throw new Error("The Provider API key is unavailable.");
+      key = credential.key;
+    }
+    assertCurrent(); const result = await operation(key); assertCurrent(); return result;
+  }
+
   /** Non-secret, process-local identity used to fence native-auth leases. */
   describeNativeAuthLease(providerId: string): {
     readonly accountId: string;
@@ -2204,6 +2237,7 @@ export class ProviderCatalogManager {
   }
 
   #descriptor(entry: ManagedProviderEntry, native = entry.backendId === this.#nativeBackendId ? this.#nativeEntries.get(entry.provider.id) : undefined): ProviderDescriptor {
+    const balance = this.describeAccountBalance(entry.backendId, entry.provider.id);
     const nativeReference = native?.credentialReferenceId ?? entry.nativeCredentialReferenceId;
     const credentials = [...new Set([
       ...Object.values(entry.credentialBindings),
@@ -2233,14 +2267,17 @@ export class ProviderCatalogManager {
       }),
       ...(nativeReference === undefined ? {} : { nativeCredentialReferenceId: nativeReference }),
       credentialReferenceIds: existing.map((item) => item.credentialReferenceId).sort(),
+      ...(balance ? { accountBalanceRevision: createHash("sha256").update(balance.key).digest("hex") } : {}),
       authenticationState,
       supportsModelRefresh: entry.provider.baseUrl !== undefined || native?.modelRefreshAvailable === true,
       loginMethods: entry.supportsLogin
         ? native?.loginMethods ?? nativeProviderLoginMethods(undefined, entry.kind)
         : [],
-      capabilities: new Set(native?.accountUsageAvailable === true && native.kind === "subscription"
-        ? [PROVIDER_ACCOUNT_USAGE_CAPABILITY]
-        : []),
+      capabilities: new Set([
+        ...(native?.accountUsageAvailable === true && native.kind === "subscription" ? [PROVIDER_ACCOUNT_USAGE_CAPABILITY] : []),
+        ...((native?.kind ?? entry.kind) === "api_key" || !native && entry.kind === "custom_endpoint"
+          ? !entry.provider.keyless && accountBalanceIntegration(entry.provider.baseUrl) ? [PROVIDER_ACCOUNT_BALANCE_CAPABILITY] : [] : [])
+      ]),
       ...(expires.length === 0 ? {} : { credentialExpiresAt: Math.min(...expires) }),
       ...(override?.error === undefined ? {} : { error: override.error })
     };

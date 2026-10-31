@@ -230,6 +230,7 @@ import { OperationalBrowserState } from "./operational-browser-state.js";
 import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-snapshots.js";
 import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
+import { ProviderAccountBalanceProvider } from "./provider-account-balance.js";
 import { PiResourceManager, inspectPiSkillPackage } from "./resource-manager.js";
 import { BuiltinSkillCatalog } from "./builtin-skills.js";
 import { PluginAuthoringTools } from "./plugin-authoring-tools.js";
@@ -571,6 +572,7 @@ export interface OrchestratorApplication {
   readonly providerAuth?: PiProviderAuthSupervisor;
   /** Capability-owned, in-memory Provider account quota reader. */
   readonly providerAccountUsage?: ProviderAccountUsageProvider;
+  readonly providerAccountBalance?: ProviderAccountBalanceProvider;
   readonly messageSearch?: MessageSearchEmbeddingCoordinator;
   readonly makerMemory?: MakerMemoryController;
   readonly partnerMemoryPreferences?: PartnerMemoryPreferences;
@@ -638,6 +640,7 @@ export interface OrchestratorApplicationDependencies {
   readonly codeHostProviders?: readonly CodeHostProvider[];
   /** Test-only transport seam; production uses the host fetch implementation. */
   readonly providerAccountUsageFetch?: typeof fetch;
+  readonly providerAccountBalanceFetch?: typeof fetch;
   /** Test-only transport seam; production uses the configured generic APNs provider. */
   readonly mobilePushProvider?: MobilePushProviderPort;
   /** Test-only direct-Messaging loopback seams; not sourced from product configuration. */
@@ -1097,6 +1100,7 @@ export async function createOrchestratorApplication(
       ? {}
       : { fetch: dependencies.providerAccountUsageFetch })
   });
+  const providerAccountBalance = new ProviderAccountBalanceProvider(providers, dependencies.providerAccountBalanceFetch);
   await mcpRouter.initialize();
   const extensionSources = new ExtensionSourceManager({
     store,
@@ -3381,6 +3385,7 @@ export async function createOrchestratorApplication(
     await attempt(() => mobilePush.close());
     await attempt(() => providerAuth.beginShutdown());
     await attempt(() => providerAccountUsage.invalidate());
+    await attempt(() => providerAccountBalance.dispose());
     await attempt(() => managedModelRuntimeSystem.close());
     await attempt(() => objectives?.close());
     await attempt(() => collaborationGoals.close());
@@ -3583,6 +3588,7 @@ export async function createOrchestratorApplication(
     diagnosticsBundles,
     providerAuth,
     providerAccountUsage,
+    providerAccountBalance,
     messageSearch,
     makerMemory,
     partnerMemoryPreferences,
@@ -3689,6 +3695,7 @@ export async function createOrchestratorApplication(
         helpAssistant.close();
         await attempt(() => providerAuth.beginShutdown());
         await attempt(() => providerAccountUsage.invalidate());
+        await attempt(() => providerAccountBalance.dispose());
         await attempt(() => localBackendRuntimeSetup.close());
         await attempt(() => managedModelRuntimeSystem.close());
         await attempt(() => objectives?.close());
@@ -3784,6 +3791,7 @@ export async function createOrchestratorApplication(
     await attempt(() => stopExtensionLibraryAuthorityNotifications());
     await attempt(() => providerAuth.beginShutdown());
     await attempt(() => providerAccountUsage.invalidate());
+    await attempt(() => providerAccountBalance.dispose());
     await attempt(() => startupHistoryMaintenance?.close());
     cleanupErrors.push(...await cleanupStartupBackendOwners());
     await attempt(() => startupSessionWorktrees?.dispose());
