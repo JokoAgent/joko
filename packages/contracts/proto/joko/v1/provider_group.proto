@@ -19,6 +19,7 @@ service ProviderGroupService {
   rpc ReportProviderGroupLeases(ReportProviderGroupLeasesRequest) returns (ReportProviderGroupLeasesResponse);
   rpc ReportProviderGroupUsage(ReportProviderGroupUsageRequest) returns (ReportProviderGroupUsageResponse);
   rpc GetProviderSchedulingState(GetProviderSchedulingStateRequest) returns (GetProviderSchedulingStateResponse);
+  rpc GetProviderGroupMemberAccountUsage(GetProviderGroupMemberAccountUsageRequest) returns (GetProviderGroupMemberAccountUsageResponse);
 }
 message ProviderGroupKey { string backend_id = 1; string provider_id = 2; }
 enum ProviderGroupStrategy {
@@ -132,3 +133,11 @@ message ReportProviderGroupUsageRequest {
 message ReportProviderGroupUsageResponse { bool accepted = 1; bool complete = 2; }
 message GetProviderSchedulingStateRequest { ProviderGroupKey key = 1; string model_id = 2; }
 message GetProviderSchedulingStateResponse { uint32 active_turns = 1; ProviderAccountUsageSnapshot account_usage = 2; }
+message GetProviderGroupMemberAccountUsageRequest {
+  ProviderGroupKey key = 1; uint64 expected_revision = 2; string member_key = 3;
+}
+message GetProviderGroupMemberAccountUsageResponse {
+  uint64 revision = 1; string member_key = 2;
+  // ready, unsupported, offline, or shared. Shared members never expose the owner's account.
+  string state = 3; ProviderAccountUsageSnapshot account_usage = 4;
+}

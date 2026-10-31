@@ -20,6 +20,9 @@ export interface ProviderGroupConnectOptions {
   readonly authenticate: (context: HandlerContext) => ProviderGroupPrincipal | Promise<ProviderGroupPrincipal>;
   readonly assertRemoteAllowed: (key: ProviderGroupKey) => void;
   readonly schedulingState: (key: ProviderGroupKey, modelId: string, signal: AbortSignal) => Promise<{ readonly activeTurns: number; readonly accountUsage?: ProviderAccountUsageSnapshot }>;
+  readonly memberAccountUsage?: (key: ProviderGroupKey, expectedRevision: bigint, memberKey: string, signal: AbortSignal) => Promise<{
+    readonly state: "ready" | "unsupported" | "offline" | "shared"; readonly accountUsage?: ProviderAccountUsageSnapshot;
+  }>;
   readonly taskAccountUsage?: (sessionId: string, generation: bigint, signal: AbortSignal) => Promise<{
     readonly member: ProviderGroupTaskMember; readonly snapshot?: ProviderAccountUsageSnapshot;
   } | undefined>;
@@ -155,6 +158,13 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
         if (group.revision === 0n || !row.memberKey || groupKey(row.group) === "") throw new Error("Unknown group usage owner.");
       }); pending.delete(principal.id);
       return create(contract.ReportProviderGroupUsageResponseSchema, { accepted, complete: true });
+    }),
+    getProviderGroupMemberAccountUsage: (request, context) => invoke(context, true, async principal => {
+      identity(request.memberKey);
+      if (!options.memberAccountUsage) throw new ConnectError("Member account usage is unavailable.", Code.Unimplemented);
+      const value = await options.memberAccountUsage(key(request.key, principal), request.expectedRevision, request.memberKey, context.signal);
+      return create(contract.GetProviderGroupMemberAccountUsageResponseSchema, { revision: request.expectedRevision, memberKey: request.memberKey,
+        state: value.state, ...(value.accountUsage ? { accountUsage: toGroupAccountUsage(value.accountUsage) } : {}) });
     }),
     getProviderSchedulingState: (request, context) => invoke(context, false, async principal => {
       const state = await options.schedulingState(key(request.key, principal), request.modelId, context.signal);

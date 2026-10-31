@@ -7,6 +7,7 @@ export interface ProviderGroupSettingsApi {
   listProviderGroupCandidates(key: { readonly backendId: string; readonly providerId: string }, signal?: AbortSignal): Promise<readonly contract.ProviderGroupCandidate[]>;
   updateProviderGroup(key: { readonly backendId: string; readonly providerId: string }, expectedRevision: bigint, config: contract.ProviderGroupConfig | undefined, signal?: AbortSignal): Promise<contract.ProviderGroupSnapshot>;
   getProviderGroupUsage(query: Omit<contract.GetProviderGroupUsageRequest, "$typeName">, signal?: AbortSignal): Promise<readonly contract.ProviderGroupUsageRow[]>;
+  getProviderGroupMemberAccountUsage(query: Omit<contract.GetProviderGroupMemberAccountUsageRequest, "$typeName">, signal?: AbortSignal): Promise<contract.GetProviderGroupMemberAccountUsageResponse>;
 }
 /** The parent gateway owns the authenticated current-node client. Mutations
  * are never replayed after a transport failure or a configuration conflict. */
@@ -30,7 +31,14 @@ export function createProviderGroupSettingsApi(client: Client<typeof contract.Pr
         update: config ? { case: "config", value: config } : { case: "delete", value: create(contract.DeleteProviderGroupSchema) } }, { signal });
       return assertSnapshot(result.group, key);
     },
-    getProviderGroupUsage: async (query, signal) => (await client.getProviderGroupUsage(query, { signal })).rows
+    getProviderGroupUsage: async (query, signal) => (await client.getProviderGroupUsage(query, { signal })).rows,
+    getProviderGroupMemberAccountUsage: async (query, signal) => {
+      const result = await client.getProviderGroupMemberAccountUsage(query, { signal });
+      if (result.memberKey !== query.memberKey || result.revision !== query.expectedRevision
+        || !['ready', 'unsupported', 'offline', 'shared'].includes(result.state)
+        || (result.state === 'ready') !== (result.accountUsage !== undefined)) throw new Error('The original Provider account quota changed.');
+      return result;
+    }
   };
 }
 export function providerGroupDraft(config: contract.ProviderGroupConfig | undefined, candidates: readonly contract.ProviderGroupCandidate[], key: { readonly backendId: string; readonly providerId: string }): contract.ProviderGroupConfig {

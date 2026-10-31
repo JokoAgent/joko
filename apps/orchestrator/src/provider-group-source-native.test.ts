@@ -130,6 +130,15 @@ it("runs same-owner C through B's group decision directly on A with the actual S
     const a = await f.node("A"), b = await f.node("B"), c = await f.node("C"); await f.pair(b, a); await f.pair(c, a); await f.pair(c, b);
     const key = { backendId: "pi", providerId: "provider" }, remoteA = b.groups.sources().find(source => source.nodeId === "A" && source.providerId === "provider")!;
     b.groups.store.update(key, { strategy: "ordered", autoSwitch: true, members: [providerGroupDefaultMember(remoteA), providerGroupDefaultMember(b.groups.sources().find(source => source.kind === "local" && source.providerId === "provider")!)] }, 0n);
+    const quotaGroup = b.groups.store.snapshot(key), quotaSignal = new AbortController().signal;
+    const remoteQuota = await b.groups.memberAccountUsage(key, quotaGroup.revision, remoteA.key, quotaSignal);
+    expect(remoteQuota).toMatchObject({ state: 'ready', accountUsage: { primaryWindow: { usedPercent: 12 } } });
+    const ownMember = quotaGroup.config!.members.find(member => member.kind === 'local')!;
+    expect(await b.groups.memberAccountUsage(key, quotaGroup.revision, ownMember.key, quotaSignal))
+      .toMatchObject({ state: 'ready', accountUsage: { primaryWindow: { usedPercent: 89 } } });
+    const staleQuota = b.groups.memberAccountUsage(key, quotaGroup.revision, remoteA.key, quotaSignal);
+    b.groups.store.update(key, { ...quotaGroup.config!, members: quotaGroup.config!.members.map(member => ({ ...member, weight: member.weight + 1 })) }, quotaGroup.revision);
+    await expect(staleQuota).rejects.toThrow('changed');
     await c.sources.refresh(c.connection); const bSource = c.groups.sources().find(source => source.nodeId === "B" && source.providerId === "provider")!;
     await c.host.registerTarget({ id: "remote-target", backendId: bSource.backendId, displayName: "Original C", workspaceRoot: join(c.root, "workspace"), managed: false, trusted: true });
     c.store.upsertTarget(c.store.getTarget("remote-target").descriptor, { workspaceId: "original-project-workspace" });
