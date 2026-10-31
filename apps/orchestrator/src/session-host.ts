@@ -1034,7 +1034,7 @@ export class SessionHost {
   readonly #serviceRuntimePrompts = new Map<string, { readonly baseDigest: string; readonly text: string }>();
   readonly #resolveServiceRuntimeConfiguration: ((session: SessionDescriptor) => string | undefined) | undefined;
   readonly #prepareManagedProviderRuntime: ((context: AdapterContext) => Promise<void>) | undefined;
-  readonly #resolveModelWorkingContext: ((target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined) | undefined;
+  readonly #resolveModelWorkingContext: ((target: { readonly backendId: string; readonly providerId: string; readonly modelId: string; readonly sessionId?: string }) => number | undefined) | undefined;
   readonly #serviceRuntimeConfigurations = new Map<string, string>();
   readonly #serviceSessionRuntimeFallback: (input: {
     readonly sessionId: string;
@@ -1189,7 +1189,7 @@ export class SessionHost {
       readonly resolveServiceRuntimeConfiguration?: (session: SessionDescriptor) => string | undefined;
       /** Node-owned local inference readiness, after durable Queue admission and before sending. */
       readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
-      readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined;
+      readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string; readonly sessionId?: string }) => number | undefined;
       readonly resolveMcpAppModelContext?: (sessionId: string) => Promise<McpAppModelContext>;
       /** Service-owned fallback order, independent of the ordinary task preference. */
       readonly serviceSessionRuntimeFallback?: (input: {
@@ -4826,11 +4826,13 @@ export class SessionHost {
   async refreshModelWorkingContexts(
     targets: readonly { readonly backendId: string; readonly providerId: string; readonly modelId: string }[],
     assertCurrent: () => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onlySessionId?: string
   ): Promise<void> {
     this.#assertOpen(); assertCurrent();
     const check = (): void => { signal?.throwIfAborted(); this.#assertOpen(); assertCurrent(); };
     for (const sessionId of [...this.#active.keys()]) {
+      if (onlySessionId !== undefined && sessionId !== onlySessionId) continue;
       await this.#withSessionRuntimeControlLock(sessionId, async () => {
         check();
         const active = this.#active.get(sessionId);
@@ -7604,7 +7606,7 @@ export class SessionHost {
         || existing.backendInstanceGeneration !== active.backendInstanceGeneration) {
         this.#workingContextTurns.set(stored.descriptor.id, { generation: stored.descriptor.binding.generation,
           backendInstanceGeneration: active.backendInstanceGeneration, runIds: new Set([item.runId]),
-          budgets: this.captureModelWorkingContexts(stored.descriptor.backendId) });
+          budgets: this.captureModelWorkingContexts(stored.descriptor.backendId, stored.descriptor.id) });
       } else existing.runIds.add(item.runId);
     }
     const overrides = item.executionOverrides;
@@ -14345,11 +14347,11 @@ export class SessionHost {
     };
   }
 
-  private captureModelWorkingContexts(backendId: string): ReadonlyMap<string, number | undefined> {
+  private captureModelWorkingContexts(backendId: string, sessionId: string): ReadonlyMap<string, number | undefined> {
     const budgets = new Map<string, number | undefined>();
     if (this.#resolveModelWorkingContext !== undefined) {
       for (const model of this.#store.getBackend(backendId).descriptor.models) {
-        budgets.set(JSON.stringify([model.providerId, model.modelId]), this.#resolveModelWorkingContext({ backendId, providerId: model.providerId, modelId: model.modelId }));
+        budgets.set(JSON.stringify([model.providerId, model.modelId]), this.#resolveModelWorkingContext({ backendId, providerId: model.providerId, modelId: model.modelId, sessionId }));
       }
     }
     return budgets;
@@ -14445,7 +14447,7 @@ export class SessionHost {
       && turnBudget.backendInstanceGeneration === backendInstanceGeneration
       && (runId !== undefined && turnBudget.runIds.has(runId)
         || this.#sessionRuntimeMutationMustDefer(sessionId))
-      ? turnBudget.budgets : this.captureModelWorkingContexts(target.backendId);
+      ? turnBudget.budgets : this.captureModelWorkingContexts(target.backendId, sessionId);
     const context: AdapterContext = {
       nativeToolAuthorization: {
         required: this.#extensionNativeToolAuthorization?.(sessionId)?.required === true

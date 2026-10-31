@@ -80,6 +80,7 @@ export * from "./schedule-coordinator.js";
 export * from "./schedule-hook-script-installer.js";
 export * from "./server.js";
 export * from "./provider-account-balance.js";
+export * from "./session-context-budget.js";
 export * from "./session-host.js";
 export * from "./task-sharing-home.js";
 export { PartnerManager } from "./partner-manager.js";

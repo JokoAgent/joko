@@ -77,6 +77,8 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { ModelWorkingContextCoordinator } from "./model-working-context.js";
+import { SessionContextBudgetCoordinator } from "./session-context-budget.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import { ObjectiveManager } from "./objective-manager.js";
@@ -6001,6 +6003,37 @@ describe("SessionHost", () => {
       rpcEventType: "extension_command_completed",
       payload: { case: "diagnostic", value: { nativeEventType: "extension_command_completed" } }
     });
+  });
+
+  it("keeps task budgets independent, clamps them to model limits, and refreshes only the edited native task", async () => {
+    const profile = { ...PI_LIKE_PROFILE, models: PI_LIKE_PROFILE.models.map(model => ({ ...model, contextWindow: 1_000_000 })),
+      capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "model.working_context", supported: true }] };
+    const adapter = new FakeBackendAdapter(profile), refresh = vi.fn(async (_context: AdapterContext) => {}); Object.assign(adapter, { refreshModelWorkingContext: refresh });
+    let budgets: SessionContextBudgetCoordinator | undefined;
+    const f = await createFixture(adapter, { resolveModelWorkingContext: target => budgets?.resolve(target.sessionId!, target) ?? 1_000_000 });
+    const models = new ModelWorkingContextCoordinator({ store: f.store, currentOwner: () => ({ ownerId: "node", generation: 1 }),
+      resolveRoute: target => { const backend = f.store.getBackend(target.backendId), model = backend.descriptor.models.find(model => model.providerId === target.providerId && model.modelId === target.modelId);
+        return model ? { model, catalogRevision: backend.revision, instanceGeneration: backend.descriptor.instanceGeneration, supported: true, available: true } : undefined; },
+      refresh: async (targets, check) => { await f.host.refreshModelWorkingContexts(targets, check); } });
+    budgets = new SessionContextBudgetCoordinator(f.store, models, (sessionId, target, check) => f.host.refreshModelWorkingContexts([target], check, undefined, sessionId), () => false);
+    const create = async (id: string) => (await f.host.createSession({ operationId: id, connection: f.connection, targetId: "target-one", title: id, providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const one = await create("budget-one"), two = await create("budget-two"), generation = f.store.getSession(one).descriptor.binding.generation;
+    const before = budgets.read(one, generation); await budgets.set({ sessionId: one, generation, tokens: 500_000, expectedRevision: before.revision, expectedSourceRevision: before.sourceRevision }, () => {});
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sessionId: one }));
+    expect(refresh.mock.calls[0]![0].resolveModelWorkingContext?.({ providerId: "test", modelId: "text" })).toBe(500_000);
+    expect(budgets.read(two, f.store.getSession(two).descriptor.binding.generation)).toMatchObject({ effectiveWindowTokens: 1_000_000 });
+    const target = before.target!, modelView = await models.read({ target });
+    await models.set({ target, operationId: "model-limit", limit: 300_000, expectedRevision: modelView.revision, expectedSourceRevision: modelView.sourceRevision });
+    expect(budgets.read(one, generation)).toMatchObject({ budgetTokens: 500_000, effectiveWindowTokens: 300_000, modelLimitTokens: 300_000 });
+    expect(budgets.read(two, f.store.getSession(two).descriptor.binding.generation)).toMatchObject({ effectiveWindowTokens: 300_000 });
+    const stale = budgets.read(one, generation); const original = budgets;
+    budgets = new SessionContextBudgetCoordinator(f.store, models, original.refresh, () => false);
+    expect(budgets.read(one, generation).budgetTokens).toBe(500_000);
+    await budgets.set({ sessionId: one, generation, expectedRevision: stale.revision, expectedSourceRevision: stale.sourceRevision }, () => {});
+    expect(budgets.read(one, generation).budgetTokens).toBeUndefined();
+    expect(models.configuredLimit(target)).toBe(300_000);
+    await expect(budgets.set({ sessionId: one, generation, tokens: 1_000, expectedRevision: stale.revision, expectedSourceRevision: stale.sourceRevision }, () => {})).rejects.toMatchObject({ reason: "conflict" });
+    await expect(budgets.set({ sessionId: one, generation: generation + 1, tokens: 1_000, expectedRevision: 0n, expectedSourceRevision: "old" }, () => {})).rejects.toMatchObject({ reason: "conflict" });
   });
 
   it("refreshes working contexts only on exact idle active routes and never activates sleeping sessions", async () => {
@@ -16774,7 +16807,7 @@ async function createFixture(
     readonly sessionRuntimeRecoveryDelayMs?: (attempt: number) => number;
     readonly backendDispatchBlocked?: (backendId: string) => boolean;
     readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
-    readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined;
+    readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string; readonly sessionId?: string }) => number | undefined;
     readonly resolveMcpAppModelContext?: (sessionId: string) => Promise<import("./mcp-apps/host.js").McpAppModelContext>;
     readonly onBackendMayBeIdle?: (backendId: string) => void;
     readonly onServiceRunSettled?: (input: {

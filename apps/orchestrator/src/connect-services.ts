@@ -240,6 +240,7 @@ import {
   type ProviderAccountUsageSnapshot as NativeProviderAccountUsageSnapshot
 } from "./provider-account-usage.js";
 import type { ProviderAccountBalanceProvider, AccountBalanceResult } from "./provider-account-balance.js";
+import { SessionContextBudgetError, type SessionContextBudgetCoordinator, type SessionContextBudgetView } from "./session-context-budget.js";
 import type {
   McpCredentialBinding as NativeMcpCredentialBinding,
   McpRouter,
@@ -582,6 +583,7 @@ export interface ConnectServiceDependencies {
   readonly providerAuth?: PiProviderAuthSupervisor;
   readonly providerAccountUsage?: ProviderAccountUsageProvider;
   readonly providerAccountBalance?: ProviderAccountBalanceProvider;
+  readonly sessionContextBudget?: SessionContextBudgetCoordinator;
   readonly messageSearch?: MessageSearchEmbeddingCoordinator;
   readonly makerMemory?: MakerMemoryController;
   readonly partnerGroupRuntime?: OrchestratorApplication["partnerGroupRuntime"];
@@ -1377,6 +1379,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.providerAuth === undefined ? {} : { providerAuth: application.providerAuth }),
     ...(application.providerAccountUsage === undefined ? {} : { providerAccountUsage: application.providerAccountUsage }),
     ...(application.providerAccountBalance === undefined ? {} : { providerAccountBalance: application.providerAccountBalance }),
+    ...(application.sessionContextBudget === undefined ? {} : { sessionContextBudget: application.sessionContextBudget }),
     ...(application.messageSearch === undefined ? {} : { messageSearch: application.messageSearch }),
     ...(application.makerMemory === undefined ? {} : { makerMemory: application.makerMemory }),
     ...(application.partnerGroupRuntime === undefined ? {} : { partnerGroupRuntime: application.partnerGroupRuntime }),
@@ -2116,6 +2119,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
   } satisfies ServiceImpl<typeof contract.OperationService>;
 
   const backend = {
+    getSessionContextBudget: (request, context) => {
+      authenticate(context);
+      if (!dependencies.sessionContextBudget) throw new ConnectError("Task context budgets are unavailable.", Code.Unimplemented);
+      try { return { budget: mapSessionContextBudget(dependencies.sessionContextBudget.read(request.sessionId, Number(request.generation))) }; }
+      catch (error) { if (error instanceof SessionContextBudgetError) throw new ConnectError(error.message, error.reason === "invalid" ? Code.InvalidArgument : Code.Aborted); throw error; }
+    },
     ...createModelWorkingContextConnectMethods(dependencies.modelWorkingContext, authenticate,
       connection => dependencies.connections.fence(connection),
       (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener)),
@@ -9259,6 +9268,13 @@ async function logoutManagedNativeProvider(
     throw error;
   }
   dependencies.messageSearch?.reconcileAvailability();
+}
+
+function mapSessionContextBudget(value: SessionContextBudgetView): contract.SessionContextBudgetView {
+  const tokens = (value: number | undefined) => value === undefined ? undefined : BigInt(value);
+  return create(contract.SessionContextBudgetViewSchema, { sessionId: value.sessionId, generation: BigInt(value.generation), target: value.target,
+    budgetTokens: tokens(value.budgetTokens), defaultWindowTokens: tokens(value.defaultWindowTokens), maximumWindowTokens: tokens(value.maximumWindowTokens),
+    modelLimitTokens: tokens(value.modelLimitTokens), effectiveWindowTokens: tokens(value.effectiveWindowTokens), revision: { value: value.revision }, sourceRevision: value.sourceRevision, canConfigure: value.canConfigure });
 }
 
 function mapAccountBalance(result: AccountBalanceResult): contract.ProviderAccountBalanceResult {
@@ -17425,6 +17441,15 @@ async function dispatchMutation(
         }
       });
       return presented(execution);
+    }
+    case "setSessionContextBudget": {
+      const value = payload.value, coordinator = dependencies.sessionContextBudget;
+      if (!coordinator) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Task context budgets are unavailable.");
+      if (!value.expectedRevision) throw invalidArgument("The task budget revision is required.");
+      const generation = Number(value.generation), tokens = value.budgetTokens === undefined ? undefined : Number(value.budgetTokens);
+      if (!Number.isSafeInteger(generation) || generation < 1 || tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 1000 || tokens > 100_000_000)) throw invalidArgument("The task context budget is invalid.");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, { accepted: true, resultCase: "session", entityId: value.sessionId },
+        () => coordinator.set({ sessionId: value.sessionId, generation, tokens, expectedRevision: value.expectedRevision!.value, expectedSourceRevision: value.expectedSourceRevision }, () => dependencies.connections.fence(connection)));
     }
     case "setSessionRuntime": {
       const value = payload.value, expectedGeneration = Number(value.expectedRuntimeGeneration);

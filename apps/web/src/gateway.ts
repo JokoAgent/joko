@@ -7827,6 +7827,26 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapModelWorkingContext(response.context, target);
   }
 
+  async getSessionContextBudget(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").SessionContextBudgetView> {
+    if (this.#taskSharing) throw new GatewayError("The task owner must read its context budget.");
+    const scope = this.captureActionScope(signal);
+    const identity = () => { const session = this.#snapshot?.sessions.find(value => value.id === sessionId);
+      if (!session || session.generation !== generation) throw new GatewayError("The original task changed.");
+      return JSON.stringify([session.backendId, session.model?.providerId, session.model?.modelId]); };
+    const original = identity();
+    const response = await createClient(BackendService, scope.transport).getSessionContextBudget({ sessionId, generation }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.budget || response.budget.sessionId !== sessionId || response.budget.generation !== generation || original !== identity()) throw new GatewayError("The original task context changed.");
+    return response.budget;
+  }
+  async setSessionContextBudget(observed: import("@joko/contracts").SessionContextBudgetView, tokens: number | undefined, signal?: AbortSignal): Promise<void> {
+    if (this.#taskSharing || tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 1000 || tokens > 100_000_000)) throw new GatewayError("The task context budget is invalid.");
+    const session = this.#snapshot?.sessions.find(value => value.id === observed.sessionId);
+    if (!session || session.generation !== observed.generation) throw new GatewayError("The original task generation changed.");
+    await this.submit({ case: "setSessionContextBudget", value: { sessionId: observed.sessionId, generation: observed.generation,
+      expectedRevision: observed.revision, expectedSourceRevision: observed.sourceRevision, ...(tokens === undefined ? {} : { budgetTokens: BigInt(tokens) }) } }, true, [], signal);
+  }
+
   async setModelWorkingContext(target: ModelWorkingContextTarget, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, tokens?: number, signal?: AbortSignal): Promise<ModelWorkingContextView> {
     validateWorkingContextTarget(target); validateWorkingContextObservation(observed);
     if (tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 1_000 || tokens > 100_000_000)) throw new GatewayError("Invalid working context budget.");

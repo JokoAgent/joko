@@ -5,6 +5,14 @@ import { connectionEntriesEnglish, connectionEntriesChinese } from './i18n/conne
 import { serverAccessEnglish, serverAccessChinese } from '@joko/contracts/server-access';
 
 const en = {
+  "contextBudget.title": "Task context budget",
+  "contextBudget.help": "Applies to this task at a safe runtime boundary. The context ring continues to show the Backend's actual window. Model limits and physical capacity take precedence.",
+  "contextBudget.default": "Model default ({tokens})",
+  "contextBudget.current": "Current choice ({tokens})",
+  "contextBudget.effective": "Configured working window: {tokens}",
+  "contextBudget.compactSoon": "Current context exceeds this budget. Compaction may run when the new budget takes effect.",
+  "contextBudget.failed": "Could not confirm the task context budget. Reload its current setting before retrying.",
+  "contextBudget.unsupported": "This task cannot configure a context budget.",
   "balance.title": "Account balance / plan usage",
   "balance.total": "Total balance: {amount}",
   "balance.granted": "Granted balance: {amount}",
@@ -6560,6 +6568,14 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  "contextBudget.title": "任务上下文预算",
+  "contextBudget.help": "仅用于本任务，在安全的运行边界生效。上下文圆环继续显示 Backend 的实际窗口；模型级上限和物理容量优先。",
+  "contextBudget.default": "跟随模型默认（{tokens}）",
+  "contextBudget.current": "当前选择（{tokens}）",
+  "contextBudget.effective": "配置的工作窗口：{tokens}",
+  "contextBudget.compactSoon": "当前上下文已超过此预算，新预算生效时可能触发压缩。",
+  "contextBudget.failed": "无法确认任务上下文预算，请重新读取当前设置后重试。",
+  "contextBudget.unsupported": "此任务无法配置上下文预算。",
   "balance.title": "账户余额／套餐用量",
   "balance.total": "总余额：{amount}",
   "balance.granted": "赠送余额：{amount}",

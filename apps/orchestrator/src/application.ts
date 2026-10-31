@@ -231,6 +231,7 @@ import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-
 import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
 import { ProviderAccountBalanceProvider } from "./provider-account-balance.js";
+import { SessionContextBudgetCoordinator } from "./session-context-budget.js";
 import { PiResourceManager, inspectPiSkillPackage } from "./resource-manager.js";
 import { BuiltinSkillCatalog } from "./builtin-skills.js";
 import { PluginAuthoringTools } from "./plugin-authoring-tools.js";
@@ -573,6 +574,7 @@ export interface OrchestratorApplication {
   /** Capability-owned, in-memory Provider account quota reader. */
   readonly providerAccountUsage?: ProviderAccountUsageProvider;
   readonly providerAccountBalance?: ProviderAccountBalanceProvider;
+  readonly sessionContextBudget?: SessionContextBudgetCoordinator;
   readonly messageSearch?: MessageSearchEmbeddingCoordinator;
   readonly makerMemory?: MakerMemoryController;
   readonly partnerMemoryPreferences?: PartnerMemoryPreferences;
@@ -1887,6 +1889,7 @@ export async function createOrchestratorApplication(
   let partnerTodos: PartnerTodoManager | undefined;
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
   let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
+  let sessionContextBudget: SessionContextBudgetCoordinator | undefined;
   const sessionHost: SessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
     partnerLearning: {
       captureSource: source => partnerLearning?.captureSource(source) ?? false,
@@ -1895,7 +1898,7 @@ export async function createOrchestratorApplication(
       settled: (occurrenceId, completionEventId, outcome) => partnerLearning?.settled(occurrenceId, completionEventId, outcome)
     },
     registerPartnerLearningToolAuthority: authority => mcpRouter.registerPartnerLearningToolAuthority(authority),
-    resolveModelWorkingContext: target => modelWorkingContext?.resolve(target),
+    resolveModelWorkingContext: target => target.sessionId && sessionContextBudget ? sessionContextBudget.resolve(target.sessionId, target) : modelWorkingContext?.resolve(target),
     resolveMcpAppModelContext: async sessionId => await mcpApps?.host.modelContext(sessionId)
       ?? { text: "", async assertCurrent() {}, consume() {} },
     prepareManagedProviderRuntime: async context => { await managedModelRuntimeForSession?.prepareProviderRuntime(context); },
@@ -2149,6 +2152,9 @@ export async function createOrchestratorApplication(
     sessionHost,
     currentOwner: () => closed ? undefined : workingContextOwner
   });
+  sessionContextBudget = new SessionContextBudgetCoordinator(store, modelWorkingContext,
+    (sessionId, target, check) => sessionHost.refreshModelWorkingContexts([target], check, undefined, sessionId),
+    sessionId => { const session = store.getSession(sessionId).descriptor; return store.findSessionRuntimePolicy(sessionId)?.policy === "review_read_only" || session.derivationOrigin?.sideChat === true && session.worktree === undefined; });
   objectives = new ObjectiveManager({ store, sessionHost });
   let reconcileLearnedResourceRuntime: (backendId: string, resourceId: string, fence: symbol) => Promise<void> = async () => undefined;
   const skillLearning = new SkillLearningManager({
@@ -3589,6 +3595,7 @@ export async function createOrchestratorApplication(
     providerAuth,
     providerAccountUsage,
     providerAccountBalance,
+    sessionContextBudget,
     messageSearch,
     makerMemory,
     partnerMemoryPreferences,
