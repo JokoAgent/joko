@@ -443,17 +443,14 @@ export interface ProviderModel {
   readonly declaredSupportsUltrafastMode?: boolean;
   readonly referenceApi?: string;
   readonly protocolMode?: "matching" | "compatibility" | "unknown";
-  readonly cost: {
-    readonly input: number;
-    readonly output: number;
-    readonly cacheRead: number;
-    readonly cacheWrite: number;
-  };
+  /** Absent fields are unknown; a quoted zero is free. Values are per million tokens. */
+  readonly cost: ModelTokenPrices;
   /** Optional authoritative or catalog reference used for local cost estimates. */
   readonly pricing?: {
     readonly source: "providerReference" | "upstream";
     readonly currencyCode: string;
     readonly updatedAt?: number;
+    readonly tariffs?: readonly ModelReferenceTariff[];
     readonly cacheReadAvailable?: boolean;
     readonly cacheWriteAvailable?: boolean;
     readonly fastModeMultiplier?: number;
@@ -470,6 +467,28 @@ export interface ProviderModel {
       readonly cacheWriteMultiplier: number;
     };
   };
+}
+
+export interface ModelTokenPrices {
+  readonly input?: number;
+  readonly output?: number;
+  readonly cacheRead?: number;
+  readonly cacheWrite?: number;
+  readonly cacheWrite1h?: number;
+}
+
+export interface ModelReferenceTariff {
+  readonly currencyCode: string;
+  readonly variant: "standard" | "priority" | "batch" | "fast";
+  readonly cost: ModelTokenPrices;
+  /** Inclusive lower bound and exclusive upper bound; omitted bounds are unbounded. */
+  readonly minInputTokens?: number;
+  readonly maxInputTokens?: number;
+  /** UTC calendar days, inclusive start and exclusive end. */
+  readonly effectiveFrom: string;
+  readonly effectiveUntil?: string;
+  readonly sourceUrl: string;
+  readonly verifiedAt: string;
 }
 
 export type ProviderLoginMethod = "api_key" | "oauth_browser" | "device_code" | "subscription";
@@ -635,6 +654,10 @@ export interface UsageSnapshot {
   readonly pricingContext?: {
     readonly inputTokens: number;
     readonly fastMode?: boolean | "ultrafast";
+    readonly requestedAt?: number;
+    readonly cacheWriteTtl?: "5m" | "1h";
+    /** Native one-hour subset of this observation's cacheWriteTokens, when reported. */
+    readonly cacheWrite1hTokens?: number;
   };
   readonly cost: number;
 }

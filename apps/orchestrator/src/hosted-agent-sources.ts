@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { fromProtoModelTokenPrices, fromProtoModelReferenceTariff } from "./model-pricing-projection.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fromJson, toJson, type JsonValue } from "@bufbuild/protobuf";
@@ -523,8 +524,8 @@ function fromModel(model: contract.ModelDescriptor): ProviderModel {
     ...(["declared", "estimated"].includes(model.maxOutputTokensSource ?? "") ? { maxOutputTokensSource: model.maxOutputTokensSource as "declared" | "estimated" } : {}),
     ...(model.priceSource === contract.ModelPriceSource.UNSPECIFIED ? {} : { pricing: {
       source: model.priceSource === contract.ModelPriceSource.PROVIDER_REFERENCE ? "providerReference" as const : "upstream" as const,
-      currencyCode: model.currencyCode, ...(model.priceUpdatedAt === undefined ? {} : { updatedAt: fromProtoTimestamp(model.priceUpdatedAt)! }) } }),
-    cost: { input: number(model.inputCostMicrosPerMillion) / 1_000_000, output: number(model.outputCostMicrosPerMillion) / 1_000_000,
-      cacheRead: number(model.cacheReadCostMicrosPerMillion) / 1_000_000, cacheWrite: number(model.cacheWriteCostMicrosPerMillion) / 1_000_000 } };
+      currencyCode: model.currencyCode, ...(model.priceUpdatedAt === undefined ? {} : { updatedAt: fromProtoTimestamp(model.priceUpdatedAt)! }),
+      ...(model.referenceTariffs === undefined ? {} : { tariffs: model.referenceTariffs.values.map(fromProtoModelReferenceTariff) }) } }),
+    cost: fromProtoModelTokenPrices(model) };
 }
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";

@@ -41,7 +41,7 @@ describe("Codex model estimates", () => {
     ["gpt-6-luna", { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 }, Date.UTC(2026, 8, 23)]
   ] as const)("projects the fixed %s price bands", (modelId, price, updatedAt) => {
     expect(codexModelEstimate(modelId)).toEqual({
-      contextWindow: 272_000,
+      contextWindow: modelId === "gpt-6.1-sol" ? 500_000 : 272_000,
       maximumOutputTokens: 128_000,
       price,
       updatedAt,

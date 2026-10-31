@@ -222,6 +222,16 @@ message Usage {
   uint64 total_tokens = 5;
   int64 cost_micros = 6;
   string currency_code = 7;
+  UsagePricingContext pricing_context = 8;
+}
+
+// Per-request facts, distinct from cumulative usage counters.
+message UsagePricingContext {
+  uint64 input_tokens = 1;
+  optional string speed = 2;
+  google.protobuf.Timestamp requested_at = 3;
+  optional string cache_write_ttl = 4;
+  optional uint64 cache_write_1h_tokens = 5;
 }
 
 message ContextUsage {

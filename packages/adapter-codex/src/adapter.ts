@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join, normalize, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import {
   CAPABILITIES,
+  catalogModelReferencePricing,
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
@@ -8433,6 +8434,7 @@ function stateFromThread(binding: NativeSessionBinding, thread: NativeThread): N
 
 function modelFromNative(model: NativeModel, providerId: string): ProviderModel {
   const estimate = codexModelEstimate(model.model);
+  const pricing = catalogModelReferencePricing(model.model.startsWith("openai/") ? model.model : `openai/${model.model}`);
   return {
     providerId,
     modelId: model.model,
@@ -8459,21 +8461,21 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
       || model.serviceTiersDeclared !== true && estimate?.fastModeMultiplier !== undefined,
     supportsUltrafastMode: model.serviceTiers.some((tier) => tier.id === "ultrafast"),
     thinkingLevels: model.supportedReasoningEfforts.map((effort) => effort.reasoningEffort),
-    cost: estimate?.price === undefined ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } : {
+    cost: estimate?.price === undefined ? {} : {
       input: estimate.price.input,
       output: estimate.price.output,
-      cacheRead: estimate.price.cacheRead ?? 0,
-      cacheWrite: estimate.price.cacheWrite ?? 0
+      cacheRead: estimate.price.cacheRead,
+      cacheWrite: estimate.price.cacheWrite
     },
-    ...(estimate?.price === undefined ? {} : {
-      pricing: {
+    ...(estimate?.price === undefined && pricing === undefined ? {} : {
+      pricing: pricing ?? {
         source: "providerReference" as const,
         currencyCode: "USD",
-        updatedAt: estimate.updatedAt ?? CODEX_MODEL_ESTIMATES_UPDATED_AT,
-        cacheReadAvailable: estimate.price.cacheRead !== undefined,
-        cacheWriteAvailable: estimate.price.cacheWrite !== undefined,
-        ...(estimate.fastModeMultiplier === undefined ? {} : { fastModeMultiplier: estimate.fastModeMultiplier }),
-        ...(estimate.longContext === undefined ? {} : { longContext: estimate.longContext })
+        updatedAt: estimate?.updatedAt ?? CODEX_MODEL_ESTIMATES_UPDATED_AT,
+        cacheReadAvailable: estimate?.price?.cacheRead !== undefined,
+        cacheWriteAvailable: estimate?.price?.cacheWrite !== undefined,
+        ...(estimate?.fastModeMultiplier === undefined ? {} : { fastModeMultiplier: estimate.fastModeMultiplier }),
+        ...(estimate?.longContext === undefined ? {} : { longContext: estimate.longContext })
       }
     })
   };

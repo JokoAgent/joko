@@ -11,8 +11,8 @@ const roots: Root[] = [];
 beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); });
 afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); document.body.replaceChildren(); Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT"); });
 const t: ProviderGroupSettingsTranslator = key => key.split(".").at(-1)!;
-function fixture() {
-  const key = { backendId: "native", providerId: "provider" }, member = create(contract.ProviderGroupMemberSchema, { key: "member", kind: contract.ProviderGroupMemberKind.LOCAL,
+function fixture(kind = contract.ProviderGroupMemberKind.LOCAL, available = true) {
+  const key = { backendId: "native", providerId: "provider" }, member = create(contract.ProviderGroupMemberSchema, { key: "member", kind,
     ...key, nativeBackendId: key.backendId, nodeId: "node", displayName: "This computer", capacity: 4, weight: 1 });
   let snapshot = create(contract.ProviderGroupSnapshotSchema, { key, revision: 1n, config: { strategy: contract.ProviderGroupStrategy.LEAST_BUSY, autoSwitch: true, members: [member] } });
   const get = vi.fn(async () => snapshot), update = vi.fn(async (_key: typeof key, revision: bigint, config: contract.ProviderGroupConfig | undefined) => {
@@ -20,13 +20,39 @@ function fixture() {
   });
   const usage = vi.fn(async () => [create(contract.ProviderGroupUsageRowSchema, { group: key, memberKey: "old-member", nodeId: "old-node", nodeName: "Removed computer", partyId: "person", partyName: "Person",
     modelId: "model", turns: 2n, totalTokens: 14n, costMicros: 1000001n, currencyCode: "USD", estimated: true, tokensComplete: true, costComplete: false })]);
-  const api: ProviderGroupSettingsApi = { getProviderGroup: get, listProviderGroupCandidates: async () => [create(contract.ProviderGroupCandidateSchema, { member, available: true })],
-    updateProviderGroup: update, getProviderGroupUsage: usage };
-  return { api, get, update, usage, key };
+  const quota = vi.fn(async (_query: Omit<contract.GetProviderGroupMemberAccountUsageRequest, '$typeName'>, _signal?: AbortSignal) => create(contract.GetProviderGroupMemberAccountUsageResponseSchema, { memberKey: member.key, revision: 1n, state: 'ready',
+    accountUsage: { providerId: key.providerId, primaryWindow: { usedPercent: 12.5, windowMinutes: 300 }, credits: { balance: '7.5000' } } }));
+  const api: ProviderGroupSettingsApi = { getProviderGroup: get, listProviderGroupCandidates: async () => [create(contract.ProviderGroupCandidateSchema, { member, available })],
+    updateProviderGroup: update, getProviderGroupUsage: usage, getProviderGroupMemberAccountUsage: quota };
+  return { api, get, update, usage, quota, key };
 }
 async function mount(f: ReturnType<typeof fixture>) { const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
   await act(async () => root.render(<ProviderGroupSettings api={f.api} nodeName="Owner" providers={[{ ...f.key, displayName: "Native Provider" }]} t={t} />)); return { container, root }; }
 function button(container: HTMLElement, text: string) { const value = [...container.querySelectorAll("button")].find(button => button.textContent === text); if (!value) throw new Error("Missing " + text); return value; }
+it('reads only the expanded original account and retires a late result when collapsed', async () => {
+  const f = fixture(), { container } = await mount(f);
+  expect(f.quota).not.toHaveBeenCalled();
+  await act(async () => button(container, 'accountQuota').click());
+  expect(f.quota).toHaveBeenCalledExactlyOnceWith({ key: f.key, expectedRevision: 1n, memberKey: 'member' }, expect.any(AbortSignal));
+  expect(container.querySelector('[role="region"]')?.textContent).toContain('remaining');
+  expect(container.querySelector('[role="region"]')?.textContent).toContain('7.5000');
+  await act(async () => button(container, 'accountQuota').click());
+  let finish!: (value: Awaited<ReturnType<typeof f.quota>>) => void;
+  f.quota.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await act(async () => button(container, 'accountQuota').click());
+  const signal = f.quota.mock.calls[1]?.[1] as AbortSignal;
+  await act(async () => button(container, 'accountQuota').click());
+  expect(signal.aborted).toBe(true);
+  await act(async () => finish(create(contract.GetProviderGroupMemberAccountUsageResponseSchema, { memberKey: 'member', revision: 1n, state: 'ready', accountUsage: { providerId: 'provider', credits: { balance: 'LATE_ACCOUNT' } } })));
+  expect(container.textContent).not.toContain('LATE_ACCOUNT'); expect(container.querySelector('[role="region"]')).toBeNull();
+});
+it.each([['shared', contract.ProviderGroupMemberKind.SHARE, true], ['offline', contract.ProviderGroupMemberKind.DEVICE, false]] as const)(
+  'shows %s accounts without querying their quota', async (_state, kind, available) => {
+    const f = fixture(kind, available), { container } = await mount(f);
+    await act(async () => button(container, 'accountQuota').click());
+    expect(f.quota).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="region"]')?.textContent).toContain(available ? 'quotaShared' : 'quotaOffline');
+  });
 async function input(element: HTMLInputElement, value: string) { await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(element, value); element.dispatchEvent(new Event("input", { bubbles: true })); }); }
 it("edits all four strategies and exact member bounds and saves one CAS with real incomplete usage", async () => {
   const f = fixture(), { container } = await mount(f), strategy = container.querySelectorAll("select")[1]!;

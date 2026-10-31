@@ -15,7 +15,8 @@ it("keeps a failed provider directory visible and retries it on the same connect
   const key = { backendId: "backend", providerId: "provider" };
   const group = create(contract.ProviderGroupSnapshotSchema, { key, revision: 1n });
   const api: ProviderGroupSettingsApi = { getProviderGroup: vi.fn(async () => group), listProviderGroupCandidates: vi.fn(async () => []),
-    getProviderGroupUsage: vi.fn(async () => []), updateProviderGroup: vi.fn(async () => group) };
+    getProviderGroupUsage: vi.fn(async () => []), updateProviderGroup: vi.fn(async () => group),
+    getProviderGroupMemberAccountUsage: vi.fn(async () => create(contract.GetProviderGroupMemberAccountUsageResponseSchema, { memberKey: 'unused', revision: 1n, state: 'unsupported' })) };
   const read = vi.fn().mockRejectedValueOnce(new Error("offline")).mockResolvedValue(create(contract.GetHostedAgentCatalogResponseSchema, {
     backends: [{ backendId: key.backendId, displayName: "Backend", providers: [{ providerId: key.providerId, displayName: "Provider", connected: true }] }]
   }));

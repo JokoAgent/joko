@@ -8,16 +8,18 @@ export interface ProjectedMessageGenerationTiming {
 }
 
 /** Project one native assistant-message accounting record without inventing partial values. */
-export function projectMessageUsage(value: unknown, fastMode?: boolean): UsageSnapshot | undefined {
+export function projectMessageUsage(value: unknown, fastMode?: boolean, requestedAt?: unknown): UsageSnapshot | undefined {
   if (!isRecord(value)) return undefined;
   const inputTokens = tokenCount(value.input);
   const outputTokens = tokenCount(value.output);
   const cacheReadTokens = tokenCount(value.cacheRead);
   const cacheWriteTokens = tokenCount(value.cacheWrite);
+  const cacheWrite1hTokens = value.cacheWrite1h === undefined ? undefined : tokenCount(value.cacheWrite1h);
   if (inputTokens === undefined
     || outputTokens === undefined
     || cacheReadTokens === undefined
-    || cacheWriteTokens === undefined) return undefined;
+    || cacheWriteTokens === undefined
+    || value.cacheWrite1h !== undefined && (cacheWrite1hTokens === undefined || cacheWrite1hTokens > cacheWriteTokens)) return undefined;
   const derivedTotal = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
   if (!Number.isSafeInteger(derivedTotal)) return undefined;
   const totalTokens = value.totalTokens === undefined ? derivedTotal : tokenCount(value.totalTokens);
@@ -33,7 +35,9 @@ export function projectMessageUsage(value: unknown, fastMode?: boolean): UsageSn
     totalTokens,
     pricingContext: {
       inputTokens: inputTokens + cacheReadTokens + cacheWriteTokens,
-      ...(fastMode === undefined ? {} : { fastMode })
+      ...(fastMode === undefined ? {} : { fastMode }),
+      ...(typeof requestedAt !== "number" || !Number.isSafeInteger(requestedAt) || requestedAt < 0 || requestedAt > 8_640_000_000_000_000 ? {} : { requestedAt }),
+      ...(cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens })
     },
     cost
   };

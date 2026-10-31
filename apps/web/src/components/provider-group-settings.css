@@ -11,6 +11,11 @@
 .provider-group-settings__fields input { width: 6rem; min-height: var(--settings-control-height); }
 .provider-group-settings__fields p { flex-basis: 100%; margin: 0; font-size: var(--text-12); }
 .provider-group-settings__reorder { display: flex; gap: var(--settings-row-gap); }
+.provider-group-settings__quota { margin-block-start: var(--settings-row-gap); }
+.provider-group-settings__quota [role="region"] { margin-block-start: var(--settings-row-gap); padding: var(--settings-card-padding); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow-wrap: anywhere; }
+.provider-group-settings__quota dl { display: grid; gap: var(--settings-row-gap); margin: 0; }
+.provider-group-settings__quota dl > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--settings-row-gap); }
+.provider-group-settings__quota dd { margin: 0; }
 .provider-group-settings__actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--settings-row-gap); padding-block: var(--settings-card-padding); }
 .provider-group-settings__usage { display: grid; gap: var(--settings-row-gap); }
 .provider-group-settings__usage > :is(h4, p), .provider-group-settings__usage-filters { margin: 0; }

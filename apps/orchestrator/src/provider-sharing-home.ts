@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { fromProtoModelTokenPrices, fromProtoModelReferenceTariff } from "./model-pricing-projection.js";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { create, fromJsonString, toJsonString } from "@bufbuild/protobuf";
@@ -320,9 +321,9 @@ function fromModel(row: contract.ModelDescriptor): ProviderModel {
     ...(["declared", "estimated"].includes(row.contextWindowSource ?? "") ? { contextWindowSource: row.contextWindowSource as "declared" | "estimated" } : {}),
     ...(["declared", "estimated"].includes(row.maxOutputTokensSource ?? "") ? { maxOutputTokensSource: row.maxOutputTokensSource as "declared" | "estimated" } : {}),
     ...(row.priceSource === contract.ModelPriceSource.UNSPECIFIED ? {} : { pricing: { source: row.priceSource === contract.ModelPriceSource.PROVIDER_REFERENCE ? "providerReference" as const : "upstream" as const,
-      currencyCode: row.currencyCode, ...(row.priceUpdatedAt === undefined ? {} : { updatedAt: Number(row.priceUpdatedAt.seconds) * 1000 + row.priceUpdatedAt.nanos / 1_000_000 }) } }),
-    cost: { input: number(row.inputCostMicrosPerMillion) / 1_000_000,
-      output: number(row.outputCostMicrosPerMillion) / 1_000_000, cacheRead: number(row.cacheReadCostMicrosPerMillion) / 1_000_000, cacheWrite: number(row.cacheWriteCostMicrosPerMillion) / 1_000_000 } };
+      currencyCode: row.currencyCode, ...(row.priceUpdatedAt === undefined ? {} : { updatedAt: Number(row.priceUpdatedAt.seconds) * 1000 + row.priceUpdatedAt.nanos / 1_000_000 }),
+      ...(row.referenceTariffs === undefined ? {} : { tariffs: row.referenceTariffs.values.map(fromProtoModelReferenceTariff) }) } }),
+    cost: fromProtoModelTokenPrices(row) };
 }
 function safePerson(row: contract.ProviderSharingPerson | undefined): { name: string; avatarUrl?: string } {
   if (!row || !row.name || row.name !== row.name.trim() || row.name.length > 200 || /[\0-\x1f\x7f]/u.test(row.name)) throw invalid();

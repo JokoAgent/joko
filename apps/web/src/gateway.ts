@@ -14591,10 +14591,11 @@ function mapModel(
     efforts: model.effortLevels.sort((left, right) => left.order - right.order).map((effort) => effort.effortId),
     contextWindow: numberValue(model.contextWindowTokens),
     maximumOutputTokens: numberValue(model.maximumOutputTokens),
-    inputCostMicrosPerMillion: numberValueSigned(model.inputCostMicrosPerMillion),
-    outputCostMicrosPerMillion: numberValueSigned(model.outputCostMicrosPerMillion),
-    cacheReadCostMicrosPerMillion: numberValueSigned(model.cacheReadCostMicrosPerMillion),
-    cacheWriteCostMicrosPerMillion: numberValueSigned(model.cacheWriteCostMicrosPerMillion),
+    inputCostMicrosPerMillion: model.inputCostMicrosPerMillion === undefined ? undefined : numberValueSigned(model.inputCostMicrosPerMillion),
+    outputCostMicrosPerMillion: model.outputCostMicrosPerMillion === undefined ? undefined : numberValueSigned(model.outputCostMicrosPerMillion),
+    cacheReadCostMicrosPerMillion: model.cacheReadCostMicrosPerMillion === undefined ? undefined : numberValueSigned(model.cacheReadCostMicrosPerMillion),
+    cacheWriteCostMicrosPerMillion: model.cacheWriteCostMicrosPerMillion === undefined ? undefined : numberValueSigned(model.cacheWriteCostMicrosPerMillion),
+    referenceTariffs: model.referenceTariffs?.values.map(mapModelReferenceTariff),
     currencyCode: model.currencyCode || "USD",
     metadata: {
       ...(model.description === undefined ? {} : { description: model.description }),
@@ -14865,7 +14866,8 @@ function protoModelPriceQuote(quote: ModelPriceQuoteView): {
   };
 }
 
-function priceUnitsToMicros(value: number): bigint {
+function priceUnitsToMicros(value: number | undefined): bigint {
+  if (value === undefined) throw new GatewayError("Input and output prices are required for a model price override.");
   const micros = Math.round(value * 1_000_000);
   if (!Number.isFinite(value) || value < 0 || !Number.isSafeInteger(micros)) {
     throw new GatewayError("Model prices must be finite non-negative values.");
@@ -14902,9 +14904,25 @@ function mapModelPriceOverride(
   };
 }
 
+function mapModelReferenceTariff(price: import("@joko/contracts").ModelReferenceTariff): import("./model.js").ModelReferenceTariffView {
+  if (price.variant !== "standard" && price.variant !== "priority" && price.variant !== "batch" && price.variant !== "fast") {
+    throw new GatewayError("Orchestrator returned an invalid price variant.");
+  }
+  const units = (value: bigint | undefined): number | undefined => value === undefined ? undefined : numberValue(value) / 1_000_000;
+  const source = new URL(price.sourceUrl);
+  if (source.protocol !== "https:" || source.username || source.password) throw new GatewayError("Orchestrator returned an invalid price source.");
+  return { currencyCode: price.currencyCode, variant: price.variant,
+    inputPerMillion: units(price.inputCostMicrosPerMillion), outputPerMillion: units(price.outputCostMicrosPerMillion),
+    cacheReadPerMillion: units(price.cacheReadCostMicrosPerMillion), cacheWritePerMillion: units(price.cacheWriteCostMicrosPerMillion),
+    cacheWrite1hPerMillion: units(price.cacheWrite1hCostMicrosPerMillion),
+    minInputTokens: price.minInputTokens === undefined ? undefined : numberValue(price.minInputTokens),
+    maxInputTokens: price.maxInputTokens === undefined ? undefined : numberValue(price.maxInputTokens),
+    effectiveFrom: price.effectiveFrom, effectiveUntil: price.effectiveUntil, sourceUrl: price.sourceUrl, verifiedAt: price.verifiedAt };
+}
+
 function mapModelPriceQuote(quote: ProtoModelPriceQuote): ModelPriceQuoteView {
-  const input = Number(quote.inputCostMicrosPerMillion);
-  const output = Number(quote.outputCostMicrosPerMillion);
+  const input = quote.inputCostMicrosPerMillion === undefined ? undefined : Number(quote.inputCostMicrosPerMillion);
+  const output = quote.outputCostMicrosPerMillion === undefined ? undefined : Number(quote.outputCostMicrosPerMillion);
   const cacheRead = quote.cacheReadCostMicrosPerMillion === undefined ? undefined : Number(quote.cacheReadCostMicrosPerMillion);
   const cacheWrite = quote.cacheWriteCostMicrosPerMillion === undefined ? undefined : Number(quote.cacheWriteCostMicrosPerMillion);
   if ([input, output, cacheRead, cacheWrite].some((value) => value !== undefined && (!Number.isSafeInteger(value) || value < 0))) {
@@ -14912,8 +14930,8 @@ function mapModelPriceQuote(quote: ProtoModelPriceQuote): ModelPriceQuoteView {
   }
   return {
     currency: modelPriceCurrency(quote.currency),
-    inputPerMillion: input / 1_000_000,
-    outputPerMillion: output / 1_000_000,
+    ...(input === undefined ? {} : { inputPerMillion: input / 1_000_000 }),
+    ...(output === undefined ? {} : { outputPerMillion: output / 1_000_000 }),
     ...(cacheRead === undefined ? {} : { cacheReadPerMillion: cacheRead / 1_000_000 }),
     ...(cacheWrite === undefined ? {} : { cacheWritePerMillion: cacheWrite / 1_000_000 })
   };

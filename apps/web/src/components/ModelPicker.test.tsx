@@ -341,7 +341,9 @@ describe("ModelPicker", () => {
     const subscriptionReference = { ...model("provider-a", "Alpha", "reference", "Subscription reference", [], false, 2_000_000, 6_000_000), providerAccessKind: "subscription" as const, pricingKnown: true, pricingSource: "providerReference" as const };
     const free = { ...model("provider-b", "Beta", "free", "Free model", [], false, 0, 0), providerAccessKind: "apiKey" as const, pricingKnown: true, pricingSource: "providerReference" as const };
     const unknown = { ...model("provider-b", "Beta", "unknown", "Unknown price", [], false, 0, 0), providerAccessKind: "apiKey" as const, pricingKnown: false };
-    await renderPicker(undefined, "owner-one", undefined, false, undefined, [subscription, pricedSubscription, subscriptionReference, free, unknown]);
+    const partial = { ...model("provider-b", "Beta", "partial", "Partial price", [], false, 0, 0),
+      inputCostMicrosPerMillion: undefined, providerAccessKind: "apiKey" as const, pricingKnown: true, pricingSource: "upstream" as const };
+    await renderPicker(undefined, "owner-one", undefined, false, undefined, [subscription, pricedSubscription, subscriptionReference, free, unknown, partial]);
     await openPicker();
 
     expect(findRow("Included model").querySelector(".model-picker__price")?.textContent).toBe("Subscription");
@@ -349,6 +351,7 @@ describe("ModelPicker", () => {
     expect(findRow("Subscription reference").querySelector(".model-picker__price")?.textContent).toBe("Subscription");
     expect(findRow("Free model").querySelector(".model-picker__price")?.textContent).toBe("Free");
     expect(findRow("Unknown price").querySelector(".model-picker__price")).toBeNull();
+    expect(findRow("Partial price").querySelector(".model-picker__price")).toBeNull();
   });
 
   it("switches among all three local layouts and supports keyboard selection", async () => {

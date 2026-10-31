@@ -173,11 +173,40 @@ export class ProviderGroupRuntime {
   }
   connectOptions(authenticate: ProviderGroupConnectOptions["authenticate"]): ProviderGroupConnectOptions {
     return { service: this.service, usage: this.usage, authenticate, assertRemoteAllowed: this.#options.assertRemoteAllowed,
+      memberAccountUsage: (key, revision, memberKey, signal) => this.memberAccountUsage(key, revision, memberKey, signal),
       schedulingState: async (key, _modelId, signal) => {
         this.#options.assertRemoteAllowed(key);
         const accountUsage = await this.#options.readAccountUsage(key.backendId, key.providerId, signal);
         return { activeTurns: this.#options.activeTurns(key.backendId, key.providerId), ...(accountUsage ? { accountUsage } : {}) };
       }, ...(this.#options.now ? { now: this.#options.now } : {}) };
+  }
+  /** Owner settings read only the expanded member, through its original live source. */
+  async memberAccountUsage(key: ProviderGroupKey, revision: bigint, memberKey: string, signal: AbortSignal): Promise<{
+    readonly state: 'ready' | 'unsupported' | 'offline' | 'shared'; readonly accountUsage?: ProviderAccountUsageSnapshot;
+  }> {
+    signal.throwIfAborted(); const generation = this.#options.ownerGeneration(), snapshot = this.store.snapshot(key);
+    if (snapshot.revision !== revision) throw new Error('The Provider group changed.');
+    const member = snapshot.config?.members.find(row => row.key === memberKey);
+    if (!member) throw new Error('The original Provider group member is unavailable.');
+    const assertCurrent = () => {
+      signal.throwIfAborted(); if (generation !== this.#options.ownerGeneration() || this.store.snapshot(key).revision !== revision)
+        throw new Error('The Provider group owner or membership changed.');
+    };
+    assertCurrent(); if (member.kind === 'share') return { state: 'shared' };
+    const source = this.sources().find(row => row.key === member.key && row.kind === member.kind && row.backendId === member.backendId
+      && row.providerId === member.providerId && row.nativeBackendId === member.nativeBackendId && row.nodeId === member.nodeId);
+    if (!source?.available) return { state: 'offline' };
+    source.assertCurrent();
+    const accountUsage = member.kind === 'local' ? await this.#options.readAccountUsage(member.backendId, member.providerId, signal) : await (async () => {
+      const captured = this.#options.sources.captureGroupPeer(member.backendId);
+      if (captured.nativeBackendId !== member.nativeBackendId) throw new Error('The original Provider source changed.');
+      const result = await createClient(contract.ProviderGroupService, captured.transport).getProviderSchedulingState({
+        key: { backendId: member.nativeBackendId, providerId: member.providerId }, modelId: ''
+      }, { signal });
+      captured.assertCurrent(); return fromGroupAccountUsage(result.accountUsage);
+    })();
+    assertCurrent(); source.assertCurrent();
+    return accountUsage ? { state: 'ready', accountUsage } : { state: 'unsupported' };
   }
   decorateCatalog(catalog: contract.GetHostedAgentCatalogResponse): contract.GetHostedAgentCatalogResponse {
     return { ...catalog, backends: catalog.backends.map(backend => ({ ...backend, providers: backend.providers.map(provider => {

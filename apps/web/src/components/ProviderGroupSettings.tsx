@@ -4,11 +4,14 @@ import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import * as contract from "@joko/contracts";
 import { providerGroupDraft, providerGroupUsageDateRange, type ProviderGroupSettingsApi } from "../provider-group-settings.js";
 import { Button, Spinner, SwitchControl } from "./ui.js";
+import { ProviderGroupMemberQuota } from "./ProviderGroupMemberQuota.js";
 import "./provider-group-settings.css";
 
 export const providerGroupSettingsMessageKeys = ["title", "body", "provider", "loading", "loadFailed", "saveFailed", "conflict", "saved", "refresh", "save", "delete", "reloadDraft", "strategy",
   "leastBusy", "roundRobin", "ordered", "weighted", "autoSwitch", "members", "noCandidates", "unavailable", "capacity", "weight", "paused", "localPause", "moveUp", "moveDown", "invalidNumbers",
-  "usage", "period", "all", "last30Days", "last7Days", "today", "specificDay", "person", "node", "model", "turns", "tokens", "cost", "estimated", "incomplete", "noUsage"] as const;
+  "usage", "period", "all", "last30Days", "last7Days", "today", "specificDay", "person", "node", "model", "turns", "tokens", "cost", "estimated", "incomplete", "noUsage",
+  "accountQuota", "quotaShared", "quotaUnsupported", "quotaOffline", "primaryWindow", "secondaryWindow", "credits", "unlimited", "remaining", "resets", "observed", "extraUsage", "resetCredits",
+  "quotaExhausted", "creditsAvailable", "creditsNone", "extraDisabled", "windowMinutes"] as const;
 export type ProviderGroupSettingsMessage = typeof providerGroupSettingsMessageKeys[number];
 export type ProviderGroupSettingsTranslator = (key: `settings.providerGroups.${ProviderGroupSettingsMessage}`, values?: Readonly<Record<string, string | number>>) => string;
 export interface ProviderGroupSettingsProps {
@@ -104,6 +107,8 @@ function GroupPanel({ api, provider, t }: { readonly api: ProviderGroupSettingsA
             </div>
             {member.kind === contract.ProviderGroupMemberKind.LOCAL && <p className="muted">{t("settings.providerGroups.localPause")}</p>}
           </div>}
+          {snapshot?.config?.members.some(row => row.key === member.key) && <ProviderGroupMemberQuota key={`${member.key}:${snapshot.revision}`} api={api}
+            group={provider} revision={snapshot.revision} member={member} available={candidate.available} t={t} />}
         </div>;
       })}
       {!config && <p role="alert">{t("settings.providerGroups.invalidNumbers")}</p>}
