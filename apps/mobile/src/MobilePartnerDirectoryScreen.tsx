@@ -50,6 +50,7 @@ import { MobileActionSheet } from "./MobileActionSheet";
 import type { MobilePartnerGroupRoster, MobilePartnerGroupRosterShard, MobilePartnerGroupDisplay, MobilePartnerGroupSelection } from "./mobile-partner-group-roster";
 import type { MobilePartnerOfflineConversation } from "./mobile-partner-offline-conversation";
 import { MobilePartnerOfflineConversationScreen } from "./MobilePartnerOfflineConversation";
+import type { MobileHomePartnerEntry } from "./MobileHomePartners";
 
 export interface MobilePartnerDirectoryScreenProps {
   readonly colors: MobilePartnersColors;
@@ -81,6 +82,8 @@ export interface MobilePartnerDirectoryScreenProps {
   readonly onOpenTask: (sessionId: string) => void;
   readonly roster?: MobilePartnerRoster;
   readonly rosterActive?: boolean;
+  readonly initialHomeEntry?: MobileHomePartnerEntry;
+  readonly onHomeEntryConsumed?: () => void;
   readonly readOfflineConversation?: (source: MobilePartnerRosterSource, row: MobilePartnerRosterDisplay,
     signal: AbortSignal) => Promise<MobilePartnerOfflineConversation>;
   readonly onOpenSource?: (source: MobilePartnerRosterSource, partner: MobilePartnerDirectoryProfile,
@@ -130,7 +133,7 @@ function Action({ label, colors, onPress, disabled = false, testID }: {
   </Pressable>;
 }
 
-function PartnerRow({ partner, colors, locale, opening, recoverable, online, observation, workingTransport, last, onOpen }: {
+export function MobilePartnerDirectoryRow({ partner, colors, locale, opening, recoverable, online, observation, workingTransport, last, deviceName, onOpen }: {
   readonly partner: MobilePartnerDirectoryProfile;
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
@@ -140,6 +143,7 @@ function PartnerRow({ partner, colors, locale, opening, recoverable, online, obs
   readonly observation?: MobilePartnerDirectoryObservation;
   readonly workingTransport?: MobilePartnerWorkingTransport;
   readonly last: boolean;
+  readonly deviceName?: string;
   readonly onOpen: () => void;
 }) {
   const available = online && partner.lifecycle === "active" && partner.initializationState === "ready"
@@ -177,6 +181,7 @@ function PartnerRow({ partner, colors, locale, opening, recoverable, online, obs
     <View style={[styles.rowBody, !last && { borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth }]}>
       <View style={styles.titleRow}>
         <Text style={[styles.name, { color: colors.ink }]} numberOfLines={1}>{partner.displayName}</Text>
+        {deviceName && <Text style={[styles.caption, { color: colors.muted, flexShrink: 3 }]} numberOfLines={1}>· {deviceName}</Text>}
         <View style={styles.grow} />
         {opening || working ? <View testID={`partnerDirectory.working.${partner.partnerId}`}><ActivityIndicator color={colors.muted} /></View>
           : <Text style={[styles.time, { color: colors.muted }]} numberOfLines={1}>
@@ -196,10 +201,11 @@ function PartnerRow({ partner, colors, locale, opening, recoverable, online, obs
     </View>
   </Pressable>;
 }
+const PartnerRow = MobilePartnerDirectoryRow;
 
 export function MobilePartnerDirectoryScreen({ colors, locale, transport, observation, workingTransport, initializationTransport, creationTransport, importFactory, deletionTransport, restartTransport, resumeFactory, memoryFactory,
   groupApi, groupAttachments, groupCreationStorage, groupReceiptScope, groupSourceKey, initialGroupSelection, groupRoster, groupSourceClaimCurrent, groupSourceClaimRetained, onOpenGroupSource, onGroupOpened, onOpenConversations, onOpenIdentities, onBack, onOpenTask,
-  roster, rosterActive = true, onOpenSource, onOpenSourceInitialization, readOfflineConversation }:
+  roster, rosterActive = true, onOpenSource, onOpenSourceInitialization, readOfflineConversation, initialHomeEntry, onHomeEntryConsumed }:
   MobilePartnerDirectoryScreenProps) {
   const shards = useSyncExternalStore(roster?.subscribe ?? noSubscription, () => roster?.snapshot ?? NO_SHARDS);
   const groupShards = useSyncExternalStore(groupRoster?.subscribe ?? noSubscription, () => groupRoster?.snapshot ?? NO_GROUP_SHARDS);
@@ -223,6 +229,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   const [actionError, setActionError] = useState<string>();
   const [initialization, setInitialization] = useState<{ readonly ownerKey: string; readonly partnerId: string }>();
   const [creation, setCreation] = useState(false);
+  const consumedHomeEntry = useRef<MobileHomePartnerEntry | undefined>(undefined);
   const [importEditor, setImportEditor] = useState<PartnerImportEditor>();
   useEffect(() => () => importEditor?.dispose(), [importEditor]);
   const [deletion, setDeletion] = useState<{ readonly ownerKey: string; readonly partner: MobilePartnerDirectoryProfile }>();
@@ -405,6 +412,38 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
       if (!abort.signal.aborted) setActionError(error instanceof Error ? error.message : String(error));
     }).finally(() => { if (!abort.signal.aborted) setSourceOpening(undefined); });
   };
+  useEffect(() => {
+    const entry = initialHomeEntry;
+    if (!entry || consumedHomeEntry.current === entry || !rosterActive || sourceOpening) return;
+    if (entry.kind === "create" || entry.kind === "create-group") {
+      consumedHomeEntry.current = entry; onHomeEntryConsumed?.();
+      if (entry.kind === "create-group" && groupRoster) setGroupChoosing(true);
+      else if (entry.kind === "create" && creationTransport && creationTransport.ownerKey === transport?.ownerKey) setCreation(true);
+      else setActionError(mobileMessage(locale, "partnerDirectory.unavailable"));
+      return;
+    }
+    const shard = roster?.snapshot.find(item => item.source.key === entry.sourceKey);
+    const groupShard = groupRoster?.snapshot.find(item => item.source.key === entry.sourceKey);
+    if (shard && !roster?.transport(entry.sourceKey) && (shard.refreshing || shard.status === "loading")) return;
+    if (entry.kind === "group" && groupShard && !groupRoster?.transport(entry.sourceKey)
+      && (groupShard.refreshing || groupShard.status === "loading")) return;
+    consumedHomeEntry.current = entry; onHomeEntryConsumed?.();
+    if (shard && entry.kind === "group" && groupRoster?.transport(entry.sourceKey)
+      && groupShard?.catalog?.groups.some(group => group.id === entry.id && !group.deleting)) {
+      openGroupSource(shard.source, entry.id); return;
+    }
+    const partner = shard?.catalog?.partners.find(item => item.partnerId === entry.id && item.lifecycle !== "archived");
+    if (shard && entry.kind === "partner" && partner && roster?.transport(entry.sourceKey)) {
+      if (partner.lifecycle === "active" && partner.initializationState !== "ready") openSourceInitialization(shard.source, partner);
+      else openSource(shard.source, partner, "conversation");
+      return;
+    }
+    const cached = shard?.display.find(item => item.partnerId === entry.id);
+    if (shard && entry.kind === "partner" && cached?.conversation && readOfflineConversation) {
+      openOfflineConversation(shard.source, cached); return;
+    }
+    setActionError(mobileMessage(locale, "partnerDirectory.unavailable"));
+  }, [initialHomeEntry, rosterActive, shards, groupShards, sourceOpening, creationTransport?.ownerKey, transport?.ownerKey]);
   const open = (partner: MobilePartnerDirectoryProfile): void => {
     const current = transportRef.current;
     if (!current || openingId !== undefined || current.ownerKey !== state.ownerKey) return;

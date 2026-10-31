@@ -26,6 +26,7 @@ import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import { MobilePhotoLibrary } from "./mobile-photo-library";
 import { MobileAttachmentFiles } from "./mobile-attachment-files";
 import { MobilePartnerRoster, mobilePartnerRosterSourceKey, type MobilePartnerRosterSourceTransport } from "./mobile-partner-roster";
+import { MobileHomePartners, type MobileHomePartnerEntry } from "./MobileHomePartners";
 import { MobilePartnerGroupRoster, type MobilePartnerGroupSelection } from "./mobile-partner-group-roster";
 import { mobileMessage } from "./mobile-messages";
 
@@ -292,6 +293,51 @@ function pairedGroupsFixture() {
   return { sources: () => sources, props, adopt, open, roster, groupRoster, first, second, apis,
     failSecond: () => { secondOffline = true; groupRoster.refresh(sources[1]!.key); } };
 }
+it("mixes all saved-source Partners and groups in home activity order, retains collapse, searches names and blocks stale group entry", async () => {
+  const f = pairedGroupsFixture(), values = new Map<string, string>(), open = vi.fn();
+  const storage = { getItem: async (key: string) => values.get(key) ?? null,
+    setItem: vi.fn(async (key: string, value: string) => { values.set(key, value); }) };
+  container = document.body.appendChild(document.createElement("div")); root = createRoot(container);
+  const show = async (query = "", active = true, visible = true) => act(async () => root.render(createElement(MobileHomePartners, {
+    roster: f.roster, groups: f.groupRoster, storage, colors, locale: "en", query, active, visible, canCreate: true, onOpen: open
+  })));
+  await show();
+  await act(async () => { await vi.waitFor(() => expect(f.groupRoster.snapshot.every(item => item.status === "online")
+    && f.roster.snapshot.every(item => item.status === "online")).toBe(true)); });
+  expect(container.textContent!.indexOf("Second group")).toBeLessThan(container.textContent!.indexOf("First group"));
+  expect(container.querySelectorAll('[data-testid="partnerDirectory.item.ada"]')).toHaveLength(1);
+  await press("Show all"); expect(container.querySelectorAll('[data-testid="partnerDirectory.item.ada"]')).toHaveLength(2);
+  expect(container.textContent).not.toContain("Archived");
+  await press(mobileMessage("en", "home.partners.create")); await press(groupWire.partnerGroupMessages("en").create);
+  expect(open).toHaveBeenLastCalledWith({ kind: "create-group" });
+  await press("Collapse Partners"); expect(container.querySelector('[data-testid="home.partners.strip"]')).not.toBeNull();
+  expect(storage.setItem).toHaveBeenLastCalledWith("joko.mobile.home-partners.v1", "collapsed");
+  await show("Second group"); expect(container.querySelector('[data-testid="home.partners.strip"]')).toBeNull();
+  expect(container.textContent).toContain("Second group"); expect(container.textContent).not.toContain("First group");
+  const second = container.querySelector<HTMLButtonElement>('button[aria-label="Second group"]')!;
+  await act(async () => second.click());
+  expect(open).toHaveBeenLastCalledWith({ kind: "group", sourceKey: f.sources()[1]!.key, id: "shared-group" });
+  await act(async () => { f.failSecond(); await vi.waitFor(() => expect(f.groupRoster.snapshot[1]?.status).toBe("offline")); });
+  expect(container.textContent).toContain("Second preview"); expect(container.querySelector<HTMLButtonElement>('button[aria-label="Second group"]')!.disabled).toBe(true);
+  await show(""); expect(container.querySelector('[data-testid="home.partners.strip"]')).not.toBeNull();
+  await show("", false); expect(f.roster.transport(f.sources()[0]!.key)).toBeUndefined();
+  expect(container.querySelector<HTMLButtonElement>('button[aria-label="Create Partner or group"]')!.disabled).toBe(true);
+  await show("", false, false); expect(container.querySelector('[data-testid="home.partners"]')).toBeNull();
+});
+
+it("opens a home group selection once after refreshing its source and rejects a forgotten source", async () => {
+  const f = pairedGroupsFixture(), consumed = vi.fn();
+  const entry: MobileHomePartnerEntry = { kind: "group", sourceKey: f.sources()[1]!.key, id: "shared-group" };
+  await render(transport("directory-0"), undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    { ...f.props(), initialHomeEntry: entry, onHomeEntryConsumed: consumed });
+  await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("Second conversation body")); });
+  expect(f.open).toHaveBeenCalledOnce(); expect(consumed).toHaveBeenCalledOnce();
+  expect(f.open).toHaveBeenCalledWith(expect.objectContaining({ key: entry.sourceKey }), "shared-group", expect.any(AbortSignal));
+  await act(async () => native.back?.());
+  await render(transport("directory-1"), undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    { ...f.props(), initialHomeEntry: { kind: "partner", sourceKey: "forgotten-source", id: "ada" }, onHomeEntryConsumed: consumed });
+  expect(f.open).toHaveBeenCalledOnce(); expect(container.querySelector('[role="alert"]')).not.toBeNull();
+});
 it("opens a same-ID group from its original source and hides its body synchronously on source change", async () => {
   const f = pairedGroupsFixture();
   await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, f.props());

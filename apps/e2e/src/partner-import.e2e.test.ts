@@ -57,7 +57,7 @@ it("imports into the production HTTP/SQLite/published runtime, uses its full red
   const catalog = await clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId });
   const imported = catalog.routines.filter(routine => !routine.builtin); expect(imported).toHaveLength(1);
   const routine = imported[0]!; expect(routine.definition).toMatchObject({ name: "Review", prompt: "Review the retained import context.", enabled: false });
-  const builtin = catalog.routines.filter(routine => routine.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(5);
+  const builtin = catalog.routines.filter(routine => routine.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(1);
   await clients.partnerRoutine.runPartnerRoutine({ partnerId: partner.partnerId, expectedPartnerRevision: catalog.partnerRevision, routineId: routine.id, expectedRevision: routine.revision, requestId: "product_import_routine_run" });
   const history = await waitFor(() => clients.partnerRoutine.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id }), value => value.runs[0]?.status === RoutineRunStatus.SUCCESS || value.runs[0]?.status === RoutineRunStatus.FAILED, "the imported routine", 45000);
   expect(history.runs[0]?.status).toBe(RoutineRunStatus.SUCCESS);

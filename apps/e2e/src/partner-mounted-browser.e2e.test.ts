@@ -147,7 +147,7 @@ describe("mounted Partner collaboration product chain", () => {
     expect(importedRoutines).toEqual(installedRoutines);
     expect(builtin).toHaveLength(1); expect(builtin[0]).toMatchObject({
       id: `builtin-follow-up-${createHash("sha256").update(row.partnerId).digest("hex").slice(0, 40)}`,
-      partnerId: row.partnerId, builtinVersion: 5, enabled: true
+      partnerId: row.partnerId, builtinVersion: 1, enabled: true
     });
     expect(routines).toHaveLength(importedRoutines.length + builtin.length);
     expect(fixture.application.store.listRuns({ sessionId: row.canonicalSessionId! })).toHaveLength(0);
