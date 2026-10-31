@@ -55,7 +55,7 @@ it("requires a held handle, commits one exact reorder, and cancels background or
     await act(async () => { handle.onPanResponderGrant!({}, { y0: 125 }); await vi.advanceTimersByTimeAsync(250); });
     expect(sorting).toHaveBeenLastCalledWith(true);
     await act(async () => handle.onPanResponderMove!({}, { moveY: 210 })); await tick();
-    expect([...host.querySelectorAll("button")].every(button => button.disabled)).toBe(true);
+    expect(Array.from(host.querySelectorAll("button")).every(button => button.disabled)).toBe(true);
     await act(async () => { handle.onPanResponderRelease!(); handle.onPanResponderRelease!(); });
     expect(reorder).toHaveBeenCalledExactlyOnceWith("one", 1, ["one", "two"], 7n);
     await act(async () => { handle.onPanResponderGrant!({}, { y0: 125 }); await vi.advanceTimersByTimeAsync(250); });
