@@ -462,11 +462,11 @@ export function ConnectionScreen({ controller, t, initialInvitation }: { readonl
             <div className="pair-form__row">
               {(!challengePairing || challengeMatches) && <label>
                 <span>{t("connection.code")}</span>
-                <input required disabled={actionsDisabled} value={code} onChange={(event) => setCode(event.target.value)} placeholder="XXXX-XXXX" autoComplete="one-time-code" spellCheck={false} />
+                <input aria-label={t("connection.code")} required disabled={actionsDisabled} value={code} onChange={(event) => setCode(event.target.value)} placeholder="XXXX-XXXX" autoComplete="one-time-code" spellCheck={false} />
               </label>}
               <label>
                 <span>{t("connection.deviceName")}</span>
-                <input required disabled={actionsDisabled} value={deviceName} onChange={(event) => { setDeviceName(event.target.value); invalidatePairing(); }} autoComplete="off" />
+                <input aria-label={t("connection.deviceName")} required disabled={actionsDisabled} value={deviceName} onChange={(event) => { setDeviceName(event.target.value); invalidatePairing(); }} autoComplete="off" />
               </label>
             </div>
             {challengePairing && <>
