@@ -206,7 +206,7 @@ import { MobileTaskRenameSheet } from "./MobileTaskRenameSheet";
 import { MobileMessageRewindSheet } from "./MobileMessageRewindSheet";
 import { MobileSessionDerivationMarker } from "./MobileSessionDerivationMarker";
 import { MobileTaskHeader, type MobileTaskHeaderAction } from "./MobileTaskHeader";
-import { MobileTaskTagDots, MobileTaskTagsSheet, mobileTaskTagName } from "./MobileTaskTags";
+import { MobileTaskTagDots, MobileTaskTagsSheet, MobileTaskTagQuickChoices, mobileTaskTagColor, mobileTaskTagName } from "./MobileTaskTags";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
 import {
   MobileComposerRichInput,
@@ -1611,9 +1611,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
             || mobileMessage(locale, "home.taskOptions")}</Text>
           <MenuRow label={mobileMessage(locale, "common.rename")} onPress={() => scheduleOption("rename")} colors={colors}
             disabled={state.status !== "connected"} />
-          {(state.owner?.taskTagCatalog?.taskTags ?? []).slice(0, 7).map((tag) => <MenuRow key={tag.taskTagId}
-            label={`${optionsSession?.taskTags.some((candidate) => candidate.taskTagId === tag.taskTagId) === true ? "✓ " : ""}${mobileTaskTagName(tag, locale)}`}
-            onPress={() => scheduleOption(`tag:${tag.taskTagId}`)} colors={colors} disabled={state.status !== "connected"} />)}
+          <MobileTaskTagQuickChoices tags={state.owner?.taskTagCatalog?.taskTags ?? []} selected={optionsSession?.taskTags ?? []}
+            locale={locale} colors={colors} disabled={state.status !== "connected"} onSelect={id => scheduleOption(`tag:${id}`)} />
           <MenuRow label={mobileMessage(locale, "taskTags.manage")} onPress={() => scheduleOption("tags")} colors={colors}
             disabled={state.status !== "connected"} />
           <MenuRow label={mobileMessage(locale, copyBusy ? "actions.copyingLink" : "actions.copyTaskLink")}
@@ -6508,7 +6507,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           disabled: !partnerIdentity.ready || state.detail === undefined || state.busy || attachmentBusy || voice.busy },
         ...(state.owner?.taskTagCatalog?.taskTags ?? []).slice(0, 7).map((tag) => ({
           id: `tag:${tag.taskTagId}` as const,
-          label: `${session?.taskTags.some((candidate) => candidate.taskTagId === tag.taskTagId) === true ? "✓ " : ""}${mobileTaskTagName(tag, locale)}`,
+          label: mobileTaskTagName(tag, locale),
+          swatch: { color: mobileTaskTagColor(tag.color, colors.dark), selected: session?.taskTags.some(candidate => candidate.taskTagId === tag.taskTagId) === true },
           onPress: () => {
             if (!session) return;
             const attached = session.taskTags.some((candidate) => candidate.taskTagId === tag.taskTagId);

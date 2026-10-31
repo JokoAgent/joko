@@ -17,6 +17,7 @@ import type { MobileClient } from "./mobile-client";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import { MobileTaskTagsNative, mobileTaskTagsNativeAvailable } from "./MobileTaskTagsNative";
+import { MobileTaskTagReorderList } from "./MobileTaskTagReorderList";
 
 export interface MobileTaskTagColors {
   readonly background: string;
@@ -48,6 +49,30 @@ const DARK_COLOR_VALUE: Readonly<Record<number, string>> = {
   [TaskTagColor.GRAY]: "#a9afb7", [TaskTagColor.PINK]: "#e883b4", [TaskTagColor.CORAL]: "#f18476",
   [TaskTagColor.TEAL]: "#5bbdb4", [TaskTagColor.INDIGO]: "#8d92ee", [TaskTagColor.WHITE]: "#ffffff"
 };
+
+export function mobileTaskTagColor(color: TaskTagColor, dark = false): string {
+  return (dark ? DARK_COLOR_VALUE : LIGHT_COLOR_VALUE)[color] ?? LIGHT_COLOR_VALUE[TaskTagColor.GRAY]!;
+}
+
+export function MobileTaskTagQuickChoices({ tags, selected, locale, colors, disabled, onSelect }: {
+  readonly tags: readonly TaskTag[]; readonly selected: readonly TaskTag[]; readonly locale: MobileSupportedLocale;
+  readonly colors: { readonly ink: string; readonly border: string; readonly dark?: boolean };
+  readonly disabled: boolean; readonly onSelect: (id: string) => void;
+}) {
+  return <View style={{ flexDirection: "row", justifyContent: "space-evenly" }}>
+    {tags.slice(0, 7).map(tag => {
+      const checked = selected.some(value => value.taskTagId === tag.taskTagId);
+      return <Pressable key={tag.taskTagId} accessibilityRole="checkbox" accessibilityLabel={mobileTaskTagName(tag, locale)}
+        accessibilityState={{ checked, disabled }} disabled={disabled} onPress={() => onSelect(tag.taskTagId)}
+        style={{ minWidth: 36, minHeight: 44, alignItems: "center", justifyContent: "center" }}>
+        <View style={{ width: 24, height: 24, borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: colors.border,
+          backgroundColor: mobileTaskTagColor(tag.color, colors.dark), alignItems: "center", justifyContent: "center" }}>
+          <Text style={{ color: colors.ink }}>{checked ? "✓" : ""}</Text>
+        </View>
+      </Pressable>;
+    })}
+  </View>;
+}
 
 export function mobileTaskTagName(tag: TaskTag, locale: MobileSupportedLocale): string {
   if (tag.nameCustomized || tag.presetKey === undefined) return tag.name;
@@ -99,6 +124,8 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
   const [editingId, setEditingId] = useState<string>();
   const [editName, setEditName] = useState("");
   const [editColor, setEditColor] = useState(TaskTagColor.BLUE);
+  const [adding, setAdding] = useState(false);
+  const [sorting, setSorting] = useState(false);
   const tags = catalog?.taskTags ?? [];
   const palette = colors.dark ? DARK_COLOR_VALUE : LIGHT_COLOR_VALUE;
   const editing = tags.find((tag) => tag.taskTagId === editingId);
@@ -123,6 +150,8 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
     setCreateName("");
     setCreateColor(TaskTagColor.BLUE);
     setEditingId(undefined);
+    setAdding(false);
+    setSorting(false);
     operation.current = undefined;
     confirmationEpoch.current++;
     return () => { operation.current = undefined; };
@@ -145,14 +174,12 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
       if (current() && operation.current === actionOwner) setError(mobileMessage(locale, "taskTags.changeFailed"));
     } finally { if (operation.current === actionOwner) { operation.current = undefined; setBusy(false); } }
   };
-  const reorder = (tagId: string, direction: -1 | 1): void => {
+  const reorder = (tagId: string, to: number, ids = tags.map(tag => tag.taskTagId), revision = catalog?.revision?.value ?? 0n): void => {
     if (!session) return;
-    const index = tags.findIndex((tag) => tag.taskTagId === tagId);
-    const other = index + direction;
-    if (index < 0 || other < 0 || other >= tags.length) return;
-    const ids = tags.map((tag) => tag.taskTagId);
-    [ids[index], ids[other]] = [ids[other] as string, ids[index] as string];
-    void run(() => client.reorderTaskTags(session.sessionId, ids, catalog?.revision?.value ?? 0n));
+    const from = ids.indexOf(tagId);
+    if (from < 0 || to < 0 || to >= ids.length || from === to) return;
+    const next = [...ids]; next.splice(from, 1); next.splice(to, 0, tagId);
+    void run(() => client.reorderTaskTags(session.sessionId, next, revision));
   };
   const previewDelete = async (tag: TaskTag): Promise<void> => {
     if (operation.current || !session || !current()) return;
@@ -183,89 +210,67 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
   };
 
   if (mobileTaskTagsNativeAvailable) return <MobileTaskTagsNative key={scope} visible={visible && session !== undefined} busy={busy} error={error}
-    colors={colors} locale={locale} subtitle={session?.displayName} onClose={onClose} onBack={() => setEditingId(undefined)}
-    items={tags.map((tag, index) => ({ id: tag.taskTagId, name: mobileTaskTagName(tag, locale), color: palette[tag.color] ?? palette[TaskTagColor.GRAY]!,
+    colors={colors} locale={locale} subtitle={session?.displayName} onClose={onClose} onBack={() => { setEditingId(undefined); setAdding(false); }}
+    adding={adding} revision={catalog?.revision?.value ?? 0n} onAdd={() => setAdding(true)} onMove={(from, to) => { const tag = tags[from]; if (tag) reorder(tag.taskTagId, to); }}
+    items={tags.map((tag) => ({ id: tag.taskTagId, name: mobileTaskTagName(tag, locale), color: palette[tag.color] ?? palette[TaskTagColor.GRAY]!,
       attached: attached.has(tag.taskTagId), onToggle: () => { if (session) void run(() => client.setSessionTaskTag(session.sessionId, tag.taskTagId, !attached.has(tag.taskTagId))); },
-      onEdit: () => setEditingId(tag.taskTagId), ...(index > 0 ? { onUp: () => reorder(tag.taskTagId, -1) } : {}),
-      ...(index < tags.length - 1 ? { onDown: () => reorder(tag.taskTagId, 1) } : {}) }))}
+      onEdit: () => setEditingId(tag.taskTagId) }))}
     palette={COLORS.map(value => ({ value, name: mobileMessage(locale, colorMessageKey(value)), hex: palette[value]! }))}
     create={{ name: createName, color: createColor, canSave: !!createName.trim() && tags.length < 256, onName: setCreateName, onColor: setCreateColor,
-      onSave: () => { if (session) void run(() => client.createTaskTag(session.sessionId, createName, createColor, catalog?.revision?.value ?? 0n), () => { setCreateName(""); setCreateColor(TaskTagColor.BLUE); }); } }}
+      onSave: () => { if (session) void run(() => client.createTaskTag(session.sessionId, createName, createColor, catalog?.revision?.value ?? 0n), () => { setCreateName(""); setCreateColor(TaskTagColor.BLUE); setAdding(false); }); } }}
     {...(editing ? { edit: { name: editName, color: editColor, canSave: !!editName.trim() && (editName.trim() !== editing.name || editColor !== editing.color),
       onName: setEditName, onColor: setEditColor, onSave: () => { if (session) void run(() => client.updateTaskTag(session.sessionId, editing.taskTagId, editing.revision?.value ?? 0n,
         { ...(editName.trim() === editing.name ? {} : { name: editName.trim() }), ...(editColor === editing.color ? {} : { color: editColor }) }), () => setEditingId(undefined)); } } } : {})}
     onDelete={() => { if (editing) void previewDelete(editing); }} />;
 
-  return <>
-    <Modal visible={visible && session !== undefined} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => { if (!busy) onClose(); }}>
-      <SafeAreaView style={[styles.root, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
-        <View style={[styles.header, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-          <View style={styles.fill}><Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "taskTags.title")}</Text>
-            <Text numberOfLines={1} style={[styles.caption, { color: colors.muted }]}>{session?.displayName}</Text></View>
-          <SheetButton label={mobileMessage(locale, "common.cancel")} colors={colors} disabled={busy} onPress={onClose} />
-        </View>
-        <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-          <Text style={[styles.help, { color: colors.muted }]}>{mobileMessage(locale, "taskTags.help")}</Text>
-          {tags.map((tag, index) => {
-            const isAttached = attached.has(tag.taskTagId);
-            return <View key={tag.taskTagId} style={[styles.row, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-              <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: isAttached, disabled: busy }} disabled={busy}
-                accessibilityLabel={`${isAttached ? mobileMessage(locale, "taskTags.detach") : mobileMessage(locale, "taskTags.attach")} ${mobileTaskTagName(tag, locale)}`}
-                onPress={() => session && void run(() => client.setSessionTaskTag(session.sessionId, tag.taskTagId, !isAttached))}
-                style={[styles.check, { borderColor: isAttached ? colors.accent : colors.border, backgroundColor: isAttached ? colors.brandBackground : colors.background }]}>
-                <Text style={{ color: colors.ink }}>{isAttached ? "✓" : ""}</Text>
-              </Pressable>
-              <View style={[styles.dot, { backgroundColor: palette[tag.color] ?? palette[TaskTagColor.GRAY] }]} />
-              <Text numberOfLines={1} style={[styles.rowName, { color: colors.ink }]}>{mobileTaskTagName(tag, locale)}</Text>
-              <SheetButton compact symbol="↑" label={mobileMessage(locale, "taskTags.moveUp")} colors={colors} disabled={busy || index === 0} onPress={() => reorder(tag.taskTagId, -1)} />
-              <SheetButton compact symbol="↓" label={mobileMessage(locale, "taskTags.moveDown")} colors={colors} disabled={busy || index === tags.length - 1} onPress={() => reorder(tag.taskTagId, 1)} />
-              <SheetButton compact symbol="•••" label={mobileMessage(locale, "taskTags.manage")} colors={colors} disabled={busy} onPress={() => setEditingId(tag.taskTagId)} />
-            </View>;
-          })}
-          {tags.length === 0 && <Text style={[styles.empty, { color: colors.muted }]}>{mobileMessage(locale, "taskTags.empty")}</Text>}
-          <View style={[styles.create, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-            <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "taskTags.create")}</Text>
-            <TextInput accessibilityLabel={mobileMessage(locale, "taskTags.name")} value={createName} maxLength={80} editable={!busy && tags.length < 256}
-              onChangeText={setCreateName} placeholder={mobileMessage(locale, "taskTags.name")} placeholderTextColor={colors.muted}
-              style={[styles.input, { borderColor: colors.border, backgroundColor: colors.background, color: colors.ink }]} />
-            <ColorPicker value={createColor} colors={colors} locale={locale} disabled={busy || tags.length >= 256} onChange={setCreateColor} />
-            <SheetButton label={mobileMessage(locale, "taskTags.create")} colors={colors} disabled={busy || !createName.trim() || tags.length >= 256} onPress={() => {
-              if (!session) return;
-              void run(() => client.createTaskTag(session.sessionId, createName, createColor, catalog?.revision?.value ?? 0n), () => {
-                setCreateName(""); setCreateColor(TaskTagColor.BLUE);
-              });
-            }} />
-          </View>
-          {tags.length >= 256 && <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "taskTags.catalogLimit")}</Text>}
-          {error !== "" && <Text accessibilityRole="alert" style={[styles.error, { color: colors.negative }]}>{error}</Text>}
-        </ScrollView>
-        {busy && <ActivityIndicator accessibilityLabel={mobileMessage(locale, "common.refreshing")} color={colors.accent} style={styles.busy} />}
-      </SafeAreaView>
-    </Modal>
-    <Modal visible={visible && editing !== undefined} transparent animationType="fade" onRequestClose={() => { if (!busy) setEditingId(undefined); }}>
-      <View style={styles.dialogRoot}>
-        <View style={[styles.dialog, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-          <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "taskTags.manage")}</Text>
-          <TextInput accessibilityLabel={mobileMessage(locale, "taskTags.name")} value={editName} maxLength={80} editable={!busy} onChangeText={setEditName}
-            style={[styles.input, { borderColor: colors.border, backgroundColor: colors.background, color: colors.ink }]} />
-          <ColorPicker value={editColor} colors={colors} locale={locale} disabled={busy} onChange={setEditColor} />
-          {error !== "" && <Text accessibilityRole="alert" style={[styles.error, { color: colors.negative }]}>{error}</Text>}
-          <View style={styles.actions}>
-            <SheetButton label={mobileMessage(locale, "taskTags.delete")} destructive colors={colors} disabled={busy} onPress={() => { if (editing) void previewDelete(editing); }} />
-            <View style={styles.fill} />
-            <SheetButton label={mobileMessage(locale, "common.cancel")} colors={colors} disabled={busy} onPress={() => setEditingId(undefined)} />
-            <SheetButton label={mobileMessage(locale, "taskTags.save")} colors={colors} disabled={busy || !editName.trim() || editing === undefined || editName.trim() === editing.name && editColor === editing.color} onPress={() => {
-              if (!session || !editing) return;
-              const name = editName.trim();
-              void run(() => client.updateTaskTag(session.sessionId, editing.taskTagId, editing.revision?.value ?? 0n, {
-                ...(name === editing.name ? {} : { name }), ...(editColor === editing.color ? {} : { color: editColor })
-              }), () => setEditingId(undefined));
-            }} />
-          </View>
-        </View>
+  const form = adding || editing !== undefined;
+  return <Modal visible={visible && session !== undefined} animationType="slide" presentationStyle="pageSheet"
+    onRequestClose={() => { if (!busy && !sorting) { if (form) { setAdding(false); setEditingId(undefined); } else onClose(); } }}>
+    <SafeAreaView style={[styles.root, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
+      <View style={[styles.header, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+        <View style={styles.fill}><Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, editing ? "taskTags.manage" : adding ? "taskTags.create" : "taskTags.title")}</Text>
+          <Text numberOfLines={1} style={[styles.caption, { color: colors.muted }]}>{session?.displayName}</Text></View>
+        <SheetButton label={mobileMessage(locale, form ? "common.back" : "common.cancel")} colors={colors} disabled={busy || sorting}
+          onPress={() => { if (form) { setAdding(false); setEditingId(undefined); setError(""); } else onClose(); }} />
       </View>
-    </Modal>
-  </>;
+      {form ? <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        <View style={[styles.create, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+          <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale, "taskTags.name")}</Text>
+          <TextInput autoFocus accessibilityLabel={mobileMessage(locale, "taskTags.name")} value={editing ? editName : createName}
+            maxLength={80} editable={!busy} onChangeText={editing ? setEditName : setCreateName}
+            placeholder={mobileMessage(locale, "taskTags.name")} placeholderTextColor={colors.muted}
+            style={[styles.input, { borderColor: colors.border, backgroundColor: colors.background, color: colors.ink }]} />
+          <ColorPicker value={editing ? editColor : createColor} colors={colors} locale={locale} disabled={busy}
+            onChange={editing ? setEditColor : setCreateColor} />
+          {editing && <SheetButton label={mobileMessage(locale, "taskTags.delete")} destructive colors={colors} disabled={busy}
+            onPress={() => void previewDelete(editing)} />}
+          <SheetButton label={mobileMessage(locale, "taskTags.save")} colors={colors}
+            disabled={busy || (editing ? !editName.trim() || editName.trim() === editing.name && editColor === editing.color : !createName.trim() || tags.length >= 256)}
+            onPress={() => {
+              if (!session) return;
+              if (editing) {
+                void run(() => client.updateTaskTag(session.sessionId, editing.taskTagId, editing.revision?.value ?? 0n, {
+                  ...(editName.trim() === editing.name ? {} : { name: editName.trim() }), ...(editColor === editing.color ? {} : { color: editColor })
+                }), () => setEditingId(undefined));
+              } else {
+                void run(() => client.createTaskTag(session.sessionId, createName, createColor, catalog?.revision?.value ?? 0n),
+                  () => { setCreateName(""); setCreateColor(TaskTagColor.BLUE); setAdding(false); });
+              }
+            }} />
+        </View>
+      </ScrollView> : <>
+        <Text style={[styles.help, { color: colors.muted, padding: 16 }]}>{mobileMessage(locale, "taskTags.help")}</Text>
+        <MobileTaskTagReorderList key={scope} tags={tags} revision={catalog?.revision?.value ?? 0n} attached={attached} busy={busy}
+          visible={visible} colors={colors} locale={locale} name={tag => mobileTaskTagName(tag, locale)} palette={palette}
+          onToggle={tag => { if (session) void run(() => client.setSessionTaskTag(session.sessionId, tag.taskTagId, !attached.has(tag.taskTagId))); }}
+          onEdit={tag => setEditingId(tag.taskTagId)} onReorder={reorder} onSortingChange={setSorting} />
+        <View style={styles.content}><SheetButton label={mobileMessage(locale, "taskTags.create")} colors={colors}
+          disabled={busy || sorting || tags.length >= 256} onPress={() => setAdding(true)} /></View>
+      </>}
+      {!!error && <Text accessibilityRole="alert" style={[styles.error, { color: colors.negative, padding: 16 }]}>{error}</Text>}
+      {busy && <ActivityIndicator accessibilityLabel={mobileMessage(locale, "common.refreshing")} color={colors.accent} style={styles.busy} />}
+    </SafeAreaView>
+  </Modal>;
 }
 
 function ColorPicker({ value, colors, locale, disabled, onChange }: {
@@ -277,13 +282,13 @@ function ColorPicker({ value, colors, locale, disabled, onChange }: {
 }) {
   const palette = colors.dark ? DARK_COLOR_VALUE : LIGHT_COLOR_VALUE;
   return <View><Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "taskTags.color")}</Text>
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.palette}>
+    <View style={styles.palette}>
       {COLORS.map((color) => <Pressable key={color} accessibilityRole="radio" accessibilityState={{ selected: color === value, disabled }}
         accessibilityLabel={mobileMessage(locale, colorMessageKey(color))} disabled={disabled} onPress={() => onChange(color)}
         style={[styles.swatchShell, { borderColor: color === value ? colors.accent : colors.border }]}>
         <View style={[styles.swatch, { backgroundColor: palette[color] }]} />
       </Pressable>)}
-    </ScrollView>
+    </View>
   </View>;
 }
 
@@ -320,7 +325,7 @@ const styles = StyleSheet.create({
   row: { minHeight: 52, flexDirection: "row", alignItems: "center", gap: 8, borderWidth: StyleSheet.hairlineWidth, borderRadius: 12, padding: 8 }, rowName: { flex: 1, minWidth: 0, fontSize: 14, fontWeight: "600" },
   check: { width: 30, height: 30, alignItems: "center", justifyContent: "center", borderWidth: 1, borderRadius: 8 }, empty: { paddingVertical: 24, textAlign: "center", fontSize: 13 },
   create: { gap: 9, borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, padding: 12, marginTop: 4 }, label: { fontSize: 14, fontWeight: "700" }, input: { minHeight: 44, borderWidth: 1, borderRadius: 10, paddingHorizontal: 12, fontSize: 15 },
-  palette: { gap: 8, paddingVertical: 7 }, swatchShell: { width: 34, height: 34, alignItems: "center", justifyContent: "center", borderWidth: 2, borderRadius: 17 }, swatch: { width: 22, height: 22, borderRadius: 11, borderWidth: StyleSheet.hairlineWidth, borderColor: "rgba(0,0,0,.2)" },
+  palette: { flexDirection: "row", flexWrap: "wrap", paddingVertical: 7 }, swatchShell: { width: "16.666%", height: 48, alignItems: "center", justifyContent: "center", borderWidth: 2, borderRadius: 10 }, swatch: { width: 24, height: 24, borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: "rgba(0,0,0,.2)" },
   button: { minHeight: 40, alignItems: "center", justifyContent: "center", borderWidth: StyleSheet.hairlineWidth, borderRadius: 10, paddingHorizontal: 12 }, buttonCompact: { width: 34, minHeight: 34, paddingHorizontal: 0 }, buttonText: { fontSize: 13, fontWeight: "600" }, buttonCompactText: { fontSize: 15, fontWeight: "700" },
   actions: { flexDirection: "row", alignItems: "center", gap: 8 }, dialogRoot: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "rgba(0,0,0,.46)" }, dialog: { width: "100%", maxWidth: 520, gap: 12, borderWidth: StyleSheet.hairlineWidth, borderRadius: 16, padding: 16 },
   error: { fontSize: 12, lineHeight: 18 }, busy: { position: "absolute", top: 18, right: 100 }, disabled: { opacity: .45 }, pressed: { opacity: .68 }

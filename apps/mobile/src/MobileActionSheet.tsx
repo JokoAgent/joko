@@ -21,6 +21,7 @@ export interface MobileSheetActionItem<Action extends string> {
   readonly destructive?: boolean;
   readonly disabled?: boolean;
   readonly separatorBefore?: boolean;
+  readonly swatch?: { readonly color: string; readonly selected: boolean };
 }
 
 export function MobileActionSheet<Action extends string>({
@@ -105,7 +106,16 @@ export function MobileActionSheet<Action extends string>({
   };
 
   if (!mounted) return null;
-  const rows = items.map((item) => <View key={item.id}>
+  const firstSwatch = items.findIndex(item => item.swatch !== undefined);
+  const rows = items.map((item, index) => item.swatch !== undefined ? index === firstSwatch ? <View key={item.id} style={styles.swatches}>
+    {items.filter(item => item.swatch !== undefined).map(item => <Pressable key={item.id} accessibilityRole="checkbox"
+      accessibilityLabel={item.label} accessibilityState={{ checked: item.swatch!.selected, disabled: item.disabled === true }}
+      disabled={item.disabled} onPress={() => select(item.id)} style={[styles.swatchButton, item.disabled && styles.disabled]}>
+      <View style={[styles.swatch, { backgroundColor: item.swatch!.color, borderColor: colors.border }]}>
+        <Text style={{ color: colors.ink }}>{item.swatch!.selected ? "✓" : ""}</Text>
+      </View>
+    </Pressable>)}
+  </View> : null : <View key={item.id}>
     {item.separatorBefore && <View style={[styles.separator, { backgroundColor: colors.border }]} />}
     <Pressable accessibilityRole="button" accessibilityLabel={item.label}
       accessibilityState={{ disabled: item.disabled === true }} disabled={item.disabled}
@@ -139,6 +149,9 @@ const styles = StyleSheet.create({
   card: { borderRadius: 18, borderWidth: StyleSheet.hairlineWidth, overflow: "hidden" },
   separator: { height: StyleSheet.hairlineWidth },
   row: { minHeight: 54, justifyContent: "center", paddingHorizontal: 18 },
+  swatches: { flexDirection: "row", justifyContent: "space-evenly", paddingHorizontal: 8 },
+  swatchButton: { minWidth: 36, minHeight: 44, alignItems: "center", justifyContent: "center" },
+  swatch: { width: 24, height: 24, borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center" },
   cancel: { minHeight: 54, borderRadius: 18, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center" },
   label: { fontSize: 16, fontWeight: "700" },
   disabled: { opacity: 0.48 },

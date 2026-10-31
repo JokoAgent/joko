@@ -17,6 +17,7 @@ export interface MobileTaskHeaderAction {
   readonly disabled: boolean;
   readonly onPress: () => void;
   readonly destructive?: boolean;
+  readonly swatch?: { readonly color: string; readonly selected: boolean };
 }
 
 export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationRef, quickSwitch, persistentNavigation,
