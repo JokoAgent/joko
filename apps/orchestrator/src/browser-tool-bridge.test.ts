@@ -909,7 +909,7 @@ describe("BrowserToolBridgeProvider", () => {
     const store = browserBridgeAuthorityStore(); knowledgeStores.add(store);
     const state = new OperationalBrowserState(store);
     state.recordHumanPage({ browserProviderId: "browser", pageId: "page-1", generation: 6, sessionId: "session-a", targetId: "target-a", bindingGeneration: 1,
-      url: "https://example.test/", title: "Example", updatedAt: 1 });
+      url: "https://example.test/", title: "Example", updatedAt: 1 }, { active: false });
     const { bridge, knowledge } = fixture(undefined, undefined, { state }); const recipeDraft = exampleReadRecipe();
     await bridge.callTool("browser", { action: "recipe", site: "example.test", recipeDraft, targetId: "page-1" }, undefined,
       browserBridgeContext("a", "session-a", "target-a", 1, 6));
@@ -955,7 +955,7 @@ describe("BrowserToolBridgeProvider", () => {
     expect((await bridge.callTool("browser", { action: "recipeHelp", site: "example.test" })).structuredContent).toMatchObject({ data: { observations } });
     vi.mocked(browser.extract).mockRejectedValueOnce(new Error("Read failed."));
     await expect(flow()).rejects.toThrow(/Read failed/u);
-    markSecretEntered("page-1");
+    markSecretEntered("https://example.test/");
     try { await expect(flow()).rejects.toThrow(); } finally { clearSecretPages(); }
     expect(await knowledge.listExperiences?.("example.test")).toEqual(observations);
   });
