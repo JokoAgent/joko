@@ -84,6 +84,7 @@ message OperationMutation {
     ExportSessionMutation export_session = 32;
     SetSessionModelMutation set_session_model = 33;
     SetSessionRuntimeMutation set_session_runtime = 224;
+    SetSessionContextBudgetMutation set_session_context_budget = 230;
     SetSessionPermissionMutation set_session_permission = 34;
     SetSessionPlanModeMutation set_session_plan_mode = 35;
     MoveSessionProjectMutation move_session_project = 36;
@@ -800,6 +801,14 @@ enum SessionExportFormat {
 message SetSessionModelMutation {
   string session_id = 1;
   ModelSelection model = 2;
+}
+
+message SetSessionContextBudgetMutation {
+  string session_id = 1;
+  uint64 generation = 2;
+  optional uint64 budget_tokens = 3;
+  Revision expected_revision = 4;
+  string expected_source_revision = 5;
 }
 
 message SetSessionPermissionMutation {

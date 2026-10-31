@@ -117,6 +117,7 @@ service BackendService {
   rpc GetModelWorkingContext(GetModelWorkingContextRequest) returns (GetModelWorkingContextResponse);
   rpc SetModelWorkingContext(SetModelWorkingContextRequest) returns (SetModelWorkingContextResponse);
   rpc ResetModelWorkingContext(ResetModelWorkingContextRequest) returns (ResetModelWorkingContextResponse);
+  rpc GetSessionContextBudget(GetSessionContextBudgetRequest) returns (GetSessionContextBudgetResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc GetProviderLoginFlow(GetProviderLoginFlowRequest) returns (GetProviderLoginFlowResponse);
 }
@@ -1283,6 +1284,12 @@ message ResetModelWorkingContextRequest {
   string expected_source_revision = 5;
 }
 message ResetModelWorkingContextResponse { ModelWorkingContextView context = 1; }
+
+message GetSessionContextBudgetRequest {
+  string session_id = 1;
+  uint64 generation = 2;
+}
+message GetSessionContextBudgetResponse { SessionContextBudgetView budget = 1; }
 
 message GetModelPriceOverrideResponse {
   ModelPriceOverrideView price = 1;
