@@ -334,6 +334,7 @@ import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobilePartnerNetworkScreen } from "./MobilePartnerNetworkScreen";
 import { MobilePartnerIdentityScreen } from "./MobilePartnerIdentityScreen";
 import { MobilePartnerDirectoryScreen } from "./MobilePartnerDirectoryScreen";
+import { MobileHomePartners, type MobileHomePartnerEntry } from "./MobileHomePartners";
 import { useMobilePartnerIdentity, useMobilePartnerRead } from "./use-mobile-partner-read";
 import { MobilePartnerAvatar, MobilePartnerAvatarProvider } from "./MobilePartnerAvatar";
 import { MobilePartnerConversationRow } from "./MobilePartnerConversationRow";
@@ -577,6 +578,7 @@ async function performMobileImageOutput(
 
 export function App() {
   const [partnerSettingsEntry, setPartnerSettingsEntry] = useState<{ readonly profileId: string; readonly sessionId: string; readonly partnerId: string }>();
+  const [homePartnerEntry, setHomePartnerEntry] = useState<MobileHomePartnerEntry>();
   useEffect(() => {
     const sync = (): void => { if (client.state.status !== "starting") {
       const sources = client.partnerRosterSources(); partnerRoster.setSources(sources); partnerGroupRoster.setSources(sources);
@@ -1047,7 +1049,7 @@ export function App() {
                     onSearchFocus: () => setHomeSearchFocusRequest((value) => value + 1),
                     onNavigated: () => { setNativeIntentMessageFocus(undefined); setFocusTaskComposer(false); setPartnerSettingsEntry(undefined); },
                     onMenu: () => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); },
-                    onOpenShare: () => setPage("new"), registerNavigation: registerTaskHomeNavigation }}
+                    onOpenShare: () => setPage("new"), onPartners: entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }, registerNavigation: registerTaskHomeNavigation }}
                   partnerSettingsEntry={partnerSettingsEntry} onPartnerSettingsEntryConsumed={() => setPartnerSettingsEntry(undefined)}
                   onBack={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
                   onHome={() => { setNativeIntentMessageFocus(undefined); setPage("home"); }}
@@ -1086,6 +1088,14 @@ export function App() {
                   onOpenConversations={() => setPage("partner-network")}
                   onOpenIdentities={() => setPage("partner-identities")}
                   roster={partnerRoster} rosterActive={foreground}
+                  initialHomeEntry={homePartnerEntry} onHomeEntryConsumed={() => setHomePartnerEntry(undefined)}
+                  groupRoster={partnerGroupRoster} groupApi={client.partnerGroupApi()} groupAttachments={client.partnerGroupAttachmentTransport()}
+                  groupCreationStorage={mobilePlainStorage} groupReceiptScope={client.partnerGroupReceiptScope()}
+                  groupSourceKey={client.partnerRosterSources().find(source => source.current)?.key}
+                  initialGroupSelection={nativeIntentGroupSelection} onGroupOpened={() => setNativeIntentGroupSelection(undefined)}
+                  groupSourceClaimCurrent={selection => client.partnerGroupSourceClaimCurrent(selection)}
+                  groupSourceClaimRetained={selection => client.partnerGroupSourceClaimRetained(selection)}
+                  onOpenGroupSource={(source, groupId, signal) => client.openPartnerGroupRosterSource(source.profile.profileId, groupId, signal, source.key)}
                   readOfflineConversation={(source, row, signal) => client.readPartnerOfflineConversation(source, row, signal)}
                   onOpenSourceInitialization={(source, partner, signal) => client.openPartnerRosterInitializationSource(source.profile.profileId, partner, signal)}
                   onOpenSource={async (source, partner, mode, signal) => {
@@ -1166,6 +1176,7 @@ export function App() {
                 page === "device" && deviceId ? <DeviceScreen {...common} deviceId={deviceId} onBack={() => setPage("devices")}
                   onRemoteDesktop={() => openRemoteDesktop("device", deviceId)} /> :
                 <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={() => setPage("task")}
+                  onPartners={entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }}
                   viewState={homeViewState} onViewStateChange={setHomeViewState} foreground={foreground}
                   incomingShare={incomingShare} onOpenShare={() => setPage("new")}
                   menuButtonRef={homeMenuButtonRef} searchFocusRequest={homeSearchFocusRequest}
@@ -1240,6 +1251,7 @@ export interface TaskHomeNavigationProps {
   readonly onSearchFocus: () => void;
   readonly onMenu: () => void;
   readonly onOpenShare: () => void;
+  readonly onPartners?: (entry: MobileHomePartnerEntry) => void;
   readonly onNavigated?: () => void;
   readonly registerNavigation?: (port: TaskHomeNavigationPort) => () => void;
 }
@@ -1290,7 +1302,7 @@ function ConnectionScreen({ state, locale, dark, onBack, onConnected, invitation
 
 export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomingShare, onOpenShare,
   menuButtonRef, searchFocusRequest, viewState, onViewStateChange, currentSessionId, runNavigation,
-  foreground = AppState.currentState === "active", host = "home", newTaskInSystemBar = false }: ScreenProps & {
+  foreground = AppState.currentState === "active", host = "home", newTaskInSystemBar = false, onPartners }: ScreenProps & {
   onNew: () => void; onSelect: () => void; onMenu: () => void;
   incomingShare: MobileIncomingShareSnapshot; onOpenShare: () => void;
   menuButtonRef: RefObject<View | null>; searchFocusRequest: number;
@@ -1298,6 +1310,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   currentSessionId?: string; runNavigation?: (intent: MobileHomeNavigationIntent) => void;
   foreground?: boolean; host?: "home" | "drawer" | "persistent";
   newTaskInSystemBar?: boolean;
+  onPartners?: (entry: MobileHomePartnerEntry) => void;
 }) {
   const [localViewState, setLocalViewState] = useState<MobileHomeViewState>({ search: "", statusFilter: "active" });
   const { search, statusFilter } = viewState ?? localViewState;
@@ -1374,6 +1387,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     } else if (intent.kind === "new-task") onNew();
     else if (intent.kind === "incoming-share") onOpenShare();
     else if (intent.kind === "menu") onMenu();
+    else if (intent.kind === "page") intent.action();
   };
 
   const runMutation = (action: () => Promise<boolean>): void => {
@@ -1563,6 +1577,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete"].includes(item.kind))}
       colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
+      ListHeaderComponent={onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
+        active={foreground} visible={statusFilter !== "archived"} query={search} colors={colors} locale={locale}
+        canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} />}
       renderSectionHeader={({ section }) => <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
         ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
@@ -6187,6 +6204,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     viewState={homeNavigation?.viewState ?? localHomeView} onViewStateChange={homeNavigation?.onViewStateChange ?? setLocalHomeView}
     currentSessionId={state.taskSource?.kind === "joined" ? undefined : state.selectedId} host={host} foreground={AppState.currentState === "active" && (host !== "drawer" || drawerOpen)}
     newTaskInSystemBar={newTaskInSystemBar}
+    onPartners={homeNavigation?.onPartners}
     runNavigation={(intent) => { requestTaskHomeNavigation(intent, host === "drawer"); }} />;
   const renderTimelineImage = (item: TimelineRow, image: NonNullable<TimelineRow["images"]>[number], index: number): ReactNode => <MobileTimelineImage key={image.pageId} client={client} page={image}
             eventId={image.sourceEventId ?? item.eventId} ownerKey={client.timelineImagePreviewOwnerKey()}

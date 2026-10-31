@@ -10,6 +10,11 @@ type MobilePartnerMessageRow = readonly [
 ];
 
 const rows = [
+  ["home.partners.create", "Create Partner or group", "新建伙伴或群聊", "新增夥伴或群聊", "パートナーまたはグループを作成", "파트너 또는 그룹 만들기"],
+  ["home.partners.expand", "Expand Partners", "展开伙伴", "展開夥伴", "パートナーを展開", "파트너 펼치기"],
+  ["home.partners.collapse", "Collapse Partners", "收起伙伴", "收合夥伴", "パートナーを折りたたむ", "파트너 접기"],
+  ["home.partners.showAll", "Show all", "显示全部", "顯示全部", "すべて表示", "모두 표시"],
+  ["home.partners.showLess", "Show less", "收起", "收合", "表示を減らす", "간략히 표시"],
   ["partnerGroups.search", "Search Partners and groups", "搜索伙伴和群聊", "搜尋夥伴和群聊", "パートナーとグループを検索", "파트너와 그룹 검색"],
   ["partnerGroups.sourceChoice", "{name} · {origin}", "{name} · {origin}", "{name} · {origin}", "{name} · {origin}", "{name} · {origin}"],
   ["partnerGroups.loading", "Loading groups…", "正在加载群聊…", "正在載入群聊…", "グループを読み込み中…", "그룹 불러오는 중…"],
