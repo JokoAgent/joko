@@ -1,6 +1,7 @@
 import type { OperationalStore } from "@joko/store";
 
 import type { BrowserUserKnowledgeLayer } from "./browser-tool-bridge.js";
+import { browserExperienceSite, validBrowserExperience, type BrowserExperience } from "./browser-experience.js";
 
 export const BROWSER_USER_KNOWLEDGE_SETTING_KEY = "settings.browser.user_knowledge";
 
@@ -48,10 +49,37 @@ export class BrowserUserKnowledgeStore implements BrowserUserKnowledgeLayer {
     return this.#catalog.catalogVersion;
   }
 
+  async listExperiences(site: string): Promise<readonly BrowserExperience[]> {
+    if (!browserExperienceSite(site)) throw new Error("Browser experience site is invalid.");
+    const value = this.#store.findSetting<unknown>("service", this.#scopeId, `settings.browser.experience:${site}`)?.value;
+    if (value === undefined) return [];
+    if (!isRecord(value) || Object.keys(value).sort().join("|") !== "entries|format" || value["format"] !== 1
+      || !Array.isArray(value["entries"]) || value["entries"].length > 32
+      || value["entries"].some(row => !validBrowserExperience(row) || row.site !== site)) throw new Error("Stored Browser experience is invalid.");
+    return structuredClone(value["entries"] as readonly BrowserExperience[]);
+  }
+
+  async recordExperience(input: Pick<BrowserExperience, "site" | "actions">, assertCurrent: () => void): Promise<BrowserExperience> {
+    const task = this.#tail.then(async () => {
+      assertCurrent();
+      const next = { site: input.site, actions: [...input.actions], observations: 1, updatedAt: Date.now() };
+      if (!validBrowserExperience(next)) throw new Error("Browser experience must contain only a site and bounded action shape.");
+      const existing = await this.listExperiences(next.site); assertCurrent();
+      const key = next.actions.join("/"), previous = existing.find(row => row.actions.join("/") === key);
+      next.observations = Math.min((previous?.observations ?? 0) + 1, 1_000_000);
+      const entries = [...existing.filter(row => row.actions.join("/") !== key), next].slice(-32);
+      this.#store.setSetting("service", this.#scopeId, `settings.browser.experience:${next.site}`, { format: 1, entries });
+      return structuredClone(next);
+    });
+    this.#tail = task.then(() => undefined, () => undefined); return task;
+  }
+
   save(input: {
     readonly site: string;
     readonly recipe: Readonly<Record<string, unknown>>;
     readonly siteGuide?: Readonly<Record<string, unknown>>;
+    readonly assertCurrent?: () => void;
+    readonly expectedRecipe?: string | null;
   }): Promise<void> {
     const task = this.#tail.then(() => this.#saveNow(input), () => this.#saveNow(input));
     this.#tail = task.then(() => undefined, () => undefined);
@@ -62,6 +90,8 @@ export class BrowserUserKnowledgeStore implements BrowserUserKnowledgeLayer {
     readonly site: string;
     readonly recipe: Readonly<Record<string, unknown>>;
     readonly siteGuide?: Readonly<Record<string, unknown>>;
+    readonly assertCurrent?: () => void;
+    readonly expectedRecipe?: string | null;
   }): Promise<void> {
     const site = requiredIdentifier(input.site, "Browser site guide site");
     const recipe = cloneRecord(input.recipe);
@@ -71,6 +101,10 @@ export class BrowserUserKnowledgeStore implements BrowserUserKnowledgeLayer {
       throw new Error("Browser site guide does not match its durable catalog key.");
     }
     const recipes = new Map(this.#catalog.recipes.map((item) => [recordIdentifier(item, "id", "Browser recipe ID"), item]));
+    input.assertCurrent?.();
+    if (input.expectedRecipe !== undefined && (recipes.has(recipeId) ? JSON.stringify(recipes.get(recipeId)) : null) !== input.expectedRecipe) {
+      throw new Error("Browser recipe changed before this update could be saved.");
+    }
     const siteGuides = new Map(this.#catalog.siteGuides.map((item) => [recordIdentifier(item, "site", "Browser site guide site"), item]));
     recipes.set(recipeId, recipe);
     if (siteGuide !== undefined) siteGuides.set(site, siteGuide);
@@ -82,6 +116,7 @@ export class BrowserUserKnowledgeStore implements BrowserUserKnowledgeLayer {
     });
     // OperationalStore commits this single row in one SQLite transaction.  Do
     // not publish the in-memory projection until that commit has succeeded.
+    input.assertCurrent?.();
     this.#store.setSetting(
       "service",
       this.#scopeId,
