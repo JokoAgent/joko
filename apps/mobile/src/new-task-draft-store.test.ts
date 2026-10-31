@@ -276,7 +276,7 @@ describe("mobile new-task retained draft store", () => {
       input: structuredInput()
     });
     const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":9');
+    expect(raw).toContain('"version":1');
     expect(raw).toContain('"routeKind":"path"');
     expect(raw).toContain('"serialized":"@src/main.ts"');
     expect(raw).not.toContain("D:\\\\repo");
@@ -299,7 +299,7 @@ describe("mobile new-task retained draft store", () => {
       first, authority.createOperationId, local, attachedInput("uploaded")
     )).rejects.toThrow(/changed while it was being committed/u);
     const raw = memory.values.get(mobileNewTaskDraftTesting.storageKey(first))!;
-    expect(raw).toContain('"version":9');
+    expect(raw).toContain('"version":1');
     expect(raw).not.toContain("content://");
     expect(raw).not.toContain("file://");
   });
@@ -315,7 +315,7 @@ describe("mobile new-task retained draft store", () => {
     expect((await new MobileNewTaskDraftStore(memory.driver).read(first))?.submission).toBeUndefined();
   });
 
-  it("rejects damaged, oversized, legacy, and cross-profile records", async () => {
+  it("rejects damaged, oversized, unsupported-version, and cross-profile records", async () => {
     const memory = memoryDriver();
     const key = mobileNewTaskDraftTesting.storageKey(first);
     const store = new MobileNewTaskDraftStore(memory.driver);
@@ -331,7 +331,7 @@ describe("mobile new-task retained draft store", () => {
 
     const crossProfile = new MobileNewTaskDraftStore(memory.driver);
     memory.values.set(key, JSON.stringify({
-      version: 9,
+      version: 1,
       identity: second,
       draft: { targetId: "target-one", name: "", input: input("cross owner") }
     }));
@@ -344,7 +344,7 @@ describe("mobile new-task retained draft store", () => {
     }));
     await expect(new MobileNewTaskDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
-    for (const version of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    for (const version of [0, 2, 3, 4, 5, 6, 7, 8, 9]) {
       memory.values.set(key, JSON.stringify({
         version,
         identity: first,
@@ -354,7 +354,7 @@ describe("mobile new-task retained draft store", () => {
     }
 
     memory.values.set(key, JSON.stringify({
-      version: 9,
+      version: 1,
       identity: first,
       draft: {
         targetId: "target-one",

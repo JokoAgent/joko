@@ -6708,7 +6708,8 @@ describe("PiBackendAdapter", () => {
           defaultVisible: false,
           defaultEffort: "medium",
           declaredInputModalities: ["text", "image"],
-          pricing: { tariffs: [expect.objectContaining({ cost: { input: 1, output: 2, cacheWrite1h: 3 } })] }
+          pricing: { source: "providerReference", currencyCode: "USD",
+            tariffs: [expect.objectContaining({ cost: { input: 1, output: 2, cacheWrite1h: 3 } })] }
         })
       ])
     });

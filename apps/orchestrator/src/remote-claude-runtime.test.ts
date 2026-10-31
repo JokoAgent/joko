@@ -929,14 +929,14 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
         : callback === "productMcpTool"
           ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         : "66666666-6666-4666-8666-666666666666";
-    query.process.send({ v: 2, kind: "callback", callbackId, queryId: query.queryId, callback, value });
+    query.process.send({ v: 1, kind: "callback", callbackId, queryId: query.queryId, callback, value });
     return new Promise((resolve, reject) => this.#callbacks.set(callbackId, { resolve, reject }));
   }
 
   cancelCallback(callbackId: string): void {
     const query = this.#query;
     if (query === undefined) throw new Error("No query is attached.");
-    query.process.send({ v: 2, kind: "callback_cancel", callbackId });
+    query.process.send({ v: 1, kind: "callback_cancel", callbackId });
   }
 
   #accept(frame: Record<string, unknown>, process: FixtureProcess): void {
@@ -962,8 +962,8 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     if (frame.kind !== "request" || typeof frame.id !== "string" || typeof frame.method !== "string") return;
     const params = record(frame.params);
     if (frame.method === "hello") return process.respond(frame.id, {
-      protocolVersion: 2,
-      managerVersion: "2.0.0",
+      protocolVersion: 1,
+      managerVersion: "0.1.0",
       managerSha256: this.#options.managerSha256 ?? MANAGER_SHA256,
       managerGeneration: this.#managerGeneration
     });
@@ -1142,7 +1142,7 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
       operation.childSessionId = FORK_ID;
       this.#storeFork = { id, process };
       process.send({
-        v: 2,
+        v: 1,
         kind: "callback",
         callbackId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
         callback: "storeChildReserved",
@@ -1190,7 +1190,7 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
   #emit(event: "message" | "retired", value?: unknown): void {
     if (this.#query === undefined) return;
     const frame: Record<string, unknown> = {
-      v: 2,
+      v: 1,
       kind: "event",
       queryId: this.#query.queryId,
       seq: this.#sequence++,
@@ -1236,11 +1236,11 @@ class FixtureProcess extends EventEmitter implements RemoteProcessHandle {
   }
 
   respond(id: string, value: unknown): void {
-    this.send({ v: 2, kind: "response", id, ok: true, value });
+    this.send({ v: 1, kind: "response", id, ok: true, value });
   }
 
   rejectResponse(id: string, code: string, stateMayHaveChanged: boolean): void {
-    this.send({ v: 2, kind: "response", id, ok: false, error: { code, stateMayHaveChanged } });
+    this.send({ v: 1, kind: "response", id, ok: false, error: { code, stateMayHaveChanged } });
   }
 
   send(value: unknown): void {

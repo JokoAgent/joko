@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { catalogModelReferencePricing } from "@joko/core";
 
 import { claudeModelEstimate } from "./model-estimates.js";
 import { providerModel, SafeProjection } from "./projection.js";
@@ -20,6 +21,13 @@ describe("Claude model estimates", () => {
   });
 
   it("combines fixed Opus 5.5 metadata with runtime-owned membership", () => {
+    const pricing = catalogModelReferencePricing("anthropic/claude-opus-5-5");
+    expect(pricing?.tariffs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ variant: "standard", currencyCode: "USD",
+        cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5, cacheWrite1h: 8 } }),
+      expect.objectContaining({ variant: "fast", currencyCode: "USD",
+        cost: { input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10, cacheWrite1h: 16 } })
+    ]));
     expect(providerModel({
       value: "claude-opus-5-5",
       displayName: "Opus 5.5",
@@ -44,14 +52,7 @@ describe("Claude model estimates", () => {
       thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
       defaultEffort: "medium",
       cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
-      pricing: {
-        source: "providerReference",
-        currencyCode: "USD",
-        updatedAt: Date.UTC(2026, 8, 23),
-        cacheReadAvailable: true,
-        cacheWriteAvailable: true,
-        fastModeMultiplier: 2
-      }
+      pricing
     });
   });
 

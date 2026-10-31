@@ -20,7 +20,7 @@ function fixture() {
         generation: 1n, resumeCursor: { generation: 1n, sequence: 0n },
         backends: [{ backendId: "backend", capabilities: { capabilities: [{ name: "input.text", support: CapabilitySupport.SUPPORTED }] } }],
         sessions: [{ sessionId: "task", backendId: "backend", targetId: "target", state: SessionState.IDLE,
-          nativeBinding: { runtimeGeneration: generation } }]
+          location: { kind: { case: "serviceNode", value: {} } }, nativeBinding: { runtimeGeneration: generation } }]
       }) }));
       if (method.localName === "listManagedModelRuntimes") return response(create(ListManagedModelRuntimesResponseSchema));
       if (method.localName === "getOperation") {
@@ -74,6 +74,9 @@ it("creates a different attempt only after a confirmed rejection and blocks stal
     await gateway.sendRichAnswer("task", 8n, "answer:button", "Continue");
     expect(f.mutations).toHaveLength(2);
     expect(f.mutations[1].operationId).not.toBe(original);
+    // submit() starts a background refresh. Settle that observation before
+    // changing the server, so the next refresh cannot join the older request.
+    await gateway.refresh();
     f.setGeneration(9n);
     await gateway.refresh();
     expect(await gateway.sendRichAnswer("task", 9n, "answer:button", "Continue")).toBe(true);

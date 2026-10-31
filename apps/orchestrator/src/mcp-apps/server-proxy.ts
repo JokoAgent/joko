@@ -32,7 +32,7 @@ interface Options {
  * The internal capability superset permits forwarding ordinary MCP methods. */
 class ModelProxyServer extends McpServer {
   constructor(name: string, private readonly readInitialize: () => Promise<{ instructions?: string; capabilities: ServerCapabilities }>) {
-    super({ name, version: "1.0.0" }, { capabilities: {
+    super({ name, version: "0.1.0" }, { capabilities: {
       tools: { listChanged: true }, resources: { listChanged: true, subscribe: true }, prompts: { listChanged: true },
       completions: {}, logging: {}, tasks: { requests: { tools: { call: {} } } },
     } });

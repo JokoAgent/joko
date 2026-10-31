@@ -28,7 +28,7 @@ test("copies complete skill assets and freezes approval independently from mutab
     const mount = snapshot.skills[0]!;
     expect(await readFile(mount.filePath, "utf8")).toBe(body);
     expect(await readFile(join(mount.path, "assets", "template.bin"))).toEqual(asset);
-    expect(JSON.parse(await readFile(join(snapshot.pluginRoot, ".claude-plugin", "plugin.json"), "utf8"))).toEqual({ name: "joko-approved-skills", version: "1.0.0" });
+    expect(JSON.parse(await readFile(join(snapshot.pluginRoot, ".claude-plugin", "plugin.json"), "utf8"))).toEqual({ name: "joko-approved-skills", version: "0.1.0" });
     source.assertCurrent = () => undefined;
     current = false;
     expect(() => snapshot.assertCurrent()).toThrow("approved skill snapshot");

@@ -353,13 +353,13 @@ it("recovers a Scribe recording longer than sixty seconds from exact unconfirmed
     const retiredCaptureCount = captured.length;
     expect(totalDurationMs).toBe(60_000);
     const acknowledgedPcm = Buffer.concat(captured.map(chunk => chunk.audio));
-    expect(Buffer.concat(original.commits)).toEqual(acknowledgedPcm);
+    expectSamePcm(Buffer.concat(original.commits), acknowledgedPcm);
     await append(20_000);
     await vi.waitFor(() => expect(original.commits).toHaveLength(4), { timeout: 2_000 });
     const recoveryCaptureCount = captured.length;
     const unconfirmed = captured.slice(retiredCaptureCount, recoveryCaptureCount);
     const unconfirmedPcm = Buffer.concat(unconfirmed.map(chunk => chunk.audio));
-    expect(original.commits[3]).toEqual(unconfirmedPcm);
+    expectSamePcm(original.commits[3]!, unconfirmedPcm);
     expect(totalDurationMs).toBe(80_000);
     original.socket.terminate();
     await vi.waitFor(async () => {
@@ -390,15 +390,15 @@ it("recovers a Scribe recording longer than sixty seconds from exact unconfirmed
     expect(stopFailure).toBeUndefined(); expect(stopSettled).toBe(false);
     // The first recovered boundary contains exactly the captured HTTP suffix;
     // the three acknowledged segments and the later append are absent.
-    expect(recovered.commits[0]).toEqual(unconfirmedPcm);
-    expect(Buffer.concat(recovered.packets.map(packet => packet.audio))).toEqual(unconfirmedPcm);
+    expectSamePcm(recovered.commits[0]!, unconfirmedPcm);
+    expectSamePcm(Buffer.concat(recovered.packets.map(packet => packet.audio)), unconfirmedPcm);
     await scribeSend(recovered.socket, { message_type: "committed_transcript", text: unknownText });
     await vi.waitFor(() => expect(recovered.commits).toHaveLength(2), { timeout: 2_000 });
     await scribeRoundTrip(recovered.socket);
     expect(stopFailure).toBeUndefined(); expect(stopSettled).toBe(false);
     const paddedTail = Buffer.concat([newTailPcm, Buffer.alloc((2_100 - 1_000) * 32)]);
-    expect(recovered.commits[1]).toEqual(paddedTail);
-    expect(Buffer.concat(recovered.packets.map(packet => packet.audio))).toEqual(Buffer.concat([unconfirmedPcm, paddedTail]));
+    expectSamePcm(recovered.commits[1]!, paddedTail);
+    expectSamePcm(Buffer.concat(recovered.packets.map(packet => packet.audio)), Buffer.concat([unconfirmedPcm, paddedTail]));
     expect(recovered.packets.every(packet => packet.messageType === "input_audio_chunk" && packet.sampleRate === 16_000)).toBe(true);
     await scribeSend(recovered.socket, { message_type: "committed_transcript", text: tailText });
     await voiceDeadline(pendingStop, 5_000);
@@ -685,6 +685,12 @@ async function saucReplaySend(socket: WebSocket, frame: Buffer): Promise<void> {
 function scribeReady(): string {
   return JSON.stringify({ message_type: "session_started", config: { model_id: "scribe_v2_realtime",
     audio_format: "pcm_16000", sample_rate: 16_000, commit_strategy: "manual" } });
+}
+
+// Native byte comparison preserves exact equality without delaying fixture ACKs.
+function expectSamePcm(actual: Buffer, expected: Buffer): void {
+  expect(actual.byteLength).toBe(expected.byteLength);
+  expect(actual.equals(expected), "Captured PCM bytes differ.").toBe(true);
 }
 
 async function scribeSend(socket: WebSocket, message: unknown): Promise<void> {

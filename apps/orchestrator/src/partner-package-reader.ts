@@ -11,7 +11,7 @@ import { AgentImportError, type ImportItem, type ImportSnapshot } from '@joko/ag
 export const PARTNER_PACKAGE_IDS = ['engineer-bot', 'nightly-audit-engineer', 'startup-qa-bot',
   'seo-aeo-desk', 'cooper', 'video-editor', 'proto-bot',
   'ad-spend-watch', 'apple-search-ads-review', 'sable-game-art'] as const;
-export const PARTNER_PACKAGE_VERSION = '0.5.0';
+export const PARTNER_PACKAGE_VERSION = '0.1.0';
 const MAX_FILE = 2 * 1024 * 1024;
 const MAX_TOTAL = 16 * 1024 * 1024;
 const invalid = (): never => { throw new AgentImportError('INVALID_PACKAGE'); };
@@ -125,7 +125,7 @@ export async function readNativePartnerPackage(root: string, packageId: string):
   }
   const manifestBytes = files.get('manifest.json') ?? invalid();
   const manifest = record(JSON.parse(manifestBytes.toString('utf8')));
-  if (manifest.schemaVersion !== 2 || manifest.packageId !== packageId || manifest.packageVersion !== PARTNER_PACKAGE_VERSION) invalid();
+  if (manifest.schemaVersion !== 1 || manifest.packageId !== packageId || manifest.packageVersion !== PARTNER_PACKAGE_VERSION) invalid();
   const integrity = record(record(manifest.integrity).files);
   if (Object.keys(integrity).length !== files.size - 1) invalid();
   for (const [name, hash] of Object.entries(integrity)) {

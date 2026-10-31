@@ -318,7 +318,7 @@ export class CodexMcpBridgeManager {
       callTool, redact: value => this.#router.redactModelValue(value),
     }) : undefined;
     const server = modelProxy ?? new ProtocolServer(
-      { name: `joko-codex-${route.serverId}`, version: "1.0.0" },
+      { name: `joko-codex-${route.serverId}`, version: "0.1.0" },
       { capabilities: { tools: {} } }
     );
     let session: ProtocolSession;

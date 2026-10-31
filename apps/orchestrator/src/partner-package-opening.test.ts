@@ -2,7 +2,7 @@ import { expect, it, vi } from "vitest";
 import type { AuxiliaryTextRouting, AuxiliaryTextRunOptions } from "./auxiliary-text-routing.js";
 import { partnerPackageOpening } from "./partner-package-opening.js";
 
-const native = { packageId: "engineering", packageVersion: "0.5.0", packageHash: "a".repeat(64), description: "Engineering", avatarPreset: "orbit" as const, locale: "en",
+const native = { packageId: "engineering", packageVersion: "0.1.0", packageHash: "a".repeat(64), description: "Engineering", avatarPreset: "orbit" as const, locale: "en",
   opening: { welcome: "Hello. What should we review?", capabilities: ["Code", "Evidence", "Delivery"], starterOptions: ["Review code", "Check evidence", "Plan delivery"] } };
 it("uses only the auxiliary chain under one four-second deadline and validates authored starter cardinality", async () => {
   const run = vi.fn(async (_plan: unknown, options: AuxiliaryTextRunOptions) => {

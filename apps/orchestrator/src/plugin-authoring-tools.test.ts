@@ -78,6 +78,6 @@ it("packs the actual runnable example shipped with the creator Skill", async () 
   await cp(fileURLToPath(new URL("./system-skills/joko-plugin-creator/examples/status/", import.meta.url)), f.source, { recursive: true, force: true });
   const packed = await f.tools.callTool("pack_extension_package", { directory: "plugin" }, new AbortController().signal, f.context);
   expect(packed.isError, JSON.stringify(packed.content)).toBe(false);
-  expect(packed.hostArtifacts?.[0]?.blob.fileName).toBe("joko-status-example-1.0.0.tgz");
+  expect(packed.hostArtifacts?.[0]?.blob.fileName).toBe("joko-status-example-0.1.0.tgz");
   expect(packed.structuredContent).toMatchObject({ name: "joko-status-example", validated: true, installed: false });
 }, 30_000);

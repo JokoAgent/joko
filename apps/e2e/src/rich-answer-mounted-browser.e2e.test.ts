@@ -59,6 +59,11 @@ mountedIt("sends a rich answer through the production task queue while preservin
   expect(await draft.textContent()).toBe("My unfinished composer draft");
   expect(await answer.getByRole("button", { name: "Sent", exact: true }).isDisabled()).toBe(true);
   await page.reload({ waitUntil: "domcontentloaded" });
+  // Manual pairing leaves automatic entry disabled. Reconnect the original
+  // saved node before checking the task's durable answer receipt.
+  await page.locator(".connection-tabs > button").nth(1).click();
+  await page.locator(".connection-card .profile-card").filter({ has: page.getByText(fixture.baseUrl, { exact: true }) })
+    .getByRole("button", { name: "Connect", exact: true }).click();
   await answer.getByRole("button", { name: "Sent", exact: true }).waitFor({ state: "visible", timeout: 20_000 });
   expect(await answer.getByRole("checkbox", { name: "Include details", exact: true }).isChecked()).toBe(true);
   expect(await answer.getByRole("button", { name: "Sent", exact: true }).isDisabled()).toBe(true);

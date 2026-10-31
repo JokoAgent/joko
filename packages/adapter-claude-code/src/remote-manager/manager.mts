@@ -13,8 +13,8 @@ import { ListToolsRequestSchema, JSONRPCMessageSchema } from "@modelcontextproto
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import { z } from "zod";
 
-const PROTOCOL_VERSION = 2;
-const MANAGER_VERSION = "2.0.0";
+const PROTOCOL_VERSION = 1;
+const MANAGER_VERSION = "0.1.0";
 const SESSION_STORE_MODULE_BASE64 = "__JOKO_EMBEDDED_CLAUDE_SESSION_STORE_V1__";
 const FRESH_CONTEXT_MODULE_BASE64 = "__JOKO_EMBEDDED_CLAUDE_FRESH_CONTEXT_OWNER_V1__";
 const MANAGER_SHA256 = createHash("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
@@ -1086,7 +1086,7 @@ function productMcpModelIds(value) {
 /** The remote SDK retains its normal in-process MCP transport. Only standard
  * protocol frames cross the original owned Query channel. */
 class RemoteModelMcpServer extends McpServer {
-  constructor(name, serverId, query) { super({ name, version: "1.0.0" }); this.serverId = serverId; this.query = query; this.active = undefined; }
+  constructor(name, serverId, query) { super({ name, version: "0.1.0" }); this.serverId = serverId; this.query = query; this.active = undefined; }
   async connect(transport) {
     await this.active?.close();
     const query = this.query, connection = query.connection, channelId = randomUUID(), serverId = this.serverId;
@@ -1171,7 +1171,7 @@ function createProductMcpServers(value, query, modelIds = new Set()) {
     if (modelIds.has(serverId)) continue;
     const name = `joko_${createHash("sha256").update(serverId).digest("hex").slice(0, 24)}`;
     if (name === MANAGED_AGENT_SERVER || Object.hasOwn(servers, name)) throw fault("mcp_catalog_invalid", false);
-    const instance = new McpServer({ name, version: "1.0.0" });
+    const instance = new McpServer({ name, version: "0.1.0" });
     for (const tool of entries) {
       let checkInput;
       let checkOutput;
@@ -1223,7 +1223,7 @@ function createProductMcpServers(value, query, modelIds = new Set()) {
 function createManagedAgentServer(query) {
   return query.state.sdk.createSdkMcpServer({
     name: MANAGED_AGENT_SERVER,
-    version: "1.0.0",
+    version: "0.1.0",
     tools: [{
       name: MANAGED_AGENT_TOOL,
       description: "Run an exactly configured Joko-managed Claude subagent.",

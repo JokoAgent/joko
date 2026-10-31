@@ -1435,7 +1435,7 @@ describe("CodexBackendAdapter", () => {
 
     const descriptor = await setup.adapter.describe();
     expect(descriptor.models.find((model) => model.modelId === "gpt-6.1-sol")).toMatchObject({
-      contextWindow: 272_000,
+      contextWindow: 500_000,
       maxOutputTokens: 128_000,
       supportsFastMode: false,
       declaredSupportsFastMode: false,

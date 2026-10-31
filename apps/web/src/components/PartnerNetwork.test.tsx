@@ -99,12 +99,28 @@ describe("Shared conversation UI receipts", () => {
     const f = setup(); f.api.joinPartnerNetwork.mockRejectedValueOnce(new ConnectError("reply lost", Code.Unavailable));
     const invitation = "joko://conversation/join#private-invitation-secret", view = await mount(<PartnerNetworkSection controller={f.controller} partners={[]} />);
     const open = async () => { await act(async () => { button("Enter invitation link…", view.element).click(); await settle(); }); const inputs = document.body.querySelectorAll<HTMLInputElement>('[role="dialog"] input'); await fill(inputs[0]!, invitation); await fill(inputs[1]!, "Guest"); };
-    await open(); await act(async () => { button("Read invitation").click(); await settle(); }); await act(async () => { button("Accept and join").click(); await settle(); });
+    await open(); await act(async () => {
+      button("Read invitation").click();
+      await vi.waitFor(() => expect(f.api.previewPartnerNetwork).toHaveBeenCalledTimes(1));
+    });
+    await act(async () => {
+      button("Accept and join").click();
+      // Preparing the original ID hashes and verifies its journal before RPC.
+      // A fixed delay does not establish that private asynchronous boundary.
+      await vi.waitFor(() => expect(f.api.joinPartnerNetwork).toHaveBeenCalledTimes(1));
+    });
+    expect(document.querySelector('[role="dialog"] [role="alert"]')).not.toBeNull();
     expect(f.api.joinPartnerNetwork).toHaveBeenCalledTimes(1); const original = f.api.joinPartnerNetwork.mock.calls[0]; expect(JSON.stringify(Object.values(localStorage))).not.toContain("private-invitation-secret");
     const close = document.querySelector<HTMLButtonElement>('[role="dialog"] button[aria-label="Close"]');
-    await act(async () => { close!.click(); await settle(); }); await open(); await act(async () => { button("Read invitation").click(); await settle(); });
+    await act(async () => { close!.click(); await settle(); }); await open();
+    await act(async () => {
+      button("Read invitation").click();
+      // Joining is followed by an asynchronous journal confirmation before
+      // navigation. A request count alone does not prove that receipt settled.
+      await vi.waitFor(() => expect(f.controller.navigate).toHaveBeenCalledWith({ kind: "partners", groupId: "network:joined:room" }));
+    });
     expect(f.api.previewPartnerNetwork).toHaveBeenCalledTimes(1); expect(f.api.joinPartnerNetwork).toHaveBeenCalledTimes(2); expect(f.api.joinPartnerNetwork.mock.calls[1]?.[0]).toEqual(original?.[0]);
-    expect(f.controller.navigate).toHaveBeenCalled();
+    expect(f.controller.navigate).toHaveBeenCalledTimes(1);
   });
   it("withdraws history and the composer on an explicit membership rejection", async () => {
     const f = setup(); f.api.getPartnerNetwork.mockRejectedValue(new ConnectError("revoked", Code.PermissionDenied));

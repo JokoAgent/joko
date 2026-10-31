@@ -52,7 +52,7 @@ async function connectImportedConnection(
     } catch { throw new AgentImportError('CONNECTION_FAILED'); }
     assertOwner();
   }
-  const client = new Client({ name: 'joko-partner-connections', version: '1.0.0' });
+  const client = new Client({ name: 'joko-partner-connections', version: '0.1.0' });
   const transport = server.command
     ? new StdioClientTransport({ command: server.command, args: server.args ?? [], cwd: server.cwd,
       env: importedProcessEnvironment({ ...environment, ...server.env }), stderr: 'ignore' })
