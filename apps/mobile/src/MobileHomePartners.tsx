@@ -12,9 +12,9 @@ import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import type { MobilePartnerRoster, MobilePartnerRosterShard } from "./mobile-partner-roster";
 import type { MobilePartnerGroupRoster, MobilePartnerGroupDisplay } from "./mobile-partner-group-roster";
 
-export type MobileHomePartnerEntry = { readonly kind: "create" | "create-group" } | {
-  readonly kind: "partner" | "group"; readonly sourceKey: string; readonly id: string;
-};
+export type MobileHomePartnerEntry = { readonly kind: "create" } | { readonly kind: "create-group" }
+  | { readonly kind: "partner"; readonly sourceKey: string; readonly id: string }
+  | { readonly kind: "group"; readonly sourceKey: string; readonly id: string };
 interface HomeEntry {
   readonly key: string; readonly source: MobilePartnerRosterShard; readonly id: string;
   readonly kind: "partner" | "group"; readonly name: string; readonly at: number;
