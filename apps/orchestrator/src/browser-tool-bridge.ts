@@ -27,6 +27,7 @@ import {
 } from "@joko/tool-browser";
 
 import type { ArtifactStore } from "./artifact-store.js";
+import { BrowserResultCache, type BrowserResultSource } from "./browser-result-cache.js";
 import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-builtin-catalog.js";
 import { BROWSER_RECIPE_AUTHOR_RULES, BROWSER_WORKFLOW_RULES } from "./browser-rules.js";
@@ -85,7 +86,7 @@ const MAXIMUM_UNIFIED_RESULT_BYTES = 200_000;
 const unifiedActions = [
   "doctor", "status", "setBackend", "start", "stop", "profiles", "tabs", "open", "focus", "close",
   "snapshot", "screenshot", "navigate", "console", "pdf", "upload", "dialog", "act",
-  "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe"
+  "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe", "readResult"
 ] as const;
 
 const actKinds = [
@@ -154,6 +155,8 @@ const actRequestSchema = objectSchema({
 }, ["kind"]);
 
 const unifiedSchema = objectSchema({
+  resultId: { type: "string", minLength: 1, maxLength: 128 },
+  offset: { type: "integer", minimum: 0, maximum: 2_000_000 },
   action: { type: "string", enum: unifiedActions },
   backend: { type: "string", enum: ["external", "sidebar"], description: "Only setBackend: save the global Browser presentation mode; modes keep separate profiles and tabs." },
   proxyServer: { type: "string", minLength: 1, maxLength: 2048, description: "Only start in external mode: a proxy URL without credentials." },
@@ -406,6 +409,9 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   #tail: Promise<void> = Promise.resolve();
   #activeContext: BridgeToolCallContext | undefined;
   #activePageIds = new Set<string>();
+  readonly #results = new BrowserResultCache();
+  #resultEpoch = "";
+  #remoteResultActive = false;
 
   constructor(input: {
     readonly browser: BrowserProvider;
@@ -495,7 +501,9 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   ): Promise<McpCallResult> {
     this.#activeContext = context;
     this.#activePageIds = new Set<string>();
+    this.#remoteResultActive = false;
     try {
+      this.#syncResultEpoch();
       if (context !== undefined && (
         !Number.isSafeInteger(context.providerGeneration) || (context.providerGeneration ?? 0) < 1 ||
         !/^[a-f0-9]{64}$/u.test(context.requestIdentity ?? "") ||
@@ -504,12 +512,24 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       )) throw new Error("Browser bridge request authority is invalid.");
       this.#assertSessionContext();
       const result = await this.#execute(name, arguments_, signal);
+      signal?.throwIfAborted();
       this.#assertSessionContext();
       for (const pageId of this.#activePageIds) this.#assertPageContext(pageId);
+      const payload = result.structuredContent;
+      if (isRecord(payload) && payload["ok"] === true && typeof payload["action"] === "string" && "data" in payload) {
+        const source: BrowserResultSource = { owner: this.#resultOwner(), epoch: this.#syncResultEpoch(), pages: [...this.#activePageIds] };
+        const bounded = boundedBrowserResult({ ok: true, action: payload["action"], data: payload["data"] }, result.content.filter(item => !(isRecord(item) && item["type"] === "text")),
+          this.#remoteResultActive ? undefined : { cache: this.#results, source });
+        return name === "call_tool" ? { content: bounded.content, isError: bounded.isError } : bounded;
+      }
       return result;
+    } catch (error) {
+      this.#results.clearOwner(this.#resultOwner());
+      throw error;
     } finally {
       this.#activeContext = undefined;
       this.#activePageIds = new Set<string>();
+      this.#remoteResultActive = false;
     }
   }
 
@@ -559,7 +579,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         }
         try {
           const result = await this.#execute("browser", args, signal);
-          return { content: result.content, isError: result.isError };
+          return { content: result.content, isError: result.isError, structuredContent: result.structuredContent };
         } catch (error) {
           return publicTextResult({
             ok: false,
@@ -781,9 +801,32 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     if (input["target"] === "node") return this.#executeRemote(action, input, signal);
     assertUnifiedRoute(input, this.#browser.targetMode);
     switch (action) {
+      case "readResult": {
+        const id = requiredString(input, "resultId", 128), owner = this.#resultOwner();
+        const source = this.#results.source(id, owner);
+        if (!source || source.epoch !== this.#syncResultEpoch()) { const value = this.#results.read(id, owner, 0, 1); return { ...publicTextResult(value, true), structuredContent: value }; }
+        const pageId = optionalString(input, "targetId", 512);
+        if (pageId !== undefined && !source.pages.includes(pageId)) return browserError(action, { message: "This result belongs to another Browser page." });
+        const read = async (): Promise<McpCallResult> => {
+          assertCurrent();
+          const value = this.#results.read(id, owner, optionalInteger(input, "offset", 0, 2_000_000) ?? 0,
+            optionalInteger(input, "maxChars", 1, 24_000) ?? 12_000);
+          return { ...publicTextResult(value, value["ok"] !== true), structuredContent: value };
+        };
+        try {
+          if (!source.pages.length && hasSecretPages()) throw new Error("Browser page reading is paused for private input.");
+          return await this.#withLease(async () => {
+            for (const page of source.pages) await this.#assertPageReadable(page, true);
+            if (source.epoch !== this.#syncResultEpoch()) throw new Error("The Browser result generation retired.");
+            const value = await read();
+            for (const page of source.pages) await this.#assertPageReadable(page, true);
+            return value;
+          });
+        } catch (error) { this.#results.clearOwner(owner); throw error; }
+      }
       case "doctor": {
         const pages = this.#browser.running ? await this.#listVisiblePages() : [];
-        return browserResult(action, {
+        return this.#result(action, {
           healthy: this.#browser.running,
           running: this.#browser.running,
           generation: this.#browser.generation,
@@ -794,7 +837,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         });
       }
       case "status":
-        return browserResult(action, {
+        return this.#result(action, {
           running: this.#browser.running,
           generation: this.#browser.generation,
           target: this.#browser.targetMode,
@@ -807,7 +850,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         const backend = await this.#setBackend(requested, assertCurrent);
         assertCurrent();
         return backend === requested
-          ? browserResult(action, { backend, scope: "global", persisted: true })
+          ? this.#result(action, { backend, scope: "global", persisted: true })
           : browserError(action, { backend, scope: "global", errorCode: "BROWSER_MODE_CHANGED", message: "The Browser mode changed; query status again." });
       }
       case "start": {
@@ -822,14 +865,14 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         await this.#browser.start({ ...(next.mode === "direct" ? {} : { proxyServer: next.server,
           ...(next.allowedHostnames === undefined ? {} : { proxyAllowedHostnames: next.allowedHostnames }) }),
           ...(signal === undefined ? {} : { signal }), assertCurrent });
-        return browserResult(action, { running: true, generation: this.#browser.generation, target: this.#browser.targetMode, proxy: this.#browser.proxyState() });
+        return this.#result(action, { running: true, generation: this.#browser.generation, target: this.#browser.targetMode, proxy: this.#browser.proxyState() });
       }
       case "stop":
         await this.#assertNoForeignLivePages();
         await this.#browser.stop();
-        return browserResult(action, { running: false, generation: this.#browser.generation, target: this.#browser.targetMode });
+        return this.#result(action, { running: false, generation: this.#browser.generation, target: this.#browser.targetMode });
       case "profiles":
-        return browserResult(action, {
+        return this.#result(action, {
           profiles: [
             { name: "sidebar", target: "sandbox", active: this.#browser.targetMode === "sidebar" },
             { name: "external", target: "host", active: this.#browser.targetMode === "external" }
@@ -842,25 +885,25 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           }))
         });
       case "tabs":
-        return browserResult(action, { tabs: (await this.#listVisiblePages()).map(publicPage) });
+        return this.#result(action, { tabs: (await this.#listVisiblePages()).map(publicPage) });
       case "open": {
         const candidate = optionalString(input, "url", 8_192);
         const label = optionalString(input, "label", 256);
         return this.#openOwnedPage(
           candidate === undefined ? undefined : agentUrl(candidate),
           label,
-          (page) => browserResult(action, { tab: publicPage(page) })
+          (page) => this.#result(action, { tab: publicPage(page) })
         );
       }
       case "focus": {
         const pageId = this.#unifiedPageId(input);
-        return this.#withLease(async (lease) => browserResult(action, {
+        return this.#withLease(async (lease) => this.#result(action, {
           tab: publicPage(await this.#browser.focusPage(pageId, lease))
         }));
       }
       case "close": {
         const pageId = this.#unifiedPageId(input);
-        return this.#closeOwnedPage(pageId, () => browserResult(action, { closedTargetId: pageId }));
+        return this.#closeOwnedPage(pageId, () => this.#result(action, { closedTargetId: pageId }));
       }
       case "snapshot": {
         const pageId = this.#unifiedPageId(input);
@@ -879,7 +922,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           });
           const screenshot = boundedInlineBytes(snapshot.screenshot, "Browser snapshot screenshot");
           await this.#recordScreenshot(pageId, screenshot);
-          return browserMixedResult(action, {
+          return this.#mixedResult(action, {
             page: publicPage(snapshot.page),
             snapshot: snapshot.aria
           }, [{ type: "image", data: Buffer.from(screenshot).toString("base64"), mimeType: "image/png" }]);
@@ -899,7 +942,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           }), "Browser screenshot");
           const mimeType = type === "jpeg" ? "image/jpeg" : "image/png";
           await this.#recordScreenshot(pageId, bytes, mimeType);
-          return browserMixedResult(action, { targetId: pageId, mediaType: mimeType, byteSize: bytes.byteLength }, [{
+          return this.#mixedResult(action, { targetId: pageId, mediaType: mimeType, byteSize: bytes.byteLength }, [{
             type: "image", data: Buffer.from(bytes).toString("base64"), mimeType
           }]);
         });
@@ -911,7 +954,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         });
       case "console": {
         const pageId = this.#unifiedPageId(input);
-        return this.#withPageReadLease(pageId, async (lease) => browserResult(action, {
+        return this.#withPageReadLease(pageId, async (lease) => this.#result(action, {
           messages: (await this.#browser.readConsoleMessages(pageId, lease, {
             ...(input["limit"] === undefined ? {} : { limit: requiredInteger(input, "limit", 1, MAXIMUM_DIAGNOSTIC_READ_LIMIT) }),
             ...(input["filter"] === undefined ? {} : { filter: requiredString(input, "filter", 4_096, true) }),
@@ -927,7 +970,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           const artifact = await this.#artifacts.ingestBytes(pdf, {
             fileName: `${pageId}.pdf`, mimeType: "application/pdf", expiresAt: Date.now() + 24 * 60 * 60_000
           });
-          return browserResult(action, { artifact: publicArtifact(artifact), mediaType: "application/pdf" });
+          return this.#result(action, { artifact: publicArtifact(artifact), mediaType: "application/pdf" });
         });
       }
       case "upload": {
@@ -942,27 +985,27 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           uploaded.push(publicTransfer(transfer));
         }
         this.#assertPageContext(pageId);
-        return browserResult(action, { transfers: uploaded });
+        return this.#result(action, { transfers: uploaded });
       }
       case "dialog": {
         const pageId = this.#unifiedPageId(input);
         return this.#withLease(async (lease) => {
           if (input["accept"] === undefined) {
-            return browserResult(action, { dialogs: await this.#browser.listDialogs(pageId, lease) });
+            return this.#result(action, { dialogs: await this.#browser.listDialogs(pageId, lease) });
           }
           await this.#browser.handleDialog(pageId, lease, {
             dialogId: optionalString(input, "dialogId", 256),
             accept: requiredBoolean(input, "accept"),
             promptText: optionalString(input, "promptText", MAXIMUM_ACTION_TEXT_LENGTH)
           });
-          return browserResult(action, { handled: true });
+          return this.#result(action, { handled: true });
         });
       }
       case "act":
         return this.#executeUnifiedAct(input, signal);
       case "requests": {
         const pageId = this.#unifiedPageId(input);
-        return this.#withPageReadLease(pageId, async (lease) => browserResult(action, {
+        return this.#withPageReadLease(pageId, async (lease) => this.#result(action, {
           requests: (await this.#browser.readHttpRequestSummaries(pageId, lease, {
             ...(input["limit"] === undefined ? {} : { limit: requiredInteger(input, "limit", 1, MAXIMUM_DIAGNOSTIC_READ_LIMIT) }),
             ...(input["filter"] === undefined ? {} : { filter: requiredString(input, "filter", 4_096, true) }),
@@ -972,7 +1015,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
       case "responseBody": {
         const pageId = this.#unifiedPageId(input);
-        return this.#withPageReadLease(pageId, async (lease) => browserResult(action, await this.#browser.readResponseBody(
+        return this.#withPageReadLease(pageId, async (lease) => this.#result(action, await this.#browser.readResponseBody(
           pageId,
           lease,
           requiredString(input, "url", 4_096),
@@ -984,7 +1027,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       case "extract": {
         const pageId = this.#unifiedPageId(input);
         const spec = requiredRecord(input, "extract") as unknown as BrowserExtractSpec;
-        return this.#withPageReadLease(pageId, async (lease) => browserResult(action, await this.#browser.extract(
+        return this.#withPageReadLease(pageId, async (lease) => this.#result(action, await this.#browser.extract(
           pageId,
           lease,
           spec,
@@ -1094,7 +1137,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
             });
             pages.push(result.structuredContent);
           }
-          return browserResult("act", { kind, fields: pages.length, page: publicPage((await this.#listVisiblePages()).find((page) => page.id === pageId) ?? invalidPage()) });
+          return this.#result("act", { kind, fields: pages.length, page: publicPage((await this.#listVisiblePages()).find((page) => page.id === pageId) ?? invalidPage()) });
         }
         return this.#unifiedActResult("act", { targetId: pageId }, {
           type: "fill",
@@ -1119,7 +1162,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
             const ready = await this.#withPageReadLease(pageId, (lease) => this.#browser.evaluatePage(
               pageId, lease, requiredString(request, "fn", 64 * 1024), Math.min(2_000, timeout)
             ));
-            if (ready === true) return browserResult("act", { kind, ready: true });
+            if (ready === true) return this.#result("act", { kind, ready: true });
             if (Date.now() - started >= timeout) throw new Error("Browser wait predicate timed out.");
             await delay(100, signal);
           }
@@ -1145,7 +1188,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           requiredString(request, "fn", 64 * 1024),
           request["timeoutMs"] === undefined ? undefined : requiredInteger(request, "timeoutMs", 1, MAXIMUM_WAIT_MILLISECONDS)
         ));
-        return browserResult("act", { kind, result });
+        return this.#result("act", { kind, result });
       }
       case "saveResource": {
         const resource = await this.#withLease((lease) => this.#browser.captureResource(
@@ -1154,10 +1197,10 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         const artifact = await this.#artifacts.ingestBytes(resource.bytes, {
           fileName: resource.fileName, mimeType: resource.mediaType, expiresAt: Date.now() + 24 * 60 * 60_000
         });
-        return browserResult("act", { kind, url: resource.url, artifact: publicArtifact(artifact) });
+        return this.#result("act", { kind, url: resource.url, artifact: publicArtifact(artifact) });
       }
       case "close":
-        return this.#closeOwnedPage(pageId, () => browserResult("act", { kind, closedTargetId: pageId }));
+        return this.#closeOwnedPage(pageId, () => this.#result("act", { kind, closedTargetId: pageId }));
     }
   }
 
@@ -1166,6 +1209,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     input: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined
   ): Promise<McpCallResult> {
+    this.#remoteResultActive = true;
     const nodeId = requiredString(input, "node", 512);
     const route = await this.#remoteNodes?.resolve(nodeId);
     if (route === undefined || route.id !== nodeId || !route.available) {
@@ -1320,6 +1364,13 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     result: BrowserRemoteAutomationResult,
     data: unknown
   ): Promise<McpCallResult> {
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      const record = data as Record<string, unknown>, full = record["fullResult"];
+      if (full && typeof full === "object" && !Array.isArray(full)) {
+        const descriptor = full as Record<string, unknown>, read = descriptor["read"];
+        if (read && typeof read === "object" && !Array.isArray(read)) data = { ...record, fullResult: { ...descriptor, read: { ...read, target: "node", node: nodeId } } };
+      }
+    }
     if (!result.ok) {
       return browserError(action, {
         node: nodeId,
@@ -1329,7 +1380,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       });
     }
     if (result.binary === undefined) {
-      return browserResult(action, { node: nodeId, generation, result: data });
+      return this.#result(action, { node: nodeId, generation, result: data });
     }
     if (!route.capabilities.has("binary-result")) {
       throw new Error("Remote Browser node returned binary data without advertising binary-result.");
@@ -1337,7 +1388,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     const bytes = boundedInlineBytes(result.binary.bytes, "Remote Browser binary result");
     if (result.binary.mediaType === "image/png" || result.binary.mediaType === "image/jpeg") {
       if (sniffMediaMime(bytes) !== result.binary.mediaType) throw new Error("Remote Browser image MIME does not match its bytes.");
-      return browserMixedResult(action, {
+      return this.#mixedResult(action, {
         node: nodeId,
         generation,
         result: data,
@@ -1350,7 +1401,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       mimeType: result.binary.mediaType,
       expiresAt: Date.now() + 24 * 60 * 60_000
     });
-    return browserResult(action, {
+    return this.#result(action, {
       node: nodeId,
       generation,
       result: data,
@@ -1364,7 +1415,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     browserAction: Parameters<BrowserProvider["act"]>[2]
   ): Promise<McpCallResult> {
     const pageId = this.#unifiedPageId(input);
-    return this.#withLease(async (lease) => browserResult(action, {
+    return this.#withLease(async (lease) => this.#result(action, {
       page: publicPage(await this.#browser.act(pageId, lease, browserAction))
     }));
   }
@@ -1422,7 +1473,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         let result: McpCallResult;
         if (step.action === "extract" && guard !== undefined) {
           const pageId = this.#unifiedPageId(input);
-          result = await this.#withPageReadLease(pageId, async lease => browserResult("extract", await this.#browser.extract(
+          result = await this.#withPageReadLease(pageId, async lease => this.#result("extract", await this.#browser.extract(
             pageId, lease, step.extract!, step.timeoutMs, undefined, guard
           )));
         } else if (step.action === "evaluate" && this.#recipeProvenance(id) === "builtin") {
@@ -1435,7 +1486,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
             source,
             step.timeoutMs
           ));
-          result = browserResult("act", { kind: "evaluate", result: value });
+          result = this.#result("act", { kind: "evaluate", result: value });
         } else {
           result = await this.#executeUnified(call, signal);
         }
@@ -1462,7 +1513,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         });
       }
     }
-    return browserResult("recipe", {
+    return this.#result("recipe", {
       recipe: id,
       provenance: this.#recipeProvenance(id),
       steps: completed,
@@ -1474,7 +1525,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     const site = optionalString(input, "site", 256);
     if (site === undefined) {
       const guided = new Set([...this.#siteGuides.values()].flatMap((guide) => [...(guide.recipes ?? [])]));
-      return browserResult("siteguide", {
+      return this.#result("siteguide", {
         sites: [...this.#siteGuides.values()].map((guide) => ({
           site: guide.site,
           provenance: this.#siteGuideProvenance(guide.site),
@@ -1490,7 +1541,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     }
     const guide = this.#siteGuides.get(site);
     if (guide === undefined) throw new Error(`No browser site guide exists for '${site}'.`);
-    return browserResult("siteguide", {
+    return this.#result("siteguide", {
       provenance: this.#siteGuideProvenance(site),
       data: guide,
       recipes: (guide.recipes ?? []).map((id) => ({
@@ -1517,7 +1568,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       this.#siteGuides.set(site, guide);
       this.#userSiteGuideIds.add(site);
     }
-    return browserResult("saveRecipe", {
+    return this.#result("saveRecipe", {
       saved: true,
       site,
       recipeId: recipe.id,
@@ -1579,16 +1630,18 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   }
 
   async #withPageReadLease<T>(pageId: string, callback: (lease: BrowserLease) => Promise<T>): Promise<T> {
-    const assertReadable = async () => {
-      if (!hasSecretPages()) return;
+    return this.#withLease(async lease => { await this.#assertPageReadable(pageId); const result = await callback(lease); await this.#assertPageReadable(pageId); return result; });
+  }
+
+  async #assertPageReadable(pageId: string, requirePresent = false): Promise<void> {
+      this.#assertPageContext(pageId);
+      if (!hasSecretPages() && !requirePresent) return;
       const generation = this.#browser.generation;
       this.#assertPageContext(pageId);
       const page = (await this.#browser.listPages()).find(value => value.id === pageId);
       this.#assertPageContext(pageId);
       if (!page || this.#browser.generation !== generation) throw new Error("The Browser page changed before the read.");
       if (isSecretPage(page.url)) throw new Error("The owner entered private text on this page. Script evaluation, network and console reads are paused until this tab leaves the page. Use snapshot or screenshot, or navigate on.");
-    };
-    return this.#withLease(async lease => { await assertReadable(); const result = await callback(lease); await assertReadable(); return result; });
   }
 
   async #withLease<T>(callback: (lease: BrowserLease) => Promise<T>): Promise<T> {
@@ -1630,7 +1683,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
 
   #assertPageContext(pageId: string): RecoverableBrowserPageRecord | undefined {
     const context = this.#activeContext;
-    if (context === undefined) return undefined;
+    if (context === undefined) { this.#activePageIds.add(pageId); return undefined; }
     if (this.#state === undefined) throw new Error("Browser product authority is unavailable.");
     const page = this.#state.assertPageAuthority({
       browserProviderId: this.#browser.id,
@@ -1773,6 +1826,21 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     }
   }
 
+  #resultOwner(): string {
+    const context = this.#activeContext;
+    return context ? JSON.stringify([context.sessionId, context.targetId, context.generation, context.providerGeneration]) : "local-service";
+  }
+  #syncResultEpoch(): string {
+    const epoch = JSON.stringify([this.#browser.id, this.#browser.generation, this.#browser.targetMode]);
+    if (epoch !== this.#resultEpoch) { this.#results.clear(); this.#resultEpoch = epoch; }
+    return epoch;
+  }
+  #mixedResult(action: string, data: unknown, extraContent: readonly unknown[]): McpCallResult {
+    const payload = { ok: true, action, data: action === "readResult" ? data : sanitizePublicPayload(data, 0) };
+    return { content: [{ type: "text", text: JSON.stringify(payload) }, ...extraContent], structuredContent: payload, isError: false };
+  }
+  #result(action: string, data: unknown): McpCallResult { return this.#mixedResult(action, data, []); }
+
   async #closeOwnedPage(pageId: string, result: () => McpCallResult): Promise<McpCallResult> {
     this.#assertPageContext(pageId);
     return this.#withLease(async (lease) => {
@@ -1785,12 +1853,10 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   }
 }
 
-function browserResult(action: string, data: unknown): McpCallResult {
-  return browserMixedResult(action, data, []);
-}
-
-function browserMixedResult(action: string, data: unknown, extraContent: readonly unknown[]): McpCallResult {
-  const payload = { ok: true, action, data: sanitizePublicPayload(data, 0) };
+function boundedBrowserResult(payload: { readonly ok: true; readonly action: string; readonly data: unknown }, extraContent: readonly unknown[], retained?: { readonly cache: BrowserResultCache; readonly source: BrowserResultSource }): McpCallResult {
+  const action = payload.action;
+  const digest = retained?.cache.digest(payload, retained.source);
+  if (digest) return { content: [{ type: "text", text: JSON.stringify(digest) }, ...extraContent], structuredContent: digest, isError: !digest.ok };
   const serialized = JSON.stringify(payload);
   if (Buffer.byteLength(serialized, "utf8") > MAXIMUM_UNIFIED_RESULT_BYTES) {
     const byteSize = Buffer.byteLength(serialized, "utf8");
@@ -2086,6 +2152,7 @@ function scopedRemotePageId(
     case "responseBody":
     case "extract":
     case "recipe":
+    case "readResult":
       if (typeof input["targetId"] !== "string") {
         throw new Error("Session-scoped remote Browser actions require an exact targetId.");
       }

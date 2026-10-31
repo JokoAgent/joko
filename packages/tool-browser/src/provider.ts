@@ -345,7 +345,7 @@ export interface BrowserResourceSnapshot {
 export type BrowserAutomationAction =
   | "doctor" | "status" | "setBackend" | "start" | "stop" | "profiles" | "tabs" | "open" | "focus" | "close"
   | "snapshot" | "screenshot" | "navigate" | "console" | "pdf" | "upload" | "dialog" | "act"
-  | "requests" | "responseBody" | "extract" | "recipe" | "siteguide" | "saveRecipe";
+  | "requests" | "responseBody" | "extract" | "recipe" | "siteguide" | "saveRecipe" | "readResult";
 
 export type BrowserAutomationActKind =
   | "click" | "clickCoords" | "type" | "press" | "hover" | "drag" | "select" | "fill" | "resize"

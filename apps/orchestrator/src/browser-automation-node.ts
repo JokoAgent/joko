@@ -29,7 +29,7 @@ import type { DiscoveredNodeRecord, LanDiscoveryService } from "./lan-discovery.
 export const BROWSER_AUTOMATION_ACTIONS = [
   "doctor", "status", "start", "stop", "profiles", "tabs", "open", "focus", "close",
   "snapshot", "screenshot", "navigate", "console", "pdf", "upload", "dialog", "act",
-  "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe"
+  "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe", "readResult"
 ] as const satisfies readonly BrowserAutomationAction[];
 
 export const BROWSER_AUTOMATION_ACT_KINDS = [

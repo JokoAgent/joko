@@ -10,6 +10,7 @@ import type { BrowserTransferCoordinator } from "./browser-transfers.js";
 import { OperationalBrowserState } from "./operational-browser-state.js";
 import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 import { clearSecretPages, markSecretEntered } from "./input-handoff/secretTaint.js";
+import { BrowserAutomationNodeExecutor, BROWSER_AUTOMATION_NODE_CAPABILITIES } from "./browser-automation-node.js";
 
 function fixture(
   remoteNodes?: BrowserRemoteNodeRouter,
@@ -165,6 +166,68 @@ function fixture(
 }
 
 describe("BrowserToolBridgeProvider", () => {
+  it("binds cached originals to the task identity and original page ownership", async () => {
+    const store = browserBridgeAuthorityStore(), state = new OperationalBrowserState(store);
+    state.recordHumanPage({ browserProviderId: "browser", pageId: "page-1", generation: 6, sessionId: "session-a", targetId: "target-a", bindingGeneration: 1,
+      url: "https://example.test/", title: "Owned", updatedAt: 1 });
+    const { bridge, browser } = fixture(undefined, undefined, { state });
+    vi.mocked(browser.evaluatePage).mockResolvedValue({ text: "original private task data ".repeat(1_000) });
+    const one = browserBridgeContext("a", "session-a", "target-a", 1, 6), other = browserBridgeContext("b", "session-b", "target-b", 1, 6);
+    try {
+      const result = await bridge.callTool("browser", { action: "act", targetId: "page-1", request: { kind: "evaluate", fn: "() => document.title" } }, undefined, one);
+      const read = (result.structuredContent as any).data.fullResult.read;
+      expect((await bridge.callTool("browser", read, undefined, other)).isError).toBe(true);
+      expect((await bridge.callTool("browser", read, undefined, one)).isError).toBe(false);
+      state.closeHumanPage("browser", "page-1", 6);
+      await expect(bridge.callTool("browser", read, undefined, one)).rejects.toThrow(/authority/u);
+    } finally { store.close(); }
+  });
+
+  it("keeps remote originals on the authenticated Browser node and returns its exact read route", async () => {
+    const child = fixture(); vi.mocked(child.browser.evaluatePage).mockResolvedValue({ text: "remote result 🙂 ".repeat(2_000) });
+    const executor = new BrowserAutomationNodeExecutor({ nodeId: "node-one", displayName: "Node", generation: 4, bridge: child.bridge, artifacts: {} as ArtifactStore });
+    const route = { id: "node-one", generation: 4, available: true, capabilities: BROWSER_AUTOMATION_NODE_CAPABILITIES,
+      call: (request: { action: any; arguments: Readonly<Record<string, unknown>> }, signal?: AbortSignal) => executor.execute({ nodeId: "node-one", expectedGeneration: 4, ...request }, signal) };
+    const parent = fixture({ resolve: () => route, list: () => [route] });
+    const result = await parent.bridge.callTool("browser", { target: "node", node: "node-one", action: "act", targetId: "page-1", request: { kind: "evaluate", fn: "() => document.title" } });
+    const full = (result.structuredContent as any).data.result.fullResult;
+    expect(full.read).toMatchObject({ action: "readResult", target: "node", node: "node-one", targetId: "page-1" });
+    expect((await parent.bridge.callTool("browser", { action: "readResult", resultId: full.id })).isError).toBe(true);
+    const page = await parent.bridge.callTool("browser", full.read);
+    expect((page.structuredContent as any).data.result.text).toContain("remote result"); expect(child.browser.evaluatePage).toHaveBeenCalledOnce();
+  });
+  it("retains a large nested Browser result and reads every segment without repeating its original action", async () => {
+    const { bridge, browser } = fixture();
+    const original = "- button Continue 🙂\n".repeat(2_000);
+    vi.mocked(browser.snapshot).mockResolvedValue({ page: { id: "page-1", url: "https://example.test/", title: "Example", state: "ready" }, aria: original, screenshot: Buffer.from("png") });
+    const nested = (args: Readonly<Record<string, unknown>>) => bridge.callTool("call_tool", { name: "browser", args });
+    const result = await nested({ action: "snapshot", targetId: "page-1" }), summary = JSON.parse((result.content[0] as { text: string }).text);
+    expect(result.structuredContent).toBeUndefined(); expect(summary.data.truncated).toBe(true);
+    expect(summary.data.fullResult.read).toMatchObject({ action: "readResult", targetId: "page-1", offset: 0 });
+    let offset: number | null = 0, output = "";
+    while (offset !== null) {
+      const page = JSON.parse(((await nested({ ...summary.data.fullResult.read, offset, maxChars: 12_000 })).content[0] as { text: string }).text);
+      expect(page.ok).toBe(true); output += page.data.text; offset = page.data.nextOffset;
+    }
+    expect(JSON.parse(output).data.snapshot).toBe(original); expect(browser.snapshot).toHaveBeenCalledOnce();
+    Object.assign(browser, { generation: 7 });
+    expect((await nested(summary.data.fullResult.read)).isError).toBe(true);
+  });
+
+  it("clears retained output when its original page enters private input protection or closes", async () => {
+    const { bridge, browser } = fixture(); clearSecretPages();
+    vi.mocked(browser.evaluatePage).mockResolvedValue({ text: "safe result ".repeat(2_000), authorization: "must-never-be-retained" });
+    const result = await bridge.callTool("browser", { action: "act", targetId: "page-1", request: { kind: "evaluate", fn: "() => document.title" } });
+    const full = (result.structuredContent as any).data.fullResult;
+    const before = await bridge.callTool("browser", full.read); expect(JSON.stringify(before)).not.toContain("must-never-be-retained");
+    markSecretEntered("https://example.test/");
+    try { await expect(bridge.callTool("browser", full.read)).rejects.toThrow(/private text/u); }
+    finally { clearSecretPages(); }
+    expect((await bridge.callTool("browser", full.read)).isError).toBe(true);
+    const fresh = await bridge.callTool("browser", { action: "act", targetId: "page-1", request: { kind: "evaluate", fn: "() => document.title" } });
+    vi.mocked(browser.listPages).mockResolvedValue([]);
+    await expect(bridge.callTool("browser", (fresh.structuredContent as any).data.fullResult.read)).rejects.toThrow(/page changed/u);
+  });
   it("pauses all script, console and network reads of a handoff page while allowing screenshots and later navigation", async () => {
     const { bridge, browser, captureScreenshot, readConsoleMessages, readHttpRequestSummaries } = fixture();
     clearSecretPages(); markSecretEntered("https://example.test/?entry=private");
