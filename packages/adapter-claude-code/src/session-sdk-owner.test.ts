@@ -61,7 +61,9 @@ describe("SessionSdkOwner", () => {
       await owner.close();
       await rm(root, { recursive: true, force: true });
     }
-  });
+    // The real worker has a 10s operation and 2s cleanup bound above. Allow
+    // those original bounds and fixture I/O to finish before the test ends.
+  }, 15_000);
 
   test("registers the exact new identity before exit and admits only the transcript profile environment", async () => {
     const { owner, worker, factory } = setup();

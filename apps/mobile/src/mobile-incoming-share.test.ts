@@ -472,7 +472,7 @@ describe("mobile incoming-share plan and durable commit", () => {
     })).parts.map((part) => part.content.case)).toEqual(["text", "image", "text"]);
   });
 
-  it("retains a file-text-file native order in a new-task draft and its v9 durable record", async () => {
+  it("retains a file-text-file native order in a new-task draft and its v1 durable record", async () => {
     const items = [readyItem(itemOne, 0), textItem(itemTwo, 1, "Between the files", "text"), readyItem(itemThree, 2)];
     const batch = normalizedBatch(withClaim({ ...rawBatch(batchOne), boundProfileId: profileId, items },
       [itemOne, itemTwo, itemThree]));
@@ -492,7 +492,7 @@ describe("mobile incoming-share plan and durable commit", () => {
       }))
     });
     expect(mobileComposerInput(sendable).parts.map((part) => part.content.case)).toEqual(["image", "text", "image"]);
-    expect([...store.memory.values()][0]).toContain('"version":9');
+    expect([...store.memory.values()][0]).toContain('"version":1');
   });
 
   it("fails closed after a claimed text import was removed during an uncertain acknowledgement", async () => {

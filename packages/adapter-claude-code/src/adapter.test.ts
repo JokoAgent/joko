@@ -399,8 +399,8 @@ describe("ClaudeCodeAdapter", () => {
     try {
       const models = (await adapter.describe()).models;
       expect(models[0]).toMatchObject({ description: "Native description", declaredSupportsFastMode: false, contextWindowSource: "estimated", maxOutputTokensSource: "estimated", protocolMode: "matching" });
-      expect(models[0]!.defaultEffort).toBeUndefined(); expect(models[0]!.declaredSupportsImages).toBeUndefined();
-      expect(models[1]!.declaredSupportsFastMode).toBeUndefined(); expect(models[1]!.contextWindowSource).toBeUndefined();
+      expect(models[0]!.defaultEffort).toBe("medium"); expect(models[0]!.declaredSupportsImages).toBeUndefined();
+      expect(models[1]!.defaultEffort).toBeUndefined(); expect(models[1]!.declaredSupportsFastMode).toBeUndefined(); expect(models[1]!.contextWindowSource).toBeUndefined();
       expect(models).toHaveLength(2);
     } finally { await adapter.dispose(); }
   });

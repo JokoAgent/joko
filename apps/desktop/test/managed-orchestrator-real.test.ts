@@ -16,6 +16,7 @@ import { ConnectionService, DesktopHostedAgentService, EntityKind, EventService,
 import { createDesktopHostedAgentDelegate } from "../src/hosted-agent-delegate.js";
 
 import {
+  MANAGED_ORCHESTRATOR_START_TIMEOUT_MS,
   probeManagedOrchestratorConnection,
   resolveManagedOrchestratorEntry,
   selectManagedOrchestratorPorts,
@@ -29,6 +30,8 @@ const orchestratorEntryPath = resolveManagedOrchestratorEntry(resolve(repository
   developmentWorkspace: true
 });
 const cleanups: Array<() => Promise<void> | void> = [];
+// Each of the two real starts keeps its own production deadline.
+const restartTestBudgetMs = 2 * MANAGED_ORCHESTRATOR_START_TIMEOUT_MS + 15_000;
 
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
@@ -134,7 +137,7 @@ describe("real managed Orchestrator child", () => {
     await restarted.stop();
     checkpoint("completed");
     // Two native bootstraps may each use 30s, with explicit shutdown between them.
-  }, process.platform === "win32" ? 75_000 : 45_000);
+  }, restartTestBudgetMs);
 
   it("recovers persisted metadata when the commit ACK was lost and fences an ephemeral smoke child", async () => {
     const fixture = createFixture();
@@ -159,7 +162,7 @@ describe("real managed Orchestrator child", () => {
     await expectEventuallyAbsent(recovered);
     await recovered.stop();
     expect(recoveredAuthKey).toMatch(/^[A-Za-z0-9_-]{43}$/u);
-  }, 45_000);
+  }, restartTestBudgetMs);
 });
 
 function createFixture() {

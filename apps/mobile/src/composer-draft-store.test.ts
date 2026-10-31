@@ -274,7 +274,7 @@ describe("mobile composer draft store", () => {
     });
   });
 
-  it("rejects the previous plain-text shape, damaged mention ranges, and cross-owner records", async () => {
+  it("rejects incompatible shapes, unsupported versions, damaged mention ranges, and cross-owner records", async () => {
     const memory = memoryDriver();
     const key = mobileComposerDraftTesting.storageKey(first);
     memory.values.set(key, "legacy plain text");
@@ -307,7 +307,7 @@ describe("mobile composer draft store", () => {
     }));
     await expect(new MobileComposerDraftStore(memory.driver).read(first)).rejects.toThrow(/could not be read/);
 
-    for (const version of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    for (const version of [0, 2, 3, 4, 5, 6, 7, 8, 9]) {
       memory.values.set(key, JSON.stringify({
         version,
         identity: first,

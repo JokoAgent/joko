@@ -6,6 +6,9 @@ import { describe, expect, it, vi } from "vitest";
 import { createPiModelCatalogAdditions, type createPiModelCatalogAdditionsFactory } from "./model-catalog-additions.js";
 import { MANAGED_MODEL_CATALOG_RUNTIME_SOURCE } from "./model-catalog-runtime.js";
 
+type NativeProvider = ReturnType<ModelRuntime["getProviders"]>[number];
+type NativeModel = ReturnType<NativeProvider["getModels"]>[number];
+
 async function nativeRuntime() {
   return await ModelRuntime.create({
     modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
@@ -17,11 +20,23 @@ describe("Pi model catalog additions", () => {
   it("provides exact native routes for the additional public models and preserves provider-specific prices", async () => {
     const runtime = await nativeRuntime(), additions = createPiModelCatalogAdditions();
     const models = (providerId: string) => additions.extendProvider(runtime.getProvider(providerId)!).getModels();
-    expect(models('opencode-go').find(model => model.id === 'deepseek-v4.1-flash')).toMatchObject({
+    // Exercise the admitted route independently of the installed subscription
+    // catalog's endpoint and membership. No credential or request is created.
+    const go: NativeProvider = { ...runtime.getProvider("opencode-go")!, baseUrl: "https://opencode.ai/zen/go/v1", getModels: () => [] };
+    expect(additions.extendProvider(go).getModels().find(model => model.id === 'deepseek-v4.1-flash')).toMatchObject({
       provider: 'opencode-go', baseUrl: 'https://opencode.ai/zen/go/v1', api: 'openai-completions', contextWindow: 1_000_000,
       maxTokens: 384_000, input: ['text', 'image'], cost: { input: 0.15, output: 0.6, cacheRead: 0.003 },
       compat: { supportsStore: false, maxTokensField: 'max_tokens', requiresReasoningContentOnAssistantMessages: true }
     });
+    expect(go.getModels()).toEqual([]);
+    for (const excluded of [
+      { ...go, baseUrl: "https://custom.test/api" },
+      { ...go, baseUrl: undefined },
+      { ...go, id: "unlisted-provider" }
+    ]) {
+      expect(additions.extendProvider(excluded)).toBe(excluded);
+      expect(excluded.getModels()).toEqual([]);
+    }
     const build = models('xai').find(model => model.id === 'grok-build-0.1')!;
     expect(build).toMatchObject({ api: 'openai-responses', contextWindow: 256_000, maxTokens: 256_000 });
     expect(additions.referenceCatalogMetadata(build)).toMatchObject({ defaultVisible: false, pricing: { source: "providerReference" } });
@@ -61,15 +76,50 @@ describe("Pi model catalog additions", () => {
     }
   });
 
-  it.each(['github-copilot', 'google', 'google-vertex', 'opencode', 'vercel-ai-gateway'])("withdraws Gemini minimal effort on its exact %s route", async providerId => {
-    const runtime = await nativeRuntime(), additions = createPiModelCatalogAdditions(), provider = runtime.getProvider(providerId)!;
+  it.each([
+    ["github-copilot", "https://api.individual.githubcopilot.com"],
+    ["google", "https://generativelanguage.googleapis.com/v1beta"],
+    ["google-vertex", "https://{location}-aiplatform.googleapis.com"],
+    ["opencode", "https://opencode.ai/zen/v1"],
+    ["vercel-ai-gateway", "https://ai-gateway.vercel.sh"]
+  ])("withdraws Gemini minimal effort on its exact %s route", async (providerId, baseUrl) => {
+    const runtime = await nativeRuntime(), additions = createPiModelCatalogAdditions();
+    const model: NativeModel = {
+      id: providerId === "vercel-ai-gateway" ? "google/gemini-3.8-flash" : "gemini-3.8-flash",
+      name: "Synthetic Gemini catalog entry", provider: providerId, baseUrl, api: "google-generative-ai",
+      reasoning: true, input: ["text", "image"], contextWindow: 100_000, maxTokens: 1024,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { minimal: "minimal", low: "low" }
+    };
+    const provider: NativeProvider = { ...runtime.getProvider(providerId)!, baseUrl, getModels: () => [model] };
     const extended = additions.extendProvider(provider);
-    const model = extended.getModels().find(model => /^(?:google\/)?gemini-3\.8-flash$/.test(model.id));
-    expect(model?.thinkingLevelMap?.minimal).toBeNull();
+    expect(extended.getModels()).toEqual([{ ...model, thinkingLevelMap: { minimal: null, low: "low" } }]);
+    expect(model.thinkingLevelMap?.minimal).toBe("minimal");
     expect(extended.auth).toBe(provider.auth);
     expect(extended.filterModels).toBe(provider.filterModels);
+    expect(additions.extendProvider({ ...provider, getModels: () => [] }).getModels()).toEqual([]);
     const custom = { ...provider, baseUrl: 'https://custom.test/api' };
     expect(additions.extendProvider(custom)).toBe(custom);
+    const otherEndpoint = { ...model, baseUrl: "https://custom.test/api" };
+    expect(additions.extendProvider({ ...provider, getModels: () => [otherEndpoint] }).getModels()).toEqual([otherEndpoint]);
+    const absentRoute = { ...provider, id: "unlisted-provider" };
+    expect(additions.extendProvider(absentRoute)).toBe(absentRoute);
+  });
+
+  it("leaves installed OpenCode provider membership and source model records intact", async () => {
+    const runtime = await nativeRuntime(), additions = createPiModelCatalogAdditions();
+    const providerIds = runtime.getProviders().map(provider => provider.id);
+    for (const providerId of ["opencode-go", "opencode"]) {
+      const provider = runtime.getProvider(providerId)!;
+      expect(provider).toBeDefined();
+      const original = structuredClone(provider.getModels());
+      const extended = additions.extendProvider(provider);
+      expect(provider.getModels()).toEqual(original);
+      expect(extended.getModels().map(model => model.id)).toEqual(expect.arrayContaining(original.map(model => model.id)));
+      expect(extended.auth).toBe(provider.auth);
+      expect(extended.filterModels).toBe(provider.filterModels);
+
+    }
+    expect(runtime.getProviders().map(provider => provider.id)).toEqual(providerIds);
   });
 
   it("projects only the admitted exact provider routes and keeps unknown subscription pricing unknown", async () => {
