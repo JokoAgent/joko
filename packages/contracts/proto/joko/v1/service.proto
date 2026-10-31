@@ -108,6 +108,7 @@ service BackendService {
   rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
   rpc GetProvider(GetProviderRequest) returns (GetProviderResponse);
   rpc GetProviderUsage(GetProviderUsageRequest) returns (GetProviderUsageResponse);
+  rpc GetProviderAccountBalance(GetProviderAccountBalanceRequest) returns (GetProviderAccountBalanceResponse);
   rpc GetUsageHistory(GetUsageHistoryRequest) returns (GetUsageHistoryResponse);
   rpc GetUsageReport(GetUsageReportRequest) returns (GetUsageReportResponse);
   rpc GetModelPriceOverride(GetModelPriceOverrideRequest) returns (GetModelPriceOverrideResponse);
@@ -1139,6 +1140,16 @@ message GetProviderUsageResponse {
   ProviderUsageSummary usage = 1;
   RateLimitState rate_limit = 2;
   ProviderAccountUsageSnapshot account_usage = 3;
+}
+
+message GetProviderAccountBalanceRequest {
+  string backend_id = 1;
+  string provider_id = 2;
+  bool force_refresh = 3;
+}
+
+message GetProviderAccountBalanceResponse {
+  ProviderAccountBalanceResult result = 1;
 }
 
 message ListModelsRequest {
