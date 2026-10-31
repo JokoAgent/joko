@@ -49,7 +49,7 @@ describe("mounted Provider configuration", () => {
           }) as typeof fetch));
         const ticket = credentials.createUploadTicket({ kind: "api_key" }); credentials.upload(ticket.credentialUploadTicketId, "mounted-balance-secret");
         await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "balance-key", displayName: "Balance key", kind: "api_key" });
-        await providers.upsert({ backendId, credentialOrigin: "https://api.deepseek.com", provider: { id: "deepseek", baseUrl: "https://api.deepseek.com/v1", api: "openai-completions", apiKeyEnv: "BALANCE_KEY", models: [] },
+        await providers.upsert({ backendId, credentialOrigin: "https://api.deepseek.com", provider: { id: "deepseek", baseUrl: "https://api.deepseek.com/v1", api: "openai-completions", apiKeyEnv: "BALANCE_KEY", models: [{ id: "balance-fixture", defaultVisible: false }] },
           displayName: "Official balance", kind: "api_key", credentialBindings: { BALANCE_KEY: "balance-key" }, enabled: true, supportsLogin: false, supportsLogout: true, supportsRefresh: false });
         const providerAccountBalance = new ProviderAccountBalanceProvider(providers, (async (url, init) => {
           expect(url).toBe("https://api.deepseek.com/user/balance"); expect(new Headers(init?.headers).get("authorization")).toBe("Bearer mounted-balance-secret"); fetches++;

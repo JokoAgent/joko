@@ -123,7 +123,11 @@ export function SessionHeaderActionsMenu({
       if (node instanceof Node && details.contains(node)) return;
       close();
     };
-    const closeForViewportChange = (): void => close();
+    const closeForViewportChange = (event: Event): void => {
+      const target = event.target;
+      if (event.type === "scroll" && target instanceof Node && details.contains(target)) return;
+      close();
+    };
     ownerDocument.addEventListener("pointerdown", closeOutside, true);
     ownerDocument.addEventListener("scroll", closeForViewportChange, true);
     ownerWindow.addEventListener("resize", closeForViewportChange);
