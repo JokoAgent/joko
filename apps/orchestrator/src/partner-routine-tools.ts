@@ -43,6 +43,10 @@ export class PartnerRoutineTools implements BridgeToolProvider {
     tool("routine_save", "Create or fully update your own routine only when the user requests recurring work, reminders or event-triggered automation. Multiple triggers are OR. Read routine_list first; updates require its expectedRevision. Preserve trigger ids and interval anchors. Omitted silentWhenIdle and preRunHook preserve existing choices; null removes the hook. New checks may use silentWhenIdle=true and notify only when actionable. Confirm by reading routine_list; on an unknown result read before an explicit new intent.", {
       id, expectedRevision: revision, name: { type: "string", minLength: 1, maxLength: 200 },
       prompt: { type: "string", minLength: 1, maxLength: 100_000 }, enabled: { type: "boolean" }, silentWhenIdle: { type: "boolean" },
+      sessionMode: { type: "string", enum: ["persistent", "fresh"] },
+      modelOverride: { anyOf: [{ type: "null" }, object({ backendId: id, providerId: id, modelId: id,
+        effort: { type: "string", minLength: 1, maxLength: 128 }, fastMode: { anyOf: [{ type: "boolean" }, { const: "ultrafast" }] }
+      }, ["backendId", "providerId", "modelId", "fastMode"])] },
       preRunHook: { anyOf: [{ type: "null" }, object({ command: { type: "string", minLength: 1, maxLength: 32_000 },
         timeoutMs: revision }, ["command"])] }, triggers: { type: "array", minItems: 1, maxItems: 32, items: triggerSchema }
     }, ["name", "prompt", "enabled", "triggers"], true),
@@ -68,6 +72,11 @@ export class PartnerRoutineTools implements BridgeToolProvider {
 
   async callTool(name: string, input: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext) {
     try {
+      if (name === "schedule_notify_current_run" && this.profiles.connections.profiles.getSessionLink(context.sessionId)?.role === 'routine') {
+        keys(input, []); signal?.throwIfAborted(); this.routines.assertExecutionCaller(context);
+        const result = { ok: true, result: { notified: true, ...this.notifications.notify({ sessionId: context.sessionId, targetId: context.targetId }) } };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }], structuredContent: result, isError: false };
+      }
       const caller = this.profiles.currentCaller(context, signal);
       const assertCaller = () => caller.assertCurrent();
       const partnerId = caller.profile.id, partnerRevision = caller.profile.revision;
@@ -81,7 +90,7 @@ export class PartnerRoutineTools implements BridgeToolProvider {
           keys(input, ["id", "offset"]);
           result = this.routines.history(partnerId, identity(input["id"]), input["offset"] === undefined ? 0 : integer(input["offset"], 0)); break;
         case "routine_save": {
-          keys(input, ["id", "expectedRevision", "name", "prompt", "enabled", "silentWhenIdle", "preRunHook", "triggers"]);
+          keys(input, ["id", "expectedRevision", "name", "prompt", "enabled", "silentWhenIdle", "preRunHook", "triggers", "sessionMode", "modelOverride"]);
           const routineId = input["id"] === undefined ? undefined : identity(input["id"]);
           const previous = routineId === undefined ? undefined : this.routines.list(partnerId).find(routine => routine.id === routineId);
           if (routineId !== undefined && previous === undefined) throw new ConnectError("Routine is unavailable for this Partner.", Code.NotFound);
@@ -168,6 +177,8 @@ function definition(input: Readonly<Record<string, unknown>>, previous: Routine 
   if (hook !== undefined) keys(hook, ["command", "timeoutMs"]);
   try {
     return parseRoutineInput({ name: input["name"], prompt: input["prompt"], enabled: input["enabled"], triggers: input["triggers"],
+      sessionMode: input["sessionMode"] ?? previous?.sessionMode,
+      modelOverride: input["modelOverride"] === undefined ? previous?.modelOverride : input["modelOverride"],
       silentWhenIdle: input["silentWhenIdle"] ?? previous?.silentWhenIdle ?? false, ...(hook === undefined ? {} : { preRunHook: hook }) });
   } catch { return invalid(); }
 }

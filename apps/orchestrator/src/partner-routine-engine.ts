@@ -25,6 +25,7 @@ export interface RoutineEngineDeps {
     canDispatch: () => boolean,
   ): Promise<{
     scheduleRunId?: string;
+    sessionId?: string;
     error?: string;
     resultText?: string;
     deferred?: boolean;
@@ -229,12 +230,13 @@ export class RoutineEngine {
             (routine) => routine.id === id && routine.partnerId === partnerId,
           )
         : undefined;
-      const input = options.builtin && existing ? { ...parsed, enabled: existing.enabled } : parsed;
+      const input = options.builtin && existing ? { ...parsed, enabled: existing.enabled,
+        sessionMode: existing.sessionMode, modelOverride: existing.modelOverride } : parsed;
       if (id && !existing && !creationId && !options.builtin) throw new Error("Routine not found");
       if ((creationId || options.builtin) && state.routines.some(row => row.id === id && row.partnerId !== partnerId)) throw new Error("Routine creation ID already used");
       if (existing?.builtin && !options.builtin
-        && JSON.stringify(parseRoutineInput({ ...existing, enabled: input.enabled })) !== JSON.stringify(input)) {
-        throw new Error("Built-in routines can only be paused or resumed.");
+        && JSON.stringify(parseRoutineInput({ ...existing, enabled: input.enabled, sessionMode: input.sessionMode, modelOverride: input.modelOverride })) !== JSON.stringify(input)) {
+        throw new Error("Built-in routine instructions and triggers cannot be edited.");
       }
       const builtin = options.builtin ?? existing?.builtin, builtinVersion = options.builtinVersion ?? existing?.builtinVersion;
       if (creationId && existing && JSON.stringify(parseRoutineInput(existing)) !== JSON.stringify(input)) throw new Error("Routine already created; refresh before editing");

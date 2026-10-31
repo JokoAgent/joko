@@ -38,13 +38,15 @@ class RecordingAdapter extends FakeBackendAdapter {
 }
 async function fixture(streamDelayMs = 0) {
   const root = await mkdtemp(join(tmpdir(), "joko-partner-routine-")); const store = new OperationalStore(join(root, "operational.db")); const profiles = new PartnerStore(join(root, "partners.db"));
+  let partners: PartnerManager;
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
   const adapter = new RecordingAdapter({ ...profile, streamDelayMs }); const host = new SessionHost(store, artifacts, [adapter], {
-    partnerSessionRetiring: id => profiles.isPartnerSessionRetiring(id) || profiles.isPartnerTargetRetiring(store.getSession(id).descriptor.targetId),
+    partnerSessionRetiring: id => profiles.isPartnerSessionRetiring(id) || partners?.isRoutineSessionRetiring(id) === true || profiles.isPartnerTargetRetiring(store.getSession(id).descriptor.targetId),
     partnerTargetRetired: id => profiles.isPartnerTargetRetired(id), partnerSessionRestarting: id => profiles.isPartnerSessionRestarting(id),
     partnerSessionPaused: id => profiles.isPartnerSessionPaused(id) }); await host.initialize();
   let routines: PartnerRoutineManager;
-  const partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host, homesRoot: join(root, "homes"),
+  partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host, homesRoot: join(root, "homes"),
+    routineModel: (partnerId, key) => routines?.engine.list(partnerId).find(item => key === `routine:${item.id}` || key.startsWith(`routine:${item.id}:`))?.modelOverride ?? undefined,
     workspaceService: { register: async input => input, unregister: () => undefined }, onRoutineLifecycle: (id, state) => routines.lifecycle(id, state) });
   const scheduler = new ScheduleCoordinator(store, host); const storage = new PartnerRoutineStore(join(root, "routines"));
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage }); await routines.start(); scheduler.start();
@@ -73,14 +75,59 @@ async function toolsFixture(f: Awaited<ReturnType<typeof fixture>>) {
   const caller = { sessionId: session.id, targetId: session.targetId, generation: session.binding.generation, providerGeneration: 1, effectIdentity: "a".repeat(64) };
   return { tools, router, caller, notifications };
 }
-describe("Partner routine authority and canonical execution", () => {
+describe("Partner routine authority and independent execution", () => {
+  it.each(['persistent', 'fresh'] as const)('runs %s routines with their own model, history and Partner identity', async sessionMode => {
+    const f = await fixture(), canonical = f.store.getSession(f.partner.canonicalSessionId!).descriptor;
+    const modelOverride = { backendId: profile.id, providerId: 'vision', modelId: 'multimodal', effort: 'high', fastMode: false } as const;
+    const saved = await f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision, requestId: `routine-model-${sessionMode}-creation`,
+      definition: { name: 'Independent review', prompt: 'Review this home.', enabled: false, silentWhenIdle: true,
+        triggers: [], sessionMode, modelOverride } });
+    for (let index = 0; index < 2; index++) {
+      await f.routines.run({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: saved.id,
+        revision: saved.revision, requestId: `routine-model-${sessionMode}-run-${index}` });
+      await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs.filter(run => run.status === 'success')).toHaveLength(index + 1));
+    }
+    const runs = f.routines.history(f.partner.id, saved.id).runs;
+    const sessions = runs.map(run => f.store.getSession(run.sessionId!).descriptor);
+    expect(new Set(sessions.map(session => session.id)).size).toBe(sessionMode === 'fresh' ? 2 : 1);
+    for (const session of sessions) {
+      expect(session.id).not.toBe(canonical.id);
+      expect(session).toMatchObject({ providerId: 'vision', modelId: 'multimodal', effort: 'high',
+        permissionMode: canonical.permissionMode, planMode: canonical.planMode, targetId: canonical.targetId, archived: sessionMode === 'fresh' });
+      expect(f.profiles.getSessionLink(session.id)).toMatchObject({ role: 'routine', partnerId: f.partner.id, profileVersion: f.partner.profileVersion });
+      expect(() => f.partners.canonicalCaller(session.id)).toThrow();
+      if (sessionMode === 'persistent') {
+        expect(f.partners.runtimeCaller(session.id).id).toBe(f.partner.id);
+        expect(f.partners.routineFallback({ sessionId: session.id, current: modelOverride, currentHop: 0, visitedRoutes: [] })).toEqual({ owned: true });
+      }
+    }
+    expect(f.store.getSession(canonical.id).descriptor).toEqual(canonical);
+    expect(f.store.listQueueItems({ sessionId: canonical.id })).toEqual([]);
+    expect((await f.storage.load())?.runs.filter(run => run.routineId === saved.id).map(run => run.sessionId)).toEqual(runs.slice().reverse().map(run => run.sessionId));
+    expect(f.adapter.sent).toHaveLength(2);
+  });
+
+  it('retains the original reserved routine identity after an unknown native creation', async () => {
+    const f = await fixture();
+    const create = vi.spyOn(f.host, 'createServiceSession').mockImplementation(async input => {
+      await input.preparePrivateSession?.('routine-unknown-native', f.store.getTarget(f.partner.homeTargetId).descriptor);
+      throw new Error('Native creation acknowledgement was lost.');
+    });
+    const input = { partnerId: f.partner.id, key: 'routine:unknown', title: 'Unknown creation', assertCurrent: () => undefined };
+    await expect(f.partners.ensureRoutineSession(input)).rejects.toThrow();
+    await expect(f.partners.ensureRoutineSession(input)).rejects.toThrow('original routine task');
+    expect(create).toHaveBeenCalledOnce();
+    expect(f.profiles.getSessionLink('routine-unknown-native')).toMatchObject({ role: 'routine', routineKey: input.key, partnerId: f.partner.id });
+  });
+
   it("settles the exact routine after its own native runtime activation renews the Queue attempt", async () => {
-    const f = await fixture(); const sessionId = f.partner.canonicalSessionId!;
-    await f.host.closeIfActive(sessionId);
-    const before = f.store.getSession(sessionId).descriptor.binding;
+    const f = await fixture();
     const saved = await f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision,
       requestId: "routine-resume-creation", definition: { ...definition, enabled: false,
         triggers: [{ id: "timer", kind: "interval", intervalMs: 3600000 }] } });
+    const { id: sessionId } = await f.partners.ensureRoutineSession({ partnerId: f.partner.id, key: `routine:${saved.id}`, title: saved.name, assertCurrent: () => undefined });
+    await f.host.closeIfActive(sessionId);
+    const before = f.store.getSession(sessionId).descriptor.binding;
     await f.routines.run({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: saved.id,
       revision: saved.revision, requestId: "routine-resume-explicit-run" });
     await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs[0]?.status).toBe("success"));
@@ -94,12 +141,12 @@ describe("Partner routine authority and canonical execution", () => {
     expect(f.adapter.sent).toHaveLength(1);
   });
   it.each(["binding-replacement", "generation-reset"] as const)("rejects an external %s after native routine completion", async change => {
-    const f = await fixture(); const sessionId = f.partner.canonicalSessionId!;
-    await f.host.closeIfActive(sessionId);
+    const f = await fixture();
     const dispatch = f.scheduler.runNowWithResult.bind(f.scheduler);
     vi.spyOn(f.scheduler, "runNowWithResult").mockImplementation(async (...args) => {
       const result = await dispatch(...args);
       await vi.waitFor(() => expect(f.store.getRun(result.runId).descriptor.state).toBe("completed"));
+      const sessionId = f.store.getRun(result.runId).descriptor.sessionId;
       const current = f.store.getSession(sessionId);
       f.store.updateSession(sessionId, { binding: change === "binding-replacement"
         ? { ...current.descriptor.binding, opaqueRef: "external-native-replacement", nativeSessionId: "external-native-replacement" }
@@ -164,13 +211,15 @@ describe("Partner routine authority and canonical execution", () => {
     expect(ready).not.toHaveProperty("preRunHook"); expect(ready.silentWhenIdle).toBe(false);
     const runCaller = { ...t.caller, effectIdentity: "c".repeat(64) };
     expect((await t.tools.callTool("routine_run_now", { id: ready.id, expectedRevision: ready.revision }, undefined, runCaller)).isError).toBe(false);
-    await vi.waitFor(() => expect(f.store.listRuns({ sessionId: t.caller.sessionId, activeOnly: true }).some(run => f.store.findScheduleRunByRunId(run.descriptor.id))).toBe(true));
-    const notified = await t.tools.callTool("schedule_notify_current_run", {}, undefined, t.caller);
+    await vi.waitFor(() => expect(f.adapter.sent).toHaveLength(1));
+    const routineSession = f.store.getSession(f.adapter.sent[0]!.sessionId).descriptor;
+    const notified = await t.tools.callTool("schedule_notify_current_run", {}, undefined, {
+      ...t.caller, sessionId: routineSession.id, targetId: routineSession.targetId, generation: routineSession.binding.generation });
     expect(notified.isError, JSON.stringify(notified)).toBe(false);
     expect(t.notifications.hasOverride((notified.structuredContent!.result as { runId: string }).runId)).toBe(true);
     await vi.waitFor(() => expect(f.routines.history(f.partner.id, ready.id).runs[0]?.status).toBe("success"), { timeout: 5000 });
     expect((await t.tools.callTool("routine_run_now", { id: ready.id, expectedRevision: ready.revision }, undefined, runCaller)).isError).toBe(false);
-    expect(f.adapter.sent).toHaveLength(1); expect(f.adapter.sent[0]?.sessionId).toBe(t.caller.sessionId);
+    expect(f.adapter.sent).toHaveLength(1); expect(f.adapter.sent[0]?.sessionId).not.toBe(t.caller.sessionId);
     const history = await t.tools.callTool("routine_history", { id: ready.id }, undefined, t.caller);
     expect(history.structuredContent!.result).toMatchObject({ runs: [expect.objectContaining({ status: "success" }), expect.objectContaining({ status: "skipped" })] });
     expect((await t.tools.callTool("routine_delete", { id: ready.id, expectedRevision: ready.revision }, undefined, t.caller)).isError).toBe(false);
@@ -231,7 +280,7 @@ describe("Partner routine authority and canonical execution", () => {
     expect(f.routines.list(paused.id).find(routine => routine.id === enabled.id)?.enabled).toBe(true);
     expect(f.routines.list(paused.id).find(routine => routine.id === disabled.id)?.enabled).toBe(false); expect(f.adapter.sent).toEqual([]);
   });
-  it("authenticates generated writes, recovers creation receipts, fences stale edits and dispatches one canonical Queue input", async () => {
+  it("authenticates generated writes, recovers creation receipts, fences stale edits and dispatches one independent Queue input", async () => {
     const f = await fixture(); let authorized = true;
     const service = createPartnerRoutineConnectService(f.routines, () => { if (!authorized) throw new ConnectError("Revoked", Code.Unauthenticated); });
     const input = create(contract.SavePartnerRoutineRequestSchema, { partnerId: f.partner.id, expectedPartnerRevision: { value: f.partner.revision }, definition,
@@ -245,8 +294,10 @@ describe("Partner routine authority and canonical execution", () => {
     await service.runPartnerRoutine(run, context());
     await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs[0]?.status).toBe("success"), { timeout: 5000 });
     await service.runPartnerRoutine(run, context()); await new Promise(resolve => setTimeout(resolve, 25)); expect(f.adapter.sent).toHaveLength(1);
-    expect(f.adapter.sent[0]?.sessionId).toBe(f.partner.canonicalSessionId); expect(f.adapter.sent[0]?.input.text).toContain(definition.prompt);
-    expect(f.store.listQueueItems({ sessionId: f.partner.canonicalSessionId }).some(item => item.body.text.includes(definition.prompt))).toBe(true);
+    const executionSessionId = f.adapter.sent[0]!.sessionId;
+    expect(executionSessionId).not.toBe(f.partner.canonicalSessionId); expect(f.adapter.sent[0]?.input.text).toContain(definition.prompt);
+    expect(f.store.listQueueItems({ sessionId: executionSessionId }).some(item => item.body.text.includes(definition.prompt))).toBe(true);
+    expect(f.store.listQueueItems({ sessionId: f.partner.canonicalSessionId })).toEqual([]);
     const history = create(contract.ListPartnerRoutineRunsResponseSchema, await service.listPartnerRoutineRuns(create(contract.ListPartnerRoutineRunsRequestSchema, { partnerId: f.partner.id, routineId: saved.id }), context()));
     expect(history.runs[0]?.status).toBe(contract.RoutineRunStatus.SUCCESS); expect(history.runs[0]?.scheduleRunId).toBeTruthy();
     const archived = await f.partners.setLifecycle(f.partner.id, f.partner.revision, "archived"); expect(f.routines.catalog(archived.id).writable).toBe(false);

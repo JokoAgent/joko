@@ -159,6 +159,7 @@ export interface PartnerManagerOptions {
   readonly resumeIndependentReturns?: (partnerId: string) => Promise<void>;
   readonly pauseGoal?: (sessionId: string, operationId: string) => Promise<void>;
   readonly onRoutineLifecycle?: (partnerId: string, state: PartnerLifecycle) => Promise<void>;
+  readonly routineModel?: (partnerId: string, key: string) => PartnerModelRouteRecord | undefined;
   readonly prepareImportDeletion?: (partnerId: string) => Promise<void>;
   readonly onReady?: (partnerId: string) => Promise<void>;
   readonly homeChanging?: (partnerId: string) => boolean;
@@ -225,6 +226,7 @@ export class PartnerManager {
   readonly #resumeIndependentReturns: PartnerManagerOptions["resumeIndependentReturns"];
   readonly #pauseGoal: PartnerManagerOptions["pauseGoal"];
   readonly #routineLifecycle: PartnerManagerOptions["onRoutineLifecycle"];
+  readonly #routineModel: PartnerManagerOptions["routineModel"];
   readonly #locks = new Map<string, Promise<void>>();
   readonly #pauseFlights = new Map<string, Promise<void>>();
 
@@ -243,6 +245,7 @@ export class PartnerManager {
     this.#resumeIndependentReturns = options.resumeIndependentReturns;
     this.#pauseGoal = options.pauseGoal;
     this.#routineLifecycle = options.onRoutineLifecycle;
+    this.#routineModel = options.routineModel;
     this.#prepareImportDeletion = options.prepareImportDeletion;
     this.#optionsOnReady = options.onReady;
     this.#prepareAvatar = options.prepareAvatar ?? (async ({ partner, homePath }) => {
@@ -336,8 +339,21 @@ export class PartnerManager {
     return partner;
   }
 
+  /** Independent routines keep Partner identity without acquiring profile-management authority. */
+  runtimeCaller(sessionId: string): PartnerProfileRecord {
+    const link = this.#store.getSessionLink(sessionId);
+    if (link?.role !== "routine") return this.canonicalCaller(sessionId);
+    const partner = this.getPartner(link.partnerId), session = this.#operationalStore.getSession(sessionId).descriptor;
+    if (partner.lifecycle !== "active" || partner.initializationState !== "ready" || partner.pauseCleanupPending
+      || session.targetId !== partner.homeTargetId || session.archived || session.deletedAt !== undefined
+      || link.profileVersion !== partner.profileVersion || this.isRoutineSessionRetiring(sessionId)) {
+      throw new PartnerManagerError("PARTNER_SESSION_INACTIVE", "The routine task is unavailable.");
+    }
+    return partner;
+  }
+
   resolveTaskModel(sessionId: string, explicit?: PartnerModelRouteRecord): { readonly route: PartnerModelRouteRecord; readonly assertCurrent: () => void } {
-    const profile = this.canonicalCaller(sessionId), session = this.#operationalStore.getSession(sessionId).descriptor;
+    const profile = this.runtimeCaller(sessionId), session = this.#operationalStore.getSession(sessionId).descriptor;
     const target = this.#operationalStore.getTarget(session.targetId);
     const callerGeneration = this.#operationalStore.getBackend(session.backendId).descriptor.instanceGeneration;
     const runtime = this.#sessionHost.getSessionRuntimeControl(sessionId);
@@ -354,7 +370,7 @@ export class PartnerManager {
     };
     const sourceCatalog = catalog();
     const assertCurrent = () => {
-      const current = this.canonicalCaller(sessionId), live = this.#operationalStore.getSession(sessionId).descriptor;
+      const current = this.runtimeCaller(sessionId), live = this.#operationalStore.getSession(sessionId).descriptor;
       const home = this.#operationalStore.getTarget(session.targetId);
       if (current.revision !== profile.revision || current.profileVersion !== profile.profileVersion
         || live.binding.generation !== session.binding.generation || live.backendId !== session.backendId
@@ -447,7 +463,7 @@ export class PartnerManager {
         link,
         ...(session === undefined ? {} : { session }),
         available: session !== undefined && session.deletedAt === undefined,
-        readOnly: !['canonical', 'topic'].includes(link.role) || partner.lifecycle !== 'active' || session?.archived === true || session?.deletedAt !== undefined
+        readOnly: !['canonical', 'topic', 'routine'].includes(link.role) || partner.lifecycle !== 'active' || session?.archived === true || session?.deletedAt !== undefined
       };
     });
   }
@@ -456,6 +472,95 @@ export class PartnerManager {
     const link = this.#store.getSessionLink(sessionId);
     if (link?.role !== 'topic') return undefined;
     return this.listSessions(link.partnerId).find(row => row.link.sessionId === sessionId);
+  }
+
+  async ensureRoutineSession(input: { readonly partnerId: string; readonly key: string; readonly title: string;
+    readonly modelOverride?: PartnerModelRouteRecord | null; readonly assertCurrent: () => void }): Promise<SessionDescriptor> {
+    return this.#serialized(`routine:${input.partnerId}:${input.key}`, async () => {
+      const profile = this.getPartner(input.partnerId), route = input.modelOverride ?? profile.capabilities.modelChain[0]!;
+      const assertOwner = () => {
+        input.assertCurrent(); const current = this.getPartner(profile.id);
+        if (current.revision !== profile.revision || current.profileVersion !== profile.profileVersion || current.lifecycle !== 'active'
+          || current.initializationState !== 'ready' || current.pauseCleanupPending) throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The routine owner changed.');
+        this.#validateCapabilities({ ...profile.capabilities, modelChain: [route] });
+        if (!this.#homeRouteAvailable(this.#operationalStore.getTarget(profile.homeTargetId).descriptor, route)) throw modelUnavailable();
+      };
+      assertOwner();
+      const title = `${profile.displayName}: ${input.title}`.slice(0, 200);
+      const existing = this.#store.listSessionLinks(profile.id, 'routine').find(link => link.routineKey === input.key);
+      let replaces: { readonly sessionId: string; readonly operationId: string } | undefined;
+      if (existing) {
+        const stored = this.#operationalStore.findSession(existing.sessionId)?.descriptor;
+        if (stored && stored.targetId === profile.homeTargetId && !stored.archived && stored.deletedAt === undefined) {
+          if (this.#operationalStore.findOperation(existing.routineOperationId!)?.status !== 'completed')
+            throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The original routine creation has not been confirmed.');
+          if (existing.profileVersion !== profile.profileVersion || stored.backendId !== route.backendId || stored.providerId !== route.providerId
+            || stored.modelId !== route.modelId || stored.effort !== route.effort || stored.fastMode !== route.fastMode
+            || stored.permissionMode !== profile.capabilities.permissionMode || stored.planMode !== profile.capabilities.planMode
+            || stored.appendSystemPrompt !== profile.identitySource || this.#sessionHost.getSessionRuntimeControl(stored.id).handoffState === 'pending') {
+            await this.#applyCanonicalSettings({ ...profile, capabilities: { ...profile.capabilities, modelChain: [route] } }, stored.id, title);
+          } else if (stored.title !== title) this.#operationalStore.updateSession(stored.id, { title }, this.#operationalStore.getSession(stored.id).revision);
+          assertOwner(); this.#store.advanceRoutineSessionProfile(stored.id, existing.profileVersion, profile.revision);
+          return this.#operationalStore.getSession(stored.id).descriptor;
+        }
+        if (!existing.routineOperationId || !this.#sessionHost.isPrivateSessionCreationClosed(existing.routineOperationId, existing.sessionId)) {
+          throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The original routine task is unavailable or its creation is unknown.');
+        }
+        replaces = { sessionId: existing.sessionId, operationId: existing.routineOperationId };
+      }
+      let operationId = `partner-routine-session:${createHash('sha256').update(JSON.stringify([profile.id, input.key, replaces?.operationId ?? null])).digest('hex')}`;
+      for (let retry = 0; this.#operationalStore.findOperation(operationId)?.status === 'failed'; retry++) {
+        if (retry >= 20) throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'Routine creation needs attention before retrying.');
+        operationId = `partner-routine-session:${createHash('sha256').update(operationId).digest('hex')}`;
+      }
+      const result = await this.#sessionHost.createServiceSession({ operationId, serviceKind: 'partner', targetId: profile.homeTargetId,
+        runtimeBackendId: route.backendId, title, providerId: route.providerId, modelId: route.modelId,
+        ...(route.effort === undefined ? {} : { effort: route.effort }), fastMode: route.fastMode,
+        permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode, appendSystemPrompt: profile.identitySource,
+        assertServiceScope: assertOwner, preparePrivateSession: async sessionId => {
+          assertOwner(); this.#store.bindRoutineSession({ partnerId: profile.id, expectedRevision: profile.revision,
+            profileVersion: profile.profileVersion, sessionId, key: input.key, operationId, ...(replaces ? { replaces } : {}) });
+          if (replaces) this.#sessionHost.releasePrivateSessionCreationReceipt(replaces.operationId, replaces.sessionId);
+        } });
+      assertOwner(); return this.#operationalStore.getSession(result.value.sessionId).descriptor;
+    });
+  }
+
+  routineModels(partnerId: string) {
+    const profile = this.getPartner(partnerId), target = this.#operationalStore.getTarget(profile.homeTargetId).descriptor;
+    return this.#operationalStore.listBackends().flatMap(({ descriptor: backend }) => backend.models.flatMap(model => {
+      const route: PartnerModelRouteRecord = { backendId: backend.id, providerId: model.providerId, modelId: model.modelId,
+        ...(model.defaultEffort === undefined ? model.thinkingLevels[0] === undefined ? {} : { effort: model.thinkingLevels[0] } : { effort: model.defaultEffort }), fastMode: false };
+      try {
+        this.#validateCapabilities({ ...profile.capabilities, modelChain: [route] });
+        if (!this.#homeRouteAvailable(target, route)) return [];
+        return [{ route, name: `${backend.displayName} · ${model.providerId} · ${model.displayName}`, efforts: [...model.thinkingLevels],
+          supportsFastMode: model.supportsFastMode === true && backend.capabilities.get('model.fast_mode')?.supported === true,
+          supportsUltrafastMode: model.supportsUltrafastMode === true && backend.capabilities.get('model.fast_mode')?.supported === true }];
+      } catch { return []; }
+    }));
+  }
+
+  routineFallback(input: Parameters<typeof partnerSessionRuntimeFallback>[1]): ReturnType<typeof partnerSessionRuntimeFallback> {
+    const link = this.#store.getSessionLink(input.sessionId);
+    if (link?.role !== 'routine') return { owned: false };
+    const profile = this.getPartner(link.partnerId);
+    if (this.#routineModel?.(profile.id, link.routineKey!) !== undefined) return { owned: true };
+    return partnerSessionRuntimeFallback({ findPartnerByCanonicalSession: () => profile }, input);
+  }
+
+  isRoutineSessionRetiring(sessionId: string): boolean {
+    return this.#operationalStore.findSetting<{ readonly state: string }>('service', 'partner-routine-close', sessionId)?.value.state === 'pending';
+  }
+
+  async closeRoutineSession(sessionId: string): Promise<void> {
+    const link = this.#store.getSessionLink(sessionId);
+    if (link?.role !== 'routine') throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The routine task owner is unavailable.');
+    const saved = this.#operationalStore.findSetting<{ readonly state: string }>('service', 'partner-routine-close', sessionId);
+    if (saved?.value.state === 'completed') return;
+    if (!saved) this.#operationalStore.setSetting('service', 'partner-routine-close', sessionId, { version: 1, state: 'pending' });
+    await this.#sessionHost.retirePartnerSession(sessionId, `partner-routine-close:${sessionId}`);
+    this.#operationalStore.setSetting('service', 'partner-routine-close', sessionId, { version: 1, state: 'completed' });
   }
 
   /** The message owner supplies a private key and rechecks its exact channel
@@ -579,7 +684,7 @@ export class PartnerManager {
     readonly targetPartnerId: string;
     readonly content: string;
   }): Promise<PartnerPrivateMessageDelivery> {
-    const caller = this.canonicalCaller(input.callerSessionId);
+    const caller = this.runtimeCaller(input.callerSessionId);
     const target = this.#store.getPartner(input.targetPartnerId);
     if (target.canonicalSessionId === undefined) {
       throw new PartnerManagerError("PARTNER_DELIVERY_UNAVAILABLE", "The target partner has no canonical task.");
@@ -590,7 +695,7 @@ export class PartnerManager {
         ...(input.messageId === undefined ? {} : { id: input.messageId }),
         senderPartnerId: caller.id,
         recipientPartnerId: target.id,
-        senderSessionId: caller.canonicalSessionId!,
+        senderSessionId: input.callerSessionId,
         recipientSessionId: target.canonicalSessionId!,
         content: input.content
       });
@@ -623,12 +728,12 @@ export class PartnerManager {
     readonly title: string;
     readonly objective: string;
   }): Promise<PartnerDelegationView> {
-    const caller = this.canonicalCaller(input.callerSessionId);
+    const caller = this.runtimeCaller(input.callerSessionId);
     const created = this.#store.createDelegation({
       ...(input.delegationId === undefined ? {} : { id: input.delegationId }),
       requesterPartnerId: caller.id,
       targetPartnerId: input.targetPartnerId,
-      parentSessionId: caller.canonicalSessionId!,
+      parentSessionId: input.callerSessionId,
       title: input.title,
       objective: input.objective
     });
@@ -1408,6 +1513,13 @@ export class PartnerManager {
       }
       current = this.#store.getPartner(current.id);
       const ready = this.#store.markReady(current.id, current.revision);
+      for (const link of this.#store.listSessionLinks(ready.id, 'routine')) {
+        const session = this.#operationalStore.findSession(link.sessionId)?.descriptor;
+        if (!session || session.archived || session.deletedAt !== undefined || this.isRoutineSessionRetiring(session.id)) continue;
+        const route = this.#routineModel?.(ready.id, link.routineKey!) ?? ready.capabilities.modelChain[0]!;
+        await this.#applyCanonicalSettings({ ...ready, capabilities: { ...ready.capabilities, modelChain: [route] } }, session.id, session.title);
+        this.#store.advanceRoutineSessionProfile(session.id, link.profileVersion, ready.revision);
+      }
       if (this.#optionsOnReady) {
         const scope = { key: current.id, active: true };
         try { await this.#importScope.run(scope, () => this.#optionsOnReady!(ready.id)); }
@@ -1484,12 +1596,12 @@ export class PartnerManager {
       permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode }, latest.revision);
   }
 
-  async #applyCanonicalSettings(profile: PartnerProfileRecord, sessionId: string): Promise<void> {
+  async #applyCanonicalSettings(profile: PartnerProfileRecord, sessionId: string, title = profile.displayName): Promise<void> {
     const primary = profile.capabilities.modelChain[0]!;
     await this.#sessionHost.updateServiceSessionPrompt(sessionId, profile.identitySource);
     const before = this.#operationalStore.getSession(sessionId);
     if (before.descriptor.backendId !== primary.backendId) {
-      this.#operationalStore.updateSession(sessionId, { title: profile.displayName, permissionMode: profile.capabilities.permissionMode,
+      this.#operationalStore.updateSession(sessionId, { title, permissionMode: profile.capabilities.permissionMode,
         planMode: profile.capabilities.planMode }, before.revision);
       const runtime = this.#sessionHost.getSessionRuntimeControl(sessionId);
       await this.#sessionHost.setSessionRuntimeControl({ sessionId, expectedGeneration: runtime.generation, patch: { ...primary } });
@@ -1526,7 +1638,7 @@ export class PartnerManager {
         throw new PartnerStoreError("PARTNER_CHANGED", "The canonical Session changed while partner settings were applied.");
       }
       this.#operationalStore.updateSession(sessionId, {
-        title: profile.displayName,
+        title,
         providerId: state.providerId,
         modelId: state.modelId,
         effort: primary.effort ?? null,
@@ -1537,7 +1649,9 @@ export class PartnerManager {
     } catch (error) {
       await this.#sessionHost.retirePartnerPolicyRuntime(sessionId, before.descriptor.binding, () => {
         const owner = this.#store.getPartner(profile.id);
-        if (owner.canonicalSessionId !== sessionId || owner.homeTargetId !== profile.homeTargetId || owner.lifecycle === "deleted") {
+        const link = this.#store.getSessionLink(sessionId);
+        if (owner.canonicalSessionId !== sessionId && (link?.partnerId !== owner.id || link.role !== 'routine')
+          || owner.homeTargetId !== profile.homeTargetId || owner.lifecycle === "deleted") {
           throw new PartnerStoreError("PARTNER_CHANGED", "The canonical permission owner changed.");
         }
       });

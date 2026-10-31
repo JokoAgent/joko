@@ -4,6 +4,7 @@ package joko.v1;
 
 import "google/protobuf/timestamp.proto";
 import "joko/v1/common.proto";
+import "joko/v1/model.proto";
 
 enum RoutineFilterOperator {
   ROUTINE_FILTER_OPERATOR_UNSPECIFIED = 0;
@@ -37,6 +38,22 @@ message RoutineTrigger {
   oneof kind { RoutineCronTrigger cron = 2; RoutineIntervalTrigger interval = 3; RoutineOnceTrigger once = 4; RoutineEventTrigger event = 5; }
 }
 message RoutinePreRunHook { string command = 1; optional uint64 timeout_ms = 2; }
+message RoutineModel {
+  string backend_id = 1;
+  ModelSelection selection = 2;
+}
+message RoutineModelChoice {
+  RoutineModel route = 1;
+  string name = 2;
+  repeated string efforts = 3;
+  bool supports_fast_mode = 4;
+  bool supports_ultrafast_mode = 5;
+}
+enum RoutineSessionMode {
+  ROUTINE_SESSION_MODE_UNSPECIFIED = 0;
+  ROUTINE_SESSION_MODE_PERSISTENT = 1;
+  ROUTINE_SESSION_MODE_FRESH = 2;
+}
 message RoutineDefinition {
   string name = 1;
   string prompt = 2;
@@ -44,6 +61,9 @@ message RoutineDefinition {
   repeated RoutineTrigger triggers = 4;
   optional bool silent_when_idle = 5;
   RoutinePreRunHook pre_run_hook = 6;
+  RoutineSessionMode session_mode = 7;
+  // Absence follows the Partner model. This is a complete route, including speed.
+  RoutineModel model_override = 8;
 }
 message PartnerRoutine {
   string id = 1;
@@ -75,6 +95,7 @@ message PartnerRoutineRun {
   optional string error = 8;
   optional string schedule_run_id = 9;
   optional string result_text = 10;
+  optional string session_id = 11;
 }
 message ListPartnerRoutinesRequest { string partner_id = 1; }
 message ListPartnerRoutinesResponse {
@@ -83,6 +104,7 @@ message ListPartnerRoutinesResponse {
   bool writable = 3;
   repeated PartnerRoutine routines = 4;
   repeated RoutineSource sources = 5;
+  repeated RoutineModelChoice models = 6;
 }
 message SavePartnerRoutineRequest {
   string partner_id = 1;

@@ -1,5 +1,13 @@
 export interface RoutinePreRunHook { readonly command: string; readonly timeoutMs?: number; }
 
+export interface RoutineModel {
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly effort?: string;
+  readonly fastMode: boolean | "ultrafast";
+}
+
 /** Sources describe events, independently of the connector transporting them. */
 export interface RoutineSource {
   id: string;
@@ -50,8 +58,10 @@ export interface Routine {
   triggers: RoutineTrigger[];
   /** Suppress successful attention unless explicitly requested by the run. */
   silentWhenIdle: boolean;
-  /** A check can skip model dispatch before the canonical task starts. */
+  /** A check can skip model dispatch before the independent task starts. */
   preRunHook?: RoutinePreRunHook;
+  sessionMode?: "persistent" | "fresh";
+  modelOverride?: RoutineModel | null;
   revision: number;
   createdAt: number;
   updatedAt: number;
@@ -59,7 +69,7 @@ export interface Routine {
 
 export type RoutineInput = Pick<
   Routine,
-  "name" | "prompt" | "enabled" | "triggers" | "silentWhenIdle" | "preRunHook"
+  "name" | "prompt" | "enabled" | "triggers" | "silentWhenIdle" | "preRunHook" | "sessionMode" | "modelOverride"
 >;
 
 /** Durable receipt and execution history share one identity across all trigger kinds. */
@@ -75,6 +85,7 @@ export interface RoutineRun {
   finishedAt?: number;
   error?: string;
   scheduleRunId?: string;
+  sessionId?: string;
   resultText?: string;
 }
 

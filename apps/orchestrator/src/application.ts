@@ -1162,7 +1162,7 @@ export async function createOrchestratorApplication(
       messageSearch: () => messageSearchForHelperTools,
       taskSenderPartner: sessionId => {
         const link = partnerStore.getSessionLink(sessionId);
-        if (link?.role !== "canonical") return undefined;
+        if (link?.role !== "canonical" && link?.role !== "routine") return undefined;
         const partner = partnerStore.getPartner(link.partnerId);
         return { senderPartnerId: partner.id, senderPartnerName: partner.displayName };
       }
@@ -1939,9 +1939,11 @@ export async function createOrchestratorApplication(
     serviceSessionRuntimeFallback: (input) => {
       const task = partnerSessionTasks?.fallback(input);
       const group = partnerGroupRuntime?.fallback(input);
-      return task?.owned ? task : group?.owned ? group : partnerSessionRuntimeFallback(partnerStore, input);
+      const routine = partners.routineFallback(input);
+      return task?.owned ? task : group?.owned ? group : routine.owned ? routine : partnerSessionRuntimeFallback(partnerStore, input);
     },
     partnerSessionRetiring: (sessionId) => partnerStore.isPartnerSessionRetiring(sessionId)
+      || partners.isRoutineSessionRetiring(sessionId)
       || (partnerHomeRuntime?.blocksExecution(sessionId) ?? partnerHomeStorage.blocksSession(sessionId))
       || partnerStore.isPartnerTargetRetiring(store.getSession(sessionId).descriptor.targetId) || partnerSessionTasks?.isRetiring(sessionId) === true
       || partnerGroupRuntime?.isRetiring(sessionId) === true || partnerNetworkLanes?.isRetiring(sessionId) === true,
@@ -1949,7 +1951,8 @@ export async function createOrchestratorApplication(
     partnerSessionRestarting: (sessionId) => partnerStore.isPartnerSessionRestarting(sessionId) || partnerMessaging?.isRestarting(sessionId) === true,
     partnerSessionPaused: (sessionId) => partnerStore.isPartnerSessionPaused(sessionId) || partnerSessionTasks?.isHeld(sessionId) === true || partnerGroupRuntime?.isHeld(sessionId) === true || partnerNetworkLanes?.isHeld(sessionId) === true,
     partnerSessionPolicy: (sessionId) => {
-      const profile = partnerStore.findPartnerByCanonicalSession(sessionId);
+      const link = partnerStore.getSessionLink(sessionId);
+      const profile = link?.role === 'routine' ? partnerStore.getPartner(link.partnerId) : partnerStore.findPartnerByCanonicalSession(sessionId);
       return profile === undefined ? undefined : {
         identity: JSON.stringify([profile.id, profile.homeTargetId, profile.canonicalSessionId, profile.profileVersion, profile.capabilities.permissionMode]),
         status: profile.initializationState
@@ -2217,6 +2220,8 @@ export async function createOrchestratorApplication(
     workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes"),
     onReady: async partnerId => { await partnerImports?.activatePackage(partnerId); },
+    routineModel: (partnerId, key) => partnerRoutines?.engine.list(partnerId).find(routine =>
+      key === `routine:${routine.id}` || key.startsWith(`routine:${routine.id}:`))?.modelOverride ?? undefined,
     onRoutineLifecycle: async (partnerId, state) => { await partnerRoutines?.lifecycle(partnerId, state); await partnerGroups?.partnerLifecycle(partnerId, state); await partnerMessaging?.lifecycle(partnerId, state); },
     prepareImportDeletion: async partnerId => { await partnerImports?.prepareDeletion(partnerId); await startupPartnerImportRuntime?.close();
       partnerMemoryPreferences.remove(partnerStore.getPartner(partnerId).homeTargetId);

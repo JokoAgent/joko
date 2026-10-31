@@ -15,7 +15,7 @@ export class PartnerRuntimePromptResolver {
     const groupTarget = link.role === "group" && link.profileVersion === profile.profileVersion && this.validGroupTarget(session, profile.id);
     if (profile.lifecycle !== "active" || profile.initializationState !== "ready" || session.targetId !== profile.homeTargetId && !groupTarget
       || !this.store.getTarget(session.targetId).descriptor.trusted) return undefined;
-    const identitySource = link.role === "canonical" || groupTarget ? profile.identitySource
+    const identitySource = link.role === "canonical" || link.role === "routine" || groupTarget ? profile.identitySource
       : this.profiles.listProfileVersions(profile.id).find(version => version.version === link.profileVersion)?.identitySource;
     if (identitySource === undefined) return undefined;
     const assertOwner = () => {

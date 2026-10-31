@@ -28,8 +28,11 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
     value => value.runs[0]?.status === RoutineRunStatus.SUCCESS || value.runs[0]?.status === RoutineRunStatus.FAILED, "the service-owned timer", 45000);
   expect(result.runs[0]?.status).toBe(RoutineRunStatus.SUCCESS);
   const backingId = `partner-routine-${routine.id}`;
-  expect(fixture.application.store.getSchedule(backingId).sessionId).toBe(partner.canonicalSessionId);
-  expect(fixture.application.store.listQueueItems({ sessionId: partner.canonicalSessionId }).some(item => item.body.text.includes(save.definition.prompt))).toBe(true);
+  const sessionId = result.runs[0]!.sessionId!;
+  expect(sessionId).toBeTruthy(); expect(sessionId).not.toBe(partner.canonicalSessionId);
+  expect(fixture.application.store.getSchedule(backingId).sessionId).toBe(sessionId);
+  expect(fixture.application.store.listQueueItems({ sessionId }).some(item => item.body.text.includes(save.definition.prompt))).toBe(true);
+  expect(fixture.application.store.listQueueItems({ sessionId: partner.canonicalSessionId })).toEqual([]);
   expect((await clients.scheduler.listSchedules({})).schedules.some(schedule => schedule.scheduleId === backingId)).toBe(false);
   await expect(clients.scheduler.getSchedule({ scheduleId: backingId })).rejects.toMatchObject({ code: Code.NotFound });
   const snapshot = await clients.event.getSnapshot({ scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: {} } }) });

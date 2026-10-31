@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState, useSyncExternalStore, type JSX } from "re
 import { create } from "@bufbuild/protobuf";
 import { PartnerRoutineEditor, RoutineCreationReceipts, RoutineTriggerSchema, RoutineFilterOperator, RoutineSourceStatus,
   newRoutineTrigger, routineMessages, routineDateInput, routineTimestamp, routineMilliseconds, routineTime, validRoutineDraft,
-  type RoutineTrigger, type RoutineMessages } from "@joko/contracts";
+  RoutineSessionMode, RoutineModelSchema, decodeModelSpeed, encodeModelSpeed,
+  type RoutineDefinition, type RoutineModelChoice, type RoutineTrigger, type RoutineMessages } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import { usePartnerDocumentForeground } from "./use-partner-working-status.js";
 import { Button, Modal, CheckboxControl } from "./ui.js";
+import { ModelSpeedControl } from "./ModelSpeedControl.js";
 
 export function PartnerRoutineDialog({ controller, partnerId, ownerKey, onClose, ownerDocument = document }: {
   readonly controller: AppController; readonly partnerId: string; readonly ownerKey: string; readonly onClose: () => void;
@@ -27,11 +29,13 @@ export function PartnerRoutineDialog({ controller, partnerId, ownerKey, onClose,
     } catch { setFailed(true); }
     return () => current?.dispose();
   }, [controller, partnerId, ownerKey, ownerDocument]);
-  return editor ? <RoutineContent editor={editor} connected={controller.state.connectionState === "connected"} m={m} onClose={onClose} ownerDocument={ownerDocument} />
+  return editor ? <RoutineContent editor={editor} connected={controller.state.connectionState === "connected"} m={m} onClose={onClose} ownerDocument={ownerDocument}
+    locale={controller.state.effectiveLocale} onOpenSession={sessionId => { onClose(); controller.navigate({ kind: "session", sessionId }); }} />
     : <Modal open ownerDocument={ownerDocument} title={m.title} size="large" onClose={onClose} showClose closeLabel={m.close}><p role="alert">{failed ? m.failed : m.busy}</p></Modal>;
 }
 
-function RoutineContent({ editor, connected, m, onClose, ownerDocument }: { readonly editor: PartnerRoutineEditor; readonly connected: boolean; readonly m: RoutineMessages; readonly onClose: () => void; readonly ownerDocument: Document }): JSX.Element {
+function RoutineContent({ editor, connected, m, onClose, ownerDocument, locale, onOpenSession }: { readonly editor: PartnerRoutineEditor; readonly connected: boolean; readonly m: RoutineMessages; readonly onClose: () => void; readonly ownerDocument: Document;
+  readonly locale: string; readonly onOpenSession: (sessionId: string) => void }): JSX.Element {
   const state = useSyncExternalStore(editor.subscribe, editor.snapshot);
   const foreground = usePartnerDocumentForeground(ownerDocument);
   const [confirm, setConfirm] = useState<{ readonly body: string; readonly action: () => void }>();
@@ -70,17 +74,53 @@ function RoutineContent({ editor, connected, m, onClose, ownerDocument }: { read
         <Button disabled={!editor.dirty || !validRoutineDraft(draft)} onClick={() => void editor.save()}>{m.save}</Button>
         {editor.dirty && <Button onClick={() => setConfirm({ body: m.discardBody, action: () => editor.discard() })}>{m.discard}</Button>}
       </fieldset>}
+      {draft && <fieldset disabled={locked || !!state.pendingId} className="partner-capabilities">
+        <legend>{locale === "zh-CN" ? "执行方式" : "Execution"}</legend>
+        <RoutineExecutionFields draft={draft} models={state.catalog?.models ?? []} locale={locale} onChange={patch => editor.edit(patch)} />
+        {state.selected?.builtin && <><Button disabled={!editor.dirty || !validRoutineDraft(draft)} onClick={() => void editor.save()}>{m.save}</Button>
+          {editor.dirty && <Button onClick={() => setConfirm({ body: m.discardBody, action: () => editor.discard() })}>{m.discard}</Button>}</>}
+      </fieldset>}
       {state.selected?.builtin && <p>{state.selected.definition?.prompt}</p>}
       {state.selected && <><div className="toolbar-actions">{!state.selected.builtin && <><Button disabled={locked || editor.dirty} onClick={() => void editor.run()}>{m.run}</Button>
         <Button disabled={locked || editor.dirty} onClick={() => setConfirm({ body: m.deleteBody, action: () => void editor.remove() })}>{m.remove}</Button></>}
         <Button disabled={state.busy || state.requiresRefresh || !foreground || !connected} onClick={() => void editor.history()}>{m.history}</Button></div>
-        <ul aria-label={m.history}>{state.runs.map(run => <li key={run.id}><strong>{m.states[run.status] ?? m.states[0]}</strong> · {new Date(routineTime(run.createdAt)).toLocaleString()}<p>{run.error ?? run.resultText}</p></li>)}</ul>
+        <ul aria-label={m.history}>{state.runs.map(run => <li key={run.id}><strong>{m.states[run.status] ?? m.states[0]}</strong> · {new Date(routineTime(run.createdAt)).toLocaleString()}<p>{run.error ?? run.resultText}</p>
+          {run.sessionId && <Button disabled={!foreground || !connected || state.requiresRefresh} onClick={() => onOpenSession(run.sessionId!)}>{locale === "zh-CN" ? "查看任务" : "View task"}</Button>}</li>)}</ul>
         {state.runs.length === 0 && <p>{m.noHistory}</p>}{state.nextOffset !== undefined && <Button disabled={state.busy || state.requiresRefresh} onClick={() => void editor.history(true)}>{m.more}</Button>}</>}
     </div>
     {confirm && <Modal open ownerDocument={ownerDocument} title={m.title} description={confirm.body} size="small" dialogRole="alertdialog" onClose={() => setConfirm(undefined)} showClose closeLabel={m.close}>
       <Button onClick={() => { const action = confirm.action; setConfirm(undefined); action(); }}>{m.confirm}</Button><Button onClick={() => setConfirm(undefined)}>{m.back}</Button>
     </Modal>}
   </Modal>;
+}
+
+function RoutineExecutionFields({ draft, models, locale, onChange }: { readonly draft: RoutineDefinition;
+  readonly models: readonly RoutineModelChoice[]; readonly locale: string; readonly onChange: (patch: Partial<RoutineDefinition>) => void }) {
+  const zh = locale === "zh-CN", route = draft.modelOverride, selection = route?.selection;
+  const key = (value: typeof route) => value ? JSON.stringify([value.backendId, value.selection?.model?.providerId, value.selection?.model?.modelId]) : "";
+  const selected = models.find(model => key(model.route) === key(route));
+  return <>
+    <label className="field"><span>{zh ? "任务上下文" : "Task context"}</span><select value={draft.sessionMode === RoutineSessionMode.FRESH ? "fresh" : "persistent"}
+      onChange={event => onChange({ sessionMode: event.target.value === "fresh" ? RoutineSessionMode.FRESH : RoutineSessionMode.PERSISTENT })}>
+      <option value="persistent">{zh ? "沿用同一任务" : "Reuse the same task"}</option><option value="fresh">{zh ? "每次新建任务" : "Create a new task each time"}</option>
+    </select></label>
+    <label className="field"><span>{zh ? "例行模型" : "Routine model"}</span><select value={key(route)} onChange={event => {
+      const model = models.find(item => key(item.route) === event.target.value);
+      onChange({ modelOverride: model?.route ? create(RoutineModelSchema, model.route) : undefined });
+    }}><option value="">{zh ? "跟随伙伴模型" : "Follow the Partner model"}</option>
+      {route && !selected && <option value={key(route)}>{selection?.model?.providerId} · {selection?.model?.modelId} · {zh ? "不可用" : "Unavailable"}</option>}
+      {models.map(model => <option key={key(model.route)} value={key(model.route)}>{model.name}</option>)}
+    </select></label>
+    {route && selection && selected && <>
+      {selected.efforts.length > 0 && <label className="field"><span>{zh ? "推理强度" : "Reasoning effort"}</span><select value={selection.effortId}
+        onChange={event => onChange({ modelOverride: create(RoutineModelSchema, { ...route, selection: { ...selection, effortId: event.target.value } }) })}>
+        {!selected.efforts.includes(selection.effortId) && <option value={selection.effortId}>{selection.effortId || (zh ? "默认" : "Default")}</option>}
+        {selected.efforts.map(effort => <option key={effort} value={effort}>{effort}</option>)}
+      </select></label>}
+      <ModelSpeedControl value={decodeModelSpeed(selection)} supportsFast={selected.supportsFastMode} supportsUltrafast={selected.supportsUltrafastMode} locale={locale}
+        onChange={speed => onChange({ modelOverride: create(RoutineModelSchema, { ...route, selection: { ...selection, ...encodeModelSpeed(speed) } }) })} />
+    </>}
+  </>;
 }
 
 function RoutineTriggerFields({ trigger, editor, m, onChange, onRemove }: { readonly trigger: RoutineTrigger; readonly editor: PartnerRoutineEditor;

@@ -48,7 +48,11 @@ export class PartnerRoutineEditor {
   }
   select(routine?: PartnerRoutine): void { if (!this.state.busy && !this.state.requiresRefresh && !this.dirty) this.#select(routine); }
   discard(): void { if (!this.state.busy) this.#select(this.state.selected); }
-  edit(patch: Partial<RoutineDefinition>): void { if (this.writable && !this.state.selected?.builtin && this.state.draft) this.#set({ draft: create(RoutineDefinitionSchema, { ...this.state.draft, ...patch }) }); }
+  edit(patch: Partial<RoutineDefinition>): void {
+    if (!this.writable || !this.state.draft) return;
+    if (this.state.selected?.builtin && Object.keys(patch).some(key => key !== "sessionMode" && key !== "modelOverride")) return;
+    this.#set({ draft: create(RoutineDefinitionSchema, { ...this.state.draft, ...patch }) });
+  }
   async refresh(): Promise<void> {
     if (this.dirty) return;
     await this.#perform(async signal => {

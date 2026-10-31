@@ -554,7 +554,7 @@ export type PartnerInitializationErrorCodeView =
   | "stateChanged";
 export type PartnerInvitationStageView = "home" | "avatar" | "session" | "ready" | "failed";
 export type PartnerPermissionModeView = PermissionMode;
-export type PartnerSessionRoleView = "canonical" | "history" | "delegation" | "topic";
+export type PartnerSessionRoleView = "canonical" | "history" | "delegation" | "topic" | "routine";
 export type PartnerPrivateThreadStatusView = "active" | "closed";
 export type PartnerPrivateThreadCloseReasonView = "messageLimit" | "idleTimeout";
 export type PartnerPrivateMessageDeliveryStatusView = "pending" | "delivered" | "failed";

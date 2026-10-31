@@ -62,6 +62,13 @@ function assertState(value: unknown): asserts value is RoutineState {
       || !Array.isArray(routine.triggers) || routine.triggers.length > 32
       || routine.enabled && routine.triggers.length === 0) invalid();
     ids.add(routine.id);
+    if (routine.sessionMode !== undefined && routine.sessionMode !== "persistent" && routine.sessionMode !== "fresh") invalid();
+    if (routine.modelOverride !== undefined && routine.modelOverride !== null) {
+      const model = record(routine.modelOverride);
+      if (!text(model.backendId, 256) || !text(model.providerId, 256) || !text(model.modelId, 256)
+        || model.effort !== undefined && !text(model.effort, 128)
+        || typeof model.fastMode !== "boolean" && model.fastMode !== "ultrafast") invalid();
+    }
     if (routine.builtin !== undefined && routine.builtin !== "follow-up"
       || routine.builtinVersion !== undefined && (routine.builtin === undefined || !positive(routine.builtinVersion))) invalid();
     if (routine.preRunHook !== undefined) {
@@ -111,7 +118,7 @@ function assertState(value: unknown): asserts value is RoutineState {
           || !(typeof field === "string" && field.length <= 8000 || typeof field === "boolean"
             || typeof field === "number" && Number.isFinite(field)))) invalid();
     }
-    for (const key of ["error", "resultText", "scheduleRunId"]) if (run[key] !== undefined && typeof run[key] !== "string") invalid();
+    for (const key of ["error", "resultText", "scheduleRunId", "sessionId"]) if (run[key] !== undefined && typeof run[key] !== "string") invalid();
   }
 }
 function record(value: unknown): Record<string, unknown> {

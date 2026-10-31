@@ -21,7 +21,8 @@ export function createPartnerRoutineConnectService(manager: PartnerRoutineManage
       const catalog = owner().catalog(request.partnerId);
       return create(contract.ListPartnerRoutinesResponseSchema, { partnerId: catalog.partnerId,
         partnerRevision: toProtoRevision(catalog.partnerRevision), writable: catalog.writable,
-        routines: catalog.routines.map(toProtoRoutine), sources: catalog.sources.map(toProtoSource) });
+        routines: catalog.routines.map(toProtoRoutine), sources: catalog.sources.map(toProtoSource),
+        models: catalog.models.map(model => ({ ...model, route: toProtoRoutineModel(model.route) })) });
     }),
     savePartnerRoutine: (request, context) => invoke(context, async () => {
       if (!request.definition || request.intent.case === undefined) throw new ConnectError("Definition and intent are required.", Code.InvalidArgument);
@@ -67,7 +68,16 @@ function safeNumber(value: bigint): number {
   return Number(value);
 }
 function fromProtoDefinition(value: contract.RoutineDefinition): RoutineInput {
+  const mode = value.sessionMode;
+  if (![contract.RoutineSessionMode.UNSPECIFIED, contract.RoutineSessionMode.PERSISTENT, contract.RoutineSessionMode.FRESH].includes(mode))
+    throw new ConnectError("Routine session mode is invalid.", Code.InvalidArgument);
+  const model = value.modelOverride;
+  if (model && !model.selection?.model) throw new ConnectError("A complete routine model route is required.", Code.InvalidArgument);
   return parseRoutineInput({ name: value.name, prompt: value.prompt, enabled: value.enabled, silentWhenIdle: value.silentWhenIdle,
+    sessionMode: mode === contract.RoutineSessionMode.FRESH ? "fresh" : "persistent",
+    ...(model ? { modelOverride: { backendId: model.backendId, providerId: model.selection!.model!.providerId,
+      modelId: model.selection!.model!.modelId, ...(model.selection!.effortId ? { effort: model.selection!.effortId } : {}),
+      fastMode: contract.decodeModelSpeed(model.selection!) } } : { modelOverride: null }),
     ...(value.preRunHook ? { preRunHook: { command: value.preRunHook.command,
       ...(value.preRunHook.timeoutMs === undefined ? {} : { timeoutMs: safeNumber(value.preRunHook.timeoutMs) }) } } : {}),
     triggers: value.triggers.map((trigger): RoutineTrigger => {
@@ -94,6 +104,8 @@ function toProtoRoutine(value: Routine): contract.PartnerRoutine {
   return create(contract.PartnerRoutineSchema, { id: value.id, partnerId: value.partnerId, revision: toProtoRevision(BigInt(value.revision)),
     ...(value.builtin ? { builtin: value.builtin, builtinVersion: value.builtinVersion } : {}),
     definition: { name: value.name, prompt: value.prompt, enabled: value.enabled, silentWhenIdle: value.silentWhenIdle,
+      sessionMode: value.sessionMode === "fresh" ? contract.RoutineSessionMode.FRESH : contract.RoutineSessionMode.PERSISTENT,
+      ...(value.modelOverride ? { modelOverride: toProtoRoutineModel(value.modelOverride) } : {}),
       ...(value.preRunHook ? { preRunHook: { command: value.preRunHook.command,
         ...(value.preRunHook.timeoutMs === undefined ? {} : { timeoutMs: BigInt(value.preRunHook.timeoutMs) }) } } : {}),
       triggers: value.triggers.map(toProtoRoutineTrigger) }, ...(value.activity ? { activity: runStatus(value.activity) } : {}),
@@ -120,7 +132,11 @@ function toProtoRun(value: RoutineRun): contract.PartnerRoutineRun {
   return create(contract.PartnerRoutineRunSchema, { id: value.id, routineId: value.routineId,
     definitionRevision: toProtoRevision(BigInt(value.revision)), triggerIds: value.triggerIds, status: runStatus(value.status),
     createdAt: toProtoTimestamp(value.createdAt), ...(value.finishedAt === undefined ? {} : { finishedAt: toProtoTimestamp(value.finishedAt) }),
-    error: value.error, scheduleRunId: value.scheduleRunId, resultText: value.resultText });
+    error: value.error, scheduleRunId: value.scheduleRunId, sessionId: value.sessionId, resultText: value.resultText });
+}
+function toProtoRoutineModel(value: NonNullable<Routine["modelOverride"]>) {
+  return { backendId: value.backendId, selection: { model: { providerId: value.providerId, modelId: value.modelId },
+    ...(value.effort === undefined ? {} : { effortId: value.effort }), ...contract.encodeModelSpeed(value.fastMode) } };
 }
 function toProtoSource(value: RoutineSource): contract.RoutineSource {
   return create(contract.RoutineSourceSchema, { id: value.id, name: value.name, events: value.events,

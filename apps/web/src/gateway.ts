@@ -22133,13 +22133,13 @@ function mapPartnerSession(value: ProtoPartnerSession): PartnerSessionView {
   }
   const role: PartnerSessionRoleView = value.role === PartnerSessionRole.CANONICAL ? "canonical"
     : value.role === PartnerSessionRole.HISTORY ? "history"
-      : value.role === PartnerSessionRole.DELEGATION ? "delegation" : value.role === PartnerSessionRole.TOPIC ? 'topic'
+      : value.role === PartnerSessionRole.DELEGATION ? "delegation" : value.role === PartnerSessionRole.TOPIC ? 'topic' : value.role === PartnerSessionRole.ROUTINE ? 'routine'
         : (() => { throw new GatewayError("Orchestrator returned an unknown Partner task role."); })();
   if ((role === "delegation" || role === 'topic') !== (value.parentSessionId !== undefined)
     || (role === "delegation") !== (value.delegationId !== undefined)
     || (role === 'topic') !== Boolean(value.topicRoot)
     || (value.topicRoot && (value.topicRoot.sessionId !== value.parentSessionId || value.topicRoot.generation < 1n || !value.topicRoot.eventId || !value.topicRoot.messageId))
-    || (!['canonical', 'topic'].includes(role) && !value.readOnly)) {
+    || (!['canonical', 'topic', 'routine'].includes(role) && !value.readOnly)) {
     throw new GatewayError("Orchestrator returned an inconsistent Partner task link.");
   }
   return {

@@ -68,6 +68,9 @@ export class PartnerRoutineManager {
   }
   #now(): number { return (this.options.now ?? Date.now)(); }
   async start(): Promise<void> {
+    for (const row of this.options.store.listSettings('service', 'partner-routine-close')) {
+      if ((row.value as { readonly state?: string }).state === 'pending') await this.options.partners.closeRoutineSession(row.key);
+    }
     const saved = await this.options.storage.load();
     const states = new Map<string, "active" | "paused" | "deleted">();
     for (const routine of saved?.routines ?? []) {
@@ -99,9 +102,18 @@ export class PartnerRoutineManager {
   catalog(partnerId: string) {
     const { partner } = this.#owner(partnerId, false);
     return { partnerId, partnerRevision: partner.revision, writable: partner.lifecycle === "active",
-      routines: this.engine.list(partnerId), sources: this.engine.listSources() };
+      routines: this.engine.list(partnerId), sources: this.engine.listSources(), models: this.options.partners.routineModels(partnerId) };
   }
   sources(partnerId: string): readonly RoutineSource[] { this.#owner(partnerId, false); return this.engine.listSources(); }
+  assertExecutionCaller(context: { readonly sessionId: string; readonly targetId: string; readonly generation: number;
+    readonly providerGeneration?: number }): void {
+    const partner = this.options.partners.runtimeCaller(context.sessionId), session = this.options.store.getSession(context.sessionId).descriptor;
+    if (session.targetId !== context.targetId || session.binding.generation !== context.generation
+      || context.providerGeneration !== undefined && context.providerGeneration !== 1
+      || !this.options.partners.listSessions(partner.id).some(row => row.link.sessionId === session.id && row.link.role === 'routine')) {
+      throw new PartnerRoutineError('changed', 'The routine execution caller changed.');
+    }
+  }
   history(partnerId: string, routineId: string, offset = 0): { readonly runs: readonly RoutineRun[]; readonly nextOffset?: number } {
     this.#owner(partnerId, false); this.#routine(partnerId, routineId);
     const runs = this.engine.history(routineId);
@@ -119,6 +131,8 @@ export class PartnerRoutineManager {
     return this.options.partners.runOwnedManagement(input.partnerId, input.partnerRevision, async () => {
     input.assertCaller?.();
     this.#owner(input.partnerId, true, input.partnerRevision);
+    if (input.definition.modelOverride) this.options.partners.resolveTaskModel(
+      this.options.partners.getPartner(input.partnerId).canonicalSessionId!, input.definition.modelOverride).assertCurrent();
     if (input.routineId !== undefined) {
       this.#routine(input.partnerId, input.routineId);
       if (revision === undefined) throw new PartnerRoutineError("invalid", "Routine revision is required.");
@@ -207,17 +221,21 @@ export class PartnerRoutineManager {
   async #execute(routine: Routine, run: RoutineRun, signal: AbortSignal, canDispatch: () => boolean) {
     if (this.options.partners.isHomeChanging(routine.partnerId)) return { deferred: true };
     if (this.options.partners.getPartner(routine.partnerId).lifecycle === "paused") return { deferred: true };
-    const { partner, session } = this.#owner(routine.partnerId, true);
+    const { partner, session: canonical } = this.#owner(routine.partnerId, true);
+    let session = canonical;
     const followUp = routine.builtin === "follow-up" ? this.#followUp?.prepare(routine, run) : undefined;
     if (routine.builtin === "follow-up" && !followUp) return { skipped: true, resultText: "No currently authorized task needs observation." };
     const id = `partner-routine-${routine.id}`;
-    const backendGeneration = this.options.store.getBackend(session.backendId).descriptor.instanceGeneration;
+    let backendGeneration = this.options.store.getBackend(session.backendId).descriptor.instanceGeneration;
     let executionRunId: string | undefined;
     const assertCurrent = () => {
       followUp?.assertCurrent();
       if (!canDispatch() || signal.aborted) throw new PartnerRoutineError("changed", "Routine was changed or cancelled.");
-      const current = this.#owner(partner.id, true, partner.revision).session;
-      const changed = () => { throw new PartnerRoutineError("changed", "Canonical task changed during routine execution."); };
+      const owner = this.#owner(partner.id, true, partner.revision);
+      const current = this.options.store.getSession(session.id).descriptor;
+      const changed = () => { throw new PartnerRoutineError("changed", "The routine task changed during execution."); };
+      if (owner.session.id !== canonical.id || current.archived || current.deletedAt !== undefined) changed();
+      if (session.id !== canonical.id) this.options.partners.runtimeCaller(session.id);
       if (current.id !== session.id || current.backendId !== session.backendId || current.targetId !== session.targetId
         || current.binding.opaqueRef !== session.binding.opaqueRef || current.binding.nativeSessionId !== session.binding.nativeSessionId
         || this.options.store.getBackend(session.backendId).descriptor.instanceGeneration !== backendGeneration) changed();
@@ -239,8 +257,6 @@ export class PartnerRoutineManager {
         || !this.options.store.listAttempts(executionRunId!).some(previous => previous.descriptor.generation === session.binding.generation)) changed();
     };
     assertCurrent();
-    if (this.options.store.listRuns({ sessionId: session.id, activeOnly: true }).length > 0
-      || this.options.store.getQueueControl(session.id).paused) return { deferred: true };
     const imported = await this.#imports?.prepare(routine, run.id, signal, assertCurrent); assertCurrent();
     if (imported?.deferred) return { deferred: true };
     if (imported?.skipped) return { skipped: true, resultText: "Imported check found no work.", ...(imported.exhausted ? { disableRoutine: true } : {}) };
@@ -248,6 +264,17 @@ export class PartnerRoutineManager {
       const exhausted = await this.#imports!.finish(routine, session.id, run.id, imported.direct, true, signal, assertCurrent);
       assertCurrent(); return { resultText: imported.direct.slice(0, 2000), ...(exhausted ? { disableRoutine: true } : {}) };
     }
+    const key = `routine:${routine.id}${routine.sessionMode === 'fresh' ? `:${run.id}` : ''}`;
+    const previous = this.options.partners.listSessions(partner.id).find(row => row.link.role === 'routine' && row.link.routineKey === key)?.session;
+    if (previous && (this.options.store.listRuns({ sessionId: previous.id, activeOnly: true }).length > 0
+      || this.options.store.getQueueControl(previous.id).paused)) return { deferred: true };
+    session = await this.options.partners.ensureRoutineSession({ partnerId: partner.id, key, title: routine.name,
+      modelOverride: routine.modelOverride, assertCurrent });
+    backendGeneration = this.options.store.getBackend(session.backendId).descriptor.instanceGeneration;
+    try {
+    assertCurrent();
+    if (this.options.store.listRuns({ sessionId: session.id, activeOnly: true }).length > 0
+      || this.options.store.getQueueControl(session.id).paused) return { deferred: true };
     let checkSummary = "";
     if (routine.preRunHook) {
       const target = this.options.store.getTarget(session.targetId).descriptor;
@@ -257,8 +284,8 @@ export class PartnerRoutineManager {
         stdinPayload: { event: "schedule-pre-run", scheduleId: `partner-routine-${routine.id}`, scheduleName: routine.name,
           runId: run.id, firedAt: run.createdAt, workingDir: target.workspaceRoot } });
       assertCurrent();
-      if (checked.decision === "skip") return { skipped: true, resultText: "Pre-run check found no work." };
-      if (checked.decision === "block") return { error: redactSecrets(schedulePreRunFailureSummary(checked)).slice(0, 1000) };
+      if (checked.decision === "skip") return { skipped: true, sessionId: session.id, resultText: "Pre-run check found no work." };
+      if (checked.decision === "block") return { sessionId: session.id, error: redactSecrets(schedulePreRunFailureSummary(checked)).slice(0, 1000) };
       checkSummary = redactSecrets(checked.stdout).slice(0, 8000);
     }
     const existing = this.options.store.findSchedule(id);
@@ -280,21 +307,24 @@ export class PartnerRoutineManager {
         try { assertCurrent(); return true; } catch { return false; }
       });
       if (dispatched.status === "skipped") return { deferred: true };
-      if (dispatched.status !== "queued") return { error: "Routine could not be admitted to its canonical task.", scheduleRunId: dispatched.runId };
+      if (dispatched.status !== "queued") return { sessionId: session.id, error: "Routine could not be admitted to its independent task.", scheduleRunId: dispatched.runId };
       executionRunId = dispatched.runId;
       for (;;) {
         if (signal.aborted) { await this.options.scheduler.abortSchedule(id); throw new Error("Routine cancelled."); }
         const completed = this.options.store.findRun(dispatched.runId)?.descriptor;
         if (!completed) throw new Error("Routine execution receipt is unavailable.");
         if (["completed", "failed", "aborted", "dispatch_unknown"].includes(completed.state)) {
-          if (completed.state !== "completed") return { scheduleRunId: dispatched.runId, error: `Routine ended with ${completed.state}.` };
+          if (completed.state !== "completed") return { sessionId: session.id, scheduleRunId: dispatched.runId, error: `Routine ended with ${completed.state}.` };
           const text = this.#result(session.id, dispatched.runId, imported ? 2 * 1024 * 1024 : 2000);
           const exhausted = imported && await this.#imports!.finish(routine, session.id, run.id, text, false, signal, assertCurrent);
-          assertCurrent(); return { scheduleRunId: dispatched.runId, resultText: text.slice(0, 2000), ...(exhausted ? { disableRoutine: true } : {}) };
+          assertCurrent(); return { sessionId: session.id, scheduleRunId: dispatched.runId, resultText: text.slice(0, 2000), ...(exhausted ? { disableRoutine: true } : {}) };
         }
         await delay(100, undefined, { signal });
       }
     } finally { signal.removeEventListener("abort", abort); await cancellation; }
+    } finally {
+      if (routine.sessionMode === 'fresh') await this.options.partners.closeRoutineSession(session.id);
+    }
   }
   #result(sessionId: string, runId: string, maximumCharacters = 2000): string {
     let cursor = 0n; let result = "Routine completed.";
