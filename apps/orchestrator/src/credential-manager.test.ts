@@ -494,7 +494,8 @@ describe("ProviderCatalogManager", () => {
     expect(providers.get("pi", "discoverable")).toMatchObject({ supportsModelRefresh: true });
     expect(providers.get("pi", "discoverable").provider.models).toEqual([
       { id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000 },
-      { id: "new-model", name: "New model", contextWindow: 1_000_000, maxTokens: 16_384, defaultVisible: false }
+      { id: "new-model", name: "New model", contextWindow: 1_000_000, maxTokens: 16_384, defaultVisible: false,
+        contextWindowSource: "declared", maxOutputTokensSource: "estimated" }
     ]);
     await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toMatchObject({
       addedModelIds: [],
@@ -502,6 +503,37 @@ describe("ProviderCatalogManager", () => {
     });
     expect(stringify(store.listSettings())).not.toContain("discovery-secret-value");
     store.close();
+  });
+
+  it("persists newly discovered capabilities through restart and the actual native generation without changing declared models", async () => {
+    const { root, store, credentials } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
+    await providers.upsert({ backendId: "pi", credentialOrigin: "http://127.0.0.1:11434", displayName: "Local", enabled: true,
+      kind: "local_keyless", credentialBindings: {}, supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+      provider: { id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true,
+        models: [{ id: "kept", contextWindow: 32_000, maxTokens: 4_000, input: ["text"], supportsFastMode: false }] } });
+    const refresh = () => providers.discoverProviderModels("pi", "local", (async () => new Response(JSON.stringify({ data: [
+      { id: "kept", context_window: 128_000, capabilities: { vision: true } },
+      { id: "new", max_context_window: 64_000, max_output_tokens: 8_000, native_api: "anthropic-messages",
+        architecture: { input_modalities: ["text", "image"], output_modalities: ["text"] },
+        supported_parameters: ["tools", "reasoning"], reasoning: { supportedEfforts: ["high", "max"], defaultEffort: "max" }, supports_fast_mode: false }
+    ] }))) as typeof fetch);
+    try {
+      await refresh();
+      const kept = providers.get("pi", "local").provider.models[0];
+      expect(kept).toEqual({ id: "kept", contextWindow: 32_000, maxTokens: 4_000, input: ["text"], supportsFastMode: false });
+      const restored = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); restored.initialize();
+      expect(restored.get("pi", "local").provider.models[1]).toMatchObject({ id: "new", contextWindow: 64_000, contextWindowSource: "estimated",
+        maxTokens: 8_000, maxOutputTokensSource: "declared", reasoning: true, defaultEffort: "max", input: ["text", "image"],
+        supportsTools: true, referenceApi: "anthropic-messages", supportsFastMode: false, defaultVisible: false });
+      const snapshot = await restored.createPiGenerationSnapshot({ snapshotsRoot: join(root, "snapshots") });
+      const native = JSON.parse(await readFile(join(snapshot.agentHome, "models.json"), "utf8")).providers.local;
+      expect(native.api).toBe("openai-completions");
+      expect(native.models[1]).toMatchObject({ id: "new", contextWindow: 64_000, maxTokens: 8_000,
+        input: ["text", "image"], thinkingLevelMap: { off: null, low: null, high: "high", max: "max" } });
+      for (const key of ["referenceApi", "defaultEffort", "contextWindowSource", "maxOutputTokensSource", "supportsFastMode", "supportsTools", "defaultVisible"]) expect(native.models[1]).not.toHaveProperty(key);
+      await refresh(); expect(providers.get("pi", "local").provider.models[0]).toEqual(kept);
+    } finally { store.close(); }
   });
 
   it("requires an unambiguous pinned HTTPS embedding route, with loopback HTTP as the only exception", async () => {

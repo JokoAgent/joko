@@ -4,6 +4,8 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
   provisionManagedCatalog,
+  supportedPiThinkingLevels,
+  type PiManagedModel,
   type PiManagedProvider,
   type PiManagedSettings
 } from "@joko/adapter-pi";
@@ -15,6 +17,7 @@ import { accountBalanceIntegration, PROVIDER_ACCOUNT_BALANCE_CAPABILITY, type Ac
 import {
   ProviderModelDiscoveryError,
   fetchProviderModels,
+  type DiscoveredProviderModel,
   type ProviderModelDiscoverySpec
 } from "./provider-model-discovery.js";
 import {
@@ -1655,13 +1658,7 @@ export class ProviderCatalogManager {
           ...current.provider,
           models: [
             ...current.provider.models,
-            ...additions.map((model) => ({
-              id: model.id,
-              name: model.name,
-              contextWindow: model.contextWindow ?? 128_000,
-              maxTokens: 16_384,
-              defaultVisible: false
-            }))
+            ...additions.map(discoveredManagedModel)
           ]
         },
         version: current.version + 1n,
@@ -2666,6 +2663,33 @@ function assertLeasedNativeCredentialAccount(current: NativePiCredential, next: 
   if (currentAccount !== undefined && nextAccount !== currentAccount) {
     throw new Error("Pi native Provider account identity changed during credential refresh.");
   }
+}
+
+function discoveredManagedModel(model: DiscoveredProviderModel): PiManagedModel {
+  const metadata = model.metadata;
+  const levels = metadata?.efforts;
+  const thinkingLevelMap = levels === undefined ? undefined : Object.fromEntries(
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => [level, levels.includes(level) ? level : null]));
+  const input = metadata?.inputModalities?.filter((value): value is "text" | "image" => value === "text" || value === "image");
+  const supportsImages = metadata?.supportsImages;
+  const modalities = supportsImages === false ? input?.filter(value => value !== "image") ?? ["text" as const]
+    : supportsImages === true ? [...new Set([...(input ?? ["text" as const]), "image" as const])] : input;
+  const result: PiManagedModel = {
+    id: model.id, name: model.name, defaultVisible: false,
+    contextWindow: model.contextWindow ?? metadata?.contextWindowMax ?? 128_000,
+    contextWindowSource: model.contextWindow === undefined ? "estimated" : "declared",
+    maxTokens: metadata?.maxOutputTokens ?? 16_384,
+    maxOutputTokensSource: metadata?.maxOutputTokens === undefined ? "estimated" : "declared",
+    ...(metadata?.description === undefined ? {} : { description: metadata.description }),
+    ...(metadata?.nativeApi === undefined ? {} : { referenceApi: metadata.nativeApi }),
+    ...(modalities === undefined ? {} : { input: modalities.length ? modalities : ["text"] }),
+    ...(metadata?.outputModalities === undefined ? {} : { declaredOutputModalities: metadata.outputModalities }),
+    ...(metadata?.supportsTools === undefined ? {} : { supportsTools: metadata.supportsTools }),
+    ...(metadata?.supportsFastMode === undefined ? {} : { supportsFastMode: metadata.supportsFastMode }),
+    ...(thinkingLevelMap === undefined ? {} : { reasoning: levels!.some(level => level !== "ultra"), thinkingLevelMap })
+  };
+  return metadata?.defaultEffort != null && supportedPiThinkingLevels(result.reasoning, result.thinkingLevelMap).includes(metadata.defaultEffort)
+    ? { ...result, defaultEffort: metadata.defaultEffort } : result;
 }
 
 function validateProviderEntry(entry: ManagedProviderEntry): void {

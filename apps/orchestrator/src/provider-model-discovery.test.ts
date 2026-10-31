@@ -50,6 +50,37 @@ describe("Provider model discovery", () => {
     }));
   });
 
+  it("accepts native catalog identities and explicit capability denials without inventing a wire protocol", () => {
+    expect(parseProviderModels(["plain", { key: "local", model_info: { max_input_tokens: 48_000, max_output_tokens: 8_000, supports_vision: false, supports_function_calling: false } }, {
+      name: "models/gemini-test", displayName: "Gemini Test", supportedGenerationMethods: ["generateContent"], inputTokenLimit: 256_000, outputTokenLimit: 32_000
+    }])).toEqual([
+      { id: "plain", name: "plain" },
+      { id: "local", name: "local", contextWindow: 48_000, metadata: { maxOutputTokens: 8_000, supportsImages: false, supportsTools: false } },
+      { id: "gemini-test", name: "Gemini Test", contextWindow: 256_000, metadata: { maxOutputTokens: 32_000 } }
+    ]);
+    expect(parseProviderModels({ data: [{ id: "explicit", reasoning: { supportedEfforts: [], defaultEffort: null },
+      supports_fast_mode: false, native_api: "openai-responses", context_window: 64_000, max_context_window: 32_000 }] })[0])
+      .toEqual({ id: "explicit", name: "explicit", contextWindow: 64_000,
+        metadata: { efforts: [], defaultEffort: null, supportsFastMode: false, nativeApi: "openai-responses" } });
+    expect(parseProviderModels({ data: [{ id: "bad", max_output_tokens: 1e30, max_context_window: 0.5, reasoning: { supportedEfforts: ["unknown"] }, capabilities: { vision: "true" } }] }))
+      .toEqual([{ id: "bad", name: "bad" }]);
+  });
+
+  it("keeps exact source-specific chat discovery separate from media and declared non-chat models", () => {
+    const data = [{ id: "speech", architecture: { input_modalities: ["text"], output_modalities: ["speech"] } },
+      { id: "language", type: "language", max_tokens: 8_192, supported_parameters: ["tools", "reasoning"], reasoning_options: [{ type: "effort", values: ["low", "high"] }] },
+      { id: "picture", type: "image" }, { model_id: "tts", can_do_text_to_speech: true }, { id: "embedding", mode: "embedding" }];
+    expect(parseProviderModels({ data }, "https://openrouter.ai/api/v1/models").map(model => model.id)).not.toContain("speech");
+    const vercel = parseProviderModels({ data }, "https://ai-gateway.vercel.sh/v1/models");
+    expect(vercel.map(model => model.id)).not.toContain("picture");
+    expect(vercel.find(model => model.id === "language")).toMatchObject({ metadata: { maxOutputTokens: 8_192, supportsTools: true, efforts: ["low", "high"] } });
+    const custom = parseProviderModels({ data }, "https://relay.example/v1/models");
+    expect(custom.find(model => model.id === "language")?.metadata).not.toHaveProperty("maxOutputTokens");
+    expect(custom.map(model => model.id)).toContain("speech");
+    expect(custom.map(model => model.id)).not.toContain("tts");
+    expect(custom.map(model => model.id)).not.toContain("embedding");
+  });
+
   it("fails closed for unauthenticated remote endpoints and invalid payloads", async () => {
     await expect(fetchProviderModels({ baseUrl: "https://api.example.test/v1" }, vi.fn() as typeof fetch))
       .rejects.toMatchObject({ code: "unsafe_endpoint" });
