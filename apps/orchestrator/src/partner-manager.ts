@@ -489,6 +489,7 @@ export class PartnerManager {
       const title = `${profile.displayName}: ${input.title}`.slice(0, 200);
       const existing = this.#store.listSessionLinks(profile.id, 'routine').find(link => link.routineKey === input.key);
       let replaces: { readonly sessionId: string; readonly operationId: string } | undefined;
+      let releaseCreationReceipt = false;
       if (existing) {
         const stored = this.#operationalStore.findSession(existing.sessionId)?.descriptor;
         if (stored && stored.targetId === profile.homeTargetId && !stored.archived && stored.deletedAt === undefined) {
@@ -503,7 +504,11 @@ export class PartnerManager {
           assertOwner(); this.#store.advanceRoutineSessionProfile(stored.id, existing.profileVersion, profile.revision);
           return this.#operationalStore.getSession(stored.id).descriptor;
         }
-        if (!existing.routineOperationId || !this.#sessionHost.isPrivateSessionCreationClosed(existing.routineOperationId, existing.sessionId)) {
+        const retired = this.#operationalStore.findLatestSessionLifecycleCleanup(existing.sessionId);
+        const closed = stored !== undefined && stored.targetId === profile.homeTargetId && (stored.archived || stored.deletedAt !== undefined)
+          && retired?.state === 'completed' && retired.closeCompleted;
+        releaseCreationReceipt = existing.routineOperationId !== undefined && this.#sessionHost.isPrivateSessionCreationClosed(existing.routineOperationId, existing.sessionId);
+        if (!existing.routineOperationId || !closed && !releaseCreationReceipt) {
           throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The original routine task is unavailable or its creation is unknown.');
         }
         replaces = { sessionId: existing.sessionId, operationId: existing.routineOperationId };
@@ -520,7 +525,7 @@ export class PartnerManager {
         assertServiceScope: assertOwner, preparePrivateSession: async sessionId => {
           assertOwner(); this.#store.bindRoutineSession({ partnerId: profile.id, expectedRevision: profile.revision,
             profileVersion: profile.profileVersion, sessionId, key: input.key, operationId, ...(replaces ? { replaces } : {}) });
-          if (replaces) this.#sessionHost.releasePrivateSessionCreationReceipt(replaces.operationId, replaces.sessionId);
+          if (replaces && releaseCreationReceipt) this.#sessionHost.releasePrivateSessionCreationReceipt(replaces.operationId, replaces.sessionId);
         } });
       assertOwner(); return this.#operationalStore.getSession(result.value.sessionId).descriptor;
     });

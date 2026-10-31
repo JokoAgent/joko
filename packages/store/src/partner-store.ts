@@ -1019,7 +1019,8 @@ export class PartnerStore {
         const old = this.getSessionLink(input.replaces.sessionId);
         if (old?.role !== 'routine' || old.partnerId !== profile.id || old.routineKey !== key
           || old.routineOperationId !== input.replaces.operationId) throw changed(profile.id);
-        this.#database.prepare("DELETE FROM partner_session_links WHERE session_id = ? AND role = 'routine'").run(old.sessionId);
+        this.#database.prepare("UPDATE partner_session_links SET role = 'history', routine_key = NULL, routine_operation_id = NULL WHERE session_id = ? AND role = 'routine'")
+          .run(old.sessionId);
       }
       this.#database.prepare(`INSERT INTO partner_session_links(session_id,partner_id,role,profile_version,routine_key,routine_operation_id,created_at)
         VALUES (?,?,'routine',?,?,?,?)`).run(sessionId, profile.id, profile.profileVersion, key, entityId(input.operationId, 'Routine operation ID'), this.#now());

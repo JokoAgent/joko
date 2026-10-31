@@ -120,6 +120,19 @@ describe("Partner routine authority and independent execution", () => {
     expect(f.profiles.getSessionLink('routine-unknown-native')).toMatchObject({ role: 'routine', routineKey: input.key, partnerId: f.partner.id });
   });
 
+  it('keeps archived routine history and starts the next trigger only after the original native close is confirmed', async () => {
+    const f = await fixture();
+    const input = { partnerId: f.partner.id, key: 'routine:archived', title: 'Archived review', assertCurrent: () => undefined };
+    const original = await f.partners.ensureRoutineSession(input);
+    await f.partners.closeRoutineSession(original.id);
+    expect(f.store.findLatestSessionLifecycleCleanup(original.id)).toMatchObject({ state: 'completed', closeCompleted: true });
+    const next = await f.partners.ensureRoutineSession(input);
+    expect(next.id).not.toBe(original.id);
+    expect(f.store.getSession(original.id).descriptor.archived).toBe(true);
+    expect(f.profiles.getSessionLink(original.id)).toMatchObject({ role: 'history', partnerId: f.partner.id });
+    expect(f.profiles.getSessionLink(next.id)).toMatchObject({ role: 'routine', routineKey: input.key });
+  });
+
   it("settles the exact routine after its own native runtime activation renews the Queue attempt", async () => {
     const f = await fixture();
     const saved = await f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision,

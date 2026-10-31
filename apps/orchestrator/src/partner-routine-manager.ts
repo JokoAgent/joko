@@ -267,7 +267,7 @@ export class PartnerRoutineManager {
     }
     const key = `routine:${routine.id}${routine.sessionMode === 'fresh' ? `:${run.id}` : ''}`;
     const previous = this.options.partners.listSessions(partner.id).find(row => row.link.role === 'routine' && row.link.routineKey === key)?.session;
-    if (previous && (this.options.store.listRuns({ sessionId: previous.id, activeOnly: true }).length > 0
+    if (previous && !previous.archived && previous.deletedAt === undefined && (this.options.store.listRuns({ sessionId: previous.id, activeOnly: true }).length > 0
       || this.options.store.getQueueControl(previous.id).paused)) return { deferred: true };
     session = await this.options.partners.ensureRoutineSession({ partnerId: partner.id, key, title: routine.name,
       modelOverride: routine.modelOverride, assertCurrent });
