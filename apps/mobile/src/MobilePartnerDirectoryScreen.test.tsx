@@ -330,8 +330,10 @@ it("opens a home group selection once after refreshing its source and rejects a 
   const entry: MobileHomePartnerEntry = { kind: "group", sourceKey: f.sources()[1]!.key, id: "shared-group" };
   await render(transport("directory-0"), undefined, undefined, undefined, undefined, undefined, undefined, undefined,
     { ...f.props(), initialHomeEntry: entry, onHomeEntryConsumed: consumed });
-  await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("Second conversation body")); });
+  await vi.waitFor(async () => { await act(async () => {}); expect(container.textContent).toContain("Second conversation body"); });
   expect(f.open).toHaveBeenCalledOnce(); expect(consumed).toHaveBeenCalledOnce();
+  expect(f.apis[1]!.get).toHaveBeenCalledWith("shared-group", undefined, expect.any(AbortSignal));
+  expect(f.apis[0]!.get).not.toHaveBeenCalled();
   expect(f.open).toHaveBeenCalledWith(expect.objectContaining({ key: entry.sourceKey }), "shared-group", expect.any(AbortSignal));
   await act(async () => native.back?.());
   await render(transport("directory-1"), undefined, undefined, undefined, undefined, undefined, undefined, undefined,

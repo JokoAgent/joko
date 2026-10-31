@@ -211,7 +211,8 @@ beforeAll(async () => {
     learningProfileProps = props;
     return props.visible ? createElement("output", { "data-testid": "learning-settings" }, props.initialLearningDestination ?? "profile") : null;
   } }));
-  vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
+  vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagQuickChoices: () => null,
+    MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
   vi.doMock("./MobilePartnerAvatar", () => ({ MobilePartnerAvatar: () => null, MobilePartnerAvatarProvider: surface }));
   vi.doMock("./MobilePartnerConversationRow", () => ({ MobilePartnerConversationRow: surface }));
   vi.doMock("./MobileKeyboardAvoidingView", () => ({ MobileKeyboardAvoidingView: surface,

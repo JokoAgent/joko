@@ -35,7 +35,7 @@ describe("CredentialManager", () => {
       const ticket = credentials.createUploadTicket({ kind: "api_key" }); credentials.upload(ticket.credentialUploadTicketId, "first-account-key");
       await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "balance-key", displayName: "Key", kind: "api_key" });
       const entry = { backendId: "pi", credentialOrigin: "https://api.deepseek.com", provider: { id: "deepseek", baseUrl: "https://api.deepseek.com/v1", api: "openai-completions" as const,
-        apiKeyEnv: "DEEPSEEK_KEY", models: [] }, credentialBindings: { DEEPSEEK_KEY: "balance-key" }, enabled: true, displayName: "DeepSeek", kind: "api_key" as const, supportsLogin: false, supportsLogout: true, supportsRefresh: false };
+        apiKeyEnv: "DEEPSEEK_KEY", models: [{ id: "balance-fixture", defaultVisible: false }] }, credentialBindings: { DEEPSEEK_KEY: "balance-key" }, enabled: true, displayName: "DeepSeek", kind: "api_key" as const, supportsLogin: false, supportsLogout: true, supportsRefresh: false };
       await providers.upsert(entry);
       const resolve = vi.spyOn(credentials, "resolve"), first = providers.describeAccountBalance("pi", "deepseek")!;
       const originalRevision = providers.get("pi", "deepseek").accountBalanceRevision;

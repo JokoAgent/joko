@@ -4931,12 +4931,12 @@ function SessionActionsMenu({ session, t, onStartRename, taskTags, onToggleTaskT
         <button type="button" role="menuitem" onClick={() => { close(false); onStartRename(); }}>{t("session.rename")}</button>
         {taskTags.length > 0 && <>
           <div className="menu-separator" role="separator" />
-          {taskTags.slice(0, 7).map((tag) => {
+          <div className="task-tag-menu-swatches" role="group" aria-label={t("taskTags.title")}>{taskTags.slice(0, 7).map((tag) => {
             const attached = session.taskTags?.some((candidate) => candidate.id === tag.id) === true;
-            return <button key={tag.id} type="button" role="menuitemcheckbox" aria-checked={attached} className="task-tag-menu-item" onClick={() => run((selected) => onToggleTaskTag(selected, tag.id, !attached))}>
-              <TaskTagDot tag={tag} t={t} /><span>{taskTagDisplayName(tag, t)}</span>{attached && <Check aria-hidden="true" />}
+            return <button key={tag.id} type="button" role="menuitemcheckbox" aria-checked={attached} aria-label={taskTagDisplayName(tag, t)} title={taskTagDisplayName(tag, t)} className="task-tag-menu-swatch" onClick={() => run((selected) => onToggleTaskTag(selected, tag.id, !attached))}>
+              <TaskTagDot tag={tag} t={t} />{attached && <Check aria-hidden="true" />}
             </button>;
-          })}
+          })}</div>
         </>}
         <button type="button" role="menuitem" onClick={() => run(onManageTaskTags)}><Tags aria-hidden="true" />{t("taskTags.manage")}</button>
         {!session.archived && session.remoteWorkspace === undefined && <button

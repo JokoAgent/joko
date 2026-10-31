@@ -9,9 +9,11 @@ export interface MobileTaskTagNativeForm {
 }
 export interface MobileTaskTagsNativeProps {
   readonly visible: boolean; readonly busy: boolean; readonly error: string;
+  readonly adding: boolean; readonly onAdd: () => void; readonly onMove: (from: number, to: number) => void;
+  readonly revision: bigint;
   readonly colors: MobileTaskTagColors; readonly locale: MobileSupportedLocale; readonly subtitle?: string;
   readonly items: readonly { readonly id: string; readonly name: string; readonly color: string; readonly attached: boolean;
-    readonly onToggle: () => void; readonly onEdit: () => void; readonly onUp?: () => void; readonly onDown?: () => void }[];
+    readonly onToggle: () => void; readonly onEdit: () => void }[];
   readonly palette: readonly { readonly value: TaskTagColor; readonly name: string; readonly hex: string }[];
   readonly create: MobileTaskTagNativeForm; readonly edit?: MobileTaskTagNativeForm;
   readonly onDelete: () => void; readonly onBack: () => void; readonly onClose: () => void;

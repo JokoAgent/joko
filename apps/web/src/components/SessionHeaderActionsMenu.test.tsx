@@ -31,6 +31,22 @@ afterEach(async () => {
 });
 
 describe("SessionHeaderActionsMenu", () => {
+  it("keeps internal menu scrolling interactive and closes for scrolling outside or resizing", async () => {
+    const container = await renderMenu(callbackProps()), details = container.querySelector("details")!;
+    const open = async () => act(async () => { details.open = true; details.dispatchEvent(new Event("toggle")); });
+    await open();
+    await act(async () => { container.querySelector(".session-header-menu__popover")!.dispatchEvent(new Event("scroll")); });
+    expect(details.open).toBe(true);
+    await click(button(container, "session.rename"));
+    expect(details.open).toBe(false);
+    await open();
+    const outside = document.createElement("div"); document.body.append(outside);
+    await act(async () => { outside.dispatchEvent(new Event("scroll")); });
+    expect(details.open).toBe(false);
+    await open(); await act(async () => { window.dispatchEvent(new Event("resize")); });
+    expect(details.open).toBe(false);
+  });
+
   it("opens every retained Side Chat, including children beyond the old display limits", async () => {
     const children = Array.from({ length: 61 }, (_, index) => ({ ...session, id: `aside-${index}`, name: `Aside ${index}` }));
     const onSelectSideChat = vi.fn();
