@@ -119,6 +119,7 @@ message ProviderDescriptor {
   ProviderAccountUsageSnapshot account_usage = 20;
   optional string access_product = 21;
   repeated ProviderCredentialSurface credential_surfaces = 22;
+  optional string account_balance_revision = 23;
 }
 
 message RateLimitState {
