@@ -33,7 +33,7 @@ it('reads only the expanded original account and retires a late result when coll
   const f = fixture(), { container } = await mount(f);
   expect(f.quota).not.toHaveBeenCalled();
   await act(async () => button(container, 'accountQuota').click());
-  expect(f.quota).toHaveBeenCalledExactlyOnceWith({ key: f.key, expectedRevision: 1n, memberKey: 'member' }, expect.any(AbortSignal));
+  expect(f.quota).toHaveBeenCalledExactlyOnceWith({ key: create(contract.ProviderGroupKeySchema, f.key), expectedRevision: 1n, memberKey: 'member' }, expect.any(AbortSignal));
   expect(container.querySelector('[role="region"]')?.textContent).toContain('remaining');
   expect(container.querySelector('[role="region"]')?.textContent).toContain('7.5000');
   await act(async () => button(container, 'accountQuota').click());

@@ -1,6 +1,7 @@
 import { useEffect, useId, useState } from "react";
 import type { ProviderAccountUsageSnapshot, ProviderAccountUsageWindow, ProviderGroupMember, GetProviderGroupMemberAccountUsageResponse } from "@joko/contracts";
-import { ProviderGroupMemberKind } from "@joko/contracts";
+import { ProviderGroupKeySchema, ProviderGroupMemberKind } from "@joko/contracts";
+import { create } from "@bufbuild/protobuf";
 import type { ProviderGroupSettingsApi } from "../provider-group-settings.js";
 import type { ProviderGroupSettingsTranslator } from "./ProviderGroupSettings.js";
 import { Button, Spinner } from "./ui.js";
@@ -26,7 +27,7 @@ function MemberQuotaRead({ api, group, revision, memberKey, t }: { readonly api:
     const abort = new AbortController(); let live = true;
     setResult(undefined); setFailed(false);
     const timer = setTimeout(() => { if (live) { setFailed(true); abort.abort(); } }, 8_000);
-    void api.getProviderGroupMemberAccountUsage({ key: group, expectedRevision: revision, memberKey }, abort.signal)
+    void api.getProviderGroupMemberAccountUsage({ key: create(ProviderGroupKeySchema, group), expectedRevision: revision, memberKey }, abort.signal)
       .then(value => { if (live && !abort.signal.aborted) setResult(value); })
       .catch(() => { if (live && !abort.signal.aborted) setFailed(true); })
       .finally(() => clearTimeout(timer));

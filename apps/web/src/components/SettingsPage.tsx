@@ -3458,7 +3458,6 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
     if (initialView !== undefined) return initialView;
     return first === undefined ? "" : `provider:${first.id}`;
   });
-  const [compactProviderView, setCompactProviderView] = useState(() => settingsViewportIsCompact());
   const [mobileDetailOpen, setMobileDetailOpen] = useState(() => settingsViewportIsCompact() && initialView !== undefined);
   const [refreshingProviderKey, setRefreshingProviderKey] = useState<string>();
   const [modelRefreshFeedback, setModelRefreshFeedback] = useState<{
@@ -3508,13 +3507,6 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
     ? selectedItem
     : orderedProviders[0] === undefined ? "" : `provider:${orderedProviders[0].id}`;
   useEffect(() => {
-    if (typeof window.matchMedia !== "function") return;
-    const media = window.matchMedia("(max-width: 720px)");
-    const sync = (): void => setCompactProviderView(media.matches);
-    media.addEventListener("change", sync);
-    return () => media.removeEventListener("change", sync);
-  }, []);
-  useEffect(() => {
     if (effectiveSelectedItem !== selectedItem) setSelectedItem(effectiveSelectedItem);
   }, [effectiveSelectedItem, selectedItem]);
   useEffect(() => {
@@ -3528,7 +3520,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
       ? value.slice("provider:".length)
       : undefined);
     setSelectedItem(value);
-    if (compactProviderView) setMobileDetailOpen(true);
+    setMobileDetailOpen(true);
     const hash = value === "credentials" ? "#/settings/providers/credentials" : "#/settings/providers";
     if (window.location.hash !== hash) window.history.replaceState(null, "", hash);
   };

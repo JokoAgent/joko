@@ -1,6 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
-import { OperationState, SessionState } from "@joko/contracts";
+import { OperationState, ProviderGroupKeySchema, SessionState } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
@@ -20,6 +20,7 @@ async function fixture(read?: () => Promise<unknown>, loseFirstSubmit = false) {
     let value: unknown;
     if (method.localName === "getSnapshot") value = { snapshot: { generation: 1n, sessions: [session] } };
     else if (method.localName === "getTaskProviderGroupRebalance") value = read ? await read() : { suggestion };
+    else if (method.localName === "getProviderGroupMemberAccountUsage") value = read ? await read() : { memberKey: "from", revision: 5n, state: "unsupported" };
     else if (method.localName === "submitOperation") {
       if (++submissions === 1 && loseFirstSubmit) throw new ConnectError("Original admission response was lost", Code.Unavailable);
       value = { operation: { operationId: input.operationId, connectionId: input.connectionId, state: OperationState.SUCCEEDED, mutation: input.mutation } };
@@ -43,6 +44,21 @@ it("reads the exact native generation and carries only its fixed choice on the o
     expect(sends).toHaveLength(1); expect(sends[0]!.input.mutation).toMatchObject({ preconditions: [{ entity: { id: "original-task" }, expectedGeneration: 3n }],
       payload: { case: "sendInput", value: { sessionId: "original-task", providerGroupRebalance: { suggestionKey: key, remember: true } } } });
     expect(sends[0]!.input.mutation.payload.value.input).not.toHaveProperty("providerGroupRebalance");
+  } finally { f.gateway.disconnect(); }
+});
+
+it("forwards expanded account quota through the authenticated group facade and retires its connection", async () => {
+  let finish!: (value: unknown) => void;
+  const f = await fixture(() => new Promise(resolve => { finish = resolve; }));
+  try {
+    const api = f.gateway.providerGroupSettingsApi();
+    const query = { key: create(ProviderGroupKeySchema, { backendId: "native", providerId: "account" }), memberKey: "from", expectedRevision: 5n };
+    const pending = api.getProviderGroupMemberAccountUsage(query), rejected = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    expect(f.calls.filter(call => call.method === "getProviderGroupMemberAccountUsage")).toMatchObject([{ input: query }]);
+    f.gateway.disconnect();
+    finish({ memberKey: "from", revision: 5n, state: "unsupported" });
+    await rejected;
   } finally { f.gateway.disconnect(); }
 });
 

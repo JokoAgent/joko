@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { SessionContextBudgetViewSchema, type SessionContextBudgetView } from "@joko/contracts";
+import { RevisionSchema, SessionContextBudgetViewSchema, type SessionContextBudgetView } from "@joko/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import type { SessionView } from "../model.js";
@@ -17,7 +17,7 @@ function fixture() {
     defaultWindowTokens: 1_000_000n, maximumWindowTokens: 1_000_000n, effectiveWindowTokens: 1_000_000n, sourceRevision: "catalog-one", revision: { value: 1n } });
   const read = vi.fn(async (_sessionId: string, _generation: bigint, _signal?: AbortSignal): Promise<SessionContextBudgetView> => view);
   const save = vi.fn(async (_original: SessionContextBudgetView, tokens: number | undefined) => { view = create(SessionContextBudgetViewSchema, { ...view, budgetTokens: tokens === undefined ? undefined : BigInt(tokens),
-    effectiveWindowTokens: BigInt(tokens ?? 1_000_000), revision: { value: (view.revision?.value ?? 0n) + 1n } }); });
+    effectiveWindowTokens: BigInt(tokens ?? 1_000_000), revision: create(RevisionSchema, { value: (view.revision?.value ?? 0n) + 1n }) }); });
   const controller = { getSessionContextBudget: read, setSessionContextBudget: save } as unknown as AppController;
   const session = { id: "one", generation: 1n, backendId: "pi", model: { providerId: "provider", modelId: "model" }, context: { usedTokens: 600_000, contextWindow: 1_000_000 } } as SessionView;
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host); roots.push(root);

@@ -33,6 +33,8 @@ export interface PiManagedModel {
   readonly input?: readonly ("text" | "image")[];
   readonly contextWindow?: number;
   readonly maxTokens?: number;
+  readonly contextWindowSource?: "declared" | "estimated";
+  readonly maxOutputTokensSource?: "declared" | "estimated";
   readonly cost?: {
     readonly input: number;
     readonly output: number;
@@ -522,7 +524,9 @@ function validateProvider(provider: PiManagedProvider): void {
       || model.displayThinkingLevels !== undefined && (!Array.isArray(model.displayThinkingLevels) || model.displayThinkingLevels.length > 16
         || model.displayThinkingLevels.some(level => typeof level !== "string" || level.length === 0 || level.length > 128))
       || model.declaredOutputModalities !== undefined && (!Array.isArray(model.declaredOutputModalities) || model.declaredOutputModalities.length > 16
-        || model.declaredOutputModalities.some(value => typeof value !== "string" || value.length === 0 || value.length > 128))) {
+        || model.declaredOutputModalities.some(value => typeof value !== "string" || value.length === 0 || value.length > 128))
+      || model.contextWindowSource !== undefined && !["declared", "estimated"].includes(model.contextWindowSource)
+      || model.maxOutputTokensSource !== undefined && !["declared", "estimated"].includes(model.maxOutputTokensSource)) {
       throw piError("PI_MODEL_INVALID_METADATA", `Model '${provider.id}/${model.id}' has invalid declared metadata`, "provision");
     }
     if (ids.has(model.id)) throw piError("PI_MODEL_DUPLICATE", `Duplicate model '${provider.id}/${model.id}'`, "provision");
@@ -600,8 +604,8 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
     ...(model.supportsFastMode === undefined ? {} : { declaredSupportsFastMode: model.supportsFastMode }),
     contextWindow,
     maxOutputTokens: piModelOutputTokenLimit(model.maxTokens, contextWindow),
-    ...(model.contextWindow === undefined ? {} : { contextWindowSource: "declared" as const }),
-    ...(model.maxTokens === undefined ? {} : { maxOutputTokensSource: "declared" as const }),
+    ...(model.contextWindow === undefined ? {} : { contextWindowSource: model.contextWindowSource ?? "declared" as const }),
+    ...(model.maxTokens === undefined ? {} : { maxOutputTokensSource: model.maxOutputTokensSource ?? "declared" as const }),
     supportsImages: model.input?.includes("image") ?? false,
     ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools }),
     defaultVisible: model.defaultVisible ?? true,
@@ -631,6 +635,8 @@ function managedPiModelConfiguration(model: PiManagedModel): Record<string, unkn
     displayThinkingLevels: _displayThinkingLevels,
     referenceApi: _referenceApi,
     declaredOutputModalities: _declaredOutputModalities,
+    contextWindowSource: _contextWindowSource,
+    maxOutputTokensSource: _maxOutputTokensSource,
     ...piModel
   } = model;
   const contextWindow = model.contextWindow ?? 128_000;

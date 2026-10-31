@@ -15,7 +15,7 @@ afterEach(async () => { for (const root of roots.splice(0)) await act(async () =
 function fixture() {
   const read = vi.fn(async (_backend: string, _provider: string, _force: boolean, _signal?: AbortSignal): Promise<ProviderAccountBalanceResult> => create(ProviderAccountBalanceResultSchema, { status: "ready", snapshot: { case: "deepseek", value: { isAvailable: true, balances: [{ currency: "CNY", totalBalance: "2.123456789", grantedBalance: "0", toppedUpBalance: "2.123456789" }] } } }));
   const controller = { state: { effectiveLocale: "en" }, readProviderAccountBalance: read } as unknown as AppController;
-  const runtime = { backendId: "pi", id: "deepseek", capabilities: new Set(["provider.account_balance"]), accountBalanceRevision: "original" } as ProviderRuntimeView;
+  const runtime = { backendId: "pi", id: "deepseek", capabilities: new Set(["provider.account_balance"]), accountBalanceRevision: "original" } as unknown as ProviderRuntimeView;
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
   const render = async (value = runtime) => { await act(async () => root.render(<ProviderAccountBalance controller={controller} runtime={value} t={t} />)); };
   const click = async (label: string) => { const button = [...container.querySelectorAll("button")].find(button => button.textContent === label); if (!button) throw new Error(label); await act(async () => button.click()); };

@@ -2,6 +2,21 @@ export interface DiscoveredProviderModel {
   readonly id: string;
   readonly name: string;
   readonly contextWindow?: number;
+  readonly metadata?: DiscoveredProviderModelMetadata;
+}
+
+export interface DiscoveredProviderModelMetadata {
+  readonly contextWindowMax?: number;
+  readonly maxOutputTokens?: number;
+  readonly description?: string;
+  readonly nativeApi?: "anthropic-messages" | "openai-responses" | "openai-completions" | "google-generative-ai";
+  readonly inputModalities?: readonly string[];
+  readonly outputModalities?: readonly string[];
+  readonly efforts?: readonly string[];
+  readonly defaultEffort?: string | null;
+  readonly supportsImages?: boolean;
+  readonly supportsTools?: boolean;
+  readonly supportsFastMode?: boolean;
 }
 
 export interface ProviderModelDiscoverySpec {
@@ -39,9 +54,9 @@ export function deriveProviderModelsUrl(baseUrl: string): string {
   return url.toString();
 }
 
-export function parseProviderModels(value: unknown): readonly DiscoveredProviderModel[] {
-  if (!isRecord(value)) return [];
-  const list = Array.isArray(value["data"])
+export function parseProviderModels(value: unknown, sourceUrl?: string): readonly DiscoveredProviderModel[] {
+  if (!Array.isArray(value) && !isRecord(value)) return [];
+  const list = Array.isArray(value) ? value : Array.isArray(value["data"])
     ? value["data"]
     : Array.isArray(value["models"])
       ? value["models"]
@@ -51,16 +66,31 @@ export function parseProviderModels(value: unknown): readonly DiscoveredProvider
   const seen = new Set<string>();
   for (const item of list) {
     const record = isRecord(item) ? item : undefined;
+    const google = typeof record?.["name"] === "string" && record["name"].startsWith("models/")
+      && Array.isArray(record["supportedGenerationMethods"]) && record["supportedGenerationMethods"].includes("generateContent") ? record : undefined;
     const id = typeof item === "string"
       ? item
       : typeof record?.["id"] === "string"
         ? record["id"]
         : typeof record?.["slug"] === "string"
           ? record["slug"]
-          : undefined;
+          : typeof record?.["key"] === "string" ? record["key"]
+            : typeof record?.["model_name"] === "string" ? record["model_name"]
+              : typeof record?.["model_id"] === "string" ? record["model_id"]
+                : google ? String(google["name"]).slice("models/".length) : undefined;
     if (!validIdentity(id) || seen.has(id)) continue;
     seen.add(id);
-    const name = typeof record?.["display_name"] === "string" && validLabel(record["display_name"])
+    const info = isRecord(record?.["model_info"]) ? record["model_info"] : {};
+    const vercel = officialModelsEndpoint(sourceUrl, "https://ai-gateway.vercel.sh/v1/models");
+    const mode = record?.["mode"] ?? info["mode"];
+    // Importing a media/embedding model as a chat route would make it appear usable in the task picker.
+    if (typeof mode === "string" && mode !== "chat" || vercel && record?.["type"] !== undefined && record["type"] !== "language"
+      || record?.["model_id"] === id && typeof record["can_do_text_to_speech"] === "boolean") continue;
+    const architecture = isRecord(record?.["architecture"]) ? record["architecture"] : {};
+    if (officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")
+      && Array.isArray(architecture["output_modalities"]) && architecture["output_modalities"].includes("speech")) continue;
+    const name = typeof google?.["displayName"] === "string" && validLabel(google["displayName"]) ? google["displayName"]
+      : typeof record?.["display_name"] === "string" && validLabel(record["display_name"])
       ? record["display_name"]
       : typeof record?.["name"] === "string" && validLabel(record["name"])
         ? record["name"]
@@ -69,17 +99,74 @@ export function parseProviderModels(value: unknown): readonly DiscoveredProvider
       ? undefined
       : [
         record["context_length"],
+        record["contextWindow"],
         record["context_window"],
         record["max_context_length"],
-        record["max_input_tokens"]
+        record["max_input_tokens"],
+        google?.["inputTokenLimit"],
+        info["max_input_tokens"]
       ].find(validPositiveInteger);
+    const metadata = discoveredMetadata(record ?? {}, info, architecture, google, vercel, typeof rawWindow === "number" ? Math.floor(rawWindow) : undefined);
     result.push({
       id,
       name,
-      ...(typeof rawWindow === "number" ? { contextWindow: Math.floor(rawWindow) } : {})
+      ...(typeof rawWindow === "number" ? { contextWindow: Math.floor(rawWindow) } : {}),
+      ...(Object.keys(metadata).length ? { metadata } : {})
     });
   }
   return result;
+}
+
+function discoveredMetadata(record: Readonly<Record<string, unknown>>, info: Readonly<Record<string, unknown>>,
+  architecture: Readonly<Record<string, unknown>>, google: Readonly<Record<string, unknown>> | undefined, vercel: boolean, workingWindow: number | undefined): DiscoveredProviderModelMetadata {
+  const result: Record<string, unknown> = {};
+  const capabilities = isRecord(record["capabilities"]) ? record["capabilities"] : {};
+  const reasoning = isRecord(record["reasoning"]) ? record["reasoning"] : {};
+  const modalities = isRecord(record["modalities"]) ? record["modalities"] : {};
+  const input = stringList(modalities["input"] ?? architecture["input_modalities"] ?? record["input_modalities"]);
+  const output = stringList(modalities["output"] ?? architecture["output_modalities"]);
+  if (input) result["inputModalities"] = input;
+  if (output) result["outputModalities"] = output;
+  const maximum = record["max_context_window"] ?? record["contextWindowMax"];
+  if (validPositiveInteger(maximum) && (workingWindow === undefined || maximum >= workingWindow)) result["contextWindowMax"] = Math.floor(maximum);
+  const top = isRecord(record["top_provider"]) ? record["top_provider"] : {};
+  const limit = record["max_output_tokens"] ?? info["max_output_tokens"] ?? google?.["outputTokenLimit"]
+    ?? record["maxOutputTokens"] ?? (vercel ? record["max_tokens"] : undefined) ?? top["max_completion_tokens"];
+  if (validPositiveInteger(limit)) result["maxOutputTokens"] = Math.floor(limit);
+  if (typeof record["description"] === "string" && validLabel(record["description"])) result["description"] = record["description"];
+  const api = record["nativeApi"] ?? record["native_api"];
+  if (typeof api === "string" && ["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"].includes(api)) result["nativeApi"] = api;
+  const declaredLevels = (value: unknown, key: string) => Array.isArray(value) ? value.map(row => isRecord(row) ? row[key] : row).filter(level => level !== "none") : undefined;
+  const parameters = Array.isArray(record["supported_parameters"]) ? record["supported_parameters"] : undefined;
+  const options = Array.isArray(record["reasoning_options"]) ? record["reasoning_options"] : [];
+  const rawLevels = reasoning["supportedEfforts"] ?? declaredLevels(reasoning["supported_efforts"], "effort") ?? record["supported_efforts"]
+    ?? declaredLevels(record["supported_reasoning_levels"], "effort")
+    ?? (record["supportsReasoningEffort"] === false ? [] : declaredLevels(record["reasoningEfforts"], "value"))
+    ?? (vercel ? options.find(row => isRecord(row) && row["type"] === "effort")?.["values"] : undefined)
+    ?? (record["reasoning"] === false || info["supports_reasoning"] === false
+      || parameters && !parameters.some(value => ["reasoning", "reasoning_effort", "reasoning_budget", "thinking"].includes(String(value))) ? [] : undefined);
+  if (Array.isArray(rawLevels) && rawLevels.every(level => typeof level === "string" && EFFORTS.includes(level))) result["efforts"] = [...new Set(rawLevels)];
+  const defaultEffort = [reasoning["defaultEffort"], reasoning["default_effort"], record["default_effort"], record["default_reasoning_level"], record["reasoningEffort"]]
+    .find(value => value !== undefined);
+  if (defaultEffort === null || defaultEffort === "none") result["defaultEffort"] = null;
+  else if (typeof defaultEffort === "string" && EFFORTS.includes(defaultEffort)) result["defaultEffort"] = defaultEffort;
+  const tiers = record["service_tiers"], additional = record["additional_speed_tiers"];
+  const validTiers = Array.isArray(tiers) && tiers.every(row => isRecord(row) && typeof row["id"] === "string");
+  const fast = record["supports_fast_mode"] ?? record["supportsServiceTier"]
+    ?? (validTiers ? tiers.some(row => ["fast", "priority"].includes(String(row["id"]))) : Array.isArray(additional) ? additional.includes("fast") : undefined);
+  const images = record["supports_image_input"] ?? info["supports_vision"] ?? capabilities["vision"] ?? (input ? input.includes("image") : undefined);
+  const tools = parameters ? parameters.includes("tools") : info["supports_function_calling"] ?? capabilities["trained_for_tool_use"];
+  for (const [key, value] of [["supportsImages", images], ["supportsTools", tools], ["supportsFastMode", fast]] as const) if (typeof value === "boolean") result[key] = value;
+  return result as DiscoveredProviderModelMetadata;
+}
+
+const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+function stringList(value: unknown): readonly string[] | undefined {
+  return Array.isArray(value) && value.length <= 16 && value.every(item => typeof item === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(item))
+    && new Set(value).size === value.length ? [...value] : undefined;
+}
+function officialModelsEndpoint(value: string | undefined, endpoint: string): boolean {
+  try { const url = new URL(value ?? ""), expected = new URL(endpoint); return url.origin === expected.origin && url.pathname.replace(/\/+$/u, "") === expected.pathname; } catch { return false; }
 }
 
 export async function fetchProviderModels(
@@ -95,10 +182,11 @@ export async function fetchProviderModels(
   if (!hasAuthentication(headers) && !isLoopback(baseUrl.hostname)) {
     throw new ProviderModelDiscoveryError("unsafe_endpoint");
   }
-  let response: Response;
+  let response: Response, sourceUrl: string;
   try {
     const endpoint = spec.modelsEndpoint === undefined ? new URL(deriveProviderModelsUrl(baseUrl.toString())) : new URL(spec.modelsEndpoint);
     if (endpoint.origin !== baseUrl.origin || endpoint.username !== "" || endpoint.password !== "" || endpoint.hash !== "" || endpoint.search !== "") throw new Error("Model catalog authority differs.");
+    sourceUrl = endpoint.toString();
     response = await fetchImpl(endpoint.toString(), {
       method: "GET",
       headers,
@@ -128,7 +216,7 @@ export async function fetchProviderModels(
   } catch {
     throw new ProviderModelDiscoveryError("invalid_response");
   }
-  const models = parseProviderModels(value);
+  const models = parseProviderModels(value, sourceUrl);
   if (models.length === 0) throw new ProviderModelDiscoveryError("invalid_response");
   return models;
 }

@@ -22,6 +22,16 @@ describe("managed Pi catalog", () => {
     const native = JSON.parse(await readFile(join(home, "models.json"), "utf8")).providers.gateway.models[0];
     for (const key of ["description", "defaultEffort", "displayThinkingLevels", "referenceApi", "declaredOutputModalities", "supportsFastMode"]) expect(native[key]).toBeUndefined();
   });
+  it("keeps estimated limits labeled in the public catalog while passing only numeric limits to Pi", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-estimated-limits-"));
+    const result = await provisionManagedCatalog(home, [{ id: "local", models: [{ id: "capacity-only", contextWindow: 64_000,
+      maxTokens: 16_384, contextWindowSource: "estimated", maxOutputTokensSource: "estimated" }] }]);
+    expect(result.models[0]).toMatchObject({ contextWindow: 64_000, maxOutputTokens: 16_384, contextWindowSource: "estimated", maxOutputTokensSource: "estimated" });
+    const model = JSON.parse(await readFile(join(home, "models.json"), "utf8")).providers.local.models[0];
+    expect(model).toMatchObject({ contextWindow: 64_000, maxTokens: 16_384 });
+    expect(model).not.toHaveProperty("contextWindowSource"); expect(model).not.toHaveProperty("maxOutputTokensSource");
+  });
+
   it("writes a current object output schema and rejects non-object roots", async () => {
     const home = await mkdtemp(join(tmpdir(), "joko-pi-mcp-schema-"));
     const path = join(home, "mcp.json");
