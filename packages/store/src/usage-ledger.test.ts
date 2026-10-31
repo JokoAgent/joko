@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { captureModelPriceReference, modelPricesWithOverride } from "@joko/core";
 
 import { OperationalStore, StaleGenerationError, StoreError, UsageReportCapacityError, UsageReportQueryError } from "./index.js";
 
@@ -38,12 +39,13 @@ describe("durable usage ledger", () => {
       costRates: { outputMicrosPerMillion: 2_000_000 } }));
     expect(result).toMatchObject({ costMicros: 200, costComplete: false, estimated: true });
     fixture.reopen();
-    const report = fixture.store.getUsageReport({ ownerId: "owner-a", group: "model" });
+    const query = { ownerId: "owner-a", group: "model" as const, pageSize: 1 };
+    const report = fixture.store.getUsageReport(query);
     expect(report.totals[0]).toMatchObject({ costMicros: 200 });
     const duplicate = fixture.store.recordUsageObservation(observation({ inputTokens: 100, outputTokens: 100, totalTokens: 200,
       costRates: { inputMicrosPerMillion: 9_000_000, outputMicrosPerMillion: 9_000_000 } }));
     expect(duplicate.changed).toBe(false);
-    expect(fixture.store.getUsageReport({ ownerId: "owner-a", group: "model" }).totals).toEqual(report.totals);
+    expect(fixture.store.getUsageReport(query).totals).toEqual(report.totals);
   });
   it("pages historical route totals without repricing or borrowing the current task model", () => {
     const fixture = createFixture();
@@ -327,10 +329,7 @@ describe("durable usage ledger", () => {
       backendId: "backend-a",
       providerId: "provider-a",
       modelId: "model-a",
-      currencyCode: "CNY",
-      inputCostMicrosPerMillion: 7_500_000,
-      outputCostMicrosPerMillion: 21_000_000,
-      cacheReadCostMicrosPerMillion: 750_000,
+      values: { currencyCode: "CNY", input: 7.5, output: 21, cacheRead: 0.75, cacheWrite: null },
       updatedAt: 42
     });
     expect(saved).toMatchObject({
@@ -338,19 +337,17 @@ describe("durable usage ledger", () => {
       backendId: "backend-a",
       providerId: "provider-a",
       modelId: "model-a",
-      currencyCode: "CNY",
-      cacheReadCostMicrosPerMillion: 750_000,
+      values: { currencyCode: "CNY", cacheRead: 0.75, cacheWrite: null },
       updatedAt: 42
     });
-    expect(saved).not.toHaveProperty("cacheWriteCostMicrosPerMillion");
+    expect(saved.values.cacheWrite).toBeNull();
     fixture.store.upsertModelPriceOverride({
       ownerId: "owner-a",
       backendId: "backend-b",
       providerId: "provider-a",
       modelId: "model-a",
-      currencyCode: "USD",
-      inputCostMicrosPerMillion: 1_000_000,
-      outputCostMicrosPerMillion: 2_000_000,
+      values: { input: 1, cacheRead: null },
+      baseReference: captureModelPriceReference({ cost: { input: 2, output: 6, cacheRead: 0.2 } }, 43),
       updatedAt: 43
     });
     expect(fixture.store.findModelPriceOverride("owner-b", "backend-a", "provider-a", "model-a"))
@@ -362,9 +359,13 @@ describe("durable usage ledger", () => {
 
     fixture.reopen();
     expect(fixture.store.findModelPriceOverride("owner-a", "backend-a", "provider-a", "model-a"))
-      .toMatchObject({ currencyCode: "CNY", inputCostMicrosPerMillion: 7_500_000 });
+      .toMatchObject({ values: { currencyCode: "CNY", input: 7.5 } });
     expect(fixture.store.findModelPriceOverride("owner-a", "backend-b", "provider-a", "model-a"))
-      .toMatchObject({ currencyCode: "USD", inputCostMicrosPerMillion: 1_000_000 });
+      .toMatchObject({ values: { input: 1, cacheRead: null }, baseReference: { at: 43, model: { cost: { input: 2, output: 6 } } } });
+    const restored = fixture.store.findModelPriceOverride("owner-a", "backend-b", "provider-a", "model-a")!;
+    expect(restored.values.output).toBeUndefined();
+    expect(modelPricesWithOverride({ cost: { input: 4, output: 12, cacheRead: 0.4 } }, restored, { at: 44 })?.cost)
+      .toEqual({ input: 1, output: 12 });
     expect(fixture.store.deleteModelPriceOverride("owner-a", "backend-a", "provider-a", "model-a"))
       .toBe(true);
     expect(fixture.store.deleteModelPriceOverride("owner-a", "backend-a", "provider-a", "model-a"))

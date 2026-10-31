@@ -14,6 +14,8 @@ import type {
   InteractionId,
   InteractionPayload,
   NativeSessionCatalogEntry,
+  ModelPriceOverrideValues,
+  ModelPriceReferenceSnapshot,
   OperationId,
   PiEventMetadata,
   PromptInput,
@@ -2355,11 +2357,8 @@ export interface ModelPriceOverrideRecord {
   readonly backendId: string;
   readonly providerId: string;
   readonly modelId: string;
-  readonly currencyCode: ModelPriceCurrency;
-  readonly inputCostMicrosPerMillion: number;
-  readonly outputCostMicrosPerMillion: number;
-  readonly cacheReadCostMicrosPerMillion?: number;
-  readonly cacheWriteCostMicrosPerMillion?: number;
+  readonly values: ModelPriceOverrideValues;
+  readonly baseReference?: ModelPriceReferenceSnapshot;
   readonly updatedAt: UnixMillis;
   readonly revision: bigint;
 }
@@ -2369,11 +2368,8 @@ export interface UpsertModelPriceOverrideInput {
   readonly backendId: string;
   readonly providerId: string;
   readonly modelId: string;
-  readonly currencyCode: ModelPriceCurrency;
-  readonly inputCostMicrosPerMillion: number;
-  readonly outputCostMicrosPerMillion: number;
-  readonly cacheReadCostMicrosPerMillion?: number;
-  readonly cacheWriteCostMicrosPerMillion?: number;
+  readonly values: ModelPriceOverrideValues;
+  readonly baseReference?: ModelPriceReferenceSnapshot;
   readonly updatedAt?: UnixMillis;
 }
 

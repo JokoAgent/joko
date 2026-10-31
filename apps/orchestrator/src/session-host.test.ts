@@ -77,6 +77,8 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { ModelWorkingContextCoordinator } from "./model-working-context.js";
+import { SessionContextBudgetCoordinator } from "./session-context-budget.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import { ObjectiveManager } from "./objective-manager.js";
@@ -5088,16 +5090,16 @@ describe("SessionHost", () => {
     { name: "fast above the threshold", requestInput: 272_001, fastMode: true, costMicros: 14_900_080 },
     { name: "unobserved fast mode", requestInput: 272_000, fastMode: undefined, costMicros: 3_750_000 },
     { name: "unobserved request size", requestInput: 272_001, fastMode: true, omitPricingContext: true, costMicros: 3_750_020 },
-    { name: "owner price override", requestInput: 272_001, fastMode: true, override: true, costMicros: 546_002 },
+    { name: "owner Standard price override with context bands", requestInput: 272_001, fastMode: false, override: true, costMicros: 1_091_004 },
+    { name: "independent Fast price with a Standard override", requestInput: 272_001, fastMode: true, override: true, costMicros: 14_900_080 },
     { name: "reported cost", requestInput: 272_001, fastMode: true, reportedCost: true, costMicros: 500_000 }
   ])("prices $name from request observations without multiplying cumulative usage or duplicate events", async (testCase) => {
     const fixture = await createFixture(new TieredUsageFakeAdapter(testCase), {
       usageMoneyKind: () => "reference-value"
     });
     if (testCase.override) fixture.store.upsertModelPriceOverride({
-      ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text", currencyCode: "USD",
-      inputCostMicrosPerMillion: 1_000_000, outputCostMicrosPerMillion: 1_000_000,
-      cacheReadCostMicrosPerMillion: 1_000_000, cacheWriteCostMicrosPerMillion: 1_000_000
+      ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text",
+      values: { currencyCode: "USD", input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }
     });
     const sessionId = (await fixture.host.createSession({
       operationId: "create-tiered-usage", connection: fixture.connection, targetId: "target-one", title: "Tiered usage",
@@ -5122,14 +5124,20 @@ describe("SessionHost", () => {
 
   it.each([
     { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, costMicros: 890_000, complete: true },
+    { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, overrideCacheWrite: 10, costMicros: 916_000, complete: true },
     { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: true, cacheWrite1hTokens: 1_000, costMicros: 1_780_000, complete: true },
     { model: "google/gemini-3.8-flash", at: Date.UTC(2026, 11, 31, 23, 59, 59), fastMode: false, costMicros: 169_500, complete: false },
     { model: "google/gemini-3.8-flash", at: Date.UTC(2027, 0, 1), fastMode: false, costMicros: 339_000, complete: false }
   ])("records $model tariffs using request time $at and observed cache duration", async testCase => {
-    const { catalogModelReferencePricing } = await import("@joko/core");
+    const { catalogModelReferencePricing, captureModelPriceReference } = await import("@joko/core");
     const fixture = await createFixture(new TieredUsageFakeAdapter({ requestInput: 200_000, fastMode: testCase.fastMode,
       requestedAt: testCase.at, cacheWrite1hTokens: testCase.cacheWrite1hTokens, pricing: catalogModelReferencePricing(testCase.model) }),
     { usageMoneyKind: () => "reference-value" });
+    if (testCase.overrideCacheWrite !== undefined) fixture.store.upsertModelPriceOverride({
+      ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text",
+      values: { cacheWrite: testCase.overrideCacheWrite },
+      baseReference: captureModelPriceReference(fixture.store.getBackend(fixture.adapter.id).descriptor.models[0]!, testCase.at)
+    });
     const sessionId = (await fixture.host.createSession({ operationId: "create-tariff-usage", connection: fixture.connection,
       targetId: "target-one", title: "Tariff usage", providerId: "test", modelId: "text", fastMode: testCase.fastMode,
       permissionMode: "ask", planMode: false })).value.sessionId;
@@ -5268,9 +5276,7 @@ describe("SessionHost", () => {
       backendId: primary.id,
       providerId: "test",
       modelId: "text",
-      currencyCode: "CNY",
-      inputCostMicrosPerMillion: 10_000_000,
-      outputCostMicrosPerMillion: 20_000_000
+      values: { currencyCode: "CNY", input: 10, output: 20, cacheRead: null, cacheWrite: null }
     });
 
     const createAndRun = async (operation: string, targetId: string) => {
@@ -5997,6 +6003,37 @@ describe("SessionHost", () => {
       rpcEventType: "extension_command_completed",
       payload: { case: "diagnostic", value: { nativeEventType: "extension_command_completed" } }
     });
+  });
+
+  it("keeps task budgets independent, clamps them to model limits, and refreshes only the edited native task", async () => {
+    const profile = { ...PI_LIKE_PROFILE, models: PI_LIKE_PROFILE.models.map(model => ({ ...model, contextWindow: 1_000_000 })),
+      capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "model.working_context", supported: true }] };
+    const adapter = new FakeBackendAdapter(profile), refresh = vi.fn(async (_context: AdapterContext) => {}); Object.assign(adapter, { refreshModelWorkingContext: refresh });
+    let budgets: SessionContextBudgetCoordinator | undefined;
+    const f = await createFixture(adapter, { resolveModelWorkingContext: target => budgets?.resolve(target.sessionId!, target) ?? 1_000_000 });
+    const models = new ModelWorkingContextCoordinator({ store: f.store, currentOwner: () => ({ ownerId: "node", generation: 1 }),
+      resolveRoute: target => { const backend = f.store.getBackend(target.backendId), model = backend.descriptor.models.find(model => model.providerId === target.providerId && model.modelId === target.modelId);
+        return model ? { model, catalogRevision: backend.revision, instanceGeneration: backend.descriptor.instanceGeneration, supported: true, available: true } : undefined; },
+      refresh: async (targets, check) => { await f.host.refreshModelWorkingContexts(targets, check); } });
+    budgets = new SessionContextBudgetCoordinator(f.store, models, (sessionId, target, check) => f.host.refreshModelWorkingContexts([target], check, undefined, sessionId), () => false);
+    const create = async (id: string) => (await f.host.createSession({ operationId: id, connection: f.connection, targetId: "target-one", title: id, providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const one = await create("budget-one"), two = await create("budget-two"), generation = f.store.getSession(one).descriptor.binding.generation;
+    const before = budgets.read(one, generation); await budgets.set({ sessionId: one, generation, tokens: 500_000, expectedRevision: before.revision, expectedSourceRevision: before.sourceRevision }, () => {});
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sessionId: one }));
+    expect(refresh.mock.calls[0]![0].resolveModelWorkingContext?.({ providerId: "test", modelId: "text" })).toBe(500_000);
+    expect(budgets.read(two, f.store.getSession(two).descriptor.binding.generation)).toMatchObject({ effectiveWindowTokens: 1_000_000 });
+    const target = before.target!, modelView = await models.read({ target });
+    await models.set({ target, operationId: "model-limit", limit: 300_000, expectedRevision: modelView.revision, expectedSourceRevision: modelView.sourceRevision });
+    expect(budgets.read(one, generation)).toMatchObject({ budgetTokens: 500_000, effectiveWindowTokens: 300_000, modelLimitTokens: 300_000 });
+    expect(budgets.read(two, f.store.getSession(two).descriptor.binding.generation)).toMatchObject({ effectiveWindowTokens: 300_000 });
+    const stale = budgets.read(one, generation); const original = budgets;
+    budgets = new SessionContextBudgetCoordinator(f.store, models, original.refresh, () => false);
+    expect(budgets.read(one, generation).budgetTokens).toBe(500_000);
+    await budgets.set({ sessionId: one, generation, expectedRevision: stale.revision, expectedSourceRevision: stale.sourceRevision }, () => {});
+    expect(budgets.read(one, generation).budgetTokens).toBeUndefined();
+    expect(models.configuredLimit(target)).toBe(300_000);
+    await expect(budgets.set({ sessionId: one, generation, tokens: 1_000, expectedRevision: stale.revision, expectedSourceRevision: stale.sourceRevision }, () => {})).rejects.toMatchObject({ reason: "conflict" });
+    await expect(budgets.set({ sessionId: one, generation: generation + 1, tokens: 1_000, expectedRevision: 0n, expectedSourceRevision: "old" }, () => {})).rejects.toMatchObject({ reason: "conflict" });
   });
 
   it("refreshes working contexts only on exact idle active routes and never activates sleeping sessions", async () => {
@@ -16770,7 +16807,7 @@ async function createFixture(
     readonly sessionRuntimeRecoveryDelayMs?: (attempt: number) => number;
     readonly backendDispatchBlocked?: (backendId: string) => boolean;
     readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
-    readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined;
+    readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string; readonly sessionId?: string }) => number | undefined;
     readonly resolveMcpAppModelContext?: (sessionId: string) => Promise<import("./mcp-apps/host.js").McpAppModelContext>;
     readonly onBackendMayBeIdle?: (backendId: string) => void;
     readonly onServiceRunSettled?: (input: {

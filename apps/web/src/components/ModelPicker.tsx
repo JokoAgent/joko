@@ -976,35 +976,40 @@ function groupUsageText(route: { readonly backendId: string; readonly providerId
 }
 
 function PriceMark({ model, tier, t }: { readonly model: ModelView; readonly tier: 0 | 1 | 2 | 3; readonly t: Translator }): JSX.Element | null {
-  const pricingUnavailable = model.pricingSource === undefined
-    || model.pricingKnown === false
-    || model.inputCostMicrosPerMillion === undefined
-    || model.outputCostMicrosPerMillion === undefined
-    || model.inputCostMicrosPerMillion < 0
-    || model.outputCostMicrosPerMillion < 0;
-  if (model.providerAccessKind === "subscription"
+  const price = modelDisplayPrice(model);
+  const pricingUnavailable = model.priceOverride === undefined && (model.pricingSource === undefined || model.pricingKnown === false)
+    || price.input === undefined || price.output === undefined || price.input < 0 || price.output < 0;
+  if (model.priceOverride === undefined && model.providerAccessKind === "subscription"
     && (model.pricingSource === undefined || model.pricingSource === "providerReference")) {
     return <span className="model-picker__price is-subscription" title={t("modelPicker.subscription")}>{t("modelPicker.subscription")}</span>;
   }
   if (pricingUnavailable) return null;
   const title = t("modelPicker.priceTitle", {
-    input: model.inputCostMicrosPerMillion,
-    output: model.outputCostMicrosPerMillion,
-    currency: model.currencyCode
+    input: price.input,
+    output: price.output,
+    currency: price.currency
   });
   if (tier === 0) return <span className="model-picker__price is-free" title={title}>{t("modelPicker.free")}</span>;
-  return <span className={cx("model-picker__price", `is-tier-${tier}`)} title={title}>{currencySymbol(model.currencyCode).repeat(tier)}</span>;
+  return <span className={cx("model-picker__price", `is-tier-${tier}`)} title={title}>{currencySymbol(price.currency).repeat(tier)}</span>;
+}
+
+function modelDisplayPrice(model: ModelView): { readonly input?: number; readonly output?: number; readonly currency: string } {
+  const override = model.priceOverride;
+  return override === undefined ? { input: model.inputCostMicrosPerMillion, output: model.outputCostMicrosPerMillion, currency: model.currencyCode }
+    : { input: override.inputPerMillion === undefined ? undefined : override.inputPerMillion * 1_000_000,
+      output: override.outputPerMillion === undefined ? undefined : override.outputPerMillion * 1_000_000, currency: override.currency };
 }
 
 function priceTierMap(models: readonly ModelView[]): ReadonlyMap<string, 0 | 1 | 2 | 3> {
-  const totals = models.flatMap((model) => model.inputCostMicrosPerMillion === undefined || model.outputCostMicrosPerMillion === undefined ? [] : [{ key: modelKey(model), total: model.inputCostMicrosPerMillion + model.outputCostMicrosPerMillion }])
+  const quotes = models.map(model => ({ key: modelKey(model), ...modelDisplayPrice(model) }));
+  const totals = quotes.flatMap(price => price.input === undefined || price.output === undefined ? [] : [{ key: price.key, total: price.input + price.output }])
     .filter((item) => item.total > 0)
     .sort((left, right) => left.total - right.total);
   const result = new Map<string, 0 | 1 | 2 | 3>();
-  for (const model of models) {
-    if (model.inputCostMicrosPerMillion === undefined || model.outputCostMicrosPerMillion === undefined) continue;
-    const total = model.inputCostMicrosPerMillion + model.outputCostMicrosPerMillion;
-    if (total === 0) result.set(modelKey(model), 0);
+  for (const price of quotes) {
+    if (price.input === undefined || price.output === undefined) continue;
+    const total = price.input + price.output;
+    if (total === 0) result.set(price.key, 0);
   }
   totals.forEach((item, index) => result.set(item.key, Math.min(3, Math.floor(index * 3 / Math.max(1, totals.length)) + 1) as 1 | 2 | 3));
   return result;

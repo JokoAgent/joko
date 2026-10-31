@@ -14,7 +14,7 @@ import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { SessionRuntimeHandoffStore, type RuntimeHandoffSource } from "./session-runtime-handoff-store.js";
 import { TaskShareStore, taskShareQueueLockOwner, type TaskShareGuestProof } from "./task-share-store.js";
-import { validModelSubstitution } from "@joko/core";
+import { captureModelPriceReference, validateModelPriceOverrideValues, validModelSubstitution } from "@joko/core";
 import { SIDE_CHAT_HISTORY_BOUNDARY_KEY } from "./side-chat-history.js";
 import { parseCurrentRunUsageEventPayload, parseRunUsageSummary, runUsageSettingKey } from "./run-usage-shape.js";
 
@@ -18286,15 +18286,14 @@ export class OperationalStore {
     const backendId = usageIdentity(input.backendId, "model price Backend ID", 256, false);
     const providerId = usageIdentity(input.providerId, "model price Provider ID", 512, false);
     const modelId = usageIdentity(input.modelId, "model price model ID", 512, false);
-    const currencyCode = modelPriceCurrency(input.currencyCode);
-    const inputCost = safeUsageInteger(input.inputCostMicrosPerMillion, "model input price");
-    const outputCost = safeUsageInteger(input.outputCostMicrosPerMillion, "model output price");
-    const cacheReadCost = input.cacheReadCostMicrosPerMillion === undefined
-      ? undefined
-      : safeUsageInteger(input.cacheReadCostMicrosPerMillion, "model cache-read price");
-    const cacheWriteCost = input.cacheWriteCostMicrosPerMillion === undefined
-      ? undefined
-      : safeUsageInteger(input.cacheWriteCostMicrosPerMillion, "model cache-write price");
+    const values = validateModelPriceOverrideValues(input.values);
+    if (Object.keys(values).length === 0) throw new StoreError("A model price override needs a changed field.");
+    const valuesJson = serializeJson(values);
+    const baseReference = input.baseReference === undefined ? undefined
+      : captureModelPriceReference(input.baseReference.model, input.baseReference.at);
+    if (input.baseReference !== undefined && baseReference === undefined) throw new StoreError("Invalid model price reference snapshot.");
+    const baseReferenceJson = baseReference === undefined ? null : serializeJson(baseReference);
+    if (valuesJson.length > 4096 || (baseReferenceJson?.length ?? 0) > 262_144) throw new StoreError("Model price override exceeds the storage limit.");
     const updatedAt = safeUsageInteger(input.updatedAt ?? this.now(), "model price update time");
     return this.write(() => {
       const existing = this.findModelPriceOverride(ownerId, backendId, providerId, modelId);
@@ -18308,22 +18307,16 @@ export class OperationalStore {
       }
       this.database.prepare(`
         INSERT INTO model_price_overrides(
-          owner_id, backend_id, provider_id, model_id, currency_code,
-          input_cost_micros_per_million, output_cost_micros_per_million,
-          cache_read_cost_micros_per_million, cache_write_cost_micros_per_million,
+          owner_id, backend_id, provider_id, model_id, values_json, base_reference_json,
           updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(owner_id, backend_id, provider_id, model_id) DO UPDATE SET
-          currency_code = excluded.currency_code,
-          input_cost_micros_per_million = excluded.input_cost_micros_per_million,
-          output_cost_micros_per_million = excluded.output_cost_micros_per_million,
-          cache_read_cost_micros_per_million = excluded.cache_read_cost_micros_per_million,
-          cache_write_cost_micros_per_million = excluded.cache_write_cost_micros_per_million,
+          values_json = excluded.values_json,
+          base_reference_json = excluded.base_reference_json,
           updated_at = excluded.updated_at,
           revision = excluded.revision
       `).run(
-        ownerId, backendId, providerId, modelId, currencyCode, inputCost, outputCost,
-        cacheReadCost ?? null, cacheWriteCost ?? null, updatedAt,
+        ownerId, backendId, providerId, modelId, valuesJson, baseReferenceJson, updatedAt,
         asSqlInteger(this.requireActiveRevision())
       );
       return this.findModelPriceOverride(ownerId, backendId, providerId, modelId)!;
@@ -21706,11 +21699,10 @@ function modelPriceOverrideFromRow(row: Row): ModelPriceOverrideRecord {
     backendId: stringValue(row["backend_id"]),
     providerId: stringValue(row["provider_id"]),
     modelId: stringValue(row["model_id"]),
-    currencyCode: modelPriceCurrency(stringValue(row["currency_code"])),
-    inputCostMicrosPerMillion: numberValue(row["input_cost_micros_per_million"]),
-    outputCostMicrosPerMillion: numberValue(row["output_cost_micros_per_million"]),
-    ...optionalNumber("cacheReadCostMicrosPerMillion", row["cache_read_cost_micros_per_million"]),
-    ...optionalNumber("cacheWriteCostMicrosPerMillion", row["cache_write_cost_micros_per_million"]),
+    values: validateModelPriceOverrideValues(parseJson(stringValue(row["values_json"])) as ModelPriceOverrideRecord["values"]),
+    ...(row["base_reference_json"] === null ? {} : {
+      baseReference: parseJson(stringValue(row["base_reference_json"])) as ModelPriceOverrideRecord["baseReference"]
+    }),
     updatedAt: numberValue(row["updated_at"]),
     revision: toBigInt(row["revision"])
   };
@@ -23868,11 +23860,6 @@ function usageCurrency(value: string): string {
   const normalized = value.trim().toUpperCase();
   if (!/^[A-Z]{3,8}$/u.test(normalized)) throw new StoreError("Usage currency is invalid.");
   return normalized;
-}
-
-function modelPriceCurrency(value: string): "USD" | "CNY" {
-  if (value !== "USD" && value !== "CNY") throw new StoreError("Model price currency is invalid.");
-  return value;
 }
 
 const TASK_TAG_PRESETS = [

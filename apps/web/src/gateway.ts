@@ -1501,6 +1501,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.refresh();
   }
 
+  async readProviderAccountBalance(backendId: string, providerId: string, forceRefresh: boolean, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountBalanceResult> {
+    if (this.#taskSharing) throw new GatewayError("The task owner must read Provider account balances.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope(signal);
+    const provider = this.#snapshot?.providers.find(value => value.backendId === backendId && value.id === providerId);
+    const identity = provider?.accountBalanceRevision;
+    if (!provider?.capabilities.has("provider.account_balance")) throw new GatewayError("Provider account balances are unavailable.");
+    const response = await createClient(BackendService, scope.transport).getProviderAccountBalance({ backendId, providerId, forceRefresh }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (this.#transport !== scope.transport || this.#snapshot?.providers.find(value => value.backendId === backendId && value.id === providerId)?.accountBalanceRevision !== identity
+      || !response.result) throw new GatewayError("The original Provider changed.");
+    return response.result;
+  }
+
   async readTaskProviderGroupUsage(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<TaskProviderGroupUsageView | undefined> {
     if (this.#taskSharing) throw new GatewayError("The task owner must read Provider group usage.", { code: "ACCESS_DENIED" });
     const scope = this.captureActionScope(signal);
@@ -5849,13 +5862,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     signal?: AbortSignal
   ): Promise<ModelPriceOverrideView> {
     const model = checkedModelPriceTarget(backendId, providerId, modelId);
-    const client = createClient(BackendService, this.requireTransport());
+    const scope = this.captureActionScope(signal);
+    const client = createClient(BackendService, scope.transport);
     const response = await client.setModelPriceOverride(
       { ...model, desired: protoModelPriceQuote(desired) },
-      signal === undefined ? undefined : { signal }
+      { signal: scope.signal }
     );
     if (response.price === undefined) throw new GatewayError("Orchestrator returned an empty model price.");
-    return mapModelPriceOverride(response.price, model);
+    const price = mapModelPriceOverride(response.price, model);
+    await this.#refreshPromise?.catch(() => undefined);
+    scope.signal.throwIfAborted();
+    await this.refresh();
+    scope.signal.throwIfAborted();
+    return price;
   }
 
   async resetModelPriceOverride(
@@ -5865,13 +5884,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     signal?: AbortSignal
   ): Promise<ModelPriceOverrideView> {
     const model = checkedModelPriceTarget(backendId, providerId, modelId);
-    const client = createClient(BackendService, this.requireTransport());
+    const scope = this.captureActionScope(signal);
+    const client = createClient(BackendService, scope.transport);
     const response = await client.resetModelPriceOverride(
       model,
-      signal === undefined ? undefined : { signal }
+      { signal: scope.signal }
     );
     if (response.price === undefined) throw new GatewayError("Orchestrator returned an empty model price.");
-    return mapModelPriceOverride(response.price, model);
+    const price = mapModelPriceOverride(response.price, model);
+    await this.#refreshPromise?.catch(() => undefined);
+    scope.signal.throwIfAborted();
+    await this.refresh();
+    scope.signal.throwIfAborted();
+    return price;
   }
 
   async terminateRuntimeProcess(process: RuntimeProcessUsageView): Promise<void> {
@@ -7742,6 +7767,26 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const response = await createClient(BackendService, scope.transport).getModelWorkingContext({ target: workingContextRoute(target), relatedTargets: (target.relatedTargets ?? []).map(workingContextRoute) }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapModelWorkingContext(response.context, target);
+  }
+
+  async getSessionContextBudget(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").SessionContextBudgetView> {
+    if (this.#taskSharing) throw new GatewayError("The task owner must read its context budget.");
+    const scope = this.captureActionScope(signal);
+    const identity = () => { const session = this.#snapshot?.sessions.find(value => value.id === sessionId);
+      if (!session || session.generation !== generation) throw new GatewayError("The original task changed.");
+      return JSON.stringify([session.backendId, session.model?.providerId, session.model?.modelId]); };
+    const original = identity();
+    const response = await createClient(BackendService, scope.transport).getSessionContextBudget({ sessionId, generation }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.budget || response.budget.sessionId !== sessionId || response.budget.generation !== generation || original !== identity()) throw new GatewayError("The original task context changed.");
+    return response.budget;
+  }
+  async setSessionContextBudget(observed: import("@joko/contracts").SessionContextBudgetView, tokens: number | undefined, signal?: AbortSignal): Promise<void> {
+    if (this.#taskSharing || tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 1000 || tokens > 100_000_000)) throw new GatewayError("The task context budget is invalid.");
+    const session = this.#snapshot?.sessions.find(value => value.id === observed.sessionId);
+    if (!session || session.generation !== observed.generation) throw new GatewayError("The original task generation changed.");
+    await this.submit({ case: "setSessionContextBudget", value: { sessionId: observed.sessionId, generation: observed.generation,
+      expectedRevision: observed.revision, expectedSourceRevision: observed.sourceRevision, ...(tokens === undefined ? {} : { budgetTokens: BigInt(tokens) }) } }, true, [], signal);
   }
 
   async setModelWorkingContext(target: ModelWorkingContextTarget, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, tokens?: number, signal?: AbortSignal): Promise<ModelWorkingContextView> {
@@ -14577,6 +14622,7 @@ function mapModel(
         ? { pricingSource: "upstream" as const }
         : {}),
     ...(model.priceUpdatedAt === undefined ? {} : { pricingUpdatedAt: timestampMs(model.priceUpdatedAt) }),
+    ...(model.ownerPriceOverride === undefined ? {} : { priceOverride: mapModelPriceQuote(model.ownerPriceOverride) }),
     modelId: model.key?.modelId ?? "",
     logicalId: model.logicalId || model.key?.modelId || "",
     name: model.displayName,
@@ -14895,12 +14941,26 @@ function mapModelPriceOverride(
     ...expected,
     reference: mapModelPriceQuote(price.reference),
     effective: mapModelPriceQuote(price.effective),
-    ...(price.override === undefined ? {} : { override: mapModelPriceQuote(price.override) }),
+    ...(price.override === undefined ? {} : { override: mapModelPriceOverrideValues(price.override) }),
+    conflict: price.conflict,
     allowedCurrencies,
     referenceAvailable: price.referenceAvailable,
     ...(price.registryUpdatedAt === undefined ? {} : { registryUpdatedAt: timestampMs(price.registryUpdatedAt) }),
     ...(updatedAt === undefined ? {} : { updatedAt }),
     ...(price.version?.revision?.value === undefined ? {} : { revision: price.version.revision.value })
+  };
+}
+
+function mapModelPriceOverrideValues(values: import("@joko/contracts").ModelPriceOverrideValues): NonNullable<ModelPriceOverrideView["override"]> {
+  const units = (value: bigint | undefined): number | undefined => value === undefined ? undefined : numberValue(value) / 1_000_000;
+  if (values.clearCacheRead && values.cacheReadCostMicrosPerMillion !== undefined
+    || values.clearCacheWrite && values.cacheWriteCostMicrosPerMillion !== undefined) throw new GatewayError("Orchestrator returned conflicting cache price overrides.");
+  return {
+    ...(values.currency === undefined ? {} : { currency: modelPriceCurrency(values.currency) }),
+    ...(values.inputCostMicrosPerMillion === undefined ? {} : { inputPerMillion: units(values.inputCostMicrosPerMillion) }),
+    ...(values.outputCostMicrosPerMillion === undefined ? {} : { outputPerMillion: units(values.outputCostMicrosPerMillion) }),
+    ...(values.clearCacheRead ? { cacheReadPerMillion: null } : values.cacheReadCostMicrosPerMillion === undefined ? {} : { cacheReadPerMillion: units(values.cacheReadCostMicrosPerMillion) }),
+    ...(values.clearCacheWrite ? { cacheWritePerMillion: null } : values.cacheWriteCostMicrosPerMillion === undefined ? {} : { cacheWritePerMillion: units(values.cacheWriteCostMicrosPerMillion) })
   };
 }
 
@@ -14948,6 +15008,7 @@ function mapProviderRuntime(provider: ProviderDescriptor, routingEnabled = true)
   const usage = provider.usage;
   const accountUsage = provider.accountUsage;
   return {
+    ...(provider.accountBalanceRevision === undefined ? {} : { accountBalanceRevision: provider.accountBalanceRevision }),
     backendId: provider.backendId,
     id: provider.providerId,
     name: provider.displayName,

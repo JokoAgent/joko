@@ -853,6 +853,12 @@ describe("Connect security and protocol audit", () => {
       cacheReadCostMicrosPerMillion: 700_000n
     });
     expect(changed.price?.override).toBeDefined();
+    const catalog = await invoke(services.backend.listModels, { backendId: "", providerId: "" }, context()) as contract.ListModelsResponse;
+    const ownerModel = catalog.models.find(model => model.backendId === "backend-usage");
+    expect(ownerModel?.ownerPriceOverride).toMatchObject({ currency: contract.ModelPriceCurrency.CNY, inputCostMicrosPerMillion: 7_000_000n });
+    expect(ownerModel?.inputCostMicrosPerMillion).toBe(2_000_000n);
+    expect(ownerModel?.currencyCode).toBe("USD");
+    expect(catalog.models.find(model => model.backendId === "backend-usage-secondary")?.ownerPriceOverride).toBeUndefined();
     const isolated = await invoke(services.backend.getModelPriceOverride, {
       backendId: "backend-usage-secondary",
       providerId: "provider-usage",
@@ -871,6 +877,29 @@ describe("Connect security and protocol audit", () => {
     }, context()) as { price?: contract.ModelPriceOverrideView };
     expect(reset.price?.override).toBeUndefined();
     expect(reset.price?.effective?.currency).toBe(contract.ModelPriceCurrency.USD);
+    const resetCatalog = await invoke(services.backend.listModels, { backendId: "backend-usage", providerId: "" }, context()) as contract.ListModelsResponse;
+    expect(resetCatalog.models[0]?.ownerPriceOverride).toBeUndefined();
+    const sparse = await invoke(services.backend.setModelPriceOverride, {
+      backendId: "backend-usage", providerId: "provider-usage", modelId: "model-usage",
+      desired: create(contract.ModelPriceQuoteSchema, { currency: contract.ModelPriceCurrency.USD,
+        inputCostMicrosPerMillion: 3_000_000n, outputCostMicrosPerMillion: 6_000_000n, cacheWriteCostMicrosPerMillion: 2_000_000n })
+    }, context()) as { price?: contract.ModelPriceOverrideView };
+    expect(sparse.price?.override).toMatchObject({ inputCostMicrosPerMillion: 3_000_000n, clearCacheRead: true });
+    expect(sparse.price?.override?.outputCostMicrosPerMillion).toBeUndefined();
+    expect(sparse.price?.override?.currency).toBeUndefined();
+    const changedBackend = store.getBackend("backend-usage").descriptor;
+    store.upsertBackend({ ...changedBackend, models: changedBackend.models.map(model => ({ ...model,
+      cost: { input: 4, output: 12, cacheRead: 0.4, cacheWrite: 4 } })) });
+    const refreshed = await invoke(services.backend.getModelPriceOverride, {
+      backendId: "backend-usage", providerId: "provider-usage", modelId: "model-usage"
+    }, context()) as { price?: contract.ModelPriceOverrideView };
+    expect(refreshed.price).toMatchObject({ conflict: true, effective: { inputCostMicrosPerMillion: 3_000_000n,
+      outputCostMicrosPerMillion: 12_000_000n, cacheWriteCostMicrosPerMillion: 4_000_000n } });
+    expect(refreshed.price?.effective?.cacheReadCostMicrosPerMillion).toBeUndefined();
+    const accepted = await invoke(services.backend.setModelPriceOverride, {
+      backendId: "backend-usage", providerId: "provider-usage", modelId: "model-usage", desired: refreshed.price!.effective
+    }, context()) as { price?: contract.ModelPriceOverrideView };
+    expect(accepted.price?.conflict).toBe(false);
     expect(authenticate).toHaveBeenCalled();
   });
 

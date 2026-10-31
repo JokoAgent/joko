@@ -21,6 +21,29 @@ afterEach(async () => {
 });
 
 describe("ModelPriceOverrideDialog", () => {
+  it("edits effective inherited fields and exposes a changed reference for a sparse override", async () => {
+    const price: ModelPriceOverrideView = {
+      backendId: model.backendId, providerId: model.providerId, modelId: model.modelId,
+      reference: { currency: "USD", inputPerMillion: 4, outputPerMillion: 12, cacheReadPerMillion: 0.4, cacheWritePerMillion: 4 },
+      effective: { currency: "USD", inputPerMillion: 3, outputPerMillion: 12, cacheWritePerMillion: 4 },
+      override: { inputPerMillion: 3, cacheReadPerMillion: null }, conflict: true,
+      allowedCurrencies: ["USD", "CNY"], referenceAvailable: true
+    };
+    const save = vi.fn(async () => price);
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container); roots.push(root);
+    await act(async () => root.render(<ModelPriceOverrideDialog model={model}
+      controller={{ getModelPriceOverride: vi.fn(async () => price), setModelPriceOverride: save, resetModelPriceOverride: vi.fn(async () => price) }}
+      t={(key, values) => translate("en", key, values)} onClose={() => undefined} />));
+    expect(inputFor("Input").value).toBe("3");
+    expect(inputFor("Output").value).toBe("12");
+    expect(inputFor("Cache read (optional)").value).toBe("");
+    expect(inputFor("Cache write (optional)").value).toBe("4");
+    expect(document.body.querySelector('[role="status"]')?.textContent).toContain("reference price has changed");
+    await act(async () => button("Save").click());
+    expect(save).toHaveBeenCalledWith(model.backendId, model.providerId, model.modelId, price.effective);
+  });
+
   it("loads, resets, and saves one exact Backend, Provider, and model route", async () => {
     const initial: ModelPriceOverrideView = {
       backendId: model.backendId,

@@ -28,6 +28,31 @@ async function fixture(now = 1_800_000_000_000) {
 }
 
 describe("CredentialManager", () => {
+  it("opens only the exact official account's key and retires a late balance after credential replacement", async () => {
+    const { credentials, store } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
+    try {
+      const ticket = credentials.createUploadTicket({ kind: "api_key" }); credentials.upload(ticket.credentialUploadTicketId, "first-account-key");
+      await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "balance-key", displayName: "Key", kind: "api_key" });
+      const entry = { backendId: "pi", credentialOrigin: "https://api.deepseek.com", provider: { id: "deepseek", baseUrl: "https://api.deepseek.com/v1", api: "openai-completions" as const,
+        apiKeyEnv: "DEEPSEEK_KEY", models: [] }, credentialBindings: { DEEPSEEK_KEY: "balance-key" }, enabled: true, displayName: "DeepSeek", kind: "api_key" as const, supportsLogin: false, supportsLogout: true, supportsRefresh: false };
+      await providers.upsert(entry);
+      const resolve = vi.spyOn(credentials, "resolve"), first = providers.describeAccountBalance("pi", "deepseek")!;
+      const originalRevision = providers.get("pi", "deepseek").accountBalanceRevision;
+      expect(originalRevision).toBeTruthy(); expect(resolve).not.toHaveBeenCalled();
+      await expect(providers.useAccountBalanceCredential(first, async key => key)).resolves.toBe("first-account-key");
+      let finish!: () => void; const gate = new Promise<void>(resolve => { finish = resolve; });
+      const pending = providers.useAccountBalanceCredential(first, async () => { await gate; return "old-account-result"; });
+      await credentials.replaceSecret("balance-key", "replacement-key"); finish();
+      await expect(pending).rejects.toThrow("original Provider credential changed");
+      expect(providers.get("pi", "deepseek").accountBalanceRevision).not.toBe(originalRevision);
+      await expect(providers.useAccountBalanceCredential(first, async () => "never")).rejects.toThrow();
+      expect(providers.describeAccountBalance("other", "deepseek")).toBeUndefined();
+      await providers.upsert({ ...entry, provider: { ...entry.provider, baseUrl: "https://proxy.example/v1" }, credentialBindings: {}, credentialOrigin: "https://proxy.example" });
+      expect(providers.describeAccountBalance("pi", "deepseek")).toBeUndefined();
+      resolve.mockRestore();
+    } finally { store.close(); }
+  });
   it("claims new service credentials privately and leaves mismatched tickets with their original owner", async () => {
     const { credentials, store } = await fixture();
     try {

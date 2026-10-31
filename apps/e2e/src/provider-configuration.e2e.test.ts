@@ -3,12 +3,44 @@ import { clone, create } from "@bufbuild/protobuf";
 import { Code, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { CredentialKind, CredentialService, ModelInputModality, OperationMutationSchema, OperationState, ProviderApiCompatibility, ProviderConfigurationSchema, ProviderKind } from "@joko/contracts";
-import { CredentialManager, CredentialVault, ProviderCatalogManager } from "@joko/orchestrator";
+import { CredentialManager, CredentialVault, ProviderCatalogManager, ProviderAccountBalanceProvider } from "@joko/orchestrator";
 import type { BackendDescriptor } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { expect, it } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture } from "./fixture.js";
 import { submit } from "./operations.js";
+
+it("reads official account balances through the authenticated Backend API and fences replaced keys", async () => {
+  const backendId = PI_LIKE_PROFILE.id; const keys: string[] = [];
+  const fixture = await OrchestratorE2eFixture.start({ profiles: [PI_LIKE_PROFILE], createAdapter: profile => new ProviderConfigurationAdapter(profile),
+    createAuxiliaryServices: async (store, directory) => {
+      const vault = await CredentialVault.open(join(directory, "balance-vault.key")), credentials = new CredentialManager({ vault, storagePath: join(directory, "balance-credentials.json") });
+      await credentials.initialize(); const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: backendId }); providers.initialize();
+      const ticket = credentials.createUploadTicket({ kind: "api_key" }); credentials.upload(ticket.credentialUploadTicketId, "original-balance-key");
+      await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "balance-key", displayName: "Balance key", kind: "api_key" });
+      await providers.upsert({ backendId, credentialOrigin: "https://api.deepseek.com", provider: { id: "deepseek", baseUrl: "https://api.deepseek.com/v1", api: "openai-completions", apiKeyEnv: "BALANCE_KEY", models: [] },
+        displayName: "Official account", kind: "api_key", credentialBindings: { BALANCE_KEY: "balance-key" }, enabled: true, supportsLogin: false, supportsLogout: true, supportsRefresh: false });
+      const providerAccountBalance = new ProviderAccountBalanceProvider(providers, (async (url, init) => {
+        expect(url).toBe("https://api.deepseek.com/user/balance"); expect(init?.redirect).toBe("error"); keys.push(new Headers(init?.headers).get("authorization")!);
+        return Response.json({ is_available: true, balance_infos: [{ currency: "CNY", total_balance: "7.123456789", granted_balance: "1", topped_up_balance: "6.123456789" }] });
+      }) as typeof fetch);
+      return { credentials, providers, providerAccountBalance };
+    } });
+  try {
+    const connection = await fixture.pair("Account owner"), api = connection.clients.backend;
+    const initial = await api.getProvider({ backendId, providerId: "deepseek" });
+    expect(initial.provider?.capabilities?.capabilities.some(value => value.name === "provider.account_balance")).toBe(true);
+    const result = (await api.getProviderAccountBalance({ backendId, providerId: "deepseek" })).result!;
+    expect(result.status).toBe("ready"); expect(result.snapshot.case).toBe("deepseek");
+    if (result.snapshot.case === "deepseek") expect(result.snapshot.value.balances[0]?.totalBalance).toBe("7.123456789");
+    expect(JSON.stringify(result, (_key, value) => typeof value === "bigint" ? String(value) : value)).not.toContain("balance-key");
+    await fixture.application.credentials!.replaceSecret("balance-key", "replacement-balance-key");
+    expect((await api.getProvider({ backendId, providerId: "deepseek" })).provider?.accountBalanceRevision).not.toBe(initial.provider?.accountBalanceRevision);
+    expect((await api.getProviderAccountBalance({ backendId, providerId: "deepseek" })).result?.status).toBe("ready");
+    expect(keys).toEqual(["Bearer original-balance-key", "Bearer replacement-balance-key"]);
+    await expect(fixture.anonymous.backend.getProviderAccountBalance({ backendId, providerId: "deepseek" })).rejects.toMatchObject({ code: Code.Unauthenticated });
+  } finally { await fixture.close(); }
+});
 
 class ProviderConfigurationAdapter extends InstrumentedFakeAdapter {
   override async describe(): Promise<BackendDescriptor> {

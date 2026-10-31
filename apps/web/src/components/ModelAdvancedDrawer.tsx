@@ -203,7 +203,7 @@ function ModelPricing({ controller, model, ownerKey, refreshRevision, disabled, 
   const [revision, setRevision] = useState(0);
   useEffect(() => {
     const abort = new AbortController(); setPrice(undefined); setFailed(false);
-    if (model.pricingKnown === true && model.pricingSource !== undefined && !disabled) void controller.getModelPriceOverride(model.backendId, model.providerId, model.modelId, abort.signal).then(value => { if (!abort.signal.aborted) setPrice(value); }, () => { if (!abort.signal.aborted) setFailed(true); });
+    if (!disabled) void controller.getModelPriceOverride(model.backendId, model.providerId, model.modelId, abort.signal).then(value => { if (!abort.signal.aborted) setPrice(value); }, () => { if (!abort.signal.aborted) setFailed(true); });
     return () => abort.abort();
   }, [controller, ownerKey, model.backendId, model.providerId, model.modelId, disabled, revision, refreshRevision]);
   const quote = price?.effective;
@@ -211,7 +211,8 @@ function ModelPricing({ controller, model, ownerKey, refreshRevision, disabled, 
   const labels = ["settings.modelPrice.input", "settings.modelPrice.output", "settings.modelPrice.cacheRead", "settings.modelPrice.cacheWrite"] as const;
   const priced = quote !== undefined && (price?.referenceAvailable || price?.override !== undefined);
   return <Section title={t("settings.modelAdvanced.pricing")}>
-    {model.providerAccessKind === "subscription" && !priced ? <p>{t("modelPicker.subscription")}</p> : priced ? fields.map((field, i) => quote[field] === undefined ? null : <Fact key={field} label={t(labels[i]!)}>{quote[field]} {quote.currency} / 1M {price?.override !== undefined && price.reference[field] !== quote[field] && <del>{price.reference[field]} {price.reference.currency}</del>}</Fact>) : model.pricingKnown === true && model.pricingSource !== undefined && model.inputCostMicrosPerMillion === 0 && model.outputCostMicrosPerMillion === 0 ? <p>{t("modelPicker.free")}</p> : <p>{t("settings.modelAdvanced.noPricing")}</p>}
+    {price?.conflict === true && <p role="status">{t("settings.modelPrice.conflict")}</p>}
+    {model.providerAccessKind === "subscription" && !priced ? <p>{t("modelPicker.subscription")}</p> : priced ? fields.map((field, i) => quote[field] === undefined ? null : <Fact key={field} label={t(labels[i]!)}>{quote[field]} {quote.currency} / 1M {price?.override !== undefined && price.referenceAvailable && price.reference[field] !== undefined && price.reference[field] !== quote[field] && <del>{price.reference[field]} {price.reference.currency}</del>}</Fact>) : model.pricingKnown === true && model.pricingSource !== undefined && model.inputCostMicrosPerMillion === 0 && model.outputCostMicrosPerMillion === 0 ? <p>{t("modelPicker.free")}</p> : <p>{t("settings.modelAdvanced.noPricing")}</p>}
     {(model.referenceTariffs?.length ?? 0) > 0 && <details>
       <summary>{t("settings.modelPrice.tariffs")}</summary>
       {model.referenceTariffs!.map((tariff, index) => <section key={index} className="model-advanced-section">

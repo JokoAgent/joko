@@ -45,6 +45,8 @@ import { composerCaretTextOffset, composerDirectoryQueryToken, composerMentionCa
 import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
 import { ContextCapacityRing } from "./ContextCapacityRing.js";
 import { SessionUsageChip } from "./SessionUsageChip.js";
+import { ProviderAccountBalance } from "./ProviderAccountBalance.js";
+import { SessionContextBudget } from "./SessionContextBudget.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { objectiveDialogRequestMatchesOwner, type ObjectiveDialogHandoffRequest } from "./ObjectiveIndicator.js";
@@ -3041,7 +3043,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           locale={controller.state.effectiveLocale}
           t={t}
         />
+        {controller.state.snapshot?.providers.filter(runtime => runtime.backendId === session.backendId && runtime.id === session.model?.providerId)
+          .map(runtime => <ProviderAccountBalance key={`${runtime.backendId}:${runtime.id}`} controller={controller} runtime={runtime} t={t} />)}
         <ContextCapacityRing context={session.context} modelContextWindow={session.model?.contextWindow} onCompact={onCompact} t={t} />
+        <SessionContextBudget controller={controller} session={session} supported={!guest && !readOnly && backend?.capabilities.get("model.working_context")?.supported === true} t={t} />
       </div>}
     </div>
     <ComposerPastedTextDialog

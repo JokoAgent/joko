@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { modelTokenPricesAt } from "@joko/core";
-import { priceMicros } from "./model-pricing-projection.js";
+import { captureModelPriceReference, createModelPriceOverrideValues, modelPriceOverrideConflict, modelPricesWithOverride, modelTokenPricesAt, type ModelPriceReferenceSnapshot } from "@joko/core";
+import { priceMicros, toProtoModelPriceOverrideValues } from "./model-pricing-projection.js";
 import type { ExtensionSettingsManager } from "./extension-settings.js";
 import type { ExtensionDirectoryPicker, ExtensionDirectoryPage, PickedExtensionDirectory } from "./extension-directory-picker.js";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
@@ -239,6 +239,8 @@ import {
   type ProviderAccountUsageProvider,
   type ProviderAccountUsageSnapshot as NativeProviderAccountUsageSnapshot
 } from "./provider-account-usage.js";
+import type { ProviderAccountBalanceProvider, AccountBalanceResult } from "./provider-account-balance.js";
+import { SessionContextBudgetError, type SessionContextBudgetCoordinator, type SessionContextBudgetView } from "./session-context-budget.js";
 import type {
   McpCredentialBinding as NativeMcpCredentialBinding,
   McpRouter,
@@ -580,6 +582,8 @@ export interface ConnectServiceDependencies {
   readonly diagnosticsBundles?: DiagnosticsBundleService;
   readonly providerAuth?: PiProviderAuthSupervisor;
   readonly providerAccountUsage?: ProviderAccountUsageProvider;
+  readonly providerAccountBalance?: ProviderAccountBalanceProvider;
+  readonly sessionContextBudget?: SessionContextBudgetCoordinator;
   readonly messageSearch?: MessageSearchEmbeddingCoordinator;
   readonly makerMemory?: MakerMemoryController;
   readonly partnerGroupRuntime?: OrchestratorApplication["partnerGroupRuntime"];
@@ -1374,6 +1378,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.diagnosticsBundles === undefined ? {} : { diagnosticsBundles: application.diagnosticsBundles }),
     ...(application.providerAuth === undefined ? {} : { providerAuth: application.providerAuth }),
     ...(application.providerAccountUsage === undefined ? {} : { providerAccountUsage: application.providerAccountUsage }),
+    ...(application.providerAccountBalance === undefined ? {} : { providerAccountBalance: application.providerAccountBalance }),
+    ...(application.sessionContextBudget === undefined ? {} : { sessionContextBudget: application.sessionContextBudget }),
     ...(application.messageSearch === undefined ? {} : { messageSearch: application.messageSearch }),
     ...(application.makerMemory === undefined ? {} : { makerMemory: application.makerMemory }),
     ...(application.partnerGroupRuntime === undefined ? {} : { partnerGroupRuntime: application.partnerGroupRuntime }),
@@ -2113,6 +2119,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
   } satisfies ServiceImpl<typeof contract.OperationService>;
 
   const backend = {
+    getSessionContextBudget: (request, context) => {
+      authenticate(context);
+      if (!dependencies.sessionContextBudget) throw new ConnectError("Task context budgets are unavailable.", Code.Unimplemented);
+      try { return { budget: mapSessionContextBudget(dependencies.sessionContextBudget.read(request.sessionId, Number(request.generation))) }; }
+      catch (error) { if (error instanceof SessionContextBudgetError) throw new ConnectError(error.message, error.reason === "invalid" ? Code.InvalidArgument : Code.Aborted); throw error; }
+    },
     ...createModelWorkingContextConnectMethods(dependencies.modelWorkingContext, authenticate,
       connection => dependencies.connections.fence(connection),
       (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener)),
@@ -2313,6 +2325,23 @@ export function createConnectServices(application: OrchestratorApplication, proj
         }
       };
     },
+    getProviderAccountBalance: async (request, context) => {
+      const auth = authenticate(context);
+      const backend = dependencies.store.getBackend(request.backendId);
+      if (!managedProviderCatalogApplies(dependencies, backend.descriptor.id, request.providerId)) {
+        return { result: { status: "unsupported" } };
+      }
+      dependencies.providers.get(request.backendId, request.providerId);
+      const revoked = new AbortController(), stop = dependencies.connections.onRevoked(auth.id, () => revoked.abort());
+      try {
+        const signal = AbortSignal.any([context.signal, revoked.signal]);
+        const result = await dependencies.providerAccountBalance?.get(request.backendId, request.providerId, request.forceRefresh, signal) ?? { status: "unsupported" as const };
+        signal.throwIfAborted();
+        const current = authenticate(context);
+        if (current.id !== auth.id || current.authKeyDigest !== auth.authKeyDigest) throw new ConnectError("The original connection changed.", Code.PermissionDenied);
+        return { result: mapAccountBalance(result) };
+      } finally { stop(); }
+    },
     getProviderUsage: async (request, context) => {
       authenticate(context);
       const records = request.backendId === ""
@@ -2410,7 +2439,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
         })
       };
       const ownerId = usageOwnerId(dependencies);
-      if (reference.available && sameModelPrice(reference.quote, quote)) {
+      const values = createModelPriceOverrideValues({ currencyCode, cost: {
+        input: quote.inputCostMicrosPerMillion / 1_000_000, output: quote.outputCostMicrosPerMillion / 1_000_000,
+        cacheRead: quote.cacheReadCostMicrosPerMillion === undefined ? undefined : quote.cacheReadCostMicrosPerMillion / 1_000_000,
+        cacheWrite: quote.cacheWriteCostMicrosPerMillion === undefined ? undefined : quote.cacheWriteCostMicrosPerMillion / 1_000_000
+      } }, reference.snapshot);
+      if (Object.keys(values).length === 0) {
         dependencies.store.deleteModelPriceOverride(
           ownerId,
           reference.backendId,
@@ -2423,7 +2457,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
           backendId: reference.backendId,
           providerId: reference.providerId,
           modelId: reference.modelId,
-          ...quote,
+          values,
+          baseReference: reference.snapshot,
           updatedAt: (dependencies.now ?? Date.now)()
         });
       }
@@ -2467,7 +2502,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const values = records.flatMap((record) => backendCatalogModels(dependencies, record.descriptor)
         .filter((model) => request.providerId === "" || model.providerId === request.providerId)
         .map((model) => {
-          const descriptor = toProtoModelDescriptor(record.descriptor.id, model);
+          const descriptor = ownerModelDescriptor(dependencies, record.descriptor.id, model);
           const authenticationState = managedProviderCatalogApplies(dependencies, record.descriptor.id)
             ? providerAuthentication.get(providerDescriptorKey(record.descriptor.id, model.providerId))
             : undefined;
@@ -9235,6 +9270,24 @@ async function logoutManagedNativeProvider(
   dependencies.messageSearch?.reconcileAvailability();
 }
 
+function mapSessionContextBudget(value: SessionContextBudgetView): contract.SessionContextBudgetView {
+  const tokens = (value: number | undefined) => value === undefined ? undefined : BigInt(value);
+  return create(contract.SessionContextBudgetViewSchema, { sessionId: value.sessionId, generation: BigInt(value.generation), target: value.target === undefined ? undefined : create(contract.ModelWorkingContextTargetSchema, value.target),
+    budgetTokens: tokens(value.budgetTokens), defaultWindowTokens: tokens(value.defaultWindowTokens), maximumWindowTokens: tokens(value.maximumWindowTokens),
+    modelLimitTokens: tokens(value.modelLimitTokens), effectiveWindowTokens: tokens(value.effectiveWindowTokens), revision: toProtoRevision(value.revision), sourceRevision: value.sourceRevision, canConfigure: value.canConfigure });
+}
+
+function mapAccountBalance(result: AccountBalanceResult): contract.ProviderAccountBalanceResult {
+  const snapshot = result.snapshot;
+  const window = (value: import("./provider-account-balance.js").AccountBalanceWindow | undefined, minutes: number) => value === undefined ? undefined
+    : create(contract.ProviderAccountUsageWindowSchema, { usedPercent: value.usedPercent, windowMinutes: minutes, ...(value.resetAt === undefined ? {} : { resetAt: toProtoTimestamp(value.resetAt) }) });
+  return create(contract.ProviderAccountBalanceResultSchema, { status: result.status, error: result.error, stale: result.stale ?? false,
+    dashboardUrl: result.dashboardUrl, retryAt: result.retryAt === undefined ? undefined : toProtoTimestamp(result.retryAt),
+    observedAt: result.observedAt === undefined ? undefined : toProtoTimestamp(result.observedAt),
+    snapshot: snapshot?.kind === "deepseek" ? { case: "deepseek", value: create(contract.DeepSeekAccountBalanceSchema, { isAvailable: snapshot.isAvailable, balances: snapshot.balances.map(line => create(contract.ProviderAccountBalanceLineSchema, line)) }) }
+      : snapshot?.kind === "zhipu" ? { case: "zhipu", value: create(contract.ZhipuCodingPlanBalanceSchema, { noPlan: snapshot.noPlan, level: snapshot.level, fiveHour: window(snapshot.fiveHour, 300), weekly: window(snapshot.weekly, 10_080) }) } : { case: undefined } });
+}
+
 function mapProviderDescriptor(
   backendId: string,
   item: NativeProviderDescriptor,
@@ -9266,6 +9319,7 @@ function mapProviderDescriptor(
       : [],
     supportsModelRefresh: item.supportsModelRefresh === true,
     credentialSurfaces: [],
+    accountBalanceRevision: item.accountBalanceRevision,
     credentialExpiresAt: item.credentialExpiresAt === undefined ? undefined : toProtoTimestamp(item.credentialExpiresAt),
     rateLimit,
     usage,
@@ -9721,6 +9775,9 @@ interface ModelPriceReference {
   readonly backendId: string;
   readonly providerId: string;
   readonly modelId: string;
+  readonly model: ProviderModel;
+  readonly at: number;
+  readonly snapshot?: ModelPriceReferenceSnapshot;
   readonly quote: {
     readonly currencyCode: "USD" | "CNY";
     readonly inputCostMicrosPerMillion?: number;
@@ -9755,13 +9812,17 @@ function modelPriceReference(
     candidate.providerId === providerId && candidate.modelId === modelId
   );
   if (model === undefined) throw new NotFoundError("Model", `${backendId}/${providerId}/${modelId}`);
-  const selected = modelTokenPricesAt(model, { at: Date.now() });
+  const at = (dependencies.now ?? Date.now)();
+  const selected = modelTokenPricesAt(model, { at });
   const cost = selected?.cost ?? {};
   const available = Object.values(cost).some(value => value !== undefined);
   return {
     backendId,
     providerId,
     modelId,
+    model,
+    at,
+    snapshot: captureModelPriceReference(model, at),
     quote: {
       currencyCode: model.pricing?.currencyCode === "CNY" ? "CNY" : "USD",
       inputCostMicrosPerMillion: priceMicros(cost.input),
@@ -9790,18 +9851,36 @@ function modelPriceOverrideView(
     modelId
   );
   const updatedAt = override?.updatedAt ?? reference.updatedAt;
+  const effective = modelPricesWithOverride(reference.model, override, { at: reference.at });
   return create(contract.ModelPriceOverrideViewSchema, {
     backendId,
     model: create(contract.ModelKeySchema, { providerId, modelId }),
     reference: protoModelPriceQuote(reference.quote),
-    effective: protoModelPriceQuote(override ?? reference.quote),
-    override: override === undefined ? undefined : protoModelPriceQuote(override),
+    effective: protoModelPriceQuote(effective === undefined ? reference.quote : {
+      currencyCode: effective.currencyCode === "CNY" ? "CNY" : "USD",
+      inputCostMicrosPerMillion: priceMicros(effective.cost.input), outputCostMicrosPerMillion: priceMicros(effective.cost.output),
+      cacheReadCostMicrosPerMillion: priceMicros(effective.cost.cacheRead), cacheWriteCostMicrosPerMillion: priceMicros(effective.cost.cacheWrite)
+    }),
+    override: override === undefined ? undefined : toProtoModelPriceOverrideValues(override.values),
+    conflict: override !== undefined && modelPriceOverrideConflict(reference.model, override, reference.at),
     allowedCurrencies: [contract.ModelPriceCurrency.USD, contract.ModelPriceCurrency.CNY],
     referenceAvailable: reference.available,
     registryUpdatedAt: reference.registryUpdatedAt === undefined ? undefined : toProtoTimestamp(reference.registryUpdatedAt),
     updatedAt: toProtoTimestamp(updatedAt),
     version: toProtoEntityVersion(override?.revision ?? reference.revision, 0, updatedAt)
   });
+}
+
+function ownerModelDescriptor(dependencies: ConnectServiceDependencies, backendId: string, model: ProviderModel): contract.ModelDescriptor {
+  const descriptor = toProtoModelDescriptor(backendId, model);
+  const override = dependencies.store.findModelPriceOverride(usageOwnerId(dependencies), backendId, model.providerId, model.modelId);
+  const effective = override === undefined ? undefined : modelPricesWithOverride(model, override, { at: (dependencies.now ?? Date.now)() });
+  if (effective !== undefined) descriptor.ownerPriceOverride = protoModelPriceQuote({
+    currencyCode: effective.currencyCode === "CNY" ? "CNY" : "USD",
+    inputCostMicrosPerMillion: priceMicros(effective.cost.input), outputCostMicrosPerMillion: priceMicros(effective.cost.output),
+    cacheReadCostMicrosPerMillion: priceMicros(effective.cost.cacheRead), cacheWriteCostMicrosPerMillion: priceMicros(effective.cost.cacheWrite)
+  });
+  return descriptor;
 }
 
 function protoModelPriceQuote(value: {
@@ -9828,17 +9907,6 @@ function modelPriceCurrencyCode(value: contract.ModelPriceCurrency): "USD" | "CN
   if (value === contract.ModelPriceCurrency.USD) return "USD";
   if (value === contract.ModelPriceCurrency.CNY) return "CNY";
   throw invalidArgument("Model price currency must be USD or CNY.");
-}
-
-function sameModelPrice(
-  left: ModelPriceReference["quote"],
-  right: ModelPriceReference["quote"]
-): boolean {
-  return left.currencyCode === right.currencyCode
-    && left.inputCostMicrosPerMillion === right.inputCostMicrosPerMillion
-    && left.outputCostMicrosPerMillion === right.outputCostMicrosPerMillion
-    && left.cacheReadCostMicrosPerMillion === right.cacheReadCostMicrosPerMillion
-    && left.cacheWriteCostMicrosPerMillion === right.cacheWriteCostMicrosPerMillion;
 }
 
 export { providerRateLimitSettingKey } from "./provider-rate-limit.js";
@@ -14117,7 +14185,7 @@ async function enrichSnapshot(
       for (const model of backendCatalogModels(dependencies, record.descriptor)) {
         projectedModelMap.set(
           modelDescriptorKey(backend.backendId, model.providerId, model.modelId),
-          toProtoModelDescriptor(backend.backendId, model)
+          ownerModelDescriptor(dependencies, backend.backendId, model)
         );
       }
     }
@@ -17373,6 +17441,15 @@ async function dispatchMutation(
         }
       });
       return presented(execution);
+    }
+    case "setSessionContextBudget": {
+      const value = payload.value, coordinator = dependencies.sessionContextBudget;
+      if (!coordinator) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Task context budgets are unavailable.");
+      if (!value.expectedRevision) throw invalidArgument("The task budget revision is required.");
+      const generation = Number(value.generation), tokens = value.budgetTokens === undefined ? undefined : Number(value.budgetTokens);
+      if (!Number.isSafeInteger(generation) || generation < 1 || tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 1000 || tokens > 100_000_000)) throw invalidArgument("The task context budget is invalid.");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, { accepted: true, resultCase: "session", entityId: value.sessionId },
+        () => coordinator.set({ sessionId: value.sessionId, generation, tokens, expectedRevision: value.expectedRevision!.value, expectedSourceRevision: value.expectedSourceRevision }, () => dependencies.connections.fence(connection)));
     }
     case "setSessionRuntime": {
       const value = payload.value, expectedGeneration = Number(value.expectedRuntimeGeneration);

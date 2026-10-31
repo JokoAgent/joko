@@ -13,6 +13,7 @@ export * from "./projection.js";
 export * from "./subagents.js";
 export * from "./types.js";
 export * from "./model-pricing.js";
+export * from "./model-price-override.js";
 export * from "./partner-workbench.js";
 export * from "./native-session-preview.js";
 export * from "./partner-routines.js";

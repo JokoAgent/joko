@@ -347,6 +347,7 @@ export interface ModelView {
   readonly providerAccessKind?: ProviderConfigurationView["kind"];
   readonly pricingKnown?: boolean;
   readonly pricingSource?: "providerReference" | "upstream";
+  readonly priceOverride?: ModelPriceQuoteView;
   readonly pricingUpdatedAt?: number;
   readonly modelId: string;
   readonly logicalId?: string;
@@ -1410,7 +1411,14 @@ export interface ModelPriceOverrideView {
   readonly modelId: string;
   readonly reference: ModelPriceQuoteView;
   readonly effective: ModelPriceQuoteView;
-  readonly override?: ModelPriceQuoteView;
+  readonly override?: {
+    readonly currency?: ModelPriceCurrencyView;
+    readonly inputPerMillion?: number;
+    readonly outputPerMillion?: number;
+    readonly cacheReadPerMillion?: number | null;
+    readonly cacheWritePerMillion?: number | null;
+  };
+  readonly conflict?: boolean;
   readonly allowedCurrencies: readonly ModelPriceCurrencyView[];
   readonly referenceAvailable: boolean;
   readonly registryUpdatedAt?: number;
@@ -3927,6 +3935,7 @@ export interface ProviderCompatibilityConfigurationView {
 }
 
 export interface ProviderRuntimeView {
+  readonly accountBalanceRevision?: string;
   readonly backendId: string;
   readonly id: string;
   readonly name: string;
@@ -6120,6 +6129,9 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   closeTerminal(sessionId: string, terminalId: string, generation: bigint, signal?: AbortSignal): Promise<void>;
   refresh(): Promise<void>;
   refreshProviderAccountUsage(backendId: string, providerId: string): Promise<void>;
+  getSessionContextBudget?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").SessionContextBudgetView>;
+  setSessionContextBudget?(observed: import("@joko/contracts").SessionContextBudgetView, tokens: number | undefined, signal?: AbortSignal): Promise<void>;
+  readProviderAccountBalance?(backendId: string, providerId: string, forceRefresh: boolean, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountBalanceResult>;
   readTaskProviderGroupUsage?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("./provider-group-task-usage.js").TaskProviderGroupUsageView | undefined>;
   readTaskProviderGroupRebalance?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderGroupRebalanceView | undefined>;
   getArtifactStorageStats(protectedSha256?: readonly string[]): Promise<ArtifactStorageMaintenanceView>;

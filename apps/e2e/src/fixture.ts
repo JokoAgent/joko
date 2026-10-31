@@ -71,7 +71,7 @@ export type { E2eClients, PairedClient } from "./connect-clients.js";
 type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
   "auxiliaryText" | "subagentModels" | "sessionNavigation" | "providers" | "providerAuth"
   | "refreshPiGeneration" | "mcpRouter" | "sshKeys" | "credentials" | "remoteHosts" | "browser"
-  | "messageSearch"
+  | "messageSearch" | "providerAccountBalance"
   | "browserSettings" | "browserState" | "voiceInput" | "diagnosticsBundles">;
 
 export interface FixtureOptions {
@@ -568,6 +568,7 @@ export class OrchestratorE2eFixture {
         await attempt(() => auxiliaryServices?.browser?.stop());
         await attempt(() => auxiliaryServices?.voiceInput?.close());
         await attempt(() => auxiliaryServices?.providerAuth?.close());
+        await attempt(() => auxiliaryServices?.providerAccountBalance?.dispose());
         await attempt(() => lanDiscovery.stop());
         await attempt(() => auxiliaryServices?.sshKeys?.close());
         await attempt(() => contacts.close());

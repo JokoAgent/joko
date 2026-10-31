@@ -695,15 +695,8 @@ CREATE TABLE model_price_overrides (
           length(trim(model_id)) BETWEEN 1 AND 512
           AND instr(model_id, char(0)) = 0
         ),
-        currency_code TEXT NOT NULL CHECK (currency_code IN ('USD', 'CNY')),
-        input_cost_micros_per_million INTEGER NOT NULL
-          CHECK (input_cost_micros_per_million >= 0),
-        output_cost_micros_per_million INTEGER NOT NULL
-          CHECK (output_cost_micros_per_million >= 0),
-        cache_read_cost_micros_per_million INTEGER
-          CHECK (cache_read_cost_micros_per_million IS NULL OR cache_read_cost_micros_per_million >= 0),
-        cache_write_cost_micros_per_million INTEGER
-          CHECK (cache_write_cost_micros_per_million IS NULL OR cache_write_cost_micros_per_million >= 0),
+        values_json TEXT NOT NULL CHECK (json_valid(values_json) AND length(values_json) <= 4096),
+        base_reference_json TEXT CHECK (base_reference_json IS NULL OR (json_valid(base_reference_json) AND length(base_reference_json) <= 262144)),
         updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
         revision INTEGER NOT NULL CHECK (revision >= 1),
         PRIMARY KEY(owner_id, backend_id, provider_id, model_id)

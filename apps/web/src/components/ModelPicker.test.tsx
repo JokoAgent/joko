@@ -354,6 +354,19 @@ describe("ModelPicker", () => {
     expect(findRow("Partial price").querySelector(".model-picker__price")).toBeNull();
   });
 
+  it("shows the owner's effective quote even when the reference price was withdrawn", async () => {
+    const overridden = { ...model("provider-a", "Alpha", "overridden", "Custom price", [], false, 0, 0),
+      providerAccessKind: "subscription" as const, pricingKnown: false,
+      priceOverride: { currency: "CNY" as const, inputPerMillion: 3, outputPerMillion: 12 } };
+    await renderPicker(undefined, "owner-one", undefined, false, undefined, [overridden]);
+    await openPicker();
+    const price = required(findRow("Custom price").querySelector<HTMLElement>(".model-picker__price"));
+    expect(price.textContent).toBe("¥");
+    expect(price.title).toContain("3000000");
+    expect(price.title).toContain("12000000");
+    expect(price.title).toContain("CNY");
+  });
+
   it("switches among all three local layouts and supports keyboard selection", async () => {
     const onSelect = vi.fn<(selection: ModelPickerSelection | undefined) => void>();
     await renderPicker(onSelect);

@@ -1,5 +1,6 @@
 import "./protobuf-text-encoding.js";
 export * from "./model-speed.js";
+export * from "./session-context-budget.js";
 export * from "./extension-settings-bridge.js";
 export * from "./session-archive.js";
 export * from "./remote-desktop-viewer.js";

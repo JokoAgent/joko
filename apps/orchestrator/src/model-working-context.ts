@@ -66,6 +66,10 @@ export class ModelWorkingContextError extends Error {
 /** Explicit working budgets, independent of catalog capacities and managed-runtime configuration. */
 export class ModelWorkingContextCoordinator {
   constructor(readonly options: ModelWorkingContextOptions) {}
+  configuredLimit(target: ModelRouteTarget): number | undefined {
+    const owner = this.options.currentOwner();
+    return owner ? this.state(owner.ownerId).entries.find(entry => key(entry.target) === key(target))?.overrideTokens : undefined;
+  }
   resolve(target: ModelRouteTarget): number | undefined {
     const owner = this.options.currentOwner();
     if (!owner) return undefined;
