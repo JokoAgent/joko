@@ -18,7 +18,7 @@ afterEach(async () => { await act(async () => { root?.unmount(); }); root = unde
 const share = create(TaskShareSchema, { shareId: "share", shareGeneration: 1n, sessionId: "task", hostServerId: "host", hostOrigin: "https://host.example", title: "Shared task", status: "active" });
 const joined = create(JoinedTaskShareSchema, { joinId: "joined", status: "active", share, member: { memberId: "member", memberGeneration: 1n, status: "active", displayName: "Guest" } });
 const invitation = buildTaskShareInvitation({ hostOrigin: "https://host.example", hostServerId: "host", endpointPublicKey: `ed25519:${"a".repeat(64)}`, shareId: "share", shareGeneration: 1n, inviteSecret: "a".repeat(48) });
-async function fixture(options: { readonly sessionId?: string; readonly invitation?: string; readonly pending?: PendingTaskSharingAction } = {}) {
+async function fixture(options: { readonly sessionId?: string; readonly invitation?: string; readonly pending?: PendingTaskSharingAction; readonly ownerDocument?: Document } = {}) {
   const pending = new Map<string, PendingTaskSharingAction>(); if (options.pending) pending.set(options.pending.operationId, options.pending);
   const local = { taskSharingActions: vi.fn(async () => [...pending.values()]),
     saveTaskSharingAction: vi.fn(async (_owner: string, action: PendingTaskSharingAction) => { pending.set(action.operationId, action); }),
@@ -30,7 +30,8 @@ async function fixture(options: { readonly sessionId?: string; readonly invitati
     lookupJoin: vi.fn().mockResolvedValue({ intent: { joined, status: "joined" } }),
     lookupAction: vi.fn(), endAll: vi.fn(), end: vi.fn().mockResolvedValue({ share: { ...share, status: "ended" } }), leave: vi.fn(), remove: vi.fn() };
   const controller = { taskSharing: api, state: { snapshot: emptySnapshot(), activeProfile: { id: "home", serverId: "home-server" }, connectionGeneration: 1, route: { kind: "settings" } }, navigate: vi.fn() } as unknown as AppController;
-  const host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
+  const documentOwner = options.ownerDocument ?? document;
+  const host = documentOwner.body.appendChild(documentOwner.createElement("div")); root = createRoot(host);
   await act(async () => root!.render(<TaskSharingSettings controller={controller} t={key => key} sessionId={options.sessionId} initialInvitation={options.invitation} />));
   return { api, local, pending, controller, host };
 }
@@ -63,6 +64,63 @@ describe("Task Sharing management", () => {
     await click(f.host.querySelector<HTMLElement>("[data-task-sharing-invite]")!);
     expect(writeText).toHaveBeenCalledExactlyOnceWith(invitation);
     expect(f.host.textContent).toContain("taskSharing.invitationCopied"); expect(f.pending.size).toBe(0);
+  });
+  it("copies an invitation in the clicked task document instead of the renderer's global document", async () => {
+    const iframe = document.body.appendChild(document.createElement("iframe")), ownerDocument = iframe.contentDocument!;
+    const f = await fixture({ sessionId: "task", ownerDocument });
+    f.api.list.mockResolvedValue({ owned: [share], joined: [], intents: [] });
+    const mainCopy = vi.fn().mockRejectedValue(new Error("The global document is not the task owner."));
+    const ownerCopy = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: mainCopy } });
+    Object.defineProperty(ownerDocument.defaultView!.navigator, "clipboard", { configurable: true, value: { writeText: ownerCopy } });
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-start]")!);
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-invite]")!);
+    expect(ownerCopy).toHaveBeenCalledExactlyOnceWith(invitation); expect(mainCopy).not.toHaveBeenCalled();
+    expect(f.host.textContent).toContain("taskSharing.invitationCopied"); expect(f.pending.size).toBe(0);
+  });
+  it("keeps a completed invitation separate from a failed clipboard effect and requires an explicit new attempt", async () => {
+    const f = await fixture({ sessionId: "task" });
+    f.api.list.mockResolvedValue({ owned: [share], joined: [], intents: [] });
+    const writeText = vi.fn().mockRejectedValueOnce(new DOMException("clipboard denied", "NotAllowedError")).mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-start]")!);
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-invite]")!);
+    expect(f.api.invite).toHaveBeenCalledOnce(); expect(f.pending.size).toBe(0);
+    expect(f.host.textContent).toContain("taskSharing.invitationCopyFailed");
+    expect(f.host.textContent).not.toContain("taskSharing.unknown");
+    expect(f.host.textContent).not.toContain("clipboard denied");
+    expect(f.host.querySelector<HTMLButtonElement>("[data-task-sharing-invite]")?.disabled).toBe(false);
+    expect(f.api.lookupAction).not.toHaveBeenCalled();
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-invite]")!);
+    expect(f.api.invite).toHaveBeenCalledTimes(2);
+    expect(f.api.invite.mock.calls[0]![0]).not.toEqual(f.api.invite.mock.calls[1]![0]);
+    expect(f.host.textContent).toContain("taskSharing.invitationCopied"); expect(f.pending.size).toBe(0);
+  });
+  it("keeps the original invitation fenced when its remote result is unknown", async () => {
+    const f = await fixture({ sessionId: "task" });
+    f.api.list.mockResolvedValue({ owned: [share], joined: [], intents: [] });
+    const writeText = vi.fn(); Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-start]")!);
+    f.api.invite.mockRejectedValue(new ConnectError("offline", Code.Unavailable));
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-invite]")!);
+    expect(f.pending.size).toBe(1); expect(writeText).not.toHaveBeenCalled();
+    expect(f.host.querySelector<HTMLButtonElement>("[data-task-sharing-invite]")?.disabled).toBe(true);
+    f.api.lookupAction.mockResolvedValue({ status: "applied", kind: "task_share_invite", failedShareIds: [] });
+    await click(button(f.host, "taskSharing.check"));
+    expect(f.api.lookupAction).toHaveBeenCalledWith(f.api.invite.mock.calls[0]![0], expect.any(AbortSignal));
+    expect(f.api.invite).toHaveBeenCalledOnce(); expect(writeText).not.toHaveBeenCalled();
+    expect(f.pending.size).toBe(0); expect(f.host.textContent).toContain("taskSharing.invitationLost");
+  });
+  it("retains the exact pending invitation when recording completion fails before clipboard dispatch", async () => {
+    const f = await fixture({ sessionId: "task" });
+    f.api.list.mockResolvedValue({ owned: [share], joined: [], intents: [] });
+    const writeText = vi.fn(); Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-start]")!);
+    f.local.finishTaskSharingAction.mockRejectedValueOnce(new Error("local completion unavailable"));
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-invite]")!);
+    expect(f.pending.size).toBe(1); expect(writeText).not.toHaveBeenCalled();
+    expect([...f.pending.values()]).toEqual([{ kind: "invite", operationId: f.api.invite.mock.calls[0]![0] }]);
+    expect(f.host.querySelector<HTMLButtonElement>("[data-task-sharing-invite]")?.disabled).toBe(true);
   });
   it("preflights before joining and cleans the exact journal after immediate successful navigation unmount", async () => {
     const f = await fixture({ invitation });

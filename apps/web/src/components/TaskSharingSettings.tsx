@@ -11,6 +11,7 @@ import { clearTaskSharingInvitation, useTaskSharingInvitation } from "../task-sh
 import type { Translator } from "./types.js";
 import { Button, ErrorBanner, Modal, Pill, Spinner, cx } from "./ui.js";
 import { moveTablistSelection } from "./tablist-navigation.js";
+import { writeClipboardText } from "../clipboard-action.js";
 import "./task-sharing.css";
 
 type Confirmation = { readonly kind: "end"; readonly share: TaskShare }
@@ -45,24 +46,31 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
   const owned = directory.value?.owned.filter(share => share.status === "active") ?? [];
   const joined = directory.value?.joined.filter(item => item.status !== "left") ?? [];
   const selected = sessionId ? owned.find(share => share.sessionId === sessionId) : undefined;
-  const run = async (kind: PendingTaskSharingAction["kind"] | "preview", action: (id: string, signal: AbortSignal) => Promise<void>): Promise<void> => {
+  const run = async (kind: PendingTaskSharingAction["kind"] | "preview", action: (id: string, signal: AbortSignal) => Promise<void>,
+    afterApplied?: (signal: AbortSignal) => Promise<void>): Promise<void> => {
     if (!api || !storage.current || flight.current || unknown) return;
     flight.current = true; setBusy(true); setError(undefined); setNotice(undefined);
     const id = randomUuid(), signal = lifetime.current.signal, local = storage.current;
-    let admitted = false;
+    let admitted = false, recorded = false;
     try {
       if (kind !== "preview") await local.saveTaskSharingAction(owner, { operationId: id, kind });
       signal.throwIfAborted(); admitted = true;
       await action(id, signal);
       if (kind !== "preview") await local.finishTaskSharingAction(owner, id);
-      if (!signal.aborted) { setConfirmation(undefined); await directory.refresh(); }
+      recorded = true;
+      if (!signal.aborted) {
+        await afterApplied?.(signal);
+        if (!signal.aborted) { setConfirmation(undefined); await directory.refresh(); }
+      }
     }
     catch (cause) {
       if (!signal.aborted) {
         setError(cause instanceof Error ? cause.message : t("taskSharing.unavailable"));
         const definite = cause instanceof ConnectError && [Code.InvalidArgument, Code.PermissionDenied, Code.NotFound, Code.FailedPrecondition].includes(cause.code);
-        if (kind !== "preview" && admitted && !definite) setUnknown({ operationId: id, kind });
-        else if (kind !== "preview") await local.finishTaskSharingAction(owner, id);
+        if (kind !== "preview" && !recorded) {
+          if (admitted && !definite) setUnknown({ operationId: id, kind });
+          else await local.finishTaskSharingAction(owner, id);
+        }
       }
     } finally { if (!signal.aborted) setBusy(false); flight.current = false; }
   };
@@ -71,12 +79,21 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
     if (!profile || !item.share || !item.member) return;
     openJoinedTask(controller, item.joinId);
   };
-  const copyInvitation = (share: TaskShare): void => { void run("invite", async (id, signal) => {
-    const result = await api!.invite(id, share.shareId, signal);
-    signal.throwIfAborted();
-    await navigator.clipboard.writeText(result.invitation);
-    signal.throwIfAborted(); setNotice(t("taskSharing.invitationCopied"));
-  }); };
+  const copyInvitation = (share: TaskShare, ownerDocument: Document): void => {
+    let text: string | undefined;
+    void run("invite", async (id, signal) => {
+      const result = await api!.invite(id, share.shareId, signal);
+      signal.throwIfAborted(); text = result.invitation;
+    }, async signal => {
+      try {
+        if (text === undefined) throw new Error();
+        await writeClipboardText(text, { ownerDocument, signal });
+        signal.throwIfAborted(); setNotice(t("taskSharing.invitationCopied"));
+      } catch {
+        signal.throwIfAborted(); throw new Error(t("taskSharing.invitationCopyFailed"));
+      } finally { text = undefined; }
+    });
+  };
   const confirm = (): void => { const captured = confirmation; if (!captured) return;
     void run(captured.kind, async (id, signal) => {
       if (captured.kind === "end") await api!.end(id, captured.share.shareId, signal);
@@ -117,7 +134,7 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
   };
   const shareCard = (share: TaskShare): JSX.Element => <article className="settings-card settings-card--content" key={share.shareId} data-task-sharing-owned data-share-id={share.shareId} data-session-id={share.sessionId}>
     <h3>{share.title || share.sessionId}</h3><p>{share.hostOrigin}</p>
-    <div className="settings-actions"><Button data-task-sharing-invite disabled={busy || !!unknown} onClick={() => copyInvitation(share)}>{t("taskSharing.invite")}</Button>
+    <div className="settings-actions"><Button data-task-sharing-invite disabled={busy || !!unknown} onClick={event => copyInvitation(share, event.currentTarget.ownerDocument)}>{t("taskSharing.invite")}</Button>
       <Button data-task-sharing-end tone="danger" disabled={busy || !!unknown} onClick={() => setConfirmation({ kind: "end", share })}>{t("taskSharing.end")}</Button></div>
     <h4>{t("taskSharing.participants")}</h4>
     {share.members.filter(member => member.status === "active").map(member => <div className="setting-row" key={member.memberId}>
