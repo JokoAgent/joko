@@ -1458,6 +1458,8 @@ export class PartnerStore {
       const retired = this.#database.prepare("UPDATE partner_session_links SET role = 'history' WHERE session_id = ? AND partner_id = ? AND role = 'canonical'")
         .run(current.canonicalSessionId, current.id);
       if (Number(retired.changes) !== 1) throw unavailable("The previous canonical Session link is missing.");
+      this.#database.prepare("UPDATE partner_session_links SET role = 'history', routine_key = NULL, routine_operation_id = NULL WHERE partner_id = ? AND role = 'routine'")
+        .run(current.id);
       const updated = this.#database.prepare(`UPDATE partners SET revision = ?, profile_version = ?, home_target_id = ?, canonical_session_id = ?,
         model_chain_json = ?, task_model_json = NULL, permission_mode = ?, plan_mode = ?, input_handoff = ?, uses_directory_defaults = 0,
         initialization_state = 'ready', invitation_stage = 'ready', initialization_error_code = NULL, updated_at = ? WHERE id = ? AND revision = ?`)

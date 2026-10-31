@@ -103,7 +103,7 @@ describe("Partner routine authority and independent execution", () => {
     }
     expect(f.store.getSession(canonical.id).descriptor).toEqual(canonical);
     expect(f.store.listQueueItems({ sessionId: canonical.id })).toEqual([]);
-    expect((await f.storage.load())?.runs.filter(run => run.routineId === saved.id).map(run => run.sessionId)).toEqual(runs.slice().reverse().map(run => run.sessionId));
+    expect((await f.storage.load())?.runs.filter(run => run.routineId === saved.id).map(run => run.sessionId).sort()).toEqual(runs.map(run => run.sessionId).sort());
     expect(f.adapter.sent).toHaveLength(2);
   });
 

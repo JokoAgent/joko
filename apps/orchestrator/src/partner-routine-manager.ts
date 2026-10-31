@@ -131,7 +131,8 @@ export class PartnerRoutineManager {
     return this.options.partners.runOwnedManagement(input.partnerId, input.partnerRevision, async () => {
     input.assertCaller?.();
     this.#owner(input.partnerId, true, input.partnerRevision);
-    if (input.definition.modelOverride) this.options.partners.resolveTaskModel(
+    const previous = input.routineId ? this.#routine(input.partnerId, input.routineId) : undefined;
+    if (input.definition.modelOverride && (input.definition.enabled || JSON.stringify(input.definition.modelOverride) !== JSON.stringify(previous?.modelOverride))) this.options.partners.resolveTaskModel(
       this.options.partners.getPartner(input.partnerId).canonicalSessionId!, input.definition.modelOverride).assertCurrent();
     if (input.routineId !== undefined) {
       this.#routine(input.partnerId, input.routineId);
