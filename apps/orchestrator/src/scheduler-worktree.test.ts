@@ -33,14 +33,16 @@ afterEach(async () => {
 describe("scheduled isolated workspaces", () => {
   it("restores an archived ordinary task without creating another native context", async () => {
     const fixture = await createFixture(), scheduler = new ScheduleCoordinator(fixture.store, fixture.host), id = "restore-plain";
-    const executionSnapshot = { ...(worktreeSchedule(id).executionSnapshot as Record<string, unknown>), useWorktree: false };
+    const executionSnapshot = withoutNewWorktree(worktreeSchedule(id).executionSnapshot);
     fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "persistent", executionSnapshot }));
     const first = await scheduler.runNowWithResult(id, "initial-plain");
+    expect(first.status).toBe("queued");
     await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
     await fixture.host.closeIfActive(first.sessionId!);
     const stored = fixture.store.getSession(first.sessionId!);
     fixture.store.updateSession(first.sessionId!, { archived: true }, stored.revision);
     const second = await scheduler.runNowWithResult(id, "restored-plain");
+    expect(second.status).toBe("queued");
     expect(second.sessionId).toBe(first.sessionId);
     await eventually(() => fixture.store.getRun(second.runId).descriptor.state === "completed");
     expect(fixture.store.getSession(first.sessionId!).descriptor.archived).toBe(false);
@@ -57,8 +59,9 @@ describe("scheduled isolated workspaces", () => {
     expect(fixture.store.getSession(first.sessionId!).descriptor).toMatchObject({ archived: true, worktree: { state: "preserved" } });
     const current = fixture.store.getSchedule(id);
     fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode, sessionId: first.sessionId, expectedRevision: current.revision,
-      executionSnapshot: { ...(current.executionSnapshot as Record<string, unknown>), useWorktree: false } }));
+      executionSnapshot: withoutNewWorktree(current.executionSnapshot) }));
     const second = await scheduler.runNowWithResult(id, `restored-${sessionMode}`);
+    expect(second.status).toBe("queued");
     expect(second.sessionId).toBe(first.sessionId);
     expect(fixture.worktrees.restores).toEqual([first.sessionId]);
     await eventually(() => fixture.store.getRun(second.runId).descriptor.state === "completed");
@@ -77,7 +80,7 @@ describe("scheduled isolated workspaces", () => {
     await fixture.host.reconcileScheduledWorktrees();
     const current = fixture.store.getSchedule(id);
     fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "bound", sessionId: first.sessionId, expectedRevision: current.revision,
-      executionSnapshot: { ...(current.executionSnapshot as Record<string, unknown>), useWorktree: false } }));
+      executionSnapshot: withoutNewWorktree(current.executionSnapshot) }));
     const restore = vi.spyOn(fixture.worktrees, "restore").mockRejectedValueOnce(new Error("restore result unknown"));
     await expect(scheduler.runNowWithResult(id, "same-restore")).rejects.toThrow("restore result unknown");
     await expect(scheduler.runNowWithResult(id, "same-restore")).rejects.toThrow();
@@ -93,7 +96,7 @@ describe("scheduled isolated workspaces", () => {
     const first = await scheduler.runNowWithResult(id, "initial-revoked");
     await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
     await fixture.host.reconcileScheduledWorktrees();
-    const current = fixture.store.getSchedule(id), executionSnapshot = { ...(current.executionSnapshot as Record<string, unknown>), useWorktree: false };
+    const current = fixture.store.getSchedule(id), executionSnapshot = withoutNewWorktree(current.executionSnapshot);
     fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "bound", sessionId: first.sessionId, expectedRevision: current.revision, executionSnapshot }));
     const restore = fixture.worktrees.restore.bind(fixture.worktrees);
     vi.spyOn(fixture.worktrees, "restore").mockImplementationOnce(async sessionId => {
@@ -464,6 +467,12 @@ function worktreeSchedule(
 function ownerSettings(store: OperationalStore) {
   return store.listSettings("service")
     .filter((setting) => setting.key === SCHEDULED_WORKTREE_OWNER_SETTING_KEY);
+}
+
+function withoutNewWorktree(value: unknown): Record<string, unknown> {
+  const execution: Record<string, unknown> = { ...(value as Record<string, unknown>), useWorktree: false, refreshWorktreeRemote: false };
+  delete execution["worktreeSourceRef"];
+  return execution;
 }
 
 async function eventually(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {

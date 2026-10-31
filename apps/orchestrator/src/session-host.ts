@@ -524,8 +524,18 @@ export interface CreateSessionInput {
 }
 
 export interface CreateScheduledSessionInput {
-  /** Private occurrence authority; ordinary Schedule creation uses its revision fence. */
+  /** Revalidate the private caller before effects and product adoption. */
   readonly assertServiceScope?: () => void;
+  /** Called only after native creation returned its exact binding. A cancelled
+   * result permits recording that receipt, without any further native setup. */
+  readonly assertCreationAdoption?: () => "active" | "cancelled";
+  /** Only script occurrences that already persisted their running route may
+   * adopt a task after a later Schedule configuration edit. */
+  readonly frozenOccurrenceRouting?: {
+    readonly backendId: string;
+    readonly targetId: string;
+    readonly boundSessionId?: string;
+  };
   readonly operationId: string;
   readonly targetId: string;
   readonly title: string;
@@ -2101,7 +2111,15 @@ export class SessionHost {
   async createScheduledSession(input: CreateScheduledSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
     input.assertServiceScope?.();
+    if (input.assertCreationAdoption !== undefined && (input.assertServiceScope === undefined || input.frozenOccurrenceRouting !== undefined)) {
+      throw new StoreError("Scheduled creation receipt adoption requires its original agent occurrence authority.");
+    }
     const target = this.#store.getTarget(input.targetId);
+    if (input.frozenOccurrenceRouting !== undefined && (input.assertServiceScope === undefined
+      || input.frozenOccurrenceRouting.backendId !== target.descriptor.backendId
+      || input.frozenOccurrenceRouting.targetId !== input.targetId)) {
+      throw new StoreError("Scheduled task creation requires its original occurrence authority.");
+    }
     this.validateFastSelection(
       target.descriptor.backendId,
       input.providerId,
@@ -11370,6 +11388,14 @@ export class SessionHost {
     }
 
     let createdBinding: NativeSessionBinding | undefined;
+    const assertCreationAdoption = (): "active" | "cancelled" => {
+      this.#assertOpen();
+      if (createdBinding !== undefined && "assertCreationAdoption" in input && input.assertCreationAdoption !== undefined) {
+        return input.assertCreationAdoption();
+      }
+      if ("assertServiceScope" in input) input.assertServiceScope?.();
+      return "active";
+    };
     let adapterForCleanup: BackendAdapter | undefined;
     let personalNativeCreationDispatched = false;
     let personalNativeCreationClosed = false;
@@ -11669,6 +11695,7 @@ export class SessionHost {
         let binding: NativeSessionBinding;
         let attachedState: NativeSessionState | undefined;
         let nativeHistory: NativeHistoryProjection | undefined;
+        let createdPlanMode = false;
         if (catalogBinding !== undefined) {
           binding = catalogBinding;
         } else {
@@ -11717,8 +11744,10 @@ export class SessionHost {
           }
           createdBinding = binding;
           contextForCleanup = { ...context, binding };
-          if ("assertServiceScope" in input) input.assertServiceScope?.();
-          if (!attaching && input.planMode) await adapter.setPlanMode(true, contextForCleanup);
+          if (assertCreationAdoption() === "active" && !attaching && input.planMode) {
+            await adapter.setPlanMode(true, contextForCleanup);
+            createdPlanMode = true;
+          }
           if (nativeStart.kind === "attach") {
             attachedState = await adapter.inspectSession(binding, contextForCleanup);
             assertAttachedNativeState(binding, attachedState, context.generation);
@@ -11749,7 +11778,7 @@ export class SessionHost {
         if (operationBodyHash(createSessionOperationBody(input)) !== claim.operation.bodyHash) {
           throw new Error("Create task input changed during execution.");
         }
-        if ("assertServiceScope" in input) input.assertServiceScope?.();
+        assertCreationAdoption();
         this.assertCurrentAdapterGeneration(
           target.descriptor.backendId,
           adapter,
@@ -11759,7 +11788,7 @@ export class SessionHost {
             if (provisionalReadiness !== undefined && "connection" in input && this.assertProvisionalCreationReady(input) !== provisionalReadiness) {
               throw new StoreError("Draft runtime approval changed before adoption.");
             }
-            if ("assertServiceScope" in input) input.assertServiceScope?.();
+            const creationCancelled = assertCreationAdoption() === "cancelled";
             const catalogAdoption = store.findNativeCatalogAdoption(input.operationId);
             if (catalogAdoption !== undefined) {
               if (catalogBinding === undefined || catalogAdoption.binding.opaqueRef !== binding.opaqueRef) {
@@ -11775,7 +11804,9 @@ export class SessionHost {
             if (duplicate !== undefined) throw nativeBindingConflict(duplicate.descriptor.id);
             if (automationOrigin !== undefined) {
               const currentSchedule = store.getSchedule(automationOrigin.scheduleId);
-              if (!("assertServiceScope" in input && input.assertServiceScope) && currentSchedule.revision !== automationOrigin.scheduleRevision) {
+              if (!("frozenOccurrenceRouting" in input && input.frozenOccurrenceRouting !== undefined)
+                && !creationCancelled
+                && currentSchedule.revision !== automationOrigin.scheduleRevision) {
                 throw new RevisionConflictError(
                   "Schedule",
                   automationOrigin.scheduleId,
@@ -11810,7 +11841,7 @@ export class SessionHost {
                 ? attachedState?.permissionMode ?? input.permissionMode
                 : "ask",
               planMode: catalogBinding === undefined
-                ? attachedState?.planMode ?? (attaching ? false : input.planMode)
+                ? attachedState?.planMode ?? createdPlanMode
                 : false,
               ...(catalogBinding !== undefined
                 ? { fastMode: false }
@@ -11840,8 +11871,8 @@ export class SessionHost {
               configuration: provisionalConfiguration(input), targetRevision: currentTarget.revision.toString()
             });
             const created = store.createSession(descriptor, {
-              ...(automationOrigin && "assertServiceScope" in input && input.assertServiceScope ? {
-                automationOccurrenceRouting: { backendId: target.descriptor.backendId, targetId: input.targetId }
+              ...("frozenOccurrenceRouting" in input && input.frozenOccurrenceRouting !== undefined ? {
+                automationOccurrenceRouting: input.frozenOccurrenceRouting
               } : {}),
               localRuntimeBackendSelection: runtimeBackendId !== undefined || groupAssignment !== undefined,
               nativeSessionBlank: nativeStart.kind === "new"
@@ -18368,6 +18399,9 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
         scheduleRevision: input.automationOrigin.scheduleRevision.toString(10)
       }
     } : {}),
+    ...("frozenOccurrenceRouting" in input && input.frozenOccurrenceRouting !== undefined
+      ? { frozenOccurrenceRouting: input.frozenOccurrenceRouting }
+      : {}),
     ...("serviceKind" in input ? { serviceKind: input.serviceKind } : {}),
     ...("serviceKind" in input && input.hidden !== undefined ? { hidden: input.hidden === true } : {}),
     ...("originSessionId" in input && input.originSessionId !== undefined ? {

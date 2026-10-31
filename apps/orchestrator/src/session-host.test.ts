@@ -5190,6 +5190,7 @@ describe("SessionHost", () => {
       pricing: { source: "providerReference", currencyCode: "CNY", cacheReadAvailable: true, cacheWriteAvailable: false },
       costMicros: 204_000,
       currencyCode: "CNY",
+      runCurrencyCode: "CNY",
       costComplete: false
     },
     {
@@ -5198,6 +5199,7 @@ describe("SessionHost", () => {
       pricing: null,
       costMicros: 0,
       currencyCode: "USD",
+      runCurrencyCode: undefined,
       costComplete: false
     },
     {
@@ -5207,6 +5209,7 @@ describe("SessionHost", () => {
       substitutedModelId: "actual-model",
       costMicros: 0,
       currencyCode: "CNY",
+      runCurrencyCode: undefined,
       costComplete: false
     }
   ] as const)("$name", async (testCase) => {
@@ -5238,7 +5241,7 @@ describe("SessionHost", () => {
       totalTokens: 402_000, costMicros: testCase.costMicros, costComplete: testCase.costComplete, estimated: true
     });
     expect(fixture.store.getRun(queued.value.runId).descriptor.usage?.currencyCode)
-      .toBe(testCase.costComplete ? testCase.currencyCode : undefined);
+      .toBe(testCase.runCurrencyCode);
   });
 
   it("applies a model price override only to the matching Backend identity", async () => {
@@ -9453,14 +9456,14 @@ describe("SessionHost", () => {
     expect(onActivityTransition).toHaveBeenCalledTimes(2);
   });
 
-  it("fences deletion through awaited task creation while keep leaves the generated task usable", async () => {
+  it.each(["fresh", "persistent"] as const)("fences deletion through awaited %s task creation while keep leaves the generated task usable", async sessionMode => {
     const adapter = new GatedFakeAdapter();
     const fixture = await createFixture(adapter);
     const scheduleInput = {
       id: "schedule-delete-resolve-race",
       backendId: fixture.adapter.id,
       targetId: "target-one",
-      sessionMode: "fresh" as const,
+      sessionMode,
       name: "Delete resolve race",
       kind: "manual" as const,
       timezone: "UTC",
@@ -9469,7 +9472,7 @@ describe("SessionHost", () => {
       executionSnapshot: {
         ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT,
         permissionMode: "ask",
-        planMode: false
+        planMode: true
       },
       overlapPolicy: "queue" as const,
       misfirePolicy: "run_once" as const
@@ -9477,28 +9480,51 @@ describe("SessionHost", () => {
     fixture.store.upsertSchedule(scheduleInput);
     const scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
     const gate = adapter.holdCreate();
+    const nativeCreate = vi.spyOn(adapter, "createSession");
+    const planMode = vi.spyOn(adapter, "setPlanMode");
+    const send = vi.spyOn(adapter, "send");
 
     const dispatch = scheduler.runNow(scheduleInput.id, "delete-resolve-race-run");
     await gate.entered;
+    const operation = fixture.store.getOperation("manual-schedule-delete-resolve-race-run-session");
+    const originalRevision = fixture.store.getSchedule(scheduleInput.id).revision;
+    const prepared = scheduler.prepareScheduleDeletion({
+      operationId: "delete-resolve-race-operation",
+      scheduleId: scheduleInput.id,
+      disposition: "keep",
+      at: 10
+    });
+    expect(prepared.generatedSessionIds).toHaveLength(0);
+    expect(fixture.store.getSchedule(scheduleInput.id)).toMatchObject({ enabled: false });
+    expect(fixture.store.getSchedule(scheduleInput.id).revision).not.toBe(originalRevision);
     const deletion = scheduler.beginScheduleDeletion(scheduleInput.id, "delete-resolve-race-operation");
     expect(scheduler.isScheduleDeletionFenced(scheduleInput.id)).toBe(true);
     gate.release();
     const occurrenceRunIds = await deletion;
     await dispatch;
+    expect(adapter.createCalls).toBe(1);
+    expect(planMode).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(fixture.store.getOperation(operation.id)).toMatchObject({ status: "completed", bodyHash: operation.bodyHash });
 
     expect(fixture.store.listRuns({ activeOnly: true })).toHaveLength(0);
     expect(fixture.store.listQueueItems().filter((item) =>
       item.state === "accepted" || item.state === "dispatching"
     )).toHaveLength(0);
-    const manifest = fixture.store.prepareScheduleDeletionCleanup({
+    const manifest = fixture.store.refreshScheduleDeletionCleanup({
       operationId: "delete-resolve-race-operation",
-      scheduleId: scheduleInput.id,
-      disposition: "keep",
       occurrenceRunIds,
       at: 10
     });
     expect(manifest.generatedSessionIds).toHaveLength(1);
     const generatedSessionId = manifest.generatedSessionIds[0]!;
+    expect(fixture.store.getSession(generatedSessionId).descriptor).toMatchObject({
+      binding: await nativeCreate.mock.results[0]!.value,
+      planMode: false,
+      archived: false
+    });
+    await expect(scheduler.runNow(scheduleInput.id, "delete-resolve-race-run")).rejects.toThrow("deletion");
+    expect(adapter.createCalls).toBe(1);
     const resumeSession = vi.spyOn(adapter, "resumeSession");
     await fixture.host.closeIfActive(generatedSessionId);
     await expect(fixture.host.inspect(generatedSessionId)).resolves.toBeDefined();
@@ -9529,6 +9555,45 @@ describe("SessionHost", () => {
     const recreated = fixture.store.listScheduleRuns(scheduleInput.id)[0]!;
     await eventually(() => fixture.store.getRun(recreated.runId).descriptor.state === "completed", 5_000);
   });
+
+  it.each(["edited-back", "source-revoked", "untrusted", "unknown-result"] as const)(
+    "does not use a keep-deletion receipt to adopt native creation after %s", async change => {
+      const adapter = new GatedFakeAdapter(), fixture = await createFixture(adapter);
+      const schedule = fixture.store.upsertSchedule({
+        id: `schedule-keep-${change}`, backendId: adapter.id, targetId: "target-one", sessionMode: "fresh",
+        name: "Original", kind: "manual", timezone: "UTC", enabled: true,
+        prompt: { text: "must not send", images: [], files: [], mentions: [], disposition: "prompt" },
+        executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, planMode: true },
+        overlapPolicy: "queue", misfirePolicy: "run_once"
+      });
+      const scheduler = new ScheduleCoordinator(fixture.store, fixture.host), gate = adapter.holdCreate();
+      const closed = vi.spyOn(adapter, "closeSession"), planMode = vi.spyOn(adapter, "setPlanMode");
+      let sourceCurrent = true;
+      const pending = scheduler.runNowWithResult(schedule.id, "keep-fenced", () => sourceCurrent);
+      const result = pending.then(() => undefined, error => error);
+      await gate.entered;
+      if (change === "edited-back") {
+        const edited = fixture.store.upsertSchedule({ ...schedule, name: "Edited", expectedRevision: schedule.revision });
+        fixture.store.upsertSchedule({ ...schedule, expectedRevision: edited.revision });
+      } else if (change === "source-revoked") sourceCurrent = false;
+      else if (change === "untrusted") fixture.store.upsertTarget({ ...fixture.store.getTarget("target-one").descriptor, trusted: false });
+      else adapter.failCreates = true;
+      const operationId = `delete-${change}`;
+      scheduler.prepareScheduleDeletion({ operationId, scheduleId: schedule.id, disposition: "keep" });
+      const deletion = scheduler.beginScheduleDeletion(schedule.id, operationId);
+      gate.release();
+      await deletion;
+      expect(await result).toBeInstanceOf(OperationPreviouslyFailedError);
+      expect(adapter.createCalls).toBe(1);
+      expect(closed).toHaveBeenCalledTimes(change === "unknown-result" ? 0 : 1);
+      expect(planMode).not.toHaveBeenCalled();
+      expect(fixture.store.listSessions({ includeArchived: true, includeDeleted: true })).toHaveLength(0);
+      expect(fixture.store.listQueueItems()).toHaveLength(0);
+      expect(fixture.store.refreshScheduleDeletionCleanup({ operationId }).generatedSessionIds).toHaveLength(0);
+      scheduler.releaseScheduleDeletion(schedule.id, operationId);
+      scheduler.stop();
+    }
+  );
 
   it("keeps a dormant generated task fenced across service restart until its manifest completes", async () => {
     const fixture = await createFixture();
@@ -10407,6 +10472,49 @@ describe("SessionHost", () => {
     expect(await pending).toMatchObject({ status: "aborted" }); expect(adapter.createCalls).toBe(1); expect(closed).toHaveBeenCalledOnce();
     expect(f.store.listSessions()).toHaveLength(0); expect(f.store.listQueueItems()).toHaveLength(0);
   });
+
+  it.each(["disabled", "pause-resume", "deleted", "untrusted", "retired", "source-revoked"] as const)(
+    "does not adopt a late script task after its occurrence is %s", async retirement => {
+      const adapter = new GatedFakeAdapter(), f = await createFixture(adapter), gate = adapter.holdCreate();
+      const closed = vi.spyOn(adapter, "closeSession"), id = `script-retired-${retirement}`;
+      seedScriptSchedule(f, id);
+      let sourceCurrent = true, occurrenceId = "";
+      const coordinator = new ScheduleCoordinator(f.store, f.host, { executeScript: async input => {
+        occurrenceId = input.runId;
+        return dispatchScriptTask(input);
+      } });
+      cleanups.push(() => coordinator.stop());
+      const pending = coordinator.runNowWithResult(id, "original-fire", () => sourceCurrent);
+      try {
+        await gate.entered;
+        const schedule = f.store.getSchedule(id);
+        if (retirement === "disabled" || retirement === "pause-resume") {
+          f.store.upsertSchedule({ ...schedule, enabled: false, expectedRevision: schedule.revision });
+          if (retirement === "pause-resume") {
+            await coordinator.abortSchedule(id);
+            const paused = f.store.getSchedule(id);
+            f.store.upsertSchedule({ ...paused, enabled: true, expectedRevision: paused.revision });
+          }
+        } else if (retirement === "deleted") {
+          f.store.deleteSchedule(id, schedule.revision);
+        } else if (retirement === "untrusted") {
+          f.store.upsertTarget({ ...f.store.getTarget("target-one").descriptor, trusted: false });
+        } else if (retirement === "retired") {
+          const occurrence = f.store.findScheduleRunByRunId(occurrenceId)!;
+          f.store.recordScheduleOccurrence({ scheduleId: id, runId: occurrenceId, firedAt: occurrence.firedAt,
+            status: "interrupted", detail: { reason: "Original occurrence retired" } });
+        } else sourceCurrent = false;
+      } finally { gate.release(); }
+      expect(await pending).toMatchObject({ runId: occurrenceId, status: retirement === "pause-resume" ? "aborted" : "failed" });
+      expect(adapter.createCalls).toBe(1);
+      expect(closed).toHaveBeenCalledOnce();
+      expect(f.store.listSessions()).toHaveLength(0);
+      expect(f.store.listQueueItems()).toHaveLength(0);
+      if (retirement === "retired") expect(f.store.findScheduleRunByRunId(occurrenceId))
+        .toMatchObject({ status: "interrupted", detail: { reason: "Original occurrence retired" } });
+      if (retirement === "deleted") expect(f.store.findSchedule(id)).toBeUndefined();
+    }
+  );
 
   it("aborts an in-flight script Schedule without creating a product task", async () => {
     const fixture = await createFixture();

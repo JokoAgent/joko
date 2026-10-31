@@ -18277,7 +18277,7 @@ async function dispatchMutation(
               // after a process loss in any awaited deletion phase.
               const current = dependencies.store.getSchedule(scheduleId);
               const projectOrigin = scheduleProjectAutomationOrigin(current.executionSnapshot);
-              durable = dependencies.store.prepareScheduleDeletionCleanup({
+              durable = dependencies.scheduleCoordinator.prepareScheduleDeletion({
                 operationId,
                 scheduleId,
                 disposition,

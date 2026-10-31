@@ -285,6 +285,8 @@ function servicesFor(fixture: ReturnType<typeof createFixture>, overrides: Recor
     gitSafety: { closeSession: fixture.closeGitSafety },
     terminals: { closeSession: fixture.closeTerminals },
     scheduler: {
+      prepareScheduleDeletion: (input: Parameters<OperationalStore["prepareScheduleDeletionCleanup"]>[0]) =>
+        fixture.store.prepareScheduleDeletionCleanup(input),
       beginScheduleDeletion: async () => [],
       releaseScheduleDeletion: () => undefined
     },

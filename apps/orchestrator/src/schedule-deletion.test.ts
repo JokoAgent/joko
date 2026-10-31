@@ -433,6 +433,8 @@ function servicesFor(
     terminals: { closeSession: options.closeTerminals ?? (async () => undefined) },
     ...(options.sessionWorktrees === undefined ? {} : { sessionWorktrees: options.sessionWorktrees }),
     scheduler: {
+      prepareScheduleDeletion: (input: Parameters<OperationalStore["prepareScheduleDeletionCleanup"]>[0]) =>
+        fixture.store.prepareScheduleDeletionCleanup(input),
       beginScheduleDeletion: fixture.beginScheduleDeletion,
       releaseScheduleDeletion: fixture.releaseScheduleDeletion
     },
