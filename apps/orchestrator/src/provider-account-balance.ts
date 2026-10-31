@@ -97,7 +97,8 @@ export class ProviderAccountBalanceProvider {
 
   private async refresh(slot: string, identity: AccountBalanceIdentity, controller: AbortController, previous?: CacheEntry): Promise<AccountBalanceResult> {
     const current = () => !controller.signal.aborted && this.providers.describeAccountBalance(identity.backendId, identity.providerId)?.key === identity.key;
-    const timer = setTimeout(() => controller.abort(), 10_000);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 10_000);
     let rejectAbort: (() => void) | undefined;
     let result: AccountBalanceResult;
     try {
@@ -128,7 +129,8 @@ export class ProviderAccountBalanceProvider {
       result = { ...(stale ?? { status: "unavailable" as const }), error: code, stale: stale !== undefined, dashboardUrl: identity.integration.dashboardUrl,
         ...(error instanceof BalanceError && error.retryAt ? { retryAt: error.retryAt } : {}) };
     } finally { clearTimeout(timer); if (rejectAbort) controller.signal.removeEventListener("abort", rejectAbort); }
-    if (!current()) return { status: "unavailable", error: controller.signal.aborted ? "network" : "no-credentials" };
+    if (this.providers.describeAccountBalance(identity.backendId, identity.providerId)?.key !== identity.key) return { status: "unavailable", error: "no-credentials" };
+    if (controller.signal.aborted && !timedOut) return { status: "unavailable", error: "network" };
     this.#cache.set(slot, { identity: identity.key, result, expiresAt: result.error ? 0 : this.now() + 300_000, attemptedAt: this.now(), retryAt: result.retryAt ?? 0 });
     return result;
   }
@@ -138,12 +140,13 @@ async function boundedJson(response: Response, signal: AbortSignal): Promise<unk
   const limit = 64 * 1024, size = response.headers.get("content-length");
   if (size !== null && (!/^\d+$/u.test(size) || Number(size) > limit) || !response.body) throw new BalanceError("invalid-response");
   const reader = response.body.getReader(), chunks: Uint8Array[] = []; let length = 0;
+  const cancel = () => { void reader.cancel().catch(() => undefined); }; signal.addEventListener("abort", cancel, { once: true });
   try {
     for (;;) { signal.throwIfAborted(); const item = await reader.read(); if (item.done) break;
       length += item.value.byteLength; if (length > limit) { void reader.cancel().catch(() => undefined); throw new BalanceError("invalid-response"); } chunks.push(item.value); }
     const bytes = new Uint8Array(length); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
     try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { throw new BalanceError("invalid-response"); }
-  } finally { reader.releaseLock(); }
+  } finally { signal.removeEventListener("abort", cancel); reader.releaseLock(); }
 }
 function record(value: unknown): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw new BalanceError("invalid-response"); return value as Record<string, unknown>; }
 export function parseDeepSeekBalance(value: unknown): AccountBalanceSnapshot {

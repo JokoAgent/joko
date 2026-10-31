@@ -11,7 +11,7 @@ import type { BrowserTransferCoordinator } from "./browser-transfers.js";
 it.skipIf(!process.env.JOKO_BROWSER_EXECUTABLE)("reads a real page's complete large extract in segments without re-extracting or dispatching an action", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-browser-results-"));
   const native = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true }), context = await native.newContext();
-  const titles = Array.from({ length: 320 }, (_, index) => `Record ${index} 中文🙂 ${"descriptive text ".repeat(8)}`);
+  const titles = Array.from({ length: 320 }, (_, index) => `Record ${index} 中文🙂 ${"descriptive text ".repeat(8)}`.trim());
   await context.route("https://results.example.test/**", route => route.fulfill({ contentType: "text/html", body: titles.map(title => `<article><h2>${title}</h2></article>`).join("") }));
   const provider = new BrowserProvider({ providerId: "result-test", executablePath: process.env.JOKO_BROWSER_EXECUTABLE!,
     profileDirectories: { sidebar: join(root, "sidebar"), external: join(root, "external") }, targetMode: "sidebar", downloadDirectory: join(root, "downloads"), uploadRoots: [root], launchPersistentContext: async () => context });

@@ -169,7 +169,7 @@ describe("BrowserToolBridgeProvider", () => {
   it("binds cached originals to the task identity and original page ownership", async () => {
     const store = browserBridgeAuthorityStore(), state = new OperationalBrowserState(store);
     state.recordHumanPage({ browserProviderId: "browser", pageId: "page-1", generation: 6, sessionId: "session-a", targetId: "target-a", bindingGeneration: 1,
-      url: "https://example.test/", title: "Owned", updatedAt: 1 });
+      url: "https://example.test/", title: "Owned", updatedAt: 1 }, { active: false });
     const { bridge, browser } = fixture(undefined, undefined, { state });
     vi.mocked(browser.evaluatePage).mockResolvedValue({ text: "original private task data ".repeat(1_000) });
     const one = browserBridgeContext("a", "session-a", "target-a", 1, 6), other = browserBridgeContext("b", "session-b", "target-b", 1, 6);

@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 
 import { chromium, type Browser, type Page } from "playwright-core";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BackendDescriptor } from "@joko/core";
 import { CredentialManager, CredentialVault, ProviderCatalogManager, ProviderAccountBalanceProvider } from "@joko/orchestrator";
@@ -31,6 +31,7 @@ describe("mounted Provider configuration", () => {
     browser = undefined;
     await fixture?.close();
     fixture = undefined;
+    vi.restoreAllMocks();
   });
 
   mountedIt("reads the selected official account, keeps exact decimal balances, and retires the expanded view", { timeout: 90_000 }, async () => {
@@ -39,6 +40,13 @@ describe("mounted Provider configuration", () => {
       createAuxiliaryServices: async (store, directory) => {
         const vault = await CredentialVault.open(join(directory, "balance-vault.key")), credentials = new CredentialManager({ vault, storagePath: join(directory, "balance-credentials.json") });
         await credentials.initialize(); const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: backendId }); providers.initialize();
+        const discoverModels = providers.discoverProviderModels.bind(providers);
+        vi.spyOn(providers, "discoverProviderModels").mockImplementation((targetBackendId, providerId) =>
+          discoverModels(targetBackendId, providerId, (async (url, init) => {
+            expect(url).toBe("https://api.deepseek.com/v1/models");
+            expect(new Headers(init?.headers).get("authorization")).toBe("Bearer mounted-balance-secret");
+            return Response.json({ data: [] });
+          }) as typeof fetch));
         const ticket = credentials.createUploadTicket({ kind: "api_key" }); credentials.upload(ticket.credentialUploadTicketId, "mounted-balance-secret");
         await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "balance-key", displayName: "Balance key", kind: "api_key" });
         await providers.upsert({ backendId, credentialOrigin: "https://api.deepseek.com", provider: { id: "deepseek", baseUrl: "https://api.deepseek.com/v1", api: "openai-completions", apiKeyEnv: "BALANCE_KEY", models: [] },

@@ -9272,20 +9272,20 @@ async function logoutManagedNativeProvider(
 
 function mapSessionContextBudget(value: SessionContextBudgetView): contract.SessionContextBudgetView {
   const tokens = (value: number | undefined) => value === undefined ? undefined : BigInt(value);
-  return create(contract.SessionContextBudgetViewSchema, { sessionId: value.sessionId, generation: BigInt(value.generation), target: value.target,
+  return create(contract.SessionContextBudgetViewSchema, { sessionId: value.sessionId, generation: BigInt(value.generation), target: value.target === undefined ? undefined : create(contract.ModelWorkingContextTargetSchema, value.target),
     budgetTokens: tokens(value.budgetTokens), defaultWindowTokens: tokens(value.defaultWindowTokens), maximumWindowTokens: tokens(value.maximumWindowTokens),
-    modelLimitTokens: tokens(value.modelLimitTokens), effectiveWindowTokens: tokens(value.effectiveWindowTokens), revision: { value: value.revision }, sourceRevision: value.sourceRevision, canConfigure: value.canConfigure });
+    modelLimitTokens: tokens(value.modelLimitTokens), effectiveWindowTokens: tokens(value.effectiveWindowTokens), revision: toProtoRevision(value.revision), sourceRevision: value.sourceRevision, canConfigure: value.canConfigure });
 }
 
 function mapAccountBalance(result: AccountBalanceResult): contract.ProviderAccountBalanceResult {
   const snapshot = result.snapshot;
   const window = (value: import("./provider-account-balance.js").AccountBalanceWindow | undefined, minutes: number) => value === undefined ? undefined
-    : { usedPercent: value.usedPercent, windowMinutes: minutes, ...(value.resetAt === undefined ? {} : { resetAt: toProtoTimestamp(value.resetAt) }) };
-  return create(contract.ProviderAccountBalanceResultSchema, { status: result.status, error: result.error, stale: result.stale,
+    : create(contract.ProviderAccountUsageWindowSchema, { usedPercent: value.usedPercent, windowMinutes: minutes, ...(value.resetAt === undefined ? {} : { resetAt: toProtoTimestamp(value.resetAt) }) });
+  return create(contract.ProviderAccountBalanceResultSchema, { status: result.status, error: result.error, stale: result.stale ?? false,
     dashboardUrl: result.dashboardUrl, retryAt: result.retryAt === undefined ? undefined : toProtoTimestamp(result.retryAt),
     observedAt: result.observedAt === undefined ? undefined : toProtoTimestamp(result.observedAt),
-    snapshot: snapshot?.kind === "deepseek" ? { case: "deepseek", value: { isAvailable: snapshot.isAvailable, balances: [...snapshot.balances] } }
-      : snapshot?.kind === "zhipu" ? { case: "zhipu", value: { noPlan: snapshot.noPlan, level: snapshot.level, fiveHour: window(snapshot.fiveHour, 300), weekly: window(snapshot.weekly, 10_080) } } : undefined });
+    snapshot: snapshot?.kind === "deepseek" ? { case: "deepseek", value: create(contract.DeepSeekAccountBalanceSchema, { isAvailable: snapshot.isAvailable, balances: snapshot.balances.map(line => create(contract.ProviderAccountBalanceLineSchema, line)) }) }
+      : snapshot?.kind === "zhipu" ? { case: "zhipu", value: create(contract.ZhipuCodingPlanBalanceSchema, { noPlan: snapshot.noPlan, level: snapshot.level, fiveHour: window(snapshot.fiveHour, 300), weekly: window(snapshot.weekly, 10_080) }) } : { case: undefined } });
 }
 
 function mapProviderDescriptor(

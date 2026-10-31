@@ -50,5 +50,5 @@ it("preserves the selection after a rejected save and requires reading the curre
   await act(async () => { select.value = "250000"; select.dispatchEvent(new Event("change", { bubbles: true })); });
   expect(select.disabled).toBe(true); expect(select.value).toBe("default"); expect(document.querySelector('[role="alert"]')?.textContent).toBe(t("contextBudget.failed"));
   const retry = [...document.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === t("common.retry"))!;
-  await act(async () => retry.click()); expect(select.isConnected).toBe(false); expect(f.save).toHaveBeenCalledOnce(); expect(f.read).toHaveBeenCalledTimes(2);
+  await act(async () => retry.click()); expect(document.querySelector<HTMLSelectElement>('select[aria-label="Task context budget"]')?.disabled).toBe(false); expect(f.save).toHaveBeenCalledOnce(); expect(f.read).toHaveBeenCalledTimes(2);
 });
