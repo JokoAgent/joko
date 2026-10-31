@@ -278,7 +278,9 @@ jobs:
   ios-startup-diagnostics:
     if: ${{ inputs.scope == 'ios-startup-diagnostics' }}
     name: Owned iOS Simulator startup command probe (no application)
-    runs-on: macos-latest
+    runs-on: macos-15-intel
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     timeout-minutes: 8
     steps:
       - name: Check out repository
@@ -319,7 +321,10 @@ jobs:
   ios-simulator:
     if: ${{ inputs.scope != 'js-exports' && inputs.scope != 'android-signer-diagnostics' && inputs.scope != 'ios-startup-diagnostics' && (github.event_name != 'workflow_dispatch' || inputs.platform != 'android') }}
     name: iOS Simulator Debug build and Swift checks
-    runs-on: macos-latest
+    # Use the standard 14 GB image for the Simulator and its paired Node Host.
+    runs-on: macos-15-intel
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     timeout-minutes: 75
     steps:
       - name: Check out repository
@@ -461,7 +466,9 @@ jobs:
     needs: ios-simulator
     name: iOS Simulator startup and native GUI on a fresh runner
     # Match the app build's Xcode/SDK family on a separate fresh runner.
-    runs-on: macos-latest
+    runs-on: macos-15-intel
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     timeout-minutes: 45
     steps:
       - name: Check out repository
