@@ -235,8 +235,19 @@ final class JokoConnectionUITests: XCTestCase {
         // through the real keyboard and verify the empty value before typing.
         let placeholder = field.placeholderValue ?? ""
         if let value = field.value as? String, !value.isEmpty && value != placeholder {
-            field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
-            field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: value.count))
+            if field.elementType == .textView {
+                // The preceding CONNECT invitation can wrap and scroll. Clear
+                // its remaining visible suffix through the real caret before
+                // replacing the public pin; never type over a partial draft.
+                for _ in 0..<8 {
+                    guard let remaining = field.value as? String, !remaining.isEmpty, remaining != placeholder else { break }
+                    field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.95)).tap()
+                    field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: remaining.count))
+                }
+            } else {
+                field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
+                field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: value.count))
+            }
             let cleared = XCTNSPredicateExpectation(predicate: NSPredicate(
                 format: "value == '' OR value == %@", placeholder), object: field)
             let clearedResult = XCTWaiter.wait(for: [cleared], timeout: 10)
