@@ -1,6 +1,12 @@
 import { MessagingTransportError } from "../types.js";
+import { splitMarkdownChunks } from "../markdown-chunks.js";
 
 export const TELEGRAM_TEXT_LIMIT = 4_096;
+
+/** Budget Markdown before rendering, closing and reopening fences at every boundary. */
+export function splitTelegramMarkdown(source: string): readonly string[] {
+  return splitMarkdownChunks(source, 3_000);
+}
 
 /** Splits on a useful boundary without ever bisecting a UTF-16 surrogate pair. */
 export function splitTelegramText(source: string, limit = TELEGRAM_TEXT_LIMIT): readonly string[] {

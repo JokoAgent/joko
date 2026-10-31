@@ -15,6 +15,7 @@ import {
   type TelegramNormalizationResult
 } from "./normalize.js";
 import { TELEGRAM_TEXT_LIMIT } from "./text.js";
+import { renderTelegramMarkdown, stripTelegramHtmlTags } from "./markdown.js";
 
 export interface TelegramTransportOptions extends TelegramApiOptions {
   readonly connectionId: string;
@@ -141,37 +142,52 @@ export class TelegramTransport {
     };
   }
 
-  /** One call is one external effect; the durable manager owns chunk sequencing and retries. */
+  /** The durable manager owns chunks/retries; a structured HTML rejection permits one plain replacement. */
   async sendTextPart(input: {
     readonly address: MessagingAddress;
     readonly text: string;
     readonly replyToMessageId?: string;
     readonly parseMode?: "HTML";
+    readonly format?: "markdown";
+    readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt> {
     this.#assertAddress(input.address);
-    if (input.text.length === 0 || input.text.length > TELEGRAM_TEXT_LIMIT) {
+    const visibleLength = input.parseMode === "HTML" ? stripTelegramHtmlTags(input.text).length : input.text.length;
+    if (visibleLength === 0 || visibleLength > TELEGRAM_TEXT_LIMIT || input.text.length > 64 * 1024
+      || input.format === "markdown" && input.parseMode !== undefined) {
       throw invalidInput(`Telegram text must contain 1-${TELEGRAM_TEXT_LIMIT} UTF-16 code units.`);
     }
     const replyId = input.replyToMessageId === undefined ? null : numericCoordinate(input.replyToMessageId, "message");
-    const sent = await this.#api.call<TelegramMessage>("sendMessage", {
-      chat_id: numericCoordinate(input.address.providerConversationId, "conversation"),
-      text: input.text,
-      ...(input.address.providerThreadId === null
-        ? {}
-        : { message_thread_id: numericCoordinate(input.address.providerThreadId, "thread") }),
-      ...(input.parseMode === undefined ? {} : { parse_mode: input.parseMode }),
-      ...(replyId === null ? {} : {
-        reply_parameters: { message_id: replyId, allow_sending_without_reply: true }
-      })
-    }, { signal: input.signal, effect: "unknown" });
-    if (!Number.isSafeInteger(sent.message_id)) {
-      throw new MessagingTransportError("malformed_response", "Telegram returned an invalid sent message.", {
-        retryable: false,
-        effect: "unknown"
-      });
+    const post = async (text: string, parseMode?: "HTML"): Promise<MessagingSendReceipt> => {
+      input.signal?.throwIfAborted(); input.assertCurrent?.();
+      const sent = await this.#api.call<TelegramMessage>("sendMessage", {
+        chat_id: numericCoordinate(input.address.providerConversationId, "conversation"),
+        text,
+        ...(input.address.providerThreadId === null
+          ? {}
+          : { message_thread_id: numericCoordinate(input.address.providerThreadId, "thread") }),
+        ...(parseMode === undefined ? {} : { parse_mode: parseMode }),
+        ...(replyId === null ? {} : {
+          reply_parameters: { message_id: replyId, allow_sending_without_reply: true }
+        })
+      }, { signal: input.signal, effect: "unknown" });
+      if (!Number.isSafeInteger(sent.message_id)) {
+        throw new MessagingTransportError("malformed_response", "Telegram returned an invalid sent message.", {
+          retryable: false,
+          effect: "unknown"
+        });
+      }
+      return { providerMessageId: String(sent.message_id), address: input.address };
+    };
+    if (input.format !== "markdown") return post(input.text, input.parseMode);
+    try {
+      return await post(renderTelegramMarkdown(input.text) || "…", "HTML");
+    } catch (error) {
+      // Only a complete, structured rejection proves that no message landed.
+      if (!(error instanceof MessagingTransportError) || error.options.effect !== "none" || error.options.providerStatus !== 400) throw error;
+      return post(input.text);
     }
-    return { providerMessageId: String(sent.message_id), address: input.address };
   }
 
   /** One multipart call is one external effect; unknown outcomes are never replayed blindly. */

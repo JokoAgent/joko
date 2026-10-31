@@ -12,7 +12,7 @@ import {
   splitDingTalkText,
   splitDiscordText,
   splitSlackText,
-  splitTelegramText,
+  splitTelegramMarkdown,
   splitWeComText,
   splitWeChatText,
   type DingTalkCallbackUpdate,
@@ -237,6 +237,8 @@ interface MessagingTransportEffectsPort {
     readonly replyToMessageId?: string;
     /** Exact inbound callback identity; used only by callback-capable transports. */
     readonly callbackMessageId?: string;
+    readonly format?: "markdown";
+    readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
   editTextPart?(input: {
@@ -639,7 +641,7 @@ export class MessagingManager {
         if (input.text.trim() || images.length || files.length) payloads.push({ kind: 'text', payload: { ...base,
           text: input.text || (images.length ? '' : 'Files delivered.'), files: images, feishuAnswer: true } });
       } else {
-        const split = channel === 'telegram' ? splitTelegramText : channel === 'discord' ? splitDiscordText : channel === 'dingtalk' ? splitDingTalkText
+        const split = channel === 'telegram' ? splitTelegramMarkdown : channel === 'discord' ? splitDiscordText : channel === 'dingtalk' ? splitDingTalkText
           : channel === 'slack' ? splitSlackText : channel === 'wechat' ? splitWeChatText : splitWeComText;
         for (const text of split(input.text)) payloads.push({ kind: 'text', payload: { ...base, text } });
         const batch = channel === 'telegram' || channel === 'discord' ? 10 : 1;
@@ -1315,7 +1317,7 @@ export class MessagingManager {
                   ? splitWeComText(deliveryText)
                   : channel === "wechat"
                     ? splitWeChatText(deliveryText)
-                  : splitTelegramText(text);
+                  : splitTelegramMarkdown(text);
           for (const part of parts) {
             const partIndex = deliveries.length;
             deliveries.push({
@@ -3848,6 +3850,7 @@ async function dispatchMessagingDelivery(
       ...(context === undefined ? {} : { context }),
       ...(payload.replyToMessageId === undefined ? {} : { replyToMessageId: payload.replyToMessageId }),
       ...(payload.callbackMessageId === undefined ? {} : { callbackMessageId: payload.callbackMessageId }),
+      ...(transport.channel === "telegram" && delivery.kind === "text" ? { format: "markdown" as const, assertCurrent } : {}),
       signal
     });
     return receipt.providerMessageId;

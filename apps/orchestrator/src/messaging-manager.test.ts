@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   MessagingTransportError,
+  TelegramTransport,
   type DingTalkCallbackUpdate,
   type DingTalkNormalizationResult,
   type DingTalkPollResult,
@@ -651,6 +652,43 @@ describe("MessagingManager", () => {
     await vi.waitFor(() => {
       expect(fixture.store.listMessagingDeliveries().every((delivery) => delivery.status === "sent")).toBe(true);
     }, { timeout: 2_000 });
+  });
+
+  it("dispatches a durable Telegram Markdown reply through the actual renderer and confirms only its final plain receipt", async () => {
+    class RenderedTransport extends FakeTelegramTransport {
+      readonly bodies: Record<string, unknown>[] = [];
+      outbound?: TelegramTransport;
+      override bind(options: TelegramTransportOptions): this {
+        super.bind(options);
+        this.outbound = new TelegramTransport({ ...options, fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          this.bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response(JSON.stringify(this.bodies.length === 1
+            ? { ok: false, error_code: 400, description: "Can't parse entities" }
+            : { ok: true, result: { message_id: 901 } }), { status: this.bodies.length === 1 ? 400 : 200 });
+        }) as typeof fetch });
+        return this;
+      }
+      override sendTextPart(input: Parameters<TelegramTransport["sendTextPart"]>[0]) { return this.outbound!.sendTextPart(input); }
+    }
+    class ReplyAdapter extends FakeBackendAdapter {
+      override async send(_input: PromptInput, context: AdapterContext) {
+        await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "**Answer**\n```ts\n    const value = '<&>';\n```" }] });
+        await context.emit({ type: "done", outcome: "completed" });
+      }
+    }
+    const transport = new RenderedTransport(directMessageBatch());
+    const fixture = await createFixture(() => transport, () => new ReplyAdapter(PI_LIKE_PROFILE));
+    const connection = await enableTelegramReply(fixture, "formatted-reply");
+    await vi.waitFor(() => {
+      const deliveries = fixture.store.listMessagingDeliveries({ connectionId: connection.id }).filter(item => item.kind === "text");
+      expect(deliveries).toHaveLength(1);
+      expect(deliveries[0]).toMatchObject({ status: "sent", providerMessageId: "901", attempts: 1 });
+    });
+    expect(transport.bodies).toHaveLength(2);
+    expect(transport.bodies[0]).toMatchObject({ parse_mode: "HTML", text: "<b>Answer</b>\n<pre><code class=\"language-ts\">    const value = '&lt;&amp;&gt;';</code></pre>" });
+    expect(transport.bodies[1]).toMatchObject({ text: "**Answer**\n```ts\n    const value = '<&>';\n```" });
+    expect(transport.bodies[1]).not.toHaveProperty("parse_mode");
+    expect(transport.bodies[1]!.chat_id).toBe(transport.bodies[0]!.chat_id);
   });
 
   it("keeps an uncertain outbound Telegram effect unknown and never sends it again after reconnect", async () => {
