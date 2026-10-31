@@ -28,6 +28,8 @@ import {
 
 import type { ArtifactStore } from "./artifact-store.js";
 import { BrowserResultCache, type BrowserResultSource } from "./browser-result-cache.js";
+import { BrowserExperienceRecorder, BROWSER_EXPERIENCE_ACTIONS, browserExperienceSite, deferredBrowserRecipeIssue, suggestBrowserRecipes,
+  type BrowserExperience, type BrowserExperienceAction } from "./browser-experience.js";
 import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-builtin-catalog.js";
 import { BROWSER_RECIPE_AUTHOR_RULES, BROWSER_WORKFLOW_RULES } from "./browser-rules.js";
@@ -86,7 +88,7 @@ const MAXIMUM_UNIFIED_RESULT_BYTES = 200_000;
 const unifiedActions = [
   "doctor", "status", "setBackend", "start", "stop", "profiles", "tabs", "open", "focus", "close",
   "snapshot", "screenshot", "navigate", "console", "pdf", "upload", "dialog", "act",
-  "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe", "readResult"
+  "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe", "readResult", "recipeHelp"
 ] as const;
 
 const actKinds = [
@@ -196,6 +198,8 @@ const unifiedSchema = objectSchema({
   recipeId: { type: "string", minLength: 1, maxLength: 256 },
   inputs: { type: "object", additionalProperties: true },
   site: { type: "string", minLength: 1, maxLength: 256 },
+  intent: { type: "string", maxLength: 4_096 },
+  deferValidation: { type: "boolean" },
   recipeDraft: { type: "object", additionalProperties: true },
   siteGuideDraft: { type: "object", additionalProperties: true },
   request: actRequestSchema
@@ -231,6 +235,8 @@ interface BrowserRecipe {
   readonly id: string;
   readonly match?: readonly string[];
   readonly description?: string;
+  readonly access?: "read" | "write";
+  readonly validation?: { readonly site: string; readonly state: "candidate" | "active" | "suspended"; readonly profile?: string };
   readonly inputs?: Readonly<Record<string, { readonly required?: boolean }>>;
   readonly steps: readonly BrowserRecipeStep[];
   readonly output?: string;
@@ -249,11 +255,23 @@ interface BrowserSiteGuide {
 export interface BrowserUserKnowledgeLayer {
   readonly recipes?: readonly unknown[];
   readonly siteGuides?: readonly unknown[];
+  readonly catalogVersion?: number;
+  listExperiences?(site: string): Promise<readonly BrowserExperience[]>;
+  recordExperience?(input: Pick<BrowserExperience, "site" | "actions">, assertCurrent: () => void): Promise<BrowserExperience>;
   save(input: {
     readonly site: string;
     readonly recipe: Readonly<Record<string, unknown>>;
     readonly siteGuide?: Readonly<Record<string, unknown>>;
+    readonly assertCurrent?: () => void;
+    readonly expectedRecipe?: string | null;
   }): Promise<void>;
+}
+
+interface BrowserRecipeTaskState {
+  readonly verified: Map<string, { readonly site: string; readonly content: string; readonly profile: string; readonly epoch: string }>;
+  readonly remoteVerified: Map<string, { readonly site: string; readonly digest: string; readonly epoch: string }>;
+  readonly failed: Set<string>; readonly repairs: Set<string>; readonly recorder: BrowserExperienceRecorder;
+  readonly hints: Set<string>; readonly discovered: Map<string, string>;
 }
 
 /**
@@ -406,6 +424,8 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   readonly #builtinSiteGuideIds = new Set<string>();
   readonly #userRecipeIds = new Set<string>();
   readonly #userSiteGuideIds = new Set<string>();
+  readonly #recipeTasks = new Map<string, BrowserRecipeTaskState>();
+  #knowledgeVersion: number | undefined;
   #tail: Promise<void> = Promise.resolve();
   #activeContext: BridgeToolCallContext | undefined;
   #activePageIds = new Set<string>();
@@ -458,6 +478,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       this.#siteGuides.set(guide.site, guide);
       this.#userSiteGuideIds.add(guide.site);
     }
+    this.#knowledgeVersion = input.userKnowledge?.catalogVersion;
   }
 
   get generation(): number {
@@ -504,6 +525,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     this.#remoteResultActive = false;
     try {
       this.#syncResultEpoch();
+      this.#refreshKnowledge();
       if (context !== undefined && (
         !Number.isSafeInteger(context.providerGeneration) || (context.providerGeneration ?? 0) < 1 ||
         !/^[a-f0-9]{64}$/u.test(context.requestIdentity ?? "") ||
@@ -511,9 +533,12 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         !/^sha256:[a-f0-9]{64}$/u.test(context.requestBodyHash ?? "")
       )) throw new Error("Browser bridge request authority is invalid.");
       this.#assertSessionContext();
-      const result = await this.#execute(name, arguments_, signal);
+      let result = await this.#execute(name, arguments_, signal);
       signal?.throwIfAborted();
       this.#assertSessionContext();
+      for (const pageId of this.#activePageIds) this.#assertPageContext(pageId);
+      result = await this.#observeBrowserFlow(name, arguments_, result, signal);
+      signal?.throwIfAborted(); this.#assertSessionContext();
       for (const pageId of this.#activePageIds) this.#assertPageContext(pageId);
       const payload = result.structuredContent;
       if (isRecord(payload) && payload["ok"] === true && typeof payload["action"] === "string" && "data" in payload) {
@@ -524,6 +549,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
       return result;
     } catch (error) {
+      this.#recipeTasks.get(this.#resultOwner())?.recorder.clear();
       this.#results.clearOwner(this.#resultOwner());
       throw error;
     } finally {
@@ -792,6 +818,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   ): Promise<McpCallResult> {
     signal?.throwIfAborted();
     const action = requiredEnum(input, "action", unifiedActions);
+    if (input["deferValidation"] !== undefined && action !== "saveRecipe") throw new Error("deferValidation is only accepted by saveRecipe.");
     if (input["backend"] !== undefined && action !== "setBackend") throw new Error("backend is only accepted by action=setBackend.");
     const hasProxy = input["proxyServer"] !== undefined || input["proxyAllowedHostnames"] !== undefined;
     if (hasProxy && action !== "start") throw new Error("Proxy options are only accepted by action=start.");
@@ -1040,7 +1067,14 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       case "siteguide":
         return this.#readSiteGuide(input);
       case "saveRecipe":
-        return this.#saveRecipe(input);
+        return this.#saveRecipe(input, signal);
+      case "recipeHelp": {
+        const site = optionalString(input, "site", 256);
+        let observations: readonly BrowserExperience[] = [];
+        if (site !== undefined && !browserExperienceSite(site)) throw new Error("recipeHelp requires a full site hostname.");
+        try { if (site !== undefined) observations = await this.#userKnowledge?.listExperiences?.(site) ?? []; } catch { /* Optional observations cannot block help. */ }
+        assertCurrent(); return this.#result(action, { rules: BROWSER_RECIPE_AUTHOR_RULES, observations });
+      }
     }
   }
 
@@ -1223,6 +1257,22 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       throw new Error(`Remote Browser node does not advertise action:${action}.`);
     }
     const actKind = validateRemoteBrowserInput(action, input);
+    const recipeId = action === "recipe" || action === "saveRecipe"
+      ? isRecord(input["recipeDraft"]) ? validateRecipe(input["recipeDraft"]).id : requiredString(input, "recipeId", 256) : undefined;
+    const recipeKey = recipeId === undefined ? undefined : JSON.stringify([nodeId, recipeId]);
+    const recipeEpoch = JSON.stringify([nodeId, generation, this.#syncResultEpoch()]);
+    const recipeTask = recipeKey === undefined ? undefined : this.#recipeTask();
+    if (action === "recipe" && recipeKey !== undefined) {
+      if (recipeTask!.remoteVerified.size >= 256 && !recipeTask!.remoteVerified.has(recipeKey)) throw new Error("Too many pending remote recipe validations in this task.");
+      recipeTask!.remoteVerified.delete(recipeKey);
+    }
+    if (action === "saveRecipe" && input["deferValidation"] !== true) {
+      const draft = validateRecipe(requiredRecord(input, "recipeDraft")), proof = recipeTask!.remoteVerified.get(recipeKey!);
+      const digest = createHash("sha256").update(JSON.stringify(draft)).digest("hex");
+      if (!proof || proof.epoch !== recipeEpoch || proof.site !== requiredString(input, "site", 256) || proof.digest !== digest) {
+        throw new Error("Validate the unchanged remote recipeDraft in this task before saving it.");
+      }
+    }
     if (actKind !== undefined && !route.capabilities.has(`act:${actKind}`)) {
       throw new Error(`Remote Browser node does not advertise act:${actKind}.`);
     }
@@ -1275,6 +1325,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
 
     const result = await route.call({ action, arguments: copyRemoteArguments(input) }, signal);
     this.#assertRemoteRoute(route, generation);
+    signal?.throwIfAborted(); this.#assertSessionContext();
     if (context !== undefined) {
       this.#assertSessionContext();
       if (pageId !== undefined) {
@@ -1282,6 +1333,15 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         if (result.ok && (action === "close" || remoteActClosesPage(action, input))) {
           this.#state?.closeHumanPage(remoteProviderId, pageId, generation);
         }
+      }
+    }
+    if (result.ok && recipeKey !== undefined) {
+      if (action === "saveRecipe") recipeTask!.remoteVerified.delete(recipeKey);
+      const verification = isRecord(result.data) ? result.data["verification"] : undefined;
+      if (action === "recipe" && isRecord(verification) && verification["id"] === recipeId && browserExperienceSite(verification["site"])
+        && typeof verification["digest"] === "string" && /^[a-f0-9]{64}$/u.test(verification["digest"])
+        && JSON.stringify([nodeId, generation, this.#syncResultEpoch()]) === recipeEpoch) {
+        recipeTask!.remoteVerified.set(recipeKey, { site: verification["site"], digest: verification["digest"], epoch: recipeEpoch });
       }
     }
     const projected = context === undefined
@@ -1426,10 +1486,121 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     return pageId;
   }
 
+  #recipeTask(): BrowserRecipeTaskState {
+    const owner = this.#resultOwner();
+    let state = this.#recipeTasks.get(owner);
+    if (!state) {
+      if (this.#recipeTasks.size >= 512) throw new Error("Browser recipe learning is at capacity. Recover the Browser before validating another task's draft.");
+      state = { verified: new Map(), remoteVerified: new Map(), failed: new Set(), repairs: new Set(), recorder: new BrowserExperienceRecorder(), hints: new Set(), discovered: new Map() };
+      this.#recipeTasks.set(owner, state);
+    }
+    return state;
+  }
+
+  #refreshKnowledge(): void {
+    const layer = this.#userKnowledge;
+    if (layer?.catalogVersion === undefined || layer.catalogVersion === this.#knowledgeVersion) return;
+    const recipes = new Map<string, BrowserRecipe>(), guides = new Map<string, BrowserSiteGuide>();
+    for (const raw of BUILTIN_BROWSER_RECIPES) { if (!isRecord(raw)) throw new Error("Built-in Browser recipe is invalid."); const value = validateRecipe(raw); recipes.set(value.id, value); }
+    for (const raw of BUILTIN_BROWSER_SITE_GUIDES) { if (!isRecord(raw)) throw new Error("Built-in Browser guide is invalid."); const value = validateSiteGuide(raw); guides.set(value.site, value); }
+    const recipeIds = new Set<string>(), guideIds = new Set<string>();
+    for (const raw of layer.recipes ?? []) {
+      if (!isRecord(raw)) throw new Error("User Browser recipe is invalid.");
+      const value = validateRecipe(raw); validateUserRecipeSafety(value); recipes.set(value.id, value); recipeIds.add(value.id);
+    }
+    for (const raw of layer.siteGuides ?? []) {
+      if (!isRecord(raw)) throw new Error("User Browser site guide is invalid.");
+      const value = validateSiteGuide(raw); guides.set(value.site, value); guideIds.add(value.site);
+    }
+    this.#recipes.clear(); for (const [id, value] of recipes) this.#recipes.set(id, value);
+    this.#siteGuides.clear(); for (const [site, value] of guides) this.#siteGuides.set(site, value);
+    this.#userRecipeIds.clear(); for (const id of recipeIds) this.#userRecipeIds.add(id);
+    this.#userSiteGuideIds.clear(); for (const site of guideIds) this.#userSiteGuideIds.add(site);
+    this.#knowledgeVersion = layer.catalogVersion;
+  }
+
+  async #observeBrowserFlow(name: string, input: Readonly<Record<string, unknown>>, result: McpCallResult, signal?: AbortSignal): Promise<McpCallResult> {
+    try {
+      const args = name === "browser" ? input : name === "call_tool" && input["name"] === "browser" ? optionalRecord(input, "args") : undefined;
+      if (!args || args["target"] === "node") return result;
+      const action = args["action"], request = optionalRecord(args, "request");
+      if (action === "stop") { this.#recipeTasks.clear(); return result; }
+      if (!["open", "navigate", "close", "act", "extract", "recipe"].includes(String(action))) return result;
+      const epoch = this.#syncResultEpoch(), state = this.#recipeTask();
+      if (action === "recipe") { state.recorder.clear(); return result; }
+      const payload = result.structuredContent, data = isRecord(payload?.["data"]) ? payload["data"] : undefined;
+      const page = isRecord(data?.["page"]) ? data["page"] : isRecord(data?.["tab"]) ? data["tab"] : undefined;
+      const pageId = typeof page?.["id"] === "string" ? page["id"] : typeof args["targetId"] === "string" ? args["targetId"]
+        : typeof request?.["targetId"] === "string" ? request["targetId"] : this.#activePageIds.size === 1 ? [...this.#activePageIds][0] : undefined;
+      if (pageId === undefined) return result;
+      const profile = this.#browser.targetMode, key = JSON.stringify([profile, pageId]);
+      const inner = data?.["result"];
+      if (result.isError || payload?.["ok"] !== true || action === "extract" && isRecord(inner) && inner["ok"] === false
+        || action === "close" || request?.["kind"] === "close") { state.recorder.clear(key); return result; }
+      const assertCurrent = () => {
+        signal?.throwIfAborted(); this.#assertSessionContext(); this.#assertPageContext(pageId);
+        if (this.#syncResultEpoch() !== epoch) throw new Error("Browser learning source retired.");
+      };
+      await this.#assertPageReadable(pageId, true); assertCurrent();
+      let extras: Record<string, unknown> | undefined;
+      if (action === "open" || action === "navigate") {
+        const url = typeof page?.["url"] === "string" ? page["url"] : optionalString(args, "url", 8_192);
+        if (url === undefined) return result;
+        state.recorder.start(key, url);
+        const site = new URL(url).hostname, intent = args["intent"] === undefined ? "" : requiredString(args, "intent", 4_096, true);
+        const hintKey = JSON.stringify([site, profile, intent]), version = String(this.#userKnowledge?.catalogVersion ?? "");
+        if (state.discovered.get(hintKey) !== version) {
+          if (state.discovered.size >= 64) state.discovered.delete(state.discovered.keys().next().value!);
+          state.discovered.set(hintKey, version);
+          const recipes = suggestBrowserRecipes([...this.#recipes.values()], site, intent, profile);
+          if (recipes.length) extras = { recipeSuggestions: recipes.map(recipe => ({ ...recipeSummary(recipe, recipe.id),
+            access: recipe.access ?? "unspecified", state: recipe.validation?.state ?? "active", provenance: this.#recipeProvenance(recipe.id) })) };
+        }
+      } else {
+        const kind = action === "extract" ? "extract" : request?.["kind"];
+        if (BROWSER_EXPERIENCE_ACTIONS.includes(kind as BrowserExperienceAction)) {
+          const observation = state.recorder.step(key, kind as BrowserExperienceAction);
+          if (observation && !(isRecord(inner) && inner["ok"] === false) && this.#userKnowledge?.recordExperience) {
+            const saved = await this.#userKnowledge.recordExperience(observation, assertCurrent); assertCurrent();
+            const hint = JSON.stringify([saved.site, saved.actions]);
+            if (saved.observations >= 2 && !state.hints.has(hint)) {
+              if (state.hints.size >= 64) state.hints.delete(state.hints.values().next().value!);
+              state.hints.add(hint); extras = { learningOpportunity: { site: saved.site, observations: saved.observations,
+                hint: "This action shape has repeated; it does not prove the same business intent. Use recipeHelp and the successful steps from this task if a reusable flow would help. Occasional work needs no recipe." } };
+            }
+          }
+        }
+      }
+      if (extras && data && typeof action === "string") return this.#mixedResult(action, { ...data, ...extras }, result.content.filter(item => !isRecord(item) || item["type"] !== "text"));
+    } catch { this.#recipeTasks.get(this.#resultOwner())?.recorder.clear(); /* Advisory learning never changes a completed action's outcome. */ }
+    return result;
+  }
+
   async #runRecipe(input: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined): Promise<McpCallResult> {
-    const id = requiredString(input, "recipeId", 256);
-    const recipe = this.#recipes.get(id);
-    if (recipe === undefined) throw new Error(`Unknown browser recipe '${id}'.`);
+    const draft = optionalRecord(input, "recipeDraft"), requestedId = optionalString(input, "recipeId", 256);
+    const recipe = draft === undefined ? this.#recipes.get(requiredString(input, "recipeId", 256)) : validateRecipe(draft);
+    if (recipe === undefined) throw new Error(`Unknown browser recipe '${requestedId}'.`);
+    const id = recipe.id;
+    if (requestedId !== undefined && requestedId !== recipe.id) throw new Error("recipeId must match recipeDraft.id.");
+    const epoch = this.#syncResultEpoch(), task = this.#recipeTask(), profile = this.#browser.targetMode;
+    task.recorder.clear();
+    const persisted = this.#recipes.get(recipe.id), verifying = draft !== undefined || recipe.validation?.state === "candidate";
+    const site = draft === undefined ? recipe.validation?.site : requiredString(input, "site", 256);
+    const { validation: _validation, ...authored } = recipe;
+    if (draft !== undefined && draft["validation"] !== undefined) throw new Error("Recipe validation is owned by the host.");
+    if (verifying) validateRecipeDraft(authored, site);
+    if (draft === undefined && recipe.validation?.state === "candidate") {
+      const issue = deferredBrowserRecipeIssue(recipe); if (issue) throw new Error(issue);
+    }
+    if (persisted?.validation?.profile !== undefined && persisted.validation.profile !== profile) throw new Error("This recipe belongs to another Browser profile.");
+    if (draft !== undefined && persisted?.validation && persisted.validation.site !== site) throw new Error("A revised recipe must retain its original site.");
+    const suspended = task.failed.has(recipe.id) || persisted?.validation?.state === "suspended";
+    if (draft === undefined && suspended) return browserError("recipe", { recipe: recipe.id, message: "This recipe is suspended. Observe the current page and explicitly validate a corrected draft; never replay an uncertain write." });
+    if (draft !== undefined && task.repairs.has(recipe.id)) return browserError("recipe", { recipe: recipe.id, message: "This task has used its one repair validation for this recipe. Continue with ordinary Browser actions." });
+    if (verifying && task.verified.size >= 256 && !task.verified.has(recipe.id)) return browserError("recipe", { recipe: recipe.id, failureKind: "input", message: "Too many pending recipe validations in this task." });
+    task.verified.delete(recipe.id);
+    const expectedRecipe = this.#userKnowledge?.recipes?.find(raw => isRecord(raw) && raw["id"] === recipe.id);
+    const expectedContent = expectedRecipe === undefined ? null : JSON.stringify(expectedRecipe);
     const vars: Record<string, unknown> = { ...(optionalRecord(input, "inputs") ?? {}) };
     for (const [name, spec] of Object.entries(recipe.inputs ?? {})) {
       if (spec.required === true && (vars[name] === undefined || vars[name] === null)) {
@@ -1446,12 +1617,15 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       vars[name] = String(value);
     }
     const completed: Array<{ action: string; ok: boolean }> = [];
+    let activeTargetId = optionalString(input, "targetId", 512);
     for (let index = 0; index < recipe.steps.length; index += 1) {
       signal?.throwIfAborted();
       const step = recipe.steps[index]!;
       let failureKind: "input" | "guard" | "expect" | "action" = "input";
+      let dispatched = false;
       try {
-        const call = recipeStepInput(step, vars, input);
+        const routed = activeTargetId === undefined ? input : { ...input, targetId: activeTargetId };
+        const call = recipeStepInput(step, vars, routed);
         const guard = step.guard === undefined ? undefined : {
           url: interpolateRecipe(step.guard.url, vars),
           ...(step.guard.selector === undefined ? {} : { selector: interpolateRecipe(step.guard.selector, vars) }),
@@ -1465,20 +1639,23 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         };
         if (guard !== undefined && step.action !== "extract") {
           failureKind = "guard";
-          const pageId = this.#unifiedPageId(input);
+          const pageId = this.#unifiedPageId(routed);
           const matched = await this.#withPageReadLease(pageId, lease => this.#browser.checkPageGuard(pageId, lease, guard, step.timeoutMs));
           if (!matched) throw new BrowserPageGuardError();
         }
+        this.#unifiedPageId(routed);
         failureKind = "action";
+        dispatched = true;
+        if (draft !== undefined && suspended) task.repairs.add(recipe.id);
         let result: McpCallResult;
         if (step.action === "extract" && guard !== undefined) {
-          const pageId = this.#unifiedPageId(input);
+          const pageId = this.#unifiedPageId(routed);
           result = await this.#withPageReadLease(pageId, async lease => this.#result("extract", await this.#browser.extract(
             pageId, lease, step.extract!, step.timeoutMs, undefined, guard
           )));
-        } else if (step.action === "evaluate" && this.#recipeProvenance(id) === "builtin") {
+        } else if (draft === undefined && step.action === "evaluate" && this.#recipeProvenance(id) === "builtin") {
           if (step.fn === undefined) throw new Error("Browser recipe evaluate step requires fn.");
-          const pageId = this.#unifiedPageId(input);
+          const pageId = this.#unifiedPageId(routed);
           const source = interpolateRecipe(step.fn, vars);
           const value = await this.#withPageReadLease(pageId, (lease) => this.#browser.evaluateBundledRecipe(
             pageId,
@@ -1491,6 +1668,9 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           result = await this.#executeUnified(call, signal);
         }
         const value = recipeStepValue(step, result);
+        const data = result.structuredContent?.["data"];
+        const page = isRecord(data) && isRecord(data["page"]) ? data["page"] : undefined;
+        if (typeof page?.["id"] === "string") activeTargetId = page["id"];
         if (result.isError || result.structuredContent?.["ok"] === false
           || step.action === "extract" && typeof value === "object" && value !== null && "ok" in value && value.ok === false) {
           throw new Error(`Browser recipe step '${step.action}' returned an error.`);
@@ -1503,26 +1683,58 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         if (error instanceof BrowserPageGuardError) failureKind = "guard";
         if (failureKind !== "guard" && failureKind !== "input") completed.push({ action: step.action, ok: false });
         if (step.optional === true && failureKind === "action") continue;
+        let maintenanceMessage: string | undefined;
+        if (dispatched && failureKind !== "input" && this.#syncResultEpoch() === epoch) {
+          if (draft === undefined || persisted === undefined || suspended) task.failed.add(recipe.id);
+          if (!verifying && persisted) maintenanceMessage = await this.#suspendRecipe(persisted, expectedContent, signal);
+        }
         return browserError("recipe", {
           recipe: id,
           steps: completed,
           failedStep: index,
           failedAction: step.action,
           failureKind,
-          message: error instanceof Error ? error.message : String(error)
+          message: error instanceof Error ? error.message : String(error),
+          ...(maintenanceMessage === undefined ? {} : { maintenanceMessage })
         });
       }
     }
+    let verified = false;
+    if (verifying && this.#syncResultEpoch() === epoch) {
+      signal?.throwIfAborted(); this.#assertSessionContext();
+      task.verified.set(recipe.id, { site: site!, content: JSON.stringify(authored), profile, epoch }); verified = true;
+    }
     return this.#result("recipe", {
-      recipe: id,
-      provenance: this.#recipeProvenance(id),
+      recipe: recipe.id,
+      provenance: draft === undefined ? this.#recipeProvenance(recipe.id) : "user",
       steps: completed,
+      ...(verifying ? { verified, ...(verified ? { verification: { id: recipe.id, site, digest: createHash("sha256").update(JSON.stringify(authored)).digest("hex") } } : {}),
+        message: "Execution does not save or activate a recipe. Use saveRecipe with the unchanged draft." } : {}),
       ...(recipe.output === undefined ? {} : { output: resolveRecipeOutput(recipe.output, vars) })
     });
   }
 
+  async #suspendRecipe(recipe: BrowserRecipe, expectedRecipe: string | null, signal?: AbortSignal): Promise<string | undefined> {
+    const sites = recipe.validation ? [recipe.validation.site] : [...this.#siteGuides.values()].filter(guide => guide.recipes?.includes(recipe.id)).map(guide => guide.site);
+    if (sites.length !== 1 || !this.#userKnowledge) return "Reuse is paused in this task. Its original site or durable recipe owner could not be confirmed.";
+    const suspended: BrowserRecipe = { ...recipe, validation: { ...recipe.validation, site: sites[0]!, state: "suspended" } };
+    const epoch = this.#syncResultEpoch();
+    try {
+      await this.#userKnowledge.save({ site: sites[0]!, recipe: suspended as unknown as Readonly<Record<string, unknown>>, expectedRecipe,
+        assertCurrent: () => { signal?.throwIfAborted(); this.#assertSessionContext(); if (epoch !== this.#syncResultEpoch()) throw new Error("Browser recipe source changed."); } });
+      this.#recipes.set(recipe.id, suspended); this.#userRecipeIds.add(recipe.id); this.#refreshKnowledge();
+    } catch { return "Reuse is paused in this task. The durable suspension could not be saved; a newer recipe remains unchanged."; }
+    return undefined;
+  }
+
   #readSiteGuide(input: Readonly<Record<string, unknown>>): McpCallResult {
     const site = optionalString(input, "site", 256);
+    if (site !== undefined && input["intent"] !== undefined) {
+      if (!browserExperienceSite(site)) throw new Error("Recipe suggestions require a full site hostname.");
+      const intent = requiredString(input, "intent", 4_096, true);
+      return this.#result("siteguide", { site, recipes: suggestBrowserRecipes([...this.#recipes.values()], site.toLocaleLowerCase("en-US"), intent, this.#browser.targetMode)
+        .map(recipe => ({ ...recipeSummary(recipe, recipe.id), provenance: this.#recipeProvenance(recipe.id) })) });
+    }
     if (site === undefined) {
       const guided = new Set([...this.#siteGuides.values()].flatMap((guide) => [...(guide.recipes ?? [])]));
       return this.#result("siteguide", {
@@ -1539,7 +1751,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           .map((recipe) => ({ ...recipeSummary(recipe, recipe.id), provenance: this.#recipeProvenance(recipe.id) }))
       });
     }
-    const guide = this.#siteGuides.get(site);
+    const guide = this.#siteGuides.get(site) ?? [...this.#siteGuides.values()].find(value => Array.isArray(value["aliases"]) && value["aliases"].includes(site));
     if (guide === undefined) throw new Error(`No browser site guide exists for '${site}'.`);
     return this.#result("siteguide", {
       provenance: this.#siteGuideProvenance(site),
@@ -1550,28 +1762,51 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     });
   }
 
-  async #saveRecipe(input: Readonly<Record<string, unknown>>): Promise<McpCallResult> {
+  async #saveRecipe(input: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<McpCallResult> {
+    if (!this.#userKnowledge) throw new Error("Durable Browser recipe saving is unavailable on this host.");
     const site = requiredString(input, "site", 256);
-    const recipe = validateRecipe(requiredRecord(input, "recipeDraft"));
+    const draft = requiredRecord(input, "recipeDraft");
+    if (draft["validation"] !== undefined) throw new Error("Recipe validation is owned by the host.");
+    const recipe = validateRecipe(draft);
     validateUserRecipeSafety(recipe);
+    validateRecipeDraft(recipe, site);
+    const epoch = this.#syncResultEpoch(), task = this.#recipeTask(), profile = this.#browser.targetMode;
+    const deferred = input["deferValidation"] === undefined ? false : requiredBoolean(input, "deferValidation");
+    const proof = task.verified.get(recipe.id);
+    const persisted = this.#recipes.get(recipe.id);
+    if (persisted?.validation && (persisted.validation.site !== site || persisted.validation.profile !== undefined && persisted.validation.profile !== profile)) {
+      throw new Error("A recipe revision must retain its original site and Browser profile.");
+    }
+    if (deferred) {
+      const issue = deferredBrowserRecipeIssue(recipe); if (issue) throw new Error(issue);
+      if (persisted) throw new Error("An unverified candidate cannot replace an existing recipe. Validate the revision first.");
+    } else if (!proof || proof.site !== site || proof.content !== JSON.stringify(recipe) || proof.profile !== profile || proof.epoch !== epoch) {
+      throw new Error("Validate the unchanged recipeDraft with action=recipe and site in this task before saving it.");
+    }
     const guideValue = optionalRecord(input, "siteGuideDraft");
     const guide = guideValue === undefined ? undefined : validateSiteGuide(guideValue);
     if (guide !== undefined && guide.site !== site) throw new Error("Browser site guide must match the requested site.");
-    await this.#userKnowledge?.save({
+    const saved: BrowserRecipe = { ...recipe, validation: { site, state: deferred ? "candidate" : "active", profile } };
+    await this.#userKnowledge.save({
       site,
-      recipe: recipe as unknown as Readonly<Record<string, unknown>>,
+      recipe: saved as unknown as Readonly<Record<string, unknown>>,
+      ...(deferred ? { expectedRecipe: null } : {}),
+      assertCurrent: () => { signal?.throwIfAborted(); this.#assertSessionContext(); if (this.#syncResultEpoch() !== epoch) throw new Error("Browser recipe source retired before saving."); },
       ...(guide === undefined ? {} : { siteGuide: guide as Readonly<Record<string, unknown>> })
     });
-    this.#recipes.set(recipe.id, recipe);
+    this.#recipes.set(recipe.id, saved);
     this.#userRecipeIds.add(recipe.id);
+    task.verified.delete(recipe.id); task.failed.delete(recipe.id);
     if (guide !== undefined) {
       this.#siteGuides.set(site, guide);
       this.#userSiteGuideIds.add(site);
     }
+    this.#refreshKnowledge();
     return this.#result("saveRecipe", {
       saved: true,
       site,
       recipeId: recipe.id,
+      state: saved.validation!.state,
       provenance: this.#recipeProvenance(recipe.id)
     });
   }
@@ -1832,7 +2067,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   }
   #syncResultEpoch(): string {
     const epoch = JSON.stringify([this.#browser.id, this.#browser.generation, this.#browser.targetMode]);
-    if (epoch !== this.#resultEpoch) { this.#results.clear(); this.#resultEpoch = epoch; }
+    if (epoch !== this.#resultEpoch) { this.#results.clear(); this.#recipeTasks.clear(); this.#resultEpoch = epoch; }
     return epoch;
   }
   #mixedResult(action: string, data: unknown, extraContent: readonly unknown[]): McpCallResult {
@@ -2130,6 +2365,7 @@ function scopedRemotePageId(
     case "open":
     case "siteguide":
     case "saveRecipe":
+    case "recipeHelp":
       return undefined;
     case "act": {
       const request = requiredRecord(input, "request");
@@ -2315,14 +2551,40 @@ function validateRecipe(value: Readonly<Record<string, unknown>>): BrowserRecipe
       ? {}
       : { required: requiredBoolean(spec, "required") };
   }
+  const rawValidation = optionalRecord(value, "validation");
+  const validation = rawValidation === undefined ? undefined : {
+    site: requiredString(rawValidation, "site", 256),
+    state: requiredEnum(rawValidation, "state", ["candidate", "active", "suspended"] as const),
+    ...(rawValidation["profile"] === undefined ? {} : { profile: requiredString(rawValidation, "profile", 256, true) })
+  };
+  if (validation !== undefined && !browserExperienceSite(validation.site)) throw new Error("Browser recipe validation site is invalid.");
   return {
     id,
+    ...(value["access"] === undefined ? {} : { access: requiredEnum(value, "access", ["read", "write"] as const) }),
+    ...(validation === undefined ? {} : { validation }),
     ...(value["match"] === undefined ? {} : { match: requiredStringArray(value, "match", 256, 256) }),
     ...(value["description"] === undefined ? {} : { description: requiredString(value, "description", 4_096, true) }),
     ...(rawInputs === undefined ? {} : { inputs }),
     steps,
     ...(value["output"] === undefined ? {} : { output: requiredString(value, "output", 4_096, true) })
   };
+}
+
+function validateRecipeDraft(recipe: BrowserRecipe, site: string | undefined): void {
+  if (!browserExperienceSite(site)) throw new Error("A recipe draft requires site as a full hostname.");
+  validateUserRecipeSafety(recipe);
+  for (const step of recipe.steps) {
+    if (["click", "type", "select", "extract", "evaluate"].includes(step.action) && step.guard === undefined) {
+      throw new Error("Interactive and read steps require an exact page guard before draft validation.");
+    }
+    for (const url of [step.guard?.url, step.action === "navigate" ? step.url : undefined]) {
+      if (url === undefined) continue;
+      const parsed = new URL(agentUrl(url));
+      if (parsed.hostname !== site.toLocaleLowerCase("en-US")) throw new Error("Draft guard and navigation URLs must belong to site.");
+    }
+  }
+  const last = recipe.steps.at(-1);
+  if (!last?.expect || !last.as || recipe.output !== `{{${last.as}}}`) throw new Error("The last draft step must validate its result with expect and return it through as/output.");
 }
 
 function validateRecipeExpectation(value: Readonly<Record<string, unknown>>): BrowserRecipeExpectation {
@@ -2429,6 +2691,8 @@ function recipeSummary(recipe: BrowserRecipe | undefined, id: string): Readonly<
   return {
     id,
     description: recipe?.description,
+    ...(recipe?.access === undefined ? {} : { access: recipe.access }),
+    ...(recipe?.validation === undefined ? {} : { state: recipe.validation.state }),
     inputs: Object.keys(recipe?.inputs ?? {}),
     required: Object.entries(recipe?.inputs ?? {}).filter(([, spec]) => spec.required === true).map(([name]) => name),
     match: recipe?.match ?? []

@@ -44,12 +44,15 @@ A recipe is declarative site knowledge, not executable host code. Use it for a f
 
 #### Reconnaissance to persistence
 
-1. Call \`siteguide\` for the host. If no recipe fits, navigate to the real page, take a scoped snapshot, and inspect narrowly filtered requests.
+1. Reuse the current task's successful steps and automatic recipe suggestions, then call \`siteguide\` for the host if needed. \`recipeHelp\` observations contain only action shapes and counts; they do not prove business identity, selectors, scripts or values. Inspect a scoped snapshot or narrowly filtered requests only for missing evidence.
 2. Prefer a stable public JSON/XML endpoint when one exists. Put changing query terms, page numbers, IDs, and cursors in declared inputs and interpolate them in the URL.
 3. Record authentication expectations in the site guide. Login is performed by the user in the persistent managed Browser; recipes may probe login state with optional steps but must never contain credentials.
 4. Confirm every DOM selector with a scoped snapshot. Use \`extract\` for fields: strings select text, \`{selector,attr}\` selects an attribute, and \`{selector,type:"href"}\` resolves a link. Use \`from\` and \`multiple\` for records.
 5. Recipe interaction steps use stable CSS selectors rather than snapshot refs, because refs are generation- and observation-scoped. A \`type\` step may set \`submit:true\`.
-6. Run the saved draft immediately with \`recipe\`, verify its output and failure step, then persist the corrected draft with \`saveRecipe\` and an optional site-guide draft.
+6. Validate with \`action:"recipe", site, recipeDraft, inputs\` during a real task. Interactive and read steps need exact page guards. The last step must use \`expect\` and \`as\`, with \`output:"{{variable}}"\` returning that validated result. Successful execution does not save or activate a draft.
+7. Explicitly save the unchanged, just-validated draft with \`saveRecipe\`. New \`access:"read"\` flows may instead use \`deferValidation:true\` to save a candidate for the next real task; candidates allow only navigate, wait without a function, extract, requests and responseBody. They cannot replace existing recipes. Interactive or script actions must be validated during their real work, never replayed merely to test a recipe.
+
+Validation belongs to the current task, Browser generation and profile. The host owns \`validation\`; do not put it in a draft. An input error does not suspend a recipe. A dispatched non-input failure pauses reuse; observe the current page before explicitly validating a correction. Each task permits one dispatched repair validation per failed recipe. Failed drafts cannot suspend a different saved active version, and candidate execution never silently promotes or writes back its snapshot. Active means only the executed checks passed. Parameterize business values; do not save user records or secrets.
 
 #### API strategy
 

@@ -1,7 +1,8 @@
 import { BrowserPageGuardError, type BrowserLease, type BrowserProvider, type BrowserRemoteNodeRouter } from "@joko/tool-browser";
 import { runInNewContext } from "node:vm";
 import { OperationalStore } from "@joko/store";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { BrowserUserKnowledgeStore } from "./browser-user-knowledge-store.js";
 
 import type { ArtifactStore } from "./artifact-store.js";
 import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-builtin-catalog.js";
@@ -12,6 +13,9 @@ import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 import { clearSecretPages, markSecretEntered } from "./input-handoff/secretTaint.js";
 import { BrowserAutomationNodeExecutor, BROWSER_AUTOMATION_NODE_CAPABILITIES } from "./browser-automation-node.js";
 
+const knowledgeStores = new Set<OperationalStore>();
+afterEach(() => { for (const store of knowledgeStores) store.close(); knowledgeStores.clear(); });
+
 function fixture(
   remoteNodes?: BrowserRemoteNodeRouter,
   userKnowledge?: BrowserUserKnowledgeLayer,
@@ -21,8 +25,14 @@ function fixture(
     readonly enabledForNewSessions?: (targetId: string) => boolean;
     readonly state?: OperationalBrowserState;
     readonly setBackend?: (mode: "external" | "sidebar", assertCurrent: () => void) => Promise<"external" | "sidebar">;
+    readonly recipes?: readonly Readonly<Record<string, unknown>>[];
   } = {}
 ) {
+  if (userKnowledge === undefined) {
+    const store = new OperationalStore(":memory:"); knowledgeStores.add(store);
+    if (options.recipes) store.setSetting("service", "orchestrator", "settings.browser.user_knowledge", { format: 1, catalogVersion: 1, recipes: options.recipes, siteGuides: [] });
+    userKnowledge = new BrowserUserKnowledgeStore(store);
+  }
   const lease: BrowserLease = {
     id: "lease-1",
     providerId: "browser",
@@ -150,6 +160,7 @@ function fixture(
   });
   return {
     bridge,
+    knowledge: userKnowledge,
     browser,
     start,
     actions,
@@ -469,16 +480,16 @@ describe("BrowserToolBridgeProvider", () => {
       }>> } };
     }).data.schema;
     expect(Object.keys(schema.properties)).toEqual([
-      "action", "backend", "proxyServer", "proxyAllowedHostnames", "profile", "target", "node", "url", "targetId", "label", "limit", "maxChars",
+      "resultId", "offset", "action", "backend", "proxyServer", "proxyAllowedHostnames", "profile", "target", "node", "url", "targetId", "label", "limit", "maxChars",
       "mode", "snapshotFormat", "refs", "interactive", "compact", "depth", "selector", "frame", "labels", "urls",
       "fullPage", "ref", "type", "level", "paths", "inputRef", "query", "timeoutMs", "dialogId",
-      "accept", "promptText", "filter", "clear", "extract", "recipeId", "inputs", "site", "recipeDraft",
+      "accept", "promptText", "filter", "clear", "extract", "recipeId", "inputs", "site", "intent", "deferValidation", "recipeDraft",
       "siteGuideDraft", "request"
     ]);
     expect(schema.properties["action"]?.enum).toEqual([
       "doctor", "status", "setBackend", "start", "stop", "profiles", "tabs", "open", "focus", "close",
       "snapshot", "screenshot", "navigate", "console", "pdf", "upload", "dialog", "act",
-      "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe"
+      "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe", "readResult", "recipeHelp"
     ]);
     expect(schema.properties["request"]?.properties?.["kind"]?.enum).toEqual([
       "click", "clickCoords", "type", "press", "hover", "drag", "select", "fill", "resize",
@@ -585,19 +596,23 @@ describe("BrowserToolBridgeProvider", () => {
   });
 
   it("saves, discovers, and executes validated reusable browser recipes", async () => {
-    const { bridge, actions } = fixture();
+    const { bridge, actions, knowledge } = fixture();
+    const recipeDraft = {
+      id: "example-search", inputs: { query: { required: true } },
+      steps: [
+        { action: "navigate", url: "https://example.test/search?q={{query|url}}" },
+        { action: "click", selector: "#result", guard: { url: "https://example.test/search?q={{query|url}}" } },
+        { action: "extract", extract: { fields: { title: "h1" } }, guard: { url: "https://example.test/next" }, expect: { requiredFields: ["title"] }, as: "rows" }
+      ], output: "{{rows}}"
+    };
+    await expect(bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft })).rejects.toThrow(/Validate/u);
+    expect((await bridge.callTool("browser", { action: "recipe", site: "example.test", recipeDraft, targetId: "page-1", inputs: { query: "safe phrase" } })).structuredContent)
+      .toMatchObject({ ok: true, data: { verified: true } });
+    expect(knowledge.recipes).toHaveLength(0);
     const saved = await bridge.callTool("browser", {
       action: "saveRecipe",
       site: "example.test",
-      recipeDraft: {
-        id: "example-search",
-        inputs: { query: { required: true } },
-        steps: [
-          { action: "navigate", url: "https://example.test/search?q={{query|url}}" },
-          { action: "click", selector: "#result", as: "selected" }
-        ],
-        output: "{{selected}}"
-      },
+      recipeDraft,
       siteGuideDraft: {
         site: "example.test",
         auth: "none",
@@ -629,12 +644,11 @@ describe("BrowserToolBridgeProvider", () => {
   });
 
   it.each([false, true])("stops after a failed recipe result unless the step is optional (%s)", async optional => {
-    const { bridge, browser, actions } = fixture();
-    vi.mocked(browser.extract).mockRejectedValue(new Error("The page extraction failed."));
-    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
+    const { bridge, browser, actions } = fixture(undefined, undefined, { recipes: [{
       id: "failed-result", steps: [{ action: "extract", extract: { fields: { title: "h1" } }, optional },
         { action: "navigate", url: "https://example.test/after" }]
-    } });
+    }] });
+    vi.mocked(browser.extract).mockRejectedValue(new Error("The page extraction failed."));
     const result = await bridge.callTool("browser", { action: "recipe", recipeId: "failed-result", targetId: "page-1" });
     expect(result.isError).toBe(!optional);
     expect(actions.some(action => (action as { type?: string }).type === "navigate")).toBe(optional);
@@ -642,22 +656,20 @@ describe("BrowserToolBridgeProvider", () => {
   });
 
   it("preserves an evaluate result containing ok:false as data", async () => {
-    const { bridge, browser } = fixture();
-    vi.mocked(browser.evaluatePage).mockResolvedValue({ ok: false, title: "An ordinary record" });
-    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
+    const { bridge, browser } = fixture(undefined, undefined, { recipes: [{
       id: "record", steps: [{ action: "evaluate", fn: "() => ({ ok: false })", as: "record" }], output: "{{record}}"
-    } });
+    }] });
+    vi.mocked(browser.evaluatePage).mockResolvedValue({ ok: false, title: "An ordinary record" });
     expect((await bridge.callTool("browser", { action: "recipe", recipeId: "record", targetId: "page-1" })).structuredContent)
       .toMatchObject({ ok: true, data: { output: { ok: false, title: "An ordinary record" } } });
   });
 
   it("does not perform an action when the page guard fails, and never makes validation optional", async () => {
-    const { bridge, browser, actions } = fixture();
     const step = { action: "click", selector: "#send", guard: { url: "https://example.test/", selector: "h1", text: "Inbox" } };
+    const { bridge, browser, actions } = fixture(undefined, undefined, { recipes: [{ id: "guarded-click", steps: [step] }] });
     await expect(bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
       id: "unsafe-guard", steps: [{ ...step, optional: true }]
     } })).rejects.toThrow(/cannot be optional/u);
-    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: { id: "guarded-click", steps: [step] } });
     vi.mocked(browser.checkPageGuard).mockResolvedValue(false);
     const result = await bridge.callTool("browser", { action: "recipe", recipeId: "guarded-click", targetId: "page-1" });
     expect(result.structuredContent).toMatchObject({ ok: false, failureKind: "guard", failedStep: 0, steps: [] });
@@ -665,27 +677,31 @@ describe("BrowserToolBridgeProvider", () => {
   });
 
   it("checks guarded extraction in the same read and validates actual records before continuing", async () => {
-    const { bridge, browser, actions } = fixture();
     const guard = { url: "https://example.test/", text: "Results" };
-    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: {
+    const recipe = {
       id: "validated-results", inputs: { expected: { required: true } }, steps: [
         { action: "extract", extract: { fields: { title: "h1" } }, guard, expect: {
           minCount: 1, requiredFields: ["title"], equals: { title: "{{expected}}" }
         }, as: "rows" }, { action: "navigate", url: "https://example.test/after" }
       ], output: "{{rows}}"
-    } });
+    };
+    const { bridge, browser, actions } = fixture(undefined, undefined, { recipes: [recipe] });
     const run = () => bridge.callTool("browser", { action: "recipe", recipeId: "validated-results", targetId: "page-1", inputs: { expected: "Example" } });
     vi.mocked(browser.extract).mockRejectedValueOnce(new BrowserPageGuardError());
     expect((await run()).structuredContent).toMatchObject({ ok: false, failureKind: "guard", steps: [] });
     expect(browser.checkPageGuard).not.toHaveBeenCalled();
     expect(browser.extract).toHaveBeenCalledWith("page-1", expect.anything(), { fields: { title: "h1" } }, undefined, undefined, guard);
     for (const records of [[], [{ title: " " }], [{ title: "Other" }]]) {
-      vi.mocked(browser.extract).mockResolvedValueOnce({ ok: true, count: 100, records });
-      expect((await run()).structuredContent).toMatchObject({ ok: false, failureKind: "expect", failedStep: 0 });
+      const failed = fixture(undefined, undefined, { recipes: [recipe] });
+      vi.mocked(failed.browser.extract).mockResolvedValueOnce({ ok: true, count: 100, records });
+      expect((await failed.bridge.callTool("browser", { action: "recipe", recipeId: recipe.id, targetId: "page-1", inputs: { expected: "Example" } })).structuredContent)
+        .toMatchObject({ ok: false, failureKind: "expect", failedStep: 0 });
+      expect(failed.actions).toEqual([]);
     }
     expect(actions).toEqual([]);
-    expect((await run()).isError).toBe(false);
-    expect(actions).toEqual([{ type: "navigate", url: "https://example.test/after" }]);
+    const success = fixture(undefined, undefined, { recipes: [recipe] });
+    expect((await success.bridge.callTool("browser", { action: "recipe", recipeId: recipe.id, targetId: "page-1", inputs: { expected: "Example" } })).isError).toBe(false);
+    expect(success.actions).toEqual([{ type: "navigate", url: "https://example.test/after" }]);
   });
 
   it("validates and exposes the built-in recipe and site-guide catalog", async () => {
@@ -770,14 +786,18 @@ describe("BrowserToolBridgeProvider", () => {
     const initial = await bridge.callTool("browser", { action: "siteguide", site: "personal.example" });
     expect(initial.structuredContent).toMatchObject({ data: { provenance: "user" } });
 
+    const recipeDraft = {
+      id: "arxiv-search", description: "Local override",
+      steps: [{ action: "navigate", url: "https://arxiv.org/" }, {
+        action: "extract", guard: { url: "https://arxiv.org/" }, extract: { fields: { title: "h1" } },
+        expect: { requiredFields: ["title"] }, as: "rows"
+      }], output: "{{rows}}"
+    };
+    await bridge.callTool("browser", { action: "recipe", site: "arxiv.org", recipeDraft, targetId: "page-1" });
     await bridge.callTool("browser", {
       action: "saveRecipe",
       site: "arxiv.org",
-      recipeDraft: {
-        id: "arxiv-search",
-        description: "Local override",
-        steps: [{ action: "navigate", url: "https://arxiv.org/" }]
-      },
+      recipeDraft,
       siteGuideDraft: { site: "arxiv.org", recipes: ["arxiv-search"] }
     });
     expect(save).toHaveBeenCalledWith(expect.objectContaining({
@@ -787,6 +807,157 @@ describe("BrowserToolBridgeProvider", () => {
     }));
     const overridden = await bridge.callTool("browser", { action: "siteguide", site: "arxiv.org" });
     expect(overridden.structuredContent).toMatchObject({ data: { provenance: "overridden" } });
+  });
+
+  it("keeps read-only candidates deferred until the unchanged trial is explicitly saved", async () => {
+    const { bridge, knowledge, browser, actions } = fixture();
+    const recipeDraft = exampleReadRecipe();
+    const saved = await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft, deferValidation: true });
+    expect(saved.structuredContent).toMatchObject({ data: { state: "candidate" } });
+    expect(actions).toEqual([]); expect(browser.extract).not.toHaveBeenCalled();
+    expect((await bridge.callTool("browser", { action: "recipe", recipeId: recipeDraft.id, targetId: "page-1" })).structuredContent)
+      .toMatchObject({ ok: true, data: { verified: true } });
+    expect(knowledge.recipes?.[0]).toMatchObject({ validation: { state: "candidate", profile: "external" } });
+    await expect(bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: { ...recipeDraft, description: "Changed after trial" } })).rejects.toThrow(/unchanged/u);
+    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft });
+    expect(knowledge.recipes?.[0]).toMatchObject({ validation: { state: "active" } });
+    const second = fixture(undefined, knowledge);
+    await expect(second.bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft })).rejects.toThrow(/in this task/u);
+  });
+
+  it("rejects unsafe, cross-site and replacement candidates before any browser effect", async () => {
+    const { bridge, browser, actions } = fixture();
+    const draft = exampleReadRecipe();
+    for (const recipeDraft of [
+      { ...draft, access: "write" },
+      { ...draft, steps: [{ action: "click", selector: "#send", guard: { url: "https://example.test/" } }, ...draft.steps] },
+      { ...draft, steps: [{ action: "wait", fn: "() => true" }, ...draft.steps] },
+      { ...draft, steps: [{ ...draft.steps[0], guard: { url: "https://notexample.test/" } }] },
+      { ...draft, validation: { site: "example.test", state: "active" } }
+    ]) await expect(bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft, deferValidation: true })).rejects.toThrow();
+    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: draft, deferValidation: true });
+    await expect(bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: draft, deferValidation: true })).rejects.toThrow(/cannot replace/u);
+    expect(actions).toEqual([]); expect(browser.extract).not.toHaveBeenCalled();
+  });
+
+  it("durably suspends dispatched failures, permits one repair, and never spends it on a failed pre-guard", async () => {
+    const recipeDraft = exampleReadRecipe();
+    const saved = { ...recipeDraft, validation: { site: "example.test", state: "active", profile: "external" } };
+    const { bridge, browser, knowledge } = fixture(undefined, undefined, { recipes: [saved] });
+    vi.mocked(browser.extract).mockRejectedValueOnce(new Error("The page changed."));
+    expect((await bridge.callTool("browser", { action: "recipe", recipeId: recipeDraft.id, targetId: "page-1" })).isError).toBe(true);
+    expect(knowledge.recipes?.[0]).toMatchObject({ validation: { state: "suspended" } });
+    const restarted = fixture(undefined, knowledge);
+    expect((await restarted.bridge.callTool("browser", { action: "recipe", recipeId: recipeDraft.id })).isError).toBe(true);
+    expect(restarted.browser.extract).not.toHaveBeenCalled();
+    const guarded = { ...recipeDraft, steps: [{ action: "wait", guard: { url: "https://example.test/" }, selector: "h1" }, ...recipeDraft.steps] };
+    vi.mocked(browser.checkPageGuard).mockResolvedValueOnce(false);
+    expect((await bridge.callTool("browser", { action: "recipe", site: "example.test", recipeDraft: guarded, targetId: "page-1" })).isError).toBe(true);
+    expect((await bridge.callTool("browser", { action: "recipe", site: "example.test", recipeDraft: guarded, targetId: "page-1" })).structuredContent)
+      .toMatchObject({ ok: true, data: { verified: true } });
+    const extracts = vi.mocked(browser.extract).mock.calls.length;
+    expect((await bridge.callTool("browser", { action: "recipe", site: "example.test", recipeDraft: guarded, targetId: "page-1" })).isError).toBe(true);
+    expect(browser.extract).toHaveBeenCalledTimes(extracts);
+    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft: guarded });
+    expect(knowledge.recipes?.[0]).toMatchObject({ validation: { state: "active" } });
+  });
+
+  it("preserves a saved active version when an unsaved revision fails", async () => {
+    const recipeDraft = exampleReadRecipe();
+    const saved = { ...recipeDraft, validation: { site: "example.test", state: "active", profile: "external" } };
+    const { bridge, browser, knowledge } = fixture(undefined, undefined, { recipes: [saved] });
+    vi.mocked(browser.extract).mockRejectedValueOnce(new Error("Revision selector failed."));
+    await bridge.callTool("browser", { action: "recipe", site: "example.test", recipeDraft: { ...recipeDraft, description: "Unverified revision" }, targetId: "page-1" });
+    expect(knowledge.recipes).toEqual([saved]);
+    expect((await bridge.callTool("browser", { action: "recipe", recipeId: recipeDraft.id, targetId: "page-1" })).isError).toBe(false);
+  });
+
+  it("does not overwrite a concurrent revision with a failure suspension or a successful candidate trial", async () => {
+    const recipeDraft = exampleReadRecipe();
+    const saved = { ...recipeDraft, validation: { site: "example.test", state: "active", profile: "external" } };
+    const { bridge, browser, knowledge } = fixture(undefined, undefined, { recipes: [saved] });
+    const newer = { ...saved, description: "Saved concurrently" };
+    vi.mocked(browser.extract).mockImplementationOnce(async () => {
+      await knowledge.save({ site: "example.test", recipe: newer }); throw new Error("Old version failed.");
+    });
+    expect((await bridge.callTool("browser", { action: "recipe", recipeId: recipeDraft.id, targetId: "page-1" })).structuredContent)
+      .toMatchObject({ ok: false, maintenanceMessage: expect.stringContaining("newer recipe") });
+    expect(knowledge.recipes).toEqual([newer]);
+    const candidate = { ...saved, validation: { ...saved.validation, state: "candidate" } };
+    await knowledge.save({ site: "example.test", recipe: candidate });
+    const trial = fixture(undefined, knowledge);
+    vi.mocked(trial.browser.extract).mockImplementationOnce(async () => {
+      await knowledge.save({ site: "example.test", recipe: newer }); return { ok: true, count: 1, records: [{ title: "Example" }] };
+    });
+    await trial.bridge.callTool("browser", { action: "recipe", recipeId: recipeDraft.id, targetId: "page-1" });
+    expect(knowledge.recipes).toEqual([newer]);
+    expect((await trial.bridge.callTool("browser", { action: "siteguide", site: "example.test", intent: "" })).structuredContent)
+      .toMatchObject({ data: { recipes: [expect.objectContaining({ description: "Saved concurrently" })] } });
+  });
+
+  it("expires draft proof across Browser generations and profiles", async () => {
+    for (const field of ["generation", "targetMode"] as const) {
+      const { bridge, browser, knowledge } = fixture(); const recipeDraft = exampleReadRecipe();
+      await bridge.callTool("browser", { action: "recipe", site: "example.test", recipeDraft, targetId: "page-1" });
+      Object.defineProperty(browser, field, { value: field === "generation" ? 7 : "sidebar" });
+      await expect(bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft })).rejects.toThrow(/Validate/u);
+      expect(knowledge.recipes).toHaveLength(0);
+    }
+  });
+
+  it("does not transfer a validated draft to another product Session", async () => {
+    const store = browserBridgeAuthorityStore(); knowledgeStores.add(store);
+    const state = new OperationalBrowserState(store);
+    state.recordHumanPage({ browserProviderId: "browser", pageId: "page-1", generation: 6, sessionId: "session-a", targetId: "target-a", bindingGeneration: 1,
+      url: "https://example.test/", title: "Example", updatedAt: 1 });
+    const { bridge, knowledge } = fixture(undefined, undefined, { state }); const recipeDraft = exampleReadRecipe();
+    await bridge.callTool("browser", { action: "recipe", site: "example.test", recipeDraft, targetId: "page-1" }, undefined,
+      browserBridgeContext("a", "session-a", "target-a", 1, 6));
+    await expect(bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft }, undefined,
+      browserBridgeContext("b", "session-b", "target-b", 1, 6))).rejects.toThrow(/in this task/u);
+    expect(knowledge.recipes).toHaveLength(0);
+    await bridge.callTool("browser", { action: "saveRecipe", site: "example.test", recipeDraft }, undefined,
+      browserBridgeContext("c", "session-a", "target-a", 1, 6));
+    expect(knowledge.recipes?.[0]).toMatchObject({ validation: { state: "active" } });
+  });
+
+  it("binds remote trial receipts to their originating caller before forwarding an explicit save", async () => {
+    const child = fixture(); const recipeDraft = exampleReadRecipe();
+    const executor = new BrowserAutomationNodeExecutor({ nodeId: "node-one", displayName: "Node", generation: 4, bridge: child.bridge, artifacts: {} as ArtifactStore });
+    const call = vi.fn((request: { action: any; arguments: Readonly<Record<string, unknown>> }, signal?: AbortSignal) => executor.execute({ nodeId: "node-one", expectedGeneration: 4, ...request }, signal));
+    const route = { id: "node-one", generation: 4, available: true, capabilities: BROWSER_AUTOMATION_NODE_CAPABILITIES, call };
+    const router = { resolve: () => route, list: () => [route] };
+    const one = fixture(router), other = fixture(router);
+    const remote = { target: "node", node: "node-one", site: "example.test" };
+    await one.bridge.callTool("browser", { ...remote, action: "saveRecipe", recipeDraft, deferValidation: true });
+    expect((await one.bridge.callTool("browser", { ...remote, action: "recipe", recipeId: recipeDraft.id, targetId: "page-1" })).structuredContent)
+      .toMatchObject({ data: { result: { verified: true } } });
+    const calls = call.mock.calls.length;
+    await expect(other.bridge.callTool("browser", { ...remote, action: "saveRecipe", recipeDraft })).rejects.toThrow(/in this task/u);
+    expect(call).toHaveBeenCalledTimes(calls);
+    expect((await one.bridge.callTool("browser", { ...remote, action: "saveRecipe", recipeDraft })).isError).toBe(false);
+    expect(child.knowledge.recipes?.[0]).toMatchObject({ validation: { state: "active" } });
+  });
+
+  it("learns only successful action shapes, hints once, and excludes private or failed reads", async () => {
+    const { bridge, browser, knowledge } = fixture();
+    const flow = async () => {
+      await bridge.callTool("browser", { action: "navigate", targetId: "page-1", url: "https://example.test/private?query=business-value" });
+      await bridge.callTool("browser", { action: "act", targetId: "page-1", request: { kind: "type", selector: "#query", text: "private-record" } });
+      return bridge.callTool("browser", { action: "extract", targetId: "page-1", extract: { fields: { title: "h1" } } });
+    };
+    expect((await flow()).structuredContent?.["data"]).not.toHaveProperty("learningOpportunity");
+    expect((await flow()).structuredContent).toMatchObject({ data: { learningOpportunity: { site: "example.test", observations: 2 } } });
+    expect((await flow()).structuredContent?.["data"]).not.toHaveProperty("learningOpportunity");
+    const observations = await knowledge.listExperiences?.("example.test");
+    expect(observations).toEqual([{ site: "example.test", actions: ["navigate", "type", "extract"], observations: 3, updatedAt: expect.any(Number) }]);
+    expect(JSON.stringify(observations)).not.toMatch(/business-value|private-record|#query|private\?/u);
+    expect((await bridge.callTool("browser", { action: "recipeHelp", site: "example.test" })).structuredContent).toMatchObject({ data: { observations } });
+    vi.mocked(browser.extract).mockRejectedValueOnce(new Error("Read failed."));
+    await expect(flow()).rejects.toThrow(/Read failed/u);
+    markSecretEntered("page-1");
+    try { await expect(flow()).rejects.toThrow(); } finally { clearSecretPages(); }
+    expect(await knowledge.listExperiences?.("example.test")).toEqual(observations);
   });
 
   it("routes target=node only through explicit action and act-kind capabilities", async () => {
@@ -1132,6 +1303,15 @@ describe("BrowserToolBridgeProvider", () => {
     expect(readConsoleMessages).not.toHaveBeenCalled();
   });
 });
+
+function exampleReadRecipe() {
+  return {
+    id: "example-read", match: ["example.test"], access: "read", steps: [{
+      action: "extract", guard: { url: "https://example.test/" }, extract: { fields: { title: "h1" } },
+      expect: { requiredFields: ["title"] }, as: "rows"
+    }], output: "{{rows}}"
+  };
+}
 
 function browserBridgeAuthorityStore(): OperationalStore {
   const store = new OperationalStore(":memory:");
