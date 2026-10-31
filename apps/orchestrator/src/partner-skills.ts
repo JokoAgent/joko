@@ -269,7 +269,7 @@ export class PartnerSkillsManager {
   }
   caller(context: BridgeToolCallContext, signal?: AbortSignal) {
     const session = this.store.getSession(context.sessionId).descriptor, link = this.profiles.getSessionLink(session.id);
-    if (!link || !['canonical', 'delegation', 'group', 'topic', 'channel'].includes(link.role)) return fail("The task does not own personal skills.");
+    if (!link || !['canonical', 'delegation', 'group', 'topic', 'channel', 'routine'].includes(link.role)) return fail("The task does not own personal skills.");
     const profile = this.profiles.getPartner(link.partnerId), backend = this.store.getBackend(session.backendId).descriptor;
     const assertCurrent = () => {
       signal?.throwIfAborted();

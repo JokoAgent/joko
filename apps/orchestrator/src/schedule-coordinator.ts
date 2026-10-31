@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { redactSecrets, type PermissionMode, type SessionDescriptor } from "@joko/core";
 import type {
   OperationalStore,
+  ScheduleDeletionCleanupRecord,
   ScheduleRecord,
   ScheduleRuntimeOccurrenceRecord,
   UpsertScheduleInput
@@ -86,6 +87,12 @@ export class ScheduleCoordinator {
   readonly #recovery: SchedulerOccurrenceRecovery;
   readonly #activeOccurrences = new Map<string, Set<AbortController>>();
   readonly #deletionFences = new Map<string, string>();
+  readonly #deletionCreationReceipts = new Map<string, {
+    readonly operationId: string;
+    readonly originalRevision: bigint;
+    readonly deletionRevision: bigint;
+    readonly manifestRevision: bigint;
+  }>();
   readonly #scheduleIdleWaiters = new Map<string, Set<() => void>>();
   readonly #admittedRuns = new Set<string>();
   #unsubscribeRuns: (() => void) | undefined;
@@ -156,6 +163,7 @@ export class ScheduleCoordinator {
     this.#unsubscribeRuns = undefined;
     this.#releaseDispatchGate?.();
     this.#releaseDispatchGate = undefined;
+    this.#deletionCreationReceipts.clear();
     for (const controllers of this.#activeOccurrences.values()) {
       for (const controller of controllers) controller.abort();
     }
@@ -269,6 +277,29 @@ export class ScheduleCoordinator {
     }
   }
 
+  /** Capture only this process's in-flight creation authority around the
+   * synchronous durable deletion transaction. It cannot recover an unknown
+   * native creation after restart. */
+  prepareScheduleDeletion(
+    input: Parameters<OperationalStore["prepareScheduleDeletionCleanup"]>[0]
+  ): ScheduleDeletionCleanupRecord {
+    const owner = this.#deletionFences.get(input.scheduleId);
+    if (owner !== undefined && owner !== input.operationId) throw new Error("Another Schedule deletion is already in progress.");
+    const existing = this.#store.findScheduleDeletionCleanup(input.operationId);
+    if (existing !== undefined) return this.#store.prepareScheduleDeletionCleanup(input);
+    const original = this.#store.getSchedule(input.scheduleId);
+    const manifest = this.#store.prepareScheduleDeletionCleanup(input);
+    if (manifest.state === "pending" && manifest.disposition === "keep") {
+      this.#deletionCreationReceipts.set(input.scheduleId, {
+        operationId: manifest.operationId,
+        originalRevision: original.revision,
+        deletionRevision: this.#store.getSchedule(input.scheduleId).revision,
+        manifestRevision: manifest.revision
+      });
+    }
+    return manifest;
+  }
+
   /** Fence new dispatch synchronously, cancel current occurrences, and wait
    * through the pre-Session resolution window before deletion can snapshot. */
   async beginScheduleDeletion(
@@ -283,15 +314,23 @@ export class ScheduleCoordinator {
     }
     const occurrenceRunIds = this.#store.listScheduleRuntimeOccurrences({ scheduleId, limit: 10_000 })
       .map((occurrence) => occurrence.runId);
+    const receipt = this.#deletionCreationReceipts.get(scheduleId);
     this.#deletionFences.set(scheduleId, ownerId);
-    await this.abortSchedule(scheduleId, linkedOccurrences);
-    await this.waitForScheduleIdle(scheduleId);
-    return occurrenceRunIds;
+    try {
+      await this.abortSchedule(scheduleId, linkedOccurrences);
+      await this.waitForScheduleIdle(scheduleId);
+      return occurrenceRunIds;
+    } finally {
+      if (receipt?.operationId === ownerId && this.#deletionCreationReceipts.get(scheduleId) === receipt) {
+        this.#deletionCreationReceipts.delete(scheduleId);
+      }
+    }
   }
 
   /** Only used when deletion failed before any durable manifest was written. */
   releaseScheduleDeletion(scheduleId: string, ownerId: string): void {
     if (this.#deletionFences.get(scheduleId) === ownerId) this.#deletionFences.delete(scheduleId);
+    if (this.#deletionCreationReceipts.get(scheduleId)?.operationId === ownerId) this.#deletionCreationReceipts.delete(scheduleId);
   }
 
   isScheduleDeletionFenced(scheduleId: string): boolean {
@@ -569,6 +608,20 @@ export class ScheduleCoordinator {
       return { runId, status: "skipped" };
     }
 
+    if (schedule.sessionMode !== "fresh" && schedule.sessionId !== undefined) {
+      const session = this.#store.findSession(schedule.sessionId);
+      if (session && session.descriptor.deletedAt === undefined
+        && (session.descriptor.archived || session.descriptor.worktree?.state === "preserved")) {
+        await this.#host.restoreScheduledTarget({ sessionId: session.descriptor.id, operationId: `${operationId}-restore`, assertCurrent: () => {
+          signal.throwIfAborted();
+          const current = this.#store.findSchedule(schedule.id);
+          if (!current || current.revision !== schedule.revision || current.sessionId !== session.descriptor.id
+            || this.#deletionFences.has(schedule.id) || this.#recovery.wasForceReleased(runId) || options.canDispatch?.() === false) {
+            throw new Error("The Schedule changed or was cancelled before its task could be restored.");
+          }
+        } });
+      }
+    }
     const preRunRevision = schedule.revision;
     this.#recovery.transition(runId, "running", { executionMode: extension.executionMode });
     const preRun = await this.evaluatePreRunHook(schedule, runId, scheduledAt, extension.preRunHook, signal);
@@ -637,10 +690,11 @@ export class ScheduleCoordinator {
         scheduledAt,
         ...(nextRunAt === undefined ? {} : { nextRunAt }),
         signal,
+        ...(options.canDispatch === undefined ? {} : { canDispatch: options.canDispatch }),
         ...(preRun === undefined ? {} : { preRunDetail: preRun.detail })
       });
     }
-    const resolved = await this.resolveSession(schedule, operationId, runId, worktree);
+    const resolved = await this.resolveSession(schedule, operationId, runId, worktree, signal, options.canDispatch);
     if (this.#recovery.wasForceReleased(runId)) return { runId, status: "failed" };
     schedule = resolved.schedule;
     const sessionId = resolved.sessionId;
@@ -701,13 +755,19 @@ export class ScheduleCoordinator {
   ): Promise<{ readonly result: SchedulePreRunHookResult; readonly detail: Readonly<Record<string, unknown>> } | undefined> {
     if (hook === undefined) return undefined;
     const capturedTarget = this.#store.getTarget(schedule.targetId);
-    const target = capturedTarget.descriptor;
+    const isolated = schedule.sessionMode !== "fresh" && schedule.sessionId !== undefined
+      && this.#store.getSession(schedule.sessionId).descriptor.worktree !== undefined;
+    const target = isolated
+      ? this.#host.scheduledExecutionTarget(schedule.sessionId!) : capturedTarget.descriptor;
     const assertCurrent = () => {
       signal.throwIfAborted();
+      if (schedule.sessionMode === "bound" || schedule.sessionMode === "persistent" && schedule.sessionId !== undefined
+        && this.#store.findSession(schedule.sessionId)?.descriptor.deletedAt === undefined) this.requireUsableSession(schedule, schedule.sessionId);
       const current = this.#store.getTarget(schedule.targetId);
+      const currentExecution = isolated ? this.#host.scheduledExecutionTarget(schedule.sessionId!) : current.descriptor;
       if (this.#deletionFences.has(schedule.id) || this.#recovery.wasForceReleased(runId)
         || this.#store.findSchedule(schedule.id)?.revision !== schedule.revision
-        || current.revision !== capturedTarget.revision || current.descriptor.workspaceRoot !== target.workspaceRoot
+        || current.revision !== capturedTarget.revision || currentExecution.workspaceRoot !== target.workspaceRoot
         || !current.descriptor.trusted) throw new Error("The pre-run hook workspace or Schedule authority changed.");
     };
     let result: SchedulePreRunHookResult;
@@ -801,6 +861,7 @@ export class ScheduleCoordinator {
     readonly scheduledAt: number;
     readonly nextRunAt?: number;
     readonly signal: AbortSignal;
+    readonly canDispatch?: () => boolean;
     readonly preRunDetail?: Readonly<Record<string, unknown>>;
   }): Promise<ScheduleDispatchResult> {
     const config = input.extension.scriptConfig;
@@ -819,15 +880,20 @@ export class ScheduleCoordinator {
       });
       return { runId: input.runId, status: "failed" };
     }
-    this.#store.recordScheduleOccurrence({
+    input.signal.throwIfAborted();
+    if (this.#store.findSchedule(input.schedule.id)?.revision !== input.schedule.revision || this.#deletionFences.has(input.schedule.id)) {
+      throw new Error("The Schedule changed before script execution.");
+    }
+    const routing = { backendId: input.schedule.backendId, targetId: input.schedule.targetId,
+      ...(input.schedule.sessionMode === "bound" ? { boundSessionId: input.schedule.sessionId } : {}) };
+    const occurrence = this.#store.recordScheduleOccurrence({
       scheduleId: input.schedule.id,
       runId: input.runId,
       firedAt: input.scheduledAt,
       status: "running",
       detail: {
         ...(input.preRunDetail ?? {}),
-        routing: { backendId: input.schedule.backendId, targetId: input.schedule.targetId,
-          ...(input.schedule.sessionMode === "bound" ? { boundSessionId: input.schedule.sessionId } : {}) },
+        routing,
         script: { status: "running" },
         costAttribution: "zero",
         cadence: {
@@ -838,10 +904,28 @@ export class ScheduleCoordinator {
     });
     const runningSchedule = structuredClone(this.#store.getSchedule(input.schedule.id));
     const target = this.#store.getTarget(runningSchedule.targetId);
+    const isolated = runningSchedule.sessionMode === "bound" && runningSchedule.sessionId !== undefined
+      && this.#store.getSession(runningSchedule.sessionId).descriptor.worktree !== undefined;
+    const executionTarget = isolated
+      ? this.#host.scheduledExecutionTarget(runningSchedule.sessionId!) : target.descriptor;
     let scopeOpen = true;
+    const ownsOccurrence = () => {
+      const current = this.#store.findScheduleRunByRunId(input.runId);
+      const detail = current?.detail;
+      const frozen = isRecord(detail) && isRecord(detail["routing"]) ? detail["routing"] : undefined;
+      return current?.id === occurrence.id && current.scheduleId === runningSchedule.id
+        && current.firedAt === occurrence.firedAt && current.status === "running"
+        && frozen?.["backendId"] === routing.backendId && frozen?.["targetId"] === routing.targetId
+        && frozen?.["boundSessionId"] === routing.boundSessionId;
+    };
     const assertCurrent = () => {
       input.signal.throwIfAborted();
-      if (!scopeOpen || this.#recovery.wasForceReleased(input.runId) || this.#deletionFences.has(runningSchedule.id) || !this.#store.findSchedule(runningSchedule.id)) {
+      const currentSchedule = this.#store.findSchedule(runningSchedule.id);
+      // Configuration edits belong to the next occurrence. Pause/delete still
+      // abort the captured signal, and a direct disable also retires this scope.
+      if (!scopeOpen || this.#recovery.wasForceReleased(input.runId) || this.#deletionFences.has(runningSchedule.id)
+        || currentSchedule === undefined || runningSchedule.enabled && !currentSchedule.enabled
+        || input.canDispatch?.() === false || !ownsOccurrence()) {
         throw new Error("The Schedule occurrence is no longer active.");
       }
       const current = this.#store.getTarget(runningSchedule.targetId);
@@ -849,12 +933,15 @@ export class ScheduleCoordinator {
         throw new Error("The Schedule workspace changed or is no longer trusted.");
       }
       if (runningSchedule.sessionMode === "bound") this.requireUsableSession(runningSchedule, runningSchedule.sessionId);
+      if (isolated && this.#host.scheduledExecutionTarget(runningSchedule.sessionId!).workspaceRoot !== executionTarget.workspaceRoot) {
+        throw new Error("The Schedule task workspace changed.");
+      }
     };
     try {
       assertCurrent();
       const result = await this.#executeScript({
         command: config.command,
-        cwd: target.descriptor.workspaceRoot,
+        cwd: executionTarget.workspaceRoot,
         schedule: runningSchedule,
         assertCurrent,
         runId: input.runId,
@@ -882,7 +969,7 @@ export class ScheduleCoordinator {
       });
       return { runId: input.runId, ...(sessionId === undefined ? {} : { sessionId }), status: "success" };
     } catch (error) {
-      if (this.#recovery.wasForceReleased(input.runId)) return { runId: input.runId, status: "failed" };
+      if (this.#recovery.wasForceReleased(input.runId) || !ownsOccurrence()) return { runId: input.runId, status: "failed" };
       const status = input.signal.aborted ? "aborted" : "failed";
       const current = this.#store.findSchedule(runningSchedule.id);
       if (current !== undefined) {
@@ -1087,8 +1174,40 @@ export class ScheduleCoordinator {
     schedule: ScheduleRecord,
     operationId: string,
     runId: string,
-    worktree: ScheduleWorktreeConfiguration
+    worktree: ScheduleWorktreeConfiguration,
+    signal: AbortSignal,
+    canDispatch?: () => boolean
   ): Promise<{ readonly schedule: ScheduleRecord; readonly sessionId: string }> {
+    const assertOwner = () => {
+      if (this.#recovery.wasForceReleased(runId) || canDispatch?.() === false) {
+        throw new Error("The Schedule occurrence authority changed before task admission.");
+      }
+    };
+    const assertSchedule = () => {
+      assertOwner();
+      signal.throwIfAborted();
+      if (this.#store.findSchedule(schedule.id)?.revision !== schedule.revision || this.#deletionFences.has(schedule.id)
+        || this.#store.findPendingScheduleDeletionCleanupForSchedule(schedule.id) !== undefined) {
+        throw new Error("The Schedule changed before task admission.");
+      }
+    };
+    const assertCreationAdoption = (): "active" | "cancelled" => {
+      assertOwner();
+      const receipt = this.#deletionCreationReceipts.get(schedule.id);
+      const manifest = receipt === undefined ? undefined : this.#store.findScheduleDeletionCleanup(receipt.operationId);
+      if (receipt !== undefined && receipt.originalRevision === schedule.revision
+        && this.#deletionFences.get(schedule.id) === receipt.operationId
+        && this.#store.findSchedule(schedule.id)?.revision === receipt.deletionRevision
+        && manifest?.state === "pending" && manifest.disposition === "keep"
+        && manifest.scheduleId === schedule.id && manifest.revision === receipt.manifestRevision
+        && manifest.occurrenceRunIds.includes(runId)
+        && this.#store.getTarget(schedule.targetId).descriptor.trusted) {
+        return "cancelled";
+      }
+      assertSchedule();
+      return "active";
+    };
+    assertSchedule();
     if (schedule.sessionMode === "bound") {
       return { schedule, sessionId: this.requireUsableSession(schedule, schedule.sessionId) };
     }
@@ -1096,17 +1215,18 @@ export class ScheduleCoordinator {
       const existing = this.#store.getSession(schedule.sessionId);
       if (
         existing.descriptor.deletedAt === undefined &&
-        !existing.descriptor.archived &&
         existing.descriptor.backendId === schedule.backendId &&
         existing.descriptor.targetId === schedule.targetId
       ) {
-        return { schedule, sessionId: existing.descriptor.id };
+        return { schedule, sessionId: this.requireUsableSession(schedule, existing.descriptor.id) };
       }
     }
 
     const execution = scheduleCreationSnapshot(schedule.executionSnapshot);
     const created = await this.#host.createScheduledSession({
       operationId: `${operationId}-session`,
+      assertServiceScope: assertSchedule,
+      assertCreationAdoption,
       targetId: schedule.targetId,
       title: schedule.name,
       automationOrigin: { scheduleId: schedule.id, scheduleName: schedule.name, runId, scheduleRevision: schedule.revision },
@@ -1125,6 +1245,7 @@ export class ScheduleCoordinator {
       } : {})
     });
     const sessionId = created.value.sessionId;
+    if (this.#deletionFences.has(schedule.id)) return { schedule, sessionId };
     if (schedule.sessionMode === "fresh") return { schedule, sessionId };
 
     // Persist the generated Session before the prompt is queued. If an edit
@@ -1290,6 +1411,7 @@ function advanceScheduleWithoutSession(
   nextRunAt: number | undefined,
   now: number
 ): void {
+  if (store.findPendingScheduleDeletionCleanupForSchedule(schedule.id) !== undefined) return;
   if (store.getSchedule(schedule.id).revision !== schedule.revision) return;
   store.upsertSchedule(copyScheduleForCoordinator(schedule, {
     enabled: schedule.kind !== "one_shot" && schedule.enabled,

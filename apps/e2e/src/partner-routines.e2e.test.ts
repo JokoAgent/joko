@@ -28,8 +28,11 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
     value => value.runs[0]?.status === RoutineRunStatus.SUCCESS || value.runs[0]?.status === RoutineRunStatus.FAILED, "the service-owned timer", 45000);
   expect(result.runs[0]?.status).toBe(RoutineRunStatus.SUCCESS);
   const backingId = `partner-routine-${routine.id}`;
-  expect(fixture.application.store.getSchedule(backingId).sessionId).toBe(partner.canonicalSessionId);
-  expect(fixture.application.store.listQueueItems({ sessionId: partner.canonicalSessionId }).some(item => item.body.text.includes(save.definition.prompt))).toBe(true);
+  const sessionId = result.runs[0]!.sessionId!;
+  expect(sessionId).toBeTruthy(); expect(sessionId).not.toBe(partner.canonicalSessionId);
+  expect(fixture.application.store.getSchedule(backingId).sessionId).toBe(sessionId);
+  expect(fixture.application.store.listQueueItems({ sessionId }).some(item => item.body.text.includes(save.definition.prompt))).toBe(true);
+  expect(fixture.application.store.listQueueItems({ sessionId: partner.canonicalSessionId })).toEqual([]);
   expect((await clients.scheduler.listSchedules({})).schedules.some(schedule => schedule.scheduleId === backingId)).toBe(false);
   await expect(clients.scheduler.getSchedule({ scheduleId: backingId })).rejects.toMatchObject({ code: Code.NotFound });
   const snapshot = await clients.event.getSnapshot({ scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: {} } }) });
@@ -42,7 +45,7 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
   await expect(clients.partnerRoutine.savePartnerRoutine({ ...save, intent: { case: "creationRequestId", value: requestId } })).rejects.toMatchObject({ code: Code.FailedPrecondition });
   const beforeRestart = await clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId });
   expect(beforeRestart.routines.filter(value => !value.builtin)).toEqual([disabled]);
-  const builtin = beforeRestart.routines.filter(value => value.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(5);
+  const builtin = beforeRestart.routines.filter(value => value.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(1);
   await fixture.close(); fixture = await RealPiSystemFixture.start({ rootDirectory: root, keepRoot: true, port });
   const reopened = fixture.clients(paired.authKey).partnerRoutine;
   const catalog = await reopened.listPartnerRoutines({ partnerId: partner.partnerId }); const persisted = catalog.routines.find(value => value.id === routine.id)!;

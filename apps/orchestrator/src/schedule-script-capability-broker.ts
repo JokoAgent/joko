@@ -124,6 +124,7 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
         title,
         automationOrigin: { scheduleId: schedule.id, scheduleName: schedule.name, runId: context.runId, scheduleRevision: schedule.revision },
         assertServiceScope: context.assertCurrent,
+        frozenOccurrenceRouting: { backendId: schedule.backendId, targetId: schedule.targetId },
         ...(execution.providerId === undefined ? {} : { providerId: execution.providerId }),
         ...(execution.modelId === undefined ? {} : { modelId: execution.modelId }),
         ...(execution.effort === undefined ? {} : { effort: execution.effort }),

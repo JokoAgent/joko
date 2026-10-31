@@ -1,4 +1,4 @@
-import type { Routine, RoutineEvent, RoutineInput, RoutineSource, RoutineTrigger, RoutinePreRunHook } from "@joko/core";
+import type { Routine, RoutineEvent, RoutineInput, RoutineSource, RoutineTrigger, RoutinePreRunHook, RoutineModel } from "@joko/core";
 export type { Routine, RoutineEvent, RoutineInput, RoutineSource, RoutineTrigger } from "@joko/core";
 import { nextOccurrence } from "./scheduler.js";
 const nextRun = (expression: string, from: number, timezone: string) => nextOccurrence({ kind: "cron", expression, timezone }, from);
@@ -96,9 +96,21 @@ export function parseRoutineInput(value: unknown): RoutineInput {
     preRunHook = { command: string(hook.command, 32_000),
       ...(hook.timeoutMs === undefined ? {} : { timeoutMs: Number(hook.timeoutMs) }) };
   }
+  if (input.sessionMode !== undefined && input.sessionMode !== "persistent" && input.sessionMode !== "fresh")
+    throw new Error("Invalid routine session mode");
+  let modelOverride: RoutineModel | null | undefined;
+  if (input.modelOverride === null) modelOverride = null;
+  else if (input.modelOverride !== undefined) {
+    const model = record(input.modelOverride);
+    if (typeof model.fastMode !== "boolean" && model.fastMode !== "ultrafast") throw new Error("Invalid routine model speed");
+    modelOverride = { backendId: string(model.backendId, 256), providerId: string(model.providerId, 256), modelId: string(model.modelId, 256),
+      ...(model.effort === undefined ? {} : { effort: string(model.effort, 128) }), fastMode: model.fastMode };
+  }
   return {
     silentWhenIdle: input.silentWhenIdle as boolean,
     ...(preRunHook === undefined ? {} : { preRunHook }),
+    ...(input.sessionMode === undefined ? {} : { sessionMode: input.sessionMode }),
+    ...(modelOverride === undefined ? {} : { modelOverride }),
     name: string(input.name, 200),
     prompt: string(input.prompt, 100_000),
     enabled: input.enabled,

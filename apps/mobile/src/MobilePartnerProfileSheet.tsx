@@ -15,8 +15,7 @@ import { mobilePartnerDirectoryIdentity, type MobilePartnerDirectoryProfile } fr
 import { MobilePartnerProfileValidationError, mobilePartnerProfileDraft, validateMobilePartnerProfileDraft,
   type MobilePartnerProfileDraft, type MobilePartnerProfileSnapshot, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
-import { partnerResumeMessages, routineMessages, type PartnerRoutineEditor, type PartnerResumeEditor } from "@joko/contracts";
-import { MobilePartnerRoutineSheet } from "./MobilePartnerRoutineSheet";
+import { partnerResumeMessages, type PartnerResumeEditor } from "@joko/contracts";
 import { MobilePartnerResumeSheet } from "./MobilePartnerResumeSheet";
 import { MobilePartnerMemorySheet } from "./MobilePartnerMemorySheet";
 import { partnerMemoryMessages, type PartnerMemoryEditor } from "@joko/contracts";
@@ -35,13 +34,12 @@ interface OutputHandoff {
   readonly row: MobilePartnerTaskOutput;
 }
 
-export function MobilePartnerProfileSheet({ visible, partner, transport, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale, onClose, onSaved, onSearch, online = true, onOutputsPageChange, onOpenOutputError, initialLearningDestination, onOpenHome }: {
+export function MobilePartnerProfileSheet({ visible, partner, transport, deletionTransport, restartTransport, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale, onClose, onSaved, onSearch, online = true, onOutputsPageChange, onOpenOutputError, initialLearningDestination, onOpenHome }: {
   readonly visible: boolean;
   readonly partner?: MobilePartnerDirectoryProfile;
   readonly transport?: MobilePartnerProfileTransport;
   readonly deletionTransport?: MobilePartnerDeletionTransport;
   readonly restartTransport?: MobilePartnerRestartTransport;
-  readonly routineFactory?: (partnerId: string, ownerKey: string) => PartnerRoutineEditor | undefined;
   readonly resumeFactory?: (partner: MobilePartnerDirectoryProfile) => PartnerResumeEditor | undefined;
   readonly memoryFactory?: (partner: MobilePartnerDirectoryProfile, ownerKey: string) => PartnerMemoryEditor | undefined;
   readonly connectionsFactory?: (partner: MobilePartnerDirectoryProfile, ownerKey: string) => PartnerConnectionsEditor | undefined;
@@ -58,7 +56,6 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   readonly onOpenHome?: (partner: MobilePartnerDirectoryProfile) => void;
 }) {
   const binding = visible && partner && transport ? `${transport.ownerKey}\u001f${partner.partnerId}` : undefined;
-  const [routine, setRoutine] = useState<PartnerRoutineEditor>();
   const [resume, setResume] = useState<PartnerResumeEditor>();
   const [memory, setMemory] = useState<PartnerMemoryEditor>();
   const [connections, setConnections] = useState<PartnerConnectionsEditor>();
@@ -75,8 +72,6 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   useEffect(() => () => memory?.dispose(), [memory]);
   useEffect(() => { setResume(undefined); }, [binding]);
   useEffect(() => () => resume?.dispose(), [resume]);
-  useEffect(() => { setRoutine(undefined); }, [binding]);
-  useEffect(() => () => routine?.dispose(), [routine]);
   const [deletionBusy, setDeletionBusy] = useState(false);
   const [restartBusy, setRestartBusy] = useState(false);
   const restartBusyRef = useRef(false); restartBusyRef.current = restartBusy;
@@ -151,7 +146,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   const snapshot = state.binding === binding && binding !== undefined ? state.snapshot : undefined;
   const draft = snapshot ? state.draft : undefined;
   const dirty = !!snapshot && !!draft && JSON.stringify(mobilePartnerProfileDraft(snapshot.partner)) !== JSON.stringify(draft);
-  const editable = !!snapshot && !!draft && !busy && !taskBusy && !restartBusy && !routine && !resume && !memory && !connections && !skills && snapshot.partner.pauseCleanupPending !== true && !state.requiresRefresh;
+  const editable = !!snapshot && !!draft && !busy && !taskBusy && !restartBusy && !resume && !memory && !connections && !skills && snapshot.partner.pauseCleanupPending !== true && !state.requiresRefresh;
   const learningEntryRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!binding || !initialLearningDestination) { learningEntryRef.current = undefined; return; }
@@ -197,7 +192,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   }, [binding]);
 
   const close = (next?: "search" | OutputHandoff): void => {
-    if (busyRef.current || avatarPreparingRef.current || deletionBusyRef.current || restartBusyRef.current || routine || resume || memory || connections || skills) return;
+    if (busyRef.current || avatarPreparingRef.current || deletionBusyRef.current || restartBusyRef.current || resume || memory || connections || skills) return;
     const expected = sourceOwner;
     const finish = (): void => {
       if (!mountedRef.current || expected !== sourceOwnerRef.current || next === "search" && expected === undefined) return;
@@ -269,14 +264,13 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
     {connections && visible && `${connections.api.ownerKey}\u001f${connections.initial.partnerId}` === binding && <MobilePartnerConnectionsSheet editor={connections} colors={colors} locale={locale} onClose={() => setConnections(undefined)} />}
     {skills && visible && `${skills.api.ownerKey}\u001f${skills.initial.partnerId}` === binding && <MobilePartnerSkillsSheet editor={skills} colors={colors} locale={locale} onClose={() => setSkills(undefined)} />}
     {memory && visible && `${memory.api.ownerKey}\u001f${memory.initial.partnerId}` === binding && <MobilePartnerMemorySheet editor={memory} colors={colors} locale={locale} onClose={() => setMemory(undefined)} />}
-    {routine && visible && `${routine.api.ownerKey}\u001f${routine.partnerId}` === binding && <MobilePartnerRoutineSheet editor={routine} colors={colors} locale={locale} onClose={() => setRoutine(undefined)} />}
     {resume && visible && transport && `${resume.api.ownerKey}\u001f${resume.initial.partnerId}` === binding && <MobilePartnerResumeSheet editor={resume} colors={colors} locale={locale}
       onClose={() => setResume(undefined)} onChanged={load} />}
     <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]} edges={["top", "bottom"]}>
       <MobileKeyboardAvoidingView style={styles.screen} keyboard={keyboard} consumedBottomInset={insets.bottom}>
         <View style={styles.header}>
           {outputsOpen && action(mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "partnerProfile.title") }), () => setOutputsOpen(false))}
-          {action(mobileMessage(locale, "common.close"), () => close(), busy || avatarPreparing || deletionBusy || restartBusy || !!routine || !!resume || !!memory || !!connections || !!skills)}
+          {action(mobileMessage(locale, "common.close"), () => close(), busy || avatarPreparing || deletionBusy || restartBusy || !!resume || !!memory || !!connections || !!skills)}
           <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, outputsOpen ? "partnerOutputs.title" : "partnerProfile.title")}</Text>
         </View>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
@@ -285,7 +279,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
           onOpen={row => { if (sourceOwner && online && foreground && transport.openOutputTask) close({ owner: sourceOwner, snapshot, transport, row }); }} /> : <>
         {snapshot && transport?.listOutputs && transport.openOutputTask && action(mobileMessage(locale, "partnerOutputs.title"), () => setOutputsOpen(true),
           !editable || avatarPreparing || deletionBusy || !online || !foreground)}
-        {onSearch && action(mobileMessage(locale, "conversationSearch.title"), () => close("search"), sourceOwner === undefined || busy || avatarPreparing || deletionBusy || restartBusy || !!routine || !!resume || !!memory || !!connections || !!skills)}
+        {onSearch && action(mobileMessage(locale, "conversationSearch.title"), () => close("search"), sourceOwner === undefined || busy || avatarPreparing || deletionBusy || restartBusy || !!resume || !!memory || !!connections || !!skills)}
         {snapshot && <View>
           <Text accessibilityRole="header" style={{ color: colors.ink }}>{partnerSessionTaskMessages(locale).title}</Text>
           {taskError && <Text accessibilityRole="alert" style={{ color: colors.negative }}>{partnerSessionTaskMessages(locale).failed}</Text>}
@@ -323,18 +317,15 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
           () => { if (transport) setConnections(connectionsFactory(snapshot.partner, transport.ownerKey)); }, !editable || dirty || deletionBusy || avatarPreparing)}
         {memoryFactory && snapshot?.partner.initializationState === "ready" && snapshot.partner.canonicalSessionId && action(partnerMemoryMessages(locale).title,
           () => { if (transport) setMemory(memoryFactory(snapshot.partner, transport.ownerKey)); }, !editable || dirty || deletionBusy || avatarPreparing)}
-        {routineFactory && partner?.initializationState === "ready" && partner.canonicalSessionId && action(routineMessages(locale).title,
-          () => { if (transport && snapshot) setRoutine(routineFactory(snapshot.partner.partnerId, transport.ownerKey)); },
-          !editable || dirty || deletionBusy || avatarPreparing)}
         {resumeFactory && snapshot?.partner.lifecycle === "paused" && action(partnerResumeMessages(locale).action,
-          () => setResume(resumeFactory(snapshot.partner)), busy || dirty || deletionBusy || restartBusy || avatarPreparing || !!routine || !!resume || !!memory || !!connections || !!skills)}
+          () => setResume(resumeFactory(snapshot.partner)), busy || dirty || deletionBusy || restartBusy || avatarPreparing || !!resume || !!memory || !!connections || !!skills)}
         {visible && deletionTransport && <MobilePartnerDeletionPanel transport={deletionTransport}
-          disabled={restartBusy || !!routine || !!resume || !!memory || !!connections || !!skills}
+          disabled={restartBusy || !!resume || !!memory || !!connections || !!skills}
           partner={snapshot?.partner} colors={colors} locale={locale}
           onBusyChange={(value) => { deletionBusyRef.current = value; setDeletionBusy(value); }}
           onChanged={(deletion) => { if (deletion?.phase === "completed" && deletion.partnerId === deletingPartner.current) onClose(); }} />}
         {visible && restartTransport && <MobilePartnerRestartPanel transport={restartTransport} partner={snapshot?.partner}
-          colors={colors} locale={locale} disabled={busy || deletionBusy || avatarPreparing || dirty || !!routine || !!resume || !!memory || !!connections || !!skills}
+          colors={colors} locale={locale} disabled={busy || deletionBusy || avatarPreparing || dirty || !!resume || !!memory || !!connections || !!skills}
           onBusyChange={(value) => { restartBusyRef.current = value; setRestartBusy(value); }} onChanged={() => undefined} />}
         {!binding ? <Text style={[styles.notice, { color: colors.muted }]}>{mobileMessage(locale, "partnerProfile.offline")}</Text>
           : !snapshot ? <View style={styles.center}>

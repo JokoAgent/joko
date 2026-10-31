@@ -191,7 +191,7 @@ export class PartnerToolBridgeProvider implements BridgeToolProvider {
       || session.archived || session.deletedAt !== undefined) {
       throw new PartnerToolError("STALE_SCOPE", "The Partner tool scope is stale or read-only.");
     }
-    const caller = this.#partners.canonicalCaller(context.sessionId);
+    const caller = this.#partners.runtimeCaller(context.sessionId);
     if (caller.homeTargetId !== context.targetId) {
       throw new PartnerToolError("STALE_SCOPE", "The Partner task no longer belongs to this home.");
     }

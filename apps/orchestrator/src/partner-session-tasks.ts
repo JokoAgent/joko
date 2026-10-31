@@ -121,10 +121,10 @@ export class PartnerSessionTaskManager {
     return candidate === undefined ? { owned: true } : { owned: true, candidate };
   }
   caller(sessionId: string) {
-    const group = this.groupPublisher?.capture(sessionId), profile = group?.profile ?? this.partners.canonicalCaller(sessionId);
+    const group = this.groupPublisher?.capture(sessionId), profile = group?.profile ?? this.partners.runtimeCaller(sessionId);
     const assertCurrent = () => {
       group?.assertCurrent();
-      const current = group ? this.partners.getPartner(profile.id) : this.partners.canonicalCaller(sessionId);
+      const current = group ? this.partners.getPartner(profile.id) : this.partners.runtimeCaller(sessionId);
       const session = this.store.getSession(sessionId).descriptor;
       if (current.revision !== profile.revision || current.profileVersion !== profile.profileVersion || current.lifecycle !== "active"
         || current.initializationState !== "ready" || session.archived || session.deletedAt !== undefined) throw changed();

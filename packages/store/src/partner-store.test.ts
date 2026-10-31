@@ -16,6 +16,19 @@ afterEach(async () => {
 });
 
 describe("PartnerStore", () => {
+  it('retains old routine history while a home move reserves a fresh independent execution owner', async () => {
+    const f = await fileStore(), partner = readyPartner(f.store, 'routine-owner', 'Routine owner', 'main-session');
+    f.store.bindRoutineSession({ partnerId: partner.id, expectedRevision: partner.revision, profileVersion: partner.profileVersion,
+      sessionId: 'old-routine-session', key: 'routine:daily', operationId: 'old-native-creation' });
+    const moved = f.store.moveHome({ partnerId: partner.id, expectedRevision: partner.revision, sourceSessionId: 'main-session',
+      targetId: 'new-home', sessionId: 'new-main-session', capabilities: partner.capabilities });
+    expect(f.store.getSessionLink('old-routine-session')).toMatchObject({ partnerId: partner.id, role: 'history', profileVersion: partner.profileVersion });
+    expect(f.store.getSessionLink('old-routine-session')).not.toHaveProperty('routineKey');
+    f.store.bindRoutineSession({ partnerId: partner.id, expectedRevision: moved.revision, profileVersion: moved.profileVersion,
+      sessionId: 'new-routine-session', key: 'routine:daily', operationId: 'new-native-creation' });
+    expect(f.store.listSessionLinks(partner.id, 'routine').map(link => link.sessionId)).toEqual(['new-routine-session']);
+    expect(f.store.listSessionLinks(partner.id, 'history').map(link => link.sessionId)).toEqual(expect.arrayContaining(['main-session', 'old-routine-session']));
+  });
   it("defaults private input handoff on, persists its independent false switch and freezes the prior profile across reopen", async () => {
     const f = await fileStore();
     let profile = f.store.createPartner({ ...draft("Private input owner"), expectedDirectoryRevision: f.store.directoryState().revision });

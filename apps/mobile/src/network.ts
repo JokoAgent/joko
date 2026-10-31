@@ -29,7 +29,7 @@ import { MobilePartnerCreationRejected, projectMobilePartnerCreationOptions, pro
   type MobilePartnerCreationOptions, type MobilePartnerCreationDraft, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import { createConnectTransport, createConnectionFetch, rememberEndpointTrust, trustedEndpointPublicKey } from "@joko/connection-transport";
 import { assertTrustedEndpointServerId, endpointTransportForNewDevice, formatTrustedNodeInvitation, irohTransportForRecipient, isLoopbackEndpoint, normalizeEndpointPublicKey, pairingVerificationOrigin, requireIrohRelayInvitationRequest, trustedEndpointTransport, trustedEndpointTransportKind, type NewDeviceAuthorizationOptions, type NodePairingInvitation, type EndpointTransportKind } from "@joko/connection-transport/trust";
-import { createPartnerRoutineApi, PartnerRoutineService, type PartnerRoutineApi, createPartnerImportApi, PartnerImportService, type PartnerImportApi,
+import { createPartnerImportApi, PartnerImportService, type PartnerImportApi,
   createPartnerAutonomyApi, type PartnerAutonomyApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService, type PartnerHomeApi } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService, type PartnerGroupApi } from "@joko/contracts";
@@ -302,8 +302,6 @@ export interface MobileNetwork {
     assertCurrent: (signal: AbortSignal) => void): PartnerConnectionsApi;
   partnerSkillsApi?(credential: PairedCredential, partnerId: string, ownerKey: string,
     assertCurrent: (signal: AbortSignal) => void): PartnerSkillsApi;
-  partnerRoutineApi?(credential: PairedCredential, partnerId: string, ownerKey: string,
-    newRequestId: () => string, assertCurrent: (signal: AbortSignal) => void): PartnerRoutineApi;
   partnerAutonomyApi?(credential: PairedCredential, ownerKey: string, newOperationId: () => string, assertCurrent: (signal: AbortSignal) => void): PartnerAutonomyApi;
   partnerGroupApi?(credential: PairedCredential, ownerKey: string, newRequestId: () => string,
     assertCurrent: (signal: AbortSignal) => void): PartnerGroupApi;
@@ -1999,10 +1997,6 @@ export const mobileNetwork: MobileNetwork = {
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop clipboard content result.");
     return response.result;
-  },
-  partnerRoutineApi(credential, partnerId, ownerKey, newRequestId, assertCurrent) {
-    return createPartnerRoutineApi({ rpc: createClient(PartnerRoutineService, credentialTransport(credential)),
-      partnerId, ownerKey, newRequestId, assertCurrent });
   },
   partnerAutonomyApi(credential, ownerKey, newOperationId, assertCurrent) {
     return createPartnerAutonomyApi({ rpc: createClient(PartnerService, credentialTransport(credential)), ownerKey, newOperationId, assertCurrent });

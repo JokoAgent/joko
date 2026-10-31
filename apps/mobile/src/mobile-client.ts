@@ -41,7 +41,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { Code } from "@connectrpc/connect";
 import {
-  PartnerRoutineEditor, RoutineCreationReceipts, PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor,
+  PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor,
   PartnerGroupAttachmentSchema, PartnerGroupAttachmentCategory,
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, OpenSideChatMutationSchema, SessionDerivationKind,
@@ -2396,18 +2396,6 @@ export class MobileClient {
     };
   }
 
-  partnerRoutineApi(partnerId: string, conversationOwnerKey?: string): import("@joko/contracts").PartnerRoutineApi | undefined {
-    const context = this.#partnerPrivateContext();
-    if (!context || !this.network.partnerRoutineApi
-      || conversationOwnerKey !== undefined && !this.#partnerProfileOwnerMatches(conversationOwnerKey)) return undefined;
-    const ownerKey = conversationOwnerKey ?? context.authorityKey;
-    return this.network.partnerRoutineApi(context.credential, partnerId, ownerKey, this.newId, signal => {
-      signal.throwIfAborted();
-      if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential
-        || conversationOwnerKey !== undefined && !this.#partnerProfileOwnerMatches(conversationOwnerKey))
-        throw new Error("Partner routine owner changed.");
-    });
-  }
   partnerAutonomyApi(conversationOwnerKey: string): import("@joko/contracts").PartnerAutonomyApi | undefined {
     const context = this.#partnerPrivateContext();
     if (!context || !this.network.partnerAutonomyApi || this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) return undefined;
@@ -2416,13 +2404,6 @@ export class MobileClient {
       if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey
         || this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) throw new Error("The Partner glance owner changed.");
     });
-  }
-
-  partnerRoutineEditor(partnerId: string, storage: import("@joko/contracts").RoutineReceiptStorage, conversationOwnerKey?: string): import("@joko/contracts").PartnerRoutineEditor | undefined {
-    const api = this.partnerRoutineApi(partnerId, conversationOwnerKey); const credential = this.#credential;
-    if (!api || !credential) return undefined;
-    return new PartnerRoutineEditor(api, new RoutineCreationReceipts(storage,
-      JSON.stringify([credential.serverId, credential.profileId, credential.deviceId, new URL(credential.origin).href])), partnerId);
   }
 
   partnerResourceTransport(): MobilePartnerResourceTransport | undefined {

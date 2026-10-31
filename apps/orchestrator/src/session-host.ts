@@ -524,8 +524,18 @@ export interface CreateSessionInput {
 }
 
 export interface CreateScheduledSessionInput {
-  /** Private occurrence authority; ordinary Schedule creation uses its revision fence. */
+  /** Revalidate the private caller before effects and product adoption. */
   readonly assertServiceScope?: () => void;
+  /** Called only after native creation returned its exact binding. A cancelled
+   * result permits recording that receipt, without any further native setup. */
+  readonly assertCreationAdoption?: () => "active" | "cancelled";
+  /** Only script occurrences that already persisted their running route may
+   * adopt a task after a later Schedule configuration edit. */
+  readonly frozenOccurrenceRouting?: {
+    readonly backendId: string;
+    readonly targetId: string;
+    readonly boundSessionId?: string;
+  };
   readonly operationId: string;
   readonly targetId: string;
   readonly title: string;
@@ -2101,7 +2111,15 @@ export class SessionHost {
   async createScheduledSession(input: CreateScheduledSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
     input.assertServiceScope?.();
+    if (input.assertCreationAdoption !== undefined && (input.assertServiceScope === undefined || input.frozenOccurrenceRouting !== undefined)) {
+      throw new StoreError("Scheduled creation receipt adoption requires its original agent occurrence authority.");
+    }
     const target = this.#store.getTarget(input.targetId);
+    if (input.frozenOccurrenceRouting !== undefined && (input.assertServiceScope === undefined
+      || input.frozenOccurrenceRouting.backendId !== target.descriptor.backendId
+      || input.frozenOccurrenceRouting.targetId !== input.targetId)) {
+      throw new StoreError("Scheduled task creation requires its original occurrence authority.");
+    }
     this.validateFastSelection(
       target.descriptor.backendId,
       input.providerId,
@@ -2110,6 +2128,59 @@ export class SessionHost {
       "Creating a scheduled task"
     );
     return this.createSessionOnce(input);
+  }
+
+  /** Scheduler uses the ordinary archive boundary before hooks or native input. */
+  async restoreScheduledTarget(input: { readonly sessionId: string; readonly operationId: string; readonly assertCurrent: () => void }): Promise<void> {
+    this.#assertOpen(); input.assertCurrent();
+    await this.#withSessionRuntimeControlLock(input.sessionId, async () => {
+      input.assertCurrent();
+      const initial = this.#store.getSession(input.sessionId).descriptor;
+      if (!initial.archived && initial.worktree?.state !== "preserved") return;
+      const target = this.#store.getTarget(initial.targetId);
+      const binding = operationBodyHash(initial.binding);
+      const worktree = initial.worktree === undefined ? undefined : operationBodyHash({ ...initial.worktree, state: "active", updatedAt: 0 });
+      const check = () => {
+        this.#assertOpen(); input.assertCurrent();
+        const session = this.#store.getSession(input.sessionId).descriptor;
+        const currentTarget = this.#store.getTarget(initial.targetId);
+        this.assertArchivedSessionSendRestorable(input.sessionId);
+        if (session.backendId !== initial.backendId || session.targetId !== initial.targetId || operationBodyHash(session.binding) !== binding
+          || session.hidden || this.#store.sessionCreationServiceKind(session.id) !== undefined
+          || this.#store.findSessionRuntimePolicy(session.id) !== undefined || this.#partnerSessionPolicy(session.id) !== undefined
+          || readPersonalDevelopmentPurpose(this.#store, session.id) !== undefined
+          || this.#sessionLifecycleFences.has(session.id) || this.#store.findPendingSessionLifecycleCleanup(session.id) !== undefined
+          || this.#store.findPendingScheduleDeletionCleanupForSession(session.id) !== undefined
+          || currentTarget.revision !== target.revision || !currentTarget.descriptor.trusted
+          || (session.worktree === undefined ? undefined : operationBodyHash({ ...session.worktree, state: "active", updatedAt: 0 })) !== worktree) {
+          throw new StoreError("The scheduled task or its workspace authority changed during restore.");
+        }
+      };
+      const body = { sessionId: initial.id, backendId: initial.backendId, targetId: initial.targetId, binding, worktree: worktree ?? null };
+      const commit = (store: OperationalStore) => {
+        check(); const current = store.getSession(input.sessionId);
+        if (current.descriptor.worktree?.state === "preserved") throw new StoreError("The scheduled workspace restore is not confirmed.");
+        if (current.descriptor.archived) store.updateSession(input.sessionId, { archived: false }, current.revision);
+        return { sessionId: input.sessionId };
+      };
+      if (initial.worktree?.state !== "preserved") {
+        this.#store.runOperation({ id: input.operationId, kind: "restore_scheduled_target", body }, commit);
+        return;
+      }
+      check();
+      if (!this.#worktrees) throw new StoreError("The scheduled workspace lifecycle is unavailable.");
+      const claim = this.#store.claimDeferredEffectOperation<{ readonly sessionId: string }>({ id: input.operationId, kind: "restore_scheduled_target", body }, check);
+      if (!claim.claimed) { check(); return; }
+      // A started receipt is deliberately retained on failure. Recovery must
+      // inspect the original worktree lease instead of repeating an unknown effect.
+      await this.#worktrees.restore(input.sessionId);
+      this.#store.completeDeferredEffectOperation(input.operationId, claim.operation.bodyHash, commit);
+    });
+  }
+
+  scheduledExecutionTarget(sessionId: string): TargetDescriptor {
+    this.#assertOpen();
+    return this.targetForSession(this.#store.getSession(sessionId));
   }
 
   /** Creates a normal visible Session for a trusted service workflow. The
@@ -8830,68 +8901,60 @@ export class SessionHost {
    * reap fence makes a concurrent caller wait for detach before resuming the
    * same durable JSONL binding.
    */
-  async reapIdleRuntimes(idleForMs = 30 * 60_000): Promise<readonly string[]> {
+  async reapIdleRuntimes(idleForMs = 30 * 60_000, scope: "all" | "ordinaryPi" = "all"): Promise<readonly string[]> {
     this.#assertOpen();
     if (!Number.isFinite(idleForMs) || idleForMs < 1_000) {
       throw new Error("Runtime idle timeout must be at least one second.");
     }
-    const now = this.#monotonicNow();
     const reclaimed: string[] = [];
     for (const [sessionId, candidate] of [...this.#active]) {
-      if (this.isReviewReadOnlySession(sessionId)) continue;
-      if (now - candidate.lastActivityAt < idleForMs || !this.canReapRuntime(sessionId)) continue;
-      const stored = this.#store.getSession(sessionId);
-      let releaseAdmission: (() => void) | undefined;
-      try {
+      await this.#withSessionRuntimeControlLock(sessionId, async () => {
+        const eligible = () => {
+          const session = this.#store.getSession(sessionId).descriptor;
+          if (scope === "ordinaryPi" && (this.#store.getBackend(session.backendId).descriptor.adapterKind !== "pi"
+            || session.remoteWorkspace !== undefined || session.hidden
+            || this.#store.sessionCreationServiceKind(sessionId) !== undefined
+            || this.#partnerSessionPolicy(sessionId) !== undefined
+            || readPersonalDevelopmentPurpose(this.#store, sessionId) !== undefined)) return false;
+          return !session.archived && session.deletedAt === undefined && !this.isReviewReadOnlySession(sessionId)
+            && this.#store.findSessionRuntimePolicy(sessionId) === undefined
+            && this.#store.findPendingSessionLifecycleCleanup(sessionId) === undefined
+            && this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) === undefined
+            && !this.#sessionLifecycleFences.has(sessionId)
+            && this.#active.get(sessionId) === candidate && this.canReapRuntime(sessionId)
+            && this.#monotonicNow() - candidate.lastActivityAt >= idleForMs;
+        };
+        if (!eligible()) return;
+        const stored = this.#store.getSession(sessionId);
+        let releaseAdmission: (() => void) | undefined;
         try {
-          releaseAdmission = this.beginBackendAdmissionEffect(stored.descriptor.backendId);
-        } catch {
-          continue;
-        }
-        const nativeState = await candidate.adapter.inspectSession(
-          stored.descriptor.binding,
-          this.contextFor(stored, undefined, undefined, undefined, undefined, candidate.backendInstanceGeneration)
-        ).catch(() => undefined);
-        if (
-          nativeState === undefined ||
-          nativeState.streaming ||
-          nativeState.compacting ||
-          nativeState.pendingMessages > 0 ||
-          this.#active.get(sessionId) !== candidate ||
-          this.#adapters.get(stored.descriptor.backendId) !== candidate.adapter ||
-          this.#adapterGenerations.get(stored.descriptor.backendId) !== candidate.backendInstanceGeneration ||
-          this.#store.getBackend(stored.descriptor.backendId).descriptor.instanceGeneration
-            !== candidate.backendInstanceGeneration ||
-          now - candidate.lastActivityAt < idleForMs ||
-          !this.canReapRuntime(sessionId)
-        ) continue;
-
-        const task = (async (): Promise<void> => {
-          try {
+          try { releaseAdmission = this.beginBackendAdmissionEffect(stored.descriptor.backendId); }
+          catch { return; }
+          const nativeState = await candidate.adapter.inspectSession(
+            stored.descriptor.binding,
+            this.contextFor(stored, undefined, undefined, undefined, undefined, candidate.backendInstanceGeneration)
+          ).catch(() => undefined);
+          if (!nativeState || nativeState.streaming || nativeState.compacting || nativeState.pendingMessages > 0
+            || this.#adapters.get(stored.descriptor.backendId) !== candidate.adapter
+            || this.#adapterGenerations.get(stored.descriptor.backendId) !== candidate.backendInstanceGeneration
+            || this.#store.getBackend(stored.descriptor.backendId).descriptor.instanceGeneration !== candidate.backendInstanceGeneration
+            || !eligible()) return;
+          const task = (async (): Promise<void> => {
             if (candidate.adapter.detachSession !== undefined) {
               await candidate.adapter.detachSession(stored.descriptor.binding, this.contextFor(stored));
             } else {
               await candidate.adapter.closeSession(stored.descriptor.binding, this.contextFor(stored));
             }
-          } finally {
             this.deleteActiveSession(sessionId, candidate);
             this.clearTurnOverrideLeases(sessionId);
-          }
-        })();
-        this.#reaping.set(sessionId, task);
-        releaseAdmission();
-        releaseAdmission = undefined;
-        try {
-          await task;
-          reclaimed.push(sessionId);
-        } catch (error) {
-          this.recordFailure("runtime_idle_reap", error);
-        } finally {
-          if (this.#reaping.get(sessionId) === task) this.#reaping.delete(sessionId);
-        }
-      } finally {
-        releaseAdmission?.();
-      }
+          })();
+          this.#reaping.set(sessionId, task);
+          releaseAdmission(); releaseAdmission = undefined;
+          try { await task; reclaimed.push(sessionId); }
+          catch (error) { this.recordFailure("runtime_idle_reap", error); }
+          finally { if (this.#reaping.get(sessionId) === task) this.#reaping.delete(sessionId); }
+        } finally { releaseAdmission?.(); }
+      });
     }
     return reclaimed;
   }
@@ -8954,6 +9017,12 @@ export class SessionHost {
   private canReapRuntime(sessionId: string): boolean {
     if (
       this.#activating.has(sessionId) ||
+      this.#dispatchPreparations.has(sessionId) ||
+      this.#nativeCompactions.has(sessionId) ||
+      this.#explicitCompactionFlights.has(sessionId) ||
+      this.#compactionEffects.has(sessionId) ||
+      this.#closeIfActiveFlights.has(sessionId) ||
+      this.#sessionRuntimeControlEffects.has(sessionId) ||
       this.#messageDeletionLocks.has(sessionId) ||
       this.#sessionResetLocks.has(sessionId) ||
       (this.#activeEffects.get(sessionId) ?? 0) > 0 ||
@@ -11319,6 +11388,14 @@ export class SessionHost {
     }
 
     let createdBinding: NativeSessionBinding | undefined;
+    const assertCreationAdoption = (): "active" | "cancelled" => {
+      this.#assertOpen();
+      if (createdBinding !== undefined && "assertCreationAdoption" in input && input.assertCreationAdoption !== undefined) {
+        return input.assertCreationAdoption();
+      }
+      if ("assertServiceScope" in input) input.assertServiceScope?.();
+      return "active";
+    };
     let adapterForCleanup: BackendAdapter | undefined;
     let personalNativeCreationDispatched = false;
     let personalNativeCreationClosed = false;
@@ -11618,6 +11695,7 @@ export class SessionHost {
         let binding: NativeSessionBinding;
         let attachedState: NativeSessionState | undefined;
         let nativeHistory: NativeHistoryProjection | undefined;
+        let createdPlanMode = false;
         if (catalogBinding !== undefined) {
           binding = catalogBinding;
         } else {
@@ -11666,8 +11744,10 @@ export class SessionHost {
           }
           createdBinding = binding;
           contextForCleanup = { ...context, binding };
-          if ("assertServiceScope" in input) input.assertServiceScope?.();
-          if (!attaching && input.planMode) await adapter.setPlanMode(true, contextForCleanup);
+          if (assertCreationAdoption() === "active" && !attaching && input.planMode) {
+            await adapter.setPlanMode(true, contextForCleanup);
+            createdPlanMode = true;
+          }
           if (nativeStart.kind === "attach") {
             attachedState = await adapter.inspectSession(binding, contextForCleanup);
             assertAttachedNativeState(binding, attachedState, context.generation);
@@ -11698,7 +11778,7 @@ export class SessionHost {
         if (operationBodyHash(createSessionOperationBody(input)) !== claim.operation.bodyHash) {
           throw new Error("Create task input changed during execution.");
         }
-        if ("assertServiceScope" in input) input.assertServiceScope?.();
+        assertCreationAdoption();
         this.assertCurrentAdapterGeneration(
           target.descriptor.backendId,
           adapter,
@@ -11708,7 +11788,7 @@ export class SessionHost {
             if (provisionalReadiness !== undefined && "connection" in input && this.assertProvisionalCreationReady(input) !== provisionalReadiness) {
               throw new StoreError("Draft runtime approval changed before adoption.");
             }
-            if ("assertServiceScope" in input) input.assertServiceScope?.();
+            const creationCancelled = assertCreationAdoption() === "cancelled";
             const catalogAdoption = store.findNativeCatalogAdoption(input.operationId);
             if (catalogAdoption !== undefined) {
               if (catalogBinding === undefined || catalogAdoption.binding.opaqueRef !== binding.opaqueRef) {
@@ -11724,7 +11804,9 @@ export class SessionHost {
             if (duplicate !== undefined) throw nativeBindingConflict(duplicate.descriptor.id);
             if (automationOrigin !== undefined) {
               const currentSchedule = store.getSchedule(automationOrigin.scheduleId);
-              if (!("assertServiceScope" in input && input.assertServiceScope) && currentSchedule.revision !== automationOrigin.scheduleRevision) {
+              if (!("frozenOccurrenceRouting" in input && input.frozenOccurrenceRouting !== undefined)
+                && !creationCancelled
+                && currentSchedule.revision !== automationOrigin.scheduleRevision) {
                 throw new RevisionConflictError(
                   "Schedule",
                   automationOrigin.scheduleId,
@@ -11759,7 +11841,7 @@ export class SessionHost {
                 ? attachedState?.permissionMode ?? input.permissionMode
                 : "ask",
               planMode: catalogBinding === undefined
-                ? attachedState?.planMode ?? (attaching ? false : input.planMode)
+                ? attachedState?.planMode ?? createdPlanMode
                 : false,
               ...(catalogBinding !== undefined
                 ? { fastMode: false }
@@ -11789,8 +11871,8 @@ export class SessionHost {
               configuration: provisionalConfiguration(input), targetRevision: currentTarget.revision.toString()
             });
             const created = store.createSession(descriptor, {
-              ...(automationOrigin && "assertServiceScope" in input && input.assertServiceScope ? {
-                automationOccurrenceRouting: { backendId: target.descriptor.backendId, targetId: input.targetId }
+              ...("frozenOccurrenceRouting" in input && input.frozenOccurrenceRouting !== undefined ? {
+                automationOccurrenceRouting: input.frozenOccurrenceRouting
               } : {}),
               localRuntimeBackendSelection: runtimeBackendId !== undefined || groupAssignment !== undefined,
               nativeSessionBlank: nativeStart.kind === "new"
@@ -18328,6 +18410,9 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
         scheduleRevision: input.automationOrigin.scheduleRevision.toString(10)
       }
     } : {}),
+    ...("frozenOccurrenceRouting" in input && input.frozenOccurrenceRouting !== undefined
+      ? { frozenOccurrenceRouting: input.frozenOccurrenceRouting }
+      : {}),
     ...("serviceKind" in input ? { serviceKind: input.serviceKind } : {}),
     ...("serviceKind" in input && input.hidden !== undefined ? { hidden: input.hidden === true } : {}),
     ...("originSessionId" in input && input.originSessionId !== undefined ? {

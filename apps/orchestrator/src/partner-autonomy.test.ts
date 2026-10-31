@@ -79,7 +79,7 @@ describe("Partner task observation", () => {
     new TaskShareStore(f.store).create({ shareId: "shared-task", sessionId: task.id, invitationSha256Hex: "a".repeat(64) });
     expect(() => prepared.assertCurrent()).toThrow(); expect(f.autonomy.prepare(routine, run)).toBeUndefined();
     f.update("disable-observer", { disabled: true }); expect(() => prepared.assertCurrent()).toThrow();
-    await expect(f.routines.engine.put(f.partner.id, { ...routine, prompt: "Change the task without asking" }, routine.id, routine.revision)).rejects.toThrow("paused or resumed");
+    await expect(f.routines.engine.put(f.partner.id, { ...routine, prompt: "Change the task without asking" }, routine.id, routine.revision)).rejects.toThrow("instructions and triggers cannot be edited");
     await expect(f.routines.engine.remove(f.partner.id, routine.id)).rejects.toThrow("cannot be deleted");
   });
   it("uses the longer threshold for a live tool and excludes shared or remote work from wakeups", async () => {

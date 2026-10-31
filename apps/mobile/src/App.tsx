@@ -1102,7 +1102,6 @@ export function App() {
                   deletionTransport={client.partnerDeletionTransport()}
                   restartTransport={client.partnerRestartTransport()}
                   resumeFactory={partner => client.partnerResumeEditor(partner)}
-                  routineFactory={partnerId => client.partnerRoutineEditor(partnerId, mobilePlainStorage)}
                   memoryFactory={partner => client.partnerMemoryEditor(partner)}
                   creationTransport={client.partnerCreationTransport()}
                   importFactory={() => client.partnerImportEditor(mobilePlainStorage)}
@@ -7160,7 +7159,6 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={offlineOutputsShell?.partner ?? partnerRead.partner ?? client.partnerProfileContinuationPartner()}
       initialLearningDestination={partnerLearningEntry && partnerLearningEntry.owner === partnerSettingsOwner ? partnerLearningEntry.destination : undefined}
       transport={offlineOutputsShell?.transport ?? partnerProfileTransport} online={state.status === "connected"}
-      routineFactory={(partnerId, ownerKey) => client.partnerRoutineEditor(partnerId, mobilePlainStorage, ownerKey)}
       memoryFactory={(partner, ownerKey) => client.partnerMemoryEditor(partner, ownerKey)}
       connectionsFactory={(partner, ownerKey) => client.partnerConnectionsEditor(partner, ownerKey)}
       skillsFactory={(partner, ownerKey) => client.partnerSkillsEditor(partner, ownerKey)}

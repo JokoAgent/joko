@@ -318,6 +318,14 @@ function directSchemaFieldType(schema: Readonly<Record<string, unknown>>): Dynam
   if (value === "string" || value === "number" || value === "integer" || value === "boolean" || value === "object" || value === "array") {
     return value;
   }
+  // JSON Schema permits a scalar const without a redundant type. Keep the
+  // invocation schema intact; this only supplies the display projection.
+  if (value === undefined) {
+    const literal = schema["const"];
+    if (typeof literal === "string") return "string";
+    if (typeof literal === "boolean") return "boolean";
+    if (typeof literal === "number" && Number.isFinite(literal)) return Number.isInteger(literal) ? "integer" : "number";
+  }
   return undefined;
 }
 
@@ -346,7 +354,8 @@ function unionFieldType(value: unknown, fieldPath: string, keyword: "anyOf" | "o
   const types = new Set<DynamicInputFieldType | "null">();
   for (const [index, candidate] of value.entries()) {
     const branch = record(candidate, `${fieldPath}.${keyword}[${index}]`);
-    const type = branch["type"] === "null" ? "null" : directSchemaFieldType(branch);
+    const type = branch["type"] === "null" || branch["type"] === undefined && branch["const"] === null
+      ? "null" : directSchemaFieldType(branch);
     if (type === undefined) return undefined;
     types.add(type);
   }

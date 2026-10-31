@@ -38,8 +38,8 @@ export class PartnerLearningManager {
     const session = store.getSession(source.sessionId).descriptor;
     const target = store.getTarget(source.targetId);
     const link = profiles.getSessionLink(source.sessionId);
-    if (!link || link.role !== "canonical" && link.role !== "history" && link.role !== "topic" && link.role !== 'channel'
-      || canonical && link.role !== "canonical" && link.role !== "topic" && link.role !== 'channel'
+    if (!link || link.role !== "canonical" && link.role !== "history" && link.role !== "topic" && link.role !== 'channel' && link.role !== 'routine'
+      || canonical && link.role !== "canonical" && link.role !== "topic" && link.role !== 'channel' && link.role !== 'routine'
       || partnerId !== undefined && link.partnerId !== partnerId) throw new Error("Learning source is unavailable.");
     const profile = partners.getPartner(link.partnerId);
     const queue = store.getQueueItem(source.sourceQueueItemId);

@@ -1120,7 +1120,7 @@ function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, init
   if (error !== undefined && data === undefined) return <div className="partner-workspace-state" role="alert"><CircleAlert aria-hidden="true" /><p>{error}</p><Button onClick={() => load()}>{t("common.retry")}</Button></div>;
   if (data === undefined) return <div className="partner-workspace-state"><Spinner /></div>;
 
-  const histories = data.sessions.filter((session) => session.role === "history");
+  const histories = data.sessions.filter((session) => session.role === "history" || session.role === "routine");
   const canonical = data.sessions.find((session) => session.role === "canonical");
   const actions = {
     copyFile: controller.copyArtifactFile,

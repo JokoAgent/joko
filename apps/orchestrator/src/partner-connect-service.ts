@@ -573,7 +573,7 @@ function toProtoPartnerSession(view: PartnerSessionView): contract.PartnerSessio
     partnerId: view.link.partnerId,
     role: view.link.role === "canonical"
       ? contract.PartnerSessionRole.CANONICAL
-      : view.link.role === 'channel' ? contract.PartnerSessionRole.CHANNEL : view.link.role === 'topic' ? contract.PartnerSessionRole.TOPIC : view.link.role === "history"
+      : view.link.role === 'routine' ? contract.PartnerSessionRole.ROUTINE : view.link.role === 'channel' ? contract.PartnerSessionRole.CHANNEL : view.link.role === 'topic' ? contract.PartnerSessionRole.TOPIC : view.link.role === "history"
         ? contract.PartnerSessionRole.HISTORY
         : contract.PartnerSessionRole.DELEGATION,
     profileVersion: BigInt(view.link.profileVersion),

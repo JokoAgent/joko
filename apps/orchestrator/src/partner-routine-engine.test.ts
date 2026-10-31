@@ -14,6 +14,16 @@ function fixture(execute: RoutineEngineDeps["execute"] = async () => ({}), initi
 }
 async function idle(): Promise<void> { for (let i = 0; i < 30; i++) await Promise.resolve(); }
 describe("durable routine admission", () => {
+  it('lets built-in routines retain model and context choices while protecting their host instructions', async () => {
+    const f = fixture(); await f.engine.start();
+    const initial = await f.engine.ensureBuiltin('partner-one', definition, 'builtin-follow-up', 1);
+    const modelOverride = { backendId: 'pi', providerId: 'test', modelId: 'model', effort: 'high', fastMode: false } as const;
+    const edited = await f.engine.put('partner-one', { ...definition, sessionMode: 'fresh', modelOverride }, initial!.id, initial!.revision);
+    await expect(f.engine.put('partner-one', { ...edited, prompt: 'Replace host instructions' }, edited.id, edited.revision)).rejects.toThrow('instructions');
+    const ensured = await f.engine.ensureBuiltin('partner-one', definition, initial!.id, 1);
+    expect(ensured).toMatchObject({ prompt: definition.prompt, sessionMode: 'fresh', modelOverride });
+    await f.engine.stop();
+  });
   it("commits a running receipt before effects, coalesces matching triggers, deduplicates publications and keeps one lane", async () => {
     let finish!: () => void;
     const f = fixture(async () => { expect(f.saved().runs.find(run => run.status === "running")).toBeDefined(); await new Promise<void>(resolve => { finish = resolve; }); return {}; });

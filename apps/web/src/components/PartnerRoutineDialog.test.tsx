@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { ListPartnerRoutinesResponseSchema, PartnerRoutineSchema, ListPartnerRoutineRunsResponseSchema,
   GetPartnerRoutineCreationResponseSchema, RetirePartnerRoutineCreationResponseSchema, RoutineFilterOperator, RoutineSourceStatus,
-  type PartnerRoutineApi } from "@joko/contracts";
+  RoutineSessionMode, type PartnerRoutineApi } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { PartnerRoutineDialog } from "./PartnerRoutineDialog.js";
@@ -15,6 +15,7 @@ beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); localStorage
 afterEach(async () => { await act(async () => root?.unmount()); root = undefined; document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); localStorage.clear(); });
 function fixture() {
   let catalog = create(ListPartnerRoutinesResponseSchema, { partnerId: "partner", partnerRevision: { value: 3n }, writable: true,
+    models: [{ route: { backendId: 'pi', selection: { model: { providerId: 'vision', modelId: 'multimodal' }, effortId: 'medium' } }, name: 'Pi · Vision', efforts: ['medium', 'high'] }],
     sources: [{ id: "extension:watcher", name: "Watcher", status: RoutineSourceStatus.LISTENING, events: [{ type: "change", name: "Change", fields: ["path"] }] }] });
   let sequence = 0;
   const api: PartnerRoutineApi = { ownerKey: "owner", newRequestId: () => `routine-request-${++sequence}`,
@@ -40,6 +41,16 @@ async function fill(label: string, value: string) { const field = input(label);
     Object.getOwnPropertyDescriptor(prototype, "value")!.set!.call(field, value); field.dispatchEvent(new Event(field instanceof HTMLSelectElement ? "change" : "input", { bubbles: true })); }); }
 
 describe("Partner routine settings", () => {
+  it('saves an independent task mode and complete model route, then restores inheritance explicitly', async () => {
+    const f = fixture(); await f.render(); await fill('Name', 'Separate review'); await fill('Instructions', 'Review work');
+    await fill('Task context', 'fresh'); await fill('Routine model', JSON.stringify(['pi', 'vision', 'multimodal'])); await fill('Reasoning effort', 'high');
+    await press('Save');
+    expect(f.api.save).toHaveBeenLastCalledWith(3n, expect.objectContaining({ sessionMode: RoutineSessionMode.FRESH,
+      modelOverride: expect.objectContaining({ backendId: 'pi', selection: expect.objectContaining({ model: expect.objectContaining({ providerId: 'vision', modelId: 'multimodal' }), effortId: 'high' }) })
+    }), expect.anything(), expect.any(AbortSignal));
+    await fill('Routine model', ''); await fill('Task context', 'persistent'); await press('Save');
+    expect(f.api.save).toHaveBeenLastCalledWith(3n, expect.objectContaining({ sessionMode: RoutineSessionMode.PERSISTENT, modelOverride: undefined }), expect.anything(), expect.any(AbortSignal));
+  });
   it("edits OR time and event filters, saves through the owner API and confirms destructive actions", async () => {
     const f = fixture(); await f.render(); await fill("Name", "Review"); await fill("Instructions", "Inspect changes");
     await press("+ Event"); await fill("Event source", "extension:watcher"); await fill("Event type", "change"); await press("Add filter");

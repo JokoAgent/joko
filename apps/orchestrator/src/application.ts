@@ -1162,7 +1162,7 @@ export async function createOrchestratorApplication(
       messageSearch: () => messageSearchForHelperTools,
       taskSenderPartner: sessionId => {
         const link = partnerStore.getSessionLink(sessionId);
-        if (link?.role !== "canonical") return undefined;
+        if (link?.role !== "canonical" && link?.role !== "routine") return undefined;
         const partner = partnerStore.getPartner(link.partnerId);
         return { senderPartnerId: partner.id, senderPartnerName: partner.displayName };
       }
@@ -1883,7 +1883,7 @@ export async function createOrchestratorApplication(
   let partnerTodos: PartnerTodoManager | undefined;
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
   let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
-  const sessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
+  const sessionHost: SessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
     partnerLearning: {
       captureSource: source => partnerLearning?.captureSource(source) ?? false,
       accepted: occurrenceId => partnerLearning?.accepted(occurrenceId),
@@ -1939,9 +1939,11 @@ export async function createOrchestratorApplication(
     serviceSessionRuntimeFallback: (input) => {
       const task = partnerSessionTasks?.fallback(input);
       const group = partnerGroupRuntime?.fallback(input);
-      return task?.owned ? task : group?.owned ? group : partnerSessionRuntimeFallback(partnerStore, input);
+      const routine = partners.routineFallback(input);
+      return task?.owned ? task : group?.owned ? group : routine.owned ? routine : partnerSessionRuntimeFallback(partnerStore, input);
     },
     partnerSessionRetiring: (sessionId) => partnerStore.isPartnerSessionRetiring(sessionId)
+      || partners.isRoutineSessionRetiring(sessionId)
       || (partnerHomeRuntime?.blocksExecution(sessionId) ?? partnerHomeStorage.blocksSession(sessionId))
       || partnerStore.isPartnerTargetRetiring(store.getSession(sessionId).descriptor.targetId) || partnerSessionTasks?.isRetiring(sessionId) === true
       || partnerGroupRuntime?.isRetiring(sessionId) === true || partnerNetworkLanes?.isRetiring(sessionId) === true,
@@ -1949,7 +1951,8 @@ export async function createOrchestratorApplication(
     partnerSessionRestarting: (sessionId) => partnerStore.isPartnerSessionRestarting(sessionId) || partnerMessaging?.isRestarting(sessionId) === true,
     partnerSessionPaused: (sessionId) => partnerStore.isPartnerSessionPaused(sessionId) || partnerSessionTasks?.isHeld(sessionId) === true || partnerGroupRuntime?.isHeld(sessionId) === true || partnerNetworkLanes?.isHeld(sessionId) === true,
     partnerSessionPolicy: (sessionId) => {
-      const profile = partnerStore.findPartnerByCanonicalSession(sessionId);
+      const link = partnerStore.getSessionLink(sessionId);
+      const profile = link?.role === 'routine' ? partnerStore.getPartner(link.partnerId) : partnerStore.findPartnerByCanonicalSession(sessionId);
       return profile === undefined ? undefined : {
         identity: JSON.stringify([profile.id, profile.homeTargetId, profile.canonicalSessionId, profile.profileVersion, profile.capabilities.permissionMode]),
         status: profile.initializationState
@@ -2201,7 +2204,7 @@ export async function createOrchestratorApplication(
   let partnerImports: PartnerImportManager | undefined;
   const assertImportService = () => { if (closed) throw new Error("Import service is closed."); };
   let appDefaultModels: AppDefaultModelCoordinator | undefined;
-  const partners = new PartnerManager({
+  const partners: PartnerManager = new PartnerManager({
     store: partnerStore,
     operationalStore: store,
     homeChanging: partnerId => partnerHomeStorage.changing(partnerId),
@@ -2217,6 +2220,8 @@ export async function createOrchestratorApplication(
     workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes"),
     onReady: async partnerId => { await partnerImports?.activatePackage(partnerId); },
+    routineModel: (partnerId, key) => partnerRoutines?.engine.list(partnerId).find(routine =>
+      key === `routine:${routine.id}` || key.startsWith(`routine:${routine.id}:`))?.modelOverride ?? undefined,
     onRoutineLifecycle: async (partnerId, state) => { await partnerRoutines?.lifecycle(partnerId, state); await partnerGroups?.partnerLifecycle(partnerId, state); await partnerMessaging?.lifecycle(partnerId, state); },
     prepareImportDeletion: async partnerId => { await partnerImports?.prepareDeletion(partnerId); await startupPartnerImportRuntime?.close();
       partnerMemoryPreferences.remove(partnerStore.getPartner(partnerId).homeTargetId);
@@ -2981,9 +2986,10 @@ export async function createOrchestratorApplication(
   });
   managedModelRuntimeForSession = managedModelRuntimeSystem;
 
-  const runMaintenance = (): Promise<void> => {
+  const runMaintenance = (full = true): Promise<void> => {
     const maintenance = maintenanceTail.catch(() => undefined).then(async () => {
       if (closed) return;
+      if (!full) { await sessionHost.reapIdleRuntimes(undefined, "ordinaryPi"); return; }
       const now = Date.now();
       store.expireToolLeases(now);
       store.prunePairings({
@@ -2998,8 +3004,9 @@ export async function createOrchestratorApplication(
     return maintenance;
   };
   const armMaintenance = (): void => {
+    let scans = 0;
     maintenanceTimer = setInterval(() => {
-      void runMaintenance().catch(() => {
+      void runMaintenance(++scans % 3 === 0).catch(() => {
         if (closed) return;
         store.appendDiagnostic({
           severity: "warning",
@@ -3009,7 +3016,7 @@ export async function createOrchestratorApplication(
           details: {}
         });
       });
-    }, 15 * 60_000);
+    }, 5 * 60_000);
     maintenanceTimer.unref();
   };
 

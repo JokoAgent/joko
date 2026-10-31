@@ -8,13 +8,15 @@ import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
 import type { Revision } from "./common_pb.js";
 import { file_joko_v1_common } from "./common_pb.js";
+import type { ModelSelection } from "./model_pb.js";
+import { file_joko_v1_model } from "./model_pb.js";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file joko/v1/partner_routine.proto.
  */
 export const file_joko_v1_partner_routine: GenFile = /*@__PURE__*/
-  fileDesc("Ch1qb2tvL3YxL3BhcnRuZXJfcm91dGluZS5wcm90bxIHam9rby52MSI6ChJSb3V0aW5lQ3JvblRyaWdnZXISEgoKZXhwcmVzc2lvbhgBIAEoCRIQCgh0aW1lem9uZRgCIAEoCSJTChZSb3V0aW5lSW50ZXJ2YWxUcmlnZ2VyEhMKC2ludGVydmFsX21zGAEgASgEEhYKCWFuY2hvcl9tcxgCIAEoBEgAiAEBQgwKCl9hbmNob3JfbXMiPAoSUm91dGluZU9uY2VUcmlnZ2VyEiYKAmF0GAEgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJkChJSb3V0aW5lRXZlbnRGaWx0ZXISDQoFZmllbGQYASABKAkSMAoIb3BlcmF0b3IYAiABKA4yHi5qb2tvLnYxLlJvdXRpbmVGaWx0ZXJPcGVyYXRvchINCgV2YWx1ZRgDIAEoCSJqChNSb3V0aW5lRXZlbnRUcmlnZ2VyEhEKCXNvdXJjZV9pZBgBIAEoCRISCgpldmVudF90eXBlGAIgASgJEiwKB2ZpbHRlcnMYAyADKAsyGy5qb2tvLnYxLlJvdXRpbmVFdmVudEZpbHRlciLiAQoOUm91dGluZVRyaWdnZXISCgoCaWQYASABKAkSKwoEY3JvbhgCIAEoCzIbLmpva28udjEuUm91dGluZUNyb25UcmlnZ2VySAASMwoIaW50ZXJ2YWwYAyABKAsyHy5qb2tvLnYxLlJvdXRpbmVJbnRlcnZhbFRyaWdnZXJIABIrCgRvbmNlGAQgASgLMhsuam9rby52MS5Sb3V0aW5lT25jZVRyaWdnZXJIABItCgVldmVudBgFIAEoCzIcLmpva28udjEuUm91dGluZUV2ZW50VHJpZ2dlckgAQgYKBGtpbmQiTAoRUm91dGluZVByZVJ1bkhvb2sSDwoHY29tbWFuZBgBIAEoCRIXCgp0aW1lb3V0X21zGAIgASgESACIAQFCDQoLX3RpbWVvdXRfbXMi5AEKEVJvdXRpbmVEZWZpbml0aW9uEgwKBG5hbWUYASABKAkSDgoGcHJvbXB0GAIgASgJEhQKB2VuYWJsZWQYAyABKAhIAIgBARIpCgh0cmlnZ2VycxgEIAMoCzIXLmpva28udjEuUm91dGluZVRyaWdnZXISHQoQc2lsZW50X3doZW5faWRsZRgFIAEoCEgBiAEBEjAKDHByZV9ydW5faG9vaxgGIAEoCzIaLmpva28udjEuUm91dGluZVByZVJ1bkhvb2tCCgoIX2VuYWJsZWRCEwoRX3NpbGVudF93aGVuX2lkbGUi+AIKDlBhcnRuZXJSb3V0aW5lEgoKAmlkGAEgASgJEhIKCnBhcnRuZXJfaWQYAiABKAkSIwoIcmV2aXNpb24YAyABKAsyES5qb2tvLnYxLlJldmlzaW9uEi4KCmRlZmluaXRpb24YBCABKAsyGi5qb2tvLnYxLlJvdXRpbmVEZWZpbml0aW9uEjAKCGFjdGl2aXR5GAUgASgOMhkuam9rby52MS5Sb3V0aW5lUnVuU3RhdHVzSACIAQESLgoKY3JlYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgHIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASFAoHYnVpbHRpbhgIIAEoCUgBiAEBEhwKD2J1aWx0aW5fdmVyc2lvbhgJIAEoDUgCiAEBQgsKCV9hY3Rpdml0eUIKCghfYnVpbHRpbkISChBfYnVpbHRpbl92ZXJzaW9uIkAKElJvdXRpbmVTb3VyY2VFdmVudBIMCgR0eXBlGAEgASgJEgwKBG5hbWUYAiABKAkSDgoGZmllbGRzGAMgAygJIrcBCg1Sb3V0aW5lU291cmNlEgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSLAoGc3RhdHVzGAMgASgOMhwuam9rby52MS5Sb3V0aW5lU291cmNlU3RhdHVzEisKBmV2ZW50cxgEIAMoCzIbLmpva28udjEuUm91dGluZVNvdXJjZUV2ZW50EjEKDWxhc3RfZXZlbnRfYXQYBSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIv4CChFQYXJ0bmVyUm91dGluZVJ1bhIKCgJpZBgBIAEoCRISCgpyb3V0aW5lX2lkGAIgASgJEi4KE2RlZmluaXRpb25fcmV2aXNpb24YAyABKAsyES5qb2tvLnYxLlJldmlzaW9uEhMKC3RyaWdnZXJfaWRzGAQgAygJEikKBnN0YXR1cxgFIAEoDjIZLmpva28udjEuUm91dGluZVJ1blN0YXR1cxIuCgpjcmVhdGVkX2F0GAYgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIvCgtmaW5pc2hlZF9hdBgHIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASEgoFZXJyb3IYCCABKAlIAIgBARIcCg9zY2hlZHVsZV9ydW5faWQYCSABKAlIAYgBARIYCgtyZXN1bHRfdGV4dBgKIAEoCUgCiAEBQggKBl9lcnJvckISChBfc2NoZWR1bGVfcnVuX2lkQg4KDF9yZXN1bHRfdGV4dCIwChpMaXN0UGFydG5lclJvdXRpbmVzUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJIsQBChtMaXN0UGFydG5lclJvdXRpbmVzUmVzcG9uc2USEgoKcGFydG5lcl9pZBgBIAEoCRIrChBwYXJ0bmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIQCgh3cml0YWJsZRgDIAEoCBIpCghyb3V0aW5lcxgEIAMoCzIXLmpva28udjEuUGFydG5lclJvdXRpbmUSJwoHc291cmNlcxgFIAMoCzIWLmpva28udjEuUm91dGluZVNvdXJjZSKCAgoZU2F2ZVBhcnRuZXJSb3V0aW5lUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEjQKGWV4cGVjdGVkX3BhcnRuZXJfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEi4KCmRlZmluaXRpb24YAyABKAsyGi5qb2tvLnYxLlJvdXRpbmVEZWZpbml0aW9uEh0KE2NyZWF0aW9uX3JlcXVlc3RfaWQYBCABKAlIABIUCgpyb3V0aW5lX2lkGAUgASgJSAASLAoRZXhwZWN0ZWRfcmV2aXNpb24YBiABKAsyES5qb2tvLnYxLlJldmlzaW9uQggKBmludGVudCJGChpTYXZlUGFydG5lclJvdXRpbmVSZXNwb25zZRIoCgdyb3V0aW5lGAEgASgLMhcuam9rby52MS5QYXJ0bmVyUm91dGluZSK6AQoYUnVuUGFydG5lclJvdXRpbmVSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSNAoZZXhwZWN0ZWRfcGFydG5lcl9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SEgoKcm91dGluZV9pZBgDIAEoCRIsChFleHBlY3RlZF9yZXZpc2lvbhgEIAEoCzIRLmpva28udjEuUmV2aXNpb24SEgoKcmVxdWVzdF9pZBgFIAEoCSIbChlSdW5QYXJ0bmVyUm91dGluZVJlc3BvbnNlIqkBChtEZWxldGVQYXJ0bmVyUm91dGluZVJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRI0ChlleHBlY3RlZF9wYXJ0bmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhISCgpyb3V0aW5lX2lkGAMgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAQgASgLMhEuam9rby52MS5SZXZpc2lvbiIeChxEZWxldGVQYXJ0bmVyUm91dGluZVJlc3BvbnNlImcKHUxpc3RQYXJ0bmVyUm91dGluZVJ1bnNSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSEgoKcm91dGluZV9pZBgCIAEoCRITCgZvZmZzZXQYAyABKA1IAIgBAUIJCgdfb2Zmc2V0InQKHkxpc3RQYXJ0bmVyUm91dGluZVJ1bnNSZXNwb25zZRIoCgRydW5zGAEgAygLMhouam9rby52MS5QYXJ0bmVyUm91dGluZVJ1bhIYCgtuZXh0X29mZnNldBgCIAEoDUgAiAEBQg4KDF9uZXh0X29mZnNldCJKCiBHZXRQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEhIKCnJlcXVlc3RfaWQYAiABKAkiXgohR2V0UGFydG5lclJvdXRpbmVDcmVhdGlvblJlc3BvbnNlEigKB3JvdXRpbmUYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lEg8KB3JldGlyZWQYAiABKAgiTQojUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvblJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJImEKJFJldGlyZVBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXNwb25zZRIoCgdyb3V0aW5lGAEgASgLMhcuam9rby52MS5QYXJ0bmVyUm91dGluZRIPCgdyZXRpcmVkGAIgASgIKrIBChVSb3V0aW5lRmlsdGVyT3BlcmF0b3ISJwojUk9VVElORV9GSUxURVJfT1BFUkFUT1JfVU5TUEVDSUZJRUQQABIiCh5ST1VUSU5FX0ZJTFRFUl9PUEVSQVRPUl9FUVVBTFMQARIkCiBST1VUSU5FX0ZJTFRFUl9PUEVSQVRPUl9DT05UQUlOUxACEiYKIlJPVVRJTkVfRklMVEVSX09QRVJBVE9SX05PVF9FUVVBTFMQAyqaAgoQUm91dGluZVJ1blN0YXR1cxIiCh5ST1VUSU5FX1JVTl9TVEFUVVNfVU5TUEVDSUZJRUQQABIdChlST1VUSU5FX1JVTl9TVEFUVVNfUVVFVUVEEAESHgoaUk9VVElORV9SVU5fU1RBVFVTX1JVTk5JTkcQAhIeChpST1VUSU5FX1JVTl9TVEFUVVNfU1VDQ0VTUxADEh0KGVJPVVRJTkVfUlVOX1NUQVRVU19GQUlMRUQQBBIiCh5ST1VUSU5FX1JVTl9TVEFUVVNfSU5URVJSVVBURUQQBRIgChxST1VUSU5FX1JVTl9TVEFUVVNfQ0FOQ0VMTEVEEAYSHgoaUk9VVElORV9SVU5fU1RBVFVTX1NLSVBQRUQQByqqAQoTUm91dGluZVNvdXJjZVN0YXR1cxIlCiFST1VUSU5FX1NPVVJDRV9TVEFUVVNfVU5TUEVDSUZJRUQQABIjCh9ST1VUSU5FX1NPVVJDRV9TVEFUVVNfTElTVEVOSU5HEAESJgoiUk9VVElORV9TT1VSQ0VfU1RBVFVTX0RJU0NPTk5FQ1RFRBACEh8KG1JPVVRJTkVfU09VUkNFX1NUQVRVU19FUlJPUhADMvUFChVQYXJ0bmVyUm91dGluZVNlcnZpY2USYAoTTGlzdFBhcnRuZXJSb3V0aW5lcxIjLmpva28udjEuTGlzdFBhcnRuZXJSb3V0aW5lc1JlcXVlc3QaJC5qb2tvLnYxLkxpc3RQYXJ0bmVyUm91dGluZXNSZXNwb25zZRJdChJTYXZlUGFydG5lclJvdXRpbmUSIi5qb2tvLnYxLlNhdmVQYXJ0bmVyUm91dGluZVJlcXVlc3QaIy5qb2tvLnYxLlNhdmVQYXJ0bmVyUm91dGluZVJlc3BvbnNlEloKEVJ1blBhcnRuZXJSb3V0aW5lEiEuam9rby52MS5SdW5QYXJ0bmVyUm91dGluZVJlcXVlc3QaIi5qb2tvLnYxLlJ1blBhcnRuZXJSb3V0aW5lUmVzcG9uc2USYwoURGVsZXRlUGFydG5lclJvdXRpbmUSJC5qb2tvLnYxLkRlbGV0ZVBhcnRuZXJSb3V0aW5lUmVxdWVzdBolLmpva28udjEuRGVsZXRlUGFydG5lclJvdXRpbmVSZXNwb25zZRJpChZMaXN0UGFydG5lclJvdXRpbmVSdW5zEiYuam9rby52MS5MaXN0UGFydG5lclJvdXRpbmVSdW5zUmVxdWVzdBonLmpva28udjEuTGlzdFBhcnRuZXJSb3V0aW5lUnVuc1Jlc3BvbnNlEnIKGUdldFBhcnRuZXJSb3V0aW5lQ3JlYXRpb24SKS5qb2tvLnYxLkdldFBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXF1ZXN0Giouam9rby52MS5HZXRQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVzcG9uc2USewocUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvbhIsLmpva28udjEuUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvblJlcXVlc3QaLS5qb2tvLnYxLlJldGlyZVBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXNwb25zZWIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_common]);
+  fileDesc("Ch1qb2tvL3YxL3BhcnRuZXJfcm91dGluZS5wcm90bxIHam9rby52MSI6ChJSb3V0aW5lQ3JvblRyaWdnZXISEgoKZXhwcmVzc2lvbhgBIAEoCRIQCgh0aW1lem9uZRgCIAEoCSJTChZSb3V0aW5lSW50ZXJ2YWxUcmlnZ2VyEhMKC2ludGVydmFsX21zGAEgASgEEhYKCWFuY2hvcl9tcxgCIAEoBEgAiAEBQgwKCl9hbmNob3JfbXMiPAoSUm91dGluZU9uY2VUcmlnZ2VyEiYKAmF0GAEgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJkChJSb3V0aW5lRXZlbnRGaWx0ZXISDQoFZmllbGQYASABKAkSMAoIb3BlcmF0b3IYAiABKA4yHi5qb2tvLnYxLlJvdXRpbmVGaWx0ZXJPcGVyYXRvchINCgV2YWx1ZRgDIAEoCSJqChNSb3V0aW5lRXZlbnRUcmlnZ2VyEhEKCXNvdXJjZV9pZBgBIAEoCRISCgpldmVudF90eXBlGAIgASgJEiwKB2ZpbHRlcnMYAyADKAsyGy5qb2tvLnYxLlJvdXRpbmVFdmVudEZpbHRlciLiAQoOUm91dGluZVRyaWdnZXISCgoCaWQYASABKAkSKwoEY3JvbhgCIAEoCzIbLmpva28udjEuUm91dGluZUNyb25UcmlnZ2VySAASMwoIaW50ZXJ2YWwYAyABKAsyHy5qb2tvLnYxLlJvdXRpbmVJbnRlcnZhbFRyaWdnZXJIABIrCgRvbmNlGAQgASgLMhsuam9rby52MS5Sb3V0aW5lT25jZVRyaWdnZXJIABItCgVldmVudBgFIAEoCzIcLmpva28udjEuUm91dGluZUV2ZW50VHJpZ2dlckgAQgYKBGtpbmQiTAoRUm91dGluZVByZVJ1bkhvb2sSDwoHY29tbWFuZBgBIAEoCRIXCgp0aW1lb3V0X21zGAIgASgESACIAQFCDQoLX3RpbWVvdXRfbXMiTgoMUm91dGluZU1vZGVsEhIKCmJhY2tlbmRfaWQYASABKAkSKgoJc2VsZWN0aW9uGAIgASgLMhcuam9rby52MS5Nb2RlbFNlbGVjdGlvbiKWAQoSUm91dGluZU1vZGVsQ2hvaWNlEiQKBXJvdXRlGAEgASgLMhUuam9rby52MS5Sb3V0aW5lTW9kZWwSDAoEbmFtZRgCIAEoCRIPCgdlZmZvcnRzGAMgAygJEhoKEnN1cHBvcnRzX2Zhc3RfbW9kZRgEIAEoCBIfChdzdXBwb3J0c191bHRyYWZhc3RfbW9kZRgFIAEoCCLGAgoRUm91dGluZURlZmluaXRpb24SDAoEbmFtZRgBIAEoCRIOCgZwcm9tcHQYAiABKAkSFAoHZW5hYmxlZBgDIAEoCEgAiAEBEikKCHRyaWdnZXJzGAQgAygLMhcuam9rby52MS5Sb3V0aW5lVHJpZ2dlchIdChBzaWxlbnRfd2hlbl9pZGxlGAUgASgISAGIAQESMAoMcHJlX3J1bl9ob29rGAYgASgLMhouam9rby52MS5Sb3V0aW5lUHJlUnVuSG9vaxIxCgxzZXNzaW9uX21vZGUYByABKA4yGy5qb2tvLnYxLlJvdXRpbmVTZXNzaW9uTW9kZRItCg5tb2RlbF9vdmVycmlkZRgIIAEoCzIVLmpva28udjEuUm91dGluZU1vZGVsQgoKCF9lbmFibGVkQhMKEV9zaWxlbnRfd2hlbl9pZGxlIvgCCg5QYXJ0bmVyUm91dGluZRIKCgJpZBgBIAEoCRISCgpwYXJ0bmVyX2lkGAIgASgJEiMKCHJldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbhIuCgpkZWZpbml0aW9uGAQgASgLMhouam9rby52MS5Sb3V0aW5lRGVmaW5pdGlvbhIwCghhY3Rpdml0eRgFIAEoDjIZLmpva28udjEuUm91dGluZVJ1blN0YXR1c0gAiAEBEi4KCmNyZWF0ZWRfYXQYBiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnVwZGF0ZWRfYXQYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhQKB2J1aWx0aW4YCCABKAlIAYgBARIcCg9idWlsdGluX3ZlcnNpb24YCSABKA1IAogBAUILCglfYWN0aXZpdHlCCgoIX2J1aWx0aW5CEgoQX2J1aWx0aW5fdmVyc2lvbiJAChJSb3V0aW5lU291cmNlRXZlbnQSDAoEdHlwZRgBIAEoCRIMCgRuYW1lGAIgASgJEg4KBmZpZWxkcxgDIAMoCSK3AQoNUm91dGluZVNvdXJjZRIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiwKBnN0YXR1cxgDIAEoDjIcLmpva28udjEuUm91dGluZVNvdXJjZVN0YXR1cxIrCgZldmVudHMYBCADKAsyGy5qb2tvLnYxLlJvdXRpbmVTb3VyY2VFdmVudBIxCg1sYXN0X2V2ZW50X2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCKmAwoRUGFydG5lclJvdXRpbmVSdW4SCgoCaWQYASABKAkSEgoKcm91dGluZV9pZBgCIAEoCRIuChNkZWZpbml0aW9uX3JldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbhITCgt0cmlnZ2VyX2lkcxgEIAMoCRIpCgZzdGF0dXMYBSABKA4yGS5qb2tvLnYxLlJvdXRpbmVSdW5TdGF0dXMSLgoKY3JlYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLwoLZmluaXNoZWRfYXQYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhIKBWVycm9yGAggASgJSACIAQESHAoPc2NoZWR1bGVfcnVuX2lkGAkgASgJSAGIAQESGAoLcmVzdWx0X3RleHQYCiABKAlIAogBARIXCgpzZXNzaW9uX2lkGAsgASgJSAOIAQFCCAoGX2Vycm9yQhIKEF9zY2hlZHVsZV9ydW5faWRCDgoMX3Jlc3VsdF90ZXh0Qg0KC19zZXNzaW9uX2lkIjAKGkxpc3RQYXJ0bmVyUm91dGluZXNSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAki8QEKG0xpc3RQYXJ0bmVyUm91dGluZXNSZXNwb25zZRISCgpwYXJ0bmVyX2lkGAEgASgJEisKEHBhcnRuZXJfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhAKCHdyaXRhYmxlGAMgASgIEikKCHJvdXRpbmVzGAQgAygLMhcuam9rby52MS5QYXJ0bmVyUm91dGluZRInCgdzb3VyY2VzGAUgAygLMhYuam9rby52MS5Sb3V0aW5lU291cmNlEisKBm1vZGVscxgGIAMoCzIbLmpva28udjEuUm91dGluZU1vZGVsQ2hvaWNlIoICChlTYXZlUGFydG5lclJvdXRpbmVSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSNAoZZXhwZWN0ZWRfcGFydG5lcl9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SLgoKZGVmaW5pdGlvbhgDIAEoCzIaLmpva28udjEuUm91dGluZURlZmluaXRpb24SHQoTY3JlYXRpb25fcmVxdWVzdF9pZBgEIAEoCUgAEhQKCnJvdXRpbmVfaWQYBSABKAlIABIsChFleHBlY3RlZF9yZXZpc2lvbhgGIAEoCzIRLmpva28udjEuUmV2aXNpb25CCAoGaW50ZW50IkYKGlNhdmVQYXJ0bmVyUm91dGluZVJlc3BvbnNlEigKB3JvdXRpbmUYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lIroBChhSdW5QYXJ0bmVyUm91dGluZVJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRI0ChlleHBlY3RlZF9wYXJ0bmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhISCgpyb3V0aW5lX2lkGAMgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAQgASgLMhEuam9rby52MS5SZXZpc2lvbhISCgpyZXF1ZXN0X2lkGAUgASgJIhsKGVJ1blBhcnRuZXJSb3V0aW5lUmVzcG9uc2UiqQEKG0RlbGV0ZVBhcnRuZXJSb3V0aW5lUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEjQKGWV4cGVjdGVkX3BhcnRuZXJfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhIKCnJvdXRpbmVfaWQYAyABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YBCABKAsyES5qb2tvLnYxLlJldmlzaW9uIh4KHERlbGV0ZVBhcnRuZXJSb3V0aW5lUmVzcG9uc2UiZwodTGlzdFBhcnRuZXJSb3V0aW5lUnVuc1JlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRISCgpyb3V0aW5lX2lkGAIgASgJEhMKBm9mZnNldBgDIAEoDUgAiAEBQgkKB19vZmZzZXQidAoeTGlzdFBhcnRuZXJSb3V0aW5lUnVuc1Jlc3BvbnNlEigKBHJ1bnMYASADKAsyGi5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lUnVuEhgKC25leHRfb2Zmc2V0GAIgASgNSACIAQFCDgoMX25leHRfb2Zmc2V0IkoKIEdldFBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSEgoKcmVxdWVzdF9pZBgCIAEoCSJeCiFHZXRQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVzcG9uc2USKAoHcm91dGluZRgBIAEoCzIXLmpva28udjEuUGFydG5lclJvdXRpbmUSDwoHcmV0aXJlZBgCIAEoCCJNCiNSZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEhIKCnJlcXVlc3RfaWQYAiABKAkiYQokUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvblJlc3BvbnNlEigKB3JvdXRpbmUYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lEg8KB3JldGlyZWQYAiABKAgqsgEKFVJvdXRpbmVGaWx0ZXJPcGVyYXRvchInCiNST1VUSU5FX0ZJTFRFUl9PUEVSQVRPUl9VTlNQRUNJRklFRBAAEiIKHlJPVVRJTkVfRklMVEVSX09QRVJBVE9SX0VRVUFMUxABEiQKIFJPVVRJTkVfRklMVEVSX09QRVJBVE9SX0NPTlRBSU5TEAISJgoiUk9VVElORV9GSUxURVJfT1BFUkFUT1JfTk9UX0VRVUFMUxADKpoCChBSb3V0aW5lUnVuU3RhdHVzEiIKHlJPVVRJTkVfUlVOX1NUQVRVU19VTlNQRUNJRklFRBAAEh0KGVJPVVRJTkVfUlVOX1NUQVRVU19RVUVVRUQQARIeChpST1VUSU5FX1JVTl9TVEFUVVNfUlVOTklORxACEh4KGlJPVVRJTkVfUlVOX1NUQVRVU19TVUNDRVNTEAMSHQoZUk9VVElORV9SVU5fU1RBVFVTX0ZBSUxFRBAEEiIKHlJPVVRJTkVfUlVOX1NUQVRVU19JTlRFUlJVUFRFRBAFEiAKHFJPVVRJTkVfUlVOX1NUQVRVU19DQU5DRUxMRUQQBhIeChpST1VUSU5FX1JVTl9TVEFUVVNfU0tJUFBFRBAHKqoBChNSb3V0aW5lU291cmNlU3RhdHVzEiUKIVJPVVRJTkVfU09VUkNFX1NUQVRVU19VTlNQRUNJRklFRBAAEiMKH1JPVVRJTkVfU09VUkNFX1NUQVRVU19MSVNURU5JTkcQARImCiJST1VUSU5FX1NPVVJDRV9TVEFUVVNfRElTQ09OTkVDVEVEEAISHwobUk9VVElORV9TT1VSQ0VfU1RBVFVTX0VSUk9SEAMqfwoSUm91dGluZVNlc3Npb25Nb2RlEiQKIFJPVVRJTkVfU0VTU0lPTl9NT0RFX1VOU1BFQ0lGSUVEEAASIwofUk9VVElORV9TRVNTSU9OX01PREVfUEVSU0lTVEVOVBABEh4KGlJPVVRJTkVfU0VTU0lPTl9NT0RFX0ZSRVNIEAIy9QUKFVBhcnRuZXJSb3V0aW5lU2VydmljZRJgChNMaXN0UGFydG5lclJvdXRpbmVzEiMuam9rby52MS5MaXN0UGFydG5lclJvdXRpbmVzUmVxdWVzdBokLmpva28udjEuTGlzdFBhcnRuZXJSb3V0aW5lc1Jlc3BvbnNlEl0KElNhdmVQYXJ0bmVyUm91dGluZRIiLmpva28udjEuU2F2ZVBhcnRuZXJSb3V0aW5lUmVxdWVzdBojLmpva28udjEuU2F2ZVBhcnRuZXJSb3V0aW5lUmVzcG9uc2USWgoRUnVuUGFydG5lclJvdXRpbmUSIS5qb2tvLnYxLlJ1blBhcnRuZXJSb3V0aW5lUmVxdWVzdBoiLmpva28udjEuUnVuUGFydG5lclJvdXRpbmVSZXNwb25zZRJjChREZWxldGVQYXJ0bmVyUm91dGluZRIkLmpva28udjEuRGVsZXRlUGFydG5lclJvdXRpbmVSZXF1ZXN0GiUuam9rby52MS5EZWxldGVQYXJ0bmVyUm91dGluZVJlc3BvbnNlEmkKFkxpc3RQYXJ0bmVyUm91dGluZVJ1bnMSJi5qb2tvLnYxLkxpc3RQYXJ0bmVyUm91dGluZVJ1bnNSZXF1ZXN0Gicuam9rby52MS5MaXN0UGFydG5lclJvdXRpbmVSdW5zUmVzcG9uc2UScgoZR2V0UGFydG5lclJvdXRpbmVDcmVhdGlvbhIpLmpva28udjEuR2V0UGFydG5lclJvdXRpbmVDcmVhdGlvblJlcXVlc3QaKi5qb2tvLnYxLkdldFBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXNwb25zZRJ7ChxSZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uEiwuam9rby52MS5SZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVxdWVzdBotLmpva28udjEuUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvblJlc3BvbnNlYgZwcm90bzM", [file_google_protobuf_timestamp, file_joko_v1_common, file_joko_v1_model]);
 
 /**
  * @generated from message joko.v1.RoutineCronTrigger
@@ -200,6 +202,65 @@ export const RoutinePreRunHookSchema: GenMessage<RoutinePreRunHook> = /*@__PURE_
   messageDesc(file_joko_v1_partner_routine, 6);
 
 /**
+ * @generated from message joko.v1.RoutineModel
+ */
+export type RoutineModel = Message<"joko.v1.RoutineModel"> & {
+  /**
+   * @generated from field: string backend_id = 1;
+   */
+  backendId: string;
+
+  /**
+   * @generated from field: joko.v1.ModelSelection selection = 2;
+   */
+  selection?: ModelSelection | undefined;
+};
+
+/**
+ * Describes the message joko.v1.RoutineModel.
+ * Use `create(RoutineModelSchema)` to create a new message.
+ */
+export const RoutineModelSchema: GenMessage<RoutineModel> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 7);
+
+/**
+ * @generated from message joko.v1.RoutineModelChoice
+ */
+export type RoutineModelChoice = Message<"joko.v1.RoutineModelChoice"> & {
+  /**
+   * @generated from field: joko.v1.RoutineModel route = 1;
+   */
+  route?: RoutineModel | undefined;
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name: string;
+
+  /**
+   * @generated from field: repeated string efforts = 3;
+   */
+  efforts: string[];
+
+  /**
+   * @generated from field: bool supports_fast_mode = 4;
+   */
+  supportsFastMode: boolean;
+
+  /**
+   * @generated from field: bool supports_ultrafast_mode = 5;
+   */
+  supportsUltrafastMode: boolean;
+};
+
+/**
+ * Describes the message joko.v1.RoutineModelChoice.
+ * Use `create(RoutineModelChoiceSchema)` to create a new message.
+ */
+export const RoutineModelChoiceSchema: GenMessage<RoutineModelChoice> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 8);
+
+/**
  * @generated from message joko.v1.RoutineDefinition
  */
 export type RoutineDefinition = Message<"joko.v1.RoutineDefinition"> & {
@@ -232,6 +293,18 @@ export type RoutineDefinition = Message<"joko.v1.RoutineDefinition"> & {
    * @generated from field: joko.v1.RoutinePreRunHook pre_run_hook = 6;
    */
   preRunHook?: RoutinePreRunHook | undefined;
+
+  /**
+   * @generated from field: joko.v1.RoutineSessionMode session_mode = 7;
+   */
+  sessionMode: RoutineSessionMode;
+
+  /**
+   * Absence follows the Partner model. This is a complete route, including speed.
+   *
+   * @generated from field: joko.v1.RoutineModel model_override = 8;
+   */
+  modelOverride?: RoutineModel | undefined;
 };
 
 /**
@@ -239,7 +312,7 @@ export type RoutineDefinition = Message<"joko.v1.RoutineDefinition"> & {
  * Use `create(RoutineDefinitionSchema)` to create a new message.
  */
 export const RoutineDefinitionSchema: GenMessage<RoutineDefinition> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 7);
+  messageDesc(file_joko_v1_partner_routine, 9);
 
 /**
  * @generated from message joko.v1.PartnerRoutine
@@ -296,7 +369,7 @@ export type PartnerRoutine = Message<"joko.v1.PartnerRoutine"> & {
  * Use `create(PartnerRoutineSchema)` to create a new message.
  */
 export const PartnerRoutineSchema: GenMessage<PartnerRoutine> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 8);
+  messageDesc(file_joko_v1_partner_routine, 10);
 
 /**
  * @generated from message joko.v1.RoutineSourceEvent
@@ -323,7 +396,7 @@ export type RoutineSourceEvent = Message<"joko.v1.RoutineSourceEvent"> & {
  * Use `create(RoutineSourceEventSchema)` to create a new message.
  */
 export const RoutineSourceEventSchema: GenMessage<RoutineSourceEvent> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 9);
+  messageDesc(file_joko_v1_partner_routine, 11);
 
 /**
  * @generated from message joko.v1.RoutineSource
@@ -360,7 +433,7 @@ export type RoutineSource = Message<"joko.v1.RoutineSource"> & {
  * Use `create(RoutineSourceSchema)` to create a new message.
  */
 export const RoutineSourceSchema: GenMessage<RoutineSource> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 10);
+  messageDesc(file_joko_v1_partner_routine, 12);
 
 /**
  * @generated from message joko.v1.PartnerRoutineRun
@@ -415,6 +488,11 @@ export type PartnerRoutineRun = Message<"joko.v1.PartnerRoutineRun"> & {
    * @generated from field: optional string result_text = 10;
    */
   resultText?: string | undefined;
+
+  /**
+   * @generated from field: optional string session_id = 11;
+   */
+  sessionId?: string | undefined;
 };
 
 /**
@@ -422,7 +500,7 @@ export type PartnerRoutineRun = Message<"joko.v1.PartnerRoutineRun"> & {
  * Use `create(PartnerRoutineRunSchema)` to create a new message.
  */
 export const PartnerRoutineRunSchema: GenMessage<PartnerRoutineRun> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 11);
+  messageDesc(file_joko_v1_partner_routine, 13);
 
 /**
  * @generated from message joko.v1.ListPartnerRoutinesRequest
@@ -439,7 +517,7 @@ export type ListPartnerRoutinesRequest = Message<"joko.v1.ListPartnerRoutinesReq
  * Use `create(ListPartnerRoutinesRequestSchema)` to create a new message.
  */
 export const ListPartnerRoutinesRequestSchema: GenMessage<ListPartnerRoutinesRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 12);
+  messageDesc(file_joko_v1_partner_routine, 14);
 
 /**
  * @generated from message joko.v1.ListPartnerRoutinesResponse
@@ -469,6 +547,11 @@ export type ListPartnerRoutinesResponse = Message<"joko.v1.ListPartnerRoutinesRe
    * @generated from field: repeated joko.v1.RoutineSource sources = 5;
    */
   sources: RoutineSource[];
+
+  /**
+   * @generated from field: repeated joko.v1.RoutineModelChoice models = 6;
+   */
+  models: RoutineModelChoice[];
 };
 
 /**
@@ -476,7 +559,7 @@ export type ListPartnerRoutinesResponse = Message<"joko.v1.ListPartnerRoutinesRe
  * Use `create(ListPartnerRoutinesResponseSchema)` to create a new message.
  */
 export const ListPartnerRoutinesResponseSchema: GenMessage<ListPartnerRoutinesResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 13);
+  messageDesc(file_joko_v1_partner_routine, 15);
 
 /**
  * @generated from message joko.v1.SavePartnerRoutineRequest
@@ -525,7 +608,7 @@ export type SavePartnerRoutineRequest = Message<"joko.v1.SavePartnerRoutineReque
  * Use `create(SavePartnerRoutineRequestSchema)` to create a new message.
  */
 export const SavePartnerRoutineRequestSchema: GenMessage<SavePartnerRoutineRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 14);
+  messageDesc(file_joko_v1_partner_routine, 16);
 
 /**
  * @generated from message joko.v1.SavePartnerRoutineResponse
@@ -542,7 +625,7 @@ export type SavePartnerRoutineResponse = Message<"joko.v1.SavePartnerRoutineResp
  * Use `create(SavePartnerRoutineResponseSchema)` to create a new message.
  */
 export const SavePartnerRoutineResponseSchema: GenMessage<SavePartnerRoutineResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 15);
+  messageDesc(file_joko_v1_partner_routine, 17);
 
 /**
  * @generated from message joko.v1.RunPartnerRoutineRequest
@@ -579,7 +662,7 @@ export type RunPartnerRoutineRequest = Message<"joko.v1.RunPartnerRoutineRequest
  * Use `create(RunPartnerRoutineRequestSchema)` to create a new message.
  */
 export const RunPartnerRoutineRequestSchema: GenMessage<RunPartnerRoutineRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 16);
+  messageDesc(file_joko_v1_partner_routine, 18);
 
 /**
  * @generated from message joko.v1.RunPartnerRoutineResponse
@@ -592,7 +675,7 @@ export type RunPartnerRoutineResponse = Message<"joko.v1.RunPartnerRoutineRespon
  * Use `create(RunPartnerRoutineResponseSchema)` to create a new message.
  */
 export const RunPartnerRoutineResponseSchema: GenMessage<RunPartnerRoutineResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 17);
+  messageDesc(file_joko_v1_partner_routine, 19);
 
 /**
  * @generated from message joko.v1.DeletePartnerRoutineRequest
@@ -624,7 +707,7 @@ export type DeletePartnerRoutineRequest = Message<"joko.v1.DeletePartnerRoutineR
  * Use `create(DeletePartnerRoutineRequestSchema)` to create a new message.
  */
 export const DeletePartnerRoutineRequestSchema: GenMessage<DeletePartnerRoutineRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 18);
+  messageDesc(file_joko_v1_partner_routine, 20);
 
 /**
  * @generated from message joko.v1.DeletePartnerRoutineResponse
@@ -637,7 +720,7 @@ export type DeletePartnerRoutineResponse = Message<"joko.v1.DeletePartnerRoutine
  * Use `create(DeletePartnerRoutineResponseSchema)` to create a new message.
  */
 export const DeletePartnerRoutineResponseSchema: GenMessage<DeletePartnerRoutineResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 19);
+  messageDesc(file_joko_v1_partner_routine, 21);
 
 /**
  * @generated from message joko.v1.ListPartnerRoutineRunsRequest
@@ -664,7 +747,7 @@ export type ListPartnerRoutineRunsRequest = Message<"joko.v1.ListPartnerRoutineR
  * Use `create(ListPartnerRoutineRunsRequestSchema)` to create a new message.
  */
 export const ListPartnerRoutineRunsRequestSchema: GenMessage<ListPartnerRoutineRunsRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 20);
+  messageDesc(file_joko_v1_partner_routine, 22);
 
 /**
  * @generated from message joko.v1.ListPartnerRoutineRunsResponse
@@ -686,7 +769,7 @@ export type ListPartnerRoutineRunsResponse = Message<"joko.v1.ListPartnerRoutine
  * Use `create(ListPartnerRoutineRunsResponseSchema)` to create a new message.
  */
 export const ListPartnerRoutineRunsResponseSchema: GenMessage<ListPartnerRoutineRunsResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 21);
+  messageDesc(file_joko_v1_partner_routine, 23);
 
 /**
  * @generated from message joko.v1.GetPartnerRoutineCreationRequest
@@ -708,7 +791,7 @@ export type GetPartnerRoutineCreationRequest = Message<"joko.v1.GetPartnerRoutin
  * Use `create(GetPartnerRoutineCreationRequestSchema)` to create a new message.
  */
 export const GetPartnerRoutineCreationRequestSchema: GenMessage<GetPartnerRoutineCreationRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 22);
+  messageDesc(file_joko_v1_partner_routine, 24);
 
 /**
  * @generated from message joko.v1.GetPartnerRoutineCreationResponse
@@ -730,7 +813,7 @@ export type GetPartnerRoutineCreationResponse = Message<"joko.v1.GetPartnerRouti
  * Use `create(GetPartnerRoutineCreationResponseSchema)` to create a new message.
  */
 export const GetPartnerRoutineCreationResponseSchema: GenMessage<GetPartnerRoutineCreationResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 23);
+  messageDesc(file_joko_v1_partner_routine, 25);
 
 /**
  * @generated from message joko.v1.RetirePartnerRoutineCreationRequest
@@ -752,7 +835,7 @@ export type RetirePartnerRoutineCreationRequest = Message<"joko.v1.RetirePartner
  * Use `create(RetirePartnerRoutineCreationRequestSchema)` to create a new message.
  */
 export const RetirePartnerRoutineCreationRequestSchema: GenMessage<RetirePartnerRoutineCreationRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 24);
+  messageDesc(file_joko_v1_partner_routine, 26);
 
 /**
  * @generated from message joko.v1.RetirePartnerRoutineCreationResponse
@@ -774,7 +857,7 @@ export type RetirePartnerRoutineCreationResponse = Message<"joko.v1.RetirePartne
  * Use `create(RetirePartnerRoutineCreationResponseSchema)` to create a new message.
  */
 export const RetirePartnerRoutineCreationResponseSchema: GenMessage<RetirePartnerRoutineCreationResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_partner_routine, 25);
+  messageDesc(file_joko_v1_partner_routine, 27);
 
 /**
  * @generated from enum joko.v1.RoutineFilterOperator
@@ -888,6 +971,32 @@ export enum RoutineSourceStatus {
  */
 export const RoutineSourceStatusSchema: GenEnum<RoutineSourceStatus> = /*@__PURE__*/
   enumDesc(file_joko_v1_partner_routine, 2);
+
+/**
+ * @generated from enum joko.v1.RoutineSessionMode
+ */
+export enum RoutineSessionMode {
+  /**
+   * @generated from enum value: ROUTINE_SESSION_MODE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: ROUTINE_SESSION_MODE_PERSISTENT = 1;
+   */
+  PERSISTENT = 1,
+
+  /**
+   * @generated from enum value: ROUTINE_SESSION_MODE_FRESH = 2;
+   */
+  FRESH = 2,
+}
+
+/**
+ * Describes the enum joko.v1.RoutineSessionMode.
+ */
+export const RoutineSessionModeSchema: GenEnum<RoutineSessionMode> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner_routine, 3);
 
 /**
  * @generated from service joko.v1.PartnerRoutineService
