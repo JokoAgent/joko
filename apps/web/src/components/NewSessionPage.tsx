@@ -2694,8 +2694,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             </label>
             {currentWorktreeProbe?.canRefreshRemote && <label className="new-task-worktree__refresh"><CheckboxControl checked={refreshWorktreeRemote} disabled={submitting} onChange={(event) => setRefreshWorktreeRemote(event.target.checked)} /><span>{t("worktree.refreshRemote")}</span></label>}
             {worktreeSourceRef && typeof controller.getTargetWorktreeBranchStatus === "function" && <WorktreeBranchSync
-              key={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.connectionGeneration, selected?.id, selected?.revision.toString(), worktreeSourceRef])}
-              api={controller} ownerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.endpointPublicKey, selected?.revision.toString()])}
+              key={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.connectionGeneration, selected?.id, selected?.revision?.toString(), worktreeSourceRef])}
+              api={controller} ownerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.deviceId, controller.state.activeProfile?.endpointPublicKey, selected?.revision?.toString()])}
               targetId={selected!.id} sourceRef={worktreeSourceRef} disabled={submitting} t={t}
               onUpdated={async signal => { const sources = await controller.listTargetWorktreeSources(selected!.id, signal); if (!signal.aborted) setWorktreeSources(sources); }} />}
           </div>}

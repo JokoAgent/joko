@@ -27,6 +27,8 @@ function fixture() {
   return { read, start, poll, updated, show, button, click };
 }
 it("reads without updating, retains the original intent before dispatch, and refreshes sources after completion", async () => {
+  const nativeCrypto = globalThis.crypto;
+  vi.stubGlobal("crypto", { getRandomValues: nativeCrypto.getRandomValues.bind(nativeCrypto) });
   const f = fixture();
   f.start.mockImplementation(async input => {
     expect(localStorage.length).toBe(1);
@@ -35,7 +37,8 @@ it("reads without updating, retains the original intent before dispatch, and ref
   });
   await f.show(); expect(f.start).not.toHaveBeenCalled(); expect(document.body.textContent).toContain("Ahead 0 · Behind 1 · Local changes 2");
   await f.click("Update selected branch");
-  expect(f.start).toHaveBeenCalledWith({ targetId: "target", sourceRef: "refs/heads/main", expectedRevision: status.revision, operationId: expect.any(String) }, expect.any(AbortSignal));
+  expect(f.start).toHaveBeenCalledWith({ targetId: "target", sourceRef: "refs/heads/main", expectedRevision: status.revision,
+    operationId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u) }, expect.any(AbortSignal));
   expect(f.updated).toHaveBeenCalledOnce(); expect(localStorage.length).toBe(0); expect(document.body.textContent).toContain("Updated commits: 1.");
 });
 it("does not block creating a task during an update and discards late results after changing the branch", async () => {

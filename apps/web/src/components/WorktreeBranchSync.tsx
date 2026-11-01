@@ -2,6 +2,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { useEffect, useRef, useState } from "react";
 import type { OperationApi, WorktreeBranchStatusView, WorktreeBranchSyncOperationView } from "../model.js";
 import type { Translator } from "./types.js";
+import { randomUuid } from "../web-crypto.js";
 import { Button, Spinner } from "./ui.js";
 
 type Api = Pick<OperationApi, "getTargetWorktreeBranchStatus" | "syncTargetWorktreeBranch" | "getWorktreeBranchSyncOperation">;
@@ -79,7 +80,7 @@ export function WorktreeBranchSync({ api, ownerKey, targetId, sourceRef, disable
   const sync = async () => {
     const signal = lifetime.current?.signal;
     if (!signal || signal.aborted || !status || status.blocked || journal || flight.current || disabled) return;
-    const original: Journal = { format: 1, operationId: crypto.randomUUID(), expectedRevision: status.revision };
+    const original: Journal = { format: 1, operationId: randomUuid(), expectedRevision: status.revision };
     try { window.localStorage.setItem(storageKey, JSON.stringify(original));
       if (window.localStorage.getItem(storageKey) !== JSON.stringify(original)) throw new Error("Receipt was not retained");
     } catch { setStorageError(true); return; }
