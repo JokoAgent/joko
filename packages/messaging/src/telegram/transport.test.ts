@@ -7,6 +7,34 @@ import { TelegramTransport } from "./transport.js";
 const TOKEN = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd";
 
 describe("TelegramTransport", () => {
+  it("edits Markdown with a guarded plain fallback, accepts not-modified, and confirms cleanup", async () => {
+    const requests: Array<{ method: string; body: Record<string, unknown> }> = [];
+    const transport = createTransport(fakeFetch(async (url, init) => {
+      const method = url.split("/").at(-1)!; requests.push({ method, body: JSON.parse(String(init.body)) });
+      if (requests.length === 1) return jsonResponse({ ok: false, error_code: 400, description: "Can't parse entities" }, 400);
+      if (requests.length === 3) return jsonResponse({ ok: false, error_code: 400, description: "Bad Request: message is not modified" }, 400);
+      return jsonResponse({ ok: true, result: method === "deleteMessage" ? true : { message_id: 88, chat: { id: 42, type: "private" }, date: 1 } });
+    }));
+    const address: MessagingAddress = { channel: "telegram", connectionId: "connection-1", providerConversationId: "42", providerThreadId: null, conversationKind: "direct" };
+    const current = vi.fn();
+    await transport.editTextPart({ address, messageId: "88", text: "**Working**", format: "markdown", assertCurrent: current });
+    await expect(transport.editTextPart({ address, messageId: "88", text: "Same", format: "markdown" })).resolves.toMatchObject({ providerMessageId: "88" });
+    await transport.removeTextPart({ address, messageId: "88", assertCurrent: current });
+    expect(requests).toEqual([
+      { method: "editMessageText", body: { chat_id: 42, message_id: 88, text: "<b>Working</b>", parse_mode: "HTML" } },
+      { method: "editMessageText", body: { chat_id: 42, message_id: 88, text: "**Working**" } },
+      { method: "editMessageText", body: { chat_id: 42, message_id: 88, text: "Same", parse_mode: "HTML" } },
+      { method: "deleteMessage", body: { chat_id: 42, message_id: 88 } }
+    ]); expect(current).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not turn an uncertain edit into a second edit or a new send", async () => {
+    const request = vi.fn(async () => { throw new TypeError("Response lost."); }) as unknown as typeof fetch;
+    const address: MessagingAddress = { channel: "telegram", connectionId: "connection-1", providerConversationId: "42", providerThreadId: null, conversationKind: "direct" };
+    await expect(createTransport(request).editTextPart({ address, messageId: "88", text: "**Working**", format: "markdown" })).rejects.toMatchObject({ options: { effect: "unknown" } });
+    expect(request).toHaveBeenCalledOnce();
+  });
+
   it("renders a Markdown reply and uses one plain replacement only after a structured 400", async () => {
     const bodies: Record<string, unknown>[] = [], current = vi.fn();
     const transport = createTransport(fakeFetch(async (_url, init) => {

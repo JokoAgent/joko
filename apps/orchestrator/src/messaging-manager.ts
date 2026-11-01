@@ -52,7 +52,7 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
-import type { BlobRef, InteractionQuestionField, MessageBlock, PromptInput, TurnExecutionOverrides } from "@joko/core";
+import { redactSecrets, type BlobRef, type InteractionQuestionField, type MessageBlock, type PromptInput, type TurnExecutionOverrides } from "@joko/core";
 import {
   messagingConversationContextAad,
   operationBodyHash,
@@ -245,8 +245,12 @@ interface MessagingTransportEffectsPort {
     readonly address: MessagingAddress;
     readonly messageId: string;
     readonly text: string;
+    readonly format?: "markdown";
+    readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
+  removeTextPart?(input: { readonly address: MessagingAddress; readonly messageId: string;
+    readonly assertCurrent?: () => void; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt>;
   sendAttachments(input: {
     readonly address: MessagingAddress;
     readonly context?: { readonly contextToken: string; readonly clientId: string };
@@ -474,6 +478,8 @@ export interface MessagingManagerOptions {
     readonly firstProgressMs: number;
     readonly repeatProgressMs: number;
   };
+  /** Test-only acceleration of the fixed Telegram/Discord trailing throttle. */
+  readonly replyStreamTiming?: { readonly telegramMs: number; readonly discordMs: number };
   readonly now?: () => number;
   readonly idFactory?: () => string;
 }
@@ -528,6 +534,9 @@ export class MessagingManager {
   #unsubscribeProgress: (() => void) | undefined;
   readonly #feishuProgress = new Map<string, { readonly connectionId: string; readonly generation: number; readonly controller: AbortController;
     readonly blocks: Map<string, string>; flushed: string; timer?: ReturnType<typeof setTimeout>; inFlight: boolean }>();
+  readonly #replyStreams = new Map<string, { readonly connectionId: string; readonly generation: number; readonly blocks: Map<string, string>;
+    readonly tools: Map<string, string>; flushed: string; pendingId?: string; timer?: ReturnType<typeof setTimeout> }>();
+  readonly #replyStreamTiming: { readonly telegramMs: number; readonly discordMs: number };
 
   constructor(options: MessagingManagerOptions) {
     this.#store = options.store;
@@ -536,6 +545,7 @@ export class MessagingManager {
     this.#sessionHost = options.sessionHost;
     this.#artifacts = options.artifacts;
     this.#now = options.now ?? Date.now;
+    this.#replyStreamTiming = options.replyStreamTiming ?? { telegramMs: 1500, discordMs: 1300 };
     this.#idFactory = options.idFactory ?? randomUUID;
     this.#pollTimeoutSeconds = boundedInteger(options.pollTimeoutSeconds ?? 50, 0, 50, "poll timeout");
     this.#retryDelayMs = boundedInteger(options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS, 1, 60_000, "retry delay");
@@ -587,7 +597,7 @@ export class MessagingManager {
     }
     this.#store.recoverClaimedMessagingDeliveries(this.#now());
     this.#store.recoverClaimedMessagingInteractions(this.#now());
-    this.#unsubscribeProgress = this.#store.subscribe(event => this.#observeFeishuProgress(event));
+    this.#unsubscribeProgress = this.#store.subscribe(event => { this.#observeFeishuProgress(event); this.#observeReplyStream(event); });
     await this.#cleanupCredentials();
     for (const connection of this.#store.listMessagingConnections()) {
       if (connection.enabled) this.#startWorker(connection.id);
@@ -608,6 +618,9 @@ export class MessagingManager {
         for (const request of this.#store.listMessagingInboundRequests({
           connectionId: connection.id, statuses: ["completed", "failed", "cancelled"], limit: 500
         })) this.#finishSlackProgress(request);
+      }
+      if (connection.enabled && (connection.channel === "telegram" || connection.channel === "discord")) {
+        for (const request of this.#store.listMessagingInboundRequests({ connectionId: connection.id, statuses: ["completed", "failed", "cancelled"], limit: 500 })) this.#finishReplyStream(request.id);
       }
     }
   }
@@ -1282,6 +1295,7 @@ export class MessagingManager {
     if (request !== undefined) this.#stopWeChatPresence(request);
     if (request !== undefined) this.#stopSlackPresence(request);
     if (request !== undefined) this.#stopFeishuProgress(request.id);
+    if (request !== undefined) this.#stopReplyStream(request.id);
     if (request === undefined || request.status !== "queued") return;
     const conversation = request.conversationId === undefined
       ? undefined
@@ -1306,11 +1320,12 @@ export class MessagingManager {
           : text;
         const deliveries: Array<{ readonly kind: "text" | "file"; readonly payload: unknown }> = [];
         const feishu = channel === 'feishu' || channel === 'lark';
-        if (!feishu && text.trim() !== "NO_REPLY" && (text !== "" || channel === "wecom" || channel === "wechat")) {
+        const discordImageOnly = channel === "discord" && output.attachments.some(file => file.kind === "image") && (!text.trim() || text.trim() === "NO_REPLY");
+        if (!feishu && (text.trim() !== "NO_REPLY" || discordImageOnly) && (text !== "" || channel === "wecom" || channel === "wechat" || discordImageOnly)) {
           const parts = channel === "slack"
             ? splitSlackText(text)
             : channel === "discord"
-            ? splitDiscordText(text)
+            ? splitDiscordText(discordImageOnly ? "🖼️" : text)
             : channel === "dingtalk"
               ? splitDingTalkText(text)
               : channel === "wecom"
@@ -1326,6 +1341,7 @@ export class MessagingManager {
                 format: 1,
                 address: addressFor(connection, conversation),
                 text: part,
+                ...(channel === "discord" && partIndex === 0 ? { streamFinalRequestId: current.id } : {}),
                 ...(channel === "wecom" && partIndex === 0 && current.providerMessageId !== undefined
                   ? { callbackMessageId: current.providerMessageId }
                   : {}),
@@ -1445,8 +1461,10 @@ export class MessagingManager {
       this.#finishSlackProgress(this.#store.getMessagingInboundRequest(request.id));
     }
     if (connection.channel === 'feishu' || connection.channel === 'lark') this.#finishFeishuProgress(request.id);
+    if (connection.channel === 'telegram' || connection.channel === 'discord') this.#finishReplyStream(request.id);
     this.#scheduleDeliveryDrain(connection.id);
-    if (connection.channel === "slack" || connection.channel === 'feishu' || connection.channel === 'lark') {
+    if (connection.channel === "slack" || connection.channel === 'feishu' || connection.channel === 'lark'
+      || connection.channel === "telegram" || connection.channel === "discord") {
       // Terminal reactions are ordered after the accepted reaction even when
       // admission and settlement share one millisecond. Wake the outbox once
       // they become due instead of waiting for the next Socket poll.
@@ -1459,6 +1477,7 @@ export class MessagingManager {
     if (this.#closed) return;
     this.#unsubscribeProgress?.(); this.#unsubscribeProgress = undefined;
     for (const requestId of this.#feishuProgress.keys()) this.#stopFeishuProgress(requestId);
+    for (const requestId of this.#replyStreams.keys()) this.#stopReplyStream(requestId);
     for (const state of this.#weChatPresence.values()) clearTimeout(state.timer);
     this.#weChatPresence.clear();
     for (const state of this.#slackPresence.values()) clearTimeout(state.timer);
@@ -1512,6 +1531,7 @@ export class MessagingManager {
     previous?.controller.abort();
     this.#workers.delete(connectionId);
     const connection = this.#store.getMessagingConnection(connectionId);
+    for (const [requestId, state] of this.#replyStreams) if (state.connectionId === connectionId) this.#stopReplyStream(requestId);
     for (const [requestId, state] of this.#slackPresence) {
       if (state.connectionId !== connectionId || (connection.enabled && state.generation === connection.generation)) continue;
       clearTimeout(state.timer);
@@ -2504,6 +2524,14 @@ export class MessagingManager {
             conversationId: activeConversation.id, dedupeKey: `request:${request.id}:progress:start`, kind: 'notice', partIndex: 0, partCount: 1,
             payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
         }
+        if (connection.channel === "discord" && transport.editTextPart && transport.removeTextPart) {
+          const payload = { format: 1, address: addressFor(connection, activeConversation), text: "…",
+            replyStream: { requestId: admittedRequest.id, phase: "start" },
+            ...(shouldQuote(configuration, activeConversation, 0) ? { replyToMessageId: event.messageId } : {}) };
+          store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: activeConversation.id,
+            dedupeKey: `request:${admittedRequest.id}:progress:start`, kind: "notice", partIndex: 0, partCount: 1,
+            payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
+        }
         if (connection.channel === "slack") {
           const progressPayload = {
             format: 1,
@@ -3043,6 +3071,127 @@ export class MessagingManager {
     };
   }
 
+  #replyStreamSource(requestId: string, delivery?: MessagingDeliveryRecord) {
+    const request = this.#store.findMessagingInboundRequest(requestId);
+    if (!request?.conversationId || !request.runId) return;
+    const connection = this.#store.findMessagingConnection(request.connectionId), conversation = this.#store.findMessagingConversation(request.conversationId);
+    if (!connection?.enabled || !["telegram", "discord"].includes(connection.channel) || connection.generation !== request.channelGeneration
+      || conversation?.status !== "active" || conversation.connectionId !== connection.id || conversation.channelGeneration !== connection.generation
+      || !conversation.sessionId || this.#store.findRun(request.runId)?.descriptor.sessionId !== conversation.sessionId
+      || this.#store.getSession(conversation.sessionId).descriptor.binding.generation !== conversation.sessionGeneration
+      || request.attemptId !== undefined && this.#store.getAttempt(request.attemptId).descriptor.generation !== conversation.sessionGeneration
+      || delivery && (delivery.connectionId !== connection.id || delivery.channelGeneration !== connection.generation || delivery.conversationId !== conversation.id)) return;
+    return { request, connection, conversation };
+  }
+
+  #observeReplyStream(event: PersistedEvent): void {
+    if (this.#closed || !event.runId || !["text_delta", "tool_start", "tool_result"].includes(event.payload.type)) return;
+    const request = this.#store.findMessagingInboundRequestByRunId(event.runId);
+    const source = request && this.#replyStreamSource(request.id), worker = source && this.#workers.get(source.connection.id);
+    if (!source || source.request.status !== "queued" || source.conversation.sessionId !== event.sessionId || source.conversation.sessionGeneration !== event.generation
+      || worker?.generation !== source.connection.generation || !worker.transport?.editTextPart || !worker.transport.removeTextPart) return;
+    let state = this.#replyStreams.get(source.request.id);
+    if (!state) {
+      if (this.#replyStreams.size >= 512) this.#stopReplyStream(this.#replyStreams.keys().next().value!);
+      state = { connectionId: source.connection.id, generation: source.connection.generation, blocks: new Map(), tools: new Map(), flushed: "" };
+      this.#replyStreams.set(source.request.id, state);
+    }
+    if (event.payload.type === "text_delta") {
+      if (state.blocks.size >= 128 && !state.blocks.has(event.payload.blockId)) return;
+      const remaining = MAXIMUM_OUTBOUND_CHARACTERS - [...state.blocks.values()].reduce((sum, value) => sum + value.length, 0);
+      if (remaining > 0) state.blocks.set(event.payload.blockId, (state.blocks.get(event.payload.blockId) ?? "") + event.payload.delta.slice(0, remaining));
+    } else if (event.payload.type === "tool_start") {
+      if (state.tools.size < 8) state.tools.set(event.payload.callId, redactSecrets(event.payload.name).replace(/[\r\n\t]/gu, " ").slice(0, 128));
+    } else if (event.payload.type === "tool_result") state.tools.delete(event.payload.callId);
+    if (!state.timer) {
+      const interval = source.connection.channel === "telegram" ? this.#replyStreamTiming.telegramMs : this.#replyStreamTiming.discordMs;
+      const current = state;
+      state.timer = setTimeout(() => { delete current.timer; this.#flushReplyStream(source.request.id); }, interval);
+      state.timer.unref?.();
+    }
+  }
+
+  #flushReplyStream(requestId: string): void {
+    const state = this.#replyStreams.get(requestId), source = this.#replyStreamSource(requestId);
+    if (!state) return;
+    if (!source || source.request.status !== "queued" || source.connection.generation !== state.generation) { this.#stopReplyStream(requestId); return; }
+    const { request, connection, conversation } = source;
+    let retry = false;
+    try {
+      const body = redactSecrets([...state.blocks.values()].join("\n\n"))
+        .replace(/!?\[([^\]\r\n]*)\]\((?:file:|artifact:|blob:|joko-[\w-]+:)[^\r\n)]*\)/giu, "$1");
+      if (body.trim() && "NO_REPLY".startsWith(body.trim())) return;
+      const text = [body, ...[...state.tools.values()].map(name => `Using ${name}…`)].filter(Boolean).join("\n\n");
+      if (!text.trim() || text === state.flushed || text.length > (connection.channel === "telegram" ? 3800 : 1900)) return;
+      const prefix = `request:${requestId}:progress:`;
+      if (this.#store.hasUnknownMessagingDelivery({ connectionId: connection.id, channelGeneration: connection.generation, conversationId: conversation.id, dedupeKeyPrefix: prefix })) {
+        this.#stopReplyStream(requestId); return;
+      }
+      if (state.pendingId) {
+        const pending = this.#store.getMessagingDelivery(state.pendingId);
+        if (pending.status === "pending" || pending.status === "dispatching") { retry = true; return; }
+        if (pending.status !== "sent") { this.#stopReplyStream(requestId); return; }
+      }
+      const start = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `${prefix}start` });
+      if (start && (start.status !== "sent" || !start.providerMessageId)) { retry = start.status === "pending" || start.status === "dispatching"; return; }
+      const phase = start ? "edit" : "start", dedupeKey = start ? `${prefix}frame:${operationBodyHash(text)}` : `${prefix}start`;
+      const payload = { format: 1, address: addressFor(connection, conversation), text,
+        replyStream: { requestId, phase, ...(start ? { messageId: start.providerMessageId } : {}) },
+        ...(!start && shouldQuote(decodeSupportedConnection(connection), conversation, 0) && request.providerMessageId ? { replyToMessageId: request.providerMessageId } : {}) };
+      const delivery = this.#store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
+        conversationId: conversation.id, dedupeKey, kind: "notice", partIndex: 0, partCount: 1,
+        payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
+      state.pendingId = delivery.id; state.flushed = text;
+      this.#scheduleDeliveryDrain(connection.id);
+    } catch (error) { this.#stopReplyStream(requestId); this.#recordFailure("REPLY_STREAM_FAILED", connection.id, error); }
+    finally {
+      if (retry && this.#replyStreams.get(requestId) === state && !state.timer) {
+        state.timer = setTimeout(() => { delete state.timer; this.#flushReplyStream(requestId); }, connection.channel === "telegram" ? this.#replyStreamTiming.telegramMs : this.#replyStreamTiming.discordMs);
+        state.timer.unref?.();
+      }
+    }
+  }
+
+  #stopReplyStream(requestId: string): void {
+    const state = this.#replyStreams.get(requestId); if (state) clearTimeout(state.timer); this.#replyStreams.delete(requestId);
+  }
+
+  #finishReplyStream(requestId: string): void {
+    const source = this.#replyStreamSource(requestId);
+    if (!source || !["completed", "failed", "cancelled"].includes(source.request.status)) return;
+    const { request, connection, conversation } = source;
+    const start = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${requestId}:progress:start` });
+    if (start?.status !== "sent" || !start.providerMessageId) return;
+    const answer = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `run:${request.runId}:answer` });
+    if (answer) {
+      if (answer.partCount > 1000) return;
+      for (let index = 0; index < answer.partCount; index++) if (this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id,
+        channelGeneration: connection.generation, dedupeKey: answer.dedupeKey, partIndex: index })?.status !== "sent") return;
+      if (connection.channel === "discord" && answer.kind === "text" && answer.providerMessageId === start.providerMessageId) return;
+    }
+    const payload = { format: 1, address: addressFor(connection, conversation), replyStream: { requestId, phase: "remove", messageId: start.providerMessageId } };
+    this.#store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: conversation.id,
+      dedupeKey: `request:${requestId}:progress:remove`, kind: "notice", partIndex: 0, partCount: 1, payloadHash: operationBodyHash(payload), payload,
+      availableAt: this.#now(), createdAt: this.#now() });
+    this.#scheduleDeliveryDrain(connection.id);
+  }
+
+  #streamDeliverySource(delivery: MessagingDeliveryRecord) {
+    const value = isRecord(delivery.payload) ? delivery.payload : undefined, marker = value && isRecord(value["replyStream"]) ? value["replyStream"] : undefined;
+    const requestId = marker?.["requestId"] ?? value?.["streamFinalRequestId"];
+    if (typeof requestId !== "string") return;
+    const source = this.#replyStreamSource(requestId, delivery);
+    if (!source) return;
+    if (!validAddress(value?.["address"]) || operationBodyHash(value["address"]) !== operationBodyHash(addressFor(source.connection, source.conversation))) return;
+    if (marker && !["start", "edit", "remove"].includes(String(marker["phase"]))) return;
+    if (marker && (marker["phase"] === "start" || marker["phase"] === "edit") && source.request.status !== "queued") return;
+    if (marker?.["phase"] === "remove" && !["completed", "failed", "cancelled"].includes(source.request.status)) return;
+    if (!marker && (source.connection.channel !== "discord" || source.request.status !== "completed")) return;
+    const start = this.#store.findMessagingDeliveryByDedupe({ connectionId: source.connection.id, channelGeneration: source.connection.generation, dedupeKey: `request:${requestId}:progress:start` });
+    if (marker && marker["phase"] !== "start" && (start?.status !== "sent" || marker["messageId"] !== start.providerMessageId)) return;
+    return { ...source, start };
+  }
+
   #observeFeishuProgress(event: PersistedEvent): void {
     if (this.#closed || event.payload.type !== 'text_delta' || !event.runId) return;
     const request = this.#store.findMessagingInboundRequestByRunId(event.runId);
@@ -3465,7 +3614,8 @@ export class MessagingManager {
       });
       if (delivery === undefined) return;
       try {
-        if (this.#obsoleteInteractionDelivery(delivery)) {
+        const streamPayload = isRecord(delivery.payload) && (delivery.payload["replyStream"] !== undefined || delivery.payload["streamFinalRequestId"] !== undefined);
+        if (this.#obsoleteInteractionDelivery(delivery) || streamPayload && !this.#streamDeliverySource(delivery)) {
           this.#store.settleMessagingDelivery({
             deliveryId: delivery.id,
             expectedRevision: delivery.revision,
@@ -3478,6 +3628,7 @@ export class MessagingManager {
         const context = transport.channel === "wechat" ? this.#weChatSendContext(connection, delivery) : undefined;
         const assertDeliveryCurrent = () => {
           signal.throwIfAborted(); this.#requireWorkerConnection(connection.id, connection.generation); this.#partnerRuntime?.assertOutboundCurrent(delivery);
+          if (streamPayload && !this.#streamDeliverySource(delivery)) throw new MessagingTransportError("cancelled", "The original reply stream retired.", { effect: "none", retryable: false });
         };
         assertDeliveryCurrent();
         const sourceConnection = this.#partnerRuntime?.outboundSourceConnection(delivery);
@@ -3492,7 +3643,14 @@ export class MessagingManager {
           const progress = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${source.id}:progress:start` });
           if (progress?.status === 'sent' && progress.conversationId === delivery.conversationId) fallbackProgressMessageId = progress.providerMessageId;
         }
-        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, deliverySignal, context, fallbackProgressMessageId, assertDeliveryCurrent);
+        let streamCarrierMessageId: string | undefined;
+        if (streamPayload && isRecord(delivery.payload) && delivery.payload["streamFinalRequestId"] !== undefined) {
+          const source = this.#streamDeliverySource(delivery)!;
+          // An uncertain intermediate edit may still arrive late. Publish an independent final in that case.
+          if (source.start?.status === "sent" && !this.#store.hasUnknownMessagingDelivery({ connectionId: connection.id, channelGeneration: connection.generation,
+            conversationId: delivery.conversationId, dedupeKeyPrefix: `request:${source.request.id}:progress:` })) streamCarrierMessageId = source.start.providerMessageId;
+        }
+        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, deliverySignal, context, fallbackProgressMessageId, assertDeliveryCurrent, streamCarrierMessageId);
         const settled = this.#store.settleMessagingDelivery({
           deliveryId: delivery.id,
           expectedRevision: delivery.revision,
@@ -3502,6 +3660,12 @@ export class MessagingManager {
           settledAt: this.#now()
         });
         if (settled.kind === "interaction") this.#retireSentInteractionIfSettled(connection, settled);
+        if (connection.channel === "telegram" || connection.channel === "discord") {
+          const value = isRecord(settled.payload) ? settled.payload : {}, marker = isRecord(value["replyStream"]) ? value["replyStream"] : {};
+          const requestId = typeof marker["requestId"] === "string" ? marker["requestId"] : typeof value["streamFinalRequestId"] === "string" ? value["streamFinalRequestId"]
+            : settled.dedupeKey.startsWith("run:") && settled.dedupeKey.endsWith(":answer") ? this.#store.findMessagingInboundRequestByRunId(settled.dedupeKey.slice(4, -7))?.id : undefined;
+          if (requestId) this.#finishReplyStream(requestId);
+        }
         if ((connection.channel === 'feishu' || connection.channel === 'lark') && isRecord(settled.payload)
           && typeof settled.payload['requestId'] === 'string' && (settled.payload['feishuAnswer'] === true || settled.payload['feishuProgress'] === 'open')) {
           this.#finishFeishuProgress(settled.payload['requestId']);
@@ -3767,9 +3931,28 @@ async function dispatchMessagingDelivery(
   signal: AbortSignal,
   context?: { readonly contextToken: string; readonly clientId: string },
   fallbackProgressMessageId?: string,
-  assertCurrent: () => void = () => signal.throwIfAborted()
+  assertCurrent: () => void = () => signal.throwIfAborted(),
+  streamCarrierMessageId?: string
 ): Promise<string> {
   assertCurrent();
+  if ((transport.channel === "telegram" || transport.channel === "discord") && isRecord(delivery.payload) && isRecord(delivery.payload["replyStream"])) {
+    const value = delivery.payload, stream = value["replyStream"] as Record<string, unknown>;
+    if (!validAddress(value["address"]) || value["address"].connectionId !== transport.connectionId || value["address"].channel !== transport.channel) throw invalid("The reply stream address is invalid.");
+    const address = value["address"], phase = stream["phase"], messageId = stream["messageId"];
+    if (phase === "remove") {
+      if (!transport.removeTextPart || typeof messageId !== "string" || !messageId) throw invalid("The reply stream cleanup identity is invalid.");
+      return (await transport.removeTextPart({ address, messageId, signal, assertCurrent })).providerMessageId;
+    }
+    if (typeof value["text"] !== "string" || !value["text"].trim()) throw invalid("The reply stream text is invalid.");
+    const text = value["text"], format = transport.channel === "telegram" ? "markdown" as const : undefined;
+    if (phase === "edit") {
+      if (!transport.editTextPart || typeof messageId !== "string" || !messageId) throw invalid("The reply stream edit identity is invalid.");
+      return (await transport.editTextPart({ address, messageId, text, ...(format ? { format } : {}), signal, assertCurrent })).providerMessageId;
+    }
+    if (phase !== "start" || value["replyToMessageId"] !== undefined && typeof value["replyToMessageId"] !== "string") throw invalid("The reply stream opener is invalid.");
+    return (await transport.sendTextPart({ address, text, ...(format ? { format } : {}), signal, assertCurrent,
+      ...(typeof value["replyToMessageId"] === "string" ? { replyToMessageId: value["replyToMessageId"] } : {}) })).providerMessageId;
+  }
   if ((transport.channel === 'feishu' || transport.channel === 'lark') && isRecord(delivery.payload)) {
     const value = delivery.payload;
     if (value['feishuProgress'] !== undefined || value['feishuAnswer'] === true) {
@@ -3832,6 +4015,10 @@ async function dispatchMessagingDelivery(
   const payload = deliveryPayload(delivery.payload);
   if (delivery.kind === "text" || delivery.kind === "notice") {
     if (typeof payload.text !== "string") throw invalid("Messaging text delivery payload is invalid.");
+    if (streamCarrierMessageId !== undefined && transport.channel === "discord" && delivery.kind === "text" && delivery.partIndex === 0) {
+      if (!transport.editTextPart) throw invalid("The original Discord answer carrier cannot be edited.");
+      return (await transport.editTextPart({ address: payload.address, messageId: streamCarrierMessageId, text: payload.text, signal, assertCurrent })).providerMessageId;
+    }
     if (payload.editMessageId !== undefined) {
       if (transport.channel !== "slack" || transport.editTextPart === undefined) {
         throw invalid("Messaging edit delivery is unavailable for this channel.");

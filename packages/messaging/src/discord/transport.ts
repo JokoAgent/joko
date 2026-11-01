@@ -257,6 +257,23 @@ export class DiscordTransport {
     return receiptOf(sent, input.address);
   }
 
+  async editTextPart(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text: string;
+    readonly assertCurrent?: () => void; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    const channelId = this.#assertAddress(input.address), messageId = discordSnowflake(input.messageId, "message identifier");
+    if (!input.text.length || input.text.length > DISCORD_TEXT_LIMIT) throw invalidInput("Discord edit text exceeds its single-message limit.");
+    input.signal?.throwIfAborted(); input.assertCurrent?.();
+    const edited = await this.#api.editMessage(channelId, messageId, { content: input.text, allowed_mentions: { parse: [] } }, input.signal);
+    if (edited.id !== messageId) throw malformed("Discord edit returned another message identity.");
+    return receiptOf(edited, input.address);
+  }
+
+  async removeTextPart(input: { readonly address: MessagingAddress; readonly messageId: string;
+    readonly assertCurrent?: () => void; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    const channelId = this.#assertAddress(input.address), messageId = discordSnowflake(input.messageId, "message identifier");
+    input.signal?.throwIfAborted(); input.assertCurrent?.(); await this.#api.deleteMessage(channelId, messageId, input.signal);
+    return { providerMessageId: messageId, address: input.address };
+  }
+
   async sendAttachments(input: {
     readonly address: MessagingAddress;
     readonly attachments: readonly DiscordOutboundAttachment[];

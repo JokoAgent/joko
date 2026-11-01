@@ -7100,6 +7100,16 @@ export class OperationalStore {
     return row === undefined ? undefined : messagingDeliveryFromRow(row);
   }
 
+  hasUnknownMessagingDelivery(input: { readonly connectionId: string; readonly channelGeneration: number;
+    readonly conversationId: string; readonly dedupeKeyPrefix: string }): boolean {
+    this.assertOpen();
+    const connectionId = messagingIdentity(input.connectionId, "connection ID"), generation = messagingPositiveInteger(input.channelGeneration, "channel generation");
+    const conversationId = messagingIdentity(input.conversationId, "conversation ID"), prefix = messagingIdentity(input.dedupeKeyPrefix, "delivery dedupe prefix", 512);
+    return this.database.prepare(`SELECT 1 FROM messaging_deliveries WHERE connection_id = ? AND channel_generation = ?
+      AND conversation_id = ? AND status = 'unknown' AND substr(dedupe_key, 1, length(?)) = ? LIMIT 1`)
+      .get(connectionId, generation, conversationId, prefix, prefix) !== undefined;
+  }
+
   getMessagingDelivery(id: string): MessagingDeliveryRecord {
     const delivery = this.findMessagingDelivery(id);
     if (delivery === undefined) throw new NotFoundError("Messaging delivery", id);

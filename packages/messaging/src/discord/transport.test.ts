@@ -66,6 +66,7 @@ describe("DiscordTransport effects", () => {
       if ((method === "PUT" || method === "DELETE") && url.pathname.includes("/reactions/")) return empty();
       const edit = new RegExp(`/channels/${DM_ID}/messages/([1-9][0-9]{16,19})$`, "u").exec(url.pathname);
       if (method === "PATCH" && edit !== null) return json(message(edit[1]!));
+      if (method === "DELETE" && edit !== null) return empty();
       if (method === "POST" && url.pathname.endsWith(`/channels/${DM_ID}/messages`)) {
         nextMessageId += 1n;
         return json(message(String(nextMessageId)));
@@ -92,6 +93,8 @@ describe("DiscordTransport effects", () => {
       conversationKind: "direct"
     });
     await transport.sendTextPart({ address, text: "reply", replyToMessageId: MESSAGE_ID });
+    await transport.editTextPart({ address, messageId: MESSAGE_ID, text: "Updated @everyone" });
+    await transport.removeTextPart({ address, messageId: MESSAGE_ID });
     await transport.sendAttachments({
       address,
       attachments: [{
@@ -138,6 +141,8 @@ describe("DiscordTransport effects", () => {
         })
       }),
       expect.objectContaining({ method: "PATCH", path: expect.stringContaining(`/channels/${DM_ID}/messages/`) }),
+      { method: "PATCH", path: `/api/v10/channels/${DM_ID}/messages/${MESSAGE_ID}`, body: { content: "Updated @everyone", allowed_mentions: { parse: [] } } },
+      { method: "DELETE", path: `/api/v10/channels/${DM_ID}/messages/${MESSAGE_ID}` },
       expect.objectContaining({ method: "POST", path: `/api/v10/channels/${DM_ID}/typing` }),
       expect.objectContaining({ method: "PUT", path: expect.stringContaining(`/channels/${DM_ID}/messages/${MESSAGE_ID}/reactions/`) }),
       expect.objectContaining({ method: "DELETE", path: expect.stringContaining(`/channels/${DM_ID}/messages/${MESSAGE_ID}/reactions/`) })

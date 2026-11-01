@@ -190,6 +190,46 @@ export class TelegramTransport {
     }
   }
 
+  async editTextPart(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text: string;
+    readonly format?: "markdown"; readonly assertCurrent?: () => void; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    this.#assertAddress(input.address);
+    const messageId = numericCoordinate(input.messageId, "message");
+    if (!input.text.length || input.text.length > TELEGRAM_TEXT_LIMIT) throw invalidInput("Telegram edit text exceeds its single-message limit.");
+    const receipt = { providerMessageId: String(messageId), address: input.address };
+    const patch = async (text: string, parseMode?: "HTML"): Promise<MessagingSendReceipt> => {
+      input.signal?.throwIfAborted(); input.assertCurrent?.();
+      try {
+        const edited = await this.#api.call<TelegramMessage | true>("editMessageText", {
+          chat_id: numericCoordinate(input.address.providerConversationId, "conversation"), message_id: messageId, text,
+          ...(parseMode ? { parse_mode: parseMode } : {})
+        }, { signal: input.signal, effect: "unknown" });
+        if (edited !== true && (!isTelegramMessage(edited) || edited.message_id !== messageId)) throw new MessagingTransportError("malformed_response", "Telegram edit returned another message identity.", { effect: "unknown", retryable: false });
+        return receipt;
+      } catch (error) {
+        if (error instanceof MessagingTransportError && error.options.effect === "none" && error.options.providerStatus === 400
+          && /message is not modified/iu.test(error.message)) return receipt;
+        throw error;
+      }
+    };
+    if (input.format !== "markdown") return patch(input.text);
+    try { return await patch(renderTelegramMarkdown(input.text) || "…", "HTML"); }
+    catch (error) {
+      if (!(error instanceof MessagingTransportError) || error.options.effect !== "none" || error.options.providerStatus !== 400) throw error;
+      return patch(input.text);
+    }
+  }
+
+  async removeTextPart(input: { readonly address: MessagingAddress; readonly messageId: string;
+    readonly assertCurrent?: () => void; readonly signal?: AbortSignal }): Promise<MessagingSendReceipt> {
+    this.#assertAddress(input.address); const messageId = numericCoordinate(input.messageId, "message");
+    input.signal?.throwIfAborted(); input.assertCurrent?.();
+    const removed = await this.#api.call<boolean>("deleteMessage", {
+      chat_id: numericCoordinate(input.address.providerConversationId, "conversation"), message_id: messageId
+    }, { signal: input.signal, effect: "unknown" });
+    if (removed !== true) throw new MessagingTransportError("malformed_response", "Telegram deletion was not confirmed.", { effect: "unknown", retryable: false });
+    return { providerMessageId: String(messageId), address: input.address };
+  }
+
   /** One multipart call is one external effect; unknown outcomes are never replayed blindly. */
   async sendAttachments(input: {
     readonly address: MessagingAddress;

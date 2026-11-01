@@ -69,6 +69,110 @@ afterEach(async () => {
 });
 
 describe("MessagingManager", () => {
+  it.each(["telegram", "discord"] as const)("serializes %s progress before the final and retains the channel's final-message lifecycle", async channel => {
+    const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
+    const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
+      channel === "discord" ? () => transport as StreamingDiscordTransport : undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, channel); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.emit({ type: "tool_start", callId: "read-one", name: "read", input: "private-tool-argument" });
+    await vi.waitFor(() => expect([...transport.sentText, ...transport.stream.edits].some(row => row.text.includes("Using read"))).toBe(true));
+    await adapter.emit({ type: "tool_result", callId: "read-one", name: "read", output: "private-tool-result", isError: false });
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(transport.stream.edits.some(row => row.text === "Draft")).toBe(true));
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; }); cleanups.push(() => release());
+    transport.stream.beforeEdit = input => input.text.includes("late draft") ? gate : Promise.resolve();
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: " late draft" });
+    await vi.waitFor(() => expect(transport.stream.attempts.some(row => row.text.includes("late draft"))).toBe(true));
+    const image = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "stream-result.png", mimeType: "image/png" });
+    await adapter.emit(generatedImageResult(image));
+    await adapter.finish("Final " + "x".repeat(4_200));
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]?.status).toBe("completed"));
+    expect(transport.stream.attempts.some(row => row.text.startsWith("Final"))).toBe(false);
+    expect(transport.sentText.some(row => row.text.startsWith("Final"))).toBe(false);
+    release();
+    await vi.waitFor(() => {
+      const answers = fixture.store.listMessagingDeliveries().filter(row => row.dedupeKey.endsWith(":answer"));
+      expect(answers.length).toBeGreaterThan(1); expect(answers.every(row => row.status === "sent")).toBe(true);
+      if (channel === "telegram") expect(transport.stream.removed).toHaveLength(1);
+    });
+    const start = fixture.store.listMessagingDeliveries().find(row => row.dedupeKey.endsWith(":progress:start"))!;
+    const first = fixture.store.listMessagingDeliveries().find(row => row.dedupeKey.endsWith(":answer") && row.partIndex === 0)!;
+    if (channel === "discord") {
+      expect(first.providerMessageId).toBe(start.providerMessageId); expect(transport.stream.removed).toEqual([]);
+      expect(transport.stream.edits.at(-1)?.text).toMatch(/^Final/u);
+    } else expect(first.providerMessageId).not.toBe(start.providerMessageId);
+    expect(JSON.stringify([...transport.sentText, ...transport.stream.edits])).not.toMatch(/private-tool-argument|private-tool-result/u);
+    const count = transport.sentText.length + transport.stream.edits.length;
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "too late" });
+    await new Promise(resolve => setTimeout(resolve, 30)); expect(transport.sentText.length + transport.stream.edits.length).toBe(count);
+  });
+
+  it("retains a Telegram progress carrier when the independent final ACK is unknown, including after restart", async () => {
+    const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
+    const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, "telegram"); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(transport.sentText).toHaveLength(1));
+    transport.unknownFinal = true; await adapter.finish("Final answer");
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] }).some(row => row.dedupeKey.endsWith(":answer"))).toBe(true));
+    const attempts = transport.textAttempts; expect(transport.stream.removed).toEqual([]);
+    await fixture.restartManager(); expect(transport.textAttempts).toBe(attempts); expect(transport.stream.removed).toEqual([]);
+  });
+
+  it("retires a pending stream when its original connection generation is disabled", async () => {
+    const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
+    const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 20, discordMs: 20 });
+    const enabled = await enableReplyStream(fixture, "telegram"); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    const current = fixture.store.getMessagingConnection(enabled.id);
+    await fixture.manager.setEnabled({ connectionId: current.id, expectedRevision: current.revision, expectedGeneration: current.generation, enabled: false });
+    const sent = transport.sentText.length, edited = transport.stream.edits.length;
+    await adapter.finish("Final answer"); await new Promise(resolve => setTimeout(resolve, 40));
+    expect(transport.sentText).toHaveLength(sent); expect(transport.stream.edits).toHaveLength(edited); expect(transport.stream.removed).toEqual([]);
+  });
+
+  it("publishes Discord's final independently after an uncertain progress edit and never replays that edit", async () => {
+    const adapter = new ControlledReplyAdapter(), transport = new StreamingDiscordTransport();
+    const fixture = await createFixture(undefined, () => adapter, () => transport, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, "discord"); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await vi.waitFor(() => expect(transport.sentText).toHaveLength(1)); transport.stream.unknownEdit = true;
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] })).toHaveLength(1));
+    await adapter.finish("Final answer");
+    await vi.waitFor(() => { expect(transport.sentText.some(row => row.text === "Final answer")).toBe(true); expect(transport.stream.removed).toHaveLength(1); });
+    const attempts = transport.stream.attempts.length; await fixture.restartManager(); expect(transport.stream.attempts).toHaveLength(attempts);
+    expect(transport.stream.edits).toEqual([]);
+  });
+
+  it.each(["telegram", "discord"] as const)("keeps an unknown %s opener single-attempt while delivering an independent final", async channel => {
+    const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport(); transport.unknownStart = true;
+    const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
+      channel === "discord" ? () => transport as StreamingDiscordTransport : undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, channel); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] })).toHaveLength(1));
+    await adapter.finish("Final answer");
+    await vi.waitFor(() => expect(transport.sentText.some(row => row.text === "Final answer")).toBe(true));
+    expect(transport.stream.removed).toEqual([]); expect(transport.stream.edits).toEqual([]);
+    await fixture.restartManager();
+    expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] })[0]?.attempts).toBe(1);
+    expect(transport.sentText.filter(row => row.text === "Final answer")).toHaveLength(1);
+  });
+
+  it.each(["telegram", "discord"] as const)("keeps %s NO_REPLY prefixes silent and retires only its confirmed carrier", async channel => {
+    const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
+    const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
+      channel === "discord" ? () => transport as StreamingDiscordTransport : undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, channel); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    if (channel === "discord") await vi.waitFor(() => expect(transport.sentText).toHaveLength(1));
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "NO_" }); await new Promise(resolve => setTimeout(resolve, 25));
+    expect([...transport.sentText, ...transport.stream.edits].some(row => row.text.includes("NO_"))).toBe(false);
+    await adapter.finish("NO_REPLY");
+    await vi.waitFor(() => { expect(fixture.store.listMessagingInboundRequests()[0]?.status).toBe("completed");
+      if (channel === "discord") expect(transport.stream.removed).toHaveLength(1); });
+    expect(fixture.store.listMessagingDeliveries().some(row => row.dedupeKey.endsWith(":answer"))).toBe(false);
+  });
+
   it("orders a fast failed Slack run's accepted and terminal reactions after durable ACK", async () => {
     const transport = new FastFailureSlackTransport();
     const fixture = await createFixture(
@@ -2042,6 +2146,46 @@ class FakeDiscordTransport {
   async close(): Promise<void> {}
 }
 
+interface ReplyEditInput {
+  readonly address: MessagingAddress; readonly messageId: string; readonly text: string;
+  readonly assertCurrent?: () => void; readonly signal?: AbortSignal;
+}
+class ControlledReplyEffects {
+  readonly attempts: ReplyEditInput[] = []; readonly edits: ReplyEditInput[] = []; readonly removed: string[] = [];
+  beforeEdit?: (input: ReplyEditInput) => Promise<void>; unknownEdit = false;
+  async edit(input: ReplyEditInput) {
+    this.attempts.push(input); await this.beforeEdit?.(input); input.signal?.throwIfAborted(); input.assertCurrent?.();
+    if (this.unknownEdit) throw new MessagingTransportError("network", "Progress ACK lost.", { effect: "unknown", retryable: true });
+    this.edits.push(input); return { providerMessageId: input.messageId, address: input.address };
+  }
+  async remove(input: { readonly address: MessagingAddress; readonly messageId: string; readonly assertCurrent?: () => void; readonly signal?: AbortSignal }) {
+    input.signal?.throwIfAborted(); input.assertCurrent?.(); this.removed.push(input.messageId);
+    return { providerMessageId: input.messageId, address: input.address };
+  }
+}
+class StreamingTelegramTransport extends FakeTelegramTransport {
+  readonly stream = new ControlledReplyEffects(); unknownFinal = false; unknownStart = false;
+  constructor() { super(directMessageBatch()); }
+  editTextPart(input: ReplyEditInput) { return this.stream.edit(input); }
+  removeTextPart(input: Parameters<ControlledReplyEffects["remove"]>[0]) { return this.stream.remove(input); }
+  override async sendTextPart(input: Parameters<FakeTelegramTransport["sendTextPart"]>[0]) {
+    if (this.unknownStart) { this.unknownStart = false; this.textAttempts++; throw new MessagingTransportError("network", "Opener ACK lost.", { effect: "unknown", retryable: true }); }
+    if (this.unknownFinal && input.text.startsWith("Final")) {
+      this.textAttempts++; throw new MessagingTransportError("network", "Final ACK lost.", { effect: "unknown", retryable: true });
+    }
+    return super.sendTextPart(input);
+  }
+}
+class StreamingDiscordTransport extends FakeDiscordTransport {
+  readonly stream = new ControlledReplyEffects(); unknownStart = false;
+  override async sendTextPart(input: Parameters<FakeDiscordTransport["sendTextPart"]>[0]) {
+    if (this.unknownStart) { this.unknownStart = false; throw new MessagingTransportError("network", "Opener ACK lost.", { effect: "unknown", retryable: true }); }
+    return super.sendTextPart(input);
+  }
+  editTextPart(input: ReplyEditInput) { return this.stream.edit(input); }
+  removeTextPart(input: Parameters<ControlledReplyEffects["remove"]>[0]) { return this.stream.remove(input); }
+}
+
 class AuthLossDiscordTransport extends FakeDiscordTransport {
   polls = 0;
 
@@ -3124,6 +3268,17 @@ class BoundedAlbumPagesTransport extends FakeTelegramTransport {
   }
 }
 
+class ControlledReplyAdapter extends FakeBackendAdapter {
+  context?: AdapterContext;
+  constructor() { super(PI_LIKE_PROFILE); }
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> { this.context = context; }
+  async emit(event: EventPayload): Promise<void> { if (!this.context) throw new Error("No admitted reply run."); await this.context.emit(event); }
+  async finish(text: string): Promise<void> {
+    await this.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] });
+    await this.emit({ type: "done", outcome: "completed" });
+  }
+}
+
 class AttachmentFakeAdapter extends FakeBackendAdapter {
   blocks: readonly MessageBlock[] = [{ kind: "text", text: "Files are ready." }];
   events: readonly EventPayload[] = [];
@@ -3162,6 +3317,14 @@ async function enableTelegramReply(fixture: Awaited<ReturnType<typeof createFixt
     ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off"
   } });
   return replaceCredential(fixture, created, suffix, true);
+}
+
+async function enableReplyStream(fixture: Awaited<ReturnType<typeof createFixture>>, channel: "telegram" | "discord") {
+  fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+  const created = channel === "telegram" ? fixture.manager.createTelegramConnection({ ownerProviderUserId: "42", configuration: {
+    ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" } }) : fixture.manager.createDiscordConnection({ ownerProviderUserId: "111111111111111111",
+    configuration: { ...DEFAULT_DISCORD_MESSAGING_CONFIGURATION, emojiReactions: "off", lifecycleAnnouncements: false } });
+  return replaceCredential(fixture, created, `${channel}-stream`, true);
 }
 
 async function enableFeishuReply(fixture: Awaited<ReturnType<typeof createFixture>>) {
@@ -3350,7 +3513,8 @@ async function createFixture(
   weComTransportFactory?: (options: WeComTransportOptions) => FakeWeComTransport,
   weChatTransportFactory?: (options: WeChatTransportOptions) => FakeWeChatTransport,
   weChatPresenceTiming?: MessagingManagerOptions["weChatPresenceTiming"],
-  slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport
+  slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport,
+  replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"]
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -3390,6 +3554,7 @@ async function createFixture(
     artifacts,
     retryDelayMs: 5,
     ...(weChatPresenceTiming === undefined ? {} : { weChatPresenceTiming }),
+    ...(replyStreamTiming === undefined ? {} : { replyStreamTiming }),
     pollTimeoutSeconds: 0,
     ...(transportFactory === undefined ? {} : {
       createTelegramTransport: (input) => transportFactory(input).bind(input)
