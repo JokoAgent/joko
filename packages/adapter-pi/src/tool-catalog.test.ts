@@ -103,6 +103,23 @@ describe("Pi built-in tool catalog", () => {
     });
   });
 
+  it.each(["anyOf", "oneOf"] as const)("projects scalar const branches in %s without narrowing a mixed fast mode", keyword => {
+    const schema = { type: "object", properties: {
+      fastMode: { [keyword]: [{ type: "boolean" }, { const: "ultrafast" }] },
+      count: { [keyword]: [{ const: 1 }, { const: 2.5 }] },
+      optional: { [keyword]: [{ const: null }, { const: false }] }
+    } };
+    const before = JSON.stringify(schema);
+    expect(projectPiInputSchema(schema, "routine_save")).toMatchObject({ fields: [
+      { fieldPath: "count", type: "number" }, { fieldPath: "fastMode", type: "unknown", enumValues: [] },
+      { fieldPath: "optional", type: "unknown" }
+    ] });
+    expect(JSON.stringify(schema)).toBe(before);
+    expect(() => projectPiInputSchema({ type: "object", properties: {
+      fastMode: { [keyword]: [{ type: "boolean" }, { type: "invented", const: "ultrafast" }] }
+    } }, "routine_save")).toThrow("unsupported schema type");
+  });
+
   it("projects nullable fields through their concrete branch while retaining nested fields", () => {
     expect(projectPiInputSchema({
       type: "object",
