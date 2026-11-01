@@ -74,6 +74,8 @@ describe("mounted Provider configuration", () => {
     expect(await region.textContent()).not.toContain("mounted-balance-secret"); expect(fetches).toBe(1);
     await region.getByRole("button", { name: "Refresh", exact: true }).click(); expect(fetches).toBe(1);
     await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" }); await page.setViewportSize({ width: 390, height: 844 });
+    await region.getByText("Total balance: 7.123456789", { exact: true }).waitFor({ state: "visible" });
+    expect(fetches).toBe(1);
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     await toggle.click(); expect(await region.count()).toBe(0); expect(errors).toEqual([]);
   });

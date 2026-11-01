@@ -4002,7 +4002,7 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 
 /* Modals and interactions */
 .modal-open { overflow: hidden; }
-.modal-layer { position: fixed; z-index: 200; inset: 0; display: grid; place-items: center; padding: 18px; background: rgb(0 0 0 / .48); animation: fade-in .15s ease-out; }
+.modal-layer { position: fixed; z-index: 1000; inset: 0; display: grid; place-items: center; padding: 18px; background: rgb(0 0 0 / .48); animation: fade-in .15s ease-out; }
 @keyframes fade-in { from { opacity: 0; } }
 .modal { width: min(100%, 40em); max-height: min(85vh, 800px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); box-shadow: var(--shadow-lg); animation: modal-in .18s ease-out; }
 .modal--small { max-width: 28.5em; border: 0; }.modal--large { width: min(100%, 54.3em); max-width: 54.3em; }
