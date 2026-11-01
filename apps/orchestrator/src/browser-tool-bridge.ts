@@ -1708,10 +1708,10 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       recipe: recipe.id,
       provenance: draft === undefined ? this.#recipeProvenance(recipe.id) : "user",
       steps: completed,
-      ...(verifying ? { verified, ...(verified ? { verification: { id: recipe.id, site, digest: createHash("sha256").update(JSON.stringify(authored)).digest("hex") } } : {}),
+      ...(verifying ? { verified,
         message: "Execution does not save or activate a recipe. Use saveRecipe with the unchanged draft." } : {}),
       ...(recipe.output === undefined ? {} : { output: resolveRecipeOutput(recipe.output, vars) })
-    });
+    }, verified ? { id: recipe.id, site: site!, digest: createHash("sha256").update(JSON.stringify(authored)).digest("hex") } : undefined);
   }
 
   async #suspendRecipe(recipe: BrowserRecipe, expectedRecipe: string | null, signal?: AbortSignal): Promise<string | undefined> {
@@ -2070,11 +2070,18 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     if (epoch !== this.#resultEpoch) { this.#results.clear(); this.#recipeTasks.clear(); this.#resultEpoch = epoch; }
     return epoch;
   }
-  #mixedResult(action: string, data: unknown, extraContent: readonly unknown[]): McpCallResult {
-    const payload = { ok: true, action, data: action === "readResult" ? data : sanitizePublicPayload(data, 0) };
-    return { content: [{ type: "text", text: JSON.stringify(payload) }, ...extraContent], structuredContent: payload, isError: false };
+  #mixedResult(action: string, data: unknown, extraContent: readonly unknown[],
+    recipeVerification?: { readonly id: string; readonly site: string; readonly digest: string }): McpCallResult {
+    const publicData = action === "readResult" ? data : sanitizePublicPayload(data, 0);
+    // This receipt is computed by the host after a successful guarded trial.
+    // Its digest is protocol metadata, not opaque page text to redact.
+    const payload = { ok: true, action, data: recipeVerification === undefined ? publicData
+      : { ...publicData as Readonly<Record<string, unknown>>, verification: recipeVerification } };
+    return { content: [{ type: "text", text: serializeBrowserPayload(payload) }, ...extraContent], structuredContent: payload, isError: false };
   }
-  #result(action: string, data: unknown): McpCallResult { return this.#mixedResult(action, data, []); }
+  #result(action: string, data: unknown, recipeVerification?: { readonly id: string; readonly site: string; readonly digest: string }): McpCallResult {
+    return this.#mixedResult(action, data, [], recipeVerification);
+  }
 
   async #closeOwnedPage(pageId: string, result: () => McpCallResult): Promise<McpCallResult> {
     this.#assertPageContext(pageId);
@@ -2088,11 +2095,18 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   }
 }
 
+function serializeBrowserPayload(value: unknown): string {
+  // Durable receipts canonicalize object keys. Produce the same text before
+  // persistence and on replay so an acknowledged effect keeps its exact reply.
+  return JSON.stringify(value, (_key, item: unknown) => isRecord(item)
+    ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) : item);
+}
+
 function boundedBrowserResult(payload: { readonly ok: true; readonly action: string; readonly data: unknown }, extraContent: readonly unknown[], retained?: { readonly cache: BrowserResultCache; readonly source: BrowserResultSource }): McpCallResult {
   const action = payload.action;
   const digest = retained?.cache.digest(payload, retained.source);
   if (digest) return { content: [{ type: "text", text: JSON.stringify(digest) }, ...extraContent], structuredContent: digest, isError: !digest.ok };
-  const serialized = JSON.stringify(payload);
+  const serialized = serializeBrowserPayload(payload);
   if (Buffer.byteLength(serialized, "utf8") > MAXIMUM_UNIFIED_RESULT_BYTES) {
     const byteSize = Buffer.byteLength(serialized, "utf8");
     let previewCharacters = Math.min(serialized.length, Math.floor(MAXIMUM_UNIFIED_RESULT_BYTES / 2));
