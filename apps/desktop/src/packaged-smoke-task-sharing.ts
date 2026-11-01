@@ -55,18 +55,28 @@ export async function verifyPackagedSmokeTaskSharing(options: {
     "  invite.click(); return shareId;"
   ]);
   let invitation: string | undefined;
+  let clipboardObservation = { hasValue: false, parsed: false, ownerMatched: false, shareMatched: false };
   const copyDeadline = Date.now() + 12_000;
   while (Date.now() < copyDeadline) {
     const value = options.readClipboard();
+    clipboardObservation = { hasValue: value.length > 0, parsed: false, ownerMatched: false, shareMatched: false };
     try {
       const parsed = parseTaskShareInvitation(value);
+      clipboardObservation = { hasValue: true, parsed: true, ownerMatched: parsed.hostServerId === options.serverId, shareMatched: parsed.shareId === shareId };
       if (parsed.hostServerId === options.serverId && parsed.shareId === shareId) {
         invitation = value; options.copiedInvitation(value); break;
       }
     } catch { /* Native clipboard publication may still be in flight. */ }
     await pause();
   }
-  if (!invitation) throw new Error("The actual invitation action did not copy this task's invitation.");
+  if (!invitation) {
+    const surface = await script([
+      "  const root = document.querySelector('[data-task-sharing-management]');",
+      "  return { state: root?.getAttribute('data-state'), focused: document.hasFocus(), alerts: [...(root?.querySelectorAll('[role=alert]') ?? [])].map(node => node.textContent?.slice(0, 500)) };"
+    ]).catch(() => ({ unavailable: true }));
+    await options.recordSurface("management");
+    throw new Error(`The actual invitation action did not copy this task's invitation. ${JSON.stringify({ clipboard: clipboardObservation, surface, windowFocused: window.isFocused() })}`);
+  }
   await options.recordSurface("management");
   await script([...closeManagement, "  return true;"]);
   invitation = undefined;

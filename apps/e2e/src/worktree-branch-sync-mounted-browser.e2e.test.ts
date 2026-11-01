@@ -58,6 +58,9 @@ mountedIt("updates the selected branch through the production page and recovers 
   await page.getByText("The original update is unconfirmed. Inspect the repository and its status before another update.", { exact: true }).waitFor({ state: "visible" });
   expect(await page.locator(".new-task-page .send-button").isEnabled()).toBe(true);
   await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+  await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
+    .getByRole("button", { name: "Connect", exact: true }).click();
   await page.getByText("Updated commits: 1.", { exact: true }).waitFor({ state: "visible" });
   expect(mutations).toBe(1); expect(await git(repository, "rev-parse", "HEAD")).toBe(next);
   expect(await readFile(join(repository, "other.txt"), "utf8")).toBe("preserve owner edits\n");
