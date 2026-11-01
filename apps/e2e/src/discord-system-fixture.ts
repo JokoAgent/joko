@@ -368,7 +368,7 @@ function owner(): Readonly<Record<string, unknown>> {
   };
 }
 
-function outboundMessage(id: string, channelId: string, content: string): Readonly<Record<string, unknown>> {
+function outboundMessage(id: string, channelId: string, content: string): DiscordSystemMessage {
   return {
     id,
     channel_id: channelId,
