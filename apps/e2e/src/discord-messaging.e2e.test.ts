@@ -123,6 +123,9 @@ describe("Discord Messaging production product chain", () => {
       "the real Pi reply to leave through Discord REST",
       60_000
     );
+    const firstReply = required(discord.outboundMessages.find(message => message.text === FIRST_REPLY), "confirmed edited reply");
+    expect(discord.methods).toContain(`PATCH channels/${DISCORD_SYSTEM_THREAD_ID}/messages/${firstReply.messageId}`);
+    expect(discord.methods.filter(method => method === `POST channels/${DISCORD_SYSTEM_THREAD_ID}/messages`)).toHaveLength(1);
 
     const firstRequest = required(fixture.application.store.listMessagingInboundRequests()[0], "first Discord request");
     expect(firstRequest).toMatchObject({

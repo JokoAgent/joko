@@ -12,6 +12,7 @@ export const DISCORD_SYSTEM_ROOT_CHANNEL_ID = "666666666666666666";
 export const DISCORD_SYSTEM_THREAD_ID = "777777777777777777";
 
 export interface DiscordSystemOutboundMessage {
+  readonly messageId: string;
   readonly channelId: string;
   readonly text: string;
   readonly replyToMessageId?: string;
@@ -282,7 +283,26 @@ export class DiscordSystemFixture {
       }
       if (request.method === "PATCH" && getMessage !== null) {
         const existing = this.#messages.get(getMessage[2]!);
-        return json(response, 200, existing ?? outboundMessage(getMessage[2]!, getMessage[1]!, ""));
+        if (!existing || existing.channel_id !== getMessage[1] || existing.author["id"] !== DISCORD_SYSTEM_BOT_ID) {
+          return json(response, 404, { code: 10008, message: "unknown message" });
+        }
+        const body = await readJson(request);
+        const content = typeof body["content"] === "string" ? body["content"]
+          : typeof recordArray(body["embeds"])[0]?.["description"] === "string" ? recordArray(body["embeds"])[0]!["description"] as string : existing.content;
+        const edited = { ...existing, content }; this.#messages.set(edited.id, edited);
+        const index = this.outboundMessages.findIndex(message => message.messageId === edited.id && message.channelId === edited.channel_id);
+        if (index >= 0) this.outboundMessages[index] = { ...this.outboundMessages[index]!, text: content };
+        return json(response, 200, edited);
+      }
+      if (request.method === "DELETE" && getMessage !== null) {
+        const existing = this.#messages.get(getMessage[2]!);
+        if (!existing || existing.channel_id !== getMessage[1] || existing.author["id"] !== DISCORD_SYSTEM_BOT_ID) {
+          return json(response, 404, { code: 10008, message: "unknown message" });
+        }
+        this.#messages.delete(existing.id);
+        const index = this.outboundMessages.findIndex(message => message.messageId === existing.id);
+        if (index >= 0) this.outboundMessages.splice(index, 1);
+        return empty(response);
       }
 
       const send = /^channels\/([1-9][0-9]{16,19})\/messages$/u.exec(path);
@@ -296,13 +316,16 @@ export class DiscordSystemFixture {
         const replyToMessageId = reference === undefined || typeof reference["message_id"] !== "string"
           ? undefined
           : reference["message_id"];
+        this.#nextOutboundMessageId += 1n;
+        const message = outboundMessage(String(this.#nextOutboundMessageId), send[1]!, content);
+        this.#messages.set(message.id, message);
         this.outboundMessages.push({
+          messageId: message.id,
           channelId: send[1]!,
           text: content,
           ...(replyToMessageId === undefined ? {} : { replyToMessageId })
         });
-        this.#nextOutboundMessageId += 1n;
-        return json(response, 200, outboundMessage(String(this.#nextOutboundMessageId), send[1]!, content));
+        return json(response, 200, message);
       }
 
       if (request.method === "POST" && /^channels\/[1-9][0-9]{16,19}\/typing$/u.test(path)) {
