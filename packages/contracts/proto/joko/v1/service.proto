@@ -472,6 +472,9 @@ service BrowserService {
 service WorktreeService {
   rpc ProbeTargetWorktree(ProbeTargetWorktreeRequest) returns (ProbeTargetWorktreeResponse);
   rpc ListTargetWorktreeSources(ListTargetWorktreeSourcesRequest) returns (ListTargetWorktreeSourcesResponse);
+  rpc GetTargetWorktreeBranchStatus(GetTargetWorktreeBranchStatusRequest) returns (GetTargetWorktreeBranchStatusResponse);
+  rpc SyncTargetWorktreeBranch(SyncTargetWorktreeBranchRequest) returns (SyncTargetWorktreeBranchResponse);
+  rpc GetWorktreeBranchSyncOperation(GetWorktreeBranchSyncOperationRequest) returns (GetWorktreeBranchSyncOperationResponse);
   rpc GetSessionWorktreeRemovalPreview(GetSessionWorktreeRemovalPreviewRequest) returns (GetSessionWorktreeRemovalPreviewResponse);
   rpc ListWorktreeRecycleStatus(ListWorktreeRecycleStatusRequest) returns (ListWorktreeRecycleStatusResponse);
   rpc ControlWorktreeRecycle(ControlWorktreeRecycleRequest) returns (ControlWorktreeRecycleResponse);
@@ -1783,6 +1786,43 @@ message ListTargetWorktreeSourcesResponse {
   repeated WorktreeSourceOption sources = 1;
   PageInfo page = 2;
 }
+
+// Read-only local-ref observation. The opaque revision binds the exact
+// repository, branch, remote configuration and local checkout observation.
+message WorktreeBranchStatus {
+  string branch = 1;
+  bool remote_only = 2;
+  optional string remote = 3;
+  optional string remote_branch = 4;
+  uint32 ahead = 5;
+  uint32 behind = 6;
+  uint32 dirty_files = 7;
+  optional string blocked = 8;
+  string revision = 9;
+}
+message GetTargetWorktreeBranchStatusRequest {
+  string target_id = 1;
+  string source_ref = 2;
+}
+message GetTargetWorktreeBranchStatusResponse { WorktreeBranchStatus status = 1; }
+message SyncTargetWorktreeBranchRequest {
+  string target_id = 1;
+  string source_ref = 2;
+  string expected_revision = 3;
+  string operation_id = 4;
+}
+message WorktreeBranchSyncOperation {
+  string operation_id = 1;
+  bool pending = 2;
+  // An interrupted or unconfirmed effect is retained and never re-dispatched.
+  bool unknown = 3;
+  WorktreeBranchStatus status = 4;
+  uint32 updated = 5;
+  optional string error_code = 6;
+}
+message SyncTargetWorktreeBranchResponse { WorktreeBranchSyncOperation operation = 1; }
+message GetWorktreeBranchSyncOperationRequest { string operation_id = 1; }
+message GetWorktreeBranchSyncOperationResponse { WorktreeBranchSyncOperation operation = 1; }
 
 message GetSessionWorktreeRemovalPreviewRequest {
   string session_id = 1;
