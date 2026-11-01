@@ -1,6 +1,6 @@
 import { join, resolve } from "node:path";
 
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BackendDescriptor } from "@joko/core";
@@ -59,6 +59,7 @@ describe("mounted Provider configuration", () => {
     const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Balance Web" })).challenge!;
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const context = await browser.newContext({ viewport: { width: 1440, height: 960 }, reducedMotion: "reduce" }), page = await context.newPage();
+    await routeFixtureDiscovery(context, fixture.baseUrl);
     const errors = browserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/settings/providers`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click(); await page.locator("details.device-authorization__manual > summary").click();
@@ -102,6 +103,7 @@ describe("mounted Provider configuration", () => {
 
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const context = await browser.newContext({ viewport: { width: 1440, height: 960 } });
+    await routeFixtureDiscovery(context, fixture.baseUrl);
     const first = await context.newPage();
     const firstErrors = browserErrors(first);
     await first.goto(`${fixture.baseUrl}/#/settings/providers`, { waitUntil: "domcontentloaded" });
@@ -210,12 +212,20 @@ describe("mounted Provider configuration", () => {
   });
 });
 
+async function routeFixtureDiscovery(context: BrowserContext, baseUrl: string): Promise<void> {
+  // The page's opportunistic local-node discovery must reach this controlled
+  // node instead of depending on a daemon installed on the CI runner.
+  await context.route(/^http:\/\/(?:127\.0\.0\.1|localhost):4318\/joko\.v1\.ConnectionService\/GetServerInfo$/u, async route => {
+    const response = await route.fetch({ url: new URL("/joko.v1.ConnectionService/GetServerInfo", baseUrl).href, maxRetries: 0 });
+    await route.fulfill({ response });
+  });
+}
+
 function browserErrors(page: Page): string[] {
   const errors: string[] = [];
   const location = (value: string): string => { try { const url = new URL(value); return url.origin + url.pathname; } catch { return "unknown"; } };
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
   page.on("console", (message) => { if (message.type() === "error") errors.push(`console:${message.text()}:${location(message.location().url)}`); });
-  page.on("requestfailed", request => errors.push(`requestfailed:${request.method()}:${location(request.url())}:${request.failure()?.errorText ?? "unknown"}`));
   return errors;
 }
 

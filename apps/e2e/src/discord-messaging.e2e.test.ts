@@ -199,8 +199,16 @@ describe("Discord Messaging production product chain", () => {
       text: "Continue in the same visible thread task after restart."
     });
     await waitFor(
-      async () => discord?.outboundMessages ?? [],
-      (messages) => messages.some((message) => message.text === SECOND_REPLY),
+      async () => ({
+        messages: discord?.outboundMessages ?? [],
+        requests: fixture!.application.store.listMessagingInboundRequests().map(({ id, status, runId, queueItemId, errorCode }) => ({ id, status, runId, queueItemId, errorCode })),
+        deliveries: fixture!.application.store.listMessagingDeliveries().map(({ id, dedupeKey, kind, status, attempts, providerMessageId, errorCode }) => ({ id, dedupeKey, kind, status, attempts, providerMessageId, errorCode })),
+        connection: { status: fixture!.application.store.getMessagingConnection(created.connectionId).runtimeStatus,
+          errorCode: fixture!.application.store.getMessagingConnection(created.connectionId).errorCode },
+        providerRequests: fixture!.providerRequests.length,
+        diagnostics: JSON.stringify(fixture!.application.store.listDiagnostics({ limit: 8 }), (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)
+      }),
+      (state) => state.messages.some((message) => message.text === SECOND_REPLY),
       "the restarted Discord worker to deliver the second reply",
       60_000
     );

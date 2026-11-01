@@ -16,7 +16,7 @@ import {
   PermissionMode,
   RunState
 } from "@joko/contracts";
-import { chromium, type Browser, type Page, type Route } from "playwright-core";
+import { chromium, type Browser, type Page, type Request, type Response, type Route } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { queueRunIdFrom, sendInputMutation, submit } from "./operations.js";
@@ -511,16 +511,41 @@ describe("mounted Partner collaboration product chain", () => {
     const cancelCard = page.getByLabel(`Delegated work: ${CANCEL_TITLE}`);
     await cancelCard.waitFor({ state: "visible", timeout: 30_000 });
     await cancelCard.getByText("Running", { exact: true }).waitFor({ state: "visible" });
-    const [cancelledRpc] = await Promise.all([
-      page.waitForResponse(response => {
-        if (!response.url().endsWith("/joko.v1.PartnerService/CancelPartnerDelegation")) return false;
-        const body = response.request().postDataBuffer();
-        if (body === null) return false;
-        const request = fromBinary(CancelPartnerDelegationRequestSchema, body);
-        return request.partnerId === first.partnerId && request.delegationId === cancellable.delegationId;
-      }, { timeout: 30_000 }),
-      cancelCard.getByRole("button", { name: "Stop delegation" }).click()
-    ]);
+    const cancellationRequests: unknown[] = [], cancellationFailures: string[] = [];
+    const cancellationEndpoint = "/joko.v1.PartnerService/CancelPartnerDelegation";
+    const observeCancellation = (request: Request): void => {
+      if (!request.url().endsWith(cancellationEndpoint)) return;
+      const body = request.postDataBuffer();
+      try {
+        const decoded = body === null ? undefined : fromBinary(CancelPartnerDelegationRequestSchema, body);
+        cancellationRequests.push({ method: request.method(), partnerId: decoded?.partnerId,
+          delegationId: decoded?.delegationId, expectedRevision: decoded?.expectedRevision?.value.toString() });
+      } catch { cancellationRequests.push({ method: request.method(), bytes: body?.length }); }
+    };
+    const observeCancellationFailure = (request: Request): void => {
+      if (request.url().endsWith(cancellationEndpoint)) cancellationFailures.push(request.failure()?.errorText ?? "unknown");
+    };
+    page.on("request", observeCancellation); page.on("requestfailed", observeCancellationFailure);
+    let cancellationClicked = false, cancelledRpc: Response;
+    try {
+      [cancelledRpc] = await Promise.all([
+        page.waitForResponse(response => {
+          if (!response.url().endsWith(cancellationEndpoint)) return false;
+          const body = response.request().postDataBuffer();
+          if (body === null) return false;
+          const request = fromBinary(CancelPartnerDelegationRequestSchema, body);
+          return request.partnerId === first.partnerId && request.delegationId === cancellable.delegationId;
+        }, { timeout: 30_000 }),
+        cancelCard.getByRole("button", { name: "Stop delegation" }).click().then(() => { cancellationClicked = true; })
+      ]);
+    } catch (cause) {
+      throw new Error(`The inline delegation cancellation did not settle: ${JSON.stringify({
+        clicked: cancellationClicked, requests: cancellationRequests, failures: cancellationFailures,
+        card: (await cancelCard.textContent({ timeout: 5_000 }))?.slice(-2_000), browserErrors
+      })}`, { cause });
+    } finally {
+      page.off("request", observeCancellation); page.off("requestfailed", observeCancellationFailure);
+    }
     const cancellationRequest = fromBinary(CancelPartnerDelegationRequestSchema, required(cancelledRpc.request().postDataBuffer(), "the cancellation request"));
     const requestedRevision = required(cancellationRequest.expectedRevision, "the requested delegation revision").value;
     expect(requestedRevision).toBeGreaterThanOrEqual(currentCardRevision);

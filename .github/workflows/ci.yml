@@ -516,7 +516,7 @@ jobs:
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 15
         shell: bash
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/paired-backends.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/paired-backends.e2e.test.ts src/discord-messaging.e2e.test.ts src/provider-configuration-mounted-browser.e2e.test.ts src/worktree-branch-sync-mounted-browser.e2e.test.ts src/partner-mounted-browser.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
         env:
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
@@ -532,6 +532,7 @@ jobs:
           else
             files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts)
           fi
+          files+=(src/discord-messaging.e2e.test.ts src/provider-configuration-mounted-browser.e2e.test.ts src/worktree-branch-sync-mounted-browser.e2e.test.ts src/partner-mounted-browser.e2e.test.ts)
           echo "selected_files=${files[*]}" >> "$GITHUB_OUTPUT"
           pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
 
