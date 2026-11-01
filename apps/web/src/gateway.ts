@@ -961,6 +961,8 @@ import type {
   ProjectDirectoryListingView,
   TargetWorktreeProbeView,
   WorktreeSourceView,
+  WorktreeBranchStatusView,
+  WorktreeBranchSyncOperationView,
   WorkspaceView
 } from "./model.js";
 import { messageMentionWireText } from "./message-reference.js";
@@ -3224,6 +3226,31 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       pageToken = nextPageToken;
     }
     throw new GatewayError("Worktree source discovery exceeded the safe pagination limit.");
+  }
+
+  async getTargetWorktreeBranchStatus(targetId: string, sourceRef: string, signal?: AbortSignal): Promise<WorktreeBranchStatusView> {
+    if (this.#taskSharing) throw new GatewayError("A normal node connection is required.");
+    const scope = this.captureActionScope(), active = signal ? AbortSignal.any([scope.signal, signal]) : scope.signal;
+    const result = await createClient(WorktreeService, scope.transport).getTargetWorktreeBranchStatus({ targetId, sourceRef }, { signal: active });
+    active.throwIfAborted();
+    if (this.#transport !== scope.transport) throw new GatewayError("The original repository connection changed.");
+    return mapWorktreeBranchStatus(result.status);
+  }
+  async syncTargetWorktreeBranch(input: { readonly targetId: string; readonly sourceRef: string; readonly expectedRevision: string; readonly operationId: string }, signal?: AbortSignal): Promise<WorktreeBranchSyncOperationView> {
+    if (this.#taskSharing) throw new GatewayError("A normal node connection is required.");
+    const scope = this.captureActionScope(), active = signal ? AbortSignal.any([scope.signal, signal]) : scope.signal;
+    const result = await createClient(WorktreeService, scope.transport).syncTargetWorktreeBranch(input, { signal: active });
+    active.throwIfAborted();
+    if (this.#transport !== scope.transport) throw new GatewayError("The original repository connection changed.");
+    return mapWorktreeBranchOperation(result.operation, input.operationId);
+  }
+  async getWorktreeBranchSyncOperation(operationId: string, signal?: AbortSignal): Promise<WorktreeBranchSyncOperationView> {
+    if (this.#taskSharing) throw new GatewayError("A normal node connection is required.");
+    const scope = this.captureActionScope(), active = signal ? AbortSignal.any([scope.signal, signal]) : scope.signal;
+    const result = await createClient(WorktreeService, scope.transport).getWorktreeBranchSyncOperation({ operationId }, { signal: active });
+    active.throwIfAborted();
+    if (this.#transport !== scope.transport) throw new GatewayError("The original repository connection changed.");
+    return mapWorktreeBranchOperation(result.operation, operationId);
   }
 
   async getSessionWorktreeRemovalPreview(
@@ -14128,6 +14155,23 @@ function mapWorktreeRecycleRecord(record: WorktreeRecycleRecord): WorktreeRecycl
     || !Number.isSafeInteger(nextAttemptAt) || nextAttemptAt < 0) throw new GatewayError("The worktree recovery record is incomplete.");
   return { id: record.id, generation: record.generation, sessionId: record.sessionId, displayName: record.displayName,
     pathDisplay: record.pathDisplay, state, reason, failures: record.failures, nextAttemptAt };
+}
+
+function mapWorktreeBranchStatus(value: import("@joko/contracts").WorktreeBranchStatus | undefined): WorktreeBranchStatusView {
+  const blocked = ["no-remote", "missing-remote", "not-local", "multiple-checkouts", "diverged", "conflict", "changed"];
+  if (!value || !value.branch || value.branch.length > 1_024 || !/^[a-f0-9]{64}$/u.test(value.revision)
+    || value.blocked !== undefined && !blocked.includes(value.blocked)) throw new GatewayError("The selected branch status is invalid.");
+  return { branch: value.branch, remoteOnly: value.remoteOnly, ahead: value.ahead, behind: value.behind, dirtyFiles: value.dirtyFiles,
+    revision: value.revision, ...(value.remote === undefined ? {} : { remote: value.remote }),
+    ...(value.remoteBranch === undefined ? {} : { remoteBranch: value.remoteBranch }),
+    ...(value.blocked === undefined ? {} : { blocked: value.blocked as WorktreeBranchStatusView["blocked"] }) };
+}
+function mapWorktreeBranchOperation(value: import("@joko/contracts").WorktreeBranchSyncOperation | undefined, operationId: string): WorktreeBranchSyncOperationView {
+  if (!value || value.operationId !== operationId || value.pending && value.unknown
+    || !value.pending && !value.unknown && !value.status && !value.errorCode) throw new GatewayError("The original branch operation receipt is invalid.");
+  return { operationId, pending: value.pending, unknown: value.unknown, updated: value.updated,
+    ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
+    ...(value.status === undefined ? {} : { status: mapWorktreeBranchStatus(value.status) }) };
 }
 
 function mapWorktreeEligibility(value: WorktreeEligibility): TargetWorktreeProbeView["eligibility"] {

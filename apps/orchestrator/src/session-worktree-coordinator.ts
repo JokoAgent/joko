@@ -8,6 +8,10 @@ import { operationBodyHash, type OperationalStore, type StoredSession, type Stor
 import type { RemoteGitCheckoutInspection, RemoteGitCheckoutLease, RemoteGitCheckoutPlan } from "@joko/remote-ssh";
 import {
   EphemeralWorktreeService,
+  readWorktreeBranchStatus,
+  syncWorktreeBranch,
+  type WorktreeBranchStatus,
+  type WorktreeBranchSyncResult,
   type WorktreeCallOptions,
   type WorktreeErrorCode,
   type WorktreeLease,
@@ -251,6 +255,16 @@ export class SessionWorktreeCoordinator {
     const result = await this.#service.listSources(target.workspaceRoot);
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     return result.value;
+  }
+
+  async branchStatus(target: TargetDescriptor, sourceRef: string, options?: WorktreeCallOptions): Promise<WorktreeBranchStatus> {
+    if (target.remoteWorkspace || !target.trusted) throw new SessionWorktreeCoordinatorError("REPOSITORY_UNSAFE");
+    return readWorktreeBranchStatus(target.workspaceRoot, sourceRef, options);
+  }
+
+  async syncBranch(target: TargetDescriptor, sourceRef: string, expectedRevision: string, assertCurrent: () => void): Promise<WorktreeBranchSyncResult> {
+    if (target.remoteWorkspace || !target.trusted) throw new SessionWorktreeCoordinatorError("REPOSITORY_UNSAFE");
+    return syncWorktreeBranch({ cwd: target.workspaceRoot, sourceRef, expectedRevision, assertCurrent });
   }
 
   async acquire(input: AcquireSessionWorktreeInput): Promise<SessionWorktreeBinding> {

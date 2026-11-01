@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import { createWorktreeBranchSyncService } from "./worktree-branch-sync-service.js";
 import { NotFoundError, StoreClosedError, type OperationalStore } from "@joko/store";
 
 import {
@@ -20,6 +21,7 @@ export function createWorktreeConnectService(
   authenticate: (context: HandlerContext) => unknown
 ): ServiceImpl<typeof contract.WorktreeService> {
   return {
+    ...createWorktreeBranchSyncService(coordinator, store, authenticate),
     probeTargetWorktree: async (request, context) => worktreeRpc(async () => {
       authenticate(context);
       const target = store.getTarget(publicTargetId(request.targetId));

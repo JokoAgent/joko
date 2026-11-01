@@ -6223,6 +6223,21 @@ const en = {
   ,"worktree.defaultSource": "Current branch"
   ,"worktree.current": "current"
   ,"worktree.refreshRemote": "Refresh remote branches before creating"
+  ,"worktree.branch.sync": "Update selected branch"
+  ,"worktree.branch.syncing": "Updating branch…"
+  ,"worktree.branch.refresh": "Refresh branch status"
+  ,"worktree.branch.counts": "Ahead {ahead} · Behind {behind} · Local changes {dirty}"
+  ,"worktree.branch.updated": "Updated commits: {count}."
+  ,"worktree.branch.no-remote": "This branch has no configured remote."
+  ,"worktree.branch.missing-remote": "The configured remote branch is unavailable."
+  ,"worktree.branch.not-local": "The selected local branch no longer exists."
+  ,"worktree.branch.multiple-checkouts": "This branch is checked out more than once. Resolve the checkout ownership first."
+  ,"worktree.branch.diverged": "Local and remote histories have diverged. Resolve them before updating."
+  ,"worktree.branch.conflict": "The update overlaps local files. Preserve and resolve those changes first."
+  ,"worktree.branch.changed": "The branch or its source changed. Refresh its status before updating."
+  ,"worktree.branch.unknown": "The original update is unconfirmed. Inspect the repository and its status before another update."
+  ,"worktree.branch.unavailable": "The branch status or update could not be confirmed. Refresh its status to continue."
+  ,"worktree.branch.receiptUnavailable": "The update receipt could not be retained. Check local storage before starting an update."
   ,"worktree.creating": "Creating isolated worktree…"
   ,"worktree.creatingDescription": "This task will open when its private workspace is ready."
   ,"worktree.sessionBadge": "Isolated worktree branch {branch}"
@@ -10203,6 +10218,21 @@ const zhBase: Record<MessageKey, string> = {
   "worktree.defaultSource": "当前分支",
   "worktree.current": "当前",
   "worktree.refreshRemote": "创建前刷新远端分支",
+  "worktree.branch.sync": "更新所选分支",
+  "worktree.branch.syncing": "正在更新分支…",
+  "worktree.branch.refresh": "刷新分支状态",
+  "worktree.branch.counts": "领先 {ahead} · 落后 {behind} · 本地变更 {dirty}",
+  "worktree.branch.updated": "分支更新完成：{count} 个提交。",
+  "worktree.branch.no-remote": "此分支没有配置远端。",
+  "worktree.branch.missing-remote": "配置的远端分支不可用。",
+  "worktree.branch.not-local": "所选本地分支已不存在。",
+  "worktree.branch.multiple-checkouts": "此分支同时位于多个工作区，请先确认工作区归属。",
+  "worktree.branch.diverged": "本地与远端历史已分叉，请先处理分叉。",
+  "worktree.branch.conflict": "更新会覆盖本地文件，请先保存并处理这些变更。",
+  "worktree.branch.changed": "分支或来源已变化，请先刷新状态再更新。",
+  "worktree.branch.unknown": "原更新结果尚未确认，请检查仓库和分支状态后再进行其他更新。",
+  "worktree.branch.unavailable": "无法确认分支状态或更新结果，请刷新状态后继续。",
+  "worktree.branch.receiptUnavailable": "无法保留更新回执，请确认本地存储可用后再更新。",
   "worktree.creating": "正在创建隔离工作树…",
   "worktree.creatingDescription": "专属工作区就绪后会打开本任务。",
   "worktree.sessionBadge": "隔离工作树分支 {branch}",

@@ -4201,6 +4201,9 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .new-task-worktree__toggle input, .new-task-worktree__refresh input { width: 14px; height: 14px; margin: 0; accent-color: var(--accent-edge); }
 .new-task-worktree__toggle:has(input:disabled), .new-task-worktree__refresh:has(input:disabled) { cursor: not-allowed; opacity: .55; }
 .new-task-worktree__options { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.worktree-branch-sync { grid-column: 1 / -1; display: grid; min-width: 0; gap: 5px; }
+.worktree-branch-sync__actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.worktree-branch-sync p { margin: 0; overflow-wrap: anywhere; font-size: var(--text-11); }
 .new-task-worktree__options > label:first-child { min-width: 0; display: grid; gap: 5px; color: var(--text-faint); font-size: var(--text-10); }
 .new-task-worktree__options .select-control { width: 100%; min-width: 0; min-height: 30px; border-radius: 8px; padding: 0 9px; background: var(--surface); font-size: var(--text-11); }
 .new-task-worktree__options .select-control:focus-visible { border-color: var(--accent-edge); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-edge) 12%, transparent); }

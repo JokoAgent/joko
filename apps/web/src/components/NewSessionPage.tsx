@@ -1,5 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 import { resolveModelSpeed } from "../model-speed.js";
+import { WorktreeBranchSync } from "./WorktreeBranchSync.js";
 import { ProvisionalDraftTask } from "../provisional-draft-task.js";
 import { previewProvisionalTask } from "../provisional-draft-preview.js";
 import { builtinSkillIntentForText } from "../builtin-skill-intent.js";
@@ -1419,7 +1420,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (!abort.signal.aborted && sequence === worktreeProbeSequenceRef.current) setWorktreeLoading(false);
     });
     return () => abort.abort();
-  }, [hydrated, selected?.id, startKind, worktreeApplicable, worktreeProbeRevision]);
+  }, [hydrated, selected?.id, selected?.revision, startKind, worktreeApplicable, worktreeProbeRevision]);
 
   useEffect(() => {
     if (selectedModel === undefined) return;
@@ -2692,6 +2693,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               </SelectControl>
             </label>
             {currentWorktreeProbe?.canRefreshRemote && <label className="new-task-worktree__refresh"><CheckboxControl checked={refreshWorktreeRemote} disabled={submitting} onChange={(event) => setRefreshWorktreeRemote(event.target.checked)} /><span>{t("worktree.refreshRemote")}</span></label>}
+            {worktreeSourceRef && typeof controller.getTargetWorktreeBranchStatus === "function" && <WorktreeBranchSync
+              key={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.connectionGeneration, selected?.id, selected?.revision.toString(), worktreeSourceRef])}
+              api={controller} ownerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.endpointPublicKey, selected?.revision.toString()])}
+              targetId={selected!.id} sourceRef={worktreeSourceRef} disabled={submitting} t={t}
+              onUpdated={async signal => { const sources = await controller.listTargetWorktreeSources(selected!.id, signal); if (!signal.aborted) setWorktreeSources(sources); }} />}
           </div>}
         </section>}
         {startKind === "attach" && selected !== undefined && <section className="native-session-picker new-task-native" aria-label={t("session.nativeSessions")}>

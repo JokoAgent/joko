@@ -17,6 +17,8 @@ export interface GitResult {
 
 export interface GitRunOptions {
   readonly timeoutCapMs?: number;
+  /** Optional inactivity budget within the existing whole-operation deadline. */
+  readonly idleTimeoutMs?: number;
   readonly environment?: Readonly<Record<string, string>>;
   readonly indexFile?: string;
 }
@@ -48,6 +50,9 @@ export async function runGit(
     throw new WorktreeServiceError("INVALID_ARGUMENT", "The Git argument vector is invalid.");
   }
   const timeoutMs = control.remaining(options.timeoutCapMs ?? DEFAULT_GIT_STEP_TIMEOUT_MS);
+  if (options.idleTimeoutMs !== undefined && (!Number.isSafeInteger(options.idleTimeoutMs) || options.idleTimeoutMs < 1)) {
+    throw new WorktreeServiceError("INVALID_ARGUMENT", "The Git inactivity budget is invalid.");
+  }
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
     LC_ALL: "C",
@@ -102,9 +107,11 @@ export async function runGit(
     let terminationError: WorktreeServiceError | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
     let settleTimer: NodeJS.Timeout | undefined;
+    let idleTimer: NodeJS.Timeout | undefined;
 
     const cleanup = (): void => {
       clearTimeout(timeoutTimer);
+      clearTimeout(idleTimer);
       if (forceTimer !== undefined) clearTimeout(forceTimer);
       if (settleTimer !== undefined) clearTimeout(settleTimer);
       control.signal?.removeEventListener("abort", abort);
@@ -127,6 +134,7 @@ export async function runGit(
       settleTimer.unref();
     };
     const collect = (target: Buffer[], chunk: Buffer): void => {
+      resetIdleTimer();
       outputBytes += chunk.byteLength;
       if (outputBytes > MAXIMUM_GIT_OUTPUT_BYTES) {
         terminate(new WorktreeServiceError(
@@ -139,10 +147,17 @@ export async function runGit(
       target.push(chunk);
     };
     const abort = (): void => terminate(new WorktreeServiceError("ABORTED", "The worktree operation was aborted."));
+    const resetIdleTimer = (): void => {
+      if (options.idleTimeoutMs === undefined || settled || terminationError !== undefined) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => terminate(new WorktreeServiceError("OPERATION_TIMEOUT", "Git stopped reporting progress.")), options.idleTimeoutMs);
+      idleTimer.unref();
+    };
     const timeoutTimer = setTimeout(() => {
       terminate(new WorktreeServiceError("OPERATION_TIMEOUT", "A Git operation exceeded its deadline."));
     }, timeoutMs);
     timeoutTimer.unref();
+    resetIdleTimer();
 
     stdoutStream.on("data", (chunk: Buffer) => collect(stdout, chunk));
     stderrStream.on("data", (chunk: Buffer) => collect(stderr, chunk));

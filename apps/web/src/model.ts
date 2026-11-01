@@ -5559,6 +5559,26 @@ export interface WorktreeSourceView {
   readonly current: boolean;
 }
 
+export interface WorktreeBranchStatusView {
+  readonly branch: string;
+  readonly remoteOnly: boolean;
+  readonly remote?: string;
+  readonly remoteBranch?: string;
+  readonly ahead: number;
+  readonly behind: number;
+  readonly dirtyFiles: number;
+  readonly blocked?: "no-remote" | "missing-remote" | "not-local" | "multiple-checkouts" | "diverged" | "conflict" | "changed";
+  readonly revision: string;
+}
+export interface WorktreeBranchSyncOperationView {
+  readonly operationId: string;
+  readonly pending: boolean;
+  readonly unknown: boolean;
+  readonly status?: WorktreeBranchStatusView;
+  readonly updated: number;
+  readonly errorCode?: string;
+}
+
 export type NewSessionDraftSelection =
   | { readonly kind: "target"; readonly targetId: string }
   | { readonly kind: "dialogue"; readonly backendId: string };
@@ -6211,6 +6231,9 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   controlWorktreeRecycle(record: Pick<WorktreeRecycleRecordView, "id" | "generation">, action: "retry" | "keep", signal?: AbortSignal): Promise<WorktreeRecycleRecordView | undefined>;
   probeTargetWorktree(targetId: string, signal?: AbortSignal): Promise<TargetWorktreeProbeView>;
   listTargetWorktreeSources(targetId: string, signal?: AbortSignal): Promise<readonly WorktreeSourceView[]>;
+  getTargetWorktreeBranchStatus(targetId: string, sourceRef: string, signal?: AbortSignal): Promise<WorktreeBranchStatusView>;
+  syncTargetWorktreeBranch(input: { readonly targetId: string; readonly sourceRef: string; readonly expectedRevision: string; readonly operationId: string }, signal?: AbortSignal): Promise<WorktreeBranchSyncOperationView>;
+  getWorktreeBranchSyncOperation(operationId: string, signal?: AbortSignal): Promise<WorktreeBranchSyncOperationView>;
   discoverNativeSessions(targetId: string, signal?: AbortSignal): Promise<readonly NativeSessionCandidateView[]>;
   scanNativeSessionCatalog(
     backendId: string,
