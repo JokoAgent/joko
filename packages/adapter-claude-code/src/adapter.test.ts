@@ -2145,7 +2145,7 @@ describe("ClaudeCodeAdapter", () => {
 
     expect(descriptor.adapterKind).toBe("claude-agent-sdk-stdio");
     expect(descriptor.instanceGeneration).toBe(INSTANCE_GENERATION);
-    expect(descriptor.version).toBe(`sdk-${CLAUDE_AGENT_SDK_VERSION}+cli-2.1.280`);
+    expect(descriptor.version).toBe(`sdk-${CLAUDE_AGENT_SDK_VERSION}+cli-2.1.292`);
     expect(descriptor.installationState).toBe("installed");
     expect(descriptor.authenticationState).toBe("signed_out");
     expect(descriptor.models.map((model) => model.modelId)).toEqual(["model-a", "model-b"]);
@@ -2177,7 +2177,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(descriptor.capabilities.get("workspace.extra_dirs")?.options).toEqual(["read_write"]);
   });
 
-  test.each(["2.1.279", "2.1.281", "unknown"])("keeps same-turn input closed for an unverified CLI %s", async (version) => {
+  test.each(["2.1.280", "2.1.291", "2.1.293", "unknown"])("keeps same-turn input closed for an unverified CLI %s", async (version) => {
     const runtime = new FakeSdkRuntime({ initialFrameOverrides: { claude_code_version: version } });
     runtime.probeCliVersion = version;
     const adapter = adapterFor(runtime);
@@ -2471,7 +2471,7 @@ describe("ClaudeCodeAdapter", () => {
   test("uses an exact bundled CLI binding for the first configured subtask default", async () => {
     const runtime = new FakeSdkRuntime();
     runtime.probeCliVersion = undefined;
-    runtime.bundledCliVersion = "2.1.280";
+    runtime.bundledCliVersion = "2.1.292";
     const adapter = adapterFor(runtime, { resolveSubagentModel: () => "model-a" });
     try {
       await adapter.createSession(createInput(), contextFor().context);
@@ -2485,7 +2485,7 @@ describe("ClaudeCodeAdapter", () => {
   test("does not trust a bundled CLI binding for an executable override", async () => {
     const runtime = new FakeSdkRuntime();
     runtime.probeCliVersion = undefined;
-    runtime.bundledCliVersion = "2.1.280";
+    runtime.bundledCliVersion = "2.1.292";
     const adapter = adapterFor(runtime, {
       pathToClaudeCodeExecutable: "D:\\custom\\claude.exe",
       resolveSubagentModel: () => "model-a"
@@ -2501,7 +2501,7 @@ describe("ClaudeCodeAdapter", () => {
     }
   });
 
-  test.each([undefined, "2.1.258", "2.1.260"])("rejects a configured subtask default without exact native precedence (%s)", async (version) => {
+  test.each([undefined, "2.1.258", "2.1.260", "2.1.280", "2.1.293"])("rejects a configured subtask default without exact native precedence (%s)", async (version) => {
     const runtime = new FakeSdkRuntime();
     runtime.probeCliVersion = version;
     let selectedModel: string | undefined = "model-a";
@@ -4083,7 +4083,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(query.params.options.env["CLAUDE_AGENT_SDK_CLIENT_APP"]).toBe("joko/0.1.0");
 
     const beforeTurn = await adapter.describe();
-    expect(beforeTurn.version).toBe(`sdk-${CLAUDE_AGENT_SDK_VERSION}+cli-2.1.280`);
+    expect(beforeTurn.version).toBe(`sdk-${CLAUDE_AGENT_SDK_VERSION}+cli-2.1.292`);
     expect(beforeTurn.models.map((model) => model.modelId)).toEqual(["model-a", "model-b"]);
     expect(beforeTurn.tools).toEqual([]);
 
@@ -4091,7 +4091,7 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.send(textPrompt("confirm the turn"), active.context);
     expect(query.receivedInputs).toHaveLength(1);
     const afterTurnStart = await adapter.describe();
-    expect(afterTurnStart.version).toContain("cli-2.1.280");
+    expect(afterTurnStart.version).toContain("cli-2.1.292");
     expect(afterTurnStart.tools.map((tool) => tool.name)).toEqual(["Bash", "Edit", "Read"]);
     query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
     await eventually(() => active.events.some((event) => event.type === "done"));
@@ -7113,7 +7113,7 @@ class FakeSdkRuntime implements ClaudeSdkRuntime {
   readonly options: FakeRuntimeOptions;
   probeInitialization: ClaudeSdkInitializationResult | undefined = initialization();
   queryInitialization: ClaudeSdkInitializationResult = initialization();
-  probeCliVersion: string | undefined = "2.1.280";
+  probeCliVersion: string | undefined = "2.1.292";
   probeApiKeySource: string | undefined = "none";
   queryFailure: unknown = undefined;
   admitTurns: boolean;
@@ -7807,7 +7807,7 @@ function systemInit(sessionId: string) {
     subtype: "init",
     session_id: sessionId,
     uuid: randomUUID(),
-    claude_code_version: "2.1.280",
+    claude_code_version: "2.1.292",
     apiKeySource: "none",
     cwd: process.cwd(),
     model: "model-a",

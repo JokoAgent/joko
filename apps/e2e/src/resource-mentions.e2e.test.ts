@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import {
   CLAUDE_AGENT_SDK_VERSION,
+  CLAUDE_AGENT_SDK_CLI_VERSION,
   ClaudeCodeAdapter,
   type ClaudeTextResourceSeed
 } from "@joko/adapter-claude-code";
@@ -347,7 +348,7 @@ class ControlledClaudeRuntime implements ClaudeSdkRuntime {
     return {
       installed: true,
       packageVersion: this.packageVersion,
-      cliVersion: "2.1.280",
+      cliVersion: CLAUDE_AGENT_SDK_CLI_VERSION,
       apiKeySource: "none",
       initialization: claudeInitialization
     };
@@ -518,7 +519,7 @@ function claudeSystemInit(nativeSessionId: string, params: ClaudeSdkQueryParams)
     subtype: "init",
     session_id: nativeSessionId,
     uuid: randomUUID(),
-    claude_code_version: "2.1.280",
+    claude_code_version: CLAUDE_AGENT_SDK_CLI_VERSION,
     apiKeySource: "none",
     cwd: params.options.cwd,
     model: params.options.model ?? "fixture-model",

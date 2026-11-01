@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   CLAUDE_AGENT_SDK_VERSION,
+  CLAUDE_AGENT_SDK_CLI_VERSION,
   type ClaudeSdkForkOptions,
   type ClaudeSdkGetSessionMessagesOptions,
   type ClaudeSdkInitializationResult,
@@ -61,7 +62,7 @@ export class ControlledClaudeRuntime implements ClaudeSdkRuntime {
     return {
       installed: true,
       packageVersion: this.packageVersion,
-      cliVersion: "2.1.280",
+      cliVersion: CLAUDE_AGENT_SDK_CLI_VERSION,
       initialization
     };
   }
@@ -158,7 +159,7 @@ export class ControlledClaudeQuery implements ClaudeSdkQuery {
         subtype: "init",
         session_id: this.#sessionId,
         uuid: randomUUID(),
-        claude_code_version: "2.1.280",
+        claude_code_version: CLAUDE_AGENT_SDK_CLI_VERSION,
         apiKeySource: "managed-provider",
         cwd: this.params.options.cwd,
         model: "claude-remote-fixture",
