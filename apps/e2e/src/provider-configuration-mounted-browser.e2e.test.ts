@@ -212,8 +212,10 @@ describe("mounted Provider configuration", () => {
 
 function browserErrors(page: Page): string[] {
   const errors: string[] = [];
+  const location = (value: string): string => { try { const url = new URL(value); return url.origin + url.pathname; } catch { return "unknown"; } };
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
-  page.on("console", (message) => { if (message.type() === "error") errors.push(`console:${message.text()}`); });
+  page.on("console", (message) => { if (message.type() === "error") errors.push(`console:${message.text()}:${location(message.location().url)}`); });
+  page.on("requestfailed", request => errors.push(`requestfailed:${request.method()}:${location(request.url())}:${request.failure()?.errorText ?? "unknown"}`));
   return errors;
 }
 
