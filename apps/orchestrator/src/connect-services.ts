@@ -1587,7 +1587,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const worktree = createWorktreeConnectService(
     dependencies.sessionWorktrees,
     dependencies.store,
-    (context) => ({ connectionId: authenticate(context).id })
+    (context) => { const connection = authenticate(context); return { connectionId: connection.id, authKeyDigest: connection.authKeyDigest }; }
   );
 
   const connection = {
