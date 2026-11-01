@@ -2177,7 +2177,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(descriptor.capabilities.get("workspace.extra_dirs")?.options).toEqual(["read_write"]);
   });
 
-  test.each(["2.1.279", "2.1.281", "unknown"])("keeps same-turn input closed for an unverified CLI %s", async (version) => {
+  test.each(["2.1.280", "2.1.291", "2.1.293", "unknown"])("keeps same-turn input closed for an unverified CLI %s", async (version) => {
     const runtime = new FakeSdkRuntime({ initialFrameOverrides: { claude_code_version: version } });
     runtime.probeCliVersion = version;
     const adapter = adapterFor(runtime);
@@ -2501,7 +2501,7 @@ describe("ClaudeCodeAdapter", () => {
     }
   });
 
-  test.each([undefined, "2.1.258", "2.1.260"])("rejects a configured subtask default without exact native precedence (%s)", async (version) => {
+  test.each([undefined, "2.1.258", "2.1.260", "2.1.280", "2.1.293"])("rejects a configured subtask default without exact native precedence (%s)", async (version) => {
     const runtime = new FakeSdkRuntime();
     runtime.probeCliVersion = version;
     let selectedModel: string | undefined = "model-a";
