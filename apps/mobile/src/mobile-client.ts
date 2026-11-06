@@ -13757,7 +13757,7 @@ export class MobileClient {
     return async (displayed, submission) => {
       if (!this.#current(epoch) || this.#state.status !== "connected") return false;
       const current = this.taskInteractions().find(item => item.interactionId === displayed.interactionId);
-      if (!equals(InteractionSchema, current, displayed)) return false;
+      if (current === undefined || !equals(InteractionSchema, current, displayed)) return false;
       return this.resolveInteraction(displayed.interactionId, submission);
     };
   }
