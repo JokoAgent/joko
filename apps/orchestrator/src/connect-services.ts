@@ -1483,6 +1483,25 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const extensionSurfaceRevocations = new Map<string, () => void>();
 
   const authenticate = (context: HandlerContext): ConnectionRecord => requireAuthentication(dependencies, context);
+  const readAuthorized = async <T>(
+    context: HandlerContext,
+    read: (connection: ConnectionRecord, signal: AbortSignal) => Promise<T>
+  ): Promise<T> => {
+    const connection = authenticate(context);
+    const owner = captureConnectionRevocation(dependencies.connections, connection);
+    const signal = AbortSignal.any([owner.signal, context.signal]);
+    try {
+      signal.throwIfAborted();
+      return await read(connection, signal);
+    } finally {
+      try {
+        dependencies.connections.fence(connection);
+        signal.throwIfAborted();
+      } finally {
+        owner.dispose();
+      }
+    }
+  };
   const ensureExtensionSurfaceRevocation = (connectionId: string): void => {
     if (extensionSurfaceRevocations.has(connectionId)
       || dependencies.extensionMainViews === undefined && dependencies.extensionLibraries === undefined
@@ -1836,8 +1855,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
   } satisfies ServiceImpl<typeof contract.ConnectionService>;
 
   const event = {
-    getSnapshot: async (request, context) => {
-      const authenticated = authenticate(context);
+    getSnapshot: (request, context) => readAuthorized(context, async (authenticated, signal) => {
       if (request.currentDeviceNameSource !== undefined) {
         const kind = dependencies.store.getDevice(authenticated.deviceId).kind;
         if (kind !== "mobile" && kind !== "desktop") {
@@ -1868,7 +1886,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           dependencies.sessionHost.getSessionRuntimeControl(sessionId).effective
       });
       const createdAt = now();
-      const enriched = await enrichSnapshot(dependencies, projected, scope, createdAt, context.signal);
+      const enriched = await enrichSnapshot(dependencies, projected, scope, createdAt, signal);
       return {
         snapshot: create(contract.SnapshotSchema, {
           ...enriched,
@@ -1881,7 +1899,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           }))
         })
       };
-    },
+    }),
     getRuntimeActivity: (_request, context) => {
       authenticate(context);
       const kinds = new Set<contract.RuntimeActivityKind>();
@@ -2202,10 +2220,10 @@ export function createConnectServices(application: OrchestratorApplication, proj
         }))
       };
     },
-    listProviders: async (request, context) => {
-      const connection = authenticate(context);
+    listProviders: (request, context) => readAuthorized(context, async (connection, signal) => {
       await dependencies.hostedAgentSources?.refresh(connection);
-      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+      signal.throwIfAborted();
+      dependencies.connections.fence(connection);
       const records = request.backendId === ""
         ? dependencies.store.listBackends()
         : [dependencies.store.getBackend(request.backendId)];
@@ -2217,7 +2235,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
             provider,
             providerUsageSummary(dependencies, provider.provider.id, record.descriptor.id),
             providerRateLimit(dependencies, record.descriptor.id, provider.provider.id),
-            await providerAccountUsageSnapshot(dependencies, provider, context.signal)
+            await providerAccountUsageSnapshot(dependencies, provider, signal)
           ))));
         }
         const providerIds = new Set<string>();
@@ -2251,7 +2269,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
                 credentialSurfaces: provider.credentialSurfaces
               }
             ),
-            context.signal
+            signal
           ));
         }
         for (const model of record.descriptor.models) {
@@ -2271,16 +2289,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
                 record.updatedAt,
                 backendProviderOperations(record.descriptor)
               ),
-              context.signal
+              signal
             ));
           }
         }
       }
       const result = paginate(providers, request.page);
       return { providers: result.values, page: result.page };
-    },
-    getProvider: async (request, context) => {
-      authenticate(context);
+    }),
+    getProvider: (request, context) => readAuthorized(context, async (_connection, signal) => {
       const records = request.backendId === ""
         ? dependencies.store.listBackends().filter((record) => backendOwnsUsageProvider(dependencies, record.descriptor, request.providerId))
         : [dependencies.store.getBackend(request.backendId)];
@@ -2294,7 +2311,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           provider,
           providerUsageSummary(dependencies, provider.provider.id, record.descriptor.id),
           providerRateLimit(dependencies, record.descriptor.id, provider.provider.id),
-          await providerAccountUsageSnapshot(dependencies, provider, context.signal)
+          await providerAccountUsageSnapshot(dependencies, provider, signal)
         ) };
       }
       const explicit = record.descriptor.providers?.find((item) => item.providerId === request.providerId);
@@ -2329,13 +2346,13 @@ export function createConnectServices(application: OrchestratorApplication, proj
             request.providerId,
             record.revision,
             mapped,
-            context.signal
+            signal
           ),
           usage: providerUsageSummary(dependencies, request.providerId, record.descriptor.id),
           rateLimit: providerRateLimit(dependencies, record.descriptor.id, request.providerId)
         }
       };
-    },
+    }),
     getProviderAccountBalance: async (request, context) => {
       const auth = authenticate(context);
       const backend = dependencies.store.getBackend(request.backendId);
@@ -2353,8 +2370,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         return { result: mapAccountBalance(result) };
       } finally { stop(); }
     },
-    getProviderUsage: async (request, context) => {
-      authenticate(context);
+    getProviderUsage: (request, context) => readAuthorized(context, async (_connection, signal) => {
       const records = request.backendId === ""
         ? dependencies.store.listBackends().filter((record) => backendOwnsUsageProvider(dependencies, record.descriptor, request.providerId))
         : [dependencies.store.getBackend(request.backendId)];
@@ -2375,16 +2391,16 @@ export function createConnectServices(application: OrchestratorApplication, proj
             dependencies,
             backend.descriptor,
             request.providerId,
-            context.signal
+            signal
           );
       return {
         usage: providerUsageSummary(dependencies, request.providerId, backend.descriptor.id),
         rateLimit: providerRateLimit(dependencies, backend.descriptor.id, request.providerId),
         ...(provider === undefined
           ? nativeAccountUsage === undefined ? {} : { accountUsage: nativeAccountUsage }
-          : { accountUsage: await providerAccountUsageSnapshot(dependencies, provider, context.signal) })
+          : { accountUsage: await providerAccountUsageSnapshot(dependencies, provider, signal) })
       };
-    },
+    }),
     getUsageHistory: (request, context) => {
       authenticate(context);
       const days = request.days === 0 ? 140 : request.days;
@@ -9465,6 +9481,7 @@ async function providerAccountUsageSnapshot(
   provider: NativeProviderDescriptor,
   signal?: AbortSignal
 ): Promise<contract.ProviderAccountUsageSnapshot | undefined> {
+  signal?.throwIfAborted();
   if (dependencies.providerAccountUsage === undefined
       || provider.capabilities?.has(PROVIDER_ACCOUNT_USAGE_CAPABILITY) !== true) return undefined;
   const snapshot = await dependencies.providerAccountUsage.get(provider.provider.id, signal);
@@ -9501,6 +9518,7 @@ async function backendProviderAccountUsageSnapshot(
   providerId: string,
   signal?: AbortSignal
 ): Promise<contract.ProviderAccountUsageSnapshot | undefined> {
+  signal?.throwIfAborted();
   if (!backendProviderAccountUsageAvailable(dependencies, descriptor, providerId)) return undefined;
   try {
     return await dependencies.sessionHost.invokeBackendAdapter(descriptor.id, async (adapter) => {
