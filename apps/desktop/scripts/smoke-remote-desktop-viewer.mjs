@@ -1045,6 +1045,15 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
     stage = "native saved setting disable";
     await interact(`[...document.querySelectorAll('.remote-viewer-check')].find(item=>item.textContent.includes('Auto unlock'))?.querySelector('input').click()`);
     await until(async () => !credentialSaved && viewer.webContents.executeJavaScript(`[...document.querySelectorAll('.remote-viewer-check')].find(item=>item.textContent.includes('Auto unlock'))?.querySelector('input')?.checked===false`));
+    stage = "explicit control before changing resolution";
+    await focusInteraction();
+    await until(async () => viewer.webContents.executeJavaScript(`(()=> {
+      const button=document.querySelector('.remote-viewer-toolbar .button');
+      if(!button || button.disabled) return false;
+      if(button.getAttribute('aria-pressed')==='false') button.click();
+      return true;
+    })()`));
+    await until(async () => control && viewer.webContents.executeJavaScript(`document.querySelector('.remote-viewer-toolbar .button')?.getAttribute('aria-pressed')==='true'`));
     const selectMode = async (modeId) => {
       await interact(`(()=> {
         if(!document.querySelector('.remote-viewer-panel[aria-label="Display settings"]'))
