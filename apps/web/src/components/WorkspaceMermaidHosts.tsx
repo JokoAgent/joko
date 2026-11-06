@@ -133,7 +133,7 @@ function MermaidSourceEditor({ detail, labels, onClose }: {
     if (detail.apply(draft) === "target-missing") { setError(labels.targetMissing); return; }
     close();
   };
-  return <Modal ownerDocument={ownerDocument} open title={labels.editTitle} onClose={close} size="large" restoreFocus={false}
+  return <Modal ownerDocument={ownerDocument} open title={labels.editTitle} onClose={close} size="large" restoreFocus={false} dismissOnBackdrop={false}
     className="workspace-mermaid-source-modal" initialFocus={() => textareaRef.current}
   >
     <div className="workspace-mermaid-source-modal__content" onKeyDown={(event) => {
