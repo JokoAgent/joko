@@ -120,9 +120,9 @@ describe("EphemeralWorktreeService", () => {
     });
     await started; retired = true; releaseLock(); await lock;
     expectFailure(await keep, "ABORTED");
-    let checks = 0;
+    let publicationChecks = 0;
     expectFailure(await service.controlRecycle({ id: pending.id, generation: pending.generation, action: "retry" }, undefined, () => {
-      if (++checks === 3) throw new WorktreeServiceError("ABORTED", "The test owner retired before publication.");
+      if (++publicationChecks === 3) throw new WorktreeServiceError("ABORTED", "The test owner retired before publication.");
     }), "ABORTED");
     expect(service.listRecycleStatus()[0]).toEqual(pending);
     expect(await readFile(statePath, "utf8")).toBe(before);
