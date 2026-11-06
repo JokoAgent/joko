@@ -23,9 +23,15 @@ export async function copyExtensionLibrary(input: {
   readonly extensionId: string;
   readonly now?: () => number;
   readonly freeBytes?: (root: string) => Promise<number | undefined>;
+  readonly onTargetCreated?: (identity: ExtensionLibraryRootIdentity) => Promise<void>;
 }): Promise<{ readonly vault: ExtensionLibraryVault; readonly result: ExtensionLibraryTransferResult }> {
   const source = await input.source.snapshot();
   await mkdir(input.targetRoot, { recursive: false, mode: 0o700 });
+  if (input.onTargetCreated !== undefined) {
+    const targetIdentity = await captureExtensionLibraryRootIdentity(input.targetRoot);
+    await input.onTargetCreated(targetIdentity);
+    await assertExtensionLibraryRootIdentity(input.targetRoot, targetIdentity);
+  }
   const targetVault = new ExtensionLibraryVault({
     root: input.targetRoot,
     extensionId: input.extensionId,
