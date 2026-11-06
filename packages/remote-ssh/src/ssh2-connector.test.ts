@@ -334,6 +334,41 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
     expect(isRemoteFileMissing(missing)).toBe(true);
     await connection.close();
   });
+
+  it("uses standard SFTP rename when a destination appears, even when POSIX replacement is available", async () => {
+    const server = await startSshServer();
+    const connection = await connect(server.port);
+    const openSftp = ssh2.Client.prototype.sftp;
+    const negotiate = vi.spyOn(ssh2.Client.prototype, "sftp").mockImplementation(function (this: InstanceType<typeof ssh2.Client>, callback) {
+      return openSftp.call(this, (error, channel) => {
+        // ssh2's test server leaves the extension list empty. Install the
+        // supported extension on the test client so it sends the real packet.
+        if (!error) {
+          const extensions = Reflect.get(channel, "_extensions") as Record<string, string>;
+          extensions["posix-rename@openssh.com"] = "1";
+        }
+        callback(error, channel);
+      });
+    });
+    try {
+      const files = connection.files!;
+      const source = "/workspace/source.txt", destination = "/workspace/target.txt";
+      await files.mkdir("/workspace");
+      await files.write({ path: source, content: Buffer.from("original") });
+      await expect(files.stat(destination)).rejects.toSatisfy(isRemoteFileMissing);
+      await files.write({ path: destination, content: Buffer.from("concurrent") });
+      await expect(files.rename(source, destination)).rejects.toMatchObject({ code: "FILE_TRANSFER_FAILED" });
+      const read = async (path: string) => Buffer.from(await files.read({ path, maximumBytes: 64 })).toString("utf8");
+      expect(await read(source)).toBe("original");
+      expect(await read(destination)).toBe("concurrent");
+
+      await files.write({ path: destination, content: Buffer.from("explicit replacement"), atomic: true });
+      expect(await read(destination)).toBe("explicit replacement");
+    } finally {
+      negotiate.mockRestore();
+      await connection.close();
+    }
+  });
 });
 
 describe("SSH interactive terminal transport", () => {
@@ -908,7 +943,7 @@ function installMemorySftp(sftp: SFTPWrapper): void {
     files.delete(path);
     okay(requestId);
   });
-  const rename = (requestId: number, sourceValue: string, destinationValue: string): void => {
+  const rename = (requestId: number, sourceValue: string, destinationValue: string, overwrite: boolean): void => {
     const source = memoryPath(sourceValue);
     const destination = memoryPath(destinationValue);
     const entry = source === undefined ? undefined : files.get(source);
@@ -916,11 +951,12 @@ function installMemorySftp(sftp: SFTPWrapper): void {
       missing(requestId);
       return;
     }
+    if (!overwrite && files.has(destination)) { failure(requestId); return; }
     files.delete(source);
     files.set(destination, entry);
     okay(requestId);
   };
-  sftp.on("RENAME", rename);
+  sftp.on("RENAME", (requestId, source, destination) => rename(requestId, source, destination, false));
   sftp.on("EXTENDED", (requestId: number, name: string, data: Buffer) => {
     if (name !== "posix-rename@openssh.com") {
       sftp.status(requestId, STATUS_CODE.OP_UNSUPPORTED);
@@ -931,7 +967,7 @@ function installMemorySftp(sftp: SFTPWrapper): void {
       failure(requestId);
       return;
     }
-    rename(requestId, decoded[0], decoded[1]);
+    rename(requestId, decoded[0], decoded[1], true);
   });
 }
 
