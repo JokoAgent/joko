@@ -13,6 +13,7 @@ export {
   CLAUDE_MANAGED_AGENT_SERVER,
   CLAUDE_MANAGED_AGENT_TOOL,
   CLAUDE_MANAGED_AGENT_TOOL_NAME,
+  claudeInputDispatchFence,
   type ClaudeRemoteRuntimePort,
   type ClaudeTargetRuntime,
   type ClaudeSdkRuntime,

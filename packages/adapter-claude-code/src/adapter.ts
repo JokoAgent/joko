@@ -104,6 +104,7 @@ import {
   CLAUDE_AGENT_SDK_VERSION,
   CLAUDE_MANAGED_AGENT_TOOL_NAME,
   DefaultClaudeSdkRuntime,
+  claudeInputDispatchFence,
   claudeMcpServerName,
   type ClaudeCanUseToolOptions,
   type ClaudePermissionResult,
@@ -1996,25 +1997,36 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     // Runtime retirement must also settle the not-yet-awaited admission safely.
     void turn.admission.promise.catch(() => undefined);
     runtime.activeTurn = turn;
+    const assertInputCurrent = (): void => {
+      prepared.assertCurrent();
+      runtime.nativeSkills?.assertCurrent();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed) {
+        throw dispatchError("The native input authority ended before consumption.", turn.inputConsumed);
+      }
+    };
+    const markDispatched = (): void => {
+      turn.inputConsumed = true;
+      runtime.freshSessionCanRestart = false;
+    };
+    const beforeRemoteWrite = runtime.remote && runtime.sdkRuntime.fencesRemoteInputDispatch === true
+      && input.mentions.some(mention => mention.kind === "resource") ? () => {
+        try { assertInputCurrent(); }
+        catch { throw dispatchError("The original resource authority retired during native dispatch.", turn.inputConsumed); }
+        markDispatched();
+      } : undefined;
     const nativeInput: ClaudeSdkUserMessage = {
       type: "user",
       message: { role: "user", content: prepared.content },
       parent_tool_use_id: null,
       origin: { kind: "human" },
-      uuid: turn.userMessageUuid
+      uuid: turn.userMessageUuid,
+      ...(beforeRemoteWrite === undefined ? {} : { [claudeInputDispatchFence]: beforeRemoteWrite })
     };
     try {
       await waitFor(
-        runtime.gate.offer(nativeInput, () => {
-          turn.inputConsumed = true;
-          runtime.freshSessionCanRestart = false;
-        }, preparationSignal, () => {
-          prepared.assertCurrent();
-          runtime.nativeSkills?.assertCurrent();
-          this.#assertCurrent(runtime, context, context.binding);
-          if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed) {
-            throw dispatchError("The native input authority ended before consumption.", false);
-          }
+        runtime.gate.offer(nativeInput, beforeRemoteWrite === undefined ? markDispatched : undefined, preparationSignal, () => {
+          assertInputCurrent();
           if (runtime.freshContext !== undefined && !runtime.remote) {
             // Complete the synchronous durable fence before the SDK iterator
             // can receive this context's first prompt.

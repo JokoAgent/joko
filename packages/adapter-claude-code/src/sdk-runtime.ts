@@ -159,7 +159,11 @@ export type ClaudeSdkOAuthTokenProvider = (
   options: ClaudeSdkOAuthTokenOptions
 ) => Promise<string | null>;
 
+/** Control-node callback carried by an exact message and omitted from JSON frames. */
+export const claudeInputDispatchFence = Symbol("claudeInputDispatchFence");
+
 export interface ClaudeSdkUserMessage {
+  readonly [claudeInputDispatchFence]?: () => void;
   readonly type: "user";
   readonly message: {
     readonly role: "user";
@@ -369,6 +373,7 @@ export interface ClaudeSdkFreshContextRuntime {
 
 export interface ClaudeSdkRuntime {
   readonly packageVersion: string;
+  readonly fencesRemoteInputDispatch?: boolean;
   /** Exact CLI version declared by this runtime's bundled executable. Callers
    * may trust it only when they did not supply an executable override. */
   readonly bundledCliVersion?: string;
