@@ -190,6 +190,8 @@ export interface WorkspaceFilesSidebarProps {
   readonly workspaceId: string;
   /** Projection fence used to invalidate the lazy filename index after watcher updates. */
   readonly workspaceRevision?: string;
+  /** Stable authenticated node and workspace source for reusable filename snapshots. */
+  readonly fileIndexCacheKey?: string;
   readonly workspaceDisplayName: string;
   readonly selectedPath?: string;
   readonly activeTargetId?: string;
@@ -347,6 +349,7 @@ const DEFAULT_LABELS: WorkspaceFilesSidebarLabels = {
 const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, WorkspaceFilesSidebarProps>(function WorkspaceFilesSidebarBody({
   workspaceId,
   workspaceRevision,
+  fileIndexCacheKey,
   workspaceDisplayName,
   selectedPath,
   activeTargetId,
@@ -395,7 +398,8 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
     rowRefs,
     onRevealFailure: reportRevealFailure
   });
-  const fileIndex = useWorkspaceFileIndex({ workspaceId, revision: workspaceRevision, initialFileIndex, loadFileIndex, enabled: filterQuery.trim() !== "" });
+  const fileIndex = useWorkspaceFileIndex({ workspaceId, cacheKey: fileIndexCacheKey, revision: workspaceRevision,
+    initialFileIndex, loadFileIndex, enabled: filterQuery.trim() !== "" });
   const search = useWorkspaceSearch({
     workspaceId,
     query: searchQuery,
@@ -1116,6 +1120,7 @@ function useWorkspaceDirectoryTree(input: {
 
 function useWorkspaceFileIndex(input: {
   readonly workspaceId: string;
+  readonly cacheKey?: string;
   readonly revision?: string;
   readonly initialFileIndex?: WorkspaceFilesFileIndexPage;
   readonly loadFileIndex?: WorkspaceFilesSidebarProps["loadFileIndex"];
@@ -1134,12 +1139,12 @@ function useWorkspaceFileIndex(input: {
     abortRef.current?.abort();
     abortRef.current = undefined;
     generationRef.current += 1;
-    workspaceFileIndexCache.delete(input.workspaceId);
+    if (input.cacheKey !== undefined) workspaceFileIndexCache.delete(input.cacheKey);
     setState({ status: "idle", paths: [], truncated: false });
-  }, [input.workspaceId]);
+  }, [input.cacheKey, input.workspaceId]);
   const load = useCallback(async (force = false): Promise<void> => {
     if (input.loadFileIndex === undefined) return;
-    const cached = workspaceFileIndexCache.get(input.workspaceId);
+    const cached = input.cacheKey === undefined ? undefined : workspaceFileIndexCache.get(input.cacheKey);
     if (!force && cached !== undefined && workspaceFileIndexSnapshotFresh(cached, Date.now())) {
       setState({
         status: "loaded",
@@ -1164,7 +1169,7 @@ function useWorkspaceFileIndex(input: {
         ...(result.revision === undefined ? {} : { revision: result.revision }),
         fetchedAt: Date.now()
       };
-      workspaceFileIndexCache.set(input.workspaceId, snapshot);
+      if (input.cacheKey !== undefined) workspaceFileIndexCache.set(input.cacheKey, snapshot);
       setState({
         status: "loaded",
         paths,
@@ -1176,11 +1181,11 @@ function useWorkspaceFileIndex(input: {
         setState((current) => ({ ...current, status: "error" }));
       }
     }
-  }, [input.loadFileIndex, input.workspaceId]);
-  useEffect(() => {
+  }, [input.cacheKey, input.loadFileIndex, input.workspaceId]);
+  useLayoutEffect(() => {
     abortRef.current?.abort();
     generationRef.current += 1;
-    const cached = workspaceFileIndexCache.get(input.workspaceId);
+    const cached = input.cacheKey === undefined ? undefined : workspaceFileIndexCache.get(input.cacheKey);
     setState(input.initialFileIndex === undefined && cached !== undefined
       ? {
           status: workspaceFileIndexSnapshotFresh(cached, Date.now()) ? "loaded" : "idle",
@@ -1189,7 +1194,7 @@ function useWorkspaceFileIndex(input: {
           ...(cached.revision === undefined ? {} : { revision: cached.revision })
         }
       : normalizeInitialFileIndex(input.initialFileIndex));
-  }, [input.initialFileIndex, input.workspaceId]);
+  }, [input.cacheKey, input.initialFileIndex, input.loadFileIndex, input.workspaceId]);
   useEffect(() => () => abortRef.current?.abort(), []);
   useEffect(() => {
     if (revisionRef.current === input.revision) return;

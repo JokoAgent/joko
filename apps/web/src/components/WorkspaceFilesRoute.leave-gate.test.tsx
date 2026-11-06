@@ -18,6 +18,53 @@ afterEach(() => {
 });
 
 describe("WorkspaceFilesRoute leave gate", () => {
+  it("scopes a warm filename filter to its node and device before the next node's first watch event", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    const view = { ...workspace(), id: "workspace-local" };
+    const index = (path: string) => ({ paths: [path], truncated: false, revision: path });
+    const listA = vi.fn<AppController["listWorkspaceFiles"]>(async () => index("a-only.md"));
+    let finishB!: (index: ReturnType<typeof index>) => void;
+    const listB = vi.fn<AppController["listWorkspaceFiles"]>(() => new Promise(resolve => { finishB = resolve; }));
+    const owner = (serverId: string, listWorkspaceFiles: AppController["listWorkspaceFiles"]): AppController => {
+      const base = controller();
+      return { ...base, state: { ...base.state, activeProfile: {
+        id: `profile-${serverId}`, deviceId: `device-${serverId}`, serverId, name: serverId, origin: "http://127.0.0.1"
+      } }, listWorkspaceEntries: async () => [], listWorkspaceFiles };
+    };
+    const nodeA = owner("node-a", listA), nodeB = owner("node-b", listB);
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    const filter = () => act(async () => {
+      const input = host.querySelector<HTMLInputElement>('input[aria-label="workspace.filterFiles"]')!;
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "only");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    try {
+      await act(async () => root.render(routeView(nodeA, backend(), view)));
+      expect(listA).not.toHaveBeenCalled();
+      await filter();
+      expect(host.textContent).toContain("a-only.md");
+      await act(async () => root.render(null));
+
+      await act(async () => root.render(routeView(nodeB, backend(), view)));
+      await filter();
+      expect(listB).toHaveBeenCalledExactlyOnceWith(view.id, expect.any(AbortSignal));
+      expect(host.textContent).not.toContain("a-only.md");
+      await act(async () => finishB(index("b-only.md")));
+      expect(host.textContent).toContain("b-only.md");
+      await act(async () => root.render(null));
+
+      await act(async () => root.render(routeView(nodeA, backend(), view)));
+      await filter();
+      expect(listA).toHaveBeenCalledTimes(1);
+      expect(host.textContent).toContain("a-only.md");
+      expect(host.textContent).not.toContain("b-only.md");
+    } finally {
+      await act(async () => root.unmount());
+      host.remove();
+    }
+  });
+
   it("reruns an already settled Files search against the rebound workspace", async () => {
     vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     vi.useFakeTimers();
