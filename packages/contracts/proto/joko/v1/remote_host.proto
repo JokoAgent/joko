@@ -454,16 +454,25 @@ message RemoteHostConnectionTestResult {
   RemoteHostConnectionTestOutcome outcome = 1;
   RemoteHost host = 2;
   google.protobuf.Timestamp tested_at = 3;
+  // The public identity seen during a rejected handshake, for explicit recovery.
+  RemoteHostKeyIdentity observed_host_key = 4;
 }
 
 message TestRemoteHostConnectionResponse {
   RemoteHostConnectionTestResult result = 1;
 }
 
+message RemoteHostKeyIdentity {
+  string algorithm = 1;
+  string sha256_fingerprint = 2;
+}
+
 message ClearRemoteHostTrustRequest {
   string target_id = 1;
   string host_id = 2;
   Revision expected_revision = 3;
+  // Required. The exact replacement displayed and approved by the Owner.
+  RemoteHostKeyIdentity replacement = 4;
 }
 
 message ClearRemoteHostTrustResponse {

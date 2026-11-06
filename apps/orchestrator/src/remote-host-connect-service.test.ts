@@ -12,6 +12,7 @@ import {
   AgentAuthConnectorFailure,
   RemoteSshError,
   parseSshConfig,
+  sshHostKeyFingerprint,
   type RemoteProcessHandle,
   type RemoteProcessTransportPort,
   type SshConfigFilePort
@@ -414,6 +415,51 @@ describe("RemoteHostService", () => {
     expect(resolve).toHaveBeenCalledTimes(2);
     expect(credentialViews).toHaveLength(2);
     expect(credentialViews.every((value) => [...value].every((byte) => byte === 0))).toBe(true);
+  });
+
+  it("replaces a trusted key only with the original Owner's exact rejected handshake observation", async () => {
+    const oldKey = Uint8Array.of(1), newKey = Uint8Array.of(2), laterKey = Uint8Array.of(3);
+    const algorithm = "ssh-ed25519";
+    let presented = oldKey;
+    const authenticateSsh = vi.fn();
+    const capabilities = { commandExecution: false, processStreaming: false, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false };
+    const fixture = createFixture({ connector: { capabilities, async connect(request) {
+      await request.verifyHostKey({ algorithm, key: presented });
+      authenticateSsh();
+      request.onAuthenticating();
+      return { close: async () => undefined };
+    } } });
+    const host = fixture.registry.create({ targetId: "target-a", id: "build-box", hostname: "build.example.test", user: "maker", source: "manual" });
+    const ready = await fixture.registry.connect(host.targetId, host.id, host.revision);
+    expect(ready.ok).toBe(true);
+    const { service, original, observer } = pairedOwners(fixture);
+    const input = { targetId: host.targetId, hostId: host.id };
+    presented = newKey;
+    const failed = await service.testRemoteHostConnection(create(contract.TestRemoteHostConnectionRequestSchema, {
+      ...input, expectedRevision: toProtoRevision(ready.host.revision)
+    }), original);
+    const revision = failed.result?.host?.revision;
+    const observed = failed.result?.observedHostKey;
+    expect(observed).toMatchObject({ algorithm, sha256Fingerprint: sshHostKeyFingerprint(newKey) });
+    const confirm = (replacement?: contract.RemoteHostKeyIdentity, caller = original) => service.clearRemoteHostTrust(
+      create(contract.ClearRemoteHostTrustRequestSchema, { ...input, expectedRevision: revision, replacement }), caller);
+    await expect(confirm()).rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+    await expect(confirm(observed, observer)).rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+    await expect(confirm(create(contract.RemoteHostKeyIdentitySchema, { algorithm, sha256Fingerprint: sshHostKeyFingerprint(laterKey) })))
+      .rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+    expect(fixture.registry.get(host.targetId, host.id).trust).toEqual(ready.host.trust);
+    expect(authenticateSsh).toHaveBeenCalledOnce();
+
+    presented = laterKey;
+    const replaced = await confirm(observed);
+    expect(replaced.host?.trust?.sha256Fingerprint).toBe(sshHostKeyFingerprint(newKey));
+    const refused = await fixture.registry.connect(host.targetId, host.id, replaced.host!.revision!.value);
+    expect(refused.failure?.code).toBe("host_key_changed");
+    expect(refused.host.trust?.fingerprint).toBe(sshHostKeyFingerprint(newKey));
+    expect(authenticateSsh).toHaveBeenCalledOnce();
+    presented = newKey;
+    expect((await fixture.registry.connect(host.targetId, host.id, refused.host.revision)).ok).toBe(true);
+    expect(authenticateSsh).toHaveBeenCalledTimes(2);
   });
 
   it.each(["handshake", "verification"] as const)("prevents a revoked Owner from pinning the first SSH key during %s", async (stage) => {

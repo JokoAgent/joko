@@ -24,7 +24,6 @@ import {
   NotFoundError,
   RevisionConflictError,
   StoreError,
-  type ClearRemoteHostTrustInput,
   type CreateRemoteHostInput,
   type DeleteRemoteHostInput,
   type OperationalStore,
@@ -62,7 +61,11 @@ export interface RemoteHostRegistryOptions {
 export type RemoteHostCreate = Omit<CreateRemoteHostInput, "ownerId">;
 export type RemoteHostUpdate = Omit<UpdateRemoteHostInput, "ownerId">;
 export type RemoteHostDelete = Omit<DeleteRemoteHostInput, "ownerId">;
-export type RemoteHostTrustReset = Omit<ClearRemoteHostTrustInput, "ownerId">;
+interface RemoteHostKeyIdentity {
+  readonly algorithm: string;
+  readonly fingerprint: string;
+}
+type TrustedRemoteHost = RemoteHostRecord & { readonly trust: NonNullable<RemoteHostRecord["trust"]> };
 export type RemoteHostAutoConnectSet = Omit<SetRemoteHostAutoConnectInput, "ownerId">;
 
 export interface RemoteHostConnectionOutcome {
@@ -72,6 +75,7 @@ export interface RemoteHostConnectionOutcome {
     readonly code: RemoteHostFailureCode;
     readonly retryable: boolean;
   };
+  readonly observedHostKey?: RemoteHostKeyIdentity;
 }
 
 export interface RemoteHostCommandOutcome {
@@ -89,6 +93,7 @@ interface ManagedController {
   readonly controller: RemoteSshConnectionController;
   readonly scope: { readonly ownerId: string; readonly targetId: string };
   readonly unsubscribe: () => void;
+  readonly pinStore: OperationalHostKeyPinStore;
 }
 
 /**
@@ -109,6 +114,11 @@ export class RemoteHostRegistry {
   readonly #sshConfig: SshConfigFilePort | undefined;
   readonly #defaultSshUser: string | undefined;
   readonly #controllers = new Map<string, ManagedController>();
+  readonly #trustReviews = new Map<string, {
+    readonly connectionId: string;
+    readonly revision: bigint;
+    readonly replacement: RemoteHostKeyIdentity;
+  }>();
   readonly #listeners = new Map<string, Set<RemoteHostRegistryListener>>();
   readonly #refreshes = new Map<string, Promise<RemoteHostRecord[]>>();
   #autoConnectFlight: Promise<void> | undefined;
@@ -241,11 +251,36 @@ export class RemoteHostRegistry {
     return host;
   }
 
-  clearTrust(input: RemoteHostTrustReset): RemoteHostRecord {
+  replaceTrust(input: {
+    readonly targetId: string;
+    readonly id: string;
+    readonly expectedRevision: bigint;
+    readonly connectionId: string;
+    readonly replacement: RemoteHostKeyIdentity;
+  }): RemoteHostRecord {
     this.assertOpen();
-    const host = this.#store.clearRemoteHostTrust({ ...input, ownerId: this.#ownerId });
-    this.publish({ kind: "upserted", host });
-    return host;
+    const review = this.#trustReviews.get(controllerKey(input.targetId, input.id));
+    const changed = this.#store.transaction((store) => {
+      const host = this.get(input.targetId, input.id);
+      assertRevision(host, input.expectedRevision);
+      const original = host.trust;
+      if (review === undefined || review.connectionId !== input.connectionId || review.revision !== host.revision || original === undefined
+        || !sameHostKey(review.replacement, input.replacement)) throw new StoreError("An exact SSH host key review is required.");
+      const aliases = trustedEndpointHosts(store, host);
+      if (aliases.some(alias => isActiveStatus(alias.status.state) || !sameHostKey(alias.trust, original))) {
+        throw new StoreError("Disconnect matching aliases and resolve conflicting SSH pins before replacing the key.");
+      }
+      return aliases.map(alias => {
+        const scope = { ownerId: alias.ownerId, targetId: alias.targetId, id: alias.id };
+        const cleared = store.clearRemoteHostTrust({ ...scope, expectedRevision: alias.revision });
+        return store.pinRemoteHostTrust({ ...scope, ...review.replacement, expectedRevision: cleared.revision });
+      });
+    });
+    for (const host of changed) {
+      this.retireController(host.targetId, host.id);
+      this.publish({ kind: "upserted", host });
+    }
+    return this.get(input.targetId, input.id);
   }
 
   delete(input: RemoteHostDelete): RemoteHostRecord {
@@ -287,16 +322,26 @@ export class RemoteHostRegistry {
     id: string,
     expectedRevision: bigint,
     signal?: AbortSignal,
-    assertCurrent?: () => void
+    assertCurrent?: () => void,
+    connectionId?: string
   ): Promise<RemoteHostConnectionOutcome> {
-    return this.runConnectionTest(targetId, id, expectedRevision, true, signal, assertCurrent);
+    const result = await this.runConnectionTest(targetId, id, expectedRevision, true, signal, assertCurrent);
+    assertCurrent?.();
+    if (connectionId === undefined || result.failure?.code !== "host_key_changed") return result;
+    const key = controllerKey(targetId, id);
+    const replacement = this.#controllers.get(key)?.pinStore.observedMismatch;
+    const current = this.get(targetId, id);
+    if (replacement === undefined || current.revision !== result.host.revision || !sameHostKey(replacement.original, current.trust)) return result;
+    this.#trustReviews.set(key, { connectionId, revision: current.revision, replacement: replacement.presented });
+    return { ...result, observedHostKey: replacement.presented };
   }
 
   startAutoConnect(): Promise<void> {
     this.assertOpen();
     if (this.#autoConnectFlight !== undefined) return this.#autoConnectFlight;
     const attempts = this.#store.listRemoteHosts(this.#ownerId)
-      .filter((host) => host.autoConnect)
+      // Earlier builds could clear the pin while retaining this failure.
+      .filter((host) => host.autoConnect && (host.trust !== undefined || host.status.failure?.code !== "host_key_changed"))
       .map((host) => host.authenticationMode === "node_key" && host.nodeKey !== undefined
         ? this.connect(host.targetId, host.id, host.revision)
         : Promise.resolve().then(() => {
@@ -466,6 +511,7 @@ export class RemoteHostRegistry {
     }
     if (autoConnectFlight !== undefined) await autoConnectFlight;
     this.#controllers.clear();
+    this.#trustReviews.clear();
     this.#listeners.clear();
     this.#closed = true;
   }
@@ -643,9 +689,13 @@ export class RemoteHostRegistry {
       now: this.#now
     });
     const unsubscribe = controller.onStatus(scopeOf(host), (snapshot) => {
+      if (snapshot.status === "connecting") {
+        pinStore.observedMismatch = undefined;
+        this.#trustReviews.delete(key);
+      }
       this.persistSnapshot(snapshot);
     });
-    const managed = { controller, scope: scopeOf(host), unsubscribe };
+    const managed = { controller, scope: scopeOf(host), unsubscribe, pinStore };
     this.#controllers.set(key, managed);
     return managed;
   }
@@ -727,6 +777,7 @@ export class RemoteHostRegistry {
     const managed = this.#controllers.get(key);
     managed?.unsubscribe();
     this.#controllers.delete(key);
+    this.#trustReviews.delete(key);
   }
 
   private publish(change: RemoteHostRegistryChange): void {
@@ -819,7 +870,8 @@ interface OperationalHostKeyPinStoreOptions {
 
 class OperationalHostKeyPinStore implements SshHostKeyPinStorePort {
   readonly #options: OperationalHostKeyPinStoreOptions;
-  #acceptedPin: { readonly algorithm: string; readonly fingerprint: string } | undefined;
+  #acceptedPin: RemoteHostKeyIdentity | undefined;
+  observedMismatch: { readonly original: RemoteHostKeyIdentity; readonly presented: RemoteHostKeyIdentity } | undefined;
 
   constructor(options: OperationalHostKeyPinStoreOptions) {
     this.#options = options;
@@ -863,6 +915,7 @@ class OperationalHostKeyPinStore implements SshHostKeyPinStorePort {
         }
         return "matched";
       }
+      this.observedMismatch = { original: current.trust, presented: { algorithm, fingerprint: request.fingerprint } };
       throw new RemoteSshError("HOST_KEY_CHANGED", "The remote host key changed. Connection was refused.", false);
     }
     try {
@@ -887,21 +940,26 @@ class OperationalHostKeyPinStore implements SshHostKeyPinStorePort {
   }
 
   private assertEndpointTrust(current: RemoteHostRecord, algorithm: string, fingerprint: string): void {
-    const endpoint = sshHostKeyEndpointId(current.hostname, current.port);
-    for (const candidate of this.#options.store.listRemoteHosts(current.ownerId)) {
-      const pin = candidate.trust;
-      if (pin === undefined || candidate.port !== current.port || pin.algorithm === algorithm && pin.fingerprint === fingerprint) continue;
-      let candidateEndpoint: string;
-      try { candidateEndpoint = sshHostKeyEndpointId(candidate.hostname, candidate.port); }
-      catch (error) {
-        if (error instanceof RemoteSshError && error.code === "HOST_KEY_INVALID") continue;
-        throw error;
-      }
-      if (candidateEndpoint === endpoint) {
-        throw new RemoteSshError("HOST_KEY_CHANGED", "The remote host key changed. Connection was refused.", false);
-      }
+    if (trustedEndpointHosts(this.#options.store, current).some(candidate => !sameHostKey(candidate.trust, { algorithm, fingerprint }))) {
+      throw new RemoteSshError("HOST_KEY_CHANGED", "The remote host key changed. Connection was refused.", false);
     }
   }
+}
+
+function trustedEndpointHosts(store: OperationalStore, current: RemoteHostRecord): TrustedRemoteHost[] {
+  const endpoint = sshHostKeyEndpointId(current.hostname, current.port);
+  return store.listRemoteHosts(current.ownerId).filter((candidate): candidate is TrustedRemoteHost => {
+    if (candidate.trust === undefined || candidate.port !== current.port) return false;
+    try { return sshHostKeyEndpointId(candidate.hostname, candidate.port) === endpoint; }
+    catch (error) {
+      if (error instanceof RemoteSshError && error.code === "HOST_KEY_INVALID") return false;
+      throw error;
+    }
+  });
+}
+
+function sameHostKey(left: RemoteHostKeyIdentity, right: RemoteHostKeyIdentity | undefined): boolean {
+  return right !== undefined && left.algorithm === right.algorithm && left.fingerprint === right.fingerprint;
 }
 
 function hostKeyStoreFailure(error: unknown): RemoteSshError {

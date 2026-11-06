@@ -805,6 +805,8 @@ import type {
   RemoteHostDirectoryInspectionView,
   RemoteHostDirectoryListingView,
   RemoteHostDraft,
+  RemoteHostKeyIdentityView,
+  RemoteHostTestView,
   RemoteHostView,
   RemoteWorkspaceView,
   ScheduleView,
@@ -10084,19 +10086,21 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return requireRemoteHost(response.host);
   }
 
-  async testRemoteHostConnection(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView> {
+  async testRemoteHostConnection(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostTestView> {
     const client = createClient(RemoteHostService, this.requireTransport());
     const response = await client.testRemoteHostConnection(
       { targetId, hostId, expectedRevision: { value: expectedRevision } },
       remoteHostRpcOptions(this.#abort?.signal)
     );
-    return requireRemoteHost(response.result?.host);
+    const host = requireRemoteHost(response.result?.host);
+    const observed = response.result?.observedHostKey;
+    return observed === undefined ? host : { ...host, observedHostKey: { algorithm: observed.algorithm, sha256Fingerprint: observed.sha256Fingerprint } };
   }
 
-  async clearRemoteHostTrust(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView> {
+  async clearRemoteHostTrust(targetId: string, hostId: string, expectedRevision: bigint, replacement: RemoteHostKeyIdentityView): Promise<RemoteHostView> {
     const client = createClient(RemoteHostService, this.requireTransport());
     const response = await client.clearRemoteHostTrust(
-      { targetId, hostId, expectedRevision: { value: expectedRevision } },
+      { targetId, hostId, expectedRevision: { value: expectedRevision }, replacement },
       remoteHostRpcOptions(this.#abort?.signal)
     );
     return requireRemoteHost(response.host);
