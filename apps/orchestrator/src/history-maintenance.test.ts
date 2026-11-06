@@ -3,16 +3,25 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { createClient, createRouterTransport } from "@connectrpc/connect";
+import * as contract from "@joko/contracts";
 import type { EventPayload, SessionDescriptor } from "@joko/core";
-import { OperationalStore } from "@joko/store";
+import { OperationalStore, type ConnectionRecord } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { HistoryMaintenance, type HistoryBindingReplacement } from "./history-maintenance.js";
+import type { OrchestratorApplication } from "./application.js";
+import { ArtifactStore } from "./artifact-store.js";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { registerConnectServices } from "./connect-services.js";
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
+import { HistoryMaintenance, type HistoryBindingPreparation, type HistoryBindingReplacement } from "./history-maintenance.js";
 import { cleanHistoryMaintenanceCopy, HistoryWorkCancelledError } from "./history-maintenance-worker.js";
+import { SessionHost } from "./session-host.js";
 
 const NOW = 1_000_000_000;
 const OLD = 1_000;
 const RECENT = NOW - 24 * 60 * 60_000;
+const historyOwnerKey = "history-cleanup-fixture-owner";
 const cleanups: Array<() => void> = [];
 
 afterEach(() => {
@@ -85,7 +94,7 @@ describe("HistoryMaintenance", () => {
       messageCount: 3
     });
 
-    const outcome = await maintenance.cleanup(scan.scanId, true);
+    const outcome = await maintenance.cleanup(scan.scanId, true, fixture.connection);
     expect(outcome).toMatchObject({
       outcome: "completed",
       result: {
@@ -100,7 +109,7 @@ describe("HistoryMaintenance", () => {
     expect(prepareBindings).toHaveBeenCalledWith([expect.objectContaining({
       sessionId: "active-old",
       source: sourceBinding
-    })]);
+    })], expect.any(Function));
     expect(release).toHaveBeenCalledWith(["active-old"]);
     expect(release).toHaveBeenCalledTimes(1);
     expect(removeSessionHistory).toHaveBeenCalledWith(["active-old", "archived-old", "deleted-old"]);
@@ -169,7 +178,7 @@ describe("HistoryMaintenance", () => {
     const session = fixture.store.getSession("archived-old");
     fixture.store.updateSession("archived-old", { archived: false }, session.revision, NOW);
 
-    const outcome = await maintenance.cleanup(scan.scanId, false);
+    const outcome = await maintenance.cleanup(scan.scanId, false, fixture.connection);
     expect(outcome).toMatchObject({
       outcome: "completed",
       result: { messageCount: 0, skippedTaskCount: 1, backupCreated: false }
@@ -199,7 +208,7 @@ describe("HistoryMaintenance", () => {
       workDatabase: async (input) => cleanHistoryMaintenanceCopy(input)
     });
     const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: true });
-    await expect(maintenance.cleanup(scan.scanId, false)).rejects.toThrow("Task history maintenance failed.");
+    await expect(maintenance.cleanup(scan.scanId, false, fixture.connection)).rejects.toThrow("Task history maintenance failed.");
     expect(fixture.store.getSession("active-old").descriptor.binding).toEqual(source);
     expect(fixture.store.searchSessionMessages({ scope: { sessionId: "active-old" }, query: "retain this source history" }).matches)
       .toHaveLength(1);
@@ -226,7 +235,7 @@ describe("HistoryMaintenance", () => {
     });
 
     const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: true });
-    await expect(maintenance.cleanup(scan.scanId, false)).resolves.toMatchObject({ outcome: "completed" });
+    await expect(maintenance.cleanup(scan.scanId, false, fixture.connection)).resolves.toMatchObject({ outcome: "completed" });
     expect(fixture.store.listEvents({ sessionId: "active-old" }).map((event) => event.payload.type))
       .toEqual(["history_pruned"]);
   });
@@ -248,8 +257,8 @@ describe("HistoryMaintenance", () => {
       }
     });
     const scan = first.scan({ retention: "7-days", includeActiveTasks: false });
-    const started = first.beginCleanup(scan.scanId, false);
-    const replayed = first.beginCleanup(scan.scanId, false);
+    const started = first.beginCleanup(scan.scanId, false, fixture.connection);
+    const replayed = first.beginCleanup(scan.scanId, false, fixture.connection);
     expect(replayed.maintenanceId).toBe(started.maintenanceId);
     continueWork();
     await vi.waitFor(() => expect(first.getCleanup(started.maintenanceId)?.status).toBe("completed"));
@@ -298,7 +307,7 @@ describe("HistoryMaintenance", () => {
       }
     });
     const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: false });
-    const started = maintenance.beginCleanup(scan.scanId, true);
+    const started = maintenance.beginCleanup(scan.scanId, true, fixture.connection);
     await vi.waitFor(() => expect(maintenance.getCleanup(started.maintenanceId)).toMatchObject({
       status: "running",
       phase: "cleaning",
@@ -316,11 +325,62 @@ describe("HistoryMaintenance", () => {
       .toBe(false);
     expect(existsSync(`${fixture.filePath}.history-backup`)).toBe(false);
   });
+
+  it("keeps archived history when the original device is revoked while a native replacement is settling", async () => {
+    const { store, filePath, connection } = createFixture();
+    const observerKey = "history-cleanup-fixture-observer";
+    store.createConnection({ id: "history-observer-device", name: "Observer", authKeyDigest: digestAuthKey(observerKey) });
+    createTask(store, "active-old", "active", OLD, visible("original active context"));
+    createTask(store, "archived-old", "archived", OLD, visible("archive must survive"));
+    const artifacts = new ArtifactStore({ rootDirectory: path.join(path.dirname(filePath), "artifacts"),
+      repository: new OperationalArtifactRepository(store), ingestRoots: [path.dirname(filePath)] });
+    const host = new SessionHost(store, artifacts, []);
+    let prepared!: () => void, unpause!: () => void;
+    const preparedNative = new Promise<void>(resolve => { prepared = resolve; });
+    const pending = new Promise<void>(resolve => { unpause = resolve; });
+    const prepare = vi.fn(async ([request]: readonly HistoryBindingPreparation[], assertCurrent: () => void) => {
+      assertCurrent();
+      prepared();
+      await pending;
+      return [{ ...request!, replacement: { opaqueRef: "native/pending-reset", generation: 1 } }];
+    });
+    const discard = vi.fn(async () => undefined);
+    const workDatabase = vi.fn(async (input: Parameters<typeof cleanHistoryMaintenanceCopy>[0]) => cleanHistoryMaintenanceCopy(input));
+    const maintenance = new HistoryMaintenance({ store, activeSessions: { prepare, discard, release: () => undefined },
+      now: () => NOW, workDatabase });
+    try {
+      await artifacts.initialize();
+      await host.initialize();
+      const application = { config: { publicOrigin: "https://orchestrator.example.test" }, store, adapters: [], sessionHost: host,
+        historyMaintenance: maintenance, connections: new ConnectionManager(store) } as unknown as OrchestratorApplication;
+      const transport = createRouterTransport(router => registerConnectServices(router, application));
+      const history = createClient(contract.HistoryMaintenanceService, transport), operations = createClient(contract.OperationService, transport);
+      const auth = (key: string) => ({ headers: { authorization: `Bearer ${key}` } });
+      const { scan } = await history.scanTaskHistory({ retention: contract.TaskHistoryRetention.SEVEN_DAYS, includeActiveTasks: true }, auth(historyOwnerKey));
+      expect(scan).toMatchObject({ activeTaskCount: 1n, archivedTaskCount: 1n });
+      const { progress } = await history.beginTaskHistoryCleanup({ scanId: scan!.scanId, backupEnabled: true }, auth(historyOwnerKey));
+      expect(progress?.status).toBe(contract.TaskHistoryMaintenanceStatus.RUNNING);
+      await preparedNative;
+      await expect(operations.submitOperation({ operationId: "history-owner-device-revoked", mutation: {
+        payload: { case: "revokeDevice", value: { deviceId: connection.deviceId } }
+      } }, auth(observerKey))).resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+      unpause();
+      await vi.waitFor(async () => expect(await history.getTaskHistoryCleanup({ maintenanceId: progress!.maintenanceId }, auth(observerKey)))
+        .toMatchObject({ progress: { status: contract.TaskHistoryMaintenanceStatus.FAILED } }));
+      await vi.waitFor(() => expect(discard).toHaveBeenCalledOnce());
+      expect(workDatabase).not.toHaveBeenCalled();
+      expect(store.getSession("active-old").descriptor.binding.opaqueRef).not.toBe("native/pending-reset");
+      expect(store.searchSessionMessages({ scope: { sessionId: "archived-old" }, query: "archive must survive" }).matches).toHaveLength(1);
+      expect(store.listEvents({ sessionId: "archived-old" }).some(event => event.payload.type === "history_pruned")).toBe(false);
+      expect(existsSync(`${filePath}.history-backup`)).toBe(false);
+    } finally { unpause(); await maintenance.close(); await host.dispose(); }
+  });
 });
 
 function createFixture(): {
   readonly store: OperationalStore;
   readonly filePath: string;
+  readonly connection: ConnectionRecord;
   readonly replaceStore: (replacement: OperationalStore) => void;
 } {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-history-maintenance-"));
@@ -349,6 +409,7 @@ function createFixture(): {
     managed: false,
     trusted: true
   });
+  const connection = store.createConnection({ id: "history-cleanup-device", name: "History owner", authKeyDigest: digestAuthKey(historyOwnerKey) });
   cleanups.push(() => {
     try { store.close(); } catch { /* A restart test may already have closed the prior handle. */ }
     rmSync(directory, { recursive: true, force: true });
@@ -356,6 +417,7 @@ function createFixture(): {
   return {
     get store() { return store; },
     filePath,
+    connection,
     replaceStore(replacement: OperationalStore) { store = replacement; }
   };
 }
