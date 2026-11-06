@@ -6,7 +6,7 @@ import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import type { AdapterContext } from "@joko/core";
 import { createClaudeHostedTools } from "@joko/adapter-claude-code";
-import { HostedAgentClaudeExecutor } from "./hosted-agent-claude-executor.js";
+import { HostedAgentClaudeExecutor, type HostedAgentClaudeAuthorization } from "./hosted-agent-claude-executor.js";
 import { HostedAgentExecutor } from "./hosted-agent-executor.js";
 import { createHostedAgentToolChannel } from "./hosted-agent-tool-channel.js";
 import { readHostedAgentClaudePdf } from "./hosted-agent-claude-pdf.js";
@@ -100,6 +100,89 @@ describe("Claude Source MCP executor", () => {
       expect(await f.call("BashOutput", { bash_id: id })).toMatchObject({ content: [{ text: expect.stringContaining("completed") }] });
     } finally { await f.close(); }
   }, 30_000);
+  it("pages completed Source output past four MiB without splitting UTF-8 or consuming it on a rejected filter", async () => {
+    const prefix = Buffer.alloc(4 * 1024 * 1024 - 1, "x");
+    const tail = Buffer.from("🧪\nFINISH-OK\n", "utf8");
+    const f = await fixture(async (input, _signal, effects) => {
+      if ((input as { operation: string }).operation !== "exec.run") return {};
+      effects?.onOutput?.(prefix);
+      effects?.onOutput?.(tail.subarray(0, 2));
+      effects?.onOutput?.(tail.subarray(2));
+      return { output: "", exitCode: 0 };
+    });
+    try {
+      const id = await startBackground(f, "emit report");
+      expect(await f.call("BashOutput", { bash_id: id, filter: "[" })).toMatchObject({ isError: true });
+      const first = await f.call("BashOutput", { bash_id: id });
+      const text = (first.content[0] as { text: string }).text;
+      expect(text).toContain(`Status: completed (exit 0)\n${"x".repeat(128)}`);
+      expect(text).toContain("More output is available");
+      expect(text).not.toContain("FINISH-OK");
+      expect(text).not.toContain("Output exceeded its retained limit");
+      expect(await f.call("BashOutput", { bash_id: id })).toMatchObject({ isError: false,
+        content: [{ text: "Status: completed (exit 0)\n🧪\nFINISH-OK\n" }] });
+      expect(await f.call("BashOutput", { bash_id: id })).toMatchObject({ content: [{ text: "Status: completed (exit 0)\n" }] });
+    } finally { await f.close(); }
+  }, 30_000);
+  it("reuses space after a Source output page has been read while its command is running", async () => {
+    let finish!: () => void;
+    const hold = new Promise<void>(resolve => { finish = resolve; });
+    const page = Buffer.alloc(4 * 1024 * 1024, "y");
+    const f = await fixture(async (input, signal, effects) => {
+      if ((input as { operation: string }).operation !== "exec.run") return {};
+      effects?.onOutput?.(page);
+      await hold;
+      signal?.throwIfAborted();
+      effects?.onOutput?.(page);
+      effects?.onOutput?.(Buffer.from("NEXT-PAGE"));
+      return { output: page.toString("base64"), exitCode: 0 };
+    });
+    try {
+      const id = await startBackground(f, "emit report in parts");
+      const first = await f.call("BashOutput", { bash_id: id });
+      expect((first.content[0] as { text: string }).text).toHaveLength("Status: running\n".length + page.length);
+      finish();
+      const second = await f.call("BashOutput", { bash_id: id });
+      const secondText = (second.content[0] as { text: string }).text;
+      expect(secondText).toContain("More output is available");
+      expect(secondText).not.toContain("Output exceeded its retained limit");
+      expect(secondText).toContain("y".repeat(128));
+      expect(await f.call("BashOutput", { bash_id: id })).toMatchObject({
+        content: [{ text: "Status: completed (exit 0)\nNEXT-PAGE" }]
+      });
+      expect(await f.call("BashOutput", { bash_id: id })).toMatchObject({
+        content: [{ text: "Status: completed (exit 0)\n" }]
+      });
+    } finally { finish(); await f.close(); }
+  }, 30_000);
+  it("starts the 257th Source command while retaining an active command and unread output", async () => {
+    const f = await fixture(async (input, signal, effects) => {
+      const request = input as { operation: string; payload: { command: string } };
+      if (request.operation !== "exec.run") return {};
+      effects?.onOutput?.(Buffer.from(request.payload.command));
+      if (request.payload.command === "hold") {
+        signal?.throwIfAborted();
+        await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+      }
+      return { exitCode: 0 };
+    });
+    try {
+      const unread = await startBackground(f, "unread output");
+      const active = await startBackground(f, "hold");
+      const consumed: string[] = [];
+      for (let index = 0; index < 254; index++) {
+        const id = await startBackground(f, `command ${index}`);
+        consumed.push(id);
+        expect(await f.call("BashOutput", { bash_id: id })).toMatchObject({ content: [{ text: `Status: completed (exit 0)\ncommand ${index}` }] });
+      }
+      const next = await startBackground(f, "still runs");
+      await expect(f.call("BashOutput", { bash_id: consumed[0]! })).rejects.toThrow("The task executor rejected the operation.");
+      expect(await f.call("BashOutput", { bash_id: unread })).toMatchObject({ content: [{ text: "Status: completed (exit 0)\nunread output" }] });
+      expect(await f.call("BashOutput", { bash_id: active })).toMatchObject({ content: [{ text: "Status: running\nhold" }] });
+      expect(await f.call("BashOutput", { bash_id: next })).toMatchObject({ content: [{ text: "Status: completed (exit 0)\nstill runs" }] });
+      expect(await f.call("KillShell", { shell_id: active })).toMatchObject({ isError: false });
+    } finally { await f.close(); }
+  }, 60_000);
   it("never grants a pending native call another operation's authority", async () => {
     const f = await fixture();
     try {
@@ -117,7 +200,15 @@ describe("Claude Source MCP executor", () => {
   });
 });
 
-async function fixture() {
+async function startBackground(f: Awaited<ReturnType<typeof fixture>>, command: string): Promise<string> {
+  const launch = await f.call("Bash", { command, run_in_background: true });
+  expect(launch.isError).toBe(false);
+  const id = /shell-[a-f0-9-]+/u.exec(JSON.stringify(launch))?.[0];
+  if (id === undefined) throw new Error("The task did not return a background command identity.");
+  return id;
+}
+
+async function fixture(execute?: HostedAgentClaudeAuthorization["execute"]) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-hosted-claude-source-"))), source = join(root, "source"), virtual = join(root, "model");
   await Promise.all([mkdir(source), mkdir(virtual)]); const lifetime = new AbortController();
   const context: AdapterContext = { sessionId: "source-task", generation: 1, backendInstanceGeneration: 1, operationId: "source-input", signal: lifetime.signal,
@@ -127,7 +218,7 @@ async function fixture() {
   const executor = new HostedAgentExecutor({ context, virtualRoot: virtual, assertCurrent: () => lifetime.signal.throwIfAborted(),
     readPolicy: () => ({ revision: "1", permissionMode: "bypassPermissions", planMode: false, approvedRoots: [], confirmCredentials: false }) });
   const helper = new HostedAgentClaudeExecutor({ workspaceRoot: virtual, signal: lifetime.signal, assertCurrent: () => lifetime.signal.throwIfAborted() });
-  const authorization = { execute: executor.execute.bind(executor), readPdf: readHostedAgentClaudePdf };
+  const authorization = { execute: execute ?? executor.execute.bind(executor), readPdf: readHostedAgentClaudePdf };
   const channel = await createHostedAgentToolChannel({ assertCurrent: () => lifetime.signal.throwIfAborted(), execute: async (input, signal) => {
     const { origin, ...primitive } = input as Record<string, unknown>; if (origin !== "agent") throw new Error("Wrong native owner.");
     return await helper.execute(primitive, signal, authorization) ?? executor.execute(primitive, signal);
