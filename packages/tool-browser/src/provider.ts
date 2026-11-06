@@ -1283,15 +1283,18 @@ export class BrowserProvider {
    */
   runHumanTakeoverOperation<T>(
     fence: BrowserTakeoverFence,
-    operation: (page: Page) => Promise<T>
+    operation: (page: Page) => Promise<T>,
+    assertCurrent?: () => void
   ): Promise<T> {
     const expected = copyTakeoverFence(fence);
     validateTakeoverFence(expected);
     return this.queueLifecycle(async () => {
       const current = this.assertHumanTakeover(expected);
       const page = this.requirePageNow(current.pageId);
+      assertCurrent?.();
       const result = await raceAgainstAbort(operation(page), this.#generationAbort.signal);
       this.assertHumanTakeover(expected);
+      assertCurrent?.();
       return result;
     });
   }
@@ -1405,7 +1408,7 @@ export class BrowserProvider {
   }
 
   /** Executes one bounded remote-human input under the exact active fence. */
-  performHumanTakeoverAction(fence: BrowserTakeoverFence, input: BrowserTakeoverInput): Promise<void> {
+  performHumanTakeoverAction(fence: BrowserTakeoverFence, input: BrowserTakeoverInput, assertCurrent?: () => void): Promise<void> {
     let action: BrowserTakeoverInput;
     try {
       validateTakeoverInput(input);
@@ -1502,7 +1505,7 @@ export class BrowserProvider {
         pageId: fence.pageId,
         detail: navigation ? sanitizeBrowserUrlForDisplay(page.url()) : action.type
       });
-    });
+    }, assertCurrent);
   }
 
   async listPages(): Promise<readonly BrowserPageState[]> {

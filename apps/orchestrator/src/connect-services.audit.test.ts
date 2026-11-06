@@ -4768,19 +4768,21 @@ describe("Connect security and protocol audit", () => {
   });
 
   it("authenticates and exact-fences every typed remote Browser takeover input", async () => {
+    const connections = revocableConnections();
     const takeover = {
       providerId: "browser",
       pageId: "page-1",
       takeoverId: "takeover-1",
       generation: 7,
-      owner: "connection-owner",
+      owner: connections.authenticated.id,
       startedAt: 1,
       expiresAt: 60_000
     } as const;
     const performHumanTakeoverAction = vi.fn(async (
       _fence: typeof takeover,
-      _input: unknown
-    ) => undefined);
+      _input: unknown,
+      assertCurrent: () => void
+    ) => { assertCurrent(); });
     const recordHumanPage = vi.fn();
     const store = { findOperation: () => undefined };
     const mutate = vi.fn(async (input: {
@@ -4839,7 +4841,7 @@ describe("Connect security and protocol audit", () => {
         }),
         recordHumanPage
       },
-      connections: { authenticate: () => ({ id: takeover.owner, authKeyDigest: "digest", state: "active" }) }
+      connections
     }));
     const actions: readonly contract.BrowserTakeoverActionMutation["action"][] = [
       {
@@ -4934,6 +4936,9 @@ describe("Connect security and protocol audit", () => {
       sessionId: "session-owner",
       url: "https://example.test/docs"
     }), { active: true });
+    const admittedFence = performHumanTakeoverAction.mock.calls[0]![2];
+    connections.revoke();
+    expect(admittedFence).toThrow(ConnectionAuthenticationError);
   });
 
   it("rejects stale, foreign-owner, and out-of-range Browser takeover input before dispatch", async () => {

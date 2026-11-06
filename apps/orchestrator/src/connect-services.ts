@@ -22627,6 +22627,13 @@ async function dispatchMutation(
         current.pageId,
         current.generation
       );
+      const assertPageCurrent = () => {
+        requireActiveBrowserPageAuthority(dependencies.browserState, current.providerId, current.pageId, current.generation, pageOwner);
+      };
+      const assertEffectCurrent = () => {
+        dependencies.connections.fence(connection);
+        assertPageCurrent();
+      };
       let updatedPage: NativeBrowserPage | undefined;
       const execution = await host.mutate({
         operationId,
@@ -22635,24 +22642,12 @@ async function dispatchMutation(
         body: mutation,
         precondition: () => {
           dependencies.browserProvider!.assertHumanTakeover(current);
-          requireActiveBrowserPageAuthority(
-            dependencies.browserState,
-            current.providerId,
-            current.pageId,
-            current.generation,
-            pageOwner
-          );
+          assertPageCurrent();
         },
         effect: async () => {
-          await dependencies.browserProvider!.performHumanTakeoverAction(current, input);
+          await dependencies.browserProvider!.performHumanTakeoverAction(current, input, assertEffectCurrent);
           updatedPage = (await dependencies.browserProvider!.listPages()).find((page) => page.id === current.pageId);
-          requireActiveBrowserPageAuthority(
-            dependencies.browserState,
-            current.providerId,
-            current.pageId,
-            current.generation,
-            pageOwner
-          );
+          assertEffectCurrent();
         },
         commit: () => {
           const projection = updatedPage === undefined ? undefined : durableBrowserPageProjection(updatedPage);
