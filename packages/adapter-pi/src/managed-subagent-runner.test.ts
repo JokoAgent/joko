@@ -1,25 +1,30 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, createPublicKey, generateKeyPairSync, randomUUID, verify } from "node:crypto";
 import type { KeyObject } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it } from "vitest";
+import type { AdapterContext } from "@joko/core";
+import { createCommandConcurrencyGate } from "@joko/runtime-governance";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { COMMAND_GATE_REQUEST_PREFIX } from "./command-gate-bridge.js";
 import {
   managedSubagentSessionKey,
   reconcileManagedSubagentAuthHomes,
   stopAndRemoveManagedSubagentRuns,
   stopManagedSubagentRunsByProvider
 } from "./durable-subagent-runs.js";
+import { ManagedSubagentObserver } from "./managed-subagent-observer.js";
 import {
   MANAGED_SUBAGENT_RUNNER_FILE_NAME,
   MANAGED_SUBAGENT_RUNNER_SOURCE
 } from "./managed-subagent-runner-source.js";
+import { encodePolicyDecisionRequest } from "./policy-decision-bridge.js";
 import { mkdtemp } from "./test-paths.js";
 
 const execFileAsync = promisify(execFile);
@@ -847,6 +852,92 @@ describe("managed detached subagent runner", () => {
     expect(persisted).not.toContain("Bounded arguments");
   });
 
+  it("forwards the whole private policy reply through the runner mailbox", { timeout: 20_000 }, async () => {
+    const title = encodePolicyDecisionRequest({ policyGeneration: 7,
+      observation: { subjectKind: "command", risk: "medium", toolName: "bash" },
+      toolCall: { toolName: "bash", input: { command: `printf '%s' '${"x".repeat(1_000)}'` } }
+    });
+    expect(Buffer.byteLength(title)).toBeGreaterThan(1024);
+    const fixture = await createRunnerFixture({ settleDelayMs: 10_000, requestApproval: title });
+    const finished = runFixtureRunner(fixture);
+    void finished.catch(() => undefined);
+    try {
+      const pending = await waitForPendingApproval(fixture.statusPath, 5_000);
+      expect(pending).toMatchObject({ id: "fixture-approval", method: "input", title });
+      const value = JSON.stringify({ decision: "default", ownerUserInstructions: [`主人😀${"\u0001".repeat(15_996)}`] });
+      const requestId = randomUUID();
+      const content = `${JSON.stringify({
+        format: 1, requestId, runId: fixture.runId, launchToken: fixture.launchToken, productSessionId: fixture.productSessionId,
+        productGeneration: 1, taskId: fixture.taskId, childId: `${fixture.taskId}:child`, approvalId: pending.id,
+        action: "approval", value, requestedAt: Date.now()
+      })}\n`;
+      expect(Buffer.byteLength(content)).toBeGreaterThan(64 * 1024);
+      const temporary = join(fixture.runDirectory, "approval-control.tmp");
+      await writeFile(temporary, content, { mode: 0o600 });
+      await rename(temporary, join(fixture.runDirectory, "approval-control.json"));
+      await finished;
+      const status = await waitForTerminalStatus(fixture.statusPath, 3_000);
+      expect(status).toMatchObject({ state: "completed", lastApprovalControl: { requestId, accepted: true } });
+      const trace = (await readFile(fixture.childTracePath, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(trace).toContainEqual({ type: "approval", id: "fixture-approval", value });
+      const transcript = await readFile(join(fixture.runDirectory, "transcript.jsonl"), "utf8");
+      expect(transcript).not.toContain(title);
+      expect(transcript).not.toContain("主人😀");
+    } finally {
+      await finished.catch(() => undefined);
+    }
+  });
+
+  it("delivers both parallel acquisitions through the runner, prioritizing the release that unblocks the second", { timeout: 20_000 }, async () => {
+    const fixture = await createRunnerFixture({ settleDelayMs: 10_000, parallelCommandGate: true });
+    const gate = createCommandConcurrencyGate({ readMaximum: () => 1, maximumWaitMs: 60_000 });
+    const context: AdapterContext = {
+      sessionId: fixture.productSessionId,
+      generation: 1,
+      target: { id: "runner-gate-fixture", backendId: "pi", displayName: "Runner gate fixture",
+        workspaceRoot: fixture.runDirectory, managed: true, trusted: true },
+      signal: new AbortController().signal,
+      emit: async () => undefined,
+      requestInteraction: async () => { throw new Error("Unexpected public interaction"); },
+      storeArtifact: async () => { throw new Error("Unexpected artifact"); },
+      artifactCapacityBytes: 1024 * 1024
+    };
+    const observer = new ManagedSubagentObserver({ root: fixture.root, context, intervalMs: 100, commandConcurrencyGate: gate });
+    await gate.acquire({ sessionId: "outside", commandId: "outside-command" });
+    const finished = runFixtureRunner(fixture);
+    void finished.catch(() => undefined);
+    observer.start();
+    try {
+      await vi.waitFor(async () => {
+        const status = JSON.parse(await readFile(fixture.statusPath, "utf8"));
+        expect(status.pendingApproval).toMatchObject({ id: "acquire-first" });
+        expect(gate.snapshot()).toEqual({ running: 1, queued: 1 });
+      }, { timeout: 5_000 });
+      gate.release("outside-command", "fixture-finished");
+      await vi.waitFor(async () => {
+        const status = JSON.parse(await readFile(fixture.statusPath, "utf8"));
+        expect(status.pendingApproval).toMatchObject({ id: "acquire-second" });
+        expect(gate.snapshot()).toEqual({ running: 1, queued: 1 });
+      }, { timeout: 5_000 });
+      await writeFile(join(fixture.runDirectory, "release-first-command"), "", { mode: 0o600 });
+      await finished;
+      expect(await waitForTerminalStatus(fixture.statusPath, 3_000)).toMatchObject({ state: "completed", lastApprovalControl: { accepted: true } });
+      const approvals = (await readFile(fixture.childTracePath, "utf8")).trim().split("\n")
+        .map((line) => JSON.parse(line)).filter((event) => event.type === "approval");
+      expect(approvals).toEqual([
+        { type: "approval", id: "acquire-first", value: "admitted" },
+        { type: "approval", id: "release-first", value: "released" },
+        { type: "approval", id: "acquire-second", value: "admitted" },
+        { type: "approval", id: "release-second", value: "released" }
+      ]);
+      expect(gate.snapshot()).toEqual({ running: 0, queued: 0 });
+    } finally {
+      await observer.stopAndDrain();
+      gate.close();
+      await finished.catch(() => undefined);
+    }
+  });
+
   it("reconciles a stale queued launch whose runner never claimed ownership", async () => {
     const fixture = await createRunnerFixture({ settleDelayMs: 10_000 });
     const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as Record<string, unknown>;
@@ -918,7 +1009,8 @@ interface RunnerFixture {
 async function createRunnerFixture(options: {
   readonly settleDelayMs: number;
   readonly settleOnAbort?: boolean;
-  readonly requestApproval?: boolean;
+  readonly requestApproval?: true | string;
+  readonly parallelCommandGate?: boolean;
   readonly nativeAuthRequired?: boolean;
   readonly providerId?: string;
   readonly refreshNativeAuth?: boolean;
@@ -965,8 +1057,8 @@ async function createRunnerFixture(options: {
     writeFile(runnerPath, runnerSource, { encoding: "utf8", mode: 0o600 }),
     writeFile(
       fakeChildPath,
-      fakeChildSource(options.settleDelayMs, options.settleOnAbort ?? true, options.requestApproval === true,
-        options.refreshNativeAuth !== false, childTracePath),
+      fakeChildSource(options.settleDelayMs, options.settleOnAbort ?? true, options.requestApproval,
+        options.refreshNativeAuth !== false, childTracePath, options.parallelCommandGate === true),
       { encoding: "utf8", mode: 0o600 }
     ),
     writeFile(childTracePath, "", { encoding: "utf8", mode: 0o600 }),
@@ -1185,14 +1277,21 @@ async function stoppedProcessId(): Promise<number> {
 function fakeChildSource(
   settleDelayMs: number,
   settleOnAbort: boolean,
-  requestApproval: boolean,
+  requestApproval: true | string | undefined,
   refreshNativeAuth: boolean,
-  childTracePath: string
+  childTracePath: string,
+  parallelCommandGate: boolean
 ): string {
+  const promptEffect = typeof requestApproval === "string"
+    ? `send(${JSON.stringify({ type: "extension_ui_request", id: "fixture-approval", method: "input", title: requestApproval })});`
+    : requestApproval === true
+      ? 'send({ type: "extension_ui_request", id: "fixture-approval", method: "confirm", title: "joko:permission:bash", message: "Bounded evidence " + (process.env.JOKO_RUNNER_TEST_SECRET || "none") });'
+      : `setTimeout(() => complete("done"), ${settleDelayMs});`;
   return `"use strict";
 const fs = require("node:fs");
 const path = require("node:path");
 const tracePath = ${JSON.stringify(childTracePath)};
+const parallelCommandGate = ${parallelCommandGate};
 const args = process.argv.slice(2);
 const valueAfter = (name) => { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; };
 const sessionDir = valueAfter("--session-dir");
@@ -1223,6 +1322,10 @@ function send(value) {
   if (value && value.type === "agent_settled") trace({ type: "terminal", event: value.type });
   process.stdout.write(JSON.stringify(value) + "\\n");
 }
+function commandGate(id, action, toolCallId) {
+  send({ type: "extension_ui_request", id, method: "input",
+    title: ${JSON.stringify(COMMAND_GATE_REQUEST_PREFIX)} + action + "/" + Buffer.from(toolCallId).toString("base64url") });
+}
 function complete(text) {
   const secret = process.env.JOKO_RUNNER_TEST_SECRET || "none";
   assistant = { role: "assistant", content: [{ type: "text", text: text + " " + secret + " " + nativeSecret + " " + refreshedNativeSecret }], stopReason: "stop" };
@@ -1245,11 +1348,27 @@ process.stdin.on("data", (chunk) => {
     else if (command.type === "get_session_stats") send({ type: "response", id: command.id, command: command.type, success: true, data: { sessionId, tokens: { input: 4, output: 5, total: 9 }, cost: 0.01, toolCalls: 2 } });
     else if (command.type === "prompt") {
       send({ type: "response", id: command.id, command: command.type, success: true, data: {} });
-      ${requestApproval
-        ? 'send({ type: "extension_ui_request", id: "fixture-approval", method: "confirm", title: "joko:permission:bash", message: "Bounded evidence " + (process.env.JOKO_RUNNER_TEST_SECRET || "none") });'
-        : `setTimeout(() => complete("done"), ${settleDelayMs});`}
+      if (parallelCommandGate) {
+        commandGate("acquire-first", "acquire", "tool-first");
+        commandGate("acquire-second", "acquire", "tool-second");
+        commandGate("acquire-second", "acquire", "tool-second");
+      } else { ${promptEffect} }
     } else if (command.type === "extension_ui_response") {
-      complete(command.confirmed === true ? "approved" : "denied");
+      if (typeof command.value === "string") trace({ type: "approval", id: command.id, value: command.value });
+      if (!parallelCommandGate) complete(command.confirmed === true ? "approved" : "denied");
+      else if (command.cancelled) complete("command was cancelled");
+      else if (command.id === "acquire-first" && command.value === "admitted") {
+        const trigger = path.join(path.dirname(tracePath), "release-first-command");
+        const watch = setInterval(() => {
+          if (!fs.existsSync(trigger)) return;
+          clearInterval(watch);
+          commandGate("release-first", "release", "tool-first");
+        }, 20);
+      } else if (command.id === "acquire-second" && command.value === "admitted") {
+        commandGate("release-second", "release", "tool-second");
+      } else if (command.id === "release-second" && command.value === "released") {
+        complete("both commands finished");
+      }
     } else if (command.type === "abort") {
       send({ type: "response", id: command.id, command: command.type, success: true, data: {} });
       ${settleOnAbort ? `assistant = { role: "assistant", content: [], stopReason: "aborted" };

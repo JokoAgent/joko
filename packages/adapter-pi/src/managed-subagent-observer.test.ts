@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { AdapterContext, BlobRef, EventPayload, InteractionPayload, TargetDescriptor } from "@joko/core";
+import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { describe, expect, it, vi } from "vitest";
 
+import { COMMAND_GATE_REQUEST_PREFIX } from "./command-gate-bridge.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./managed-durable-store.js";
 import {
@@ -14,7 +16,12 @@ import {
   ManagedSubagentObserver,
   writeManagedSubagentDurableControl
 } from "./managed-subagent-observer.js";
-import { encodePolicyDecisionRequest } from "./policy-decision-bridge.js";
+import {
+  encodePolicyDecisionRequest,
+  MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS,
+  MAXIMUM_POLICY_DECISION_TITLE_BYTES,
+  POLICY_DECISION_REQUEST_PREFIX
+} from "./policy-decision-bridge.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("managed Subagent public observation", () => {
@@ -268,6 +275,8 @@ describe("managed Subagent public observation", () => {
     await writeManagedSubagentDurableControl(input);
     await writeManagedSubagentDurableControl(input);
 
+    expect(store.scanTaskIds).toEqual([taskId, taskId, taskId]);
+    expect(store.tailReads).toBe(0);
     expect(store.controls).toHaveLength(1);
     expect(store.controls[0]).toMatchObject({
       kind: "control",
@@ -560,26 +569,91 @@ describe("managed Subagent public observation", () => {
     observer.stop();
   });
 
+  it("services release from one child while another waits, and drains an undelivered acquire on stop", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-subagent-command-wait-"));
+    const root = join(directory, "subagent-runs");
+    const sessionId = `session-${randomUUID()}`;
+    const gate = createCommandConcurrencyGate({ readMaximum: () => 1, maximumWaitMs: 60_000 });
+    const observer = new ManagedSubagentObserver({ root, context: context(sessionId, 6, []), commandConcurrencyGate: gate });
+    const title = (action: "acquire" | "release") => `${COMMAND_GATE_REQUEST_PREFIX}${action}/${Buffer.from("provider-call-one").toString("base64url")}`;
+    const approval = (taskId: string, id: string, action: "acquire" | "release") => ({
+      id, childId: `${taskId}:child`, method: "input", title: title(action), requestedAt: Date.now()
+    });
+    const createRun = async (taskId: string) => {
+      const { runId } = await physicalRun(root, sessionId, taskId, 5, 1, [], undefined, "running", {
+        pendingApproval: approval(taskId, `${taskId}-acquire`, "acquire")
+      });
+      return join(root, managedSubagentSessionKey(sessionId), runId);
+    };
+    const setApproval = async (run: string, pendingApproval?: ReturnType<typeof approval>) => {
+      const statusPath = join(run, "status.json");
+      const status = JSON.parse(await readFile(statusPath, "utf8")) as Record<string, unknown>;
+      await writeFile(statusPath, JSON.stringify({ ...status, heartbeatAt: Date.now(), pendingApproval }), { mode: 0o600 });
+    };
+    const readReply = async (run: string) => JSON.parse(await readFile(join(run, "approval-control.json"), "utf8")) as Record<string, unknown>;
+    try {
+      const first = await createRun("first");
+      await vi.waitFor(async () => {
+        await observer.refresh();
+        expect(await readReply(first)).toMatchObject({ approvalId: "first-acquire", value: "admitted" });
+      });
+      const second = await createRun("second");
+      await observer.refresh();
+      expect(gate.snapshot()).toEqual({ running: 1, queued: 1 });
+      await expect(readReply(second)).rejects.toMatchObject({ code: "ENOENT" });
+
+      await setApproval(first, approval("first", "first-release", "release"));
+      await vi.waitFor(async () => {
+        await observer.refresh();
+        expect(await readReply(first)).toMatchObject({ approvalId: "first-release", value: "released" });
+        expect(await readReply(second)).toMatchObject({ approvalId: "second-acquire", value: "admitted" });
+      });
+      await setApproval(first);
+      await setApproval(second, approval("second", "second-release", "release"));
+      await observer.refresh();
+      expect(gate.snapshot()).toEqual({ running: 0, queued: 0 });
+
+      await gate.acquire({ commandId: "outside", sessionId: "other-session" });
+      await setApproval(second, approval("second", "retire-waiter", "acquire"));
+      await observer.refresh();
+      expect(gate.snapshot()).toEqual({ running: 1, queued: 1 });
+      await observer.stopAndDrain();
+      expect(gate.snapshot()).toEqual({ running: 1, queued: 0 });
+      expect(await readReply(second)).toMatchObject({ approvalId: "second-release", value: "released" });
+    } finally {
+      await observer.stopAndDrain();
+      gate.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("evaluates current delegated policy requests and fails an older policy generation closed", async () => {
     const root = join(await mkdtemp(join(tmpdir(), "joko-subagent-policy-")), "subagent-runs");
     const sessionId = `session-${randomUUID()}`;
     const currentTaskId = "policy-call:current";
     const staleTaskId = "policy-call:stale";
-    const observation = {
-      subjectKind: "browser" as const,
-      risk: "high" as const,
-      toolProviderId: "browser",
-      toolName: "navigate"
-    };
+    const observation = { subjectKind: "command" as const, risk: "medium" as const, toolName: "bash" };
+    const request = (command: string) => encodePolicyDecisionRequest({
+      policyGeneration: 7,
+      observation,
+      toolCall: { toolName: "bash", input: { command } }
+    });
+    const emptyCommand = "printf '%s' ''";
+    const overhead = Buffer.from(request(emptyCommand).slice(POLICY_DECISION_REQUEST_PREFIX.length), "base64url").byteLength;
+    const command = `printf '%s' '${"x".repeat(MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS * 3 / 4 - overhead)}'`;
+    const title = request(command);
+    expect(Buffer.byteLength(title)).toBe(MAXIMUM_POLICY_DECISION_TITLE_BYTES);
     const currentApprovalId = `policy-${randomUUID()}`;
     const staleApprovalId = `policy-${randomUUID()}`;
-    const [current, stale] = await Promise.all([
+    const malformedTaskId = "policy-call:malformed";
+    const malformedApprovalId = `policy-${randomUUID()}`;
+    const [current, stale, malformed] = await Promise.all([
       physicalRun(root, sessionId, currentTaskId, 6, 1, [], undefined, "running", {
         pendingApproval: {
           id: currentApprovalId,
           childId: `${currentTaskId}:child`,
           method: "input",
-          title: encodePolicyDecisionRequest({ policyGeneration: 7, observation }),
+          title,
           placeholder: "",
           requestedAt: Date.now()
         }
@@ -593,6 +667,9 @@ describe("managed Subagent public observation", () => {
           placeholder: "",
           requestedAt: Date.now()
         }
+      }),
+      physicalRun(root, sessionId, malformedTaskId, 6, 1, [], undefined, "running", {
+        pendingApproval: { id: malformedApprovalId, childId: `${malformedTaskId}:child`, method: "input", title: `${title}a` }
       })
     ]);
     const base = context(sessionId, 6, []);
@@ -607,11 +684,10 @@ describe("managed Subagent public observation", () => {
           targetId: base.target.id,
           workspaceRoot: base.target.workspaceRoot,
           rules: [{
-            id: "deny-browser-navigation",
+            id: "deny-shell-command",
             effect: "deny",
-            subjectKind: "browser",
-            toolProviderId: "browser",
-            toolName: "navigate",
+            subjectKind: "command",
+            toolName: "bash",
             ceiling: "critical",
             priority: 1,
             order: 0
@@ -632,7 +708,107 @@ describe("managed Subagent public observation", () => {
     )) as Record<string, unknown>;
     expect(currentControl).toMatchObject({ approvalId: currentApprovalId, value: "deny" });
     expect(staleControl).toMatchObject({ approvalId: staleApprovalId, value: "stale" });
+    expect(JSON.parse(await readFile(join(root, managedSubagentSessionKey(sessionId), malformed.runId, "approval-control.json"), "utf8")))
+      .toMatchObject({ approvalId: malformedApprovalId, cancelled: true });
     observer.stop();
+  });
+
+  it("replays a complete policy reply for a short request from the private delivery journal", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-subagent-policy-replay-"));
+    const root = join(directory, "subagent-runs");
+    const sessionId = `session-${randomUUID()}`;
+    const taskId = "policy-call:owner-reply";
+    const approvalId = `policy-${randomUUID()}`;
+    const ownerText = `主人😀${"\u0001".repeat(15_996)}`;
+    const readOwnerUserInstructions = vi.fn(() => [ownerText]);
+    const events: EventPayload[] = [];
+    const base = context(sessionId, 6, events);
+    const options = {
+      root, policyGeneration: 7,
+      context: { ...base, nativeToolAuthorization: {
+        required: true,
+        capture: () => "current",
+        assertCurrent() {},
+        review: async () => ({ verdict: "default" as const }),
+        readOwnerUserInstructions
+      } }
+    };
+    const observer = new ManagedSubagentObserver(options);
+    const restarted = new ManagedSubagentObserver(options);
+    try {
+      const physical = await physicalRun(root, sessionId, taskId, 6, 1, [], undefined, "running", {
+        pendingApproval: { id: approvalId, childId: `${taskId}:child`, method: "input",
+          title: encodePolicyDecisionRequest({ policyGeneration: 7,
+            observation: { subjectKind: "command", risk: "medium", toolName: "bash" },
+            toolCall: { toolName: "bash", input: { command: "pwd" } }
+          })
+        }
+      });
+      await observer.refresh();
+      observer.stop();
+      const controlPath = join(root, managedSubagentSessionKey(sessionId), physical.runId, "approval-control.json");
+      const first = await readFile(controlPath, "utf8");
+      expect(Buffer.byteLength(first)).toBeGreaterThan(64 * 1024);
+      expect(JSON.parse(first)).toMatchObject({ approvalId, value: JSON.stringify({ decision: "default", ownerUserInstructions: [ownerText] }) });
+      await rm(controlPath);
+      await restarted.refresh();
+      expect(readOwnerUserInstructions).toHaveBeenCalledTimes(1);
+      expect(await readFile(controlPath, "utf8")).toBe(first);
+      expect(JSON.stringify(events)).not.toContain("主人😀");
+    } finally {
+      observer.stop();
+      restarted.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks recursive Pi child reads that cover denied paths while retaining scoped reads", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-subagent-recursive-policy-"));
+    const root = join(directory, "subagent-runs"), sessionId = "recursive-policy-owner";
+    const base = context(sessionId, 6, []);
+    const cases = [
+      { name: "grep", raw: ".", expected: "deny" },
+      { name: "find", raw: "src", path: "src", expected: "deny" },
+      { name: "ls", raw: join("src", "restricted"), path: "src/restricted", expected: "deny" },
+      { name: "grep", raw: "alias", path: "src/restricted", expected: "deny" },
+      { name: "grep", raw: join("src", "restricted", "alias"), path: "public", expected: "deny" },
+      { name: "grep", raw: "public", path: "public", expected: "allow" },
+      { name: "grep", raw: "reports", path: "reports", expected: "default" }
+    ];
+    const observer = new ManagedSubagentObserver({ root, policyGeneration: 7, context: { ...base,
+      policySnapshot: {
+        generation: "5", backendId: base.target.backendId, targetId: base.target.id, workspaceRoot: base.target.workspaceRoot,
+        rules: [
+          { id: "deny-subtree", effect: "deny", subjectKind: "file_read", workspaceRelativePathPrefix: "src/restricted",
+            ceiling: "critical", priority: 1, order: 0 },
+          { id: "allow-public", effect: "allow", subjectKind: "file_read", workspaceRelativePathPrefix: "public",
+            ceiling: "critical", priority: 2, order: 1 },
+          { id: "allow-one-report", effect: "allow", subjectKind: "file_read", workspaceRelativePathPrefix: "reports/summary",
+            ceiling: "critical", priority: 2, order: 2 }
+        ]
+      }
+    }, intervalMs: 60_000 });
+    try {
+      const requests = await Promise.all(cases.map(async (item, index) => {
+        const taskId = `recursive-search-${index}`, approvalId = `policy-${randomUUID()}`;
+        const run = await physicalRun(root, sessionId, taskId, 6, 1, [], undefined, "running", {
+          pendingApproval: { id: approvalId, childId: `${taskId}:child`, method: "input",
+            title: encodePolicyDecisionRequest({ policyGeneration: 7,
+              observation: { subjectKind: "file_read", risk: "read_only", toolName: item.name,
+                ...(item.path === undefined ? {} : { workspaceRelativePath: item.path }) },
+              toolCall: { toolName: item.name, input: { path: item.raw, pattern: "needle" } }
+            }), placeholder: "", requestedAt: Date.now() }
+        });
+        return { approvalId, runId: run.runId, expected: item.expected };
+      }));
+      await observer.refresh();
+      for (const request of requests) {
+        const control = JSON.parse(await readFile(join(root, managedSubagentSessionKey(sessionId), request.runId, "approval-control.json"), "utf8"));
+        expect(control.approvalId).toBe(request.approvalId);
+        if (request.expected === "default") expect(JSON.parse(control.value)).toMatchObject({ decision: "default" });
+        else expect(control.value).toBe(request.expected);
+      }
+    } finally { observer.stop(); await rm(directory, { recursive: true, force: true }); }
   });
 });
 
@@ -643,6 +819,8 @@ class DurableStoreFixture implements PiManagedDurableStore {
   }> = [];
   failuresRemaining = 0;
   scanCalls = 0;
+  readonly scanTaskIds: (string | undefined)[] = [];
+  tailReads = 0;
 
   readonly #sessionId: string;
   readonly #taskId: string;
@@ -691,6 +869,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
   async scan(input: {
     readonly sessionId: string;
     readonly sessionKey: string;
+    readonly taskId?: string;
     readonly afterRevision?: string;
     readonly limitBytes: number;
   }): Promise<{
@@ -700,6 +879,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
     readonly runs: readonly PiManagedDurableRunSnapshot[];
   }> {
     this.scanCalls += 1;
+    this.scanTaskIds.push(input.taskId);
     if (this.failuresRemaining > 0) {
       this.failuresRemaining -= 1;
       throw new Error("simulated remote scan failure");
@@ -707,16 +887,11 @@ class DurableStoreFixture implements PiManagedDurableStore {
     expect(input.sessionId).toBe(this.#sessionId);
     expect(input.sessionKey).toBe(managedSubagentSessionKey(this.#sessionId));
     expect(input.limitBytes).toBeGreaterThanOrEqual(this.#transcript.byteLength);
-    const runDirectory = `/home/fixture/.joko/subagent-runs/${input.sessionKey}/${this.#runId}`;
-    const runnerScript = `${runDirectory}/joko-managed-subagent-runner.cjs`;
-    const transcriptPath = `${runDirectory}/transcript.jsonl`;
     const config = {
       format: 1,
       runId: this.#runId,
       launchToken: this.#launchToken,
       runnerInstanceId: this.#runnerInstanceId,
-      runDir: runDirectory,
-      runnerScript,
       runnerScriptSha256: this.#runnerScriptSha256,
       productSessionId: this.#sessionId,
       productGeneration: 3,
@@ -730,8 +905,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
         route: this.#route ?? { provider: this.#providerId, model: "fixture", effort: "high" }
       }),
       nativeSessionId: randomUUID(),
-      turnCount: 1,
-      transcriptPath
+      turnCount: 1
     };
     const owner = {
       format: 1,
@@ -739,7 +913,6 @@ class DurableStoreFixture implements PiManagedDurableStore {
       launchToken: this.#launchToken,
       productSessionId: this.#sessionId,
       taskId: this.#taskId,
-      runnerScript,
       runnerScriptSha256: this.#runnerScriptSha256,
       state: "running",
       runnerPid: 42,
@@ -758,7 +931,6 @@ class DurableStoreFixture implements PiManagedDurableStore {
       task: "Inspect the remote fixture",
       readOnly: false,
       contextMode: "fork",
-      runnerScript,
       runnerScriptSha256: this.#runnerScriptSha256,
       runnerPid: 42,
       runnerInstanceId: this.#runnerInstanceId,
@@ -769,8 +941,6 @@ class DurableStoreFixture implements PiManagedDurableStore {
       ...(this.#state === "aborted" ? { endedAt: Date.now() } : {}),
       heartbeatAt: 1_002,
       nativeSessionId: config.nativeSessionId,
-      nativeSessionPath: `${runDirectory}/sessions/${config.nativeSessionId}.jsonl`,
-      transcriptPath,
       turnCount: 1,
       pendingApproval: {
         id: this.#approvalId,
@@ -832,6 +1002,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
     readonly eof: boolean;
     readonly content: Uint8Array;
   }> {
+    this.tailReads += 1;
     expect(input).toMatchObject({
       sessionId: this.#sessionId,
       runId: this.#runId,

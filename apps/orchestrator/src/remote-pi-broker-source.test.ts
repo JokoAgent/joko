@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -133,6 +133,7 @@ interface BrokerFixture {
   readonly identity: string;
   readonly recoveryIdentity: string;
   readonly compatibilityHash: string;
+  readonly nodeExecutable?: string;
 }
 
 async function brokerFixture(source = REMOTE_PI_BROKER_SOURCE): Promise<BrokerFixture> {
@@ -421,7 +422,7 @@ function bootstrap(
       : {})
   };
   const shape = {
-    command: process.execPath,
+    command: fixture.nodeExecutable ?? process.execPath,
     args: [fixture.childPath],
     cwd: fixture.root,
     env
@@ -442,7 +443,7 @@ function bootstrap(
     version: REMOTE_PI_BROKER_PROTOCOL_VERSION,
     identity: fixture.identity,
     launchHash: remotePiLaunchHash(shape),
-    executable: process.execPath,
+    executable: shape.command,
     args: shape.args,
     cwd: shape.cwd,
     env,
@@ -494,7 +495,7 @@ function nonManagedBootstrap(
   delete env.JOKO_PI_SUBAGENT_NODE_EXECUTABLE;
   delete env.JOKO_PI_NATIVE_AUTH_RESERVATION_TOKEN;
   const shape = {
-    command: process.execPath,
+    command: String(value["executable"]),
     args: [fixture.childPath],
     cwd: fixture.root,
     env
@@ -531,7 +532,7 @@ async function startBridge(
   readonly state: AuthorityState;
 }> {
   const startedAt = performance.now();
-  const child = spawn(process.execPath, [
+  const child = spawn(fixture.nodeExecutable ?? process.execPath, [
     fixture.sourcePath,
     "bridge",
     fixture.managedRoot,
@@ -1066,6 +1067,7 @@ async function managedStoreRequest(
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk: string) => { output += chunk; });
   child.stderr.resume();
+  const closed = once(child, "close");
   child.stdin.end(`${JSON.stringify({
     action: "managed-store",
     version: REMOTE_PI_BROKER_PROTOCOL_VERSION,
@@ -1074,7 +1076,7 @@ async function managedStoreRequest(
     authority,
     ...operation
   })}\n`);
-  expect(await processExit(child)).toBe(0);
+  expect((await closed)[0]).toBe(0);
   return JSON.parse(output) as Record<string, unknown>;
 }
 
@@ -1289,6 +1291,44 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
     },
     15_000
   );
+
+  it.runIf(process.platform === "linux")("waits for the exact Linux process when its first post-signal identity read is inconclusive", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-broker-exit-transition-"));
+    const harnessPath = join(directory, "exit-transition.mjs");
+    const harness = REMOTE_PI_BROKER_SOURCE.replace("main().catch(() => process.exit(1));", String.raw`
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+const exited = new Promise((resolveExit, rejectExit) => {
+  child.once("exit", (_code, signal) => resolveExit(signal));
+  child.once("error", rejectExit);
+});
+try {
+  const fingerprint = await waitForFingerprint(child.pid);
+  const observe = recordedProcessFingerprint;
+  let observations = 0;
+  recordedProcessFingerprint = async (expected) => {
+    if (++observations === 2) throw new ProcessIdentityUnconfirmed("fixture exit transition");
+    return observe(expected);
+  };
+  const stopped = await stopExactProcess(fingerprint);
+  const signal = await exited;
+  process.stdout.write(JSON.stringify({ stopped, observations, signal }));
+} finally {
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+}
+`);
+    try {
+      expect(harness).not.toBe(REMOTE_PI_BROKER_SOURCE);
+      await writeFile(harnessPath, harness, { mode: 0o600 });
+      const result = spawnSync(process.execPath, [harnessPath], { encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      const output = JSON.parse(result.stdout);
+      expect(output).toMatchObject({ stopped: true, signal: "SIGTERM" });
+      expect(output.observations).toBeGreaterThanOrEqual(3);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it.runIf(process.platform === "linux" || process.platform === "win32")(
     "keeps the exact child and replay alive across manager crash, then rotates relay authority",
@@ -1551,6 +1591,86 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
   );
 
   it.runIf(process.platform === "linux")(
+    "keeps the attested owner and child attached after their Linux Node image is replaced",
+    async () => {
+      const base = await brokerFixture();
+      const nodeExecutable = join(base.root, "node");
+      const replacement = join(base.root, "node-replacement");
+      const moved = join(base.root, "node-held");
+      const fixture = { ...base, nodeExecutable };
+      const target = await upstream();
+      let original: Awaited<ReturnType<typeof brokerMetadata>> | undefined;
+      let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
+      let reattached: Awaited<ReturnType<typeof startBridge>> | undefined;
+      let retired = false;
+      try {
+        await copyFile(process.execPath, nodeExecutable);
+        await copyFile(process.execPath, replacement);
+        await chmod(nodeExecutable, 0o700);
+        await chmod(replacement, 0o700);
+        const value = nonManagedBootstrap(fixture, 1, "replaced-node-bearer-00000000000000", target.port);
+        bridge = await startBridge(fixture, value);
+        original = await brokerMetadata(fixture);
+        bridge.process.kill("SIGKILL");
+        await processExit(bridge.process);
+        const recovery = { ...value, authority: { ...value.authority, recovery: bridge.authority } };
+        const reapedPath = join(fixture.managedRoot, "sessions", fixture.identity, "reaped.json");
+
+        await rename(nodeExecutable, moved);
+        await rename(replacement, nodeExecutable);
+        expect(await readlink(`/proc/${original.child.pid}/exe`)).toBe(moved);
+        await expect(startBridge(fixture, recovery)).rejects.toThrow();
+        expect(await brokerMetadata(fixture)).toMatchObject({ owner: original.owner, child: original.child });
+        await expect(lstat(reapedPath)).rejects.toMatchObject({ code: "ENOENT" });
+        await rename(nodeExecutable, replacement);
+        await rename(moved, nodeExecutable);
+
+        await rename(replacement, nodeExecutable);
+        const deletedImage = `${nodeExecutable} (deleted)`;
+        expect(await readlink(`/proc/${original.owner.pid}/exe`)).toBe(deletedImage);
+        expect(await readlink(`/proc/${original.child.pid}/exe`)).toBe(deletedImage);
+
+        reattached = await startBridge(fixture, recovery);
+        expect(reattached.authority).toEqual(bridge.authority);
+        expect(await brokerMetadata(fixture)).toMatchObject({ owner: original.owner, child: original.child, janitor: original.janitor });
+        await expect(lstat(reapedPath)).rejects.toMatchObject({ code: "ENOENT" });
+        reattached.process.stdin.write(sequencedFrame(FRAME_STDIN, 1, Buffer.from("suffix\n")));
+        const output = sequenced(await nextFrameOfType(reattached.reader, FRAME_STDOUT));
+        expect(output.content.toString()).toContain('"fresh"');
+        reattached.process.stdin.write(sequencedFrame(FRAME_OUTPUT_ACK, output.sequence));
+
+        // A regular file at the displayed pathname still does not own the running image.
+        await writeFile(deletedImage, "decoy", { mode: 0o600 });
+        await authorityKill(fixture, reattached.authority);
+        const childPid = original.child.pid;
+        await waitUntil(async () => {
+          try { await lstat(`/proc/${childPid}`); return false; } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+            throw error;
+          }
+        });
+        retired = true;
+      } finally {
+        const authority = reattached?.authority ?? bridge?.authority;
+        if (!retired && authority !== undefined) await authorityKill(fixture, authority).catch(() => undefined);
+        bridge?.process.kill("SIGKILL");
+        reattached?.process.kill("SIGKILL");
+        if (original !== undefined) {
+          const argv = await readFile(`/proc/${original.child.pid}/cmdline`, "utf8").catch(() => "");
+          if (argv.split("\0").includes(fixture.childPath)) {
+            try { process.kill(original.child.pid, "SIGKILL"); } catch { /* already stopped */ }
+          }
+          await exactKill(original.owner.pid, "owner", fixture.sourcePath).catch(() => undefined);
+        }
+        await closeServer(target.server);
+        try { await exactKill(await managerPid(fixture), "daemon", fixture.sourcePath); } catch { /* already stopped */ }
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    },
+    40_000
+  );
+
+  it.runIf(process.platform === "linux")(
     "uses the independent janitor to stop the exact child after owner SIGKILL",
     async () => {
       const fixture = await brokerFixture();
@@ -1719,6 +1839,12 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
         expect(runs[0]?.["runId"]).toBe(runner.runId);
         expect(runs[0]?.["resumeSafe"]).toBe(true);
         expect(runs[0]?.["controlSafe"]).toBe(true);
+        expect(runs[0]?.["runnerScriptSha256"]).toBe(fixture.trustedRunnerScriptSha256);
+        for (const manifest of ["config", "status", "owner"]) {
+          expect(runs[0]?.[manifest]).toMatchObject({ runnerScriptSha256: fixture.trustedRunnerScriptSha256 });
+          expect(runs[0]?.[manifest]).not.toHaveProperty("runnerScript");
+          expect(runs[0]?.[manifest]).not.toHaveProperty("transcriptPath");
+        }
         expect(JSON.stringify(scanned)).not.toContain(currentBearer);
         expect(JSON.stringify(scanned)).not.toContain("joko-broker-stable-bearer");
 
@@ -1827,7 +1953,7 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
           seq: number;
         };
         expect(secondControl.seq).toBeGreaterThan(firstControl.seq);
-        const approved = await managedStoreRequest(fixture, bridge.authority, {
+        const approvalRequest = {
           operation: "write-control",
           sessionId: fixture.productSessionId,
           runId: runner.runId,
@@ -1847,17 +1973,51 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
             childId: "remote-child-id",
             action: "approval",
             approvalId: "approval-test",
-            confirmed: true,
             requestedAt: Date.now()
           }
+        };
+        const approved = await managedStoreRequest(fixture, bridge.authority, {
+          ...approvalRequest,
+          value: { ...approvalRequest.value, confirmed: true }
         });
         expect(approved["controlRevision"]).not.toBe(controlledAgain["controlRevision"]);
-        expect(JSON.parse(await readFile(join(runner.runDirectory, "approval-control.json"), "utf8")))
-          .toMatchObject({ action: "approval", approvalId: "approval-test" });
+        const approvalPath = join(runner.runDirectory, "approval-control.json");
+        expect(JSON.parse(await readFile(approvalPath, "utf8"))).toMatchObject({ action: "approval", approvalId: "approval-test" });
+        const value = JSON.stringify({ decision: "default", ownerUserInstructions: [`主人😀${"\u0001".repeat(15_996)}`] });
+        await managedStoreRejected(fixture, bridge.authority, {
+          ...approvalRequest, expectedControlRevision: approved["controlRevision"], value: { ...approvalRequest.value, value }
+        });
         const staleStatusPath = join(runner.runDirectory, "status.json");
         const freshStatus = JSON.parse(await readFile(staleStatusPath, "utf8")) as Record<string, unknown>;
+        const approvalId = "policy-approval-test";
+        const title = `joko:policy-decision/v1/${Buffer.from(JSON.stringify({
+          format: 1, policyGeneration: 1, subjectKind: "command", risk: "medium", toolName: "bash"
+        })).toString("base64url")}`;
+        const policyStatus = {
+          ...freshStatus, heartbeatAt: Date.now(), pendingApproval: { id: approvalId, childId: "remote-child-id", method: "input", title }
+        };
+        await writeFile(staleStatusPath, JSON.stringify(policyStatus), { mode: 0o600 });
+        const pendingPolicy = await managedStoreRequest(fixture, bridge.authority, {
+          operation: "scan", sessionId: fixture.productSessionId, sessionKey, limitBytes: 1024 * 1024
+        });
+        const pendingRuns = pendingPolicy["runs"] as Array<Record<string, unknown>>;
+        const policyRequest = {
+          ...approvalRequest, expectedControlRevision: pendingRuns[0]?.["controlRevision"],
+          value: { ...approvalRequest.value, requestId: randomUUID(), approvalId, value }
+        };
+        const policyApproved = await managedStoreRequest(fixture, bridge.authority, policyRequest);
+        const firstPolicyContent = await readFile(approvalPath, "utf8");
+        expect(Buffer.byteLength(firstPolicyContent)).toBeGreaterThan(64 * 1024);
+        const firstPolicyControl = JSON.parse(firstPolicyContent) as { seq: number };
+        expect(firstPolicyControl).toMatchObject(policyRequest.value);
+        const retried = await managedStoreRequest(fixture, bridge.authority, {
+          ...policyRequest, expectedControlRevision: policyApproved["controlRevision"]
+        });
+        const replayed = JSON.parse(await readFile(approvalPath, "utf8")) as { seq: number };
+        expect(replayed).toMatchObject(policyRequest.value);
+        expect(replayed.seq).toBeGreaterThan(firstPolicyControl.seq);
         await writeFile(staleStatusPath, `${JSON.stringify({
-          ...freshStatus,
+          ...policyStatus,
           heartbeatAt: Date.now() - 60_000
         })}\n`, { mode: 0o600 });
         await managedStoreRejected(fixture, bridge.authority, {
@@ -1867,7 +2027,7 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
           runnerInstanceId: runner.runnerFence,
           launchToken: runner.launchToken,
           runnerScriptSha256: fixture.trustedRunnerScriptSha256,
-          expectedControlRevision: approved["controlRevision"],
+          expectedControlRevision: retried["controlRevision"],
           kind: "control",
           value: {
             format: 1,
@@ -1882,7 +2042,7 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
           }
         });
         await writeFile(staleStatusPath, `${JSON.stringify({
-          ...freshStatus,
+          ...policyStatus,
           heartbeatAt: Date.now()
         })}\n`, { mode: 0o600 });
 
@@ -1933,6 +2093,118 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
       }
     },
     30_000
+  );
+
+  it.runIf(process.platform === "linux")(
+    "pages a large managed history at one revision and still controls one live task",
+    async () => {
+      const fixture = await brokerFixture();
+      const target = await upstream();
+      const sessionKey = digest(fixture.productSessionId).slice(0, 40);
+      const sessionRoot = join(fixture.runRoot, sessionKey);
+      const scope = { sessionId: fixture.productSessionId, sessionKey };
+      let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
+      let runner: Awaited<ReturnType<typeof remoteRunnerFixture>> | undefined;
+      try {
+        bridge = await startBridge(fixture, bootstrap(fixture, 1, "store-paged-bearer-00000000000000000", target.port));
+        runner = await remoteRunnerFixture(fixture, 1, false);
+        const runnerStatusPath = join(runner.runDirectory, "status.json");
+        const runnerStatus = JSON.parse(await readFile(runnerStatusPath, "utf8")) as Record<string, unknown>;
+        await writeFile(runnerStatusPath, JSON.stringify({ ...runnerStatus, heartbeatAt: Date.now() - 60_000 }));
+        const history: string[] = [];
+        for (let index = 1; index <= 110; index += 1) {
+          const runId = `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+          const runDir = join(sessionRoot, runId);
+          const runnerScript = join(runDir, "joko-managed-subagent-runner.cjs");
+          const taskId = `history:${index}`;
+          const task = index % 2 === 0 ? "x".repeat(5_000) : "审计".repeat(834);
+          const common = {
+            format: 1, runId, launchToken: randomUUID(), runnerInstanceId: randomUUID(),
+            runnerScript, runnerScriptSha256: fixture.trustedRunnerScriptSha256,
+            productSessionId: fixture.productSessionId, taskId, childId: `${taskId}:child`
+          };
+          const status = { ...common, task, state: "completed", runnerPid: 0, summary: "original" };
+          await mkdir(runDir, { mode: 0o700 });
+          await Promise.all([
+            writeFile(runnerScript, RUNNER_SOURCE, { mode: 0o600 }),
+            writeFile(join(runDir, "config.json"), JSON.stringify({ ...common, runDir, productGeneration: 1, task }), { mode: 0o600 }),
+            writeFile(join(runDir, "owner.json"), JSON.stringify({ ...common, state: "reserved" }), { mode: 0o600 }),
+            writeFile(join(runDir, "status.json"), JSON.stringify(status), { mode: 0o600 })
+          ]);
+          history.push(runId);
+        }
+        const authority = bridge.authority;
+        const scan = { operation: "scan", ...scope, limitBytes: 1024 * 1024 };
+        const collect = async (first: Record<string, unknown>): Promise<Record<string, unknown>[]> => {
+          const runs: Record<string, unknown>[] = [];
+          let page = first;
+          for (let index = 0; index <= history.length; index += 1) {
+            expect(page["revision"]).toBe(first["revision"]);
+            expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(scan.limitBytes);
+            runs.push(...page["runs"] as Record<string, unknown>[]);
+            if (page["nextPage"] === undefined) return runs;
+            page = await managedStoreRequest(fixture, authority, { ...scan, page: page["nextPage"] });
+          }
+          throw new Error("The managed history scan did not reach its last page.");
+        };
+        const last = history.at(-1)!;
+        const transcriptPath = join(sessionRoot, last, "transcript.jsonl");
+        await writeFile(transcriptPath, '{"type":"history","version":"A"}\n', { mode: 0o600 });
+        const first = await managedStoreRequest(fixture, authority, scan);
+        expect(first["nextPage"]).toMatchObject({ index: 1 });
+        expect((first["runs"] as Record<string, unknown>[]).some((run) => run["runId"] === last)).toBe(false);
+        const changedTranscript = '{"type":"history","version":"B"}\n';
+        await writeFile(transcriptPath, changedTranscript);
+        await managedStoreRejected(fixture, authority, {
+          ...scan, taskId: "remote-runner-task", page: first["nextPage"]
+        });
+        const frozen = await collect(first);
+        expect(frozen.map((run) => run["runId"])).toEqual([...history, runner.runId].sort());
+        expect(first["revision"]).toBe(digest(JSON.stringify([
+          fixture.productSessionId, ...frozen.map((run) => [run["runId"], run["revision"]])
+        ])));
+        const old = frozen.find((run) => run["runId"] === last)!;
+        const changed = await managedStoreRequest(fixture, authority, { ...scan, afterRevision: first["revision"] });
+        expect(changed["revision"]).not.toBe(first["revision"]);
+        const replacement = (await collect(changed)).find((run) => run["runId"] === last)!;
+        expect(replacement["transcriptBytes"]).toBe(old["transcriptBytes"]);
+        expect(replacement["transcriptRevision"]).not.toBe(old["transcriptRevision"]);
+        const tail = await managedStoreRequest(fixture, authority, {
+          operation: "read-tail", sessionId: scope.sessionId, runId: last, runnerInstanceId: replacement["runnerInstanceId"],
+          artifactRevision: replacement["transcriptRevision"], pathKind: "transcript", offset: 0, maxBytes: 1_024
+        });
+        expect(Buffer.from(String(tail["content"]), "base64").toString("utf8")).toBe(changedTranscript);
+        expect(await managedStoreRequest(fixture, authority, { ...scan, afterRevision: changed["revision"] }))
+          .toMatchObject({ revision: changed["revision"], unchanged: true, runs: [] });
+
+        await writeFile(runnerStatusPath, JSON.stringify({ ...runnerStatus, heartbeatAt: Date.now() }));
+        const targetScan = await managedStoreRequest(fixture, authority, { ...scan, taskId: "remote-runner-task", limitBytes: 8192 });
+        const runs = targetScan["runs"] as Record<string, unknown>[];
+        expect(runs).toEqual([expect.objectContaining({ runId: runner.runId, controlSafe: true })]);
+        const control = {
+          format: 1, requestId: randomUUID(), runId: runner.runId, launchToken: runner.launchToken,
+          productSessionId: fixture.productSessionId, productGeneration: 1,
+          taskId: "remote-runner-task", action: "stop", requestedAt: Date.now()
+        };
+        expect(await managedStoreRequest(fixture, authority, {
+          operation: "write-control", sessionId: scope.sessionId, runId: runner.runId, runnerInstanceId: runner.runnerFence,
+          launchToken: runner.launchToken, runnerScriptSha256: fixture.trustedRunnerScriptSha256,
+          expectedControlRevision: runs[0]?.["controlRevision"], kind: "control", value: control
+        })).toMatchObject({ receipt: expect.stringMatching(/^[0-9a-f]{64}$/u) });
+        expect(JSON.parse(await readFile(join(runner.runDirectory, "control.json"), "utf8"))).toMatchObject(control);
+      } finally {
+        if (bridge !== undefined) {
+          await managedStoreRequest(fixture, bridge.authority, { operation: "stop-remove-session", ...scope, timeoutMs: 100 })
+            .catch(() => undefined);
+          bridge.process.kill("SIGKILL");
+        }
+        runner?.process.kill("SIGKILL");
+        await closeServer(target.server);
+        try { await exactKill(await managerPid(fixture), "daemon", fixture.sourcePath); } catch { /* already stopped */ }
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    },
+    60_000
   );
 
   it.runIf(process.platform === "linux")(

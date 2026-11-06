@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { type BigIntStats } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, rmdir, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -82,7 +83,7 @@ import {
 } from "@joko/runtime-governance";
 import { provisionManagedBridge } from "./bridge.js";
 import { assertPiHostedModel, provisionPiHostedExecution, restrictPiHostedGuestHome } from "./hosted-execution.js";
-import { handleCommandGateExtensionRequest } from "./command-gate-bridge.js";
+import { handleCommandGateExtensionRequest, readCommandGateExtensionRequest } from "./command-gate-bridge.js";
 import { capturePartnerLearningExtensionRequest, consumePartnerLearningNativeReply } from "./partner-learning-bridge.js";
 import { PiNativeRootTools } from "./native-root-tools.js";
 import {
@@ -193,8 +194,14 @@ import {
 const execFileAsync = promisify(execFile);
 type PiCompatibilityOutcome =
   | { readonly status: "compatible"; readonly report: PiCompatibilityReport }
-  | { readonly status: "incompatible"; readonly diagnostic: string; readonly cause: unknown };
-const DEFAULT_EXECUTABLE_COMPATIBILITY_CACHE = new Map<string, Promise<PiCompatibilityOutcome>>();
+  | { readonly status: "incompatible" | "unavailable"; readonly diagnostic: string; readonly cause: PiAdapterError };
+const DEFAULT_EXECUTABLE_COMPATIBILITY_CACHE = new Map<string, Promise<PiCompatibilityReport>>();
+const PI_INCOMPATIBLE_PROBE_RESULTS = new Set([
+  "PI_COMPATIBILITY_STATE_INVALID",
+  "PI_COMPATIBILITY_COMMANDS_INVALID",
+  "PI_COMPATIBILITY_BRIDGE_INCOMPLETE",
+  "PI_COMPATIBILITY_LIFECYCLE_INVALID"
+]);
 const INLINE_USER_SHELL_OUTPUT_LIMIT = 256 * 1024;
 const MAXIMUM_PI_TREE_PREVIEW_CHARACTERS = 200;
 const PI_STANDARD_RPC_TIMEOUT_MS = 30_000;
@@ -880,8 +887,8 @@ export class PiBackendAdapter implements
     ) || (this.#options.nativeAuthenticatedProviderIds?.length ?? 0) > 0;
     const diagnostics: string[] = [];
     if (probe.error) diagnostics.push(probe.error);
-    if (compatibility.status === "incompatible") diagnostics.push(compatibility.diagnostic);
-    else diagnostics.push(...compatibility.report.diagnostics);
+    if (compatibility.status === "compatible") diagnostics.push(...compatibility.report.diagnostics);
+    else diagnostics.push(compatibility.diagnostic);
     if ((this.#options.providers ?? []).length === 0) diagnostics.push("No managed provider catalog is configured.");
     if (!this.#options.readBlob) diagnostics.push("Image BlobRef resolution is unavailable until readBlob is configured.");
     return {
@@ -890,7 +897,7 @@ export class PiBackendAdapter implements
       instanceGeneration: 0,
       displayName: "Pi",
       version: probe.version ?? "unknown",
-      health: compatibility.status === "incompatible"
+      health: compatibility.status !== "compatible"
         ? "unavailable"
         : probe.error !== undefined || compatibility.report.unsupportedCommands.length > 0
           ? "degraded"
@@ -1000,6 +1007,7 @@ export class PiBackendAdapter implements
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
     if (input.fastMode === "ultrafast") throw piError("PI_ULTRAFAST_UNSUPPORTED", "Ultrafast requires the Codex runtime", "provision");
     await this.validateTarget(input.target);
+    input.assertNativeCreationCurrent?.();
     const runtimePolicy = input.runtimePolicy ?? "standard";
     if (runtimePolicy !== (context.runtimePolicy ?? "standard")) {
       throw piError("PI_RUNTIME_POLICY_MISMATCH", "Create input and host context runtime policies differ", "provision");
@@ -1051,7 +1059,7 @@ export class PiBackendAdapter implements
       : undefined;
     // A parented new_session starts by resuming the parent JSONL, avoiding the
     // otherwise unavoidable throwaway fresh JSONL before the RPC transition.
-    let runtime = await this.#startRuntime(attachedBinding ?? parentBinding, profile, context);
+    let runtime = await this.#startRuntime(attachedBinding ?? parentBinding, profile, context, input.assertNativeCreationCurrent);
     if (
       start.kind === "new"
       && start.parentNativeReference === undefined
@@ -2564,7 +2572,9 @@ export class PiBackendAdapter implements
 
   async exportSession(context: AdapterContext): Promise<BlobRef> {
     this.#assertReviewOperationAllowed(context, "export native history");
-    const response = await this.#runtime(context).transport.request({ type: "export_html" }, { signal: context.signal });
+    const runtime = this.#runtime(context);
+    if (context.target.remoteWorkspace === undefined) return this.#exportLocalSession(runtime, context);
+    const response = await runtime.transport.request({ type: "export_html" }, { signal: context.signal });
     const data = responseData(response);
     if (!isRecord(data) || typeof data.path !== "string") throw piError("PI_EXPORT_INVALID_RESPONSE", "Pi export_html returned no path", "dispatch");
     const exportPath = isAbsolute(data.path) ? resolve(data.path) : resolve(context.target.workspaceRoot, data.path);
@@ -2586,6 +2596,69 @@ export class PiBackendAdapter implements
         retryable: true,
         recovery: "Retry artifact ingestion while the Pi export path is still available."
       });
+    }
+  }
+
+  async #exportLocalSession(runtime: PiRuntime, context: AdapterContext): Promise<BlobRef> {
+    const parent = runtime.artifactDirectory;
+    const unsafe = () => piError("PI_EXPORT_FILE_UNSAFE", "The private Pi export destination changed", "dispatch", {
+      recovery: "Retry the export after resuming the task."
+    });
+    const parentIdentity = await lstat(parent, { bigint: true });
+    if (!parentIdentity.isDirectory() || !samePath(await realpath(parent), parent)) throw unsafe();
+    context.signal.throwIfAborted();
+    const directory = await mkdtemp(join(parent, "html-export-"));
+    const path = join(directory, "session.html");
+    let directoryIdentity: BigIntStats | undefined;
+    let file: FileHandle | undefined;
+    let fileIdentity: BigIntStats | undefined;
+    const directoryCurrent = async (): Promise<boolean> => {
+      if (directoryIdentity === undefined || !samePath(await realpath(directory), directory)) return false;
+      const [currentParent, currentDirectory] = await Promise.all([
+        lstat(parent, { bigint: true }), lstat(directory, { bigint: true })
+      ]);
+      return currentParent.isDirectory() && samePiExportObject(parentIdentity, currentParent)
+        && currentDirectory.isDirectory() && samePiExportObject(directoryIdentity, currentDirectory);
+    };
+    const assertCurrent = async (expected: BigIntStats): Promise<void> => {
+      const current = await lstat(path, { bigint: true }).catch(() => undefined);
+      if (!await directoryCurrent().catch(() => false) || !current?.isFile() || current.nlink !== 1n
+        || !samePiExportObject(expected, current) || current.size !== expected.size
+        || current.mtimeNs !== expected.mtimeNs || current.ctimeNs !== expected.ctimeNs) throw unsafe();
+      context.signal.throwIfAborted();
+    };
+    try {
+      directoryIdentity = await lstat(directory, { bigint: true });
+      if (!await directoryCurrent().catch(() => false)) throw unsafe();
+      file = await open(path, "wx+", 0o600);
+      fileIdentity = await file.stat({ bigint: true });
+      await assertCurrent(fileIdentity);
+      const response = await runtime.transport.request({ type: "export_html", outputPath: path }, { signal: context.signal });
+      const data = responseData(response);
+      if (!isRecord(data) || data.path !== path) {
+        throw piError("PI_EXPORT_INVALID_RESPONSE", "Pi did not acknowledge the requested export destination", "dispatch");
+      }
+      const exported = await file.stat({ bigint: true });
+      await assertCurrent(exported);
+      if (exported.size <= 0n || exported.size > BigInt(requireArtifactCapacity(context))) {
+        throw piError("PI_EXPORT_FILE_SIZE_INVALID", "Pi export is empty or exceeds the Artifact size limit", "dispatch");
+      }
+      try {
+        return await context.storeArtifact(path, {
+          fileName: `pi-${context.sessionId}.html`, mimeType: "text/html",
+          openFile: { handle: file, expectedSize: Number(exported.size), assertCurrent: () => assertCurrent(exported) }
+        });
+      } catch (error) {
+        throw asPiError(error, { code: "PI_EXPORT_STORE_FAILED", phase: "dispatch", retryable: true,
+          recovery: "Retry the Session export." });
+      }
+    } finally {
+      if (await directoryCurrent().catch(() => false)) {
+        const current = await lstat(path, { bigint: true }).catch(() => undefined);
+        if (fileIdentity && current?.isFile() && samePiExportObject(fileIdentity, current)) await unlink(path).catch(() => undefined);
+      }
+      await file?.close().catch(() => undefined);
+      if (await directoryCurrent().catch(() => false)) await rmdir(directory).catch(() => undefined);
     }
   }
 
@@ -4672,17 +4745,15 @@ export class PiBackendAdapter implements
   }
 
   async #probeCompatibility(): Promise<PiCompatibilityOutcome> {
-    this.#compatibilityProbe ??= (async () => {
+    const probe = this.#compatibilityProbe ??= (async (): Promise<PiCompatibilityOutcome> => {
       const environment = this.#baseEnvironment();
       const proxySecrets = credentialedProxySecrets(environment);
       try {
         const identity = await canonicalPiExecutableIdentity(this.#command, this.#commandArgs, environment);
         const cache = this.#usesDefaultProcessFactory || this.#usesBundledCommand
           ? DEFAULT_EXECUTABLE_COMPATIBILITY_CACHE
-          : new Map<string, Promise<PiCompatibilityOutcome>>();
-        const cached = cache.get(identity);
-        if (cached !== undefined) return cached;
-        const pending = probePiExecutable({
+          : undefined;
+        const pending = cache?.get(identity) ?? probePiExecutable({
           command: this.#command,
           commandArgs: this.#commandArgs,
           // An injected factory is an in-memory runtime seam, not executable
@@ -4693,40 +4764,45 @@ export class PiBackendAdapter implements
           shutdownTimeoutMs: this.#options.shutdownTimeoutMs,
           maxRecordBytes: this.#options.maxRecordBytes,
           redactValues: proxySecrets.values
-        }).then((report): PiCompatibilityOutcome => ({ status: "compatible", report }))
-          .catch((error): PiCompatibilityOutcome => {
-            const failure = asPiError(error, {
-              code: "PI_EXECUTABLE_INCOMPATIBLE",
-              phase: "probe",
-              recovery: "Install a compatible executable before probing again."
-            }, proxySecrets.values);
-            return {
-              status: "incompatible",
-              diagnostic: `PI_EXECUTABLE_INCOMPATIBLE: ${failure.publicError.message}`,
-              cause: failure
-            };
-          });
-        cache.set(identity, pending);
-        return pending;
+        });
+        cache?.set(identity, pending);
+        try {
+          return { status: "compatible", report: await pending };
+        } catch (error) {
+          if (cache !== undefined && cache.get(identity) === pending) cache.delete(identity);
+          throw error;
+        }
       } catch (error) {
         const failure = asPiError(error, {
-          code: "PI_EXECUTABLE_INCOMPATIBLE",
+          code: "PI_EXECUTABLE_PROBE_UNAVAILABLE",
           phase: "probe",
-          recovery: "Install a compatible executable before probing again."
+          retryable: true,
+          recovery: "Restore the service environment and retry the Pi compatibility probe."
         }, proxySecrets.values);
+        const incompatible = PI_INCOMPATIBLE_PROBE_RESULTS.has(failure.publicError.code);
+        const code = incompatible ? "PI_EXECUTABLE_INCOMPATIBLE" : "PI_EXECUTABLE_PROBE_UNAVAILABLE";
         return {
-          status: "incompatible",
-          diagnostic: `PI_EXECUTABLE_INCOMPATIBLE: ${failure.publicError.message}`,
+          status: incompatible ? "incompatible" : "unavailable",
+          diagnostic: `${code}: ${failure.publicError.message}`,
           cause: failure
         };
       }
     })();
-    return this.#compatibilityProbe;
+    const outcome = await probe;
+    if (outcome.status === "unavailable" && this.#compatibilityProbe === probe) this.#compatibilityProbe = undefined;
+    return outcome;
   }
 
   async #requireCompatibility(): Promise<PiCompatibilityReport> {
     const outcome = await this.#probeCompatibility();
     if (outcome.status === "compatible") return outcome.report;
+    if (outcome.status === "unavailable") {
+      throw piError("PI_EXECUTABLE_PROBE_UNAVAILABLE", "The Pi compatibility probe could not be completed", "probe", {
+        retryable: true,
+        recovery: "Restore the service environment and retry; no replacement product Session was created.",
+        cause: outcome.cause
+      });
+    }
     throw piError("PI_EXECUTABLE_INCOMPATIBLE", "The configured Pi executable failed its typed RPC compatibility probe", "probe", {
       retryable: false,
       stateMayHaveChanged: false,
@@ -4747,7 +4823,8 @@ export class PiBackendAdapter implements
     return this.#startRuntime(binding, profile, context);
   }
 
-  async #startRuntime(binding: NativeSessionBinding | undefined, profile: SessionSpawnProfile, context: AdapterContext): Promise<PiRuntime> {
+  async #startRuntime(binding: NativeSessionBinding | undefined, profile: SessionSpawnProfile, context: AdapterContext,
+    assertStartupCurrent?: () => void): Promise<PiRuntime> {
     const pending = this.#runtimeStarts.get(context.sessionId);
     if (pending) {
       const runtime = await pending;
@@ -4762,7 +4839,7 @@ export class PiBackendAdapter implements
     this.#assertNotDisposed();
     await this.#requireCompatibility();
     const managedGeneration = this.#managedGeneration;
-    const start = this.#spawnRuntime(binding, profile, context, managedGeneration)
+    const start = this.#spawnRuntime(binding, profile, context, managedGeneration, assertStartupCurrent)
       .finally(() => this.#runtimeStarts.delete(context.sessionId));
     this.#runtimeStarts.set(context.sessionId, start);
     return start;
@@ -4772,7 +4849,8 @@ export class PiBackendAdapter implements
     binding: NativeSessionBinding | undefined,
     profile: SessionSpawnProfile,
     context: AdapterContext,
-    managedGeneration: PiManagedGeneration
+    managedGeneration: PiManagedGeneration,
+    assertStartupCurrent?: () => void
   ): Promise<PiRuntime> {
     this.#retainManagedGeneration(managedGeneration);
     const options = managedGeneration.options;
@@ -5116,6 +5194,7 @@ export class PiBackendAdapter implements
         agentHome: preparedAgentHome.path, environment: env });
       if (remoteHome?.discardNativeAuth) preparedAgentHome = { path: preparedAgentHome.path, redactValues: [] };
       if (hosted) assertHostedExecution(hosted);
+      assertStartupCurrent?.();
       const process = await this.#processFactory({
         command: this.#command,
         args,
@@ -5123,7 +5202,8 @@ export class PiBackendAdapter implements
         env: remoteHome?.environment ?? env,
         ...(context.target.remoteWorkspace === undefined
           ? {}
-          : { remoteWorkspace: context.target.remoteWorkspace })
+          : { remoteWorkspace: context.target.remoteWorkspace }),
+        ...(assertStartupCurrent === undefined ? {} : { assertStartupCurrent })
       });
       if (context.target.remoteWorkspace === undefined && process.pid !== undefined) {
         const result = await (options.applyProcessPriority ?? applyNewProcessPriority)(
@@ -5408,6 +5488,21 @@ export class PiBackendAdapter implements
 
   #wireRuntime(runtime: PiRuntime): void {
     const isCurrent = () => this.#runtimes.get(runtime.key) === runtime && runtime.transport.generation === runtime.context.generation;
+    const reportEventFailure = async (context: AdapterContext, error: unknown): Promise<void> => {
+      if (!isCurrent()) return;
+      await context.emit({
+        type: "error",
+        error: {
+          code: "PI_EVENT_TRANSLATION_FAILED",
+          message: redactedDiagnostic(error),
+          phase: "stream",
+          retryable: true,
+          stateMayHaveChanged: false,
+          recovery: "Reload the session projection from its last durable event cursor."
+        },
+        terminal: false
+      }, piMetadata("adapter_translation_error"));
+    };
     runtime.transport.onEvent((event) => {
       const rawEvent = event as unknown as Record<string, unknown>;
       if (event.type === "compaction_end" && runtime.compactionMemoryEnabled) {
@@ -5445,6 +5540,19 @@ export class PiBackendAdapter implements
         runningExtensionCommand !== undefined && isExtensionUiRequest(event) ? runningExtensionCommand.context
           : lifecycle === undefined ? runtime.context : routeLifecycleEvent(lifecycle, event)
       );
+      if (isExtensionUiRequest(event) && readCommandGateExtensionRequest(rawEvent) !== undefined) {
+        // A command finishing on this same transport can release the slot an
+        // earlier request is waiting for. Keep both off the ordered event chain.
+        void handleCommandGateExtensionRequest(rawEvent, {
+          gate: runtime.generationLease.generation.options.commandConcurrencyGate,
+          sessionId: runtime.key,
+          generation: runtime.transport.generation,
+          signal: capturedEventContext.signal,
+          transport: runtime.transport,
+          isCurrent
+        }).catch((error: unknown) => reportEventFailure(capturedEventContext, error)).catch(() => undefined);
+        return;
+      }
       const capturedUserOccurrence = event.type === "message_end" && isRecord(rawEvent.message) && rawEvent.message.role === "user"
         ? lifecycle?.currentUserOccurrence : undefined;
       if (capturedUserOccurrence !== undefined) {
@@ -5527,17 +5635,6 @@ export class PiBackendAdapter implements
               transport: runtime.transport,
               isCurrent
             })) return;
-            if (await handleCommandGateExtensionRequest(
-              event as unknown as Record<string, unknown>,
-              {
-                gate: runtime.generationLease.generation.options.commandConcurrencyGate,
-                sessionId: runtime.key,
-                generation: runtime.transport.generation,
-                signal: eventContext.signal,
-                transport: runtime.transport,
-                isCurrent
-              }
-            )) return;
             if (await handlePolicyDecisionExtensionRequest(
               event as unknown as Record<string, unknown>,
               {
@@ -5609,24 +5706,7 @@ export class PiBackendAdapter implements
             }
           }
         })
-        .catch(async (error) => {
-          if (!isCurrent()) return;
-          await failureContext.emit(
-            {
-              type: "error",
-              error: {
-                code: "PI_EVENT_TRANSLATION_FAILED",
-                message: redactedDiagnostic(error),
-                phase: "stream",
-                retryable: true,
-                stateMayHaveChanged: false,
-                recovery: "Reload the session projection from its last durable event cursor."
-              },
-              terminal: false
-            },
-            piMetadata("adapter_translation_error")
-          );
-        });
+        .catch((error: unknown) => reportEventFailure(failureContext, error));
     });
     runtime.transport.onExit((exit) => {
       const lifecycle = runtime.lifecycle;
@@ -6086,6 +6166,8 @@ export class PiBackendAdapter implements
 
   async #finalizeRuntimeMaterial(runtime: PiRuntime): Promise<void> {
     try {
+    const observer = this.#subagentObservers.get(runtime.key);
+    if (observer?.generation === runtime.transport.generation) observer.retireCommandGateApprovals();
     runtime.generationLease.generation.options.commandConcurrencyGate?.releaseSession(runtime.key, "runtime_closed");
     let updates: readonly { readonly providerId: string; readonly credential: PiNativeCredential }[] = [];
     let readError: unknown;
@@ -6631,6 +6713,11 @@ export class PiBackendAdapter implements
   }
 
   #capabilities(compatibility: PiCompatibilityOutcome): ReadonlyMap<string, Capability> {
+    const probeFailureDetail = compatibility.status === "incompatible"
+      ? "The configured Pi executable failed its typed RPC compatibility probe"
+      : compatibility.status === "unavailable"
+        ? "The Pi compatibility probe could not be completed. Retry after restoring the service environment."
+        : undefined;
     const supported = new Set<KnownCapability>(compatibility.status === "compatible" ? [
       "session.preview",
       "session.discovery",
@@ -6727,22 +6814,20 @@ export class PiBackendAdapter implements
           {
             key,
             supported: false,
-            reason: processSupervisorMissing
+            reason: processSupervisorMissing || compatibility.status === "unavailable"
               ? "platform_limited"
               : compatibility.status === "incompatible" || optionalCommand !== undefined || upstreamMissing
                 ? "upstream_missing"
                 : "not_implemented",
-            detail: compatibility.status === "incompatible"
-              ? "The configured Pi executable failed its typed RPC compatibility probe"
-              : processSupervisorMissing
+            detail: probeFailureDetail ?? (processSupervisorMissing
                 ? "OS process identity supervision is unavailable for this process factory"
-              : optionalCommand !== undefined
-                ? `The installed Pi RPC does not expose compatible ${optionalCommand} responses`
-                : key === "model.fast_mode"
-              ? "No model in the current installed Pi catalog explicitly supports Fast Mode"
-              : upstreamMissing
-                ? "The installed Pi RPC does not advertise this capability"
-                : "Owned by another Orchestrator provider or not configured"
+                : optionalCommand !== undefined
+                  ? `The installed Pi RPC does not expose compatible ${optionalCommand} responses`
+                  : key === "model.fast_mode"
+                    ? "No model in the current installed Pi catalog explicitly supports Fast Mode"
+                    : upstreamMissing
+                      ? "The installed Pi RPC does not advertise this capability"
+                      : "Owned by another Orchestrator provider or not configured")
           }
         ];
       });
@@ -8824,6 +8909,10 @@ function samePath(left: string, right: string): boolean {
   const normalizedLeft = resolve(left);
   const normalizedRight = resolve(right);
   return process.platform === "win32" ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase() : normalizedLeft === normalizedRight;
+}
+
+function samePiExportObject(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 function inactiveContinuationError(disposition: "steer" | "follow_up") {

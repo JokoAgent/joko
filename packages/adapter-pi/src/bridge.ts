@@ -1,6 +1,8 @@
 import { join } from "node:path";
 import {
-  MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS
+  MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS,
+  MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS,
+  POLICY_DECISION_REQUEST_PREFIX
 } from "./policy-decision-bridge.js";
 import { provisionManagedAutoReviewRuntime } from "./auto-review-runtime.js";
 import { provisionManagedModelCatalogRuntime } from "./model-catalog-runtime.js";
@@ -75,8 +77,9 @@ const PARTNER_LEARNING_REQUEST_PREFIX = "joko:tool-turn/v1/";
 const NATIVE_ROOT_REQUEST_PREFIX = "joko:native-root-call/v1/";
 const PARTNER_LEARNING_REPLY_STATUS_KEY = "joko-reply-identity/v1";
 const COMPACTION_IDENTITY_STATUS_KEY = "joko-compaction-identity/v1";
-const POLICY_DECISION_REQUEST_PREFIX = "joko:policy-decision/v1/";
+const POLICY_DECISION_REQUEST_PREFIX = ${JSON.stringify(POLICY_DECISION_REQUEST_PREFIX)};
 const MAX_POLICY_DECISION_ENVELOPE_CHARACTERS = ${MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS};
+const MAX_POLICY_DECISION_REPLY_CHARACTERS = ${MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS};
 
 const controlPath = process.env.JOKO_PI_CONTROL_FILE;
 const mcpDescriptorPath = process.env.JOKO_PI_MCP_DESCRIPTOR_FILE;
@@ -489,7 +492,7 @@ async function orderedPolicyDecision(
   const response = await ctx.ui.input(POLICY_DECISION_REQUEST_PREFIX + encoded, "");
   const decisions = ["allow", "deny", "ask", "default", "stale", "delegated_allow"];
   if (decisions.includes(response)) return { decision: response, ownerUserInstructions: [] };
-  if (typeof response !== "string" || response.length > 128 * 1024) return stale;
+  if (typeof response !== "string" || response.length > MAX_POLICY_DECISION_REPLY_CHARACTERS) return stale;
   try {
     const value = JSON.parse(response);
     if (!value || Object.keys(value).sort().join(",") !== "decision,ownerUserInstructions" || !decisions.includes(value.decision)

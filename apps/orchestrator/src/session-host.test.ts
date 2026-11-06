@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
@@ -2659,7 +2660,7 @@ describe("SessionHost", () => {
     expect(adapter.effortSelections).toEqual([]);
   });
 
-  it("reconciles protocol-valid native history after service recovery without publishing replay or redispatching durable input", { timeout: 20_000 }, async () => {
+  it.each(["ssh", "local profile restore"] as const)("reconciles protocol-valid native history after service recovery without redispatching (%s)", { timeout: 20_000 }, async location => {
     const directory = mkdtempSync(join(tmpdir(), "joko-host-service-recovery-"));
     const store = new OperationalStore(join(directory, "store.db"));
     const repository = new OperationalArtifactRepository(store);
@@ -2686,7 +2687,8 @@ describe("SessionHost", () => {
       includeManagedSubagentTools: () => false,
       validateRemoteWorkspace: async () => undefined,
       processFactory: (spec) => {
-        const processHandle = new HostServiceRecoveryProcess(spec, nativeEntries, { recovering });
+        const processHandle = new HostServiceRecoveryProcess(spec, nativeEntries, { recovering,
+          appendModelControl: recovering && location === "local profile restore" });
         processes.push(processHandle);
         return processHandle;
       }
@@ -2700,8 +2702,8 @@ describe("SessionHost", () => {
         id: "remote-target",
         backendId: "pi",
         displayName: "Remote target",
-        workspaceRoot: "/workspace",
-        remoteWorkspace: { kind: "ssh", hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" },
+        workspaceRoot: location === "ssh" ? "/workspace" : directory,
+        ...(location === "ssh" ? { remoteWorkspace: { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "host-a", workspaceRoot: "/workspace" } } : {}),
         managed: true,
         trusted: true
       } as const;
@@ -2746,9 +2748,19 @@ describe("SessionHost", () => {
       expect(processes).toHaveLength(2);
       expect(processes[0]!.spec.args).toContain("--session-id");
       expect(processes[1]!.spec.args).toContain("--session");
-      expect(processes[1]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY)
-        .toBe(processes[0]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY);
-      expect(processes[0]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY).toMatch(/^[a-f0-9]{64}$/u);
+      if (location === "ssh") {
+        expect(processes[1]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY)
+          .toBe(processes[0]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY);
+        expect(processes[0]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY).toMatch(/^[a-f0-9]{64}$/u);
+      } else {
+        const commands = processes[1]!.commands.map(command => command.type);
+        expect(commands.indexOf("set_model")).toBeGreaterThanOrEqual(0);
+        expect(commands.indexOf("get_entries")).toBeGreaterThan(commands.indexOf("set_model"));
+        expect(nativeEntries.at(-1)).toMatchObject({ type: "model_change", provider: "local", modelId: "test-model" });
+        const control = store.listEvents({ sessionId }).find(event => event.payload.type === "status" && event.payload.key === "pi.history.model");
+        expect(control).toBeDefined();
+        expect(control?.runId).toBeUndefined();
+      }
       expect(processes[1]!.commands.filter((command: Record<string, unknown>) => command.type === "prompt")).toHaveLength(0);
       expect(store.getQueueItem(dispatch.value.queueItemId).state).toBe("completed");
       expect(store.getRun(dispatch.value.runId).descriptor.state).toBe("completed");
@@ -2760,7 +2772,7 @@ describe("SessionHost", () => {
           : []);
       expect(projectedText.filter((text) => text === "completed while service was unavailable")).toHaveLength(1);
       expect(projectedText).not.toContain("stale replay must remain private");
-      expect(processes[1]!.commands.slice(0, 3).map((command: Record<string, unknown>) => command.type))
+      if (location === "ssh") expect(processes[1]!.commands.slice(0, 3).map(command => command.type))
         .toEqual(["clear_queue", "abort", "get_state"]);
     } finally {
       await recoveredHost?.dispose().catch(() => undefined);
@@ -2793,6 +2805,14 @@ describe("SessionHost", () => {
       initialPrefix: true,
       mutate(entries: Record<string, unknown>[]) {
         entries.splice(entries.length - 1, 1);
+      }
+    },
+    {
+      label: "has an unrelated control entry after the assistant",
+      initialPrefix: true,
+      mutate(entries: Record<string, unknown>[]) {
+        entries.push({ type: "session_info", id: "unrelated-session-info", parentId: hostServiceLeafId(entries),
+          timestamp: new Date(20).toISOString(), name: "Unrelated session change" });
       }
     }
   ])("keeps an uncertain dispatch fenced when recovered native history $label", { timeout: 20_000 }, async ({ initialPrefix, mutate }) => {
@@ -3677,6 +3697,56 @@ describe("SessionHost", () => {
     expect(fixture.store.getBackend(adapter.id).descriptor.instanceGeneration).toBe(current.instanceGeneration);
   });
 
+  it("keeps the previous Pi task owned until a retried Backend replacement confirms exit", async () => {
+    const previous = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const replacement = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const fixture = await createFixture(previous);
+    const { sessionId } = (await fixture.host.createSession({
+      operationId: "create-pi-unconfirmed-retirement",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Pi retirement confirmation",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value;
+    const originalBinding = fixture.store.getSession(sessionId).descriptor.binding;
+    const current = fixture.store.getBackend(previous.id).descriptor;
+    const close = vi.spyOn(previous, "closeSession").mockRejectedValueOnce(new JokoError({
+      code: "PI_PROCESS_KILL_UNCONFIRMED", message: "Pi did not confirm exit", phase: "shutdown",
+      retryable: true, stateMayHaveChanged: true, recovery: "Confirm the prior process exit and retry."
+    }));
+    const resumePrevious = vi.spyOn(previous, "resumeSession");
+    const replace = () => {
+      const { generation } = fixture.store.reserveBackendInstanceGeneration({ backendId: previous.id, adapterKind: current.adapterKind });
+      return fixture.host.replaceBackendInstance({
+        backendId: previous.id,
+        expectedCurrentGeneration: current.instanceGeneration,
+        perform: async (hooks) => {
+          await hooks.preparePrevious(replacement, generation);
+          const publication = fixture.store.publishBackendInstanceDescriptor({
+            descriptor: { ...current, instanceGeneration: generation },
+            expectedCurrentGeneration: current.instanceGeneration
+          });
+          if (publication.status !== "published") throw new Error("Fixture publication lost its generation fence.");
+          hooks.activateCurrent();
+        }
+      });
+    };
+
+    await expect(replace()).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
+    expect(fixture.host.currentAdapter(previous.id)).toBe(previous);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(fixture.store.getBackend(previous.id).descriptor.instanceGeneration).toBe(current.instanceGeneration);
+    expect(resumePrevious).not.toHaveBeenCalled();
+
+    await replace();
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(fixture.host.currentAdapter(previous.id)).toBe(replacement);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
+  });
+
   it("returns only a durable, identity-matching Session export BlobRef", async () => {
     const fixture = await createFixture();
     const sessionId = (await fixture.host.createSession({
@@ -3705,6 +3775,33 @@ describe("SessionHost", () => {
 
     exportSession.mockResolvedValue({ ...artifact, id: "missing-export-artifact" });
     await expect(fixture.host.exportSession(sessionId)).rejects.toThrow("Artifact does not exist or has expired.");
+  });
+
+  it("adopts a staged Session export from its original handle after checking its owner", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({ operationId: "create-staged-export", connection: fixture.connection,
+      targetId: "target-one", title: "Staged export", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const exported = Buffer.from("<!doctype html><title>Staged export</title>");
+    const sourcePath = join(fixture.directory, "staged-export.html");
+    const misleadingPath = join(fixture.directory, "other-export.html");
+    writeFileSync(sourcePath, exported);
+    writeFileSync(misleadingPath, "different contents");
+    let current = false;
+    const assertCurrent = vi.fn(async () => { if (!current) throw new Error("Staged export source retired."); });
+    vi.spyOn(fixture.adapter, "exportSession").mockImplementation(async (context) => {
+      const handle = await open(sourcePath, "r");
+      try {
+        return await context.storeArtifact(misleadingPath, { fileName: "staged-export.html", mimeType: "text/html",
+          openFile: { handle, expectedSize: exported.length, assertCurrent } });
+      } finally { await handle.close(); }
+    });
+    await expect(fixture.host.exportSession(sessionId)).rejects.toThrow("Staged export source retired.");
+    expect(fixture.store.listEvents({ sessionId, limit: 100 }).filter((event) => event.payload.type === "artifact")).toHaveLength(0);
+    current = true;
+    const blob = await fixture.host.exportSession(sessionId);
+    expect(blob.sha256).toBe(createHash("sha256").update(exported).digest("hex"));
+    expect(fixture.store.hasArtifactSource(blob.id)).toBe(false);
+    expect(assertCurrent).toHaveBeenCalledTimes(2);
   });
 
   it("captures only the first exact local Backend source and revalidates it on every reveal", async () => {
@@ -16442,13 +16539,13 @@ interface HostServiceRecoveryProcessOptions {
   readonly outcome?: "completed" | "aborted" | "failed";
   readonly persistNativeTurn?: boolean;
   readonly mutatePrefixOnPrompt?: boolean;
+  readonly appendModelControl?: boolean;
 }
 
 class HostServiceRecoveryProcess extends EventEmitter implements PiProcessHandle {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
   readonly stdin: Writable;
-  readonly pid: number;
   readonly serviceRecovery: { readonly required: true } | undefined;
   readonly spec: PiProcessSpec;
   readonly commands: Record<string, unknown>[] = [];
@@ -16469,8 +16566,7 @@ class HostServiceRecoveryProcess extends EventEmitter implements PiProcessHandle
     this.spec = spec;
     this.#entries = entries;
     this.#options = options;
-    this.serviceRecovery = options.recovering ? { required: true } : undefined;
-    this.pid = options.recovering ? 702 : 701;
+    this.serviceRecovery = options.recovering && spec.remoteWorkspace !== undefined ? { required: true } : undefined;
     const sessionDirectory = hostServiceArgument(spec.args, "--session-dir");
     const resumedSession = hostServiceOptionalArgument(spec.args, "--session");
     this.#sessionId = hostServiceOptionalArgument(spec.args, "--session-id") ??
@@ -16640,6 +16736,12 @@ class HostServiceRecoveryProcess extends EventEmitter implements PiProcessHandle
         return;
       }
       case "set_model":
+        if (this.#options.appendModelControl) {
+          const entry = { type: "model_change", id: `service-recovery-model-${this.#entries.length}`, parentId: hostServiceLeafId(this.#entries),
+            timestamp: new Date(20).toISOString(), provider: command.provider, modelId: command.modelId };
+          this.#entries.push(entry);
+          writeFileSync(this.#sessionFile, `${JSON.stringify(entry)}\n`, { flag: "a" });
+        }
         this.#success(command, {
           provider: String(command.provider ?? "local"),
           id: String(command.modelId ?? "test-model"),

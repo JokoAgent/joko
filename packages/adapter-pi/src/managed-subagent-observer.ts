@@ -5,6 +5,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type {
   AdapterContext,
   InteractionDecision,
+  PolicyObservation,
+  PolicySnapshot,
   PublicError,
   SubagentActivityEntry,
   SubagentControlAction,
@@ -13,11 +15,18 @@ import type {
   SubagentTranscriptEntry,
   SubagentUsage
 } from "@joko/core";
-import { evaluateOrderedPolicyRules } from "@joko/core";
+import { evaluateOrderedPolicyRules, policyObservationForToolCall, workspaceSubtreePolicyObservations } from "@joko/core";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 
-import { handleCommandGateExtensionRequest } from "./command-gate-bridge.js";
-import { handlePolicyDecisionExtensionRequest } from "./policy-decision-bridge.js";
+import { COMMAND_GATE_REQUEST_PREFIX, handleCommandGateExtensionRequest, readCommandGateExtensionRequest } from "./command-gate-bridge.js";
+import {
+  handlePolicyDecisionExtensionRequest,
+  MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS,
+  MAXIMUM_POLICY_DECISION_TITLE_BYTES,
+  POLICY_DECISION_REQUEST_PREFIX,
+  type PolicyDecisionRequest,
+  type PolicyDecisionResult
+} from "./policy-decision-bridge.js";
 import { redactManagedSecrets } from "./errors.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./managed-durable-store.js";
@@ -100,8 +109,18 @@ interface PendingApproval {
   readonly childId: string;
   readonly method: "confirm" | "input";
   readonly title: string;
+  readonly requestedAt: number;
   readonly message?: string;
   readonly placeholder?: string;
+}
+
+interface CommandGateApproval {
+  readonly interactionId: string;
+  readonly cancellation: AbortController;
+  readonly signal: AbortSignal;
+  delivery?: ApprovalDelivery;
+  releaseBeforeDispatch?: () => void;
+  writeAttempted: boolean;
 }
 
 export interface ManagedSubagentObserverOptions {
@@ -133,6 +152,8 @@ export class ManagedSubagentObserver {
   readonly #transcriptCache = new Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>();
   readonly #resultCache = new Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }>();
   readonly #controlRevisions = new Map<string, { readonly snapshotRevision: string; readonly currentRevision: string }>();
+  readonly #commandGateApprovals = new Map<string, CommandGateApproval>();
+  readonly #commandGateWork = new Set<Promise<void>>();
   readonly #durableProjectionState: DurableProjectionState = {
     projections: [],
     retryAfterMs: DEFAULT_INTERVAL_MS
@@ -187,11 +208,17 @@ export class ManagedSubagentObserver {
     this.#stopped = true;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.retireCommandGateApprovals();
+  }
+
+  retireCommandGateApprovals(): void {
+    for (const runId of this.#commandGateApprovals.keys()) this.#retireCommandGateApproval(runId);
   }
 
   async stopAndDrain(): Promise<void> {
     this.stop();
     await this.#refreshing?.catch(() => undefined);
+    await Promise.all(this.#commandGateWork);
   }
 
   /**
@@ -237,6 +264,10 @@ export class ManagedSubagentObserver {
       this.#resultCache,
       this.#durableProjectionState
     );
+    const currentRuns = new Set(projections.map((projection) => projection.latest.runId));
+    for (const runId of this.#commandGateApprovals.keys()) {
+      if (!currentRuns.has(runId)) this.#retireCommandGateApproval(runId);
+    }
     for (const projection of projections) {
       await this.#processApproval(projection);
       await this.#publish(projection);
@@ -285,9 +316,12 @@ export class ManagedSubagentObserver {
 
   async #processApproval(projection: LogicalProjection): Promise<void> {
     if (this.#stopped) return;
-    const pending = pendingApprovalOf(projection, this.#redactValues);
-    if (pending === undefined) return;
-    const journal = await this.#journal(projection.taskId);
+    const pending = projection.latest.controlSafe && projection.latest.status["state"] === "running"
+      ? pendingApprovalOf(projection, this.#redactValues) : undefined;
+    if (pending === undefined) {
+      this.#retireCommandGateApproval(projection.latest.runId);
+      return;
+    }
     const launchGeneration = requiredGeneration(projection.latest.config["productGeneration"]);
     const interactionId = approvalInteractionId(
       this.#context.sessionId,
@@ -296,6 +330,15 @@ export class ManagedSubagentObserver {
       pending.childId,
       pending.id
     );
+    const extensionEvent = { type: "extension_ui_request", id: pending.id, method: pending.method,
+      title: pending.title, placeholder: pending.placeholder ?? "" } as const;
+    const gateRequest = readCommandGateExtensionRequest(extensionEvent);
+    if (gateRequest !== undefined) {
+      await this.#processCommandGateApproval(projection, pending, interactionId, launchGeneration, gateRequest.command?.action === "acquire");
+      return;
+    }
+    this.#retireCommandGateApproval(projection.latest.runId);
+    const journal = await this.#journal(projection.taskId);
     const retained = journal.approval;
     if (retained !== undefined && retained.runId === projection.latest.runId
         && retained.childId === pending.childId && retained.approvalId === pending.id
@@ -307,13 +350,6 @@ export class ManagedSubagentObserver {
     if (pending.method === "input") {
       let delivered: ApprovalDelivery | undefined;
       const observer = this;
-      const extensionEvent = {
-        type: "extension_ui_request",
-        id: pending.id,
-        method: pending.method,
-        title: pending.title,
-        placeholder: pending.placeholder ?? ""
-      } as const;
       const extensionTransport = {
         get closed() { return observer.#stopped; },
         async notify(message: { readonly value: string } | { readonly cancelled: true }) {
@@ -325,34 +361,23 @@ export class ManagedSubagentObserver {
           );
         }
       };
-      let handled = await handleCommandGateExtensionRequest(extensionEvent, {
-        gate: this.#commandConcurrencyGate,
-        sessionId: this.#context.sessionId,
-        generation: this.#context.generation,
-        signal: this.#context.signal,
+      const handled = await handlePolicyDecisionExtensionRequest(extensionEvent, {
+        decide: async (request) => {
+          if (request.policyGeneration !== this.#policyGeneration) return "stale";
+          const snapshot = this.#context.policySnapshot;
+          const remoteRoot = this.#context.target.remoteWorkspace?.workspaceRoot;
+          const decision = snapshot === undefined
+            ? "default"
+            : orderedSubagentPolicy(snapshot, request, remoteRoot === undefined ? undefined : remoteRoot.startsWith("/") ? "posix" : "win32");
+          if (decision !== "default") return decision;
+          return { decision, ownerUserInstructions: (this.#context.nativeToolAuthorization?.readOwnerUserInstructions?.() ?? [])
+            .map(text => redactManagedSecrets(text, this.#redactValues)) };
+        },
         transport: extensionTransport,
         isCurrent: () => !this.#stopped
           && this.#context.sessionId === projection.run.sessionId
           && this.#context.generation >= launchGeneration
       }).catch(() => false);
-      if (!handled) {
-        handled = await handlePolicyDecisionExtensionRequest(extensionEvent, {
-          decide: async (request) => {
-            if (request.policyGeneration !== this.#policyGeneration) return "stale";
-            const snapshot = this.#context.policySnapshot;
-            const decision = snapshot === undefined
-              ? "default"
-              : evaluateOrderedPolicyRules(snapshot, request.observation)?.action ?? "default";
-            if (decision !== "default") return decision;
-            return { decision, ownerUserInstructions: (this.#context.nativeToolAuthorization?.readOwnerUserInstructions?.() ?? [])
-              .map(text => redactManagedSecrets(text, this.#redactValues)) };
-          },
-          transport: extensionTransport,
-          isCurrent: () => !this.#stopped
-            && this.#context.sessionId === projection.run.sessionId
-            && this.#context.generation >= launchGeneration
-        }).catch(() => false);
-      }
       if (!handled || delivered === undefined) {
         delivered = this.#approvalDelivery(projection, pending, interactionId, { cancelled: true });
       }
@@ -381,11 +406,81 @@ export class ManagedSubagentObserver {
     await this.#retainAndWriteApproval(journal, projection, pending, delivery);
   }
 
+  async #processCommandGateApproval(
+    projection: LogicalProjection,
+    pending: PendingApproval,
+    interactionId: string,
+    launchGeneration: number,
+    acquire: boolean
+  ): Promise<void> {
+    const runId = projection.latest.runId;
+    const ownerIsCurrent = () => !this.#stopped
+      && this.#context.sessionId === projection.run.sessionId && this.#context.generation >= launchGeneration;
+    const resolve = async (signal: AbortSignal, waiting?: CommandGateApproval): Promise<ApprovalResponse> => {
+      let response: ApprovalResponse = { cancelled: true };
+      await handleCommandGateExtensionRequest({ ...pending }, {
+        gate: this.#commandConcurrencyGate,
+        sessionId: this.#context.sessionId,
+        generation: launchGeneration,
+        runId,
+        signal,
+        transport: { closed: false, async notify(message) {
+          response = "value" in message ? { value: message.value } : { cancelled: true };
+        } },
+        isCurrent: () => ownerIsCurrent() && (waiting === undefined || this.#commandGateApprovals.get(runId) === waiting),
+        onAdmitted: waiting === undefined ? undefined : (release) => { waiting.releaseBeforeDispatch = release; }
+      });
+      return response;
+    };
+    const decide = (response: ApprovalResponse, decidedAt?: number) =>
+      this.#approvalDelivery(projection, pending, interactionId, response, decidedAt);
+    if (!acquire || this.#commandConcurrencyGate === undefined) {
+      const response = await resolve(this.#context.signal);
+      await this.#writeApprovalControl(projection, pending, decide(response, acquire ? undefined : pending.requestedAt));
+      return;
+    }
+
+    // Admission is a live service lease. A later refresh uses the current
+    // mailbox revision to reply; it never replays a lease from the journal.
+    const waiting = this.#commandGateApprovals.get(runId);
+    if (waiting?.interactionId !== interactionId) {
+      this.#retireCommandGateApproval(runId);
+      const cancellation = new AbortController();
+      const admission: CommandGateApproval = { interactionId, cancellation,
+        signal: AbortSignal.any([this.#context.signal, cancellation.signal]), writeAttempted: false };
+      this.#commandGateApprovals.set(runId, admission);
+      const work: Promise<void> = resolve(admission.signal, admission).then(
+        (response) => { admission.delivery = decide(response); },
+        () => { admission.delivery = decide({ cancelled: true }); }
+      ).finally(() => { this.#commandGateWork.delete(work); });
+      this.#commandGateWork.add(work);
+      return;
+    }
+    if (waiting.delivery === undefined) return;
+    if (waiting.signal.aborted && waiting.delivery.response.value === "admitted") {
+      if (waiting.writeAttempted) return;
+      waiting.releaseBeforeDispatch?.();
+      waiting.delivery = decide({ cancelled: true });
+    }
+    waiting.writeAttempted = true;
+    waiting.releaseBeforeDispatch = undefined;
+    await this.#writeApprovalControl(projection, pending, waiting.delivery);
+  }
+
+  #retireCommandGateApproval(runId: string): void {
+    const waiting = this.#commandGateApprovals.get(runId);
+    if (waiting === undefined) return;
+    this.#commandGateApprovals.delete(runId);
+    waiting.cancellation.abort();
+    waiting.releaseBeforeDispatch?.();
+  }
+
   #approvalDelivery(
     projection: LogicalProjection,
     pending: PendingApproval,
     interactionId: string,
-    response: ApprovalResponse
+    response: ApprovalResponse,
+    decidedAt = Date.now()
   ): ApprovalDelivery {
     return {
       runId: projection.latest.runId,
@@ -393,7 +488,7 @@ export class ManagedSubagentObserver {
       approvalId: pending.id,
       interactionId,
       requestId: deterministicUuid(`${interactionId}\u0000${pending.id}`),
-      decidedAt: Date.now(),
+      decidedAt,
       response
     };
   }
@@ -415,6 +510,8 @@ export class ManagedSubagentObserver {
   ): Promise<void> {
     if (this.#stopped || delivery.runId !== projection.latest.runId || delivery.childId !== pending.childId
         || delivery.approvalId !== pending.id) return;
+    if (delivery.response.value !== undefined && delivery.response.value.length > 1024
+        && (pending.method !== "input" || !pending.title.startsWith(POLICY_DECISION_REQUEST_PREFIX))) return;
     const config = projection.latest.config;
     const value = {
       format: FORMAT,
@@ -551,6 +648,34 @@ export class ManagedSubagentObserver {
   }
 }
 
+function orderedSubagentPolicy(snapshot: PolicySnapshot, request: PolicyDecisionRequest, pathStyle?: "posix" | "win32"): PolicyDecisionResult {
+  const { observation, toolCall } = request;
+  const direct = evaluateOrderedPolicyRules(snapshot, observation)?.action ?? "default";
+  const name = observation.toolName;
+  if (direct === "deny" || observation.toolProviderId !== undefined || name === undefined
+    || !["grep", "find", "ls"].includes(name)) return direct;
+
+  const roots = new Set<string>();
+  if (observation.subjectKind === "file_read") roots.add(observation.workspaceRelativePath ?? ".");
+  const extra: PolicyObservation[] = [];
+  if (toolCall?.toolName === name) {
+    const input = isRecord(toolCall.input) ? toolCall.input : {};
+    const raw = [input.path, input.file_path, input.filePath, input.directory].find((value): value is string =>
+      typeof value === "string" && value.trim() !== "") ?? ".";
+    roots.add(raw);
+    const lexical = policyObservationForToolCall({ name, args: { path: raw } }, {
+      workspaceRoot: snapshot.workspaceRoot, extraReadOnlyRoots: [], ...(pathStyle === undefined ? {} : { pathStyle })
+    });
+    if (lexical.workspaceRelativePath !== undefined) extra.push({ ...lexical, risk: observation.risk });
+  }
+  for (const root of roots) extra.push(...workspaceSubtreePolicyObservations(snapshot, observation, root, "file_read", pathStyle));
+  const decisions = extra.map((item) => evaluateOrderedPolicyRules(snapshot, item)?.action);
+  // A rule for one descendant can restrict the search, while only the direct
+  // observation may grant the entire operation.
+  if (decisions.includes("deny")) return "deny";
+  return decisions.includes("ask") ? "ask" : direct;
+}
+
 /** The hosted reverse-tool port uses the same private manifest and runner-claim
  * validation as observation. A reserved identity never authorizes tool effects. */
 export async function assertManagedSubagentHostedToolScope(input: {
@@ -601,7 +726,8 @@ export async function assertManagedSubagentControlTarget(input: {
     new Map(),
     input.durableStore === undefined
       ? undefined
-      : { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS }
+      : { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS },
+    input.runId
   );
   const projection = assertOwnedManagedSubagentControlTarget(projections, input);
   return currentProviderId(projection.latest.config["route"]);
@@ -632,7 +758,8 @@ export async function writeManagedSubagentDurableControl(input: {
     transcriptCache,
     input.durableStore,
     resultCache,
-    durableState
+    durableState,
+    input.runId
   );
   let projections = await read();
   let projection = assertOwnedManagedSubagentControlTarget(projections, input);
@@ -859,7 +986,8 @@ async function readLogicalProjections(
   transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>,
   durableStore?: PiManagedDurableStore,
   resultCache: Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }> = new Map(),
-  durableState?: DurableProjectionState
+  durableState?: DurableProjectionState,
+  durableTaskId?: string
 ): Promise<readonly LogicalProjection[]> {
   if (durableStore !== undefined) {
     return readDurableLogicalProjections(
@@ -870,7 +998,8 @@ async function readLogicalProjections(
       redactValues,
       transcriptCache,
       resultCache,
-      durableState ?? { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS }
+      durableState ?? { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS },
+      durableTaskId
     );
   }
   const sessionDirectory = join(root, managedSubagentSessionKey(productSessionId));
@@ -914,11 +1043,13 @@ async function readDurableLogicalProjections(
   redactValues: readonly string[],
   transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>,
   resultCache: Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }>,
-  durableState: DurableProjectionState
+  durableState: DurableProjectionState,
+  taskId?: string
 ): Promise<readonly LogicalProjection[]> {
   const scan = await store.scan({
     sessionId: productSessionId,
     sessionKey: managedSubagentSessionKey(productSessionId),
+    ...(taskId === undefined ? {} : { taskId }),
     ...(durableState.revision === undefined ? {} : { afterRevision: durableState.revision }),
     limitBytes: REMOTE_SCAN_LIMIT_BYTES
   });
@@ -937,6 +1068,7 @@ async function readDurableLogicalProjections(
   }
   const grouped = new Map<string, PhysicalRun[]>();
   for (const snapshot of scan.runs) {
+    if (taskId !== undefined && snapshot.config["taskId"] !== taskId) continue;
     const physical = await readDurablePhysicalRun(
       store,
       snapshot,
@@ -944,12 +1076,13 @@ async function readDurableLogicalProjections(
       productGeneration,
       redactValues,
       transcriptCache,
-      resultCache
+      resultCache,
+      taskId !== undefined
     );
-    const taskId = requiredString(physical.status["taskId"], 256);
-    const runs = grouped.get(taskId) ?? [];
+    const logicalTaskId = requiredString(physical.status["taskId"], 256);
+    const runs = grouped.get(logicalTaskId) ?? [];
     runs.push(physical);
-    grouped.set(taskId, runs);
+    grouped.set(logicalTaskId, runs);
   }
   const values: LogicalProjection[] = [];
   for (const [taskId, physicalRuns] of grouped) {
@@ -1080,7 +1213,8 @@ async function readDurablePhysicalRun(
   productGeneration: number,
   redactValues: readonly string[],
   transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>,
-  resultCache: Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }>
+  resultCache: Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }>,
+  metadataOnly: boolean
 ): Promise<PhysicalRun> {
   const runId = requiredUuid(snapshot.runId, "run");
   const revision = requiredRevision(snapshot.revision);
@@ -1104,7 +1238,8 @@ async function readDurablePhysicalRun(
   const status = { ...snapshot.status };
   const claim = snapshot.claim === undefined ? undefined : { ...snapshot.claim };
   const taskId = requiredString(status["taskId"], 256);
-  const runnerScript = requiredRemotePath(config["runnerScript"], "runner script");
+  // The broker checks canonical runner and artifact paths on the remote host.
+  // Its projection binds them by identity and revision without returning paths.
   if (
     config["format"] !== FORMAT || owner["format"] !== FORMAT || status["format"] !== FORMAT
     || config["runId"] !== runId || owner["runId"] !== runId || status["runId"] !== runId
@@ -1114,7 +1249,6 @@ async function readDurablePhysicalRun(
     || status["productSessionId"] !== productSessionId || !Number.isSafeInteger(config["productGeneration"])
     || number(config["productGeneration"]) < 0 || number(config["productGeneration"]) > productGeneration
     || config["taskId"] !== taskId || owner["taskId"] !== taskId
-    || owner["runnerScript"] !== runnerScript || status["runnerScript"] !== runnerScript
     || config["runnerScriptSha256"] !== runnerScriptSha256
     || owner["runnerScriptSha256"] !== runnerScriptSha256 || status["runnerScriptSha256"] !== runnerScriptSha256
     || config["runnerInstanceId"] !== runnerInstanceId
@@ -1137,11 +1271,19 @@ async function readDurablePhysicalRun(
       || runnerPid > 0 && status["runnerInstanceId"] !== runnerInstanceId) {
     throw new Error("managed Subagent durable process identity mismatch");
   }
-  const transcriptPath = requiredRemotePath(config["transcriptPath"], "transcript");
-  if (status["transcriptPath"] !== transcriptPath) {
-    throw new Error("managed Subagent durable transcript identity mismatch");
-  }
-
+  const manifest = {
+    runId,
+    directory: `durable:${runId}`,
+    durableRevision: revision,
+    durableControlRevision: controlRevision,
+    durableTranscriptRevision: transcriptRevision,
+    durableResultRevision: resultRevision,
+    config,
+    status,
+    resumeSafe: snapshot.resumeSafe,
+    controlSafe: snapshot.controlSafe
+  };
+  if (metadataOnly) return { ...manifest, transcript: [] };
   const cacheKey = `durable:${runId}:transcript:${transcriptRevision}`;
   let transcript = transcriptCache.get(cacheKey);
   if (transcript === undefined || transcript.size !== snapshot.transcriptBytes) {
@@ -1181,18 +1323,9 @@ async function readDurablePhysicalRun(
     result = { ...cachedResult.result };
   }
   return {
-    runId,
-    directory: `durable:${runId}`,
-    durableRevision: revision,
-    durableControlRevision: controlRevision,
-    durableTranscriptRevision: transcriptRevision,
-    durableResultRevision: resultRevision,
-    config,
-    status,
+    ...manifest,
     ...(result === undefined ? {} : { result }),
-    transcript: transcript.records,
-    resumeSafe: snapshot.resumeSafe,
-    controlSafe: snapshot.controlSafe
+    transcript: transcript.records
   };
 }
 
@@ -1620,19 +1753,22 @@ function pendingApprovalOf(projection: LogicalProjection, redactValues: readonly
   const id = optionalString(value["id"], 512, redactValues);
   const childId = optionalString(value["childId"], 512, redactValues);
   const method = value["method"];
-  const title = optionalString(value["title"], 1024, redactValues);
+  const rawTitle = value["title"];
+  const policyRequest = method === "input" && typeof rawTitle === "string" && rawTitle.startsWith(POLICY_DECISION_REQUEST_PREFIX);
+  const title = optionalString(rawTitle, policyRequest ? MAXIMUM_POLICY_DECISION_TITLE_BYTES : 1024, redactValues);
   const expectedChildId = requiredString(projection.latest.config["childId"], 512);
   if (id === undefined || childId !== expectedChildId || (method !== "confirm" && method !== "input") || title === undefined) {
     return undefined;
   }
   if (method === "confirm" && !title.startsWith("joko:permission:")) return undefined;
-  if (method === "input" && !title.startsWith("joko:command-gate/v1/")
-      && !title.startsWith("joko:policy-decision/v1/")) return undefined;
+  if (method === "input" && !title.startsWith(COMMAND_GATE_REQUEST_PREFIX)
+      && !title.startsWith(POLICY_DECISION_REQUEST_PREFIX)) return undefined;
   return {
     id,
     childId,
     method,
     title,
+    requestedAt: timestamp(value["requestedAt"], Date.now()),
     ...(method === "confirm"
       ? { message: optionalString(value["message"], 8192, redactValues) ?? "" }
       : { placeholder: optionalString(value["placeholder"], 1024, redactValues) })
@@ -1692,14 +1828,6 @@ function requiredDigest(value: unknown, label: string): string {
 
 function requiredRevision(value: unknown): string {
   return requiredDigest(value, "durable revision");
-}
-
-function requiredRemotePath(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length < 1 || value.length > 32_768
-      || !value.startsWith("/") || value.includes("\0")) {
-    throw new Error(`managed Subagent remote ${label} path is invalid`);
-  }
-  return value;
 }
 
 async function decisionOrCancellation(
@@ -1781,9 +1909,10 @@ function isApprovalDelivery(value: unknown): value is ApprovalDelivery {
   const response = value["response"];
   const fields = [response["confirmed"] !== undefined, response["value"] !== undefined, response["cancelled"] !== undefined]
     .filter(Boolean).length;
-  return fields === 1
+  return fields === 1 && Object.keys(response).length === 1
     && (response["confirmed"] === undefined || typeof response["confirmed"] === "boolean")
-    && (response["value"] === undefined || typeof response["value"] === "string" && response["value"].length <= 1024)
+    && (response["value"] === undefined || typeof response["value"] === "string"
+      && response["value"].length <= MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS)
     && (response["cancelled"] === undefined || response["cancelled"] === true);
 }
 

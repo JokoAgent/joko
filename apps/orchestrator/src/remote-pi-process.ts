@@ -20,6 +20,7 @@ import { StringDecoder } from "node:string_decoder";
 
 import {
   MANAGED_SUBAGENT_NODE_ENV,
+  MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS,
   MANAGED_SUBAGENT_PRODUCT_SESSION_ENV,
   MANAGED_SUBAGENT_RUNNER_FILE_NAME,
   type PiManagedDurableRunSnapshot,
@@ -47,6 +48,7 @@ import {
   REMOTE_PI_BROKER_PROTOCOL_VERSION,
   REMOTE_PI_BROKER_SOURCE,
   REMOTE_PI_BROKER_SOURCE_SHA256,
+  REMOTE_PI_MANAGED_SCAN_LIMIT_BYTES,
   remotePiLaunchHash
 } from "./remote-pi-broker-source.js";
 import { REMOTE_PI_SESSION_SOURCE, REMOTE_PI_SESSION_SOURCE_SHA256 } from "./remote-pi-session-source.js";
@@ -202,9 +204,9 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     this.#navigationRoot = join(options.authorityRoot, "navigation");
   }
 
-  readonly create: PiProcessFactory = async (spec) => {
+  readonly create: PiProcessFactory = async ({ assertStartupCurrent, ...spec }) => {
     if (spec.remoteWorkspace === undefined) return this.#localFactory(spec);
-    return this.#createRemote(spec);
+    return this.#createRemote(spec, assertStartupCurrent);
   };
 
   readonly navigationOwner: PiRemoteNavigationOwner = {
@@ -456,14 +458,16 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     authority.assertCurrent();
   }
 
-  async #createRemote(spec: PiProcessSpec): Promise<PiProcessHandle> {
+  async #createRemote(spec: PiProcessSpec, assertStartupCurrent?: () => void): Promise<PiProcessHandle> {
     const binding = spec.remoteWorkspace;
     if (binding === undefined) throw new Error("Remote Pi requires a remote workspace binding.");
     const targetId = requiredEnvironment(spec.env, "JOKO_PI_TARGET_ID");
+    assertStartupCurrent?.();
     const initialAuthority = await this.#remoteExecution.workspace(binding);
+    const startupAuthority = fencePiStartup(initialAuthority, assertStartupCurrent);
     const targetPaths = remotePlatformPaths(initialAuthority.pathStyle);
     const remoteNodeExecutable = remoteNodeExecutableFor(binding);
-    const files = initialAuthority.files;
+    const files = startupAuthority.files;
     const canonicalWorkspace = await files.realpath(binding.workspaceRoot);
     if (canonicalWorkspace !== binding.workspaceRoot) throw new Error("Remote workspace root is not canonical.");
     if ((await files.stat(canonicalWorkspace)).kind !== "directory") {
@@ -692,21 +696,33 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       remoteRuntime,
       assets: compatibilityAssets
     });
-    if (existingAuthority === undefined) await stageRemoteRuntime(initialAuthority, binding, stagingPlans);
+    if (existingAuthority === undefined) await stageRemoteRuntime(startupAuthority, binding, stagingPlans);
     const sourcePath = targetPaths.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
-    const openAttachment = async (selectedAuthority: RemoteWorkspaceAuthority): Promise<RemoteBridgeAttachment> => {
-      selectedAuthority.assertCurrent();
+    const openAttachment = async (
+      selectedAuthority: RemoteWorkspaceAuthority,
+      assertBeforeStartup?: () => void,
+      reconnectAttestation?: string
+    ): Promise<RemoteBridgeAttachment> => {
+      const effectAuthority = fencePiStartup(selectedAuthority, assertBeforeStartup);
+      effectAuthority.assertCurrent();
       if (selectedAuthority.pathStyle !== initialAuthority.pathStyle) {
         throw new Error("Remote Pi target path style changed during execution.");
       }
-      const selectedFiles = selectedAuthority.files;
+      const previous = await this.#authorityStore.read(identity, authorityScope);
+      if (
+        reconnectAttestation !== undefined && (
+          previous === undefined || previous.authority.attestation !== reconnectAttestation || previous.deletion !== undefined
+        )
+      ) {
+        throw new Error("The original Remote Pi authority is no longer available for reattachment.");
+      }
+      const selectedFiles = effectAuthority.files;
       await provisionRemoteBroker(selectedFiles, managedRoot, selectedAuthority.pathStyle);
       await ensureRemotePrivateDirectory(selectedFiles, remoteRuntime, selectedAuthority.pathStyle);
       await ensureRemotePrivateDirectory(selectedFiles, remoteSessions, selectedAuthority.pathStyle);
       if (remoteManagedRunRoot !== undefined) {
         await ensureRemotePrivateDirectory(selectedFiles, remoteManagedRunRoot, selectedAuthority.pathStyle);
       }
-      const previous = await this.#authorityStore.read(identity, authorityScope);
       await refreshRuntimeFiles(
         selectedFiles,
         spec.env,
@@ -716,7 +732,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       const bridgeOptions: OpenRemoteBrokerBridgeOptions = {
         processes: selectedAuthority.processes,
         forwarding: selectedAuthority.forwarding,
-        files: selectedFiles,
+        files: selectedAuthority.files,
         controlCwd,
         managedRoot,
         sourcePath,
@@ -741,6 +757,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
         localEnvironment: spec.env,
         pathMap,
         authorityStore: this.#authorityStore,
+        ...(assertBeforeStartup === undefined ? {} : { assertBeforeStartup: effectAuthority.assertCurrent }),
         ...(currentNativeAuthReservationToken === undefined ? {} : { currentNativeAuthReservationToken }),
         ...(previous === undefined ? {} : { previousAuthority: previous })
       };
@@ -748,10 +765,11 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
         return await openRemoteBrokerBridge(bridgeOptions);
       } catch (error) {
         if (
-          !(error instanceof RemoteAuthorityRejectedError) ||
+          reconnectAttestation !== undefined || !(error instanceof RemoteAuthorityRejectedError) ||
           error.authorityVerified !== true || previous === undefined
         ) throw error;
         if (error.reason === "launch_mismatch") {
+          effectAuthority.assertCurrent();
           await requestRemoteBrokerKill({
             processes: selectedAuthority.processes,
             sourcePath,
@@ -765,18 +783,25 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
           });
         } else if (error.reason !== "child_absent") throw error;
         await this.#authorityStore.remove(identity);
-        await stageRemoteRuntime(selectedAuthority, binding, stagingPlans);
+        await stageRemoteRuntime(effectAuthority, binding, stagingPlans);
         await refreshRuntimeFiles(selectedFiles, spec.env, pathMap);
         const { previousAuthority: _previousAuthority, ...freshBridgeOptions } = bridgeOptions;
         return openRemoteBrokerBridge(freshBridgeOptions);
       }
     };
-    const initialAttachment = await openAttachment(initialAuthority);
+    const initialAttachment = await openAttachment(initialAuthority, assertStartupCurrent);
     return new MappedRemotePiProcess({
       initialAttachment,
       reattach: async () => {
         const next = await this.#remoteExecution.workspace(binding);
-        return openAttachment(next);
+        try {
+          return { attachment: await openAttachment(next, undefined, initialAttachment.authority.attestation) };
+        } catch (error) {
+          if (error instanceof RemoteAuthorityRejectedError && error.authorityVerified && error.reason === "child_absent") {
+            return { childAbsentFiles: next.files };
+          }
+          throw error;
+        }
       },
       localSessionRoot: resolve(localSessionRoot),
       localRuntime: resolve(localRuntime),
@@ -785,6 +810,24 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       pathMap
     });
   }
+}
+
+function fencePiStartup(authority: RemoteWorkspaceAuthority, assertStartupCurrent?: () => void): RemoteWorkspaceAuthority {
+  if (assertStartupCurrent === undefined) return authority;
+  const files = authority.files;
+  const assertCurrent = (): void => { assertStartupCurrent(); authority.assertCurrent(); };
+  return {
+    ...authority,
+    assertCurrent,
+    files: {
+      realpath: files.realpath.bind(files), stat: files.stat.bind(files), list: files.list.bind(files), read: files.read.bind(files),
+      async write(request) { assertCurrent(); await files.write(request); },
+      async mkdir(path, options) { assertCurrent(); await files.mkdir(path, options); },
+      async rename(source, destination, signal) { assertCurrent(); await files.rename(source, destination, signal); },
+      async remove(path, options) { assertCurrent(); await files.remove(path, options); }
+    },
+    processes: { async open(request) { assertCurrent(); return authority.processes.open(request); } }
+  };
 }
 
 class RemotePiManagedDurableStore implements PiManagedDurableStore {
@@ -802,53 +845,55 @@ class RemotePiManagedDurableStore implements PiManagedDurableStore {
     this.#authorityStore = options.authorityStore;
   }
 
-  async scan(input: {
-    readonly sessionId: string;
-    readonly sessionKey: string;
-    readonly afterRevision?: string;
-    readonly limitBytes: number;
-  }): Promise<{
-    readonly revision: string;
-    readonly unchanged: boolean;
-    readonly retryAfterMs: number;
-    readonly runs: readonly PiManagedDurableRunSnapshot[];
-  }> {
+  async scan(input: Parameters<PiManagedDurableStore["scan"]>[0]) {
     this.#assertSession(input.sessionId, input.sessionKey);
     if (!Number.isSafeInteger(input.limitBytes) || input.limitBytes < 1 || input.limitBytes > 1024 * 1024) {
       throw new Error("Remote managed durable store scan limit is invalid.");
     }
-    const response = await this.#request({
+    const taskId = input.taskId === undefined ? undefined : exactBoundedText(input.taskId, 256, "managed task identity");
+    const request = {
       operation: "scan",
       sessionId: input.sessionId,
       sessionKey: input.sessionKey,
       limitBytes: input.limitBytes,
-      ...(input.afterRevision === undefined ? {} : {
-        afterRevision: exactDigest(input.afterRevision, "managed store revision")
-      })
-    });
-    assertExactKeys(response, [
-      "ok", "authorityVerified", "revision", "unchanged", "retryAfterMs", "runs"
-    ]);
-    const unchanged = response["unchanged"];
-    const retryAfterMs = positiveSafeInteger(response["retryAfterMs"], "managed store retry delay");
-    if (
-      response["ok"] !== true || response["authorityVerified"] !== true ||
-      typeof unchanged !== "boolean" || retryAfterMs < 100 || retryAfterMs > 60_000 ||
-      !Array.isArray(response["runs"]) || response["runs"].length > 256 ||
-      unchanged && response["runs"].length !== 0 ||
-      unchanged && input.afterRevision === undefined
-    ) {
-      throw new Error("Remote managed durable store scan response failed its schema fence.");
-    }
-    const revision = exactDigest(response["revision"], "managed store revision");
-    if (unchanged && revision !== input.afterRevision) {
-      throw new Error("Remote managed durable store unchanged response crossed its revision fence.");
+      ...(taskId === undefined ? {} : { taskId })
+    };
+    const afterRevision = input.afterRevision === undefined
+      ? undefined : exactDigest(input.afterRevision, "managed store revision");
+    const first = parseRemoteManagedScanPage(await this.#request({
+      ...request, ...(afterRevision === undefined ? {} : { afterRevision })
+    }), afterRevision);
+    const { revision, unchanged, retryAfterMs } = first;
+    const runs = [...first.runs];
+    let page = first.nextPage;
+    if (page !== undefined) {
+      const scanId = page.scanId;
+      let bytes = Buffer.byteLength(JSON.stringify(runs)) - 1;
+      for (let index = 1; page !== undefined; index += 1) {
+        if (page.scanId !== scanId || page.index !== index || index >= 256) {
+          throw new Error("Remote managed durable store scan crossed its page fence.");
+        }
+        const next = parseRemoteManagedScanPage(await this.#request({ ...request, page }));
+        bytes += Buffer.byteLength(JSON.stringify(next.runs)) - 1;
+        if (next.revision !== revision || next.retryAfterMs !== retryAfterMs || next.runs.length === 0
+          || runs.length + next.runs.length > 256 || bytes > REMOTE_PI_MANAGED_SCAN_LIMIT_BYTES) {
+          throw new Error("Remote managed durable store scan page crossed its revision or size fence.");
+        }
+        runs.push(...next.runs);
+        page = next.nextPage;
+      }
+      const digest = createHash("sha256").update(JSON.stringify([
+        input.sessionId, ...runs.map((run) => [run.runId, run.revision])
+      ])).digest("hex");
+      if (digest !== revision || runs.some((run, index) => index > 0 && runs[index - 1]!.runId >= run.runId)) {
+        throw new Error("Remote managed durable store scan pages do not form the attested snapshot.");
+      }
     }
     return {
       revision,
       unchanged,
       retryAfterMs,
-      runs: response["runs"].map((value) => parseRemoteManagedRunSnapshot(value))
+      runs: taskId === undefined ? runs : runs.filter((run) => run.config["taskId"] === taskId)
     };
   }
 
@@ -926,11 +971,12 @@ class RemotePiManagedDurableStore implements PiManagedDurableStore {
     readonly value: Readonly<Record<string, unknown>>;
   }): Promise<{ readonly controlRevision: string; readonly receipt: string }> {
     this.#assertSession(input.sessionId);
-    if (!isPlainRecord(input.value) || Buffer.byteLength(JSON.stringify(input.value), "utf8") > 64 * 1024) {
-      throw new Error("Remote managed durable store control value is invalid.");
-    }
     if (input.kind !== "control" && input.kind !== "approval") {
       throw new Error("Remote managed durable store control kind is invalid.");
+    }
+    const maximumBytes = input.kind === "approval" ? MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.controlFileBytes : 64 * 1024;
+    if (!isPlainRecord(input.value) || Buffer.byteLength(JSON.stringify(input.value), "utf8") > maximumBytes) {
+      throw new Error("Remote managed durable store control value is invalid.");
     }
     const response = await this.#request({
       operation: "write-control",
@@ -1132,7 +1178,7 @@ interface RemoteBridgeAttachment {
   readonly process: RemoteProcessHandle;
   readonly processes: RemoteProcessTransportPort;
   readonly files: RemoteFileTransportPort;
-  readonly watchers: readonly FSWatcher[];
+  readonly watchers: readonly Pick<FSWatcher, "close">[];
   readonly reverseForward?: RemoteReverseForwardHandle;
   readonly brokerSourcePath: string;
   readonly brokerRoot: string;
@@ -1141,7 +1187,7 @@ interface RemoteBridgeAttachment {
   readonly pathStyle: "posix" | "win32";
   readonly identity: string;
   readonly terminalFence: string;
-  readonly authority?: RemoteAuthorityEnvelope;
+  readonly authority: RemoteAuthorityEnvelope;
   readonly state?: RemoteAuthorityState;
   readonly persistOutputCursor?: (sequence: number) => Promise<void>;
 }
@@ -1176,6 +1222,7 @@ interface OpenRemoteBrokerBridgeOptions {
   readonly authorityStore: RemotePiAuthorityStore;
   readonly currentNativeAuthReservationToken?: string;
   readonly previousAuthority?: RemoteAuthorityRecord;
+  readonly assertBeforeStartup?: () => void;
 }
 
 async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): Promise<RemoteBridgeAttachment> {
@@ -1194,6 +1241,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
         throw new Error("Managed tool bridge must use a service-node loopback endpoint.");
       }
       const localPort = Number(endpoint.port || (endpoint.protocol === "https:" ? 443 : 80));
+      options.assertBeforeStartup?.();
       reverseForward = await options.forwarding.listen({
         localDestinationHost: normalizeLoopback(endpoint.hostname),
         localDestinationPort: localPort
@@ -1223,6 +1271,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
     }
 
     const terminalFence = randomUUID();
+    options.assertBeforeStartup?.();
     remoteProcess = await processes.open({
       executable: options.nodeExecutable,
       args: [
@@ -1271,6 +1320,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
       remoteProcess.kill("SIGKILL");
       throw new Error("Remote Pi launch configuration exceeded its bounded broker envelope.");
     }
+    options.assertBeforeStartup?.();
     remoteProcess.stdin.write(bootstrapLine);
     const control = await readRemoteAuthorityControl(remoteProcess.stdout);
     if (!control.ok) {
@@ -1354,6 +1404,8 @@ class RemoteAuthorityRejectedError extends Error {
     this.name = "RemoteAuthorityRejectedError";
   }
 }
+
+class RemoteOutputAcknowledgementLost extends Error {}
 
 async function readRemoteAuthorityControl(stream: Readable): Promise<RemoteAuthorityControl> {
   return parseRemoteAuthorityControl(await readRemoteControlFrame(stream, REMOTE_FRAME_AUTHORITY));
@@ -1557,8 +1609,8 @@ function assertAuthorityMatchesRequest(
     authority.trustedRunnerScriptSha256 !== previous.trustedRunnerScriptSha256
   ) throw new Error("Remote Pi recovery changed the attested child identity.");
   if (options.runtimeGeneration === previous.runtimeGeneration) {
-    if (authority.epoch !== previous.epoch) {
-      throw new Error("Remote Pi idempotent attachment changed its authority epoch.");
+    if (authority.epoch !== previous.epoch || authority.attestation !== previous.attestation) {
+      throw new Error("Remote Pi idempotent attachment changed its authority envelope.");
     }
   } else if (
     options.runtimeGeneration !== previous.runtimeGeneration + 1 || authority.epoch !== previous.epoch + 1
@@ -1973,6 +2025,40 @@ function exactUuid(value: unknown, label: string): string {
   return accepted.toLowerCase();
 }
 
+function parseRemoteManagedScanPage(response: Record<string, unknown>, afterRevision?: string): {
+  readonly revision: string;
+  readonly unchanged: boolean;
+  readonly retryAfterMs: number;
+  readonly runs: readonly PiManagedDurableRunSnapshot[];
+  readonly nextPage?: { readonly scanId: string; readonly index: number };
+} {
+  const cursor = response["nextPage"];
+  assertExactKeys(response, [
+    "ok", "authorityVerified", "revision", "unchanged", "retryAfterMs", "runs",
+    ...(cursor === undefined ? [] : ["nextPage"])
+  ]);
+  const revision = exactDigest(response["revision"], "managed store revision");
+  const unchanged = response["unchanged"];
+  const retryAfterMs = positiveSafeInteger(response["retryAfterMs"], "managed store retry delay");
+  const runs = response["runs"];
+  if (response["ok"] !== true || response["authorityVerified"] !== true || typeof unchanged !== "boolean"
+    || retryAfterMs < 100 || retryAfterMs > 60_000 || !Array.isArray(runs) || runs.length > 256
+    || unchanged && (runs.length !== 0 || revision !== afterRevision || cursor !== undefined)) {
+    throw new Error("Remote managed durable store scan response failed its schema or revision fence.");
+  }
+  let nextPage;
+  if (cursor !== undefined) {
+    if (!isPlainRecord(cursor) || runs.length === 0) throw new Error("Remote managed durable store scan cursor is invalid.");
+    assertExactKeys(cursor, ["scanId", "index"]);
+    nextPage = {
+      scanId: exactUuid(cursor["scanId"], "managed store scan identity"),
+      index: positiveSafeInteger(cursor["index"], "managed store scan page")
+    };
+  }
+  return { revision, unchanged, retryAfterMs, runs: runs.map(parseRemoteManagedRunSnapshot),
+    ...(nextPage === undefined ? {} : { nextPage }) };
+}
+
 function parseRemoteManagedRunSnapshot(value: unknown): PiManagedDurableRunSnapshot {
   if (!isPlainRecord(value)) {
     throw new Error("Remote managed durable run snapshot failed its schema fence.");
@@ -2092,7 +2178,9 @@ function assertStableLocalFile(left: Stats, right: Stats): void {
 
 interface MappedRemotePiProcessOptions {
   readonly initialAttachment: RemoteBridgeAttachment;
-  readonly reattach: () => Promise<RemoteBridgeAttachment>;
+  readonly reattach: () => Promise<
+    { readonly attachment: RemoteBridgeAttachment } | { readonly childAbsentFiles: RemoteFileTransportPort }
+  >;
   readonly localSessionRoot: string;
   readonly localRuntime: string;
   readonly remoteSessionRoot: string;
@@ -2179,8 +2267,6 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
       attachment.process.kill("SIGKILL");
       return;
     }
-    this.#attachment = attachment;
-    this.#lastFiles = attachment.files;
     if (attachment.state !== undefined) {
       if (
         attachment.state.outputAcknowledged !== this.#outputCursor ||
@@ -2188,8 +2274,9 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
         attachment.state.inputAcknowledged < this.#inputAcknowledged ||
         attachment.state.inputAcknowledged > this.#inputSequence
       ) {
-        attachment.process.kill("SIGKILL");
+        for (const watcher of attachment.watchers) watcher.close();
         void attachment.reverseForward?.close().catch(() => undefined);
+        attachment.process.kill("SIGKILL");
         throw new Error("Remote Pi authority state crossed its reliable stream fence.");
       }
       this.#acknowledgeInput(attachment.state.inputAcknowledged);
@@ -2204,9 +2291,14 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
         );
       }
     }
+    this.#attachment = attachment;
+    this.#lastFiles = attachment.files;
     const generation = ++this.#attachmentGeneration;
     let terminal: RemoteTerminalState | undefined;
-    const outputDecoder = new RemoteBridgeOutputTransform(async (type, sequence, content) => {
+    let activeFrame = Promise.resolve();
+    let detaching = false;
+    let errorTimer: NodeJS.Timeout | undefined;
+    const receiveFrame = async (type: number, sequence: number, content: Buffer): Promise<void> => {
       if (type === REMOTE_FRAME_INPUT_ACK) {
         this.#acknowledgeInput(sequence);
         return;
@@ -2232,23 +2324,38 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
       this.#outputCursor = sequence;
       await attachment.persistOutputCursor?.(sequence);
       await this.#sendOutputAcknowledgement(attachment, sequence);
+    };
+    const outputDecoder = new RemoteBridgeOutputTransform((type, sequence, content) => {
+      activeFrame = receiveFrame(type, sequence, content);
+      return activeFrame;
     });
-    outputDecoder.once("error", () => {
-      try {
-        attachment.process.kill("SIGKILL");
-      } catch {
-        // The reconnect fence below remains authoritative.
+    const detach = async (decoderError?: Error): Promise<void> => {
+      if (detaching) return;
+      detaching = true;
+      if (errorTimer !== undefined) clearTimeout(errorTimer);
+      attachment.process.stdout.unpipe(outputDecoder);
+      attachment.process.stderr.unpipe(this.stderr);
+      outputDecoder.destroy();
+      // Finish the accepted frame before opening another attachment with its cursor.
+      const frameError: unknown = await activeFrame.then(() => undefined, (error: unknown) => error);
+      const failure = decoderError ?? frameError;
+      if (failure !== undefined) {
+        try { attachment.process.kill("SIGKILL"); } catch { /* The bridge is already unavailable. */ }
       }
-      void this.#protocolFailure(attachment, generation);
-    });
+      if (terminal !== undefined || failure === undefined || failure instanceof RemoteOutputAcknowledgementLost) {
+        await this.#attachmentEnded(attachment, generation, terminal);
+      } else {
+        await this.#protocolFailure(attachment, generation);
+      }
+    };
+    outputDecoder.once("error", (error: Error) => { void detach(error); });
     attachment.process.stdout.pipe(outputDecoder);
     attachment.process.stderr.pipe(this.stderr, { end: false });
     this.#inputSendTail = Promise.resolve();
     this.#flushInput(attachment);
-    let errorTimer: NodeJS.Timeout | undefined;
     attachment.process.once("error", () => {
       errorTimer = setTimeout(() => {
-        void this.#attachmentEnded(attachment, generation, terminal);
+        void detach();
       }, 100);
       errorTimer.unref?.();
     });
@@ -2260,7 +2367,7 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
           const timer = setTimeout(resolveOutput, 100);
           timer.unref?.();
         })
-      ]).then(() => this.#attachmentEnded(attachment, generation, terminal));
+      ]).then(() => detach());
     });
     if (this.#killRequested) void this.#requestBrokerKill(attachment, this.#killSignal);
   }
@@ -2311,49 +2418,33 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
     sequence: number
   ): Promise<void> {
     if (this.#attachment !== attachment) return;
-    await writeStreamChunk(
-      attachment.process.stdin,
-      encodeRemoteSequencedFrame(REMOTE_FRAME_OUTPUT_ACK, sequence)
-    );
+    const acknowledgement = encodeRemoteSequencedFrame(REMOTE_FRAME_OUTPUT_ACK, sequence);
+    try {
+      await writeStreamChunk(attachment.process.stdin, acknowledgement);
+    } catch (error) {
+      throw new RemoteOutputAcknowledgementLost("Remote Pi bridge lost its output acknowledgement.", { cause: error });
+    }
   }
 
   async #requestBrokerKill(
     attachment: RemoteBridgeAttachment,
     signal: "SIGKILL" | "SIGTERM"
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
-      if (attachment.authority !== undefined) {
-        await requestRemoteBrokerKill({
-          processes: attachment.processes,
-          sourcePath: attachment.brokerSourcePath,
-          managedRoot: attachment.brokerRoot,
-          nodeExecutable: attachment.nodeExecutable,
-          pathStyle: attachment.pathStyle,
-          controlCwd: attachment.controlCwd,
-          identity: attachment.identity,
-          signal,
-          authority: attachment.authority
-        });
-        return;
-      }
-      const request = await attachment.processes.open({
-        executable: attachment.nodeExecutable,
-        args: [
-          attachment.brokerSourcePath,
-          "kill",
-          attachment.brokerRoot,
-          attachment.identity,
-          signal
-        ],
-        cwd: attachment.controlCwd,
-        env: { JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 }
+      await requestRemoteBrokerKill({
+        processes: attachment.processes,
+        sourcePath: attachment.brokerSourcePath,
+        managedRoot: attachment.brokerRoot,
+        nodeExecutable: attachment.nodeExecutable,
+        pathStyle: attachment.pathStyle,
+        controlCwd: attachment.controlCwd,
+        identity: attachment.identity,
+        signal,
+        authority: attachment.authority
       });
-      request.stdin.end();
-      request.stdout.resume();
-      request.stderr.resume();
-      request.once("error", () => undefined);
+      return true;
     } catch {
-      // PiRpcTransport will report an unconfirmed kill if the broker cannot be reached.
+      return false;
     }
   }
 
@@ -2382,10 +2473,15 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
       this.#attachmentGeneration !== generation
     ) return;
     this.#attachment = undefined;
+    this.#killRequested = true;
+    this.#killSignal = "SIGKILL";
     for (const watcher of attachment.watchers) watcher.close();
     await attachment.reverseForward?.close().catch(() => undefined);
-    await this.#requestBrokerKill(attachment, "SIGKILL");
-    await this.#finish(1, null, attachment.files);
+    if (await this.#requestBrokerKill(attachment, "SIGKILL")) {
+      await this.#finish(null, null, attachment.files);
+      return;
+    }
+    this.#startReconnect();
   }
 
   #startReconnect(): void {
@@ -2397,7 +2493,12 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
         if (attempt > 0) await reconnectDelay(Math.min(2_000, 100 * (2 ** Math.min(attempt - 1, 5))));
         if (this.#settled || this.#attachment !== undefined) break;
         try {
-          const attachment = await this.#options.reattach();
+          const reattachment = await this.#options.reattach();
+          if ("childAbsentFiles" in reattachment) {
+            await this.#finish(null, null, reattachment.childAbsentFiles);
+            break;
+          }
+          const { attachment } = reattachment;
           if (this.#settled || this.#attachment !== undefined) {
             for (const watcher of attachment.watchers) watcher.close();
             await attachment.reverseForward?.close().catch(() => undefined);
@@ -2464,7 +2565,7 @@ class RemoteBridgeOutputTransform extends Transform {
   }
 
   async #drain(): Promise<void> {
-    while (this.#pending.byteLength >= 5) {
+    while (!this.destroyed && this.#pending.byteLength >= 5) {
       const length = this.#pending.readUInt32BE(1);
       if (length > MAXIMUM_REMOTE_FRAME_BYTES) throw new Error("Remote Pi broker frame exceeded its safety limit.");
       if (this.#pending.byteLength < length + 5) return;
@@ -2905,20 +3006,28 @@ function watchRuntimeFiles(
   environment: Readonly<NodeJS.ProcessEnv>,
   pathMap: ReadonlyMap<string, string>,
   childRuntimeGeneration: number
-): readonly FSWatcher[] {
+): readonly Pick<FSWatcher, "close">[] {
   const paths = [
     environment["JOKO_PI_CONTROL_FILE"],
     environment["JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE"]
   ].filter((value): value is string => value !== undefined);
   return paths.map((local) => {
     const remote = rewriteLocalPath(local, pathMap);
+    const name = basename(local);
+    const lifetime = new AbortController();
     let tail = Promise.resolve();
-    return watch(local, { persistent: false }, () => {
+    // The control writer atomically replaces the file, so follow its name in the parent directory.
+    const watcher = watch(dirname(local), { persistent: false, signal: lifetime.signal }, (_event, filename) => {
+      if (filename !== null && filename !== name) return;
       tail = tail.then(async () => {
+        if (lifetime.signal.aborted) return;
         const content = await runtimeControlContent(local, childRuntimeGeneration);
-        await files.write({ path: remote, content, mode: 0o600, atomic: true });
+        lifetime.signal.throwIfAborted();
+        await files.write({ path: remote, content, mode: 0o600, atomic: true, signal: lifetime.signal });
       }).catch(() => undefined);
     });
+    watcher.once("error", () => lifetime.abort());
+    return { close: () => lifetime.abort() };
   });
 }
 

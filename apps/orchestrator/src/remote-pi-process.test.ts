@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
-import { link, mkdir, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join, posix as remotePath, win32, type PlatformPath } from "node:path";
 import { PassThrough } from "node:stream";
 
 import {
+  createPiAdapter,
   MANAGED_SUBAGENT_NODE_ENV,
   MANAGED_SUBAGENT_RUNNER_FILE_NAME,
   type PiProcessHandle,
@@ -24,14 +25,17 @@ import type {
   RemoteProcessStartRequest,
   RemoteSshTransportLease
 } from "@joko/remote-ssh";
-import type { OperationalStore } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { OperationalStore, OperationPreviouslyFailedError } from "@joko/store";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { ArtifactStore } from "./artifact-store.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import { REMOTE_PI_BROKER_SOURCE_SHA256 } from "./remote-pi-broker-source.js";
 import type { RemoteWorkspaceAuthority } from "./remote-execution-router.js";
 import { RemotePiProcessFactory } from "./remote-pi-process.js";
+import { SessionHost } from "./session-host.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -47,6 +51,62 @@ afterEach(async () => {
 });
 
 describe("RemotePiProcessFactory", () => {
+  it.each([1, 2])("leaves SSH runtime files untouched when the original Owner is revoked during workspace preflight %s", async (preflight) => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-remote-pi-create-authority-"));
+    temporaryDirectories.push(directory);
+    const files = new PiMemoryRemoteFiles();
+    await files.mkdir("/workspace", { recursive: true });
+    await files.mkdir("/home/maker", { recursive: true });
+    const open = vi.fn(async () => { throw new Error("The retired creation reached SSH process startup."); });
+    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false };
+    const registry = { transports: async () => ({ host: {}, lease: { capabilities, files, processes: { open } } }) } as unknown as RemoteHostRegistry;
+    const factory = remoteFactory(registry, join(directory, "authority"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"),
+      repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
+    const adapter = createPiAdapter({ agentHome: join(directory, "agent-home"), sessionRoot: join(directory, "sessions"),
+      versionProbe: async () => "pi 99.1.0", includeManagedSubagentTools: () => false,
+      providers: [{ id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true,
+        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }] }],
+      validateRemoteWorkspace: (target, signal) => factory.validate(target.remoteWorkspace!, signal), processFactory: factory.create });
+    const host = new SessionHost(store, artifacts, [adapter]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let pending: Promise<unknown> | undefined;
+    try {
+      await artifacts.initialize();
+      await host.initialize();
+      const target = { id: TEST_REMOTE_WORKSPACE.hostTargetId, backendId: "pi", workspaceRoot: "/workspace",
+        displayName: "Remote project", remoteWorkspace: TEST_REMOTE_WORKSPACE, managed: true, trusted: true };
+      await host.registerTarget(target);
+      const connection = store.createConnection({ id: "original-owner", name: "Original", authKeyDigest: "original-digest" });
+      const healthy = store.createConnection({ id: "other-owner", name: "Other", authKeyDigest: "other-digest" });
+      const stat = files.stat.bind(files);
+      const reached = vi.fn();
+      let workspaceReads = 0;
+      vi.spyOn(files, "stat").mockImplementation(async (path) => {
+        const result = await stat(path);
+        if (path === "/workspace" && ++workspaceReads === preflight) { reached(); await gate; }
+        return result;
+      });
+      const mkdirRemote = vi.spyOn(files, "mkdir"), writeRemote = vi.spyOn(files, "write");
+      const operationId = "revoked-ssh-pi-create";
+      const creation = host.createSession({ operationId, connection, targetId: target.id, title: "Remote task",
+        providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask", planMode: false });
+      pending = creation.catch(() => undefined);
+      await vi.waitFor(() => expect(reached).toHaveBeenCalledOnce());
+      store.revokeDevice(connection.deviceId);
+      release();
+      await expect(creation).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+      expect(store.getOperation(operationId).status).toBe("failed");
+      expect(store.listSessions()).toEqual([]);
+      expect(mkdirRemote).not.toHaveBeenCalled();
+      expect(writeRemote).not.toHaveBeenCalled();
+      expect(open).not.toHaveBeenCalled();
+      expect(store.authorizeConnection(healthy.id, healthy.authKeyDigest).id).toBe(healthy.id);
+    } finally { release(); await pending; await host.dispose(); store.close(); }
+  });
+
   it.each(["cleanup", "unknown", "adopt"] as const)("keeps the exact remote navigation receipt across restart for %s", async (outcome) => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-navigation-"));
     temporaryDirectories.push(fixture);
@@ -236,6 +296,7 @@ describe("RemotePiProcessFactory", () => {
     await mkdir(sessions, { recursive: true });
     await mkdir(managedRunRoot, { recursive: true });
     const control = join(runtime, "control.json");
+    const retryControl = join(runtime, "silent-encrypted-retry.json");
     const descriptor = join(runtime, "mcp.json");
     const cli = join(fixture, "pi-cli.mjs");
     const managedSupport = join(runtime, "managed-support");
@@ -244,6 +305,7 @@ describe("RemotePiProcessFactory", () => {
     await mkdir(managedSupport, { recursive: true });
     await Promise.all([
       writeFile(control, JSON.stringify({ generation: 1 }), { mode: 0o600 }),
+      writeFile(retryControl, JSON.stringify({ format: 1, generation: 1, enabled: false }), { mode: 0o600 }),
       writeFile(descriptor, JSON.stringify({ endpoint: "http://127.0.0.1:39471/rpc" }), { mode: 0o600 }),
       writeFile(cli, "export {};", { mode: 0o600 }),
       writeFile(managedExtension, "export const extension = true;\n", { mode: 0o600 }),
@@ -259,6 +321,7 @@ describe("RemotePiProcessFactory", () => {
     });
     const remoteProcess = new ManualRemoteProcess({ authorityCommitGate });
     const managedStoreOperations: Record<string, unknown>[] = [];
+    let pagination: { wrongRevision: boolean } | undefined;
     let processRequest: RemoteProcessStartRequest | undefined;
     let forwardClosed = false;
     const lease: RemoteSshTransportLease = {
@@ -273,7 +336,7 @@ describe("RemotePiProcessFactory", () => {
       processes: {
         open: async (request) => {
           if (request.args[1] === "store") {
-            return new ManagedStoreRemoteProcess(managedStoreOperations);
+            return new ManagedStoreRemoteProcess(managedStoreOperations, pagination);
           }
           processRequest = request;
           return remoteProcess;
@@ -317,6 +380,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_GENERATION: "1",
         JOKO_PI_MCP_TOKEN: "bridge-token-a",
         JOKO_PI_CONTROL_FILE: control,
+        JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE: retryControl,
         JOKO_PI_MCP_DESCRIPTOR_FILE: descriptor,
         PI_CODING_AGENT_SESSION_DIR: sessions,
         JOKO_PI_SUBAGENT_RUN_ROOT: managedRunRoot,
@@ -397,6 +461,17 @@ describe("RemotePiProcessFactory", () => {
     expect(files.allText()).not.toContain(nativeAuthReservationToken);
 
     const remoteControl = bootstrap.env.JOKO_PI_CONTROL_FILE!;
+    const remoteRetryControl = bootstrap.env.JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE!;
+    expect(JSON.parse(files.text(remoteRetryControl))).toMatchObject({ format: 1, generation: 1, enabled: false });
+    for (const [index, enabled] of [true, false, true].entries()) {
+      const temporary = `${retryControl}.${index}.tmp`;
+      await writeFile(temporary, JSON.stringify({ format: 1, generation: 1, enabled }), { mode: 0o600 });
+      await rename(temporary, retryControl);
+      await waitUntil(() => JSON.parse(files.text(remoteRetryControl)).enabled === enabled);
+      expect(JSON.parse(files.text(remoteRetryControl))).toEqual({ format: 1, generation: 1, enabled });
+    }
+    expect(await files.stat(remoteRetryControl)).toMatchObject({ mode: 0o600 });
+    expect(scopes).toEqual([["target-a", "host-a"]]);
     mapped.stdin.write(`${JSON.stringify({ control })}\n`);
     await waitUntil(() => remoteProcess.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 1));
     const inbound = remoteProcess.input.find((entry, index) => index > 0 && decodeTestFrame(entry).type === 1)!;
@@ -447,16 +522,26 @@ describe("RemotePiProcessFactory", () => {
       maxBytes: 1024
     });
     expect(Buffer.from(tail.content).toString("utf8")).toBe("entry\n");
-    await store!.writeControl({
+    const controlScope = {
       sessionId: productSessionId,
       runId: scan.runs[0]!.runId,
       runnerInstanceId: scan.runs[0]!.runnerInstanceId,
       launchToken: scan.runs[0]!.launchToken,
       runnerScriptSha256: scan.runs[0]!.runnerScriptSha256,
-      expectedControlRevision: scan.runs[0]!.controlRevision,
+      expectedControlRevision: scan.runs[0]!.controlRevision
+    };
+    await store!.writeControl({
+      ...controlScope,
       kind: "control",
       value: { format: 1, action: "stop" }
     });
+    const approvalValue = { format: 1, action: "approval",
+      value: JSON.stringify({ decision: "default", ownerUserInstructions: [`主人😀${"\u0001".repeat(15_996)}`] }) };
+    expect(Buffer.byteLength(JSON.stringify(approvalValue))).toBeGreaterThan(64 * 1024);
+    await store!.writeControl({ ...controlScope, kind: "approval", value: approvalValue });
+    expect(managedStoreOperations.at(-1)).toMatchObject({ kind: "approval", value: approvalValue });
+    await expect(store!.writeControl({ ...controlScope, kind: "control", value: approvalValue }))
+      .rejects.toThrow("control value is invalid");
     await store!.dispose();
 
     const restartedFactory = remoteFactory(registry, authorityRoot);
@@ -473,6 +558,14 @@ describe("RemotePiProcessFactory", () => {
       afterRevision: scan.revision,
       limitBytes: 256 * 1024
     })).toMatchObject({ revision: scan.revision, unchanged: true, runs: [] });
+    const scanInput = { sessionId: productSessionId, sessionKey, limitBytes: 256 * 1024 };
+    pagination = { wrongRevision: false };
+    expect((await rediscovered!.scan(scanInput)).runs.map((run) => run.runId))
+      .toEqual([MANAGED_STORE_RUN_ID, MANAGED_STORE_SECOND_RUN_ID]);
+    expect(managedStoreOperations.at(-1)).toMatchObject({ page: { scanId: MANAGED_STORE_SCAN_ID, index: 1 } });
+    pagination = { wrongRevision: true };
+    await expect(rediscovered!.scan(scanInput)).rejects.toThrow("scan page crossed its revision or size fence");
+    pagination = undefined;
     const removal = await rediscovered!.stopAndRemoveSession({
       sessionId: productSessionId,
       sessionKey,
@@ -515,7 +608,7 @@ describe("RemotePiProcessFactory", () => {
     expect(finalizedAuthority).not.toHaveProperty("currentBearer");
     expect(JSON.stringify(finalizedAuthority)).not.toContain(nativeAuthReservationToken);
     expect(managedStoreOperations.map((value) => value.operation)).toEqual([
-      "scan", "read-tail", "write-control", "scan", "stop-remove-session",
+      "scan", "read-tail", "write-control", "write-control", "scan", "scan", "scan", "scan", "scan", "stop-remove-session",
       "finalize-deletion", "finalize-deletion"
     ]);
     expect(managedStoreOperations.every((value) =>
@@ -624,7 +717,7 @@ describe("RemotePiProcessFactory", () => {
     await terminal;
   });
 
-  it("reattaches after an unexpected SSH bridge exit and publishes the remote terminal once", async () => {
+  it.each(["bridge exit", "lost output acknowledgement", "verified child absence"] as const)("resolves %s against the original remote child", async (loss) => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-reconnect-"));
     temporaryDirectories.push(fixture);
     const runtime = join(fixture, "runtime");
@@ -641,7 +734,10 @@ describe("RemotePiProcessFactory", () => {
     const files = new PiMemoryRemoteFiles();
     await files.mkdir("/workspace", { recursive: true });
     await files.mkdir("/home/maker", { recursive: true });
-    const bridges = [new ManualRemoteProcess(), new ManualRemoteProcess()];
+    const bridges = [
+      new ManualRemoteProcess(),
+      new ManualRemoteProcess(loss === "verified child absence" ? { recoveryRejection: "child_absent" } : {})
+    ];
     const requests: RemoteProcessStartRequest[] = [];
     let transportCall = 0;
     let forwardCloseCount = 0;
@@ -695,15 +791,24 @@ describe("RemotePiProcessFactory", () => {
     });
 
     const output: string[] = [];
+    let exits = 0;
+    const terminal = new Promise<[number | null, NodeJS.Signals | null]>((resolveExit) => {
+      mapped.on("exit", (code, signal) => {
+        exits += 1;
+        resolveExit([code, signal]);
+      });
+    });
     mapped.stdout.on("data", (chunk: Buffer | string) => output.push(String(chunk)));
     bridges[0]!.stdout.write(testFrame(2, 1, Buffer.from('{"phase":"before"}\n')));
     const splitLine = Buffer.from(`${JSON.stringify({ phase: MULTILINGUAL_FIXTURES.splitPhase })}\n`, "utf8");
     const splitAt = splitLine.indexOf(Buffer.from(MULTILINGUAL_FIXTURES.splitCharacter, "utf8")) + 1;
-    bridges[0]!.stdout.write(testFrame(2, 2, splitLine.subarray(0, splitAt)));
     mapped.stdin.write('{"type":"uncertain"}\n');
     await waitUntil(() => bridges[0]!.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 1));
     const uncertainFirst = bridges[0]!.input.find((entry, index) => index > 0 && decodeTestFrame(entry).type === 1)!;
-    bridges[0]!.complete(75);
+    await waitUntil(() => bridges[0]!.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 6));
+    if (loss === "lost output acknowledgement") bridges[0]!.stdin.end();
+    bridges[0]!.stdout.write(testFrame(2, 2, splitLine.subarray(0, splitAt)));
+    if (loss !== "lost output acknowledgement") bridges[0]!.complete(75);
     await waitUntil(() => bridges[1]!.input.length > 0);
     const firstBootstrap = JSON.parse(bridges[0]!.input[0]!.toString("utf8")) as {
       launchHash: string;
@@ -712,9 +817,21 @@ describe("RemotePiProcessFactory", () => {
     const secondBootstrap = JSON.parse(bridges[1]!.input[0]!.toString("utf8")) as {
       launchHash: string;
       relay: { port: number };
+      outputCursor: number;
+      authority: { recovery: { processStartIdentity: string; epoch: number } };
     };
     expect(secondBootstrap.launchHash).toBe(firstBootstrap.launchHash);
     expect(secondBootstrap.relay.port).not.toBe(firstBootstrap.relay.port);
+    expect(secondBootstrap.outputCursor).toBe(2);
+    expect(secondBootstrap.authority.recovery).toMatchObject({ processStartIdentity: "c".repeat(64), epoch: 1 });
+    if (loss === "verified child absence") {
+      expect(await terminal).toEqual([null, null]);
+      expect(exits).toBe(1);
+      expect(requests.map((request) => request.args[1])).toEqual(["bridge", "bridge"]);
+      expect(forwardCloseCount).toBe(2);
+      return;
+    }
+    expect(exits).toBe(0);
 
     await waitUntil(() => bridges[1]!.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 1));
     const uncertainReplay = bridges[1]!.input.find((entry, index) => index > 0 && decodeTestFrame(entry).type === 1)!;
@@ -729,13 +846,6 @@ describe("RemotePiProcessFactory", () => {
     expect(decodeTestFrame(continued).content.toString("utf8")).toBe('{"type":"continue"}\n');
     bridges[1]!.stdout.write(testFrame(7, 2));
 
-    let exits = 0;
-    const terminal = new Promise<[number | null, NodeJS.Signals | null]>((resolveExit) => {
-      mapped.on("exit", (code, signal) => {
-        exits += 1;
-        resolveExit([code, signal]);
-      });
-    });
     bridges[1]!.stdout.write(testFrame(4, 4, terminalContent(0, null)));
     bridges[1]!.complete(0);
     expect(await terminal).toEqual([0, null]);
@@ -1212,10 +1322,11 @@ describe("RemotePiProcessFactory", () => {
   });
 
   it.each([
-    ["an output sequence gap", () => testFrame(2, 2, Buffer.from("skipped\n"))],
-    ["a forged input acknowledgement", () => testFrame(7, 1)],
-    ["an oversized frame declaration", () => oversizedTestFrameHeader()]
-  ])("fails the attachment closed on %s", async (_label, maliciousFrame) => {
+    ["an output sequence gap", () => testFrame(2, 2, Buffer.from("skipped\n")), true],
+    ["a forged input acknowledgement", () => testFrame(7, 1), true],
+    ["an oversized frame declaration", () => oversizedTestFrameHeader(), true],
+    ["a sequence gap with unconfirmed termination", () => testFrame(2, 2, Buffer.from("skipped\n")), false]
+  ] as const)("fails the attachment closed on %s", async (_label, maliciousFrame, confirmKill) => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-invalid-frame-"));
     temporaryDirectories.push(fixture);
     const runtime = join(fixture, "runtime");
@@ -1230,11 +1341,13 @@ describe("RemotePiProcessFactory", () => {
     await files.mkdir("/workspace", { recursive: true });
     await files.mkdir("/home/maker", { recursive: true });
     const first = new SignalOnlyRemoteProcess();
-    const auxiliary = new ManualRemoteProcess();
+    const second = new SignalOnlyRemoteProcess();
+    const auxiliary = new ManualRemoteProcess({ completeKill: confirmKill });
     let transportCall = 0;
+    let reattachedKillRequests = 0;
     const registry = {
       transports: async () => {
-        transportCall += 1;
+        const currentBridge = transportCall++ === 0 ? first : second;
         return {
           host: {},
           lease: {
@@ -1247,7 +1360,12 @@ describe("RemotePiProcessFactory", () => {
             },
             files,
             processes: {
-              open: async (request) => request.args[1] === "kill" ? auxiliary : first
+              open: async (request) => {
+                if (request.args[1] !== "kill") return currentBridge;
+                if (currentBridge === first) return auxiliary;
+                reattachedKillRequests += 1;
+                throw new Error("The reattached broker control connection is unavailable.");
+              }
             }
           } satisfies RemoteSshTransportLease
         };
@@ -1268,13 +1386,29 @@ describe("RemotePiProcessFactory", () => {
       },
       remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
+    const observedExit = vi.fn();
     const terminal = new Promise<[number | null, NodeJS.Signals | null]>((resolveExit) => {
-      mapped.once("exit", (code, signal) => resolveExit([code, signal]));
+      mapped.once("exit", (code, signal) => { observedExit(); resolveExit([code, signal]); });
     });
     first.stdout.write(maliciousFrame());
-    expect(await terminal).toEqual([1, null]);
+    if (confirmKill) {
+      expect(await terminal).toEqual([null, null]);
+      expect(transportCall).toBe(1);
+    } else {
+      await waitUntil(() => auxiliary.input.length > 0);
+      expect(observedExit).not.toHaveBeenCalled();
+      auxiliary.complete(1);
+      await waitUntil(() => reattachedKillRequests > 0);
+      expect(transportCall).toBe(2);
+      expect(observedExit).not.toHaveBeenCalled();
+      expect(JSON.parse(second.input[0]!.toString("utf8"))).toMatchObject({
+        authority: { recovery: { processStartIdentity: "c".repeat(64), epoch: 1 } }
+      });
+      second.stdout.write(testFrame(4, 1, terminalContent(0, null)));
+      second.complete(0);
+      expect(await terminal).toEqual([0, null]);
+    }
     expect(first.signals).toContain("SIGKILL");
-    expect(transportCall).toBe(1);
   });
 });
 
@@ -1331,6 +1465,8 @@ type PiMemoryEntry =
   | { kind: "file"; mode: number; modifiedAt: number; content: Buffer };
 
 const MANAGED_STORE_RUN_ID = "22222222-2222-4222-8222-222222222222";
+const MANAGED_STORE_SECOND_RUN_ID = "22222222-2222-4222-8222-222222222223";
+const MANAGED_STORE_SCAN_ID = "22222222-2222-4222-8222-222222222224";
 const MANAGED_STORE_RUNNER_ID = "33333333-3333-4333-8333-333333333333";
 const MANAGED_STORE_LAUNCH_TOKEN = "44444444-4444-4444-8444-444444444444";
 const MANAGED_STORE_SCRIPT_HASH = "5".repeat(64);
@@ -1346,7 +1482,7 @@ class ManagedStoreRemoteProcess extends EventEmitter implements RemoteProcessHan
   signalCode: NodeJS.Signals | null = null;
   #pending = Buffer.alloc(0);
 
-  constructor(readonly operations: Record<string, unknown>[]) {
+  constructor(readonly operations: Record<string, unknown>[], pagination?: { readonly wrongRevision: boolean }) {
     super();
     this.stdin.on("data", (chunk: Buffer | string) => {
       this.#pending = Buffer.concat([this.#pending, Buffer.from(chunk)]);
@@ -1357,19 +1493,27 @@ class ManagedStoreRemoteProcess extends EventEmitter implements RemoteProcessHan
       const operation = request.operation;
       let response: Record<string, unknown>;
       if (operation === "scan") {
+        const continuing = request.page !== undefined;
         const identity = {
-          runId: MANAGED_STORE_RUN_ID,
+          runId: continuing ? MANAGED_STORE_SECOND_RUN_ID : MANAGED_STORE_RUN_ID,
           runnerInstanceId: MANAGED_STORE_RUNNER_ID,
           launchToken: MANAGED_STORE_LAUNCH_TOKEN,
           runnerScriptSha256: MANAGED_STORE_SCRIPT_HASH
         };
+        const revision = pagination === undefined || continuing && pagination.wrongRevision
+          ? MANAGED_STORE_REVISION
+          : createHash("sha256").update(JSON.stringify([
+            request.sessionId, [MANAGED_STORE_RUN_ID, MANAGED_STORE_RUN_REVISION],
+            [MANAGED_STORE_SECOND_RUN_ID, MANAGED_STORE_RUN_REVISION]
+          ])).digest("hex");
         response = {
           ok: true,
           authorityVerified: true,
-          revision: MANAGED_STORE_REVISION,
-          unchanged: request.afterRevision === MANAGED_STORE_REVISION,
+          revision,
+          unchanged: request.afterRevision === revision,
           retryAfterMs: 1_000,
-          runs: request.afterRevision === MANAGED_STORE_REVISION ? [] : [{
+          ...(pagination !== undefined && !continuing ? { nextPage: { scanId: MANAGED_STORE_SCAN_ID, index: 1 } } : {}),
+          runs: request.afterRevision === revision ? [] : [{
             ...identity,
             revision: MANAGED_STORE_RUN_REVISION,
             controlRevision: MANAGED_STORE_RUN_REVISION,
@@ -1585,6 +1729,7 @@ class ManualRemoteProcess extends EventEmitter implements RemoteProcessHandle {
     readonly recoveryRejection?: "child_absent" | "launch_mismatch";
     readonly clockOffsetMs?: number;
     readonly authorityCommitGate?: Promise<void>;
+    readonly completeKill?: boolean;
   } = {}) {
     super();
     this.#authorityCommitGate = authorityState.authorityCommitGate;
@@ -1608,7 +1753,7 @@ class ManualRemoteProcess extends EventEmitter implements RemoteProcessHandle {
       const value = JSON.parse(this.#controlPending.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
       this.#bootstrapped = true;
       if (value.action === "kill") {
-        queueMicrotask(() => this.complete(0));
+        if (authorityState.completeKill !== false) queueMicrotask(() => this.complete(0));
         return;
       }
       if (value.action !== "ensure") return;
@@ -1617,7 +1762,7 @@ class ManualRemoteProcess extends EventEmitter implements RemoteProcessHandle {
       const generation = Number(requested.runtimeGeneration);
       const outputCursor = Number(value.outputCursor ?? 0);
       const recovering = recovery !== undefined && generation === Number(recovery.runtimeGeneration) + 1;
-      if (recovering && authorityState.recoveryRejection !== undefined) {
+      if (recovery !== undefined && authorityState.recoveryRejection !== undefined) {
         this.stdout.write(testControlFrame(8, {
           ok: false,
           recoveryRejected: true,

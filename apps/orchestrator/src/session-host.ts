@@ -10407,6 +10407,7 @@ export class SessionHost {
               retired = true;
             } catch (error) {
               if (!(error instanceof BackendRetirementTimeoutError)) {
+                if (error instanceof JokoError && error.publicError.code === "PI_PROCESS_KILL_UNCONFIRMED") throw error;
                 // A completed close rejection may already have retired native
                 // state. Preserve the prior fail-closed restoration behavior.
                 retired = true;
@@ -11672,6 +11673,12 @@ export class SessionHost {
         this.#store.setSetting("service", sessionId, PRIVATE_CREATION_RECEIPT_KEY, { version: 1, operationId: claim.operation.id, phase: "prepared" } satisfies PrivateCreationReceipt);
         input.assertServiceScope(); await input.beforeNativeCreation(sessionId, runtimeTarget); input.assertServiceScope();
       }
+      const creationAuthority = authorized && runtimeTarget.remoteWorkspace?.kind === "ssh" ? {
+        assertNativeCreationCurrent: () => {
+          this.#assertOpen();
+          this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+        }
+      } : {};
       let context = { ...this.provisionalContext(
         sessionId,
         runtimeTarget,
@@ -11765,7 +11772,7 @@ export class SessionHost {
               if (provisionalReadiness !== undefined && "connection" in input && this.assertProvisionalCreationReady(input) !== provisionalReadiness) {
                 throw new StoreError("Draft runtime approval changed before native startup.");
               }
-              binding = await adapter.createSession({ target: runtimeTarget, name: input.title,
+              binding = await adapter.createSession({ target: runtimeTarget, name: input.title, ...creationAuthority,
                 ...(!attaching && routedInput.providerId !== undefined ? { providerId: routedInput.providerId } : {}),
                 ...(!attaching && routedInput.modelId !== undefined ? { modelId: routedInput.modelId } : {}),
                 ...(!attaching && routedInput.effort !== undefined ? { effort: routedInput.effort } : {}),
@@ -14934,9 +14941,19 @@ export class SessionHost {
           return current;
         };
         assertArtifactAuthority(this.#store);
-        const artifact = await this.#artifactStore.ingestPath(sourcePath, { ...options, expiresAt: Date.now() + 10 * 60_000 });
+        const { openFile, ...metadata } = options ?? {};
+        const staging = { ...metadata, expiresAt: Date.now() + 10 * 60_000 };
+        const artifact = openFile === undefined
+          ? await this.#artifactStore.ingestPath(sourcePath, staging)
+          : await this.#artifactStore.ingestFileHandle(openFile.handle, {
+            ...staging, expectedSize: openFile.expectedSize, signal,
+            beforeFinalize: async () => {
+              await openFile.assertCurrent();
+              assertArtifactAuthority(this.#store);
+            }
+          });
         let localSource: Awaited<ReturnType<typeof validateLocalArtifactSource>> | undefined;
-        if (target.remoteWorkspace === undefined) {
+        if (openFile === undefined && target.remoteWorkspace === undefined) {
           try {
             const validated = await validateLocalArtifactSource({
               workspaceRoot: target.workspaceRoot,
@@ -18210,7 +18227,24 @@ function nativeDispatchHistoryOwnership(
   if (suffixLineage.slice(1).some((entry) => (eventsByEntry.get(entry.entryId) ?? []).some((event) =>
     event.payload.type === "message_complete" && event.payload.role === "user"))) return undefined;
 
-  const terminalEvents = eventsByEntry.get(suffixLineage.at(-1)!.entryId) ?? [];
+  let terminalIndex = suffixLineage.length - 1;
+  if (mode === "recovery" && store.getBackend(session.backendId).descriptor.adapterKind === "pi"
+    && userMessages[0]!.metadata?.namespace === "pi.native_history") {
+    while (terminalIndex > 0) {
+      const entryId = suffixLineage[terminalIndex]!.entryId;
+      const projections = eventsByEntry.get(entryId);
+      const control = projections?.[0];
+      if (projections?.length !== 1 || control?.metadata?.namespace !== "pi.native_history" || control.contentIndex !== 0
+        || control.metadata.fields["nativeEntryType"] !== control.projectionKind || control.payload.type !== "status"
+        || !(control.projectionKind === "model_change" && control.payload.key === "pi.history.model"
+          || control.projectionKind === "thinking_level_change" && control.payload.key === "pi.history.thinking_level")) break;
+      // A restored profile can append these controls after the completed
+      // turn. Preserve their history without attributing them to that Run.
+      suffixIds.delete(entryId);
+      terminalIndex -= 1;
+    }
+  }
+  const terminalEvents = eventsByEntry.get(suffixLineage[terminalIndex]!.entryId) ?? [];
   const terminalAssistantMessages = terminalEvents.filter((event) =>
     event.payload.type === "message_complete" && event.payload.role === "assistant");
   const turnId = userMessages[0]!.metadata?.fields["turnId"];
@@ -18228,7 +18262,8 @@ function nativeDispatchHistoryOwnership(
   if (mode === "recovery" && terminalAssistantMessages.length === 0 && codexTurnStatus("native_turn_failed", "failed")) {
     return { baseline, outcome: "failed", nativeEntryIds: suffixIds };
   }
-  if (suffixLineage.length < 2 || terminalAssistantMessages.length !== 1) return undefined;
+  if (terminalIndex < 1 || terminalAssistantMessages.length !== 1) return undefined;
+  if (terminalIndex < suffixLineage.length - 1 && terminalAssistantMessages[0]!.metadata?.namespace !== "pi.native_history") return undefined;
   const terminalOutcome = terminalAssistantMessages[0]!.metadata?.fields["nativeTerminalOutcome"];
   if (terminalOutcome !== "completed" && terminalOutcome !== "aborted" && terminalOutcome !== "failed") {
     return undefined;

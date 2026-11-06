@@ -1,14 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, PartnerLearningTurnSource, PolicySnapshot, ProviderModel, TargetDescriptor } from "@joko/core";
+import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { describe, expect, it, vi } from "vitest";
 import { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { appendVisionBridgeDescriptions, createPiAdapter, escapePiComposerSlashCommand, isRuntimeResourceProvenLoaded, mergeManagedResourceSnapshots, projectPiTreeNodes, resolvePiComposerSlashCommand } from "./adapter.js";
+import { COMMAND_GATE_REQUEST_PREFIX } from "./command-gate-bridge.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableStore } from "./managed-durable-store.js";
 import {
@@ -52,6 +54,7 @@ interface ScriptedPiProcessOptions {
   readonly runtimeToolCatalog?: unknown;
   readonly runtimeToolCatalogStatuses?: readonly unknown[];
   readonly responseDelayMsByCommand?: Readonly<Record<string, number>>;
+  readonly htmlExportReceipt?: (path: string) => string;
   readonly omitResponsesFor?: readonly string[];
   readonly failResponsesFor?: readonly string[];
   readonly clearQueueResponseData?: unknown;
@@ -499,9 +502,10 @@ class ScriptedPiProcess extends EventEmitter {
         this.#success(command, { summary: "summary", firstKeptEntryId: "entry-1", tokensBefore: 80, estimatedTokensAfter: 20 });
         return;
       case "export_html": {
-        const path = join(this.spec.cwd, "export.html");
+        const outputPath = typeof command.outputPath === "string" ? command.outputPath : undefined;
+        const path = outputPath ?? join(this.spec.cwd, "export.html");
         writeFileSync(path, "<html></html>");
-        this.#success(command, { path: "export.html" });
+        this.#success(command, { path: this.options.htmlExportReceipt?.(path) ?? outputPath ?? "export.html" });
         return;
       }
       case "bash": {
@@ -702,7 +706,11 @@ describe("PiBackendAdapter", () => {
       providers: [{ id: "local", api: "openai-completions", baseUrl: "http://127.0.0.1:1234/v1", models: [{ id: "test-model", contextWindow: 32_768 }] }],
       processFactory: spec => {
         const child = new ScriptedPiProcess(spec), original = child.kill.bind(child);
-        child.kill = signal => permitExit ? original(signal) : true;
+        child.kill = signal => {
+          if (permitExit) return original(signal);
+          child.emit("error", Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill" }));
+          return false;
+        };
         if (processes.length > 0) child.sessionId = processes[0]!.sessionId;
         processes.push(child); return child as unknown as PiProcessHandle;
       } });
@@ -710,11 +718,20 @@ describe("PiBackendAdapter", () => {
     const base = { ...makeContext(target, []), resolveModelWorkingContext: () => budget };
     try {
       const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, base), bound = { ...base, binding };
+      const oldHome = processes[0]!.spec.env["PI_CODING_AGENT_DIR"]!;
+      const originalMaterial = join(oldHome, "retirement-canary");
+      await writeFile(originalMaterial, "original runtime material", { mode: 0o600 });
       budget = 20_000; await expect(adapter.refreshModelWorkingContext(bound)).rejects.toBeDefined();
+      await expect(adapter.closeSession(binding, bound)).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
+      await expect(access(join(oldHome, "settings.json"))).resolves.toBeUndefined();
+      await expect(readFile(originalMaterial, "utf8")).resolves.toBe("original runtime material");
+      expect(processes[0]!.exitCode).toBeNull();
       expect(processes).toHaveLength(1);
       await expect(adapter.send({ text: "retained", images: [], files: [], mentions: [], disposition: "steer" }, bound)).rejects.toMatchObject({ publicError: { code: "PI_WORKING_CONTEXT_UNCONFIRMED" } });
       permitExit = true; budget = 12_000; await adapter.refreshModelWorkingContext(bound);
       expect(processes).toHaveLength(2); expect(processes[1]!.sessionFile).toBe(binding.opaqueRef);
+      expect(processes[0]!.exitCode).toBe(0);
+      await expect(access(originalMaterial)).rejects.toMatchObject({ code: "ENOENT" });
     } finally { permitExit = true; await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
   });
   it("isolates explicit skills for an empty shelf while retaining the native policy bridge", async () => {
@@ -2624,6 +2641,54 @@ describe("PiBackendAdapter", () => {
     }
   });
 
+  it("releases root Pi capacity while the next tool is waiting on the same RPC transport", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-command-gate-"));
+    const gate = createCommandConcurrencyGate({ readMaximum: () => 1, maximumWaitMs: 60_000 });
+    let child!: ScriptedPiProcess;
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1",
+      commandConcurrencyGate: gate, processFactory: (spec) => {
+        child = new ScriptedPiProcess(spec);
+        return child as unknown as PiProcessHandle;
+      }
+    });
+    const target: TargetDescriptor = { id: "gate-target", backendId: adapter.id, displayName: "Gate fixture",
+      workspaceRoot: directory, managed: true, trusted: true };
+    const owner = new AbortController();
+    const request = (id: string, action: "acquire" | "release", callId: string) =>
+      child.emitExtensionInput(id, `${COMMAND_GATE_REQUEST_PREFIX}${action}/${Buffer.from(callId).toString("base64url")}`);
+    const reply = (id: string) => child.commands.find((entry) => entry.type === "extension_ui_response" && entry.id === id);
+    try {
+      await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" },
+        { ...makeContext(target, []), signal: owner.signal });
+      request("admit-first", "acquire", "tool-one");
+      request("admit-second", "acquire", "tool-two");
+      await vi.waitFor(() => {
+        expect(reply("admit-first")).toMatchObject({ value: "admitted" });
+        expect(gate.snapshot()).toEqual({ running: 1, queued: 1 });
+      });
+      expect(reply("admit-second")).toBeUndefined();
+      request("release-first", "release", "tool-one");
+      await vi.waitFor(() => {
+        expect(reply("release-first")).toMatchObject({ value: "released" });
+        expect(reply("admit-second")).toMatchObject({ value: "admitted" });
+        expect(gate.snapshot()).toEqual({ running: 1, queued: 0 });
+      });
+      request("cancel-third", "acquire", "tool-three");
+      await vi.waitFor(() => expect(gate.snapshot()).toEqual({ running: 1, queued: 1 }));
+      owner.abort();
+      request("release-second", "release", "tool-two");
+      await vi.waitFor(() => {
+        expect(reply("cancel-third")).toMatchObject({ cancelled: true });
+        expect(reply("release-second")).toMatchObject({ value: "released" });
+        expect(gate.snapshot()).toEqual({ running: 0, queued: 0 });
+      });
+    } finally {
+      gate.close();
+      await adapter.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("projects the live Pi tool registry and uses tool source evidence for a commandless extension", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-runtime-tools-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-runtime-tools-workspace-"));
@@ -3250,6 +3315,43 @@ describe("PiBackendAdapter", () => {
     } finally {
       await adapter.dispose().catch(() => undefined);
     }
+  });
+
+  it.each(["different receipt", "cancelled", "native failure",
+    ...(process.platform === "win32" ? [] : ["replaced directory"] as const)] as const)("does not adopt a Pi HTML export after %s", async (failure) => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-export-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-export-workspace-"));
+    const abort = new AbortController();
+    let destination: string | undefined;
+    const adapter = createPiAdapter({ agentHome, sessionRoot: agentHome, versionProbe: async () => "pi 99.1.0-export",
+      processFactory: (spec) => new ScriptedPiProcess(spec, {
+        failResponsesFor: failure === "native failure" ? ["export_html"] : [],
+        htmlExportReceipt: (path) => {
+          destination = path;
+          if (failure === "different receipt") return join(workspace, "another.html");
+          if (failure === "cancelled") abort.abort();
+          if (failure === "replaced directory") {
+            renameSync(dirname(path), `${dirname(path)}-original`);
+            mkdirSync(dirname(path));
+            writeFileSync(path, "unowned replacement");
+          }
+          return path;
+        }
+      }) as unknown as PiProcessHandle });
+    const target: TargetDescriptor = { id: "export-target", backendId: "pi", displayName: "Export", workspaceRoot: workspace,
+      managed: true, trusted: false };
+    const storeArtifact = vi.fn();
+    const context = { ...makeContext(target, []), storeArtifact };
+    try {
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, context);
+      const workspaceBefore = await readdir(workspace);
+      await expect(adapter.exportSession({ ...context, signal: abort.signal, binding })).rejects.toThrow();
+      expect(storeArtifact).not.toHaveBeenCalled();
+      expect(destination).toBeDefined();
+      expect(await readdir(workspace)).toEqual(workspaceBefore);
+      if (failure === "replaced directory") await expect(readFile(destination!, "utf8")).resolves.toBe("unowned replacement");
+      else await expect(access(dirname(destination!))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await adapter.dispose(); }
   });
 
   it("reports a typed incomplete user Bash result one byte above host Artifact capacity", async () => {
@@ -7946,7 +8048,7 @@ describe("managed resource precedence", () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-workspace-"));
     const command = join(agentHome, "custom-pi.exe");
-    await writeFile(command, "not a compatible RPC executable\n");
+    await writeFile(command, "not a compatible RPC executable\n", { mode: 0o700 });
     let spawns = 0;
     const adapter = createPiAdapter({
       agentHome,

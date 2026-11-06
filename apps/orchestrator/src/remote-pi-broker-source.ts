@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 
+import { MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS } from "@joko/adapter-pi";
+
 export const REMOTE_PI_BROKER_PROTOCOL_VERSION = 1;
+export const REMOTE_PI_MANAGED_SCAN_LIMIT_BYTES = 64 * 1024 * 1024;
+
 export const REMOTE_PI_BROKER_SOURCE = String.raw`
 import { execFile, spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -38,6 +42,13 @@ const MANAGED_ARTIFACT_CHUNK_BYTES = 256 * 1024;
 const MANAGED_ARTIFACT_SNAPSHOT_TTL_MS = 15 * 60_000;
 const MANAGED_DELETION_RECEIPT_TTL_MS = 24 * 60 * 60_000;
 const MAX_MANAGED_RUNS = 256;
+const MAX_MANAGED_SCAN_BYTES = ${REMOTE_PI_MANAGED_SCAN_LIMIT_BYTES};
+const MAX_MANAGED_SCAN_SNAPSHOTS = 4;
+const MANAGED_SCAN_SNAPSHOT_TTL_MS = 60_000;
+const MAX_MANAGED_CONTROL_FILE_BYTES = 64 * 1024;
+const MAX_MANAGED_APPROVAL_CONTROL_BYTES = ${MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.controlFileBytes};
+const MAX_POLICY_DECISION_REPLY_CHARACTERS = ${MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.replyCharacters};
+const POLICY_DECISION_REQUEST_PREFIX = ${JSON.stringify(MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.requestPrefix)};
 const DISABLED_MANAGED_RUNNER_DIGEST = "0".repeat(64);
 const FRAME_STDIN = 1;
 const FRAME_STDOUT = 2;
@@ -453,22 +464,49 @@ function fingerprintIdentity(value) {
     executableHash: value.executableHash
   })).digest("hex");
 }
+async function linuxProcessStatus(proc) {
+  const value = await readFile(proc + "/stat");
+  if (value.byteLength > 16 * 1024) fail();
+  const text = value.toString("utf8");
+  const close = text.lastIndexOf(")");
+  if (close < 1) fail();
+  const fields = text.slice(close + 1).trim().split(/\s+/);
+  const state = fields[0];
+  const startTicks = fields[19];
+  if (state === undefined || startTicks === undefined || !/^[0-9]+$/.test(startTicks)) fail();
+  return { startTicks, exited: state === "Z" || state === "X" };
+}
+async function linuxProcessExecutable(path) {
+  const link = await readlink(path);
+  if (!isAbsolute(link)) fail();
+  const deleted = " (deleted)";
+  if (!link.endsWith(deleted)) return realpath(path);
+
+  // procfs can still open the running image after its pathname is unlinked.
+  // Distinguish that suffix from a literal name that still refers to the image.
+  const image = await stat(path, { bigint: true });
+  const named = await stat(link, { bigint: true }).catch((error) => {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (await readlink(path) !== link) fail();
+  if (named?.dev === image.dev && named.ino === image.ino) return realpath(path);
+  return link.slice(0, -deleted.length);
+}
 async function processFingerprint(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) return undefined;
   if (process.platform === "win32") return windowsProcessFingerprint(pid);
   if (process.platform !== "linux") return undefined;
   try {
-    const processInfo = await lstat("/proc/" + pid);
-    const processStat = await readFile("/proc/" + pid + "/stat");
-    const commandLine = await readFile("/proc/" + pid + "/cmdline");
-    if (processStat.byteLength > 16 * 1024 || commandLine.byteLength === 0 || commandLine.byteLength > 64 * 1024) return undefined;
-    const statText = processStat.toString("utf8");
-    const close = statText.lastIndexOf(")");
-    if (close < 1) return undefined;
-    const fields = statText.slice(close + 1).trim().split(/\s+/);
-    const startTicks = fields[19];
-    if (startTicks === undefined || !/^[0-9]+$/.test(startTicks)) return undefined;
-    const executable = await realpath("/proc/" + pid + "/exe");
+    const proc = "/proc/" + pid;
+    const { startTicks, exited } = await linuxProcessStatus(proc);
+    if (exited) return undefined;
+    const processInfo = await lstat(proc);
+    const commandLine = await readFile(proc + "/cmdline");
+    if (commandLine.byteLength === 0 || commandLine.byteLength > 64 * 1024) return undefined;
+    const executable = await linuxProcessExecutable(proc + "/exe");
+    const confirmed = await linuxProcessStatus(proc);
+    if (confirmed.exited || confirmed.startTicks !== startTicks) return undefined;
     const args = commandLine.toString("utf8").split("\0");
     if (args[args.length - 1] === "") args.pop();
     if (args.length === 0 || args.some((entry) => entry.includes("\0"))) return undefined;
@@ -483,6 +521,35 @@ async function processFingerprint(pid) {
     };
   } catch {
     return undefined;
+  }
+}
+class ProcessIdentityUnconfirmed extends Error {}
+async function recordedProcessFingerprint(expected) {
+  const observed = await processFingerprint(expected.pid);
+  if (process.platform !== "linux") return observed;
+  if (observed !== undefined) {
+    if (observed.startTicks !== expected.startTicks || fingerprintsMatch(observed, expected)) return observed;
+    throw new ProcessIdentityUnconfirmed("The recorded process is alive but its executable or command identity changed.");
+  }
+
+  try {
+    const status = await linuxProcessStatus("/proc/" + expected.pid);
+    if (status.exited || status.startTicks !== expected.startTicks) return undefined;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      try { process.kill(expected.pid, 0); } catch (probeError) {
+        if (probeError?.code === "ESRCH") return undefined;
+      }
+    }
+  }
+  throw new ProcessIdentityUnconfirmed("The recorded process identity could not be confirmed.");
+}
+async function waitForRecordedProcessFingerprint(expected) {
+  for (;;) {
+    try { return await recordedProcessFingerprint(expected); } catch (error) {
+      if (!(error instanceof ProcessIdentityUnconfirmed)) throw error;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    }
   }
 }
 async function trustedWindowsPowerShell() {
@@ -627,7 +694,7 @@ async function bootstrapOwnerProcess(root, record) {
     record.identity, record.ownerLaunchHash, record.ownerIdentity
   ];
   if (record.owner !== undefined) {
-    const current = await processFingerprint(record.owner.pid);
+    const current = await recordedProcessFingerprint(record.owner);
     if (current === undefined) return undefined;
     if (
       !fingerprintsMatch(current, record.owner) || !sameFingerprintOwner(current)
@@ -652,7 +719,7 @@ async function bootstrapOwnerProcess(root, record) {
 }
 async function bootstrapChildProcess(record) {
   if (record.child !== undefined) {
-    const current = await processFingerprint(record.child.pid);
+    const current = await recordedProcessFingerprint(record.child);
     if (current === undefined) return undefined;
     if (!fingerprintsMatch(current, record.child) || !(await bootstrapChildMatches(current, record))) fail();
     return current;
@@ -693,25 +760,32 @@ async function waitForFingerprint(pid, deadline = Date.now() + START_TIMEOUT_MS)
   }
   fail();
 }
+async function waitForRecordedProcessExit(fingerprint, deadline) {
+  for (;;) {
+    try {
+      if (!fingerprintsMatch(await recordedProcessFingerprint(fingerprint), fingerprint)) return true;
+    } catch (error) {
+      // Linux can clear cmdline/exe before publishing the exit state. This
+      // interval proves neither a different owner nor a completed shutdown.
+      if (!(error instanceof ProcessIdentityUnconfirmed)) throw error;
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+}
 async function stopExactProcess(fingerprint, requestedSignal = "SIGTERM") {
-  let current = await processFingerprint(fingerprint.pid);
+  const current = await recordedProcessFingerprint(fingerprint);
   if (current === undefined) return true;
   if (!fingerprintsMatch(current, fingerprint)) return false;
   try { process.kill(fingerprint.pid, signalName(requestedSignal)); } catch {}
   if (requestedSignal !== "SIGKILL") {
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      current = await processFingerprint(fingerprint.pid);
-      if (current === undefined || !fingerprintsMatch(current, fingerprint)) return true;
-      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
-    }
-    current = await processFingerprint(fingerprint.pid);
-    if (fingerprintsMatch(current, fingerprint)) {
-      try { process.kill(fingerprint.pid, "SIGKILL"); } catch {}
-    }
+    if (await waitForRecordedProcessExit(fingerprint, Date.now() + 5_000)) return true;
+    const remaining = await recordedProcessFingerprint(fingerprint);
+    if (!fingerprintsMatch(remaining, fingerprint)) return true;
+    try { process.kill(fingerprint.pid, "SIGKILL"); } catch {}
   }
-  while (fingerprintsMatch(await processFingerprint(fingerprint.pid), fingerprint)) {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  if (!(await waitForRecordedProcessExit(fingerprint, Date.now() + 5_000))) {
+    throw new ProcessIdentityUnconfirmed("The exact process did not confirm exit.");
   }
   return true;
 }
@@ -1438,7 +1512,7 @@ async function spawnRecoveryJanitor(root, paths, record) {
   janitor.unref();
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const child = await processFingerprint(record.child.pid);
+    const child = await recordedProcessFingerprint(record.child);
     if (!fingerprintsMatch(child, record.child)) {
       if (await validReaped(paths, record)) return;
     }
@@ -1448,8 +1522,8 @@ async function spawnRecoveryJanitor(root, paths, record) {
 }
 async function cleanupReapedSession(paths, record) {
   if (!(await validReaped(paths, record))) fail();
-  const owner = await processFingerprint(record.owner.pid);
-  const child = await processFingerprint(record.child.pid);
+  const owner = await recordedProcessFingerprint(record.owner);
+  const child = await recordedProcessFingerprint(record.child);
   if (fingerprintsMatch(owner, record.owner) || fingerprintsMatch(child, record.child)) fail();
   await writeTombstone(paths, record);
   await privateDirectory(paths.sessionRoot);
@@ -1471,7 +1545,7 @@ async function recoverDeadOwner(root, sessionIdentity) {
     if (error && error.code === "ENOENT") return false;
     throw error;
   }
-  const owner = await processFingerprint(record.owner.pid);
+  const owner = await recordedProcessFingerprint(record.owner);
   if (fingerprintsMatch(owner, record.owner)) return false;
   let bootstrap;
   try {
@@ -1491,7 +1565,7 @@ async function recoverDeadOwner(root, sessionIdentity) {
       && !(await stopExactProcess(pendingChild, "SIGTERM"))
     ) fail();
   }
-  const observedChild = await processFingerprint(record.child.pid);
+  const observedChild = await recordedProcessFingerprint(record.child);
   const child = fingerprintsMatch(observedChild, record.child) ? observedChild : undefined;
   if (child !== undefined) await spawnRecoveryJanitor(root, paths, record);
   else if (!(await validReaped(paths, record))) await writeReaped(paths, record);
@@ -1507,7 +1581,7 @@ async function spawnBootstrapReaper(root, record, child) {
   reaper.unref();
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const current = await processFingerprint(child.pid);
+    const current = await recordedProcessFingerprint(child);
     if (current === undefined) return;
     if (!fingerprintsMatch(current, child)) fail();
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
@@ -1966,7 +2040,7 @@ async function managedResumeSafety(layout, config, status, runId) {
     return false;
   }
 }
-async function inspectManagedRun(session, sessionId, runId) {
+async function inspectManagedRun(session, sessionId, runId, taskId) {
   if (!exactUuid(runId)) fail();
   const layout = managedSessionLayout(session, sessionId);
   await privateDirectory(layout.runRoot);
@@ -1979,6 +2053,8 @@ async function inspectManagedRun(session, sessionId, runId) {
   const ownerPath = join(runDirectory, "owner.json");
   const claimPath = join(runDirectory, "runner.claim.json");
   const runnerScript = join(runDirectory, "joko-managed-subagent-runner.cjs");
+  const scopedConfig = taskId === undefined ? undefined : await privateRegularFile(configPath, 512 * 1024);
+  if (scopedConfig !== undefined && parsedPrivateRecord(scopedConfig).taskId !== taskId) return undefined;
   const [
     configBytes,
     statusBytes,
@@ -1990,13 +2066,13 @@ async function inspectManagedRun(session, sessionId, runId) {
     transcriptSnapshot,
     resultSnapshot
   ] = await Promise.all([
-    privateRegularFile(configPath, 512 * 1024),
+    scopedConfig ?? privateRegularFile(configPath, 512 * 1024),
     privateRegularFile(statusPath, 512 * 1024),
     privateRegularFile(ownerPath, 512 * 1024),
     optionalPrivateRegularFile(claimPath, 64 * 1024),
     privateRegularFile(runnerScript, 512 * 1024),
-    optionalPrivateRegularFile(join(runDirectory, "control.json"), 64 * 1024),
-    optionalPrivateRegularFile(join(runDirectory, "approval-control.json"), 64 * 1024),
+    optionalPrivateRegularFile(join(runDirectory, "control.json"), MAX_MANAGED_CONTROL_FILE_BYTES),
+    optionalPrivateRegularFile(join(runDirectory, "approval-control.json"), MAX_MANAGED_APPROVAL_CONTROL_BYTES),
     optionalPrivateRegularFileSnapshot(join(runDirectory, "transcript.jsonl"), 50 * 1024 * 1024),
     optionalPrivateRegularFileSnapshot(join(runDirectory, "result.json"), 512 * 1024)
   ]);
@@ -2025,6 +2101,7 @@ async function inspectManagedRun(session, sessionId, runId) {
     || owner.productSessionId !== layout.sessionId || owner.runnerInstanceId !== runnerInstanceId
     || owner.runnerScript !== runnerScript || owner.runnerScriptSha256 !== runnerScriptSha256
     || !["reserved", "running"].includes(owner.state)
+    || taskId !== undefined && (status.taskId !== taskId || owner.taskId !== taskId)
   ) fail();
   if (config.nativeAuthRequired === true) {
     if (
@@ -2201,6 +2278,9 @@ function managedArtifactRevision(session, run, kind, artifact) {
 function attachManagedArtifactRevisions(session, snapshot) {
   snapshot.transcriptRevision = managedArtifactRevision(session, snapshot, "transcript", snapshot.transcriptSnapshot);
   snapshot.resultRevision = managedArtifactRevision(session, snapshot, "result", snapshot.resultSnapshot);
+  snapshot.revision = digestBytes(Buffer.from(JSON.stringify([
+    snapshot.revision, snapshot.transcriptRevision, snapshot.resultRevision
+  ])));
   return snapshot;
 }
 function sameOpenFileIdentity(info, snapshot) {
@@ -2262,11 +2342,42 @@ async function readManagedArtifactSnapshot(snapshot, offset, maximumReadBytes) {
     await handle.close();
   }
 }
+function managedScanResponse(session, limitBytes, revision, unchanged, runs, nextPage) {
+  const response = assertManagedResponseSecretFree(session, {
+    ok: true, revision, unchanged, retryAfterMs: 1_000, runs,
+    ...(nextPage === undefined ? {} : { nextPage })
+  });
+  if (Buffer.byteLength(JSON.stringify(response)) > limitBytes) fail();
+  return response;
+}
+function managedScanPage(session, scanId, scan, index) {
+  const more = index + 1 < scan.pages.length;
+  const response = managedScanResponse(session, scan.limitBytes, scan.revision, false, scan.pages[index],
+    more ? { scanId, index: index + 1 } : undefined);
+  if (more) scan.deadline = performance.now() + MANAGED_SCAN_SNAPSHOT_TTL_MS;
+  else session.managedScanSnapshots.delete(scanId);
+  return response;
+}
 async function scanManagedRuns(session, value) {
   const layout = managedSessionLayout(session, value.sessionId, value.sessionKey);
-  const limitBytes = value.limitBytes;
-  if (!Number.isSafeInteger(limitBytes) || limitBytes < 1 || limitBytes > 1024 * 1024) fail();
+  if (!Number.isSafeInteger(value.limitBytes) || value.limitBytes < 1 || value.limitBytes > MAX_CONTROL_BYTES) fail();
+  const limitBytes = Math.min(MAX_CONTROL_BYTES - 4096, value.limitBytes);
+  const taskId = value.taskId === undefined ? undefined : boundedText(value.taskId, 256);
   const afterRevision = value.afterRevision === undefined ? undefined : launchHash(value.afterRevision);
+  const scans = session.managedScanSnapshots;
+  const now = performance.now();
+  for (const [scanId, scan] of scans) {
+    if (scan.deadline <= now || scan.epoch !== session.authorityEpoch || scan.generation !== session.childGeneration) {
+      scans.delete(scanId);
+    }
+  }
+  if (value.page !== undefined) {
+    const page = value.page;
+    if (!page || !exactUuid(page.scanId) || !Number.isSafeInteger(page.index) || page.index < 1 || afterRevision !== undefined) fail();
+    const scan = scans.get(page.scanId);
+    if (scan === undefined || scan.taskId !== taskId || scan.limitBytes !== limitBytes || page.index >= scan.pages.length) fail();
+    return managedScanPage(session, page.scanId, scan, page.index);
+  }
   await privateDirectory(layout.runRoot);
   let entries;
   try {
@@ -2285,26 +2396,46 @@ async function scanManagedRuns(session, value) {
   }
   runIds.sort();
   const snapshots = [];
+  let bytes = 0;
   for (const runId of runIds) {
-    snapshots.push(attachManagedArtifactRevisions(
-      session,
-      await inspectManagedRun(session, layout.sessionId, runId)
-    ));
+    const inspected = await inspectManagedRun(session, layout.sessionId, runId, taskId);
+    if (inspected === undefined) continue;
+    const run = publicManagedSnapshot(attachManagedArtifactRevisions(session, inspected));
+    const size = Buffer.byteLength(JSON.stringify(run)) + 1;
+    bytes += size;
+    if (bytes > MAX_MANAGED_SCAN_BYTES) fail();
+    snapshots.push({ run, size });
   }
   const revision = digestBytes(Buffer.from(JSON.stringify([
     layout.sessionId,
-    ...snapshots.map((snapshot) => [snapshot.runId, snapshot.revision])
+    ...snapshots.map(({ run }) => [run.runId, run.revision])
   ])));
-  const unchanged = afterRevision === revision;
-  const runs = unchanged ? [] : snapshots.map(publicManagedSnapshot);
-  const response = assertManagedResponseSecretFree(session, {
-    ok: true,
-    revision,
-    unchanged,
-    retryAfterMs: 1_000,
-    runs
-  });
-  if (Buffer.byteLength(JSON.stringify(response)) > Math.min(MAX_CONTROL_BYTES - 4096, limitBytes)) fail();
+  if (afterRevision === revision) return managedScanResponse(session, limitBytes, revision, true, []);
+  const headerBytes = Buffer.byteLength(JSON.stringify({ ok: true, revision, unchanged: false, retryAfterMs: 1_000, runs: [] }));
+  if (headerBytes + Math.max(0, bytes - 1) <= limitBytes) {
+    return managedScanResponse(session, limitBytes, revision, false, snapshots.map(({ run }) => run));
+  }
+  const maximumPageBytes = limitBytes - headerBytes - 128;
+  const pages = [[]];
+  let pageBytes = 0;
+  for (const { run, size } of snapshots) {
+    if (size > maximumPageBytes) fail();
+    if (pageBytes + size > maximumPageBytes) {
+      pages.push([]);
+      pageBytes = 0;
+    }
+    pages.at(-1).push(run);
+    pageBytes += size;
+  }
+  const cachedBytes = [...scans.values()].reduce((sum, scan) => sum + scan.bytes, 0);
+  if (scans.size >= MAX_MANAGED_SCAN_SNAPSHOTS || cachedBytes + bytes > MAX_MANAGED_SCAN_BYTES) fail();
+  const scanId = randomUUID();
+  const scan = {
+    taskId, limitBytes, revision, pages, bytes, epoch: session.authorityEpoch,
+    generation: session.childGeneration, deadline: now + MANAGED_SCAN_SNAPSHOT_TTL_MS
+  };
+  const response = managedScanPage(session, scanId, scan, 0);
+  scans.set(scanId, scan);
   return response;
 }
 async function readManagedTail(session, value) {
@@ -2340,6 +2471,7 @@ function validateManagedControlValue(snapshot, sessionId, kind, value) {
     || value.productSessionId !== sessionId || value.productGeneration !== snapshot.config.productGeneration
     || value.taskId !== snapshot.config.taskId || !Number.isFinite(value.requestedAt)
   ) fail();
+  let maximumBytes = MAX_MANAGED_CONTROL_FILE_BYTES;
   if (kind === "control") {
     if (!["stop", "steer", "follow_up"].includes(value.action)) fail();
     if (value.action === "stop") {
@@ -2353,17 +2485,20 @@ function validateManagedControlValue(snapshot, sessionId, kind, value) {
       || pendingApproval.id !== value.approvalId || pendingApproval.childId !== value.childId
       || typeof value.approvalId !== "string" || value.approvalId.length < 1 || value.approvalId.length > 512
       || !(value.confirmed === true || value.confirmed === false || typeof value.value === "string" || value.cancelled === true)
-      || typeof value.value === "string" && value.value.length > 1024
     ) fail();
+    const policyRequest = pendingApproval.method === "input" && typeof pendingApproval.title === "string"
+      && pendingApproval.title.startsWith(POLICY_DECISION_REQUEST_PREFIX);
+    if (typeof value.value === "string" && value.value.length > (policyRequest ? MAX_POLICY_DECISION_REPLY_CHARACTERS : 1024)) fail();
+    if (policyRequest) maximumBytes = MAX_MANAGED_APPROVAL_CONTROL_BYTES;
   }
-  if (Buffer.byteLength(JSON.stringify(value)) > 64 * 1024) fail();
-  return structuredClone(value);
+  return { control: structuredClone(value), maximumBytes };
 }
 async function previousManagedControlSequence(snapshot, sessionId, kind) {
   const path = join(snapshot.runDirectory, kind === "control" ? "control.json" : "approval-control.json");
   let bytes;
-  try { bytes = await privateRegularFile(path, 64 * 1024); }
-  catch (error) {
+  try {
+    bytes = await privateRegularFile(path, kind === "approval" ? MAX_MANAGED_APPROVAL_CONTROL_BYTES : MAX_MANAGED_CONTROL_FILE_BYTES);
+  } catch (error) {
     if (error && error.code === "ENOENT") return 0;
     throw error;
   }
@@ -2389,7 +2524,7 @@ async function writeManagedControl(session, value) {
     || launchHash(value.expectedControlRevision) !== snapshot.controlRevision
     || !["control", "approval"].includes(value.kind)
   ) fail();
-  const requestedControl = validateManagedControlValue(snapshot, value.sessionId, value.kind, value.value);
+  const { control: requestedControl, maximumBytes } = validateManagedControlValue(snapshot, value.sessionId, value.kind, value.value);
   const previousSequence = await previousManagedControlSequence(
     snapshot,
     value.sessionId,
@@ -2401,6 +2536,7 @@ async function writeManagedControl(session, value) {
     ...requestedControl,
     seq: Math.max(previousSequence + 1, Date.now())
   };
+  if (Buffer.byteLength(JSON.stringify(control)) > maximumBytes) fail();
   await atomicJson(join(snapshot.runDirectory, value.kind === "control" ? "control.json" : "approval-control.json"), control);
   const refreshed = await inspectManagedRun(session, value.sessionId, value.runId);
   const receipt = digestBytes(Buffer.from(JSON.stringify([
@@ -2416,6 +2552,7 @@ async function writeManagedControl(session, value) {
   });
 }
 async function completeManagedRemoval(session, layout, terminalRunIds) {
+  session.managedScanSnapshots.clear();
   if (session.managedRemoval !== undefined) {
     const previous = managedRemovalRecord(session.managedRemoval);
     if (previous.sessionId !== layout.sessionId || previous.sessionKey !== layout.sessionKey) fail();
@@ -3332,6 +3469,7 @@ async function runSessionOwner(root, request, ownerIdentity) {
       inputTail: Promise.resolve(),
       nativeAuthGenerations: new Map(),
       nativeAuthReservations: new Map(),
+      managedScanSnapshots: new Map(),
       managedArtifactSnapshots: new Map(),
       managedArtifactSnapshotChunks: 0,
       managedRemoval: undefined,
@@ -3370,7 +3508,7 @@ async function runSessionOwner(root, request, ownerIdentity) {
         closeListeningServer(relayServer)
       ]);
       if (session.committed) {
-        const currentChild = await processFingerprint(session.childFingerprint.pid);
+        const currentChild = await recordedProcessFingerprint(session.childFingerprint);
         if (fingerprintsMatch(currentChild, session.childFingerprint)) fail();
         await writeTombstone(paths, ownerRecord(ownerMetadata(session), session.identity));
       }
@@ -4059,8 +4197,8 @@ async function runJanitor(root, expectedIdentity, expectedHash, expectedOwnerIde
   };
   let childReaped = false;
   for (;;) {
-    const currentOwner = await processFingerprint(owner.pid);
-    const currentChild = await processFingerprint(child.pid);
+    const currentOwner = await waitForRecordedProcessFingerprint(owner);
+    const currentChild = await waitForRecordedProcessFingerprint(child);
     if (fingerprintsMatch(currentOwner, owner)) {
       if (currentChild === undefined || !fingerprintsMatch(currentChild, child)) {
         if (!childReaped) {
@@ -4078,16 +4216,16 @@ async function runJanitor(root, expectedIdentity, expectedHash, expectedOwnerIde
     try { process.kill(child.pid, "SIGTERM"); } catch {}
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      const candidate = await processFingerprint(child.pid);
+      const candidate = await waitForRecordedProcessFingerprint(child);
       if (candidate === undefined) return finishOwnerLoss();
       if (!fingerprintsMatch(candidate, child)) return;
       await new Promise((resolveWait) => setTimeout(resolveWait, 50));
     }
-    const candidate = await processFingerprint(child.pid);
+    const candidate = await waitForRecordedProcessFingerprint(child);
     if (fingerprintsMatch(candidate, child)) {
       try { process.kill(child.pid, "SIGKILL"); } catch {}
     }
-    while (fingerprintsMatch(await processFingerprint(child.pid), child)) {
+    while (fingerprintsMatch(await waitForRecordedProcessFingerprint(child), child)) {
       await new Promise((resolveWait) => setTimeout(resolveWait, 25));
     }
     return finishOwnerLoss();
@@ -4106,7 +4244,7 @@ async function runBootstrapReaper(root, expectedIdentity, expectedHash, expected
     executableHash: launchHash(values[3])
   };
   if (record.child !== undefined && !fingerprintsMatch(record.child, child)) fail();
-  const current = await processFingerprint(child.pid);
+  const current = await recordedProcessFingerprint(child);
   if (current === undefined) return;
   if (!fingerprintsMatch(current, child) || !(await bootstrapChildMatches(current, record))) fail();
   if (!(await stopExactProcess(child, "SIGTERM"))) fail();

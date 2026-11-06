@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, link, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, SessionTreeNode, TargetDescriptor } from "@joko/core";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -268,11 +268,20 @@ describe("real Pi managed generation smoke", () => {
         expect.objectContaining({ type: "compaction", state: "completed", reason: "manual" })
       ]));
 
+      const preserved = join(agentHome, "existing-export-target.html");
+      const defaultExportPath = join(workspace, `pi-session-${basename(firstBinding.opaqueRef, ".jsonl")}.html`);
+      await writeFile(preserved, "existing user content");
+      if (process.platform === "win32") await link(preserved, defaultExportPath);
+      else await symlink(preserved, defaultExportPath);
+      const workspaceBeforeExport = await readdir(workspace);
       const artifact = await adapter.exportSession(first);
       expect(artifact).toMatchObject({ mimeType: "text/html", fileName: `pi-${first.sessionId}.html` });
       expect(artifacts).toHaveLength(1);
       expect(artifacts[0]?.mimeType).toBe("text/html");
       expect(Buffer.from(artifacts[0]?.bytes ?? []).toString("utf8")).toContain("<!DOCTYPE html>");
+      await expect(readFile(preserved, "utf8")).resolves.toBe("existing user content");
+      await expect(readdir(workspace)).resolves.toEqual(workspaceBeforeExport);
+      await expect(access(artifacts[0]!.sourcePath)).rejects.toMatchObject({ code: "ENOENT" });
 
       await expect(adapter.runBash(`node "${bashSuccessScript}"`, false, first)).resolves.toMatchObject({
         output: "native-user-bash",
@@ -800,7 +809,9 @@ function smokeContext(target: TargetDescriptor, generation: number, sink: EventS
     requestInteraction: async () => ({ kind: "confirmed", confirmed: true }),
     artifactCapacityBytes: 256 * 1024 * 1024,
     storeArtifact: async (sourcePath, options) => {
-      const bytes = await readFile(sourcePath);
+      await options?.openFile?.assertCurrent();
+      const bytes = await (options?.openFile?.handle.readFile() ?? readFile(sourcePath));
+      await options?.openFile?.assertCurrent();
       artifacts?.push({
         sourcePath,
         bytes,
