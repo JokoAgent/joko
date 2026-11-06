@@ -225,7 +225,9 @@ describe("native import service and owning effects", () => {
     const published = await skillOwner.read(partner.id, skill.resource.id, signal);
     expect(partner.identitySource).toContain(publicNote);
     expect(published.skill.body).toContain(publicNote);
-    for (const token of [direct, override, referenced]) expect(JSON.stringify([preview, partner.identitySource, published.skill])).not.toContain(token);
+    const publication = JSON.stringify([preview, partner.identitySource, published.skill], (_key, value: unknown) =>
+      typeof value === "bigint" ? value.toString() : value);
+    for (const token of [direct, override, referenced]) expect(publication).not.toContain(token);
 
     // Simulate a retained checkpoint created before source credential masking.
     await f.storage.environment.update(partner.id, () => {}, (environment) => {
@@ -317,7 +319,7 @@ describe("native import service and owning effects", () => {
     );
   }, 20_000);
 
-  it("saves a complete package without a model and projects its saved files only after an explicit real model selection", async () => {
+  it.each([false, true])("projects a saved package after model selection with a legacy null binding of %s", async (legacy) => {
     const f = await fixture({ resourceFiles: 20, noDefaults: true }); const signal = new AbortController().signal;
     const entry = (await f.api.packages!("en", signal)).find(row => row.packageId === "engineer-bot")!;
     const admitted = await f.api.invitePackage!(entry, "en", signal);
@@ -334,6 +336,12 @@ describe("native import service and owning effects", () => {
     expect(f.resources.list({ targetId: pending.homeTargetId })).toHaveLength(0);
     expect(f.store.listSessions({ targetId: pending.homeTargetId })).toHaveLength(0);
     expect(f.storage.readReceipt(saved.requestId)?.checkpointCleared).toBe(false);
+    if (legacy) {
+      const receipt = f.storage.readReceipt(saved.requestId)!;
+      receipt.result.canonicalSessionId = undefined;
+      f.storage.saveReceipt(receipt);
+    }
+    expect(f.storage.readReceipt(saved.requestId)?.result.canonicalSessionId).toBeUndefined();
     await expect(f.partners.createPartner({ requestId: "manual_empty_model_request", expectedDirectoryRevision: f.partners.directory().state.revision,
       displayName: "Manual", templateId: "general", avatar: "orbit", identitySource: "Manual identity", usesDirectoryDefaults: false,
       capabilities: { modelChain: [], permissionMode: "ask", planMode: false } })).rejects.toMatchObject({ code: "PARTNER_INVALID" });
