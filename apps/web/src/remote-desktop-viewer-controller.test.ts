@@ -27,6 +27,7 @@ function fixture(platform = "win32", temporary = false, portal = false, systemAu
   let pendingControl: Promise<object> | undefined;
   let heartbeatFailure = false;
   let geometryGeneration = 2n;
+  const displays = [{ displayId: "one", name: "One", width: 1200, height: 800 }, { displayId: "two", name: "Two", width: 1000, height: 700 }];
   const api: DesktopRemoteDesktopViewerApi = {
     platform, state: vi.fn(() => initialState),
     ready: vi.fn(async () => { onState({ ...SCOPE, active: true }); }),
@@ -40,10 +41,10 @@ function fixture(platform = "win32", temporary = false, portal = false, systemAu
         return { ok: false as const, code: Code.FailedPrecondition, reason: RemoteDesktopFailureReason.LEASE_EXPIRED };
       }
       const output = name === "getRemoteDesktopCapabilities" ? { capabilities: { protocolVersion: 1, enabled: true,
-        canControl: !portal, autoControl, platform: portal || systemAudio ? "linux" : platform, displays: [{ displayId: "one", name: "One", width: 1200, height: 800 }],
+        canControl: !portal, autoControl, platform: portal || systemAudio ? "linux" : platform, displays,
         jpegFallback: true, webrtcVideo: true, videoSettings: true, systemAudio, automaticReconnect: true, connectionTakeover: true, clipboardContent: true, hostMute: true, lockOnExit: true, clipboardSync: true, privacyScreen: true, displayModes: true, resolutionRestore: temporary,
         viewerDisplay: platform === "linux", viewerDisplayRestore: platform === "linux" } } :
-        name === "startRemoteDesktop" ? { lease: { leaseId: "lease", display: { displayId: "one", width: 1200, height: 800 }, controlling: input["control"] === true, controlGeneration: 1n } } :
+        name === "startRemoteDesktop" ? { lease: { leaseId: "lease", display: displays.find(display => display.displayId === input["displayId"]), controlling: input["control"] === true, controlGeneration: 1n } } :
         name === "setRemoteDesktopControl" ? await (pendingControl ?? Promise.resolve({ state: { controlling: input["enabled"], controlGeneration: geometryGeneration } })) :
         name === "heartbeatRemoteDesktop" ? { state: { controlling: !portal, controlGeneration: geometryGeneration } } :
         name === "getRemoteDesktopFrame" ? { result: { frame: { jpeg: new Uint8Array([255,216,255,217]) } } } :
@@ -91,6 +92,25 @@ describe("Desktop viewer presentation adapter", () => {
     f.controller.focusLost(); window.dispatchEvent(new Event("focus")); await flush();
     expect(f.controller.snapshot.controlling).toBe(false);
     expect(f.inputCalls.filter(call => call.name === "setRemoteDesktopControl")).toHaveLength(2);
+  });
+
+  it.each([false, true])("switches displays with the current control choice %s on an auto-control host", async (controlling) => {
+    const f = fixture("win32", false, false, false, Promise.resolve(SCOPE), true); await flush();
+    f.post({ type: "framePresented" });
+    expect(f.controller.snapshot.controlling).toBe(true);
+    if (!controlling) await f.controller.control(false);
+    expect(f.controller.snapshot.controlling).toBe(controlling);
+
+    await f.controller.selectDisplay("two");
+    f.post({ type: "framePresented" });
+    window.dispatchEvent(new Event("focus")); await flush();
+
+    expect(f.inputCalls.filter(call => call.name === "startRemoteDesktop").map(call => call.input)).toEqual([
+      expect.objectContaining({ displayId: "one", control: true }),
+      expect.objectContaining({ displayId: "two", control: controlling })
+    ]);
+    expect(f.inputCalls.filter(call => call.name === "setRemoteDesktopControl").map(call => call.input["enabled"])).toEqual(controlling ? [] : [false]);
+    expect(f.controller.snapshot).toMatchObject({ ready: true, controlling, lease: { display: { displayId: "two" } } });
   });
 
   it("retires deferred initial control when its viewer binding becomes inactive", async () => {

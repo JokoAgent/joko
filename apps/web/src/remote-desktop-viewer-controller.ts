@@ -248,7 +248,7 @@ export class DesktopRemoteDesktopViewerController {
       }
     }, 60000);
   }
-  private async connect(displayId?: string, takeover = false, resume = false): Promise<void> {
+  private async connect(displayId?: string, { takeover = false, resume = false, wantsControl = true } = {}): Promise<void> {
     if (this.#opening || this.#client === undefined || !this.#scope?.active) return;
     this.#opening = true;
     const epoch = this.#epoch;
@@ -263,16 +263,17 @@ export class DesktopRemoteDesktopViewerController {
       }
       this.publish({ caps });
       const display = caps.displays.find((item) => item.displayId === displayId) ?? caps.displays[0]!;
+      const canTakeControl = wantsControl && caps.canControl;
       const started = await rpc.startRemoteDesktop({ displayId: display.displayId,
         inputHandoffRequestId: this.#scope?.target?.inputHandoffRequestId,
         mode: takeover ? RemoteDesktopStartMode.TAKEOVER : resume ? RemoteDesktopStartMode.RESUME : RemoteDesktopStartMode.NEW,
-        control: caps.autoControl && caps.canControl }, this.options());
+        control: caps.autoControl && canTakeControl }, this.options());
       if (!this.current(epoch)) return;
       if (started.lease === undefined || !started.lease.leaseId || started.lease.display === undefined) throw new Error("Invalid lease.");
       this.#sourceDisplayId = display.displayId;
       this.publish({ lease: started.lease, controlling: started.lease.controlling, sourceDisplayId: display.displayId, viewerDisplayFitted: started.lease.display.displayId !== display.displayId });
-      this.#wantedControl = caps.canControl;
-      this.#initialControlPending = caps.canControl && !started.lease.controlling;
+      this.#wantedControl = canTakeControl;
+      this.#initialControlPending = canTakeControl && !started.lease.controlling;
       this.initMedia();
       await this.acquireInitialControl();
       if (this.current(epoch) && caps.displayModes) void this.loadModes();
@@ -545,7 +546,7 @@ export class DesktopRemoteDesktopViewerController {
       this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControl = false;
       const epoch = this.#epoch;
       this.#retryTimer = setTimeout(() => { this.#retryTimer = undefined;
-        if (this.current(epoch)) void this.connect(displayId, false, true); }, this.#retryDelay);
+        if (this.current(epoch)) void this.connect(displayId, { resume: true }); }, this.#retryDelay);
       this.#retryDelay = Math.min(8000, this.#retryDelay * 2);
       return;
     }
@@ -685,7 +686,7 @@ export class DesktopRemoteDesktopViewerController {
     }
     if (!this.current(epoch)) return;
     this.cancel(); this.publish({ lease: undefined, controlling: false, ready: false, media: "none", modeNotice: undefined });
-    await this.connect(this.#sourceDisplayId, takeover);
+    await this.connect(this.#sourceDisplayId, { takeover });
   }
   async selectDisplay(displayId: string): Promise<void> {
     const rpc = this.#client, lease = this.#snapshot.lease;
@@ -695,8 +696,9 @@ export class DesktopRemoteDesktopViewerController {
     this.syncControl();
     try { await rpc.stopRemoteDesktop({ leaseId: lease.leaseId }, this.options());
       if (!this.current(epoch)) return;
+      const wantsControl = this.#wantedControl;
       this.cancel(); this.publish({ lease: undefined, controlling: false, ready: false, media: "none" });
-      await this.connect(displayId);
+      await this.connect(displayId, { wantsControl });
     } catch { if (this.current(epoch)) this.publish({ error: "display" }); }
     finally { if (!this.#disposed && this.#scope?.generation === generation) { this.publish({ settingsBusy: false }); this.syncControl(); } }
   }
