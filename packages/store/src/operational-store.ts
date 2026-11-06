@@ -446,6 +446,7 @@ export function messagingConversationContextAad(
 const MESSAGE_SEARCH_RRF_K = 60;
 const STORE_SCAN_PAGE_SIZE = 100_000;
 const NATIVE_BLANK_RECOVERY_SETTING_KEY = "runtime.native_blank_recovery";
+const RETAINED_CONTEXT_EVENTS_KEY = "runtime.retained_context_events";
 
 type SqlFilter = {
   readonly where: string;
@@ -10931,6 +10932,7 @@ export class OperationalStore {
     readonly eventId?: string;
     readonly nativeBoundaryId?: string;
     readonly completedAssistantOnly?: boolean;
+    readonly includeRetainedContext?: boolean;
   }): { readonly messageId: string; readonly eventId: string } | undefined {
     this.assertOpen();
     const sessionId = nonBlank(input.sessionId, "Session message origin Session ID");
@@ -10970,6 +10972,10 @@ export class OperationalStore {
         )
       )`);
       params.push(boundaryId, boundaryId);
+    }
+    if (input.nativeBoundaryId !== undefined || input.includeRetainedContext === false) {
+      clauses.push(`NOT EXISTS (SELECT 1 FROM retained_context_events AS retained
+        WHERE retained.session_id = event.session_id AND retained.event_cursor = event.global_cursor)`);
     }
     const ctePrefix = nativeVisibility === undefined ? "" : `WITH RECURSIVE ${nativeVisibility.ctes}`;
     const row = this.database.prepare(`
@@ -11240,6 +11246,18 @@ export class OperationalStore {
     return row === undefined ? undefined : stringValue(row["handoff"]);
   }
 
+  /** Exact Product events carried through a native replacement by message deletion. */
+  getRetainedSessionContextCursors(sessionId: string): ReadonlySet<bigint> | undefined {
+    const setting = this.findSetting<{ format: number; cursors: string[] }>("session", sessionId, RETAINED_CONTEXT_EVENTS_KEY);
+    if (setting === undefined) return undefined;
+    const value = setting.value;
+    if (value?.format !== 1 || !Array.isArray(value.cursors)
+      || value.cursors.some(cursor => typeof cursor !== "string" || !/^[1-9]\d{0,18}$/u.test(cursor))) {
+      throw new StoreError("Retained context event cursors are invalid.");
+    }
+    return new Set(value.cursors.map(cursor => BigInt(cursor)));
+  }
+
   /**
    * Arm a content-free native recovery fence after the typed terminal error is
    * durable. Repeated terminal frames are idempotent and never displace an
@@ -11378,6 +11396,7 @@ export class OperationalStore {
     readonly operationId?: string;
     readonly handoff?: string;
     readonly restoreRuntimeHandoff?: boolean;
+    readonly retainContextEventCursors?: readonly bigint[];
     readonly replayScheduled?: boolean;
     readonly traceId: string;
     readonly at?: number;
@@ -11396,8 +11415,18 @@ export class OperationalStore {
       }
       const at = input.at ?? this.now();
       const handoff = input.handoff === undefined ? undefined : redactSecrets(input.handoff).trim();
-      if (pending.reason !== "message_deletion" && (!handoff || Buffer.byteLength(handoff, "utf8") > 512 * 1024)) {
-        throw new StoreError("Unhealthy native context rebuild requires a bounded redacted handoff.");
+      if ((pending.reason !== "message_deletion" || input.restoreRuntimeHandoff === true)
+        && (!handoff || Buffer.byteLength(handoff, "utf8") > 512 * 1024)) {
+        throw new StoreError("Native context rebuild requires a bounded redacted handoff.");
+      }
+      if (input.retainContextEventCursors !== undefined) {
+        const highWater = this.latestEventCursor();
+        if (pending.reason !== "message_deletion" || input.restoreRuntimeHandoff !== true
+          || input.retainContextEventCursors.some(cursor => cursor < 1n || cursor > highWater)) {
+          throw new StoreError("Retained context history requires its exact message deletion rebuild.");
+        }
+        this.setSetting("session", input.sessionId, RETAINED_CONTEXT_EVENTS_KEY,
+          { format: 1, cursors: [...new Set(input.retainContextEventCursors)].map(cursor => cursor.toString(10)) }, at);
       }
       if (pending.sourceRunId !== undefined && pending.sourceQueueItemId !== undefined) {
         const recoveryError: PublicError = {
@@ -11450,7 +11479,8 @@ export class OperationalStore {
       }
       const updated = this.updateSession(input.sessionId, { binding: input.binding }, refreshed.revision, at);
       this.database.prepare("DELETE FROM session_context_handoffs WHERE session_id = ?").run(input.sessionId);
-      if (input.restoreRuntimeHandoff === true && pending.reason === "manual_restart" && handoff !== undefined) {
+      if (input.restoreRuntimeHandoff === true && handoff !== undefined
+        && (pending.reason === "manual_restart" || pending.reason === "message_deletion")) {
         this.database.prepare("INSERT INTO session_context_handoffs(session_id, binding_opaque_ref, handoff, updated_at) VALUES (?, ?, ?, ?)")
           .run(input.sessionId, input.binding.opaqueRef, handoff, at);
       }
@@ -12484,6 +12514,16 @@ export class OperationalStore {
           JOIN json_each(boundary.value_json, '$.entryIds') AS entry
           WHERE native_session.derivation_kind = 'side_chat'${scopeClause}
         ),
+        retained_context_events AS MATERIALIZED (
+          SELECT native_session.id AS session_id, CAST(cursor.value AS INTEGER) AS event_cursor
+          FROM product_sessions AS native_session
+          JOIN settings AS retained ON retained.scope_type = 'session' AND retained.scope_id = native_session.id
+            AND retained.key = '${RETAINED_CONTEXT_EVENTS_KEY}' AND json_extract(retained.value_json, '$.format') = 1
+            AND json_type(retained.value_json, '$.cursors') = 'array'
+          JOIN json_each(retained.value_json, '$.cursors') AS cursor
+          WHERE native_session.deleted_at IS NULL AND cursor.type = 'text' AND CAST(cursor.value AS INTEGER) > 0
+            AND CAST(CAST(cursor.value AS INTEGER) AS TEXT) = cursor.value${scopeClause}
+        ),
         confirmed_native_hydration AS (
           SELECT
             canonical.session_id,
@@ -12513,7 +12553,7 @@ export class OperationalStore {
               )
             )
         )`,
-      params: [asSqlInteger(highWater), ...scopeParams, ...scopeParams, asSqlInteger(highWater), ...scopeParams],
+      params: [asSqlInteger(highWater), ...scopeParams, ...scopeParams, ...scopeParams, asSqlInteger(highWater), ...scopeParams],
       clause: (eventAlias) => ` AND NOT EXISTS (
         SELECT 1 FROM product_sessions AS side_chat
         WHERE side_chat.id = ${eventAlias}.session_id AND side_chat.derivation_kind = 'side_chat'
@@ -12529,6 +12569,10 @@ export class OperationalStore {
               WHERE inherited.session_id = side_chat.id AND inherited.entry_id = json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'))
           )
       ) AND (
+        EXISTS (
+          SELECT 1 FROM retained_context_events AS retained
+          WHERE retained.session_id = ${eventAlias}.session_id AND retained.event_cursor = ${eventAlias}.global_cursor
+        ) OR
         (
           NULLIF(json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'), '') IS NOT NULL
           AND (

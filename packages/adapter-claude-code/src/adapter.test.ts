@@ -6084,6 +6084,8 @@ describe("ClaudeCodeAdapter", () => {
     const runtime = new FakeSdkRuntime();
     runtime.freshContexts = new ClaudeFreshContextOwner({ rootDirectory: directory, namespace: "backend-restart", generation: INSTANCE_GENERATION });
     const adapter = adapterFor(runtime); const source = await adapter.createSession(createInput(), contextFor().context);
+    expect((await adapter.describe()).capabilities.get("session.message_delete"))
+      .toMatchObject({ supported: true, options: ["service_node_only"] });
     const context = contextFor(source, { operationId: "restart-native-context" }).context;
     await expect(adapter.prepareRestartContext(context)).rejects.toMatchObject({ publicError: { stateMayHaveChanged: true } });
     await adapter.closeSession(source, context);

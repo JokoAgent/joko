@@ -31,13 +31,13 @@ export function mobileRewindCapability(backend: BackendDescriptor, name: string)
   return matches.length === 1 && matches[0]!.support === CapabilitySupport.SUPPORTED;
 }
 
-export function mobileRewindToStartSupported(backend: BackendDescriptor, target: Target): boolean {
-  const matches = backend.capabilities?.capabilities.filter((value) => value.name === "session.rewind_to_start") ?? [];
+export function mobileScopedSessionCapability(backend: BackendDescriptor, name: string, target: Target | undefined): boolean {
+  const matches = backend.capabilities?.capabilities.filter((value) => value.name === name) ?? [];
   const capability = matches[0];
   if (matches.length !== 1 || capability?.support !== CapabilitySupport.SUPPORTED) return false;
   const options = capability.options?.kind;
   return options === undefined || options.case === undefined
-    || options.case === "session" && (!options.value.serviceNodeOnly || target.location?.kind.case === "serviceNode");
+    || options.case === "session" && (!options.value.serviceNodeOnly || target?.location?.kind.case === "serviceNode");
 }
 
 export function mobileMessageRewindIdle(session: Session, detail: Snapshot): boolean {

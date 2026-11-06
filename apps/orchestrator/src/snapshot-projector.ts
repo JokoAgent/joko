@@ -496,7 +496,8 @@ export class SnapshotProjector {
             this.readTimeline(store, normalized.sessionId, base.globalCursor)
               .filter((event) => event.payload.type !== "task_tag_catalog_changed"
                 && sideChatHistoryEventVisible(base.session.descriptor, event, inheritedSideChatEntries)),
-            base.session.descriptor.binding
+            base.session.descriptor.binding,
+            store.getRetainedSessionContextCursors(normalized.sessionId)
           ).slice(-timelineLimit);
       const scope = proto<SnapshotScope>("joko.v1.SnapshotScope", {
         kind: {
@@ -855,7 +856,8 @@ export class SnapshotProjector {
  */
 export function activeNativeTimeline(
   events: readonly PersistedEvent[],
-  currentBinding?: { readonly opaqueRef: string; readonly generation: number }
+  currentBinding?: { readonly opaqueRef: string; readonly generation: number },
+  retainedContext?: ReadonlySet<bigint>
 ): PersistedEvent[] {
   const nativeEntryKey = (event: PersistedEvent): string | undefined => {
     const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
@@ -877,6 +879,7 @@ export function activeNativeTimeline(
     if (currentBinding === undefined) return deduplicateNativeLive(events);
     const currentFingerprint = nativeBindingFingerprint(currentBinding.opaqueRef);
     return deduplicateNativeLive(events.filter((event) => {
+      if (retainedContext?.has(event.globalCursor)) return true;
       const identity = nativeHistoryEventContext(event.payload)?.identity;
       if (identity !== undefined || event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== undefined) {
         return event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === currentFingerprint;
@@ -885,14 +888,14 @@ export function activeNativeTimeline(
     }));
   }
   if (currentBinding !== undefined && marker.payload.opaqueRef !== currentBinding.opaqueRef) {
-    return deduplicateNativeLive(events.filter((event) =>
+    return deduplicateNativeLive(events.filter((event) => retainedContext?.has(event.globalCursor) || (
       (nativeHistoryEventContext(event.payload)?.identity === undefined
         || (event.metadata?.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] === true
           && event.globalCursor > marker.globalCursor)) &&
       (event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === undefined
         ? event.generation === currentBinding.generation
         : event.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === nativeBindingFingerprint(currentBinding.opaqueRef))
-    ));
+    )));
   }
   const nativeReference = marker.payload.opaqueRef;
   const bindingFingerprint = nativeBindingFingerprint(nativeReference);
@@ -913,6 +916,7 @@ export function activeNativeTimeline(
     cursor = parents.get(cursor);
   }
   return deduplicateNativeLive(events.filter((event) => {
+    if (retainedContext?.has(event.globalCursor)) return true;
     const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
     if (entryId !== undefined) {
       const eventBindingFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
