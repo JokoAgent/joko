@@ -200,6 +200,9 @@ const MAXIMUM_QUEUE_TEXT_EDIT_BYTES = 4 * 1024 * 1024;
 const MAXIMUM_QUEUE_TEXT_EDIT_REPLAY_WORK_BYTES = 64 * 1024 * 1024;
 const SESSION_COMPACTION_QUEUE_SETTING_KEY = "runtime.compaction.dispatch.queue";
 const SESSION_NATIVE_DISPATCH_RECOVERY_SETTING_KEY = "native.dispatch.recovery";
+const PROTECTED_NATIVE_INPUT_PREFIX = "messaging.protected-native-input:";
+const PROTECTED_MESSAGE_QUEUE_TTL_MS = 15 * 60_000;
+const MAXIMUM_PROTECTED_MESSAGE_QUEUE = 256;
 const PORTABLE_IMPORT_SOURCE_SETTING_KEY = "portable.import.source";
 const PORTABLE_IMPORT_ACTIVATION_SETTING_KEY = "portable.import.activation";
 const PORTABLE_IMPORT_DRAFT_TTL_MS = 10 * 60 * 1_000;
@@ -758,6 +761,8 @@ export interface EnqueueServiceInput {
   readonly sessionId: string;
   readonly prompt: PromptInput;
   readonly source: "schedule" | "system";
+  /** A Telegram admission may keep this prompt only in the current process. */
+  readonly protectedMessagingRequestId?: string;
   readonly parentRunId?: string;
   /** Durable non-secret ownership fence for cross-Session helper messages. */
   readonly originSessionId?: string;
@@ -922,6 +927,7 @@ export class SessionHost {
   readonly #drainSettlements = new Map<string, Promise<void>>();
   readonly #pendingInteractions = new Map<string, PendingInteraction>();
   readonly #applicationQueueGuards = new Map<string, McpAppMessageGuard>();
+  readonly #protectedMessagingPrompts = new Map<string, { readonly prompt: PromptInput; readonly expiry: ReturnType<typeof setTimeout> }>();
   readonly #inputHandoffQueueScopes = new Map<string, InputHandoffTaskScope>();
   readonly #inputHandoffAdmissions = new WeakSet<PromptInput>();
   #partnerHomeInputGuard: ((sessionId: string) => void) | undefined;
@@ -3219,6 +3225,23 @@ export class SessionHost {
     const acceptedPrompt = this.canonicalQueuedPrompt(input.sessionId, input.prompt);
     assertPromptInlineTextRanges(acceptedPrompt);
     this.assertInputCapabilities(input.sessionId, acceptedPrompt);
+    const protectedRequestId = input.protectedMessagingRequestId;
+    if (protectedRequestId !== undefined) {
+      const request = this.#store.getMessagingInboundRequest(protectedRequestId);
+      if (input.source !== "system" || input.operationId !== `messaging-input-${request.id}` || !request.protectedContent
+        || this.#store.getMessagingConnection(request.connectionId).channel !== "telegram"
+        || acceptedPrompt.disposition !== "prompt" || acceptedPrompt.images.length || acceptedPrompt.files.length || acceptedPrompt.mentions.length
+        || (acceptedPrompt.messagingOrigin !== undefined && acceptedPrompt.messagingOrigin.requestId !== request.id)) {
+        throw new StoreError("Protected Telegram input requires its original admission.");
+      }
+      if (this.#protectedMessagingPrompts.size >= MAXIMUM_PROTECTED_MESSAGE_QUEUE) {
+        throw new StoreError("The protected Telegram input queue is full.");
+      }
+    }
+    const durablePrompt: PromptInput = protectedRequestId === undefined ? acceptedPrompt : {
+      text: "[Protected message]", images: [], files: [], mentions: [], disposition: "prompt",
+      ...(acceptedPrompt.messagingOrigin === undefined ? {} : { messagingOrigin: acceptedPrompt.messagingOrigin })
+    };
     if (this.isReviewReadOnlySession(input.sessionId)) {
       throw new StoreError("Reviewer input is admitted only through the host-owned Review queue.");
     }
@@ -3268,8 +3291,9 @@ export class SessionHost {
         kind: "service_send_input",
         body: {
           sessionId: input.sessionId,
-          prompt: acceptedPrompt,
+          prompt: durablePrompt,
           source: input.source,
+          ...(protectedRequestId === undefined ? {} : { protectedMessagingRequestId: protectedRequestId }),
           ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
           ...(input.originSessionId === undefined ? {} : { originSessionId: input.originSessionId }),
           ...(input.partnerPrivateOrigin === undefined ? {} : { partnerPrivateOrigin: input.partnerPrivateOrigin }),
@@ -3302,16 +3326,27 @@ export class SessionHost {
           attemptId,
           operationId: input.operationId,
           disposition: acceptedPrompt.disposition,
-          body: acceptedPrompt,
+          body: durablePrompt,
           ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
           createdAt: now
         });
         const result = { sessionId: input.sessionId, runId, attemptId, queueItemId };
         input.onAdmitted?.(store, result);
+        if (protectedRequestId !== undefined) {
+          const request = store.getMessagingInboundRequest(protectedRequestId);
+          if (request.runId !== runId || request.queueItemId !== queueItemId) throw new StoreError("Protected Telegram admission lost its Queue identity.");
+        }
         return result;
       }
     );
-    if (!execution.replayed) void this.drain(input.sessionId);
+    if (!execution.replayed) {
+      if (protectedRequestId !== undefined) {
+        const expiry = setTimeout(() => this.#forgetProtectedMessagingPrompt(queueItemId), PROTECTED_MESSAGE_QUEUE_TTL_MS);
+        expiry.unref();
+        this.#protectedMessagingPrompts.set(queueItemId, { prompt: acceptedPrompt, expiry });
+      }
+      void this.drain(input.sessionId);
+    }
     return execution;
   }
 
@@ -6333,6 +6368,7 @@ export class SessionHost {
       || groups.store.snapshot({ backendId: session.profile.backendId, providerId: session.profile.providerId }).config !== undefined;
   }
   #providerGroupMayHandleRun(sessionId: string, runId: string, error: PublicError): boolean {
+    if (this.#store.findMessagingInboundRequestByRunId(runId)?.protectedContent === true) return false;
     const item = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
     return item !== undefined && !hasTurnRouteOverrides(item.executionOverrides)
       && new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId !== sessionId
@@ -7968,6 +8004,7 @@ export class SessionHost {
     this.#assertOpen();
     if (this.isReviewReadOnlySession(input.sessionId)) throw new StoreError("Reviewer portable export is disabled.");
     const stored = this.#store.getSession(input.sessionId);
+    assertProtectedNativeExport(this.#store, stored.descriptor);
     const adapter = this.requireAdapter(stored.descriptor.backendId);
     const capability = this.#store.getBackend(stored.descriptor.backendId).descriptor.capabilities
       .get("session.portable_transfer");
@@ -7992,6 +8029,7 @@ export class SessionHost {
       }
       nativeSession = await active.adapter.exportPortableNativeSession(lease.context);
       this.assertActiveBackendSideEffectLease(lease);
+      assertProtectedNativeExport(this.#store, current.descriptor);
     } finally {
       lease.release();
     }
@@ -10709,6 +10747,7 @@ export class SessionHost {
     }
     this.#pendingInteractions.clear();
     this.#applicationQueueGuards.clear();
+    for (const id of this.#protectedMessagingPrompts.keys()) this.#forgetProtectedMessagingPrompt(id);
     this.#inputHandoffQueueScopes.clear();
     for (const watchdog of this.#runSilenceWatchdogs.values()) {
       if (watchdog.timer !== undefined) clearTimeout(watchdog.timer);
@@ -13410,6 +13449,7 @@ export class SessionHost {
       && sourceInputPending
       && queueItem.disposition === "prompt"
       && (run.descriptor.source === "user" || this.#trustedMessageInput(queueItem))
+      && store.findMessagingInboundRequestByRunId(runId)?.protectedContent !== true
       && !evidence.hasExternalDispatchOwner;
     return {
       reason,
@@ -13755,6 +13795,9 @@ export class SessionHost {
         { format: 1, entries: [...journal.entries, baseline] } satisfies NativeDispatchRecoveryJournal,
         baseline.recordedAt
       );
+      if (store.findMessagingInboundRequestByRunId(runId)?.protectedContent === true) {
+        store.setSetting("session", item.sessionId, `${PROTECTED_NATIVE_INPUT_PREFIX}${item.id}`, baseline, baseline.recordedAt);
+      }
     });
   }
 
@@ -13807,6 +13850,12 @@ export class SessionHost {
         if (this.#store.getQueueControl(sessionId).paused) return;
         let pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
         if (pending === undefined) return;
+        if (this.#store.findMessagingInboundRequestByRunId(pending.runId)?.protectedContent === true
+          && !this.#protectedMessagingPrompts.has(pending.id)) {
+          this.#failExpiredApplicationInput(pending, protectedMessagingInputExpired().publicError);
+          await this.notifyServiceRunSettled(sessionId, pending.runId, "failed");
+          continue;
+        }
         try { await this.#assertApplicationQueueCurrent(pending); }
         catch {
           this.#failExpiredApplicationInput(pending);
@@ -13925,6 +13974,7 @@ export class SessionHost {
         const dispatchPreparation = this.beginDispatchPreparation(sessionId);
         let item = claimedItem;
         const run = this.#store.getRun(item.runId);
+        const protectedInput = this.#store.findMessagingInboundRequestByRunId(item.runId)?.protectedContent === true;
         let attemptId = item.attemptId;
         const reviewReadOnly = this.isReviewReadOnlySession(sessionId);
         let releaseMcpAppSignal: (() => void) | undefined;
@@ -14096,7 +14146,13 @@ export class SessionHost {
             partnerPolicy
           );
           this.assertQueueProviderAuthentication(item, stored);
-          let dispatchBody = this.resolveSessionReferencesForDispatch(sessionId, item.body);
+          const originalPrompt = protectedInput ? this.#protectedMessagingPrompts.get(item.id)?.prompt : item.body;
+          if (originalPrompt === undefined) throw protectedMessagingInputExpired();
+          if (protectedInput && active.adapter.getNativeHistoryProjection !== undefined
+            && active.adapter.sendWithDurableNativeDispatchFence === undefined) {
+            throw inputCapabilityError("PROTECTED_INPUT_UNSUPPORTED", "This Backend cannot protect a Telegram input in native history.");
+          }
+          let dispatchBody = this.resolveSessionReferencesForDispatch(sessionId, originalPrompt);
           if (item.body.todoQuote) {
             if (!this.#resolvePartnerTodoQuote) throw inputCapabilityError('INPUT_PARTNER_TODO_UNAVAILABLE', 'Partner Todo quotes are unavailable.');
             const prefix = `${this.#resolvePartnerTodoQuote(sessionId, item.body.todoQuote)}\n\n`;
@@ -14125,6 +14181,7 @@ export class SessionHost {
           await appContext?.assertCurrent();
           await this.#assertApplicationQueueCurrent(item);
           this.assertDispatchAdmissionOwner(item, attemptId, active, stored.descriptor.binding.generation, partnerPolicy);
+          if (protectedInput && !this.#forgetProtectedMessagingPrompt(item.id)) throw protectedMessagingInputExpired();
           dispatchPreparation.phase = "sending";
           const pendingAcceptance: PendingDispatchAcceptance = {};
           this.#pendingDispatchAcceptances.set(run.descriptor.id, pendingAcceptance);
@@ -14338,6 +14395,7 @@ export class SessionHost {
             this.settleReviewRuntime(sessionId, { state: "failed" });
           }
         } finally {
+          if (protectedInput) this.#forgetProtectedMessagingPrompt(item.id);
           releaseMcpAppSignal?.();
           this.finishDispatchPreparation(sessionId, dispatchPreparation);
         }
@@ -14673,6 +14731,11 @@ export class SessionHost {
             releaseContextFlight();
             return Promise.resolve();
           }
+        }
+        if (payload.type === "message_complete" && payload.role === "user" && runId !== undefined
+          && this.#store.findMessagingInboundRequestByRunId(runId)?.protectedContent === true) {
+          releaseContextFlight();
+          return Promise.resolve();
         }
         const durablePayload = this.withAcceptedInputMetadata(payload, sessionId, runId);
         // An automatic compaction lifecycle belongs to the native binding even
@@ -15277,13 +15340,22 @@ export class SessionHost {
     guard.signal.throwIfAborted();
   }
 
-  #failExpiredApplicationInput(item: QueueItemRecord): void {
-    const error: PublicError = { code: "APPLICATION_INPUT_EXPIRED", message: "The application runtime is no longer available.",
-      phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Open the application card and repeat the action." };
+  #forgetProtectedMessagingPrompt(queueItemId: string): boolean {
+    const original = this.#protectedMessagingPrompts.get(queueItemId);
+    if (original === undefined) return false;
+    clearTimeout(original.expiry);
+    return this.#protectedMessagingPrompts.delete(queueItemId);
+  }
+
+  #failExpiredApplicationInput(item: QueueItemRecord, error: PublicError = {
+    code: "APPLICATION_INPUT_EXPIRED", message: "The application runtime is no longer available.",
+    phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Open the application card and repeat the action."
+  }): void {
     this.#store.transaction(store => {
       if (store.getQueueItem(item.id).state !== "accepted") return;
-      store.updateQueueState({ queueItemId: item.id, state: "failed", error, traceId: `mcp-app-expired:${item.id}` });
-      store.updateRunState({ runId: item.runId, state: "failed", error, activeAttemptId: item.attemptId, traceId: `mcp-app-expired:${item.id}` });
+      const traceId = error.code === "APPLICATION_INPUT_EXPIRED" ? `mcp-app-expired:${item.id}` : `protected-input-expired:${item.id}`;
+      store.updateQueueState({ queueItemId: item.id, state: "failed", error, traceId });
+      store.updateRunState({ runId: item.runId, state: "failed", error, activeAttemptId: item.attemptId, traceId });
       if (item.attemptId !== undefined) store.finishAttempt(item.attemptId, error);
     });
     this.#applicationQueueGuards.delete(item.id);
@@ -16278,6 +16350,7 @@ export class SessionHost {
       readonly nativeUserEntryIdForOperation?: (operationId: string) => string;
     };
     const bindingFingerprint = nativeBindingFingerprint(session.binding.opaqueRef);
+    const protectedFingerprints = protectedNativeInputFingerprints(store, session.id, bindingFingerprint);
     if (nativeIdentityAdapter.nativeUserEntryIdForOperation !== undefined) {
       for (const item of listAllQueueItems(store, { sessionId: session.id })) {
         const entryId = nativeIdentityAdapter.nativeUserEntryIdForOperation(item.operationId);
@@ -16376,6 +16449,12 @@ export class SessionHost {
       const recoveredQueueItem = recoveredProjection && recoveryOwnership !== undefined
         ? store.findQueueItemByRunId(session.id, recoveryOwnership.runId)
         : undefined;
+      if (projection.payload.type === "message_complete" && projection.payload.role === "user") {
+        const fingerprint = projection.metadata?.fields["nativeDispatchFingerprint"];
+        const queueItem = acceptedQueueItem ?? recoveredQueueItem;
+        if ((typeof fingerprint === "string" && protectedFingerprints.has(fingerprint))
+          || (queueItem !== undefined && store.findMessagingInboundRequestByRunId(queueItem.runId)?.protectedContent === true)) continue;
+      }
       let canonicalQueuePayload: EventPayload | undefined;
       if (
         (acceptedQueueItem !== undefined || recoveredQueueItem !== undefined)
@@ -18082,6 +18161,26 @@ function nativeDispatchRecoveryJournal(value: unknown): NativeDispatchRecoveryJo
     entries.push(entry);
   }
   return { format: 1, entries };
+}
+
+function protectedNativeInputFingerprints(store: OperationalStore, sessionId: string, bindingFingerprint: string): ReadonlySet<string> {
+  const fingerprints = new Set<string>();
+  for (const setting of store.listSettings("session", sessionId)) {
+    if (!setting.key.startsWith(PROTECTED_NATIVE_INPUT_PREFIX)) continue;
+    const receipt = nativeDispatchRecoveryBaseline(setting.value);
+    if (receipt?.bindingFingerprint === bindingFingerprint) fingerprints.add(receipt.inputFingerprint);
+  }
+  return fingerprints;
+}
+
+function assertProtectedNativeExport(store: OperationalStore, session: SessionDescriptor): void {
+  if (protectedNativeInputFingerprints(store, session.id, nativeBindingFingerprint(session.binding.opaqueRef)).size === 0) return;
+  throw inputCapabilityError("PROTECTED_NATIVE_EXPORT_UNAVAILABLE", "This native task contains protected Telegram input and cannot be exported as a portable task.");
+}
+
+function protectedMessagingInputExpired(): JokoError {
+  return new JokoError({ code: "PROTECTED_INPUT_EXPIRED", message: "The protected Telegram input expired before dispatch.",
+    phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Send a new message from Telegram." });
 }
 
 function nativeDispatchRecoveryBaseline(value: unknown): NativeDispatchRecoveryBaseline | undefined {

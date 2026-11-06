@@ -17933,6 +17933,9 @@ async function dispatchMutation(
     }
     case "retryRun": {
       const run = dependencies.store.getRun(payload.value.runId);
+      if (dependencies.store.findMessagingInboundRequestByRunId(run.descriptor.id)?.protectedContent === true) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Send a new message from Telegram to repeat this protected input.");
+      }
       if (run.descriptor.state !== "failed" || run.descriptor.error?.retryable !== true) {
         return unsupportedOperation(
           dependencies,
