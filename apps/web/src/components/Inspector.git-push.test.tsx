@@ -21,8 +21,38 @@ const session: SessionView = { id: "task", backendId: "backend", targetId: "targ
   state: "idle", pinned: false, archived: false, fastMode: false, planMode: false, permissionMode: "ask", updatedAt: 1 };
 const workspace: WorkspaceView = { id: "workspace", targetId: "target", name: "Project", kind: "userProject", serverPath: "D:/project",
   trusted: true, branch: "feature/local", head: diff.headRevision, dirty: false, entries: [] };
+const remoteWorkspace: WorkspaceView = { ...workspace,
+  remoteWorkspace: { kind: "ssh", hostId: "ssh-host", hostTargetId: "ssh-target", workspaceRoot: "/project" } };
 
 describe("Inspector Git push destinations", () => {
+  it("replaces a settled Review diff when the same workspace is rebound to SSH", async () => {
+    const file = (path: string) => ({ path, source: "unstaged" as const, status: "modified" as const, binary: false, text: "", hunks: [] });
+    const view = await mount({ ...diff, files: [file("local-only.txt")] });
+    expect(view.host.textContent).toContain("local-only.txt");
+    view.api.getWorkspaceDiff.mockClear();
+    view.api.listWorkspaceChangeSets.mockClear();
+    let resolveRemote!: (diff: WorkspaceDiffView) => void;
+    const remote = new Promise<WorkspaceDiffView>((resolve) => { resolveRemote = resolve; });
+    view.api.getWorkspaceDiff.mockReturnValue(remote);
+    await view.render(remoteWorkspace);
+    expect(view.host.textContent).not.toContain("local-only.txt");
+    expect(view.api.getWorkspaceDiff).toHaveBeenCalledWith(workspace.id, expect.objectContaining({ source: "unstaged" }));
+    expect(view.api.listWorkspaceChangeSets).toHaveBeenCalledExactlyOnceWith(workspace.id, session.id);
+    await act(async () => resolveRemote({ ...diff, repositoryRevision: "remote", files: [file("remote-only.txt")] }));
+    expect(view.host.textContent).toContain("remote-only.txt");
+  });
+
+  it("retires a pending push intent if its workspace changes before the fence arrives", async () => {
+    const view = await mount();
+    let resolveOldFence!: (diff: WorkspaceDiffView) => void;
+    view.api.getWorkspaceDiff.mockReturnValueOnce(new Promise((resolve) => { resolveOldFence = resolve; }));
+    await act(async () => button(view.host, "workspace.reviewPush").click());
+    await view.render(remoteWorkspace);
+    await act(async () => resolveOldFence(diff));
+    await view.flush();
+    expect(view.api.pushWorkspaceBranch).not.toHaveBeenCalled();
+  });
+
   it("pushes to the displayed upstream even when a fresh repository read reports a different default", async () => {
     const view = await mount();
     expect(view.inputs().map((input) => input.value)).toEqual(["team/upstream", "refs/heads/published/topic"]);
@@ -99,11 +129,12 @@ async function mount(initial = diff, canCommitDiff = false) {
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host); roots.push(root);
   const pending: Promise<void>[] = [];
-  await act(async () => root.render(<ChangesPanel controller={api as unknown as AppController} session={session} workspace={workspace}
+  const render = (selectedWorkspace = workspace) => act(async () => root.render(<ChangesPanel controller={api as unknown as AppController} session={session} workspace={selectedWorkspace}
     canDiff canPushDiff canCommitDiff={canCommitDiff} canDiffImagePreview={false} canStageDiff={false} canUnstageDiff={false} canRevertDiff={false} canRewind={false}
     t={(key) => key} runAction={(_key, action) => { pending.push(action().catch(() => undefined)); }} />));
+  await render();
   const flush = () => act(async () => { await Promise.all(pending); });
-  return { api, host, flush,
+  return { api, host, flush, render,
     inputs: () => [...host.querySelectorAll<HTMLInputElement>(".review-push-target input")],
     push: async () => { await act(async () => button(host, "workspace.reviewPush").click()); await flush(); },
     edit: async (remote: string, ref: string) => {

@@ -1674,17 +1674,20 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
     return () => { current = false; };
   }, [filePreviewOwner, selectedPath, workspace?.id, workspace?.revision]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setSearchMatches([]);
     setSearchError(undefined);
     setSearchTotalMatches(0);
     setSearchTotalFiles(0);
     setSearchTruncated(false);
-    if (workspace === undefined || query.trim().length < 2) return;
+    if (workspace === undefined || query.trim().length < 2) {
+      setSearching(false);
+      return;
+    }
     let current = true;
     const abort = new AbortController();
+    setSearching(true);
     const timer = window.setTimeout(() => {
-      setSearching(true);
       void collectCompleteWorkspaceSearch((pageToken) => controllerRef.current.searchWorkspacePage(workspace.id, {
         query: query.trim(),
         caseSensitive: false,
@@ -1704,7 +1707,7 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
       });
     }, 250);
     return () => { current = false; abort.abort(); window.clearTimeout(timer); };
-  }, [query, searchRetry, workspace?.id]);
+  }, [filePreviewOwner, query, searchRetry, workspace?.id]);
 
   if (workspace === undefined) return <PanelEmpty text={t("workspace.noWorkspace")} />;
   return (
@@ -1919,7 +1922,7 @@ export function FileTreeNode({ controller, workspaceId, entry, selectedPath, onS
   return <div role="treeitem" tabIndex={-1} data-inspector-tree-key={entry.path} aria-label={entry.name} aria-level={level} aria-selected={selectedPath === entry.path}><button className={cx("file-tree__row", selectedPath === entry.path && "is-active")} type="button" tabIndex={-1} data-inspector-tree-primary="" onClick={() => onSelect(entry.path)}><span className="tree-spacer" /><File aria-hidden="true" /><span>{entry.name}</span>{entry.status !== undefined && <i className={`file-status file-status--${entry.status}`} aria-label={entry.status} />}</button></div>;
 }
 
-export function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, canDiffImagePreview, canStageDiff, canUnstageDiff, canRevertDiff, canCommitDiff, canPushDiff, canRewind, gitWriteDisabledReason, t, runAction }: {
+interface ChangesPanelProps {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly workspace?: WorkspaceView;
@@ -1935,7 +1938,18 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
   readonly gitWriteDisabledReason?: string;
   readonly t: Translator;
   readonly runAction: RunAction;
-}): JSX.Element {
+}
+
+export function ChangesPanel(props: ChangesPanelProps): JSX.Element {
+  const { workspace } = props;
+  const sourceKey = JSON.stringify([workspace?.id, workspace?.targetId, workspace?.serverPath, workspace?.remoteWorkspace, workspace?.trusted]);
+  const source = useMemo(() => ({ key: sourceKey }), [sourceKey]);
+  const currentSource = useRef(source);
+  useLayoutEffect(() => { currentSource.current = source; }, [source]);
+  return <WorkspaceChangesPanel key={source.key} {...props} isCurrentSource={() => currentSource.current === source} />;
+}
+
+function WorkspaceChangesPanel({ controller, session, workspace, focusRequest, canDiff, canDiffImagePreview, canStageDiff, canUnstageDiff, canRevertDiff, canCommitDiff, canPushDiff, canRewind, gitWriteDisabledReason, t, runAction, isCurrentSource }: ChangesPanelProps & { readonly isCurrentSource: () => boolean }): JSX.Element {
   const [diff, setDiff] = useState<WorkspaceDiffView>();
   const [changeSets, setChangeSets] = useState<readonly WorkspaceChangeSetView[]>([]);
   const [preview, setPreview] = useState<WorkspaceRewindPreviewView>();
@@ -2107,6 +2121,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
   };
   const canExecute = preview !== undefined && (preview.safety !== "blocked" || (preview.dialogueOnlyAvailable && dialogueOnly));
   const reloadCurrentDiff = async (): Promise<void> => {
+    if (!isCurrentSource()) return;
     const next = await loadReviewSourceDiff(controller, workspace.id, sourceDescriptor, changeSets, hideWhitespace);
     setDiff(next);
     setSelectedFileKey((selected) => next.files.some((file) => reviewFileKey(file) === selected) ? selected : reviewFileKey(next.files[0] ?? { source: "unspecified", path: "" }));
@@ -2173,6 +2188,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
     fence: Pick<WorkspaceDiffView, "headRevision" | "repositoryRevision">,
     expectedRemoteOid?: string
   ): Promise<void> => {
+    if (!isCurrentSource()) return;
     const selectedRemote = destination.remote.trim();
     const selectedRemoteRef = destination.remoteRef.trim();
     if (selectedRemote === "" || selectedRemoteRef === "") throw new Error(t("workspace.reviewPushTargetRequired"));
@@ -2221,6 +2237,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
       let committed = false;
       try {
         const fence = await currentMutationFence();
+        if (!isCurrentSource()) return;
         const committedFence = await controller.commitWorkspaceDiff(workspace.id, {
           message,
           includeUnstaged,

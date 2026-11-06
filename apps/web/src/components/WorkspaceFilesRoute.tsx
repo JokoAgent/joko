@@ -508,6 +508,7 @@ export function WorkspaceFilesRoute({
     return await controllerRef.current.listWorkspaceFiles(workspaceId, signal);
   }, [workspace.id]);
 
+  // The sidebar also retires its current search when a rebind changes the read owner.
   const searchWorkspace = useCallback((request: WorkspaceFilesSearchRequest, signal: AbortSignal): AsyncIterable<WorkspaceFilesSearchEvent> => {
     if (request.workspaceId !== workspace.id) throw new Error("The workspace changed while search was running.");
     return controllerRef.current.streamWorkspaceSearch(
@@ -516,7 +517,7 @@ export function WorkspaceFilesRoute({
       request.caseSensitive,
       signal
     );
-  }, [workspace.id]);
+  }, [previewOwnerKey, workspace.id]);
 
   const guardAffectedDocument = useCallback(async (reason: "switch-file" | "close-file", path: string, directory: boolean): Promise<boolean> => {
     const prefix = `${path}/`;

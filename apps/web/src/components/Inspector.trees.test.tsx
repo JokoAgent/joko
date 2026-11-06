@@ -42,6 +42,40 @@ afterEach(async () => {
 });
 
 describe("Inspector production trees", () => {
+  it("keeps the search query but retires settled matches after a workspace rebind", async () => {
+    vi.useFakeTimers();
+    const page = { matches: [], truncated: false, totalFiles: 0, totalMatches: 0, revision: "new" };
+    const searchWorkspacePage = vi.fn<AppController["searchWorkspacePage"]>(async () => page).mockResolvedValueOnce({
+      ...page, revision: "old", totalFiles: 1, totalMatches: 1,
+      matches: [{ path: "report.txt", line: 1, preview: "needle_A from the old root", submatches: [], revision: "old",
+        range: { startByte: 0, endByte: 8, startLine: 1, endLine: 1, startColumn: 1, endColumn: 9 } }]
+    });
+    const controller = { state: { connectionGeneration: 1 }, listWorkspaceEntries: vi.fn(async () => []), searchWorkspacePage } as unknown as AppController;
+    const original = workspace([]);
+    const view = (selected: WorkspaceView) => <FilesPanel controller={controller} workspace={selected} sessionId="session-one" canWrite={false} t={t} onSelectionQuote={vi.fn()} />;
+    try {
+      const host = await render(view(original));
+      const search = required(host.querySelector<HTMLInputElement>('input[type="search"]'));
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(search, "needle_A");
+        search.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      expect(host.textContent).toContain("needle_A from the old root");
+      await act(async () => roots.at(-1)!.render(view({ ...original,
+        remoteWorkspace: { kind: "ssh", hostId: "ssh-host", hostTargetId: "ssh-target", workspaceRoot: "/project" }
+      })));
+      expect(search.value).toBe("needle_A");
+      expect(host.textContent).not.toContain("needle_A from the old root");
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      expect(searchWorkspacePage).toHaveBeenCalledTimes(2);
+      expect(searchWorkspacePage).toHaveBeenLastCalledWith(original.id, expect.objectContaining({ query: "needle_A" }), expect.any(AbortSignal));
+      expect(host.textContent).toContain(t("workspace.noMatches"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("navigates and expands the Files tree without tabbing through every row button", async () => {
     const entries = [directory("src"), file("README.md")];
     const listWorkspaceEntries = vi.fn(async (_workspaceId: string, path: string) => path === "src" ? [file("src/App.tsx")] : entries);
