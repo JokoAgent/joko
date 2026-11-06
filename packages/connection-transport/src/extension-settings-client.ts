@@ -145,7 +145,9 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
       if (extension.setup.state === "notRequired") return setup(extension);
       if (!await host.confirm(extension.name, extension.permissions.map(permission => `${permission.label}: ${permission.description}`).join("\n"), signal)) throw new Error("Plugin permission was cancelled.");
       current(); await begin();
-      for (const field of extension.setup.fields.filter(field => field.kind === "confirmation" && !field.configured)) {
+      // Configured may describe the preceding authorization. The user's
+      // confirmation here belongs to this setup attempt.
+      for (const field of extension.setup.fields.filter(field => field.kind === "confirmation")) {
         extension = (await client.field(extension, field.fieldId, true, signal)).extension; current();
       }
       extension = (await client.complete(extension, signal)).extension; current(); return setup(extension);

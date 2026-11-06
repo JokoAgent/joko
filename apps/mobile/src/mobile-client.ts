@@ -147,6 +147,7 @@ import type { MobilePartnerRestartReceipts, MobilePartnerRestartTransport } from
 import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
+  mobileExtensionOwnerKey,
   projectMobileExtensionMainViewSurface,
   sameMobileExtensionMainViewSurface,
   type MobileExtension,
@@ -2610,11 +2611,12 @@ export class MobileClient {
         this.#releaseMutation(action);
       }
     });
-    const activeSetupAttempt = (extension: MobileExtension): string => {
-      if (extension.setup.state !== "inProgress" || extension.setup.attemptId === undefined) {
+    const activeSetupAttempt = (extension: MobileExtension, replacementAttemptId?: string): string => {
+      const { attemptId, state } = extension.setup;
+      if (attemptId === undefined || state !== "inProgress" && !(state === "ready" && attemptId === replacementAttemptId)) {
         throw new Error("Begin a current Extension setup attempt before changing its fields.");
       }
-      return extension.setup.attemptId;
+      return attemptId;
     };
     const setupField = (extension: MobileExtension, fieldId: string) => {
       const matches = extension.setup.fields.filter((field) => field.fieldId === fieldId);
@@ -2657,7 +2659,10 @@ export class MobileClient {
             extensionId: extension.extensionId,
             expectedRevision: { value: extension.revision }
           } } }),
-          verify: (current) => current.setup.state === "inProgress" && current.setup.attemptId !== undefined
+          verify: (current) => current.setup.attemptId !== undefined && current.setup.attemptId !== extension.setup.attemptId
+            && (current.setup.state === "inProgress" || extension.setup.state === "ready" && current.setup.state === "ready"
+              && current.revision === extension.revision + 1n && current.setup.revision === extension.setup.revision + 1n
+              && mobileExtensionOwnerKey(current.owner) === mobileExtensionOwnerKey(extension.owner))
         };
       },
       signal
@@ -2709,9 +2714,10 @@ export class MobileClient {
       fieldId: string,
       kind: MobileExtensionCredentialKind,
       secret: string,
-      signal: AbortSignal
+      signal: AbortSignal,
+      replacementAttemptId?: string
     ) => setupMutation(expected, "extension-setup-credential", async (extension, current) => {
-      const attemptId = activeSetupAttempt(extension);
+      const attemptId = activeSetupAttempt(extension, replacementAttemptId);
       const field = setupField(extension, fieldId);
       if (field.kind !== "secret" && field.kind !== "oauth") {
         throw new Error("This Extension setup field does not accept a protected credential.");
@@ -3368,6 +3374,9 @@ export class MobileClient {
         this.#extensionOAuthRetention = retention;
         return host.authorize(...args);
       } } : host;
+      // A ready projection can still carry the newly opened replacement attempt.
+      // Only the author request that confirmed its begin can use that attempt.
+      let replacementAttemptId: string | undefined;
       const execute = (current: AbortSignal) => executeExtensionSettingsCall({ surface, api,
         ...(this.network.extensionOAuthApi ? { oauth: this.network.extensionOAuthApi(context.credential) } : {}),
         ...(this.network.extensionConnectionsApi ? { connections: this.network.extensionConnectionsApi(context.credential) } : {}),
@@ -3402,8 +3411,14 @@ export class MobileClient {
             return this.#assertExtensionDirectoryReceipt(result.operation);
           } finally { this.#releaseMutation(action); }
         },
-        begin: beginSetup, field: submitSetupInteraction,
-        secret: (extension, fieldId, value, signal) => saveSetupCredential(extension, fieldId, "headerSecret", value, signal), complete: completeSetup
+        begin: async (extension, signal) => {
+          const result = await beginSetup(extension, signal);
+          if (result.extension.setup.state === "ready") replacementAttemptId = result.extension.setup.attemptId;
+          return result;
+        },
+        field: submitSetupInteraction,
+        secret: (extension, fieldId, value, signal) => saveSetupCredential(extension, fieldId, "headerSecret", value, signal, replacementAttemptId),
+        complete: completeSetup
       }, call, settingsHost, current);
       const request = authorization ? new AbortController() : undefined;
       const unsubscribe = request ? this.subscribe(() => {

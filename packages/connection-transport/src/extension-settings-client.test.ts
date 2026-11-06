@@ -86,6 +86,23 @@ describe("author settings shared client", () => {
     expect(f.client.begin).not.toHaveBeenCalled(); expect(f.client.field).not.toHaveBeenCalled(); expect(f.client.submit).not.toHaveBeenCalled();
   });
 
+  it("records newly confirmed permissions on the active attempt even when an old authorization projects them as configured", async () => {
+    const replacing: ExtensionSettingsProjection = { ...extension, setup: { state: "inProgress",
+      fields: extension.setup.fields.map(field => ({ ...field, configured: true })) } };
+    const confirmed = { ...replacing, revision: replacing.revision + 1n };
+    const field = vi.fn<ExtensionSettingsClient<ExtensionSettingsProjection>["field"]>(async () => ({ extension: confirmed }));
+    const complete = vi.fn<ExtensionSettingsClient<ExtensionSettingsProjection>["complete"]>(async current => {
+      if (current !== confirmed) throw new Error("The current attempt is missing its confirmation.");
+      return { extension: { ...current, setup: { ...current.setup, state: "ready" } } };
+    });
+    const f = fixture({ fresh: async () => replacing, field, complete });
+    const signal = new AbortController().signal;
+    await expect(executeExtensionSettingsCall(f.client, { kind: "setup.complete" }, f.host, signal)).resolves.toMatchObject({ state: "ready" });
+    expect(f.client.begin).not.toHaveBeenCalled();
+    expect(field).toHaveBeenCalledExactlyOnceWith(replacing, "permission", true, signal);
+    expect(complete).toHaveBeenCalledExactlyOnceWith(confirmed, signal);
+  });
+
   it("uploads a secret candidate only through its private ticket and returns a validation marker", async () => {
     const begin = vi.fn((_request: unknown) => ({ ticket: { ticketId: "candidate", relativeEndpoint: "/private-upload", maximumBytes: 8192n } }));
     const check = vi.fn((_request: unknown) => ({ valid: true }));

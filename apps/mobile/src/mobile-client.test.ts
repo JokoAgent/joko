@@ -3108,6 +3108,43 @@ describe("mobile Extension catalog authority", () => {
     expect(network.listExtensions).not.toHaveBeenCalled();
   });
 
+  it.each(["replacement", "completed"] as const)("uses a ready projection for credential replacement only after adopting the new attempt %s", async attempt => {
+    const f = mobileSettingsOAuthFixture(), saved = memoryStorage(credential);
+    const fieldId = "network-secret:api_key";
+    let extension: MobileExtension = { ...f.extension, setup: { state: "ready", attemptId: "completed", revision: 7n,
+      fields: [{ fieldId, label: "API key", description: "Replacement credential", kind: "secret", required: true, configured: true, options: [] }] } };
+    f.network.getExtension = vi.fn(async () => extension);
+    f.network.listExtensions = vi.fn(async () => ({ revision: extension.revision, recoveredFromCorruption: false, extensions: [extension] }));
+    f.network.uploadExtensionSetupCredential = vi.fn(async () => "replacement-ticket");
+    f.network.submit = vi.fn(async (_credential, operationId, mutation) => {
+      const change = mutation.payload;
+      if (change.case === "beginExtensionSetup") {
+        extension = { ...extension, revision: 2n, setup: { ...extension.setup, attemptId: attempt, revision: 8n } };
+      } else {
+        expect(change).toMatchObject({ case: "commitExtensionSetupCredential", value: {
+          attemptId: "replacement", fieldId, credentialUploadTicketId: "replacement-ticket", expectedRevision: { value: 2n }
+        } });
+        extension = { ...extension, revision: 3n, setup: { ...extension.setup, state: "inProgress", revision: 9n } };
+      }
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "acknowledgement", value: { accepted: true } } } });
+    });
+    let sequence = 0;
+    const app = client(f.network, saved.storage, undefined, undefined, () => `replace-credential-${++sequence}`); await app.start();
+    const signal = new AbortController().signal;
+    const replacing = app.extensionCatalogTransport()!.callSettings!(f.surface, { kind: "secret.set", fieldId, value: "new-fixture-credential" }, f.host, signal);
+    if (attempt === "completed") {
+      await expect(replacing).rejects.toThrow(/changed again/u);
+      expect(f.network.submit).toHaveBeenCalledOnce(); expect(f.network.uploadExtensionSetupCredential).not.toHaveBeenCalled();
+    } else {
+      await expect(replacing).resolves.toMatchObject({ state: "inProgress", attemptId: "replacement", secrets: { api_key: { configured: true } } });
+      expect(f.network.uploadExtensionSetupCredential).toHaveBeenCalledExactlyOnceWith(credential, extension.extensionId,
+        "replacement", fieldId, "headerSecret", "new-fixture-credential", expect.any(AbortSignal));
+      expect(f.network.submit).toHaveBeenCalledTimes(2);
+    }
+    expect(saved.pending()).toEqual([]);
+  });
+
   it("retires an unconfirmed OAuth dialog on background without retaining its transport", async () => {
     const fixture = mobileSettingsOAuthFixture(), app = client(fixture.network, memoryStorage(credential).storage); await app.start();
     let confirm!: (value: boolean) => void;
