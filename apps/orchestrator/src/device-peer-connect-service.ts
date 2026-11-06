@@ -344,7 +344,11 @@ async function* openDevicePeerAgentCommandRoute(
     for (;;) {
       const next = await transport.nextResponse(context.signal);
       if (next.done) break;
-      if (next.value.payload.case !== "retire") dependencies.connections.fence(connection);
+      if (next.value.payload.case !== "retire") {
+        // The upload can retire this exact route while the download is backpressured.
+        if (transport.closed) continue;
+        dependencies.connections.fence(connection);
+      }
       yield toSplitCommandResponse(next.value);
     }
   } finally {

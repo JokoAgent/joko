@@ -510,7 +510,7 @@ describe("DevicePeerService Connect boundary", () => {
     await expect(downlink.next()).resolves.toMatchObject({ done: true });
   });
 
-  it("admits a split side effect before releasing it and keeps lost target admission unknown", async () => {
+  it.each(["sent", "queued"])("retires a split route with a %s side effect and keeps its receipt unknown", async (delivery) => {
     const fixture = setup();
     const downlink = openCommandRoute(
       fixture.service,
@@ -525,38 +525,41 @@ describe("DevicePeerService Connect boundary", () => {
 
     const lease = fixture.routes.getRoute(fixture.target.deviceId)!;
     const claim = fixture.routes.registerClaim({
-      requestId: "mkdir-admission",
+      requestId: "rename-admission",
       controllerDeviceId: fixture.controller.deviceId,
       targetDeviceId: fixture.target.deviceId,
       routeGeneration: lease.routeGeneration,
       capability: "files",
       effectKind: "side_effect",
-      action: "createDirectory",
+      action: "renameFile",
       payload: create(contract.DevicePeerCommandSchema, {
         capability: contract.DevicePeerCapabilityKind.FILES,
         effect: contract.DevicePeerEffectKind.SIDE_EFFECT,
         controllerDeviceId: fixture.controller.deviceId,
         action: {
-          case: "createDirectory",
-          value: create(contract.DevicePeerCreateDirectoryActionSchema, {
-            path: "C:\\peer\\created",
-            recursive: true
+          case: "renameFile",
+          value: create(contract.DevicePeerRenameFileActionSchema, {
+            sourcePath: "C:\\peer\\before.txt",
+            destinationPath: "C:\\peer\\after.txt"
           })
         }
       })
     });
     const dispatched = fixture.routes.dispatch(claim);
-    await expect(downlink.next()).resolves.toMatchObject({
-      value: { requestId: "mkdir-admission", payload: { case: "command" } }
-    });
+    if (delivery === "sent") {
+      await expect(downlink.next()).resolves.toMatchObject({
+        value: { requestId: "rename-admission", payload: { case: "command" } }
+      });
+    }
 
-    // The command has reached the target and may already be executing, but its
-    // ACCEPTED upload never reaches the controller.
+    // In the queued case the download writer has not requested the next frame.
     uplink.close();
     await expect(published).resolves.toBeDefined();
+    expect(fixture.routes.getRoute(fixture.target.deviceId)).toBeUndefined();
+    expect(fixture.connections.fence(fixture.target).id).toBe(fixture.target.id);
     await expect(dispatched).resolves.toMatchObject({
       outcome: "outcome_unknown",
-      requestId: "mkdir-admission"
+      requestId: "rename-admission"
     });
     await expect(downlink.next()).resolves.toMatchObject({
       value: { payload: { case: "retire" } }
