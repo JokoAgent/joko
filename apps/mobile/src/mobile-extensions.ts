@@ -197,6 +197,7 @@ export interface MobileExtensionTransport {
   setTaskPreferences?(expected: MobileExtension, preferences: import("@joko/contracts").ExtensionTaskPreferences, model: import("@joko/contracts").ExtensionTaskRoute | undefined,
     permissionMode: import("@joko/contracts").PermissionMode, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
   readonly ownerKey: string;
+  readonly packageReceiptRevision?: number;
   readonly pending: readonly MobileExtensionPendingMutation[];
   list(signal: AbortSignal): Promise<MobileExtensionCatalog>;
   detail(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtension>;

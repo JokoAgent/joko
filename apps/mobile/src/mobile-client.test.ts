@@ -3043,6 +3043,31 @@ describe("mobile Extension catalog authority", () => {
     expect(network.listExtensions).not.toHaveBeenCalled();
   });
 
+  it("signals the current catalog after a snapshot poll adopts the original uninstall receipt", async () => {
+    vi.useFakeTimers();
+    const network = fakeNetwork(), saved = memoryStorage(credential), extension = mobileExtensionFixture();
+    network.streamOwner = vi.fn(async function* () { throw new Error("stream transport unavailable"); });
+    network.getExtension = vi.fn(async () => extension);
+    network.submit = vi.fn(async () => { throw new Error("transport closed after dispatch"); });
+    const app = client(network, saved.storage, undefined, undefined, () => "package-poll"); await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.liveStatus).toBe("polling");
+    const active = app.extensionCatalogTransport()!;
+    await expect(active.removePackage!(extension, new AbortController().signal)).rejects.toThrow(/unknown/u);
+    expect(saved.pending()).toHaveLength(1);
+    network.getOperation = vi.fn(async (_credential, operationId) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "resource", value: create(ManagedResourceSchema, { resourceId: "resource-1" }) } }
+    }));
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(network.getOperation).toHaveBeenCalledWith(credential, "package-poll", expect.any(AbortSignal));
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(saved.pending()).toEqual([]);
+    expect(app.state.error).toBeUndefined();
+    expect(app.extensionCatalogTransport()).toMatchObject({ ownerKey: active.ownerKey, packageReceiptRevision: 1, pending: [] });
+  });
+
   it("cold-recovers an unknown package operation only through its exact original Resource result without resending", async () => {
     const network = fakeNetwork(), saved = memoryStorage(credential), extension = mobileExtensionFixture();
     network.getExtension = vi.fn(async () => extension);
@@ -3056,6 +3081,7 @@ describe("mobile Extension catalog authority", () => {
       result: { payload: { case: "resource", value: create(ManagedResourceSchema, { resourceId: resultId }) } } }));
     const restored = client(network, saved.storage); await restored.start();
     expect(saved.pending()).toHaveLength(1);
+    expect(restored.extensionCatalogTransport()?.packageReceiptRevision).toBe(0);
     expect(restored.state.error).toMatch(/original Resource/u);
     await expect(restored.extensionCatalogTransport()!.removePackage!(extension, new AbortController().signal)).rejects.toThrow(/original Extension operation/u);
     resultId = "resource-1";

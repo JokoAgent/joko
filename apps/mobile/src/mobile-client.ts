@@ -995,6 +995,7 @@ export class MobileClient {
   #streamGeneration?: bigint;
   #foreground = true;
   #extensionOAuthRetention?: { readonly transport: MobileExtensionTransport; readonly current: () => boolean };
+  #extensionPackageReceiptRevision = 0;
   #providerRebalanceConfirmation?: { readonly sourceKey: string };
   #partnerRosterEpoch = 0;
   #partnerRosterNavigation?: { readonly sourceKey: string; readonly profileId: string; readonly sessionId: string; readonly partnerId: string; readonly homeTargetId: string };
@@ -3433,6 +3434,7 @@ export class MobileClient {
     };
     const transport: MobileExtensionTransport = {
       ownerKey,
+      packageReceiptRevision: this.#extensionPackageReceiptRevision,
       openSettings,
       callSettings,
       pending: Object.freeze(this.#state.pending.flatMap((receipt) => receipt.connectionId === context.credential.connectionId
@@ -16525,7 +16527,7 @@ export class MobileClient {
     return { accepted: !rejected, definitive: isTerminal(operation.state), operation };
   }
 
-  async #receipt(operation: Operation, pending: PendingOperation, epoch: number): Promise<void> {
+  async #receipt(operation: Operation, pending: PendingOperation, epoch: number, reconciled = false): Promise<void> {
     if (!this.#current(epoch) || this.#credential?.connectionId !== pending.connectionId) return;
     if (!this.#operationReceiptMatches(operation, pending)) {
       this.#set({
@@ -16545,7 +16547,13 @@ export class MobileClient {
       ? this.#state.pending.filter((item) => item.operationId !== pending.operationId)
       : this.#state.pending.map((item) => item.operationId === pending.operationId ? { ...item, state: "accepted" as const } : item);
     if (!await this.#persistPending(next, epoch)) return;
-    this.#set({ pending: next });
+    const recoveredPackageRemoval = reconciled && pending.kind === "extension-package-remove" && operation.state === OperationState.SUCCEEDED
+      && this.#state.pending.some(item => item.operationId === pending.operationId);
+    if (recoveredPackageRemoval) this.#extensionPackageReceiptRevision++;
+    const error = this.#state.error, id = pending.operationId;
+    const resolvedError = recoveredPackageRemoval && (error?.startsWith(`Operation ${id}:`)
+      || error?.startsWith(`Could not confirm operation ${id}:`) || error?.startsWith(`Operation ${id} is not yet confirmed.`));
+    this.#set({ pending: next, ...(resolvedError ? { error: undefined } : {}) });
     if (operation.state === OperationState.SUCCEEDED
       && (pending.kind === "interaction-resolve" || pending.kind === "interaction-dismiss")
       && pending.interactionDraftKind !== undefined && pending.sessionId !== undefined && pending.interactionId !== undefined
@@ -16639,7 +16647,7 @@ export class MobileClient {
             await this.#recoverMessageRewindReceipt(pending, operation, epoch);
             if (!this.#current(epoch)) return;
           }
-          await this.#receipt(operation, pending, epoch);
+          await this.#receipt(operation, pending, epoch, true);
           if ((pending.kind === "session-rewind" || pending.kind === "session-side-chat") && exactOperation && isTerminal(operation.state) && this.#current(epoch)
             && !this.#state.pending.some((value) => value.operationId === pending.operationId)) {
             await this.composerDrafts?.clearOperationInput({ profileId: pending.taskJoinId

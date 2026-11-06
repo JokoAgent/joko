@@ -17,6 +17,7 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import {
   filterMobileExtensions,
+  mobileExtensionKey,
   mobileExtensionMainViewReady,
   type MobileExtension,
   type MobileExtensionCatalog,
@@ -184,6 +185,7 @@ export function MobileExtensionsScreen({
   const [mainView, setMainView] = useState<MainViewSelection | undefined>();
   const [libraryView, setLibraryView] = useState<LibrarySelection | undefined>();
   const ownerKey = transport?.ownerKey;
+  const packageReceiptRevision = transport?.packageReceiptRevision;
 
   useEffect(() => {
     setMainView(undefined);
@@ -196,7 +198,6 @@ export function MobileExtensionsScreen({
   }, [detail.ownerKey, detail.extension?.extensionId, detail.extension?.setup.attemptId]);
 
   useEffect(() => {
-    listAbort.current?.abort();
     detailAbort.current?.abort();
     mutationAbort.current?.abort();
     detailOccurrence.current = undefined;
@@ -212,7 +213,12 @@ export function MobileExtensionsScreen({
       setUseBusy(false);
       setUseError(undefined);
     }
-    if (!transport || !ownerKey) {
+  }, [attempt, browseAvailable, ownerKey]);
+
+  useEffect(() => {
+    listAbort.current?.abort();
+    const active = transportRef.current;
+    if (!active || !ownerKey) {
       setDirectory(emptyDirectory);
       return;
     }
@@ -221,9 +227,12 @@ export function MobileExtensionsScreen({
     setDirectory((current) => current.ownerKey === ownerKey && current.catalog
       ? { ...current, status: "ready", refreshing: true }
       : { ownerKey, status: "loading", refreshing: false });
-    void (browseAvailable && transport.browse ? transport.browse(controller.signal) : transport.list(controller.signal)).then((catalog) => {
+    void (browseAvailable && active.browse ? active.browse(controller.signal) : active.list(controller.signal)).then((catalog) => {
       if (controller.signal.aborted || transportRef.current?.ownerKey !== ownerKey) return;
       setDirectory({ ownerKey, status: "ready", refreshing: false, catalog });
+      setDetail(current => current.ownerKey === ownerKey && current.extensionId !== undefined
+        && !catalog.extensions.some(item => item.extensionId === current.extensionId
+          && (!current.extension || mobileExtensionKey(item) === mobileExtensionKey(current.extension))) ? emptyDetail : current);
     }, () => {
       if (controller.signal.aborted || transportRef.current?.ownerKey !== ownerKey) return;
       setDirectory((current) => current.ownerKey === ownerKey && current.catalog
@@ -231,7 +240,7 @@ export function MobileExtensionsScreen({
         : { ownerKey, status: "error", refreshing: false });
     });
     return () => controller.abort();
-  }, [attempt, browseAvailable, ownerKey]);
+  }, [attempt, browseAvailable, ownerKey, packageReceiptRevision]);
 
   useEffect(() => () => {
     listAbort.current?.abort();
@@ -294,11 +303,13 @@ export function MobileExtensionsScreen({
     void currentTransport.detail(expected, controller.signal).then((extension) => {
       if (controller.signal.aborted || detailOccurrence.current !== occurrence
         || transportRef.current?.ownerKey !== currentTransport.ownerKey) return;
-      setDetail({ ownerKey: currentTransport.ownerKey, extensionId: expected.extensionId, status: "ready", extension });
+      setDetail(current => current.ownerKey === currentTransport.ownerKey && current.extensionId === expected.extensionId
+        ? { ...current, status: "ready", extension } : current);
     }, () => {
       if (controller.signal.aborted || detailOccurrence.current !== occurrence
         || transportRef.current?.ownerKey !== currentTransport.ownerKey) return;
-      setDetail({ ownerKey: currentTransport.ownerKey, extensionId: expected.extensionId, status: "error" });
+      setDetail(current => current.ownerKey === currentTransport.ownerKey && current.extensionId === expected.extensionId
+        ? { ...current, status: "error" } : current);
     });
   };
 
@@ -565,7 +576,7 @@ export function MobileExtensionsScreen({
               onPress={() => { const active = transportRef.current; if (active) { setLibraryView(undefined); setMainView({ ownerKey: active.ownerKey, extension, settings: true }); } }}
               testID="extensions.settings.open" />}
             {transport && <MobileExtensionPackages extension={extension} transport={transport} colors={colors} locale={locale}
-              disabled={selectedBusy || mutation !== undefined || pending.length > 0}
+              disabled={selectedBusy || mutation !== undefined || pending.length > 0 || visibleDirectory.refreshing}
               onChanged={catalog => {
                 const visible = browseAvailable ? catalog : { ...catalog, extensions: catalog.extensions.filter(item => item.installed) };
                 setDirectory({ ownerKey, status: "ready", refreshing: false, catalog: visible });
