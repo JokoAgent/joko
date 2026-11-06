@@ -602,7 +602,8 @@ export class ExtensionLibraryVault {
       assertPathSnapshot(source, sourceIdentity),
       assertPathSnapshot(target, targetIdentity)
     ]);
-    await rename(source, target);
+    if (sourceKind === "file" && input.overwrite !== true) await moveFileNoReplace(source, target, sourceIdentity);
+    else await rename(source, target);
     const after = await supportedEntrySnapshot(await this.#resolveExisting(to, sourceKind));
     if (!sameFilesystemObject(sourceIdentity, after) || await pathKind(source) !== "missing") {
       throw new ExtensionLibraryError("CONFLICT", "Library rename could not be identity-fenced into place.");
@@ -1173,17 +1174,25 @@ async function placeStagedFile(
   if (replacing) {
     await rename(temporary, target);
   } else {
-    try {
-      await link(temporary, target);
-    } catch (error) {
-      if (isAlreadyExists(error)) {
-        throw new ExtensionLibraryError("CONFLICT", "Library write target appeared concurrently.", { cause: error });
-      }
-      throw error;
-    }
-    await unlink(temporary);
+    await moveFileNoReplace(temporary, target, stagedIdentity);
   }
   await syncDirectory(dirname(target));
+}
+
+async function moveFileNoReplace(source: string, target: string, expected: BigIntStats): Promise<void> {
+  try {
+    await link(source, target);
+  } catch (error) {
+    if (isAlreadyExists(error)) {
+      throw new ExtensionLibraryError("CONFLICT", "Library destination appeared concurrently.", { cause: error });
+    }
+    throw error;
+  }
+  const [published, remaining] = await Promise.all([regularFileSnapshot(target), regularFileSnapshot(source)]);
+  if (!sameFilesystemObject(expected, remaining) || !sameFile(published, remaining)) {
+    throw new ExtensionLibraryError("CONFLICT", "Library file changed during the move.");
+  }
+  await unlink(source);
 }
 
 function validateMetadata(value: unknown, extensionId: string): StoredLibraryMetadata {
