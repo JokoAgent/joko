@@ -1251,13 +1251,14 @@ export class ExtensionLibraryManager {
     });
   }
 
-  async purgeTrash(input: { readonly trashId: string; readonly confirmation: string }): Promise<boolean> {
+  async purgeTrash(input: { readonly trashId: string; readonly confirmation: string; readonly assertCurrent: () => void }): Promise<boolean> {
     this.#assertReady();
     return this.#mutate(async () => {
+      input.assertCurrent();
       this.#assertStateAvailable();
       const record = this.#trash(input.trashId);
       if (input.confirmation !== record.name) throw new ExtensionLibraryError("CONFLICT", "Extension Library purge confirmation did not match.");
-      await this.#purgeTrashRecord(record);
+      await this.#purgeTrashRecord(record, input.assertCurrent);
       return true;
     });
   }
@@ -1923,14 +1924,16 @@ export class ExtensionLibraryManager {
     return binding;
   }
 
-  async #purgeTrashRecord(record: StoredTrash): Promise<void> {
+  async #purgeTrashRecord(record: StoredTrash, assertCurrent?: () => void): Promise<void> {
     const container = this.#trashContainer(record.trashId);
     if (record.root !== join(container, "library")) {
       throw new ExtensionLibraryError("CORRUPT", "Extension Library purge escaped its trash container.");
     }
+    // Publishing this marker authorizes recovery to finish the purge after restart.
     await atomicJson(
       join(container, TRASH_MANIFEST_FILE),
-      { format: 1, phase: "purging", record } satisfies PurgingTrashManifest
+      { format: 1, phase: "purging", record } satisfies PurgingTrashManifest,
+      assertCurrent
     );
     if (await exists(record.root)) await removeExtensionLibraryRoot(record.root, record.identity);
     if (this.#state.trash.some((entry) => entry.trashId === record.trashId)) {
@@ -2394,11 +2397,11 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function atomicJson(path: string, value: unknown): Promise<void> {
-  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"));
+async function atomicJson(path: string, value: unknown, beforePublish?: () => void): Promise<void> {
+  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"), beforePublish);
 }
 
-async function atomicBytes(path: string, bytes: Uint8Array): Promise<void> {
+async function atomicBytes(path: string, bytes: Uint8Array, beforePublish?: () => void): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${randomUUID()}.tmp`;
   let handle: FileHandle | undefined;
@@ -2408,6 +2411,7 @@ async function atomicBytes(path: string, bytes: Uint8Array): Promise<void> {
     await handle.sync();
     await handle.close();
     handle = undefined;
+    beforePublish?.();
     await rename(temporary, path);
     await syncDirectory(dirname(path));
   } finally {

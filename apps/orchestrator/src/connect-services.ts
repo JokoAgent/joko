@@ -4876,12 +4876,18 @@ export function createConnectServices(application: OrchestratorApplication, proj
       return { extensionId: result.extensionId, location: mapExtensionLibraryLocation(result.location) };
     },
     purgeExtensionLibraryTrash: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
       const manager = requireExtensionLibraryManager(dependencies);
+      const assertCurrent = () => {
+        context.signal.throwIfAborted();
+        dependencies.connections.fence(connection);
+      };
       const purged = await extensionLibraryEffect(() => manager.purgeTrash({
         trashId: nonBlankRequest(request.trashId, "trash_id"),
-        confirmation: request.confirmation
+        confirmation: request.confirmation,
+        assertCurrent
       }));
+      assertCurrent();
       return { purged };
     },
     listExtensionLibraryGrace: (request, context) => {

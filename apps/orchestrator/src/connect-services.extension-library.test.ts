@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import { OperationalStore } from "@joko/store";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
@@ -49,6 +51,52 @@ function stubApplication(overrides: Record<string, unknown>): OrchestratorApplic
 }
 
 describe("Connect Extension Library boundary", () => {
+  it("keeps a trashed Library restorable when the device is revoked before its queued purge begins", async () => {
+    const temporaryPath = await mkdtemp(join(tmpdir(), "joko-connect-library-purge-"));
+    cleanups.push(() => rm(temporaryPath, { recursive: true, force: true }));
+    const store = new OperationalStore(":memory:");
+    cleanups.push(async () => { store.close(); });
+    const connections = new ConnectionManager(store);
+    const connection = store.createConnection({
+      id: CONNECTION_ID, name: "Library owner", authKeyDigest: digestAuthKey("extension-library-test")
+    });
+    const manager = new ExtensionLibraryManager({
+      rootDirectory: join(temporaryPath, "libraries"), freeBytes: async () => 64 * 1024 * 1024 * 1024
+    });
+    await manager.initialize();
+    cleanups.push(() => manager.close());
+    const authority = {
+      extensionId: EXTENSION_ID, extensionRevision: 7n, name: "Canvas", resourceId: "resource-library",
+      resourceRevision: 5n, discoveredRevision: "sha256:library", backendId: "pi", backendRevision: 9n,
+      backendGeneration: 3, library: { schemaVersion: 1 as const, extensionEntry: "extensions/canvas.ts" }
+    };
+    const sessionOptions = {
+      authority, surfaceId: `extension_surface_${"5".repeat(32)}`, surfaceExpiresAt: Date.now() + 600_000,
+      assertAuthorityCurrent: () => undefined
+    };
+    const opened = await manager.openSession({ ...sessionOptions, connectionId: CONNECTION_ID });
+    await manager.write(opened.sessionId, CONNECTION_ID, { path: "kept.txt", bytes: Buffer.from("kept") });
+    const trashed = await manager.trashLibrary({ ...sessionOptions, confirmation: authority.name });
+    const services = createConnectServices(stubApplication({ store, connections, extensionLibraries: manager, sessionHost: {} }));
+
+    const lease = await manager.acquireAuthorityChange(EXTENSION_ID);
+    try {
+      const purge = invoke(services.extension.purgeExtensionLibraryTrash, { trashId: trashed.trashId, confirmation: authority.name });
+      const rejected = expect(purge).rejects.toMatchObject({ code: "AUTH_REVOKED" });
+      connections.revokeDevice(connection.deviceId);
+      await lease.release();
+      await rejected;
+    } finally {
+      await lease.release();
+    }
+
+    expect(manager.listTrash()).toEqual([trashed]);
+    await manager.restoreTrash({ trashId: trashed.trashId, confirmation: authority.name });
+    const recovered = await manager.openSession({ ...sessionOptions, connectionId: "second-owner" });
+    await expect(manager.read(recovered.sessionId, "second-owner", { path: "kept.txt" }))
+      .resolves.toMatchObject({ bytes: Buffer.from("kept") });
+  });
+
   it("maps the bounded file and SQL protocol and revokes exact authority and connection sessions", async () => {
     const temporaryPath = await mkdtemp(join(tmpdir(), "joko-connect-extension-library-"));
     cleanups.push(() => rm(temporaryPath, { recursive: true, force: true }));
