@@ -418,6 +418,7 @@ export interface SessionHelperToolProviderOptions {
   readonly messageSearch?: () => Pick<MessageSearchEmbeddingCoordinator, "embedQuery"> | undefined;
   readonly now?: () => number;
   readonly taskSenderPartner?: (sessionId: string) => Pick<TaskMessageOrigin, "senderPartnerId" | "senderPartnerName"> | undefined;
+  readonly canSendTaskMessage?: (caller: SessionDescriptor, targetSessionId: string | undefined) => boolean;
 }
 
 interface HistoryMessage {
@@ -473,6 +474,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
   readonly #messageSearch: () => Pick<MessageSearchEmbeddingCoordinator, "embedQuery"> | undefined;
   readonly #now: () => number;
   readonly #taskSenderPartner: NonNullable<SessionHelperToolProviderOptions["taskSenderPartner"]>;
+  readonly #canSendTaskMessage: NonNullable<SessionHelperToolProviderOptions["canSendTaskMessage"]>;
   readonly #confirmationSecret = randomBytes(32);
 
   constructor(options: SessionHelperToolProviderOptions) {
@@ -481,6 +483,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     this.#messageSearch = options.messageSearch ?? (() => undefined);
     this.#now = options.now ?? Date.now;
     this.#taskSenderPartner = options.taskSenderPartner ?? (() => undefined);
+    this.#canSendTaskMessage = options.canSendTaskMessage ?? (() => true);
     if (SESSION_HELPER_NESTED_TOOLS.length !== 27) {
       throw new Error("The task helper catalog must expose exactly twenty-seven applicable nested tools.");
     }
@@ -1737,7 +1740,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
   async #sendToSession(
     input: Readonly<Record<string, unknown>>,
     caller: SessionDescriptor,
-    _context: BridgeToolCallContext
+    context: BridgeToolCallContext
   ): Promise<unknown> {
     assertKeys(input, [
       "target_session_id",
@@ -1752,6 +1755,10 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     ]);
     const message = requiredText(input, "message", MAXIMUM_MESSAGE_LENGTH);
     const targetSessionId = optionalId(input["target_session_id"], "target_session_id");
+    context.assertCurrent?.();
+    if (!this.#canSendTaskMessage(caller, targetSessionId)) {
+      throw new SessionHelperError("NEEDS_OWNER_REQUEST", "This automatic follow-up cannot send a message to that task without an Owner request.");
+    }
     const agentKind = optionalAgentKind(input["agent_kind"]);
     const host = this.#requireHost();
     if (targetSessionId !== undefined) {

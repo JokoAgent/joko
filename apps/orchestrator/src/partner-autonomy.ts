@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Routine, RoutineInput, RoutineRun, RunDescriptor } from "@joko/core";
+import type { Routine, RoutineInput, RoutineRun, RunDescriptor, SessionDescriptor } from "@joko/core";
 import { TaskShareStore, type ConnectionRecord, type OperationalStore, type PartnerStore } from "@joko/store";
 import type { PartnerManager } from "./partner-manager.js";
 import type { PartnerRoutineManager } from "./partner-routine-manager.js";
@@ -280,6 +280,29 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
 }
 
 export function followUpId(partnerId: string): string { return `builtin-follow-up-${hash(partnerId).slice(0, 40)}`; }
+
+/** A service-owned follow-up Session can message only a child it delegated. */
+export function canSendFollowUpTaskMessage(
+  profiles: Pick<PartnerStore, "getSessionLink" | "getPartner" | "getDelegation">,
+  caller: SessionDescriptor,
+  targetSessionId: string | undefined
+): boolean {
+  const link = profiles.getSessionLink(caller.id);
+  if (link?.role !== "routine") return true;
+  const key = `routine:${followUpId(link.partnerId)}`;
+  if (link.routineKey !== key && !link.routineKey?.startsWith(`${key}:`)) return true;
+  const owner = profiles.getPartner(link.partnerId);
+  if (!targetSessionId || owner.lifecycle !== "active" || owner.initializationState !== "ready" || owner.pauseCleanupPending
+    || owner.profileVersion !== link.profileVersion || owner.homeTargetId !== caller.targetId) return false;
+
+  const child = profiles.getSessionLink(targetSessionId);
+  if (child?.role !== "delegation" || !child.delegationId) return false;
+  const delegation = profiles.getDelegation(child.delegationId);
+  return delegation.requesterPartnerId === owner.id && delegation.childSessionId === targetSessionId
+    && delegation.targetPartnerId === child.partnerId && delegation.targetProfileVersion === child.profileVersion
+    && delegation.status !== "cancelled";
+}
+
 function followUpInput(partnerId: string): RoutineInput {
   return { name: "Follow up on tasks", prompt: "Review these tasks and tell me your judgment and suggestions about anything that needs my reply or decision. Stay quiet when there is no new information. Do not message a task, answer an interaction, approve a request, or change task state without my explicit permission.",
     enabled: true, silentWhenIdle: true, triggers: TYPES.map(type => ({ id: `event-${type}`, kind: "event", sourceId: PARTNER_HOST_SOURCE, eventType: type,

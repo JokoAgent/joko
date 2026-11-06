@@ -1,11 +1,11 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalStore, PartnerStore, PartnerRoutineStore, TaskShareStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { projectPiInputSchema } from "@joko/adapter-pi";
-import type { RoutineRun } from "@joko/core";
+import type { RoutineRun, SessionDescriptor } from "@joko/core";
 import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { PartnerManager } from "./partner-manager.js";
@@ -13,12 +13,13 @@ import { SessionHost } from "./session-host.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
-import { PartnerAutonomyManager, dueEvent, followUpId } from "./partner-autonomy.js";
+import { canSendFollowUpTaskMessage, PartnerAutonomyManager, dueEvent, followUpId } from "./partner-autonomy.js";
 import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
+import { SessionHelperToolBridgeProvider } from "./session-helper-tool-provider.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture() {
+async function fixture(permissionMode: "ask" | "bypassPermissions" = "ask") {
   const directory = await mkdtemp(join(tmpdir(), "joko-autonomy-")), store = new OperationalStore(join(directory, "operations.db"));
   const profiles = new PartnerStore(join(directory, "partners.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
@@ -30,7 +31,7 @@ async function fixture() {
     workspaceService: { register: async input => input, unregister: () => undefined } });
   const created = await partners.createPartner({ requestId: "autonomy-owner-create", expectedDirectoryRevision: profiles.directoryState().revision,
     displayName: "Ada", avatar: "orbit", identitySource: "Help review the owner's work.", templateId: "general", usesDirectoryDefaults: false,
-    capabilities: { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
+    capabilities: { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode, planMode: false } });
   expect(created.initializationState).toBe("ready"); expect(created.canonicalSessionId).toBeTypeOf("string");
   const partner = partners.getPartner(created.id), scheduler = new ScheduleCoordinator(store, host);
   const routines = new PartnerRoutineManager({ store, partners, scheduler, storage: new PartnerRoutineStore(join(directory, "routines")) });
@@ -48,7 +49,7 @@ async function fixture() {
   const update = (operationId: string, choice: Parameters<PartnerAutonomyManager["update"]>[0]["choice"]) => autonomy.update({ operationId, connection,
     expectedRevision: autonomy.settings().revision, choice, assertCurrent: () => undefined });
   cleanups.push(async () => { autonomy.stop(); await routines.stop(); await scheduler.stop(); await tasks.close(); await host.dispose(); profiles.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
-  return { store, profiles, partners, partner, adapter, routines, tasks, autonomy, connection, task, update, session, tick: (amount: number) => { now += amount; } };
+  return { store, profiles, partners, partner, adapter, routines, tasks, autonomy, host, connection, task, update, session, tick: (amount: number) => { now += amount; } };
 }
 
 describe("Partner task observation", () => {
@@ -90,6 +91,61 @@ describe("Partner task observation", () => {
     expect(dueEvent({ ...row, toolInFlight: true }, row.lastActivityAt + 45 * 60_000)).toBe("stuck");
     expect(dueEvent({ ...row, shared: true }, row.lastActivityAt + 99 * 60_000)).toBeUndefined();
     expect(dueEvent({ ...row, readOnly: true }, row.lastActivityAt + 99 * 60_000)).toBeUndefined();
+  });
+
+  it("scopes a live Full Access follow-up helper to its own delegated task", async () => {
+    const f = await fixture("bypassPermissions");
+    const worker = await f.partners.createPartner({ requestId: "autonomy-worker", expectedDirectoryRevision: f.profiles.directoryState().revision,
+      displayName: "Worker", avatar: "orbit", identitySource: "Work on assigned tasks.", templateId: "general",
+      usesDirectoryDefaults: false, capabilities: f.partner.capabilities });
+    let failedDelegation = false;
+    const send = vi.spyOn(f.adapter, "send").mockImplementation(async (_prompt, context) => {
+      if (failedDelegation || f.profiles.getSessionLink(context.sessionId)?.role !== "delegation") return;
+      failedDelegation = true;
+      await context.emit({ type: "error", terminal: true, error: { code: "FIXTURE_FAILED", message: "The delegated task needs review.",
+        phase: "run", retryable: false, stateMayHaveChanged: false, recovery: "Review the task" } });
+      await context.emit({ type: "done", outcome: "failed" });
+    });
+    const original = await f.partners.startDelegation({ callerSessionId: f.session.id, targetPartnerId: worker.id,
+      title: "Owned review", objective: "Finish the review" });
+    const childId = original.delegation.childSessionId!;
+    await vi.waitFor(() => expect(f.store.getRun(original.delegation.runId!).descriptor.state).toBe("failed"));
+    const unrelated = f.task("unrelated-owner-task");
+    expect(f.autonomy.observe().some((item) => item.sessionId === unrelated.id)).toBe(false);
+    await f.autonomy.start();
+    const scheduleId = `partner-routine-${followUpId(f.partner.id)}`;
+    const routineContext = () => {
+      const sessionId = f.store.findSchedule(scheduleId)?.sessionId;
+      return send.mock.calls.find(([, context]) => context.sessionId === sessionId)?.[1];
+    };
+    await vi.waitFor(() => expect(routineContext()).toBeDefined(), { timeout: 5_000 });
+    const routine = f.store.getSession(routineContext()!.sessionId).descriptor;
+    expect(routine.permissionMode).toBe("bypassPermissions");
+    expect(f.store.listRuns({ sessionId: routine.id }).map((run) => run.descriptor.source)).toEqual(["schedule"]);
+    const provider = new SessionHelperToolBridgeProvider({ store: f.store, host: () => f.host,
+      canSendTaskMessage: (caller, target) => canSendFollowUpTaskMessage(f.profiles, caller, target) });
+    const call = async (source: SessionDescriptor, name: string, args: Record<string, unknown>) => {
+      const input = { name, args }, signal = new AbortController().signal;
+      const assertCurrent = await f.host.authorizeNativeBridgeTool(source.id, provider.id, "call_tool", input, signal);
+      return provider.callTool("call_tool", input, signal, {
+        sessionId: source.id, targetId: source.targetId, generation: source.binding.generation, assertCurrent
+      });
+    };
+    const listing = await call(routine, "list_sessions", {});
+    expect(listing).toMatchObject({ isError: false, content: [{ text: expect.stringContaining(unrelated.id) }] });
+    const message = "Please review the report.";
+    const sessionsBefore = f.store.listSessions().length;
+    for (const args of [{ target_session_id: unrelated.id, message }, { message }]) {
+      expect(await call(routine, "send_to_session", args)).toMatchObject({ isError: true,
+        content: [{ text: expect.stringContaining("NEEDS_OWNER_REQUEST") }] });
+    }
+    expect(f.store.listSessions()).toHaveLength(sessionsBefore);
+    expect(f.store.listQueueItems({ sessionId: unrelated.id })).toEqual([]);
+    expect(await call(routine, "send_to_session", { target_session_id: childId, message })).toMatchObject({ isError: false });
+    expect(f.store.listQueueItems({ sessionId: childId }).some((item) => item.body.text === message)).toBe(true);
+    expect(await call(f.session, "send_to_session", { target_session_id: unrelated.id, message })).toMatchObject({ isError: false });
+    expect(f.store.listQueueItems({ sessionId: unrelated.id }).some((item) => item.body.text === message)).toBe(true);
+    await routineContext()!.emit({ type: "done", outcome: "completed" });
   });
 });
 
