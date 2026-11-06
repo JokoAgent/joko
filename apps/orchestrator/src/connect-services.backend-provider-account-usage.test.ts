@@ -2,13 +2,13 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Code } from "@connectrpc/connect";
+import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
-import { createConnectServices } from "./connect-services.js";
+import { createConnectServices, registerConnectServices } from "./connect-services.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { mkdtempSync } from "./test-paths.js";
 
@@ -128,12 +128,15 @@ describe("Backend-native Provider account usage", () => {
         binding: { opaqueRef: "native/task", generation: 0 }, pinned: false, archived: false, permissionMode: "ask",
         planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
     }
+    const transport = createRouterTransport(router => registerConnectServices(router, fixture.application));
+    const backend = createClient(contract.BackendService, transport), event = createClient(contract.EventService, transport);
     const call = (key: string, signal?: AbortSignal) => {
+      const options = { headers: { authorization: `Bearer ${key}` }, ...(signal === undefined ? {} : { signal }) };
       switch (endpoint) {
-        case "usage": return invoke(fixture.services.backend.getProviderUsage, { backendId, providerId }, key, signal);
-        case "list": return invoke(fixture.services.backend.listProviders, { backendId }, key, signal);
-        case "provider": return invoke(fixture.services.backend.getProvider, { backendId, providerId }, key, signal);
-        case "snapshot": return invoke(fixture.services.event.getSnapshot, {}, key, signal);
+        case "usage": return backend.getProviderUsage({ backendId, providerId }, options);
+        case "list": return backend.listProviders({ backendId }, options);
+        case "provider": return backend.getProvider({ backendId, providerId }, options);
+        case "snapshot": return event.getSnapshot({}, options);
       }
     };
     const request = new AbortController();
@@ -141,12 +144,14 @@ describe("Backend-native Provider account usage", () => {
     const observed = expect(first).rejects.toMatchObject({
       code: retirement === "revoked" ? Code.Unauthenticated : Code.Canceled
     });
-    const other = call(observerKey);
+    let other: ReturnType<typeof call>;
     try {
+      await vi.waitFor(() => expect(readAccountUsage).toHaveBeenCalledOnce());
+      other = call(observerKey);
       await vi.waitFor(() => expect(readAccountUsage).toHaveBeenCalledTimes(2));
       if (retirement === "revoked") fixture.connections.revokeDevice(fixture.original.deviceId);
       else request.abort();
-      expect(readAccountUsage.mock.calls[0]?.[1]?.aborted).toBe(true);
+      await vi.waitFor(() => expect(readAccountUsage.mock.calls[0]?.[1]?.aborted).toBe(true));
       expect(readAccountUsage.mock.calls[1]?.[1]?.aborted).toBe(false);
     } finally { release(); }
     await observed;
@@ -251,7 +256,7 @@ function createFixture(
     browserActivity: [],
     close: async () => undefined
   } as unknown as OrchestratorApplication;
-  return { services: createConnectServices(application), adapters, directory, store, connections, original };
+  return { application, services: createConnectServices(application), adapters, directory, store, connections, original };
 }
 
 function accountUsageByBackend(providers: readonly contract.ProviderDescriptor[]) {
