@@ -37,7 +37,7 @@ export class PartnerImportRuntime implements BridgeToolProvider, PartnerImported
     tool("list_documents", "List all imported document identities and safe names, in pages of 20.", { offset: { type: "integer", minimum: 0 } }, [], false),
   ];
   constructor(private readonly options: { partners: PartnerManager; storage: PartnerImportStorage; store: OperationalStore;
-    host: SessionHost; imports: PartnerImportManager; auxiliary: AuxiliaryTextRouting; routines: PartnerRoutineManager; assertServiceOwner(): void;
+    host: SessionHost; imports: PartnerImportManager; auxiliary: Pick<AuxiliaryTextRouting, "capture" | "run">; routines: PartnerRoutineManager; assertServiceOwner(): void;
     groupHomeTarget?: (sessionId: string, targetId: string) => string | undefined;
     isGroupSession?: (sessionId: string) => boolean }) {}
   close(): Promise<void> { return closeInvalidImportedConnections(); }
@@ -142,12 +142,16 @@ export class PartnerImportRuntime implements BridgeToolProvider, PartnerImported
         user: prompt, maxTokens: 4000, timeoutMs: 60_000, stillCurrent: () => { try { assertOwner(); return true; } catch { return false; } }, validate: raw => { try { JSON.parse(raw.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "")); return raw; } catch { return undefined; } } });
       assertOwner(); return response.status === "ok" ? response.text : undefined;
     },
-    authorize: async <T>(sessionId: string, action: ImportProbeAction, assertOwner: () => void, run: (signal: AbortSignal, assertCurrent: () => Promise<void>) => Promise<T>) => {
+    authorize: async <T>(sessionId: string, action: ImportProbeAction, assertOwner: () => void, run: (signal: AbortSignal, assertCurrent: () => void) => Promise<T>) => {
       const retired = new AbortController(); const signal = AbortSignal.any([AbortSignal.timeout(120_000), retired.signal]); assertOwner();
-      const watch = setInterval(() => { try { assertOwner(); } catch { retired.abort(); } }, 100); watch.unref();
+      let assertCurrent = assertOwner;
+      const watch = setInterval(() => { try { assertCurrent(); } catch { retired.abort(); } }, 100); watch.unref();
       try {
-        await this.options.host.authorizeImportProbe(sessionId, JSON.stringify(action), signal, assertOwner); assertOwner();
-        const result = await run(signal, async () => { assertOwner(); signal.throwIfAborted(); }); assertOwner(); return result;
+        assertCurrent = await this.options.host.authorizeImportProbe(sessionId, action, signal, assertOwner);
+        assertCurrent();
+        const result = await run(signal, assertCurrent);
+        assertCurrent();
+        return result;
       } finally { clearInterval(watch); }
     },
     verifyDelivery: verifyImportedDelivery,

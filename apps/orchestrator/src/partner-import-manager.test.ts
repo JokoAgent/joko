@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { create } from "@bufbuild/protobuf";
@@ -7,7 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalStore, PartnerStore, PartnerRoutineStore, partnerHomeDirectoryName } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema,
-  DeletePartnerMemoryRequestSchema, DeletePartnerSkillRequestSchema, UpdatePartnerMemoryRequestSchema, UpdatePartnerSkillRequestSchema } from "@joko/contracts";
+  DeletePartnerMemoryRequestSchema, DeletePartnerSkillRequestSchema, UpdatePartnerMemoryRequestSchema, UpdatePartnerSkillRequestSchema,
+  PermissionRisk, PolicyEffect, PolicySettingsSchema, PolicySubjectKind } from "@joko/contracts";
 import { readImportTree, createImportBudget } from "@joko/agent-import";
 import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
@@ -17,6 +19,7 @@ import { PiResourceManager } from "./resource-manager.js";
 import { PartnerManager } from "./partner-manager.js";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
+import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
 import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerImportCreation } from "./partner-import-effects.js";
 import { createPartnerImportConnectService } from "./partner-import-connect-service.js";
@@ -31,7 +34,7 @@ const backendProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.c
   ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true },
   { key: "runtime.resources", supported: true, options: ["skill", "prompt"] }] };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void; currentCanonicalSession?: () => string | undefined } = {}) {
+async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void; currentCanonicalSession?: () => string | undefined; probePlan?: string } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-import-owner-")); const native = join(root, ".hermes");
   await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));
   await writeFile(join(native, "config.yaml"), "name: Analyst\n" + (options.nativeTools ? "tools:\n  allowed: [read]\n" : "")); await writeFile(join(native, ".env"), `ACCESS_TOKEN=${secret}\n`);
@@ -57,7 +60,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     workspaceService: { register: async input => input, unregister: () => undefined },
     onRoutineLifecycle: (id, lifecycle) => routines.lifecycle(id, lifecycle), prepareImportDeletion: id => imports.prepareDeletion(id), onReady: async id => { await imports?.activatePackage(id); } });
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
-  if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false });
+  if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: false });
   imports = new PartnerImportManager({ storage, home: root, environment: {}, assertServiceOwner: () => {},
     ...(options.currentCanonicalSession ? { currentCanonicalSession: options.currentCanonicalSession } : {}),
     nativeRuntimeReady: id => partners.getPartner(id).initializationState === "ready",
@@ -69,8 +72,12 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, storage, id, assertOwner),
     runPass: (id, action) => partners.runImportManagement(id, options.observeImport ? observedImportEffect("pass", action, options.observeImport) : action), effects: context => {
       options.observeImport?.("effects-start");
+      const probePlan = options.probePlan;
+      const runtime = probePlan === undefined ? undefined : new PartnerImportRuntime({ partners, store, host, routines, storage, imports,
+        assertServiceOwner: () => {}, auxiliary: { capture: () => ({ models: [], revision: 0n, runtimeRevision: "fixture" }),
+          run: async () => ({ status: "ok", text: probePlan }) } });
       const pendingEffects = createPartnerImportEffects({ partners, routines, storage, store, memory, resources, artifacts,
-      verification: { readEnvironment: (id, owner) => storage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
+      verification: runtime?.verification ?? { readEnvironment: (id, owner) => storage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
         plan: async () => undefined, authorize: async () => { throw new Error("No external probe is authorized by this fixture"); }, verifyDelivery: async () => { throw new Error("No channel is authorized by this fixture"); } }, home: root, environment: {} }, context);
       if (!options.observeImport) return pendingEffects;
       const observe = options.observeImport;
@@ -112,6 +119,131 @@ function observedImportEffect<Args extends unknown[], Result>(phase: string, act
   };
 }
 describe("native import service and owning effects", () => {
+  it.each(["global deny", "exact deny", "revoked during handshake", "revoked before response"] as const)(
+    "keeps the imported routine paused when a probe is %s", async (mode) => {
+      const connection = "records__fixture", tool = "read_records";
+      const f = await fixture({ probePlan: JSON.stringify({ reads: [{ kind: "mcp", connection, tool, arguments: { account: "fixture" }, pointer: "/records", array: true }] }) });
+      let initializes = 0, toolCalls = 0, waiting = false;
+      let releaseResponse!: () => void;
+      const held = new Promise<void>((resolveResponse) => { releaseResponse = resolveResponse; });
+      const server = createServer((request, response) => {
+        if (request.method !== "POST") { response.writeHead(405).end(); return; }
+        const chunks: Buffer[] = [];
+        request.on("data", (chunk: Buffer) => chunks.push(chunk));
+        request.on("end", () => void (async () => {
+          const message = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { id?: number; method: string; params?: { protocolVersion?: string } };
+          if (message.id === undefined) { response.writeHead(202).end(); return; }
+          let result: unknown;
+          if (message.method === "initialize") {
+            initializes += 1;
+            if (initializes === 2 && mode === "revoked during handshake") { waiting = true; await held; }
+            result = { protocolVersion: message.params?.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1.0.0" } };
+          } else if (message.method === "tools/list") {
+            result = { tools: [{ name: tool, inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] };
+          } else if (message.method === "tools/call") {
+            toolCalls += 1;
+            if (mode === "revoked before response") { waiting = true; await held; }
+            result = { content: [], structuredContent: { records: ["fixture result"] } };
+          }
+          response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+        })().catch(() => response.destroy()));
+      });
+      await new Promise<void>((listen) => server.listen(0, "127.0.0.1", listen));
+      try {
+        const address = server.address();
+        if (address === null || typeof address === "string") throw new Error("No fixture server address.");
+        await writeFile(join(f.native, "config.yaml"), `name: Analyst\nmcp_servers:\n  ${connection}:\n    url: http://127.0.0.1:${address.port}/mcp\n`);
+        const sourceRoutine = join(f.native, "cron", "jobs.json");
+        const original = JSON.stringify([{ id: "weekly", name: "Weekly", prompt: `Use ${connection}`, enabled: true, schedule: { kind: "cron", expr: "0 9 * * 1" } }]);
+        await writeFile(sourceRoutine, original);
+        const signal = new AbortController().signal;
+        const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+        const selected = preview.entries.filter((entry) => entry.name === connection || entry.category === PartnerImportCategory.AUTOMATIONS);
+        expect(selected).toHaveLength(2);
+        const selection = { previewId: preview.id, requestId: "owner_import_probe_0001", name: "Probe fixture", entryIds: selected.map((entry) => entry.id), takeover: true, deferSetup: true };
+        await f.api.start(selection, signal);
+        const saved = await f.imports.waitForRequest(selection.requestId);
+        expect(saved.checks).toContainEqual(expect.objectContaining({ message: "IMPORT_SETUP_DEFERRED" }));
+        const deny = () => f.store.setSetting("service", "orchestrator", "settings.policy", create(PolicySettingsSchema, {
+          rules: [{ policyRuleId: "deny-import-probe", subjectKind: PolicySubjectKind.MCP, effect: PolicyEffect.DENY,
+            ceiling: PermissionRisk.CRITICAL, enabled: true, ...(mode === "global deny" ? {} : { toolProviderId: connection, toolName: tool }) }]
+        }));
+        if (mode === "global deny" || mode === "exact deny") deny();
+        await f.api.retry(selection.requestId, true, signal);
+        if (mode === "revoked during handshake" || mode === "revoked before response") {
+          await vi.waitFor(() => expect(waiting).toBe(true), { timeout: 5_000 });
+          deny(); releaseResponse();
+        }
+        const result = await f.imports.waitForRequest(selection.requestId);
+        expect(result.checks).toContainEqual(expect.objectContaining({ status: "needs-attention", message: "AUTOMATION_DATA_READ_FAILED" }));
+        expect(initializes).toBe(mode === "global deny" || mode === "exact deny" ? 1 : 2);
+        expect(toolCalls).toBe(mode === "revoked before response" ? 1 : 0);
+        await expect(readFile(sourceRoutine, "utf8")).resolves.toBe(original);
+      } finally {
+        releaseResponse(); server.closeAllConnections();
+        await new Promise<void>((closed) => server.close(() => closed()));
+      }
+    }, 20_000);
+
+  it("masks native Discord credentials in imported knowledge even when connection entries were omitted", async () => {
+    const f = await fixture({ resourceFiles: 20 });
+    const root = join(f.root, ".openclaw"), workspace = join(root, "workspace");
+    const direct = "fixture-discord-channel-credential-abcdef", override = "fixture-discord-account-credential-123456";
+    const referenced = "fixture-discord-env-credential-987654", publicNote = "Public Discord label fixture";
+    await mkdir(join(workspace, "skills", "records"), { recursive: true });
+    await writeFile(join(root, "openclaw.json"), JSON.stringify({
+      agents: { entries: [{ id: "main", default: true, name: `Analyst ${direct}` }, { id: "other" }] },
+      channels: { discord: { token: direct, accounts: { inherited: {}, separate: { token: override },
+        environment: { token: { source: "env", id: "BOT_NAME" } } }, metadata: { token: publicNote } } },
+      bindings: [{ agentId: "other", match: { channel: "discord", accountId: "separate" } }]
+    }));
+    await writeFile(join(root, ".env"), `BOT_NAME=${referenced}\n`);
+    await writeFile(join(workspace, "SOUL.md"), `Analyst notes. ${direct} ${publicNote}`);
+    await writeFile(join(workspace, "MEMORY.md"), `Retained records. ${override} ${referenced} ${publicNote}`);
+    await writeFile(join(workspace, "skills", "records", "SKILL.md"), `---\nname: Records\ndescription: Verify ${referenced}\n---\nUse records. ${direct} ${override} ${publicNote}\n`);
+    const writeMemory = f.memory.write.bind(f.memory);
+    let failMemory = true;
+    vi.spyOn(f.memory, "write").mockImplementation((target, input) => {
+      if (failMemory && input.body.includes("Retained records.")) throw new Error("Fixture memory unavailable.");
+      return writeMemory(target, input);
+    });
+    const signal = new AbortController().signal;
+    const source = (await f.api.sources(signal)).find((entry) => entry.name.startsWith("Analyst ["))!;
+    const preview = await f.api.preview(source.id, signal);
+    expect(preview.name).not.toContain(direct);
+    const skillEntry = preview.entries.find((entry) => entry.category === PartnerImportCategory.SKILLS);
+    expect(skillEntry?.description).toContain("Verify");
+    expect(skillEntry?.description).not.toContain(referenced);
+    const selection = { previewId: preview.id, requestId: "owner_import_discord_0001", name: "Redaction fixture",
+      entryIds: preview.entries.filter((entry) => entry.category !== PartnerImportCategory.CONNECTIONS).map((entry) => entry.id), takeover: false, deferSetup: true };
+    await f.api.start(selection, signal);
+    const saved = await f.imports.waitForRequest(selection.requestId);
+    expect(saved.checks).toContainEqual(expect.objectContaining({ status: "needs-attention", message: "MEMORY_WRITE_FAILED" }));
+    const partner = f.partners.getPartner(saved.partnerId);
+    const skill = f.resources.listPartnerSkills(partner.id, partner.homeTargetId)[0]!;
+    const skillOwner = new PartnerSkillsManager(f.partners, f.profiles, f.store, f.resources, new SkillMutationCoordinator());
+    const published = await skillOwner.read(partner.id, skill.resource.id, signal);
+    expect(partner.identitySource).toContain(publicNote);
+    expect(published.skill.body).toContain(publicNote);
+    for (const token of [direct, override, referenced]) expect(JSON.stringify([preview, partner.identitySource, published.skill])).not.toContain(token);
+
+    // Simulate a retained checkpoint created before source credential masking.
+    await f.storage.environment.update(partner.id, () => {}, (environment) => {
+      const pending = environment.pendingImport!;
+      const snapshot = JSON.parse(pending.snapshotJson) as Record<string, unknown>;
+      delete snapshot.publicationRedactions;
+      pending.snapshotJson = JSON.stringify(snapshot);
+      environment.contentRedactions = {};
+    });
+    failMemory = false;
+    await f.api.retry(selection.requestId, false, signal);
+    expect((await f.imports.waitForRequest(selection.requestId)).status).toBe("complete");
+    const body = f.memory.list(partner.homeTargetId).find((entry) => entry.body.includes("Retained records."))!.body;
+    expect(body).toContain(publicNote);
+    expect(body).not.toContain(override);
+    expect(body).not.toContain(referenced);
+  }, 20_000);
+
   it("retries failed package knowledge without replaying edited, removed or disabled Skills", async () => {
     const f = await fixture({ resourceFiles: 20 });
     const signal = new AbortController().signal;

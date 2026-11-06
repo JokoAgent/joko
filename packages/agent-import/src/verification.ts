@@ -13,14 +13,19 @@ import { importedHttpBases, publicImportHttpBases, resolveImportHttpPath } from 
 import { importedCommand } from './commandAutomation.js';
 
 export interface ImportProbeAction {
-  connection: string; endpoint: string; tool: string; arguments: Record<string, unknown>; untrustedToolDescription?: string;
+  readonly kind: 'mcp' | 'http';
+  readonly connection: string;
+  readonly endpoint: string;
+  readonly tool: string;
+  readonly arguments: Record<string, unknown>;
+  readonly untrustedToolDescription?: string;
 }
 export interface ImportVerificationDeps {
   readEnvironment(partnerId: string, assertOwner: () => void): Promise<ImportedEnvironment | undefined>;
   canonicalSessionId(partnerId: string): Promise<string>;
   plan(sessionId: string, prompt: string, assertOwner: () => void): Promise<string | undefined>;
   authorize<T>(sessionId: string, action: ImportProbeAction, assertOwner: () => void,
-    run: (signal: AbortSignal, assertCurrent: () => Promise<void>) => Promise<T>): Promise<T>;
+    run: (signal: AbortSignal, assertCurrent: () => void) => Promise<T>): Promise<T>;
   verifyDelivery(environment: ImportedEnvironment, deliveries: import('./types.js').ImportedDelivery[], assertOwner: () => void): Promise<void>;
 }
 interface ReadPlan {
@@ -72,9 +77,9 @@ export async function verifyImportedAutomation(partnerId: string, item: ImportIt
       const url = new URL(string(monitorUrl));
       if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new Error('Invalid monitor URL');
       assertOwner();
-      await withAuthorizedImportProbe(sessionId, { connection: 'monitor', tool: 'http_get',
+      await withAuthorizedImportProbe(sessionId, { kind: 'http', connection: 'monitor', tool: 'http_get',
         endpoint: redactEnvironmentValues(url.href, contentSecrets), arguments: { method: 'GET' } }, assertOwner,
-      async (signal, assertCurrent) => { await assertCurrent(); return readImportHttpEvidence(url, {}, false, signal); });
+      (signal, assertCurrent) => { assertCurrent(); return readImportHttpEvidence(url, {}, false, signal); });
       assertOwner(); monitorVerified = true;
     }
     const connections: Array<{ name: string; tools: Array<{ name: string; description?: string; inputSchema: unknown }> }> = [];
@@ -212,13 +217,14 @@ export async function verifyImportedAutomation(partnerId: string, item: ImportIt
         const secrets = connectionRedactions(target.server, environment.env);
         const arguments_ = restoreImportedArguments(object(read.arguments), tool.inputSchema, secrets);
         data = await withAuthorizedImportProbe(sessionId, {
-          connection: string(read.connection), tool: string(read.tool),
+          kind: 'mcp', connection: string(read.connection), tool: string(read.tool),
           endpoint: redactEnvironmentValues(target.server.url ?? [target.server.command, ...(target.server.args ?? [])].join(' '), secrets),
           arguments: redactEnvironmentData(arguments_, secrets),
           untrustedToolDescription: tool.description,
-        }, assertOwner, (signal, assertCurrent) => withImportedConnection(target.server, environment.env, assertOwner, async client => {
-          await assertCurrent();
+        }, assertOwner, (signal, assertCurrent) => withImportedConnection(target.server, environment.env, assertCurrent, async client => {
+          assertCurrent();
           const result = await client.callTool({ name: tool.name, arguments: arguments_ }, undefined, { timeout: 30_000, signal });
+          assertCurrent();
           if (result.isError) throw new Error('Query failed');
           if (result.structuredContent) return result.structuredContent;
           const blocks = Array.isArray(result.content) ? result.content : [];
@@ -238,10 +244,10 @@ export async function verifyImportedAutomation(partnerId: string, item: ImportIt
           coveredVariables.push(header.variable);
         }
         assertOwner();
-        data = await withAuthorizedImportProbe(sessionId, { connection: base.variable, tool: 'http_get',
+        data = await withAuthorizedImportProbe(sessionId, { kind: 'http', connection: base.variable, tool: 'http_get',
           endpoint: redactEnvironmentValues(url.href, httpSecrets),
           arguments: { method: 'GET', headers: redactEnvironmentData(headers, httpSecrets) } }, assertOwner,
-        async (signal, assertCurrent) => { await assertCurrent(); return readImportHttpEvidence(url, headers, true, signal); });
+        (signal, assertCurrent) => { assertCurrent(); return readImportHttpEvidence(url, headers, true, signal); });
         coveredVariables.push(base.variable);
       } else return { verified: false, reason: 'AUTOMATION_READ_NOT_VERIFIED' };
       assertOwner();
