@@ -18054,7 +18054,6 @@ function nativeDispatchHistoryOwnership(
     || (mode === "recovery" ? attempt.descriptor.endedAt === undefined : attempt.descriptor.endedAt !== undefined)) return undefined;
 
   const suffixLineage = lineage.slice(baseline.lineageCount);
-  if (suffixLineage.length < 2) return undefined;
   let expectedParent = baseline.activeEntryId;
   const suffixIds = new Set<string>();
   for (const entry of suffixLineage) {
@@ -18082,7 +18081,18 @@ function nativeDispatchHistoryOwnership(
   const terminalEvents = eventsByEntry.get(suffixLineage.at(-1)!.entryId) ?? [];
   const terminalAssistantMessages = terminalEvents.filter((event) =>
     event.payload.type === "message_complete" && event.payload.role === "assistant");
-  if (terminalAssistantMessages.length !== 1) return undefined;
+  if (mode === "recovery" && terminalAssistantMessages.length === 0) {
+    const turnId = userMessages[0]!.metadata?.fields["turnId"];
+    const belongsToTurn = (event: NativeHistoryProjection["events"][number]): boolean =>
+      event.metadata?.namespace === "codex.native_history" && event.metadata.fields["turnId"] === turnId;
+    if (typeof turnId === "string" && turnId !== "" && belongsToTurn(userMessages[0]!)
+      && terminalEvents.some(event => event.projectionKind === "turn_status" && event.contentIndex === 0
+        && event.payload.type === "status" && event.payload.key === "native_turn_failed" && event.metadata?.fields["turnStatus"] === "failed")
+      && [...eventsByEntry.values()].every(events => events.every(belongsToTurn))) {
+      return { baseline, outcome: "failed", nativeEntryIds: suffixIds };
+    }
+  }
+  if (suffixLineage.length < 2 || terminalAssistantMessages.length !== 1) return undefined;
   const terminalOutcome = terminalAssistantMessages[0]!.metadata?.fields["nativeTerminalOutcome"];
   if (terminalOutcome !== "completed" && terminalOutcome !== "aborted" && terminalOutcome !== "failed") {
     return undefined;
