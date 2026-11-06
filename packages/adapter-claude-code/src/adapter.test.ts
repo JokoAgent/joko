@@ -662,6 +662,57 @@ describe("ClaudeCodeAdapter", () => {
     expect(released).toBe(true);
   });
 
+  test.each(["complete", "bridge preview", "storage failure"] as const)("preserves the local root MCP result with %s", async (scenario) => {
+    const sdk = new FakeSdkRuntime();
+    const secret = "private-fixture-runtime-value";
+    const firstPart = "ordinary report row\n".repeat(2_000);
+    const tail = `REPORT_END 🧪 ${secret}`;
+    const content = [{ type: "text", text: firstPart }, { type: "text", text: tail }];
+    const tool = { serverId: "reports", name: "read_report", description: "Read report", inputSchema: { type: "object" } };
+    const storeArtifact = vi.fn<AdapterContext["storeArtifact"]>(async (path, options) => {
+      await options?.openFile?.assertCurrent();
+      expect(options).toMatchObject({ mimeType: "text/plain", fileName: "mcp-tool-output.txt", openFile: { expectedSize: expect.any(Number) } });
+      const text = await readFile(path, "utf8");
+      expect(text).toBe(`${firstPart}\nREPORT_END 🧪 [REDACTED]`);
+      if (scenario === "storage failure") throw new Error("fixture storage failure");
+      return { id: "report-artifact", sha256: createHash("sha256").update(text).digest("hex"),
+        byteLength: Buffer.byteLength(text, "utf8"), mimeType: "text/plain", fileName: "mcp-tool-output.txt" };
+    });
+    const adapter = adapterFor(sdk, { redactValues: [secret], mcpBridge: { open: () => ({
+      tools: [tool], assertCurrent: () => undefined, release: () => undefined,
+      call: async () => ({ content, isError: false, bridgeMetadata: { format: 1, truncated: scenario === "bridge preview" } }),
+    }) } });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const source = contextFor(binding, { operationId: "local-mcp-report" });
+      await adapter.send(textPrompt("Read the complete report"), { ...source.context, artifactCapacityBytes: 512 * 1024, storeArtifact });
+      const query = sdk.queries[1]!;
+      const toolUseId = "native-report";
+      query.push(assistantMessage(binding.nativeSessionId!, randomUUID(), [{ type: "tool_use", id: toolUseId,
+        name: `mcp__joko_${createHash("sha256").update(tool.serverId).digest("hex").slice(0, 24)}__${tool.name}`, input: {} }]));
+      const reply = await query.params.options.mcpTools![0]!.call({}, { toolUseId, signal: new AbortController().signal });
+      expect(reply.content).toEqual(content);
+      query.push(userToolResult(binding.nativeSessionId!, randomUUID(), toolUseId, content, false));
+      query.push(userToolResult(binding.nativeSessionId!, randomUUID(), toolUseId, content, false));
+      query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+      await eventually(() => source.events.some((event) => event.type === "done"));
+
+      expect(source.events.find((event) => event.type === "done")).toMatchObject({ outcome: "completed" });
+      const results = source.events.filter((event) => event.type === "tool_result");
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ callId: toolUseId, isError: false, output: expect.stringContaining("[Truncated]") });
+      expect(results[0]!.output).not.toContain("REPORT_END");
+      if (scenario === "complete") expect(results[0]!.artifact).toMatchObject({ id: "report-artifact" });
+      else expect(results[0]!.artifact).toBeUndefined();
+      expect(storeArtifact).toHaveBeenCalledTimes(scenario === "bridge preview" ? 0 : 1);
+      if (scenario === "storage failure") expect(source.events.find((event) => event.type === "error"))
+        .toMatchObject({ terminal: false, error: { code: "CLAUDE_MCP_COMPLETE_OUTPUT_UNAVAILABLE" } });
+      expect(JSON.stringify(source.events)).not.toContain(secret);
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
   test("binds a remote standard Query after durable Session identity and fences its root callback", async () => {
     const remoteTarget: TargetDescriptor = {
       ...target, id: "remote-mcp-target", workspaceRoot: "/srv/project",
@@ -7981,7 +8032,7 @@ function userToolResult(
   sessionId: string,
   uuid: string,
   toolUseId: string,
-  content: string,
+  content: string | readonly { type: string; text: string }[],
   isError: boolean
 ) {
   return {
