@@ -154,6 +154,13 @@ export class DurableWorkspaceRunCapture implements WorkspaceRunCapture {
         const queueItemId = previous?.queueItemId ?? store.findQueueItemByRunId(input.sessionId, input.runId)?.id;
         const queue = queueItemId === undefined ? undefined : store.getQueueItem(queueItemId);
         const accepted = queue?.sessionId === input.sessionId && queue.runId === input.runId && queue.backendAcceptedAt !== undefined;
+        if (accepted && store.hasOverlappingUserWorkspaceInput({ sessionId: input.sessionId, runId: input.runId,
+          startedAt: store.getRun(input.runId).descriptor.startedAt ?? queue.backendAcceptedAt!, capturedAt: changeSet.capturedAt })) {
+          // Both native occurrences can write during one workspace scan.
+          // Keep the private capture and withhold the original Run's output.
+          this.saveOutputSeal({ version: 1, sessionId: input.sessionId, runId: input.runId, queueItemId: queue.id, state: "unavailable" });
+          return;
+        }
         this.saveOutputSeal({ version: 1, sessionId: input.sessionId, runId: input.runId,
           ...(queueItemId === undefined ? {} : { queueItemId }), changeSetId: changeSet.id,
           state: accepted && changeSet.complete ? "ready" : "unavailable" });
@@ -216,6 +223,8 @@ export class DurableWorkspaceRunCapture implements WorkspaceRunCapture {
       || changeSet.workspaceId !== reference.workspaceId || !this.#store.hasVisibleWorkspaceDiff(sessionId, changeSet.id)
       || !Array.isArray(changeSet.changes) || changeSet.changes.some(change => !isRecord(change)
         || typeof change["path"] !== "string" || !["created", "updated", "deleted"].includes(String(change["kind"])))) return unavailable;
+    if (this.#store.hasOverlappingUserWorkspaceInput({ sessionId, runId,
+      startedAt: run.descriptor.startedAt ?? queue.backendAcceptedAt, capturedAt: changeSet.capturedAt })) return unavailable;
     return { readiness: seal.state === "ready" && changeSet.complete === true ? "ready" : "unavailable",
       changes: changeSet.changes.map(change => ({ path: change.path,
         status: change.kind === "created" ? "added" : change.kind === "deleted" ? "deleted" : "modified" })) };

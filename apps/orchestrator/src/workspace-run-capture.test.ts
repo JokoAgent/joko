@@ -100,6 +100,34 @@ describe("DurableWorkspaceRunCapture", () => {
     expect(await incomplete.capture.readRunOutput(incomplete.input.sessionId, "run-one")).toEqual({ readiness: "unavailable", changes: [{ path: "partial.txt", status: "added" }] });
   });
 
+  it("withholds the original Run's file output when a separate accepted follow-up wrote in the same capture", async () => {
+    const f = await outputFixture();
+    await f.capture.captureBeforeRun(f.input);
+    f.accept();
+    const sessionId = f.input.sessionId;
+    const at = Date.now();
+    const prompt = { text: "Write q.txt", images: [], files: [], mentions: [], disposition: "follow_up" as const };
+    f.store.createRun({ id: "unrelated-user", sessionId, source: "user", state: "queued", createdAt: at });
+    f.store.createAttempt({ id: "unrelated-attempt", runId: "unrelated-user", ordinal: 1, generation: 1, startedAt: at });
+    f.store.runOperation({ id: "unrelated-input", kind: "send_input", body: { sessionId, prompt } }, store => {
+      store.enqueueQueueItem({ id: "unrelated-queue", sessionId, runId: "unrelated-user", attemptId: "unrelated-attempt",
+        operationId: "unrelated-input", disposition: "follow_up", body: prompt });
+      return {};
+    });
+    expect(f.store.claimNextQueueItem({ sessionId, backendInstanceGeneration: 0 })?.id).toBe("unrelated-queue");
+    f.store.updateRunState({ runId: "unrelated-user", state: "running", activeAttemptId: "unrelated-attempt", traceId: "unrelated-running" });
+    f.store.updateQueueState({ queueItemId: "unrelated-queue", state: "backend_accepted", traceId: "unrelated-accepted" });
+    await writeFile(join(f.workspace, "q.txt"), "Output of the unrelated user input");
+    f.finish();
+    f.store.updateRunState({ runId: "unrelated-user", state: "completed", traceId: "unrelated-completed" });
+    f.store.updateQueueState({ queueItemId: "unrelated-queue", state: "completed", traceId: "unrelated-queue-completed" });
+    await f.capture.captureAfterRun(f.input);
+
+    expect(await f.capture.readRunOutput(sessionId, f.input.runId)).toEqual({ readiness: "unavailable", changes: [] });
+    expect(f.store.listEvents({ sessionId }).some(event => event.runId === f.input.runId && event.payload.type === "workspace_diff")).toBe(false);
+    expect(await readFile(join(f.workspace, "q.txt"), "utf8")).toBe("Output of the unrelated user input");
+  });
+
   it("requires exact accepted Queue and Run anchors rather than only a terminal state", async () => {
     const f = await outputFixture(); await f.capture.captureBeforeRun(f.input);
     await writeFile(join(f.workspace, "unaccepted.txt"), "not accepted"); f.finish(); await f.capture.captureAfterRun(f.input);
