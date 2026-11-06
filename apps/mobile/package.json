@@ -37,6 +37,7 @@
     "@google/model-viewer": "4.3.1",
     "@joko/brand-assets": "workspace:*",
     "@joko/contracts": "workspace:*",
+    "@joko/core": "workspace:*",
     "@joko/connection-transport": "workspace:*",
     "@jokoagent/linkspan-iroh": "*",
     "@jokoagent/linkspan-core": "*",

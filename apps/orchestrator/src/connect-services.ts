@@ -60,7 +60,7 @@ import {
   DEFAULT_COLLABORATION_SETTINGS,
   type ManagedProcessPriority
 } from "@joko/runtime-governance";
-import { JokoError, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION, MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_RESET_LOCAL_OPTION, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeMemoryResetResult, type NativeMemoryStatus, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
+import { JokoError, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION, MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_RESET_LOCAL_OPTION, containsRecognizedCredential, redactSecrets, type BackendAdapter, type BackendDescriptor, type BackendToolDescriptor, type BlobRef, type DynamicInputFieldType, type NativeMemoryResetResult, type NativeMemoryStatus, type NativeSessionCandidate as CoreNativeSessionCandidate, type NativeSessionCatalogEntry as CoreNativeSessionCatalogEntry, type PermissionMode as CorePermissionMode, type PiNativeStateMetadata, type PromptInput, type ProviderModel, type RuntimeCommand, type RuntimeResource, type RuntimeToolCatalog, type SessionTree, type SessionTreeNode, type TurnExecutionOverrides } from "@joko/core";
 import {
   AsyncTransactionError,
   AuthorizationError,
@@ -6595,6 +6595,15 @@ export function toProtoOperation(
 
 function publicOperationMutation(mutation: contract.OperationMutation): contract.OperationMutation {
   const payload = mutation.payload;
+  if (payload.case === "resolveInteraction") {
+    const resolution = payload.value.resolution;
+    if (resolution?.decision.case === "question") {
+      const decision = resolution.decision;
+      return { ...mutation, payload: { case: payload.case, value: { ...payload.value,
+        resolution: { ...resolution, decision: { case: decision.case,
+          value: { ...decision.value, answers: decision.value.answers.map(publicQuestionAnswer) } } } } } };
+    }
+  }
   if (payload.case === "browserTakeoverAction") {
     const action = payload.value.action;
     if (action.case === "textInput") return { ...mutation, payload: { case: payload.case,
@@ -6612,6 +6621,19 @@ function publicOperationMutation(mutation: contract.OperationMutation): contract
       transportConfig: { case: "stdio", value: { ...server.transportConfig.value, arguments: [] } }
     } } }
   };
+}
+
+function publicQuestionAnswer(answer: contract.QuestionAnswer): contract.QuestionAnswer {
+  const value = answer.value;
+  if (value.case === "text") return { ...answer, value: { case: value.case, value: redactSecrets(value.value) } };
+  if (value.case === "singleChoice" && value.value.selection.case === "otherText") {
+    return { ...answer, value: { case: value.case, value: { ...value.value,
+      selection: { case: "otherText", value: redactSecrets(value.value.selection.value) } } } };
+  }
+  if (value.case === "multipleChoice" && value.value.otherText !== undefined) {
+    return { ...answer, value: { case: value.case, value: { ...value.value, otherText: redactSecrets(value.value.otherText) } } };
+  }
+  return answer;
 }
 
 function browserKeyboardOperationBody(mutation: contract.OperationMutation, projection: contract.OperationMutation,
@@ -24251,18 +24273,22 @@ function submittedPlanReviewDecision(value: contract.PlanReviewDecisionKind): st
 }
 
 function submittedQuestionAnswer(answer: contract.QuestionAnswer): InteractionQuestionAnswerSubmission {
+  const requireOrdinaryText = (text: string): string => {
+    if (containsRecognizedCredential(text)) throw invalidArgument("Remove credentials from the question response.");
+    return text;
+  };
   switch (answer.value.case) {
-    case "text": return { kind: "text", value: answer.value.value };
+    case "text": return { kind: "text", value: requireOrdinaryText(answer.value.value) };
     case "singleChoice": {
       const selection = answer.value.value.selection;
       if (selection.case === "choiceId") return { kind: "choice", value: selection.value };
-      if (selection.case === "otherText") return { kind: "other", value: selection.value };
+      if (selection.case === "otherText") return { kind: "other", value: requireOrdinaryText(selection.value) };
       throw invalidArgument("Single-choice question answer selection is required.");
     }
     case "multipleChoice": return {
       kind: "choices",
       values: [...answer.value.value.choiceIds],
-      ...(answer.value.value.otherText === undefined ? {} : { otherText: answer.value.value.otherText })
+      ...(answer.value.value.otherText === undefined ? {} : { otherText: requireOrdinaryText(answer.value.value.otherText) })
     };
     case "boolean": return { kind: "boolean", value: answer.value.value };
     case undefined: throw invalidArgument("Question answer value is required.");

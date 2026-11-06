@@ -52,6 +52,32 @@ describe("mobile interaction draft store", () => {
     expect(store.readSync(first)).toMatchObject({ answers: { answer: { value: "latest" } } });
   });
 
+  it("omits recognized credentials from saved Question text and cleans the exact legacy draft on load", async () => {
+    const memory = memoryDriver();
+    const store = new MobileInteractionDraftStore(memory.driver);
+    const credential = "Bearer synthetic-question-credential-abcdef";
+    const draft = { kind: "question", fieldIndex: 2, answers: {
+      text: { kind: "text", value: credential }, single: { kind: "single", selection: { kind: "other", text: credential } },
+      multi: { kind: "multiple", choiceIds: ["selected"], otherText: credential }, normal: { kind: "text", value: "Saved response" }
+    } } as const;
+    const safe = { kind: "question", fieldIndex: 2, answers: {
+      multi: { kind: "multiple", choiceIds: ["selected"] }, normal: { kind: "text", value: "Saved response" }
+    } };
+    store.save(first, draft);
+    await store.flush(first);
+    expect(store.readSync(first)).toEqual(draft);
+    const key = mobileInteractionDraftTesting.storageKey(first);
+    const saved = JSON.parse(memory.values.get(key)!);
+    expect(saved.draft).toEqual(safe);
+
+    memory.values.set(key, JSON.stringify({ ...saved, draft }));
+    const cold = new MobileInteractionDraftStore(memory.driver);
+    await expect(cold.read(first)).resolves.toEqual(safe);
+    await cold.flush(first);
+    expect(JSON.parse(memory.values.get(key)!).draft).toEqual(safe);
+    expect(memory.values.get(key)).not.toContain(credential);
+  });
+
   it("lets newer memory and clear markers beat late storage reads", async () => {
     let resolveRead!: (value: string | null) => void;
     const driver: MobilePlainStorageDriver = {

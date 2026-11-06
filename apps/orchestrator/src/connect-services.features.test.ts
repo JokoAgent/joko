@@ -222,6 +222,37 @@ describe("Connect typed feature boundaries", () => {
     expect(resolveInteraction).not.toHaveBeenCalled();
   });
 
+  it("rejects known credentials before claiming a Question and redacts old receipts", async () => {
+    const mutate = vi.fn();
+    let stored: OperationRecord<unknown> | undefined;
+    const services = createConnectServices(stubApplication({
+      store: { findOperation: () => stored, getOperation: () => stored }, sessionHost: { mutate }
+    }));
+    const credential = "Bearer synthetic-question-credential-abcdef";
+    const values: readonly contract.QuestionAnswer["value"][] = [
+      { case: "text", value: credential },
+      { case: "singleChoice", value: create(contract.QuestionSingleChoiceAnswerSchema, { selection: { case: "otherText", value: credential } }) },
+      { case: "multipleChoice", value: create(contract.QuestionMultipleChoiceAnswerSchema, { choiceIds: ["selected"], otherText: credential }) }
+    ];
+    const mutation = (answers: contract.QuestionAnswer[]) => create(contract.OperationMutationSchema, {
+      payload: { case: "resolveInteraction", value: { interactionId: "question", interactionGeneration: 1n,
+        resolution: { decision: { case: "question", value: { answers } } } } }
+    });
+    const request = { operationId: "question-credential-fixture", connectionId: connection.id };
+    for (const value of values) {
+      await expect(invoke(services.operation.submitOperation, { ...request, mutation: mutation([create(contract.QuestionAnswerSchema, { fieldId: "field", value })]) }))
+        .rejects.toMatchObject({ code: Code.InvalidArgument, rawMessage: "Remove credentials from the question response." });
+    }
+    expect(mutate).not.toHaveBeenCalled();
+    const original = mutation(values.map((value, index) => create(contract.QuestionAnswerSchema, { fieldId: `field-${index}`, value })));
+    stored = completedRecord(request.operationId, "resolveInteraction", original, { accepted: true });
+    for (const result of [await invoke(services.operation.submitOperation, { ...request, mutation: original }),
+      await invoke(services.operation.getOperation, { operationId: request.operationId })]) {
+      expect(JSON.stringify(result, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain(credential);
+    }
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
   it("preserves every typed question-answer branch and optional Other presence", async () => {
     const resolveInteraction = vi.fn();
     const store = { findOperation: vi.fn(() => undefined) };
