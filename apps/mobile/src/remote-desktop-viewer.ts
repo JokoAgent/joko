@@ -104,7 +104,7 @@ const VIEWER_SCRIPT = String.raw`
   function click(button=0){queue({kind:'button',button,down:true,x:cx,y:cy});queue({kind:'button',button,down:false,x:cx,y:cy});flush();}
   function resetWheel(){wheelY=null;wheelGrip.style.transform='translateY(0px)';}
   function updateMouseButtons(){mouseButtons.style.display=showMouseButtons&&control&&!nativeMouseControls?'block':'none';for(const[name,button]of[['left',0],['right',2]])document.getElementById('mouse-'+name).setAttribute('aria-pressed',String(heldMouse.has(button)));}
-  function release(){clearTimeout(hold);if(gestureFrame!==null)cancelAnimationFrame(gestureFrame);gestureFrame=null;if(control){queue({kind:'release'});flush();}nativeTouchpad=null;heldMouse.clear();resetWheel();updateMouseButtons();drag=false;pointers.clear();start=last=multi=null;}
+  function release(send=true){clearTimeout(hold);if(gestureFrame!==null)cancelAnimationFrame(gestureFrame);gestureFrame=null;if(control&&send){queue({kind:'release'});flush();}nativeTouchpad=null;heldMouse.clear();resetWheel();updateMouseButtons();drag=false;pointers.clear();start=last=multi=null;}
   function listenMouse(element,type,handler){element.addEventListener(type,handler);mouseControlHandlers.set(element.id+':'+type,handler);}
   for(const[name,button]of[['left',0],['right',2]]){
     const element=document.getElementById('mouse-'+name);
@@ -222,7 +222,7 @@ const VIEWER_SCRIPT = String.raw`
       }
       case'control':{
         const generation=message.enabled===true&&Number.isSafeInteger(message.controlGeneration)&&message.controlGeneration>0?message.controlGeneration:0;
-        if(generation!==controlGeneration||generation===0){pending=[];release();pending=[];sending=false;}
+        if(generation!==controlGeneration||generation===0){pending=[];release(false);sending=false;}
         controlGeneration=generation;control=generation>0;if(!control)showKeyboard(false);updateMouseButtons();render();break;
       }
       case'mode':release();mode=message.mode;render();break;
