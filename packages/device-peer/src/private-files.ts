@@ -202,15 +202,31 @@ export async function streamUserSelectedFile(
   let spawned = false;
   let ready!: (value: boolean) => void;
   const stage = new Promise<boolean>((resolve) => { ready = resolve; });
+  let disconnectedByParent = false;
+  let exited = false;
+  let finish!: () => void;
   const closed = new Promise<void>((done) => {
-    child.on("error", () => undefined);
+    finish = () => { ready(false); done(); };
+    child.on("error", () => { if (!spawned) finish(); });
     child.once("spawn", () => { spawned = true; });
     child.on("message", (message) => {
       if (message === "ready") ready(true);
       else result = message as typeof result;
     });
-    child.once("close", () => { ready(false); done(); });
+    child.once("exit", () => {
+      exited = true;
+      if (disconnectedByParent) finish();
+    });
+    child.once("close", finish);
   });
+  const disconnect = (): void => {
+    if (!child.connected) return;
+    // Parent-side IPC closure can suppress ChildProcess's "close" event.
+    // Wait for actual exit so the writer can remove its own staged file.
+    disconnectedByParent = true;
+    child.disconnect();
+    if (exited) finish();
+  };
   let sentPublishMarker = false;
   let sourceError: unknown;
   async function* chunks() {
@@ -234,12 +250,12 @@ export async function streamUserSelectedFile(
       try { await assertCurrent?.(); } catch (error) { sourceError = error; throw error; }
       if (child.connected) {
         sentPublishMarker = true;
-        child.send("publish", (error) => { if (error !== null && child.connected) child.disconnect(); });
+        child.send("publish", (error) => { if (error !== null) disconnect(); });
       }
     }
   } catch {
     input.destroy();
-    if (child.connected) child.disconnect();
+    disconnect();
   }
   await closed;
   if (result !== undefined && "receipt" in result) return result.receipt;

@@ -114,16 +114,18 @@ describe("Desktop Extension Library native gestures", () => {
     await writeFile(join(root, "source.txt"), "library data");
     const leaf = join(parent, "copy.txt");
     const selected = await captureUserSelectedFile(leaf);
-    const source = fixtureSource(Buffer.from("library data"));
-    await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, selected, source, () => {
+    const source = fixtureSource(Buffer.from("library data"), async () => {
       writeFileSync(leaf, "independent file", { flag: "wx" });
-    })).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
+    });
+    await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, selected, source))
+      .rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
     expect(await readFile(leaf, "utf8")).toBe("independent file");
 
     const another = await captureUserSelectedFile(join(parent, "another.txt"));
     await rename(parent, moved);
     await mkdir(parent);
-    await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, another, source)).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
+    await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, another, fixtureSource(Buffer.from("library data"))))
+      .rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
     expect(await readdir(parent)).toEqual([]);
     expect(await readdir(moved)).toEqual(["copy.txt"]);
   });
@@ -138,9 +140,11 @@ describe("Desktop Extension Library native gestures", () => {
     await writeFile(join(root, "source.txt"), "library data");
     const leaf = join(parent, "copy.txt");
     try {
-      await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, await captureUserSelectedFile(leaf), fixtureSource(Buffer.from("library data")), () => {
+      const source = fixtureSource(Buffer.from("library data"), async () => {
         chmodSync(parent, 0o300);
-      })).resolves.toEqual({ bytes: 12, directorySyncFailed: true });
+      });
+      await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, await captureUserSelectedFile(leaf), source))
+        .resolves.toEqual({ bytes: 12, directorySyncFailed: true });
       expect(await readFile(leaf, "utf8")).toBe("library data");
     } finally {
       chmodSync(parent, 0o700);
@@ -163,6 +167,23 @@ describe("Desktop Extension Library native gestures", () => {
       .rejects.toThrow("source authority revoked");
     expect(await readdir(root)).toEqual(["saved.bin"]);
     expect(await readFile(destination, "utf8")).toBe("previous file");
+  });
+
+  it("finishes a cancelled save and discards the partial stage after the source read fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-library-save-read-failed-"));
+    roots.push(root);
+    const destination = join(root, "saved.bin");
+    const selected = await captureUserSelectedFile(destination);
+    const totalBytes = 1024 * 1024 + 1;
+    const source = {
+      async read(offset: number, length: number) {
+        if (offset !== 0) throw new Error("source read failed");
+        return Buffer.alloc(length, 42);
+      },
+      async verify() { throw new Error("The partial stream must not request publication."); }
+    };
+    await expect(saveExtensionLibraryFile({ totalBytes }, selected, source)).rejects.toThrow("source read failed");
+    expect(await readdir(root)).toEqual([]);
   });
 
   it("requires exact save commit fields", () => {
