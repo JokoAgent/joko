@@ -829,7 +829,7 @@ function isSnapshotContact(value: unknown): value is ContactSnapshotContact {
 
 function snapshotEntity<T>(validator: (candidate: unknown) => candidate is T) {
   return (value: unknown): value is T & RowWithId => {
-    if (!isRecord(value) || !isEntityId(value.id)) return false;
+    if (!isRecord(value) || typeof value.id !== "string") return false;
     const { id: _id, ...payload } = value;
     return validator(payload);
   };

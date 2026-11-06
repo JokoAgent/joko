@@ -261,9 +261,15 @@ describe("current-v1 Contacts store", () => {
     });
     expect(result.target.groups).toEqual([expect.objectContaining({ id: group.id, memberCount: 1 })]);
     expect(result.target.relations).toEqual([expect.objectContaining({ relatedContactId: counterpart.id, relation: "partner" })]);
-    expect(store.readContactSyncState("node-a").state.contacts).toContainEqual(expect.objectContaining({
+    const synced = store.readContactSyncState("node-a").state;
+    expect(synced.contacts).toContainEqual(expect.objectContaining({
       id: target.id, narrative: expect.objectContaining({ value: "Target narrative\n\n---\n\nMerged narrative" })
     }));
+    const mirror = createFixture().store;
+    mirror.mergeContactSyncState("node-b", synced);
+    expect(mirror.getContact(target.id)).toMatchObject({
+      narrative: "Target narrative\n\n---\n\nMerged narrative", groups: [{ id: group.id, memberCount: 1 }]
+    });
     expectContactError(() => store.getContact(merged.id), "CONTACT_NOT_FOUND");
     const counterpartAfterMerge = store.getContact(counterpart.id);
     expect(counterpartAfterMerge.revision).toBeGreaterThan(counterpart.revision);
