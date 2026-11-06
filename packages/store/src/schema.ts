@@ -3225,6 +3225,19 @@ export function configureDatabase(database: DatabaseSync): void {
   }
 }
 
+/** Holds an OS-backed writer lease independently of the replaceable database. */
+export function acquireOperationalWriterLease(filePath: string): DatabaseSync {
+  const lease = new DatabaseSync(filePath);
+  try {
+    lease.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE");
+    return lease;
+  } catch (error) {
+    lease.close();
+    if (isSqliteLockError(error)) throw new ActiveWriterError({ cause: error });
+    throw error;
+  }
+}
+
 function isSqliteLockError(error: unknown): boolean {
   return error instanceof Error && /\b(?:database|schema) is locked\b/i.test(error.message);
 }

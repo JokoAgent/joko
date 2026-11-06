@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -11,7 +12,7 @@ import {
   type SubagentRunDetail,
   type SubagentTranscriptEntry
 } from "@joko/core";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ActiveWriterError,
@@ -31,6 +32,11 @@ import {
   StoreError
 } from "./index.js";
 import type { PersistedEvent } from "./types.js";
+
+vi.mock("node:fs", async original => {
+  const fs = await original<typeof import("node:fs")>();
+  return { ...fs, renameSync: vi.fn(fs.renameSync) };
+});
 
 const cleanups: Array<() => void> = [];
 
@@ -680,6 +686,44 @@ describe("OperationalStore", () => {
     expect(backup.prepare("SELECT title FROM product_sessions WHERE id = ?").get("session-1"))
       .toMatchObject({ title: "Session" });
     backup.close();
+  });
+
+  it("rejects a second process during the maintenance swap before it can recover the active writer's files", async () => {
+    const fixture = createFixture(), filePath = fixture.store.filePath;
+    const expectedRevision = fixture.store.health().revision;
+    const workingPath = `${filePath}.history-maintenance.work`;
+    await expect(fixture.store.createHistoryMaintenanceCopy({ workingPath, expectedRevision })).resolves.toBe(true);
+    const working = new DatabaseSync(workingPath);
+    working.prepare("UPDATE product_sessions SET title = ? WHERE id = ?").run("New primary", "session-1");
+    working.close();
+    const childSource = `
+      const { OperationalStore } = await import(process.argv[1]);
+      let store;
+      try {
+        store = new OperationalStore(process.argv[2]);
+        console.log(store.getSession("session-1").descriptor.title);
+      } catch (error) { console.log(error.name); }
+      finally { store?.close(); }
+    `;
+    const openInChild = () => spawnSync(process.execPath, ["--input-type=module", "--eval", childSource,
+      new URL("../dist/index.js", import.meta.url).href, filePath], { encoding: "utf8", timeout: 10_000 });
+    const rename = vi.mocked(renameSync), original = rename.getMockImplementation()!;
+    let competing: ReturnType<typeof openInChild> | undefined;
+    rename.mockImplementation((source, destination) => {
+      original(source, destination);
+      if (source === workingPath && destination === filePath) competing = openInChild();
+    });
+    try {
+      expect(fixture.store.installHistoryMaintenanceCopy({ workingPath, expectedRevision, backupEnabled: true }).backupCreated).toBe(true);
+    } finally { rename.mockImplementation(original); }
+    expect(competing?.status, competing?.stderr).toBe(0);
+    expect(competing?.stdout.trim()).toBe("ActiveWriterError");
+    expect(fixture.store.getSession("session-1").descriptor.title).toBe("New primary");
+    expect(existsSync(`${filePath}.history-backup`)).toBe(true);
+    fixture.store.close();
+    const reopened = openInChild();
+    expect(reopened.status, reopened.stderr).toBe(0);
+    expect(reopened.stdout.trim()).toBe("New primary");
   });
 
   it("rejects a maintenance replacement after a concurrent durable write", async () => {
