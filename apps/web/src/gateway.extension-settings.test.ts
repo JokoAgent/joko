@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import { ExtensionSettingsRejected } from "@joko/connection-transport";
 import { ExtensionCatalogSource, ExtensionInstallState, ExtensionSetupState, OperationState, type ExtensionSettingsHost } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
@@ -101,6 +102,20 @@ it("confirms a terminal settings acknowledgement once even when the original sub
     await expect(api.call(surface, { kind: "routing.set", revision: "0", dataJson: "{}" }, host, signal,
       async (_record, receipt) => { observed.push(receipt?.state); })).resolves.toEqual({ revision: "0", dataJson: "{}" });
     expect(observed).toEqual([undefined, "succeeded"]); expect(f.calls.filter(call => call.method === "submitOperation")).toHaveLength(1);
+  } finally { f.gateway.disconnect(); }
+});
+
+it("classifies an exact failed settings operation after its durable receipt is adopted", async () => {
+  const f = await fixture(async (_method, input) => ({ operation: { operationId: input.operationId, connectionId: "profile",
+    mutation: input.mutation, state: OperationState.FAILED } }));
+  try {
+    const api = f.settingsApi(), signal = new AbortController().signal, surface = await api.open(f.entry.extensionId, 4n, signal);
+    const observed: Array<string | undefined> = [];
+    await expect(api.call(surface, { kind: "routing.set", revision: "0", dataJson: "{}" }, host, signal,
+      async (_record, receipt) => { observed.push(receipt?.state); })).rejects.toBeInstanceOf(ExtensionSettingsRejected);
+    expect(observed).toEqual([undefined, "failed"]);
+    await expect(api.call(surface, { kind: "routing.get" }, host, signal)).resolves.toEqual({ revision: "0", dataJson: "{}" });
+    expect(f.calls.filter(call => call.method === "submitOperation")).toHaveLength(1);
   } finally { f.gateway.disconnect(); }
 });
 

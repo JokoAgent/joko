@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   EXTENSION_LIBRARY_LIMITS,
@@ -16,8 +16,25 @@ import {
 
 const EXTENSION_ID = `extension_${"a".repeat(32)}`;
 const cleanups: Array<() => Promise<void>> = [];
+const filesystem = vi.hoisted(() => ({ beforeMove: undefined as ((source: unknown, target: unknown) => Promise<void>) | undefined }));
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    link: async (...args: unknown[]) => {
+      await filesystem.beforeMove?.(args[0], args[1]);
+      return Reflect.apply(actual.link, undefined, args);
+    },
+    rename: async (...args: unknown[]) => {
+      await filesystem.beforeMove?.(args[0], args[1]);
+      return Reflect.apply(actual.rename, undefined, args);
+    }
+  };
+});
 
 afterEach(async () => {
+  filesystem.beforeMove = undefined;
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -36,6 +53,49 @@ async function fixture(options: { readonly freeBytes?: number; readonly limits?:
 }
 
 describe("ExtensionLibraryVault", () => {
+  it("preserves a concurrent destination at the native no-overwrite move boundary", async () => {
+    const { root, vault } = await fixture();
+    await vault.open();
+    await vault.write({ path: "source.txt", bytes: Buffer.from("original") });
+    const source = join(root, "source.txt");
+    const destination = join(root, "target.txt");
+    filesystem.beforeMove = async (from, to) => {
+      if (from !== source || to !== destination) return;
+      filesystem.beforeMove = undefined;
+      await writeFile(destination, "concurrent file", { flag: "wx" });
+    };
+
+    await expect(vault.rename({ from: "source.txt", to: "target.txt" })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(readFile(source, "utf8")).resolves.toBe("original");
+    await expect(readFile(destination, "utf8")).resolves.toBe("concurrent file");
+    await expect(vault.rename({ from: "source.txt", to: "target.txt", overwrite: true })).resolves.toBeDefined();
+    await expect(readFile(destination, "utf8")).resolves.toBe("original");
+  });
+
+  it.each(["success", "ledger failure"])("enforces a peer's file count before publishing after %s", async outcome => {
+    const limits = { maximumFiles: 2 }, { root, vault } = await fixture({ limits });
+    await vault.open();
+    await vault.write({ path: "a.txt", bytes: Buffer.from("a"), ifNotExists: true });
+    const peer = new ExtensionLibraryVault({ root, extensionId: EXTENSION_ID, limits, usageSource: vault, freeBytes: async () => undefined });
+    await peer.open();
+    const usagePath = join(root, ".joko-library", "usage.json");
+    if (outcome === "ledger failure") {
+      await rename(usagePath, `${usagePath}.previous-fixture`);
+      await mkdir(usagePath);
+    }
+    const writing = peer.write({ path: "b.txt", bytes: Buffer.from("b"), ifNotExists: true });
+    if (outcome === "ledger failure") {
+      await expect(writing).rejects.toThrow();
+      await rmdir(usagePath);
+    } else await writing;
+    await expect(readFile(join(root, "b.txt"), "utf8")).resolves.toBe("b");
+
+    await expect(vault.write({ path: "c.txt", bytes: Buffer.from("c"), ifNotExists: true })).rejects.toMatchObject({ code: "FILE_LIMIT" });
+    await expect(lstat(join(root, "c.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await peer.delete("b.txt");
+    await expect(vault.write({ path: "c.txt", bytes: Buffer.from("c"), ifNotExists: true })).resolves.toMatchObject({ path: "c.txt", bytes: 1 });
+  });
+
   it("opens an empty strict-v1 root and rebuilds a damaged usage ledger without treating metadata damage as empty", async () => {
     const { root, vault } = await fixture();
     await expect(vault.open()).resolves.toMatchObject({ state: "ready", usage: { files: 0, bytes: 0 } });

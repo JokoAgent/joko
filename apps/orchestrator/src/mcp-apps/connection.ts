@@ -25,6 +25,7 @@ export interface AppServerConfig {
   url: string;
   transport: 'http' | 'sse';
   headers?: Record<string, string>;
+  assertCredentialsCurrent?: () => void;
 }
 
 /** Credentials and the MCP client always stay in Main, never in a View. */
@@ -97,6 +98,7 @@ export class AppConnection {
   async getClient(signal?: AbortSignal): Promise<Client> {
     signal?.throwIfAborted();
     if (this.closed) throw new Error('MCP_APP_CONNECTION_CLOSED');
+    this.config.assertCredentialsCurrent?.();
     if (!this.connecting) {
       const client = this.createClient();
       this.client = client;
@@ -106,6 +108,7 @@ export class AppConnection {
         const target = new URL(input instanceof Request ? input.url : String(input));
         if (target.origin !== url.origin || target.username || target.password || target.hash)
           throw new Error('MCP_APP_INVALID_SERVER_DESTINATION');
+        this.config.assertCredentialsCurrent?.();
         return fetch(input, { ...init, redirect: 'error' });
       };
       const transport: Transport =

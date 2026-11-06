@@ -201,6 +201,7 @@ interface StoredMigration {
   readonly targetKind: ExtensionLibraryLocationKind;
   readonly targetRoot: string;
   readonly stagingRoot: string;
+  readonly stagingIdentity?: ExtensionLibraryRootIdentity;
   readonly startedAt: number;
   readonly warnings: readonly string[];
   readonly files: number;
@@ -257,6 +258,7 @@ interface RestoringTrashManifest {
   readonly destinationKind: ExtensionLibraryLocationKind;
   readonly targetRoot: string;
   readonly stagingRoot: string;
+  readonly copy?: { readonly identity: ExtensionLibraryRootIdentity; readonly verified: boolean };
   readonly bindingGeneration: string;
   readonly updatedAt: number;
 }
@@ -288,6 +290,7 @@ interface ActiveStream {
   readonly sessionId: string;
   readonly path: string;
   readonly temporaryPath: string;
+  readonly temporaryIdentity: BigIntStats;
   readonly totalBytes: number;
   readonly expectedSha256?: string;
   readonly ifNotExists: boolean;
@@ -689,6 +692,10 @@ export class ExtensionLibraryManager {
       await session.vault.assertWritable(Math.min(input.totalBytes, session.vault.limits.maximumWriteBytes));
       const temporaryPath = await session.vault.allocateTemporaryPath(".stream");
       const handle = await open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+      const temporaryIdentity = await handle.stat({ bigint: true }).catch(async (error: unknown) => {
+        await handle.close().catch(() => undefined);
+        throw error;
+      });
       const streamId = `library_stream_${randomUUID().replaceAll("-", "")}`;
       const expiresAt = this.#now() + session.vault.limits.streamIdleMilliseconds;
       this.#streams.set(streamId, {
@@ -696,6 +703,7 @@ export class ExtensionLibraryManager {
         sessionId,
         path: input.path,
         temporaryPath,
+        temporaryIdentity,
         totalBytes: input.totalBytes,
         ...(input.sha256 === undefined ? {} : { expectedSha256: input.sha256 }),
         ifNotExists: input.ifNotExists === true,
@@ -748,6 +756,7 @@ export class ExtensionLibraryManager {
       try {
         const result = await session.vault.commitStagedWrite({
           temporaryPath: stream.temporaryPath,
+          temporaryIdentity: stream.temporaryIdentity,
           path: stream.path,
           bytes: stream.receivedBytes,
           sha256: digest,
@@ -905,7 +914,13 @@ export class ExtensionLibraryManager {
         targetRoot: migration.stagingRoot,
         extensionId: migration.extensionId,
         now: this.#now,
-        freeBytes: this.#freeBytes
+        freeBytes: this.#freeBytes,
+        onTargetCreated: async (stagingIdentity) => {
+          migration = await this.#mutate(async () => {
+            this.#assertMigrationCurrent(migration, "copying");
+            return this.#advanceMigration({ ...migration, stagingIdentity }, "copying");
+          });
+        }
       });
       if (transferred.result.files !== prepared.snapshot.files) {
         throw new ExtensionLibraryError("CORRUPT", "Extension Library migration file count changed.");
@@ -923,6 +938,9 @@ export class ExtensionLibraryManager {
         if (currentBinding === undefined || !sameBinding(currentBinding, migration.source)) {
           throw new ExtensionLibraryError("CONFLICT", "Extension Library binding changed during migration.");
         }
+        await assertExtensionLibraryRootIdentity(migration.source.root, migration.source.identity);
+        if (migration.stagingIdentity === undefined) throw new ExtensionLibraryError("CORRUPT", "Library migration staging ownership was not recorded.");
+        await assertExtensionLibraryRootIdentity(migration.stagingRoot, migration.stagingIdentity);
         migration = await this.#advanceMigration(migration, "switching");
         await this.#revokeSessionsInternal(migration.extensionId);
         const stableSourceSnapshot = await prepared.sourceVault.snapshot();
@@ -931,22 +949,12 @@ export class ExtensionLibraryManager {
           migrations: this.#state.migrations.map((entry) => entry.migrationId === migration.migrationId ? migration : entry)
         });
         await this.#persistState();
-        await this.#renameDirectory(migration.stagingRoot, migration.targetRoot);
-        const targetIdentity = await captureExtensionLibraryRootIdentity(migration.targetRoot);
+        const targetIdentity = await this.#placeMigrationTarget(migration);
         const targetVault = this.#createVault(migration.targetRoot, migration.extensionId);
         const targetStatus = await targetVault.open({ create: false });
         if (targetStatus.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Extension Library migration target became unavailable.");
         const targetSnapshot = await targetVault.snapshot();
-        const desiredGraceRoot = graceRootFor(migration, migration.graceId);
-        let actualGraceRoot = migration.source.root;
-        let graceIdentity = migration.source.identity;
-        try {
-          await this.#renameDirectory(migration.source.root, desiredGraceRoot);
-          actualGraceRoot = desiredGraceRoot;
-          graceIdentity = await captureExtensionLibraryRootIdentity(desiredGraceRoot);
-        } catch {
-          await assertExtensionLibraryRootIdentity(migration.source.root, migration.source.identity);
-        }
+        const { root: actualGraceRoot, identity: graceIdentity } = await this.#moveMigrationSourceToGrace(migration);
         const nextBinding: StoredBinding = {
           extensionId: migration.extensionId,
           name: boundedName(input.authority.name),
@@ -1216,7 +1224,7 @@ export class ExtensionLibraryManager {
       const vault = this.#createVault(record.root, record.extensionId);
       const status = await vault.open({ create: false });
       if (status.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Trashed Extension Library metadata is unavailable.");
-      const manifest: RestoringTrashManifest = {
+      let manifest: RestoringTrashManifest = {
         format: 1,
         phase: "restoring",
         record,
@@ -1226,7 +1234,8 @@ export class ExtensionLibraryManager {
         bindingGeneration: this.#nextGeneration(record.extensionId),
         updatedAt: this.#now()
       };
-      await atomicJson(join(this.#trashContainer(record.trashId), TRASH_MANIFEST_FILE), manifest);
+      const manifestPath = join(this.#trashContainer(record.trashId), TRASH_MANIFEST_FILE);
+      await atomicJson(manifestPath, manifest);
       let transferError: unknown;
       try {
         await moveOrCopyExtensionLibrary({
@@ -1236,9 +1245,13 @@ export class ExtensionLibraryManager {
           sourceIdentity: record.identity,
           rename: this.#renameDirectory,
           now: this.#now,
-          freeBytes: this.#freeBytes
+          freeBytes: this.#freeBytes,
+          recordCopy: async (identity, verified) => {
+            const updated = { ...manifest, copy: { identity, verified } };
+            await atomicJson(manifestPath, updated);
+            manifest = updated;
+          }
         });
-        await rename(stagingRoot, validation.libraryRoot);
       } catch (error) {
         transferError = error;
       }
@@ -1251,13 +1264,14 @@ export class ExtensionLibraryManager {
     });
   }
 
-  async purgeTrash(input: { readonly trashId: string; readonly confirmation: string }): Promise<boolean> {
+  async purgeTrash(input: { readonly trashId: string; readonly confirmation: string; readonly assertCurrent: () => void }): Promise<boolean> {
     this.#assertReady();
     return this.#mutate(async () => {
+      input.assertCurrent();
       this.#assertStateAvailable();
       const record = this.#trash(input.trashId);
       if (input.confirmation !== record.name) throw new ExtensionLibraryError("CONFLICT", "Extension Library purge confirmation did not match.");
-      await this.#purgeTrashRecord(record);
+      await this.#purgeTrashRecord(record, input.assertCurrent);
       return true;
     });
   }
@@ -1426,7 +1440,7 @@ export class ExtensionLibraryManager {
     this.#streams.delete(stream.streamId);
     await stream.handle?.close().catch(() => undefined);
     stream.handle = undefined;
-    await session.vault.discardTemporaryPath(stream.temporaryPath, ".stream").catch(() => undefined);
+    await session.vault.discardTemporaryPath(stream.temporaryPath, ".stream", stream.temporaryIdentity).catch(() => undefined);
   }
 
   async #destroySession(session: ActiveSession): Promise<void> {
@@ -1460,11 +1474,15 @@ export class ExtensionLibraryManager {
     extensionId: string,
     beforeFilesystemMutation?: NonNullable<ExtensionLibraryVaultOptions["beforeFilesystemMutation"]>
   ): ExtensionLibraryVault {
+    const binding = this.#binding(extensionId);
+    const usageSource = binding?.root === root ? [...this.#sessions.values()].find(session =>
+      session.binding.extensionId === extensionId && session.binding.generation === binding.generation && session.binding.root === root)?.vault : undefined;
     return new ExtensionLibraryVault({
       root,
       extensionId,
       now: this.#now,
       freeBytes: this.#freeBytes,
+      ...(usageSource === undefined ? {} : { usageSource }),
       ...(beforeFilesystemMutation === undefined ? {} : { beforeFilesystemMutation })
     });
   }
@@ -1591,9 +1609,31 @@ export class ExtensionLibraryManager {
 
   async #removeStaging(migration: StoredMigration): Promise<void> {
     if (!validStagingPath(migration)) throw new ExtensionLibraryError("PATH_INVALID", "Extension Library migration staging path is invalid.");
-    if (!(await exists(migration.stagingRoot))) return;
-    const identity = await captureExtensionLibraryRootIdentity(migration.stagingRoot);
-    await removeExtensionLibraryRoot(migration.stagingRoot, identity);
+    if (migration.stagingIdentity === undefined || !(await exists(migration.stagingRoot))) return;
+    await removeExtensionLibraryRoot(migration.stagingRoot, migration.stagingIdentity);
+  }
+
+  async #placeMigrationTarget(migration: StoredMigration): Promise<ExtensionLibraryRootIdentity> {
+    const expected = migration.stagingIdentity;
+    if (expected === undefined) throw new ExtensionLibraryError("CORRUPT", "Library migration staging ownership was not recorded.");
+    if (!(await exists(migration.targetRoot))) {
+      await assertExtensionLibraryRootIdentity(migration.stagingRoot, expected);
+      await this.#renameDirectory(migration.stagingRoot, migration.targetRoot);
+    } else if (await exists(migration.stagingRoot)) {
+      throw new ExtensionLibraryError("CONFLICT", "Library migration has both a staging and a final directory.");
+    }
+    return assertExtensionLibraryRootIdentity(migration.targetRoot, { ...expected, canonicalPath: migration.targetRoot });
+  }
+
+  async #moveMigrationSourceToGrace(migration: StoredMigration): Promise<{ root: string; identity: ExtensionLibraryRootIdentity }> {
+    const { source } = migration;
+    const desired = graceRootFor(migration, migration.graceId);
+    const canMove = !(await exists(desired));
+    const original = await assertExtensionLibraryRootIdentity(source.root, source.identity);
+    if (!canMove) return { root: source.root, identity: original };
+    try { await this.#renameDirectory(source.root, desired); }
+    catch { return { root: source.root, identity: await assertExtensionLibraryRootIdentity(source.root, source.identity) }; }
+    return { root: desired, identity: await assertExtensionLibraryRootIdentity(desired, { ...source.identity, canonicalPath: desired }) };
   }
 
   #trash(trashId: string): StoredTrash {
@@ -1689,7 +1729,8 @@ export class ExtensionLibraryManager {
       if ((generations.get(migration.extensionId) ?? -1n) < BigInt(migration.source.generation)) {
         throw new ExtensionLibraryError("CORRUPT", "Extension Library migration generation escaped its ledger.");
       }
-      if (!validStagingPath(migration) || migration.targetRoot === migration.source.root) {
+      if (!validStagingPath(migration) || migration.targetRoot === migration.source.root
+        || migration.stagingIdentity !== undefined && migration.stagingIdentity.canonicalPath !== migration.stagingRoot) {
         throw new ExtensionLibraryError("CORRUPT", "Extension Library migration topology is invalid.");
       }
     }
@@ -1847,12 +1888,16 @@ export class ExtensionLibraryManager {
     const stagingExists = await exists(manifest.stagingRoot);
     const targetExists = await exists(manifest.targetRoot);
     if (sourceExists) {
+      await assertExtensionLibraryRootIdentity(manifest.record.root, manifest.record.identity);
       if (targetExists) {
         throw new ExtensionLibraryError("CORRUPT", "Extension Library restore retained both its trash copy and final destination.");
       }
-      if (stagingExists) {
-        const identity = await captureExtensionLibraryRootIdentity(manifest.stagingRoot);
-        await removeExtensionLibraryRoot(manifest.stagingRoot, identity);
+      if (stagingExists && manifest.copy !== undefined) {
+        try { await removeExtensionLibraryRoot(manifest.stagingRoot, manifest.copy.identity); }
+        catch (error) {
+          if (!(error instanceof ExtensionLibraryError && error.code === "UNAVAILABLE")) throw error;
+          // Keep any directory whose ownership could not be established.
+        }
       }
       const active = this.#binding(manifest.record.extensionId);
       if (active !== undefined) throw new ExtensionLibraryError("CORRUPT", "Extension Library restore conflicts with an active binding.");
@@ -1876,10 +1921,21 @@ export class ExtensionLibraryManager {
     if (stagingExists && targetExists) {
       throw new ExtensionLibraryError("CORRUPT", "Extension Library restore has both staging and final destinations.");
     }
+    const existing = this.#binding(manifest.record.extensionId);
+    if (existing !== undefined && (existing.root !== manifest.targetRoot || existing.kind !== manifest.destinationKind
+      || existing.generation !== manifest.bindingGeneration || !targetExists)) {
+      throw new ExtensionLibraryError("CORRUPT", "Recovered Extension Library restore conflicts with its active binding.");
+    }
+    if (existing === undefined && manifest.copy?.verified === false) {
+      throw new ExtensionLibraryError("CORRUPT", "Extension Library restore has no verified copy to publish.");
+    }
+    const expected = existing?.identity ?? manifest.copy?.identity ?? manifest.record.identity;
     if (!targetExists) {
       if (!stagingExists) throw new ExtensionLibraryError("CORRUPT", "Extension Library restore lost every recoverable copy.");
+      await assertExtensionLibraryRootIdentity(manifest.stagingRoot, { ...expected, canonicalPath: manifest.stagingRoot });
       await rename(manifest.stagingRoot, manifest.targetRoot);
     }
+    const targetIdentity = await assertExtensionLibraryRootIdentity(manifest.targetRoot, { ...expected, canonicalPath: manifest.targetRoot });
     const vault = this.#createVault(manifest.targetRoot, manifest.record.extensionId);
     const status = await vault.open({ create: false });
     if (status.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Restored Extension Library metadata is unavailable.");
@@ -1887,13 +1943,7 @@ export class ExtensionLibraryManager {
     if (snapshot.files !== manifest.record.files) {
       throw new ExtensionLibraryError("CORRUPT", "Restored Extension Library file count did not match its verified trash record.");
     }
-    const existing = this.#binding(manifest.record.extensionId);
     if (existing !== undefined) {
-      if (existing.root !== manifest.targetRoot || existing.kind !== manifest.destinationKind
-        || existing.generation !== manifest.bindingGeneration) {
-        throw new ExtensionLibraryError("CORRUPT", "Recovered Extension Library restore conflicts with its active binding.");
-      }
-      await assertExtensionLibraryRootIdentity(existing.root, existing.identity);
       if (this.#state.trash.some((entry) => entry.trashId === manifest.record.trashId)) {
         this.#state = reviseState(this.#state, {
           generations: replaceGeneration(this.#state.generations, existing.extensionId, existing.generation),
@@ -1910,7 +1960,7 @@ export class ExtensionLibraryManager {
       kind: manifest.destinationKind,
       root: manifest.targetRoot,
       generation: manifest.bindingGeneration,
-      identity: await captureExtensionLibraryRootIdentity(manifest.targetRoot),
+      identity: targetIdentity,
       updatedAt: manifest.updatedAt
     };
     this.#state = reviseState(this.#state, {
@@ -1923,14 +1973,16 @@ export class ExtensionLibraryManager {
     return binding;
   }
 
-  async #purgeTrashRecord(record: StoredTrash): Promise<void> {
+  async #purgeTrashRecord(record: StoredTrash, assertCurrent?: () => void): Promise<void> {
     const container = this.#trashContainer(record.trashId);
     if (record.root !== join(container, "library")) {
       throw new ExtensionLibraryError("CORRUPT", "Extension Library purge escaped its trash container.");
     }
+    // Publishing this marker authorizes recovery to finish the purge after restart.
     await atomicJson(
       join(container, TRASH_MANIFEST_FILE),
-      { format: 1, phase: "purging", record } satisfies PurgingTrashManifest
+      { format: 1, phase: "purging", record } satisfies PurgingTrashManifest,
+      assertCurrent
     );
     if (await exists(record.root)) await removeExtensionLibraryRoot(record.root, record.identity);
     if (this.#state.trash.some((entry) => entry.trashId === record.trashId)) {
@@ -1944,7 +1996,8 @@ export class ExtensionLibraryManager {
 
   async #assertRestoreManifestTopology(manifest: RestoringTrashManifest): Promise<void> {
     if (manifest.targetRoot === manifest.record.root
-      || manifest.stagingRoot !== restoreStagingRoot(manifest.targetRoot, manifest.record.trashId)) {
+      || manifest.stagingRoot !== restoreStagingRoot(manifest.targetRoot, manifest.record.trashId)
+      || manifest.copy !== undefined && manifest.copy.identity.canonicalPath !== manifest.stagingRoot) {
       throw new ExtensionLibraryError("CORRUPT", "Extension Library restore topology is invalid.");
     }
     const parent = dirname(manifest.targetRoot);
@@ -2032,13 +2085,14 @@ export class ExtensionLibraryManager {
         changed = true;
         continue;
       }
-      if (!(await exists(migration.targetRoot))) {
-        if (!(await exists(migration.stagingRoot))) {
-          this.#stateUnavailable = true;
-          throw new ExtensionLibraryError("CORRUPT", "Extension Library switching recovery lost its target.");
-        }
-        await this.#renameDirectory(migration.stagingRoot, migration.targetRoot);
-      }
+      const graceId = migration.graceId;
+      const desiredGraceRoot = graceRootFor(migration, graceId);
+      const alreadyMoved = await exists(desiredGraceRoot);
+      const expectedSourceRoot = alreadyMoved ? desiredGraceRoot : migration.source.root;
+      const sourceIdentity = await assertExtensionLibraryRootIdentity(expectedSourceRoot, {
+        ...migration.source.identity, canonicalPath: expectedSourceRoot
+      });
+      const targetIdentity = await this.#placeMigrationTarget(migration);
       const targetVault = this.#createVault(migration.targetRoot, migration.extensionId);
       const targetStatus = await targetVault.open({ create: false });
       if (targetStatus.state === "unavailable") {
@@ -2046,20 +2100,9 @@ export class ExtensionLibraryManager {
         throw new ExtensionLibraryError("CORRUPT", "Extension Library switching target is corrupt.");
       }
       await targetVault.snapshot();
-      const graceId = migration.graceId;
-      const desiredGraceRoot = graceRootFor(migration, graceId);
-      let actualGraceRoot = desiredGraceRoot;
-      if (!(await exists(desiredGraceRoot))) {
-        if (!(await exists(migration.source.root))) {
-          this.#stateUnavailable = true;
-          throw new ExtensionLibraryError("CORRUPT", "Extension Library switching recovery lost its source grace copy.");
-        }
-        try {
-          await this.#renameDirectory(migration.source.root, desiredGraceRoot);
-        } catch {
-          actualGraceRoot = migration.source.root;
-        }
-      }
+      const { root: actualGraceRoot, identity: graceIdentity } = alreadyMoved
+        ? { root: desiredGraceRoot, identity: sourceIdentity }
+        : await this.#moveMigrationSourceToGrace(migration);
       const graceVault = this.#createVault(actualGraceRoot, migration.extensionId);
       const graceStatus = await graceVault.open({ create: false });
       if (graceStatus.state === "unavailable") {
@@ -2074,7 +2117,7 @@ export class ExtensionLibraryManager {
         kind: migration.targetKind,
         root: migration.targetRoot,
         generation: this.#nextGeneration(migration.extensionId),
-        identity: await captureExtensionLibraryRootIdentity(migration.targetRoot),
+        identity: targetIdentity,
         updatedAt: now
       };
       const grace: StoredGrace = {
@@ -2086,7 +2129,7 @@ export class ExtensionLibraryManager {
         expiresAt: now + GRACE_RETENTION_MS,
         root: actualGraceRoot,
         originalRoot: migration.source.root,
-        identity: await captureExtensionLibraryRootIdentity(actualGraceRoot),
+        identity: graceIdentity,
         source: migration.source,
         files: graceSnapshot.files,
         bytes: graceSnapshot.bytes
@@ -2394,11 +2437,11 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function atomicJson(path: string, value: unknown): Promise<void> {
-  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"));
+async function atomicJson(path: string, value: unknown, beforePublish?: () => void): Promise<void> {
+  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"), beforePublish);
 }
 
-async function atomicBytes(path: string, bytes: Uint8Array): Promise<void> {
+async function atomicBytes(path: string, bytes: Uint8Array, beforePublish?: () => void): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${randomUUID()}.tmp`;
   let handle: FileHandle | undefined;
@@ -2408,6 +2451,7 @@ async function atomicBytes(path: string, bytes: Uint8Array): Promise<void> {
     await handle.sync();
     await handle.close();
     handle = undefined;
+    beforePublish?.();
     await rename(temporary, path);
     await syncDirectory(dirname(path));
   } finally {
@@ -2576,7 +2620,7 @@ function validateGrace(value: unknown): StoredGrace {
 }
 
 function validateMigration(value: unknown): StoredMigration {
-  if (!plainObject(value) || !exactKeys(value, ["migrationId", "graceId", "extensionId", "name", "phase", "source", "targetKind", "targetRoot", "stagingRoot", "startedAt", "warnings", "files", "bytes"])
+  if (!plainObject(value) || !exactKeys(value, ["migrationId", "graceId", "extensionId", "name", "phase", "source", "targetKind", "targetRoot", "stagingRoot", "startedAt", "warnings", "files", "bytes"], ["stagingIdentity"])
     || typeof value.migrationId !== "string" || !MIGRATION_ID.test(value.migrationId)
     || typeof value.graceId !== "string" || !GRACE_ID.test(value.graceId)
     || typeof value.extensionId !== "string" || !EXTENSION_ID.test(value.extensionId)
@@ -2599,6 +2643,7 @@ function validateMigration(value: unknown): StoredMigration {
     targetKind: value.targetKind,
     targetRoot: value.targetRoot,
     stagingRoot: value.stagingRoot,
+    ...("stagingIdentity" in value ? { stagingIdentity: validateIdentity(value.stagingIdentity) } : {}),
     startedAt: value.startedAt,
     warnings: value.warnings as string[],
     files: value.files,
@@ -2655,8 +2700,8 @@ function plainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 }
 
-function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
-  return Object.keys(value).every((key) => allowed.includes(key)) && allowed.every((key) => key in value);
+function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  return Object.keys(value).every((key) => required.includes(key) || optional.includes(key)) && required.every((key) => key in value);
 }
 
 function unique(values: readonly string[], label: string): void {
@@ -2793,12 +2838,16 @@ function validateTrashManifest(value: unknown): TrashManifest {
   if (value.phase === "restoring") {
     if (!exactKeys(value, [
       "format", "phase", "record", "destinationKind", "targetRoot", "stagingRoot", "bindingGeneration", "updatedAt"
-    ]) || value.destinationKind !== "default" && value.destinationKind !== "custom"
+    ], ["copy"]) || value.destinationKind !== "default" && value.destinationKind !== "custom"
       || typeof value.targetRoot !== "string" || !isAbsolute(value.targetRoot) || resolve(value.targetRoot) !== value.targetRoot
       || typeof value.stagingRoot !== "string" || !isAbsolute(value.stagingRoot) || resolve(value.stagingRoot) !== value.stagingRoot
       || typeof value.bindingGeneration !== "string" || !REVISION.test(value.bindingGeneration) || value.bindingGeneration === "0"
       || !finiteTimestamp(value.updatedAt)) {
       throw new ExtensionLibraryError("CORRUPT", "Extension Library restoring-trash manifest is malformed.");
+    }
+    const copy = value.copy;
+    if (copy !== undefined && (!plainObject(copy) || !exactKeys(copy, ["identity", "verified"]) || typeof copy.verified !== "boolean")) {
+      throw new ExtensionLibraryError("CORRUPT", "Extension Library restore copy receipt is malformed.");
     }
     return {
       format: 1,
@@ -2807,6 +2856,7 @@ function validateTrashManifest(value: unknown): TrashManifest {
       destinationKind: value.destinationKind,
       targetRoot: value.targetRoot,
       stagingRoot: value.stagingRoot,
+      ...(copy === undefined ? {} : { copy: { identity: validateIdentity(copy.identity), verified: copy.verified === true } }),
       bindingGeneration: value.bindingGeneration,
       updatedAt: value.updatedAt
     };

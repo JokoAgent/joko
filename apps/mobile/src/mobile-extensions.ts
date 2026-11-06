@@ -197,6 +197,7 @@ export interface MobileExtensionTransport {
   setTaskPreferences?(expected: MobileExtension, preferences: import("@joko/contracts").ExtensionTaskPreferences, model: import("@joko/contracts").ExtensionTaskRoute | undefined,
     permissionMode: import("@joko/contracts").PermissionMode, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
   readonly ownerKey: string;
+  readonly packageReceiptRevision?: number;
   readonly pending: readonly MobileExtensionPendingMutation[];
   list(signal: AbortSignal): Promise<MobileExtensionCatalog>;
   detail(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtension>;
@@ -399,11 +400,12 @@ export function allowMobileExtensionMainViewNavigation(
 
 export async function collectMobileExtensionCatalog(
   readPage: (pageToken: string, signal: AbortSignal) => Promise<MobileExtensionCatalogPage>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  scope: "installed" | "all" = "installed"
 ): Promise<MobileExtensionCatalog> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      return await collectStableCatalog(readPage, signal);
+      return await collectStableCatalog(readPage, signal, scope);
     } catch (error) {
       if (!(error instanceof CatalogRevisionDrift) || attempt > 0) throw error;
     }
@@ -555,7 +557,8 @@ export function filterMobileExtensions(
 
 async function collectStableCatalog(
   readPage: (pageToken: string, signal: AbortSignal) => Promise<MobileExtensionCatalogPage>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  scope: "installed" | "all"
 ): Promise<MobileExtensionCatalog> {
   const extensions: MobileExtension[] = [];
   const identities = new Set<string>();
@@ -587,7 +590,8 @@ async function collectStableCatalog(
     }
     for (const raw of page.extensions) {
       const extension = projectMobileExtension(raw);
-      if (!extension.installed || identities.has(extension.extensionId)) invalid("installed Extension catalog entry");
+      if (scope === "installed" && !extension.installed) invalid("installed Extension catalog entry");
+      if (identities.has(extension.extensionId)) invalid("duplicate Extension catalog entry");
       identities.add(extension.extensionId);
       extensions.push(extension);
     }

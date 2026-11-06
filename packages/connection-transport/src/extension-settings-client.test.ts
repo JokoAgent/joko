@@ -1,7 +1,7 @@
 import { createClient, createRouterTransport } from "@connectrpc/connect";
-import { ExtensionAuthorizationPhase, ExtensionOAuthService, ExtensionService, type ExtensionSettingsHost } from "@joko/contracts";
+import { ExtensionAuthorizationPhase, ExtensionNetworkService, ExtensionOAuthService, ExtensionService, type ExtensionSettingsHost } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
-import { executeExtensionSettingsCall, type ExtensionSettingsClient, type ExtensionSettingsProjection } from "./extension-settings-client.js";
+import { executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionSettingsClient, type ExtensionSettingsProjection } from "./extension-settings-client.js";
 
 const extension: ExtensionSettingsProjection = { extensionId: "installed", revision: 3n, name: "Plugin", permissions: [],
   setup: { state: "required", fields: [{ fieldId: "permission", label: "Workspace", description: "Read selected files", kind: "confirmation", configured: false }] } };
@@ -19,6 +19,21 @@ function fixture(overrides: Partial<ExtensionSettingsClient<ExtensionSettingsPro
 }
 
 describe("author settings shared client", () => {
+  it("rejects a declined connection before opening a credential ticket and still reads connections", async () => {
+    const beginCredential = vi.fn(), commitCredential = vi.fn();
+    const get = vi.fn(() => ({ state: { extensionId: "installed", slots: [] } }));
+    const transport = createRouterTransport(router => router.service(ExtensionNetworkService, { beginCredential, commitCredential, get }));
+    const f = fixture({ connections: createClient(ExtensionNetworkService, transport) });
+    vi.mocked(f.host.confirm).mockResolvedValue(false);
+    const signal = new AbortController().signal;
+
+    await expect(executeExtensionSettingsCall(f.client, { kind: "connections.set", key: "api", host: "api.example.com", value: "candidate" }, f.host, signal))
+      .rejects.toBeInstanceOf(ExtensionSettingsRejected);
+    expect(beginCredential).not.toHaveBeenCalled(); expect(f.client.upload).not.toHaveBeenCalled(); expect(commitCredential).not.toHaveBeenCalled();
+    await expect(executeExtensionSettingsCall(f.client, { kind: "connections.get" }, f.host, signal)).resolves.toMatchObject({ extensionId: "installed" });
+    expect(get).toHaveBeenCalledOnce();
+  });
+
   it("keeps directory paths in the native host and submits exactly its original typed choice", async () => {
     const expiresAt = { seconds: BigInt(Math.floor(Date.now() / 1000) + 110), nanos: 0 };
     const picker = { pickerId: "original-picker", extensionId: "installed", expiresAt };
@@ -69,6 +84,23 @@ describe("author settings shared client", () => {
     if (reason === "retired") f.retire(); else abort.abort();
     accept(true); await expect(saving).rejects.toThrow();
     expect(f.client.begin).not.toHaveBeenCalled(); expect(f.client.field).not.toHaveBeenCalled(); expect(f.client.submit).not.toHaveBeenCalled();
+  });
+
+  it("records newly confirmed permissions on the active attempt even when an old authorization projects them as configured", async () => {
+    const replacing: ExtensionSettingsProjection = { ...extension, setup: { state: "inProgress",
+      fields: extension.setup.fields.map(field => ({ ...field, configured: true })) } };
+    const confirmed = { ...replacing, revision: replacing.revision + 1n };
+    const field = vi.fn<ExtensionSettingsClient<ExtensionSettingsProjection>["field"]>(async () => ({ extension: confirmed }));
+    const complete = vi.fn<ExtensionSettingsClient<ExtensionSettingsProjection>["complete"]>(async current => {
+      if (current !== confirmed) throw new Error("The current attempt is missing its confirmation.");
+      return { extension: { ...current, setup: { ...current.setup, state: "ready" } } };
+    });
+    const f = fixture({ fresh: async () => replacing, field, complete });
+    const signal = new AbortController().signal;
+    await expect(executeExtensionSettingsCall(f.client, { kind: "setup.complete" }, f.host, signal)).resolves.toMatchObject({ state: "ready" });
+    expect(f.client.begin).not.toHaveBeenCalled();
+    expect(field).toHaveBeenCalledExactlyOnceWith(replacing, "permission", true, signal);
+    expect(complete).toHaveBeenCalledExactlyOnceWith(confirmed, signal);
   });
 
   it("uploads a secret candidate only through its private ticket and returns a validation marker", async () => {

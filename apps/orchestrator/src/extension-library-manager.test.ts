@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -11,6 +11,7 @@ import {
   type ExtensionLibraryManagerOptions
 } from "./extension-library-manager.js";
 import { copyExtensionLibrary } from "./extension-library-transfer.js";
+import { ExtensionLibraryVault } from "./extension-library-vault.js";
 
 const EXTENSION_ID = `extension_${"c".repeat(32)}`;
 const authority: ExtensionLibraryAuthority = {
@@ -51,6 +52,26 @@ function currentAuthority(expected = authority) {
 }
 
 describe("ExtensionLibraryManager", () => {
+  it("rejects a cursor after another authorized session removes its preceding entry", async () => {
+    const { manager } = await fixture();
+    const open = (connectionId: string, digit: string) => manager.openSession({ authority, connectionId,
+      surfaceId: `extension_surface_${digit.repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, assertAuthorityCurrent: currentAuthority() });
+    const a = await open("web-a", "1"), b = await open("web-b", "2");
+    expect(a.bindingGeneration).toBe(b.bindingGeneration);
+    for (const name of ["a.txt", "b.txt", "c.txt"]) await manager.write(a.sessionId, "web-a", { path: name, bytes: Buffer.from(name) });
+    const first = await manager.list(a.sessionId, "web-a", { limit: 1 });
+    expect(first.entries.map(entry => entry.path)).toEqual(["a.txt"]);
+    expect(first.nextCursor).toBeDefined();
+    await manager.delete(b.sessionId, "web-b", "a.txt");
+
+    await expect(manager.list(a.sessionId, "web-a", { limit: 1, cursor: first.nextCursor! })).rejects.toMatchObject({ code: "CONFLICT" });
+    const restarted = await manager.list(a.sessionId, "web-a", { limit: 1 });
+    expect(restarted.entries.map(entry => entry.path)).toEqual(["b.txt"]);
+    const remaining = await manager.list(a.sessionId, "web-a", { limit: 1, cursor: restarted.nextCursor! });
+    expect(remaining.entries.map(entry => entry.path)).toEqual(["c.txt"]);
+    expect(remaining.nextCursor).toBeUndefined();
+  });
+
   it("bounds session expiry to its surface and retires only that surface's streams and database handles", async () => {
     const { manager } = await fixture();
     const firstSurface = `extension_surface_${"1".repeat(32)}`, secondSurface = `extension_surface_${"2".repeat(32)}`;
@@ -72,6 +93,45 @@ describe("ExtensionLibraryManager", () => {
       .rejects.toMatchObject({ code: "NOT_FOUND" });
     await expect(manager.read(second.sessionId, "web-surface", { path: "mail" })).resolves.toMatchObject({ bytes: Buffer.from("mail") });
   });
+
+  it.runIf(process.platform !== "win32").each(["unchanged", "replaced file", "redirected parent"])(
+    "aborts a staged Library stream with a %s without deleting another file", async (change) => {
+      const { manager, temporaryPath } = await fixture();
+      const owner = { authority, assertAuthorityCurrent: currentAuthority() };
+      const session = await manager.openSession({ ...owner, connectionId: "stream-owner",
+        surfaceId: `extension_surface_${"1".repeat(32)}`, surfaceExpiresAt: Date.now() + 60_000 });
+      const overview = await manager.overview(owner);
+      const stream = await manager.writeBegin(session.sessionId, "stream-owner", { path: "file.txt", totalBytes: 8 });
+      await manager.writeChunk(session.sessionId, "stream-owner", { streamId: stream.streamId, sequence: 0, bytes: Buffer.from("part") });
+      const staging = join(overview.location!.path, ".joko-library", "tmp");
+      const [name] = await readdir(staging);
+      expect(name).toMatch(/\.stream$/u);
+      const staged = join(staging, name!);
+      const displaced = join(temporaryPath, "original-stream");
+      const outside = join(temporaryPath, "outside");
+      if (change === "replaced file") {
+        await rename(staged, displaced);
+        await writeFile(staged, "replacement");
+      } else if (change === "redirected parent") {
+        await rename(staging, displaced);
+        await mkdir(outside);
+        await writeFile(join(outside, name!), "outside file");
+        await symlink(outside, staging, "dir");
+      }
+
+      await expect(manager.writeAbort(session.sessionId, "stream-owner", stream.streamId)).resolves.toBe(true);
+      await expect(manager.writeAbort(session.sessionId, "stream-owner", stream.streamId)).resolves.toBe(false);
+      if (change === "unchanged") {
+        await expect(readFile(staged)).rejects.toMatchObject({ code: "ENOENT" });
+      } else if (change === "replaced file") {
+        await expect(readFile(displaced, "utf8")).resolves.toBe("part");
+        await expect(readFile(staged, "utf8")).resolves.toBe("replacement");
+      } else {
+        await expect(readFile(join(displaced, name!), "utf8")).resolves.toBe("part");
+        await expect(readFile(join(outside, name!), "utf8")).resolves.toBe("outside file");
+      }
+    });
+
   it("fences file, stream, and SQLite handles to the exact connection, authority, and binding generation", async () => {
     const { manager } = await fixture();
     await expect(manager.overview({ authority, assertAuthorityCurrent: currentAuthority() })).resolves.toMatchObject({
@@ -363,6 +423,67 @@ describe("ExtensionLibraryManager", () => {
       .resolves.toMatchObject({ path: "after.txt" });
   });
 
+  it("does not remove the occupant of a staging name that the copy failed to create", async () => {
+    let occupied!: string;
+    const { temporaryPath, manager } = await fixture({ copyLibrary: async input => {
+      occupied = input.targetRoot;
+      await mkdir(occupied);
+      await writeFile(join(occupied, "other.txt"), "another directory's file");
+      return copyExtensionLibrary(input);
+    } });
+    const owner = { authority, assertAuthorityCurrent: currentAuthority() };
+    const session = await manager.openSession({ ...owner, connectionId: "relocation-owner",
+      surfaceId: `extension_surface_${"1".repeat(32)}`, surfaceExpiresAt: Date.now() + 60_000 });
+    await manager.write(session.sessionId, "relocation-owner", { path: "original.txt", bytes: Buffer.from("original") });
+    await expect(manager.relocate({ ...owner, destination: { kind: "custom", candidate: join(temporaryPath, "destination") } }))
+      .rejects.toMatchObject({ code: "EEXIST" });
+    await expect(readFile(join(occupied, "other.txt"), "utf8")).resolves.toBe("another directory's file");
+    await expect(manager.overview(owner)).resolves.toMatchObject({ state: "ready", location: { generation: 1n } });
+    await expect(manager.write(session.sessionId, "relocation-owner", { path: "retry.txt", bytes: Buffer.from("retry") }))
+      .resolves.toMatchObject({ path: "retry.txt" });
+  });
+
+  it.each(["unchanged", "source", "staging", "published"])(
+    "recovers a switching migration only with the original %s directory", async (replaced) => {
+      let staging!: string;
+      const { temporaryPath, manager } = await fixture({ renameDirectory: async (from, to) => {
+        if (!from.includes(".joko-library-migrate-")) return rename(from, to);
+        staging = from;
+        if (replaced === "published") await rename(from, to);
+        throw new Error("switching interrupted");
+      } });
+      const owner = { authority, assertAuthorityCurrent: currentAuthority() };
+      const session = await manager.openSession({ ...owner, connectionId: "relocation-owner",
+        surfaceId: `extension_surface_${"1".repeat(32)}`, surfaceExpiresAt: Date.now() + 60_000 });
+      await manager.write(session.sessionId, "relocation-owner", { path: "note.txt", bytes: Buffer.from("original") });
+      const source = (await manager.overview(owner)).location!.path;
+      const candidate = join(temporaryPath, "destination");
+      const target = join(candidate, EXTENSION_ID);
+      await expect(manager.relocate({ ...owner, destination: { kind: "custom", candidate } })).rejects.toThrow("switching interrupted");
+      await manager.close();
+
+      const displaced = join(temporaryPath, "displaced");
+      const replacedPath = replaced === "source" ? source : replaced === "staging" ? staging : target;
+      if (replaced !== "unchanged") {
+        await rename(replacedPath, displaced);
+        const replacement = new ExtensionLibraryVault({ root: replacedPath, extensionId: EXTENSION_ID, freeBytes: async () => undefined });
+        expect((await replacement.open()).state).toBe("ready");
+        await replacement.write({ path: "note.txt", bytes: Buffer.from("different") });
+      }
+      const recovered = new ExtensionLibraryManager({ rootDirectory: join(temporaryPath, "owner"), freeBytes: async () => undefined });
+      cleanups.push(() => recovered.close().catch(() => undefined));
+      await recovered.initialize();
+      if (replaced === "unchanged") {
+        await expect(recovered.overview(owner)).resolves.toMatchObject({ state: "ready", location: { path: target, generation: 2n } });
+        await expect(readFile(join(target, "note.txt"), "utf8")).resolves.toBe("original");
+        return;
+      }
+      await expect(recovered.overview(owner)).resolves.toMatchObject({ state: "unavailable", reason: "state_corrupt" });
+      await expect(readFile(join(replacedPath, "note.txt"), "utf8")).resolves.toBe("different");
+      await expect(readFile(join(displaced, "note.txt"), "utf8")).resolves.toBe("original");
+      if (replaced !== "published") await expect(readFile(join(target, "note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
   it("waits for an out-of-lock relocation before completing a graceful shutdown", async () => {
     const copying = deferred();
     const release = deferred();
@@ -422,6 +543,59 @@ describe("ExtensionLibraryManager", () => {
     const recreated = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-3", assertAuthorityCurrent: currentAuthority() });
     expect(recreated.bindingGeneration).toBe(3n);
   });
+
+  it.each(["copying across volumes", "moved on the same volume"])(
+    "preserves a replacement at the recorded staging name when recovery was %s", async (interruption) => {
+      const { temporaryPath, manager } = await fixture();
+      const owner = { authority, assertAuthorityCurrent: currentAuthority() };
+      const session = await manager.openSession({ ...owner, connectionId: "trash-owner",
+        surfaceId: `extension_surface_${"1".repeat(32)}`, surfaceExpiresAt: Date.now() + 60_000 });
+      await manager.write(session.sessionId, "trash-owner", { path: "note.txt", bytes: Buffer.from("original") });
+      const trashed = await manager.trashLibrary({ ...owner, confirmation: authority.name });
+      await manager.close();
+
+      const ownerRoot = join(temporaryPath, "owner");
+      const state = JSON.parse(await readFile(join(ownerRoot, "library-state.json"), "utf8")) as {
+        trash: Array<{ root: string; source: { generation: string } }>;
+      };
+      const record = state.trash[0]!;
+      const destination = join(temporaryPath, "destination");
+      await mkdir(destination);
+      const targetRoot = join(destination, EXTENSION_ID);
+      const stagingRoot = join(destination, `.joko-library-restore-${EXTENSION_ID}-${trashed.trashId.slice(-32)}`);
+      const isCopy = interruption === "copying across volumes";
+      let copy: { identity: Awaited<ReturnType<typeof copyExtensionLibrary>>["identity"]; verified: boolean } | undefined;
+      if (isCopy) {
+        const source = new ExtensionLibraryVault({ root: record.root, extensionId: EXTENSION_ID, freeBytes: async () => undefined });
+        await source.open({ create: false });
+        const staged = await copyExtensionLibrary({ source, targetRoot: stagingRoot, extensionId: EXTENSION_ID, freeBytes: async () => undefined });
+        copy = { identity: staged.identity, verified: false };
+      } else {
+        await rename(record.root, stagingRoot);
+      }
+      const displaced = join(temporaryPath, "displaced");
+      await rename(stagingRoot, displaced);
+      const replacement = new ExtensionLibraryVault({ root: stagingRoot, extensionId: EXTENSION_ID, freeBytes: async () => undefined });
+      await replacement.open();
+      await replacement.write({ path: "note.txt", bytes: Buffer.from("different") });
+      await writeFile(join(ownerRoot, "trash", trashed.trashId, "trash.json"), JSON.stringify({
+        format: 1, phase: "restoring", record, destinationKind: "custom", targetRoot, stagingRoot,
+        bindingGeneration: (BigInt(record.source.generation) + 1n).toString(10), updatedAt: Date.now(), copy
+      }));
+
+      const recovered = new ExtensionLibraryManager({ rootDirectory: ownerRoot, freeBytes: async () => undefined });
+      cleanups.push(() => recovered.close().catch(() => undefined));
+      await recovered.initialize();
+      if (isCopy) {
+        expect(recovered.listTrash(EXTENSION_ID)).toEqual([trashed]);
+        await expect(readFile(join(record.root, "note.txt"), "utf8")).resolves.toBe("original");
+      } else {
+        await expect(recovered.overview(owner)).resolves.toMatchObject({ state: "unavailable", reason: "state_corrupt" });
+      }
+      await expect(readFile(join(targetRoot, "note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(join(stagingRoot, "note.txt"), "utf8")).resolves.toBe("different");
+      await expect(readFile(join(displaced, "note.txt"), "utf8")).resolves.toBe("original");
+    });
 
   it("recovers restore and purge crashes without losing the only verified Library copy", async () => {
     const { temporaryPath, manager } = await fixture();

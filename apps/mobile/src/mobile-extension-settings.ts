@@ -1,4 +1,5 @@
 import { parseExtensionSettingsBridgeRequest, type ExtensionSettingsHost, type ExtensionSettingsCall } from "@joko/contracts";
+import { ExtensionSettingsRejected, extensionSettingsReadOnly } from "@joko/connection-transport";
 import type { MobileExtensionMainViewSurface, MobileExtensionTransport } from "./mobile-extensions";
 
 export type MobileExtensionSettingsHost = ExtensionSettingsHost;
@@ -25,11 +26,11 @@ export class MobileExtensionSettingsBridge {
     const request = parseExtensionSettingsBridgeRequest(wrapper.request);
     if (!request || this.#seen.has(request.id) || this.#seen.size >= 4096 || this.#pending.size >= 16) return;
     this.#seen.add(request.id);
-    const send = (result: unknown, ok: boolean) => {
+    const send = (result: unknown, ok: boolean, rejected?: ExtensionSettingsRejected) => {
       if (this.#closed || !this.options.current() || !this.options.foreground()) return;
       const reply = JSON.stringify({ frameId: this.options.frameId, surfaceId: this.options.surface.surfaceId,
         response: { type: "joko:extension-settings-response", version: 1, id: request.id, ok,
-          ...(ok ? { result } : { message: "Settings request could not be confirmed. Check its original operation before retrying." }) } },
+          ...(ok ? { result } : { message: rejected?.message ?? "Settings request could not be confirmed. Check its original operation before retrying." }) } },
       (_key, item: unknown) => typeof item === "bigint" ? item.toString(10) : item);
       if (new TextEncoder().encode(reply).byteLength > (request.command.kind === "directory.pick" ? 4 * 1024 ** 2 : 192 * 1024)) throw new Error("Settings response exceeds its limit.");
       this.options.send(reply);
@@ -47,10 +48,10 @@ export class MobileExtensionSettingsBridge {
     });
     const stopped = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(new Error("Settings request retired.")), { once: true }));
     const completion = Promise.race([work, stopped]); this.#queue = completion.catch(() => undefined);
-    void completion.then(result => send(result, true), () => {
-      // Reads and validation have no product effects and remain retryable.
-      if (dispatched && !["context.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(request.command.kind)) this.#faulted = true;
-      send(undefined, false);
+    void completion.then(result => send(result, true), error => {
+      const rejected = error instanceof ExtensionSettingsRejected ? error : undefined;
+      if (dispatched && !rejected && !extensionSettingsReadOnly(request.command.kind)) this.#faulted = true;
+      send(undefined, false, rejected);
     }).catch(() => { this.#faulted = true; }).finally(() => { clearTimeout(timer); abort.abort(); this.#pending.delete(abort); });
   }
   dispose(): void { this.#closed = true; for (const request of this.#pending) request.abort(); this.#pending.clear(); }

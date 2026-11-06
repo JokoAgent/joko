@@ -6,11 +6,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { CallToolResultSchema, CreateTaskResultSchema, type CallToolRequest, type CreateTaskResult, type Progress } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResultSchema, CreateTaskResultSchema, ListToolsResultSchema, type CallToolRequest, type CreateTaskResult, type Progress } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport, FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { PiMcpBridgeOptions, PiMcpToolDescriptor } from "@joko/adapter-pi";
 import { validateMcpEndpoint } from "@joko/adapter-pi";
-import { redactSecrets, type BlobRef, type PolicySubjectKind, type PartnerLearningReceipt, type PartnerLearningTurnSource, type PartnerLearningToolAuthority } from "@joko/core";
+import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, redactSecrets, type BlobRef, type PolicySubjectKind, type PartnerLearningReceipt, type PartnerLearningTurnSource, type PartnerLearningToolAuthority, type SessionDescriptor } from "@joko/core";
 import { operationBodyHash, type OperationalStore } from "@joko/store";
 
 import type { CredentialManager } from "./credential-manager.js";
@@ -37,8 +37,10 @@ import { RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server";
 import { AppConnection, type AppServerConfig } from "./mcp-apps/connection.js";
 import type { McpAppCapture, McpAppCaptureInput } from "./mcp-apps/manager.js";
 import type { McpModelChannel } from "./mcp-apps/server-proxy.js";
+import { nativeBindingFingerprint } from "./native-state-observation.js";
 
 export const MCP_BRIDGE_RESPONSE_MAXIMUM_BYTES = 2 * 1024 * 1024;
+export const MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR = "MCP command arguments cannot contain credentials. Use an environment credential binding.";
 const MCP_BRIDGE_INLINE_RESULT_MAXIMUM_BYTES = 512 * 1024;
 const MCP_BRIDGE_PREVIEW_MAXIMUM_BYTES = 128 * 1024;
 
@@ -198,6 +200,7 @@ export interface McpClientFactoryInput {
   readonly config: McpServerInput;
   readonly generation: number;
   readonly credentials: Readonly<Record<string, string>>;
+  readonly assertCurrent?: () => void;
   readonly onClose: () => void;
   readonly onError: (error: Error) => void;
 }
@@ -296,8 +299,14 @@ interface Runtime {
   readonly generation: number;
   readonly connection: McpClientConnection;
   readonly tools: readonly McpToolDescriptor[];
+  latestAppTools?: AppToolCatalog;
   state: McpServerState;
   error?: string;
+}
+
+interface AppToolCatalog {
+  readonly tools: readonly McpToolDescriptor[];
+  readonly digest: string;
 }
 
 interface BridgeGrant {
@@ -306,7 +315,9 @@ interface BridgeGrant {
   readonly authorityDigest: Buffer;
   readonly serverGenerations: ReadonlyMap<string, number>;
   readonly tools: readonly PiMcpToolDescriptor[];
+  readonly appToolCatalogs: ReadonlyMap<string, AppToolCatalog>;
   readonly audioResultMappings: ReadonlyMap<string, McpAudioResultMapping>;
+  readonly publishCompleteOutput: boolean;
   readonly expectedPiGeneration?: number;
   readonly productScope?: {
     readonly sessionId: string;
@@ -389,6 +400,11 @@ export interface NativeAuthProviderFence {
 interface NormalizedMcpResult {
   readonly value: McpCallResult;
   readonly bytes: Uint8Array;
+}
+
+interface McpCompleteOutputOwner {
+  readonly session: SessionDescriptor;
+  readonly assertCurrent: () => void;
 }
 
 export interface McpBridgeCallResult {
@@ -644,14 +660,13 @@ export class McpRouter {
         await validateServerInput(server.input);
         if (this.#servers.has(server.input.id)) throw new Error("MCP catalog contains duplicate server IDs.");
         this.#servers.set(server.input.id, server);
-        this.#states.set(server.input.id, {
-          state: server.input.enabled ? "disconnected" : "disabled",
-          generation: server.generation
-        });
+        this.#states.set(server.input.id, unsafeStdioArguments(server.input)
+          ? { state: "error", generation: server.generation, error: MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR }
+          : { state: server.input.enabled ? "disconnected" : "disabled", generation: server.generation });
       }
     }
     this.#initialized = true;
-    await Promise.all([...this.#servers.values()].filter((server) => server.input.enabled).map(async (server) => {
+    await Promise.all([...this.#servers.values()].filter((server) => server.input.enabled && this.#states.get(server.input.id)?.state !== "error").map(async (server) => {
       try { await this.#start(server); } catch { /* State retains the redacted error. */ }
     }));
   }
@@ -746,11 +761,13 @@ export class McpRouter {
     })).sort((a, b) => a.id.localeCompare(b.id, "en"));
   }
 
-  async upsert(input: McpServerInput, expectedVersion?: bigint): Promise<McpServerDescriptor> {
+  async upsert(input: McpServerInput, expectedVersion?: bigint, assertCurrent?: () => void): Promise<McpServerDescriptor> {
     this.#assertInitialized();
+    if (unsafeStdioArguments(input)) throw new Error(MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR);
     await validateServerInput(input);
     if (this.#bridgeToolProviders.has(input.id)) throw new Error("MCP server ID is reserved by a service Tool Provider.");
     return this.#mutate(async () => {
+      assertCurrent?.();
       const existing = this.#servers.get(input.id);
       if (expectedVersion !== undefined && existing !== undefined && BigInt(existing.version) !== expectedVersion) {
         throw new Error("MCP server changed concurrently.");
@@ -779,18 +796,21 @@ export class McpRouter {
         throw error;
       }
       if (input.enabled) {
-        try { await this.#start(next); } catch { /* return durable error state */ }
+        try { await this.#start(next, assertCurrent); } catch { /* return durable error state */ }
       }
       await this.#retireUnused(input.id);
+      assertCurrent?.();
       return this.#descriptor(next);
     });
   }
 
-  async restart(serverId: string): Promise<McpServerDescriptor> {
+  async restart(serverId: string, assertCurrent?: () => void): Promise<McpServerDescriptor> {
     this.#assertInitialized();
     return this.#mutate(async () => {
+      assertCurrent?.();
       const current = this.#requireServer(serverId);
       if (!current.input.enabled) throw new Error("Disabled MCP server cannot be restarted.");
+      if (unsafeStdioArguments(current.input)) throw new Error(MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR);
       const next: StoredMcpServer = {
         ...current,
         generation: ++this.#lastGeneration,
@@ -798,17 +818,24 @@ export class McpRouter {
         updatedAt: this.#now()
       };
       this.#servers.set(serverId, next);
+      try {
+        this.#persist();
+      } catch (error) {
+        this.#servers.set(serverId, current);
+        this.#lastGeneration -= 1;
+        throw error;
+      }
       this.#states.set(serverId, { state: "starting", generation: next.generation });
-      this.#persist();
-      try { await this.#start(next); } catch { /* descriptor contains failure */ }
+      try { await this.#start(next, assertCurrent); } catch { /* descriptor contains failure */ }
       await this.#retireUnused(serverId);
       return this.#descriptor(next);
     });
   }
 
-  async delete(serverId: string): Promise<boolean> {
+  async delete(serverId: string, assertCurrent?: () => void): Promise<boolean> {
     this.#assertInitialized();
     return this.#mutate(async () => {
+      assertCurrent?.();
       const existing = this.#servers.get(serverId);
       if (existing === undefined) return false;
       this.#servers.delete(serverId);
@@ -840,12 +867,31 @@ export class McpRouter {
   appServerConfig(serverId: string): AppServerConfig | undefined {
     const server = this.#servers.get(serverId);
     if (server === undefined || !server.input.enabled || server.input.transport === "stdio") return;
+    const assertCredentialsCurrent = this.#captureHeaderAuthority(server.input);
     const headers: Record<string, string> = {};
     for (const binding of server.input.credentialBindings) {
       if (binding.target !== "header") return;
       headers[binding.name] = this.#credentials.resolve(binding.credentialReferenceId);
     }
-    return { id: serverId, url: server.input.endpoint, transport: server.input.transport === "sse" ? "sse" : "http", headers };
+    return { id: serverId, url: server.input.endpoint, transport: server.input.transport === "sse" ? "sse" : "http", headers,
+      ...(assertCredentialsCurrent === undefined ? {} : { assertCredentialsCurrent }) };
+  }
+
+  #captureHeaderAuthority(input: McpServerInput): (() => void) | undefined {
+    const generations = new Map<string, string>();
+    for (const binding of input.credentialBindings) {
+      if (binding.target !== "header") continue;
+      const current = this.#credentials.find(binding.credentialReferenceId);
+      if (current?.configured !== true) throw new Error("An MCP header credential is unavailable.");
+      generations.set(binding.credentialReferenceId, current.generation);
+    }
+    if (generations.size === 0) return undefined;
+    return () => {
+      for (const [reference, generation] of generations) {
+        const current = this.#credentials.find(reference);
+        if (current?.configured !== true || current.generation !== generation) throw new Error("The original MCP header credential retired.");
+      }
+    };
   }
 
   /** The native peer negotiates its own callbacks. A model channel borrows only
@@ -902,6 +948,10 @@ export class McpRouter {
     readonly targetId?: string;
     readonly expectedPiGeneration?: number;
     readonly ttlMs?: number;
+    /** New Claude Queries have their own App client and schema validation. */
+    readonly useLatestAppTools?: boolean;
+    /** Ordinary local runtime may publish complete external results to this exact Session. */
+    readonly publishCompleteOutput?: boolean;
     readonly nativeAuthLease?: {
       readonly endpoint: string;
       readonly catalogGeneration: number;
@@ -953,6 +1003,7 @@ export class McpRouter {
       };
     }
     const serverGenerations = new Map<string, number>();
+    const appToolCatalogs = new Map<string, AppToolCatalog>();
     const references = input.targetId === undefined ? undefined : this.#targetReferences?.(input.targetId, input.sessionId);
     const tools: PiMcpToolDescriptor[] = [];
     const audioResultMappings = new Map<string, McpAudioResultMapping>();
@@ -962,7 +1013,9 @@ export class McpRouter {
       const runtime = this.#runtime(server.input.id, server.generation);
       if (runtime === undefined || runtime.state !== "connected") continue;
       serverGenerations.set(server.input.id, server.generation);
-      for (const tool of runtime.tools) {
+      const appCatalog = input.useLatestAppTools ? runtime.latestAppTools : undefined;
+      if (appCatalog !== undefined) appToolCatalogs.set(server.input.id, appCatalog);
+      for (const tool of appCatalog?.tools ?? runtime.tools) {
         if (tool.modelVisible === false) continue;
         tools.push({
           serverId: tool.serverId,
@@ -1037,6 +1090,7 @@ export class McpRouter {
       productScope,
       serverGenerations,
       tools,
+      appToolCatalogs,
       audioResultMappings,
       nativeAuth
     });
@@ -1045,7 +1099,9 @@ export class McpRouter {
       authorityDigest,
       serverGenerations,
       tools,
+      appToolCatalogs,
       audioResultMappings,
+      publishCompleteOutput: productScope !== undefined && input.publishCompleteOutput === true,
       ...(input.expectedPiGeneration === undefined ? {} : { expectedPiGeneration: input.expectedPiGeneration }),
       ...(productScope === undefined ? {} : { productScope }),
       ...(nativeAuth === undefined ? {} : { nativeAuth }),
@@ -1164,6 +1220,9 @@ export class McpRouter {
     if (!grant.tools.some((tool) => tool.serverId === input.serverId && tool.name === input.toolName)) {
       throw new Error("MCP tool is not present in this Pi runtime snapshot.");
     }
+    if (grant.appToolCatalogs.has(input.serverId) && input.appCall === undefined) {
+      throw new Error("An updated MCP tool catalog requires its original model channel.");
+    }
     let assertNativeRoot: (() => void) | undefined;
     const rootRequired = grant.tools.some(tool => tool.serverId === input.serverId && tool.name === input.toolName && tool.requiresNativeRoot);
     if (rootRequired) {
@@ -1225,11 +1284,12 @@ export class McpRouter {
       let result: McpCallResult;
       let hostImages: readonly BridgeToolImageOutput[] = [];
       let hostArtifacts: readonly BridgeToolArtifactOutput[] = [];
+      let completeOutputOwner: McpCompleteOutputOwner | undefined;
       if (bridgeProvider === undefined) {
         const runtime = this.#requireRuntime(input.serverId, serverGeneration);
         const targetRevision = this.#store.getTarget(session.targetId).revision;
         const context = { sessionId: session.id, targetId: session.targetId, generation: input.generation, requestIdentity, requestBodyHash };
-        const guard = (): void => {
+        const guard = (): SessionDescriptor => {
           assertDelegated?.();
           assertNativeRoot?.();
           modelChannel?.assertCurrent();
@@ -1240,12 +1300,22 @@ export class McpRouter {
             || current.archived || current.deletedAt !== undefined
             || this.#store.findPendingSessionLifecycleCleanup(current.id) !== undefined
             || this.#store.getTarget(context.targetId).revision !== targetRevision) throw new Error("MCP audio publication owner is no longer active.");
+          return current;
         };
         guard();
         const replay = input.appCall?.params.task ? undefined : this.#audioArtifacts?.replay(context);
         if (replay !== undefined) result = replay;
         else {
-          const tool = runtime.tools.find(candidate => candidate.name === input.toolName);
+          const tools = grant.appToolCatalogs.get(input.serverId)?.tools ?? runtime.tools;
+          const tool = tools.find(candidate => candidate.name === input.toolName);
+          if (grant.publishCompleteOutput && input.appCall?.params.task === undefined && tool?.appResourceUri === undefined
+            && audioResultMapping === undefined && this.#canPublishCompleteOutput(session)) {
+            completeOutputOwner = { session, assertCurrent: () => {
+              const current = guard();
+              if (current.binding.opaqueRef !== session.binding.opaqueRef || current.binding.nativeSessionId !== session.binding.nativeSessionId
+                || !this.#canPublishCompleteOutput(current)) throw new Error("MCP complete-output owner is no longer active.");
+            } };
+          }
           if (!input.appCall?.params.task && tool?.appResourceUri !== undefined && tool.inputSchema["type"] === "object"
             && this.#servers.get(input.serverId)?.generation === serverGeneration) {
             try {
@@ -1366,7 +1436,7 @@ export class McpRouter {
         }
         guard();
       }
-      const projected = await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts);
+      const projected = await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts, completeOutputOwner);
       return modelTask ? { ...projected, details: { ...projected.details, mcpTask: modelTask } } : projected;
     } catch (error) {
       await appCapture?.cancel(input.signal?.aborted === true).catch(() => undefined);
@@ -2314,7 +2384,8 @@ export class McpRouter {
     serverId: string,
     toolName: string,
     hostImages: readonly BridgeToolImageOutput[] = [],
-    hostArtifacts: readonly BridgeToolArtifactOutput[] = []
+    hostArtifacts: readonly BridgeToolArtifactOutput[] = [],
+    completeOutputOwner?: McpCompleteOutputOwner
   ): Promise<McpBridgeCallResult> {
     const normalized = this.#normalizeResult(result, "MCP bridge result");
     const hostDetails = {
@@ -2349,31 +2420,58 @@ export class McpRouter {
     }
 
     if (this.#resultArtifacts === undefined) throw new McpArtifactUnavailableError();
+    const owner = normalized.value.isError ? undefined : completeOutputOwner;
+    owner?.assertCurrent();
     let stored: BlobRef;
     try {
       const safeServerId = artifactNamePart(this.#redactText(serverId));
       const safeToolName = artifactNamePart(this.#redactText(toolName));
       stored = await this.#resultArtifacts.ingestBytes(normalized.bytes, {
         fileName: `${safeServerId}-${safeToolName}-${randomUUID()}.json`,
-        mimeType: "application/json"
+        mimeType: "application/json",
+        ...(owner === undefined ? {} : { expiresAt: Date.now() + 10 * 60_000 })
       });
     } catch (error) {
       throw new McpArtifactUnavailableError({ cause: error });
     }
-    const completeOutput = publicBlobRef(stored);
-    const response: McpBridgeCallResult = {
-      content: bridgeResultPreview(normalized.value.content, completeOutput, normalized.bytes.byteLength),
-      details: {
-        jokoMcpBridge: {
-          ...hostDetails,
-          truncated: true,
-          completeOutput
-        }
-      },
-      isError: normalized.value.isError
-    };
-    assertBridgeResponseWithinBudget(response);
-    return response;
+    try {
+      const completeOutput = publicBlobRef(stored);
+      const response: McpBridgeCallResult = {
+        content: bridgeResultPreview(normalized.value.content, completeOutput, normalized.bytes.byteLength),
+        details: {
+          jokoMcpBridge: {
+            ...hostDetails,
+            truncated: true,
+            completeOutput
+          }
+        },
+        isError: normalized.value.isError
+      };
+      assertBridgeResponseWithinBudget(response);
+      if (owner !== undefined) this.#store.transaction((store) => {
+        owner.assertCurrent();
+        const { session } = owner;
+        const artifact = store.adoptSessionArtifact({ blob: completeOutput, sessionId: session.id }).blob;
+        store.appendEvent({
+          backendId: session.backendId, targetId: session.targetId, sessionId: session.id,
+          generation: session.binding.generation, traceId: `artifact:${artifact.id}`,
+          metadata: { namespace: "joko.mcp_complete_output", fields: {
+            [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(session.binding.opaqueRef)
+          } },
+          payload: { type: "artifact", artifact, purpose: "backend_artifact" }
+        });
+      });
+      return response;
+    } catch (error) {
+      if (owner !== undefined) this.#store.releaseArtifactStaging([stored.id]);
+      throw error;
+    }
+  }
+
+  #canPublishCompleteOutput(session: SessionDescriptor): boolean {
+    return this.#store.findSessionRuntimePolicy(session.id)?.policy !== "review_read_only"
+      && !(session.derivationOrigin?.sideChat && session.worktree === undefined)
+      && (session.worktree === undefined || session.worktree.state === "active");
   }
 
   async #callBridgeToolProvider(
@@ -2424,26 +2522,43 @@ export class McpRouter {
     };
   }
 
-  async #start(server: StoredMcpServer): Promise<void> {
+  async #start(server: StoredMcpServer, assertCurrent?: () => void): Promise<void> {
     this.#states.set(server.input.id, { state: "starting", generation: server.generation });
     const credentials: Record<string, string> = {};
     let connection: McpClientConnection | undefined;
+    let startupAuthority = assertCurrent;
     try {
+      assertCurrent?.();
       await validateServerInput(server.input);
+      assertCurrent?.();
+      const assertHeadersCurrent = this.#captureHeaderAuthority(server.input);
       for (const binding of server.input.credentialBindings) credentials[`${binding.target}:${binding.name}`] = this.#credentials.resolve(binding.credentialReferenceId);
       let runtime: Runtime | undefined;
       connection = await this.#factory.connect({
         config: server.input,
         generation: server.generation,
         credentials,
+        ...(assertCurrent === undefined && assertHeadersCurrent === undefined ? {} : {
+          assertCurrent: () => { startupAuthority?.(); assertHeadersCurrent?.(); }
+        }),
         onClose: () => this.#runtimeClosed(server.input.id, server.generation),
         onError: (error) => this.#runtimeErrored(server.input.id, server.generation, error)
+      });
+      const app = connection.appConnection;
+      let appToolsChanged = false;
+      let refreshAppTools: (() => void) | undefined;
+      app?.listen(message => {
+        if (message.method !== "notifications/tools/list_changed") return;
+        if (refreshAppTools === undefined) appToolsChanged = true;
+        else refreshAppTools();
       });
       const tools = await discoverAllTools(
         connection,
         server.input.id,
-        this.#toolDiscoveryPolicy
+        this.#toolDiscoveryPolicy,
+        assertCurrent
       );
+      assertCurrent?.();
       const duplicate = duplicateToolName(tools);
       if (duplicate !== undefined) throw new Error(`MCP server advertised duplicate tool '${duplicate}'.`);
       runtime = { serverId: server.input.id, generation: server.generation, connection, tools, state: "connected" };
@@ -2455,6 +2570,10 @@ export class McpRouter {
       group.set(server.generation, runtime);
       if (this.#servers.get(server.input.id)?.generation === server.generation) {
         this.#states.set(server.input.id, { state: "connected", generation: server.generation });
+      }
+      if (app !== undefined) {
+        refreshAppTools = this.#createAppToolRefresh(runtime, app, assertHeadersCurrent);
+        if (appToolsChanged) refreshAppTools();
       }
     } catch (error) {
       await connection?.close().catch(() => undefined);
@@ -2469,7 +2588,49 @@ export class McpRouter {
         });
       }
       throw new Error("MCP server failed to start.", { cause: new Error(message) });
+    } finally {
+      // An adopted runtime belongs to the service, independently of the device that saved it.
+      startupAuthority = undefined;
     }
+  }
+
+  #createAppToolRefresh(runtime: Runtime, app: AppConnection, assertCredentialsCurrent?: () => void): () => void {
+    const { serverId, generation } = runtime;
+    const isCurrent = () => this.#servers.get(serverId)?.generation === generation
+      && this.#runtime(serverId, generation) === runtime && runtime.state === "connected";
+    const assertCurrent = () => {
+      if (!isCurrent()) throw new Error("The MCP tool catalog runtime retired.");
+      assertCredentialsCurrent?.();
+    };
+    let pending = false;
+    let refreshing = false;
+    const refresh = async () => {
+      while (pending && isCurrent()) {
+        pending = false;
+        try {
+          assertCurrent();
+          const client = await app.getClient();
+          if (client.getServerCapabilities()?.tools?.listChanged !== true) return;
+          // SDK listTools changes the original client's tool validators. This
+          // read feeds new Queries while that client keeps its startup schema.
+          const tools = await discoverAllTools({ listTools: (cursor, signal) => client.request({
+            method: "tools/list",
+            ...(cursor === undefined ? {} : { params: { cursor } })
+          }, ListToolsResultSchema, { signal }) }, serverId, this.#toolDiscoveryPolicy, assertCurrent);
+          assertCurrent();
+          if (duplicateToolName(tools) !== undefined) continue;
+          const digest = appToolCatalogDigest(tools);
+          runtime.latestAppTools = digest === appToolCatalogDigest(runtime.tools) ? undefined : { tools, digest };
+        } catch { /* An invalid or retired update cannot replace a verified catalog. */ }
+      }
+    };
+    return () => {
+      if (!isCurrent()) return;
+      pending = true;
+      if (refreshing) return;
+      refreshing = true;
+      void refresh().finally(() => { refreshing = false; });
+    };
   }
 
   #runtimeClosed(serverId: string, generation: number): void {
@@ -2501,7 +2662,7 @@ export class McpRouter {
       enabled: server.input.enabled,
       state: state.state,
       runtimeGeneration: server.generation,
-      tools: runtime?.tools ?? [],
+      tools: runtime?.latestAppTools?.tools ?? runtime?.tools ?? [],
       credentialBindings: server.input.credentialBindings.map((binding) => ({
         ...binding,
         configured: this.#credentials.find(binding.credentialReferenceId)?.configured === true
@@ -2510,7 +2671,7 @@ export class McpRouter {
         ? {
           case: "stdio",
           command: server.input.command,
-          arguments: [...(server.input.args ?? [])],
+          arguments: unsafeStdioArguments(server.input) ? [] : [...(server.input.args ?? [])],
           workingDirectory: server.input.cwd ?? "",
           environment: { ...(server.input.environment ?? {}) }
         }
@@ -2696,6 +2857,7 @@ export class SdkMcpClientFactory implements McpClientFactory {
         if (target.origin !== endpoint.origin || target.username !== "" || target.password !== "" || target.hash !== "") {
           throw new Error("MCP request destination is outside its configured origin.");
         }
+        input.assertCurrent?.();
         return nativeFetch(url, { ...init, redirect: "error" });
       };
       const options = { requestInit: { headers, redirect: "error" as const }, fetch };
@@ -2705,6 +2867,7 @@ export class SdkMcpClientFactory implements McpClientFactory {
     }
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
+      input.assertCurrent?.();
       await Promise.race([
         client.connect(transport),
         new Promise<never>((_resolve, reject) => {
@@ -2721,7 +2884,8 @@ export class SdkMcpClientFactory implements McpClientFactory {
     if (input.config.transport !== "stdio") {
       const headers = Object.fromEntries(input.config.credentialBindings.map(binding => [binding.name, input.credentials[`header:${binding.name}`]!]));
       appConnection = new AppConnection({ id: input.config.id, url: input.config.endpoint,
-        transport: input.config.transport === "sse" ? "sse" : "http", headers }, undefined, client);
+        transport: input.config.transport === "sse" ? "sse" : "http", headers,
+        ...(input.assertCurrent === undefined ? {} : { assertCredentialsCurrent: input.assertCurrent }) }, undefined, client);
     }
     return {
       ...(appConnection === undefined ? {} : { appConnection }),
@@ -2834,9 +2998,10 @@ function normalizeTool(serverId: string, tool: McpListedTool): McpToolDescriptor
 }
 
 async function discoverAllTools(
-  connection: McpClientConnection,
+  connection: Pick<McpClientConnection, "listTools">,
   serverId: string,
-  policy: McpToolDiscoveryPolicy
+  policy: McpToolDiscoveryPolicy,
+  assertCurrent?: () => void
 ): Promise<readonly McpToolDescriptor[]> {
   const controller = new AbortController();
   const timeoutError = new McpToolDiscoveryError("timed_out", "MCP tool discovery timed out.");
@@ -2849,6 +3014,7 @@ async function discoverAllTools(
   let catalogBytes = 2;
   try {
     for (;;) {
+      assertCurrent?.();
       throwIfDiscoveryAborted(controller.signal);
       if (pageCount >= policy.maximumPages) {
         throw new McpToolDiscoveryError("page_limit", "MCP tool discovery exceeded the page limit.");
@@ -2892,6 +3058,10 @@ async function discoverAllTools(
   } finally {
     clearTimeout(timer);
   }
+}
+
+function appToolCatalogDigest(tools: readonly McpToolDescriptor[]): string {
+  return operationBodyHash([...tools].sort((left, right) => left.name.localeCompare(right.name, "en")));
 }
 
 function throwIfDiscoveryAborted(signal: AbortSignal): void {
@@ -2952,6 +3122,15 @@ function looksSecretValue(value: string): boolean {
   return value.length > 80 && /^[A-Za-z0-9_+/=-]+$/u.test(value);
 }
 
+export function mcpStdioArgumentsContainCredential(args: readonly string[]): boolean {
+  return args.some((arg) => /^--?(?:(?:access|refresh|bearer|auth)[_-]?token|token|api[_-]?key|client[_-]?secret|authorization|password|secret|cookie|credential)(?:$|[=:])/iu.test(arg.trim())
+    || redactSecrets(arg) !== arg);
+}
+
+function unsafeStdioArguments(input: McpServerInput): boolean {
+  return input.transport === "stdio" && mcpStdioArgumentsContainCredential(input.args ?? []);
+}
+
 function safeEndpointDisplay(raw: string): string {
   const url = new URL(raw);
   return `${url.protocol}//${url.host}${url.pathname}`;
@@ -2977,6 +3156,7 @@ function bridgeGrantAuthorityDigest(input: {
   readonly productScope?: BridgeGrant["productScope"];
   readonly serverGenerations: ReadonlyMap<string, number>;
   readonly tools: readonly PiMcpToolDescriptor[];
+  readonly appToolCatalogs: ReadonlyMap<string, AppToolCatalog>;
   readonly audioResultMappings: ReadonlyMap<string, McpAudioResultMapping>;
   readonly nativeAuth?: BridgeGrant["nativeAuth"];
 }): Buffer {
@@ -3001,6 +3181,9 @@ function bridgeGrantAuthorityDigest(input: {
     audioResultMappings: [...input.audioResultMappings]
       .sort(([left], [right]) => left.localeCompare(right, "en"))
       .map(([tool, mapping]) => ({ tool, mapping })),
+    ...(input.appToolCatalogs.size === 0 ? {} : { appToolCatalogs: [...input.appToolCatalogs]
+      .sort(([left], [right]) => left.localeCompare(right, "en"))
+      .map(([serverId, catalog]) => ({ serverId, digest: catalog.digest })) }),
     ...(input.nativeAuth === undefined ? {} : {
       nativeAuth: {
         catalogGeneration: input.nativeAuth.catalogGeneration,

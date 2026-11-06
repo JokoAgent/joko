@@ -224,6 +224,48 @@ afterEach(() => {
 });
 
 describe("MobileExtensionsScreen", () => {
+  it.each([false, true])("adopts a successful uninstall with an available package remaining when browsing is %s", async (browse) => {
+    const available = { ...calendar, installed: false, installState: "available" as const };
+    const active = transport("owner-package", catalog([mail]));
+    active.browse = vi.fn(async () => catalog([mail, available]));
+    active.removePackage = vi.fn(async () => catalog([available]));
+    await render(active);
+    if (browse) await press("Browse available Extensions");
+    expect(container.textContent?.includes(available.name)).toBe(browse);
+    await press("View Mail");
+    await press("Remove package");
+    const buttons = native.alert.mock.calls[0]![2] as Array<{ onPress?: () => void }>;
+    await act(async () => buttons[1]!.onPress?.());
+
+    expect(active.removePackage).toHaveBeenCalledExactlyOnceWith(mail, expect.any(AbortSignal));
+    expect(container.textContent).not.toContain("Remove package");
+    expect(container.textContent).not.toContain(mail.name);
+    expect(container.textContent?.includes(available.name)).toBe(browse);
+  });
+
+  it("clears the obsolete uninstall detail and failure after the original receipt is recovered on the same owner", async () => {
+    const active = transport();
+    const unknown = "The package change result is unknown. Check its original operation; it was not resent.";
+    active.removePackage = vi.fn(async () => { throw new Error(unknown); });
+    await render({ ...active, packageReceiptRevision: 0 });
+    await press("View Mail"); await press("Remove package");
+    const buttons = native.alert.mock.calls[0]![2] as Array<{ onPress?: () => void }>;
+    await act(async () => buttons[1]!.onPress?.());
+    await render({ ...active, packageReceiptRevision: 0,
+      pending: [{ operationId: "remove-original", extensionId: mail.extensionId, kind: "packageRemove", state: "unknown" }] });
+    expect(container.textContent).toContain(unknown);
+    expect(container.textContent).toContain("Check result");
+
+    vi.mocked(active.list).mockResolvedValue({ ...catalog([calendar]), revision: 5n });
+    await render({ ...active, packageReceiptRevision: 1, pending: [] });
+    expect(active.list).toHaveBeenCalledTimes(2);
+    expect(active.reconcile).not.toHaveBeenCalled();
+    expect(active.removePackage).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Calendar");
+    expect(container.textContent).not.toContain(unknown);
+    expect(container.textContent).not.toContain("Remove package");
+  });
+
   it("browses, searches, and loads authoritative Extension detail", async () => {
     const active = transport();
     await render(active);

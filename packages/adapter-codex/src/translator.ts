@@ -530,9 +530,9 @@ export class CodexEventTranslator {
       }
       case "mcpToolCall": {
         const output = item["result"] === null || item["result"] === undefined
-          ? ""
+          ? mcpToolCallErrorMessage(item) ?? ""
           : safeJson(item["result"], 256 * 1024);
-        return [toolResult(item, state, output, item["error"] !== null && item["error"] !== undefined)];
+        return [toolResult(item, state, output, mcpToolCallFailed(item))];
       }
       case "dynamicToolCall": {
         const output = item["contentItems"] === undefined ? "" : safeJson(item["contentItems"], 256 * 1024);
@@ -677,6 +677,18 @@ function deltaEvent(
 
 function itemFromNotification(params: JsonValue): NativeThreadItem {
   return parseThreadItem(objectValue(params, "item notification")["item"]);
+}
+
+export function mcpToolCallFailed(item: NativeThreadItem, status = item["status"]): boolean {
+  return status === "failed" || status === "declined" || status === "interrupted"
+    || (item["error"] !== null && item["error"] !== undefined);
+}
+
+export function mcpToolCallErrorMessage(item: NativeThreadItem): string | undefined {
+  const error = item["error"];
+  return isJsonObject(error) && typeof error["message"] === "string"
+    ? safeText(error["message"], 256 * 1024)
+    : undefined;
 }
 
 export function toolIdentity(item: NativeThreadItem): { readonly name: string; readonly input: string } | undefined {

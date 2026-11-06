@@ -140,12 +140,16 @@ const PORTABLE_SEGMENT = /^[A-Za-z0-9_@][A-Za-z0-9_@.+ -]*$/u;
 const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu;
 const SQLITE_SIDECAR = /\.sqlite-(?:wal|shm|journal)$/iu;
 
+export type ExtensionLibraryRootStat = Pick<BigIntStats, "dev" | "ino" | "birthtimeNs">;
+
 export interface ExtensionLibraryVaultOptions {
   readonly root: string;
   readonly extensionId: string;
+  readonly expectedRootStat?: ExtensionLibraryRootStat;
   readonly now?: () => number;
   readonly freeBytes?: (root: string) => Promise<number | undefined>;
   readonly limits?: Partial<ExtensionLibraryLimits>;
+  readonly usageSource?: ExtensionLibraryVault;
   readonly beforeFilesystemMutation?: (
     operation: "write" | "staged_write" | "mkdir" | "delete" | "rename" | "sqlite"
   ) => void | Promise<void>;
@@ -163,8 +167,8 @@ export class ExtensionLibraryVault {
   readonly #limits: ExtensionLibraryLimits;
   readonly #beforeFilesystemMutation: NonNullable<ExtensionLibraryVaultOptions["beforeFilesystemMutation"]>;
   #metadata?: StoredLibraryMetadata;
-  #rootIdentity?: BigIntStats;
-  #usage: ExtensionLibraryUsage = { files: 0, bytes: 0, revision: 0n };
+  #rootIdentity?: ExtensionLibraryRootStat;
+  readonly #usage: { current: ExtensionLibraryUsage; needsReconcile: boolean };
   #state: ExtensionLibraryState = "unavailable";
   #reason: ExtensionLibraryStatus["reason"] = "io";
   #readonly = false;
@@ -175,10 +179,20 @@ export class ExtensionLibraryVault {
     if (!EXTENSION_ID.test(options.extensionId)) throw new TypeError("Extension Library identity is invalid.");
     this.#root = resolve(options.root);
     this.#extensionId = options.extensionId;
+    if (options.expectedRootStat !== undefined) this.#rootIdentity = { ...options.expectedRootStat };
     this.#now = options.now ?? Date.now;
     this.#freeBytes = options.freeBytes ?? filesystemFreeBytes;
     this.#limits = Object.freeze({ ...EXTENSION_LIBRARY_LIMITS, ...options.limits });
-    this.#beforeFilesystemMutation = options.beforeFilesystemMutation ?? (() => undefined);
+    const usageSource = options.usageSource;
+    if (usageSource && (usageSource.#root !== this.#root || usageSource.#extensionId !== this.#extensionId)) {
+      throw new TypeError("Library usage must belong to the same Library root and Extension.");
+    }
+    this.#usage = usageSource ? usageSource.#usage : { current: { files: 0, bytes: 0, revision: 0n }, needsReconcile: false };
+    this.#beforeFilesystemMutation = async (operation) => {
+      await options.beforeFilesystemMutation?.(operation);
+      // A filesystem effect may finish before its verification or ledger write.
+      if (operation !== "sqlite") this.#usage.needsReconcile = true;
+    };
   }
 
   get root(): string {
@@ -187,6 +201,12 @@ export class ExtensionLibraryVault {
 
   get extensionId(): string {
     return this.#extensionId;
+  }
+
+  get rootStat(): ExtensionLibraryRootStat {
+    if (this.#rootIdentity === undefined) throw new ExtensionLibraryError("UNAVAILABLE", "Library root identity is unavailable.");
+    const { dev, ino, birthtimeNs } = this.#rootIdentity;
+    return { dev, ino, birthtimeNs };
   }
 
   get limits(): ExtensionLibraryLimits {
@@ -239,16 +259,19 @@ export class ExtensionLibraryVault {
     }
     try {
       const tree = await scanTree(this.#root, this.#limits.maximumFiles);
-      const matches = storedUsage !== undefined && storedUsage.files === tree.files && storedUsage.bytes === tree.bytes;
-      this.#usage = {
+      const observedRevision = BigInt(storedUsage?.revision ?? "0");
+      const currentRevision = this.#usage.current.revision;
+      const matches = storedUsage !== undefined && storedUsage.files === tree.files && storedUsage.bytes === tree.bytes
+        && observedRevision >= currentRevision && !this.#usage.needsReconcile;
+      this.#usage.current = {
         files: tree.files,
         bytes: tree.bytes,
-        revision: matches && storedUsage !== undefined
-          ? BigInt(storedUsage.revision)
-          : BigInt(storedUsage?.revision ?? "0") + 1n
+        revision: matches ? observedRevision : (observedRevision > currentRevision ? observedRevision : currentRevision) + 1n
       };
       if (!matches) await this.#persistUsage();
+      this.#usage.needsReconcile = false;
     } catch (error) {
+      this.#usage.needsReconcile = true;
       if (error instanceof ExtensionLibraryError && error.code === "FILE_LIMIT") {
         return this.#markUnavailable("file_limit", error.message, error);
       }
@@ -266,10 +289,10 @@ export class ExtensionLibraryVault {
     return {
       state: this.#state,
       ...(this.#reason === undefined ? {} : { reason: this.#reason }),
-      usage: { ...this.#usage },
+      usage: { ...this.#usage.current },
       ...(free === undefined ? {} : { diskFreeBytes: free }),
       softLimitBytes: this.#limits.softLimitBytes,
-      softLimitExceeded: this.#usage.bytes > this.#limits.softLimitBytes,
+      softLimitExceeded: this.#usage.current.bytes > this.#limits.softLimitBytes,
       orphaned: this.#metadata?.orphaned !== undefined
     };
   }
@@ -399,7 +422,7 @@ export class ExtensionLibraryVault {
     if (existing === "file" && input.ifNotExists === true) {
       throw new ExtensionLibraryError("ALREADY_EXISTS", "Library file already exists.");
     }
-    if (existing === "missing" && this.#usage.files >= this.#limits.maximumFiles) {
+    if (existing === "missing" && this.#usage.current.files >= this.#limits.maximumFiles) {
       throw new ExtensionLibraryError("FILE_LIMIT", "Extension Library file-count fuse was exceeded.");
     }
     const existingIdentity = existing === "file" ? await regularFileSnapshot(target) : undefined;
@@ -476,7 +499,7 @@ export class ExtensionLibraryVault {
     let offset = 0;
     if (input.cursor !== undefined) {
       const cursor = parseCursor(input.cursor);
-      if (cursor.revision !== this.#usage.revision.toString(10) || cursor.prefix !== prefix
+      if (cursor.revision !== this.#usage.current.revision.toString(10) || cursor.prefix !== prefix
         || cursor.recursive !== (input.recursive === true)) {
         throw new ExtensionLibraryError("CONFLICT", "Library list cursor is stale.");
       }
@@ -491,7 +514,7 @@ export class ExtensionLibraryVault {
       entries,
       ...(nextOffset >= candidates.length ? {} : {
         nextCursor: encodeCursor({
-          revision: this.#usage.revision.toString(10),
+          revision: this.#usage.current.revision.toString(10),
           prefix,
           recursive: input.recursive === true,
           offset: nextOffset
@@ -589,7 +612,8 @@ export class ExtensionLibraryVault {
       assertPathSnapshot(source, sourceIdentity),
       assertPathSnapshot(target, targetIdentity)
     ]);
-    await rename(source, target);
+    if (sourceKind === "file" && input.overwrite !== true) await moveFileNoReplace(source, target, sourceIdentity);
+    else await rename(source, target);
     const after = await supportedEntrySnapshot(await this.#resolveExisting(to, sourceKind));
     if (!sameFilesystemObject(sourceIdentity, after) || await pathKind(source) !== "missing") {
       throw new ExtensionLibraryError("CONFLICT", "Library rename could not be identity-fenced into place.");
@@ -601,14 +625,18 @@ export class ExtensionLibraryVault {
 
   async reconcileUsage(): Promise<ExtensionLibraryUsage> {
     await this.#requireOpen();
+    await this.#assertRootIdentity();
+    this.#usage.needsReconcile = true;
     const tree = await scanTree(this.#root, this.#limits.maximumFiles);
-    this.#usage = {
+    await this.#assertRootIdentity();
+    this.#usage.current = {
       files: tree.files,
       bytes: tree.bytes,
-      revision: this.#usage.revision + 1n
+      revision: this.#usage.current.revision + 1n
     };
     await this.#persistUsage();
-    return { ...this.#usage };
+    this.#usage.needsReconcile = false;
+    return { ...this.#usage.current };
   }
 
   async snapshot(): Promise<TreeSnapshot> {
@@ -637,7 +665,7 @@ export class ExtensionLibraryVault {
     if (existing === "directory" || existing === "other") {
       throw new ExtensionLibraryError("PATH_INVALID", "Library database target is not a regular file.");
     }
-    if (existing === "missing" && this.#usage.files >= this.#limits.maximumFiles) {
+    if (existing === "missing" && this.#usage.current.files >= this.#limits.maximumFiles) {
       throw new ExtensionLibraryError("FILE_LIMIT", "Extension Library file-count fuse was exceeded.");
     }
     return target;
@@ -656,6 +684,10 @@ export class ExtensionLibraryVault {
     await this.#beforeFilesystemMutation(operation);
   }
 
+  async assertCurrentRoot(): Promise<void> {
+    await this.#assertRootIdentity();
+  }
+
   async allocateTemporaryPath(suffix: ".sqlite-backup" | ".stream"): Promise<string> {
     await this.#requireReady(true);
     const root = join(this.#hostRoot(), TEMP_DIRECTORY);
@@ -665,6 +697,7 @@ export class ExtensionLibraryVault {
 
   async commitStagedWrite(input: {
     readonly temporaryPath: string;
+    readonly temporaryIdentity?: BigIntStats;
     readonly path: string;
     readonly bytes: number;
     readonly sha256: string;
@@ -676,8 +709,10 @@ export class ExtensionLibraryVault {
       throw new ExtensionLibraryError("TOO_LARGE", "Library staged write metadata is invalid.");
     }
     const temporary = this.#assertOwnedTemporaryPath(input.temporaryPath, ".stream");
+    await assertSafeAncestry(this.#root, temporary, false);
     const before = await lstat(temporary, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink() || before.size !== BigInt(input.bytes)) {
+    if (!before.isFile() || before.isSymbolicLink() || before.size !== BigInt(input.bytes)
+      || input.temporaryIdentity !== undefined && !sameFilesystemObject(input.temporaryIdentity, before)) {
       throw new ExtensionLibraryError("CONFLICT", "Library staged write identity or size changed.");
     }
     if (await hashOpenFile(temporary, before) !== input.sha256) {
@@ -733,7 +768,7 @@ export class ExtensionLibraryVault {
     if (existing === "file" && input.ifNotExists) {
       throw new ExtensionLibraryError("ALREADY_EXISTS", "Library file already exists.");
     }
-    if (existing === "missing" && this.#usage.files >= this.#limits.maximumFiles) {
+    if (existing === "missing" && this.#usage.current.files >= this.#limits.maximumFiles) {
       throw new ExtensionLibraryError("FILE_LIMIT", "Extension Library file-count fuse was exceeded.");
     }
     const existingIdentity = existing === "file" ? await regularFileSnapshot(target) : undefined;
@@ -754,8 +789,18 @@ export class ExtensionLibraryVault {
     return { path: relativePath, bytes: input.bytes, sha256: input.sha256 };
   }
 
-  async discardTemporaryPath(temporaryPath: string, suffix: ".sqlite-backup" | ".stream"): Promise<void> {
+  async discardTemporaryPath(temporaryPath: string, suffix: ".sqlite-backup" | ".stream", expected?: BigIntStats): Promise<void> {
     const temporary = this.#assertOwnedTemporaryPath(temporaryPath, suffix);
+    await this.#assertRootIdentity();
+    await assertSafeAncestry(this.#root, temporary, true);
+    const current = await lstat(temporary, { bigint: true }).catch((error: unknown) => {
+      if (!isMissing(error)) throw error;
+      return undefined;
+    });
+    if (current === undefined) return;
+    if (!current.isFile() || current.isSymbolicLink() || expected !== undefined && !sameFilesystemObject(expected, current)) {
+      throw new ExtensionLibraryError("CONFLICT", "Library temporary file was replaced before cleanup.");
+    }
     await unlink(temporary).catch((error) => {
       if (!isMissing(error)) throw error;
     });
@@ -778,9 +823,9 @@ export class ExtensionLibraryVault {
     await mkdir(this.#hostRoot(), { recursive: true });
     await atomicJson(join(this.#hostRoot(), USAGE_FILE), {
       format: 1,
-      files: this.#usage.files,
-      bytes: this.#usage.bytes,
-      revision: this.#usage.revision.toString(10),
+      files: this.#usage.current.files,
+      bytes: this.#usage.current.bytes,
+      revision: this.#usage.current.revision.toString(10),
       updatedAt: this.#now()
     } satisfies StoredLibraryUsage);
   }
@@ -798,6 +843,7 @@ export class ExtensionLibraryVault {
       throw new ExtensionLibraryError("READ_ONLY", "Extension Library is temporarily read-only.");
     }
     await this.#assertRootIdentity();
+    if (this.#usage.needsReconcile) await this.reconcileUsage();
   }
 
   async #diskGate(incomingBytes: number): Promise<void> {
@@ -823,7 +869,7 @@ export class ExtensionLibraryVault {
       throw new ExtensionLibraryError("UNAVAILABLE", "Extension Library root moved through an alias.");
     }
     if (this.#rootIdentity === undefined) this.#rootIdentity = info;
-    else if (!sameFilesystemObject(this.#rootIdentity, info)) {
+    else if (!sameStatIdentity(this.#rootIdentity, info)) {
       throw new ExtensionLibraryError("UNAVAILABLE", "Extension Library root was replaced.");
     }
   }
@@ -877,7 +923,7 @@ export class ExtensionLibraryVault {
     return {
       state: "unavailable",
       ...(reason === undefined ? {} : { reason }),
-      usage: { ...this.#usage },
+      usage: { ...this.#usage.current },
       softLimitBytes: this.#limits.softLimitBytes,
       softLimitExceeded: false,
       orphaned: false
@@ -1144,17 +1190,25 @@ async function placeStagedFile(
   if (replacing) {
     await rename(temporary, target);
   } else {
-    try {
-      await link(temporary, target);
-    } catch (error) {
-      if (isAlreadyExists(error)) {
-        throw new ExtensionLibraryError("CONFLICT", "Library write target appeared concurrently.", { cause: error });
-      }
-      throw error;
-    }
-    await unlink(temporary);
+    await moveFileNoReplace(temporary, target, stagedIdentity);
   }
   await syncDirectory(dirname(target));
+}
+
+async function moveFileNoReplace(source: string, target: string, expected: BigIntStats): Promise<void> {
+  try {
+    await link(source, target);
+  } catch (error) {
+    if (isAlreadyExists(error)) {
+      throw new ExtensionLibraryError("CONFLICT", "Library destination appeared concurrently.", { cause: error });
+    }
+    throw error;
+  }
+  const [published, remaining] = await Promise.all([regularFileSnapshot(target), regularFileSnapshot(source)]);
+  if (!sameFilesystemObject(expected, remaining) || !sameFile(published, remaining)) {
+    throw new ExtensionLibraryError("CONFLICT", "Library file changed during the move.");
+  }
+  await unlink(source);
 }
 
 function validateMetadata(value: unknown, extensionId: string): StoredLibraryMetadata {
@@ -1235,7 +1289,11 @@ async function hashOpenFile(path: string, expected: BigIntStats): Promise<string
 }
 
 function sameFilesystemObject(left: BigIntStats, right: BigIntStats): boolean {
-  if (left.isFile() !== right.isFile() || left.isDirectory() !== right.isDirectory() || left.dev !== right.dev) return false;
+  return left.isFile() === right.isFile() && left.isDirectory() === right.isDirectory() && sameStatIdentity(left, right);
+}
+
+function sameStatIdentity(left: ExtensionLibraryRootStat, right: ExtensionLibraryRootStat): boolean {
+  if (left.dev !== right.dev) return false;
   if (left.ino !== 0n && right.ino !== 0n) return left.ino === right.ino;
   return left.ino === 0n && right.ino === 0n && left.birthtimeNs !== 0n && left.birthtimeNs === right.birthtimeNs;
 }

@@ -27,7 +27,8 @@ const roots: Root[] = [];
 const { fetchDocument } = vi.hoisted(() => ({ fetchDocument: vi.fn(async () => new Response("<!doctype html><p>private extension</p>", {
   headers: { "content-security-policy": "default-src 'none'; script-src data:" }
 })) }));
-vi.mock("@joko/connection-transport", () => ({ createConnectionFetch: () => fetchDocument }));
+vi.mock("@joko/connection-transport", async importOriginal => ({ ...await importOriginal<typeof import("@joko/connection-transport")>(),
+  createConnectionFetch: () => fetchDocument }));
 
 beforeAll(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -153,6 +154,40 @@ describe("Extension main view", () => {
     await act(async () => receipt.resolve({ state: "succeeded" })); await settle();
     expect(rendered.container.textContent).not.toContain("extensions.settingsOperationSucceeded"); expect(rendered.container.textContent).not.toContain("extensions.settingsOperationPending");
     expect(api.call).not.toHaveBeenCalled();
+  });
+
+  it("resumes the original settings document when its retained routing conflict is confirmed", async () => {
+    const extension = { ...readyExtension(EXTENSION_A, "Settings"), settings: { height: 480, mobileCustom: false } };
+    const surface = { ...mainViewSurface(extension), purpose: "settings" as const };
+    const profile = { id: "profile", serverId: "node", deviceId: "device", name: "Original", origin: "https://orchestrator.example/" };
+    const original = parsePendingExtensionSettingsOperation({ operationId: "11111111-1111-4111-8111-111111111111", kind: "setExtensionSettingsRoutingData",
+      extensionId: extension.id, resourceId: "resource-original", resourceRevision: "4", expectedRevision: "7", discoveredRevision: `sha256:${"a".repeat(64)}`,
+      profile: extensionSettingsProfilePin(profile) });
+    let retained: typeof original | undefined;
+    const call = vi.fn<ExtensionSettingsApi["call"]>(async (_surface, command) => {
+      if (command.kind === "routing.set") { retained = original; throw new ConnectError("Routing revision changed", Code.Aborted); }
+      return { revision: "2", dataJson: '{"from":"other settings page"}' };
+    });
+    const api = { open: vi.fn(async () => surface), close: vi.fn(async () => true), call, pending: vi.fn(async () => retained),
+      checkOriginal: vi.fn<NonNullable<ExtensionSettingsApi["checkOriginal"]>>(async () => { retained = undefined; return { state: "failed" }; }) };
+    const controller = controllerFor({ state: { activeProfile: profile, connectionGeneration: 1 } as AppController["state"],
+      getExtension: vi.fn(async () => catalog(extension)), extensionSettingsApi: () => api, getExtensionMainViewSurface: vi.fn(async () => surface) });
+    const rendered = await renderMainView(controller, EXTENSION_A, true), frame = required(rendered.container.querySelector<HTMLIFrameElement>("iframe"));
+    const post = vi.spyOn(required(frame.contentWindow), "postMessage").mockImplementation(() => undefined);
+
+    await act(async () => dispatchSettings(frame, "routing-write", { kind: "routing.set", revision: "1", dataJson: "{}" }));
+    await settle();
+    await act(async () => dispatchSettings(frame, "before-confirmation", { kind: "routing.get" }));
+    expect(call).toHaveBeenCalledOnce();
+    const check = required([...rendered.container.querySelectorAll("button")].find(button => button.textContent === "extensions.settingsOperationCheck"));
+    await act(async () => check.click());
+    expect(api.checkOriginal).toHaveBeenCalledExactlyOnceWith(original, expect.any(AbortSignal));
+    expect(rendered.container.textContent).toContain("extensions.settingsOperationFailed");
+    await act(async () => dispatchSettings(frame, "after-confirmation", { kind: "routing.get" }));
+    await settle();
+    expect(call.mock.calls.map(args => args[1].kind)).toEqual(["routing.set", "routing.get"]);
+    expect(postedResponse(post, "after-confirmation")).toMatchObject({ ok: true, result: { revision: "2", dataJson: '{"from":"other settings page"}' } });
+    expect(rendered.container.querySelector("iframe")).toBe(frame);
   });
 
   it("refreshes the native receipt control when reloading retires a settings document with an in-flight effect", async () => {

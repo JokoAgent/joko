@@ -1,4 +1,5 @@
 import { OperationState, type Operation } from "@joko/contracts";
+import { extensionSettingsReadOnly } from "@joko/connection-transport";
 import type { ConnectionProfile, ExtensionCatalogEntryView, ExtensionSettingsApi } from "./model.js";
 
 export const extensionSettingsOperationKinds = ["setExtensionSettingsRoutingData", "clearExtensionSetupCredential", "pickExtensionDirectory",
@@ -79,8 +80,6 @@ export function extensionSettingsOperationReceipt(record: PendingExtensionSettin
   return { state: operation.state === OperationState.SUCCEEDED ? "succeeded"
     : [OperationState.FAILED, OperationState.CONFLICT, OperationState.CANCELLED].includes(operation.state) ? "failed" : "pending" };
 }
-
-export const extensionSettingsReadOnly = (kind: string): boolean => ["context.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(kind);
 
 interface OperationJournal {
   readExtensionSettingsOperation(profile: ConnectionProfile, extensionId: string): Promise<PendingExtensionSettingsOperation | undefined>;
