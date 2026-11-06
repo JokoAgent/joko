@@ -1908,7 +1908,7 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
           seq: number;
         };
         expect(secondControl.seq).toBeGreaterThan(firstControl.seq);
-        const approved = await managedStoreRequest(fixture, bridge.authority, {
+        const approvalRequest = {
           operation: "write-control",
           sessionId: fixture.productSessionId,
           runId: runner.runId,
@@ -1928,17 +1928,51 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
             childId: "remote-child-id",
             action: "approval",
             approvalId: "approval-test",
-            confirmed: true,
             requestedAt: Date.now()
           }
+        };
+        const approved = await managedStoreRequest(fixture, bridge.authority, {
+          ...approvalRequest,
+          value: { ...approvalRequest.value, confirmed: true }
         });
         expect(approved["controlRevision"]).not.toBe(controlledAgain["controlRevision"]);
-        expect(JSON.parse(await readFile(join(runner.runDirectory, "approval-control.json"), "utf8")))
-          .toMatchObject({ action: "approval", approvalId: "approval-test" });
+        const approvalPath = join(runner.runDirectory, "approval-control.json");
+        expect(JSON.parse(await readFile(approvalPath, "utf8"))).toMatchObject({ action: "approval", approvalId: "approval-test" });
+        const value = JSON.stringify({ decision: "default", ownerUserInstructions: [`主人😀${"\u0001".repeat(15_996)}`] });
+        await managedStoreRejected(fixture, bridge.authority, {
+          ...approvalRequest, expectedControlRevision: approved["controlRevision"], value: { ...approvalRequest.value, value }
+        });
         const staleStatusPath = join(runner.runDirectory, "status.json");
         const freshStatus = JSON.parse(await readFile(staleStatusPath, "utf8")) as Record<string, unknown>;
+        const approvalId = "policy-approval-test";
+        const title = `joko:policy-decision/v1/${Buffer.from(JSON.stringify({
+          format: 1, policyGeneration: 1, subjectKind: "command", risk: "medium", toolName: "bash"
+        })).toString("base64url")}`;
+        const policyStatus = {
+          ...freshStatus, heartbeatAt: Date.now(), pendingApproval: { id: approvalId, childId: "remote-child-id", method: "input", title }
+        };
+        await writeFile(staleStatusPath, JSON.stringify(policyStatus), { mode: 0o600 });
+        const pendingPolicy = await managedStoreRequest(fixture, bridge.authority, {
+          operation: "scan", sessionId: fixture.productSessionId, sessionKey, limitBytes: 1024 * 1024
+        });
+        const pendingRuns = pendingPolicy["runs"] as Array<Record<string, unknown>>;
+        const policyRequest = {
+          ...approvalRequest, expectedControlRevision: pendingRuns[0]?.["controlRevision"],
+          value: { ...approvalRequest.value, requestId: randomUUID(), approvalId, value }
+        };
+        const policyApproved = await managedStoreRequest(fixture, bridge.authority, policyRequest);
+        const firstPolicyContent = await readFile(approvalPath, "utf8");
+        expect(Buffer.byteLength(firstPolicyContent)).toBeGreaterThan(64 * 1024);
+        const firstPolicyControl = JSON.parse(firstPolicyContent) as { seq: number };
+        expect(firstPolicyControl).toMatchObject(policyRequest.value);
+        const retried = await managedStoreRequest(fixture, bridge.authority, {
+          ...policyRequest, expectedControlRevision: policyApproved["controlRevision"]
+        });
+        const replayed = JSON.parse(await readFile(approvalPath, "utf8")) as { seq: number };
+        expect(replayed).toMatchObject(policyRequest.value);
+        expect(replayed.seq).toBeGreaterThan(firstPolicyControl.seq);
         await writeFile(staleStatusPath, `${JSON.stringify({
-          ...freshStatus,
+          ...policyStatus,
           heartbeatAt: Date.now() - 60_000
         })}\n`, { mode: 0o600 });
         await managedStoreRejected(fixture, bridge.authority, {
@@ -1948,7 +1982,7 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
           runnerInstanceId: runner.runnerFence,
           launchToken: runner.launchToken,
           runnerScriptSha256: fixture.trustedRunnerScriptSha256,
-          expectedControlRevision: approved["controlRevision"],
+          expectedControlRevision: retried["controlRevision"],
           kind: "control",
           value: {
             format: 1,
@@ -1963,7 +1997,7 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
           }
         });
         await writeFile(staleStatusPath, `${JSON.stringify({
-          ...freshStatus,
+          ...policyStatus,
           heartbeatAt: Date.now()
         })}\n`, { mode: 0o600 });
 

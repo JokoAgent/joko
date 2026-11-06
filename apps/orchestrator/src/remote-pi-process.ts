@@ -20,6 +20,7 @@ import { StringDecoder } from "node:string_decoder";
 
 import {
   MANAGED_SUBAGENT_NODE_ENV,
+  MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS,
   MANAGED_SUBAGENT_PRODUCT_SESSION_ENV,
   MANAGED_SUBAGENT_RUNNER_FILE_NAME,
   type PiManagedDurableRunSnapshot,
@@ -967,11 +968,12 @@ class RemotePiManagedDurableStore implements PiManagedDurableStore {
     readonly value: Readonly<Record<string, unknown>>;
   }): Promise<{ readonly controlRevision: string; readonly receipt: string }> {
     this.#assertSession(input.sessionId);
-    if (!isPlainRecord(input.value) || Buffer.byteLength(JSON.stringify(input.value), "utf8") > 64 * 1024) {
-      throw new Error("Remote managed durable store control value is invalid.");
-    }
     if (input.kind !== "control" && input.kind !== "approval") {
       throw new Error("Remote managed durable store control kind is invalid.");
+    }
+    const maximumBytes = input.kind === "approval" ? MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.controlFileBytes : 64 * 1024;
+    if (!isPlainRecord(input.value) || Buffer.byteLength(JSON.stringify(input.value), "utf8") > maximumBytes) {
+      throw new Error("Remote managed durable store control value is invalid.");
     }
     const response = await this.#request({
       operation: "write-control",
