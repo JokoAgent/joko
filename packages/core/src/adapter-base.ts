@@ -31,7 +31,7 @@ import type {
 export abstract class CapabilityDrivenBackendAdapter implements BackendAdapter {
   abstract readonly id: string;
   abstract describe(): Promise<BackendDescriptor>;
-  abstract validateTarget(target: TargetDescriptor): Promise<void>;
+  abstract validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void>;
   abstract createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding>;
   abstract resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
   abstract inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;

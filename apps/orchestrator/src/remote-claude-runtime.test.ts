@@ -45,6 +45,23 @@ afterEach(async () => {
 });
 
 describe("RemoteClaudeRuntimeResolver", () => {
+  it.each([false, true])("validates a prepared target before registry adoption (Device peer=%s)", async devicePeerWin32 => {
+    const fixture = createFixture({ devicePeerWin32 });
+    cleanups.push(() => fixture.resolver.close());
+    const target = { ...fixture.target, id: "prepared-target", trusted: false };
+    let current = true;
+    const assertCurrent = () => { if (!current) throw new Error("Prepared authority retired"); };
+    await expect(fixture.resolver.validateRegistration(target, assertCurrent)).resolves.toBeUndefined();
+    expect(fixture.readTarget).not.toHaveBeenCalled();
+    expect(fixture.capture).toHaveBeenCalledExactlyOnceWith(target.remoteWorkspace, undefined);
+    expect(fixture.processes.requests).toHaveLength(devicePeerWin32 ? 0 : 1);
+    expect(fixture.processes.frames).toEqual([]);
+    current = false;
+    await expect(fixture.resolver.validateRegistration(target, assertCurrent)).rejects.toThrow("Prepared authority retired");
+    expect(fixture.capture).toHaveBeenCalledOnce();
+    await expect(fixture.resolver.resolve(target)).rejects.toThrow();
+  });
+
   it("keeps standard MCP frames on the original Query connection and retires them before reconnect", async () => {
     const fixture = createFixture(); cleanups.push(() => fixture.resolver.close());
     const binding = await fixture.resolver.resolve(fixture.target);
@@ -843,9 +860,10 @@ function createFixture(options: FixtureOptions = {}) {
     assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); },
     assertForwardingCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH forwarding authority changed"); }
   }));
+  const readTarget = vi.fn(() => fixture.stored);
   const resolver = new RemoteClaudeRuntimeResolver({
     storeGeneration: options.storeGeneration ?? 7,
-    store: { getTarget: () => fixture.stored },
+    store: { getTarget: readTarget },
     remoteExecution: { processes: fixture.capture } as unknown as Pick<RemoteExecutionRouter, "processes">,
     authorizeDerivedWorkspace: async () => {
       if (options.rejectDerivedAuthorization === true) throw new Error("Remote checkout is not owned");
@@ -855,7 +873,7 @@ function createFixture(options: FixtureOptions = {}) {
       };
     }
   });
-  return Object.assign(fixture, { resolver });
+  return Object.assign(fixture, { resolver, readTarget });
 }
 
 class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {

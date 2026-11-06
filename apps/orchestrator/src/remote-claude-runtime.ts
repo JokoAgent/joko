@@ -144,6 +144,12 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     this.#authorizeDerivedWorkspace = options.authorizeDerivedWorkspace;
   }
 
+  async validateRegistration(target: TargetDescriptor, assertCurrent: () => void): Promise<void> {
+    this.#assertOpen();
+    assertCurrent();
+    await this.#probeInstallation(requireRemoteBinding(target), undefined, assertCurrent);
+  }
+
   async resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<ClaudeTargetRuntime> {
     this.#assertOpen();
     if (signal?.aborted) throw runtimeFault("cancelled", false);
@@ -208,15 +214,8 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     signal?: AbortSignal
   ): Promise<ClaudeTargetRuntime> {
     const remote = requireRemoteBinding(stored.descriptor);
-    const authority = await this.#remoteExecution.processes(remote, signal);
+    const { authority, installation } = await this.#probeInstallation(remote, signal);
     const processes = authority.processes;
-    authority.assertCurrent();
-    const installation = authority.kind === "device_peer"
-      ? await devicePeerClaudeInstallation(remote.workspaceRoot, authority.pathStyle)
-      : await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, authority.assertCurrent, signal);
-    authority.assertCurrent();
-    if (installation.state !== "ready") throw runtimeFault("runtime_unavailable", false);
-    if (installation.workspaceRoot !== remote.workspaceRoot) throw runtimeFault("workspace_alias", false);
     const ownerKey = createHash("sha256").update(JSON.stringify({
       kind: "joko-remote-claude-owner-v1",
       targetId: target.id,
@@ -298,6 +297,24 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       await this.#retire(entry).catch(() => undefined);
       throw error;
     }
+  }
+
+  async #probeInstallation(remote: RemoteWorkspaceBinding, signal?: AbortSignal, assertPrepared?: () => void) {
+    const authority = await this.#remoteExecution.processes(remote, signal);
+    const assertCurrent = (): void => {
+      this.#assertOpen();
+      assertPrepared?.();
+      authority.assertCurrent();
+      signal?.throwIfAborted();
+    };
+    assertCurrent();
+    const installation = authority.kind === "device_peer"
+      ? await devicePeerClaudeInstallation(remote.workspaceRoot, authority.pathStyle)
+      : await probeRemoteClaudeInstallation(authority.processes, remote.workspaceRoot, assertCurrent, signal);
+    assertCurrent();
+    if (installation.state !== "ready") throw runtimeFault("runtime_unavailable", false);
+    if (installation.workspaceRoot !== remote.workspaceRoot) throw runtimeFault("workspace_alias", false);
+    return { authority, installation };
   }
 
   async #retire(entry: ResolverEntry): Promise<void> {

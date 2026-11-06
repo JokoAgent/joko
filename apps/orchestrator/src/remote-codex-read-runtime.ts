@@ -72,6 +72,15 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     this.#nativeSkills = options.nativeSkillJournalRoot === undefined ? undefined : new RemoteNativeSkillOwner({ journalRoot: options.nativeSkillJournalRoot });
   }
 
+  async validateRegistration(target: TargetDescriptor, assertCurrent: () => void): Promise<void> {
+    this.#assertOpen();
+    assertCurrent();
+    const binding = requireRemoteBinding(target);
+    const authority = await this.#remoteExecution.processes(binding);
+    const installation = await this.#probeInstallation(binding, authority, undefined, assertCurrent);
+    if (installation.workspaceRoot !== binding.workspaceRoot) throw remoteRuntimeFault("The prepared remote Codex project is not canonical.");
+  }
+
   async resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteRuntime> {
     this.#assertOpen();
     if (signal?.aborted) throw remoteRuntimeFault("The remote Codex runtime lookup was cancelled.");
@@ -143,18 +152,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       ? await this.#remoteExecution.processes(binding, signal)
       : Object.freeze({ ...skillAuthority, kind: "ssh" as const, binding, pathStyle: "posix" as const });
     const processes = authority.processes;
-    authority.assertCurrent();
-    const targetPaths = remotePaths(authority.pathStyle);
-    const installation = authority.kind === "device_peer"
-      ? Object.freeze({
-          state: "ready" as const,
-          workspaceRoot: binding.workspaceRoot,
-          profileRoot: targetPaths.join(binding.workspaceRoot, ".joko", "runtime", "v1", "codex-home"),
-          executable: DEVICE_PEER_RUNTIME_EXECUTABLES.codex
-        })
-      : await probeRemoteCodexInstallation(processes, binding.workspaceRoot, authority.assertCurrent, signal);
-    authority.assertCurrent();
-    if (installation.state !== "ready") throw remoteRuntimeFault("The fixed remote Codex runtime is unavailable.");
+    const installation = await this.#probeInstallation(binding, authority, signal);
     if (skillAuthority !== undefined && skillAuthority.registration.root !== installation.workspaceRoot) throw remoteRuntimeFault("The registered remote Skill workspace is not canonical.");
     if (signal?.aborted) throw remoteRuntimeFault("The remote Codex runtime lookup was cancelled.");
     const executionDomain = executionDomainFor(authority.executionIdentity, installation.profileRoot);
@@ -242,6 +240,27 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       await this.#retire(entry, true);
       throw error;
     }
+  }
+
+  async #probeInstallation(binding: RemoteWorkspaceBinding, authority: RemoteProcessAuthority, signal?: AbortSignal, assertPrepared?: () => void) {
+    const assertCurrent = (): void => {
+      this.#assertOpen();
+      assertPrepared?.();
+      authority.assertCurrent();
+      signal?.throwIfAborted();
+    };
+    assertCurrent();
+    const installation = authority.kind === "device_peer"
+      ? Object.freeze({
+          state: "ready" as const,
+          workspaceRoot: binding.workspaceRoot,
+          profileRoot: remotePaths(authority.pathStyle).join(binding.workspaceRoot, ".joko", "runtime", "v1", "codex-home"),
+          executable: DEVICE_PEER_RUNTIME_EXECUTABLES.codex
+        })
+      : await probeRemoteCodexInstallation(authority.processes, binding.workspaceRoot, assertCurrent, signal);
+    assertCurrent();
+    if (installation.state !== "ready") throw remoteRuntimeFault("The fixed remote Codex runtime is unavailable.");
+    return installation;
   }
 
   async #retire(entry: ResolverEntry, force: boolean): Promise<void> {

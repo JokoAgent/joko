@@ -508,6 +508,7 @@ export interface ClaudeTargetRuntime {
 export interface ClaudeRemoteRuntimePort {
   /** The resolver composes a route-owned durable context and native consumption fence. */
   readonly supportsFreshContexts?: boolean;
+  validateRegistration?(target: TargetDescriptor, assertCurrent: () => void): Promise<void>;
   resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<ClaudeTargetRuntime>;
   close(): Promise<void>;
 }

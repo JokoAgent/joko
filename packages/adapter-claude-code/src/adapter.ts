@@ -1242,7 +1242,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     return (await this.describe()).models;
   }
 
-  override async validateTarget(target: TargetDescriptor): Promise<void> {
+  override async validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void> {
     if (target.backendId !== this.id) {
       throw claudeCodeError("TARGET_BACKEND_MISMATCH", "The Target belongs to a different Backend.", "target", {
         recovery: "Select a Target owned by the Claude Code Backend."
@@ -1258,6 +1258,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (!normalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)) {
         await validateCanonicalDirectory(target.workspaceRoot, "Target fallback workspace");
       }
+    }
+    if (assertPreparedRemoteCurrent !== undefined) {
+      if (!this.#remoteRuntimes?.validateRegistration) {
+        throw claudeCodeError("REMOTE_RUNTIME_UNAVAILABLE", "The remote Claude Code runtime is unavailable.", "target",
+          { retryable: true, recovery: "Install the fixed remote runtime for this project, then retry." });
+      }
+      await this.#remoteRuntimes.validateRegistration(target, assertPreparedRemoteCurrent);
+      return;
     }
     const scoped = await this.#targetRuntime(target);
     scoped.assertCurrent();

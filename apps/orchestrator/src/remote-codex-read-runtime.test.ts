@@ -23,6 +23,24 @@ afterEach(async () => {
 });
 
 describe("RemoteCodexRuntimeResolver", () => {
+  it.each([false, true])("preflights a prepared target without stored runtime authority (Device peer=%s)", async peerWin32 => {
+    const fixture = createFixture({ peerWin32 });
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const binding = fixture.target.remoteWorkspace!;
+    const target = { ...fixture.target, id: "prepared-target", trusted: false,
+      remoteWorkspace: { ...binding, workspaceRoot: peerWin32 ? binding.workspaceRoot : "/srv/project-real" } };
+    let current = true;
+    const assertCurrent = () => { if (!current) throw new Error("Prepared authority retired"); };
+    await expect(fixture.resolver.validateRegistration(target, assertCurrent)).resolves.toBeUndefined();
+    expect(fixture.readTarget).not.toHaveBeenCalled();
+    expect(fixture.capture).toHaveBeenCalledExactlyOnceWith(target.remoteWorkspace);
+    expect(fixture.processes.requests).toHaveLength(peerWin32 ? 0 : 1);
+    current = false;
+    await expect(fixture.resolver.validateRegistration(target, assertCurrent)).rejects.toThrow("Prepared authority retired");
+    expect(fixture.capture).toHaveBeenCalledOnce();
+    await expect(fixture.resolver.resolve(target)).rejects.toThrow();
+  });
+
   it.each([{ label: "SSH", options: {} as FixtureOptions }, { label: "Device", options: { peerWin32: true } as FixtureOptions }])(
     "opens the exact audited $label exec-server on its captured transport and rejects a retired authority", async ({ options }) => {
       const fixture = createFixture(options);
@@ -341,12 +359,13 @@ function createFixture(options: FixtureOptions) {
     assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); },
     assertForwardingCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH forwarding authority changed"); }
   }));
+  const readTarget = vi.fn(() => fixture.stored);
   const resolver = new RemoteCodexRuntimeResolver({
-    store: { getTarget: () => fixture.stored },
+    store: { getTarget: readTarget },
     remoteExecution: { processes: fixture.capture } as unknown as Pick<RemoteExecutionRouter, "processes">,
     ...(options.mcpBridge === undefined ? {} : { mcpBridge: options.mcpBridge })
   });
-  return Object.assign(fixture, { resolver });
+  return Object.assign(fixture, { resolver, readTarget });
 }
 
 class FakeRemoteProcesses implements RemoteProcessTransportPort {

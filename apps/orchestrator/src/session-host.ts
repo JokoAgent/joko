@@ -1562,14 +1562,19 @@ export class SessionHost {
   }
 
   /** Validate adapter ownership and workspace safety without mutating product state. */
-  async validateTarget(target: TargetDescriptor): Promise<void> {
+  async validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void> {
     this.#assertOpen();
     const adapter = this.requireAdapter(target.backendId);
     const generation = this.requireAdapterGeneration(target.backendId, adapter);
     const release = this.beginBackendAdmissionEffect(target.backendId);
     try {
       this.assertCurrentAdapterGeneration(target.backendId, adapter, generation);
-      await adapter.validateTarget(target);
+      if (assertPreparedRemoteCurrent === undefined) await adapter.validateTarget(target);
+      else {
+        assertPreparedRemoteCurrent();
+        await adapter.validateTarget(target, assertPreparedRemoteCurrent);
+        assertPreparedRemoteCurrent();
+      }
       this.assertCurrentAdapterGeneration(target.backendId, adapter, generation);
     } finally {
       release();
