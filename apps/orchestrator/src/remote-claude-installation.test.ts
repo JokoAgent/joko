@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import type { RemoteProcessHandle, RemoteProcessStartRequest, RemoteProcessTransportPort } from "@joko/remote-ssh";
+import { OperationalStore } from "@joko/store";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -12,8 +13,38 @@ import {
   probeRemoteClaudeInstallation,
   uninstallRemoteClaude
 } from "./remote-claude-installation.js";
+import { RemoteClaudeWorktreeOwner } from "./remote-claude-worktree-owner.js";
 
 describe("remote Claude installation", () => {
+  it.each([3, 4])("withholds the remote checkout request when the original connection is revoked at process %s", async retireAt => {
+    const store = new OperationalStore(":memory:");
+    try {
+      const owner = store.createConnection({ id: "checkout-owner", name: "Owner", authKeyDigest: "checkout-digest" });
+      store.upsertBackend({ id: "claude-fixture", adapterKind: "claude_code", displayName: "Claude", version: "1", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+      const remote = { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
+      const target = store.upsertTarget({ id: "remote-target", backendId: "claude-fixture", displayName: "Remote project",
+        workspaceRoot: process.cwd(), managed: true, trusted: true, remoteWorkspace: remote });
+      const ready = probeOutput("ready", { workspace: remote.workspaceRoot });
+      const processes = new ScriptedProcesses([ready, { stdout: JSON.stringify({ format: 1, status: "source", repositoryRoot: "/srv/project",
+        sourceCommit: "a".repeat(40), sourceSnapshot: `sha256:${"b".repeat(64)}` }), exitCode: 0 }, ready, { stdout: "", exitCode: 0 }]);
+      const remoteOwner = new RemoteClaudeWorktreeOwner({ store, remoteExecution: { processes: async binding => ({
+        kind: "ssh", binding, executionIdentity: "ssh-checkout-fixture", authorityIdentity: "ssh-checkout-owner", pathStyle: "posix",
+        assertCurrent() {}, assertForwardingCurrent() {}, processes: { open: async request => {
+          const handle = await processes.open(request);
+          if (processes.requests.length === retireAt) store.revokeConnection(owner.id);
+          return handle;
+        } }
+      }) } });
+      const plan = await remoteOwner.plan({ target, sessionId: "child", sourceSessionId: "parent", workspaceId: "worktree-child", sourceCwd: remote.workspaceRoot });
+      expect(plan?.format).toBe(1);
+      await expect(remoteOwner.derive(plan!, undefined, () => { store.authorizeConnection(owner.id, owner.authKeyDigest); }))
+        .rejects.toMatchObject({ code: "AUTHORITY_CHANGED", stateMayHaveChanged: false });
+      expect(processes.requests).toHaveLength(retireAt);
+      expect(processes.inputs.filter(input => input.includes('"operation":"derive"'))).toEqual([]);
+    } finally { store.close(); }
+  });
+
   it("admits only the exact Joko-owned Node, SDK, CLI, manager, and canonical workspace", async () => {
     const processes = new ScriptedProcesses([probeOutput("ready")]);
     await expect(probeRemoteClaudeInstallation(processes, "/srv/project", () => undefined)).resolves.toMatchObject({

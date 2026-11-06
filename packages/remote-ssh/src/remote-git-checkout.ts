@@ -69,6 +69,11 @@ export class RemoteGitCheckoutError extends Error {
   }
 }
 
+/** The transport refused the checkout request before sending any helper input. */
+export class RemoteGitCheckoutDispatchDeniedError extends RemoteGitCheckoutError {
+  constructor() { super("AUTHORITY_CHANGED"); }
+}
+
 export interface RemoteGitCheckoutServiceOptions {
   /** Canonical absolute native root owned by this service, separate from source repositories. */
   readonly storageRoot: string;
@@ -287,7 +292,8 @@ export class RemoteGitCheckoutService {
         timeoutMs: 120_000,
         ...(signal === undefined ? {} : { signal })
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof RemoteGitCheckoutDispatchDeniedError) throw error;
       throw new RemoteGitCheckoutError(mutating ? "OUTCOME_UNKNOWN" : "UNAVAILABLE", mutating);
     }
     try {

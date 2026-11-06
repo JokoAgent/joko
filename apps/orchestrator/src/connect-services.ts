@@ -17175,7 +17175,9 @@ async function dispatchMutation(
                 if (dependencies.sessionWorktrees === undefined) {
                   throw new ConnectError("Isolated workspace lifecycle is unavailable.", Code.FailedPrecondition);
                 }
-                await dependencies.sessionWorktrees.restore(payload.value.sessionId);
+                await dependencies.sessionWorktrees.restore(payload.value.sessionId, {
+                  assertCurrent: () => { dependencies.connections.fence(connection); }
+                });
               }
             : undefined
         );
@@ -17699,7 +17701,9 @@ async function dispatchMutation(
           effect: async () => {
             host.assertArchivedSessionSendRestorable(payload.value.sessionId);
             if (dependencies.sessionWorktrees === undefined) throw new ConnectError("Isolated workspace lifecycle is unavailable.", Code.FailedPrecondition);
-            await dependencies.sessionWorktrees.restore(payload.value.sessionId);
+            await dependencies.sessionWorktrees.restore(payload.value.sessionId, {
+              assertCurrent: () => { dependencies.connections.fence(connection); }
+            });
           }
         } : {}),
         commit: (store) => {

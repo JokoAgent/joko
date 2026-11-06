@@ -8,6 +8,7 @@ export class WorktreeOperationControl {
   readonly signal: AbortSignal | undefined;
   readonly #deadline: number;
   readonly #now: () => number;
+  readonly #assertCurrent: (() => void) | undefined;
 
   constructor(
     options: WorktreeCallOptions | undefined,
@@ -15,6 +16,7 @@ export class WorktreeOperationControl {
     now: () => number = Date.now
   ) {
     this.signal = options?.signal;
+    this.#assertCurrent = options?.assertCurrent;
     this.#now = now;
     const timeoutMs = validateWorktreeTimeout(options?.timeoutMs ?? defaultTimeoutMs, "timeoutMs");
     this.#deadline = now() + timeoutMs;
@@ -27,6 +29,7 @@ export class WorktreeOperationControl {
     if (this.#now() >= this.#deadline) {
       throw new WorktreeServiceError("OPERATION_TIMEOUT", "The worktree operation exceeded its deadline.");
     }
+    this.#assertCurrent?.();
   }
 
   remaining(maximumMs: number): number {

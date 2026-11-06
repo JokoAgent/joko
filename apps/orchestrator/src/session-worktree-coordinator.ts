@@ -393,16 +393,20 @@ export class SessionWorktreeCoordinator {
     });
   }
 
-  async acquirePlannedRemoteDerivation(plan: RemoteGitCheckoutPlan): Promise<SessionWorktreeBinding> {
+  async acquirePlannedRemoteDerivation(plan: RemoteGitCheckoutPlan, assertCurrent?: () => void): Promise<SessionWorktreeBinding> {
     this.#requireInitialized();
     this.#assertDurableRemotePlan(plan);
-    const lease = await this.#requireRemoteOwner().derive(plan);
+    assertCurrent?.();
+    const lease = await this.#requireRemoteOwner().derive(plan, undefined, assertCurrent);
     const binding = remoteBindingFromLease(plan.workspaceId, lease);
     if (!remoteBindingMatchesPlan(binding, plan)) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
     const target = this.#store.getTarget(plan.authority.targetId);
+    assertCurrent?.();
     await this.#registerRemoteWorkspace(target, binding, `${target.descriptor.displayName} · ${binding.branch}`);
+    try { assertCurrent?.(); }
+    catch (error) { this.#workspaces.unregister(binding.workspaceId); throw error; }
     this.#activeBindings.set(plan.sessionId, binding);
     return binding;
   }
@@ -906,24 +910,40 @@ export class SessionWorktreeCoordinator {
     if (binding.state !== "preserved") this.#store.updateSessionWorktreeState(sessionId, "preserved");
   }
 
-  async restore(sessionId: string): Promise<void> {
+  async restore(sessionId: string, options?: WorktreeCallOptions): Promise<void> {
     this.#requireInitialized();
     const session = this.#store.getSession(sessionId);
     const binding = session.descriptor.worktree;
     if (binding === undefined) return;
     if (binding.remote !== undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    const target = this.#store.getTarget(session.descriptor.targetId);
+    const assertCurrent = (): void => {
+      options?.assertCurrent?.();
+      const current = this.#store.getSession(sessionId).descriptor;
+      if (current.archived !== session.descriptor.archived || current.deletedAt !== session.descriptor.deletedAt
+        || current.binding.generation !== session.descriptor.binding.generation
+        || current.targetId !== target.descriptor.id || this.#store.getTarget(current.targetId).revision !== target.revision
+        || current.worktree === undefined || !samePersistedBinding(current.worktree, binding)) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
+    };
     const result = await this.#service.acquire({
       sessionId,
       cwd: binding.repositoryRoot
-    });
-    if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
+    }, { ...options, assertCurrent });
+    if (!result.ok) {
+      assertCurrent();
+      throw new SessionWorktreeCoordinatorError(result.error.code);
+    }
     const lease = result.value.lease;
     if (!sameLease(lease, { ...binding, state: "active" })) {
       await this.#service.release(sessionId, { retainForRestore: true }).catch(() => undefined);
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
     try {
+      assertCurrent();
       await this.#registerWorkspace(session, { ...binding, state: "active" });
+      assertCurrent();
       if (binding.state !== "active") this.#store.updateSessionWorktreeState(sessionId, "active");
       this.#activeBindings.set(sessionId, this.#store.getSession(sessionId).descriptor.worktree!);
     } catch (error) {

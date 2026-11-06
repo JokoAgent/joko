@@ -3,6 +3,7 @@ import { posix, win32 } from "node:path";
 import type { SessionWorktreeBinding } from "@joko/core";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import {
+  RemoteGitCheckoutDispatchDeniedError,
   RemoteGitCheckoutError,
   RemoteGitCheckoutService,
   type RemoteGitCheckoutAuthority,
@@ -59,8 +60,8 @@ export class RemoteClaudeWorktreeOwner {
     }
   }
 
-  async derive(plan: RemoteGitCheckoutPlan, signal?: AbortSignal): Promise<RemoteGitCheckoutLease> {
-    const captured = await this.#captureFor(plan.remote, signal);
+  async derive(plan: RemoteGitCheckoutPlan, signal?: AbortSignal, assertEffectCurrent?: () => void): Promise<RemoteGitCheckoutLease> {
+    const captured = await this.#captureFor(plan.remote, signal, assertEffectCurrent);
     return captured.service.derive(plan, signal);
   }
 
@@ -84,10 +85,11 @@ export class RemoteClaudeWorktreeOwner {
 
   async #captureFor(
     expected: RemoteGitCheckoutAuthority & { readonly manifestId: string },
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    assertEffectCurrent?: () => void
   ): Promise<{ readonly authority: RemoteGitCheckoutAuthority; readonly service: RemoteGitCheckoutService }> {
     const target = this.#store.getTarget(expected.targetId);
-    const captured = await this.#capture(target, signal);
+    const captured = await this.#capture(target, signal, assertEffectCurrent);
     if (!sameStableAuthority(captured.authority, expected)
       || captured.authority.targetRevision !== expected.targetRevision) {
       throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
@@ -97,7 +99,8 @@ export class RemoteClaudeWorktreeOwner {
 
   async #capture(
     target: StoredTarget,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    assertEffectCurrent?: () => void
   ): Promise<{ readonly authority: RemoteGitCheckoutAuthority; readonly service: RemoteGitCheckoutService }> {
     const remote = target.descriptor.remoteWorkspace;
     if (remote === undefined || !target.descriptor.trusted || !target.descriptor.managed) {
@@ -146,7 +149,12 @@ export class RemoteClaudeWorktreeOwner {
       },
       execute: async (options) => {
         assertCurrent();
-        const outcome = await executeRemoteProcess(processes, remote.workspaceRoot, options);
+        const assertDispatch = assertEffectCurrent === undefined ? undefined : () => {
+          try { assertCurrent(); assertEffectCurrent(); }
+          catch { throw new RemoteGitCheckoutDispatchDeniedError(); }
+        };
+        assertDispatch?.();
+        const outcome = await executeRemoteProcess(processes, remote.workspaceRoot, options, assertDispatch);
         assertCurrent();
         return outcome;
       }
@@ -212,7 +220,8 @@ function sameBinding(
 async function executeRemoteProcess(
   processes: RemoteProcessTransportPort,
   workspaceRoot: string,
-  options: RemoteGitCheckoutExecutionOptions
+  options: RemoteGitCheckoutExecutionOptions,
+  assertDispatch?: () => void
 ): Promise<RemoteSshExecutionResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 120_000);
@@ -226,6 +235,14 @@ async function executeRemoteProcess(
       cwd: options.cwd ?? workspaceRoot,
       signal: controller.signal
     });
+    try { assertDispatch?.(); }
+    catch (error) {
+      // The fixed helper waits for stdin before touching the checkout.
+      handle.once("error", () => undefined);
+      controller.abort();
+      try { handle.kill("SIGTERM"); } catch { /* The process may already be closed. */ }
+      throw error;
+    }
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let stdoutBytes = 0;
