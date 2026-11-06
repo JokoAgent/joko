@@ -1461,11 +1461,15 @@ export class ExtensionLibraryManager {
     extensionId: string,
     beforeFilesystemMutation?: NonNullable<ExtensionLibraryVaultOptions["beforeFilesystemMutation"]>
   ): ExtensionLibraryVault {
+    const binding = this.#binding(extensionId);
+    const usageSource = binding?.root === root ? [...this.#sessions.values()].find(session =>
+      session.binding.extensionId === extensionId && session.binding.generation === binding.generation && session.binding.root === root)?.vault : undefined;
     return new ExtensionLibraryVault({
       root,
       extensionId,
       now: this.#now,
       freeBytes: this.#freeBytes,
+      ...(usageSource === undefined ? {} : { usageSource }),
       ...(beforeFilesystemMutation === undefined ? {} : { beforeFilesystemMutation })
     });
   }

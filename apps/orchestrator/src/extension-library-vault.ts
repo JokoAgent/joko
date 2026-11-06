@@ -146,6 +146,7 @@ export interface ExtensionLibraryVaultOptions {
   readonly now?: () => number;
   readonly freeBytes?: (root: string) => Promise<number | undefined>;
   readonly limits?: Partial<ExtensionLibraryLimits>;
+  readonly usageSource?: ExtensionLibraryVault;
   readonly beforeFilesystemMutation?: (
     operation: "write" | "staged_write" | "mkdir" | "delete" | "rename" | "sqlite"
   ) => void | Promise<void>;
@@ -164,7 +165,7 @@ export class ExtensionLibraryVault {
   readonly #beforeFilesystemMutation: NonNullable<ExtensionLibraryVaultOptions["beforeFilesystemMutation"]>;
   #metadata?: StoredLibraryMetadata;
   #rootIdentity?: BigIntStats;
-  #usage: ExtensionLibraryUsage = { files: 0, bytes: 0, revision: 0n };
+  readonly #usage: { current: ExtensionLibraryUsage; needsReconcile: boolean };
   #state: ExtensionLibraryState = "unavailable";
   #reason: ExtensionLibraryStatus["reason"] = "io";
   #readonly = false;
@@ -178,7 +179,16 @@ export class ExtensionLibraryVault {
     this.#now = options.now ?? Date.now;
     this.#freeBytes = options.freeBytes ?? filesystemFreeBytes;
     this.#limits = Object.freeze({ ...EXTENSION_LIBRARY_LIMITS, ...options.limits });
-    this.#beforeFilesystemMutation = options.beforeFilesystemMutation ?? (() => undefined);
+    const usageSource = options.usageSource;
+    if (usageSource && (usageSource.#root !== this.#root || usageSource.#extensionId !== this.#extensionId)) {
+      throw new TypeError("Library usage must belong to the same Library root and Extension.");
+    }
+    this.#usage = usageSource ? usageSource.#usage : { current: { files: 0, bytes: 0, revision: 0n }, needsReconcile: false };
+    this.#beforeFilesystemMutation = async (operation) => {
+      await options.beforeFilesystemMutation?.(operation);
+      // A filesystem effect may finish before its verification or ledger write.
+      if (operation !== "sqlite") this.#usage.needsReconcile = true;
+    };
   }
 
   get root(): string {
@@ -239,16 +249,19 @@ export class ExtensionLibraryVault {
     }
     try {
       const tree = await scanTree(this.#root, this.#limits.maximumFiles);
-      const matches = storedUsage !== undefined && storedUsage.files === tree.files && storedUsage.bytes === tree.bytes;
-      this.#usage = {
+      const observedRevision = BigInt(storedUsage?.revision ?? "0");
+      const currentRevision = this.#usage.current.revision;
+      const matches = storedUsage !== undefined && storedUsage.files === tree.files && storedUsage.bytes === tree.bytes
+        && observedRevision >= currentRevision && !this.#usage.needsReconcile;
+      this.#usage.current = {
         files: tree.files,
         bytes: tree.bytes,
-        revision: matches && storedUsage !== undefined
-          ? BigInt(storedUsage.revision)
-          : BigInt(storedUsage?.revision ?? "0") + 1n
+        revision: matches ? observedRevision : (observedRevision > currentRevision ? observedRevision : currentRevision) + 1n
       };
       if (!matches) await this.#persistUsage();
+      this.#usage.needsReconcile = false;
     } catch (error) {
+      this.#usage.needsReconcile = true;
       if (error instanceof ExtensionLibraryError && error.code === "FILE_LIMIT") {
         return this.#markUnavailable("file_limit", error.message, error);
       }
@@ -266,10 +279,10 @@ export class ExtensionLibraryVault {
     return {
       state: this.#state,
       ...(this.#reason === undefined ? {} : { reason: this.#reason }),
-      usage: { ...this.#usage },
+      usage: { ...this.#usage.current },
       ...(free === undefined ? {} : { diskFreeBytes: free }),
       softLimitBytes: this.#limits.softLimitBytes,
-      softLimitExceeded: this.#usage.bytes > this.#limits.softLimitBytes,
+      softLimitExceeded: this.#usage.current.bytes > this.#limits.softLimitBytes,
       orphaned: this.#metadata?.orphaned !== undefined
     };
   }
@@ -399,7 +412,7 @@ export class ExtensionLibraryVault {
     if (existing === "file" && input.ifNotExists === true) {
       throw new ExtensionLibraryError("ALREADY_EXISTS", "Library file already exists.");
     }
-    if (existing === "missing" && this.#usage.files >= this.#limits.maximumFiles) {
+    if (existing === "missing" && this.#usage.current.files >= this.#limits.maximumFiles) {
       throw new ExtensionLibraryError("FILE_LIMIT", "Extension Library file-count fuse was exceeded.");
     }
     const existingIdentity = existing === "file" ? await regularFileSnapshot(target) : undefined;
@@ -476,7 +489,7 @@ export class ExtensionLibraryVault {
     let offset = 0;
     if (input.cursor !== undefined) {
       const cursor = parseCursor(input.cursor);
-      if (cursor.revision !== this.#usage.revision.toString(10) || cursor.prefix !== prefix
+      if (cursor.revision !== this.#usage.current.revision.toString(10) || cursor.prefix !== prefix
         || cursor.recursive !== (input.recursive === true)) {
         throw new ExtensionLibraryError("CONFLICT", "Library list cursor is stale.");
       }
@@ -491,7 +504,7 @@ export class ExtensionLibraryVault {
       entries,
       ...(nextOffset >= candidates.length ? {} : {
         nextCursor: encodeCursor({
-          revision: this.#usage.revision.toString(10),
+          revision: this.#usage.current.revision.toString(10),
           prefix,
           recursive: input.recursive === true,
           offset: nextOffset
@@ -601,14 +614,16 @@ export class ExtensionLibraryVault {
 
   async reconcileUsage(): Promise<ExtensionLibraryUsage> {
     await this.#requireOpen();
+    this.#usage.needsReconcile = true;
     const tree = await scanTree(this.#root, this.#limits.maximumFiles);
-    this.#usage = {
+    this.#usage.current = {
       files: tree.files,
       bytes: tree.bytes,
-      revision: this.#usage.revision + 1n
+      revision: this.#usage.current.revision + 1n
     };
     await this.#persistUsage();
-    return { ...this.#usage };
+    this.#usage.needsReconcile = false;
+    return { ...this.#usage.current };
   }
 
   async snapshot(): Promise<TreeSnapshot> {
@@ -637,7 +652,7 @@ export class ExtensionLibraryVault {
     if (existing === "directory" || existing === "other") {
       throw new ExtensionLibraryError("PATH_INVALID", "Library database target is not a regular file.");
     }
-    if (existing === "missing" && this.#usage.files >= this.#limits.maximumFiles) {
+    if (existing === "missing" && this.#usage.current.files >= this.#limits.maximumFiles) {
       throw new ExtensionLibraryError("FILE_LIMIT", "Extension Library file-count fuse was exceeded.");
     }
     return target;
@@ -733,7 +748,7 @@ export class ExtensionLibraryVault {
     if (existing === "file" && input.ifNotExists) {
       throw new ExtensionLibraryError("ALREADY_EXISTS", "Library file already exists.");
     }
-    if (existing === "missing" && this.#usage.files >= this.#limits.maximumFiles) {
+    if (existing === "missing" && this.#usage.current.files >= this.#limits.maximumFiles) {
       throw new ExtensionLibraryError("FILE_LIMIT", "Extension Library file-count fuse was exceeded.");
     }
     const existingIdentity = existing === "file" ? await regularFileSnapshot(target) : undefined;
@@ -778,9 +793,9 @@ export class ExtensionLibraryVault {
     await mkdir(this.#hostRoot(), { recursive: true });
     await atomicJson(join(this.#hostRoot(), USAGE_FILE), {
       format: 1,
-      files: this.#usage.files,
-      bytes: this.#usage.bytes,
-      revision: this.#usage.revision.toString(10),
+      files: this.#usage.current.files,
+      bytes: this.#usage.current.bytes,
+      revision: this.#usage.current.revision.toString(10),
       updatedAt: this.#now()
     } satisfies StoredLibraryUsage);
   }
@@ -798,6 +813,7 @@ export class ExtensionLibraryVault {
       throw new ExtensionLibraryError("READ_ONLY", "Extension Library is temporarily read-only.");
     }
     await this.#assertRootIdentity();
+    if (this.#usage.needsReconcile) await this.reconcileUsage();
   }
 
   async #diskGate(incomingBytes: number): Promise<void> {
@@ -877,7 +893,7 @@ export class ExtensionLibraryVault {
     return {
       state: "unavailable",
       ...(reason === undefined ? {} : { reason }),
-      usage: { ...this.#usage },
+      usage: { ...this.#usage.current },
       softLimitBytes: this.#limits.softLimitBytes,
       softLimitExceeded: false,
       orphaned: false

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,6 +36,30 @@ async function fixture(options: { readonly freeBytes?: number; readonly limits?:
 }
 
 describe("ExtensionLibraryVault", () => {
+  it.each(["success", "ledger failure"])("enforces a peer's file count before publishing after %s", async outcome => {
+    const limits = { maximumFiles: 2 }, { root, vault } = await fixture({ limits });
+    await vault.open();
+    await vault.write({ path: "a.txt", bytes: Buffer.from("a"), ifNotExists: true });
+    const peer = new ExtensionLibraryVault({ root, extensionId: EXTENSION_ID, limits, usageSource: vault, freeBytes: async () => undefined });
+    await peer.open();
+    const usagePath = join(root, ".joko-library", "usage.json");
+    if (outcome === "ledger failure") {
+      await rename(usagePath, `${usagePath}.previous-fixture`);
+      await mkdir(usagePath);
+    }
+    const writing = peer.write({ path: "b.txt", bytes: Buffer.from("b"), ifNotExists: true });
+    if (outcome === "ledger failure") {
+      await expect(writing).rejects.toThrow();
+      await rmdir(usagePath);
+    } else await writing;
+    await expect(readFile(join(root, "b.txt"), "utf8")).resolves.toBe("b");
+
+    await expect(vault.write({ path: "c.txt", bytes: Buffer.from("c"), ifNotExists: true })).rejects.toMatchObject({ code: "FILE_LIMIT" });
+    await expect(lstat(join(root, "c.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await peer.delete("b.txt");
+    await expect(vault.write({ path: "c.txt", bytes: Buffer.from("c"), ifNotExists: true })).resolves.toMatchObject({ path: "c.txt", bytes: 1 });
+  });
+
   it("opens an empty strict-v1 root and rebuilds a damaged usage ledger without treating metadata damage as empty", async () => {
     const { root, vault } = await fixture();
     await expect(vault.open()).resolves.toMatchObject({ state: "ready", usage: { files: 0, bytes: 0 } });

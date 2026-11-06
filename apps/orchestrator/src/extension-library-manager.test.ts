@@ -51,6 +51,26 @@ function currentAuthority(expected = authority) {
 }
 
 describe("ExtensionLibraryManager", () => {
+  it("rejects a cursor after another authorized session removes its preceding entry", async () => {
+    const { manager } = await fixture();
+    const open = (connectionId: string, digit: string) => manager.openSession({ authority, connectionId,
+      surfaceId: `extension_surface_${digit.repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, assertAuthorityCurrent: currentAuthority() });
+    const a = await open("web-a", "1"), b = await open("web-b", "2");
+    expect(a.bindingGeneration).toBe(b.bindingGeneration);
+    for (const name of ["a.txt", "b.txt", "c.txt"]) await manager.write(a.sessionId, "web-a", { path: name, bytes: Buffer.from(name) });
+    const first = await manager.list(a.sessionId, "web-a", { limit: 1 });
+    expect(first.entries.map(entry => entry.path)).toEqual(["a.txt"]);
+    expect(first.nextCursor).toBeDefined();
+    await manager.delete(b.sessionId, "web-b", "a.txt");
+
+    await expect(manager.list(a.sessionId, "web-a", { limit: 1, cursor: first.nextCursor! })).rejects.toMatchObject({ code: "CONFLICT" });
+    const restarted = await manager.list(a.sessionId, "web-a", { limit: 1 });
+    expect(restarted.entries.map(entry => entry.path)).toEqual(["b.txt"]);
+    const remaining = await manager.list(a.sessionId, "web-a", { limit: 1, cursor: restarted.nextCursor! });
+    expect(remaining.entries.map(entry => entry.path)).toEqual(["c.txt"]);
+    expect(remaining.nextCursor).toBeUndefined();
+  });
+
   it("bounds session expiry to its surface and retires only that surface's streams and database handles", async () => {
     const { manager } = await fixture();
     const firstSurface = `extension_surface_${"1".repeat(32)}`, secondSurface = `extension_surface_${"2".repeat(32)}`;
