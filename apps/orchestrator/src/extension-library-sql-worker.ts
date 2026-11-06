@@ -32,6 +32,7 @@ let nextFenceId = 1;
 let initialized = false;
 let acceptStartup!: (value: ExtensionLibrarySqlWorkerStartup) => void;
 const core = new Promise<ExtensionLibrarySqlWorkerStartup>((accept) => { acceptStartup = accept; }).then(initialize);
+void core.catch(() => undefined);
 let tail: Promise<void> = Promise.resolve();
 
 process.once("disconnect", () => process.exit(1));
@@ -85,6 +86,7 @@ async function initialize(input: ExtensionLibrarySqlWorkerStartup): Promise<Exte
   };
   const vault = new ExtensionLibraryVault({
     root: input.root,
+    expectedRootStat: input.rootStat,
     extensionId: input.extensionId,
     beforeFilesystemMutation: assertAuthorityCurrent
   });
@@ -112,7 +114,10 @@ async function dispatch(owner: ExtensionLibrarySqlCore, request: ExtensionLibrar
 function validateStartup(value: unknown): ExtensionLibrarySqlWorkerStartup {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Extension Library SQL worker startup.");
   const input = value as Record<string, unknown>;
+  const rootStat = input["rootStat"];
   if (typeof input["root"] !== "string" || !isAbsolute(input["root"]) || resolve(input["root"]) !== input["root"]
+    || typeof rootStat !== "object" || rootStat === null || !("dev" in rootStat) || typeof rootStat.dev !== "bigint"
+    || !("ino" in rootStat) || typeof rootStat.ino !== "bigint" || !("birthtimeNs" in rootStat) || typeof rootStat.birthtimeNs !== "bigint"
     || typeof input["extensionId"] !== "string" || !/^extension_[a-f0-9]{32}$/u.test(input["extensionId"])
     || input["limits"] === null || typeof input["limits"] !== "object" || Array.isArray(input["limits"])) {
     throw new Error("Invalid Extension Library SQL worker startup.");
