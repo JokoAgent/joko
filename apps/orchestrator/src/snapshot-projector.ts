@@ -857,7 +857,8 @@ export class SnapshotProjector {
 export function activeNativeTimeline(
   events: readonly PersistedEvent[],
   currentBinding?: { readonly opaqueRef: string; readonly generation: number },
-  retainedContext?: ReadonlySet<bigint>
+  retainedContext?: ReadonlySet<bigint>,
+  deletedParents?: ReadonlyMap<string, string>
 ): PersistedEvent[] {
   const nativeEntryKey = (event: PersistedEvent): string | undefined => {
     const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
@@ -901,19 +902,27 @@ export function activeNativeTimeline(
   const bindingFingerprint = nativeBindingFingerprint(nativeReference);
   const leafId = marker.payload.leafId;
   const parents = new Map<string, string | undefined>();
+  const incomplete = new Set<string>();
   for (const event of events) {
     const identity = nativeHistoryEventContext(event.payload)?.identity;
     const entryId = identity?.entryId;
     if (entryId === undefined) continue;
     const eventBindingFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
     if (eventBindingFingerprint !== bindingFingerprint) continue;
-    if (!parents.has(entryId)) parents.set(entryId, identity?.parentEntryId);
+    const parent = identity?.parentEntryId;
+    const hydrated = event.metadata?.fields["nativeHydration"] === true;
+    if (!parents.has(entryId)) {
+      parents.set(entryId, parent);
+      if (parent === undefined && !hydrated) incomplete.add(entryId);
+    } else if (parent !== undefined && hydrated && incomplete.delete(entryId)) {
+      parents.set(entryId, parent);
+    }
   }
   const active = new Set<string>();
   let cursor = leafId;
   while (cursor !== undefined && !active.has(cursor)) {
     active.add(cursor);
-    cursor = parents.get(cursor);
+    cursor = parents.has(cursor) ? parents.get(cursor) : deletedParents?.get(cursor);
   }
   return deduplicateNativeLive(events.filter((event) => {
     if (retainedContext?.has(event.globalCursor)) return true;

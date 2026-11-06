@@ -259,6 +259,7 @@ interface BackendSideEffectAdmissionAllowance {
   readonly backendReplacement?: boolean;
   readonly runtimeRestart?: boolean;
   readonly sessionReset?: boolean;
+  readonly messageDeletion?: boolean;
   readonly lifecycleOperationId?: string;
 }
 
@@ -3735,6 +3736,7 @@ export class SessionHost {
       messageDeletionAdmission();
     }
     let prepared: MessageDeletionPlan | undefined;
+    let retainedEventCursors: readonly bigint[] | undefined;
     const assertPrecondition = (store: OperationalStore): void => {
       input.precondition?.(store);
       const adapter = this.assertMessageDeletionSupported(input.sessionId);
@@ -3748,6 +3750,7 @@ export class SessionHost {
           reason: "message_deletion", latestDeletionOperationId: input.operationId, sourceInputPending: false, replaySafe: false
         }, new Set(current.deletedEventIds));
         assertMessageDeletionHandoffBound(remaining.handoff);
+        retainedEventCursors = remaining.retainedEventCursors;
       }
     };
     try {
@@ -3771,6 +3774,7 @@ export class SessionHost {
             requestedEventId: prepared.requestedEventId,
             deletedEventIds: prepared.deletedEventIds,
             operationId: input.operationId,
+            ...(retainedEventCursors === undefined ? {} : { retainContextEventCursors: retainedEventCursors }),
             traceId: `message-delete:${input.operationId}`
           });
           return input.result(committed.deletedEventIds);
@@ -3791,13 +3795,14 @@ export class SessionHost {
     readonly sessionId: string;
     readonly operationId: string;
     readonly source: NativeSessionBinding;
-  }[]): Promise<readonly {
+  }[], assertCurrent: () => void): Promise<readonly {
     readonly sessionId: string;
     readonly operationId: string;
     readonly source: NativeSessionBinding;
     readonly replacement: NativeSessionBinding;
   }[]> {
     this.#assertOpen();
+    assertCurrent();
     const requestsBySession = new Map<string, (typeof requests)[number]>();
     for (const request of requests) {
       const sessionId = request.sessionId.trim();
@@ -3857,6 +3862,7 @@ export class SessionHost {
     }> = [];
     try {
       for (const sessionId of ids) {
+        assertCurrent();
         const request = requestsBySession.get(sessionId)!;
         const prepared = await this.prepareSessionReset(sessionId);
         if (!sameNativeBinding(prepared.sourceBinding, request.source)) {
@@ -3866,6 +3872,7 @@ export class SessionHost {
             "Scan task history again after the task is idle."
           );
         }
+        assertCurrent();
         let replacement: NativeSessionBinding | undefined;
         try {
           replacement = await prepared.active.adapter.resetContext!({
@@ -9423,7 +9430,7 @@ export class SessionHost {
         (lifecycleOwner !== undefined && lifecycleOwner !== allowance.lifecycleOperationId) ||
         (durableLifecycle !== undefined && durableLifecycle.operationId !== allowance.lifecycleOperationId) ||
         this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined ||
-        this.#messageDeletionLocks.has(sessionId) ||
+        (this.#messageDeletionLocks.has(sessionId) && allowance.messageDeletion !== true) ||
         (this.#sessionResetLocks.has(sessionId) && allowance.sessionReset !== true) ||
         this.#closeIfActiveFlights.has(sessionId) ||
         this.#reaping.has(sessionId)
@@ -9603,6 +9610,7 @@ export class SessionHost {
   }
 
   private async prepareMessageDeletion(sessionId: string, adapter: BackendAdapter, assertCurrent: () => void): Promise<void> {
+    assertCurrent();
     this.assertMessageDeletionIdle(sessionId, this.#store);
     const active = this.#active.get(sessionId);
     if (active !== undefined) {
@@ -9612,7 +9620,8 @@ export class SessionHost {
         this.contextFor(stored)
       );
       assertNativeDeletionIdle(before);
-      await this.synchronizeNativeHistory(sessionId);
+      assertCurrent();
+      await this.synchronizeNativeHistory(sessionId, { messageDeletion: true });
       await Promise.all([
         this.#runtimeCommandTails.get(sessionId) ?? Promise.resolve(),
         this.#nativeStateTails.get(sessionId) ?? Promise.resolve(),
@@ -17522,10 +17531,13 @@ function contextRebuildInput(
   pending: Pick<PendingContextRebuild, "reason" | "latestDeletionOperationId" | "sourceInputPending" | "sourceRunId" | "replaySafe">,
   excluded?: ReadonlySet<string>
 ): ContextRebuildInput & { readonly retainedEventCursors: readonly bigint[] } {
+  const binding = store.getSession(sessionId).descriptor.binding;
+  const retained = store.getRetainedSessionContextCursors(sessionId);
   const activeTimeline = activeNativeTimeline(
     listAllVisibleSessionEvents(store, sessionId),
-    store.getSession(sessionId).descriptor.binding,
-    store.getRetainedSessionContextCursors(sessionId)
+    binding,
+    retained,
+    pending.reason === "message_deletion" ? store.getDeletedNativeHistoryParents(sessionId, binding.opaqueRef) : undefined
   ).filter(event => !excluded?.has(event.id));
   const sourceBoundary = pending.sourceInputPending
     ? activeTimeline.findIndex((event) =>

@@ -4595,7 +4595,7 @@ describe("Connect typed feature boundaries", () => {
       scanId,
       backupEnabled: true
     });
-    expect(beginCleanup).toHaveBeenCalledWith(scanId, true);
+    expect(beginCleanup).toHaveBeenCalledWith(scanId, true, connection);
     expect(begun.progress).toMatchObject({
       maintenanceId,
       status: contract.TaskHistoryMaintenanceStatus.RUNNING,

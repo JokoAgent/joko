@@ -2556,7 +2556,7 @@ export async function createOrchestratorApplication(
   const historyMaintenance = startupHistoryMaintenance = new HistoryMaintenance({
     store,
     activeSessions: {
-      prepare: (requests) => sessionHost.prepareHistoryMaintenanceBindings(requests),
+      prepare: (requests, assertCurrent) => sessionHost.prepareHistoryMaintenanceBindings(requests, assertCurrent),
       recover: (request) => sessionHost.recoverHistoryMaintenanceBinding(request),
       discard: (replacements) => sessionHost.discardHistoryMaintenanceBindings(replacements),
       finalize: (replacements) => sessionHost.finalizeHistoryMaintenanceBindings(replacements),
