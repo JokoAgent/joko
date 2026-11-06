@@ -4689,6 +4689,7 @@ describe("Connect typed feature boundaries", () => {
   it("normalizes Schedule execution snapshots including scoped extra directories", async () => {
     let captured: any;
     let targetManaged = false;
+    let targetRemote = false;
     const probeWorktree = vi.fn(async () => ({
       targetId: "target-1",
       eligibility: "eligible" as const,
@@ -4712,7 +4713,8 @@ describe("Connect typed feature boundaries", () => {
         displayName: "Project",
         workspaceRoot: "D:\\workspace",
         managed: targetManaged,
-        trusted: true
+        trusted: true,
+        ...(targetRemote ? { remoteWorkspace: { kind: "ssh", hostTargetId: "target-1", hostId: "remote", workspaceRoot: "/project" } } : {})
       } }),
       upsertSchedule: (input: unknown) => { captured = input; return input; },
       getSchedule: () => ({ ...captured, revision: 1n })
@@ -4966,6 +4968,19 @@ describe("Connect typed feature boundaries", () => {
         }
       }
     });
+    const localScript = captured;
+    targetRemote = true;
+    await expect(invoke(services.operation.submitOperation, {
+      operationId: "operation-schedule-script-remote", connectionId: connection.id,
+      mutation: mutation(create(contract.ScheduleInputSchema, {
+        ...schedule([]), sessionMode: contract.ScheduleSessionMode.FRESH, sessionId: "",
+        input: create(contract.InputContentSchema, {}),
+        execution: create(contract.ScheduleExecutionSnapshotSchema, { executionMode: contract.ScheduleExecutionMode.SCRIPT,
+          script: create(contract.ScheduleScriptExecutionSchema, { command: "node task.mjs" }) })
+      }))
+    })).rejects.toMatchObject({ code: Code.InvalidArgument, message: expect.stringContaining("project on this node") });
+    expect(captured).toBe(localScript);
+    targetRemote = false;
 
     await expect(invoke(services.operation.submitOperation, {
       operationId: "operation-schedule-script-secret",
