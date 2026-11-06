@@ -179,7 +179,7 @@ export class PartnerImportManager {
     const retained = [...this.#previews.values()];
     if (retained.length >= 4 || retained.reduce((total, value) => total + value.bytes, bytes) > MAX_SNAPSHOT_BYTES) throw new AgentImportError("SOURCE_SNAPSHOT_TOO_LARGE");
     const id = randomUUID(); this.#previews.set(id, { owner: scope.ownerKey, expires: this.#now() + PREVIEW_TTL_MS, value: snapshot, bytes, sourceId });
-    const redact = createEnvironmentRedactor(previewImportRedactions(snapshot.items));
+    const redact = createEnvironmentRedactor(snapshot.publicationRedactions ?? previewImportRedactions(snapshot.items));
     return { id, source: { id: sourceId, kind: source.kind, name: redact(source.name) }, name: redact(source.name),
       ...(snapshot.avatarImageBase64 ? { avatarImageBase64: snapshot.avatarImageBase64 } : {}),
       entries: snapshot.items.map(item => ({ ...item.view, name: redact(item.view.name),
@@ -300,6 +300,12 @@ export class PartnerImportManager {
     const context: PartnerImportEffectContext = { snapshot, selection, creationJson, publicationRedactions: masks, assertOwner };
     const redact = () => createEnvironmentRedactor(masks);
     const pass = async (reconcile: boolean) => this.options.runPass(partnerId, async () => {
+    if (snapshot.source.kind === "openclaw" && this.options.storage.readReceipt(selection.requestId)?.checkpointSaved) {
+      // Older checkpoints may lack the source's Discord masks. Re-read the
+      // same source when available before publishing any remaining copies.
+      try { extendRedactions(masks, await createImportSourceReader(this.#readers(assertOwner)).readRedactions(snapshot.source)); }
+      catch { assertOwner(); }
+    }
     assertOwner(); const effects = await this.options.effects(context); assertOwner();
     const deps: TransferDeps = {
       ...effects, assertOwner,
