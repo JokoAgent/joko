@@ -157,7 +157,7 @@ describe("Backend-native Provider account usage", () => {
     await observed;
     const response = await other;
     if (endpoint === "snapshot") {
-      expect(response).toMatchObject({ snapshot: { sessions: [{ title: "Private task" }] } });
+      expect(response).toMatchObject({ snapshot: { sessions: [{ sessionId: "task", displayName: "Private task" }] } });
     }
     if (retirement === "revoked") await expect(call(originalKey)).rejects.toMatchObject({ code: Code.Unauthenticated });
   });
