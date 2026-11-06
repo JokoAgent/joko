@@ -16545,18 +16545,20 @@ async function dispatchMutation(
             if (authority.hostRevision !== expectedHostRevision || authority.lease.files === undefined) {
               throw new ConnectError("The selected SSH Host file transport changed.", Code.Aborted);
             }
+            const assertCurrent = (): void => { dependencies.connections.fence(connection); authority.assertCurrent(); };
             const signal = new AbortController().signal;
-            const inspection = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, authority.assertCurrent);
+            const inspection = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, assertCurrent);
             let canonical = inspection.path;
             if (!inspection.exists) {
               if (!input.createIfMissing) throw new ConnectError("The SSH project directory does not exist.", Code.NotFound);
+              assertCurrent();
               await authority.lease.files.mkdir(input.workspacePath, { recursive: true, mode: 0o700, signal });
-              authority.assertCurrent();
-              const created = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, authority.assertCurrent);
+              assertCurrent();
+              const created = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, assertCurrent);
               if (!created.exists) throw new ConnectError("The SSH project directory could not be verified after creation.", Code.FailedPrecondition);
               canonical = created.path;
             }
-            authority.assertCurrent();
+            assertCurrent();
             const fallbackExisted = await pathExists(fallbackRoot);
             await mkdir(fallbackRoot, { recursive: true, mode: 0o700 });
             fallbackCreated = !fallbackExisted;
@@ -16567,14 +16569,14 @@ async function dispatchMutation(
               workspaceRoot: localRoot, managed: false, trusted: false,
               remoteWorkspace: { kind: "ssh", hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
             };
-            await host.validateTarget(descriptor, () => { dependencies.connections.fence(connection); authority.assertCurrent(); });
-            authority.assertCurrent();
+            await host.validateTarget(descriptor, assertCurrent);
+            assertCurrent();
             await dependencies.workspaceService.register({
               id: workspaceId, root: canonical, displayName: descriptor.displayName, trusted: false,
               remote: { targetId: id, binding: descriptor.remoteWorkspace! }
             });
             workspaceRegistered = true;
-            authority.assertCurrent();
+            assertCurrent();
           },
           commit: (store) => {
             if (descriptor === undefined) throw new Error("Remote project preparation completed without a Target.");
