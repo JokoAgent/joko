@@ -260,6 +260,7 @@ interface BackendSideEffectAdmissionAllowance {
   readonly backendReplacement?: boolean;
   readonly runtimeRestart?: boolean;
   readonly sessionReset?: boolean;
+  readonly messageDeletion?: boolean;
   readonly lifecycleOperationId?: string;
 }
 
@@ -9368,7 +9369,7 @@ export class SessionHost {
         (lifecycleOwner !== undefined && lifecycleOwner !== allowance.lifecycleOperationId) ||
         (durableLifecycle !== undefined && durableLifecycle.operationId !== allowance.lifecycleOperationId) ||
         this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined ||
-        this.#messageDeletionLocks.has(sessionId) ||
+        (this.#messageDeletionLocks.has(sessionId) && allowance.messageDeletion !== true) ||
         (this.#sessionResetLocks.has(sessionId) && allowance.sessionReset !== true) ||
         this.#closeIfActiveFlights.has(sessionId) ||
         this.#reaping.has(sessionId)
@@ -9548,6 +9549,7 @@ export class SessionHost {
   }
 
   private async prepareMessageDeletion(sessionId: string, adapter: BackendAdapter, assertCurrent: () => void): Promise<void> {
+    assertCurrent();
     this.assertMessageDeletionIdle(sessionId, this.#store);
     const active = this.#active.get(sessionId);
     if (active !== undefined) {
@@ -9557,7 +9559,8 @@ export class SessionHost {
         this.contextFor(stored)
       );
       assertNativeDeletionIdle(before);
-      await this.synchronizeNativeHistory(sessionId);
+      assertCurrent();
+      await this.synchronizeNativeHistory(sessionId, { messageDeletion: true });
       await Promise.all([
         this.#runtimeCommandTails.get(sessionId) ?? Promise.resolve(),
         this.#nativeStateTails.get(sessionId) ?? Promise.resolve(),
