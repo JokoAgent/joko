@@ -8421,7 +8421,7 @@ export class MobileClient {
   filesHtmlResourceOwnerKey(preview: Extract<MobileFilePreview, { kind: "text" }>): string | undefined {
     const timeline = this.#timelinePreview;
     if (this.#state.timelinePreview === preview && timeline && this.#timelinePreviewLeaseCurrent(timeline)) {
-      return JSON.stringify(["timeline", timeline.taskAuthorityKey, timeline.windowKey, preview.sourceLabel, preview.revisionKey]);
+      return JSON.stringify(["timeline", timeline.taskAuthorityKey, timeline.sourceKey, preview.sourceLabel, preview.revisionKey]);
     }
     const owner = this.filesAuthorityKey();
     return owner && this.#state.files.open && this.#state.files.status === "ready" && this.#state.files.preview === preview
