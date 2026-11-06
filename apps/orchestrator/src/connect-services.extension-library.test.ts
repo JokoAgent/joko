@@ -211,7 +211,13 @@ describe("Connect Extension Library boundary", () => {
     const original = await callExact(range, tag!);
     expect(original.result?.result).toMatchObject({ case: "read", value: { path, content: new TextEncoder().encode("ell") } });
 
-    const originalPath = join(overview.library!.location!.path, "notes", "hello.txt");
+    const bound = await invoke<contract.GetExtensionLibraryOverviewResponse>(
+      services.extension.getExtensionLibraryOverview,
+      { extensionId: EXTENSION_ID, expectedRevision: { value: 7n } }
+    );
+    const location = bound.library?.location;
+    if (location === undefined) throw new Error("The opened Library must have a bound location.");
+    const originalPath = join(location.path, "notes", "hello.txt");
     const originalTime = await stat(originalPath);
     await rename(originalPath, `${originalPath}.original`);
     await writeFile(originalPath, "other");
