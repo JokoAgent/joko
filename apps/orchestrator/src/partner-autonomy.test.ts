@@ -109,6 +109,24 @@ describe("Partner affair owner and durable UI operations", () => {
     expect(JSON.parse(result.content[0]!.text)).toMatchObject({ items: [{ key: input.key, title: input.title, outcome: input.outcome }] });
     expect((await tools.callTool("todo_list", { view: "open", order: "unknown" }, undefined, context)).isError).toBe(true);
   });
+  it("lets a live independent routine list its own Todo items without writing them", async () => {
+    const f = await fixture(), todos = new PartnerTodoManager(f.store, f.profiles, f.partners), tools = new PartnerTodoTools(todos);
+    const input = { key: "owner:routine-review", title: "Review the report", outcome: "A reviewed report", origin: "assigned" } as const;
+    const item = todos.patch(f.partner.id, input, "create-routine-review-todo", () => undefined);
+    const routine = await f.partners.ensureRoutineSession({ partnerId: f.partner.id, key: "routine:todo-review", title: "Review Todo", assertCurrent: () => undefined });
+    const context = { sessionId: routine.id, targetId: routine.targetId, generation: routine.binding.generation,
+      providerGeneration: tools.generation, effectIdentity: "b".repeat(64) };
+    const query = { view: "open", offset: 0 };
+    const result = await tools.callTool("todo_list", query, undefined, context);
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ items: [{ id: item.id, title: item.title }] });
+    const mutation = { ...input, key: "routine:attempted-write" };
+    expect((await tools.callTool("todo_update", mutation, undefined, context)).isError).toBe(true);
+    expect(todos.list(f.partner.id, "open").items).toEqual([item]);
+    await f.partners.closeRoutineSession(routine.id);
+    expect((await tools.callTool("todo_list", query, undefined, context)).isError).toBe(true);
+  });
+
   it("keeps deleted records for exact-revision undo and never replays a save under a changed identity", async () => {
     const f = await fixture(), todos = new PartnerTodoManager(f.store, f.profiles, f.partners);
     const original = todos.patch(f.partner.id, { key: "owner:review", title: "Review the report", outcome: "A reviewed report",

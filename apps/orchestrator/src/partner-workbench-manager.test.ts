@@ -292,6 +292,22 @@ describe("Partner workbench service and Queue ownership", () => {
     release(); await expect(pending).rejects.toMatchObject({ code: "WORKBENCH_OWNER_CHANGED" });
   });
 
+  it("lets an independent routine read its own overview under its live scope without acquiring canonical tool authority", async () => {
+    const f = await fixture(); await grant(f);
+    const routine = await f.partners.ensureRoutineSession({ partnerId: f.partner.id, key: "routine:workbench-overview", title: "Review work", assertCurrent: () => undefined });
+    expect(routine.id).not.toBe(f.partner.canonicalSessionId);
+    const provider = new PartnerWorkbenchToolProvider({ store: f.store, partners: f.partners, workbench: f.workbench });
+    const context = { sessionId: routine.id, targetId: routine.targetId, generation: routine.binding.generation,
+      providerGeneration: provider.generation, effectIdentity: "a".repeat(64) };
+    const result = await provider.callTool("get_workbench", {}, undefined, context);
+    expect(result.isError).toBe(false);
+    expect(JSON.parse((result.content[0] as { text: string }).text)).toMatchObject({ projects: [{ path: f.project }] });
+    expect((await provider.callTool("set_workbench", { task_id: "item:routine", project: f.project, title: "Review", verdict: "done" }, undefined, context)).isError).toBe(true);
+    expect((await f.workbench.readState(f.partner.id)).tasks.some(task => task.id === "item:routine")).toBe(false);
+    await f.partners.closeRoutineSession(routine.id);
+    expect((await provider.callTool("get_workbench", {}, undefined, context)).isError).toBe(true);
+  });
+
   it("uses the same canonical tool authority and reports each batch judgment independently", async () => {
     const f = await fixture(); const view = await grant(f);
     const provider = new PartnerWorkbenchToolProvider({ store: f.store, partners: f.partners, workbench: f.workbench });

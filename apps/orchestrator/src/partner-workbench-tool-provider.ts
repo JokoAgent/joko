@@ -37,7 +37,8 @@ export class PartnerWorkbenchToolProvider implements BridgeToolProvider {
   async callTool(name: string, input: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     signal?.throwIfAborted();
     try {
-      const owner = this.#caller(context);
+      const access = name === "get_workbench" ? "overview" : "canonical";
+      const owner = this.#caller(context, access);
       const active = this.options.workbench;
       let result: unknown;
       if (name === "get_workbench") {
@@ -85,7 +86,7 @@ export class PartnerWorkbenchToolProvider implements BridgeToolProvider {
         result = { revision: view.state.revision, projects: view.projects };
       } else throw invalid("The workbench tool is not part of this runtime snapshot.");
       signal?.throwIfAborted();
-      const current = this.#caller(context);
+      const current = this.#caller(context, access);
       if (JSON.stringify(current) !== JSON.stringify(owner)) throw invalid("The workbench caller changed.");
       return { isError: false, content: [{ type: "text", text: JSON.stringify(result, (_key, value: unknown) => typeof value === "bigint" ? value.toString(10) : value) }] };
     } catch (error) {
@@ -95,11 +96,12 @@ export class PartnerWorkbenchToolProvider implements BridgeToolProvider {
         message: redactSecrets(error instanceof Error ? error.message : "The workbench action is unavailable.").slice(0, 400) }) }] };
     }
   }
-  #caller(context: BridgeToolCallContext): PartnerWorkbenchOwner {
+  #caller(context: BridgeToolCallContext, access: "overview" | "canonical" = "canonical"): PartnerWorkbenchOwner {
+    context.assertCurrent?.();
     const session = this.options.store.getSession(context.sessionId).descriptor;
     if (context.providerGeneration !== undefined && context.providerGeneration !== this.generation || session.targetId !== context.targetId
       || session.binding.generation !== context.generation || session.archived || session.deletedAt !== undefined) throw invalid("The workbench tool scope is stale.");
-    return this.options.workbench.ownerForCaller(context.sessionId);
+    return this.options.workbench.ownerForCaller(context.sessionId, access);
   }
 }
 
