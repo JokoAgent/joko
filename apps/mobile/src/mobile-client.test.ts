@@ -9430,6 +9430,41 @@ describe("native current-task message and Queue actions", () => {
       .rejects.toThrow(/original task/u);
   });
 
+  it("keeps an available Artifact selectable and sendable when the Resource directory is fenced", async () => {
+    const network = projectedNetwork(catalogMentionSnapshot);
+    configureCatalogMentions(network);
+    const listResources = vi.mocked(network.listSessionResources);
+    listResources.mockRejectedValue(Object.assign(new Error("Resource directory fenced"), { code: Code.FailedPrecondition }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, memoryDraftStores());
+    await app.start();
+    const controls = app.taskCatalogMentionControls()!;
+
+    const partial = await app.listTaskCatalogMentionCatalog(controls.surfaceOwnerKey);
+    expect(partial).toMatchObject({ unavailable: "resource", artifacts: { items: [{ artifactId: "artifact-one", sourceSessionId: "related" }] } });
+    expect(partial.resources).toBeUndefined();
+    listResources.mockRejectedValueOnce(Object.assign(new Error("Connection revoked"), { code: Code.Unauthenticated }));
+    await expect(app.listTaskCatalogMentionCatalog(controls.surfaceOwnerKey)).rejects.toMatchObject({ code: Code.Unauthenticated });
+
+    const artifact = partial.artifacts!.items[0]!;
+    const resourceReads = listResources.mock.calls.length;
+    await expect(app.validateTaskCatalogMentionCandidate(controls.surfaceOwnerKey, artifact)).resolves.toEqual(artifact);
+    expect(listResources).toHaveBeenCalledTimes(resourceReads);
+    await expect(app.send(catalogMentionDraft())).rejects.toThrow("Resource directory fenced");
+    expect(network.submit).not.toHaveBeenCalled();
+
+    const text = "Use ";
+    const draft = insertMobileArtifactMention(plainTextMobileComposerDraft(text),
+      { start: text.length, end: text.length }, artifact, "artifact-only-occurrence").draft;
+    await expect(app.send(draft)).resolves.toBe(true);
+    expect(listResources).toHaveBeenCalledTimes(resourceReads + 1);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      payload: { case: "sendInput", value: { input: { parts: [
+        { content: { case: "text", value: draft.text } },
+        { content: { case: "artifactMention", value: { artifactId: "artifact-one", sourceSessionId: "related" } } }
+      ] } } }
+    });
+  });
+
   it("sends exact Resource and source-task Artifact wire identities with body-free receipts", async () => {
     const network = projectedNetwork(catalogMentionSnapshot);
     configureCatalogMentions(network);

@@ -290,12 +290,14 @@ import {
   assertMobileCatalogMentionDraft,
   assertMobileCatalogMentionDraftCatalog,
   createMobileCatalogMentionControls,
+  mobileCatalogMentionKinds,
   projectMobileArtifactMentionCatalog,
   projectMobileResourceMentionCatalog,
   type MobileArtifactMentionCandidate,
   type MobileCatalogMentionCandidate,
   type MobileCatalogMentionCatalog,
   type MobileCatalogMentionControls,
+  type MobileCatalogMentionPolicy,
   type MobileResourceMentionCandidate
 } from "./mobile-catalog-mentions";
 import {
@@ -10489,11 +10491,12 @@ export class MobileClient {
       }
       assertMobileWorkspacePathPasteResolutions(latestPathControls, sendDraft, resolutions);
     }
-    if (sendDraft.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+    const catalogKinds = mobileCatalogMentionKinds(sendDraft);
+    if (catalogKinds.resources || catalogKinds.artifacts) {
       if (!currentCatalogMentionControls || currentCatalogMentionControls.surfaceOwnerKey !== catalogMentionOwnerKey) {
         throw new Error("The catalog reference owner changed while the structured draft was being saved. Review the retained draft before sending.");
       }
-      const catalog = await this.listTaskCatalogMentionCatalog(currentCatalogMentionControls.surfaceOwnerKey);
+      const catalog = await this.#readCurrentCatalogMentions(currentCatalogMentionControls.surfaceOwnerKey, catalogKinds);
       if (!isCurrent()) return false;
       if (this.#taskAuthorityKey() !== authorityKey
         || this.taskCatalogMentionControls()?.surfaceOwnerKey !== currentCatalogMentionControls.surfaceOwnerKey) {
@@ -10917,15 +10920,11 @@ export class MobileClient {
       assertMobileWorkspacePathPasteResolutions(before.paths!, input, resolutions);
     }
     let catalog: MobileCatalogMentionCatalog | undefined;
-    if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+    const catalogKinds = mobileCatalogMentionKinds(input);
+    if (catalogKinds.resources || catalogKinds.artifacts) {
       const catalogControls = before.catalog!;
-      const [resources, artifacts] = await Promise.all([
-        catalogControls.policy.resources ? this.network.listSessionResources(credential, record.sessionId, signal) : undefined,
-        catalogControls.policy.artifacts ? this.network.listArtifactReferenceCatalog(credential, record.sessionId, BigInt(record.runtimeGeneration), signal) : undefined
-      ]);
+      catalog = await this.#readCatalogMentions(credential, catalogControls, catalogKinds, signal);
       assertCurrent();
-      catalog = { ...(resources === undefined ? {} : { resources: projectMobileResourceMentionCatalog(catalogControls, resources) }),
-        ...(artifacts === undefined ? {} : { artifacts: projectMobileArtifactMentionCatalog(catalogControls, artifacts.artifacts, artifacts.revision) }) };
       assertMobileCatalogMentionDraftCatalog(catalogControls, catalog, input);
     }
     for (const candidate of [...input.attachments]) {
@@ -12292,35 +12291,51 @@ export class MobileClient {
     expectedSurfaceOwnerKey: string,
     signal?: AbortSignal
   ): Promise<MobileCatalogMentionCatalog> {
+    return this.#readCurrentCatalogMentions(expectedSurfaceOwnerKey, undefined, signal);
+  }
+
+  async #readCurrentCatalogMentions(
+    expectedSurfaceOwnerKey: string,
+    kinds: MobileCatalogMentionPolicy | undefined,
+    signal?: AbortSignal
+  ): Promise<MobileCatalogMentionCatalog> {
     const context = this.#catalogMentionContext(expectedSurfaceOwnerKey);
-    const [resources, artifacts] = await Promise.all([
-      context.controls.policy.resources
-        ? this.network.listSessionResources(context.credential, context.controls.sessionId, signal)
-        : Promise.resolve(undefined),
-      context.controls.policy.artifacts
-        ? this.network.listArtifactReferenceCatalog(
-            context.credential,
-            context.controls.sessionId,
-            BigInt(context.controls.runtimeGeneration),
-            signal
-          )
-        : Promise.resolve(undefined)
-    ]);
+    const catalog = await this.#readCatalogMentions(context.credential, context.controls, kinds ?? context.controls.policy, signal, kinds === undefined);
     const current = this.#catalogMentionContext(expectedSurfaceOwnerKey);
-    if (current.controls.surfaceOwnerKey !== context.controls.surfaceOwnerKey) {
+    if (current.credential !== context.credential) {
       throw new Error("The catalog reference owner changed while its candidates were loading.");
     }
+    return catalog;
+  }
+
+  async #readCatalogMentions(
+    credential: PairedCredential,
+    controls: MobileCatalogMentionControls,
+    kinds: MobileCatalogMentionPolicy,
+    signal?: AbortSignal,
+    allowPartial = false
+  ): Promise<MobileCatalogMentionCatalog> {
+    const handleFailure = (error: unknown) => {
+      signal?.throwIfAborted();
+      if (!allowPartial || isRevoked(error) || (error as { code?: number })?.code === Code.PermissionDenied) throw error;
+      return { error };
+    };
+    const [resourceResult, artifactResult] = await Promise.all([
+      kinds.resources ? this.network.listSessionResources(credential, controls.sessionId, signal)
+        .then(rows => ({ value: projectMobileResourceMentionCatalog(controls, rows) }), handleFailure) : undefined,
+      kinds.artifacts ? this.network.listArtifactReferenceCatalog(credential, controls.sessionId, BigInt(controls.runtimeGeneration), signal)
+        .then(rows => ({ value: projectMobileArtifactMentionCatalog(controls, rows.artifacts, rows.revision) }), handleFailure) : undefined
+    ]);
+    signal?.throwIfAborted();
+    const resources = resourceResult && "value" in resourceResult ? resourceResult.value : undefined;
+    const artifacts = artifactResult && "value" in artifactResult ? artifactResult.value : undefined;
+    if (resourceResult && "error" in resourceResult && artifacts === undefined) throw resourceResult.error;
+    if (artifactResult && "error" in artifactResult && resources === undefined) throw artifactResult.error;
     return {
-      ...(resources === undefined ? {} : {
-        resources: projectMobileResourceMentionCatalog(context.controls, resources)
-      }),
-      ...(artifacts === undefined ? {} : {
-        artifacts: projectMobileArtifactMentionCatalog(
-          context.controls,
-          artifacts.artifacts,
-          artifacts.revision
-        )
-      })
+      ...(resources === undefined ? {} : { resources }),
+      ...(artifacts === undefined ? {} : { artifacts }),
+      ...(resourceResult && "error" in resourceResult ? { unavailable: "resource" as const } : {}),
+      ...(artifactResult && "error" in artifactResult ? { unavailable: "artifact" as const } : {})
     };
   }
 
@@ -12583,7 +12598,8 @@ export class MobileClient {
       || value.kind === "artifact" && !context.controls.policy.artifacts) {
       throw new Error(`This Backend no longer supports ${value.kind === "resource" ? "Resource" : "Artifact"} references.`);
     }
-    const catalog = await this.listTaskCatalogMentionCatalog(expectedSurfaceOwnerKey, signal);
+    const catalog = await this.#readCurrentCatalogMentions(expectedSurfaceOwnerKey,
+      { resources: value.kind === "resource", artifacts: value.kind === "artifact" }, signal);
     return assertMobileCatalogMentionCandidate(
       this.#catalogMentionContext(expectedSurfaceOwnerKey).controls,
       catalog,
@@ -15691,7 +15707,7 @@ export class MobileClient {
     if (!catalogControls?.policy.artifacts) {
       throw new Error("This Backend cannot add the selected Generated file as an attachment or typed reference.");
     }
-    const catalog = await this.listTaskCatalogMentionCatalog(catalogControls.surfaceOwnerKey, signal);
+    const catalog = await this.#readCurrentCatalogMentions(catalogControls.surfaceOwnerKey, { resources: false, artifacts: true }, signal);
     assertCurrent();
     const matches = (catalog.artifacts?.items ?? []).filter((candidate) => candidate.artifactId === artifact.artifactId
       && candidate.sourceSessionId === artifact.sessionId);

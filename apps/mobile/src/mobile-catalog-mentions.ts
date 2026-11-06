@@ -75,11 +75,19 @@ export interface MobileArtifactMentionCatalog {
 export interface MobileCatalogMentionCatalog {
   readonly resources?: MobileResourceMentionCatalog;
   readonly artifacts?: MobileArtifactMentionCatalog;
+  readonly unavailable?: MobileCatalogMentionCandidate["kind"];
 }
 
 export interface MobileCatalogMentionResults {
   readonly items: readonly MobileCatalogMentionCandidate[];
   readonly truncated: boolean;
+}
+
+export function mobileCatalogMentionKinds(draft: MobileComposerDraft): MobileCatalogMentionPolicy {
+  return {
+    resources: draft.mentions.some(mention => mention.kind === "resource"),
+    artifacts: draft.mentions.some(mention => mention.kind === "artifact")
+  };
 }
 
 const maximumVisibleResults = 500;
