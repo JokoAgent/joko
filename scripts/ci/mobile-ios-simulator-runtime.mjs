@@ -703,16 +703,20 @@ async function main() {
     stage = "screen observer compilation";
     await command("xcrun", ["swiftc", join(root, "scripts/ci/mobile-ios-screen-text.swift"), "-framework", "Vision", "-o", ocr],
       { timeout: 60_000, startupLabel: "compile-screen-observer" });
-    // Compile the same Debug entry before the cold Simulator starts competing
-    // for host CPU and memory. Keep this Metro instance for the actual app.
+    // Match React Native's Debug bundle options so the actual app can reuse
+    // the lazy graph compiled before the cold Simulator competes for resources.
     stage = "same-checkout Metro startup";
     const port = await freePort(), origin = `http://127.0.0.1:${port}`;
     startMetro(port); await waitForMetro(origin);
     stage = "same-checkout iOS bundle compilation";
-    const bundle = await fetch(`${origin}/.expo/.virtual-metro-entry.bundle?platform=ios&dev=true&minify=false`,
-      { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(120_000)]) });
+    const bundleUrl = new URL("/.expo/.virtual-metro-entry.bundle", origin);
+    bundleUrl.search = new URLSearchParams({
+      platform: "ios", dev: "true", lazy: "true", minify: "false", inlineSourceMap: "false",
+      modulesOnly: "false", runModule: "true", excludeSource: "true", sourcePaths: "url-server", app: bundleId
+    });
+    const bundle = await fetch(bundleUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(120_000)]) });
     if (!bundle.ok) { await bundle.body?.cancel(); throw new Error("Metro could not compile the actual iOS app entry."); }
-    await bundle.body?.cancel();
+    await bundle.body?.pipeTo(new WritableStream());
     await startOwnedSimulator({ bundleId, executable, compiledApp: app, executableSha256: await hashFile(binary),
       startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
     stage = "owned application installation";
