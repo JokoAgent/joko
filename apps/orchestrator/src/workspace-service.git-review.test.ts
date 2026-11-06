@@ -469,6 +469,73 @@ describe("WorkspaceService Git Review backend", () => {
     expect(await readFile(join(root, other), "utf8")).toBe("keep this sibling\n");
   }, 20_000);
 
+  it.each(["file", "hunk"] as const)("keeps tracked CRLF bytes when staging a %s", async target => {
+    const root = await initializedRepository("joko-review-crlf-");
+    const service = new WorkspaceService();
+    const path = "crlf.txt";
+    try {
+      await writeFile(join(root, path), "before\r\nold\r\nafter\r\n");
+      await git(root, "add", "--", path);
+      await git(root, "commit", "--quiet", "-m", "base");
+      const updated = "before\r\nnew\r\nafter\r\n";
+      await writeFile(join(root, path), updated);
+      await service.register({ id: "crlf", root, displayName: "CRLF", trusted: true });
+      const diff = await service.gitReviewDiff("crlf", { source: "unstaged" });
+      expect(diff.workingTree).toContain("-old\r\n+new\r\n");
+      await service.applyGitDiff("crlf", {
+        action: "stage", source: "unstaged", path, target, hunkIndex: 0,
+        expectedRepositoryRevision: diff.repositoryRevision
+      });
+      expect((await execFileAsync("git", ["show", `:${path}`], { cwd: root, windowsHide: true })).stdout).toBe(updated);
+      expect(await readFile(join(root, path), "utf8")).toBe(updated);
+    } finally {
+      await service.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.each(["stage", "unstage", "revert"] as const)("uses the selected hunk's preimage position for %s", async action => {
+    const root = await initializedRepository("joko-review-hunk-position-");
+    const service = new WorkspaceService();
+    const path = "blocks.txt";
+    const lines = (count: number, prefix: string) => Array.from({ length: count }, (_, index) => `${prefix}${index + 1}`);
+    const contents = (value: readonly string[]) => `${value.join("\n")}\n`;
+    try {
+      const block = ["c1", "c2", "c3", "old", "c4", "c5", "c6"];
+      const baseline = [...lines(19, "p"), ...block, ...lines(5, "sep"), ...block, ...lines(12, "q")];
+      if (action !== "stage") baseline.splice(7, block.length, "c1", "c2", "c3", "new", "c4", "c5", "c6");
+      await writeFile(join(root, path), contents(baseline));
+      await git(root, "config", "diff.context", "3");
+      await git(root, "config", "diff.interHunkContext", "0");
+      await git(root, "add", "--", path);
+      await git(root, "commit", "--quiet", "-m", "base");
+      const changed = [...lines(12, "inserted"), ...baseline];
+      changed[34] = "new";
+      await writeFile(join(root, path), contents(changed));
+      if (action === "unstage") await git(root, "add", "--", path);
+      await service.register({ id: "hunk-position", root, displayName: "Hunk position", trusted: true });
+      const source = action === "unstage" ? "staged" : "unstaged";
+      const diff = await service.gitReviewDiff("hunk-position", { source });
+      const patch = source === "staged" ? diff.index : diff.workingTree;
+      expect(patch.match(/^@@ /gmu)).toHaveLength(2);
+      expect(patch).toContain("@@ -20,7 +32,7 @@");
+      await service.applyGitDiff("hunk-position", {
+        action, source, path, target: "hunk", hunkIndex: 1,
+        expectedRepositoryRevision: diff.repositoryRevision, confirmRevert: action === "revert"
+      });
+
+      const partial = [...(action === "stage" ? baseline : changed)];
+      if (action === "stage") partial[22] = "new";
+      else partial[34] = "old";
+      expect((await execFileAsync("git", ["show", `:${path}`], { cwd: root, windowsHide: true })).stdout)
+        .toBe(contents(action === "revert" ? baseline : partial));
+      expect(await readFile(join(root, path), "utf8")).toBe(contents(action === "revert" ? partial : changed));
+    } finally {
+      await service.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("bounds commit messages and performs only explicit non-force pushes", async () => {
     const root = await initializedRepository("joko-review-effects-");
     await writeFile(join(root, "commit.txt"), "base\n", "utf8");
