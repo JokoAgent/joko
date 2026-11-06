@@ -14893,7 +14893,8 @@ describe("SessionHost", () => {
     await eventually(() => store.getRun(child!.descriptor.id).descriptor.state === "completed");
   });
 
-  it("deletes a local Codex reply and cold-dispatches only the next input in a replacement context", async () => {
+  it.each(["with surviving cursors", "from an earlier pending deletion"] as const)(
+    "deletes a local Codex reply and cold-dispatches only the next input in a replacement context %s", async (recovery) => {
     const directory = mkdtempSync(join(tmpdir(), "joko-codex-delete-host-"));
     const databasePath = join(directory, "store.db");
     const fake = new FakeCodexAppServer();
@@ -14947,6 +14948,9 @@ describe("SessionHost", () => {
         .toEqual(originalReplies.map(text => [{ kind: "text", text }]));
     });
     const replies = assistantReplies(true);
+    const snapshotBeforeDeletion = activeNativeTimeline(store.listEvents({ sessionId }), source);
+    expect(snapshotBeforeDeletion.filter(event => event.payload.type === "message_complete" && event.payload.role === "assistant")
+      .map(event => event.id)).toEqual(replies.map(event => event.id));
     const [kept, erased] = replies;
     if (kept?.payload.type !== "message_complete" || erased === undefined) throw new Error("Expected both original replies.");
     const identity = kept.payload.nativeHistory?.identity;
@@ -14963,8 +14967,10 @@ describe("SessionHost", () => {
     });
     expect((await remove("codex-delete-reply")).value).toContain(erased.id);
     expect(store.findPendingContextRebuild(sessionId)).toMatchObject({ reason: "message_deletion", state: "pending" });
+    expect(assistantReplies(true).map(event => event.id)).toEqual([kept.id]);
     expect(store.getSessionContextHandoff(sessionId)).toBeUndefined();
     expect(fake.threads.size).toBe(1);
+    if (recovery === "from an earlier pending deletion") store.deleteSetting("session", sessionId, "runtime.retained_context_events");
     await first.host.dispose();
     await first.adapter.dispose();
     await first.nativeHost.shutdown();

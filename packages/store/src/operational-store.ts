@@ -750,6 +750,7 @@ export class OperationalStore {
       }
       configureDatabase(this.database);
       initializeDatabase(this.database, this.now());
+      this.repairNativeHistoryIndexOnOpen(this.database);
       if (messageVectorAvailable) {
         const vectorTableExisted = this.database.prepare(
           "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?"
@@ -11168,6 +11169,7 @@ export class OperationalStore {
     readonly requestedEventId: string;
     readonly deletedEventIds: readonly string[];
     readonly operationId: string;
+    readonly retainContextEventCursors?: readonly bigint[];
     readonly traceId: string;
     readonly at?: number;
   }): { readonly event: PersistedEvent; readonly deletedEventIds: readonly string[] } {
@@ -11237,6 +11239,9 @@ export class OperationalStore {
       }
       this.refreshNativeHistoryCanonicalIdentities(sessionId);
       this.refreshNativeHistoryActiveEntries(sessionId);
+      if (input.retainContextEventCursors !== undefined) {
+        this.saveRetainedSessionContextCursors(sessionId, input.retainContextEventCursors, at);
+      }
       this.database.prepare(`
         INSERT INTO session_context_rebuilds(
           session_id, latest_deletion_operation_id, source_native_opaque_ref,
@@ -11298,6 +11303,27 @@ export class OperationalStore {
       throw new StoreError("Retained context event cursors are invalid.");
     }
     return new Set(value.cursors.map(cursor => BigInt(cursor)));
+  }
+
+  /** Private lineage for old pending deletions whose leaf is already tombstoned. */
+  getDeletedNativeHistoryParents(sessionId: string, nativeReference: string): ReadonlyMap<string, string> {
+    this.assertOpen();
+    const rows = this.database.prepare(`
+      SELECT identity.entry_id, identity.parent_entry_id
+      FROM native_history_event_identities AS identity
+      JOIN events AS event ON event.global_cursor = identity.event_cursor
+      JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE identity.session_id = ? AND identity.binding_fingerprint = ? AND identity.parent_entry_id IS NOT NULL
+      ORDER BY COALESCE(json_extract(event.metadata_json, '$.nativeHydration'), 0), identity.event_cursor DESC
+    `).all(sessionId, nativeBindingFingerprint(nativeReference)) as Row[];
+    return new Map(rows.map(row => [String(row["entry_id"]), String(row["parent_entry_id"])]));
+  }
+
+  private saveRetainedSessionContextCursors(sessionId: string, cursors: readonly bigint[], at: number): void {
+    const highWater = this.latestEventCursor();
+    if (cursors.some(cursor => cursor < 1n || cursor > highWater)) throw new StoreError("Retained context event cursors are invalid.");
+    this.setSetting("session", sessionId, RETAINED_CONTEXT_EVENTS_KEY,
+      { format: 1, cursors: [...new Set(cursors)].map(cursor => cursor.toString(10)) }, at);
   }
 
   /**
@@ -11462,13 +11488,10 @@ export class OperationalStore {
         throw new StoreError("Native context rebuild requires a bounded redacted handoff.");
       }
       if (input.retainContextEventCursors !== undefined) {
-        const highWater = this.latestEventCursor();
-        if (pending.reason !== "message_deletion" || input.restoreRuntimeHandoff !== true
-          || input.retainContextEventCursors.some(cursor => cursor < 1n || cursor > highWater)) {
+        if (pending.reason !== "message_deletion" || input.restoreRuntimeHandoff !== true) {
           throw new StoreError("Retained context history requires its exact message deletion rebuild.");
         }
-        this.setSetting("session", input.sessionId, RETAINED_CONTEXT_EVENTS_KEY,
-          { format: 1, cursors: [...new Set(input.retainContextEventCursors)].map(cursor => cursor.toString(10)) }, at);
+        this.saveRetainedSessionContextCursors(input.sessionId, input.retainContextEventCursors, at);
       }
       if (pending.sourceRunId !== undefined && pending.sourceQueueItemId !== undefined) {
         const recoveryError: PublicError = {
@@ -13374,18 +13397,26 @@ export class OperationalStore {
         entryId,
         parentEntryId ?? null
       );
-      const canonicalInsert = this.database.prepare(`
-        INSERT OR IGNORE INTO native_history_canonical_identities(
+      const canonicalWrite = this.database.prepare(`
+        INSERT INTO native_history_canonical_identities(
           session_id, binding_fingerprint, entry_id, event_cursor, parent_entry_id
         ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, binding_fingerprint, entry_id) DO UPDATE SET
+          event_cursor = excluded.event_cursor,
+          parent_entry_id = excluded.parent_entry_id
+        WHERE native_history_canonical_identities.parent_entry_id IS NULL
+          AND excluded.parent_entry_id IS NOT NULL AND ? = 1
+          AND (SELECT json_extract(metadata_json, '$.nativeHydration') FROM events
+            WHERE global_cursor = native_history_canonical_identities.event_cursor) IS NOT 1
       `).run(
         event.sessionId,
         fingerprintValue,
         entryId,
         asSqlInteger(event.globalCursor),
-        parentEntryId ?? null
+        parentEntryId ?? null,
+        event.metadata?.fields["nativeHydration"] === true ? 1 : 0
       );
-      if (Number(canonicalInsert.changes) === 1 && parentEntryId !== undefined) {
+      if (Number(canonicalWrite.changes) === 1 && parentEntryId !== undefined) {
         const missingActiveParent = this.database.prepare(`
           SELECT 1
           FROM native_history_current_markers AS marker
@@ -13430,10 +13461,10 @@ export class OperationalStore {
     this.refreshNativeHistoryActiveEntries(event.sessionId);
   }
 
-  private refreshNativeHistoryActiveEntries(sessionId: string): void {
-    this.database.prepare("DELETE FROM native_history_active_entries WHERE session_id = ?")
+  private refreshNativeHistoryActiveEntries(sessionId: string, database = this.database): void {
+    database.prepare("DELETE FROM native_history_active_entries WHERE session_id = ?")
       .run(sessionId);
-    const marker = this.database.prepare(`
+    const marker = database.prepare(`
       SELECT event_cursor, binding_fingerprint, leaf_id
       FROM native_history_current_markers
       WHERE session_id = ?
@@ -13442,7 +13473,7 @@ export class OperationalStore {
     const markerCursor = toBigInt(marker["event_cursor"]);
     const bindingFingerprint = String(marker["binding_fingerprint"]);
     const leafId = String(marker["leaf_id"]);
-    this.database.prepare(`
+    database.prepare(`
       WITH RECURSIVE
       ancestors(entry_id) AS (
         VALUES (?)
@@ -13513,6 +13544,47 @@ export class OperationalStore {
       JOIN native_history_event_identities AS identity
         ON identity.event_cursor = first.event_cursor
     `).run(sessionId);
+    this.promoteKnownNativeHistoryParents(this.database, sessionId);
+  }
+
+  private repairNativeHistoryIndexOnOpen(database: DatabaseSync): void {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const sessionId of this.promoteKnownNativeHistoryParents(database)) this.refreshNativeHistoryActiveEntries(sessionId, database);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** A live frame can identify an entry without observing its parent. A later
+   * persisted projection may fill that gap for the same binding and entry. */
+  private promoteKnownNativeHistoryParents(database: DatabaseSync, sessionId?: string): ReadonlySet<string> {
+    const rows = database.prepare(`
+      WITH upgrades AS MATERIALIZED (
+        SELECT canonical.session_id, canonical.binding_fingerprint, canonical.entry_id,
+               MIN(identity.event_cursor) AS event_cursor
+        FROM native_history_canonical_identities AS canonical
+        JOIN events AS first ON first.global_cursor = canonical.event_cursor
+        JOIN native_history_event_identities AS identity
+          ON identity.session_id = canonical.session_id AND identity.binding_fingerprint = canonical.binding_fingerprint
+          AND identity.entry_id = canonical.entry_id AND identity.parent_entry_id IS NOT NULL
+        JOIN events AS hydrated ON hydrated.global_cursor = identity.event_cursor
+        LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = hydrated.id
+        WHERE canonical.parent_entry_id IS NULL AND json_extract(first.metadata_json, '$.nativeHydration') IS NOT 1
+          AND json_extract(hydrated.metadata_json, '$.nativeHydration') = 1 AND tombstone.event_id IS NULL
+          ${sessionId === undefined ? "" : "AND canonical.session_id = ?"}
+        GROUP BY canonical.session_id, canonical.binding_fingerprint, canonical.entry_id
+      )
+      UPDATE native_history_canonical_identities AS canonical
+      SET event_cursor = upgrades.event_cursor, parent_entry_id = identity.parent_entry_id
+      FROM upgrades JOIN native_history_event_identities AS identity ON identity.event_cursor = upgrades.event_cursor
+      WHERE canonical.session_id = upgrades.session_id AND canonical.binding_fingerprint = upgrades.binding_fingerprint
+        AND canonical.entry_id = upgrades.entry_id
+      RETURNING session_id
+    `).all(...(sessionId === undefined ? [] : [sessionId])) as Row[];
+    return new Set(rows.map(row => String(row["session_id"])));
   }
 
   private indexVisibleMessage(event: PersistedEvent): void {
@@ -18939,6 +19011,7 @@ export class OperationalStore {
       }
       configureDatabase(database);
       initializeDatabase(database, this.now());
+      this.repairNativeHistoryIndexOnOpen(database);
       if (messageVectorAvailable) {
         database.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS ${MESSAGE_SEARCH_VECTOR_TABLE}
           USING vec0(
