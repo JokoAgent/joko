@@ -85,6 +85,8 @@ export interface AdapterContext {
   readonly persistentReadOnly?: "side_chat";
   /** Canonical service-node roots approved for this invocation. */
   readonly extraDirectories?: readonly ApprovedDirectory[];
+  /** Recheck the exact approvals held by a native runtime before using them. */
+  readonly assertExtraDirectoriesCurrent?: (directories: readonly ApprovedDirectory[]) => void;
   /** Current service-owned ordered policy authority for this Backend/Target/workspace. */
   readonly policySnapshot?: PolicySnapshot;
   /** Queue-private grants for cross-task Artifact mentions in this invocation.

@@ -3393,9 +3393,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const validated = await this.#validateExtraDirectories(directories, runtime.target);
     const paths = validated.map((directory) => directory.path);
     await this.#runIdleControl(runtime, context, "extra_directories", async (acknowledge) => {
+      context.assertExtraDirectoriesCurrent?.(validated);
       await runtime.query.applyFlagSettings({ permissions: { additionalDirectories: paths } });
       acknowledge();
       runtime.additionalDirectories = validated;
+      context.assertExtraDirectoriesCurrent?.(validated);
     });
   }
 
@@ -4001,6 +4003,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(workingContextWindow),
         CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: String(90 * Math.min(1, workingContextWindow / 100_000))
       };
+      context.assertExtraDirectoriesCurrent?.(launch.additionalDirectories);
       const query = await scoped.runtime.query({
         prompt: gate,
         options: {
@@ -5336,12 +5339,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       await managedWorkspaceParent(runtime, child.parentRawTaskId)?.workspace?.verify(child.grant.cancellation.signal);
       child.workspace?.assertCurrent();
       this.#assertManagedChildParent(runtime, child);
+      const additionalDirectories = runtime.additionalDirectories;
+      turn.context.assertExtraDirectoriesCurrent?.(additionalDirectories);
       child.queryCreationAttempted = true;
       const query = await runtime.sdkRuntime.query({
         prompt: gate,
         options: {
           abortController: child.grant.cancellation,
-          additionalDirectories: turn.context.hostedExecution ? [] : runtime.additionalDirectories.map((directory) => directory.path),
+          additionalDirectories: turn.context.hostedExecution ? [] : additionalDirectories.map((directory) => directory.path),
           allowDangerouslySkipPermissions: true,
           ...(child.input.subagent_type === undefined ? {} : { agent: child.input.subagent_type }),
           canUseTool: (toolName, input, options) => this.#canUseTool(runtime, toolName, input, {
@@ -5350,7 +5355,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             requestId: managedChildNativeIdentity(child.rawTaskId, "permission", options.requestId),
             agentID: options.agentID ?? child.rawTaskId
           }),
-          hooks: { PreToolUse: [{ hooks: [(input, toolUseId, options) => this.#nativeToolAuthorizationHook(runtime, input, toolUseId, options.signal)] }] },
+          hooks: { PreToolUse: [{ hooks: [(input, toolUseId, options) => this.#nativeToolAuthorizationHook(runtime, input, toolUseId, options.signal, additionalDirectories)] }] },
           cwd,
           env: {
             ...this.#environment,
@@ -5851,12 +5856,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     return undefined;
   }
 
-  async #nativeToolAuthorizationHook(runtime: NativeRuntime, input: ClaudeSdkHookInput, _toolUseId: string | undefined, signal: AbortSignal): Promise<ClaudeSdkHookOutput> {
+  async #nativeToolAuthorizationHook(runtime: NativeRuntime, input: ClaudeSdkHookInput, _toolUseId: string | undefined, signal: AbortSignal,
+    directories = runtime.additionalDirectories): Promise<ClaudeSdkHookOutput> {
     if (input.hook_event_name !== "PreToolUse") return { continue: true };
     const context = runtime.activeTurn?.context ?? runtime.baseContext, authority = context.nativeToolAuthorization;
     const denied = (reason: string): ClaudeSdkHookOutput => ({ continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } });
     try {
       signal.throwIfAborted(); runtime.assertRuntimeCurrent();
+      context.assertExtraDirectoriesCurrent?.(directories);
       const toolInput = structuredClone(input.tool_input) as Record<string, unknown>;
       if (context.hostedExecution) {
         const reason = this.#hostedToolDenial(runtime, input.tool_name, toolInput);
@@ -5873,6 +5880,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       const managedMcp = runtime.mcpLease?.tools.find(tool => input.tool_name === `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`);
       const result = await authority.review({ toolName: managedMcp ? `mcp__${managedMcp.serverId}__${managedMcp.name}` : input.tool_name, input: toolInput, signal });
       signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
+      context.assertExtraDirectoriesCurrent?.(directories);
       if (JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while its authorization was being reviewed.");
       if (result.verdict === "block") return denied(result.reason ?? "The current delegated task authorization denied this action.");
       if (result.verdict === "default") return { continue: true };
@@ -5887,6 +5895,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           toolName: input.tool_name, summary: permissionSummary(input.tool_name, toolInput, options, this.#projection), risk: permissionRisk(input.tool_name),
           choices: ["allow_once", "deny"] }, signal);
         signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
+        context.assertExtraDirectoriesCurrent?.(directories);
         if (!this.#isTurnCurrent(runtime, turn) || JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while permission was pending.");
         if (permissionSelection(answer) !== "allow_once") return denied("The owner denied this native operation.");
         return { continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: toolInput,
@@ -5914,6 +5923,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (!this.#isTurnCurrent(runtime, turn) || options.signal.aborted) {
       return { behavior: "deny", message: "The originating turn is no longer active." };
     }
+    const directories = runtime.additionalDirectories;
+    try { turn.context.assertExtraDirectoriesCurrent?.(directories); }
+    catch { return { behavior: "deny", message: "The originating task's extra-directory approvals changed." }; }
     if (runtime.runtimePolicy === "review_read_only") {
       return persistentSideChatReadDecision(runtime.baseContext, runtime.target.workspaceRoot, toolName, input);
     }
@@ -5951,6 +5963,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return { behavior: "deny", message: "Too many permission requests are already pending." };
     }
     const decisionPromise = this.#resolveToolInteraction(runtime, turn, toolName, input, options)
+      .then((result) => {
+        turn.context.assertExtraDirectoriesCurrent?.(directories);
+        return result;
+      })
       .catch((): ClaudePermissionResult => ({
         behavior: "deny",
         message: "The permission decision could not be completed safely."

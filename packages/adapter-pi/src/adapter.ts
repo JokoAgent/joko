@@ -2334,6 +2334,7 @@ export class PiBackendAdapter implements
         approvedRoots,
         writtenAt: new Date().toISOString()
       };
+      context.assertExtraDirectoriesCurrent?.(directories);
       await writeRuntimeControl(runtime.controlPath, {
         generation: runtime.transport.generation,
         policyGeneration: nextControl.policyGeneration,

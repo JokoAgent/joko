@@ -26,8 +26,11 @@ describe("ExtraDirectoryManager", () => {
     await manager.add({ workspaceId: "workspace-one", serverPath: ordinary, access: "read_only" });
     expect(manager.listForTarget("target-one")).toHaveLength(51);
     const selected = manager.listForTarget("target-one").find((row) => row.path === directories[0]!.path)!;
+    const retained = manager.listForTarget("target-one").find((row) => row.path === directories[1]!.path)!;
     manager.replaceWorkbenchGrant({ targetId: "target-one", revision: 3n, directories: directories.slice(1), current: () => current });
     await expect(async () => manager.resolveSelection("target-one", [selected.id])).rejects.toMatchObject({ publicError: { code: "EXTRA_DIRECTORY_NOT_APPROVED" } });
+    expect(() => manager.assertCurrent("target-one", [retained])).not.toThrow();
+    expect(() => manager.assertCurrent("target-one", [selected])).toThrow();
     manager.replaceWorkbenchGrant({ targetId: "target-one", revision: 2n, directories, current: () => current });
     expect(manager.listForTarget("target-one")).toHaveLength(50);
     current = false;
@@ -55,6 +58,10 @@ describe("ExtraDirectoryManager", () => {
     expect(manager.list()).toEqual([approved]);
     expect(manager.remove(approved.id)).toEqual(approved);
     expect(manager.list()).toEqual([]);
+    const renewed = await manager.add({ workspaceId: "workspace-one", serverPath: directory, access: "read_only" });
+    expect(renewed.id).toBe(approved.id);
+    expect(() => manager.assertCurrent("target-one", [approved])).toThrow();
+    expect(() => manager.assertCurrent("target-one", [renewed])).not.toThrow();
   });
 
   it("fails closed for files and missing paths", async () => {

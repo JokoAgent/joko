@@ -437,7 +437,6 @@ interface TurnOverrideLease {
   readonly fastModeChanged: boolean;
   readonly permissionModeChanged: boolean;
   readonly planModeChanged: boolean;
-  readonly extraDirectories: readonly ApprovedDirectory[];
   readonly extraDirectoriesChanged: boolean;
 }
 
@@ -6798,33 +6797,40 @@ export class SessionHost {
     if (registered?.setExtraDirectories === undefined) {
       throw extraDirectoryCapabilityInvariant(target.backendId);
     }
-    const directories = this.extraDirectories.listForTarget(targetId);
+    const failures: unknown[] = [];
     for (const session of this.#store.listSessions({ targetId, includeArchived: true })) {
       if (this.isReviewReadOnlySession(session.descriptor.id)) continue;
       const active = this.#active.get(session.descriptor.id);
       if (active === undefined) continue;
       if (active.adapter.setExtraDirectories === undefined) {
-        throw extraDirectoryCapabilityInvariant(target.backendId);
+        failures.push(extraDirectoryCapabilityInvariant(target.backendId));
+        continue;
       }
       let lease: ActiveBackendSideEffectLease;
       try {
         lease = this.beginActiveBackendSideEffect(session.descriptor.id, active);
       } catch (error) {
-        if (this.#backendReplacementFences.has(session.descriptor.backendId)) continue;
-        throw error;
+        if (!this.#backendReplacementFences.has(session.descriptor.backendId)) failures.push(error);
+        continue;
       }
-      const context: AdapterContext = { ...lease.context, extraDirectories: directories };
+      const context = lease.context;
       try {
-        await active.adapter.setExtraDirectories(directories, context);
+        await active.adapter.setExtraDirectories(context.extraDirectories ?? [], context);
         this.assertActiveBackendSideEffectLease(lease);
       } catch (error) {
-        await active.adapter.closeSession(lease.stored.descriptor.binding, context).catch(() => undefined);
-        this.deleteActiveSession(session.descriptor.id, active);
-        throw error;
+        failures.push(error);
+        try {
+          this.assertActiveBackendSideEffectLease(lease);
+          await active.adapter.closeSession(lease.stored.descriptor.binding, context);
+          this.deleteActiveSession(session.descriptor.id, active);
+        } catch (closeError) {
+          this.recordFailure("extra_directory_runtime_close", closeError);
+        }
       } finally {
         lease.release();
       }
     }
+    if (failures.length > 0) throw failures[0];
   }
 
   private assertSessionRuntimeProfileCapabilities(
@@ -7690,7 +7696,6 @@ export class SessionHost {
       fastModeChanged,
       permissionModeChanged,
       planModeChanged,
-      extraDirectories: baselineDirectories,
       extraDirectoriesChanged
     };
     try {
@@ -7719,6 +7724,7 @@ export class SessionHost {
         this.assertSessionNotPendingScheduleDeletion(stored.descriptor.id);
       }
       if (extraDirectoriesChanged) {
+        context.assertExtraDirectoriesCurrent?.(selectedDirectories);
         await active.adapter.setExtraDirectories!(selectedDirectories, context);
         this.assertSessionNotPendingScheduleDeletion(stored.descriptor.id);
       }
@@ -7782,7 +7788,7 @@ export class SessionHost {
       runId,
       undefined,
       undefined,
-      lease.extraDirectories,
+      undefined,
       sideEffect.backendInstanceGeneration
     );
     try {
@@ -7811,7 +7817,7 @@ export class SessionHost {
     if (lease.permissionModeChanged) await active.adapter.setPermissionMode(lease.permissionMode, context);
     if (lease.planModeChanged) await active.adapter.setPlanMode(lease.planMode, context);
     if (lease.extraDirectoriesChanged && active.adapter.setExtraDirectories !== undefined) {
-      await active.adapter.setExtraDirectories(lease.extraDirectories, context);
+      await active.adapter.setExtraDirectories(this.extraDirectories.listForTarget(context.target.id), context);
     }
   }
 
@@ -14475,6 +14481,8 @@ export class SessionHost {
       this.#active.get(sessionId)?.backendInstanceGeneration ??
       backend.instanceGeneration;
     const extraDirectoriesSupported = backend.capabilities.get("workspace.extra_dirs")?.supported === true;
+    const extraDirectories = runtimePolicy === "review_read_only" || !extraDirectoriesSupported
+      ? [] : selectedExtraDirectories ?? this.extraDirectories.listForTarget(target.id);
     const originalArtifactAuthority = artifactWorkspaceAuthority(this.#store.getTarget(target.id).descriptor, target, worktree);
     const turnBudget = this.#workingContextTurns.get(sessionId);
     const workingBudgets = turnBudget !== undefined && turnBudget.generation === generation
@@ -14496,7 +14504,7 @@ export class SessionHost {
           forBackgroundTask: (taskId: string) => {
             if (!taskId || taskId.length > 256 || /[\0\r\n]/u.test(taskId)) throw new StoreError("The native background task identity is invalid.");
             context.nativeToolAuthorization!.assertCurrent();
-            return this.makeContext(sessionId, target, generation, binding, runId, attemptId, operationId, selectedExtraDirectories,
+            return this.makeContext(sessionId, target, generation, binding, runId, attemptId, operationId, extraDirectories,
               runtimePolicy, appendSystemPrompt, backendInstanceGeneration, worktree, taskId).nativeToolAuthorization!;
           }
         }),
@@ -14541,6 +14549,7 @@ export class SessionHost {
               || current.descriptor.targetId !== target.id || current.descriptor.backendId !== target.backendId
               || artifactWorkspaceAuthority(registered, this.targetForSession(current), current.descriptor.worktree) !== originalArtifactAuthority) throw new StoreError("The native task workspace authority changed.");
           } else if (artifactWorkspaceAuthority(registered, target, worktree) !== originalArtifactAuthority) throw new StoreError("The provisional native workspace authority changed.");
+          this.extraDirectories.assertCurrent(target.id, extraDirectories);
           if (expectedRevision !== undefined && expectedRevision !== context.nativeToolAuthorization!.capture()) throw new StoreError("The native policy or originating task authority changed.");
           const authority = this.#extensionNativeToolAuthorization?.(sessionId);
           authority?.assertCurrent();
@@ -14580,9 +14589,10 @@ export class SessionHost {
       ...(runtimePolicy === undefined ? {} : { runtimePolicy }),
       ...(persistentReadOnly ? { persistentReadOnly } : {}),
       ...(runtimePolicy === "review_read_only" || appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
-      extraDirectories: runtimePolicy === "review_read_only" || !extraDirectoriesSupported
-        ? []
-        : selectedExtraDirectories ?? this.extraDirectories.listForTarget(target.id),
+      extraDirectories,
+      ...(extraDirectoriesSupported ? {
+        assertExtraDirectoriesCurrent: (directories: readonly ApprovedDirectory[]) => this.extraDirectories.assertCurrent(target.id, directories)
+      } : {}),
       ...(binding === undefined ? {} : { binding }),
       ...(operationId === undefined ? {} : { operationId }),
       signal,

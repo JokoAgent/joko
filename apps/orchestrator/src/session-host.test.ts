@@ -14053,6 +14053,43 @@ describe("SessionHost", () => {
     });
   });
 
+  it.each([0, 1, 2])("fences every native directory holder while refresh entry %i is busy", async (busyIndex) => {
+    const adapter = new PolicyFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const path = join(fixture.directory, "revoked-extra");
+    mkdirSync(path);
+    const approval = await fixture.host.extraDirectories.add({ workspaceId: "target-one", serverPath: path, access: "read_write" });
+    const created = vi.spyOn(adapter, "createSession");
+    for (const index of [0, 1, 2]) {
+      await fixture.host.createSession({ operationId: `extra-directory-holder-${index}`, connection: fixture.connection,
+        targetId: "target-one", title: `Holder ${index}`, providerId: "test", modelId: "text",
+        effort: "medium", fastMode: false, permissionMode: "ask", planMode: false });
+    }
+    const order = fixture.store.listSessions({ targetId: "target-one", includeArchived: true }).map((row) => row.descriptor.id);
+    const busy = order[busyIndex];
+    const refresh = vi.spyOn(adapter, "setExtraDirectories").mockImplementation(async (_directories, context) => {
+      if (context.sessionId === busy) throw new Error("Native task is busy.");
+    });
+    let finishClose!: () => void;
+    const closing = new Promise<void>((resolveClose) => { finishClose = resolveClose; });
+    const close = vi.spyOn(adapter, "closeSession").mockImplementationOnce(() => closing);
+    const request = { toolName: "Read", input: { file_path: join(path, "private.txt") }, signal: new AbortController().signal };
+    const oldAuthorities = created.mock.calls.map(([, context]) => context.nativeToolAuthorization!);
+    await expect(oldAuthorities[0]!.review(request)).resolves.toMatchObject({ verdict: "default" });
+    fixture.host.extraDirectories.remove(approval.id);
+    const done = expect(fixture.host.refreshTargetExtraDirectories("target-one")).rejects.toThrow("Native task is busy.");
+    try {
+      await eventually(() => close.mock.calls.length === 1);
+      for (const authority of oldAuthorities) await expect(authority.review(request)).resolves.toMatchObject({ verdict: "block" });
+    } finally {
+      finishClose();
+      await done;
+    }
+    expect(close.mock.calls.map(([, context]) => context.sessionId)).toEqual([busy]);
+    expect(refresh.mock.calls.map(([directories, context]) => [context.sessionId, directories])).toEqual(order.map((id) => [id, []]));
+    expect(fixture.host.extraDirectories.listForTarget("target-one")).toEqual([]);
+  });
+
   it("gates extra-directory policy by capability and rejects a manifest without its live setter", async () => {
     const disabledAdapter = new ExtraDirectoryContextFakeAdapter();
     const disabled = await createFixture(disabledAdapter);

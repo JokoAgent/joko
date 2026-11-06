@@ -140,6 +140,33 @@ describe("ClaudeCodeAdapter", () => {
       expect(review).toHaveBeenCalledOnce();
     } finally { await adapter.dispose(); }
   });
+  test("rechecks the directories actually installed on the Query after asynchronous tool review", async () => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk);
+    const approval = { id: "old-approval", path: process.cwd(), access: "read_write" as const };
+    let revoked = false;
+    const assertExtraDirectoriesCurrent: NonNullable<AdapterContext["assertExtraDirectoriesCurrent"]> = (directories) => {
+      if (revoked && directories.some((entry) => entry.id === approval.id)) throw new Error("Directory approval was removed.");
+    };
+    const review = vi.fn(async () => ({ verdict: "default" as const }));
+    const nativeToolAuthorization = { required: false, capture: () => "policy", assertCurrent: () => {}, review };
+    try {
+      const binding = await adapter.createSession(createInput({ permissionMode: "bypassPermissions" }),
+        { ...contextFor().context, assertExtraDirectoriesCurrent, extraDirectories: [approval] });
+      const source = { ...contextFor(binding, { operationId: "read-after-directory-removal" }).context,
+        extraDirectories: [], assertExtraDirectoriesCurrent, nativeToolAuthorization };
+      await adapter.send(textPrompt("Read the file"), source);
+      const query = sdk.queries.at(-1)!;
+      expect(query.params.options.additionalDirectories).toEqual([approval.path]);
+      const hook = query.params.options.hooks!.PreToolUse![0]!.hooks[0]!;
+      const input = { hook_event_name: "PreToolUse" as const, session_id: binding.nativeSessionId!, transcript_path: "unused",
+        cwd: target.workspaceRoot, tool_name: "Read", tool_use_id: "old-directory", tool_input: { file_path: join(approval.path, "private.txt") } };
+      await expect(hook(input, "old-directory", { signal: source.signal })).resolves.toEqual({ continue: true });
+      review.mockImplementationOnce(async () => { revoked = true; return { verdict: "default" as const }; });
+      await expect(hook(input, "old-directory", { signal: source.signal })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      await expect(hook(input, "old-directory", { signal: source.signal })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(review).toHaveBeenCalledTimes(2);
+    } finally { await adapter.dispose(); }
+  });
   test.each(["Read", "Write", "Bash", "mcp__server__read"])("enforces ordinary host policy for automatic %s tools in Full Access", async toolName => {
     const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk);
     const review = vi.fn(async () => ({ verdict: "block" as const, reason: "Ordered owner policy denies this action.", authorizationRevision: "policy-2" }));
