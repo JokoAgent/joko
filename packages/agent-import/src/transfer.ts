@@ -125,7 +125,8 @@ export async function transferPartnerImport(snapshot: ImportSnapshot, selection:
   receipt.deferSetup = selection.deferSetup === true;
   const partnerId = receipt.result.partnerId;
   receipt.result.status = 'running';
-  receipt.result.checks = receipt.result.checks.filter(item => item.entryId !== 'import');
+  receipt.result.checks = receipt.result.checks.filter(item => item.entryId !== 'import'
+    && !(receipt.nativePackage && receipt.result.canonicalSessionId !== undefined && item.entryId === 'runtime'));
   const copied = new Set(receipt.copied);
   let repairedCapture = false;
   const checkIndexes = new Map(receipt.result.checks.map((item, index) => [item.entryId, index]));

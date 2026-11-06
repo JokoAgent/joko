@@ -1038,6 +1038,32 @@ describe("PartnerManager", () => {
     for (const event of messages) if (event.payload.type === "message_complete") expect(event.payload.partnerPrivateOrigin).toBeUndefined();
   });
 
+  it("reads the original delegation reply even when an ordinary Run finishes before the first delegation check", async () => {
+    const adapter = new FakeBackendAdapter(PARTNER_PROFILE);
+    const send = vi.spyOn(adapter, "send").mockImplementation(async () => undefined);
+    const f = await createFixture(undefined, adapter);
+    const requester = await f.manager.createPartner(createInput(f.partnerStore, "Aster"));
+    const target = await f.manager.createPartner(createInput(f.partnerStore, "Beryl"));
+    const { delegation } = await f.manager.startDelegation({ callerSessionId: requester.canonicalSessionId!, targetPartnerId: target.id,
+      title: "Original work", objective: "Complete the original objective" });
+    const sessionId = delegation.childSessionId!, originalRunId = delegation.runId!;
+    await vi.waitFor(() => expect(send.mock.calls.some(([, context]) => context.runId === originalRunId)).toBe(true));
+    const original = send.mock.calls.find(([, context]) => context.runId === originalRunId)![1];
+    await original.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original delegated reply." }] });
+    await original.emit({ type: "done", outcome: "completed" });
+    const connection = f.operationalStore.createConnection({ id: "delegation-owner", name: "Owner", authKeyDigest: "delegation-key" });
+    const user = f.sessionHost.enqueueInput({ operationId: "delegation-child-ordinary", connection, sessionId,
+      prompt: { text: "A separate user request", disposition: "prompt", images: [], files: [], mentions: [] } }).value;
+    await vi.waitFor(() => expect(send.mock.calls.some(([, context]) => context.runId === user.runId)).toBe(true));
+    const later = send.mock.calls.find(([, context]) => context.runId === user.runId)![1];
+    await later.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Unrelated later reply." }] });
+    await later.emit({ type: "done", outcome: "completed" });
+    expect(f.partnerStore.getDelegation(delegation.id).status).not.toBe("completed");
+
+    const result = await f.manager.getDelegation(delegation.id, requester.id);
+    expect(result.delegation).toMatchObject({ runId: originalRunId, status: "completed", resultSummary: "Original delegated reply." });
+  });
+
   it("recovers a persisted delegation into a distinct target-owned task", async () => {
     const fixture = await createFixture();
     const requester = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Aster"));

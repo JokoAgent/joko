@@ -1013,7 +1013,7 @@ describe("PartnerService", () => {
   });
 
   it("maps activity, history, private threads, and revision-fenced delegation control", async () => {
-    const fixture = await createFixture(2_000);
+    const fixture = await createFixture(0, false, [], false, true);
     const service = createPartnerConnectService(fixture.manager, () => ({ connectionId: "connection-1" }));
     const first = await fixture.manager.createPartner(partnerInput(fixture.partnerStore, "Aster"));
     const second = await fixture.manager.createPartner(partnerInput(fixture.partnerStore, "Beryl"));
@@ -1108,7 +1108,7 @@ describe("PartnerService", () => {
   });
 });
 
-async function createFixture(streamDelayMs = 0, skillResources = false, additionalAdapters: readonly FakeBackendAdapter[] = [], captureRuns = false) {
+async function createFixture(streamDelayMs = 0, skillResources = false, additionalAdapters: readonly FakeBackendAdapter[] = [], captureRuns = false, holdDelegationReply = false) {
   const directory = mkdtempSync(join(tmpdir(), "joko-partner-service-"));
   const operationalStore = new OperationalStore(join(directory, "operational.db"));
   const partnerStore = new PartnerStore(join(directory, "partners.db"));
@@ -1119,10 +1119,29 @@ async function createFixture(streamDelayMs = 0, skillResources = false, addition
   if (captureRuns) await changes.initialize();
   const workspaceCapture = captureRuns ? new DurableWorkspaceRunCapture(operationalStore, changes) : undefined;
   class OutputAdapter extends FakeBackendAdapter {
+    readonly gates = new Map<string, { release(): void; retired: boolean }>();
     override async send(input: PromptInput, adapterContext: AdapterContext): Promise<void> {
       if (captureRuns && adapterContext.target.id.startsWith("partner-task-target:"))
         await writeFile(join(adapterContext.target.workspaceRoot, "task-report.txt"), "Private report contents");
+      if (holdDelegationReply && partnerStore.getSessionLink(adapterContext.sessionId)?.role === "delegation") {
+        let release!: () => void;
+        const settled = new Promise<void>(resolve => { release = resolve; });
+        const gate = { release, retired: false }; this.gates.set(adapterContext.sessionId, gate);
+        return super.send(input, { ...adapterContext, emit: async event => {
+          if (event.type === "message_complete") await settled;
+          if (!gate.retired) await adapterContext.emit(event);
+        } });
+      }
       return super.send(input, adapterContext);
+    }
+    override async abort(adapterContext: AdapterContext): Promise<void> {
+      const gate = this.gates.get(adapterContext.sessionId);
+      if (gate) { gate.retired = true; gate.release(); this.gates.delete(adapterContext.sessionId); }
+      await super.abort(adapterContext);
+    }
+    override async dispose(): Promise<void> {
+      for (const gate of this.gates.values()) { gate.retired = true; gate.release(); }
+      this.gates.clear(); await super.dispose();
     }
   }
   const sessionHost = new SessionHost(operationalStore, artifacts, [new OutputAdapter({

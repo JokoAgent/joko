@@ -348,6 +348,7 @@ type ArtifactKindFilter = "file" | "image" | "export" | "tool_result" | "diagnos
 type ArtifactListOptions = {
   readonly sessionId?: string;
   readonly runId?: string;
+  readonly runIds?: readonly string[];
   readonly kind?: ArtifactKindFilter;
   readonly includeDeleted?: boolean;
   readonly includeCleared?: boolean;
@@ -607,6 +608,10 @@ function artifactSqlFilter(options: ArtifactListOptions): SqlFilter {
   if (options.runId !== undefined) {
     clauses.push("artifact.run_id = ?");
     params.push(options.runId);
+  }
+  if (options.runIds !== undefined) {
+    clauses.push("artifact.run_id IN (SELECT value FROM json_each(?))");
+    params.push(serializeJson(options.runIds));
   }
   if (options.kind !== undefined) {
     clauses.push(`${ARTIFACT_KIND_SQL} = ?`);
@@ -9321,6 +9326,19 @@ export class OperationalStore {
     return value;
   }
 
+  findLatestAssistantReplyForRuns(sessionId: string, runIds: readonly string[]): PersistedEvent | undefined {
+    this.assertOpen();
+    if (runIds.length === 0) return undefined;
+    const row = this.database.prepare(`SELECT event.* FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.session_id = ? AND event.run_id IN (SELECT value FROM json_each(?))
+        AND tombstone.event_id IS NULL
+        AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
+      ORDER BY event.global_cursor DESC LIMIT 1`).get(sessionId, serializeJson(runIds)) as Row | undefined;
+    return row === undefined ? undefined : eventFromRow(row);
+  }
+
   findRun(id: string): StoredRun | undefined {
     this.assertOpen();
     const row = this.database.prepare("SELECT * FROM runs WHERE id = ?").get(id) as Row | undefined;
@@ -9872,6 +9890,26 @@ export class OperationalStore {
       `SELECT COUNT(*) AS count FROM queue_items AS item ${filter.where}`
     ).get(...filter.params) as Row;
     return numberValue(row["count"]);
+  }
+
+  hasOverlappingUserWorkspaceInput(input: {
+    readonly sessionId: string;
+    readonly runId: string;
+    readonly startedAt: number;
+    readonly capturedAt: number;
+  }): boolean {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT 1 FROM queue_items AS item
+      JOIN runs AS run ON run.id = item.run_id AND run.session_id = item.session_id
+      WHERE item.session_id = ? AND item.run_id <> ?
+        AND run.source = 'user' AND item.disposition IN ('steer', 'follow_up')
+        AND (item.backend_accepted_at IS NOT NULL OR item.state IN ('dispatching', 'dispatch_unknown'))
+        AND COALESCE(item.dispatched_at, item.backend_accepted_at, run.started_at) <= ?
+        AND (run.ended_at IS NULL OR run.ended_at >= ?)
+      LIMIT 1
+    `).get(input.sessionId, input.runId, input.capturedAt, input.startedAt);
+    return row !== undefined;
   }
 
   private assertQueueItemEditAuthority(
