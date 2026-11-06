@@ -418,7 +418,7 @@ import {
   WorkspaceSearchError,
   WorkspaceTextFileWriteError
 } from "./workspace-service.js";
-import type { GitState, WorkspaceEntryListingPolicy, WorkspaceEntryRecord, WorkspaceFilePreview, WorkspaceGitImageSide, WorkspaceGitPushResult, WorkspaceGitReviewSource, WorkspaceRegistration, WorkspaceSearchResult, WorkspaceService as NativeWorkspaceService } from "./workspace-service.js";
+import type { GitState, WorkspaceEntryListingPolicy, WorkspaceEntryRecord, WorkspaceFilePreview, WorkspaceGitCommitResult, WorkspaceGitImageSide, WorkspaceGitPushResult, WorkspaceGitReviewSource, WorkspaceRegistration, WorkspaceSearchResult, WorkspaceService as NativeWorkspaceService } from "./workspace-service.js";
 import type { WorkspaceFileChangeRecord, WorkspaceFileChangeScope } from "./workspace-change-stream.js";
 import { moveManagedWorkspaceToTrash } from "./managed-workspace-trash.js";
 import type { DiscoveredNodeRecord } from "./lan-discovery.js";
@@ -1041,6 +1041,7 @@ interface OperationOutcome {
     readonly dialogueRewound: boolean;
     readonly filesRewound: boolean;
   };
+  readonly workspaceGitCommit?: Pick<WorkspaceGitCommitResult, "repositoryRevision" | "headRevision">;
   readonly workspaceGitPush?: {
     readonly kind: "pushed" | "needs_force";
     readonly remote: string;
@@ -6683,6 +6684,12 @@ function operationResult(
     };
     return create(contract.OperationResultSchema, { payload });
   }
+  if (outcome.accepted && outcome.workspaceGitCommit !== undefined) {
+    return create(contract.OperationResultSchema, { payload: {
+      case: "workspaceGitCommit",
+      value: create(contract.WorkspaceGitCommitResultSchema, outcome.workspaceGitCommit)
+    } });
+  }
   if (outcome.accepted && outcome.workspaceGitPush !== undefined) {
     const push = outcome.workspaceGitPush;
     payload = {
@@ -7153,6 +7160,9 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
   if (typeof response["accepted"] === "boolean") {
     const rewind = asRecord(response["workspaceRewind"]);
     const login = asRecord(response["providerLogin"]);
+    const gitCommit = asRecord(response["workspaceGitCommit"]);
+    const commitRepositoryRevision = stringValue(gitCommit["repositoryRevision"]);
+    const commitHeadRevision = stringValue(gitCommit["headRevision"]);
     const gitPush = asRecord(response["workspaceGitPush"]);
     const scheduleDeletion = asRecord(response["scheduleDeletion"]);
     return {
@@ -7190,6 +7200,9 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
           ...(stringValue(login["userCode"]) === undefined ? {} : { userCode: stringValue(login["userCode"]) }),
           ...(typeof login["expiresAt"] !== "number" ? {} : { expiresAt: login["expiresAt"] })
         }
+      }),
+      ...(commitRepositoryRevision === undefined || commitHeadRevision === undefined ? {} : {
+        workspaceGitCommit: { repositoryRevision: commitRepositoryRevision, headRevision: commitHeadRevision }
       }),
       ...(gitPush["kind"] !== "pushed" && gitPush["kind"] !== "needs_force" ? {} : {
         workspaceGitPush: {
@@ -18810,18 +18823,33 @@ async function dispatchMutation(
         return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Backend does not support workspace.diff.commit.");
       }
       assertWorkspaceGitWriteIdle(dependencies.store, payload.value.workspaceId, target.descriptor.id);
-      return ackOperation(dependencies, operationId, connection, mutation, payload.case, async () => {
-        try {
-          assertWorkspaceGitWriteIdle(dependencies.store, payload.value.workspaceId, target.descriptor.id);
-          await dependencies.workspaceService.commitGitReview(payload.value.workspaceId, {
-            message: payload.value.message,
-            expectedRepositoryRevision: payload.value.expectedRepositoryRevision,
-            includeUnstaged: payload.value.includeUnstaged
-          });
-        } catch (error) {
-          throw workspaceGitConnectError(error);
+      let commitResult: WorkspaceGitCommitResult | undefined;
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        effect: async () => {
+          try {
+            assertWorkspaceGitWriteIdle(dependencies.store, payload.value.workspaceId, target.descriptor.id);
+            commitResult = await dependencies.workspaceService.commitGitReview(payload.value.workspaceId, {
+              message: payload.value.message,
+              expectedRepositoryRevision: payload.value.expectedRepositoryRevision,
+              includeUnstaged: payload.value.includeUnstaged
+            });
+          } catch (error) {
+            throw workspaceGitConnectError(error);
+          }
+        },
+        commit: () => {
+          if (commitResult === undefined) throw new ConnectError("Workspace commit did not produce a durable result.", Code.Internal);
+          return {
+            accepted: true,
+            resultCase: "workspaceGitCommit",
+            workspaceGitCommit: { repositoryRevision: commitResult.repositoryRevision, headRevision: commitResult.headRevision }
+          } satisfies OperationOutcome;
         }
-      });
+      }));
     }
     case "pushWorkspaceBranch": {
       const target = targetForWorkspace(dependencies.store, payload.value.workspaceId);

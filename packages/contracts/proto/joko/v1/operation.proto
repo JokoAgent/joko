@@ -1681,6 +1681,7 @@ message OperationResult {
     ScheduleDeletionResult schedule_deletion = 34;
     SkillMutationResult skill = 35;
     ExtensionPickedDirectoryDeposit picked_directory = 36;
+    WorkspaceGitCommitResult workspace_git_commit = 37;
   }
 }
 
@@ -1710,6 +1711,11 @@ message MemoryResetResult {
 
 message Acknowledgement {
   bool accepted = 1;
+}
+
+message WorkspaceGitCommitResult {
+  string repository_revision = 1;
+  string head_revision = 2;
 }
 
 enum WorkspaceGitPushOutcome {

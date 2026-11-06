@@ -923,6 +923,7 @@ import type {
   WorkspaceDiffImageView,
   WorkspaceFileDiffView,
   WorkspaceGitCommitDraft,
+  WorkspaceGitCommitResultView,
   WorkspaceGitPushDraft,
   WorkspaceGitPushResultView,
   WorkspaceChangeSetView,
@@ -7435,8 +7436,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
-  async commitWorkspaceDiff(workspaceId: string, draft: WorkspaceGitCommitDraft): Promise<void> {
-    await this.submit({
+  async commitWorkspaceDiff(workspaceId: string, draft: WorkspaceGitCommitDraft): Promise<WorkspaceGitCommitResultView | undefined> {
+    const operation = await this.submit({
       case: "commitWorkspaceDiff",
       value: {
         workspaceId,
@@ -7445,6 +7446,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         includeUnstaged: draft.includeUnstaged
       }
     }, true);
+    const payload = operation.result?.payload;
+    if (payload?.case !== "workspaceGitCommit") return undefined;
+    return { repositoryRevision: payload.value.repositoryRevision, headRevision: payload.value.headRevision };
   }
 
   async pushWorkspaceBranch(workspaceId: string, draft: WorkspaceGitPushDraft): Promise<WorkspaceGitPushResultView> {

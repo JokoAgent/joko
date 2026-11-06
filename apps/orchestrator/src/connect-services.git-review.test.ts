@@ -5,7 +5,7 @@ import * as contract from "@joko/contracts";
 import { operationBodyHash, type OperationRecord } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 import type { OrchestratorApplication } from "./application.js";
-import { createConnectServices } from "./connect-services.js";
+import { createConnectServices, outcomeFromRecord } from "./connect-services.js";
 
 const connection = {
   id: "connection-git-review",
@@ -253,12 +253,18 @@ describe("Connect Git Review contracts", () => {
         })
       }
     });
-    await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+    const committed = await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
       operationId: "operation-review-commit",
       connectionId: connection.id,
       mutation: commitMutation
     }), context() as never);
     expect(trace.slice(0, 2)).toEqual(["claimed", "commit-effect"]);
+    expect(committed.operation?.result?.payload).toMatchObject({
+      case: "workspaceGitCommit", value: { repositoryRevision: "new", headRevision: "a".repeat(40) }
+    });
+    expect(outcomeFromRecord(completedRecord("operation-review-commit", "commitWorkspaceDiff", commitMutation, {
+      accepted: true, resultCase: "workspaceGitCommit", workspaceGitCommit: { repositoryRevision: "new", headRevision: "a".repeat(40) }
+    })).workspaceGitCommit).toEqual({ repositoryRevision: "new", headRevision: "a".repeat(40) });
 
     const pushMutation = create(contract.OperationMutationSchema, {
       payload: {

@@ -473,6 +473,14 @@ describe("WorkspaceService Git Review backend", () => {
       expectedHeadRevision: committed.headRevision
     })).resolves.toMatchObject({ kind: "pushed", remote: "origin", remoteRef: "refs/heads/review" });
     expect(await git(bare, "rev-parse", "refs/heads/review")).toBe(committed.headRevision);
+    await git(root, "commit", "--quiet", "--allow-empty", "-m", "independent next commit");
+    const advancedHead = await git(root, "rev-parse", "HEAD");
+    await expect(service.pushGitReview("effects", {
+      remote: "origin", remoteRef: "refs/heads/review",
+      expectedRepositoryRevision: committed.repositoryRevision, expectedHeadRevision: committed.headRevision
+    })).rejects.toMatchObject({ kind: "stale" });
+    expect(await git(bare, "rev-parse", "refs/heads/review")).toBe(committed.headRevision);
+    await git(root, "update-ref", "HEAD", committed.headRevision, advancedHead);
 
     const other = await mkdtemp(join(tmpdir(), "joko-review-other-"));
     await git(tmpdir(), "clone", "--quiet", "--branch", "review", bare, other);
@@ -502,6 +510,15 @@ describe("WorkspaceService Git Review backend", () => {
       behind: 1
     });
     if (needsForce.kind !== "needs_force") throw new Error("Expected force-with-lease confirmation.");
+    await git(root, "commit", "--quiet", "--allow-empty", "-m", "commit after force confirmation");
+    const newHead = await git(root, "rev-parse", "HEAD");
+    await expect(service.pushGitReview("effects", {
+      remote: needsForce.remote, remoteRef: needsForce.remoteRef,
+      expectedRepositoryRevision: needsForce.repositoryRevision, expectedHeadRevision: needsForce.headRevision,
+      confirmForceWithLease: true, expectedRemoteOid: needsForce.remoteOid
+    })).rejects.toMatchObject({ kind: "stale" });
+    expect(await git(bare, "rev-parse", "refs/heads/review")).toBe(remoteOid);
+    await git(root, "update-ref", "HEAD", divergedHead, newHead);
     await expect(service.pushGitReview("effects", {
       remote: "origin",
       remoteRef: "refs/heads/review",

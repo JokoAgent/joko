@@ -2116,10 +2116,14 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
   const currentMutationFence = (): Promise<WorkspaceDiffView> => controller.getWorkspaceDiff(workspace.id, { source: "unstaged" });
   const displayedRemote = remote ?? diff?.pushTarget?.remote ?? "";
   const displayedRemoteRef = remoteRef ?? diff?.pushTarget?.remoteRef ?? "";
-  const executePush = async (confirmation?: WorkspaceGitPushResultView): Promise<void> => {
-    const fence = await currentMutationFence();
-    const selectedRemote = (confirmation?.remote ?? remote ?? fence.pushTarget?.remote ?? "").trim();
-    const selectedRemoteRef = (confirmation?.remoteRef ?? remoteRef ?? fence.pushTarget?.remoteRef ?? "").trim();
+  const displayedPushTarget = { remote: displayedRemote, remoteRef: displayedRemoteRef };
+  const executePush = async (
+    destination: { readonly remote: string; readonly remoteRef: string },
+    fence: Pick<WorkspaceDiffView, "headRevision" | "repositoryRevision">,
+    expectedRemoteOid?: string
+  ): Promise<void> => {
+    const selectedRemote = destination.remote.trim();
+    const selectedRemoteRef = destination.remoteRef.trim();
     if (selectedRemote === "" || selectedRemoteRef === "") throw new Error(t("workspace.reviewPushTargetRequired"));
     if (fence.headRevision === undefined || fence.headRevision === "") throw new Error(t("workspace.reviewPushHeadRequired"));
     const result = await controller.pushWorkspaceBranch(workspace.id, {
@@ -2127,8 +2131,8 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
       remoteRef: selectedRemoteRef,
       expectedRepositoryRevision: fence.repositoryRevision,
       expectedHeadRevision: fence.headRevision,
-      confirmForceWithLease: confirmation !== undefined,
-      ...(confirmation?.remoteOid === undefined ? {} : { expectedRemoteOid: confirmation.remoteOid })
+      confirmForceWithLease: expectedRemoteOid !== undefined,
+      ...(expectedRemoteOid === undefined ? {} : { expectedRemoteOid })
     });
     if (result.outcome === "needsForce") {
       setForceConfirmation(result);
@@ -2145,7 +2149,8 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
     setOperationNotice(undefined);
     runAction(confirmation === undefined ? "review:push" : "review:force-with-lease", async () => {
       try {
-        await executePush(confirmation);
+        if (confirmation !== undefined && !confirmation.remoteOid) throw new Error(t("workspace.reviewPushLeaseExpired"));
+        await executePush(confirmation ?? displayedPushTarget, confirmation ?? await currentMutationFence(), confirmation?.remoteOid);
       } catch (cause) {
         setError(isLeaseExpiredReviewError(cause) ? t("workspace.reviewPushLeaseExpired") : messageOf(cause));
         throw cause;
@@ -2165,7 +2170,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
       let committed = false;
       try {
         const fence = await currentMutationFence();
-        await controller.commitWorkspaceDiff(workspace.id, {
+        const committedFence = await controller.commitWorkspaceDiff(workspace.id, {
           message,
           includeUnstaged,
           expectedRepositoryRevision: fence.repositoryRevision
@@ -2174,7 +2179,10 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
         setCommitMessage("");
         setOperationNotice(t("workspace.reviewCommitComplete"));
         await reloadCurrentDiff();
-        if (pushAfterCommit) await executePush();
+        if (pushAfterCommit) {
+          if (committedFence === undefined) throw new Error(t("workspace.reviewCommitReceiptMissing"));
+          await executePush(displayedPushTarget, committedFence);
+        }
       } catch (cause) {
         setError(committed ? `${t("workspace.reviewCommitComplete")} ${messageOf(cause)}` : messageOf(cause));
         throw cause;
@@ -2286,7 +2294,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
       </Modal>
       <Modal open={forceConfirmation !== undefined} title={t("workspace.reviewPushForceTitle")} description={t("workspace.reviewPushForceDescription")} closeLabel={t("common.close")} onClose={() => setForceConfirmation(undefined)}>
         {forceConfirmation !== undefined && <div className="review-force-confirm">
-          <dl><div><dt>{t("workspace.reviewRemoteRef")}</dt><dd><code>{forceConfirmation.remoteRef}</code></dd></div><div><dt>{t("workspace.reviewRemoteOid")}</dt><dd><code>{forceConfirmation.remoteOid}</code></dd></div><div><dt>{t("workspace.reviewAheadBehind")}</dt><dd>↑{forceConfirmation.ahead} ↓{forceConfirmation.behind}</dd></div></dl>
+          <dl><div><dt>{t("workspace.reviewRemote")}</dt><dd><code>{forceConfirmation.remote}</code></dd></div><div><dt>{t("workspace.reviewRemoteRef")}</dt><dd><code>{forceConfirmation.remoteRef}</code></dd></div><div><dt>{t("workspace.reviewPushLocalCommit")}</dt><dd><code title={forceConfirmation.headRevision}>{forceConfirmation.headRevision.slice(0, 12)}</code></dd></div><div><dt>{t("workspace.reviewRemoteOid")}</dt><dd><code>{forceConfirmation.remoteOid}</code></dd></div><div><dt>{t("workspace.reviewAheadBehind")}</dt><dd>↑{forceConfirmation.ahead} ↓{forceConfirmation.behind}</dd></div></dl>
           <p>{t("workspace.reviewPushForceWarning")}</p>
           <div className="modal__actions"><Button onClick={() => setForceConfirmation(undefined)}>{t("common.cancel")}</Button><Button tone="danger" disabled={gitWriteDisabledReason !== undefined || pendingGitWrite !== undefined} onClick={() => { const selected = forceConfirmation; setForceConfirmation(undefined); requestPush(selected); }}>{t("workspace.reviewPushForceConfirm")}</Button></div>
         </div>}

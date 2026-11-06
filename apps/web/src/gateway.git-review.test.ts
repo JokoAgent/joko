@@ -121,7 +121,10 @@ describe("exact Git Review gateway", () => {
       }
       if (mutation?.case === "commitWorkspaceDiff") {
         expect(mutation.value).toMatchObject({ message: "review commit", includeUnstaged: true, expectedRepositoryRevision: "repo-2" });
-        return operationResponse(method, input.operationId);
+        return response(method, create(SubmitOperationResponseSchema, { operation: {
+          operationId: input.operationId, state: OperationState.SUCCEEDED,
+          result: { payload: { case: "workspaceGitCommit", value: { repositoryRevision: "repo-3", headRevision: "a".repeat(40) } } }
+        } }));
       }
       if (mutation?.case === "pushWorkspaceBranch") {
         pushes += 1;
@@ -140,7 +143,8 @@ describe("exact Git Review gateway", () => {
     await gateway.applyWorkspaceDiffHunk("workspace-1", {
       action: "revert", source: "unstaged", target: "file", path: "src/a.ts", expectedRepositoryRevision: "repo-1", ignoreWhitespace: false, confirmRevert: true
     });
-    await gateway.commitWorkspaceDiff("workspace-1", { message: "review commit", includeUnstaged: true, expectedRepositoryRevision: "repo-2" });
+    await expect(gateway.commitWorkspaceDiff("workspace-1", { message: "review commit", includeUnstaged: true, expectedRepositoryRevision: "repo-2" }))
+      .resolves.toEqual({ repositoryRevision: "repo-3", headRevision: "a".repeat(40) });
     const first = await gateway.pushWorkspaceBranch("workspace-1", {
       remote: "origin", remoteRef: "refs/heads/feature/review", expectedRepositoryRevision: "repo-3", expectedHeadRevision: "head-3", confirmForceWithLease: false
     });

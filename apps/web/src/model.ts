@@ -2643,6 +2643,11 @@ export interface WorkspaceGitCommitDraft {
   readonly expectedRepositoryRevision: string;
 }
 
+export interface WorkspaceGitCommitResultView {
+  readonly repositoryRevision: string;
+  readonly headRevision: string;
+}
+
 export interface WorkspaceGitPushDraft {
   readonly remote: string;
   readonly remoteRef: string;
@@ -6547,7 +6552,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   readWorkspaceDiffFile(workspaceId: string, file: WorkspaceFileDiffView, diff: WorkspaceDiffView): Promise<WorkspaceFilePreviewView>;
   readWorkspaceDiffImage(workspaceId: string, file: WorkspaceFileDiffView, diff: WorkspaceDiffView): Promise<WorkspaceDiffImageView>;
   applyWorkspaceDiffHunk(workspaceId: string, draft: WorkspaceDiffHunkMutationDraft): Promise<void>;
-  commitWorkspaceDiff(workspaceId: string, draft: WorkspaceGitCommitDraft): Promise<void>;
+  commitWorkspaceDiff(workspaceId: string, draft: WorkspaceGitCommitDraft): Promise<WorkspaceGitCommitResultView | undefined>;
   pushWorkspaceBranch(workspaceId: string, draft: WorkspaceGitPushDraft): Promise<WorkspaceGitPushResultView>;
   listWorkspaceChangeSets(workspaceId: string, sessionId: string): Promise<readonly WorkspaceChangeSetView[]>;
   previewWorkspaceRewind(workspaceId: string, changeSetId: string): Promise<WorkspaceRewindPreviewView>;
