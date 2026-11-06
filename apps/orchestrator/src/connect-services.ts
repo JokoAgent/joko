@@ -22272,21 +22272,26 @@ async function dispatchMutation(
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
       const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "revoke_extension_setup.expected_revision");
       const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      const assertCurrent = () => { dependencies.connections.fence(connection); };
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
         accepted: true,
         resultCase: "acknowledgement",
         entityId: entry.id
       }, async () => extensionCatalogEffect(async () => {
+        assertCurrent();
         const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
-        await dependencies.extensionCatalog!.revokeSetup(current.id, expectedRevision);
+        await dependencies.extensionCatalog!.revokeSetup(current.id, expectedRevision, assertCurrent);
         if (current.owner.kind === "mcp" && dependencies.mcpRouter !== undefined) {
           const serverId = current.owner.serverId;
           const server = dependencies.mcpRouter.list().find((candidate) => candidate.id === serverId);
           if (server?.enabled === true) {
+            assertCurrent();
             await dependencies.mcpRouter.restart(server.id);
+            assertCurrent();
             await dependencies.refreshPiGeneration?.();
           }
         }
+        assertCurrent();
         reconcileExtensionCatalog(dependencies);
       }));
     }

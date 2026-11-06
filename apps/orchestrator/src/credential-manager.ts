@@ -453,11 +453,12 @@ export class CredentialManager {
   }
 
   /** Releases only a retired reservation whose exact durable generation was removed. */
-  async retireManagedCredential(credentialReferenceId: string, expectedGeneration: string | undefined): Promise<boolean> {
+  async retireManagedCredential(credentialReferenceId: string, expectedGeneration: string | undefined, assertCurrent?: () => void): Promise<boolean> {
     this.#assertInitialized();
     const reference = normalizeReference(credentialReferenceId);
     if (!this.#managedReferences.has(reference)) throw new Error("Service credential is not reserved.");
     return this.#mutate(async () => {
+      assertCurrent?.();
       const current = this.#records.get(reference);
       if ((current === undefined ? undefined : credentialGeneration(current)) !== expectedGeneration) return false;
       if (current !== undefined) {
