@@ -143,8 +143,8 @@ export class ExtraDirectoryManager {
     return [...byId.values()].sort((left, right) => left.workspaceId.localeCompare(right.workspaceId) || left.path.localeCompare(right.path));
   }
 
-  #ordinary(): readonly ExtraDirectoryRecord[] {
-    return this.store.listSettings("target")
+  #ordinary(targetId?: string): readonly ExtraDirectoryRecord[] {
+    return this.store.listSettings("target", targetId)
       .filter((setting) => setting.key.startsWith(SETTING_PREFIX))
       .map(parseSetting)
       .filter((value): value is ExtraDirectoryRecord => value !== undefined)
@@ -152,7 +152,31 @@ export class ExtraDirectoryManager {
   }
 
   listForTarget(targetId: string): readonly ExtraDirectoryRecord[] {
-    return this.list().filter((entry) => entry.targetId === targetId);
+    const ordinary = this.#ordinary(targetId);
+    const grant = this.#workbenchGrants.get(targetId);
+    if (!grant?.current()) return ordinary;
+    const byId = new Map(ordinary.map((entry) => [entry.id, entry]));
+    for (const entry of grant.records) byId.set(entry.id, entry);
+    return [...byId.values()].sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  assertCurrent(targetId: string, directories: readonly ApprovedDirectory[]): void {
+    if (directories.length === 0) return;
+    const current = new Map(this.listForTarget(targetId).map((entry) => [entry.id, entry]));
+    const workbench = this.#workbenchGrants.get(targetId)?.records;
+    for (const directory of directories) {
+      const entry = current.get(directory.id);
+      if (entry && samePath(entry.path, directory.path) && entry.access === directory.access) {
+        // A Workbench revision covers the whole project list. Its per-project
+        // approval time remains stable when a different project changes.
+        const sameApproval = workbench?.includes(entry)
+          ? "approvedAt" in directory && entry.approvedAt === directory.approvedAt
+          : "revision" in directory && entry.revision === directory.revision;
+        if (sameApproval) continue;
+      }
+      throw directoryError("EXTRA_DIRECTORY_APPROVAL_CHANGED", "A native task's extra-directory approval changed.",
+        "Resume the task with the current workspace approvals.");
+    }
   }
 
   listForWorkspace(workspaceId: string): readonly ExtraDirectoryRecord[] {

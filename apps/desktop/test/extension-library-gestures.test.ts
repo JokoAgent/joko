@@ -1,8 +1,10 @@
-import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmodSync, writeFileSync } from "node:fs";
+import { mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { captureUserSelectedFile } from "@joko/device-peer/private-files";
 
 import {
   atomicCopyExtensionLibraryFile,
@@ -55,9 +57,10 @@ describe("Desktop Extension Library native gestures", () => {
       .resolves.toEqual({ absolutePath: source, bytes: 16 });
 
     const destination = join(temporary, "saved.bin");
-    await expect(atomicCopyExtensionLibraryFile(root, "exports/art.bin", destination)).resolves.toBe(16);
+    await expect(atomicCopyExtensionLibraryFile(root, "exports/art.bin", await captureUserSelectedFile(destination)))
+      .resolves.toMatchObject({ bytes: 16 });
     await expect(readFile(destination, "utf8")).resolves.toBe("verified artwork");
-    await expect(atomicCopyExtensionLibraryFile(root, "exports/art.bin", join(root, "copied.bin")))
+    await expect(atomicCopyExtensionLibraryFile(root, "exports/art.bin", await captureUserSelectedFile(join(root, "copied.bin"))))
       .rejects.toMatchObject({ code: "INVALID_REQUEST" });
 
     const link = join(root, "exports", "alias.bin");
@@ -69,7 +72,7 @@ describe("Desktop Extension Library native gestures", () => {
     }
   });
 
-  it("binds save tickets to one sender, expires them, and rate-limits attempts", () => {
+  it("binds save tickets to one sender, expires them, and rate-limits attempts", async () => {
     let now = 1_800_000_000_000;
     const coordinator = new ExtensionLibraryGestureCoordinator<object>(() => now);
     const firstScope = {};
@@ -82,7 +85,9 @@ describe("Desktop Extension Library native gestures", () => {
     coordinator.beginSaveDialog();
     expect(() => coordinator.beginSaveDialog()).toThrow(/dialog/u);
     coordinator.endSaveDialog();
-    const destination = join(tmpdir(), "saved.png");
+    const root = await mkdtemp(join(tmpdir(), "joko-library-save-ticket-"));
+    roots.push(root);
+    const destination = await captureUserSelectedFile(join(root, "saved.png"));
     const ticket = coordinator.issueSaveTicket(firstScope, EXTENSION_ID, destination);
     expect(() => coordinator.takeSaveTicket(secondScope, EXTENSION_ID, ticket)).toThrow(/unavailable/u);
     expect(coordinator.takeSaveTicket(firstScope, EXTENSION_ID, ticket)).toBe(destination);
@@ -94,6 +99,49 @@ describe("Desktop Extension Library native gestures", () => {
     const retired = coordinator.issueSaveTicket(firstScope, EXTENSION_ID, destination);
     coordinator.retireScope(firstScope);
     expect(() => coordinator.takeSaveTicket(firstScope, EXTENSION_ID, retired)).toThrow(/unavailable/u);
+  });
+
+  it("keeps a later file and refuses a Library ticket after its chosen directory has been replaced", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "joko-library-save-fence-"));
+    roots.push(temporary);
+    const root = join(temporary, "library");
+    const parent = join(temporary, "selected");
+    const moved = join(temporary, "moved");
+    await mkdir(root);
+    await mkdir(parent);
+    await writeFile(join(root, "source.txt"), "library data");
+    const leaf = join(parent, "copy.txt");
+    const selected = await captureUserSelectedFile(leaf);
+    await expect(atomicCopyExtensionLibraryFile(root, "source.txt", selected, undefined, () => {
+      writeFileSync(leaf, "independent file", { flag: "wx" });
+    })).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
+    expect(await readFile(leaf, "utf8")).toBe("independent file");
+
+    const another = await captureUserSelectedFile(join(parent, "another.txt"));
+    await rename(parent, moved);
+    await mkdir(parent);
+    await expect(atomicCopyExtensionLibraryFile(root, "source.txt", another)).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
+    expect(await readdir(parent)).toEqual([]);
+    expect(await readdir(moved)).toEqual(["copy.txt"]);
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("returns the published Library byte count when directory sync fails", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "joko-library-save-sync-"));
+    roots.push(temporary);
+    const root = join(temporary, "library");
+    const parent = join(temporary, "selected");
+    await mkdir(root);
+    await mkdir(parent);
+    await writeFile(join(root, "source.txt"), "library data");
+    const leaf = join(parent, "copy.txt");
+    try {
+      await expect(atomicCopyExtensionLibraryFile(root, "source.txt", await captureUserSelectedFile(leaf), undefined, () => {
+        chmodSync(parent, 0o300);
+      })).resolves.toEqual({ bytes: 12, directorySyncFailed: true });
+      expect(await readFile(leaf, "utf8")).toBe("library data");
+    } finally {
+      chmodSync(parent, 0o700);
+    }
   });
 
   it("requires exact save commit fields", () => {

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { lstat, open, realpath, rename, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { lstat, open, realpath } from "node:fs/promises";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { crc32 } from "node:zlib";
 
 import {
@@ -11,7 +11,7 @@ import {
   type DesktopExtensionLibraryCommitSaveRequest,
   type DesktopExtensionLibraryRevealRequest
 } from "./channels.js";
-import { sameFileIdentity, sameStableFile } from "@joko/device-peer/private-files";
+import { sameFileIdentity, sameStableFile, streamUserSelectedFile, type UserSelectedFileDestination, type UserSelectedFileReceipt } from "@joko/device-peer/private-files";
 
 export const EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES = 16 * 1024 * 1024;
 export const EXTENSION_LIBRARY_NATIVE_SAVE_MAXIMUM_BYTES = 8 * 1024 * 1024 * 1024;
@@ -37,7 +37,7 @@ interface SaveTicket<Scope extends object> {
   readonly id: string;
   readonly scope: Scope;
   readonly extensionId: string;
-  readonly destination: string;
+  readonly destination: UserSelectedFileDestination;
   readonly expiresAt: number;
 }
 
@@ -72,16 +72,16 @@ export class ExtensionLibraryGestureCoordinator<Scope extends object> {
     this.#saveDialogInFlight = false;
   }
 
-  issueSaveTicket(scope: Scope, extensionId: string, destination: string): string {
+  issueSaveTicket(scope: Scope, extensionId: string, destination: UserSelectedFileDestination): string {
     this.#cleanupExpired();
     if (this.#saveTickets.size >= 8) throw new ExtensionLibraryGestureError("BUSY", "Too many Extension Library saves are pending.");
-    if (!isDesktopExtensionId(extensionId) || !normalizedAbsolute(destination)) throw invalid("Extension Library save ticket is invalid.");
+    if (!isDesktopExtensionId(extensionId) || !normalizedAbsolute(destination.path)) throw invalid("Extension Library save ticket is invalid.");
     const id = `extension_library_save_${randomUUID().replaceAll("-", "")}`;
     this.#saveTickets.set(id, { id, scope, extensionId, destination, expiresAt: this.#now() + EXTENSION_LIBRARY_SAVE_TICKET_TTL_MS });
     return id;
   }
 
-  takeSaveTicket(scope: Scope, extensionId: string, ticketId: string): string {
+  takeSaveTicket(scope: Scope, extensionId: string, ticketId: string): UserSelectedFileDestination {
     this.#cleanupExpired();
     if (!SAVE_TICKET.test(ticketId)) throw invalid("Extension Library save ticket identity is invalid.");
     const ticket = this.#saveTickets.get(ticketId);
@@ -170,42 +170,36 @@ export async function resolveVerifiedExtensionLibraryFile(root: string, path: st
 export async function atomicCopyExtensionLibraryFile(
   root: string,
   path: string,
-  destination: string,
-  maximumBytes = EXTENSION_LIBRARY_NATIVE_SAVE_MAXIMUM_BYTES
-): Promise<number> {
-  if (!normalizedAbsolute(destination) || !Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+  destination: UserSelectedFileDestination,
+  maximumBytes = EXTENSION_LIBRARY_NATIVE_SAVE_MAXIMUM_BYTES,
+  assertCurrent?: () => void
+): Promise<UserSelectedFileReceipt> {
+  if (!normalizedAbsolute(destination.path) || !Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
     throw invalid("Extension Library save destination is invalid.");
   }
   const source = await resolveVerifiedExtensionLibraryFile(root, path);
-  if (inside(root, destination)) throw invalid("Extension Library save destination cannot be inside the active Library.");
+  if (inside(root, destination.path)) throw invalid("Extension Library save destination cannot be inside the active Library.");
   if (source.bytes > maximumBytes) throw new ExtensionLibraryGestureError("INVALID_REQUEST", "Extension Library file exceeds the native save limit.");
-  const existing = await missingAsUndefined(() => lstat(destination));
-  if (existing !== undefined) assertRegular(existing);
-  const sourceBefore = await lstat(source.absolutePath);
+  return await streamUserSelectedFile(destination, source.bytes, readStableLibraryFile(source, maximumBytes), assertCurrent);
+}
+
+async function* readStableLibraryFile(source: { readonly absolutePath: string; readonly bytes: number }, maximumBytes: number) {
+  const before = await lstat(source.absolutePath);
   const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
-  let sourceHandle: Awaited<ReturnType<typeof open>> | undefined;
-  let targetHandle: Awaited<ReturnType<typeof open>> | undefined;
+  const sourceHandle = await open(source.absolutePath, constants.O_RDONLY | noFollow);
   try {
-    sourceHandle = await open(source.absolutePath, constants.O_RDONLY | noFollow);
     const opened = await sourceHandle.stat();
     assertRegular(opened);
-    if (!sameStableFile(sourceBefore, opened) || opened.size > maximumBytes) {
+    if (!sameStableFile(before, opened) || opened.size !== source.bytes || opened.size > maximumBytes) {
       throw new ExtensionLibraryGestureError("STALE", "Extension Library file changed before save.");
     }
-    targetHandle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
-    const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(1, opened.size)));
     let offset = 0;
     while (offset < opened.size) {
-      const read = await sourceHandle.read(buffer, 0, Math.min(buffer.byteLength, opened.size - offset), offset);
+      const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, opened.size - offset));
+      const read = await sourceHandle.read(buffer, 0, buffer.byteLength, offset);
       if (read.bytesRead === 0) break;
-      let written = 0;
-      while (written < read.bytesRead) {
-        const result = await targetHandle.write(buffer, written, read.bytesRead - written, offset + written);
-        if (result.bytesWritten === 0) throw new Error("Extension Library save stopped making progress.");
-        written += result.bytesWritten;
-      }
       offset += read.bytesRead;
+      yield buffer.subarray(0, read.bytesRead);
     }
     const sentinel = Buffer.alloc(1);
     const extra = await sourceHandle.read(sentinel, 0, 1, offset);
@@ -215,20 +209,8 @@ export async function atomicCopyExtensionLibraryFile(
       || !sameStableFile(openedAfter, pathAfter) || !samePath(await realpath(source.absolutePath), source.absolutePath)) {
       throw new ExtensionLibraryGestureError("STALE", "Extension Library file changed during save.");
     }
-    await targetHandle.sync();
-    await targetHandle.close();
-    targetHandle = undefined;
-    await sourceHandle.close();
-    sourceHandle = undefined;
-    await rename(temporary, destination);
-    const committed = await lstat(destination);
-    assertRegular(committed);
-    if (committed.size !== opened.size) throw new Error("Extension Library native save was not committed completely.");
-    await syncDirectory(dirname(destination));
-    return committed.size;
   } finally {
-    await Promise.all([sourceHandle?.close().catch(() => undefined), targetHandle?.close().catch(() => undefined)]);
-    await unlink(temporary).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
+    await sourceHandle.close();
   }
 }
 
@@ -304,29 +286,6 @@ function samePath(left: string, right: string): boolean {
 
 function assertRegular(info: Stats): void {
   if (!info.isFile() || info.isSymbolicLink()) throw new ExtensionLibraryGestureError("STALE", "Extension Library file is not a regular file.");
-}
-
-async function missingAsUndefined<T>(action: () => Promise<T>): Promise<T | undefined> {
-  try {
-    return await action();
-  } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
-    throw error;
-  }
-}
-
-async function syncDirectory(directory: string): Promise<void> {
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(directory, constants.O_RDONLY);
-    await handle.sync();
-  } catch (error) {
-    const unsupported = process.platform === "win32" && typeof error === "object" && error !== null && "code" in error
-      && ["EACCES", "EBADF", "EINVAL", "ENOTSUP", "EPERM"].includes(String(error.code));
-    if (!unsupported) throw error;
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
 }
 
 function invalid(message: string): ExtensionLibraryGestureError {

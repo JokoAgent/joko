@@ -18688,7 +18688,7 @@ async function dispatchMutation(
           path: payload.value.relativePath,
           expectedRevision: payload.value.expectedRevision,
           confirmRecursive: payload.value.confirmRecursive
-        })
+        }, () => { dependencies.connections.fence(connection); })
       );
     case "copyWorkspaceEntry":
       return workspaceEntryEffectOperation(
@@ -18772,7 +18772,18 @@ async function dispatchMutation(
             "Approved extra-directory policy is changing."
           );
           const directory = dependencies.sessionHost.extraDirectories.remove(payload.value.extraDirectoryId);
-          await dependencies.sessionHost.refreshTargetExtraDirectories(directory.targetId);
+          try {
+            await dependencies.sessionHost.refreshTargetExtraDirectories(directory.targetId);
+          } catch (cause) {
+            throw new JokoError({
+              code: "EXTRA_DIRECTORY_RUNTIME_REFRESH_FAILED",
+              message: "The directory approval was removed, but some native tasks could not refresh it.",
+              phase: "workspace",
+              retryable: false,
+              stateMayHaveChanged: true,
+              recovery: "Refresh the workspace and resume any affected task with its current directory approvals."
+            }, { cause });
+          }
         },
         commit: () => ({ accepted: true } satisfies OperationOutcome)
       });

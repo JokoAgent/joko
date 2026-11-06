@@ -1,7 +1,11 @@
 import { constants, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 
 const MAXIMUM_PRIVATE_FILE_BYTES = 1024 * 1024;
 const privateFileOperations = new Map<string, Promise<void>>();
@@ -14,6 +18,26 @@ export interface FileSnapshot {
   readonly mtimeMs: number;
   readonly ctimeMs: number;
   readonly birthtimeMs: number;
+}
+
+export interface UserSelectedFileDestination {
+  readonly path: string;
+  readonly selectedDirectory: string;
+  readonly parent: FileSnapshot;
+  readonly existing?: FileSnapshot;
+}
+
+export interface UserSelectedFileReceipt {
+  readonly bytes: number;
+  readonly directorySyncFailed: boolean;
+  readonly temporaryCleanupFailed?: true;
+}
+
+export class UserSelectedFileSaveError extends Error {
+  constructor(readonly code: "DESTINATION_CHANGED" | "DESTINATION_UNSAFE" | "SAVE_FAILED" | "SAVE_OUTCOME_UNKNOWN", message: string) {
+    super(message);
+    this.name = "UserSelectedFileSaveError";
+  }
 }
 
 export async function readRegularFileSnapshot(path: string, maximumBytes: number): Promise<Uint8Array> {
@@ -121,44 +145,102 @@ async function writePrivateFileNow(path: string, bytes: Uint8Array): Promise<voi
   }
 }
 
-/**
- * Atomically writes bytes to a path explicitly chosen in the native save
- * dialog. The leaf may be replaced, but a directory or symbolic-link leaf is
- * rejected and the temporary file never leaves the selected directory.
- */
-export async function atomicWriteUserSelectedFile(
-  path: string,
-  bytes: Uint8Array,
-  maximumBytes: number
-): Promise<void> {
+/** Capture the actual directory and existing file as soon as the native picker returns. */
+export async function captureUserSelectedFile(path: string): Promise<UserSelectedFileDestination> {
   assertNormalizedAbsolute(path);
+  const selectedDirectory = dirname(path);
+  const directory = await realpath(selectedDirectory);
+  const parent = await lstat(directory);
+  if (!parent.isDirectory() || parent.isSymbolicLink()) {
+    throw new UserSelectedFileSaveError("DESTINATION_UNSAFE", "The selected save directory is unsafe.");
+  }
+  const canonicalPath = join(directory, basename(path));
+  const existing = await lstat(canonicalPath).catch((error: unknown) => {
+    if (isMissingFile(error)) return undefined;
+    throw error;
+  });
+  if (existing !== undefined && (!existing.isFile() || existing.isSymbolicLink())) {
+    throw new UserSelectedFileSaveError("DESTINATION_UNSAFE", "The selected save destination is unsafe.");
+  }
+  const verified = await lstat(directory);
+  if (!verified.isDirectory() || !sameFileIdentity(parent, verified) || !samePath(await realpath(selectedDirectory), directory)) {
+    throw new UserSelectedFileSaveError("DESTINATION_CHANGED", "The selected save directory changed. Choose the destination again.");
+  }
+  return { path: canonicalPath, selectedDirectory, parent: fileSnapshot(parent),
+    ...(existing === undefined ? {} : { existing: fileSnapshot(existing) }) };
+}
+
+export async function atomicWriteUserSelectedFile(
+  destination: string | UserSelectedFileDestination,
+  bytes: Uint8Array,
+  maximumBytes: number,
+  assertCurrent?: () => void
+): Promise<UserSelectedFileReceipt> {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0 || bytes.byteLength > maximumBytes) {
     throw new Error("The file save payload exceeds its size limit.");
   }
-  const existing = await lstat(path).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return undefined;
-    throw error;
-  });
-  if (existing !== undefined) assertRegularFile(existing, "The selected save destination is unsafe.");
+  const selected = typeof destination === "string" ? await captureUserSelectedFile(destination) : destination;
+  return await streamUserSelectedFile(selected, bytes.byteLength, [bytes], assertCurrent);
+}
 
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
-    await handle.writeFile(bytes);
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await rename(temporary, path);
-    const committed = await lstat(path);
-    assertRegularFile(committed, "The saved file is unsafe.");
-    await syncDirectory(dirname(path));
-  } finally {
-    await handle?.close().catch(() => undefined);
-    await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
+/** Use a per-save working directory so staging, publication and cleanup address the same directory after a rename. */
+export async function streamUserSelectedFile(
+  destination: UserSelectedFileDestination,
+  expectedBytes: number,
+  source: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+  assertCurrent?: () => void
+): Promise<UserSelectedFileReceipt> {
+  const writer = fileURLToPath(new URL("./selected-file-writer.js", import.meta.url));
+  const child = spawn(process.execPath, [writer], {
+    cwd: dirname(destination.path),
+    env: { ELECTRON_RUN_AS_NODE: "1", SystemRoot: process.env["SystemRoot"], WINDIR: process.env["WINDIR"] },
+    stdio: ["pipe", "ignore", "ignore", "ipc"],
+    windowsHide: true
+  });
+  const input = child.stdin!;
+  let result: { readonly receipt: UserSelectedFileReceipt } | { readonly error: string } | undefined;
+  let spawned = false;
+  const closed = new Promise<void>((done) => {
+    child.on("error", () => undefined);
+    child.once("spawn", () => { spawned = true; });
+    child.on("message", (message) => { result = message as typeof result; });
+    child.once("close", () => done());
+  });
+  let sentPublishMarker = false;
+  let sourceError: unknown;
+  async function* chunks() {
+    let received = 0;
+    try {
+      for await (const bytes of source) {
+        received += bytes.byteLength;
+        if (received > expectedBytes) throw new Error("The save source exceeded its expected size.");
+        yield bytes;
+      }
+      if (received !== expectedBytes) throw new Error("The save source changed size.");
+      assertCurrent?.();
+    } catch (error) {
+      sourceError = error;
+      throw error;
+    }
+    sentPublishMarker = true;
+    yield Buffer.from([1]);
   }
+  try {
+    child.send({ destination, expectedBytes }, (error) => { if (error !== null) input.destroy(error); });
+    await pipeline(Readable.from(chunks(), { objectMode: false }), input);
+  } catch {
+    input.destroy();
+  }
+  await closed;
+  if (result !== undefined && "receipt" in result) return result.receipt;
+  if (result !== undefined && result.error === "DESTINATION_CHANGED") {
+    throw new UserSelectedFileSaveError("DESTINATION_CHANGED", "The selected save destination changed. Choose the destination again.");
+  }
+  if (sourceError !== undefined) throw sourceError;
+  if (result === undefined && spawned && sentPublishMarker) {
+    throw new UserSelectedFileSaveError("SAVE_OUTCOME_UNKNOWN", "The file save could not be confirmed. Check the destination before trying again.");
+  }
+  throw new UserSelectedFileSaveError("SAVE_FAILED", "The file could not be saved at the selected destination.");
 }
 
 export async function readPrivateFile(path: string): Promise<Uint8Array | undefined> {
@@ -230,6 +312,10 @@ export function hasPrivateMode(info: Pick<FileSnapshot, "mode">, expected: 0o600
   return (info.mode & 0o777) === expected;
 }
 
+function fileSnapshot({ dev, ino, size, mode, mtimeMs, ctimeMs, birthtimeMs }: Stats): FileSnapshot {
+  return { dev, ino, size, mode, mtimeMs, ctimeMs, birthtimeMs };
+}
+
 function assertRegularFile(info: Stats, message: string): void {
   if (!info.isFile() || info.isSymbolicLink()) throw new Error(message);
 }
@@ -238,7 +324,7 @@ function assertNormalizedAbsolute(path: string): void {
   if (!isAbsolute(path) || resolve(path) !== path) throw new Error("File paths must be normalized and absolute.");
 }
 
-async function syncDirectory(directory: string): Promise<void> {
+export async function syncDirectory(directory: string): Promise<void> {
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(directory, constants.O_RDONLY);

@@ -1,11 +1,13 @@
-import { lstat, mkdir, readFile, readdir, rmdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmodSync, writeFileSync } from "node:fs";
+import { lstat, mkdir, readFile, readdir, rename, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   atomicWritePrivateFile,
   atomicWriteUserSelectedFile,
+  captureUserSelectedFile,
   deletePrivateFile,
   ensurePrivateDirectory,
   hasPrivateMode,
@@ -13,6 +15,7 @@ import {
   readRegularFileSnapshot,
   sameFileIdentity,
   sameStableFile,
+  streamUserSelectedFile,
   type FileSnapshot
 } from "@joko/device-peer/private-files";
 import { mkdtemp } from "./test-paths.js";
@@ -111,6 +114,54 @@ describe("Desktop secure files", () => {
     await expect(atomicWriteUserSelectedFile(target, new Uint8Array([1, 2, 3, 4, 5]), 4))
       .rejects.toThrow(/size limit/u);
     await expect(atomicWriteUserSelectedFile(root, new Uint8Array(), 4)).rejects.toThrow(/unsafe/u);
+  });
+
+  it("does not replace a file that appeared during a native save", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-desktop-save-exclusive-"));
+    const path = join(root, "attachment.txt");
+    const destination = await captureUserSelectedFile(path);
+    await expect(atomicWriteUserSelectedFile(destination, Buffer.from("attachment"), 1024, () => {
+      writeFileSync(path, "independent file", { flag: "wx" });
+    })).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
+    expect(await readFile(path, "utf8")).toBe("independent file");
+    expect(await readdir(root)).toEqual(["attachment.txt"]);
+  });
+
+  it.skipIf(process.platform === "win32")("cleans the original staged attachment when its parent directory moves", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-desktop-save-directory-"));
+    const parent = join(root, "selected");
+    const moved = join(root, "moved");
+    await mkdir(parent);
+    const destination = await captureUserSelectedFile(join(parent, "attachment.txt"));
+    const first = Buffer.alloc(64 * 1024, 7);
+    async function* source() {
+      yield first;
+      await vi.waitFor(async () => {
+        const staged = (await readdir(parent)).find((name) => name.startsWith(".joko-save-"));
+        expect(staged).toBeDefined();
+        expect((await stat(join(parent, staged!))).size).toBeGreaterThan(0);
+      }, { timeout: 5_000 });
+      await rename(parent, moved);
+      await mkdir(parent);
+      yield Buffer.from("end");
+    }
+    await expect(streamUserSelectedFile(destination, first.length + 3, source())).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
+    expect(await readdir(parent)).toEqual([]);
+    expect(await readdir(moved)).toEqual([]);
+  }, 15_000);
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("reports an attachment as published after directory sync is denied", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-desktop-save-sync-"));
+    const path = join(root, "attachment.txt");
+    const selected = await captureUserSelectedFile(path);
+    try {
+      await expect(atomicWriteUserSelectedFile(selected, Buffer.from("attachment"), 1024, () => {
+        chmodSync(root, 0o300);
+      })).resolves.toEqual({ bytes: 10, directorySyncFailed: true });
+      expect(await readFile(path, "utf8")).toBe("attachment");
+    } finally {
+      chmodSync(root, 0o700);
+    }
   });
 
   it("fails closed when the private directory itself is a symlink", async () => {
