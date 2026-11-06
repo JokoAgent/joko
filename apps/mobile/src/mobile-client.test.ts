@@ -7911,6 +7911,73 @@ describe("native mobile connection and operation ownership", () => {
 });
 
 describe("mobile Home search and task mutations", () => {
+  it.each(["search", "page", "anchor"] as const)("retires the original profile and its offline history when %s observes revocation", async (read) => {
+    const owner = create(SnapshotSchema, { ...offlineOwnerProjection(),
+      connections: [connection, otherConnection], devices: [device, otherDevice] });
+    const detail = offlineDetailProjection();
+    const offline = memoryOfflineCache();
+    const original = profileFromCredential(credential), other = profileFromCredential(otherCredential);
+    await offline.cache.save(other, node, owner, detail);
+    const network = projectedNetwork(owner);
+    vi.mocked(network.readSession).mockResolvedValue(detail);
+    const saved = memoryStorage([credential, otherCredential], credential.profileId);
+    const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+    await app.start();
+    expect((await offline.cache.load(original, "session"))?.detail).toBeDefined();
+    const anchor = event("e7", 7n);
+    vi.mocked(network.readAround).mockResolvedValueOnce([create(EventSchema, {
+      ...anchor, cursor: { ...anchor.cursor!, generation: detail.generation }
+    })]);
+    await app.around("e7");
+    expect(app.state.window?.map((item) => item.eventId)).toEqual(["e7"]);
+
+    const rejection = { code: Code.Unauthenticated };
+    if (read === "search") {
+      vi.mocked(network.searchSessionMessages).mockRejectedValueOnce(new Error("Network unavailable"));
+      await app.searchHome("words", "all");
+      expect(app.state).toMatchObject({ status: "connected", homeSearchStatus: "error", homeSearchError: "Network unavailable" });
+      let reject!: (error: unknown) => void;
+      vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+      const search = app.searchHome("other words", "all");
+      await app.searchHome("", "all");
+      reject(rejection);
+      await search;
+    } else if (read === "page") {
+      vi.mocked(network.readHistory).mockRejectedValueOnce(rejection);
+      await app.older();
+    } else {
+      vi.mocked(network.readAround).mockRejectedValueOnce(rejection);
+      await app.around("e6");
+    }
+
+    expect(app.state).toMatchObject({ status: "revoked", owner: undefined, detail: undefined,
+      window: undefined, older: [], selectedId: undefined, offlineSnapshotAt: undefined, historyBusy: false });
+    expect(saved.key()).toBeUndefined();
+    expect(saved.key(otherCredential.profileId)).toEqual(otherCredential);
+    await expect(offline.cache.load(original, "session")).resolves.toBeUndefined();
+    expect((await offline.cache.load(other, "session"))?.detail).toBeDefined();
+    app.dispose();
+  });
+
+  it("ignores a revoked response from a retired Home search credential", async () => {
+    const network = fakeNetwork();
+    vi.mocked(network.readOwner).mockImplementation(async (current) => current.profileId === otherCredential.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: extendedSnapshot }
+      : { connection, device, snapshot });
+    const saved = memoryStorage([credential, otherCredential], credential.profileId);
+    const app = client(network, saved.storage);
+    await app.start();
+    let reject!: (error: unknown) => void;
+    vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+    const oldSearch = app.searchHome("original words", "all");
+    await app.connectSaved(otherCredential.profileId);
+    reject({ code: Code.Unauthenticated });
+    await oldSearch;
+    expect(app.state).toMatchObject({ status: "connected", activeProfileId: otherCredential.profileId });
+    expect(saved.storage.deleteCredential).not.toHaveBeenCalled();
+    app.dispose();
+  });
+
   it("retires late message-search results when query or owner changes", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);

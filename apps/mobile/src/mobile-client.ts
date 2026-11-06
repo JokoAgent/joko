@@ -5791,6 +5791,13 @@ export class MobileClient {
       error: `${error}${cleanupError ?? ""}` });
   }
 
+  async #invalidateRevokedOwnerRead(error: unknown, epoch: number, credential: PairedCredential): Promise<boolean> {
+    if (!isRevoked(error) || !this.#current(epoch) || this.#joinedTask
+      || this.#credential !== credential || this.#activeProfileId !== credential.profileId) return false;
+    await this.#invalidateCredential(epoch, credential.profileId, "This Joko connection was revoked.");
+    return true;
+  }
+
   #schedule(): void {
     if (!this.#foreground || this.#disposed || !this.#credential) return;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
@@ -6058,6 +6065,7 @@ export class MobileClient {
     const credential = this.#credential;
     const owner = this.#state.owner;
     const profileId = this.#activeProfileId;
+    const epoch = this.#epoch;
     if (!credential || !owner || !profileId || this.#state.status !== "connected" || !this.#foreground) {
       this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "error",
         homeSearchSessionIds: [], homeSearchError: "Reconnect to search task messages." });
@@ -6083,6 +6091,7 @@ export class MobileClient {
       const sessionIds = [...new Set(matches.map((match) => match.sessionId).filter((sessionId) => visible.has(sessionId)))];
       this.#set({ homeSearchStatus: "ready", homeSearchSessionIds: sessionIds, homeSearchError: undefined });
     } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
         || profileId !== this.#activeProfileId) return;
       this.#set({ homeSearchStatus: "error", homeSearchSessionIds: [], homeSearchError: message(error) });
@@ -9350,6 +9359,7 @@ export class MobileClient {
         await this.#persistOfflineProjection(epoch, credential, this.#state.node, this.#state.owner, this.#state.detail);
       }
     } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
       throw error;
     } finally {
@@ -9372,6 +9382,7 @@ export class MobileClient {
       if (!events.some((event) => event.eventId === eventId)) throw new Error("The selected event is no longer in task history.");
       this.#set({ window: events, older: [], before: events[0]!.cursor, historyEnd: false });
     } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
       throw error;
     } finally {
