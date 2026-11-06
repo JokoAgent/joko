@@ -1,12 +1,18 @@
 import { rm } from "node:fs/promises";
+import { resolve } from "node:path";
 import { ContactKind, ContactSource, ContactStatus, ContactVCardImportDisposition } from "@joko/contracts";
+import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
 
+const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim() ? it : it.skip;
 let fixture: OrchestratorE2eFixture | undefined;
+let browser: Browser | undefined;
 let rootDirectory: string | undefined;
 
 afterEach(async () => {
+  await browser?.close();
+  browser = undefined;
   await fixture?.close({ removeRoot: false });
   fixture = undefined;
   if (rootDirectory !== undefined) await rm(rootDirectory, { recursive: true, force: true, maxRetries: 3 });
@@ -121,4 +127,45 @@ it("serves and restarts the complete authenticated local Contact chain", async (
     relations: [expect.objectContaining({ relatedDisplayName: "Analytical Engines", relation: "works at" })]
   });
   expect(related.directory!.revision!.value).toBeLessThan(restartedDirectory.revision!.value);
+});
+
+mountedIt("refreshes the mounted Contacts list and selected profile after another client writes", { timeout: 90_000 }, async () => {
+  fixture = await OrchestratorE2eFixture.start({ webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!) });
+  rootDirectory = fixture.rootDirectory;
+  const { clients: { contact } } = await fixture.pair("Contact editor");
+  const initial = (await contact.getContactDirectory({})).directory!;
+  const enabled = (await contact.setContactDirectoryEnabled({ expectedDirectoryRevision: initial.revision, enabled: true })).directory!;
+  const original = (await contact.createContact({ expectedDirectoryRevision: enabled.revision,
+    contact: { kind: ContactKind.PERSON, displayName: "Ada Lovelace", summary: "Original summary" }
+  })).contact!.summary!;
+
+  browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+  const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Contacts viewer" })).challenge!;
+  await page.goto(`${fixture.baseUrl}/#/settings/contacts`, { waitUntil: "domcontentloaded" });
+  await page.locator(".connection-tabs > button").nth(2).click();
+  await page.locator("details.device-authorization__manual > summary").click();
+  await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+  await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+  await page.getByLabel("Device name").fill("Contacts viewer");
+  await page.locator("form.pair-form button[type=submit]").click();
+  const panel = page.locator(".contacts-settings");
+  const details = panel.locator(".contact-detail");
+  await details.getByText("Original summary", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+
+  const updated = await contact.updateContact({ contactId: original.contactId, expectedRevision: original.revision,
+    patch: { summary: "Updated from a separate connection" } });
+  await contact.createContactGroup({ expectedDirectoryRevision: updated.directory!.revision, name: "Computing pioneers" });
+  const selected = panel.locator(".contacts-list__item[aria-pressed=true]");
+  await selected.getByText("Updated from a separate connection", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+  await details.getByText("Updated from a separate connection", { exact: true }).waitFor({ state: "visible" });
+  await panel.locator("option").filter({ hasText: "Computing pioneers" }).waitFor({ state: "attached" });
+  expect(await panel.locator(".contacts-directory-card__stats").textContent()).toMatch(/1\s*Groups/u);
+
+  await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+  await contact.deleteContact({ contactId: original.contactId, expectedRevision: updated.contact!.summary!.revision });
+  await details.getByText("Select a contact", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+  expect(await selected.count()).toBe(0);
 });

@@ -27,6 +27,7 @@ import type {
   RelatedContactRecord
 } from "./contact-types.js";
 import { ContactStoreError } from "./contact-types.js";
+import { isContactText } from "./contact-text.js";
 import {
   captureContactSnapshot,
   createEmptyContactSnapshot,
@@ -77,7 +78,6 @@ const MAX_NOTE = 1_000;
 const ENTITY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const PLATFORM = /^[a-z0-9_-]{1,32}$/u;
 const EVENT_DATE = /^\d{4}-(?:0[1-9]|1[0-2])(?:-(?:0[1-9]|[12]\d|3[01]))?$/u;
-const FORBIDDEN_TEXT = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 const CONTACT_SCHEMA = `
 CREATE TABLE contact_schema_version (
@@ -1457,7 +1457,7 @@ function contactDraft(input: ContactDraft): {
   if (identities.length > MAX_IDENTITIES) throw invalid("The contact identity limit was exceeded.");
   const keys = identities.map((identity) => `${identity.platform}\0${identity.normalizedValue}`);
   if (new Set(keys).size !== keys.length) throw invalid("Contact identities contain duplicates.");
-  const narrative = text(input.narrative ?? "", 0, Number.MAX_SAFE_INTEGER, "Contact narrative");
+  const narrative = text(input.narrative ?? "", 0, Number.MAX_SAFE_INTEGER, "Contact narrative", true);
   if (Buffer.byteLength(narrative, "utf8") > MAX_NARRATIVE_BYTES) throw invalid("Contact narrative is too large.");
   return {
     kind: contactKind(input.kind),
@@ -1465,7 +1465,7 @@ function contactDraft(input: ContactDraft): {
     aliases: aliasValues,
     summary: text(input.summary ?? "", 0, MAX_SUMMARY, "Contact summary"),
     narrative,
-    agentNotes: text(input.agentNotes ?? "", 0, MAX_AGENT_NOTES, "Contact agent notes"),
+    agentNotes: text(input.agentNotes ?? "", 0, MAX_AGENT_NOTES, "Contact agent notes", true),
     status: contactStatus(input.status ?? "confirmed"),
     source: contactSource(input.source ?? "manual"),
     identities
@@ -1494,11 +1494,11 @@ function contactPatch(input: ContactPatch): ContactPatch {
   }
   if (input.summary !== undefined) result.summary = text(input.summary, 0, MAX_SUMMARY, "Contact summary");
   if (input.narrative !== undefined) {
-    const value = text(input.narrative, 0, Number.MAX_SAFE_INTEGER, "Contact narrative");
+    const value = text(input.narrative, 0, Number.MAX_SAFE_INTEGER, "Contact narrative", true);
     if (Buffer.byteLength(value, "utf8") > MAX_NARRATIVE_BYTES) throw invalid("Contact narrative is too large.");
     result.narrative = value;
   }
-  if (input.agentNotes !== undefined) result.agentNotes = text(input.agentNotes, 0, MAX_AGENT_NOTES, "Contact agent notes");
+  if (input.agentNotes !== undefined) result.agentNotes = text(input.agentNotes, 0, MAX_AGENT_NOTES, "Contact agent notes", true);
   if (input.status !== undefined) result.status = contactStatus(input.status);
   return result;
 }
@@ -1709,8 +1709,8 @@ function entityId(value: unknown, label: string): string {
   return value;
 }
 
-function text(value: unknown, minimum: number, maximum: number, label: string): string {
-  if (typeof value !== "string" || value !== value.trim() || value.length < minimum || value.length > maximum || FORBIDDEN_TEXT.test(value)) {
+function text(value: unknown, minimum: number, maximum: number, label: string, multiline = false): string {
+  if (!isContactText(value, minimum, maximum, multiline)) {
     throw invalid(`${label} is invalid.`);
   }
   return value;

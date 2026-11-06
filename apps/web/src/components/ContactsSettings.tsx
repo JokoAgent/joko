@@ -90,6 +90,7 @@ export function ContactsSettings({ controller, locale, t }: {
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState<string>();
   const [reloadToken, setReloadToken] = useState(0);
+  const [catalogGeneration, setCatalogGeneration] = useState(0);
   const [editor, setEditor] = useState<ContactEditorState>();
   const [identityOpen, setIdentityOpen] = useState(false);
   const [eventOpen, setEventOpen] = useState(false);
@@ -111,34 +112,60 @@ export function ContactsSettings({ controller, locale, t }: {
     pageSize: 100,
     pageOffset: 0
   }), [appliedQuery, groupId, kind, status]);
+  const loadedCatalog = useRef<{
+    readonly ownerKey: string;
+    readonly options: typeof listOptions;
+    readonly revision: bigint;
+    readonly count: number;
+  } | undefined>(undefined);
+  const catalogRefreshing = useRef(false);
 
   useEffect(() => {
     const abort = new AbortController();
+    catalogRefreshing.current = true;
     setLoading(true);
     setError(undefined);
-    void Promise.all([
-      controller.getContactDirectory(abort.signal),
-      controller.listContactGroups(abort.signal),
-      controller.listContacts(listOptions, abort.signal)
-    ]).then(([nextDirectory, nextGroups, nextPage]) => {
+    void controller.getContactDirectory(abort.signal).then(async (nextDirectory) => {
+      const [nextGroups, firstPage] = await Promise.all([
+        controller.listContactGroups(abort.signal),
+        controller.listContacts(listOptions, abort.signal)
+      ]);
+      let nextPage = firstPage;
+      const contacts = [...nextPage.contacts];
+      while (!abort.signal.aborted && nextPage.nextPageOffset !== undefined) {
+        const current = loadedCatalog.current;
+        if (current?.ownerKey !== ownerKey || current.options !== listOptions || contacts.length >= current.count) break;
+        const offset = nextPage.nextPageOffset;
+        nextPage = await controller.listContacts({ ...listOptions, pageOffset: offset }, abort.signal);
+        contacts.push(...nextPage.contacts);
+        if (nextPage.nextPageOffset !== undefined && nextPage.nextPageOffset <= offset) break;
+      }
       if (abort.signal.aborted) return;
+      loadedCatalog.current = { ownerKey, options: listOptions, revision: nextDirectory.revision, count: contacts.length };
       setDirectory(nextDirectory);
       setGroups(nextGroups);
-      setPage(nextPage);
-      setSelectedId((current) => current !== undefined && nextPage.contacts.some((contact) => contact.id === current)
-        ? current
-        : nextPage.contacts[0]?.id);
+      setPage({ ...nextPage, contacts });
+      setSelectedId((current) => current !== undefined && contacts.some((contact) => contact.id === current)
+        ? current : contacts[0]?.id);
+      setCatalogGeneration(value => value + 1);
     }).catch((reason: unknown) => {
       if (!abort.signal.aborted) setError(errorMessage(reason, t("contacts.loadFailed")));
     }).finally(() => {
-      if (!abort.signal.aborted) setLoading(false);
+      if (!abort.signal.aborted) {
+        catalogRefreshing.current = false;
+        setLoading(false);
+      }
     });
-    return () => abort.abort();
+    return () => {
+      catalogRefreshing.current = false;
+      abort.abort();
+    };
   }, [controller, listOptions, ownerKey, reloadToken, t]);
 
   useEffect(() => {
     const abort = new AbortController();
     let loadingSync = false;
+    let checkingDirectory = false;
     const load = async (): Promise<void> => {
       if (loadingSync || abort.signal.aborted) return;
       loadingSync = true;
@@ -154,10 +181,26 @@ export function ContactsSettings({ controller, locale, t }: {
         loadingSync = false;
       }
     };
+    const checkDirectory = async (): Promise<void> => {
+      const current = loadedCatalog.current;
+      if (checkingDirectory || catalogRefreshing.current || abort.signal.aborted || current?.ownerKey !== ownerKey) return;
+      checkingDirectory = true;
+      try {
+        const next = await controller.getContactDirectory(abort.signal);
+        if (!abort.signal.aborted && !catalogRefreshing.current && loadedCatalog.current?.revision === current.revision &&
+          next.revision !== current.revision) {
+          setReloadToken(value => value + 1);
+        }
+      } catch {
+        // A transient background read leaves the current directory visible until the next check.
+      } finally {
+        checkingDirectory = false;
+      }
+    };
     setSyncStatus(undefined);
     setSyncError(undefined);
     void load();
-    const timer = setInterval(() => void load(), 5_000);
+    const timer = setInterval(() => { void load(); void checkDirectory(); }, 5_000);
     return () => {
       clearInterval(timer);
       abort.abort();
@@ -167,9 +210,11 @@ export function ContactsSettings({ controller, locale, t }: {
   useEffect(() => {
     if (selectedId === undefined) {
       setProfile(undefined);
+      setDetailLoading(false);
       return;
     }
     const abort = new AbortController();
+    setProfile(current => current?.id === selectedId ? current : undefined);
     setDetailLoading(true);
     void controller.getContact(selectedId, abort.signal).then((contact) => {
       if (!abort.signal.aborted) setProfile(contact);
@@ -182,7 +227,7 @@ export function ContactsSettings({ controller, locale, t }: {
       if (!abort.signal.aborted) setDetailLoading(false);
     });
     return () => abort.abort();
-  }, [controller, ownerKey, selectedId, t]);
+  }, [catalogGeneration, controller, ownerKey, selectedId, t]);
 
   const run = async <T,>(key: string, action: () => Promise<T>): Promise<T | undefined> => {
     setBusy(key);
@@ -403,14 +448,19 @@ export function ContactsSettings({ controller, locale, t }: {
     const next = await run("sync-now", () => controller.syncContactsNow());
     if (next !== undefined) {
       setSyncStatus(next);
-      refresh(profile?.id);
+      refresh();
     }
   };
 
   const loadMore = async (): Promise<void> => {
-    if (page.nextPageOffset === undefined) return;
-    const next = await run("contact-more", () => controller.listContacts({ ...listOptions, pageOffset: page.nextPageOffset }));
-    if (next !== undefined) setPage({ ...next, contacts: [...page.contacts, ...next.contacts] });
+    const loaded = loadedCatalog.current;
+    const offset = page.nextPageOffset;
+    if (loading || loaded?.ownerKey !== ownerKey || loaded.options !== listOptions || offset === undefined) return;
+    const next = await run("contact-more", () => controller.listContacts({ ...listOptions, pageOffset: offset }));
+    if (next === undefined || loadedCatalog.current !== loaded) return;
+    const contacts = [...page.contacts, ...next.contacts];
+    loadedCatalog.current = { ...loaded, count: contacts.length };
+    setPage({ ...next, contacts });
   };
 
   return <section className="contacts-settings">
@@ -426,7 +476,7 @@ export function ContactsSettings({ controller, locale, t }: {
         <Button tone="primary" onClick={() => setEditor({ mode: "create" })} disabled={directory === undefined || busy !== undefined}><Plus aria-hidden="true" />{t("contacts.new")}</Button>
       </div>
     </header>
-    {error !== undefined && <ErrorBanner message={error} onRetry={() => refresh(profile?.id)} onClose={() => setError(undefined)} />}
+    {error !== undefined && <ErrorBanner message={error} onRetry={() => refresh()} onClose={() => setError(undefined)} />}
     <div className="contacts-directory-card settings-card">
       <div>
         <strong>{t("contacts.directory")}</strong>
@@ -503,7 +553,7 @@ export function ContactsSettings({ controller, locale, t }: {
             <span><strong>{contact.displayName}</strong><small>{contact.summary || contact.aliases.join(" · ") || contactKindLabel(contact.kind, t)}</small></span>
             {contact.status === "pending" && <em>{t("contacts.pending")}</em>}
           </button>)}
-          {page.nextPageOffset !== undefined && <Button className="contacts-list__more" onClick={() => void loadMore()} disabled={busy !== undefined}>{t("common.loadMore")}</Button>}
+          {page.nextPageOffset !== undefined && <Button className="contacts-list__more" onClick={() => void loadMore()} disabled={loading || busy !== undefined}>{t("common.loadMore")}</Button>}
         </div>
       </aside>
       <article className="contact-detail" aria-busy={detailLoading}>
