@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -25,15 +25,13 @@ describe("DurableReviewEvidenceProvider", () => {
   it("captures the text diff and file fingerprint for a real Git C-quoted path", async () => {
     const fixture = setup();
     const workspaces = new WorkspaceService();
-    const git = (...args: string[]) => execFileSync("git", args, { cwd: fixture.root, windowsHide: true, encoding: "utf8" });
     const file = "报告.txt";
     try {
-      git("init", "--quiet");
-      git("config", "core.autocrlf", "false");
+      const git = initWorkspaceRepository(fixture.root);
       git("config", "core.quotePath", "true");
       writeWorkspaceFile(fixture.root, file, "old\n");
       git("add", "--", file);
-      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "-m", "base");
+      git("commit", "--quiet", "-m", "base");
       writeWorkspaceFile(fixture.root, file, "new\n");
       await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
 
@@ -45,6 +43,40 @@ describe("DurableReviewEvidenceProvider", () => {
       expect(capture.workspace.files).toEqual([{
         relativePath: file, byteLength: 4, sha256: createHash("sha256").update("new\n").digest("hex")
       }]);
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
+  it("captures a worktree rename without treating its old name as another status record", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    const originalPath = "MM_archive";
+    const file = "renamed.txt";
+    try {
+      const git = initWorkspaceRepository(fixture.root);
+      git("config", "status.renames", "true");
+      writeWorkspaceFile(fixture.root, originalPath, "renamed file\n");
+      writeWorkspaceFile(fixture.root, "archive/keep.txt", "keep\n");
+      git("add", "--", originalPath, "archive/keep.txt");
+      git("commit", "--quiet", "-m", "base");
+      renameSync(path.join(fixture.root, originalPath), path.join(fixture.root, file));
+      git("add", "-N", "--", file);
+      expect(git("status", "--porcelain=v1", "-z")).toBe(` R ${file}\0${originalPath}\0`);
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      await expect(workspaces.gitState("workspace")).resolves.toMatchObject({
+        changes: [{ path: file, originalPath, index: " ", worktree: "R" }]
+      });
+      const capture = await providerFor(fixture.store, workspaces, []).capture(request());
+      expect(capture.workspace.files).toEqual(expect.arrayContaining([
+        expect.objectContaining({ relativePath: file, byteLength: 13 }),
+        expect.objectContaining({ relativePath: originalPath, byteLength: 0 })
+      ]));
+      expect(capture.workspace.files).toHaveLength(2);
+      expect(capture.workspaceEvidence?.diffs).toMatchObject([
+        { relativePath: file, oldRelativePath: originalPath, source: "unstaged", status: "renamed" }
+      ]);
     } finally {
       await workspaces.close();
     }
@@ -364,6 +396,15 @@ function setup(targetId = "workspace") {
     fastMode: false, createdAt: 1, updatedAt: 1
   });
   return { store, root, directory };
+}
+
+function initWorkspaceRepository(root: string) {
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+  git("init", "--quiet");
+  git("config", "core.autocrlf", "false");
+  git("config", "user.name", "Review Test");
+  git("config", "user.email", "review@example.test");
+  return git;
 }
 
 function providerFor(
