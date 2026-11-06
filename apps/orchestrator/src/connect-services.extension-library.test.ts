@@ -1,8 +1,8 @@
 import { create } from "@bufbuild/protobuf";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -195,6 +195,33 @@ describe("Connect Extension Library boundary", () => {
     expect(new TextDecoder().decode(read.result.value.content)).toBe("hello");
     expect(read.result.value.path).toBe("notes/hello.txt");
 
+    const client = createClient(contract.ExtensionService, createRouterTransport(router => router.service(contract.ExtensionService, services.extension)));
+    const path = "notes/hello.txt";
+    const callExact = (operation: contract.ExtensionLibraryCall["operation"], match: string, onHeader?: (headers: Headers) => void) =>
+      client.callExtensionLibrary({ sessionId: sessionId!, call: { operation } }, {
+        headers: { authorization: "Bearer extension-library-test", "if-match": match }, ...(onHeader === undefined ? {} : { onHeader })
+      });
+    let tag: string | null = null;
+    const selection = await callExact({ case: "stat", value: create(contract.ExtensionLibraryStatOperationSchema, { path }) }, "*",
+      headers => { tag = headers.get("etag"); });
+    expect(tag).toMatch(/^"[a-f0-9]{64}"$/u);
+    expect(selection.result?.result).toMatchObject({ case: "stat", value: { path, bytes: 5n } });
+    expect(selection.result?.result.value).not.toHaveProperty("sourceTag");
+    const range = { case: "read", value: create(contract.ExtensionLibraryReadOperationSchema, { path, offset: 1n, length: 3n }) } as const;
+    const original = await callExact(range, tag!);
+    expect(original.result?.result).toMatchObject({ case: "read", value: { path, content: new TextEncoder().encode("ell") } });
+
+    const originalPath = join(overview.library!.location!.path, "notes", "hello.txt");
+    const originalTime = await stat(originalPath);
+    await rename(originalPath, `${originalPath}.original`);
+    await writeFile(originalPath, "other");
+    await utimes(originalPath, originalTime.atime, originalTime.mtime);
+    await expect(callExact(range, tag!)).rejects.toMatchObject({ code: Code.Aborted });
+    await callExact({ case: "stat", value: create(contract.ExtensionLibraryStatOperationSchema, { path }) }, "*",
+      headers => { tag = headers.get("etag"); });
+    const replacement = await callExact(range, tag!);
+    expect(replacement.result?.result).toMatchObject({ case: "read", value: { path, content: new TextEncoder().encode("the") } });
+
     const openedDatabase = await libraryCall(services.extension.callExtensionLibrary, sessionId!, {
       case: "sqlOpen",
       value: { path: "state.sqlite", create: true, readOnly: false }
@@ -247,10 +274,12 @@ describe("Connect Extension Library boundary", () => {
     })).rejects.toMatchObject({ code: Code.InvalidArgument });
 
     entry = { ...entry, revision: 8n };
+    await expect(callExact({ case: "stat", value: create(contract.ExtensionLibraryStatOperationSchema, { path }) }, tag!))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
     await expect(libraryCall(services.extension.callExtensionLibrary, sessionId!, {
       case: "read",
       value: { path: "notes/hello.txt" }
-    })).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    })).rejects.toMatchObject({ code: Code.NotFound });
     expect(fence).toHaveBeenCalled();
 
     const reopened = await invoke<contract.OpenExtensionLibraryResponse>(services.extension.openExtensionLibrary, {

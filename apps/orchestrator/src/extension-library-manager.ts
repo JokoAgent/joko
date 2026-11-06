@@ -647,16 +647,24 @@ export class ExtensionLibraryManager {
     };
   }
 
-  async read(sessionId: string, connectionId: string, input: { readonly path: string; readonly offset?: number; readonly length?: number }): Promise<ExtensionLibraryReadResult> {
-    return this.#withSession(sessionId, connectionId, false, (session) => session.vault.read(input));
+  async read(sessionId: string, connectionId: string, input: { readonly path: string; readonly offset?: number; readonly length?: number; readonly sourceTag?: string }): Promise<ExtensionLibraryReadResult> {
+    return this.#withSession(sessionId, connectionId, false, async (session) => {
+      const result = await session.vault.read(input);
+      if (input.sourceTag !== undefined) await this.#requireSession(sessionId, connectionId);
+      return result;
+    });
   }
 
   async write(sessionId: string, connectionId: string, input: { readonly path: string; readonly bytes: Uint8Array; readonly ifNotExists?: boolean }): Promise<ExtensionLibraryWriteResult> {
     return this.#withSession(sessionId, connectionId, true, (session) => session.vault.write(input));
   }
 
-  async stat(sessionId: string, connectionId: string, path: string): Promise<ExtensionLibraryEntry> {
-    return this.#withSession(sessionId, connectionId, false, (session) => session.vault.stat(path));
+  async stat(sessionId: string, connectionId: string, path: string, sourceTag?: string): Promise<ExtensionLibraryEntry> {
+    return this.#withSession(sessionId, connectionId, false, async (session) => {
+      const result = await session.vault.stat(path, sourceTag);
+      if (sourceTag !== undefined) await this.#requireSession(sessionId, connectionId);
+      return result;
+    });
   }
 
   async list(sessionId: string, connectionId: string, input: { readonly path?: string; readonly recursive?: boolean; readonly limit?: number; readonly cursor?: string }): Promise<{ readonly entries: readonly ExtensionLibraryEntry[]; readonly nextCursor?: string }> {
@@ -1420,6 +1428,7 @@ export class ExtensionLibraryManager {
         throw new Error("binding changed");
       }
       await assertExtensionLibraryRootIdentity(current.root, current.identity);
+      if (Atomics.load(new Int32Array(session.authorityState), 0) !== 0) throw new Error("authority retired");
     } catch (error) {
       await this.#destroySession(session);
       throw new ExtensionLibraryError("UNAVAILABLE", "Extension Library session authority was revoked.", { cause: error });

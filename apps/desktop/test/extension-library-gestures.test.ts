@@ -1,5 +1,5 @@
 import { chmodSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,14 +7,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { captureUserSelectedFile } from "@joko/device-peer/private-files";
 
 import {
-  atomicCopyExtensionLibraryFile,
   ExtensionLibraryGestureCoordinator,
   isPng,
   parseExtensionLibraryBeginSaveRequest,
   parseExtensionLibraryClipboardRequest,
   parseExtensionLibraryCommitSaveRequest,
   parseExtensionLibraryRevealRequest,
-  resolveVerifiedExtensionLibraryFile
+  resolveVerifiedExtensionLibraryFile,
+  saveExtensionLibraryFile
 } from "../src/extension-library-gestures.js";
 import { mkdtemp } from "./test-paths.js";
 
@@ -46,21 +46,23 @@ describe("Desktop Extension Library native gestures", () => {
     expect(() => parseExtensionLibraryClipboardRequest({ extensionId: EXTENSION_ID, bytes: Buffer.from("not png") })).toThrow(/PNG/u);
   });
 
-  it("resolves only stable regular files and atomically copies outside the active Library", async () => {
+  it("keeps native reveal local and saves the original node's bytes outside a local Library", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "joko-library-gesture-"));
     roots.push(temporary);
     const root = join(temporary, "library");
     await mkdir(join(root, "exports"), { recursive: true });
     const source = join(root, "exports", "art.bin");
-    await writeFile(source, Buffer.from("verified artwork"));
+    await writeFile(source, Buffer.from("local file bytes"));
     await expect(resolveVerifiedExtensionLibraryFile(root, "exports/art.bin"))
       .resolves.toEqual({ absolutePath: source, bytes: 16 });
 
     const destination = join(temporary, "saved.bin");
-    await expect(atomicCopyExtensionLibraryFile(root, "exports/art.bin", await captureUserSelectedFile(destination)))
+    const remote = fixtureSource(Buffer.from("verified artwork"));
+    await expect(saveExtensionLibraryFile({ totalBytes: 16 }, await captureUserSelectedFile(destination), remote))
       .resolves.toMatchObject({ bytes: 16 });
     await expect(readFile(destination, "utf8")).resolves.toBe("verified artwork");
-    await expect(atomicCopyExtensionLibraryFile(root, "exports/art.bin", await captureUserSelectedFile(join(root, "copied.bin"))))
+    await expect(readFile(source, "utf8")).resolves.toBe("local file bytes");
+    await expect(saveExtensionLibraryFile({ totalBytes: 16, localRoot: root }, await captureUserSelectedFile(join(root, "copied.bin")), remote))
       .rejects.toMatchObject({ code: "INVALID_REQUEST" });
 
     const link = join(root, "exports", "alias.bin");
@@ -112,7 +114,8 @@ describe("Desktop Extension Library native gestures", () => {
     await writeFile(join(root, "source.txt"), "library data");
     const leaf = join(parent, "copy.txt");
     const selected = await captureUserSelectedFile(leaf);
-    await expect(atomicCopyExtensionLibraryFile(root, "source.txt", selected, undefined, () => {
+    const source = fixtureSource(Buffer.from("library data"));
+    await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, selected, source, () => {
       writeFileSync(leaf, "independent file", { flag: "wx" });
     })).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
     expect(await readFile(leaf, "utf8")).toBe("independent file");
@@ -120,7 +123,7 @@ describe("Desktop Extension Library native gestures", () => {
     const another = await captureUserSelectedFile(join(parent, "another.txt"));
     await rename(parent, moved);
     await mkdir(parent);
-    await expect(atomicCopyExtensionLibraryFile(root, "source.txt", another)).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
+    await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, another, source)).rejects.toMatchObject({ code: "DESTINATION_CHANGED" });
     expect(await readdir(parent)).toEqual([]);
     expect(await readdir(moved)).toEqual(["copy.txt"]);
   });
@@ -135,7 +138,7 @@ describe("Desktop Extension Library native gestures", () => {
     await writeFile(join(root, "source.txt"), "library data");
     const leaf = join(parent, "copy.txt");
     try {
-      await expect(atomicCopyExtensionLibraryFile(root, "source.txt", await captureUserSelectedFile(leaf), undefined, () => {
+      await expect(saveExtensionLibraryFile({ totalBytes: 12, localRoot: root }, await captureUserSelectedFile(leaf), fixtureSource(Buffer.from("library data")), () => {
         chmodSync(parent, 0o300);
       })).resolves.toEqual({ bytes: 12, directorySyncFailed: true });
       expect(await readFile(leaf, "utf8")).toBe("library data");
@@ -144,12 +147,36 @@ describe("Desktop Extension Library native gestures", () => {
     }
   });
 
+  it("checks source authority after staging a multi-range save and keeps the existing destination on revocation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-library-save-revoked-"));
+    roots.push(root);
+    const destination = join(root, "saved.bin");
+    await writeFile(destination, "previous file");
+    const totalBytes = 16 * 1024 * 1024 + 5;
+    const original = fixtureSource(Buffer.alloc(totalBytes, 42), async () => {
+      const staged = (await readdir(root)).find(path => path.startsWith(".joko-save-"));
+      expect(staged).toBeDefined();
+      expect((await stat(join(root, staged!))).size).toBe(totalBytes);
+      throw new Error("source authority revoked");
+    });
+    await expect(saveExtensionLibraryFile({ totalBytes }, await captureUserSelectedFile(destination), original))
+      .rejects.toThrow("source authority revoked");
+    expect(await readdir(root)).toEqual(["saved.bin"]);
+    expect(await readFile(destination, "utf8")).toBe("previous file");
+  });
+
   it("requires exact save commit fields", () => {
     const root = join(tmpdir(), "joko-library-root");
     const ticketId = `extension_library_save_${"a".repeat(32)}`;
-    expect(parseExtensionLibraryCommitSaveRequest({ extensionId: EXTENSION_ID, ticketId, root, path: "art/file.png" }))
-      .toEqual({ extensionId: EXTENSION_ID, ticketId, root, path: "art/file.png" });
-    expect(() => parseExtensionLibraryCommitSaveRequest({ extensionId: EXTENSION_ID, ticketId: "bad", root, path: "art/file.png" }))
+    expect(parseExtensionLibraryCommitSaveRequest({ extensionId: EXTENSION_ID, ticketId, localRoot: root, totalBytes: 32 }))
+      .toEqual({ extensionId: EXTENSION_ID, ticketId, localRoot: root, totalBytes: 32 });
+    expect(() => parseExtensionLibraryCommitSaveRequest({ extensionId: EXTENSION_ID, ticketId: "bad", totalBytes: 32 }))
+      .toThrow(/invalid/u);
+    expect(() => parseExtensionLibraryCommitSaveRequest({ extensionId: EXTENSION_ID, ticketId, root, path: "art/file.png" }))
       .toThrow(/invalid/u);
   });
 });
+
+function fixtureSource(bytes: Uint8Array, verify = async () => {}) {
+  return { read: async (offset: number, length: number) => bytes.subarray(offset, offset + length), verify };
+}

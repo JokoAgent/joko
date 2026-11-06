@@ -188,7 +188,7 @@ export async function streamUserSelectedFile(
   destination: UserSelectedFileDestination,
   expectedBytes: number,
   source: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
-  assertCurrent?: () => void
+  assertCurrent?: () => void | Promise<void>
 ): Promise<UserSelectedFileReceipt> {
   const writer = fileURLToPath(new URL("./selected-file-writer.js", import.meta.url));
   const child = spawn(process.execPath, [writer], {
@@ -200,11 +200,16 @@ export async function streamUserSelectedFile(
   const input = child.stdin!;
   let result: { readonly receipt: UserSelectedFileReceipt } | { readonly error: string } | undefined;
   let spawned = false;
+  let ready!: (value: boolean) => void;
+  const stage = new Promise<boolean>((resolve) => { ready = resolve; });
   const closed = new Promise<void>((done) => {
     child.on("error", () => undefined);
     child.once("spawn", () => { spawned = true; });
-    child.on("message", (message) => { result = message as typeof result; });
-    child.once("close", () => done());
+    child.on("message", (message) => {
+      if (message === "ready") ready(true);
+      else result = message as typeof result;
+    });
+    child.once("close", () => { ready(false); done(); });
   });
   let sentPublishMarker = false;
   let sourceError: unknown;
@@ -217,19 +222,24 @@ export async function streamUserSelectedFile(
         yield bytes;
       }
       if (received !== expectedBytes) throw new Error("The save source changed size.");
-      assertCurrent?.();
     } catch (error) {
       sourceError = error;
       throw error;
     }
-    sentPublishMarker = true;
-    yield Buffer.from([1]);
   }
   try {
     child.send({ destination, expectedBytes }, (error) => { if (error !== null) input.destroy(error); });
     await pipeline(Readable.from(chunks(), { objectMode: false }), input);
+    if (await stage) {
+      try { await assertCurrent?.(); } catch (error) { sourceError = error; throw error; }
+      if (child.connected) {
+        sentPublishMarker = true;
+        child.send("publish", (error) => { if (error !== null && child.connected) child.disconnect(); });
+      }
+    }
   } catch {
     input.destroy();
+    if (child.connected) child.disconnect();
   }
   await closed;
   if (result !== undefined && "receipt" in result) return result.receipt;

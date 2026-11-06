@@ -463,8 +463,13 @@ export type DesktopExtensionLibrarySaveSelection =
 export interface DesktopExtensionLibraryCommitSaveRequest {
   readonly extensionId: string;
   readonly ticketId: string;
-  readonly root: string;
-  readonly path: string;
+  readonly totalBytes: number;
+  readonly localRoot?: string;
+}
+
+export interface DesktopExtensionLibrarySaveSource {
+  readonly read: (offset: number, length: number) => Promise<Uint8Array>;
+  readonly verify: () => Promise<void>;
 }
 
 export interface DesktopExtensionLibraryClipboardRequest {

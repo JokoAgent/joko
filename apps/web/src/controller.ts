@@ -3960,7 +3960,7 @@ export function useAppController(): AppController {
     purgeExpiredExtensionLibraries: async (signal) => catalogGateway().purgeExpiredExtensionLibraries(signal),
     openExtensionLibrary: async (extensionId, expectedRevision, surfaceId, signal) =>
       catalogGateway().openExtensionLibrary(extensionId, expectedRevision, surfaceId, signal),
-    callExtensionLibrary: async (sessionId, call, signal) => catalogGateway().callExtensionLibrary(sessionId, call, signal),
+    callExtensionLibrary: async (sessionId, call, signal, source) => catalogGateway().callExtensionLibrary(sessionId, call, signal, source),
     closeExtensionLibrary: async (sessionId, signal) => catalogGateway().closeExtensionLibrary(sessionId, signal),
     getExtensionPackagePreview: async (extensionId, expectedRevision, backendId, signal) =>
       catalogGateway().getExtensionPackagePreview(extensionId, expectedRevision, backendId, signal),

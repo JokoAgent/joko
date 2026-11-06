@@ -544,8 +544,11 @@ interface JokoDesktopApi {
     commitSave(request: {
       readonly extensionId: string;
       readonly ticketId: string;
-      readonly root: string;
-      readonly path: string;
+      readonly totalBytes: number;
+      readonly localRoot?: string;
+    }, source: {
+      readonly read: (offset: number, length: number) => Promise<Uint8Array>;
+      readonly verify: () => Promise<void>;
     }): Promise<number>;
     cancelSave(ticketId: string): Promise<void>;
     clipboardWrite(request: { readonly extensionId: string; readonly bytes: Uint8Array }): Promise<number>;

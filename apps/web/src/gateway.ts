@@ -692,6 +692,7 @@ import type {
   ExtensionLibraryLocationView,
   ExtensionLibraryOverviewView,
   ExtensionLibrarySessionView,
+  ExtensionLibrarySourceMatch,
   ExtensionLibrarySqlResultView,
   ExtensionLibrarySqlValueView,
   ExtensionLibraryTrashEntryView,
@@ -6365,15 +6366,28 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async callExtensionLibrary(
     sessionId: string,
     call: ExtensionLibraryCallView,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    source?: ExtensionLibrarySourceMatch
   ): Promise<ExtensionLibraryCallResultView> {
     const scope = this.captureActionScope(signal);
+    let tag: string | null = null;
     const response = await createClient(ExtensionService, scope.transport).callExtensionLibrary({
       sessionId,
       call: mapExtensionLibraryCall(call)
-    }, { signal: scope.signal });
+    }, { signal: scope.signal, ...(source === undefined ? {} : {
+      headers: { "if-match": source.tag },
+      onHeader: (headers: Headers) => { tag = headers.get("etag"); }
+    }) });
+    scope.signal.throwIfAborted();
     if (response.result === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library call result.");
-    return mapExtensionLibraryCallResult(response.result);
+    const result = mapExtensionLibraryCallResult(response.result);
+    if (source !== undefined) {
+      if (tag === null || !/^"[a-f0-9]{64}"$/u.test(tag) || source.tag !== "*" && source.tag !== tag) {
+        throw new GatewayError("Orchestrator could not verify the Extension Library save source.");
+      }
+      source.capture?.(tag);
+    }
+    return result;
   }
 
   async closeExtensionLibrary(sessionId: string, signal?: AbortSignal): Promise<boolean> {

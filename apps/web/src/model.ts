@@ -4425,6 +4425,12 @@ export interface ExtensionLibraryEntryView {
   readonly modifiedAt: number;
 }
 
+/** Private file identity used by the trusted Desktop save bridge. */
+export interface ExtensionLibrarySourceMatch {
+  readonly tag: string;
+  readonly capture?: (tag: string) => void;
+}
+
 export type ExtensionLibrarySqlValueView =
   | { readonly kind: "null" }
   | { readonly kind: "number"; readonly value: number }
@@ -6489,7 +6495,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   rollbackExtensionLibrary(extensionId: string, expectedRevision: bigint, graceId: string, signal?: AbortSignal): Promise<{ readonly location: ExtensionLibraryLocationView; readonly graceId: string }>;
   purgeExpiredExtensionLibraries(signal?: AbortSignal): Promise<{ readonly trash: number; readonly grace: number }>;
   openExtensionLibrary(extensionId: string, expectedRevision: bigint, surfaceId: string, signal?: AbortSignal): Promise<ExtensionLibrarySessionView>;
-  callExtensionLibrary(sessionId: string, call: ExtensionLibraryCallView, signal?: AbortSignal): Promise<ExtensionLibraryCallResultView>;
+  callExtensionLibrary(sessionId: string, call: ExtensionLibraryCallView, signal?: AbortSignal, source?: ExtensionLibrarySourceMatch): Promise<ExtensionLibraryCallResultView>;
   closeExtensionLibrary(sessionId: string, signal?: AbortSignal): Promise<boolean>;
   getExtensionPackagePreview(extensionId: string, expectedRevision: bigint, backendId: string, signal?: AbortSignal): Promise<ExtensionPackagePreviewView>;
   adoptExtensionPackage(preview: ExtensionPackagePreviewView, allowSourceReplacement?: boolean, signal?: AbortSignal): Promise<void>;

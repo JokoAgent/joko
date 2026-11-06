@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { Code } from "@connectrpc/connect";
+import { Code, type CallOptions } from "@connectrpc/connect";
 import {
   ExtensionLibraryCallSchema,
   ExtensionLibraryState,
@@ -191,6 +191,18 @@ describe("production Extension Library chain", () => {
       ] }
     });
 
+    const savePath = "notes/owner.txt";
+    let sourceTag: string | null = null;
+    const selectedFile = await libraryCall(restarted.clients.extension, restartedSessionId, { case: "stat", value: { path: savePath } }, {
+      headers: { "if-match": "*" }, onHeader: headers => { sourceTag = headers.get("etag"); }
+    });
+    expect(selectedFile.result).toMatchObject({ case: "stat", value: { path: savePath, bytes: BigInt(text.byteLength) } });
+    expect(sourceTag).toMatch(/^"[a-f0-9]{64}"$/u);
+    const range = await libraryCall(restarted.clients.extension, restartedSessionId, {
+      case: "read", value: { path: savePath, offset: 0n, length: 7n }
+    }, { headers: { "if-match": sourceTag! } });
+    expect(range.result).toMatchObject({ case: "read", value: { path: savePath, content: new TextEncoder().encode("durable") } });
+
     const disabled = await submit(restarted.clients.operation, restarted.connectionId, create(OperationMutationSchema, {
       payload: {
         case: "setExtensionEnabled",
@@ -202,6 +214,9 @@ describe("production Extension Library chain", () => {
       }
     }));
     expect(disabled.state).toBe(OperationState.SUCCEEDED);
+    await expect(libraryCall(restarted.clients.extension, restartedSessionId, { case: "stat", value: { path: savePath } }, {
+      headers: { "if-match": sourceTag! }
+    })).rejects.toMatchObject({ code: Code.NotFound });
     await expect(libraryCall(restarted.clients.extension, restartedSessionId, {
       case: "read",
       value: { path: "notes/owner.txt" }
@@ -214,14 +229,15 @@ describe("production Extension Library chain", () => {
 async function libraryCall(
   client: E2eClients["extension"],
   sessionId: string,
-  operation: { readonly case: string; readonly value: unknown }
+  operation: { readonly case: string; readonly value: unknown },
+  options?: CallOptions
 ): Promise<ExtensionLibraryCallResult> {
   const response = await client.callExtensionLibrary({
     sessionId,
     call: create(ExtensionLibraryCallSchema, {
       operation: operation as ExtensionLibraryCall["operation"]
     })
-  });
+  }, options);
   if (response.result === undefined) throw new Error("Extension Library call returned no result.");
   return response.result;
 }

@@ -4981,14 +4981,24 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const connection = authenticate(context);
       const manager = requireExtensionLibraryManager(dependencies);
       if (request.call === undefined || request.call.operation.case === undefined) throw invalidArgument("call.operation is required");
-      return {
-        result: await extensionLibraryEffect(() => dispatchExtensionLibraryCall(
-          manager,
-          nonBlankRequest(request.sessionId, "session_id"),
-          connection.id,
-          request.call!
-        ))
-      };
+      const match = context.requestHeader.get("if-match");
+      const operation = request.call.operation.case;
+      if (match !== null && (!(operation === "stat" || operation === "read")
+        || (operation !== "stat" || match !== "*") && !/^"[a-f0-9]{64}"$/u.test(match))) {
+        throw invalidArgument("Library file match is invalid.");
+      }
+      const result = await extensionLibraryEffect(() => dispatchExtensionLibraryCall(
+        manager,
+        nonBlankRequest(request.sessionId, "session_id"),
+        connection.id,
+        request.call!,
+        match === null ? undefined : { match, set: tag => context.responseHeader.set("etag", tag) }
+      ));
+      if (match !== null) {
+        context.signal.throwIfAborted();
+        dependencies.connections.fence(connection);
+      }
+      return { result };
     },
     closeExtensionLibrary: async (request, context) => {
       const connection = authenticate(context);
@@ -12596,7 +12606,8 @@ async function dispatchExtensionLibraryCall(
   manager: ExtensionLibraryManager,
   sessionId: string,
   connectionId: string,
-  call: contract.ExtensionLibraryCall
+  call: contract.ExtensionLibraryCall,
+  source?: { readonly match: string; readonly set: (tag: string) => void }
 ): Promise<contract.ExtensionLibraryCallResult> {
   const operation = call.operation;
   switch (operation.case) {
@@ -12604,8 +12615,10 @@ async function dispatchExtensionLibraryCall(
       const value = await manager.read(sessionId, connectionId, {
         path: operation.value.path,
         ...(operation.value.offset === undefined ? {} : { offset: safeLibraryNumber(operation.value.offset, "read.offset") }),
-        ...(operation.value.length === undefined ? {} : { length: safeLibraryNumber(operation.value.length, "read.length") })
+        ...(operation.value.length === undefined ? {} : { length: safeLibraryNumber(operation.value.length, "read.length") }),
+        ...(source === undefined ? {} : { sourceTag: source.match })
       });
+      source?.set(source.match);
       return create(contract.ExtensionLibraryCallResultSchema, {
         result: { case: "read", value: create(contract.ExtensionLibraryReadResultSchema, {
           path: value.path,
@@ -12623,7 +12636,8 @@ async function dispatchExtensionLibraryCall(
       return libraryWriteCallResult(value);
     }
     case "stat": {
-      const value = await manager.stat(sessionId, connectionId, operation.value.path);
+      const value = await manager.stat(sessionId, connectionId, operation.value.path, source?.match);
+      if (value.sourceTag !== undefined) source?.set(value.sourceTag);
       return create(contract.ExtensionLibraryCallResultSchema, {
         result: { case: "stat", value: mapExtensionLibraryEntry(value) }
       });
