@@ -256,8 +256,8 @@ describe("RemoteWorkspaceService", () => {
     }
   });
 
-  it.each(["aliases", "nested roots"] as const)("serializes old-revision saves across remote workspace %s", async kind => {
-    const f = await memoryWorkspaceFixture();
+  it.each(["aliases", "nested roots", "SSH Host aliases"] as const)("serializes old-revision saves across remote workspace %s", async kind => {
+    const f = await memoryWorkspaceFixture(undefined, kind === "SSH Host aliases" ? "same-host-key-and-account" : undefined);
     let release!: () => void;
     try {
       const file = kind === "nested roots" ? "sub/note.txt" : "note.txt", aliasRoot = kind === "nested roots" ? "/workspace/sub" : "/workspace";
@@ -265,7 +265,8 @@ describe("RemoteWorkspaceService", () => {
       await f.files.write({ path: `/workspace/${file}`, content: Buffer.from("old") });
       const revision = (await f.workspaces.preview("workspace", file)).entry.revision;
       await f.workspaces.register({ ...f.registration, id: "workspace-alias", root: aliasRoot,
-        remote: { ...f.registration.remote, binding: { ...f.registration.remote.binding, workspaceRoot: aliasRoot } } });
+        remote: { ...f.registration.remote, binding: { ...f.registration.remote.binding, workspaceRoot: aliasRoot,
+          hostId: kind === "SSH Host aliases" ? "second-host-record" : f.registration.remote.binding.hostId } } });
       let entered!: () => void;
       const started = new Promise<void>(resolve => { entered = resolve; });
       const blocked = new Promise<void>(resolve => { release = resolve; });
@@ -276,6 +277,7 @@ describe("RemoteWorkspaceService", () => {
       const second = f.workspaces.writeTextFile("workspace-alias", { path: "./note.txt", text: "second", expectedRevision: revision });
       await vi.waitFor(() => expect(f.capture).toHaveBeenCalledTimes(3));
       await new Promise<void>(done => setImmediate(done));
+      expect(write).toHaveBeenCalledOnce();
       release();
       await expect(first).resolves.toMatchObject({ revision: expect.stringContaining("sha256:") });
       await expect(second).rejects.toMatchObject({ code: "WORKSPACE_TEXT_FILE_STALE" });
@@ -510,13 +512,14 @@ describe("RemoteWorkspaceService", () => {
   });
 });
 
-async function memoryWorkspaceFixture(processes: RemoteProcessTransportPort = { open: async () => new CompletedRemoteProcess({}) }) {
+async function memoryWorkspaceFixture(processes: RemoteProcessTransportPort = { open: async () => new CompletedRemoteProcess({}) }, mutationIdentity?: string) {
   const files = new MemoryRemoteFiles(); await files.mkdir("/workspace", { recursive: true });
   const binding: Extract<import("@joko/core").RemoteWorkspaceBinding, { kind: "ssh" }> = {
     kind: "ssh", hostTargetId: "target", hostId: "host", workspaceRoot: "/workspace"
   };
   const capture = vi.fn(async (binding: Extract<import("@joko/core").RemoteWorkspaceBinding, { kind: "ssh" }>) => ({
     kind: "ssh" as const, binding, executionIdentity: binding.hostId, authorityIdentity: "route", pathStyle: "posix" as const,
+    ...(mutationIdentity === undefined ? {} : { mutationIdentity }),
     files, processes, assertCurrent: () => undefined, assertFilesCurrent: () => undefined, assertForwardingCurrent: () => undefined
   }));
   const router = { workspace: capture, files: capture } as unknown as RemoteExecutionRouter;

@@ -1006,7 +1006,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         try { assertCurrent(); } catch (error) { child.kill(); throw error; } return child;
       } },
       assertCurrent,
-      mutationScope: { executionIdentity: authority.executionIdentity, pathStyle: authority.pathStyle,
+      mutationScope: { executionIdentity: authority.mutationIdentity ?? authority.executionIdentity, pathStyle: authority.pathStyle,
         root: authority.pathStyle === "win32" ? win32.normalize(registration.root).toLowerCase() : posix.normalize(registration.root) },
       pathStyle: authority.pathStyle
     };
