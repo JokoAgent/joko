@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type JSX } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type JSX } from 'react';
 import { createPortal } from 'react-dom';
 import { create } from '@bufbuild/protobuf';
 import { DesktopVoiceConversationAction as Action, DesktopSpeechSelectionSchema, DesktopVoiceConversationPreferenceSchema,
@@ -77,7 +77,12 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   const questionRef = useRef(question); questionRef.current = question;
   const blocked = interactions.some(row => row.kind !== 'question')
     || controller.state.snapshot?.queueControls.some(row => row.sessionId === session.id && row.state === 'paused') || false;
-  const current = useRef<{ live: boolean; callId?: string; kind?: string; polling: boolean; ending?: boolean; readId: number }>({ live: true, polling: false, readId: 0 });
+  const current = useRef<{ live: boolean; callId?: string; kind?: string; polling: boolean; starting?: boolean; ending?: boolean; readId: number }>({ live: true, polling: false, readId: 0 });
+  const blockedNow = useRef(blocked), startGeneration = useRef(0);
+  useLayoutEffect(() => {
+    blockedNow.current = blocked;
+    if (blocked) startGeneration.current++;
+  }, [blocked]);
   const player = useMemo(() => new DesktopSpeechPlayer(), []), listener = useRef<ContinuousVoiceListener | undefined>(undefined);
   const spoken = useRef(new Set<string>()), speechTail = useRef<Promise<unknown>>(Promise.resolve());
   const speechRequestIds = useRef(new Map<string, string>());
@@ -94,11 +99,11 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   const saveRequest = useRef<Parameters<DesktopVoiceClient['control']>[1] | undefined>(undefined);
   const pendingInput = useRef<{ readonly inputId: string; readonly text: string; readonly forceHandoff: boolean } | undefined>(undefined);
   const read = useCallback(async () => {
-    const owner = current.current; if (!owner.live || owner.polling || owner.ending) return;
+    const owner = current.current; if (!owner.live || owner.polling || owner.starting || owner.ending) return;
     owner.polling = true; const readId = ++owner.readId;
     try {
       const result = await client.control(Action.SNAPSHOT, { callId: owner.callId ?? '' });
-      if (current.current !== owner || !owner.live || owner.readId !== readId) return;
+      if (current.current !== owner || !owner.live || owner.starting || owner.readId !== readId) return;
       setValue(result); setError(false);
       if (result.call?.endedAtMs === undefined && result.call) { owner.callId = result.call.callId; owner.kind = result.call.kind; }
       if (!result.call && owner.callId) { listener.current?.stop(); player.stop(); owner.callId = undefined; setMic(false); }
@@ -107,6 +112,7 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   }, [client, player]);
   const stop = useCallback(async () => {
     const owner = current.current, id = owner.callId;
+    startGeneration.current++;
     owner.readId++; owner.ending = true;
     speechGeneration.current++; semanticVersion.current++; exit.current = undefined; idleSince.current = undefined; setCountdown(undefined);
     listener.current?.stop(); player.stop(); setMic(false); setSpeaking(false);
@@ -215,7 +221,7 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     return () => window.clearInterval(timer);
   }, [client, player, stop, onClose]);
   const startMic = async () => {
-    if (blocked || !current.current.callId || current.current.kind !== 'conversation') return;
+    if (blockedNow.current || !current.current.live || !current.current.callId || current.current.kind !== 'conversation') return;
     listener.current?.stop();
     hasSpeechSession.current = false;
     const next = new ContinuousVoiceListener({ api: controller, onSpeech: () => {
@@ -267,15 +273,28 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     listener.current = next; setMic(true);
     try { await next.start(); } catch { next.stop(); if (current.current.live) { setMic(false); setError(true); } }
   };
-  const start = async (playbackOnly: boolean, chosen: DesktopSpeechSelection | undefined) => {
-    if (!chosen) { setSettings(true); return; }
-    if (current.current.callId) await stop();
+  const start = async (playbackOnly: boolean, chosen: DesktopSpeechSelection | undefined): Promise<boolean> => {
+    if (blockedNow.current) return false;
+    if (!chosen) { setSettings(true); return false; }
+    const owner = current.current;
+    const stopping = owner.callId ? stop() : undefined;
+    const generation = ++startGeneration.current;
+    const canStart = () => current.current === owner && owner.live && !blockedNow.current && startGeneration.current === generation;
+    await stopping;
+    if (!canStart()) return false;
     const callId = crypto.randomUUID(), operationId = `voice-start-${callId}`;
-    const result = await client.control(Action.START, { callId, operationId, selection: chosen, playbackOnly });
-    if (!current.current.live) { void client.control(Action.END, { callId }).catch(() => undefined); return; }
-    current.current.callId = callId; current.current.kind = playbackOnly ? 'playback' : 'conversation';
-    setValue(result); spoken.current.clear(); speechRequestIds.current.clear();
-    if (!playbackOnly) await startMic();
+    owner.starting = true;
+    try {
+      const result = await client.control(Action.START, { callId, operationId, selection: chosen, playbackOnly });
+      if (!canStart()) {
+        await client.control(Action.END, { callId }).catch(() => undefined);
+        return false;
+      }
+      owner.callId = callId; owner.kind = playbackOnly ? 'playback' : 'conversation';
+      setValue(result); spoken.current.clear(); speechRequestIds.current.clear();
+      if (!playbackOnly) await startMic();
+      return true;
+    } finally { owner.starting = false; }
   };
   const save = (reset: boolean) => void action(async () => {
     if (!saveRequest.current) saveRequest.current = { operationId: crypto.randomUUID(), preference: create(DesktopVoiceConversationPreferenceSchema, {
@@ -289,7 +308,7 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     if (blocked) return;
     if (!body.trim() || !selected) { setSettings(true); return; }
     if (current.current.callId && current.current.kind === 'conversation') { await interrupt(); await say(body); return; }
-    await start(true, selected);
+    if (!await start(true, selected)) return;
     try { await say(body); } finally { await stop(); }
   });
   const send = (forceHandoff: boolean) => void action(async () => {
