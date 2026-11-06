@@ -110,7 +110,16 @@ export interface AdapterContext {
   /** Exact host ArtifactStore ceiling for this invocation. Adapters must
    * reject larger materializations before reading or decoding their bytes. */
   readonly artifactCapacityBytes: number;
-  readonly storeArtifact: (sourcePath: string, options?: { fileName?: string; mimeType?: string }) => Promise<BlobRef>;
+  readonly storeArtifact: (sourcePath: string, options?: {
+    fileName?: string;
+    mimeType?: string;
+    /** An adapter-owned staging file. The caller retains and closes this handle. */
+    openFile?: {
+      readonly handle: import("node:fs/promises").FileHandle;
+      readonly expectedSize: number;
+      readonly assertCurrent: () => Promise<void>;
+    };
+  }) => Promise<BlobRef>;
 }
 
 /** Service-owned authority for turning one opaque canonical Artifact identity
