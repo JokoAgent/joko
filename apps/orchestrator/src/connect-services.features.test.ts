@@ -17,12 +17,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OrchestratorApplication } from "./application.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { BrowserSettingsController } from "./browser-settings.js";
 import { createConnectServices, registerConnectServices } from "./connect-services.js";
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { ProviderAuthUnsupportedError } from "./credential-manager.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
-import { InteractionDecisionValidationError, type SessionHost } from "./session-host.js";
+import { InteractionDecisionValidationError, SessionHost } from "./session-host.js";
 
 const connection = {
   id: "connection-features",
@@ -2501,6 +2503,52 @@ describe("Connect typed feature boundaries", () => {
       mutation: uploadMutation
     })).rejects.toMatchObject({ code: Code.FailedPrecondition });
     expect(upload).not.toHaveBeenCalled();
+  });
+
+  it("rejects a queued upload policy change after the requesting device is revoked", async () => {
+    const store = new OperationalStore(":memory:");
+    const host = new SessionHost(store, {} as never, []);
+    const connections = new ConnectionManager(store);
+    const settingsOwner = store.createConnection({ id: "settings-owner", name: "Settings owner", authKeyDigest: digestAuthKey("settings-owner-key") });
+    const uploadOwner = store.createConnection({ id: "upload-owner", name: "Upload owner", authKeyDigest: digestAuthKey("upload-owner-key") });
+    let markRefreshing!: () => void;
+    let releaseRefresh!: () => void;
+    const refreshing = new Promise<void>((resolve) => { markRefreshing = resolve; });
+    const held = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    const browserSettings = new BrowserSettingsController({
+      store,
+      defaults: { browserProviderId: "browser", enabled: true, profileDisplayName: "Joko", takeoverTimeoutMs: 60_000,
+        allowUploads: false, allowDownloads: true, automationTarget: "external" },
+      hooks: { start: async () => undefined, stop: async () => undefined, refresh: async () => {
+        markRefreshing();
+        await held;
+      } }
+    });
+    const services = createConnectServices(stubApplication({
+      store, connections, sessionHost: { mutate: host.mutate.bind(host) }, browser: { id: "browser" }, browserSettings
+    }));
+    const submit = (operationId: string, connectionId: string, patch: Partial<contract.BrowserSettingsPatch>) =>
+      invoke<contract.SubmitOperationResponse>(services.operation.submitOperation, create(contract.SubmitOperationRequestSchema, {
+        operationId, connectionId,
+        mutation: { payload: { case: "updateBrowserSettings", value: { patch: { browserProviderId: "browser", ...patch } } } }
+      }), { requestHeader: new Headers({ authorization: `Bearer ${connectionId}-key` }) });
+
+    const placement = submit("change-browser-placement", settingsOwner.id, { automationTarget: contract.BrowserAutomationTarget.SIDEBAR });
+    try {
+      await Promise.race([refreshing, placement.then(() => { throw new Error("Browser placement did not wait for refresh."); })]);
+      const upload = submit("enable-browser-uploads", uploadOwner.id, { allowUploads: true });
+      expect(store.getOperation("enable-browser-uploads").status).toBe("started");
+      connections.revokeDevice(uploadOwner.deviceId);
+      releaseRefresh();
+      await expect(placement).resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+      await expect(upload).resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED } });
+      expect(browserSettings.snapshot()).toMatchObject({ automationTarget: contract.BrowserAutomationTarget.SIDEBAR, allowUploads: false });
+    } finally {
+      releaseRefresh();
+      await placement.catch(() => undefined);
+      await host.dispose();
+      store.close();
+    }
   });
 
   it("durably commits the semantic-index preference before changing the embedding worker", async () => {

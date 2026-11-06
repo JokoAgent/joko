@@ -19644,7 +19644,7 @@ async function dispatchMutation(
         resultCase: "acknowledgement",
         entityId: BROWSER_PROVIDER_ID
       }, async () => {
-        await dependencies.browserSettings!.apply(patch);
+        await dependencies.browserSettings!.apply(patch, () => { dependencies.connections.fence(connection); });
       });
     }
     case "updateVoiceInputServiceSettings": {
