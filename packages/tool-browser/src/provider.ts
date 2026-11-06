@@ -2334,6 +2334,10 @@ export class BrowserProvider {
     assertUploadCurrent();
     // Wait for the input before dispatch, then use its exact DOM handle across navigation.
     const input = await page.locator(selector).elementHandle();
+    if (input === null) {
+      assertUploadCurrent();
+      throw new BrowserTakeoverConflictError("The Browser file input is no longer available in the original document.");
+    }
     try {
       assertUploadCurrent();
       markDispatched?.();
