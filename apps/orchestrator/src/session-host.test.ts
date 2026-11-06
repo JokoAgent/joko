@@ -623,6 +623,26 @@ describe("SessionHost", () => {
     expect(guard).toThrow();
     expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
   });
+  it("binds one approved import probe to the original task policy and plan mode", async () => {
+    const f = await createFixture();
+    const { sessionId } = (await f.host.createSession({ operationId: "import-probe-policy", connection: f.connection,
+      targetId: "target-one", title: "Import probe", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    const request = { kind: "mcp" as const, connection: "records", tool: "read", endpoint: "private endpoint", arguments: { id: "fixture" } };
+    const authorize = () => f.host.authorizeImportProbe(sessionId, request, new AbortController().signal, () => {});
+    const pending = authorize();
+    const first = f.store.listInteractions({ sessionId, status: "open" })[0]!;
+    expect(first.payload).toMatchObject({ kind: "permission", toolName: "records/read" });
+    f.store.updateSession(sessionId, { planMode: true }, f.store.getSession(sessionId).revision);
+    f.host.resolveInteraction(first.id, first.generation, { kind: "permission", decision: "allow_once" }, "stale-probe-approval");
+    await expect(pending).rejects.toThrow("Import verification authority changed.");
+    const next = authorize();
+    const second = f.store.listInteractions({ sessionId, status: "open" })[0]!;
+    f.host.resolveInteraction(second.id, second.generation, { kind: "permission", decision: "allow_once" }, "current-probe-approval");
+    const guard = await next;
+    expect(guard).not.toThrow();
+    f.store.updateSession(sessionId, { permissionMode: "auto" }, f.store.getSession(sessionId).revision);
+    expect(guard).toThrow("Import verification authority changed.");
+  });
   it("rejects queued MCP App input after its live View is revoked before dispatch", async () => {
     const f = await createFixture();
     const { sessionId } = (await f.host.createSession({ operationId: "app-create", connection: f.connection,
