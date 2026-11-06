@@ -59,6 +59,7 @@ import {
   REMOTE_CLAUDE_MANAGER_VERSION,
   REMOTE_CLAUDE_PROTOCOL_VERSION,
   devicePeerClaudeInstallation,
+  isRemoteClaudeInstallationAdmitted,
   probeRemoteClaudeInstallation,
   type RemoteClaudeInstallationProbe
 } from "./remote-claude-installation.js";
@@ -741,6 +742,11 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
     }
     this.#options.assertCurrent();
     await this.#options.verifyWorkspace?.(params.options.abortController.signal);
+    const { processes, installation, assertCurrent } = this.#options;
+    if (params.options.resume === undefined && installation.runtimeEntrypoint !== "device_peer"
+      && !(await isRemoteClaudeInstallationAdmitted(processes, installation, assertCurrent, params.options.abortController.signal))) {
+      throw runtimeFault("runtime_unavailable", false);
+    }
     let forward: RemoteReverseForwardHandle | undefined;
     let forwardedParams = params;
     try {

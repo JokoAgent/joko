@@ -182,6 +182,8 @@ export interface CodexRemoteRuntime {
   readonly executionDomain: string;
   /** Synchronous target/host/transport generation fence. */
   readonly assertCurrent: () => void;
+  /** Rechecks installation admission when opening or discovering native sessions. */
+  readonly assertNewSessionAdmitted?: (signal?: AbortSignal) => Promise<void>;
   /** Uses the exact installed executable and transport authority of this runtime. */
   readonly openExecServerProcess?: (signal: AbortSignal) => Promise<CodexNativeProcess>;
   /** Owner-private, Target-bound standard MCP route factory. */
@@ -425,6 +427,7 @@ interface CodexReadScope {
   readonly profileKey: string;
   readonly remote: boolean;
   readonly pathStyle: "posix" | "win32";
+  readonly assertNewSessionAdmitted?: CodexRemoteRuntime["assertNewSessionAdmitted"];
   readonly openExecServerProcess?: CodexRemoteRuntime["openExecServerProcess"];
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
@@ -1114,7 +1117,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       await this.#remoteRuntimes.validateRegistration(target, assertPreparedRemoteCurrent);
       return;
     }
-    await this.#readScope(target, undefined, false);
+    await this.#readScope(target, undefined, { startLocalHost: false });
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
@@ -1129,7 +1132,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (input.target.remoteWorkspace !== undefined && input.nativeStart?.kind !== "attach") {
       throw remoteMutationUnsupported("create or fork a native Session");
     }
-    const scope = await this.#readScope(input.target, context.signal);
+    const scope = await this.#readScope(input.target, context.signal, { requireNewSessionAdmission: true });
     if (input.nativeStart?.kind === "attach") {
       const binding = bindingFromReference(input.nativeStart.nativeReference, context.generation);
       const resumed = await this.#resumeSession(binding, context, true);
@@ -1649,7 +1652,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async listNativeSessions(target: TargetDescriptor): Promise<readonly NativeSessionCandidate[]> {
-    const scope = await this.#readScope(target);
+    const scope = await this.#readScope(target, undefined, { requireNewSessionAdmission: true });
     const cwd = scope.workspaceRoot;
     const candidates: NativeSessionCandidate[] = [];
     const nativeIds = new Set<string>();
@@ -1687,13 +1690,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             modifiedAt: Math.max(0, Math.trunc((thread.updatedAt ?? thread.createdAt ?? 0) * 1_000)),
             state: thread.status?.["type"] === "systemError" ? "error" : "ready"
           });
-          if (candidates.length >= this.#maximumDiscoveredThreads) {
-            scope.assertCurrent();
-            return candidates;
-          }
+          if (candidates.length >= this.#maximumDiscoveredThreads) break;
         }
+        if (candidates.length >= this.#maximumDiscoveredThreads) break;
         cursor = nextPaginationCursor(page.nextCursor, seenCursors, "CODEX_THREAD_PAGINATION_INVALID", "native Session discovery");
       } while (cursor !== undefined);
+      await scope.assertNewSessionAdmitted?.();
       scope.assertCurrent();
       return candidates;
     } catch (error) {
@@ -3227,7 +3229,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #readScope(
     target: TargetDescriptor,
     signal?: AbortSignal,
-    startLocalHost = true
+    options?: { readonly startLocalHost?: boolean; readonly requireNewSessionAdmission?: boolean }
   ): Promise<CodexReadScope> {
     this.#assertOpen();
     this.#assertTargetBackend(target);
@@ -3251,7 +3253,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           recovery: "Restore the Target workspace and retry."
         });
       }
-      const hostGeneration = startLocalHost ? await this.#ensureLocalHostStarted() : undefined;
+      const hostGeneration = options?.startLocalHost === false ? undefined : await this.#ensureLocalHostStarted();
       return {
         host: this.#host,
         ...(hostGeneration === undefined ? {} : { hostGeneration }),
@@ -3284,6 +3286,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         throw new ProtocolShapeError("remote Codex runtime scope is invalid");
       }
       runtime.assertCurrent();
+      if (options?.requireNewSessionAdmission) await runtime.assertNewSessionAdmitted?.(signal);
       const hostGeneration = await runtime.host.ensureStarted();
       runtime.assertCurrent();
       if (!runtime.host.isActiveGeneration(hostGeneration)
@@ -3302,6 +3305,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         profileKey: runtime.profileKey,
         remote: true,
         pathStyle,
+        ...(runtime.assertNewSessionAdmitted === undefined ? {} : { assertNewSessionAdmitted: runtime.assertNewSessionAdmitted }),
         ...(runtime.openExecServerProcess === undefined ? {} : { openExecServerProcess: runtime.openExecServerProcess }),
         ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
         ...(target.remoteWorkspace.kind === "ssh" && runtime.prepareNativeSkills !== undefined

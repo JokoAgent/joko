@@ -187,6 +187,15 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       profileKey,
       executionDomain,
       assertCurrent,
+      ...(authority.kind !== "ssh" ? {} : {
+        assertNewSessionAdmitted: async (admissionSignal?: AbortSignal) => {
+          assertCurrent();
+          const current = await this.#probeInstallation(binding, authority, admissionSignal, assertCurrent);
+          if (current.profileRoot !== installation.profileRoot || current.workspaceRoot !== installation.workspaceRoot) {
+            throw remoteRuntimeFault("The remote Codex installation authority changed.");
+          }
+        }
+      }),
       openExecServerProcess: async (processSignal: AbortSignal) => {
         assertCurrent(); processSignal.throwIfAborted();
         // Transfer every opened handle to the relay before its final authority

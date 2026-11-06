@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
+import { CodexBackendAdapter } from "@joko/adapter-codex";
 import type { TargetDescriptor } from "@joko/core";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
@@ -13,6 +14,7 @@ import type {
 import type { RemoteHostRecord, StoredTarget } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RemoteCodexRuntimeResolver } from "./remote-codex-read-runtime.js";
+import { uninstallRemoteCodex } from "./remote-codex-installation.js";
 import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 import type { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 
@@ -23,6 +25,24 @@ afterEach(async () => {
 });
 
 describe("RemoteCodexRuntimeResolver", () => {
+  it("rejects native candidate discovery on a warm SSH runtime after uninstall", async () => {
+    const fixture = createFixture({ nativeThread: true });
+    const adapter = new CodexBackendAdapter({ instanceGeneration: 1, remoteRuntimes: fixture.resolver });
+    cleanups.push(() => adapter.dispose());
+    const target = { ...fixture.target, workspaceRoot: "/srv/project-real",
+      remoteWorkspace: { ...fixture.target.remoteWorkspace!, workspaceRoot: "/srv/project-real" } };
+    fixture.stored = { ...fixture.stored, descriptor: target };
+    await expect(adapter.listNativeSessions(target)).resolves.toMatchObject([{ nativeSessionId: "native-thread" }]);
+    const runtime = await fixture.resolver.resolve(target);
+    const generation = runtime.host.generation;
+    await expect(uninstallRemoteCodex(fixture.processes, runtime.assertCurrent)).resolves.toMatchObject({ state: "not_installed" });
+
+    await expect(adapter.listNativeSessions(target)).rejects.toThrow("The remote Codex runtime is unavailable");
+    expect(fixture.processes.clientMessages.filter((message) => message.method === "thread/list")).toHaveLength(1);
+    expect(await fixture.resolver.resolve(target)).toBe(runtime);
+    expect(runtime.host.isActiveGeneration(generation)).toBe(true);
+  });
+
   it.each([false, true])("preflights a prepared target without stored runtime authority (Device peer=%s)", async peerWin32 => {
     const fixture = createFixture({ peerWin32 });
     cleanups.push(() => fixture.resolver.forceShutdown());
@@ -275,6 +295,7 @@ describe("RemoteCodexRuntimeResolver", () => {
 });
 
 interface FixtureOptions {
+  readonly nativeThread?: boolean;
   readonly peerWin32?: boolean;
   readonly peerPosix?: boolean;
   readonly daemonInitiallyReady?: boolean;
@@ -376,6 +397,8 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
   readonly #stderr: string;
   readonly #disconnectOnMethod: string | undefined;
   readonly #peerWin32: boolean;
+  readonly #nativeThread: boolean;
+  #runtimeAdmitted = true;
 
   constructor(options: FixtureOptions) {
     this.#daemonReady = options.daemonInitiallyReady ?? true;
@@ -383,6 +406,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
     this.#stderr = options.stderr ?? "";
     this.#disconnectOnMethod = options.disconnectOnMethod;
     this.#peerWin32 = options.peerWin32 === true;
+    this.#nativeThread = options.nativeThread === true;
   }
 
   async open(request: RemoteProcessStartRequest): Promise<RemoteProcessHandle> {
@@ -394,6 +418,11 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
     if (request.executable === "/bin/sh") {
       const processHandle = new FakeRemoteProcess();
       setImmediate(() => {
+        if (request.args[1]?.includes('rm -f "$sentinel"')) {
+          this.#runtimeAdmitted = false;
+          processHandle.finish(0);
+          return;
+        }
         if (this.#stderr.length > 0) processHandle.stderr.write(this.#stderr);
         const canonicalWorkspace = request.cwd === "/srv/project" ? "/srv/project-real" : request.cwd;
         processHandle.stdout.write(Buffer.from([
@@ -401,7 +430,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
           "/home/test/.joko/runtime/v1/codex-home",
           "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
           this.#probeVersion,
-          this.#probeVersion === "codex-cli 0.159.2" ? "ready" : "not_installed",
+          this.#runtimeAdmitted && this.#probeVersion === "codex-cli 0.159.2" ? "ready" : "not_installed",
           ""
         ].join("\0"), "utf8"));
         processHandle.finish(0);
@@ -481,7 +510,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
           platformOs: "linux"
         }
       : message.method === "thread/list"
-        ? { data: [], nextCursor: null, backwardsCursor: null }
+        ? { data: this.#nativeThread ? [{ id: "native-thread", cwd: "/srv/project-real", turns: [] }] : [], nextCursor: null, backwardsCursor: null }
         : {};
     processHandle.stdout.write(serverFrame(0x1, Buffer.from(JSON.stringify({ id: message.id, result }), "utf8")));
   }
