@@ -91,6 +91,29 @@ it.skipIf(process.platform === "win32")("rejects every configured SSH push URL b
   } finally { await f.close(); }
 });
 
+it.skipIf(process.platform === "win32")("pushes the reviewed SSH commit when the branch advances immediately before Git starts", { timeout: 30_000 }, async () => {
+  let advance: (() => Promise<void>) | undefined;
+  const f = await fixture({ ssh: true, beforeProcess: async request => {
+    if (request.args[0] === "push") await advance?.();
+  } });
+  try {
+    await f.git("init", "--bare", "--quiet", f.outside);
+    await f.git("remote", "add", "origin", f.outside);
+    await f.git("commit", "--allow-empty", "-m", "reviewed");
+    const reviewed = await f.git("rev-parse", "HEAD");
+    await f.git("commit", "--allow-empty", "-m", "newer");
+    const newer = await f.git("rev-parse", "HEAD");
+    await f.git("update-ref", "refs/heads/main", reviewed, newer);
+    const diff = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    advance = async () => { await f.git("update-ref", "refs/heads/main", newer, reviewed); };
+    await expect(f.workspaces.pushGitReview("workspace", { remote: "origin", remoteRef: "refs/heads/main",
+      expectedRepositoryRevision: diff.repositoryRevision, expectedHeadRevision: reviewed }))
+      .resolves.toMatchObject({ kind: "pushed", headRevision: reviewed });
+    expect(await f.git("rev-parse", "HEAD")).toBe(newer);
+    expect(await f.git("--git-dir", f.outside, "rev-parse", "refs/heads/main")).toBe(reviewed);
+  } finally { await f.close(); }
+});
+
 it("rejects every remote mutation through an intermediate link before delegating its effect", async () => {
   const f = await fixture();
   try {

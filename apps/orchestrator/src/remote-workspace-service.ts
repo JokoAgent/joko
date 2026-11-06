@@ -965,7 +965,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       if (!immutableRevision(input.expectedRemoteOid ?? "")) throw new WorkspaceGitReviewError("Remote lease is invalid.", "invalid");
       args.push(`--force-with-lease=${input.remoteRef}:${input.expectedRemoteOid}`);
     }
-    args.push(input.remote, `HEAD:${input.remoteRef}`);
+    args.push(input.remote, `${head}:${input.remoteRef}`);
     await requireRemoteGitRoot(registration, transports);
     await runRemote(processes, "git", args, registration.root, 120_000, 4 * 1024 * 1024);
     return { kind: "pushed", repositoryRevision: await repositoryRevision(processes, registration.root), headRevision: head, remote: input.remote, remoteRef: input.remoteRef };
