@@ -36,6 +36,7 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
   const owned = useRef<{ readonly abort: AbortController; readonly sourceKey: string; readonly local: LocalState; readonly leaveOwner: string } | undefined>(undefined);
   const historyFlight = useRef(false);
   const snapshotRef = useRef<AppSnapshot | undefined>(undefined);
+  const returning = useRef<{ readonly profileId: string; readonly joinId: string } | undefined>(undefined);
   const api = home.taskSharing, profile = home.state.activeProfile;
   const connectionKey = JSON.stringify([profile?.id, profile?.serverId, profile?.origin, home.state.connectionGeneration, home.state.connectionState]);
   useEffect(() => {
@@ -45,6 +46,11 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
     return () => { document.removeEventListener("visibilitychange", changed); window.removeEventListener("pagehide", hidden); };
   }, []);
   const back = useCallback(() => {
+    // Leaving can retire the guest gateway before the original action receipt
+    // finishes. Both paths belong to one navigation, including before React
+    // has rendered the destination and retired this view.
+    if (returning.current?.profileId === profileId && returning.current.joinId === joinId) return;
+    returning.current = { profileId, joinId };
     returnFromJoinedTask(homeRef.current, profileId, joinId);
   }, [profileId, joinId]);
   useEffect(() => {

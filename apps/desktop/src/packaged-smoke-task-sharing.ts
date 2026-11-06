@@ -47,10 +47,11 @@ export async function verifyPackagedSmokeTaskSharing(options: {
   const shareId = await script<string>([
     ...openManagement,
     "  (await button('[data-task-sharing-start]')).click();",
-    `  const row = await wait(() => [...document.querySelectorAll('[data-task-sharing-owned]')].find(node => node.getAttribute('data-session-id') === ${JSON.stringify(task.sessionId)}), 'owned task');`,
+    `  const ownedRow = () => [...document.querySelectorAll('[data-task-sharing-owned]')].find(node => node.getAttribute('data-session-id') === ${JSON.stringify(task.sessionId)});`,
+    "  const row = await wait(ownedRow, 'owned task');",
     "  const shareId = row.getAttribute('data-share-id');",
     "  if (!shareId) throw new Error('The owned task omitted its sharing identity.');",
-    "  const invite = await button('[data-task-sharing-owned] [data-task-sharing-invite]');",
+    "  const invite = await wait(() => { const current = ownedRow(); if (current?.getAttribute('data-share-id') !== shareId) return undefined; const node = current.querySelector('[data-task-sharing-invite]'); return node instanceof HTMLButtonElement && !node.disabled ? node : undefined; }, 'invitation for the owned task');",
     "  invite.click(); return shareId;"
   ]);
   let invitation: string | undefined;
