@@ -469,6 +469,13 @@ export interface RemoteHostView {
   readonly revision: bigint;
 }
 
+export interface RemoteHostKeyIdentityView {
+  readonly algorithm: string;
+  readonly sha256Fingerprint: string;
+}
+
+export type RemoteHostTestView = RemoteHostView & { readonly observedHostKey?: RemoteHostKeyIdentityView };
+
 export interface RemoteHostDirectoryListingView {
   readonly targetId: string;
   readonly hostId: string;
@@ -6836,8 +6843,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   setRemoteHostAutoConnect(targetId: string, hostId: string, expectedHostRevision: bigint, expectedAutoConnectRevision: bigint, enabled: boolean): Promise<RemoteHostView>;
   connectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
   disconnectRemoteHost(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
-  testRemoteHostConnection(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
-  clearRemoteHostTrust(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostView>;
+  testRemoteHostConnection(targetId: string, hostId: string, expectedRevision: bigint): Promise<RemoteHostTestView>;
+  clearRemoteHostTrust(targetId: string, hostId: string, expectedRevision: bigint, replacement: RemoteHostKeyIdentityView): Promise<RemoteHostView>;
   probeRemoteBackendRuntime(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, signal?: AbortSignal): Promise<RemoteBackendRuntimeView>;
   installRemoteBackendRuntime(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint, reinstall: boolean, signal?: AbortSignal): AsyncIterable<RemoteBackendRuntimeInstallEventView>;
   uninstallRemoteBackendRuntime(targetId: string, hostId: string, expectedTargetRevision: bigint, expectedHostRevision: bigint): Promise<RemoteBackendRuntimeView>;

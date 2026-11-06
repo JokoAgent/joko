@@ -73,7 +73,8 @@ export class VisualRemoteHostFixture {
   connectRemoteHost = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.change(targetId, hostId, revision, host => ({ ...host, trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:visual-fixture-only", pinnedAt: 1 }, status: { state: "ready", changedAt: 1 } }));
   disconnectRemoteHost = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.change(targetId, hostId, revision, host => ({ ...host, status: { state: "disconnected", changedAt: 1 } }));
   testRemoteHostConnection = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.requireHost(targetId, hostId, revision);
-  clearRemoteHostTrust = async (targetId: string, hostId: string, revision: bigint): Promise<RemoteHostView> => this.change(targetId, hostId, revision, host => ({ ...host, trust: undefined }));
+  clearRemoteHostTrust: AppController["clearRemoteHostTrust"] = async (targetId, hostId, revision, replacement) =>
+    this.change(targetId, hostId, revision, host => ({ ...host, trust: { ...replacement, pinnedAt: 1 } }));
   probeRemoteBackendRuntime: AppController["probeRemoteBackendRuntime"] = async (targetId, hostId, targetRevision, hostRevision, signal) => {
     await Promise.resolve(); signal?.throwIfAborted();
     return this.runtime(targetId, hostId, targetRevision, hostRevision);

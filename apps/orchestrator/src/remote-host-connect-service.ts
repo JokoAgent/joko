@@ -69,11 +69,12 @@ export function createRemoteHostConnectService(
   };
   const connectWithOwner = async (
     context: HandlerContext,
-    connect: (signal: AbortSignal, assertCurrent: () => void) => Promise<RemoteHostConnectionOutcome>
+    connect: (signal: AbortSignal, assertCurrent: () => void, connectionId: string) => Promise<RemoteHostConnectionOutcome>
   ): Promise<RemoteHostConnectionOutcome> => {
-    const observation = observeOwner(context, captureOwner(context));
+    const owner = captureOwner(context);
+    const observation = observeOwner(context, owner);
     try {
-      const result = await connect(observation.signal, observation.assertCurrent);
+      const result = await connect(observation.signal, observation.assertCurrent, owner.connectionId);
       observation.assertCurrent();
       return result;
     } finally { observation.close(); }
@@ -421,12 +422,13 @@ export function createRemoteHostConnectService(
     }),
 
     testRemoteHostConnection: async (request, context) => remoteHostRpc(async () => {
-      const result = await connectWithOwner(context, (signal, assertCurrent) => requireRegistry(registry).test(
+      const result = await connectWithOwner(context, (signal, assertCurrent, connectionId) => requireRegistry(registry).test(
         publicIdentity(request.targetId, "target_id"),
         publicHostAlias(request.hostId),
         fromProtoRevision(request.expectedRevision, "expected_revision"),
         signal,
-        assertCurrent
+        assertCurrent,
+        connectionId
       ));
       return create(contract.TestRemoteHostConnectionResponseSchema, {
         result: create(contract.RemoteHostConnectionTestResultSchema, {
@@ -434,18 +436,22 @@ export function createRemoteHostConnectService(
             ? contract.RemoteHostConnectionTestOutcome.SUCCEEDED
             : contract.RemoteHostConnectionTestOutcome.FAILED,
           host: toProtoRemoteHost(result.host),
+          ...(result.observedHostKey === undefined ? {} : { observedHostKey: { algorithm: result.observedHostKey.algorithm,
+            sha256Fingerprint: result.observedHostKey.fingerprint } }),
           testedAt: toProtoTimestamp(now())
         })
       });
     }),
 
     clearRemoteHostTrust: async (request, context) => remoteHostRpc(async () => {
-      authenticate(context);
-      const host = requireRegistry(registry).clearTrust({
+      const owner = captureOwner(context);
+      if (request.replacement === undefined) throw new ConnectError("Review the observed SSH host key before replacing it.", Code.FailedPrecondition);
+      const host = requireRegistry(registry).replaceTrust({
         targetId: publicIdentity(request.targetId, "target_id"),
         id: publicHostAlias(request.hostId),
         expectedRevision: fromProtoRevision(request.expectedRevision, "expected_revision"),
-        clearedAt: now()
+        connectionId: owner.connectionId,
+        replacement: { algorithm: request.replacement.algorithm, fingerprint: request.replacement.sha256Fingerprint }
       });
       return create(contract.ClearRemoteHostTrustResponseSchema, { host: toProtoRemoteHost(host) });
     }),

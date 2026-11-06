@@ -627,6 +627,39 @@ describe("RemoteHostRegistry host trust", () => {
     expect(authenticating).toHaveBeenCalledOnce();
   });
 
+  it.each([false, true])("refuses automatic authentication after a rejected key change with a legacy cleared pin of %s", async (legacyCleared) => {
+    const fixture = createFixture();
+    let presented = Uint8Array.of(4);
+    const authenticateSsh = vi.fn();
+    const connect = vi.fn<ResolvedAgentAuthConnectorPort["connect"]>(async (request) => {
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: presented });
+      authenticateSsh();
+      request.onAuthenticating();
+      return { close: async () => undefined };
+    });
+    const options = { nodeKeys: { readPublic: async () => "fixture key" }, connector: { connect, capabilities: {
+      commandExecution: false, processStreaming: false, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false
+    } } };
+    const registry = fixture.registry(options);
+    const host = registry.create(hostCreate({ authenticationMode: "node_key",
+      nodeKey: { id: "node-ssh", expectedFingerprint: `SHA256:${"a".repeat(43)}` } }));
+    const enabled = registry.setAutoConnect({ targetId: host.targetId, id: host.id, expectedRevision: host.revision,
+      expectedAutoConnectRevision: host.autoConnectRevision, enabled: true });
+    const ready = await registry.connect(host.targetId, host.id, enabled.revision);
+    expect(ready.ok).toBe(true);
+    presented = Uint8Array.of(5);
+    const rejected = await registry.test(host.targetId, host.id, ready.host.revision);
+    expect(rejected.failure?.code).toBe("host_key_changed");
+    if (legacyCleared) fixture.store.clearRemoteHostTrust({ ownerId: host.ownerId, targetId: host.targetId, id: host.id,
+      expectedRevision: rejected.host.revision });
+
+    const cold = fixture.registry(options);
+    await cold.startAutoConnect();
+    expect(connect).toHaveBeenCalledTimes(legacyCleared ? 2 : 3);
+    expect(authenticateSsh).toHaveBeenCalledOnce();
+    expect(cold.get(host.targetId, host.id).trust).toEqual(legacyCleared ? undefined : ready.host.trust);
+  });
+
   it("allows one DB-backed first-use pin and fails a concurrent first-use connection closed", async () => {
     const fixture = createFixture();
     let arrivals = 0;
