@@ -14818,7 +14818,7 @@ describe("SessionHost", () => {
     await eventually(() => store.getRun(importedQueued.value.runId).descriptor.state === "completed");
   });
 
-  it.each(["user only", "reasoning", "different turn"] as const)("recovers an SSH Codex failed turn without an assistant reply (%s)", { timeout: 20_000 }, async suffix => {
+  it.each(["user only", "reasoning", "different turn", "accepted completion"] as const)("settles SSH Codex only with exact original native terminal evidence (%s)", { timeout: 20_000 }, async suffix => {
     const directory = mkdtempSync(join(tmpdir(), "joko-remote-codex-terminal-"));
     const store = new OperationalStore(join(directory, "store.db"));
     const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
@@ -14851,8 +14851,27 @@ describe("SessionHost", () => {
       prompt: { text: "Persist the original user input", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
     await eventually(() => store.getQueueItem(admitted.queueItemId).state === "backend_accepted");
     const thread = remote.threads.get(threadId)!, turn = thread.turns.at(-1)!;
-    turn["status"] = "failed";
     thread.status = { type: "idle" };
+    if (suffix === "accepted completion") {
+      const items = turn["items"];
+      if (!Array.isArray(items)) throw new Error("The fixture turn has no native items.");
+      turn["items"] = [...items, { type: "agentMessage", id: "retained-completion", text: "Original native result", phase: null, memoryCitation: null, delivery: null }];
+      turn["status"] = "completed";
+      const originalProxy = remote.transport!;
+      await originalProxy.exit();
+      await eventually(() => store.getQueueItem(admitted.queueItemId).state === "completed");
+      const run = store.getRun(admitted.runId).descriptor;
+      expect(run).toMatchObject({ state: "completed", activeAttemptId: admitted.attemptId });
+      expect(store.getAttempt(admitted.attemptId).descriptor.error).toBeUndefined();
+      const events = store.listEvents({ sessionId });
+      expect(events.some(event => event.runId === admitted.runId && event.payload.type === "message_complete"
+        && event.payload.blocks.some(block => block.kind === "text" && block.text === "Original native result"))).toBe(true);
+      expect(events.some(event => event.payload.type === "error" && event.payload.error.code === "CODEX_APP_SERVER_DISCONNECTED")).toBe(false);
+      expect(remote.transport).not.toBe(originalProxy);
+      expect(remote.transport?.requests.filter(request => request.method === "turn/start")).toEqual([]);
+      return;
+    }
+    turn["status"] = "failed";
     if (suffix === "reasoning") {
       const items = turn["items"];
       if (!Array.isArray(items)) throw new Error("The fixture turn has no native items.");

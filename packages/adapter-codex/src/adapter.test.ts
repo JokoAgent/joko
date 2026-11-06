@@ -3323,7 +3323,7 @@ describe("CodexBackendAdapter", () => {
     expect(setup.remoteFake.threads.get(nativeSessionId)?.turns).toHaveLength(1);
   });
 
-  it("terminalizes only the subscribed remote runtime when its owning Host disconnects", async () => {
+  it.each([false, true])("terminalizes the subscribed remote turn only while unfinished (completed=%s)", async completed => {
     const setup = await createRemoteSetup();
     const nativeSessionId = setup.remoteFake.seedThread("/srv/joko-project");
     const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
@@ -3332,8 +3332,14 @@ describe("CodexBackendAdapter", () => {
     const bound = context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "remote-disconnect" });
     await setup.adapter.resumeSession(binding, bound);
     await setup.adapter.send(prompt("disconnect after acceptance"), bound);
+    if (completed) await setup.remoteFake.completeTurn(nativeSessionId);
     await setup.remoteFake.transport!.exit(true);
 
+    if (completed) {
+      expect(events.filter(event => event.type === "done")).toEqual([{ type: "done", outcome: "completed" }]);
+      expect(events.some(event => event.type === "error" && event.error.code === "CODEX_APP_SERVER_DISCONNECTED")).toBe(false);
+      return;
+    }
     expect(events).toContainEqual(expect.objectContaining({
       type: "error",
       terminal: true,
