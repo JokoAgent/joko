@@ -1362,13 +1362,14 @@ export class WorkspaceService {
         continue;
       }
       if (record.length < 4) continue;
-      const unmerged = isUnmergedGitStatus(record.slice(0, 2));
+      const status = record.slice(0, 2);
+      const unmerged = isUnmergedGitStatus(status);
       const change = {
         path: record.slice(3),
         index: unmerged ? "U" : record[0]!,
         worktree: unmerged ? "U" : record[1]!
       };
-      if (record[0] === "R" || record[0] === "C") {
+      if (/[RC]/u.test(status)) {
         const originalPath = records[++index];
         changes.push(originalPath === undefined ? change : { ...change, originalPath });
       } else {
