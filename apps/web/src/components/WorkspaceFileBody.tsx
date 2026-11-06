@@ -230,9 +230,10 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   const markdownImageOwnerRef = useRef(markdownImageOwner);
   markdownImageOwnerRef.current = markdownImageOwner;
   const [localPreview, setLocalPreview] = useState<WorkspaceFilePreviewView | undefined>(preview);
+  const lastEditablePreview = useRef<WorkspaceFilePreviewView | undefined>(undefined);
   const [documentSearchOpen, setDocumentSearchOpen] = useState(false);
   const [documentSearchState, setDocumentSearchState] = useState<WorkspaceEditorSearchState>(EMPTY_DOCUMENT_SEARCH_STATE);
-  const dirtyRef = useRef(false);
+  const [dirty, setDirty] = useState(false);
   const onDirtyChangeRef = useRef(onDirtyChange);
   onDirtyChangeRef.current = onDirtyChange;
   const lastJumpKeyRef = useRef<string | undefined>(undefined);
@@ -243,7 +244,7 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   }, [path, preview?.kind, preview?.path, preview?.revision, preview?.text, preview?.blobId, preview?.byteSize, preview?.modifiedAt, preview?.truncated]);
 
   useEffect(() => {
-    dirtyRef.current = false;
+    setDirty(false);
     onDirtyChangeRef.current?.(false);
     setLocalPreview(preview?.path === path ? preview : undefined);
     lastJumpKeyRef.current = undefined;
@@ -281,9 +282,16 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
     && textPreview.revision !== undefined
     && textPreview.revision.trim() !== ""
     && textPreview.text !== undefined;
+  useLayoutEffect(() => {
+    if (writable) lastEditablePreview.current = textPreview;
+  }, [textPreview, writable]);
+  // A truncated preview has no complete baseline to reconcile with a draft.
+  const retainedDraft = canWrite && dirty && textPreview?.truncated === true && lastEditablePreview.current?.path === path;
+  const editorPreview = writable ? textPreview : retainedDraft ? lastEditablePreview.current : undefined;
+  const editorMounted = editorPreview !== undefined;
 
   const setEditorDirty = useCallback((next: boolean): void => {
-    dirtyRef.current = next;
+    setDirty(next);
     onDirtyChange?.(next);
   }, [onDirtyChange]);
 
@@ -440,34 +448,34 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   }, [workspaceId]);
 
   const searchEditor = useCallback((query: string, targetLine?: number): boolean => {
-    const found = writable
+    const found = editorMounted
       ? editorRef.current?.search(query, targetLine) ?? false
       : readOnlyEditorRef.current?.search(query, targetLine) ?? false;
     if (!found && targetLine !== undefined) {
-      if (writable) editorRef.current?.revealLine(targetLine);
+      if (editorMounted) editorRef.current?.revealLine(targetLine);
       else readOnlyEditorRef.current?.revealLine(targetLine);
     }
     return found;
-  }, [writable]);
+  }, [editorMounted]);
 
   const readDocumentSearchState = useCallback((query: string, targetLine?: number): WorkspaceEditorSearchState => (
-    writable
+    editorMounted
       ? editorRef.current?.searchState(query, targetLine) ?? emptyDocumentSearchState(query)
       : readOnlyEditorRef.current?.searchState(query, targetLine) ?? emptyDocumentSearchState(query)
-  ), [writable]);
+  ), [editorMounted]);
 
   const activateDocumentSearch = useCallback((query: string, index: number): WorkspaceEditorSearchState => (
-    writable
+    editorMounted
       ? editorRef.current?.activateSearch(query, index) ?? emptyDocumentSearchState(query)
       : readOnlyEditorRef.current?.activateSearch(query, index) ?? emptyDocumentSearchState(query)
-  ), [writable]);
+  ), [editorMounted]);
 
   const clearDocumentSearch = useCallback((): void => {
-    if (writable) editorRef.current?.clearSearch();
+    if (editorMounted) editorRef.current?.clearSearch();
     else readOnlyEditorRef.current?.clearSearch();
     setDocumentSearchOpen(false);
     setDocumentSearchState(EMPTY_DOCUMENT_SEARCH_STATE);
-  }, [writable]);
+  }, [editorMounted]);
 
   const openDocumentSearch = useCallback((query = documentSearchState.query, focusInput = true, targetLine?: number): void => {
     setDocumentSearchOpen(true);
@@ -483,15 +491,15 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
     save: () => editorRef.current?.save() ?? Promise.resolve(true),
     discardLocalChanges: () => editorRef.current?.discardLocalChanges(),
     focus: () => {
-      if (writable) editorRef.current?.focus();
+      if (editorMounted) editorRef.current?.focus();
       else readOnlyEditorRef.current?.focus();
     },
     search: searchEditor,
     revealLine: (line) => {
-      if (writable) editorRef.current?.revealLine(line);
+      if (editorMounted) editorRef.current?.revealLine(line);
       else readOnlyEditorRef.current?.revealLine(line);
     }
-  }), [searchEditor, writable]);
+  }), [editorMounted, searchEditor]);
 
   useEffect(() => {
     if (textPreview === undefined || !documentSearchOpen) return;
@@ -521,7 +529,7 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   }, { enabled: textPreview !== undefined, stopImmediate: true });
 
   useAppShortcut("save-file", controller.state.preferences.appShortcutOverrides, (event) => {
-    if (textPreview === undefined || !writable) return false;
+    if (!editorMounted) return false;
     const ownerDocument = searchInputRef.current?.ownerDocument ?? document;
     if (workspaceDocumentShortcutBlocked(ownerDocument, event.target)) return false;
     void editorRef.current?.save();
@@ -541,12 +549,12 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
       setDocumentSearchState(readDocumentSearchState(query, jumpLine ?? undefined));
     }
     else if (jumpLine !== null && jumpLine !== undefined) {
-      if (writable) editorRef.current?.revealLine(jumpLine);
+      if (editorMounted) editorRef.current?.revealLine(jumpLine);
       else readOnlyEditorRef.current?.revealLine(jumpLine);
     }
     lastJumpKeyRef.current = jumpKey;
     onSearchJumpConsumed?.();
-  }, [jumpLine, jumpQuery, onSearchJumpConsumed, readDocumentSearchState, textPreview?.path, writable]);
+  }, [editorMounted, jumpLine, jumpQuery, onSearchJumpConsumed, readDocumentSearchState, textPreview?.path]);
 
   if (path === null || path === undefined || path === "") {
     return <BodyState className={className}>{labels.selectFile}</BodyState>;
@@ -590,15 +598,15 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
       {textPreview.truncated && <div className="workspace-file-body__truncated" role="status">{labels.truncated}</div>}
       <div className="workspace-file-body__text-stage">
         <div className="workspace-file-body__source">
-          {writable
+          {editorPreview !== undefined
             ? <WorkspaceFileEditorPane
                 ref={editorRef}
                 key={textPreview.path}
                 file={{
                   path: textPreview.path,
-                  text: textPreview.text ?? "",
-                  revision: textPreview.revision!,
-                  ...(textPreview.language === undefined ? {} : { languageId: textPreview.language })
+                  text: editorPreview.text ?? "",
+                  revision: editorPreview.revision!,
+                  ...(editorPreview.language === undefined ? {} : { languageId: editorPreview.language })
                 }}
                 scrollKey={`${workspaceId}\u0000${textPreview.path}`}
                 suppressInitialScrollRestore={jumpQuery !== null && jumpQuery !== undefined && jumpQuery !== ""}
@@ -635,6 +643,7 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
                 selectionQuoteLabel={onSelectionQuote === undefined ? undefined : labels.addToChat}
                 onSelectionQuote={onSelectionQuote}
                 documentGuard={documentGuard}
+                saveDisabled={!writable}
                 onSave={saveWorkspaceText}
               />
             : <ReadOnlyWorkspaceEditor
