@@ -215,7 +215,7 @@ describe("BrowserToolBridgeProvider", () => {
     vi.mocked(child.browser.listPages).mockImplementation(async () => [...pages]);
     vi.mocked(child.browser.createPage).mockImplementation(async (_lease, url) => {
       const id = `node-page-${pages.length}`, address = url!;
-      const title = new URL(address).hostname === "private-b.example.test" ? `B private page ${id} `.repeat(65) : "A ordinary page";
+      const title = new URL(address).hostname === "private-b.example.test" ? `B private page ${id} `.repeat(65).slice(0, 1_024) : "A ordinary page";
       const page = { id, url: address, title, state: "ready" as const };
       pages.push(page);
       return page;
