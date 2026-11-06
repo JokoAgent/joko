@@ -4076,28 +4076,44 @@ export class SessionHost {
   }
 
   async abort(sessionId: string, runId: string, assertAuthority?: () => void): Promise<void> {
-    assertAuthority?.();
-    this.#clearSessionRuntimeRecovery(sessionId);
-    const run = this.#store.getRun(runId);
-    if (run.descriptor.sessionId !== sessionId) throw new Error("Run does not belong to the task.");
+    await this.controlRun(sessionId, runId, "abort", assertAuthority);
+  }
+
+  private async controlRun(sessionId: string, runId: string, action: "abort" | "abortRetry", assertAuthority?: () => void): Promise<void> {
+    const original = this.#store.getRun(runId).descriptor;
+    if (original.sessionId !== sessionId) throw new StoreError("Run does not belong to the task.");
+    const originalQueue = this.#store.findQueueItemByRunId(sessionId, runId);
+    const assertRun = () => {
+      assertAuthority?.();
+      const run = this.#store.getRun(runId).descriptor;
+      const queue = this.#store.findQueueItemByRunId(sessionId, runId);
+      const attempt = run.activeAttemptId === undefined ? undefined : this.#store.getAttempt(run.activeAttemptId).descriptor;
+      const session = this.#store.getSession(sessionId).descriptor;
+      const active = ["running", "waiting", "retrying"].includes(run.state)
+        || action === "abort" && run.state === "queued" && queue?.state === "dispatching";
+      if (!active || run.activeAttemptId !== original.activeAttemptId || !attempt || attempt.endedAt !== undefined || !queue
+        || attempt.generation !== session.binding.generation || queue.id !== originalQueue?.id || queue.attemptId !== attempt.id
+        || attempt.backendInstanceGeneration !== queue.backendInstanceGeneration
+        || attempt.backendInstanceGeneration !== this.#store.getBackend(session.backendId).descriptor.instanceGeneration
+        || queue.state !== "dispatching" && queue.state !== "backend_accepted") {
+        throw new JokoError({ code: "RUN_CONTROL_TARGET_CHANGED", message: "The requested Run is no longer active.",
+          phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Refresh the task and select its current Run." });
+      }
+    };
+    assertRun();
+    if (action === "abort") this.#clearSessionRuntimeRecovery(sessionId);
     const stored = this.#store.getSession(sessionId);
-    const active = this.fencedProviderAuthenticationCleanupOwner(stored, runId)
+    const active = (action === "abort" ? this.fencedProviderAuthenticationCleanupOwner(stored, runId) : undefined)
       ?? await this.activate(sessionId);
     const lease = this.beginActiveBackendSideEffect(sessionId, active);
     try {
-      if (assertAuthority) {
-        assertAuthority();
-        const owned = this.#store.listQueueItems({ sessionId, states: ["dispatching", "backend_accepted"], limit: 100 }).some(item => item.runId === runId);
-        if (!owned || !["running", "waiting", "retrying"].includes(this.#store.getRun(runId).descriptor.state)) throw new StoreError("The original plugin execution is no longer active.");
-      }
-      await active.adapter.abort(this.contextFor(
-        lease.stored,
-        runId,
-        run.descriptor.activeAttemptId,
-        undefined,
-        undefined,
-        lease.backendInstanceGeneration
-      ));
+      const assertRunControlCurrent = () => {
+        this.assertActiveBackendSideEffectLease(lease);
+        assertRun();
+      };
+      assertRunControlCurrent();
+      const context = this.contextFor(lease.stored, runId, original.activeAttemptId, undefined, undefined, lease.backendInstanceGeneration);
+      await active.adapter[action]({ ...context, assertRunControlCurrent });
       this.assertActiveBackendSideEffectLease(lease);
     } finally {
       lease.release();
@@ -4689,16 +4705,9 @@ export class SessionHost {
     }
   }
 
-  async abortRetry(sessionId: string): Promise<void> {
+  async abortRetry(sessionId: string, runId: string, assertAuthority?: () => void): Promise<void> {
     if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer runtime settings are immutable.");
-    const active = await this.activate(sessionId);
-    const lease = this.beginActiveBackendSideEffect(sessionId, active);
-    try {
-      await active.adapter.abortRetry(lease.context);
-      this.assertActiveBackendSideEffectLease(lease);
-    } finally {
-      lease.release();
-    }
+    await this.controlRun(sessionId, runId, "abortRetry", assertAuthority);
   }
 
   async executeUserShell(sessionId: string, input: UserShellInput, operationId?: string): Promise<UserShellResult> {

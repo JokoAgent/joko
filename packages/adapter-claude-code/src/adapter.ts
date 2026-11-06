@@ -2156,6 +2156,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
 
   override async abort(context: AdapterContext): Promise<void> {
     const runtime = this.#requireRuntime(context);
+    context.assertRunControlCurrent?.();
     if (runtime.inputPreparation !== undefined) {
       runtime.inputPreparation.abort(claudeCodeError(
         "INPUT_PREPARATION_ABORTED",

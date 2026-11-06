@@ -2155,6 +2155,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async abort(context: AdapterContext): Promise<void> {
     const runtime = await this.#requireRuntime(context);
     const yieldClaim = runtime.yieldContinuation;
+    const originalStopRequested = yieldClaim?.stopRequested;
+    let controlDenied: unknown;
+    const assertControl = () => {
+      try { context.assertRunControlCurrent?.(); }
+      catch (error) {
+        controlDenied = error;
+        if (yieldClaim && runtime.yieldContinuation === yieldClaim) yieldClaim.stopRequested = originalStopRequested ?? false;
+        throw error;
+      }
+    };
+    assertControl();
     if (yieldClaim !== undefined) {
       yieldClaim.stopRequested = true;
       let yieldTurnId = yieldClaim.continuationTurnId;
@@ -2170,7 +2181,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           });
           return;
         }
-        if (startFlight !== undefined) await startFlight;
+        if (startFlight !== undefined) { await startFlight; assertControl(); }
         if (runtime.yieldContinuation !== yieldClaim) return;
         yieldTurnId = yieldClaim.continuationTurnId;
         if (yieldTurnId === undefined) {
@@ -2179,16 +2190,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       const hostGeneration = runtime.hostGeneration;
       try {
+        assertControl();
         const response = await runtime.host.request("turn/interrupt", {
           threadId: runtime.threadId,
           turnId: yieldTurnId
         }, {
           mutation: true,
           signal: AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]),
-          beforeDispatch: () => this.#assertRuntimeDispatchFence(runtime, yieldClaim.context, hostGeneration)
+          beforeDispatch: () => {
+            assertControl();
+            this.#assertRuntimeDispatchFence(runtime, yieldClaim.context, hostGeneration);
+          }
         });
         this.#assertRuntimeFence(runtime, yieldClaim.context, response.hostGeneration);
       } catch {
+        if (controlDenied !== undefined) throw controlDenied;
         throw await this.#failYieldContinuationStop(runtime, yieldClaim, hostGeneration);
       }
       if (runtime.yieldContinuation !== yieldClaim) return;
@@ -2211,7 +2227,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (turnId === undefined) return;
     const hostGeneration = runtime.hostGeneration;
     const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
-    const beforeDispatch = () => this.#assertRuntimeDispatchFence(runtime, context, hostGeneration);
+    const beforeDispatch = () => {
+      assertControl();
+      this.#assertRuntimeDispatchFence(runtime, context, hostGeneration);
+    };
     try {
       const response = await runtime.host.request("turn/interrupt", {
         threadId: runtime.threadId,
@@ -2221,6 +2240,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       this.#cancelPendingServerRequests(runtime, (pending) => pending.turnId === turnId);
       this.#cancelPendingMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);
     } catch (error) {
+      if (controlDenied !== undefined) throw controlDenied;
       throw this.#requestFailure(error, "dispatch", "CODEX_TURN_INTERRUPT_FAILED", false);
     }
   }
