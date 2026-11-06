@@ -1,4 +1,4 @@
-import { rm } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -10,9 +10,11 @@ import type { AdapterContext, NativeSessionBinding } from "@joko/core";
 import type { RemoteForwardingTransportPort } from "@joko/remote-ssh";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { ArtifactStore } from "./artifact-store.js";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
-import { McpRouter, type BridgeToolCallContext, type BridgeToolProvider } from "./mcp-router.js";
+import { McpRouter, type BridgeToolCallContext, type BridgeToolProvider, type McpClientFactory } from "./mcp-router.js";
 import { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 import { mkdtemp } from "./test-paths.js";
 
@@ -23,6 +25,38 @@ afterEach(async () => {
 });
 
 describe("CodexMcpBridgeManager", () => {
+  it("offers a bounded native reply and the complete file in the original local Session", async () => {
+    const report = `${"ordinary report row\n".repeat(30_000)}REPORT_END\n`;
+    const fixture = await createFixture({ clientFactory: { connect: async () => ({
+      listTools: async () => ({ tools: [{ name: "read_report", inputSchema: { type: "object" } }] }),
+      callTool: async () => ({ content: [{ type: "text", text: report }], isError: false }),
+      readResource: async () => ({ contents: [] }),
+      close: async () => undefined,
+    }) } });
+    await fixture.router.upsert({ id: "reports", displayName: "Reports", transport: "streamable_http",
+      endpoint: "https://reports.example.test/mcp", enabled: true, credentialBindings: [] });
+    const bridge = await fixture.manager.openLocal({
+      sessionId: "session-local", targetId: "target-local", generation: 1, threadId: "native-local-root",
+      assertSessionCurrent: () => undefined,
+      beginToolCall: () => ({ signal: new AbortController().signal, assertCurrent: () => undefined, release: () => undefined }),
+    });
+    const client = new Client({ name: "complete-output-fixture", version: "1.0.0" }, { capabilities: {} });
+    cleanups.push(async () => client.close());
+    await client.connect(new StreamableHTTPClientTransport(new URL(bridge.routes[0]!.url)));
+    const result = await client.callTool({ name: "read_report", arguments: {}, _meta: { threadId: "native-local-root" } });
+
+    const records = fixture.store.listArtifacts({ sessionId: "session-local" });
+    expect(records).toHaveLength(1);
+    const blob = records[0]!.blob;
+    expect(result).toMatchObject({ isError: false, _meta: { jokoMcpBridge: { truncated: true, completeOutput: blob } } });
+    expect(JSON.stringify(result.content)).not.toContain("REPORT_END");
+    expect(fixture.store.listEvents({ sessionId: "session-local" }).filter((event) => event.payload.type === "artifact"))
+      .toEqual([expect.objectContaining({ payload: { type: "artifact", purpose: "backend_artifact", artifact: blob } })]);
+    expect(fixture.store.listArtifacts({ sessionId: "session-remote" })).toEqual([]);
+    const stored = await fixture.artifacts.get(blob.id);
+    expect(JSON.parse(await readFile(stored.storagePath, "utf8"))).toEqual({ isError: false, content: [{ type: "text", text: report }] });
+  });
+
   it("connects a durable local Codex Session through its native config to the standard Router facade", async () => {
     const fixture = await createFixture();
     const calls: BridgeToolCallContext[] = [];
@@ -431,7 +465,7 @@ function provider(calls: BridgeToolCallContext[]): BridgeToolProvider {
   };
 }
 
-async function createFixture(options: { readonly now?: () => number; readonly grantTtlMs?: number } = {}) {
+async function createFixture(options: { readonly now?: () => number; readonly grantTtlMs?: number; readonly clientFactory?: McpClientFactory } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-remote-codex-mcp-"));
   const store = new OperationalStore(join(root, "orchestrator.db"));
   const vault = await CredentialVault.open(join(root, "vault.key"));
@@ -464,9 +498,13 @@ async function createFixture(options: { readonly now?: () => number; readonly gr
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false,
     createdAt: 2, updatedAt: 2
   });
+  const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
+  await artifacts.initialize();
   const router = new McpRouter({
     store,
     credentials,
+    resultArtifacts: artifacts,
+    ...(options.clientFactory === undefined ? {} : { clientFactory: options.clientFactory }),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.grantTtlMs === undefined ? {} : { bridgeGrantTtlMs: options.grantTtlMs })
   });
@@ -481,5 +519,5 @@ async function createFixture(options: { readonly now?: () => number; readonly gr
     store.close();
     await rm(root, { recursive: true, force: true });
   });
-  return { root, store, router, manager };
+  return { root, store, router, manager, artifacts };
 }

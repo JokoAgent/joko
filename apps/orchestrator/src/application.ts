@@ -4301,6 +4301,8 @@ function createTargetAwarePiBridgeGeneration(
         sessionId: context.sessionId,
         targetId: context.target.id,
         expectedPiGeneration: context.generation,
+        publishCompleteOutput: context.target.remoteWorkspace === undefined && context.hostedExecution === undefined
+          && context.runtimePolicy !== "review_read_only",
         nativeAuthLease,
         includeToolPolicy: (policyId) => toolPolicyEnabled(context, policyId)
       }), onRenewalFailure);

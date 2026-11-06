@@ -2310,6 +2310,9 @@ describe("McpRouter", () => {
     };
     const bridge = router.createPiBridgeSnapshot({
       endpoint: "http://127.0.0.1:4318/internal/mcp",
+      sessionId: "session-1",
+      targetId: "target-1",
+      publishCompleteOutput: true,
       expectedPiGeneration: 1
     });
     const result = await router.executeBridgeCall({
@@ -2340,6 +2343,14 @@ describe("McpRouter", () => {
     expect(details.jokoMcpBridge?.completeOutput?.storagePath).toBeUndefined();
     const artifactId = details.jokoMcpBridge?.completeOutput?.id;
     expect(artifactId).toBeTruthy();
+    expect(store.listArtifacts({ sessionId: "session-1" })).toEqual([
+      expect.objectContaining({ sessionId: "session-1", blob: expect.objectContaining({ id: artifactId }) })
+    ]);
+    expect(store.listArtifacts({ sessionId: "session-2" })).toEqual([]);
+    expect(store.listEvents({ sessionId: "session-1" }).filter((event) => event.payload.type === "artifact")).toEqual([
+      expect.objectContaining({ sessionId: "session-1", generation: 1,
+        payload: expect.objectContaining({ type: "artifact", artifact: expect.objectContaining({ id: artifactId }) }) })
+    ]);
     const artifact = await artifacts.get(artifactId!);
     const artifactJson = await readFile(artifact.storagePath, "utf8");
     expect(Buffer.byteLength(artifactJson, "utf8")).toBeGreaterThan(16 * 1024 * 1024);
@@ -2403,6 +2414,40 @@ describe("McpRouter", () => {
     bridge.revoke();
     await router.dispose();
     store.close();
+  });
+
+  it("releases staged complete MCP output if its scoped grant is revoked before publication", async () => {
+    const { store, factory, artifacts, router } = await fixture();
+    await router.upsert({ id: "search", displayName: "Search", transport: "streamable_http",
+      endpoint: "https://mcp.example.test/rpc", enabled: true, credentialBindings: [] });
+    factory.result = { content: [{ type: "text", text: "row\n".repeat(150_000) }], isError: false };
+    const bridge = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp",
+      sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1, publishCompleteOutput: true });
+    const staged = deferred<string>();
+    const release = deferred<void>();
+    const ingest = artifacts.ingestBytes.bind(artifacts);
+    vi.spyOn(artifacts, "ingestBytes").mockImplementation(async (...args) => {
+      const artifact = await ingest(...args);
+      staged.resolve(artifact.id);
+      await release.promise;
+      return artifact;
+    });
+    const call = router.executeBridgeCall({ ...bridgeScope(1), authorization: `Bearer ${bridge.mcpBridge.token}`,
+      generation: 1, serverId: "search", toolName: "echo" });
+    try {
+      const id = await Promise.race([staged.promise, call.then(() => { throw new Error("The result was not staged."); })]);
+      bridge.revoke();
+      release.resolve();
+      await expect(call).resolves.toMatchObject({ isError: true, content: [] });
+      expect(store.findArtifact(id)).toMatchObject({ metadata: { expiresAt: 0 } });
+      expect(store.listArtifacts({ sessionId: "session-1" })).toEqual([]);
+      expect(store.listEvents({ sessionId: "session-1" }).some((event) => event.payload.type === "artifact")).toBe(false);
+    } finally {
+      release.resolve();
+      await call.catch(() => undefined);
+      await router.dispose();
+      store.close();
+    }
   });
 
   it("returns a typed resource_exhausted failure only above the configured Artifact capacity", async () => {

@@ -10,7 +10,7 @@ import { CallToolResultSchema, CreateTaskResultSchema, type CallToolRequest, typ
 import type { Transport, FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { PiMcpBridgeOptions, PiMcpToolDescriptor } from "@joko/adapter-pi";
 import { validateMcpEndpoint } from "@joko/adapter-pi";
-import { redactSecrets, type BlobRef, type PolicySubjectKind, type PartnerLearningReceipt, type PartnerLearningTurnSource, type PartnerLearningToolAuthority } from "@joko/core";
+import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, redactSecrets, type BlobRef, type PolicySubjectKind, type PartnerLearningReceipt, type PartnerLearningTurnSource, type PartnerLearningToolAuthority, type SessionDescriptor } from "@joko/core";
 import { operationBodyHash, type OperationalStore } from "@joko/store";
 
 import type { CredentialManager } from "./credential-manager.js";
@@ -37,6 +37,7 @@ import { RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server";
 import { AppConnection, type AppServerConfig } from "./mcp-apps/connection.js";
 import type { McpAppCapture, McpAppCaptureInput } from "./mcp-apps/manager.js";
 import type { McpModelChannel } from "./mcp-apps/server-proxy.js";
+import { nativeBindingFingerprint } from "./native-state-observation.js";
 
 export const MCP_BRIDGE_RESPONSE_MAXIMUM_BYTES = 2 * 1024 * 1024;
 export const MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR = "MCP command arguments cannot contain credentials. Use an environment credential binding.";
@@ -309,6 +310,7 @@ interface BridgeGrant {
   readonly serverGenerations: ReadonlyMap<string, number>;
   readonly tools: readonly PiMcpToolDescriptor[];
   readonly audioResultMappings: ReadonlyMap<string, McpAudioResultMapping>;
+  readonly publishCompleteOutput: boolean;
   readonly expectedPiGeneration?: number;
   readonly productScope?: {
     readonly sessionId: string;
@@ -391,6 +393,11 @@ export interface NativeAuthProviderFence {
 interface NormalizedMcpResult {
   readonly value: McpCallResult;
   readonly bytes: Uint8Array;
+}
+
+interface McpCompleteOutputOwner {
+  readonly session: SessionDescriptor;
+  readonly assertCurrent: () => void;
 }
 
 export interface McpBridgeCallResult {
@@ -926,6 +933,8 @@ export class McpRouter {
     readonly targetId?: string;
     readonly expectedPiGeneration?: number;
     readonly ttlMs?: number;
+    /** Ordinary local runtime may publish complete external results to this exact Session. */
+    readonly publishCompleteOutput?: boolean;
     readonly nativeAuthLease?: {
       readonly endpoint: string;
       readonly catalogGeneration: number;
@@ -1070,6 +1079,7 @@ export class McpRouter {
       serverGenerations,
       tools,
       audioResultMappings,
+      publishCompleteOutput: productScope !== undefined && input.publishCompleteOutput === true,
       ...(input.expectedPiGeneration === undefined ? {} : { expectedPiGeneration: input.expectedPiGeneration }),
       ...(productScope === undefined ? {} : { productScope }),
       ...(nativeAuth === undefined ? {} : { nativeAuth }),
@@ -1249,11 +1259,12 @@ export class McpRouter {
       let result: McpCallResult;
       let hostImages: readonly BridgeToolImageOutput[] = [];
       let hostArtifacts: readonly BridgeToolArtifactOutput[] = [];
+      let completeOutputOwner: McpCompleteOutputOwner | undefined;
       if (bridgeProvider === undefined) {
         const runtime = this.#requireRuntime(input.serverId, serverGeneration);
         const targetRevision = this.#store.getTarget(session.targetId).revision;
         const context = { sessionId: session.id, targetId: session.targetId, generation: input.generation, requestIdentity, requestBodyHash };
-        const guard = (): void => {
+        const guard = (): SessionDescriptor => {
           assertDelegated?.();
           assertNativeRoot?.();
           modelChannel?.assertCurrent();
@@ -1264,12 +1275,21 @@ export class McpRouter {
             || current.archived || current.deletedAt !== undefined
             || this.#store.findPendingSessionLifecycleCleanup(current.id) !== undefined
             || this.#store.getTarget(context.targetId).revision !== targetRevision) throw new Error("MCP audio publication owner is no longer active.");
+          return current;
         };
         guard();
         const replay = input.appCall?.params.task ? undefined : this.#audioArtifacts?.replay(context);
         if (replay !== undefined) result = replay;
         else {
           const tool = runtime.tools.find(candidate => candidate.name === input.toolName);
+          if (grant.publishCompleteOutput && input.appCall?.params.task === undefined && tool?.appResourceUri === undefined
+            && audioResultMapping === undefined && this.#canPublishCompleteOutput(session)) {
+            completeOutputOwner = { session, assertCurrent: () => {
+              const current = guard();
+              if (current.binding.opaqueRef !== session.binding.opaqueRef || current.binding.nativeSessionId !== session.binding.nativeSessionId
+                || !this.#canPublishCompleteOutput(current)) throw new Error("MCP complete-output owner is no longer active.");
+            } };
+          }
           if (!input.appCall?.params.task && tool?.appResourceUri !== undefined && tool.inputSchema["type"] === "object"
             && this.#servers.get(input.serverId)?.generation === serverGeneration) {
             try {
@@ -1390,7 +1410,7 @@ export class McpRouter {
         }
         guard();
       }
-      const projected = await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts);
+      const projected = await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts, completeOutputOwner);
       return modelTask ? { ...projected, details: { ...projected.details, mcpTask: modelTask } } : projected;
     } catch (error) {
       await appCapture?.cancel(input.signal?.aborted === true).catch(() => undefined);
@@ -2338,7 +2358,8 @@ export class McpRouter {
     serverId: string,
     toolName: string,
     hostImages: readonly BridgeToolImageOutput[] = [],
-    hostArtifacts: readonly BridgeToolArtifactOutput[] = []
+    hostArtifacts: readonly BridgeToolArtifactOutput[] = [],
+    completeOutputOwner?: McpCompleteOutputOwner
   ): Promise<McpBridgeCallResult> {
     const normalized = this.#normalizeResult(result, "MCP bridge result");
     const hostDetails = {
@@ -2373,31 +2394,58 @@ export class McpRouter {
     }
 
     if (this.#resultArtifacts === undefined) throw new McpArtifactUnavailableError();
+    const owner = normalized.value.isError ? undefined : completeOutputOwner;
+    owner?.assertCurrent();
     let stored: BlobRef;
     try {
       const safeServerId = artifactNamePart(this.#redactText(serverId));
       const safeToolName = artifactNamePart(this.#redactText(toolName));
       stored = await this.#resultArtifacts.ingestBytes(normalized.bytes, {
         fileName: `${safeServerId}-${safeToolName}-${randomUUID()}.json`,
-        mimeType: "application/json"
+        mimeType: "application/json",
+        ...(owner === undefined ? {} : { expiresAt: Date.now() + 10 * 60_000 })
       });
     } catch (error) {
       throw new McpArtifactUnavailableError({ cause: error });
     }
-    const completeOutput = publicBlobRef(stored);
-    const response: McpBridgeCallResult = {
-      content: bridgeResultPreview(normalized.value.content, completeOutput, normalized.bytes.byteLength),
-      details: {
-        jokoMcpBridge: {
-          ...hostDetails,
-          truncated: true,
-          completeOutput
-        }
-      },
-      isError: normalized.value.isError
-    };
-    assertBridgeResponseWithinBudget(response);
-    return response;
+    try {
+      const completeOutput = publicBlobRef(stored);
+      const response: McpBridgeCallResult = {
+        content: bridgeResultPreview(normalized.value.content, completeOutput, normalized.bytes.byteLength),
+        details: {
+          jokoMcpBridge: {
+            ...hostDetails,
+            truncated: true,
+            completeOutput
+          }
+        },
+        isError: normalized.value.isError
+      };
+      assertBridgeResponseWithinBudget(response);
+      if (owner !== undefined) this.#store.transaction((store) => {
+        owner.assertCurrent();
+        const { session } = owner;
+        const artifact = store.adoptSessionArtifact({ blob: completeOutput, sessionId: session.id }).blob;
+        store.appendEvent({
+          backendId: session.backendId, targetId: session.targetId, sessionId: session.id,
+          generation: session.binding.generation, traceId: `artifact:${artifact.id}`,
+          metadata: { namespace: "joko.mcp_complete_output", fields: {
+            [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(session.binding.opaqueRef)
+          } },
+          payload: { type: "artifact", artifact, purpose: "backend_artifact" }
+        });
+      });
+      return response;
+    } catch (error) {
+      if (owner !== undefined) this.#store.releaseArtifactStaging([stored.id]);
+      throw error;
+    }
+  }
+
+  #canPublishCompleteOutput(session: SessionDescriptor): boolean {
+    return this.#store.findSessionRuntimePolicy(session.id)?.policy !== "review_read_only"
+      && !(session.derivationOrigin?.sideChat && session.worktree === undefined)
+      && (session.worktree === undefined || session.worktree.state === "active");
   }
 
   async #callBridgeToolProvider(
