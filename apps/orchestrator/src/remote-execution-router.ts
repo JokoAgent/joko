@@ -57,6 +57,8 @@ export interface RemoteWorkspaceAuthority {
   readonly kind: RemoteWorkspaceBinding["kind"];
   readonly binding: RemoteWorkspaceBinding;
   readonly executionIdentity: string;
+  /** Coordinates overlapping writes across Host records without transferring their authority. */
+  readonly mutationIdentity?: string;
   readonly authorityIdentity: string;
   readonly pathStyle: "posix" | "win32";
   readonly files: RemoteFileTransportPort;
@@ -128,10 +130,12 @@ export class RemoteExecutionRouter {
         || !captured.lease.capabilities.processStreaming || captured.lease.processes === undefined) {
         throw new RemoteExecutionUnavailableError("files");
       }
+      const { user, trust } = captured.host;
       return Object.freeze({
         kind: "ssh" as const,
         binding,
         executionIdentity: sshExecutionIdentity(binding, captured.host),
+        ...(trust === undefined ? {} : { mutationIdentity: JSON.stringify(["ssh", user, trust.algorithm, trust.fingerprint]) }),
         authorityIdentity: sshAuthorityIdentity(captured.hostRevision, captured.leaseGeneration),
         pathStyle: "posix" as const,
         files: captured.lease.files,
