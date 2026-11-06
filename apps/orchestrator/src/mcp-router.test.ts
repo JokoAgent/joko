@@ -2,6 +2,8 @@ import { createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, s
 import type { KeyObject } from "node:crypto";
 import type { PartnerLearningTurnSource } from "@joko/core";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { createServer } from "node:http";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +28,7 @@ import {
 } from "./mcp-audio-result-mapping.js";
 import {
   McpRouter,
+  SdkMcpClientFactory,
   type BridgeToolProvider,
   type McpClientConnection,
   type McpClientFactory,
@@ -106,6 +109,7 @@ class FakeMcpFactory implements McpClientFactory {
 }
 
 interface FixtureOptions extends Partial<Pick<McpRouterOptions, "now" | "bridgeGrantTtlMs" | "nativeAuthLeaseTtlMs" | "nativeAuth" | "nativeAuthRecovery" | "trustedManagedRunnerScriptSha256" | "toolDiscoveryPolicy" | "targetReferences" | "capturePartnerLearningSave" | "onAppToolCall">> {
+  readonly clientFactory?: McpClientFactory;
   readonly maximumBlobBytes?: number;
   readonly audioResultDownloader?: McpAudioResultDownloader;
 }
@@ -221,7 +225,7 @@ async function fixture(options: FixtureOptions = {}) {
   const router = new McpRouter({
     store,
     credentials,
-    clientFactory: factory,
+    clientFactory: options.clientFactory ?? factory,
     resultArtifacts: artifacts,
     ...(options.audioResultDownloader === undefined ? {} : { audioResultDownloader: options.audioResultDownloader }),
     ...(options.now === undefined ? {} : { now: options.now }),
@@ -241,6 +245,59 @@ async function fixture(options: FixtureOptions = {}) {
 }
 
 describe("McpRouter", () => {
+  it("fences an already-open remote model channel at the HTTP request after its Vault header is deleted", async () => {
+    const f = await fixture({ clientFactory: new SdkMcpClientFactory(2_000) });
+    const requests: Array<{ method: string; authorization: string | undefined }> = [];
+    const server = createServer(async (request, response) => {
+      if (request.method !== "POST") { response.writeHead(405).end(); return; }
+      try {
+        let body = "";
+        for await (const chunk of request) body += String(chunk);
+        const message = JSON.parse(body) as { id?: number; method: string; params?: { protocolVersion?: string } };
+        requests.push({ method: message.method, authorization: request.headers.authorization });
+        if (message.id === undefined) { response.writeHead(202).end(); return; }
+        const result = message.method === "initialize" ? { protocolVersion: message.params?.protocolVersion,
+          serverInfo: { name: "vault-fixture", version: "1.0.0" }, capabilities: { tools: {} } }
+          : { tools: [{ name: "lookup", description: "Lookup", inputSchema: { type: "object" } }] };
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+      } catch { response.writeHead(400).end(); }
+    });
+    try {
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("Loopback MCP endpoint unavailable.");
+      await f.router.upsert({ id: "vault-tool", displayName: "Vault tool", enabled: true, transport: "streamable_http",
+        endpoint: `http://127.0.0.1:${address.port}/mcp`, credentialBindings: [{ target: "header", name: "Authorization", credentialReferenceId: "cred_mcp_header" }] });
+      const snapshot = f.router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp",
+        sessionId: "session-remote", targetId: "target-remote", expectedPiGeneration: 1 });
+      const channel = f.router.createAppModelChannel(snapshot, "vault-tool", {
+        capabilities: () => ({}), request: async () => { throw new Error("Unexpected peer request."); }
+      }, () => undefined)!;
+      const client = await channel.connection.getClient();
+      await expect(client.listTools()).resolves.toMatchObject({ tools: [{ name: "lookup" }] });
+      await expect(f.router.delete("vault-tool")).resolves.toBe(true);
+      await expect(client.listTools()).resolves.toMatchObject({ tools: [{ name: "lookup" }] });
+      const received = requests.length;
+      expect(requests.at(-1)).toEqual({ method: "tools/list", authorization: "mcp-header-secret-value" });
+
+      await expect(f.credentials.delete("cred_mcp_header")).resolves.toBe(true);
+      await expect(client.listTools()).rejects.toThrow(/credential retired/u);
+      const replacement = f.credentials.createUploadTicket();
+      f.credentials.upload(replacement.credentialUploadTicketId, "replacement-mcp-header");
+      await f.credentials.commitUpload({ credentialUploadTicketId: replacement.credentialUploadTicketId,
+        credentialReferenceId: "cred_mcp_header", displayName: "Replacement header", kind: "header_secret" });
+      await expect(client.listTools()).rejects.toThrow(/credential retired/u);
+      expect(requests).toHaveLength(received);
+    } finally {
+      await f.router.dispose();
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      f.store.close();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
   it("captures the concrete native arguments and revalidates delegated authority immediately before MCP dispatch", async () => {
     const f = await fixture(); let current = true;
     const pause = deferred<void>(), entered = deferred<void>();
