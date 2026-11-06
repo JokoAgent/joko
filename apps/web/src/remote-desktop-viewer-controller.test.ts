@@ -66,7 +66,8 @@ function fixture(platform = "win32", temporary = false, portal = false, systemAu
     post: (message: Record<string, unknown>) => runtime.post?.({
       epoch: runtime.receive.mock.calls.filter(([value]) => value.type === "init").at(-1)?.[0].epoch, ...message
     }),
-    pendingControl: (value: Promise<object>) => { pendingControl = value; }, expire: () => { heartbeatFailure = true; } };
+    pendingControl: (value: Promise<object>) => { pendingControl = value; }, expire: () => { heartbeatFailure = true; },
+    disconnectDisplay: (id: string) => { const index = displays.findIndex(display => display.displayId === id); if (index >= 0) displays.splice(index, 1); } };
 }
 async function flush(): Promise<void> { for (let i = 0; i < 16; i++) await Promise.resolve(); }
 
@@ -111,6 +112,18 @@ describe("Desktop viewer presentation adapter", () => {
     ]);
     expect(f.inputCalls.filter(call => call.name === "setRemoteDesktopControl").map(call => call.input["enabled"])).toEqual(controlling ? [] : [false]);
     expect(f.controller.snapshot).toMatchObject({ ready: true, controlling, lease: { display: { displayId: "two" } } });
+  });
+
+  it("reports the selected display missing while leaving the original lease live", async () => {
+    const f = fixture("win32", false, false, false, Promise.resolve(SCOPE), true); await flush();
+    f.post({ type: "framePresented" });
+    f.disconnectDisplay("two");
+    await f.controller.selectDisplay("two");
+
+    expect(f.controller.snapshot).toMatchObject({ status: "live", error: "display", ready: true, controlling: true,
+      sourceDisplayId: "one", lease: { display: { displayId: "one" } } });
+    expect(f.inputCalls.filter(call => call.name === "stopRemoteDesktop")).toEqual([]);
+    expect(f.inputCalls.filter(call => call.name === "startRemoteDesktop")).toHaveLength(1);
   });
 
   it("retires deferred initial control when its viewer binding becomes inactive", async () => {

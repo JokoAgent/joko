@@ -163,10 +163,11 @@ export class DesktopRemoteDesktopViewerController {
       return;
     }
     this.cancel();
+    this.#sourceDisplayId = undefined;
     this.#client = scope.target === null ? undefined : createDesktopRemoteDesktopViewerClient(this.api, scope.generation);
     this.#unlockAttempted = false; this.#credentialRetry = undefined;
     this.publish({ status: scope.active ? "connecting" : "inactive", error: undefined,
-      caps: undefined, lease: undefined, ready: false, controlling: false, controlPending: false,
+      caps: undefined, lease: undefined, sourceDisplayId: undefined, ready: false, controlling: false, controlPending: false,
       media: "none", modes: [], modeNotice: undefined, settings: { ...this.#snapshot.settings, audio: scope.audio },
       settingsBusy: false, clipboardBusy: false, audioPending: false, lockOnExit: scope.lockOnExit,
       credential: undefined, credentialBusy: false, credentialNotice: undefined,
@@ -248,21 +249,29 @@ export class DesktopRemoteDesktopViewerController {
       }
     }, 60000);
   }
-  private async connect(displayId?: string, { takeover = false, resume = false, wantsControl = true } = {}): Promise<void> {
+  private async connect(displayId?: string, { takeover = false, resume = false, wantsControl = true, knownCaps }: {
+    readonly takeover?: boolean; readonly resume?: boolean; readonly wantsControl?: boolean; readonly knownCaps?: RemoteDesktopCapabilities;
+  } = {}): Promise<void> {
     if (this.#opening || this.#client === undefined || !this.#scope?.active) return;
     this.#opening = true;
+    this.#wantedControl = wantsControl;
     const epoch = this.#epoch;
     const rpc = this.#client;
     this.publish({ status: "connecting", ready: false, error: undefined });
     this.armConnectionDeadline();
     try {
-      const caps = (await rpc.getRemoteDesktopCapabilities({}, this.options())).capabilities;
+      const caps = knownCaps ?? (await rpc.getRemoteDesktopCapabilities({}, this.options())).capabilities;
       if (!this.current(epoch)) return;
       if (caps?.protocolVersion !== 1 || !caps.enabled || !caps.displays.length) {
         this.publish({ status: "error", error: caps?.enabled === false ? "disabled" : "unsupported" }); return;
       }
       this.publish({ caps });
-      const display = caps.displays.find((item) => item.displayId === displayId) ?? caps.displays[0]!;
+      const display = displayId === undefined ? caps.displays[0] : caps.displays.find((item) => item.displayId === displayId);
+      if (display === undefined) {
+        clearTimeout(this.#connectionDeadline); this.#connectionDeadline = undefined;
+        this.publish({ status: "error", error: "display" });
+        return;
+      }
       const canTakeControl = wantsControl && caps.canControl;
       const started = await rpc.startRemoteDesktop({ displayId: display.displayId,
         inputHandoffRequestId: this.#scope?.target?.inputHandoffRequestId,
@@ -546,7 +555,7 @@ export class DesktopRemoteDesktopViewerController {
       this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControl = false;
       const epoch = this.#epoch;
       this.#retryTimer = setTimeout(() => { this.#retryTimer = undefined;
-        if (this.current(epoch)) void this.connect(displayId, { resume: true }); }, this.#retryDelay);
+        if (this.current(epoch)) void this.connect(displayId, { resume: true, wantsControl: this.#wantedControl }); }, this.#retryDelay);
       this.#retryDelay = Math.min(8000, this.#retryDelay * 2);
       return;
     }
@@ -685,8 +694,9 @@ export class DesktopRemoteDesktopViewerController {
       }
     }
     if (!this.current(epoch)) return;
+    const wantsControl = this.#sourceDisplayId === undefined || this.#wantedControl;
     this.cancel(); this.publish({ lease: undefined, controlling: false, ready: false, media: "none", modeNotice: undefined });
-    await this.connect(this.#sourceDisplayId, { takeover });
+    await this.connect(this.#sourceDisplayId, { takeover, wantsControl });
   }
   async selectDisplay(displayId: string): Promise<void> {
     const rpc = this.#client, lease = this.#snapshot.lease;
@@ -694,11 +704,19 @@ export class DesktopRemoteDesktopViewerController {
     const epoch = this.#epoch, generation = this.#scope?.generation;
     this.releaseInput(); this.publish({ settingsBusy: true });
     this.syncControl();
-    try { await rpc.stopRemoteDesktop({ leaseId: lease.leaseId }, this.options());
+    try {
+      const caps = (await rpc.getRemoteDesktopCapabilities({}, this.options())).capabilities;
+      if (!this.current(epoch)) return;
+      if (caps?.protocolVersion !== 1 || !caps.enabled || !caps.displays.some(item => item.displayId === displayId)) {
+        this.publish({ ...(caps === undefined ? {} : { caps }), error: "display" });
+        return;
+      }
+      await rpc.stopRemoteDesktop({ leaseId: lease.leaseId }, this.options());
       if (!this.current(epoch)) return;
       const wantsControl = this.#wantedControl;
-      this.cancel(); this.publish({ lease: undefined, controlling: false, ready: false, media: "none" });
-      await this.connect(displayId, { wantsControl });
+      this.cancel(); this.#sourceDisplayId = displayId;
+      this.publish({ lease: undefined, sourceDisplayId: displayId, controlling: false, ready: false, media: "none" });
+      await this.connect(displayId, { wantsControl, knownCaps: caps });
     } catch { if (this.current(epoch)) this.publish({ error: "display" }); }
     finally { if (!this.#disposed && this.#scope?.generation === generation) { this.publish({ settingsBusy: false }); this.syncControl(); } }
   }
