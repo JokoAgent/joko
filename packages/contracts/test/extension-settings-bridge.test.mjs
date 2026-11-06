@@ -73,3 +73,16 @@ test("fetch uses the settings bridge and checks its routing revision before a wr
   assert.equal((await response.json()).revision, "9");
   await assert.rejects(current.context.fetch("https://foreign.example/kv"), /ambient/u);
 });
+
+test("fetch does not send a password that becomes escaped in plugin parameters", async () => {
+  const current = page(), value = 'fixture"header-secret';
+  current.dispatch("input", { target: { type: "password", value } });
+  const pending = current.context.fetch("/kv", { method: "PUT", body: JSON.stringify({ route: [{ value }] }) });
+  assert.equal(current.requests[0].command.kind, "routing.get");
+  current.respond(current.requests[0].id, { revision: "1", dataJson: "{}" });
+  await assert.rejects(pending, /Secrets/u);
+  assert.equal(current.requests.length, 1);
+  await assert.rejects(current.context.joko.settings({ kind: "routing.set", revision: "1",
+    dataJson: `{"route":${JSON.stringify(value)},"route":"ordinary"}` }), /Secrets/u);
+  assert.equal(current.requests.length, 1);
+});

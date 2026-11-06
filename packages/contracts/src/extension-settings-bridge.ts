@@ -81,11 +81,23 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
   const pending = new Map(), sensitive = new Set(); let sequence = 0, revision, closed = false;
   const marker = Symbol.for("joko.extension-settings-mobile.transport"), ready = "joko:extension-settings-ready";
   const protect = value => { if (typeof value === "string" && value) { if (sensitive.size >= 64 && !sensitive.has(value)) throw new Error("Reopen settings before entering more secrets."); sensitive.add(value); } };
+  const routingContainsSecret = raw => {
+    if (typeof raw !== "string" || raw.length > 65536) throw new Error("Plugin parameters are invalid.");
+    const includesSecret = text => { for (const secret of sensitive) if (text.includes(secret)) return true; return false; };
+    if (includesSecret(raw)) return true;
+    try {
+      JSON.parse(raw);
+      for (const [token] of raw.matchAll(/"(?:[^"\\]|\\.)*"/gu)) {
+        if (token.includes("\\") && includesSecret(JSON.parse(token))) return true;
+      }
+    } catch (_) { throw new Error("Plugin parameters are invalid."); }
+    return false;
+  };
   addEventListener("input", event => { if (event.target && event.target.type === "password") protect(event.target.value); }, true);
   const call = command => new Promise((resolve, reject) => {
     if (closed || pending.size >= 16) { reject(new Error("Settings are unavailable or busy.")); return; }
     if (command.kind === "secret.set" || command.kind === "secret.check" || command.kind === "connections.set") protect(command.value);
-    if (command.kind === "routing.set") for (const value of sensitive) if (command.dataJson.includes(value)) { reject(new Error("Secrets cannot be saved as plugin parameters.")); return; }
+    if (command.kind === "routing.set" && sensitive.size && routingContainsSecret(command.dataJson)) { reject(new Error("Secrets cannot be saved as plugin parameters.")); return; }
     const random = new Uint8Array(16); crypto.getRandomValues(random);
     const id = "settings_" + (++sequence) + "_" + Array.from(random, byte => byte.toString(16).padStart(2, "0")).join("");
     const send = () => parent.postMessage({ type: "joko:extension-settings-request", version: 1, id, command }, "*");

@@ -766,6 +766,15 @@ export class CredentialManager {
     return result;
   }
 
+  containsCredentialText(texts: readonly string[]): boolean {
+    this.#assertInitialized();
+    for (const record of this.#records.values()) {
+      const fragments = secretFragments(this.#vault.open(record.sealed, record.credentialReferenceId));
+      if (fragments.some(fragment => texts.some(text => text.includes(fragment)))) return true;
+    }
+    return false;
+  }
+
   #requireTicket(id: string): UploadTicket {
     this.#purgeTickets();
     const ticket = this.#tickets.get(id);
