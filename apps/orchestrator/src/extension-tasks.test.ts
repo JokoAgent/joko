@@ -43,7 +43,7 @@ async function fixture(options: { readonly edits?: boolean; readonly review?: Co
     assertCurrent: () => { if (!enabled || !installed || installation !== owner.installation) throw new Error("Retired source"); } };
   cleanups.push(async () => { await teams.close(); await host.dispose(); store.close(); await rm(root, { recursive: true, force: true }); });
   const request = (value: Record<string, unknown>) => tasks.request(owner, { type: "tasks-request", ...value });
-  return { root, store, host, artifacts, teams, tasks, owner, extensionId, route, request, projects, descriptor, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
+  return { root, store, host, adapter, artifacts, teams, tasks, owner, extensionId, route, request, projects, descriptor, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
 }
 it("adopts bounded plugin images through its own task Queue and preserves input-key replay", async () => {
   const f = await fixture(), model = PI_LIKE_PROFILE.models.find(model => model.supportsImages)!;
@@ -125,6 +125,36 @@ it("approves explicit Auto through the original host interaction and refuses a c
   f.store.updateSession(other.taskId, { planMode: false });
   await expect(f.request({ kind: "requestWriteAccess", taskId: other.taskId, mode: "auto" })).resolves.toMatchObject({ granted: false });
   expect(f.store.listInteractions({ sessionId: other.taskId, status: "open" })).toHaveLength(0);
+});
+it("restores the durable permission on the native task when plugin preferences tighten after the setter", async () => {
+  const f = await fixture();
+  const task = await f.request({ kind: "create", requestKey: "stale-native-write", title: "Original Ask task" }) as { taskId: string };
+  const before = f.store.getSession(task.taskId).descriptor;
+  const preferences = f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, permissionMode: "auto" }, () => undefined);
+  const inspect = f.adapter.inspectSession.bind(f.adapter);
+  let nativeChanged!: () => void, release!: () => void;
+  const observed = new Promise<void>(resolve => { nativeChanged = resolve; });
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  vi.spyOn(f.adapter, "inspectSession").mockImplementation(async (...input) => {
+    const state = await inspect(...input);
+    if (state.permissionMode === "auto") { nativeChanged(); await pending; }
+    return state;
+  });
+  const setters = vi.spyOn(f.adapter, "setPermissionMode");
+  const request = f.request({ kind: "requestWriteAccess", taskId: task.taskId, mode: "auto" });
+  const rejected = expect(request).rejects.toMatchObject({ code: "STALE_REVISION" });
+  try {
+    await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: task.taskId, status: "open" })).toHaveLength(1));
+    const approval = f.store.listInteractions({ sessionId: task.taskId, status: "open" })[0]!;
+    f.host.resolveInteraction(approval.id, approval.generation, { kind: "permission", decision: "allow_once" }, "approve-before-preference-tightens");
+    await observed;
+    expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
+    f.tasks.updatePreferences(f.extensionId, preferences.revision, { model: f.route, permissionMode: "ask" }, () => undefined);
+  } finally { release(); }
+  await rejected;
+  expect(setters.mock.calls.map(([mode]) => mode)).toEqual(["auto", "ask"]);
+  await expect(f.host.inspect(task.taskId)).resolves.toMatchObject({ permissionMode: "ask", binding: before.binding });
+  expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
 });
 it("supports an unplanned team within its approved task root and refuses an unrelated trusted target", async () => {
   const f = await fixture(); f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, permissionMode: "auto" }, () => {});
