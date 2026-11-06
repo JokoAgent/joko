@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -145,6 +145,43 @@ describe("Connect Git Review contracts", () => {
       expect(result.operation?.result?.payload.case).toBe("acknowledgement");
       expect(git("diff", "--cached", "--name-only", "-z")).toBe(`${path}\0`);
       expect(git("diff", "--name-only", "-z")).toBe("");
+    } finally {
+      await workspaces.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("lists the conflicted file in a real combined diff without treating it as an ordinary hunk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-connect-review-conflict-"));
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+    const path = "conflict.txt";
+    try {
+      git("init", "--quiet", "-b", "main");
+      git("config", "user.name", "Review Test");
+      git("config", "user.email", "review@example.test");
+      git("config", "core.autocrlf", "false");
+      await writeFile(join(root, path), "base\n");
+      git("add", "--", path);
+      git("commit", "--quiet", "-m", "base");
+      git("switch", "--quiet", "-c", "other");
+      await writeFile(join(root, path), "other\n");
+      git("commit", "--quiet", "-am", "other");
+      git("switch", "--quiet", "main");
+      await writeFile(join(root, path), "main\n");
+      git("commit", "--quiet", "-am", "main");
+      expect(spawnSync("git", ["merge", "other"], { cwd: root, windowsHide: true }).status).toBe(1);
+      expect(git("diff", "--binary")).toContain(`diff --cc ${path}\n`);
+
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces }));
+      const { diff } = await services.workspace.getWorkspaceDiff(create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED
+      }), context() as never);
+      expect(diff?.files).toMatchObject([{
+        relativePath: path, status: contract.GitFileStatus.CONFLICTED, source: contract.GitDiffSource.UNSTAGED, hunks: []
+      }]);
+      await expect(workspaces.gitState("workspace-review")).resolves.toMatchObject({ unmerged: true, operationInProgress: true });
     } finally {
       await workspaces.close();
       await rm(root, { recursive: true, force: true });

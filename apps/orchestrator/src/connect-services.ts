@@ -128,7 +128,7 @@ import {
 import type { ArtifactRecord, ArtifactRepository, ArtifactStore } from "./artifact-store.js";
 import { ImageThumbnailRenderer, ThumbnailSourceError } from "./image-thumbnail.js";
 import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
-import { readGitPatchPaths } from "./git-patch-paths.js";
+import { readGitConflictPatchPath, readGitPatchPaths } from "./git-patch-paths.js";
 import {
   ArtifactMaintenanceScanChangedError,
   ArtifactMaintenanceScanExpiredError,
@@ -8835,6 +8835,18 @@ function parseWorkspaceDiff(
       });
       currentHunk = undefined;
       continue;
+    }
+    if (line.startsWith("diff --")) {
+      const path = readGitConflictPatchPath(line);
+      if (path !== undefined) {
+        if (current !== undefined) files.push(current);
+        files.push(create(contract.FileDiffSchema, {
+          relativePath: path, oldRelativePath: path, status: contract.GitFileStatus.CONFLICTED, source
+        }));
+        current = undefined;
+        currentHunk = undefined;
+        continue;
+      }
     }
     if (current === undefined) continue;
     if (line.startsWith("new file mode")) current.status = contract.GitFileStatus.ADDED;

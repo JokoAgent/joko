@@ -1,5 +1,10 @@
 const DIFF_HEADER = "diff --git ";
 
+export function readGitConflictPatchPath(line: string): string | undefined {
+  const path = /^diff --(?:cc|combined) (.+)$/su.exec(line)?.[1];
+  return path === undefined ? undefined : decodeGitPath(path);
+}
+
 export function readGitPatchPaths(lines: readonly string[], start: number): {
   readonly oldPath: string;
   readonly path: string;
@@ -11,7 +16,7 @@ export function readGitPatchPaths(lines: readonly string[], start: number): {
   let path = paths?.path;
   for (let index = start + 1; index < lines.length; index += 1) {
     const line = lines[index]!;
-    if (line === "" || line.startsWith(DIFF_HEADER) || line.startsWith("@@") || line === "GIT binary patch") break;
+    if (line === "" || line.startsWith("diff --") || line.startsWith("@@") || line === "GIT binary patch") break;
     const extended = /^(?:rename|copy) (from|to) (.+)$/su.exec(line);
     if (extended?.[1] === "from") oldPath = decodeGitPath(extended[2]!);
     if (extended?.[1] === "to") path = decodeGitPath(extended[2]!);
