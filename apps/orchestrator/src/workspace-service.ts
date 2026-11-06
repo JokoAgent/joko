@@ -1661,10 +1661,11 @@ export class WorkspaceService {
         raw = await this.#readUntrackedDiff(workspace, [path], input.ignoreWhitespace === true);
       }
       const filePatch = selectDiffFilePatch(raw);
-      const patch = input.target === "hunk" ? selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1) : filePatch;
+      const reverse = input.action !== "stage";
+      const patch = input.target === "hunk" ? selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1, reverse) : filePatch;
       const applyArgs = ["apply", "--whitespace=nowarn"];
       if (input.action !== "revert") applyArgs.push("--cached");
-      if (input.action === "unstage" || input.action === "revert") applyArgs.push("--reverse");
+      if (reverse) applyArgs.push("--reverse");
       if (input.ignoreWhitespace === true) applyArgs.push("--ignore-space-change");
       try {
         // `git apply` validates the complete patch before updating either the
@@ -4260,18 +4261,16 @@ function uniquePaths(oldPath: string | undefined, path: string): readonly string
 }
 
 export function selectDiffFilePatch(raw: string): string {
-  const normalized = raw.replace(/\r\n/gu, "\n");
-  const fileCount = normalized.split("\n").filter((line) => line.startsWith("diff --git ")).length;
+  const fileCount = raw.split("\n").filter((line) => line.startsWith("diff --git ")).length;
   if (fileCount !== 1) {
     throw new WorkspaceGitReviewError("The selected file diff is stale or ambiguous.", "stale");
   }
-  return normalized.endsWith("\n") ? normalized : `${normalized}\n`;
+  return raw.endsWith("\n") ? raw : `${raw}\n`;
 }
 
-export function selectDiffHunkPatch(raw: string, hunkIndex: number): string {
-  const normalized = raw.replace(/\r\n/gu, "\n");
+export function selectDiffHunkPatch(raw: string, hunkIndex: number, reverse = false): string {
   const fileStarts: number[] = [];
-  const lines = normalized.split("\n");
+  const lines = raw.split("\n");
   for (let index = 0; index < lines.length; index += 1) {
     if (lines[index]?.startsWith("diff --git ") === true) fileStarts.push(index);
   }
@@ -4287,6 +4286,15 @@ export function selectDiffHunkPatch(raw: string, hunkIndex: number): string {
   const selectedEnd = hunkStarts[hunkIndex + 1] ?? lines.length;
   const header = lines.slice(fileStarts[0], hunkStarts[0]);
   const selected = lines.slice(selectedStart, selectedEnd);
+  const range = /^@@ -(\d+)(,\d+)? \+(\d+)(,\d+)?( @@.*)$/su.exec(selected[0]!);
+  if (range === null) throw new WorkspaceGitReviewError("The selected hunk is stale.", "stale");
+  const [, oldStart, oldCount = "", newStart, newCount = "", heading] = range;
+  // An isolated hunk has no earlier edits. Keep the applied preimage position
+  // and rebase the other side. Empty ranges count the line before the hunk.
+  const oldOffset = oldCount === ",0" ? 0 : 1;
+  const newOffset = newCount === ",0" ? 0 : 1;
+  const start = reverse ? Number(newStart) - newOffset : Number(oldStart) - oldOffset;
+  selected[0] = `@@ -${start + oldOffset}${oldCount} +${start + newOffset}${newCount}${heading}`;
   while (selected.at(-1) === "") selected.pop();
   return `${[...header, ...selected].join("\n")}\n`;
 }

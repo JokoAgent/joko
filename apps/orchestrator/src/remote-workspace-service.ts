@@ -900,10 +900,11 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         raw = await this.#readUntrackedDiff(registration, transports, [path], input.ignoreWhitespace === true);
       }
       const filePatch = selectDiffFilePatch(raw);
-      const patch = input.target === "file" ? filePatch : selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1);
+      const reverse = input.action !== "stage";
+      const patch = input.target === "file" ? filePatch : selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1, reverse);
       const args = ["apply", "--whitespace=nowarn"];
       if (input.action !== "revert") args.push("--cached");
-      if (input.action === "unstage" || input.action === "revert") args.push("--reverse");
+      if (reverse) args.push("--reverse");
       if (input.ignoreWhitespace) args.push("--ignore-space-change");
       if (await repositoryRevision(processes, registration.root) !== current) throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
       await requireRemoteGitRoot(registration, transports);
