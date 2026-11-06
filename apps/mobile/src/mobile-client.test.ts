@@ -14763,4 +14763,163 @@ describe("native current-task Files ownership", () => {
     expect(network.listWorkspaceFileIndex).toHaveBeenCalledTimes(2);
     expect(network.listSessionArtifacts).toHaveBeenCalledTimes(2);
   });
+
+  it.each([WorkspaceFileChangeKind.RENAMED, WorkspaceFileChangeKind.DELETED, WorkspaceFileChangeKind.OVERFLOW])(
+    "keeps the current Files window on unrelated changes and RESYNC, then retires it on %s", async (kind) => {
+      const network = fakeNetwork();
+      configureFiles(network);
+      const file = create(WorkspaceEntrySchema, { ...readme, relativePath: "docs/a.txt", displayName: "a.txt", mediaType: "text/plain" });
+      vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, path) => ({
+        entries: path === "docs" ? [file] : [sourceDirectory], revision: `directory:${path}`
+      }));
+      vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, {
+        entry: file, content: { case: "text", value: { utf8Text: "sample", startByte: 0n, endByte: 6n, totalLines: 1 } }
+      }));
+      const queued: WorkspaceFileChange[] = [];
+      let wake: (() => void) | undefined;
+      let sequence = 0n;
+      vi.mocked(network.watchWorkspace).mockImplementation(async function* (_credential, _workspace, signal) {
+        while (!signal.aborted) {
+          if (queued.length === 0) await new Promise<void>((resolve) => {
+            wake = resolve;
+            signal.addEventListener("abort", resolve, { once: true });
+          });
+          if (signal.aborted) return;
+          const change = queued.shift();
+          if (change) yield change;
+        }
+      });
+      const publish = async (kind: WorkspaceFileChangeKind, relativePath = "", previousRelativePath = "") => {
+        sequence += 1n;
+        queued.push(create(WorkspaceFileChangeSchema, { workspaceId: "workspace", kind, relativePath, previousRelativePath,
+          sequence, streamRevision: `watch-${sequence}` }));
+        wake?.();
+        await vi.advanceTimersByTimeAsync(180);
+      };
+      const app = client(network, memoryStorage(credential).storage);
+      vi.useFakeTimers();
+      await app.start();
+      await app.openFiles();
+      await app.openFilesDirectory("docs");
+      await app.openFilesPreviewPager({ kind: "workspace-entry", entry: app.state.files.entries[0]! });
+      const { preview, previewPager } = app.state.files;
+      if (preview?.kind !== "text" || !previewPager) throw new Error("The Workspace text pager did not open.");
+      expect(preview.text).toBe("sample");
+      vi.mocked(network.listWorkspaceFileIndex).mockResolvedValue({ paths: [file.relativePath, "src/b.txt"], revision: "index-2", truncated: false });
+
+      await publish(WorkspaceFileChangeKind.MODIFIED, "src/b.txt");
+      expect(app.state.files.fileIndex).toContain("src/b.txt");
+      expect(app.state.files.preview).toBe(preview);
+      expect(app.state.files.previewPager).toBe(previewPager);
+      await publish(WorkspaceFileChangeKind.RESYNC);
+      expect(app.state.files.preview).toBe(preview);
+      expect(app.state.files.previewPager).toBe(previewPager);
+      expect(network.readWorkspaceFile).toHaveBeenCalledTimes(1);
+      const copy = await app.prepareFileTextSourceCopy(preview, new AbortController().signal);
+      expect(copy.text).toBe("sample");
+      copy.assertCurrent();
+
+      if (kind === WorkspaceFileChangeKind.RENAMED) await publish(kind, "docs/renamed.txt", "docs/a.txt");
+      else await publish(kind, kind === WorkspaceFileChangeKind.DELETED ? "docs" : "");
+      expect(app.state.files.preview).toBeUndefined();
+      expect(app.state.files.previewPager).toBeUndefined();
+      expect(() => copy.assertCurrent()).toThrow(/source changed/u);
+
+      app.openGeneratedFiles();
+      vi.mocked(network.downloadBlob).mockResolvedValue({ bytes: new TextEncoder().encode("report"), mediaType: "text/plain" });
+      await app.openFilesPreviewPager({ kind: "artifact", artifact: app.state.files.artifacts[0]! });
+      const generated = app.state.files.preview;
+      const generatedPager = app.state.files.previewPager;
+      expect(generated).toMatchObject({ kind: "text", text: "report" });
+      expect(generatedPager).toBeDefined();
+      await publish(WorkspaceFileChangeKind.OVERFLOW);
+      expect(app.state.files.preview).toBe(generated);
+      expect(app.state.files.previewPager).toBe(generatedPager);
+    }
+  );
+
+  it.each([
+    { failure: "clean close", manual: false }, { failure: "clean close", manual: true }, { failure: "unavailable", manual: false }
+  ])("restores the same Files watch after $failure with manual refresh=$manual", async ({ failure, manual }) => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    let finishFirst!: () => void;
+    let sendNext!: () => void;
+    const change = create(WorkspaceFileChangeSchema, { workspaceId: "workspace", kind: WorkspaceFileChangeKind.RESYNC,
+      sequence: 1n, streamRevision: "watch-1" });
+    const watch = vi.mocked(network.watchWorkspace).mockImplementationOnce(async function* () {
+      yield change;
+      await new Promise<void>((resolve) => { finishFirst = resolve; });
+      if (failure === "unavailable") throw new ConnectError("Stream disconnected", Code.Unavailable);
+    }).mockImplementation(async function* (_credential, _workspace, signal) {
+      await new Promise<void>((resolve) => { sendNext = resolve; });
+      yield create(WorkspaceFileChangeSchema, { ...change, sequence: 2n, streamRevision: "watch-2" });
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    vi.useFakeTimers();
+    await app.start();
+    await app.openFiles();
+    await vi.advanceTimersByTimeAsync(180);
+    finishFirst();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.files).toMatchObject({ status: "ready", watchStatus: "error" });
+    await vi.advanceTimersByTimeAsync(249);
+    expect(watch).toHaveBeenCalledTimes(1);
+    if (manual) await app.refreshFiles(); else await vi.advanceTimersByTimeAsync(1);
+    expect(watch).toHaveBeenCalledTimes(2);
+    expect(watch).toHaveBeenLastCalledWith(credential, "workspace", expect.any(AbortSignal));
+    expect(app.state.files).toMatchObject({ status: "ready", watchStatus: "watching" });
+    const fresh = create(WorkspaceEntrySchema, { ...readme, relativePath: "after.txt", displayName: "after.txt" });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [fresh], revision: "after-watch" });
+    sendNext();
+    await vi.advanceTimersByTimeAsync(400);
+    expect(app.state.files.entries).toEqual([fresh]);
+    expect(watch).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels a scheduled Files watch retry when the user leaves and creates a fresh watch on reopen", async () => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const watch = vi.mocked(network.watchWorkspace).mockImplementationOnce(async function* () { return; });
+    const app = client(network, memoryStorage(credential).storage);
+    vi.useFakeTimers();
+    await app.start();
+    await app.openFiles();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.files.watchStatus).toBe("error");
+    const retired = watch.mock.calls[0]![2];
+    app.closeFiles();
+    expect(retired.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(watch).toHaveBeenCalledTimes(1);
+    await app.openFiles();
+    expect(app.state.files.watchStatus).toBe("watching");
+    expect(watch).toHaveBeenCalledTimes(2);
+    expect(watch.mock.calls[1]![2]).not.toBe(retired);
+  });
+
+  it.each([Code.PermissionDenied, Code.Unauthenticated])("retires a rejected Files watch without retrying (%s)", async (code) => {
+    const network = fakeNetwork();
+    configureFiles(network);
+    const watch = vi.mocked(network.watchWorkspace).mockImplementationOnce(async function* () { throw new ConnectError("Files watch denied", code); });
+    const storage = memoryStorage(credential).storage;
+    const app = client(network, storage);
+    vi.useFakeTimers();
+    await app.start();
+    await app.openFiles();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(watch.mock.calls[0]![2].aborted).toBe(true);
+    if (code === Code.Unauthenticated) {
+      expect(app.state.status).toBe("revoked");
+      expect(storage.deleteCredential).toHaveBeenCalledWith(credential.profileId);
+    } else {
+      expect(app.state.files).toMatchObject({ status: "ready", watchStatus: "unavailable", watchError: expect.stringContaining("Files watch denied") });
+      await app.refreshFiles();
+    }
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(watch).toHaveBeenCalledTimes(1);
+  });
 });

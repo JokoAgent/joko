@@ -68,10 +68,10 @@ import {
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
-  FileKind, ImageRefSchema, ResourceKind, RuntimeCommandInputMode,
+  FileKind, ImageRefSchema, ResourceKind, RuntimeCommandInputMode, WorkspaceFileChangeKind,
   type Artifact, type BackendDescriptor, type BlobRef, type Device, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target, type TaskTagDeletePreview,
-  type WorkspaceEntry, type WorkspaceSearchMatch
+  type WorkspaceEntry, type WorkspaceFileChange, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
 import { McpAppNativeOperation, McpAppOperation, McpAppNativeServiceOperateRequestSchema, McpAppServiceOperateRequestSchema } from "@joko/contracts";
@@ -7115,25 +7115,29 @@ export class MobileClient {
       return;
     }
     if (context.key !== this.#state.files.authorityKey) return;
+    const epoch = this.#filesEpoch;
     this.#filesListAbort?.abort();
     this.#filesSearchAbort?.abort();
     this.#filesPreviewAbort?.abort();
     await this.#releaseFilesBinaryPreviews().catch(() => undefined);
-    if (!this.#currentFiles(this.#filesEpoch, context.key)) return;
+    if (!this.#currentFiles(epoch, context.key) || this.#credential !== context.credential) return;
     if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
     this.#filesRefreshTimer = undefined;
-    const epoch = this.#filesEpoch;
-    const location = this.#state.files.location;
-    const search = {
-      query: this.#state.files.searchQuery,
-      mode: this.#state.files.searchMode,
-      caseSensitive: this.#state.files.searchCaseSensitive
-    };
     this.#set({ files: { ...this.#state.files, status: "loading", preview: undefined, error: undefined } });
-    if (!await this.#loadFiles(context, location, epoch)) return;
-    if (search.query && this.#currentFiles(epoch, context.key)) {
-      await this.searchFiles(search.query, search.mode, search.caseSensitive);
+    await this.#reloadFiles(context, epoch);
+    if (this.#currentFiles(epoch, context.key) && this.#credential === context.credential && context.authority.watchSupported
+      && this.#state.files.status === "ready" && (this.#state.files.watchStatus === "idle" || this.#state.files.watchStatus === "error")) {
+      void this.#watchFiles(context, epoch);
     }
+  }
+
+  async #reloadFiles(context: MobileFilesContext, epoch: number, watchSignal?: AbortSignal): Promise<void> {
+    const current = () => !watchSignal?.aborted && this.#currentFiles(epoch, context.key) && this.#credential === context.credential;
+    if (!current()) return;
+    const location = this.#state.files.location;
+    if (!await this.#loadFiles(context, location, epoch, watchSignal) || !current()) return;
+    const { searchQuery, searchMode, searchCaseSensitive } = this.#state.files;
+    if (searchQuery) await this.searchFiles(searchQuery, searchMode, searchCaseSensitive);
   }
 
   async openFilesDirectory(relativePath: string): Promise<void> {
@@ -7266,9 +7270,10 @@ export class MobileClient {
     const path = artifact ? "" : canonicalWorkspacePath(source.kind === "workspace-entry" ? source.entry.relativePath
       : source.kind === "search-result" && source.result.kind !== "artifact" ? source.result.kind === "workspace-content" ? source.result.match.relativePath : source.result.relativePath : "");
     const title = artifact ? artifactTitle(artifact) : workspaceBasename(path);
+    const opening = { title, sourceLabel: artifact ? "Generated" : path, workspacePath: artifact ? undefined : path,
+      mediaType: artifact?.blob?.mediaType ?? "application/octet-stream", byteSize: artifact?.blob?.byteSize ?? 0n, revisionKey: "resolving:" + title };
     this.#set({ files: { ...this.#state.files, previewPager: undefined,
-      preview: prior?.kind === "text" && prior.sourceLabel === path ? prior : { title, sourceLabel: artifact ? "Generated" : path,
-        mediaType: artifact?.blob?.mediaType ?? "application/octet-stream", byteSize: artifact?.blob?.byteSize ?? 0n, revisionKey: "resolving:" + title, kind: "loading" } } });
+      preview: prior?.kind === "text" && prior.workspacePath === path ? prior : { ...opening, kind: "loading" } } });
     let timedOut = false;
     const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
     try {
@@ -7318,8 +7323,7 @@ export class MobileClient {
     } catch (error) {
       if (!this.#currentFiles(epoch, context.key) || this.#filesPagerOpeningAbort !== controller || controller.signal.aborted && !timedOut) return;
       this.#retireFilesPreviewPager();
-      this.#set({ files: { ...this.#state.files, previewPager: undefined, preview: { title, sourceLabel: artifact ? "Generated" : path,
-        mediaType: artifact?.blob?.mediaType ?? "application/octet-stream", byteSize: artifact?.blob?.byteSize ?? 0n,
+      this.#set({ files: { ...this.#state.files, previewPager: undefined, preview: { ...opening,
         revisionKey: "unavailable:" + title, kind: "error", reason: timedOut ? "The file preview timed out. Open Files again." : message(error) } } });
     } finally { clearTimeout(deadline); if (this.#filesPagerOpeningAbort === controller) this.#filesPagerOpeningAbort = undefined; }
   }
@@ -7337,6 +7341,7 @@ export class MobileClient {
     const abort = () => controller.abort(); lease.controller.signal.addEventListener("abort", abort, { once: true });
     lease.descriptor = { ...lease.descriptor, index };
     const base = { title: page.title, sourceLabel: page.kind === "workspace" ? page.entry.relativePath : "Generated",
+      workspacePath: page.kind === "workspace" ? page.entry.relativePath : undefined,
       mediaType: page.mediaType, byteSize: page.byteSize, revisionKey: page.key };
     this.#set({ files: { ...this.#state.files, previewPager: lease.descriptor, preview: { ...base, kind: "loading" } } });
     let timedOut = false; let windowChanged: string | undefined; const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, 15_000);
@@ -15935,13 +15940,21 @@ export class MobileClient {
   async #loadFiles(
     context: MobileFilesContext,
     location: MobileFilesState["location"],
-    epoch: number
+    epoch: number,
+    watchSignal?: AbortSignal
   ): Promise<boolean> {
     this.#filesListAbort?.abort();
     const controller = new AbortController();
     this.#filesListAbort = controller;
+    const abort = () => controller.abort();
+    watchSignal?.addEventListener("abort", abort, { once: true });
+    if (watchSignal?.aborted) abort();
     const parentPath = location.kind === "workspace" ? location.path : "";
+    const ownerEpoch = this.#epoch;
+    const current = () => !controller.signal.aborted && this.#filesListAbort === controller
+      && this.#credential === context.credential && this.#currentFiles(epoch, context.key);
     try {
+      if (!current()) return false;
       const [directory, index, artifacts] = await Promise.all([
         this.network.listWorkspaceDirectory(
           context.credential,
@@ -15960,73 +15973,93 @@ export class MobileClient {
           controller.signal
         )
       ]);
-      if (controller.signal.aborted || this.#filesListAbort !== controller
-        || !this.#currentFiles(epoch, context.key)) return false;
+      if (!current()) return false;
+      const files = this.#state.files;
+      const keepLists = watchSignal !== undefined && files.status === "ready";
       this.#set({ files: {
-        ...this.#state.files,
+        ...files,
         status: "ready",
         authorityKey: context.key,
         sessionId: context.authority.sessionId,
         workspace: context.authority.workspace,
-        location: this.#state.files.location.kind === "generated" ? this.#state.files.location : location,
-        entries: sortWorkspaceEntries(directory.entries),
+        location: files.location.kind === "generated" ? files.location : location,
+        entries: keepLists && directory.revision === files.directoryRevision ? files.entries : sortWorkspaceEntries(directory.entries),
         directoryRevision: directory.revision,
         fileIndex: [...index.paths].sort((left, right) => left.localeCompare(right, "en", { numeric: true })),
         fileIndexRevision: index.revision,
         fileIndexTruncated: index.truncated,
-        artifacts: sortArtifacts(artifacts.artifacts),
+        artifacts: keepLists && artifacts.revision === files.artifactsRevision ? files.artifacts : sortArtifacts(artifacts.artifacts),
         artifactsRevision: artifacts.revision,
         error: undefined
       } });
       return true;
     } catch (error) {
-      if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return false;
-      this.#set({ files: { ...this.#state.files, status: "error", error: message(error) } });
+      if (!current() || await this.#invalidateRevokedOwnerRead(error, ownerEpoch, context.credential) || !current()) return false;
+      const files = this.#state.files;
+      const retain = watchSignal !== undefined && files.status === "ready" && (error as { code?: number })?.code !== Code.PermissionDenied;
+      if (!retain && files.preview !== undefined) {
+        this.closeFilesPreview();
+        if (!current()) return false;
+      }
+      this.#set({ files: { ...this.#state.files, status: retain ? "ready" : "error", error: message(error) } });
       return false;
     } finally {
+      watchSignal?.removeEventListener("abort", abort);
       if (this.#filesListAbort === controller) this.#filesListAbort = undefined;
     }
   }
 
   async #watchFiles(context: MobileFilesContext, epoch: number): Promise<void> {
+    if (!this.#currentFiles(epoch, context.key) || this.#credential !== context.credential) return;
     this.#filesWatchAbort?.abort();
     const controller = new AbortController();
     this.#filesWatchAbort = controller;
-    if (!this.#currentFiles(epoch, context.key)) return;
-    this.#set({ files: { ...this.#state.files, watchStatus: "watching", watchError: undefined } });
+    const ownerEpoch = this.#epoch;
+    const current = () => !controller.signal.aborted && this.#filesWatchAbort === controller
+      && this.#credential === context.credential && this.#currentFiles(epoch, context.key);
+    let retryDelay = 250;
     try {
-      for await (const _change of this.network.watchWorkspace(
-        context.credential,
-        context.authority.workspace.workspaceId,
-        controller.signal
-      )) {
-        if (controller.signal.aborted || this.#filesWatchAbort !== controller
-          || !this.#currentFiles(epoch, context.key)) return;
-        this.#scheduleFilesRefresh(context, epoch);
+      while (current()) {
+        this.#set({ files: { ...this.#state.files, watchStatus: "watching", watchError: undefined } });
+        if (!current()) return;
+        let watchError = "Workspace change monitoring ended before Files was closed.";
+        let retry = true;
+        try {
+          for await (const change of this.network.watchWorkspace(context.credential, context.authority.workspace.workspaceId, controller.signal)) {
+            if (!current()) return;
+            if (change.kind !== WorkspaceFileChangeKind.RESYNC) retryDelay = 250;
+            this.#scheduleFilesRefresh(context, epoch, controller.signal, change);
+          }
+        } catch (error) {
+          if (!current() || await this.#invalidateRevokedOwnerRead(error, ownerEpoch, context.credential) || !current()) return;
+          const code = (error as { code?: number })?.code;
+          retry = !isRevoked(error) && code !== Code.PermissionDenied && code !== Code.FailedPrecondition
+            && code !== Code.NotFound && code !== Code.Unimplemented && code !== Code.InvalidArgument;
+          watchError = message(error);
+        }
+        if (!current()) return;
+        // A broken stream may have missed a change to the displayed Workspace file.
+        if (this.#state.files.preview?.workspacePath !== undefined) this.closeFilesPreview();
+        if (!current()) return;
+        this.#set({ files: { ...this.#state.files, watchStatus: retry ? "error" : "unavailable", watchError } });
+        if (!retry) return;
+        await mobileTaskSharingDelay(retryDelay, controller.signal).catch(() => undefined);
+        retryDelay = Math.min(retryDelay * 2, 2_000);
       }
-      if (!controller.signal.aborted && this.#currentFiles(epoch, context.key)) {
-        this.#set({ files: { ...this.#state.files, watchStatus: "error",
-          watchError: "Workspace change monitoring ended before Files was closed." } });
-      }
-    } catch (error) {
-      if (controller.signal.aborted || !this.#currentFiles(epoch, context.key)) return;
-      this.#set({ files: { ...this.#state.files, watchStatus: "error", watchError: message(error) } });
     } finally {
+      controller.abort();
       if (this.#filesWatchAbort === controller) this.#filesWatchAbort = undefined;
     }
   }
 
-  #scheduleFilesRefresh(context: MobileFilesContext, epoch: number): void {
-    this.#filesPreviewAbort?.abort();
-    this.#filesPreviewAbort = undefined;
-    void this.#releaseFilesBinaryPreviews().catch(() => undefined);
-    if (this.#state.files.preview) {
-      this.#set({ files: { ...this.#state.files, preview: undefined } });
-    }
+  #scheduleFilesRefresh(context: MobileFilesContext, epoch: number, signal: AbortSignal, change: WorkspaceFileChange): void {
+    const path = this.#state.files.preview?.workspacePath;
+    if (path !== undefined && workspaceWatchChangeAffectsPath(change, path)) this.closeFilesPreview();
+    if (signal.aborted || !this.#currentFiles(epoch, context.key) || this.#credential !== context.credential) return;
     if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
     this.#filesRefreshTimer = setTimeout(() => {
       this.#filesRefreshTimer = undefined;
-      if (this.#currentFiles(epoch, context.key)) void this.refreshFiles();
+      void this.#reloadFiles(context, epoch, signal);
     }, 180);
   }
 
@@ -16042,7 +16075,7 @@ export class MobileClient {
     this.#filesPreviewAbort = controller;
     const epoch = this.#filesEpoch;
     const provisional = {
-      title: workspaceBasename(path), sourceLabel: path, mediaType: "application/octet-stream",
+      title: workspaceBasename(path), sourceLabel: path, workspacePath: path, mediaType: "application/octet-stream",
       byteSize: 0n, revisionKey: `resolving:${path}`
     };
     this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
@@ -16084,7 +16117,7 @@ export class MobileClient {
     const epoch = this.#filesEpoch;
     const page = this.#filesPreviewPager?.descriptor.pages[this.#filesPreviewPager.descriptor.index];
     const provisional = {
-      title, sourceLabel: path, mediaType: page?.kind === "workspace" && page.entry.relativePath === path ? page.mediaType : "application/octet-stream",
+      title, sourceLabel: path, workspacePath: path, mediaType: page?.kind === "workspace" && page.entry.relativePath === path ? page.mediaType : "application/octet-stream",
       byteSize: revision.byteSize, revisionKey: workspaceEntryRevisionKey(revision)
     };
     this.#set({ files: { ...this.#state.files, preview: { ...provisional, kind: "loading" } } });
@@ -16169,6 +16202,7 @@ export class MobileClient {
     const base = {
       title,
       sourceLabel: entry.relativePath,
+      workspacePath: entry.relativePath,
       fileName: workspaceBasename(entry.relativePath),
       mediaType,
       byteSize: revision.byteSize,
@@ -17032,6 +17066,15 @@ function filesComposerSourceIsCurrent(files: MobileFilesState, source: MobileFil
   if (source.kind === "workspace-entry") return files.entries.includes(source.entry);
   if (source.kind === "artifact") return files.artifacts.includes(source.artifact);
   return files.searchResults.includes(source.result);
+}
+
+function workspaceWatchChangeAffectsPath(change: WorkspaceFileChange, path: string): boolean {
+  if (change.kind === WorkspaceFileChangeKind.RESYNC) return false;
+  if (change.kind === WorkspaceFileChangeKind.OVERFLOW || change.relativePath === path) return true;
+  if (change.kind === WorkspaceFileChangeKind.RENAMED
+    && (change.previousRelativePath === path || path.startsWith(`${change.previousRelativePath}/`))) return true;
+  return (change.kind === WorkspaceFileChangeKind.RENAMED || change.kind === WorkspaceFileChangeKind.DELETED)
+    && path.startsWith(`${change.relativePath}/`);
 }
 
 function mobileFilesWorkspaceClipboardValue(relativePath: string): Pick<MobileFilesClipboardLease, "text" | "kind"> {
