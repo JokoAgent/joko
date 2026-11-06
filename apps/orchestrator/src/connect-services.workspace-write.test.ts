@@ -48,7 +48,7 @@ function application(workspaces: unknown, workspaceId: string, supportsWrite: bo
         }
       })
     },
-    connections: { authenticate: () => connection },
+    connections: { authenticate: () => connection, fence: () => connection, onRevoked: () => () => undefined },
     sessionHost: {},
     workspaces,
     workspaceChanges: {},
@@ -115,7 +115,7 @@ describe("Connect Workspace text writes", () => {
       path: "Makefile",
       text: "first\r\nsecond",
       expectedRevision: original.entry.revision
-    });
+    }, expect.objectContaining({ signal: expect.any(AbortSignal), assertCurrent: expect.any(Function) }));
     expect(await readFile(filePath, "utf8")).toBe("first\r\nsecond");
     expect(response.previousRevision).toMatchObject({
       sha256Hex: expectedRevision.sha256Hex,

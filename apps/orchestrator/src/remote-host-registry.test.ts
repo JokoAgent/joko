@@ -1035,7 +1035,7 @@ describe("RemoteHostRegistry restart and shutdown", () => {
       connector
     });
     const first = registry.create(hostCreate({ id: "first", credentialReferenceId: "agent:first" }));
-    const second = registry.create(hostCreate({ id: "second", credentialReferenceId: "agent:second" }));
+    const second = registry.create(hostCreate({ id: "second", hostname: "another-host.example.test", credentialReferenceId: "agent:second" }));
     const connectedFirst = await registry.connect(first.targetId, first.id, first.revision);
     const connectedSecond = await registry.connect(second.targetId, second.id, second.revision);
 

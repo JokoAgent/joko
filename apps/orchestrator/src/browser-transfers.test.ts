@@ -277,7 +277,7 @@ describe("BrowserTransferCoordinator", () => {
     await expect(first).resolves.toMatchObject({ state: contract.BrowserTransferState.COMPLETED });
     await expect(queued).resolves.toMatchObject({
       state: contract.BrowserTransferState.FAILED,
-      error: { code: "BROWSER_UPLOAD_AUTHORITY_RETIRED", stateMayHaveChanged: false }
+      error: { code: "BROWSER_UPLOAD_AUTHORITY_RETIRED", queueImpact: contract.StateImpact.UNCHANGED }
     });
     expect(artifacts.calls).toEqual(["resolve:blob-source"]);
     expect(provider.calls).toEqual(["acquire:connection-1:7", "act:page-1:lease-1:7", "release:lease-1:7"]);
