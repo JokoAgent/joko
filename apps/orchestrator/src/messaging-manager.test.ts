@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,7 @@ import { join } from "node:path";
 import {
   MessagingTransportError,
   TelegramTransport,
+  normalizeTelegramUpdates,
   type DingTalkCallbackUpdate,
   type DingTalkNormalizationResult,
   type DingTalkPollResult,
@@ -39,7 +41,7 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
-import type { AdapterContext, BlobRef, EventPayload, InteractionDecision, MessageBlock, PromptInput } from "@joko/core";
+import type { AdapterContext, BlobRef, DurableNativeDispatchPreparation, EventPayload, InteractionDecision, MessageBlock, NativeHistoryProjection, PromptInput } from "@joko/core";
 import { OperationalStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -756,6 +758,62 @@ describe("MessagingManager", () => {
     await vi.waitFor(() => {
       expect(fixture.store.listMessagingDeliveries().every((delivery) => delivery.status === "sent")).toBe(true);
     }, { timeout: 2_000 });
+  });
+
+  it("runs protected Telegram text once without retaining the input in Queue, Operation, or native history projection", async () => {
+    const privateText = "protectedtelegrambodya17c";
+    const transport = new ProtectedTelegramTransport(privateText);
+    const adapter = new ProtectedTelegramAdapter();
+    const fixture = await createFixture(() => transport, () => adapter);
+    const persistPoll = vi.spyOn(fixture.store, "saveMessagingPollBatch");
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const connection = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42",
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, groupActivation: { "-100555": "mention" } } });
+    await replaceCredential(fixture, connection, "protected-text", true);
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]).toMatchObject({ protectedContent: true, status: "completed" }));
+    const request = fixture.store.listMessagingInboundRequests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(adapter.received).toHaveLength(1);
+    expect(persistPoll).not.toHaveBeenCalled();
+    expect(adapter.received[0]).toContain(privateText);
+    expect(adapter.history.events[0]?.payload).toMatchObject({ role: "user", blocks: [{ text: expect.stringContaining(privateText) }] });
+    expect(queue.body.text).toBe("[Protected message]");
+    expect(fixture.store.getOperation(request.operationId!).body).toMatchObject({ prompt: { text: "[Protected message]" } });
+    expect(fixture.store.listEvents({ sessionId: queue.sessionId }).some(event => event.payload.type === "message_complete" && event.payload.role === "user")).toBe(false);
+    expect(fixture.store.searchSessionMessages({ scope: { sessionId: queue.sessionId }, query: privateText, limit: 20 }).matches).toEqual([]);
+    await vi.waitFor(() => expect(transport.sentText.some(entry => entry.text.includes("The protected request was handled."))).toBe(true));
+    await expect(fixture.host.exportPortableSession({ sessionId: queue.sessionId }))
+      .rejects.toMatchObject({ publicError: { code: "PROTECTED_NATIVE_EXPORT_UNAVAILABLE" } });
+  });
+
+  it("settles a protected Telegram Queue after losing the process-local prompt without sending a placeholder", async () => {
+    const transport = new ProtectedTelegramTransport("protectedpendingbodyd81a");
+    const fixture = await createFixture(() => transport);
+    const enqueue = fixture.store.enqueueQueueItem.bind(fixture.store);
+    vi.spyOn(fixture.store, "enqueueQueueItem").mockImplementationOnce(input => {
+      const queue = enqueue(input);
+      fixture.store.setQueuePaused({ sessionId: queue.sessionId, paused: true, traceId: "fixture:pause-before-dispatch" });
+      return queue;
+    });
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const connection = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42",
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, groupActivation: { "-100555": "mention" } } });
+    await replaceCredential(fixture, connection, "protected-restart", true);
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]).toMatchObject({ protectedContent: true, status: "queued" }));
+    const request = fixture.store.listMessagingInboundRequests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(queue).toMatchObject({ state: "accepted", body: { text: "[Protected message]" } });
+    await fixture.manager.close();
+    await fixture.host.dispose();
+    fixture.store.setQueuePaused({ sessionId: queue.sessionId, paused: false, traceId: "fixture:resume-after-restart" });
+    const coldAdapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const send = vi.spyOn(coldAdapter, "send");
+    const coldHost = new SessionHost(fixture.store, fixture.artifacts, [coldAdapter]);
+    try {
+      await coldHost.initialize();
+      await vi.waitFor(() => expect(fixture.store.getQueueItem(queue.id)).toMatchObject({ state: "failed", error: { code: "PROTECTED_INPUT_EXPIRED" } }));
+      expect(send).not.toHaveBeenCalled();
+    } finally { await coldHost.dispose(); }
   });
 
   it("dispatches a durable Telegram Markdown reply through the actual renderer and confirms only its final plain receipt", async () => {
@@ -3268,6 +3326,26 @@ class BoundedAlbumPagesTransport extends FakeTelegramTransport {
   }
 }
 
+class ProtectedTelegramAdapter extends FakeBackendAdapter {
+  readonly received: string[] = [];
+  history: NativeHistoryProjection = { events: [], activeLineage: [] };
+  constructor() { super(PI_LIKE_PROFILE); }
+  async getNativeHistoryProjection(): Promise<NativeHistoryProjection> { return this.history; }
+  async sendWithDurableNativeDispatchFence(input: PromptInput, context: AdapterContext,
+    persist: (preparation: DurableNativeDispatchPreparation) => Promise<void>): Promise<void> {
+    const inputFingerprint = createHash("sha256").update(input.text).digest("hex");
+    await persist({ inputFingerprint, nativeHistory: this.history });
+    this.received.push(input.text);
+    const echo = { type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }] } as const;
+    this.history = { events: [{ nativeEntryId: "protected-user-entry", projectionKind: "message_complete", contentIndex: 0,
+      payload: echo, metadata: { namespace: "fixture", fields: { nativeDispatchFingerprint: inputFingerprint } } }],
+      activeEntryId: "protected-user-entry", activeLineage: [{ entryId: "protected-user-entry" }] };
+    await context.emit(echo);
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The protected request was handled." }] });
+    await context.emit({ type: "done", outcome: "completed" });
+  }
+}
+
 class ControlledReplyAdapter extends FakeBackendAdapter {
   context?: AdapterContext;
   constructor() { super(PI_LIKE_PROFILE); }
@@ -3656,6 +3734,25 @@ function weChatDirectBatch(): WeChatNormalizationResult {
       { messageId: "wx-peer-b-incoming", providerConversationId: "wx-peer-b", contextToken: "private-context-b" }
     ]
   };
+}
+
+class ProtectedTelegramTransport extends FakeTelegramTransport {
+  readonly #update: TelegramUpdate;
+  constructor(text: string) {
+    const mention = "@joko_test_bot";
+    const update: TelegramUpdate = { update_id: 9, message: {
+      message_id: 77, from: { id: 42, first_name: "Owner", is_bot: false },
+      chat: { id: -100555, type: "supergroup" }, date: Math.floor(Date.now() / 1000),
+      text: `${mention} ${text}`, has_protected_content: true,
+      entities: [{ type: "mention", offset: 0, length: mention.length }]
+    } };
+    super(normalizeTelegramUpdates([update], { connectionId: "placeholder", ownerUserId: "42",
+      bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } }));
+    this.#update = update;
+  }
+  override async poll(input: Parameters<FakeTelegramTransport["poll"]>[0]): Promise<TelegramPollResult> {
+    return input.cursor === null ? { updates: [this.#update], nextCursor: "10" } : super.poll(input);
+  }
 }
 
 function directMessageBatch(): TelegramNormalizationResult {

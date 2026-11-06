@@ -1715,6 +1715,9 @@ export class MessagingManager {
       ? await transport.poll({ cursor, timeoutSeconds: this.#pollTimeoutSeconds, signal })
       : { nextCursor: retained.nextCursor, updates: retained.updates as TelegramPollResult["updates"] };
     let updates = [...result.updates];
+    // A supplemental getUpdates would acknowledge the preceding page at
+    // Telegram. Process a protected page from memory before acknowledging it.
+    if (updates.some(update => update.message?.has_protected_content === true)) return result;
     const persist = (): void => this.#store.saveMessagingPollBatch({
       connectionId: transport.connectionId,
       channelGeneration: transport.generation,
@@ -1735,6 +1738,9 @@ export class MessagingManager {
       // This response is still unacknowledged. If it would exceed the durable
       // budget, admit the retained pages first and fetch this response again.
       if (combined.length > 1_100 || Buffer.byteLength(JSON.stringify(combined)) > 16 * 1024 * 1024) break;
+      if (supplemental.updates.some(update => update.message?.has_protected_content === true)) {
+        return { updates: combined, nextCursor: supplemental.nextCursor };
+      }
       result = supplemental;
       updates = combined;
       persist();
@@ -2503,6 +2509,7 @@ export class MessagingManager {
       sessionId: activeConversation.sessionId,
       prompt,
       source: "system",
+      ...(event.protectedContent ? { protectedMessagingRequestId: request.id } : {}),
       ...(overrides === undefined ? {} : { overrides }),
       onAdmitted: (store, admitted) => {
         let admittedRequest = store.getMessagingInboundRequest(request.id);
