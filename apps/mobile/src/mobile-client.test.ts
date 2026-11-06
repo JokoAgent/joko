@@ -7912,7 +7912,7 @@ describe("native mobile connection and operation ownership", () => {
 
 describe("mobile Home search and task mutations", () => {
   it.each(["search", "page", "anchor"] as const)("retires the original profile and its offline history when %s observes revocation", async (read) => {
-    const owner = create(SnapshotSchema, { ...offlineOwnerProjection(),
+    const owner = create(SnapshotSchema, { ...runtimeControlProjection(),
       connections: [connection, otherConnection], devices: [device, otherDevice] });
     const detail = offlineDetailProjection();
     const offline = memoryOfflineCache();
@@ -7926,7 +7926,7 @@ describe("mobile Home search and task mutations", () => {
     expect((await offline.cache.load(original, "session"))?.detail).toBeDefined();
     const anchor = event("e7", 7n);
     vi.mocked(network.readAround).mockResolvedValueOnce([create(EventSchema, {
-      ...anchor, cursor: { ...anchor.cursor!, generation: detail.generation }
+      ...anchor, cursor: { ...anchor.cursor!, generation: owner.generation }
     })]);
     await app.around("e7");
     expect(app.state.window?.map((item) => item.eventId)).toEqual(["e7"]);
