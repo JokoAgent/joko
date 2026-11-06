@@ -114,6 +114,53 @@ it.skipIf(process.platform === "win32")("pushes the reviewed SSH commit when the
   } finally { await f.close(); }
 });
 
+it.skipIf(process.platform === "win32")("rejects a tag on the SSH branch push entry point", { timeout: 30_000 }, async () => {
+  const f = await fixture({ ssh: true });
+  try {
+    await f.git("init", "--bare", "--quiet", f.outside);
+    await f.git("remote", "add", "origin", f.outside);
+    await f.git("commit", "--allow-empty", "-m", "base");
+    const { repositoryRevision, headRevision } = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    const input = { remote: "origin", expectedRepositoryRevision: repositoryRevision, expectedHeadRevision: headRevision! };
+    await expect(f.workspaces.pushGitReview("workspace", { ...input, remoteRef: "refs/tags/unexpected" }))
+      .rejects.toMatchObject({ kind: "invalid" });
+    expect(f.requests.some(request => request.args[0] === "push")).toBe(false);
+    expect(await f.git("--git-dir", f.outside, "tag", "--list")).toBe("");
+    await expect(f.workspaces.pushGitReview("workspace", { ...input, remoteRef: "refs/heads/main" }))
+      .resolves.toMatchObject({ kind: "pushed", headRevision });
+    expect(await f.git("--git-dir", f.outside, "rev-parse", "refs/heads/main")).toBe(headRevision);
+  } finally { await f.close(); }
+});
+
+it.skipIf(process.platform === "win32")("keeps an independent paused SSH merge from Review Commit", { timeout: 30_000 }, async () => {
+  const f = await fixture({ ssh: true });
+  try {
+    await f.git("commit", "--allow-empty", "-m", "base");
+    await f.git("switch", "-c", "other");
+    await f.git("commit", "--allow-empty", "-m", "other branch");
+    const other = await f.git("rev-parse", "HEAD");
+    await f.git("switch", "main");
+    await f.git("commit", "--allow-empty", "-m", "main branch");
+    const head = await f.git("rev-parse", "HEAD");
+    await f.git("merge", "--no-commit", "other");
+    const review = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    for (const includeUnstaged of [false, true]) {
+      await expect(f.workspaces.commitGitReview("workspace", { message: "Review commit", expectedRepositoryRevision: review.repositoryRevision, includeUnstaged }))
+        .rejects.toMatchObject({ kind: "unsupported" });
+    }
+    expect(await f.git("rev-parse", "HEAD")).toBe(head);
+    expect(await f.git("rev-parse", "MERGE_HEAD")).toBe(other);
+    expect(f.requests.some(request => ["add", "commit"].includes(request.args[0] ?? ""))).toBe(false);
+
+    await f.git("merge", "--abort");
+    await writeFile(join(f.root, "note.txt"), "A new review change");
+    const ready = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    await expect(f.workspaces.commitGitReview("workspace", { message: "Review commit", expectedRepositoryRevision: ready.repositoryRevision, includeUnstaged: true }))
+      .resolves.toMatchObject({ headRevision: expect.stringMatching(/^[a-f0-9]{40}$/u) });
+    expect(await f.git("log", "-1", "--format=%s")).toBe("Review commit");
+  } finally { await f.close(); }
+});
+
 it("rejects every remote mutation through an intermediate link before delegating its effect", async () => {
   const f = await fixture();
   try {
