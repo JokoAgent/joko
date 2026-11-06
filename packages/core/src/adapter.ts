@@ -49,6 +49,8 @@ export interface PartnerLearningTurnHandle {
   observeNativeReply(nativeBoundaryId: string): void;
 }
 
+export type AcceptedNativeTurnOutcome = "in_progress" | "completed" | "aborted" | "failed";
+
 export interface AdapterContext {
   /** Service-issued reverse tool channel; never supplied by a model or client. */
   readonly hostedExecution?: import("./hosted-execution.js").HostedExecution;
@@ -68,8 +70,8 @@ export interface AdapterContext {
   readonly operationId?: string;
   /** Original durable input owner, minted by SessionHost rather than native callers. */
   readonly inputQueueItemId?: QueueItemId;
-  /** The Host may confirm a disconnected, already admitted native turn by its durable receipt. */
-  readonly confirmAcceptedNativeCompletion?: (nativeTurnId: string) => Promise<boolean>;
+  /** Reads a disconnected, already admitted native turn through its original durable receipt. */
+  readonly observeAcceptedNativeTurn?: (nativeTurnId: string) => Promise<AcceptedNativeTurnOutcome | "retired" | undefined>;
   /** Private authority for one user-owned dispatch. A Backend may recover a
    * deterministic optional-field rejection only before producing output or
    * running tools. Recheck after learning and immediately before replay. */
