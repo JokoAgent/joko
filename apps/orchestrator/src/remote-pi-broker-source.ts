@@ -5,7 +5,7 @@ export const REMOTE_PI_BROKER_SOURCE = String.raw`
 import { execFile, spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -453,22 +453,49 @@ function fingerprintIdentity(value) {
     executableHash: value.executableHash
   })).digest("hex");
 }
+async function linuxProcessStatus(proc) {
+  const value = await readFile(proc + "/stat");
+  if (value.byteLength > 16 * 1024) fail();
+  const text = value.toString("utf8");
+  const close = text.lastIndexOf(")");
+  if (close < 1) fail();
+  const fields = text.slice(close + 1).trim().split(/\s+/);
+  const state = fields[0];
+  const startTicks = fields[19];
+  if (state === undefined || startTicks === undefined || !/^[0-9]+$/.test(startTicks)) fail();
+  return { startTicks, exited: state === "Z" || state === "X" };
+}
+async function linuxProcessExecutable(path) {
+  const link = await readlink(path);
+  if (!isAbsolute(link)) fail();
+  const deleted = " (deleted)";
+  if (!link.endsWith(deleted)) return realpath(path);
+
+  // procfs can still open the running image after its pathname is unlinked.
+  // Distinguish that suffix from a literal name that still refers to the image.
+  const image = await stat(path, { bigint: true });
+  const named = await stat(link, { bigint: true }).catch((error) => {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (await readlink(path) !== link) fail();
+  if (named?.dev === image.dev && named.ino === image.ino) return realpath(path);
+  return link.slice(0, -deleted.length);
+}
 async function processFingerprint(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) return undefined;
   if (process.platform === "win32") return windowsProcessFingerprint(pid);
   if (process.platform !== "linux") return undefined;
   try {
-    const processInfo = await lstat("/proc/" + pid);
-    const processStat = await readFile("/proc/" + pid + "/stat");
-    const commandLine = await readFile("/proc/" + pid + "/cmdline");
-    if (processStat.byteLength > 16 * 1024 || commandLine.byteLength === 0 || commandLine.byteLength > 64 * 1024) return undefined;
-    const statText = processStat.toString("utf8");
-    const close = statText.lastIndexOf(")");
-    if (close < 1) return undefined;
-    const fields = statText.slice(close + 1).trim().split(/\s+/);
-    const startTicks = fields[19];
-    if (startTicks === undefined || !/^[0-9]+$/.test(startTicks)) return undefined;
-    const executable = await realpath("/proc/" + pid + "/exe");
+    const proc = "/proc/" + pid;
+    const { startTicks, exited } = await linuxProcessStatus(proc);
+    if (exited) return undefined;
+    const processInfo = await lstat(proc);
+    const commandLine = await readFile(proc + "/cmdline");
+    if (commandLine.byteLength === 0 || commandLine.byteLength > 64 * 1024) return undefined;
+    const executable = await linuxProcessExecutable(proc + "/exe");
+    const confirmed = await linuxProcessStatus(proc);
+    if (confirmed.exited || confirmed.startTicks !== startTicks) return undefined;
     const args = commandLine.toString("utf8").split("\0");
     if (args[args.length - 1] === "") args.pop();
     if (args.length === 0 || args.some((entry) => entry.includes("\0"))) return undefined;
@@ -483,6 +510,35 @@ async function processFingerprint(pid) {
     };
   } catch {
     return undefined;
+  }
+}
+class ProcessIdentityUnconfirmed extends Error {}
+async function recordedProcessFingerprint(expected) {
+  const observed = await processFingerprint(expected.pid);
+  if (process.platform !== "linux") return observed;
+  if (observed !== undefined) {
+    if (observed.startTicks !== expected.startTicks || fingerprintsMatch(observed, expected)) return observed;
+    throw new ProcessIdentityUnconfirmed("The recorded process is alive but its executable or command identity changed.");
+  }
+
+  try {
+    const status = await linuxProcessStatus("/proc/" + expected.pid);
+    if (status.exited || status.startTicks !== expected.startTicks) return undefined;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      try { process.kill(expected.pid, 0); } catch (probeError) {
+        if (probeError?.code === "ESRCH") return undefined;
+      }
+    }
+  }
+  throw new ProcessIdentityUnconfirmed("The recorded process identity could not be confirmed.");
+}
+async function waitForRecordedProcessFingerprint(expected) {
+  for (;;) {
+    try { return await recordedProcessFingerprint(expected); } catch (error) {
+      if (!(error instanceof ProcessIdentityUnconfirmed)) throw error;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    }
   }
 }
 async function trustedWindowsPowerShell() {
@@ -627,7 +683,7 @@ async function bootstrapOwnerProcess(root, record) {
     record.identity, record.ownerLaunchHash, record.ownerIdentity
   ];
   if (record.owner !== undefined) {
-    const current = await processFingerprint(record.owner.pid);
+    const current = await recordedProcessFingerprint(record.owner);
     if (current === undefined) return undefined;
     if (
       !fingerprintsMatch(current, record.owner) || !sameFingerprintOwner(current)
@@ -652,7 +708,7 @@ async function bootstrapOwnerProcess(root, record) {
 }
 async function bootstrapChildProcess(record) {
   if (record.child !== undefined) {
-    const current = await processFingerprint(record.child.pid);
+    const current = await recordedProcessFingerprint(record.child);
     if (current === undefined) return undefined;
     if (!fingerprintsMatch(current, record.child) || !(await bootstrapChildMatches(current, record))) fail();
     return current;
@@ -694,23 +750,23 @@ async function waitForFingerprint(pid, deadline = Date.now() + START_TIMEOUT_MS)
   fail();
 }
 async function stopExactProcess(fingerprint, requestedSignal = "SIGTERM") {
-  let current = await processFingerprint(fingerprint.pid);
+  let current = await recordedProcessFingerprint(fingerprint);
   if (current === undefined) return true;
   if (!fingerprintsMatch(current, fingerprint)) return false;
   try { process.kill(fingerprint.pid, signalName(requestedSignal)); } catch {}
   if (requestedSignal !== "SIGKILL") {
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      current = await processFingerprint(fingerprint.pid);
+      current = await recordedProcessFingerprint(fingerprint);
       if (current === undefined || !fingerprintsMatch(current, fingerprint)) return true;
       await new Promise((resolveWait) => setTimeout(resolveWait, 25));
     }
-    current = await processFingerprint(fingerprint.pid);
+    current = await recordedProcessFingerprint(fingerprint);
     if (fingerprintsMatch(current, fingerprint)) {
       try { process.kill(fingerprint.pid, "SIGKILL"); } catch {}
     }
   }
-  while (fingerprintsMatch(await processFingerprint(fingerprint.pid), fingerprint)) {
+  while (fingerprintsMatch(await recordedProcessFingerprint(fingerprint), fingerprint)) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
   }
   return true;
@@ -1438,7 +1494,7 @@ async function spawnRecoveryJanitor(root, paths, record) {
   janitor.unref();
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const child = await processFingerprint(record.child.pid);
+    const child = await recordedProcessFingerprint(record.child);
     if (!fingerprintsMatch(child, record.child)) {
       if (await validReaped(paths, record)) return;
     }
@@ -1448,8 +1504,8 @@ async function spawnRecoveryJanitor(root, paths, record) {
 }
 async function cleanupReapedSession(paths, record) {
   if (!(await validReaped(paths, record))) fail();
-  const owner = await processFingerprint(record.owner.pid);
-  const child = await processFingerprint(record.child.pid);
+  const owner = await recordedProcessFingerprint(record.owner);
+  const child = await recordedProcessFingerprint(record.child);
   if (fingerprintsMatch(owner, record.owner) || fingerprintsMatch(child, record.child)) fail();
   await writeTombstone(paths, record);
   await privateDirectory(paths.sessionRoot);
@@ -1471,7 +1527,7 @@ async function recoverDeadOwner(root, sessionIdentity) {
     if (error && error.code === "ENOENT") return false;
     throw error;
   }
-  const owner = await processFingerprint(record.owner.pid);
+  const owner = await recordedProcessFingerprint(record.owner);
   if (fingerprintsMatch(owner, record.owner)) return false;
   let bootstrap;
   try {
@@ -1491,7 +1547,7 @@ async function recoverDeadOwner(root, sessionIdentity) {
       && !(await stopExactProcess(pendingChild, "SIGTERM"))
     ) fail();
   }
-  const observedChild = await processFingerprint(record.child.pid);
+  const observedChild = await recordedProcessFingerprint(record.child);
   const child = fingerprintsMatch(observedChild, record.child) ? observedChild : undefined;
   if (child !== undefined) await spawnRecoveryJanitor(root, paths, record);
   else if (!(await validReaped(paths, record))) await writeReaped(paths, record);
@@ -1507,7 +1563,7 @@ async function spawnBootstrapReaper(root, record, child) {
   reaper.unref();
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const current = await processFingerprint(child.pid);
+    const current = await recordedProcessFingerprint(child);
     if (current === undefined) return;
     if (!fingerprintsMatch(current, child)) fail();
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
@@ -3370,7 +3426,7 @@ async function runSessionOwner(root, request, ownerIdentity) {
         closeListeningServer(relayServer)
       ]);
       if (session.committed) {
-        const currentChild = await processFingerprint(session.childFingerprint.pid);
+        const currentChild = await recordedProcessFingerprint(session.childFingerprint);
         if (fingerprintsMatch(currentChild, session.childFingerprint)) fail();
         await writeTombstone(paths, ownerRecord(ownerMetadata(session), session.identity));
       }
@@ -4059,8 +4115,8 @@ async function runJanitor(root, expectedIdentity, expectedHash, expectedOwnerIde
   };
   let childReaped = false;
   for (;;) {
-    const currentOwner = await processFingerprint(owner.pid);
-    const currentChild = await processFingerprint(child.pid);
+    const currentOwner = await waitForRecordedProcessFingerprint(owner);
+    const currentChild = await waitForRecordedProcessFingerprint(child);
     if (fingerprintsMatch(currentOwner, owner)) {
       if (currentChild === undefined || !fingerprintsMatch(currentChild, child)) {
         if (!childReaped) {
@@ -4078,16 +4134,16 @@ async function runJanitor(root, expectedIdentity, expectedHash, expectedOwnerIde
     try { process.kill(child.pid, "SIGTERM"); } catch {}
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      const candidate = await processFingerprint(child.pid);
+      const candidate = await waitForRecordedProcessFingerprint(child);
       if (candidate === undefined) return finishOwnerLoss();
       if (!fingerprintsMatch(candidate, child)) return;
       await new Promise((resolveWait) => setTimeout(resolveWait, 50));
     }
-    const candidate = await processFingerprint(child.pid);
+    const candidate = await waitForRecordedProcessFingerprint(child);
     if (fingerprintsMatch(candidate, child)) {
       try { process.kill(child.pid, "SIGKILL"); } catch {}
     }
-    while (fingerprintsMatch(await processFingerprint(child.pid), child)) {
+    while (fingerprintsMatch(await waitForRecordedProcessFingerprint(child), child)) {
       await new Promise((resolveWait) => setTimeout(resolveWait, 25));
     }
     return finishOwnerLoss();
@@ -4106,7 +4162,7 @@ async function runBootstrapReaper(root, expectedIdentity, expectedHash, expected
     executableHash: launchHash(values[3])
   };
   if (record.child !== undefined && !fingerprintsMatch(record.child, child)) fail();
-  const current = await processFingerprint(child.pid);
+  const current = await recordedProcessFingerprint(child);
   if (current === undefined) return;
   if (!fingerprintsMatch(current, child) || !(await bootstrapChildMatches(current, record))) fail();
   if (!(await stopExactProcess(child, "SIGTERM"))) fail();

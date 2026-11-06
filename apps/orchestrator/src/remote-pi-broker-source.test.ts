@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -133,6 +133,7 @@ interface BrokerFixture {
   readonly identity: string;
   readonly recoveryIdentity: string;
   readonly compatibilityHash: string;
+  readonly nodeExecutable?: string;
 }
 
 async function brokerFixture(source = REMOTE_PI_BROKER_SOURCE): Promise<BrokerFixture> {
@@ -421,7 +422,7 @@ function bootstrap(
       : {})
   };
   const shape = {
-    command: process.execPath,
+    command: fixture.nodeExecutable ?? process.execPath,
     args: [fixture.childPath],
     cwd: fixture.root,
     env
@@ -442,7 +443,7 @@ function bootstrap(
     version: REMOTE_PI_BROKER_PROTOCOL_VERSION,
     identity: fixture.identity,
     launchHash: remotePiLaunchHash(shape),
-    executable: process.execPath,
+    executable: shape.command,
     args: shape.args,
     cwd: shape.cwd,
     env,
@@ -494,7 +495,7 @@ function nonManagedBootstrap(
   delete env.JOKO_PI_SUBAGENT_NODE_EXECUTABLE;
   delete env.JOKO_PI_NATIVE_AUTH_RESERVATION_TOKEN;
   const shape = {
-    command: process.execPath,
+    command: String(value["executable"]),
     args: [fixture.childPath],
     cwd: fixture.root,
     env
@@ -531,7 +532,7 @@ async function startBridge(
   readonly state: AuthorityState;
 }> {
   const startedAt = performance.now();
-  const child = spawn(process.execPath, [
+  const child = spawn(fixture.nodeExecutable ?? process.execPath, [
     fixture.sourcePath,
     "bridge",
     fixture.managedRoot,
@@ -1543,6 +1544,86 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
         provisional?.process.kill("SIGKILL");
         await closeServer(firstTarget.server);
         await closeServer(secondTarget.server);
+        try { await exactKill(await managerPid(fixture), "daemon", fixture.sourcePath); } catch { /* already stopped */ }
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    },
+    40_000
+  );
+
+  it.runIf(process.platform === "linux")(
+    "keeps the attested owner and child attached after their Linux Node image is replaced",
+    async () => {
+      const base = await brokerFixture();
+      const nodeExecutable = join(base.root, "node");
+      const replacement = join(base.root, "node-replacement");
+      const moved = join(base.root, "node-held");
+      const fixture = { ...base, nodeExecutable };
+      const target = await upstream();
+      let original: Awaited<ReturnType<typeof brokerMetadata>> | undefined;
+      let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
+      let reattached: Awaited<ReturnType<typeof startBridge>> | undefined;
+      let retired = false;
+      try {
+        await copyFile(process.execPath, nodeExecutable);
+        await copyFile(process.execPath, replacement);
+        await chmod(nodeExecutable, 0o700);
+        await chmod(replacement, 0o700);
+        const value = nonManagedBootstrap(fixture, 1, "replaced-node-bearer-00000000000000", target.port);
+        bridge = await startBridge(fixture, value);
+        original = await brokerMetadata(fixture);
+        bridge.process.kill("SIGKILL");
+        await processExit(bridge.process);
+        const recovery = { ...value, authority: { ...value.authority, recovery: bridge.authority } };
+        const reapedPath = join(fixture.managedRoot, "sessions", fixture.identity, "reaped.json");
+
+        await rename(nodeExecutable, moved);
+        await rename(replacement, nodeExecutable);
+        expect(await readlink(`/proc/${original.child.pid}/exe`)).toBe(moved);
+        await expect(startBridge(fixture, recovery)).rejects.toThrow();
+        expect(await brokerMetadata(fixture)).toMatchObject({ owner: original.owner, child: original.child });
+        await expect(lstat(reapedPath)).rejects.toMatchObject({ code: "ENOENT" });
+        await rename(nodeExecutable, replacement);
+        await rename(moved, nodeExecutable);
+
+        await rename(replacement, nodeExecutable);
+        const deletedImage = `${nodeExecutable} (deleted)`;
+        expect(await readlink(`/proc/${original.owner.pid}/exe`)).toBe(deletedImage);
+        expect(await readlink(`/proc/${original.child.pid}/exe`)).toBe(deletedImage);
+
+        reattached = await startBridge(fixture, recovery);
+        expect(reattached.authority).toEqual(bridge.authority);
+        expect(await brokerMetadata(fixture)).toMatchObject({ owner: original.owner, child: original.child, janitor: original.janitor });
+        await expect(lstat(reapedPath)).rejects.toMatchObject({ code: "ENOENT" });
+        reattached.process.stdin.write(sequencedFrame(FRAME_STDIN, 1, Buffer.from("suffix\n")));
+        const output = sequenced(await nextFrameOfType(reattached.reader, FRAME_STDOUT));
+        expect(output.content.toString()).toContain('"fresh"');
+        reattached.process.stdin.write(sequencedFrame(FRAME_OUTPUT_ACK, output.sequence));
+
+        // A regular file at the displayed pathname still does not own the running image.
+        await writeFile(deletedImage, "decoy", { mode: 0o600 });
+        await authorityKill(fixture, reattached.authority);
+        const childPid = original.child.pid;
+        await waitUntil(async () => {
+          try { await lstat(`/proc/${childPid}`); return false; } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+            throw error;
+          }
+        });
+        retired = true;
+      } finally {
+        const authority = reattached?.authority ?? bridge?.authority;
+        if (!retired && authority !== undefined) await authorityKill(fixture, authority).catch(() => undefined);
+        bridge?.process.kill("SIGKILL");
+        reattached?.process.kill("SIGKILL");
+        if (original !== undefined) {
+          const argv = await readFile(`/proc/${original.child.pid}/cmdline`, "utf8").catch(() => "");
+          if (argv.split("\0").includes(fixture.childPath)) {
+            try { process.kill(original.child.pid, "SIGKILL"); } catch { /* already stopped */ }
+          }
+          await exactKill(original.owner.pid, "owner", fixture.sourcePath).catch(() => undefined);
+        }
+        await closeServer(target.server);
         try { await exactKill(await managerPid(fixture), "daemon", fixture.sourcePath); } catch { /* already stopped */ }
         await rm(fixture.root, { recursive: true, force: true });
       }
