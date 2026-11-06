@@ -315,6 +315,7 @@ type TransactionFrame = {
 type RunListOptions = {
   readonly sessionId?: string;
   readonly targetId?: string;
+  readonly source?: RunDescriptor["source"];
   readonly states?: readonly RunState[];
   readonly activeOnly?: boolean;
   readonly includeCleared?: boolean;
@@ -502,6 +503,10 @@ function runSqlFilter(options: RunListOptions): SqlFilter {
   if (options.states !== undefined && options.states.length > 0) {
     clauses.push(`run.state IN (${options.states.map(() => "?").join(", ")})`);
     params.push(...options.states);
+  }
+  if (options.source !== undefined) {
+    clauses.push("run.source = ?");
+    params.push(options.source);
   }
   if (options.activeOnly === true) {
     clauses.push("run.state IN ('queued', 'running', 'waiting', 'retrying', 'dispatch_unknown')");

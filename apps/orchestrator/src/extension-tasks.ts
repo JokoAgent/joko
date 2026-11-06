@@ -632,8 +632,9 @@ export function isExtensionTaskControlled(store: OperationalStore, sessionId: st
   const receipt = store.findSetting<TaskReceipt>("service", TASKS, leadSessionId)?.value;
   if (!receipt) return false;
   if (!receipt.revoked) return true;
-  if (worker && store.listRuns({ sessionId, limit: 1 })[0]?.descriptor.source !== "user") return true;
-  if (store.listRuns({ sessionId, activeOnly: true, limit: 1 })[0]?.descriptor.source === "system") return true;
+  const inProgress = ["running", "waiting", "retrying", "dispatch_unknown"] as const;
+  if (store.countRuns({ sessionId, states: inProgress, source: "system" }) > 0) return true;
+  if (worker && store.listRuns({ sessionId, states: [...inProgress, "completed", "failed", "aborted"], limit: 1 })[0]?.descriptor.source !== "user") return true;
   return store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"] }).some(item => inputReceipt(store, item.runId) !== undefined);
 }
 
