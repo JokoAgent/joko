@@ -680,6 +680,7 @@ export class ExtensionLibraryVault {
 
   async commitStagedWrite(input: {
     readonly temporaryPath: string;
+    readonly temporaryIdentity?: BigIntStats;
     readonly path: string;
     readonly bytes: number;
     readonly sha256: string;
@@ -691,8 +692,10 @@ export class ExtensionLibraryVault {
       throw new ExtensionLibraryError("TOO_LARGE", "Library staged write metadata is invalid.");
     }
     const temporary = this.#assertOwnedTemporaryPath(input.temporaryPath, ".stream");
+    await assertSafeAncestry(this.#root, temporary, false);
     const before = await lstat(temporary, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink() || before.size !== BigInt(input.bytes)) {
+    if (!before.isFile() || before.isSymbolicLink() || before.size !== BigInt(input.bytes)
+      || input.temporaryIdentity !== undefined && !sameFilesystemObject(input.temporaryIdentity, before)) {
       throw new ExtensionLibraryError("CONFLICT", "Library staged write identity or size changed.");
     }
     if (await hashOpenFile(temporary, before) !== input.sha256) {
@@ -769,8 +772,18 @@ export class ExtensionLibraryVault {
     return { path: relativePath, bytes: input.bytes, sha256: input.sha256 };
   }
 
-  async discardTemporaryPath(temporaryPath: string, suffix: ".sqlite-backup" | ".stream"): Promise<void> {
+  async discardTemporaryPath(temporaryPath: string, suffix: ".sqlite-backup" | ".stream", expected?: BigIntStats): Promise<void> {
     const temporary = this.#assertOwnedTemporaryPath(temporaryPath, suffix);
+    await this.#assertRootIdentity();
+    await assertSafeAncestry(this.#root, temporary, true);
+    const current = await lstat(temporary, { bigint: true }).catch((error: unknown) => {
+      if (!isMissing(error)) throw error;
+      return undefined;
+    });
+    if (current === undefined) return;
+    if (!current.isFile() || current.isSymbolicLink() || expected !== undefined && !sameFilesystemObject(expected, current)) {
+      throw new ExtensionLibraryError("CONFLICT", "Library temporary file was replaced before cleanup.");
+    }
     await unlink(temporary).catch((error) => {
       if (!isMissing(error)) throw error;
     });

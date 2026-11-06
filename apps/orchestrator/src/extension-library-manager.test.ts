@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -92,6 +92,45 @@ describe("ExtensionLibraryManager", () => {
       .rejects.toMatchObject({ code: "NOT_FOUND" });
     await expect(manager.read(second.sessionId, "web-surface", { path: "mail" })).resolves.toMatchObject({ bytes: Buffer.from("mail") });
   });
+
+  it.runIf(process.platform !== "win32").each(["unchanged", "replaced file", "redirected parent"])(
+    "aborts a staged Library stream with a %s without deleting another file", async (change) => {
+      const { manager, temporaryPath } = await fixture();
+      const owner = { authority, assertAuthorityCurrent: currentAuthority() };
+      const session = await manager.openSession({ ...owner, connectionId: "stream-owner",
+        surfaceId: `extension_surface_${"1".repeat(32)}`, surfaceExpiresAt: Date.now() + 60_000 });
+      const overview = await manager.overview(owner);
+      const stream = await manager.writeBegin(session.sessionId, "stream-owner", { path: "file.txt", totalBytes: 8 });
+      await manager.writeChunk(session.sessionId, "stream-owner", { streamId: stream.streamId, sequence: 0, bytes: Buffer.from("part") });
+      const staging = join(overview.location!.path, ".joko-library", "tmp");
+      const [name] = await readdir(staging);
+      expect(name).toMatch(/\.stream$/u);
+      const staged = join(staging, name!);
+      const displaced = join(temporaryPath, "original-stream");
+      const outside = join(temporaryPath, "outside");
+      if (change === "replaced file") {
+        await rename(staged, displaced);
+        await writeFile(staged, "replacement");
+      } else if (change === "redirected parent") {
+        await rename(staging, displaced);
+        await mkdir(outside);
+        await writeFile(join(outside, name!), "outside file");
+        await symlink(outside, staging, "dir");
+      }
+
+      await expect(manager.writeAbort(session.sessionId, "stream-owner", stream.streamId)).resolves.toBe(true);
+      await expect(manager.writeAbort(session.sessionId, "stream-owner", stream.streamId)).resolves.toBe(false);
+      if (change === "unchanged") {
+        await expect(readFile(staged)).rejects.toMatchObject({ code: "ENOENT" });
+      } else if (change === "replaced file") {
+        await expect(readFile(displaced, "utf8")).resolves.toBe("part");
+        await expect(readFile(staged, "utf8")).resolves.toBe("replacement");
+      } else {
+        await expect(readFile(join(displaced, name!), "utf8")).resolves.toBe("part");
+        await expect(readFile(join(outside, name!), "utf8")).resolves.toBe("outside file");
+      }
+    });
+
   it("fences file, stream, and SQLite handles to the exact connection, authority, and binding generation", async () => {
     const { manager } = await fixture();
     await expect(manager.overview({ authority, assertAuthorityCurrent: currentAuthority() })).resolves.toMatchObject({
