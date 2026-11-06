@@ -3735,13 +3735,14 @@ export class SessionHost {
     readonly sessionId: string;
     readonly operationId: string;
     readonly source: NativeSessionBinding;
-  }[]): Promise<readonly {
+  }[], assertCurrent: () => void): Promise<readonly {
     readonly sessionId: string;
     readonly operationId: string;
     readonly source: NativeSessionBinding;
     readonly replacement: NativeSessionBinding;
   }[]> {
     this.#assertOpen();
+    assertCurrent();
     const requestsBySession = new Map<string, (typeof requests)[number]>();
     for (const request of requests) {
       const sessionId = request.sessionId.trim();
@@ -3801,6 +3802,7 @@ export class SessionHost {
     }> = [];
     try {
       for (const sessionId of ids) {
+        assertCurrent();
         const request = requestsBySession.get(sessionId)!;
         const prepared = await this.prepareSessionReset(sessionId);
         if (!sameNativeBinding(prepared.sourceBinding, request.source)) {
@@ -3810,6 +3812,7 @@ export class SessionHost {
             "Scan task history again after the task is idle."
           );
         }
+        assertCurrent();
         let replacement: NativeSessionBinding | undefined;
         try {
           replacement = await prepared.active.adapter.resetContext!({

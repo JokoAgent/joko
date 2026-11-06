@@ -3,6 +3,7 @@ import { existsSync, rmSync, statfsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import type {
+  ConnectionRecord,
   MaintenanceEffectRecord,
   MaintenanceJobRecord,
   OperationalHistoryMaintenanceCandidate,
@@ -93,7 +94,7 @@ export interface HistoryBindingPreparation {
 }
 
 export interface HistoryActiveSessionResetPort {
-  prepare(requests: readonly HistoryBindingPreparation[]): Promise<readonly HistoryBindingReplacement[]>;
+  prepare(requests: readonly HistoryBindingPreparation[], assertCurrent: () => void): Promise<readonly HistoryBindingReplacement[]>;
   recover?(request: HistoryBindingPreparation): Promise<HistoryBindingReplacement | undefined>;
   discard?(replacements: readonly HistoryBindingReplacement[]): Promise<void>;
   finalize?(replacements: readonly HistoryBindingReplacement[]): Promise<void>;
@@ -111,6 +112,7 @@ interface DurableHistoryScanPayload {
 
 interface DurableHistoryJobPayload {
   readonly backupEnabled: boolean;
+  readonly initiatorConnectionId?: string;
   readonly expectedRevision?: string;
   readonly installationPrepared: boolean;
   readonly productFinalized: boolean;
@@ -223,7 +225,8 @@ export class HistoryMaintenance {
     return projection;
   }
 
-  beginCleanup(scanId: string, backupEnabled: boolean): HistoryMaintenanceJob {
+  beginCleanup(scanId: string, backupEnabled: boolean, owner: Pick<ConnectionRecord, "id" | "authKeyDigest">): HistoryMaintenanceJob {
+    const initiator = this.#store.authorizeConnection(owner.id, owner.authKeyDigest);
     const existing = this.#store.findMaintenanceJob<DurableHistoryJobPayload, HistoryMaintenanceResult>("history", scanId);
     if (existing !== undefined) {
       if (historyJobPayload(existing.payload).backupEnabled !== backupEnabled) {
@@ -244,7 +247,7 @@ export class HistoryMaintenance {
         phase: "preparing",
         percent: 1,
         cancellable: true,
-        payload: { backupEnabled, installationPrepared: false, productFinalized: false },
+        payload: { backupEnabled, initiatorConnectionId: initiator.id, installationPrepared: false, productFinalized: false },
         effects: [
           ...payload.candidates.filter((candidate) => candidate.status === "active").map((candidate) => ({
             id: bindingEffectId(candidate.sessionId),
@@ -300,8 +303,8 @@ export class HistoryMaintenance {
     return toPublicJob(job as MaintenanceJobRecord<DurableHistoryJobPayload, HistoryMaintenanceResult>);
   }
 
-  async cleanup(scanId: string, backupEnabled: boolean): Promise<HistoryMaintenanceCleanupOutcome> {
-    const started = this.beginCleanup(scanId, backupEnabled);
+  async cleanup(scanId: string, backupEnabled: boolean, owner: Pick<ConnectionRecord, "id" | "authKeyDigest">): Promise<HistoryMaintenanceCleanupOutcome> {
+    const started = this.beginCleanup(scanId, backupEnabled, owner);
     if (started.status === "scan-expired") return { outcome: "scan-expired" };
     await this.#running.get(started.maintenanceId)?.completion;
     const final = this.getCleanup(started.maintenanceId);
@@ -337,6 +340,13 @@ export class HistoryMaintenance {
         await this.#finalizeInstalledJob(maintenanceId);
         return;
       }
+      const initiatorId = payload.initiatorConnectionId;
+      const assertCurrent = (): void => {
+        if (initiatorId === undefined) throw new Error("Task history cleanup does not have an original connection.");
+        const owner = this.#store.getConnection(initiatorId);
+        this.#store.authorizeConnection(owner.id, owner.authKeyDigest);
+      };
+      assertCurrent();
       const scan = historyScanPayload(
         this.#store.getMaintenanceScan<DurableHistoryScanPayload>("history", job.scanId).payload,
         job.scanId
@@ -345,9 +355,10 @@ export class HistoryMaintenance {
       activeIds = bindingEffects.map((effect) => historyBindingEffect(effect.payload).sessionId);
       assertNotCancelled(signal, job.cancelRequested);
       this.#updateProgress(maintenanceId, "preparing", 5, true);
-      const replacements = await this.#prepareBindings(maintenanceId, bindingEffects, signal);
+      const replacements = await this.#prepareBindings(maintenanceId, bindingEffects, signal, assertCurrent);
       job = this.#store.getMaintenanceJob("history", maintenanceId);
       assertNotCancelled(signal, job.cancelRequested);
+      assertCurrent();
 
       payload = historyJobPayload(job.payload);
       const expectedRevision = payload.expectedRevision === undefined
@@ -390,6 +401,7 @@ export class HistoryMaintenance {
         return;
       }
       assertNotCancelled(signal, this.#currentCancelRequested(maintenanceId));
+      assertCurrent();
       const workResult = await this.#workDatabase({
         workingPath,
         candidates: scan.candidates,
@@ -400,6 +412,7 @@ export class HistoryMaintenance {
         onProgress: (phase, percent) => this.#updateProgress(maintenanceId, phase, percent, true)
       });
       assertNotCancelled(signal, this.#currentCancelRequested(maintenanceId));
+      assertCurrent();
       if (this.#store.health().revision !== expectedRevision) {
         await this.#finishBeforeInstall(maintenanceId, "storage_changed");
         return;
@@ -448,11 +461,13 @@ export class HistoryMaintenance {
   async #prepareBindings(
     maintenanceId: string,
     effects: readonly MaintenanceEffectRecord<DurableHistoryBindingEffect>[],
-    signal: AbortSignal
+    signal: AbortSignal,
+    assertCurrent: () => void
   ): Promise<HistoryBindingReplacement[]> {
     const replacements: HistoryBindingReplacement[] = [];
     for (const original of effects) {
       assertNotCancelled(signal, this.#currentCancelRequested(maintenanceId));
+      assertCurrent();
       let effect = this.#store.listMaintenanceEffects<DurableHistoryBindingEffect>(maintenanceId)
         .find((candidate) => candidate.id === original.id);
       if (effect === undefined) throw new Error("Task history binding receipt disappeared.");
@@ -490,11 +505,12 @@ export class HistoryMaintenance {
         });
       }
       if (effect.state !== "pending") throw new Error("Task history binding receipt is not recoverable.");
+      assertCurrent();
       this.#store.updateMaintenanceEffect({
         jobId: maintenanceId, id: effect.id, state: "claimed", payload, updatedAt: this.#now()
       });
       try {
-        const prepared = await this.#activeSessions.prepare([request]);
+        const prepared = await this.#activeSessions.prepare([request], assertCurrent);
         if (prepared.length !== 1) throw new Error("Task history binding preparation returned an invalid result.");
         const replacement = prepared[0]!;
         assertReplacement(request, replacement);
@@ -830,6 +846,7 @@ function historyJobPayload(value: unknown): DurableHistoryJobPayload {
     typeof candidate.backupEnabled !== "boolean"
     || typeof candidate.installationPrepared !== "boolean"
     || typeof candidate.productFinalized !== "boolean"
+    || (candidate.initiatorConnectionId !== undefined && (typeof candidate.initiatorConnectionId !== "string" || !candidate.initiatorConnectionId.trim()))
     || (candidate.expectedRevision !== undefined && !/^\d+$/u.test(candidate.expectedRevision))
   ) throw new Error("Task history job receipt is invalid.");
   return candidate as DurableHistoryJobPayload;

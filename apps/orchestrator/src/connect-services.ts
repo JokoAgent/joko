@@ -4119,11 +4119,11 @@ export function createConnectServices(application: OrchestratorApplication, proj
       }
     },
     beginTaskHistoryCleanup: (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
       if (!UUID_PATTERN.test(request.scanId)) throw invalidArgument("scan_id is invalid");
       try {
         return { progress: toProtoTaskHistoryProgress(
-          dependencies.historyMaintenance.beginCleanup(request.scanId, request.backupEnabled)
+          dependencies.historyMaintenance.beginCleanup(request.scanId, request.backupEnabled, connection)
         ) };
       } catch {
         throw new ConnectError("Task history cleanup could not be started.", Code.FailedPrecondition);
