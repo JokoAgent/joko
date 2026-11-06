@@ -4682,8 +4682,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         onDisconnect: async (fault) => {
           if (!this.#matchesCallbackFence(runtime, input.hostGeneration) || runtime.disconnectTerminalEmitted) return;
           const activeYieldClaim = runtime.yieldContinuation;
+          const activeTurnId = runtime.state.activeTurnId;
           const ownsRootTerminal = activeYieldClaim === undefined
-            ? runtime.yieldTerminalOwner === undefined
+            ? runtime.yieldTerminalOwner === undefined && (runtimeHasProductWork(runtime) || runtime.pendingTurnStart !== undefined)
             : claimYieldProductTerminal(runtime, activeYieldClaim);
           runtime.dispatchLifetime.abort();
           this.#cancelYieldContinuation(runtime);
@@ -4712,23 +4713,29 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             false
           );
           if (ownsRootTerminal && this.#matchesCallbackFence(runtime, input.hostGeneration)) {
-            await emit({
-              type: "error",
-              error: {
-                code: "CODEX_APP_SERVER_DISCONNECTED",
-                message: "The Codex app-server disconnected during the native Session.",
-                phase: "stream",
-                retryable: true,
-                stateMayHaveChanged: fault.stateMayHaveChanged,
-                recovery: "Reconnect and resume the native thread before sending additional work."
-              },
-              terminal: true
-            }, { namespace: "codex.app_server", fields: { state: "disconnected" } });
-            if (this.#matchesCallbackFence(runtime, input.hostGeneration)) {
-              await emit({ type: "done", outcome: "failed" }, {
-                namespace: "codex.app_server",
-                fields: { state: "disconnected" }
-              });
+            const completed = activeYieldClaim === undefined && activeTurnId !== undefined && fault.code === "process_exited"
+              && await context.confirmAcceptedNativeCompletion?.(activeTurnId).catch(() => false) === true;
+            if (completed && this.#matchesCallbackFence(runtime, input.hostGeneration)) {
+              await emit({ type: "done", outcome: "completed" }, { namespace: "codex.app_server", fields: { state: "reconciled" } });
+            } else if (this.#matchesCallbackFence(runtime, input.hostGeneration)) {
+              await emit({
+                type: "error",
+                error: {
+                  code: "CODEX_APP_SERVER_DISCONNECTED",
+                  message: "The Codex app-server disconnected during the native Session.",
+                  phase: "stream",
+                  retryable: true,
+                  stateMayHaveChanged: fault.stateMayHaveChanged,
+                  recovery: "Reconnect and resume the native thread before sending additional work."
+                },
+                terminal: true
+              }, { namespace: "codex.app_server", fields: { state: "disconnected" } });
+              if (this.#matchesCallbackFence(runtime, input.hostGeneration)) {
+                await emit({ type: "done", outcome: "failed" }, {
+                  namespace: "codex.app_server",
+                  fields: { state: "disconnected" }
+                });
+              }
             }
           }
           this.#settleCompaction(runtime, adapterError({

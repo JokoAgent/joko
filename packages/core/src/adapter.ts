@@ -68,6 +68,8 @@ export interface AdapterContext {
   readonly operationId?: string;
   /** Original durable input owner, minted by SessionHost rather than native callers. */
   readonly inputQueueItemId?: QueueItemId;
+  /** The Host may confirm a disconnected, already admitted native turn by its durable receipt. */
+  readonly confirmAcceptedNativeCompletion?: (nativeTurnId: string) => Promise<boolean>;
   /** Private authority for one user-owned dispatch. A Backend may recover a
    * deterministic optional-field rejection only before producing output or
    * running tools. Recheck after learning and immediately before replay. */
