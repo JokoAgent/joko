@@ -1651,7 +1651,8 @@ export async function createOrchestratorApplication(
           partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context
         ),
         resolveNativeSkills: (context, signal) => piResources.runtimeSkillSnapshot(instanceId, context.target.id, signal, partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context),
-        resolveNativeSkillPolicy: context => partnerConnections?.nativeSkillPolicy(context),
+        resolveNativeSkillPolicy: async context => await partnerConnections?.nativeSkillPolicy(context)
+          ?? await piResources.claudeProjectSkillPolicy(context),
         resolveArtifactMention: createArtifactMentionResolver({
           store, artifacts,
           resolveTarget: (session) => sessionWorktrees.effectiveTarget(session),

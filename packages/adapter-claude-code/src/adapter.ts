@@ -3670,7 +3670,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (!context.hostedExecution && launch.runtimePolicy === "standard" && !scoped.remote && this.#resolveNativeSkills !== undefined) {
         const resourceSignal = AbortSignal.any([context.signal, abortController.signal]);
         const policy = await this.#resolveNativeSkillPolicy?.(context);
-        nativeSkills = await snapshotNativeSkills(await this.#resolveNativeSkills(context, resourceSignal), resourceSignal, undefined, policy);
+        nativeSkills = await snapshotNativeSkills(await this.#resolveNativeSkills(context, resourceSignal), resourceSignal, undefined,
+          policy?.mode === "ambient" && !this.#settingSources.includes("project") ? undefined : policy);
       }
       if (!context.hostedExecution && (this.#resolveTextResources !== undefined || nativeSkills?.skills.some(mount => mount.seed.resource.trustedBuiltin))) {
         if (launch.runtimePolicy === "review_read_only") {
@@ -3693,7 +3694,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           this.#assertBackendInstance(context);
           this.#assertBindingContext(binding, context);
           const builtinSeeds = await Promise.all((nativeSkills?.skills ?? []).filter(mount => mount.seed.resource.trustedBuiltin
-            && nativeSkills?.skillOverrides[mount.seed.resource.name] !== "off").map(async mount => ({
+            && (!nativeSkills?.restrictImplicit || nativeSkills.skillOverrides[mount.seed.resource.name] !== "off")).map(async mount => ({
             id: mount.seed.resource.id, kind: "skill" as const, name: mount.seed.resource.name, revision: mount.seed.resource.revision!, resourceVersion: mount.seed.resource.resourceVersion!,
             content: `Skill base directory: ${JSON.stringify(mount.path)}\nResolve relative references against this exact directory.\n\n${await readFile(mount.filePath, { encoding: "utf8", signal: resourceSignal })}`,
             assertCurrent: () => { nativeSkills!.assertCurrent(); if (builtinInitializationCurrent && !builtinInitializationCurrent()) throw new Error("The native Skill plugin was not acknowledged as loaded."); }
@@ -4078,7 +4079,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             : {
                 settings: {
                   disableClaudeAiConnectors: true,
-                  ...(nativeSkills?.restrictImplicit ? { skillOverrides: { ...nativeSkills.skillOverrides } } : {}),
+                  ...(nativeSkills !== undefined && (nativeSkills.restrictImplicit || Object.keys(nativeSkills.skillOverrides).length > 0)
+                    ? { skillOverrides: { ...nativeSkills.skillOverrides } } : {}),
                   // Filesystem settings remain available below, but a native
                   // helper must never replace the Host-owned credential path.
                   // The fixed CLI additionally filters provider-related `env`

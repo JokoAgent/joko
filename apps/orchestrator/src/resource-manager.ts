@@ -5,7 +5,7 @@ import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve,
 
 import type { ProjectSkillCandidate } from "@joko/adapter-pi";
 import { CODEX_PROJECT_SKILL_ROOTS } from "@joko/adapter-codex";
-import { redactSecrets, type AdapterContext, type ApprovedSkillSeed, type RuntimeResource } from "@joko/core";
+import { redactSecrets, type AdapterContext, type ApprovedSkillSeed, type NativeSkillPolicy, type RuntimeResource } from "@joko/core";
 import { SessionRuntimeHandoffStore, type OperationalStore } from "@joko/store";
 import { readSkillFile } from "./skill-file.js";
 import type { BuiltinSkillCatalog } from "./builtin-skills.js";
@@ -2648,6 +2648,39 @@ export class PiResourceManager {
       return Object.freeze(seeds);
     });
     return waitForCaller(snapshot, signal);
+  }
+
+  /** Claude can discover the original project file independently of the managed copy. */
+  async claudeProjectSkillPolicy(context: AdapterContext): Promise<NativeSkillPolicy | undefined> {
+    const { target, signal } = context;
+    if (target.remoteWorkspace !== undefined || context.hostedExecution !== undefined) return;
+    this.#assertInitialized();
+    return waitForCaller(this.#mutate(async () => {
+      const skillRoot = join(target.workspaceRoot, ".claude", "skills");
+      const disabled: StoredResource[] = [];
+      const overrides: Array<readonly [string, "off"]> = [];
+      for (const record of this.#records.values()) {
+        signal.throwIfAborted();
+        if (record.backendId !== target.backendId || record.targetId !== target.id || record.kind !== "skill"
+          || record.state !== "disabled" || record.enabled || record.approvedAt === undefined || !isDirectProjectResource(record)
+          || !samePath(dirname(record.canonicalPath), skillRoot)) continue;
+        const name = basename(record.canonicalPath);
+        if (name.startsWith(".")) continue;
+        this.#assertStoredProjectTargetTrusted(record);
+        const path = join(record.canonicalPath, "SKILL.md");
+        const entry = await optionalLstat(path);
+        if (!entry?.isFile() || !samePath(await realpath(path), path)) continue;
+        disabled.push(record);
+        overrides.push([name, "off"]);
+      }
+      if (disabled.length === 0) return;
+      const assertCurrent = () => {
+        this.#assertTrustedProjectTarget(target.backendId, target.id, target.workspaceRoot);
+        if (disabled.some(record => this.#records.get(record.id) !== record)) throw new Error("The Claude project Skill settings changed.");
+      };
+      assertCurrent();
+      return { mode: "ambient", overrides: Object.freeze(Object.fromEntries(overrides)), assertCurrent } satisfies NativeSkillPolicy;
+    }), signal);
   }
 
   #runtimeCatalogSource(source: RuntimeResourceCatalogSource | undefined, runtimeOwner: AdapterContext | undefined): (record: StoredResource) => boolean {

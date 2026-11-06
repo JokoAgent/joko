@@ -475,6 +475,21 @@ describe("ClaudeCodeAdapter", () => {
       expect(options.plugins).toBeUndefined(); await adapter.closeSession(binding, contextFor(binding).context);
     } finally { await adapter.dispose(); }
   });
+  test.each([
+    { settingSources: ["user", "project", "local"] as const, overrides: { report: "off" } },
+    { settingSources: ["user"] as const, overrides: undefined }
+  ])("applies native project Skill disables with settings $settingSources", async ({ settingSources, overrides }) => {
+    const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime, { settingSources, resolveNativeSkills: async () => [],
+      resolveNativeSkillPolicy: () => ({ mode: "ambient", overrides: { report: "off" }, assertCurrent: () => undefined }) });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const { options } = runtime.queries[0]!.params;
+      expect(options.settingSources).toEqual(settingSources);
+      expect(options.settings).toBeTypeOf("object");
+      expect(typeof options.settings === "object" ? options.settings.skillOverrides : undefined).toEqual(overrides);
+      await adapter.closeSession(binding, contextFor(binding).context);
+    } finally { await adapter.dispose(); }
+  });
   test("loads personal skill discovery through the native plugin and retains the full original file", async () => {
     const source = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-personal-")));
     const body = "---\nname: report\ndescription: Prepare reports\n---\nComplete original instructions.\n";

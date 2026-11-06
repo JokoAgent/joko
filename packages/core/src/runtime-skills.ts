@@ -15,7 +15,12 @@ export interface ApprovedSkillSeed {
     readonly frontmatterBytes: number; readonly bodyStartLine: number };
 }
 export type ApprovedSkillResolver = (context: AdapterContext, signal: AbortSignal) => Promise<readonly ApprovedSkillSeed[]>;
-export interface NativeSkillPolicy { readonly mode: "explicit"; readonly overrides?: Readonly<Record<string, "on" | "off">>; readonly assertCurrent: () => void }
+export type NativeSkillPolicy = {
+  readonly assertCurrent: () => void;
+} & (
+  | { readonly mode: "explicit"; readonly overrides?: Readonly<Record<string, "on" | "off">> }
+  | { readonly mode: "ambient"; readonly overrides: Readonly<Record<string, "off">> }
+);
 export type NativeSkillPolicyResolver = (context: AdapterContext) => NativeSkillPolicy | undefined | Promise<NativeSkillPolicy | undefined>;
 export interface NativeSkillMount {
   readonly seed: ApprovedSkillSeed;

@@ -1,10 +1,11 @@
-import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
+import type { AdapterContext } from "@joko/core";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -734,6 +735,46 @@ describe("Pi resource production onboarding", () => {
     });
     expect(fixture.resources.get(resource!.id)).toMatchObject({ state: "removed", enabled: false });
     expect(restartBackend).toHaveBeenCalledTimes(5);
+
+    upsertClaudeBackend(["skill", "prompt"]);
+    const skill = fixture.resources.list({ backendId: "claude-code", targetId: "claude-project" }).find(entry => entry.kind === "skill")!;
+    const skillFile = join(claudeWorkspace, ".claude", "skills", "review", "SKILL.md");
+    const skillBody = "---\nname: native-review\ndescription: Review the fixture\n---\nCHECK $ARGUMENTS\n";
+    await writeFile(skillFile, skillBody);
+    await submit(fixture.services, "discover-claude-skill-revision", discoverClaudeProject);
+    const revised = fixture.resources.get(skill.id);
+    const target = fixture.store.getTarget("claude-project").descriptor;
+    const context: AdapterContext = { sessionId: "claude-task", generation: 1, backendInstanceGeneration: 1,
+      target, signal: new AbortController().signal, emit: async () => undefined, requestInteraction: async () => ({ kind: "cancelled" }),
+      artifactCapacityBytes: 0, storeArtifact: async () => { throw new Error("Unexpected artifact."); } };
+    await expect(fixture.resources.claudeProjectSkillPolicy(context)).resolves.toBeUndefined();
+    await submit(fixture.services, "approve-native-claude-skill", {
+      case: "approveResource", value: create(contract.ApproveResourceMutationSchema, { resourceId: skill.id, discoveredRevision: revised.discoveredRevision })
+    });
+    const toggle = (operationId: string, enabled: boolean) => submit(fixture.services, operationId, {
+      case: "setResourceEnabled", value: create(contract.SetResourceEnabledMutationSchema, { resourceId: skill.id, enabled })
+    });
+    await toggle("enable-native-claude-skill", true);
+    await expect(fixture.resources.runtimeSkillSnapshot(target.backendId, target.id, context.signal)).resolves.toEqual([
+      expect.objectContaining({ resource: expect.objectContaining({ id: skill.id }) })
+    ]);
+    await toggle("disable-native-claude-skill", false);
+    expect(fixture.resources.get(skill.id)).toMatchObject({ state: "disabled", enabled: false });
+    expect(restartBackend).toHaveBeenLastCalledWith("claude-code");
+    await expect(fixture.resources.runtimeSkillSnapshot(target.backendId, target.id, context.signal)).resolves.toEqual([]);
+    const policy = await fixture.resources.claudeProjectSkillPolicy(context);
+    expect(policy).toMatchObject({ mode: "ambient", overrides: { review: "off" } });
+    expect(await readFile(skillFile, "utf8")).toBe(skillBody);
+
+    const other = { ...target, id: "claude-other-project", workspaceRoot: fixture.workspace };
+    fixture.store.upsertTarget(other);
+    await expect(fixture.resources.claudeProjectSkillPolicy({ ...context, target: other })).resolves.toBeUndefined();
+    await rm(skillFile);
+    await expect(fixture.resources.claudeProjectSkillPolicy(context)).resolves.toBeUndefined();
+    await writeFile(skillFile, skillBody);
+    await toggle("reenable-native-claude-skill", true);
+    expect(() => policy!.assertCurrent()).toThrow(/settings changed/u);
+    await expect(fixture.resources.claudeProjectSkillPolicy(context)).resolves.toBeUndefined();
   });
 });
 
