@@ -82,8 +82,9 @@ enum RemoteDesktopInputWire {
     return number >= 0 && number <= 1
   }
 
-  static func encode(sequence: Int, events: [[String: Any]]) -> Data? {
-    guard sequence >= 1, !events.isEmpty, events.count <= 64 else { return nil }
+  static func encode(controlGeneration: String, sequence: Int, events: [[String: Any]]) -> Data? {
+    guard let generation = Int(controlGeneration), generation >= 1, generation <= 9_007_199_254_740_991,
+          sequence >= 1, !events.isEmpty, events.count <= 64 else { return nil }
     for event in events {
       let fields = Set(event.keys)
       switch event["kind"] as? String {
@@ -110,7 +111,7 @@ enum RemoteDesktopInputWire {
     }
     guard let encodedEvents = try? JSONSerialization.data(withJSONObject: events, options: [.withoutEscapingSlashes]),
           let text = String(data: encodedEvents, encoding: .utf8), text.utf16.count <= 16_384,
-          let data = try? JSONSerialization.data(withJSONObject: ["sequence": sequence, "events": events],
+          let data = try? JSONSerialization.data(withJSONObject: ["controlGeneration": generation, "sequence": sequence, "events": events],
             options: [.withoutEscapingSlashes]), data.count <= 32_768 else { return nil }
     return data
   }

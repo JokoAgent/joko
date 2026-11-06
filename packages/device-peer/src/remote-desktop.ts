@@ -200,6 +200,7 @@ export type RemoteDesktopRequest =
   | {
       readonly op: "input";
       readonly lease: string;
+      readonly controlGeneration: number;
       readonly sequence: number;
       readonly events: readonly RemoteDesktopInput[];
     }
@@ -493,8 +494,9 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       return Object.freeze({ op: "hostMute", lease, controlGeneration: value.controlGeneration as number,
         enabled: value.enabled });
     case "input": {
-      requireExactKeys(value, ["op", "lease", "sequence", "events"]);
-      if (!Number.isSafeInteger(value.sequence)
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "sequence", "events"]);
+      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1
+        || !Number.isSafeInteger(value.sequence)
         || (value.sequence as number) < 1
         || !Array.isArray(value.events)
         || value.events.length < 1
@@ -506,6 +508,7 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       return Object.freeze({
         op: "input",
         lease,
+        controlGeneration: value.controlGeneration as number,
         sequence: value.sequence as number,
         events: Object.freeze(value.events.map((event) => Object.freeze({ ...event })))
       });

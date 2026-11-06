@@ -125,6 +125,7 @@ export function mountRemoteDesktopViewer(root, postMessage, config) {
     fy = 0.5,
     mode = "pointer",
     control = false,
+    controlGeneration = 0,
     clipboardShortcuts = false,
     clipboardModifier = "control",
     deferredClipboardModifier = null,
@@ -859,7 +860,7 @@ export function mountRemoteDesktopViewer(root, postMessage, config) {
     }
   }
   function flush() {
-    if (!pending.length) return;
+    if (!pending.length || controlGeneration < 1) return;
     // Input is an intent about the picture the user saw, not durable work.
     // Never replay old clicks/typing after a stalled ACK or data channel drains.
     if (performance.now() - pendingSince >= 2000) {
@@ -883,7 +884,7 @@ export function mountRemoteDesktopViewer(root, postMessage, config) {
       dc.bufferedAmount < 16384
     ) {
       try {
-        dc.send(JSON.stringify({ sequence, events }));
+        dc.send(JSON.stringify({ controlGeneration, sequence, events }));
       } catch {
         pending = [];
         control = false;
@@ -892,7 +893,7 @@ export function mountRemoteDesktopViewer(root, postMessage, config) {
       }
     } else {
       sending = true;
-      post({ type: "input", sequence, events });
+      post({ type: "input", controlGeneration, sequence, events });
     }
   }
   const inputTimer = setInterval(() => {
@@ -2312,6 +2313,7 @@ export function mountRemoteDesktopViewer(root, postMessage, config) {
         stopPanAnimation();
         resetCursor();
         control = false;
+        controlGeneration = 0;
         release();
         pending = [];
         sending = false;
@@ -2382,7 +2384,9 @@ export function mountRemoteDesktopViewer(root, postMessage, config) {
         // existing sequence fence so a late old ACK cannot unlock a new batch.
         seq++;
         sending = false;
-        control = message.enabled;
+        controlGeneration = message.enabled === true && Number.isSafeInteger(message.controlGeneration) && message.controlGeneration > 0
+          ? message.controlGeneration : 0;
+        control = controlGeneration > 0;
         if (!control) showKeyboard(false);
         pending = [];
         updateMouseButtons();
@@ -2464,6 +2468,7 @@ export function mountRemoteDesktopViewer(root, postMessage, config) {
         image.style.visibility = "visible";
         showKeyboard(false);
         control = false;
+        controlGeneration = 0;
         release();
         pending = [];
         sending = false;

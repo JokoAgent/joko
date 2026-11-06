@@ -30,7 +30,7 @@ function viewer(nativeControls = false) {
   new Function(html.match(/<script>([\s\S]*?)<\/script>/u)![1]!)();
   const receive = (value: object) => scope.__jokoRemoteDesktop.receive(value);
   receive({ type: "init", epoch: "current-mouse", width: 800, height: 600, webrtc: false, sequenceBase: 100, sequenceLimit: 10_000 });
-  receive({ type: "control", enabled: true });
+  receive({ type: "control", enabled: true, controlGeneration: 1 });
   const config = (enabled: boolean, native = nativeControls) => receive({ type: "mouseButtons", epoch: "current-mouse", enabled, nativeControls: native, labels });
   config(true);
   const packets = () => posted.filter(message => message.type === "input");
@@ -73,7 +73,7 @@ describe("actual floating mouse controls viewer", () => {
   it("keeps touch movement while a floating button suppresses stage taps and the 400 ms hold", async () => {
     const value = viewer(); value.pointer(value.button("right"), "pointerdown");
     value.pointer(value.stage, "pointerdown", 12);
-    value.receive({ type: "control", enabled: true });
+    value.receive({ type: "control", enabled: true, controlGeneration: 1 });
     expect(value.button("right").getAttribute("aria-pressed")).toBe("true");
     await vi.advanceTimersByTimeAsync(450);
     value.pointer(value.stage, "pointerup", 12);

@@ -40,7 +40,7 @@ describe("native media HTML overlay", () => {
     expect(value.posted.find(message => message.type === "nativeViewport")).toMatchObject({
       epoch: "current", x: 0, y: 75, width: 800, height: 450, fillHeight: false
     });
-    value.receive({ type: "control", enabled: true });
+    value.receive({ type: "control", enabled: true, controlGeneration: 1 });
     value.receive({ type: "events", events: [{ kind: "key", code: "KeyA", down: true }] });
     expect(value.posted.find(message => message.type === "input")).toMatchObject({
       epoch: "current", sequence: 101, events: [{ kind: "key", code: "KeyA", down: true }]

@@ -14,16 +14,17 @@ describe("Remote Desktop active capture source", () => {
     const h = await harness(), channel = h.openInputChannel();
     const pending: (() => void)[] = [];
     h.input.mockImplementation(() => new Promise<void>(resolve => { pending.push(resolve); }));
-    for (let sequence = 1; sequence <= 9; sequence++) channel.receive({ sequence, events: [{ kind: "key", code: "KeyA", down: true }] });
+    for (let sequence = 1; sequence <= 9; sequence++) channel.receive({ controlGeneration: 7, sequence, events: [{ kind: "key", code: "KeyA", down: true }] });
     expect(h.input).toHaveBeenCalledTimes(9);
-    expect(h.input.mock.calls[8]).toEqual(["lease", 9, [{ kind: "release" }]]);
-    channel.receive({ sequence: 10, events: [{ kind: "move", x: 0.5, y: 0.5 }] });
+    expect(h.input.mock.calls[0]).toEqual(["lease", "attempt", 7, 1, [{ kind: "key", code: "KeyA", down: true }]]);
+    expect(h.input.mock.calls[8]).toEqual(["lease", "attempt", 7, 9, [{ kind: "release" }]]);
+    channel.receive({ controlGeneration: 7, sequence: 10, events: [{ kind: "move", x: 0.5, y: 0.5 }] });
     expect(h.input).toHaveBeenCalledTimes(9);
     channel.receive({ type: "request", id: "during-release", request: { op: "capabilities" } });
     await vi.waitFor(() => expect(channel.send).toHaveBeenCalled());
     expect(channel.close).not.toHaveBeenCalled();
     pending.splice(0).forEach(resolve => { resolve(); });
-    await vi.waitFor(() => { channel.receive({ sequence: 11, events: [{ kind: "release" }] }); expect(h.input).toHaveBeenCalledTimes(10); });
+    await vi.waitFor(() => { channel.receive({ controlGeneration: 8, sequence: 11, events: [{ kind: "release" }] }); expect(h.input).toHaveBeenCalledTimes(10); });
     pending.splice(0).forEach(resolve => { resolve(); });
     h.command({ op: "stop" });
   });
@@ -31,10 +32,10 @@ describe("Remote Desktop active capture source", () => {
   it("rejects malformed input while congested and ignores messages on a retired channel", async () => {
     const h = await harness(), channel = h.openInputChannel();
     h.input.mockImplementation(() => new Promise<void>(() => undefined));
-    for (let sequence = 1; sequence <= 8; sequence++) channel.receive({ sequence, events: [{ kind: "release" }] });
-    channel.receive({ sequence: 9, events: [{ kind: "key", code: "untrusted-code", down: true }] });
+    for (let sequence = 1; sequence <= 8; sequence++) channel.receive({ controlGeneration: 7, sequence, events: [{ kind: "release" }] });
+    channel.receive({ controlGeneration: 7, sequence: 9, events: [{ kind: "key", code: "untrusted-code", down: true }] });
     expect(channel.close).toHaveBeenCalledOnce();
-    channel.receive({ sequence: 10, events: [{ kind: "release" }] });
+    channel.receive({ controlGeneration: 7, sequence: 10, events: [{ kind: "release" }] });
     expect(h.input).toHaveBeenCalledTimes(8);
   });
 

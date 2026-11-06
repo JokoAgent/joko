@@ -147,7 +147,7 @@ describe("actual standalone Desktop viewer quiet shell", () => {
     const stage = shell.container.querySelector("#stage");
     await act(async () => {
       shell.container.querySelector<HTMLButtonElement>('[aria-label="Disconnect"]')!.click();
-      owner.post({ type: "input", epoch: "retired", sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
+      owner.post({ type: "input", epoch: "retired", controlGeneration: 1, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
       await vi.advanceTimersByTimeAsync(6000); await flush();
     });
     expect(value.requests).toHaveLength(0); expect(value.api.close).not.toHaveBeenCalled();

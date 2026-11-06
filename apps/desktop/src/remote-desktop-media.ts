@@ -135,7 +135,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   #overlayExcluded: readonly number[] = [];
   #overlayRevision = 0;
   #sourceRevision = 0;
-  #inputHandler: ((leaseId: string, sequence: number, events: readonly RemoteDesktopInput[]) => void) | undefined;
+  #inputHandler: ((leaseId: string, controlGeneration: number, sequence: number, events: readonly RemoteDesktopInput[]) => void) | undefined;
   #controlHandler: ((leaseId: string, request: unknown) => Promise<unknown>) | undefined;
   #presentationPongHandler: ((leaseId: string) => void) | undefined;
   #presentationLease: string | undefined;
@@ -163,8 +163,8 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.reply, (event, id, reply) => {
       this.#receiveReply(event, id, reply);
     });
-    ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.input, (event, leaseId, sequence, events) => {
-      this.#receiveInput(event, leaseId, sequence, events);
+    ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.input, (event, leaseId, attemptId, controlGeneration, sequence, events) => {
+      this.#receiveInput(event, leaseId, attemptId, controlGeneration, sequence, events);
     });
     ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.request, (event, leaseId, attemptId, message) =>
       this.#receiveControlRequest(event, leaseId, attemptId, message));
@@ -202,6 +202,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
 
   setInputHandler(handler: (
     leaseId: string,
+    controlGeneration: number,
     sequence: number,
     events: readonly RemoteDesktopInput[]
   ) => void): () => void {
@@ -884,17 +885,17 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   #receiveInput(
     event: IpcMainInvokeEvent,
     leaseId: unknown,
+    attemptId: unknown,
+    controlGeneration: unknown,
     sequence: unknown,
     events: unknown
   ): void {
     this.#assertSender(event);
-    if (typeof leaseId !== "string" || this.#attempt?.leaseId !== leaseId
-      || !Number.isSafeInteger(sequence) || (sequence as number) < 1) {
-      throw new Error("Remote Desktop capture input is invalid.");
-    }
-    const request = parseRemoteDesktopRequest({ op: "input", lease: leaseId, sequence, events });
+    const attempt = this.#attempt;
+    if (typeof leaseId !== "string" || attempt?.leaseId !== leaseId || attempt.attemptId !== attemptId || !attempt.current()) return;
+    const request = parseRemoteDesktopRequest({ op: "input", lease: leaseId, controlGeneration, sequence, events });
     if (request.op !== "input") throw new Error("Remote Desktop capture input is invalid.");
-    this.#inputHandler?.(leaseId, request.sequence, request.events);
+    this.#inputHandler?.(leaseId, request.controlGeneration, request.sequence, request.events);
   }
 
   async #nativeFrame(

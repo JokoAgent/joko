@@ -202,6 +202,7 @@ export interface DevicePeerRemoteDesktopHostPort {
   /** Read-only current proof; this call must never itself renew the lease. */
   probePresentation(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopPresentationProof>;
   sendInput(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
     readonly sequence: bigint;
     readonly events: readonly RemoteDesktopInputEvent[];
   }): Promise<void>;

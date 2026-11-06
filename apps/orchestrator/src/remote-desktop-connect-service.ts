@@ -214,6 +214,7 @@ export function createRemoteDesktopConnectService(
       const peer = fromProtoRouteIdentity(request.peer);
       await dependencies.coordinator.sendInput(connection, peer, {
         leaseId: request.leaseId,
+        controlGeneration: request.controlGeneration,
         sequence: request.sequence,
         events: request.events
       }, context.signal);

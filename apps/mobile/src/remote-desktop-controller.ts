@@ -241,7 +241,7 @@ export interface MobileRemoteDesktopTransport {
     lockOnExit: boolean, signal?: AbortSignal): Promise<RemoteDesktopPrivacyScreenResult>;
   presentation(host: DevicePeerDescriptor, leaseId: string, enabled: boolean,
     signal?: AbortSignal): Promise<RemoteDesktopControlState>;
-  input(host: DevicePeerDescriptor, leaseId: string, sequence: bigint,
+  input(host: DevicePeerDescriptor, leaseId: string, controlGeneration: bigint, sequence: bigint,
     events: readonly RemoteDesktopInputEvent[], signal?: AbortSignal): Promise<void>;
   iceConfiguration(host: DevicePeerDescriptor, leaseId: string,
     signal?: AbortSignal): Promise<readonly RemoteDesktopIceServer[]>;
@@ -2205,6 +2205,7 @@ export class MobileRemoteDesktopController {
     else if (message.type === "offer") void this.#offer(message.attemptId, message.sdp);
     else if (message.type === "ice") void this.#ice(message);
     else if (message.type === "input" && this.#interactive
+      && BigInt(message.controlGeneration) === this.#controlGeneration
       && message.sequence > this.#viewerSequenceBase && message.sequence <= this.#viewerSequenceLimit) {
       void this.#input(message.sequence, message.events);
     }
@@ -2693,13 +2694,14 @@ export class MobileRemoteDesktopController {
       if (!this.#ready(generation) || this.#displayModeOperation
         || this.#lease?.leaseId !== lease.leaseId) return;
       if (!validControlGeneration(state.controlGeneration)) throw new Error("Invalid Remote Desktop control generation.");
+      const controlGenerationChanged = state.controlGeneration !== this.#controlGeneration;
       if (!this.#adoptControlGeneration(state.controlGeneration)) return;
       if (state.controlling !== this.#snapshot.controlling) {
         this.#set({ ...this.#snapshot, controlling: state.controlling,
           wantedControl: state.controlling && this.#snapshot.wantedControl });
         this.#emit({ type: "control", enabled: state.controlling });
         if (!state.controlling) this.#emit({ type: "releaseInput" });
-      }
+      } else if (controlGenerationChanged && state.controlling) this.#emit({ type: "control", enabled: true });
       this.#syncHostMute();
       if (!state.controlling) this.#restoreForegroundControl();
     } catch (error) {
@@ -3053,7 +3055,7 @@ export class MobileRemoteDesktopController {
         nativeDispatched = false;
       }
       if (!current()) return;
-      await this.transport.input(host, lease.leaseId, BigInt(sequence), events, this.#request.signal);
+      await this.transport.input(host, lease.leaseId, controlGeneration, BigInt(sequence), events, this.#request.signal);
       if (current()) this.#emit({ type: "ack", epoch, sequence });
     } catch (error) {
       if (current()) {
@@ -3412,10 +3414,11 @@ export class MobileRemoteDesktopController {
     const release = create(RemoteDesktopInputEventSchema, {
       event: { case: "release", value: create(RemoteDesktopReleaseInputSchema, {}) }
     });
+    const controlGeneration = this.#controlGeneration;
     try {
-      await this.transport.input(host, lease.leaseId, BigInt(sequence), [release], this.#request.signal);
+      await this.transport.input(host, lease.leaseId, controlGeneration, BigInt(sequence), [release], this.#request.signal);
     } catch (error) {
-      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
+      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId || this.#controlGeneration !== controlGeneration) return;
       try {
         const state = await this.transport.control(host, lease.leaseId, false, this.#request.signal);
         if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
@@ -3447,6 +3450,8 @@ export class MobileRemoteDesktopController {
     // response reopen an older control authority for a later clipboard call.
     if (this.#controlGeneration !== 0n && value < this.#controlGeneration) return false;
     if (this.#controlGeneration !== 0n && value > this.#controlGeneration) {
+      this.#inputBatch = undefined;
+      this.#inputPending = false;
       if (this.#keyboardScope || this.#snapshot.keyboardOpen || this.#mouseGrants.size > 0) {
         this.#emit({ type: "releaseInput" });
         this.#retireKeyboardTools(true);
@@ -3477,7 +3482,11 @@ export class MobileRemoteDesktopController {
   }
 
   #emit(message: MobileRemoteDesktopViewerCommand): void {
-    if (message.type === "control" && message.enabled && this.#viewOnlySelected) message = { ...message, enabled: false };
+    if (message.type === "control" && message.enabled === true) {
+      const controlGeneration = Number(this.#controlGeneration);
+      message = !this.#viewOnlySelected && Number.isSafeInteger(controlGeneration) && controlGeneration > 0
+        ? { ...message, controlGeneration } : { ...message, enabled: false };
+    }
     if (message.type === "releaseInput" || message.type === "mode" || message.type === "init"
       || message.type === "stop" || (message.type === "control" && message.enabled !== true)) {
       this.#retireTouchpad();
@@ -3998,7 +4007,7 @@ type ViewerMessage =
   | { readonly type: "offer"; readonly epoch: string; readonly attemptId: string; readonly sdp: string }
   | { readonly type: "ice"; readonly epoch: string; readonly attemptId: string; readonly candidates: readonly RemoteDesktopIceCandidate[];
       readonly after: number; readonly exchangeId: number }
-  | { readonly type: "input"; readonly epoch: string; readonly sequence: number; readonly events: unknown };
+  | { readonly type: "input"; readonly epoch: string; readonly controlGeneration: number; readonly sequence: number; readonly events: unknown };
 
 function channelGeneration(value: unknown): bigint {
   if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
@@ -4034,8 +4043,10 @@ function parseViewerMessage(raw: unknown): ViewerMessage | undefined {
     && value.frameId.length >= 1 && value.frameId.length <= 512 && typeof value.presented === "boolean") {
     return { type: "framePresented", epoch: value.epoch, frameId: value.frameId, presented: value.presented };
   }
-  if (value.type === "input" && Number.isSafeInteger(value.sequence) && (value.sequence as number) > 0) {
-    return { type: "input", epoch: value.epoch, sequence: value.sequence as number, events: value.events };
+  if (value.type === "input" && Number.isSafeInteger(value.sequence) && (value.sequence as number) > 0
+    && Number.isSafeInteger(value.controlGeneration) && (value.controlGeneration as number) > 0) {
+    return { type: "input", epoch: value.epoch, controlGeneration: value.controlGeneration as number,
+      sequence: value.sequence as number, events: value.events };
   }
   if (value.type === "fallback" && value.attemptId === null) {
     return { type: "fallback", epoch: value.epoch, attemptId: null };

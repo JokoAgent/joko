@@ -639,7 +639,8 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         } catch { /* Ordinary input validation owns malformed batches. */ }
         try {
           const value: unknown = JSON.parse(data);
-          if (!record(value) || !exactKeys(value, ["sequence", "events"])
+          if (!record(value) || !exactKeys(value, ["controlGeneration", "sequence", "events"])
+            || !Number.isSafeInteger(value["controlGeneration"]) || (value["controlGeneration"] as number) < 1
             || !Number.isSafeInteger(value["sequence"]) || (value["sequence"] as number) < 1
             || !Array.isArray(value["events"]) || value["events"].length < 1
             || value["events"].length > 64 || !value["events"].every(validInput)) {
@@ -648,7 +649,7 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
           if (releasing) return;
           if (pending >= 8) {
             releasing = true;
-            void ipcRenderer.invoke(CHANNELS.input, command.leaseId, value["sequence"], [{ kind: "release" }])
+            void ipcRenderer.invoke(CHANNELS.input, command.leaseId, command.attemptId, value["controlGeneration"], value["sequence"], [{ kind: "release" }])
               .catch(() => { channel.close(); }).finally(() => { releasing = false; });
             return;
           }
@@ -656,6 +657,8 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
           void ipcRenderer.invoke(
             CHANNELS.input,
             command.leaseId,
+            command.attemptId,
+            value["controlGeneration"],
             value["sequence"],
             value["events"]
           ).catch(() => { channel.close(); }).finally(() => { pending -= 1; });

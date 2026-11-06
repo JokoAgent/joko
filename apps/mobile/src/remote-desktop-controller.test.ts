@@ -437,11 +437,11 @@ describe("Mobile native media and background presentation", () => {
     expect(value.controller.snapshot).toMatchObject({ controlling: generation, wantedControl: false, viewOnly: true });
     expect(value.control).not.toHaveBeenCalled();
     expect(value.commands.findLast(command => command.type === "inputAuthority")).toMatchObject({ grant: null });
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 3, events: [{ kind: "key", code: "KeyA", down: true }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 3, events: [{ kind: "key", code: "KeyA", down: true }] });
     await vi.advanceTimersByTimeAsync(3_000);
     expect(value.controller.snapshot).toMatchObject({ controlling: true, viewOnly: true, wantedControl: false });
     expect(value.sendInput).not.toHaveBeenCalled(); expect(value.input).not.toHaveBeenCalled();
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 4, events: [{ kind: "release" }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 4, events: [{ kind: "release" }] });
     await flushAsync(); expect(value.sendInput).toHaveBeenCalledOnce();
     await value.controller.setControl(true);
     expect(value.control).not.toHaveBeenCalled();
@@ -624,7 +624,7 @@ describe("Mobile native media and background presentation", () => {
 
   it("uses native accepted input exactly once with the complete captured grant", async () => {
     const value = await nativeFixture(true); value.input.mockClear();
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
     await flushAsync();
     expect(value.sendInput).toHaveBeenCalledWith({ epoch: value.epoch, attemptId, controlGeneration: "1",
       sequenceBase: value.init.sequenceBase, sequenceLimit: value.init.sequenceLimit,
@@ -656,7 +656,7 @@ describe("Mobile native media and background presentation", () => {
     controller.setViewerSink(command => commands.push({ ...command }));
     await controller.open(); controller.viewerMessage({ type: "ready" }); await flushAsync();
     const init = commands.findLast(command => command.type === "init")!;
-    controller.viewerMessage(JSON.stringify({ type: "input", epoch: init.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] }));
+    controller.viewerMessage(JSON.stringify({ type: "input", controlGeneration: 1, epoch: init.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] }));
     await flushAsync(); expect(value.input).toHaveBeenCalledTimes(1);
     expect(commands.at(-1)).toEqual({ type: "ack", epoch: init.epoch, sequence: 1 }); await controller.close();
   });
@@ -709,16 +709,16 @@ describe("Mobile native media and background presentation", () => {
     const value = await nativeFixture(true); value.input.mockClear();
     if (outcome === "throw") value.sendInput.mockRejectedValueOnce(new Error("unknown native receipt"));
     else value.sendInput.mockResolvedValueOnce(undefined as unknown as boolean);
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
     await flushAsync(); expect(value.input).not.toHaveBeenCalled(); expect(value.stop).toHaveBeenCalled();
     expect(value.controller.snapshot.controlling).toBe(false); await value.controller.close();
   });
 
   it("falls back once only for a false native receipt in the original control context", async () => {
     const value = await nativeFixture(true); value.sendInput.mockResolvedValueOnce(false); value.input.mockClear();
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
     await flushAsync(); expect(value.input).toHaveBeenCalledTimes(1);
-    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, expect.any(Array), expect.any(AbortSignal));
+    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, 1n, expect.any(Array), expect.any(AbortSignal));
     expect(value.commands.at(-1)).toEqual({ type: "ack", epoch: value.epoch, sequence: 1 }); await value.controller.close();
   });
 
@@ -726,7 +726,7 @@ describe("Mobile native media and background presentation", () => {
     const value = await nativeFixture(true); value.input.mockClear();
     let resolve!: (accepted: boolean) => void;
     value.sendInput.mockImplementationOnce(() => new Promise(receipt => { resolve = receipt; }));
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
     if (retirement === "attempt") value.event("iceConfig", { attemptId: nextAttemptId });
     else if (retirement === "control") await value.controller.setControl(false);
     else if (retirement === "route") value.controller.setRouteFocused(false);
@@ -1287,7 +1287,7 @@ describe("Mobile online display selection", () => {
     let httpInputSettled!: () => void;
     if (nativeVideo) value.sendInput.mockImplementationOnce(async () => new Promise<boolean>(resolve => { inputSettled = resolve; }));
     else value.input.mockImplementationOnce(async () => new Promise<void>(resolve => { httpInputSettled = resolve; }));
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "move", x: .3, y: .2 }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "move", x: .3, y: .2 }] });
     await flushAsync();
     const caps = vi.mocked(value.transport.capabilities).mock.calls.length;
     const switching = value.controller.selectDisplay("display-2");
@@ -1308,7 +1308,7 @@ describe("Mobile online display selection", () => {
     expect(nextEpoch).not.toBe(value.epoch);
     if (nativeVideo) inputSettled(false); else httpInputSettled();
     const count = value.commands.length;
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 2, events: [{ kind: "move", x: .1, y: .2 }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 2, events: [{ kind: "move", x: .1, y: .2 }] });
     value.controller.viewerMessage({ type: "streaming", epoch: value.epoch, attemptId: value.attemptId });
     value.controller.nativeMessage(JSON.stringify({ type: "videoFrameReady", epoch: value.epoch, attemptId: value.attemptId }));
     await flushAsync(); expect(value.commands).toHaveLength(count);
@@ -2228,7 +2228,7 @@ describe("MobileRemoteDesktopController", () => {
     controller.setInteractive(false);
     await flushAsync();
     expect(value.stop).not.toHaveBeenCalled();
-    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 999_999_999n,
+    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, 999_999_999n,
       [expect.objectContaining({ event: expect.objectContaining({ case: "release" }) })], expect.any(AbortSignal));
     controller.setForeground(false);
     expect(value.stop).toHaveBeenCalledTimes(1);
@@ -2384,7 +2384,7 @@ describe("MobileRemoteDesktopController", () => {
     const oldInit = commands.filter(command => command.type === "init").at(-1)!;
     await controller.fitViewerDisplay(390, 844); await flushAsync();
     expect(value.fitViewerDisplay).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, 888, 1920, expect.any(AbortSignal));
-    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, expect.any(BigInt),
+    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, expect.any(BigInt),
       [expect.objectContaining({ event: { case: "release", value: expect.any(Object) } })], expect.any(AbortSignal));
     expect(value.input.mock.invocationCallOrder[0]).toBeLessThan(value.fitViewerDisplay.mock.invocationCallOrder[0]!);
     expect(controller.snapshot).toMatchObject({ status: "live", selectedDisplayId: "display-1", viewerDisplayFitted: true,
@@ -2576,7 +2576,7 @@ describe("MobileRemoteDesktopController", () => {
     expect(nextInit).toMatchObject({ width: 1280, height: 720 }); expect(nextInit.epoch).not.toBe(oldInit.epoch);
     expect(nextInit.sequenceBase).toBeGreaterThan(oldInit.sequenceBase as number);
     controller.viewerMessage({ type: "framePresented", epoch: oldInit.epoch, attemptId: null, frameId: 1 });
-    controller.viewerMessage({ type: "input", epoch: oldInit.epoch, sequence: (oldInit.sequenceBase as number) + 1, events: [{ kind: "release" }] });
+    controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: oldInit.epoch, sequence: (oldInit.sequenceBase as number) + 1, events: [{ kind: "release" }] });
     await flushAsync(); expect(value.input).not.toHaveBeenCalled(); expect(controller.snapshot.hasFrame).toBe(false);
     await controller.close();
     expect(value.stop).toHaveBeenCalledWith(value.host, value.lease.leaseId, { lockScreen: false, controlGeneration: 0n });

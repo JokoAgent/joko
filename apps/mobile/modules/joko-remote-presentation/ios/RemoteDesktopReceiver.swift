@@ -248,7 +248,7 @@ final class RemoteDesktopReceiver: NSObject, RTCPeerConnectionDelegate, RTCDataC
           channel.bufferedAmount < 16_384, let sequence = RemoteDesktopBridgeNumber.integer(message["sequence"]),
           sequence > grant.sequenceBase, sequence <= grant.sequenceLimit, sequence > lastSequence,
           let events = message["events"] as? [[String: Any]],
-          let data = RemoteDesktopInputWire.encode(sequence: sequence, events: events) else { return false }
+          let data = RemoteDesktopInputWire.encode(controlGeneration: grant.controlGeneration, sequence: sequence, events: events) else { return false }
     guard channel.sendData(RTCDataBuffer(data: data, isBinary: false)) else { return false }
     lastSequence = sequence
     return true

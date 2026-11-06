@@ -620,16 +620,21 @@ export class RemoteDesktopCoordinator {
     identity: DevicePeerSelectionIdentity,
     input: {
       readonly leaseId: string;
+      readonly controlGeneration: bigint;
       readonly sequence: bigint;
       readonly events: readonly contract.RemoteDesktopInputEvent[];
     },
     signal: AbortSignal
   ): Promise<void> {
     const state = this.#requireLease(connection, identity, input.leaseId);
+    if (input.controlGeneration < 1n || input.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw invalidArgument("Remote Desktop input control generation is invalid.");
+    }
     validateInput(input.sequence, input.events);
     const authority = this.#capture(connection, identity);
     const action = create(contract.DevicePeerSendRemoteDesktopInputActionSchema, {
       leaseId: input.leaseId,
+      controlGeneration: input.controlGeneration,
       sequence: input.sequence,
       events: [...input.events]
     });

@@ -60,7 +60,7 @@ const VIEWER_SCRIPT = String.raw`
   const cursor=document.getElementById('cursor'),cursorImage=document.getElementById('cursor-image'),keyboard=document.getElementById('keyboard');
   const bg=document.getElementById('bg'),bgCanvas=document.getElementById('bg-canvas');
   const mouseButtons=document.getElementById('mouse-buttons'),wheel=document.getElementById('mouse-wheel'),wheelGrip=document.getElementById('mouse-wheel-grip');
-  let epoch=null,dw=1920,dh=1080,zoom=1,panX=0,panY=0,mode='touch',control=false;
+  let epoch=null,dw=1920,dh=1080,zoom=1,panX=0,panY=0,mode='touch',control=false,controlGeneration=0;
   let pc=null,dc=null,attemptId=null,generation=0,retries=0,videoPresented=false,configPending=false;
   let nativeAttempt=null,nativeVideoActive=false;
   let deadline=null,disconnectTimer=null,retryTimer=null,stableTimer=null,iceTimer=null;
@@ -99,7 +99,7 @@ const VIEWER_SCRIPT = String.raw`
   function cursorViewport(){const v=viewport(),hotX=remoteCursor?.hotX??9,hotY=remoteCursor?.hotY??9,w=remoteCursor?.width??18,h=remoteCursor?.height??18,minX=Math.min(v.width-1,8+hotX),minY=Math.min(v.top+v.height-1,v.top+8+hotY);return{minX,maxX:Math.max(minX,v.width-8-(w-hotX)),minY,maxY:Math.max(minY,v.top+v.height-8-(h-hotY))};}
   function moveTouchpad(dx,dy){const r=layout(),v=cursorViewport(),area=viewport();if(cursorNeedsEntry){cx=clamp((bounded(r.x+cx*r.w,v.minX,v.maxX)-r.x)/r.w);cy=clamp((bounded(r.y+cy*r.h,v.minY,v.maxY)-r.y)/r.h);cursorNeedsEntry=false;}cx=clamp(cx+dx/r.w);cy=clamp(cy+dy/r.h);const x=r.x+cx*r.w,y=r.y+cy*r.h;if(zoom>1||r.w>area.width||r.h>area.height){panX+=bounded(x,v.minX,v.maxX)-x;panY+=bounded(y,v.minY,v.maxY)-y;}queue({kind:'move',x:cx,y:cy});render();}
   function queue(event){if(!control)return;if(event.kind==='key'||event.kind==='text'){localCursorAwake=false;render();}if(event.kind==='move'||event.kind==='button')noteLocalCursorActivity();const tail=pending[pending.length-1];if(event.kind==='move'&&tail?.kind==='move')pending[pending.length-1]=event;else if(event.kind==='scroll'&&tail?.kind==='scroll'){tail.dx=Math.max(-2000,Math.min(2000,tail.dx+event.dx));tail.dy=Math.max(-2000,Math.min(2000,tail.dy+event.dy));}else pending.push(event);if(pending.length>64){pending=[{kind:'release'}];control=false;post({type:'inputOverflow'});}}
-  function flush(){if(!pending.length||sending)return;if(seq>=sequenceLimit){pending=[];control=false;post({type:'inputOverflow'});render();return;}const events=pending.splice(0,64),sequence=++seq;if(pc?.connectionState==='connected'&&dc?.readyState==='open'&&dc.bufferedAmount<16384)dc.send(JSON.stringify({sequence,events}));else{sending=true;post({type:'input',sequence,events});}}
+  function flush(){if(!pending.length||sending||controlGeneration<1)return;if(seq>=sequenceLimit){pending=[];control=false;post({type:'inputOverflow'});render();return;}const events=pending.splice(0,64),sequence=++seq;if(pc?.connectionState==='connected'&&dc?.readyState==='open'&&dc.bufferedAmount<16384)dc.send(JSON.stringify({controlGeneration,sequence,events}));else{sending=true;post({type:'input',controlGeneration,sequence,events});}}
   setInterval(()=>{if(wheelY?.moved&&!sending){const offset=Math.max(-24,Math.min(24,wheelY.y-wheelY.start));if(Math.abs(offset)>4)scrollMouse(Math.sign(offset)*(Math.abs(offset)-4)*1.5);}flush();},33);
   function click(button=0){queue({kind:'button',button,down:true,x:cx,y:cy});queue({kind:'button',button,down:false,x:cx,y:cy});flush();}
   function resetWheel(){wheelY=null;wheelGrip.style.transform='translateY(0px)';}
@@ -164,6 +164,7 @@ const VIEWER_SCRIPT = String.raw`
       }
       case'init':
         release();showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();cursorOverlay=message.cursorOverlay===true;resetCursor();pending=[];sending=false;
+        control=false;controlGeneration=0;
         seq=Number.isSafeInteger(message.sequenceBase)&&message.sequenceBase>=0?message.sequenceBase:0;
         sequenceLimit=Number.isSafeInteger(message.sequenceLimit)&&message.sequenceLimit>seq?message.sequenceLimit:Number.MAX_SAFE_INTEGER;
         epoch=message.epoch;dw=message.width;dh=message.height;zoom=1;panX=panY=0;cursorNeedsEntry=true;fitToInsets=false;topInset=bottomInset=0;video.muted=message.audio!==true;retries=0;render();
@@ -219,7 +220,11 @@ const VIEWER_SCRIPT = String.raw`
         image.onerror=()=>{if(epoch===frameEpoch)post({type:'framePresented',frameId,presented:false});};
         image.src='data:image/jpeg;base64,'+message.jpeg;break;
       }
-      case'control':{const enabled=message.enabled===true;if(control!==enabled||!enabled)release();control=enabled;if(!control)showKeyboard(false);updateMouseButtons();render();break;}
+      case'control':{
+        const generation=message.enabled===true&&Number.isSafeInteger(message.controlGeneration)&&message.controlGeneration>0?message.controlGeneration:0;
+        if(generation!==controlGeneration||generation===0){pending=[];release();pending=[];sending=false;}
+        controlGeneration=generation;control=generation>0;if(!control)showKeyboard(false);updateMouseButtons();render();break;
+      }
       case'mode':release();mode=message.mode;render();break;
       case'fit':zoom=1;panX=panY=0;cursorNeedsEntry=true;render();break;
       case'keyboard':showKeyboard(message.enabled===true);break;
@@ -230,7 +235,7 @@ const VIEWER_SCRIPT = String.raw`
       case'videoSettings':video.muted=message.audio!==true;retries=0;if(!nativeMedia)connect();break;
       case'presentation':void setPresentation(message.enabled===true);break;
       case'stop':
-        void setPresentation(false);showKeyboard(false);release();control=false;showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();resetCursor();cursorOverlay=false;pending=[];sending=false;epoch=null;closeRtc(message.preserveFrame===true);render();break;
+        void setPresentation(false);showKeyboard(false);release();control=false;controlGeneration=0;showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();resetCursor();cursorOverlay=false;pending=[];sending=false;epoch=null;closeRtc(message.preserveFrame===true);render();break;
     }
   }
   window.__jokoRemoteDesktop={receive};window.addEventListener('message',event=>{try{receive(typeof event.data==='string'?JSON.parse(event.data):event.data);}catch{}});document.addEventListener('message',event=>{try{receive(typeof event.data==='string'?JSON.parse(event.data):event.data);}catch{}});render();post({type:'ready'});

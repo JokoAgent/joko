@@ -731,7 +731,7 @@ describe("actual Mobile Remote Desktop Screen native composition", () => {
     expect(currentController.snapshot).toMatchObject({ status: "live", hasFrame: true, pipAvailable: true });
     expect(native.htmlCommands.findLast(command => command.type === "nativeVideo")).toEqual({ type: "nativeVideo", epoch, attemptId });
     expect(native.receive.mock.calls.some(call => call[0].type === "init" && call[0].epoch !== epoch)).toBe(false);
-    await act(async () => { webMessage({ type: "input", epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] }); await flush(); });
+    await act(async () => { webMessage({ type: "input", epoch, controlGeneration: 1, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] }); await flush(); });
     expect(native.sendInput).toHaveBeenCalledWith(expect.objectContaining({ epoch, attemptId, controlGeneration: "1",
       sequenceBase: 0, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] }));
     expect(value.input).not.toHaveBeenCalled();

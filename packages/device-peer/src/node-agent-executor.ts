@@ -775,6 +775,7 @@ export class NodeDevicePeerAgentExecutor {
         await this.#requireRemoteDesktop().sendInput({
           controllerDeviceId: command.controllerDeviceId,
           leaseId: command.action.value.leaseId,
+          controlGeneration: command.action.value.controlGeneration,
           sequence: command.action.value.sequence,
           events: command.action.value.events.map((event) => clone(RemoteDesktopInputEventSchema, event)),
           signal
@@ -2167,6 +2168,7 @@ function validateCommandInput(command: DevicePeerCommand): void {
     case "sendRemoteDesktopInput":
       remoteDesktopControllerId(command.controllerDeviceId);
       remoteDesktopLeaseId(command.action.value.leaseId);
+      remoteDesktopControlGeneration(command.action.value.controlGeneration);
       remoteDesktopSequence(command.action.value.sequence);
       remoteDesktopInput(command.action.value);
       return;

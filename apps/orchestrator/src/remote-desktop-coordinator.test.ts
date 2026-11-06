@@ -1898,6 +1898,7 @@ describe("RemoteDesktopCoordinator", () => {
     }));
     await expect(coordinator.sendInput(connection, identity, {
       leaseId: "lease-1",
+      controlGeneration: 1n,
       sequence: 1n,
       events: releases
     }, signal)).rejects.toMatchObject({ code: "invalid_argument" });
