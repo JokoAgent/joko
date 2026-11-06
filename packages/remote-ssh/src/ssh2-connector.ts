@@ -949,11 +949,11 @@ class Ssh2RemoteFileTransport implements RemoteFileTransportPort {
   async rename(sourcePath: string, destinationPath: string, signal?: AbortSignal): Promise<void> {
     const source = absoluteRemotePath(sourcePath);
     const destination = absoluteRemotePath(destinationPath);
-    await this.withSftp(signal, (sftp) => atomicSftpRename(
-      sftp,
-      source,
-      destination,
+    // A move to a new name uses SFTP's no-overwrite request. Atomic text
+    // replacement explicitly selects the OpenSSH extension in write().
+    await this.withSftp(signal, (sftp) => callbackOperation<void>(
       signal,
+      (done) => sftp.rename(source, destination, done),
       this.#invalidate
     ));
   }
