@@ -7,10 +7,10 @@ import { requestWorkspaceDocumentLeave } from "../workspace-document-lifecycle.j
 import { InspectorTabContribution, type InspectorDock } from "./inspector-layout-context.js";
 import { inspectorSessionTabKey } from "./inspector-layout.js";
 import type { TerminalPaletteView } from "../model.js";
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
 import "./interactive-terminal.css";
-import type { JSX, KeyboardEvent as ReactKeyboardEvent } from "react";
+import type { JSX, KeyboardEvent as ReactKeyboardEvent, Ref } from "react";
 import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -98,7 +98,7 @@ import { formatCompactUsageTokens, resolveSessionUsageDisplay } from "./session-
 import { StreamingMarkdown, WindowedText } from "./Timeline.js";
 import { SelectionQuoteButton } from "./SelectionQuoteButton.js";
 import { WorkspaceFileEditorPane, type WorkspaceFileEditorPaneHandle } from "./WorkspaceFileEditorPane.js";
-import { isWorkspaceFileStaleError } from "./workspace-file-editor.js";
+import { isEditableWorkspaceConflict, isWorkspaceFileStaleError } from "./workspace-file-editor.js";
 import { BackgroundTasksPanel } from "./BackgroundTasksPanel.js";
 import { SubagentsPanel } from "./SubagentsPanel.js";
 import { InspectorTabErrorBoundary } from "./InspectorTabErrorBoundary.js";
@@ -199,6 +199,7 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
   const inspectorRef = useRef<HTMLElement>(null);
   const inspectorBodyRef = useRef<HTMLDivElement>(null);
   const tabListRef = useRef<HTMLDivElement>(null);
+  const filesLeaveRef = useRef<FilesPanelLeaveHandle>(null);
   const lastMainWindowInteractionRef = useRef(false);
   const lastDetachedWindowInteractionRef = useRef(false);
   const ratioRef = useRef(readInspectorRatio());
@@ -772,9 +773,12 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
     if (terminalPendingRef.current) return;
     const owner = terminalOwner;
     const tabs = storedBucket.tabs.filter((tab) => tabIds.includes(tab.id));
-    if (tabs.some(tab => tab.kind === "files") && !await requestWorkspaceDocumentLeave({
-      reason: "route-change", matches: identity => identity.sessionId === session.id
-    })) return;
+    if (tabs.some(tab => tab.kind === "files")) {
+      if (!await requestWorkspaceDocumentLeave({ reason: "route-change", matches: identity => identity.sessionId === session.id })
+        || inspectorOwnerRef.current !== inspectorOwner) return;
+      if (filesLeaveRef.current !== null && !await filesLeaveRef.current.requestClose()) return;
+      if (inspectorOwnerRef.current !== inspectorOwner) return;
+    }
     if (terminalOwnerRef.current !== owner) return;
     const finish = (closed: readonly string[]): void => {
       if (terminalOwnerRef.current !== owner) return;
@@ -1083,7 +1087,8 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
               const drafts: PartnerWorkbenchDrafts = { messages: new Map() }; workbenchDrafts.current.set(partnerConversation.ownerKey, drafts); return drafts;
             })()} />}
           {tab.kind === "branches" && canTree && <BranchesPanel controller={controller} backend={backend} session={session} t={t} runAction={runAction} />}
-          {tab.kind === "files" && canFiles && <FilesPanel controller={controller} workspace={workspace} sessionId={session.id} canWrite={canWriteFiles} t={t} onSelectionQuote={onSelectionQuote} />}
+          {tab.kind === "files" && canFiles && <FilesPanel controller={controller} workspace={workspace} sessionId={session.id}
+            canWrite={canWriteFiles} t={t} onSelectionQuote={onSelectionQuote} leaveRef={filesLeaveRef} ownerDocument={ownerDocument} />}
           {tab.kind === "changes" && (canDiff || canRewind) && <ChangesPanel controller={controller} session={session} workspace={workspace} {...(turnReviewFocusRequest === undefined ? {} : { focusRequest: turnReviewFocusRequest })} canDiff={canDiff} canDiffImagePreview={canDiffImagePreview} canStageDiff={canStageDiff} canUnstageDiff={canUnstageDiff} canRevertDiff={canRevertDiff} canCommitDiff={canCommitDiff} canPushDiff={canPushDiff} canRewind={canRewind} gitWriteDisabledReason={gitWriteDisabledReason} t={t} runAction={runAction} />}
           {tab.kind === "background" && canBackgroundTasks && <BackgroundTasksPanel
             timeline={timeline}
@@ -1499,17 +1504,25 @@ export function containsActiveTreeNode(node: NativeSessionTreeNodeView): boolean
   return false;
 }
 
-export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSelectionQuote }: {
+interface FilesPanelLeaveHandle { requestClose(): Promise<boolean>; }
+type FilesPanelLeave = { readonly kind: "switch"; readonly path: string }
+  | { readonly kind: "close"; readonly resolve: (allowed: boolean) => void };
+
+export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSelectionQuote, leaveRef, ownerDocument }: {
   readonly controller: AppController;
   readonly workspace?: WorkspaceView;
   readonly sessionId: string;
   readonly canWrite: boolean;
   readonly t: Translator;
   readonly onSelectionQuote: (sessionId: string, quote: ComposerFileSelectionQuoteDraft) => void;
+  readonly leaveRef?: Ref<FilesPanelLeaveHandle>;
+  readonly ownerDocument?: Document;
 }): JSX.Element {
   const [query, setQuery] = useState("");
   const [selectedPath, setSelectedPath] = useState<string>();
-  const [pendingPath, setPendingPath] = useState<string>();
+  const [pendingLeave, setPendingLeave] = useState<FilesPanelLeave>();
+  const pendingLeaveRef = useRef<FilesPanelLeave | undefined>(undefined);
+  const savingLeaveRef = useRef<FilesPanelLeave | undefined>(undefined);
   const [preview, setPreview] = useState<WorkspaceFilePreviewView>();
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string>();
@@ -1531,8 +1544,7 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
   const [rootLoading, setRootLoading] = useState(false);
   const [rootError, setRootError] = useState<string>();
   const [rootRetry, setRootRetry] = useState(0);
-  const [editorDirty, setEditorDirty] = useState(false);
-  const [switching, setSwitching] = useState(false);
+  const [leaving, setLeaving] = useState(false);
   const treeNavigation = useInspectorTreeNavigation();
   const editorRef = useRef<WorkspaceFileEditorPaneHandle>(null);
   const previewRequestEpochRef = useRef(0);
@@ -1547,12 +1559,39 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
     onSelectionQuote(sessionId, quote);
   }, [onSelectionQuote, sessionId]);
 
+  const startLeave = useCallback((request: FilesPanelLeave): void => {
+    pendingLeaveRef.current = request;
+    setPendingLeave(request);
+  }, []);
+  const settleLeave = useCallback((allowed: boolean): void => {
+    const request = pendingLeaveRef.current;
+    pendingLeaveRef.current = undefined;
+    savingLeaveRef.current = undefined;
+    setPendingLeave(undefined);
+    setLeaving(false);
+    if (request?.kind === "close") request.resolve(allowed);
+  }, []);
+  useImperativeHandle(leaveRef, () => ({
+    async requestClose() {
+      if (pendingLeaveRef.current !== undefined) return false;
+      if (editorRef.current?.isDirty() !== true) return true;
+      return new Promise<boolean>(resolve => startLeave({ kind: "close", resolve }));
+    }
+  }), [startLeave]);
+
+  useEffect(() => {
+    settleLeave(false);
+    return () => {
+      const request = pendingLeaveRef.current;
+      pendingLeaveRef.current = undefined;
+      if (request?.kind === "close") request.resolve(false);
+    };
+  }, [sessionId, filePreviewOwner, settleLeave]);
+
   useEffect(() => {
     setSelectedPath(undefined);
-    setPendingPath(undefined);
     setPreview(undefined);
     setPreviewError(undefined);
-    setEditorDirty(false);
     previewRequestEpochRef.current += 1;
   }, [sessionId, workspace?.id]);
 
@@ -1576,21 +1615,42 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
   }, [rootRetry, workspace?.id, workspace?.revision]);
 
   const commitSelectedPath = useCallback((path: string): void => {
-    setPendingPath(undefined);
     setSelectedPath(path);
     setPreview((current) => current?.path === path ? current : undefined);
     setPreviewError(undefined);
-    setEditorDirty(false);
   }, []);
 
   const requestSelectedPath = useCallback((path: string): void => {
-    if (path === selectedPath) return;
-    if (editorDirty && editorRef.current?.isDirty() === true) {
-      setPendingPath(path);
+    if (path === selectedPath || pendingLeaveRef.current !== undefined) return;
+    if (editorRef.current?.isDirty() === true) {
+      startLeave({ kind: "switch", path });
       return;
     }
     commitSelectedPath(path);
-  }, [commitSelectedPath, editorDirty, selectedPath]);
+  }, [commitSelectedPath, selectedPath, startLeave]);
+
+  const confirmLeave = async (save: boolean): Promise<void> => {
+    const request = pendingLeaveRef.current;
+    const editor = editorRef.current;
+    if (request === undefined || editor === null || savingLeaveRef.current === request) return;
+    if (save) {
+      savingLeaveRef.current = request;
+      setLeaving(true);
+      try {
+        if (!await editor.save() || editorRef.current?.isDirty() === true) return;
+      } finally {
+        if (pendingLeaveRef.current === request) {
+          savingLeaveRef.current = undefined;
+          setLeaving(false);
+        }
+      }
+    } else {
+      editor.discardLocalChanges();
+    }
+    if (pendingLeaveRef.current !== request) return;
+    settleLeave(true);
+    if (request.kind === "switch") commitSelectedPath(request.path);
+  };
 
   useEffect(() => {
     setPreviewError(undefined);
@@ -1705,7 +1765,6 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
                   mermaidEditSource: t("workspace.mermaidEditSource"),
                   mermaidRenderFailed: t("workspace.mermaidRenderFailed")
                 }}
-                onDirtyChange={setEditorDirty}
                 selectionQuoteSessionId={sessionId}
                 selectionQuoteLabel={t("timeline.addToChat")}
                 onSelectionQuote={commitSelectionQuote}
@@ -1719,12 +1778,11 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
                       : { ...current, text: draft.text, revision: result.revision, truncated: false });
                     return { revision: result.revision };
                   } catch (error) {
-                    if (isWorkspaceFileStaleError(error)) {
-                      const refreshEpoch = ++previewRequestEpochRef.current;
+                    if (isWorkspaceFileStaleError(error) && previewRequestEpochRef.current === writeEpoch) {
                       try {
                         const latest = await controllerRef.current.readWorkspaceFile(workspace.id, draft.path);
-                        if (previewRequestEpochRef.current === refreshEpoch) {
-                          setPreview((current) => current?.path === draft.path && latest.path === draft.path ? latest : current);
+                        if (previewRequestEpochRef.current === writeEpoch && isEditableWorkspaceConflict(latest, draft.path)) {
+                          setPreview((current) => current?.path === draft.path ? latest : current);
                         }
                       } catch {
                         // Preserve the authoritative stale-write error. A later
@@ -1753,29 +1811,22 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
         </>}
       </section>
       <Modal
-        open={pendingPath !== undefined}
+        open={pendingLeave !== undefined}
         title={t("workspace.unsavedTitle")}
-        description={t("workspace.unsavedSwitch", { path: selectedPath ?? "" })}
+        description={t(pendingLeave?.kind === "close" ? "workspace.unsavedLeave" : "workspace.unsavedSwitch", { path: selectedPath ?? "" })}
+        ownerDocument={ownerDocument}
         size="small"
         showClose={false}
         dismissOnBackdrop={false}
-        onClose={() => setPendingPath(undefined)}
+        onClose={() => { if (savingLeaveRef.current === undefined) settleLeave(false); }}
       >
         <div className="modal__actions">
-          <Button disabled={switching} onClick={() => setPendingPath(undefined)}>{t("common.cancel")}</Button>
-          <Button disabled={switching} onClick={() => {
-            const next = pendingPath;
-            editorRef.current?.discardLocalChanges();
-            if (next !== undefined) commitSelectedPath(next);
-          }}>{t("workspace.discardAndSwitch")}</Button>
-          <Button tone="primary" disabled={switching} onClick={() => {
-            const next = pendingPath;
-            if (next === undefined) return;
-            setSwitching(true);
-            void editorRef.current?.save().then((saved) => {
-              if (saved) commitSelectedPath(next);
-            }).finally(() => setSwitching(false));
-          }}>{switching ? <Spinner label={t("workspace.saving")} /> : null}{t("workspace.saveAndSwitch")}</Button>
+          <Button disabled={leaving} onClick={() => settleLeave(false)}>{t("common.cancel")}</Button>
+          <Button disabled={leaving} onClick={() => { void confirmLeave(false); }}>{t("workspace.discardAndSwitch")}</Button>
+          <Button tone="primary" disabled={leaving} onClick={() => { void confirmLeave(true); }}>
+            {leaving ? <Spinner label={t("workspace.saving")} /> : null}
+            {t(pendingLeave?.kind === "close" ? "workspace.save" : "workspace.saveAndSwitch")}
+          </Button>
         </div>
       </Modal>
     </div>

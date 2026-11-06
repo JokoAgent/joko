@@ -1,14 +1,26 @@
 // @vitest-environment jsdom
 
+import { Code, ConnectError } from "@connectrpc/connect";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import type { WorkspaceEntryView, WorkspaceSearchMatchView, WorkspaceSearchPageView, WorkspaceView } from "../model.js";
-import { collectCompleteWorkspaceSearch, FileTreeNode, FilesPanel } from "./Inspector.js";
+import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
+import { emptySnapshot, type BackendView, type SessionView, type WorkspaceEntryView, type WorkspaceSearchMatchView,
+  type WorkspaceSearchPageView, type WorkspaceView } from "../model.js";
+import { collectCompleteWorkspaceSearch, FileTreeNode, FilesPanel, Inspector } from "./Inspector.js";
 import type { Translator } from "./types.js";
+
+vi.mock("./WorkspaceTextEditor.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./WorkspaceTextEditor.js")>();
+  return {
+    ...actual,
+    WorkspaceTextEditor: ({ value, onChange, ariaLabel }: import("./WorkspaceTextEditor.js").WorkspaceTextEditorProps) =>
+      <textarea aria-label={ariaLabel} value={value} onChange={event => onChange?.(event.target.value)} />
+  };
+});
 
 const roots: Root[] = [];
 
@@ -65,6 +77,96 @@ describe("Inspector workspace discovery", () => {
     await settle();
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(container.textContent).toContain("recovered.ts");
+  });
+
+  it.each(["text", "binary"] as const)("keeps the Inspector draft after a Connect save conflict with a %s replacement", async kind => {
+    const path = "note.txt", entry = file(path);
+    const readWorkspaceFile = vi.fn()
+      .mockResolvedValueOnce({ path, name: path, kind: "text", text: "Original text", revision: "r1", truncated: false })
+      .mockResolvedValueOnce({ path, name: path, kind, text: kind === "text" ? "New disk text" : undefined, revision: "r2", truncated: false });
+    const writeWorkspaceTextFile = vi.fn().mockRejectedValue(new ConnectError("Workspace file changed; read it again before saving.", Code.Aborted));
+    const { container } = await mount(<FilesPanel
+      controller={{ state: { connectionGeneration: 1 }, listWorkspaceEntries: async () => [entry], readWorkspaceFile, writeWorkspaceTextFile } as unknown as AppController}
+      workspace={workspace([entry])}
+      sessionId="session-one"
+      canWrite
+      t={t}
+      onSelectionQuote={() => undefined}
+    />);
+    await act(async () => container.querySelector<HTMLButtonElement>(".file-tree__row")!.click());
+    const editor = container.querySelector("textarea")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(editor, "My unsaved text");
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      editor.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    });
+    await act(async () => document.querySelector<HTMLButtonElement>(".workspace-file-editor-menu button[role=menuitem]")!.click());
+    expect(writeWorkspaceTextFile).toHaveBeenCalledExactlyOnceWith("workspace-one", { path, text: "My unsaved text", expectedRevision: "r1" });
+    expect(readWorkspaceFile).toHaveBeenCalledTimes(2);
+    expect(container.querySelector("textarea")?.value).toBe("My unsaved text");
+    const reload = [...container.querySelectorAll<HTMLButtonElement>(".workspace-file-editor-alert button")]
+      .find(button => button.textContent === t("workspace.reloadDisk"));
+    if (kind === "text") {
+      expect(reload).toBeDefined();
+      await act(async () => reload!.click());
+      expect(container.querySelector("textarea")?.value).toBe("New disk text");
+    } else {
+      expect(reload).toBeUndefined();
+      expect(container.querySelector(".workspace-file-editor-alert")).not.toBeNull();
+    }
+  });
+
+  it.each(["save", "discard"] as const)("keeps a dirty Files tab until the user can %s its draft", async finalChoice => {
+    const path = "note.txt", entry = file(path);
+    const session: SessionView = {
+      id: `close-files-${finalChoice}`, backendId: "files-backend", targetId: "target-one", name: "Task",
+      state: "idle", pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1
+    };
+    const backend: BackendView = {
+      id: session.backendId, name: "Files backend", version: "1", health: "healthy",
+      capabilities: new Map([
+        ["workspace.files", { name: "workspace.files", supported: true, options: [] }],
+        ["workspace.files.write", { name: "workspace.files.write", supported: true, options: [] }]
+      ])
+    };
+    const writeWorkspaceTextFile = vi.fn().mockRejectedValueOnce(new Error("Save denied"))
+      .mockResolvedValueOnce({ path, revision: "r2" });
+    const snapshot = { ...emptySnapshot(), backends: [backend] };
+    const controller = {
+      state: { preferences: DEFAULT_UI_PREFERENCES, connectionGeneration: 1, snapshot },
+      listWorkspaceEntries: async () => [entry],
+      readWorkspaceFile: async () => ({ path, name: path, kind: "text", text: "Original text", revision: "r1", truncated: false }),
+      writeWorkspaceTextFile
+    } as unknown as AppController;
+    const { container } = await mount(<Inspector controller={controller} snapshot={snapshot} session={session} workspace={workspace([entry])}
+      timeline={[]} open t={t} runAction={() => undefined} onClose={() => undefined} onSelectionQuote={() => undefined} />);
+    await act(async () => container.querySelector<HTMLButtonElement>(`button[aria-label="${t("inspector.addTab")}"]`)!.click());
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(button => button.textContent === t("workspace.files"))!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".file-tree__row")!.click());
+    const editor = container.querySelector("textarea")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(editor, "My unsaved text");
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const tabClose = () => container.querySelector<HTMLButtonElement>(
+      `button[aria-label="${t("inspector.closeNamedTab", { name: t("workspace.files") })}"]`
+    );
+    const choose = (label: string) => [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')]
+      .find(button => button.textContent === label)!.click();
+    await act(async () => tabClose()!.click());
+    await act(async () => choose(t("common.cancel")));
+    expect(editor.value).toBe("My unsaved text");
+    expect(writeWorkspaceTextFile).not.toHaveBeenCalled();
+
+    await act(async () => tabClose()!.click());
+    await act(async () => choose(t("workspace.save")));
+    expect(tabClose()).not.toBeNull();
+    expect(editor.value).toBe("My unsaved text");
+    await act(async () => choose(t(finalChoice === "save" ? "workspace.save" : "workspace.discardAndSwitch")));
+    expect(tabClose()).toBeNull();
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(writeWorkspaceTextFile).toHaveBeenCalledTimes(finalChoice === "save" ? 2 : 1);
   });
 
   it("shows and retries a child-directory failure", async () => {

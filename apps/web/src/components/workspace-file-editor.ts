@@ -1,3 +1,7 @@
+import { Code, ConnectError } from "@connectrpc/connect";
+
+import type { WorkspaceFilePreviewView } from "../model.js";
+
 export interface WorkspaceFileEditorBaseline {
   readonly path: string;
   readonly text: string;
@@ -128,6 +132,7 @@ export function reconcileWorkspaceExternalFileUpdate(
 }
 
 export function isWorkspaceFileStaleError(error: unknown): boolean {
+  if (error instanceof ConnectError) return error.code === Code.Aborted;
   if (typeof error !== "object" || error === null) return false;
   const record = error as { readonly code?: unknown; readonly rawMessage?: unknown; readonly message?: unknown };
   if (record.code === "WORKSPACE_TEXT_FILE_STALE") return true;
@@ -135,4 +140,8 @@ export function isWorkspaceFileStaleError(error: unknown): boolean {
     ? record.rawMessage
     : typeof record.message === "string" ? record.message : "";
   return /WORKSPACE_TEXT_FILE_STALE|revision changed|stale/iu.test(message);
+}
+export function isEditableWorkspaceConflict(preview: WorkspaceFilePreviewView, path: string): boolean {
+  return preview.path === path && preview.kind === "text" && !preview.truncated
+    && preview.revision !== undefined && preview.text !== undefined;
 }

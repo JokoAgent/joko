@@ -26,7 +26,7 @@ import type {
 } from "../model.js";
 import { workspaceDocumentController } from "../workspace-document-controller.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
-import { isWorkspaceFileStaleError, type WorkspaceFileSaveDraft } from "./workspace-file-editor.js";
+import { isEditableWorkspaceConflict, isWorkspaceFileStaleError, type WorkspaceFileSaveDraft } from "./workspace-file-editor.js";
 import {
   WorkspaceFileEditorPane,
   type WorkspaceFileEditorPaneHandle
@@ -425,10 +425,11 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
         : { ...current, text: draft.text, revision: result.revision, truncated: false });
       return { revision: result.revision };
     } catch (cause) {
-      if (isWorkspaceFileStaleError(cause)) {
+      if (isWorkspaceFileStaleError(cause) && selectedPathRef.current === draft.path) {
         try {
           const latest = await controllerRef.current.readWorkspaceFile(workspaceId, draft.path);
-          if (latest.path === draft.path) setLocalPreview(latest);
+          if (selectedWorkspaceIdRef.current === workspaceId && selectedPathRef.current === draft.path
+            && isEditableWorkspaceConflict(latest, draft.path)) setLocalPreview(latest);
         } catch {
           // Preserve the revision-fence error. A watcher refresh may still
           // provide the authoritative conflict snapshot later.
