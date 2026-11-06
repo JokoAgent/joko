@@ -95,6 +95,14 @@ export async function syncWorktreeBranch(input: {
     if (writeObservation.status.revision !== fetched.status.revision) return changed(writeObservation);
     try {
       if (fetched.checkout) {
+        const head = await optional(fetched.checkout, ["rev-parse", "--verify", "HEAD^{commit}"], control);
+        const branch = await optional(fetched.checkout, ["symbolic-ref", "--quiet", "HEAD"], control);
+        input.assertCurrent(); control.check();
+        if (head !== fetched.localCommit || branch !== fetched.localRef) {
+          const current = await inspect(input.cwd, input.sourceRef, control);
+          input.assertCurrent();
+          return changed(current);
+        }
         // Native merge protects tracked, ignored and untracked collisions and
         // retains unrelated local edits. It never creates a merge commit.
         await runGit(["merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", fetched.remoteCommit!],
