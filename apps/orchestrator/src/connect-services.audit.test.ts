@@ -13,12 +13,15 @@ import { NotFoundError, OperationConflictError, OperationPreviouslyFailedError, 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
+import { ArtifactStore } from "./artifact-store.js";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
 import {
   createConnectServices,
   providerRateLimitSettingKey,
   registerConnectServices
 } from "./connect-services.js";
-import { ConnectionAuthenticationError, ConnectionManager } from "./connection-manager.js";
+import { ConnectionAuthenticationError, ConnectionManager, digestAuthKey } from "./connection-manager.js";
+import { SessionHost } from "./session-host.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
@@ -4926,7 +4929,7 @@ describe("Connect security and protocol audit", () => {
         operationId: `operation-human-input-${index}`,
         connectionId: takeover.owner,
         mutation
-      }, context());
+      }, { requestHeader: new Headers({ authorization: "Bearer fixture-original-owner" }), signal: new AbortController().signal });
     }
 
     expect(performHumanTakeoverAction.mock.calls.map((call) => call[0])).toEqual([
@@ -4951,6 +4954,70 @@ describe("Connect security and protocol audit", () => {
     const admittedFence = performHumanTakeoverAction.mock.calls[0]![2];
     connections.revoke();
     expect(admittedFence).toThrow(ConnectionAuthenticationError);
+  });
+
+  it("keeps Browser keyboard values private across durable replay, Get, List and Watch", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-browser-private-input-"));
+    const store = new OperationalStore(":memory:");
+    cleanups.push(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+    const connections = new ConnectionManager(store);
+    const original = "fixture-authenticated-owner-key", observer = "fixture-authenticated-observer-key";
+    const owner = store.createConnection({ id: "browser-input-owner", name: "Browser owner", authKeyDigest: digestAuthKey(original) });
+    store.createConnection({ id: "browser-input-observer", name: "Observer", authKeyDigest: digestAuthKey(observer) });
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [] });
+    const host = new SessionHost(store, artifacts, []);
+    const takeover = { providerId: "browser", pageId: "page-1", takeoverId: "takeover-1", generation: 7, owner: owner.id, startedAt: 1, expiresAt: 60_000 };
+    const perform = vi.fn(async (_takeover: typeof takeover, _input: unknown, assertCurrent: () => void) => { assertCurrent(); });
+    const application = { ...stubApplication({ store,
+      browser: { id: "browser", generation: 7, currentHumanTakeover: () => takeover, assertHumanTakeover: () => takeover,
+        performHumanTakeoverAction: perform, listPages: async () => [] },
+      browserState: { findRecoverablePage: () => ({ browserProviderId: "browser", pageId: "page-1", sessionId: "session-owner",
+        targetId: "target-owner", bindingGeneration: 1, generation: 7, state: "open" }) }
+    }), connections, sessionHost: host };
+    const makeClient = () => createClient(contract.OperationService, createRouterTransport(router => registerConnectServices(router, application)));
+    const auth = (token: string) => ({ headers: { authorization: `Bearer ${token}` } });
+    const mutation = (action: contract.BrowserTakeoverActionMutation["action"]) => create(contract.OperationMutationSchema, {
+      payload: { case: "browserTakeoverAction", value: create(contract.BrowserTakeoverActionMutationSchema, {
+        browserProviderId: takeover.providerId, pageId: takeover.pageId, takeoverId: takeover.takeoverId, generation: 7n, action
+      }) }
+    });
+    const password = "K7!m2.zW8qD4";
+    const text = (value: string) => mutation({ case: "textInput", value: create(contract.BrowserTakeoverTextInputSchema, { text: value }) });
+    const request = { operationId: "browser-private-input", connectionId: owner.id, mutation: text(password) };
+    try {
+      const client = makeClient();
+      const accepted = await client.submitOperation(request, auth(original));
+      expect(accepted.operation?.mutation?.payload).toMatchObject({ case: "browserTakeoverAction", value: { action: { case: "textInput", value: { text: "" } } } });
+      const key = await client.submitOperation({ operationId: "browser-private-character", connectionId: owner.id,
+        mutation: mutation({ case: "keyPress", value: create(contract.BrowserTakeoverKeyPressSchema, { character: "q" }) }) }, auth(original));
+      expect(key.operation?.mutation?.payload).toMatchObject({ value: { action: { case: "keyPress", value: { character: "" } } } });
+      expect(perform.mock.calls.map((call) => call[1])).toEqual([{ type: "textInput", text: password }, { type: "keyPress", key: "q", modifiers: [] }]);
+      const durable = JSON.stringify(store.getOperation(request.operationId).body);
+      expect(durable).toContain("browserKeyboardFingerprint");
+      expect(durable).not.toContain(password);
+      expect(durable).not.toContain(original);
+      expect(store.getOperation("browser-private-character").body).toMatchObject({ payload: { value: { action: { value: { character: "" } } } } });
+
+      store.runAuthorizedOperation(owner.id, owner.authKeyDigest,
+        { id: "legacy-browser-input", kind: "browserTakeoverAction", body: request.mutation }, () => ({ accepted: true }));
+      const cold = makeClient();
+      await expect(cold.submitOperation(request, auth(original))).resolves.toMatchObject({ operation: { operationId: request.operationId } });
+      await expect(cold.submitOperation({ ...request, mutation: text("changed password") }, auth(original)))
+        .rejects.toMatchObject({ code: Code.AlreadyExists });
+      await expect(cold.submitOperation({ ...request, operationId: "legacy-browser-input" }, auth(original)))
+        .resolves.toMatchObject({ operation: { operationId: "legacy-browser-input" } });
+      expect(perform).toHaveBeenCalledTimes(2);
+
+      const operations = (await client.listOperations({}, auth(observer))).operations;
+      const retained = (await cold.getOperation({ operationId: "legacy-browser-input" }, auth(observer))).operation!;
+      for await (const update of cold.watchOperation({ operationId: request.operationId }, auth(observer))) operations.push(update.operation!);
+      expect(operations.length).toBeGreaterThan(3);
+      for (const operation of [...operations, retained]) {
+        const bytes = Buffer.from(toBinary(contract.OperationSchema, operation));
+        expect(bytes.includes(Buffer.from(password))).toBe(false);
+        expect(bytes.includes(Buffer.from("browserKeyboardFingerprint"))).toBe(false);
+      }
+    } finally { await host.dispose(); }
   });
 
   it("rejects stale, foreign-owner, and out-of-range Browser takeover input before dispatch", async () => {

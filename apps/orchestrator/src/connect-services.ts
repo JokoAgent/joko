@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { captureModelPriceReference, createModelPriceOverrideValues, modelPriceOverrideConflict, modelPricesWithOverride, modelTokenPricesAt, type ModelPriceReferenceSnapshot } from "@joko/core";
 import { priceMicros, toProtoModelPriceOverrideValues } from "./model-pricing-projection.js";
 import type { ExtensionSettingsManager } from "./extension-settings.js";
@@ -159,7 +159,7 @@ import type { AndroidAutomationSettingsController } from "./android-automation-s
 import type { AndroidToolBridgeProvider } from "./android-tool-bridge.js";
 import type { ComputerAutomationSettingsController } from "./computer-automation-settings.js";
 import type { ComputerToolBridgeProvider } from "./computer-tool-bridge.js";
-import { ConnectionAuthenticationError, PairingRequestError, type ConnectionManager } from "./connection-manager.js";
+import { ConnectionAuthenticationError, PairingRequestError, parseBearer, type ConnectionManager } from "./connection-manager.js";
 import { deviceAuthorizationService } from './device-authorization-service.js';
 import { connectionEntryDirectory, prepareConnectionEntry } from './connection-entries.js';
 import {
@@ -1988,25 +1988,32 @@ export function createConnectServices(application: OrchestratorApplication, proj
       if (request.mutation === undefined || request.mutation.payload.case === undefined) {
         throw invalidArgument("mutation.payload is required");
       }
+      const publicMutation = publicOperationMutation(request.mutation);
+      const privateBody = browserKeyboardOperationBody(request.mutation, publicMutation, request.operationId,
+        context.requestHeader.get("authorization") ?? undefined);
       const existing = dependencies.store.findOperation(request.operationId);
       if (existing !== undefined) {
         if (existing.connectionId !== authenticated.id) {
           throw new AuthorizationError("The operation belongs to a different connection.");
         }
-        const presentedHash = operationBodyHash(durableOperationBody(authenticated, request.mutation));
+        // Historical operations used the original body hash. Replay that exact
+        // identity in memory while projecting only the public keyboard action.
+        const presentedBody = privateBody !== undefined && Object.hasOwn(asRecord(existing.body), "browserKeyboardFingerprint")
+          ? privateBody : durableOperationBody(authenticated, request.mutation);
+        const presentedHash = operationBodyHash(presentedBody);
         if (existing.bodyHash !== presentedHash) {
           throw new OperationConflictError(request.operationId, existing.bodyHash, presentedHash);
         }
         const existingOutcome = operationOutcomes.get(existing.id) ?? outcomeFromRecord(existing);
-        operationMutations.set(existing.id, request.mutation);
+        operationMutations.set(existing.id, publicMutation);
         if (existing.status !== "started") operationOutcomes.set(existing.id, existingOutcome);
         return {
-          operation: toProtoOperation(dependencies, existing, request.mutation, existingOutcome, now())
+          operation: toProtoOperation(dependencies, existing, publicMutation, existingOutcome, now())
         };
       }
       let presented: PresentedOperation;
       try {
-        presented = await dispatchMutation(dependencies, request.operationId, stableConnection(authenticated), request.mutation);
+        presented = await dispatchMutation(dependencies, request.operationId, stableConnection(authenticated), request.mutation, privateBody);
       } catch (error) {
         if (
           !(error instanceof OperationPreviouslyFailedError)
@@ -2018,15 +2025,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
           throw new AuthorizationError("The operation belongs to a different connection.");
         }
         const currentOutcome = outcomeFromRecord(current);
-        operationMutations.set(current.id, request.mutation);
+        operationMutations.set(current.id, publicMutation);
         if (current.status !== "started") operationOutcomes.set(current.id, currentOutcome);
         return {
-          operation: toProtoOperation(dependencies, current, request.mutation, currentOutcome, now())
+          operation: toProtoOperation(dependencies, current, publicMutation, currentOutcome, now())
         };
       }
-      operationMutations.set(request.operationId, request.mutation);
+      operationMutations.set(request.operationId, publicMutation);
       operationOutcomes.set(request.operationId, presented.outcome);
-      return { operation: toProtoOperation(dependencies, presented.record, request.mutation, presented.outcome, now()) };
+      return { operation: toProtoOperation(dependencies, presented.record, publicMutation, presented.outcome, now()) };
     },
     getOperation: (request, context) => {
       authenticate(context);
@@ -6588,6 +6595,13 @@ export function toProtoOperation(
 
 function publicOperationMutation(mutation: contract.OperationMutation): contract.OperationMutation {
   const payload = mutation.payload;
+  if (payload.case === "browserTakeoverAction") {
+    const action = payload.value.action;
+    if (action.case === "textInput") return { ...mutation, payload: { case: payload.case,
+      value: { ...payload.value, action: { case: action.case, value: { ...action.value, text: "" } } } } };
+    if (action.case === "keyPress" && action.value.character !== "") return { ...mutation, payload: { case: payload.case,
+      value: { ...payload.value, action: { case: action.case, value: { ...action.value, character: "" } } } } };
+  }
   if (payload.case !== "upsertMcpServer") return mutation;
   const server = payload.value.server;
   if (server?.transportConfig.case !== "stdio" || !mcpStdioArgumentsContainCredential(server.transportConfig.value.arguments)) return mutation;
@@ -6598,6 +6612,20 @@ function publicOperationMutation(mutation: contract.OperationMutation): contract
       transportConfig: { case: "stdio", value: { ...server.transportConfig.value, arguments: [] } }
     } } }
   };
+}
+
+function browserKeyboardOperationBody(mutation: contract.OperationMutation, projection: contract.OperationMutation,
+  operationId: string, authorization: string | undefined): unknown {
+  if (mutation.payload.case !== "browserTakeoverAction") return undefined;
+  const action = mutation.payload.value.action;
+  const value = action.case === "textInput" ? action.value.text
+    : action.case === "keyPress" && action.value.character !== "" ? action.value.character : undefined;
+  if (value === undefined) return undefined;
+  const bearer = parseBearer(authorization);
+  if (bearer === undefined) throw new ConnectError("Browser keyboard input requires an authenticated Connection.", Code.Unauthenticated);
+  const browserKeyboardFingerprint = createHmac("sha256", bearer)
+    .update(JSON.stringify(["joko.browser-takeover.keyboard.v1", operationId, action.case, value])).digest("hex");
+  return { ...projection, browserKeyboardFingerprint };
 }
 
 function operationResult(
@@ -16082,9 +16110,10 @@ async function dispatchMutation(
   dependencies: ConnectServiceDependencies,
   operationId: string,
   connection: ConnectionRecord,
-  mutation: contract.OperationMutation
+  mutation: contract.OperationMutation,
+  privateBody?: unknown
 ): Promise<PresentedOperation> {
-  const host = withOperationPreconditions(dependencies.sessionHost as ExtendedSessionHost, mutation);
+  const host = withOperationPreconditions(dependencies.sessionHost as ExtendedSessionHost, mutation, privateBody);
   dependencies = { ...dependencies, sessionHost: host };
   const payload = mutation.payload;
   if (payload.value && typeof payload.value === "object" && "scheduleId" in payload.value && typeof payload.value.scheduleId === "string") {
@@ -22839,9 +22868,11 @@ async function dispatchMutation(
 
 function withOperationPreconditions(
   host: ExtendedSessionHost,
-  mutation: contract.OperationMutation
+  mutation: contract.OperationMutation,
+  privateBody?: unknown
 ): ExtendedSessionHost {
   const mutate = async <T>(input: HostMutationInput<T>): Promise<OperationExecution<T>> => {
+    if (privateBody !== undefined) input = { ...input, body: privateBody };
     const protocolPrecondition = (store: OperationalStore): void => {
       validatePreconditions(store, mutation);
       input.precondition?.(store);
