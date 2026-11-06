@@ -696,11 +696,23 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     });
     if (existingAuthority === undefined) await stageRemoteRuntime(startupAuthority, binding, stagingPlans);
     const sourcePath = targetPaths.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
-    const openAttachment = async (selectedAuthority: RemoteWorkspaceAuthority, assertBeforeStartup?: () => void): Promise<RemoteBridgeAttachment> => {
+    const openAttachment = async (
+      selectedAuthority: RemoteWorkspaceAuthority,
+      assertBeforeStartup?: () => void,
+      reconnectAttestation?: string
+    ): Promise<RemoteBridgeAttachment> => {
       const effectAuthority = fencePiStartup(selectedAuthority, assertBeforeStartup);
       effectAuthority.assertCurrent();
       if (selectedAuthority.pathStyle !== initialAuthority.pathStyle) {
         throw new Error("Remote Pi target path style changed during execution.");
+      }
+      const previous = await this.#authorityStore.read(identity, authorityScope);
+      if (
+        reconnectAttestation !== undefined && (
+          previous === undefined || previous.authority.attestation !== reconnectAttestation || previous.deletion !== undefined
+        )
+      ) {
+        throw new Error("The original Remote Pi authority is no longer available for reattachment.");
       }
       const selectedFiles = effectAuthority.files;
       await provisionRemoteBroker(selectedFiles, managedRoot, selectedAuthority.pathStyle);
@@ -709,7 +721,6 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       if (remoteManagedRunRoot !== undefined) {
         await ensureRemotePrivateDirectory(selectedFiles, remoteManagedRunRoot, selectedAuthority.pathStyle);
       }
-      const previous = await this.#authorityStore.read(identity, authorityScope);
       await refreshRuntimeFiles(
         selectedFiles,
         spec.env,
@@ -752,7 +763,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
         return await openRemoteBrokerBridge(bridgeOptions);
       } catch (error) {
         if (
-          !(error instanceof RemoteAuthorityRejectedError) ||
+          reconnectAttestation !== undefined || !(error instanceof RemoteAuthorityRejectedError) ||
           error.authorityVerified !== true || previous === undefined
         ) throw error;
         if (error.reason === "launch_mismatch") {
@@ -781,7 +792,14 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       initialAttachment,
       reattach: async () => {
         const next = await this.#remoteExecution.workspace(binding);
-        return openAttachment(next);
+        try {
+          return { attachment: await openAttachment(next, undefined, initialAttachment.authority.attestation) };
+        } catch (error) {
+          if (error instanceof RemoteAuthorityRejectedError && error.authorityVerified && error.reason === "child_absent") {
+            return { childAbsentFiles: next.files };
+          }
+          throw error;
+        }
       },
       localSessionRoot: resolve(localSessionRoot),
       localRuntime: resolve(localRuntime),
@@ -1164,7 +1182,7 @@ interface RemoteBridgeAttachment {
   readonly pathStyle: "posix" | "win32";
   readonly identity: string;
   readonly terminalFence: string;
-  readonly authority?: RemoteAuthorityEnvelope;
+  readonly authority: RemoteAuthorityEnvelope;
   readonly state?: RemoteAuthorityState;
   readonly persistOutputCursor?: (sequence: number) => Promise<void>;
 }
@@ -1382,6 +1400,8 @@ class RemoteAuthorityRejectedError extends Error {
   }
 }
 
+class RemoteOutputAcknowledgementLost extends Error {}
+
 async function readRemoteAuthorityControl(stream: Readable): Promise<RemoteAuthorityControl> {
   return parseRemoteAuthorityControl(await readRemoteControlFrame(stream, REMOTE_FRAME_AUTHORITY));
 }
@@ -1584,8 +1604,8 @@ function assertAuthorityMatchesRequest(
     authority.trustedRunnerScriptSha256 !== previous.trustedRunnerScriptSha256
   ) throw new Error("Remote Pi recovery changed the attested child identity.");
   if (options.runtimeGeneration === previous.runtimeGeneration) {
-    if (authority.epoch !== previous.epoch) {
-      throw new Error("Remote Pi idempotent attachment changed its authority epoch.");
+    if (authority.epoch !== previous.epoch || authority.attestation !== previous.attestation) {
+      throw new Error("Remote Pi idempotent attachment changed its authority envelope.");
     }
   } else if (
     options.runtimeGeneration !== previous.runtimeGeneration + 1 || authority.epoch !== previous.epoch + 1
@@ -2119,7 +2139,9 @@ function assertStableLocalFile(left: Stats, right: Stats): void {
 
 interface MappedRemotePiProcessOptions {
   readonly initialAttachment: RemoteBridgeAttachment;
-  readonly reattach: () => Promise<RemoteBridgeAttachment>;
+  readonly reattach: () => Promise<
+    { readonly attachment: RemoteBridgeAttachment } | { readonly childAbsentFiles: RemoteFileTransportPort }
+  >;
   readonly localSessionRoot: string;
   readonly localRuntime: string;
   readonly remoteSessionRoot: string;
@@ -2206,8 +2228,6 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
       attachment.process.kill("SIGKILL");
       return;
     }
-    this.#attachment = attachment;
-    this.#lastFiles = attachment.files;
     if (attachment.state !== undefined) {
       if (
         attachment.state.outputAcknowledged !== this.#outputCursor ||
@@ -2215,8 +2235,9 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
         attachment.state.inputAcknowledged < this.#inputAcknowledged ||
         attachment.state.inputAcknowledged > this.#inputSequence
       ) {
-        attachment.process.kill("SIGKILL");
+        for (const watcher of attachment.watchers) watcher.close();
         void attachment.reverseForward?.close().catch(() => undefined);
+        attachment.process.kill("SIGKILL");
         throw new Error("Remote Pi authority state crossed its reliable stream fence.");
       }
       this.#acknowledgeInput(attachment.state.inputAcknowledged);
@@ -2231,9 +2252,14 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
         );
       }
     }
+    this.#attachment = attachment;
+    this.#lastFiles = attachment.files;
     const generation = ++this.#attachmentGeneration;
     let terminal: RemoteTerminalState | undefined;
-    const outputDecoder = new RemoteBridgeOutputTransform(async (type, sequence, content) => {
+    let activeFrame = Promise.resolve();
+    let detaching = false;
+    let errorTimer: NodeJS.Timeout | undefined;
+    const receiveFrame = async (type: number, sequence: number, content: Buffer): Promise<void> => {
       if (type === REMOTE_FRAME_INPUT_ACK) {
         this.#acknowledgeInput(sequence);
         return;
@@ -2259,23 +2285,38 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
       this.#outputCursor = sequence;
       await attachment.persistOutputCursor?.(sequence);
       await this.#sendOutputAcknowledgement(attachment, sequence);
+    };
+    const outputDecoder = new RemoteBridgeOutputTransform((type, sequence, content) => {
+      activeFrame = receiveFrame(type, sequence, content);
+      return activeFrame;
     });
-    outputDecoder.once("error", () => {
-      try {
-        attachment.process.kill("SIGKILL");
-      } catch {
-        // The reconnect fence below remains authoritative.
+    const detach = async (decoderError?: Error): Promise<void> => {
+      if (detaching) return;
+      detaching = true;
+      if (errorTimer !== undefined) clearTimeout(errorTimer);
+      attachment.process.stdout.unpipe(outputDecoder);
+      attachment.process.stderr.unpipe(this.stderr);
+      outputDecoder.destroy();
+      // Finish the accepted frame before opening another attachment with its cursor.
+      const frameError: unknown = await activeFrame.then(() => undefined, (error: unknown) => error);
+      const failure = decoderError ?? frameError;
+      if (failure !== undefined) {
+        try { attachment.process.kill("SIGKILL"); } catch { /* The bridge is already unavailable. */ }
       }
-      void this.#protocolFailure(attachment, generation);
-    });
+      if (terminal !== undefined || failure === undefined || failure instanceof RemoteOutputAcknowledgementLost) {
+        await this.#attachmentEnded(attachment, generation, terminal);
+      } else {
+        await this.#protocolFailure(attachment, generation);
+      }
+    };
+    outputDecoder.once("error", (error: Error) => { void detach(error); });
     attachment.process.stdout.pipe(outputDecoder);
     attachment.process.stderr.pipe(this.stderr, { end: false });
     this.#inputSendTail = Promise.resolve();
     this.#flushInput(attachment);
-    let errorTimer: NodeJS.Timeout | undefined;
     attachment.process.once("error", () => {
       errorTimer = setTimeout(() => {
-        void this.#attachmentEnded(attachment, generation, terminal);
+        void detach();
       }, 100);
       errorTimer.unref?.();
     });
@@ -2287,7 +2328,7 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
           const timer = setTimeout(resolveOutput, 100);
           timer.unref?.();
         })
-      ]).then(() => this.#attachmentEnded(attachment, generation, terminal));
+      ]).then(() => detach());
     });
     if (this.#killRequested) void this.#requestBrokerKill(attachment, this.#killSignal);
   }
@@ -2338,49 +2379,33 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
     sequence: number
   ): Promise<void> {
     if (this.#attachment !== attachment) return;
-    await writeStreamChunk(
-      attachment.process.stdin,
-      encodeRemoteSequencedFrame(REMOTE_FRAME_OUTPUT_ACK, sequence)
-    );
+    const acknowledgement = encodeRemoteSequencedFrame(REMOTE_FRAME_OUTPUT_ACK, sequence);
+    try {
+      await writeStreamChunk(attachment.process.stdin, acknowledgement);
+    } catch (error) {
+      throw new RemoteOutputAcknowledgementLost("Remote Pi bridge lost its output acknowledgement.", { cause: error });
+    }
   }
 
   async #requestBrokerKill(
     attachment: RemoteBridgeAttachment,
     signal: "SIGKILL" | "SIGTERM"
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
-      if (attachment.authority !== undefined) {
-        await requestRemoteBrokerKill({
-          processes: attachment.processes,
-          sourcePath: attachment.brokerSourcePath,
-          managedRoot: attachment.brokerRoot,
-          nodeExecutable: attachment.nodeExecutable,
-          pathStyle: attachment.pathStyle,
-          controlCwd: attachment.controlCwd,
-          identity: attachment.identity,
-          signal,
-          authority: attachment.authority
-        });
-        return;
-      }
-      const request = await attachment.processes.open({
-        executable: attachment.nodeExecutable,
-        args: [
-          attachment.brokerSourcePath,
-          "kill",
-          attachment.brokerRoot,
-          attachment.identity,
-          signal
-        ],
-        cwd: attachment.controlCwd,
-        env: { JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 }
+      await requestRemoteBrokerKill({
+        processes: attachment.processes,
+        sourcePath: attachment.brokerSourcePath,
+        managedRoot: attachment.brokerRoot,
+        nodeExecutable: attachment.nodeExecutable,
+        pathStyle: attachment.pathStyle,
+        controlCwd: attachment.controlCwd,
+        identity: attachment.identity,
+        signal,
+        authority: attachment.authority
       });
-      request.stdin.end();
-      request.stdout.resume();
-      request.stderr.resume();
-      request.once("error", () => undefined);
+      return true;
     } catch {
-      // PiRpcTransport will report an unconfirmed kill if the broker cannot be reached.
+      return false;
     }
   }
 
@@ -2409,10 +2434,15 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
       this.#attachmentGeneration !== generation
     ) return;
     this.#attachment = undefined;
+    this.#killRequested = true;
+    this.#killSignal = "SIGKILL";
     for (const watcher of attachment.watchers) watcher.close();
     await attachment.reverseForward?.close().catch(() => undefined);
-    await this.#requestBrokerKill(attachment, "SIGKILL");
-    await this.#finish(1, null, attachment.files);
+    if (await this.#requestBrokerKill(attachment, "SIGKILL")) {
+      await this.#finish(null, null, attachment.files);
+      return;
+    }
+    this.#startReconnect();
   }
 
   #startReconnect(): void {
@@ -2424,7 +2454,12 @@ class MappedRemotePiProcess extends EventEmitter implements PiProcessHandle {
         if (attempt > 0) await reconnectDelay(Math.min(2_000, 100 * (2 ** Math.min(attempt - 1, 5))));
         if (this.#settled || this.#attachment !== undefined) break;
         try {
-          const attachment = await this.#options.reattach();
+          const reattachment = await this.#options.reattach();
+          if ("childAbsentFiles" in reattachment) {
+            await this.#finish(null, null, reattachment.childAbsentFiles);
+            break;
+          }
+          const { attachment } = reattachment;
           if (this.#settled || this.#attachment !== undefined) {
             for (const watcher of attachment.watchers) watcher.close();
             await attachment.reverseForward?.close().catch(() => undefined);
@@ -2491,7 +2526,7 @@ class RemoteBridgeOutputTransform extends Transform {
   }
 
   async #drain(): Promise<void> {
-    while (this.#pending.byteLength >= 5) {
+    while (!this.destroyed && this.#pending.byteLength >= 5) {
       const length = this.#pending.readUInt32BE(1);
       if (length > MAXIMUM_REMOTE_FRAME_BYTES) throw new Error("Remote Pi broker frame exceeded its safety limit.");
       if (this.#pending.byteLength < length + 5) return;
