@@ -1,6 +1,6 @@
 import { posix, win32 } from "node:path";
 import {
-  classifyToolCall, evaluateOrderedPolicyRules, isWithin, policyObservationForToolCall,
+  classifyToolCall, evaluateOrderedPolicyRules, policyObservationForToolCall, workspaceSubtreePolicyObservations,
   type NativeToolAuthorizationDecision, type NativeToolAuthorizationRequest, type PolicyObservation,
   type PolicySnapshot, type ToolCall
 } from "@joko/core";
@@ -65,15 +65,10 @@ export function reviewNativeToolPolicy(snapshot: PolicySnapshot, request: Native
       // A recursive search rooted above a denied subtree can disclose its
       // files without ever issuing a separate Read call for those files.
       if ((["find", "grep", "ls"].includes(candidate.name) || ["read", "write", "edit"].includes(candidate.name) && candidate.args.recursive === true) && typeof candidate.args.path === "string") {
-        const root = paths.resolve(snapshot.workspaceRoot, candidate.args.path);
         const subjectKind = ["write", "edit"].includes(candidate.name) ? "file_write" : "file_read";
-        for (const rule of snapshot.rules) {
-          if (rule.workspaceRelativePathPrefix === undefined || rule.subjectKind !== subjectKind) continue;
-          const subtree = paths.resolve(snapshot.workspaceRoot, rule.workspaceRelativePathPrefix);
-          if (!isWithin(subtree, root, options.pathStyle)) continue;
-          observations.push({ ...observation, subjectKind, workspaceRelativePath: rule.workspaceRelativePathPrefix });
-          if (request.toolName !== candidate.name) observations.push({ ...observation, toolName: request.toolName,
-            subjectKind, workspaceRelativePath: rule.workspaceRelativePathPrefix });
+        for (const covered of workspaceSubtreePolicyObservations(snapshot, observation, candidate.args.path, subjectKind, options.pathStyle)) {
+          observations.push(covered);
+          if (request.toolName !== candidate.name) observations.push({ ...covered, toolName: request.toolName });
         }
       }
     }

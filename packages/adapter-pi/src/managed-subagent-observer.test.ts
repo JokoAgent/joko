@@ -634,6 +634,55 @@ describe("managed Subagent public observation", () => {
     expect(staleControl).toMatchObject({ approvalId: staleApprovalId, value: "stale" });
     observer.stop();
   });
+
+  it("blocks recursive Pi child reads that cover denied paths while retaining scoped reads", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-subagent-recursive-policy-"));
+    const root = join(directory, "subagent-runs"), sessionId = "recursive-policy-owner";
+    const base = context(sessionId, 6, []);
+    const cases = [
+      { name: "grep", raw: ".", expected: "deny" },
+      { name: "find", raw: "src", path: "src", expected: "deny" },
+      { name: "ls", raw: join("src", "restricted"), path: "src/restricted", expected: "deny" },
+      { name: "grep", raw: "alias", path: "src/restricted", expected: "deny" },
+      { name: "grep", raw: join("src", "restricted", "alias"), path: "public", expected: "deny" },
+      { name: "grep", raw: "public", path: "public", expected: "allow" },
+      { name: "grep", raw: "reports", path: "reports", expected: "default" }
+    ];
+    const observer = new ManagedSubagentObserver({ root, policyGeneration: 7, context: { ...base,
+      policySnapshot: {
+        generation: "5", backendId: base.target.backendId, targetId: base.target.id, workspaceRoot: base.target.workspaceRoot,
+        rules: [
+          { id: "deny-subtree", effect: "deny", subjectKind: "file_read", workspaceRelativePathPrefix: "src/restricted",
+            ceiling: "critical", priority: 1, order: 0 },
+          { id: "allow-public", effect: "allow", subjectKind: "file_read", workspaceRelativePathPrefix: "public",
+            ceiling: "critical", priority: 2, order: 1 },
+          { id: "allow-one-report", effect: "allow", subjectKind: "file_read", workspaceRelativePathPrefix: "reports/summary",
+            ceiling: "critical", priority: 2, order: 2 }
+        ]
+      }
+    }, intervalMs: 60_000 });
+    try {
+      const requests = await Promise.all(cases.map(async (item, index) => {
+        const taskId = `recursive-search-${index}`, approvalId = `policy-${randomUUID()}`;
+        const run = await physicalRun(root, sessionId, taskId, 6, 1, [], undefined, "running", {
+          pendingApproval: { id: approvalId, childId: `${taskId}:child`, method: "input",
+            title: encodePolicyDecisionRequest({ policyGeneration: 7,
+              observation: { subjectKind: "file_read", risk: "read_only", toolName: item.name,
+                ...(item.path === undefined ? {} : { workspaceRelativePath: item.path }) },
+              toolCall: { toolName: item.name, input: { path: item.raw, pattern: "needle" } }
+            }), placeholder: "", requestedAt: Date.now() }
+        });
+        return { approvalId, runId: run.runId, expected: item.expected };
+      }));
+      await observer.refresh();
+      for (const request of requests) {
+        const control = JSON.parse(await readFile(join(root, managedSubagentSessionKey(sessionId), request.runId, "approval-control.json"), "utf8"));
+        expect(control.approvalId).toBe(request.approvalId);
+        if (request.expected === "default") expect(JSON.parse(control.value)).toMatchObject({ decision: "default" });
+        else expect(control.value).toBe(request.expected);
+      }
+    } finally { observer.stop(); await rm(directory, { recursive: true, force: true }); }
+  });
 });
 
 class DurableStoreFixture implements PiManagedDurableStore {

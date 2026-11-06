@@ -5,6 +5,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type {
   AdapterContext,
   InteractionDecision,
+  PolicyObservation,
+  PolicySnapshot,
   PublicError,
   SubagentActivityEntry,
   SubagentControlAction,
@@ -13,11 +15,11 @@ import type {
   SubagentTranscriptEntry,
   SubagentUsage
 } from "@joko/core";
-import { evaluateOrderedPolicyRules } from "@joko/core";
+import { evaluateOrderedPolicyRules, policyObservationForToolCall, workspaceSubtreePolicyObservations } from "@joko/core";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 
 import { handleCommandGateExtensionRequest } from "./command-gate-bridge.js";
-import { handlePolicyDecisionExtensionRequest } from "./policy-decision-bridge.js";
+import { handlePolicyDecisionExtensionRequest, type PolicyDecisionRequest, type PolicyDecisionResult } from "./policy-decision-bridge.js";
 import { redactManagedSecrets } from "./errors.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./managed-durable-store.js";
@@ -340,9 +342,10 @@ export class ManagedSubagentObserver {
           decide: async (request) => {
             if (request.policyGeneration !== this.#policyGeneration) return "stale";
             const snapshot = this.#context.policySnapshot;
+            const remoteRoot = this.#context.target.remoteWorkspace?.workspaceRoot;
             const decision = snapshot === undefined
               ? "default"
-              : evaluateOrderedPolicyRules(snapshot, request.observation)?.action ?? "default";
+              : orderedSubagentPolicy(snapshot, request, remoteRoot === undefined ? undefined : remoteRoot.startsWith("/") ? "posix" : "win32");
             if (decision !== "default") return decision;
             return { decision, ownerUserInstructions: (this.#context.nativeToolAuthorization?.readOwnerUserInstructions?.() ?? [])
               .map(text => redactManagedSecrets(text, this.#redactValues)) };
@@ -549,6 +552,34 @@ export class ManagedSubagentObserver {
     const taskKey = createHash("sha256").update(taskId).digest("hex").slice(0, 40);
     return join(observationDirectory, `${taskKey}.json`);
   }
+}
+
+function orderedSubagentPolicy(snapshot: PolicySnapshot, request: PolicyDecisionRequest, pathStyle?: "posix" | "win32"): PolicyDecisionResult {
+  const { observation, toolCall } = request;
+  const direct = evaluateOrderedPolicyRules(snapshot, observation)?.action ?? "default";
+  const name = observation.toolName;
+  if (direct === "deny" || observation.toolProviderId !== undefined || name === undefined
+    || !["grep", "find", "ls"].includes(name)) return direct;
+
+  const roots = new Set<string>();
+  if (observation.subjectKind === "file_read") roots.add(observation.workspaceRelativePath ?? ".");
+  const extra: PolicyObservation[] = [];
+  if (toolCall?.toolName === name) {
+    const input = isRecord(toolCall.input) ? toolCall.input : {};
+    const raw = [input.path, input.file_path, input.filePath, input.directory].find((value): value is string =>
+      typeof value === "string" && value.trim() !== "") ?? ".";
+    roots.add(raw);
+    const lexical = policyObservationForToolCall({ name, args: { path: raw } }, {
+      workspaceRoot: snapshot.workspaceRoot, extraReadOnlyRoots: [], ...(pathStyle === undefined ? {} : { pathStyle })
+    });
+    if (lexical.workspaceRelativePath !== undefined) extra.push({ ...lexical, risk: observation.risk });
+  }
+  for (const root of roots) extra.push(...workspaceSubtreePolicyObservations(snapshot, observation, root, "file_read", pathStyle));
+  const decisions = extra.map((item) => evaluateOrderedPolicyRules(snapshot, item)?.action);
+  // A rule for one descendant can restrict the search, while only the direct
+  // observation may grant the entire operation.
+  if (decisions.includes("deny")) return "deny";
+  return decisions.includes("ask") ? "ask" : direct;
 }
 
 /** The hosted reverse-tool port uses the same private manifest and runner-claim
