@@ -388,7 +388,6 @@ export class ExtensionTasks {
     try { await this.options.host.authorizeExtensionTaskWrite(task.descriptor.id, owner.signal, assertCurrent, mode); }
     catch { this.#assert(owner); return { granted: false, task: this.#view(this.#own(owner, task.descriptor.id)) }; }
     assertCurrent();
-    const oldMode = task.descriptor.permissionMode;
     try {
       await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: mode }, { requireNativeObservation: true });
       assertCurrent(); this.options.host.assertSessionLifecycleIdle(task.descriptor.id);
@@ -398,7 +397,18 @@ export class ExtensionTasks {
         store.updateSession(task.descriptor.id, { permissionMode: mode });
         store.setSetting("service", PREFS, owner.extensionId, { ...initial.config, permissionMode: mode === "auto" || initial.config.permissionMode === "ask" ? mode : initial.config.permissionMode });
       });
-    } catch (error) { await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: oldMode }).catch(() => undefined); throw error; }
+    } catch (error) {
+      const current = this.options.store.findSession(task.descriptor.id)?.descriptor;
+      if (current && !current.archived && current.deletedAt === undefined && current.backendId === backend.id
+        && hash(current.binding) === hash(task.descriptor.binding)
+        && this.options.store.getBackend(backend.id).descriptor.instanceGeneration === backend.instanceGeneration) {
+        // The durable mode may still be unchanged even though the native
+        // setter already ran. Reconcile it on this binding explicitly.
+        await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: current.permissionMode },
+          { reconcileNativePolicy: true }).catch(() => undefined);
+      }
+      throw error;
+    }
     this.#writeAttempts.delete(key); return { granted: true, task: this.#view(this.#own(owner, task.descriptor.id)) };
     } finally { attempt.pending = false; }
   }
