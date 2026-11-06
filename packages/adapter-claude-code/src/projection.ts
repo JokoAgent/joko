@@ -293,9 +293,12 @@ export class PartialMessageBuffer {
     // fragment boundaries. Keep the marker and all following text together.
     const bearer = /\bBearer(?=\s|$)/iu.exec(plain);
     if (bearer !== null) plain = plain.slice(0, bearer.index);
-    let boundary = interrupted && plain === tail ? plain.length : 0;
-    if (boundary === 0) {
-      for (const delimiter of plain.matchAll(PLAIN_TEXT_BOUNDARIES)) boundary = delimiter.index + delimiter[0].length;
+    let boundary = 0;
+    for (const delimiter of plain.matchAll(PLAIN_TEXT_BOUNDARIES)) boundary = delimiter.index + delimiter[0].length;
+    if (interrupted && plain === tail && /^(?:[a-z]{1,16}|[0-9]{1,16})\.?$/u.test(plain.slice(boundary))) {
+      // The final short plain word or number is useful on interruption. Keep
+      // possible unfinished structured credentials and ambiguous tokens private.
+      boundary = plain.length;
     }
     const prefix = plain.slice(0, boundary);
     if (prefix.length === 0 || (pending.published === 0 && prefix.trim() === "")

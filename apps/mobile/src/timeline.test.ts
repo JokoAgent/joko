@@ -449,6 +449,28 @@ describe("ordered Thinking inside canonical Mobile messages", () => {
     payload: { kind: { case: kind, value } as any }
   });
 
+  it("renders a live reply without a start event and reconciles the exact completed reply", () => {
+    const first = scoped(1, "textDelta", { messageId: "answer", contentIndex: 0, delta: "First " });
+    const second = scoped(2, "textDelta", { messageId: "answer", contentIndex: 0, delta: "words" });
+    const final = scoped(3, "messageCompleted", { messageId: "answer", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "Final words." } }] });
+    expect(timelineRows([first, second], true)).toMatchObject([{ id: "answer", text: "First words", completed: false }]);
+    expect(timelineRows([first, second, final])).toMatchObject([{ id: "answer", text: "Final words.", completed: true }]);
+  });
+
+  it("keeps an interrupted Claude reply when another attempt completes", () => {
+    const first = scoped(1, "textDelta", { messageId: "claude-block-1-0", contentIndex: 0, delta: "First reply." });
+    const failed = scoped(2, "terminalError", { error: { message: "The stream ended." } });
+    const next = scoped(3, "textDelta", { messageId: "claude-block-2-0", contentIndex: 0, delta: "Next reply" });
+    const final = scoped(4, "messageCompleted", { messageId: "final", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "Next reply finished." } }] });
+    for (const event of [next, final]) event.identity!.attemptId = "retry";
+    expect(timelineRows([first, failed, next, final]).filter(row => row.kind === "assistant")).toMatchObject([
+      { id: "claude-block-1-0", text: "First reply.", completed: false, runOutcome: "failed" },
+      { id: "final", text: "Next reply finished.", completed: true }
+    ]);
+  });
+
   it("keeps stream/final ordered content in one original message with canonical media and fail-closed quote authority", () => {
     const history = [scoped(1, "messageStarted", { messageId: "answer", role: MessageRole.ASSISTANT }),
       scoped(2, "thinkingDelta", { messageId: "answer", contentIndex: 0, delta: "draft" }),

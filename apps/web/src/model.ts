@@ -1609,6 +1609,8 @@ export interface TimelineItemView {
   readonly contentIndex?: number;
   /** Transient indexed text fragments retained only until completion is authoritative. */
   readonly messageTextBlocks?: readonly { readonly contentIndex: number; readonly text: string }[];
+  /** Exact Run attempt that owns a transient Claude stream row. */
+  readonly assistantStreamAttempt?: string;
   /** Durable event used to reload an around-message window for persistent deep links. */
   readonly sourceEventId?: string;
   /** Opaque native entry identity when the generated event contract supplied one. */

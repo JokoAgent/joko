@@ -2626,6 +2626,29 @@ describe("incremental event projection", () => {
     expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).refresh).toBe("authoritative");
   });
 
+  it("preserves interrupted Claude text and replaces only the completed attempt's live row", () => {
+    const identity = { sessionId: "session-1", runId: "run", attemptId: "first", generation: 2n };
+    const first = create(EventSchema, { eventId: "partial-1", identity, cursor: { generation: 1n, sequence: 1n },
+      payload: { kind: { case: "textDelta", value: { messageId: "claude-block-1-0", delta: "First reply." } } } });
+    const failed = create(EventSchema, { eventId: "failed", identity, cursor: { generation: 1n, sequence: 2n },
+      payload: { kind: { case: "terminalError", value: { error: { message: "The stream ended." } } } } });
+    const retry = { ...identity, attemptId: "second" };
+    const next = create(EventSchema, { eventId: "partial-2", identity: retry, cursor: { generation: 1n, sequence: 3n },
+      payload: { kind: { case: "textDelta", value: { messageId: "claude-block-2-0", delta: "Next reply" } } } });
+    const final = create(EventSchema, { eventId: "final", identity: retry, cursor: { generation: 1n, sequence: 4n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "final", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "Next reply finished." } }] } } } });
+    const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 3n }, timeline: [first, failed, next] });
+    const current = mapSnapshot(raw);
+    expect(current.timelineBySession.get("session-1")?.filter(item => item.kind === "assistant")).toMatchObject([
+      { text: "First reply.", streaming: false }, { text: "Next reply", streaming: true }
+    ]);
+    const projected = projectSnapshotEvent(raw, current, final);
+    expect(projected.snapshot.timelineBySession.get("session-1")?.filter(item => item.kind === "assistant")).toMatchObject([
+      { text: "First reply.", streaming: false }, { id: "final", text: "Next reply finished.", streaming: false }
+    ]);
+  });
+
   it("retains exact opaque message entry boundaries from the Backend-neutral event payload", () => {
     const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
     const started = create(EventSchema, {
