@@ -435,9 +435,10 @@ describe("RemoteHostService", () => {
     const { service, original, observer } = pairedOwners(fixture);
     const input = { targetId: host.targetId, hostId: host.id };
     presented = newKey;
-    const failed = await service.testRemoteHostConnection(create(contract.TestRemoteHostConnectionRequestSchema, {
+    const testRequest = create(contract.TestRemoteHostConnectionRequestSchema, {
       ...input, expectedRevision: toProtoRevision(ready.host.revision)
-    }), original);
+    });
+    const failed = create(contract.TestRemoteHostConnectionResponseSchema, await service.testRemoteHostConnection(testRequest, original));
     const revision = failed.result?.host?.revision;
     const observed = failed.result?.observedHostKey;
     expect(observed).toMatchObject({ algorithm, sha256Fingerprint: sshHostKeyFingerprint(newKey) });
@@ -451,7 +452,7 @@ describe("RemoteHostService", () => {
     expect(authenticateSsh).toHaveBeenCalledOnce();
 
     presented = laterKey;
-    const replaced = await confirm(observed);
+    const replaced = create(contract.ClearRemoteHostTrustResponseSchema, await confirm(observed));
     expect(replaced.host?.trust?.sha256Fingerprint).toBe(sshHostKeyFingerprint(newKey));
     const refused = await fixture.registry.connect(host.targetId, host.id, replaced.host!.revision!.value);
     expect(refused.failure?.code).toBe("host_key_changed");
