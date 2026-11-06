@@ -1,6 +1,9 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
+import { create } from "@bufbuild/protobuf";
+import { Code, type HandlerContext } from "@connectrpc/connect";
+import * as contract from "@joko/contracts";
 import { workspaceEntryAbsentRevision } from "@joko/contracts";
 import type {
   RemoteDirectoryEntry,
@@ -19,7 +22,10 @@ import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 import { RemoteWorkspaceService } from "./remote-workspace-service.js";
 import { WorkspaceService } from "./workspace-service.js";
 import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
-import type { OperationalStore } from "@joko/store";
+import { OperationalStore } from "@joko/store";
+import type { OrchestratorApplication } from "./application.js";
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
+import { createConnectServices } from "./connect-services.js";
 
 describe("RemoteWorkspaceService", () => {
   it("routes bounded files, CAS mutations, search, and Git state through owner-scoped transports", async () => {
@@ -180,6 +186,74 @@ describe("RemoteWorkspaceService", () => {
     expect(scopes.length).toBeGreaterThan(8);
     expect(scopes.every(([targetId, hostId]) => targetId === "target-a" && hostId === "host-a")).toBe(true);
     await workspaces.close();
+  });
+
+  it.each(["read-preflight", "read-in-flight", "write"] as const)("retires a revoked Connect Owner during a remote file %s", async (stage) => {
+    const f = await memoryWorkspaceFixture();
+    const store = new OperationalStore(":memory:");
+    let release!: () => void;
+    const gated = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = vi.fn();
+    const pause = async () => { waiting(); await gated; };
+    try {
+      store.upsertBackend({ id: "backend", displayName: "Backend", version: "test", health: "healthy", adapterKind: "fixture",
+        instanceGeneration: 0, installationState: "installed", authenticationState: "authenticated", models: [], tools: [], diagnostics: [],
+        capabilities: new Map([["workspace.files.write", { key: "workspace.files.write", supported: true }]]) });
+      store.upsertTarget({ id: "target", backendId: "backend", displayName: "Remote", workspaceRoot: f.registration.root,
+        managed: false, trusted: true, remoteWorkspace: f.registration.remote.binding }, { workspaceId: f.registration.id });
+      const connections = new ConnectionManager(store);
+      const caller = (id: string) => {
+        const key = `key-${id}`;
+        const connection = store.createConnection({ id, name: id, authKeyDigest: digestAuthKey(key) });
+        const context = { requestHeader: new Headers({ authorization: `Bearer ${key}` }),
+          signal: new AbortController().signal } as HandlerContext;
+        return { connection, context };
+      };
+      const original = caller("original-file-owner"), observer = caller("current-file-owner");
+      const services = createConnectServices({ config: { publicOrigin: "http://127.0.0.1" }, store, connections, workspaces: f.workspaces,
+        artifacts: { maximumBlobBytes: 1024 }, sessionHost: {}, scheduler: {}, adapters: [], browserActivity: [] } as unknown as OrchestratorApplication);
+      const path = "/workspace/note.txt", fields = { workspaceId: f.registration.id, relativePath: "note.txt" };
+      await f.files.write({ path, content: Buffer.from("Original text") });
+      const readRequest = create(contract.ReadWorkspaceFileRequestSchema, { ...fields, maximumBytes: 1024n });
+      const preview = await services.workspace.readWorkspaceFile(readRequest, observer.context);
+      const writeRequest = create(contract.WriteWorkspaceTextFileRequestSchema, {
+        ...fields, utf8Text: "Replacement text", expectedRevision: preview.preview!.entry!.revision
+      });
+      const readFile = f.files.read.bind(f.files);
+      const read = vi.spyOn(f.files, "read");
+      const write = vi.spyOn(f.files, "write");
+      if (stage === "read-in-flight") {
+        read.mockImplementationOnce(async (request) => { await pause(); return readFile(request); });
+      } else {
+        const statFile = f.files.stat.bind(f.files);
+        let blocked = false;
+        vi.spyOn(f.files, "stat").mockImplementation(async (pathToRead) => {
+          if (pathToRead === path && !blocked) { blocked = true; await pause(); }
+          return statFile(pathToRead);
+        });
+      }
+      const result = stage === "write"
+        ? services.workspace.writeWorkspaceTextFile(writeRequest, original.context)
+        : services.workspace.readWorkspaceFile(readRequest, original.context);
+      const denied = expect(result).rejects.toMatchObject({ code: Code.Unauthenticated });
+      await vi.waitFor(() => expect(waiting).toHaveBeenCalledOnce());
+      connections.revokeDevice(original.connection.deviceId);
+      release();
+      await denied;
+      expect(original.context.signal.aborted).toBe(false);
+      expect(read).toHaveBeenCalledTimes(stage === "read-in-flight" ? 1 : 0);
+      expect(write).not.toHaveBeenCalled();
+      expect(Buffer.from(await readFile({ path, maximumBytes: 1024 })).toString()).toBe("Original text");
+
+      if (stage === "write") await expect(services.workspace.writeWorkspaceTextFile(writeRequest, observer.context))
+        .resolves.toMatchObject({ newRevision: { opaqueRevision: expect.stringContaining("sha256:") } });
+      else await expect(services.workspace.readWorkspaceFile(readRequest, observer.context)).resolves.toEqual(preview);
+    } finally {
+      release?.();
+      vi.restoreAllMocks();
+      await f.workspaces.close();
+      store.close();
+    }
   });
 
   it.each(["aliases", "nested roots"] as const)("serializes old-revision saves across remote workspace %s", async kind => {

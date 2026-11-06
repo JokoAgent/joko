@@ -37,6 +37,7 @@ import {
   type WorkspaceEntryRecord,
   type WorkspaceFileIndex,
   type WorkspaceFilePreview,
+  type WorkspaceFileRequestAuthority,
   type WorkspacePreviewAuthority,
   type WorkspaceGitCommitResult,
   type WorkspaceGitDiff,
@@ -195,10 +196,10 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     } };
   }
 
-  async invoke<Result>(workspaceId: string, method: string, args: readonly unknown[]): Promise<Result> {
+  async invoke<Result>(workspaceId: string, method: string, args: readonly unknown[], request?: WorkspaceFileRequestAuthority): Promise<Result> {
     this.#assertOpen();
     const registration = this.#require(workspaceId);
-    const transports = await this.#transports(registration);
+    const transports = await this.#transports(registration, request?.signal, request?.assertCurrent);
     const execute = async (): Promise<Result> => {
       transports.assertCurrent();
       if (GIT_METHODS.has(method) && !await requireRemoteGitRoot(registration, transports, method === "gitState")) {
@@ -208,10 +209,10 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       let result: unknown;
       switch (method) {
         case "list": result = await this.#list(registration, transports.files, args[0] as string, args[1] as WorkspaceEntryListingOptions | undefined); break;
-        case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number, args[2] as number | undefined, undefined, transports.assertCurrent); break;
+        case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number, args[2] as number | undefined, request?.signal, transports.assertCurrent); break;
         case "materializeFile": result = await this.#materialize(registration, transports.files, args, transports.assertCurrent); break;
         case "listFiles": result = await this.#listFiles(registration, transports.files); break;
-        case "writeTextFile": result = await this.#writeTextFile(registration, transports.files, args[0] as WorkspaceTextFileWriteInput); break;
+        case "writeTextFile": result = await this.#writeTextFile(registration, transports.files, args[0] as WorkspaceTextFileWriteInput, request?.signal); break;
         case "createEntry": result = await this.#createEntry(registration, transports.files, args[0] as { path: string; kind: "file" | "directory"; expectedRevision: string }); break;
         case "moveEntry": result = await this.#moveEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
         case "deleteEntry": result = await this.#deleteEntry(registration, transports.files, args[0] as { path: string; expectedRevision: string; confirmRecursive: boolean }); break;
@@ -485,7 +486,8 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   async #writeTextFile(
     registration: WorkspaceRegistration,
     files: RemoteFileTransportPort,
-    input: WorkspaceTextFileWriteInput
+    input: WorkspaceTextFileWriteInput,
+    signal?: AbortSignal
   ): Promise<WorkspaceTextFileWriteResult> {
     const path = remoteWorkspacePath(registration, input.path, false);
     await assertRemoteMutationPath(registration, files, path, true);
@@ -493,6 +495,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     if (beforeInfo.kind !== "file") throw new WorkspaceTextFileWriteError("Remote text save requires a regular file.", "unsupported");
     if (beforeInfo.size > WORKSPACE_TEXT_FILE_MAXIMUM_BYTES) throw new WorkspaceTextFileWriteError("Existing remote text exceeds the save limit.", "too_large");
     const before = Buffer.from(await files.read({ path, maximumBytes: Math.max(beforeInfo.size, 1),
+      ...(signal === undefined ? {} : { signal }),
       ...(beforeInfo.version === undefined ? {} : { expectedVersion: beforeInfo.version }) }));
     const beforeRevision = contentRevision(before);
     if (input.expectedRevision !== beforeRevision && input.expectedRevision !== remoteRevision(beforeInfo)) {
@@ -507,9 +510,10 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       throw new WorkspaceTextFileWriteError("Remote file changed; read it again before saving.", "stale");
     }
     await assertRemoteMutationPath(registration, files, path, true);
-    await files.write({ path, content, mode: beforeInfo.mode & 0o777, atomic: true });
+    await files.write({ path, content, mode: beforeInfo.mode & 0o777, atomic: true, ...(signal === undefined ? {} : { signal }) });
     const after = await files.stat(path);
     const readback = Buffer.from(await files.read({ path, maximumBytes: WORKSPACE_TEXT_FILE_MAXIMUM_BYTES,
+      ...(signal === undefined ? {} : { signal }),
       ...(after.version === undefined ? {} : { expectedVersion: after.version }) }));
     if (!readback.equals(content) || remoteRevision(await files.stat(path)) !== remoteRevision(after)) {
       throw new WorkspaceTextFileWriteError("Remote file changed while the save was committed. Read it again before retrying.", "stale");
@@ -968,13 +972,15 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     return registration;
   }
 
-  async #transports(registration: WorkspaceRegistration, signal?: AbortSignal): Promise<RemoteTransports> {
+  async #transports(registration: WorkspaceRegistration, signal?: AbortSignal, assertRequestCurrent?: () => void): Promise<RemoteTransports> {
     const remote = registration.remote!;
+    assertRequestCurrent?.();
     signal?.throwIfAborted();
     const authority = await this.#remoteExecution.workspace(remote.binding, signal);
-    await validateCapturedWorkspaceRoot(registration, authority.files, authority.assertCurrent, signal);
+    const assertAuthority = (): void => { assertRequestCurrent?.(); authority.assertCurrent(); };
+    await validateCapturedWorkspaceRoot(registration, authority.files, assertAuthority, signal);
     const assertCurrent = () => {
-      signal?.throwIfAborted(); this.#assertOpen(); authority.assertCurrent();
+      signal?.throwIfAborted(); this.#assertOpen(); assertAuthority();
       if (this.#registrations.get(registration.id) !== registration) throw new WorkspaceEntryMutationError("The registered remote workspace changed.", "stale");
     };
     const guarded = async <T>(operation: () => Promise<T>): Promise<T> => { assertCurrent(); const value = await operation(); assertCurrent(); return value; };
