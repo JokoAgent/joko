@@ -20,6 +20,35 @@ afterEach(() => {
 });
 
 describe("ContactService", () => {
+  it("saves and syncs multiline contact prose through the formal create and update requests", async () => {
+    const { store, manager } = createFixture();
+    const service = createContactConnectService(manager, () => ({ connectionId: "connection-1" }));
+    const caller = context();
+    const enabled = await service.setContactDirectoryEnabled(create(contract.SetContactDirectoryEnabledRequestSchema, {
+      expectedDirectoryRevision: revision(1n), enabled: true
+    }), caller);
+    const narrative = "第一段\r\n第二段\t细节";
+    const created = await service.createContact(create(contract.CreateContactRequestSchema, {
+      expectedDirectoryRevision: enabled.directory!.revision,
+      contact: { kind: contract.ContactKind.PERSON, displayName: "Alice Chen", narrative, agentNotes: "First\nSecond" }
+    }), caller);
+    expect(created.contact).toMatchObject({ narrative, agentNotes: "First\nSecond" });
+    const contactId = created.contact!.summary!.contactId;
+    const notes = "Use preferred name\n\tConfirm with Alice";
+    const update = async (patch: { summary?: string; narrative?: string; agentNotes?: string }) => service.updateContact(
+      create(contract.UpdateContactRequestSchema, { contactId, expectedRevision: created.contact!.summary!.revision, patch }), caller
+    );
+    for (const patch of [{ summary: "First\nSecond" }, { narrative: "First\u0000Second" },
+      { narrative: "中".repeat(5_462) }, { agentNotes: "First\rSecond" }]) {
+      await expect(update(patch)).rejects.toMatchObject({ code: Code.InvalidArgument });
+    }
+    await expect(update({ agentNotes: notes })).resolves.toMatchObject({ contact: { narrative, agentNotes: notes } });
+    const destination = createFixture();
+    const sync = store.readContactSyncState("source-node").state;
+    destination.store.mergeContactSyncState("destination-node", sync);
+    expect(destination.store.getContact(contactId)).toMatchObject({ narrative, agentNotes: notes });
+  });
+
   it("authenticates and maps the full local directory lifecycle", async () => {
     const fixture = createFixture();
     const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));

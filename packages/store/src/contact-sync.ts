@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { ContactKind, ContactSource, ContactStatus } from "./contact-types.js";
+import { isContactText as isText } from "./contact-text.js";
 
 export const CONTACT_SYNC_VERSION = 1;
 export const CONTACT_SYNC_MAX_ROWS_PER_TABLE = 50_000;
@@ -21,7 +22,6 @@ const MAX_COUNTER = 9_007_199_254_740_991;
 const ENTITY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const PLATFORM = /^[a-z0-9_-]{1,32}$/u;
 const EVENT_DATE = /^\d{4}-(?:0[1-9]|1[0-2])(?:-(?:0[1-9]|[12]\d|3[01]))?$/u;
-const FORBIDDEN_TEXT = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 export interface ContactSyncStamp {
   readonly counter: number;
@@ -652,10 +652,6 @@ function isSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function isText(value: unknown, minimum: number, maximum: number): value is string {
-  return typeof value === "string" && value === value.trim() && value.length >= minimum && value.length <= maximum && !FORBIDDEN_TEXT.test(value);
-}
-
 function isStamp(value: unknown): value is ContactSyncStamp {
   return isRecord(value) && hasOnlyKeys(value, ["counter", "nodeId"]) && isSafeInteger(value.counter) &&
     value.counter >= 1 && value.counter <= MAX_COUNTER && isEntityId(value.nodeId);
@@ -716,8 +712,8 @@ function isContact(value: unknown): value is ContactSyncContact {
   ], ["deleted"]) || !isEntityId(value.id)) return false;
   return isStamped(value.kind, isKind) && isStamped(value.displayName, (item): item is string => isText(item, 1, MAX_DISPLAY_NAME)) &&
     isStamped(value.aliases, isAliases) && isStamped(value.summary, (item): item is string => isText(item, 0, MAX_SUMMARY)) &&
-    isStamped(value.narrative, (item): item is string => isText(item, 0, Number.MAX_SAFE_INTEGER) && Buffer.byteLength(item, "utf8") <= MAX_NARRATIVE_BYTES) &&
-    isStamped(value.agentNotes, (item): item is string => isText(item, 0, MAX_AGENT_NOTES)) && isStatusStamped(value.status) &&
+    isStamped(value.narrative, (item): item is string => isText(item, 0, Number.MAX_SAFE_INTEGER, true) && Buffer.byteLength(item, "utf8") <= MAX_NARRATIVE_BYTES) &&
+    isStamped(value.agentNotes, (item): item is string => isText(item, 0, MAX_AGENT_NOTES, true)) && isStatusStamped(value.status) &&
     isStamped(value.source, isSource) && isStamped(value.createdAt, isSafeInteger) && isStamped(value.updatedAt, isSafeInteger) &&
     (value.deleted === undefined || isStamp(value.deleted));
 }
@@ -826,8 +822,8 @@ function isSnapshotArray<T extends RowWithId>(
 function isSnapshotContact(value: unknown): value is ContactSnapshotContact {
   return isRecord(value) && hasOnlyKeys(value, ["id", "kind", "displayName", "aliases", "summary", "narrative", "agentNotes", "status", "source", "createdAt", "updatedAt"]) &&
     isEntityId(value.id) && isKind(value.kind) && isText(value.displayName, 1, MAX_DISPLAY_NAME) && isAliases(value.aliases) &&
-    isText(value.summary, 0, MAX_SUMMARY) && isText(value.narrative, 0, Number.MAX_SAFE_INTEGER) && Buffer.byteLength(value.narrative, "utf8") <= MAX_NARRATIVE_BYTES &&
-    isText(value.agentNotes, 0, MAX_AGENT_NOTES) && isStatus(value.status) && isSource(value.source) &&
+    isText(value.summary, 0, MAX_SUMMARY) && isText(value.narrative, 0, Number.MAX_SAFE_INTEGER, true) && Buffer.byteLength(value.narrative, "utf8") <= MAX_NARRATIVE_BYTES &&
+    isText(value.agentNotes, 0, MAX_AGENT_NOTES, true) && isStatus(value.status) && isSource(value.source) &&
     isSafeInteger(value.createdAt) && isSafeInteger(value.updatedAt) && value.updatedAt >= value.createdAt;
 }
 

@@ -41,7 +41,7 @@ describe("ContactManager portable address-book boundary", () => {
       "ORG:Northwind Labs",
       "TITLE:Principal Engineer",
       "CATEGORIES:Partners,Launch Team",
-      "NOTE:Robotics partner",
+      "NOTE:Robotics partner\\nMet at launch",
       "END:VCARD",
       "BEGIN:VCARD",
       "VERSION:4.0",
@@ -88,6 +88,7 @@ describe("ContactManager portable address-book boundary", () => {
     ]));
     const bob = fixture.manager.list({ query: "Robotics" }).contacts[0]!;
     const bobProfile = fixture.manager.get(bob.id);
+    expect(bobProfile.narrative).toBe("Robotics partner\nMet at launch");
     expect(bobProfile.aliases).toEqual(["小李", "Bobby"]);
     expect(bobProfile.identities).toEqual(expect.arrayContaining([
       expect.objectContaining({ platform: "email", value: "bob@example.com" }),
