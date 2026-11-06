@@ -18148,7 +18148,24 @@ function nativeDispatchHistoryOwnership(
   if (suffixLineage.slice(1).some((entry) => (eventsByEntry.get(entry.entryId) ?? []).some((event) =>
     event.payload.type === "message_complete" && event.payload.role === "user"))) return undefined;
 
-  const terminalEvents = eventsByEntry.get(suffixLineage.at(-1)!.entryId) ?? [];
+  let terminalIndex = suffixLineage.length - 1;
+  if (mode === "recovery" && store.getBackend(session.backendId).descriptor.adapterKind === "pi"
+    && userMessages[0]!.metadata?.namespace === "pi.native_history") {
+    while (terminalIndex > 0) {
+      const entryId = suffixLineage[terminalIndex]!.entryId;
+      const projections = eventsByEntry.get(entryId);
+      const control = projections?.[0];
+      if (projections?.length !== 1 || control?.metadata?.namespace !== "pi.native_history" || control.contentIndex !== 0
+        || control.metadata.fields["nativeEntryType"] !== control.projectionKind || control.payload.type !== "status"
+        || !(control.projectionKind === "model_change" && control.payload.key === "pi.history.model"
+          || control.projectionKind === "thinking_level_change" && control.payload.key === "pi.history.thinking_level")) break;
+      // A restored profile can append these controls after the completed
+      // turn. Preserve their history without attributing them to that Run.
+      suffixIds.delete(entryId);
+      terminalIndex -= 1;
+    }
+  }
+  const terminalEvents = eventsByEntry.get(suffixLineage[terminalIndex]!.entryId) ?? [];
   const terminalAssistantMessages = terminalEvents.filter((event) =>
     event.payload.type === "message_complete" && event.payload.role === "assistant");
   const turnId = userMessages[0]!.metadata?.fields["turnId"];
@@ -18166,7 +18183,8 @@ function nativeDispatchHistoryOwnership(
   if (mode === "recovery" && terminalAssistantMessages.length === 0 && codexTurnStatus("native_turn_failed", "failed")) {
     return { baseline, outcome: "failed", nativeEntryIds: suffixIds };
   }
-  if (suffixLineage.length < 2 || terminalAssistantMessages.length !== 1) return undefined;
+  if (terminalIndex < 1 || terminalAssistantMessages.length !== 1) return undefined;
+  if (terminalIndex < suffixLineage.length - 1 && terminalAssistantMessages[0]!.metadata?.namespace !== "pi.native_history") return undefined;
   const terminalOutcome = terminalAssistantMessages[0]!.metadata?.fields["nativeTerminalOutcome"];
   if (terminalOutcome !== "completed" && terminalOutcome !== "aborted" && terminalOutcome !== "failed") {
     return undefined;
