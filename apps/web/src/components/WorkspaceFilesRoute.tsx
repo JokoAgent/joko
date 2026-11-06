@@ -59,8 +59,7 @@ import {
 import type { WorkspaceFilesEntryView } from "./workspace-tree-state.js";
 import {
   canonicalWorkspaceRelativePath,
-  normalizeWorkspaceDirectoryEntries,
-  workspacePathParent
+  normalizeWorkspaceDirectoryEntries
 } from "./workspace-tree-state.js";
 import { WorkspaceSessionTabsBar, type WorkspaceSessionCreateOption } from "./WorkspaceSessionTabsBar.js";
 import { Button, IconButton, Modal, Spinner, StatusDot, cx } from "./ui.js";
@@ -546,11 +545,9 @@ export function WorkspaceFilesRoute({
       createDirectory: async ({ workspaceId, path }) => {
         await controllerRef.current.createWorkspaceEntry({ workspaceId, path, kind: "directory" });
       },
-      rename: async ({ workspaceId, fromPath, toPath, kind }) => {
+      rename: async ({ workspaceId, fromPath, toPath, kind, expectedRevision }) => {
         if (!(await guardAffectedDocument("switch-file", fromPath, kind === "directory"))) return false;
-        const entry = await freshWorkspaceEntry(controllerRef.current, workspaceId, fromPath);
-        if (entry.revision === undefined) throw new Error(t("workspace.revisionUnavailable"));
-        await controllerRef.current.moveWorkspaceEntry({ workspaceId, sourcePath: fromPath, destinationPath: toPath, expectedRevision: entry.revision });
+        await controllerRef.current.moveWorkspaceEntry({ workspaceId, sourcePath: fromPath, destinationPath: toPath, expectedRevision });
         workspaceOpenTabsStore.renameTabPrefix(workspaceId, fromPath, toPath);
         workspaceSelectedFileStore.renamePrefix(workspaceId, fromPath, toPath);
         if (selectedPath === fromPath || (kind === "directory" && selectedPath?.startsWith(`${fromPath}/`) === true)) {
@@ -558,10 +555,8 @@ export function WorkspaceFilesRoute({
           navigateFile(nextPath);
         }
       },
-      delete: async ({ workspaceId, path, kind }) => {
+      delete: async ({ workspaceId, path, kind, expectedRevision }) => {
         if (!(await guardAffectedDocument("close-file", path, kind === "directory"))) return false;
-        const entry = await freshWorkspaceEntry(controllerRef.current, workspaceId, path);
-        if (entry.revision === undefined) throw new Error(t("workspace.revisionUnavailable"));
         const liveTabs = workspaceOpenTabsStore.getTabs(workspaceId);
         const prefix = `${path}/`;
         const closing = liveTabs.filter((tab) => tab === path || (kind === "directory" && tab.startsWith(prefix)));
@@ -569,7 +564,7 @@ export function WorkspaceFilesRoute({
         const successor = selectedAffected && selectedPath !== undefined
           ? nextActiveWorkspaceTab(liveTabs, selectedPath, closing)
           : undefined;
-        await controllerRef.current.deleteWorkspaceEntry({ workspaceId, path, expectedRevision: entry.revision, confirmRecursive: kind === "directory" });
+        await controllerRef.current.deleteWorkspaceEntry({ workspaceId, path, expectedRevision, confirmRecursive: kind === "directory" });
         workspaceOpenTabsStore.closeTabs(workspaceId, closing);
         workspaceSelectedFileStore.clearPrefix(workspaceId, path);
         if (selectedAffected) navigateFile(successor);
@@ -1114,22 +1109,6 @@ function mapWorkspaceEntry(entry: WorkspaceEntryView): WorkspaceFilesEntryView {
     ...(entry.status === undefined ? {} : { status: entry.status }),
     generated: entry.generated
   };
-}
-
-async function freshWorkspaceEntry(
-  controller: Pick<AppController, "listWorkspaceEntries">,
-  workspaceId: string,
-  path: string
-): Promise<WorkspaceFilesEntryView> {
-  const canonical = canonicalWorkspaceRelativePath(path);
-  const parent = workspacePathParent(canonical);
-  const entry = normalizeWorkspaceDirectoryEntries(
-    parent,
-    (await controller.listWorkspaceEntries(workspaceId, parent, DOCUMENT_TREE_LISTING)).map(mapWorkspaceEntry)
-  )
-    .find((candidate) => candidate.path === canonical);
-  if (entry === undefined) throw new Error("The workspace entry no longer exists.");
-  return entry;
 }
 
 function safeWorkspacePath(value: string | undefined): { readonly path?: string; readonly error?: true } {

@@ -36,37 +36,7 @@ describe("WorkspaceFilesRoute leave gate", () => {
     const owner = new AbortController();
     let leave!: Promise<boolean>;
     try {
-      await act(async () => {
-        root.render(<WorkspaceFilesRoute
-          controller={controller()}
-          route={{ kind: "files", sessionId: "leave-task" }}
-          session={session()}
-          target={target()}
-          backend={backend()}
-          workspace={workspace()}
-          sessions={[session()]}
-          chatPane={null}
-          t={(key) => key}
-          onError={vi.fn()}
-          onArchiveSession={vi.fn()}
-          navigation={{
-            open: true,
-            mode: "expanded",
-            width: 320,
-            onCloseDrawer: vi.fn(),
-            onHide: vi.fn(),
-            onCollapse: vi.fn(),
-            onExpand: vi.fn(),
-            onResizePointerDown: vi.fn(),
-            onResizePointerMove: vi.fn(),
-            onResizePointerUp: vi.fn(),
-            onResizePointerCancel: vi.fn(),
-            onResizeKeyDown: vi.fn(),
-            onResetWidth: vi.fn(),
-            onDisconnect: vi.fn()
-          }}
-        />);
-      });
+      await act(async () => root.render(routeView(controller())));
 
       await act(async () => {
         leave = requestWorkspaceDocumentLeave({ reason: "route-change", signal: owner.signal });
@@ -87,7 +57,55 @@ describe("WorkspaceFilesRoute leave gate", () => {
       host.remove();
     }
   });
+
+  it("submits the confirmed file revision even when the same path now lists a different file", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    const path = "report.txt";
+    const file = { path, name: path, kind: "file" as const, revision: "original-revision" };
+    const listWorkspaceEntries = vi.fn(async () => [file]);
+    const deleteWorkspaceEntry = vi.fn(async () => { throw new Error("The file revision changed."); });
+    const connected = Object.assign(controller(), { listWorkspaceEntries, deleteWorkspaceEntry });
+    const writable = backend();
+    const capabilities = new Map(writable.capabilities);
+    capabilities.set("workspace.files.write", { name: "workspace.files.write", supported: true, options: [] });
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    try {
+      await act(async () => root.render(routeView(connected, { ...writable, capabilities })));
+      const row = host.querySelector(`[data-relative-path="${path}"]`);
+      expect(row).not.toBeNull();
+      await act(async () => row!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })));
+      const remove = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+        .find((button) => button.textContent === "common.delete");
+      expect(remove).toBeDefined();
+      await act(async () => remove!.click());
+      const confirm = document.querySelector<HTMLButtonElement>('[role="dialog"] button[data-confirm]');
+      expect(confirm).not.toBeNull();
+      listWorkspaceEntries.mockResolvedValue([{ ...file, revision: "replacement-revision" }]);
+
+      await act(async () => confirm!.click());
+      expect(deleteWorkspaceEntry).toHaveBeenCalledExactlyOnceWith({ workspaceId: "leave-workspace", path,
+        expectedRevision: "original-revision", confirmRecursive: false });
+      expect(document.querySelector('[role="dialog"] [role="alert"]')?.textContent).toBe("workspace.actionFailed");
+      expect(host.querySelector(`[data-relative-path="${path}"]`)).not.toBeNull();
+    } finally {
+      await act(async () => root.unmount());
+      host.remove();
+    }
+  });
 });
+
+function routeView(controller: AppController, backendView = backend()) {
+  return <WorkspaceFilesRoute controller={controller} route={{ kind: "files", sessionId: "leave-task" }}
+    session={session()} target={target()} backend={backendView} workspace={workspace()} sessions={[session()]}
+    chatPane={null} t={(key) => key} onError={vi.fn()} onArchiveSession={vi.fn()}
+    navigation={{
+      open: true, mode: "expanded", width: 320,
+      onCloseDrawer: vi.fn(), onHide: vi.fn(), onCollapse: vi.fn(), onExpand: vi.fn(), onResizePointerDown: vi.fn(),
+      onResizePointerMove: vi.fn(), onResizePointerUp: vi.fn(), onResizePointerCancel: vi.fn(),
+      onResizeKeyDown: vi.fn(), onResetWidth: vi.fn(), onDisconnect: vi.fn()
+    }} />;
+}
 
 function controller(): AppController {
   return {
