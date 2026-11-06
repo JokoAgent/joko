@@ -6,6 +6,7 @@ import type { BlobRef, MessageBlock } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 import { extractPdfText, PDF_TEXT_MAX_BYTES, PdfTextExtractionError, type PdfTextWorkerResult } from "@joko/tool-document";
 import type { ArtifactStore } from "./artifact-store.js";
+import { readGitPatchPaths } from "./git-patch-paths.js";
 import type { ReviewEvidenceProvider } from "./review-coordinator.js";
 import {
   isSensitiveReviewPath,
@@ -387,15 +388,13 @@ function unifiedDiffEvidence(
   const blocks = patch.split(/(?=^diff --git )/gmu).filter((block) => block.startsWith("diff --git "));
   if (blocks.length > MAX_REVIEW_SOURCE_DIFFS) throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review diff exceeds its file limit.");
   return blocks.map((block) => {
-    const newline = block.indexOf("\n");
-    const first = block.slice(0, newline < 0 ? undefined : newline);
-    const match = /^diff --git a\/(.+) b\/(.+)$/u.exec(first);
-    if (match === null || match[1]!.startsWith('"') || match[2]!.startsWith('"')) {
+    const lines = block.split(/\r?\n/u);
+    const paths = readGitPatchPaths(lines, 0);
+    if (paths === undefined) {
       throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review diff contains an unsupported path encoding.");
     }
-    const oldPath = canonicalReviewPath(match[1]!);
-    const path = canonicalReviewPath(match[2]!);
-    const lines = block.split("\n");
+    const oldPath = canonicalReviewPath(paths.oldPath);
+    const path = canonicalReviewPath(paths.path);
     const additions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
     const deletions = lines.filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
     const allowed = Math.min(budget.remaining, [...block].length);
