@@ -1,6 +1,6 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { Agent, ProxyAgent, buildConnector, fetch as undiciFetch, Dispatcher } from "undici";
+import { Agent, DecoratorHandler, Dispatcher, ProxyAgent, buildConnector, fetch as undiciFetch } from "undici";
 import { connectSocks5Tunnel } from "@joko/outbound-network";
 import { isBrowserProxyRequestUrlAllowed, type BrowserProxyLookup } from "@joko/tool-browser";
 import { evaluateOrderedPolicyRules, type AdapterContext } from "@joko/core";
@@ -11,6 +11,14 @@ export class HostedAgentWebFetchBlockedError extends Error {
   constructor() { super("The destination requires Source network approval."); }
 }
 type Result = Awaited<ReturnType<typeof fetchWebPage>>;
+interface PinnedSourceRequestInput {
+  readonly url: URL;
+  readonly addresses: readonly string[];
+  readonly proxy: string | null | undefined;
+  readonly init: RequestInit;
+  readonly assertCurrent: () => void;
+}
+
 export interface HostedAgentClaudeWebFetchOptions {
   readonly context: AdapterContext;
   readonly readPolicy: () => HostedAgentExecutorPolicy;
@@ -19,8 +27,7 @@ export interface HostedAgentClaudeWebFetchOptions {
   readonly environmentProxyForTarget?: (target: URL) => string | null | undefined;
   readonly lookup?: (hostname: string) => Promise<readonly string[]>;
   /** Private test/transport seam: the vetted address is explicit and must be pinned. */
-  readonly request?: (input: { readonly url: URL; readonly addresses: readonly string[]; readonly proxy: string | null | undefined;
-    readonly init: RequestInit; readonly assertCurrent: () => void }) => Promise<{ response: Response; release(): Promise<void> }>;
+  readonly request?: (input: PinnedSourceRequestInput) => Promise<{ response: Response; release(): Promise<void> }>;
 }
 
 /** Captured for one original Source Queue operation; never a creation-time
@@ -92,57 +99,96 @@ export function createHostedAgentClaudeWebFetch(options: HostedAgentClaudeWebFet
 
 /** The proxy receives a vetted IP, never an untrusted DNS name. Host and TLS
  * SNI still identify the original website. The response owns its dispatcher. */
-export async function pinnedSourceRequest(input: { readonly url: URL; readonly addresses: readonly string[];
-  readonly proxy: string | null | undefined; readonly init: RequestInit; readonly assertCurrent: () => void }): Promise<{ response: Response; release(): Promise<void> }> {
-  input.assertCurrent();
-  const address = input.addresses[0]; if (!address || !isIP(address)) throw new HostedAgentWebFetchBlockedError();
-  const originalHost = input.url.hostname.replace(/^\[|\]$/gu, ""), target = new URL(input.url);
-  target.hostname = address.includes(":") ? `[${address}]` : address;
-  let dispatcher: Dispatcher;
-  const tls = { ...(isIP(originalHost) === 0 ? { servername: originalHost } : {}), timeout: 15_000 };
-  if (!input.proxy) dispatcher = new Agent({ connect: buildConnector(tls) });
-  else {
-    let proxy: URL; try { proxy = new URL(input.proxy); } catch { throw new Error("The Source outbound proxy is invalid."); }
-    if (["http:", "https:"].includes(proxy.protocol)) dispatcher = new ProxyAgent({ uri: proxy.href, requestTls: tls });
-    else if (["socks5:", "socks5h:"].includes(proxy.protocol)) {
-      const connectTls = buildConnector(tls);
-      dispatcher = new Agent({ connect: (options, callback) => {
-        input.assertCurrent();
-        void connectSocks5Tunnel(proxy.href, address, Number(input.url.port || (input.url.protocol === "https:" ? 443 : 80))).then(socket => {
-          try { input.assertCurrent(); } catch (error) { socket.destroy(); callback(error as Error, null); return; }
-          if (input.url.protocol === "http:") callback(null, socket);
-          else connectTls({ ...options, servername: isIP(originalHost) ? undefined : originalHost, httpSocket: socket }, callback);
-        }, () => callback(new Error("The Source proxy connection failed."), null));
-      } });
-    } else throw new Error("The Source outbound proxy protocol is unsupported.");
-  }
-  const pinned = dispatcher;
-  dispatcher = new class extends Dispatcher {
-    override dispatch(options: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandlers): boolean {
-      input.assertCurrent();
-      const headers: Record<string, string | string[] | undefined> = {};
-      if (Array.isArray(options.headers)) {
-        for (let index = 0; index < options.headers.length; index += 2) {
-          const key = String(options.headers[index]); if (key.toLowerCase() !== "host") headers[key] = String(options.headers[index + 1]);
+export async function pinnedSourceRequest(input: PinnedSourceRequestInput): Promise<{ response: Response; release(): Promise<void> }> {
+  const assertCurrent = () => {
+    input.init.signal?.throwIfAborted();
+    input.assertCurrent();
+  };
+  assertCurrent();
+  const addresses = input.proxy ? input.addresses : input.addresses.slice(0, 1);
+  const headers = new Headers(input.init.headers);
+  headers.delete("authorization");
+  headers.delete("cookie");
+  headers.delete("proxy-authorization");
+  let connectionError: unknown;
+
+  for (const address of addresses) {
+    assertCurrent();
+    if (!isIP(address)) throw new HostedAgentWebFetchBlockedError();
+    const host = address.includes(":") ? `[${address}]` : address;
+    const port = input.url.port ? `:${input.url.port}` : "";
+    const origin = new URL(`${input.url.protocol}//${host}${port}`).origin;
+    const pinned = createPinnedTransport(input.url, input.proxy, address, assertCurrent);
+    let requestStarted = false;
+    let failedBeforeRequest = false;
+    const dispatcher = new class extends Dispatcher {
+      override dispatch(options: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandlers): boolean {
+        assertCurrent();
+        const forwarded: Record<string, string | string[] | undefined> = {};
+        const original = options.headers;
+        if (Array.isArray(original)) {
+          for (let index = 0; index < original.length; index += 2) {
+            const key = String(original[index]);
+            if (key.toLowerCase() !== "host") forwarded[key] = String(original[index + 1]);
+          }
+        } else {
+          for (const [key, value] of Object.entries(original ?? {})) {
+            if (key.toLowerCase() !== "host") forwarded[key] = value;
+          }
         }
-      } else {
-        for (const [key, value] of Object.entries(options.headers ?? {})) if (key.toLowerCase() !== "host") headers[key] = value;
+        forwarded.host = input.url.host;
+        const attempt = new class extends DecoratorHandler {
+          // Undici calls onConnect on the origin request just before writing it.
+          onConnect(abort: (error?: Error) => void): void {
+            requestStarted = true;
+            assertCurrent();
+            handler.onConnect?.(abort);
+          }
+          onError(error: Error): void {
+            failedBeforeRequest = !requestStarted;
+            handler.onError?.(error);
+          }
+        }(handler);
+        return pinned.dispatch({ ...options, origin, headers: forwarded }, attempt);
       }
-      headers.host = input.url.host;
-      return pinned.dispatch({ ...options, origin: target.origin, headers }, handler);
+      override close(): Promise<void> { return pinned.close(); }
+      override destroy(): Promise<void> { return pinned.destroy(); }
+    }();
+
+    try {
+      const response = await undiciFetch(input.url, { ...(input.init as Parameters<typeof undiciFetch>[1]), headers, dispatcher,
+        method: "GET", redirect: "manual", credentials: "omit" });
+      assertCurrent();
+      return { response: response as unknown as Response, release: async () => { await dispatcher.close(); } };
+    } catch (error) {
+      const canRetry = failedBeforeRequest && !requestStarted;
+      await dispatcher.destroy().catch(() => undefined);
+      if (!canRetry) throw error;
+      connectionError = error;
     }
-    override close(): Promise<void> { return pinned.close(); }
-    override destroy(): Promise<void> { return pinned.destroy(); }
-  }();
-  try {
-    input.assertCurrent();
-    const headers = new Headers(input.init.headers); headers.set("host", input.url.host);
-    headers.delete("authorization"); headers.delete("cookie"); headers.delete("proxy-authorization");
-    const response = await undiciFetch(input.url, { ...(input.init as Parameters<typeof undiciFetch>[1]), headers, dispatcher,
-      method: "GET", redirect: "manual", credentials: "omit" });
-    input.assertCurrent();
-    return { response: response as unknown as Response, release: async () => { await dispatcher.close(); } };
-  } catch (error) { await dispatcher.destroy().catch(() => undefined); throw error; }
+  }
+  throw connectionError ?? new HostedAgentWebFetchBlockedError();
+}
+
+function createPinnedTransport(url: URL, proxyUrl: string | null | undefined, address: string, assertCurrent: () => void): Dispatcher {
+  const originalHost = url.hostname.replace(/^\[|\]$/gu, "");
+  const tls = { ...(isIP(originalHost) === 0 ? { servername: originalHost } : {}), timeout: 15_000 };
+  if (!proxyUrl) return new Agent({ connect: buildConnector(tls) });
+  let proxy: URL;
+  try { proxy = new URL(proxyUrl); } catch { throw new Error("The Source outbound proxy is invalid."); }
+  if (["http:", "https:"].includes(proxy.protocol)) return new ProxyAgent({ uri: proxy.href, requestTls: tls });
+  if (!["socks5:", "socks5h:"].includes(proxy.protocol)) throw new Error("The Source outbound proxy protocol is unsupported.");
+
+  const connectTls = buildConnector(tls);
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  return new Agent({ connect: (options, callback) => {
+    assertCurrent();
+    void connectSocks5Tunnel(proxy.href, address, port).then(socket => {
+      try { assertCurrent(); } catch (error) { socket.destroy(); callback(error as Error, null); return; }
+      if (url.protocol === "http:") callback(null, socket);
+      else connectTls({ ...options, servername: tls.servername, httpSocket: socket }, callback);
+    }, () => callback(new Error("The Source proxy connection failed."), null));
+  } });
 }
 
 async function awaitAbort<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
