@@ -67,12 +67,13 @@ export class PartnerWorkbenchStore {
     }
   }
 
-  addProject(partnerId: string, expectedRevision: bigint, project: string): Promise<PartnerWorkbenchState> {
+  addProject(partnerId: string, expectedRevision: bigint, project: string, localIdentity?: PartnerWorkbenchProject["localIdentity"]): Promise<PartnerWorkbenchState> {
     const path = projectPath(project);
+    const identity = localIdentity === undefined ? undefined : parseLocalIdentity(localIdentity);
     return this.#mutate(partnerId, expectedRevision, (state) => {
       const rest = state.projects.filter((entry) => entry.path !== path);
       if (rest.length >= PARTNER_WORKBENCH_MAX_PROJECTS) throw new PartnerWorkbenchStoreError("resource_exhausted", "The workbench project limit has been reached.");
-      return { ...state, projects: [{ path, addedAt: timestamp(this.#now()) }, ...rest] };
+      return { ...state, projects: [{ path, addedAt: timestamp(this.#now()), ...(identity && { localIdentity: identity }) }, ...rest] };
     });
   }
 
@@ -168,12 +169,24 @@ function parseState(raw: string, partnerId: string): PartnerWorkbenchState {
     || !Array.isArray(value.projects) || value.projects.length > PARTNER_WORKBENCH_MAX_PROJECTS
     || !Array.isArray(value.judgments) || value.judgments.length > PARTNER_WORKBENCH_MAX_JUDGMENTS) throw invalidState();
   const projects: PartnerWorkbenchProject[] = value.projects.map((entry: unknown) => {
-    if (!record(entry) || !keys(entry, ["path", "addedAt"])) throw invalidState();
-    return { path: projectPath(entry.path), addedAt: timestamp(entry.addedAt) };
+    if (!record(entry) || !keys(entry, ["path", "addedAt"], ["localIdentity"])) throw invalidState();
+    return { path: projectPath(entry.path), addedAt: timestamp(entry.addedAt),
+      ...(entry.localIdentity === undefined ? {} : { localIdentity: parseLocalIdentity(entry.localIdentity) }) };
   });
   const judgments = value.judgments.map(parseJudgment);
   if (new Set(projects.map((entry) => entry.path)).size !== projects.length || new Set(judgments.map((entry) => entry.taskId)).size !== judgments.length) throw invalidState();
   return { partnerId, revision: BigInt(value.revision), projects, judgments };
+}
+
+function parseLocalIdentity(value: unknown): NonNullable<PartnerWorkbenchProject["localIdentity"]> {
+  const number = /^-?(?:0|[1-9][0-9]{0,19})$/u;
+  if (!record(value) || !keys(value, ["root", "device", "inode"]) || typeof value.root !== "string"
+    || value.root.length > MAX_PATH || CONTROL.test(value.root)
+    || typeof value.device !== "string" || !number.test(value.device)
+    || typeof value.inode !== "string" || !number.test(value.inode)) throw invalidState();
+  const paths = value.root.startsWith("/") ? posix : win32;
+  if (!paths.isAbsolute(value.root) || paths.normalize(value.root) !== value.root) throw invalidState();
+  return { root: value.root, device: value.device, inode: value.inode };
 }
 
 function parseJudgment(value: unknown): PartnerWorkbenchJudgment {

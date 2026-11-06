@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NativeSessionBinding, NativeSessionCatalogEntry, NativeSessionCatalogResult, NativeSessionPreview } from "@joko/core";
@@ -238,6 +238,76 @@ describe("Partner workbench service and Queue ownership", () => {
     await expect(f.workbench.addProject({ ...view.owner, sessionGeneration: view.owner.sessionGeneration + 1 }, view.state.revision, f.project)).rejects.toMatchObject({ code: "WORKBENCH_OWNER_CHANGED" });
   });
 
+  it("ties a handed-over alias to the original directory across reference and runtime reads", async () => {
+    const f = await fixture();
+    const alias = join(f.root, "project-alias");
+    const replacement = join(f.root, "another-project");
+    mkdirSync(replacement);
+    writeFileSync(join(f.project, "README.md"), "Approved directory");
+    writeFileSync(join(replacement, "README.md"), "Different directory");
+    const link = process.platform === "win32" ? "junction" : "dir";
+    symlinkSync(f.project, alias, link);
+    const methods = createPartnerWorkbenchConnectMethods(f.workbench, () => ({ id: "owner" }));
+    const context = {} as HandlerContext;
+    const initial = (await methods.getPartnerWorkbench(create(contract.GetPartnerWorkbenchRequestSchema, { partnerId: f.partner.id }), context)).workbench!;
+    const added = await methods.addPartnerWorkbenchProject(create(contract.AddPartnerWorkbenchProjectRequestSchema, {
+      owner: initial.owner, expectedRevision: initial.revision, path: alias
+    }), context);
+    expect(added.acceptedProject).toBe(alias);
+    const provider = new PartnerWorkbenchToolProvider({ partners: f.partners, store: f.store, workbench: f.workbench });
+    const owner = f.workbench.ownerForCaller(f.partner.canonicalSessionId!, "canonical");
+    const caller: BridgeToolCallContext = { sessionId: owner.sessionId, targetId: owner.targetId, generation: owner.sessionGeneration, providerGeneration: 1 };
+    const path = join(alias, "README.md");
+    const read = () => provider.callTool("read_workbench", { path }, undefined, caller);
+    expect(await read()).toMatchObject({ isError: false, content: [{ text: expect.stringContaining("Approved directory") }] });
+    expect(await f.workbenches.read(f.partner.id)).toMatchObject({
+      projects: [{ path: alias, localIdentity: { root: realpathSync(f.project) } }]
+    });
+    const native = f.host.extraDirectories.listForTarget(owner.targetId);
+    expect(native).toMatchObject([{ path: realpathSync(f.project) }]);
+
+    unlinkSync(alias);
+    symlinkSync(replacement, alias, link);
+    expect(() => f.host.extraDirectories.assertCurrent(owner.targetId, native)).toThrow("approval changed");
+    await expect(methods.resolvePartnerWorkbenchReference(create(contract.ResolvePartnerWorkbenchReferenceRequestSchema, {
+      owner: added.workbench!.owner, ref: path
+    }), context)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(await read()).toMatchObject({ isError: true });
+    expect(f.host.extraDirectories.listForTarget(owner.targetId)).toEqual([]);
+    const changed = await f.workbench.readState(f.partner.id);
+    expect(changed.projects).toEqual([{ path: alias, addedAt: expect.any(Number), name: "project-alias", exists: false }]);
+    expect(changed.briefs).toEqual([]);
+
+    const restored = await f.workbench.addProject(owner, changed.state.revision, alias);
+    expect(restored.projects).toMatchObject([{ path: alias, exists: true }]);
+    expect(await read()).toMatchObject({ isError: false, content: [{ text: expect.stringContaining("Different directory") }] });
+    expect(f.host.extraDirectories.listForTarget(owner.targetId)).toMatchObject([{ path: realpathSync(replacement) }]);
+
+    // Switch the directory during reference registration while preserving its name.
+    f.workspace.register.mockImplementationOnce(async (input) => {
+      renameSync(replacement, join(f.root, "retired-directory"));
+      mkdirSync(replacement);
+      writeFileSync(join(replacement, "README.md"), "New inode");
+      return input;
+    });
+    expect(await read()).toMatchObject({ isError: true });
+    expect(await read()).toMatchObject({ isError: true });
+    expect(f.host.extraDirectories.listForTarget(owner.targetId)).toEqual([]);
+  });
+
+  it("retains legacy project labels while requiring a new grant for an unresolved legacy alias", async () => {
+    const f = await fixture();
+    const alias = join(f.root, "legacy-alias");
+    symlinkSync(f.project, alias, process.platform === "win32" ? "junction" : "dir");
+    let saved = await f.workbenches.addProject(f.partner.id, 1n, alias);
+    await f.workbenches.addProject(f.partner.id, saved.revision, realpathSync(f.project));
+    const view = await f.workbench.readState(f.partner.id);
+    expect(view.projects).toMatchObject([{ path: realpathSync(f.project), exists: true }, { path: alias, exists: false }]);
+    await expect(f.workbench.resolveReference(view.owner, alias)).rejects.toMatchObject({ code: "PROJECT_UNAVAILABLE" });
+    saved = (await f.workbench.removeProject(view.owner, view.state.revision, alias)).state;
+    expect(saved.projects.map((item) => item.path)).toEqual([realpathSync(f.project)]);
+  });
+
   it("creates one owned background task for an item and records its actual Queue result before removing the judgment", async () => {
     const f = await fixture(); let view: PartnerWorkbenchStateView = await grant(f);
     view = await f.workbench.setJudgment(view.owner, view.state.revision, { taskId: "item:proposal", project: f.project, title: "Proposal", verdict: "idea", next: "Write the proposal" });
@@ -324,7 +394,7 @@ describe("Partner workbench service and Queue ownership", () => {
 });
 
 async function fixture(additionalAdapters: readonly FakeBackendAdapter[] = [], options: Partial<Pick<ConstructorParameters<typeof PartnerWorkbenchManager>[0], "pullRequestProviders" | "now">> = {}) {
-  const root = mkdtempSync(join(tmpdir(), "joko-workbench-manager-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "joko-workbench-manager-")));
   const managed = join(root, "managed"); const project = join(root, "project"); const home = join(root, "home");
   mkdirSync(managed); mkdirSync(project); mkdirSync(home);
   const store = new OperationalStore(join(managed, "operational.db")); const partnerStore = new PartnerStore(join(managed, "partners.db"));
@@ -337,10 +407,11 @@ async function fixture(additionalAdapters: readonly FakeBackendAdapter[] = [], o
   const sessionTasks = new PartnerSessionTaskManager(store, partners, host, workspace, managed); await sessionTasks.initialize();
   const scheduler = new ScheduleCoordinator(store, host);
   const routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(managed, "routines")) }); await routines.start();
-  const workbench = new PartnerWorkbenchManager({ partners, partnerStore, store, host, workspaces: workspace, workbenches: new PartnerWorkbenchStore(homesRoot), managedDataDirectory: managed, homeDirectory: home,
+  const workbenches = new PartnerWorkbenchStore(homesRoot);
+  const workbench = new PartnerWorkbenchManager({ partners, partnerStore, store, host, workspaces: workspace, workbenches, managedDataDirectory: managed, homeDirectory: home,
     briefs: { read: async (path, assertScope) => { assertScope(); return { project: path, docs: [], recent: [], codeHost: { pullRequests: [], issues: [] } }; } }, sessionTasks: () => sessionTasks, routines: () => routines, ...options });
   cleanups.push(async () => { await routines.stop(); await scheduler.stop(); await sessionTasks.close(); await host.dispose(); partnerStore.close(); store.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, managed, home, project, adapter, host, store, partnerStore, partners, partner, workspace, workbench, sessionTasks, routines };
+  return { root, managed, home, project, adapter, host, store, partnerStore, partners, partner, workspace, workbenches, workbench, sessionTasks, routines };
 }
 async function grant(f: Awaited<ReturnType<typeof fixture>>) { const view = await f.workbench.readState(f.partner.id); return f.workbench.addProject(view.owner, view.state.revision, f.project); }
 function entry(project: string): NativeSessionCatalogEntry { return { nativeReference: "native:source", nativeSessionId: "native-source", title: "Original native task", workingDirectory: project, projectDirectory: project,
