@@ -296,6 +296,8 @@ describe("WorkspaceService Git Review backend", () => {
     expect(unstaged.workingTree).toContain("+unstaged");
     expect(commit).toMatchObject({ source: "commit", sourceRevision: head, baseRevision: base, headRevision: head });
     expect(commit.comparison).toContain("+head");
+    await expect(service.gitReviewDiff("sources", { source: "commit", sourceRevision: "HEAD" })).resolves.toEqual(commit);
+    await expect(service.gitReviewDiff("sources", { source: "commit", sourceRevision: "HEAD^" })).rejects.toMatchObject({ kind: "invalid" });
     expect(branch).toMatchObject({ source: "branch", sourceRevision: base, requestedBaseRef: "base-branch", resolvedBaseRef: "base-branch", baseRevision: base, headRevision: head, mergeBaseRevision: base });
     expect(filtered.repositoryRevision).toBe(branch.repositoryRevision);
 

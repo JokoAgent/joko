@@ -2615,7 +2615,7 @@ export class WorkspaceService {
   }
 
   async #tryResolveGitCommit(workspace: WorkspaceRegistration, value: string, label: "base" | "head" | "source"): Promise<string | undefined> {
-    if (!isSafeGitRevision(value, label === "head")) {
+    if (!isSafeGitRevision(value, label !== "base")) {
       throw new WorkspaceGitReviewError(`The ${label} ref is invalid.`, "invalid");
     }
     if (value !== "HEAD" && !/^[0-9a-f]{40,64}$/iu.test(value)) {
