@@ -13752,6 +13752,16 @@ export class MobileClient {
     return this.#joinedTask ? all.filter(item => ["permission", "question", "planReview"].includes(item.request.case ?? "")) : all;
   }
 
+  captureTaskInteractionResolver(): (displayed: Interaction, submission: MobileInteractionSubmission) => Promise<boolean> {
+    const epoch = this.#epoch;
+    return async (displayed, submission) => {
+      if (!this.#current(epoch) || this.#state.status !== "connected") return false;
+      const current = this.taskInteractions().find(item => item.interactionId === displayed.interactionId);
+      if (!equals(InteractionSchema, current, displayed)) return false;
+      return this.resolveInteraction(displayed.interactionId, submission);
+    };
+  }
+
   async resolveInteraction(interactionId: string, submission: MobileInteractionSubmission): Promise<boolean> {
     const interaction = this.#interactionContext(interactionId);
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);

@@ -10195,6 +10195,28 @@ describe("native current-task Interaction ownership", () => {
     return () => `interaction-operation-${++value}`;
   };
 
+  it("discards a displayed permission decision after adopting a new connection for the same saved node", async () => {
+    const network = projectedNetwork(interactionSnapshot);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const original = app.taskInteractions().find(item => item.interactionId === permissionInteraction.interactionId)!;
+    expect(original).toEqual(permissionInteraction);
+    const confirmFromOldView = app.captureTaskInteractionResolver();
+    const allow = { kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE } as const;
+
+    await app.connectSaved(credential.profileId);
+    const current = app.taskInteractions().find(item => item.interactionId === original.interactionId)!;
+    expect(current).toEqual(original);
+    await expect(confirmFromOldView(original, allow)).resolves.toBe(false);
+    expect(saved.storage.savePending).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+
+    await expect(app.captureTaskInteractionResolver()(current, allow)).resolves.toBe(true);
+    expect(network.submit).toHaveBeenCalledOnce();
+    app.dispose();
+  });
+
   it("sorts exact current requests and resolves an advertised decision at revision and generation", async () => {
     const network = projectedNetwork(interactionSnapshot);
     const saved = memoryStorage(credential);

@@ -4014,6 +4014,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const advertisedQueueCapabilities = client.taskQueueCapabilities();
   const queueCapabilities = workerReadOnly ? { ...advertisedQueueCapabilities, edit: false, cancel: false, reorder: false } : advertisedQueueCapabilities;
   const interactions = state.status === "connected" ? client.taskInteractions() : [];
+  const resolveDisplayedInteraction = interactions.length > 0 ? client.captureTaskInteractionResolver() : undefined;
   const inputHandoffApi = state.status === "connected" && !workerReadOnly ? client.taskInputHandoffApi?.() : undefined;
   const runtimeControls = state.status === "connected" ? client.taskRuntimeControls() : undefined;
   useEffect(() => {
@@ -7152,7 +7153,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       busy={state.busy || interactionMutationPending} colors={colors}
       onSelect={setSelectedInteractionId} onMinimize={() => setInteractionVisible(false)}
       onResolve={async (interaction, submission) => {
-        const completed = await client.resolveInteraction(interaction.interactionId, submission);
+        const completed = await resolveDisplayedInteraction?.(interaction, submission) ?? false;
         if (completed) setInteractionVisible(true);
         return completed;
       }}
