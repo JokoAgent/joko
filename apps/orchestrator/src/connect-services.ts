@@ -15052,7 +15052,8 @@ function mapRecoverableBrowserPage(item: RecoverableBrowserPageRecord): contract
     canGoForward: false,
     recoverable: true,
     lastKnownGeneration: BigInt(item.generation),
-    sessionId: item.sessionId
+    sessionId: item.sessionId,
+    documentId: ""
   });
 }
 
