@@ -565,8 +565,8 @@ describe("Connect Maker Memory owner and reset scopes", () => {
       connections.revokeDevice(original.deviceId);
       await expect(scan).resolves.toMatchObject({ entryCount: 1 });
       await expect(reset).resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED,
-        error: { code: "CLAUDE_NATIVE_MEMORY_RESET_AUTHORIZATION_RETIRED", stateMayHaveChanged: false } } });
-      expect(store.getOperation(input.operationId).status).toBe("failed");
+        error: { code: "CLAUDE_NATIVE_MEMORY_RESET_AUTHORIZATION_RETIRED", workspaceImpact: contract.StateImpact.UNCHANGED } } });
+      expect(store.getOperation(input.operationId)).toMatchObject({ status: "failed", error: { stateMayHaveChanged: false } });
       await expect(readFile(entry, "utf8")).resolves.toBe("Preserve the original memory.");
       await expect(submitReset(services.operation.submitOperation, { ...input, operationId: "claude-memory-current",
         connectionId: observer.id, key: observerKey })).resolves.toMatchObject({ operation: {
@@ -653,7 +653,9 @@ describe("Connect Maker Memory owner and reset scopes", () => {
         dispose: async () => undefined
       } as unknown as BackendAdapter]);
       const restarted = servicesFor(host);
-      await expect(submitReset(restarted.operation.submitOperation, input)).resolves.toBeDefined();
+      await expect(submitReset(restarted.operation.submitOperation, input)).resolves.toMatchObject({ operation: {
+        result: { payload: { case: "memoryReset" } }
+      } });
       expect(restartedReset).not.toHaveBeenCalled();
 
       const failedInput = { ...input, operationId: "memory-native-durable-unknown" };
