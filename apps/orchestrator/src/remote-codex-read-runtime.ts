@@ -345,6 +345,8 @@ async function runRemoteCommand(
     const chunks: Buffer[] = [];
     let bytes = 0;
     let settled = false;
+    let exited = handle.exitCode !== null || handle.signalCode !== null;
+    let exitCode = handle.exitCode;
     const timer = setTimeout(() => fail("The remote Codex command timed out."), input.timeoutMs);
     timer.unref?.();
     const cleanup = (): void => {
@@ -352,6 +354,8 @@ async function runRemoteCommand(
       input.signal?.removeEventListener("abort", abort);
       input.signal?.removeEventListener("abort", onAbort);
       handle.stdout.removeListener("data", onData);
+      handle.stdout.removeListener("end", complete);
+      handle.stderr.removeListener("end", complete);
       handle.stdout.removeListener("error", onStreamError);
       handle.stderr.removeListener("error", onStreamError);
       handle.stdin.removeListener("error", onStreamError);
@@ -366,6 +370,12 @@ async function runRemoteCommand(
     };
     const abort = (): void => fail("The remote Codex command was cancelled.");
     const onStreamError = (): void => fail("The remote Codex command stream failed.");
+    const complete = (): void => {
+      if (settled || !exited || !handle.stdout.readableEnded || !handle.stderr.readableEnded) return;
+      settled = true;
+      cleanup();
+      resolve(Object.freeze({ stdout: Buffer.concat(chunks, bytes), exitCode }));
+    };
     const onData = (chunk: Buffer | string): void => {
       const value = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
       bytes += value.byteLength;
@@ -377,16 +387,17 @@ async function runRemoteCommand(
     };
     input.signal?.addEventListener("abort", abort, { once: true });
     handle.stdout.on("data", onData);
+    handle.stdout.once("end", complete);
+    handle.stderr.once("end", complete);
     handle.stdout.once("error", onStreamError);
     handle.stderr.once("error", onStreamError);
     handle.stdin.once("error", onStreamError);
     handle.stderr.resume();
     handle.once("error", onStreamError);
-    handle.once("exit", (exitCode) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(Object.freeze({ stdout: Buffer.concat(chunks, bytes), exitCode }));
+    handle.once("exit", (code) => {
+      exited = true;
+      exitCode = code;
+      complete();
     });
     try {
       handle.stdin.end();
@@ -394,11 +405,7 @@ async function runRemoteCommand(
       fail("The remote Codex command stream failed.");
     }
     if (input.signal?.aborted) abort();
-    else if (handle.exitCode !== null) {
-      settled = true;
-      cleanup();
-      resolve(Object.freeze({ stdout: Buffer.concat(chunks, bytes), exitCode: handle.exitCode }));
-    }
+    else complete();
   });
 }
 
