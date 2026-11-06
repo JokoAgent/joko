@@ -258,6 +258,7 @@ interface RestoringTrashManifest {
   readonly destinationKind: ExtensionLibraryLocationKind;
   readonly targetRoot: string;
   readonly stagingRoot: string;
+  readonly copy?: { readonly identity: ExtensionLibraryRootIdentity; readonly verified: boolean };
   readonly bindingGeneration: string;
   readonly updatedAt: number;
 }
@@ -1223,7 +1224,7 @@ export class ExtensionLibraryManager {
       const vault = this.#createVault(record.root, record.extensionId);
       const status = await vault.open({ create: false });
       if (status.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Trashed Extension Library metadata is unavailable.");
-      const manifest: RestoringTrashManifest = {
+      let manifest: RestoringTrashManifest = {
         format: 1,
         phase: "restoring",
         record,
@@ -1233,7 +1234,8 @@ export class ExtensionLibraryManager {
         bindingGeneration: this.#nextGeneration(record.extensionId),
         updatedAt: this.#now()
       };
-      await atomicJson(join(this.#trashContainer(record.trashId), TRASH_MANIFEST_FILE), manifest);
+      const manifestPath = join(this.#trashContainer(record.trashId), TRASH_MANIFEST_FILE);
+      await atomicJson(manifestPath, manifest);
       let transferError: unknown;
       try {
         await moveOrCopyExtensionLibrary({
@@ -1243,9 +1245,13 @@ export class ExtensionLibraryManager {
           sourceIdentity: record.identity,
           rename: this.#renameDirectory,
           now: this.#now,
-          freeBytes: this.#freeBytes
+          freeBytes: this.#freeBytes,
+          recordCopy: async (identity, verified) => {
+            const updated = { ...manifest, copy: { identity, verified } };
+            await atomicJson(manifestPath, updated);
+            manifest = updated;
+          }
         });
-        await rename(stagingRoot, validation.libraryRoot);
       } catch (error) {
         transferError = error;
       }
@@ -1882,12 +1888,16 @@ export class ExtensionLibraryManager {
     const stagingExists = await exists(manifest.stagingRoot);
     const targetExists = await exists(manifest.targetRoot);
     if (sourceExists) {
+      await assertExtensionLibraryRootIdentity(manifest.record.root, manifest.record.identity);
       if (targetExists) {
         throw new ExtensionLibraryError("CORRUPT", "Extension Library restore retained both its trash copy and final destination.");
       }
-      if (stagingExists) {
-        const identity = await captureExtensionLibraryRootIdentity(manifest.stagingRoot);
-        await removeExtensionLibraryRoot(manifest.stagingRoot, identity);
+      if (stagingExists && manifest.copy !== undefined) {
+        try { await removeExtensionLibraryRoot(manifest.stagingRoot, manifest.copy.identity); }
+        catch (error) {
+          if (!(error instanceof ExtensionLibraryError && error.code === "UNAVAILABLE")) throw error;
+          // Keep any directory whose ownership could not be established.
+        }
       }
       const active = this.#binding(manifest.record.extensionId);
       if (active !== undefined) throw new ExtensionLibraryError("CORRUPT", "Extension Library restore conflicts with an active binding.");
@@ -1911,10 +1921,21 @@ export class ExtensionLibraryManager {
     if (stagingExists && targetExists) {
       throw new ExtensionLibraryError("CORRUPT", "Extension Library restore has both staging and final destinations.");
     }
+    const existing = this.#binding(manifest.record.extensionId);
+    if (existing !== undefined && (existing.root !== manifest.targetRoot || existing.kind !== manifest.destinationKind
+      || existing.generation !== manifest.bindingGeneration || !targetExists)) {
+      throw new ExtensionLibraryError("CORRUPT", "Recovered Extension Library restore conflicts with its active binding.");
+    }
+    if (existing === undefined && manifest.copy?.verified === false) {
+      throw new ExtensionLibraryError("CORRUPT", "Extension Library restore has no verified copy to publish.");
+    }
+    const expected = existing?.identity ?? manifest.copy?.identity ?? manifest.record.identity;
     if (!targetExists) {
       if (!stagingExists) throw new ExtensionLibraryError("CORRUPT", "Extension Library restore lost every recoverable copy.");
+      await assertExtensionLibraryRootIdentity(manifest.stagingRoot, { ...expected, canonicalPath: manifest.stagingRoot });
       await rename(manifest.stagingRoot, manifest.targetRoot);
     }
+    const targetIdentity = await assertExtensionLibraryRootIdentity(manifest.targetRoot, { ...expected, canonicalPath: manifest.targetRoot });
     const vault = this.#createVault(manifest.targetRoot, manifest.record.extensionId);
     const status = await vault.open({ create: false });
     if (status.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Restored Extension Library metadata is unavailable.");
@@ -1922,13 +1943,7 @@ export class ExtensionLibraryManager {
     if (snapshot.files !== manifest.record.files) {
       throw new ExtensionLibraryError("CORRUPT", "Restored Extension Library file count did not match its verified trash record.");
     }
-    const existing = this.#binding(manifest.record.extensionId);
     if (existing !== undefined) {
-      if (existing.root !== manifest.targetRoot || existing.kind !== manifest.destinationKind
-        || existing.generation !== manifest.bindingGeneration) {
-        throw new ExtensionLibraryError("CORRUPT", "Recovered Extension Library restore conflicts with its active binding.");
-      }
-      await assertExtensionLibraryRootIdentity(existing.root, existing.identity);
       if (this.#state.trash.some((entry) => entry.trashId === manifest.record.trashId)) {
         this.#state = reviseState(this.#state, {
           generations: replaceGeneration(this.#state.generations, existing.extensionId, existing.generation),
@@ -1945,7 +1960,7 @@ export class ExtensionLibraryManager {
       kind: manifest.destinationKind,
       root: manifest.targetRoot,
       generation: manifest.bindingGeneration,
-      identity: await captureExtensionLibraryRootIdentity(manifest.targetRoot),
+      identity: targetIdentity,
       updatedAt: manifest.updatedAt
     };
     this.#state = reviseState(this.#state, {
@@ -1981,7 +1996,8 @@ export class ExtensionLibraryManager {
 
   async #assertRestoreManifestTopology(manifest: RestoringTrashManifest): Promise<void> {
     if (manifest.targetRoot === manifest.record.root
-      || manifest.stagingRoot !== restoreStagingRoot(manifest.targetRoot, manifest.record.trashId)) {
+      || manifest.stagingRoot !== restoreStagingRoot(manifest.targetRoot, manifest.record.trashId)
+      || manifest.copy !== undefined && manifest.copy.identity.canonicalPath !== manifest.stagingRoot) {
       throw new ExtensionLibraryError("CORRUPT", "Extension Library restore topology is invalid.");
     }
     const parent = dirname(manifest.targetRoot);
@@ -2822,12 +2838,16 @@ function validateTrashManifest(value: unknown): TrashManifest {
   if (value.phase === "restoring") {
     if (!exactKeys(value, [
       "format", "phase", "record", "destinationKind", "targetRoot", "stagingRoot", "bindingGeneration", "updatedAt"
-    ]) || value.destinationKind !== "default" && value.destinationKind !== "custom"
+    ], ["copy"]) || value.destinationKind !== "default" && value.destinationKind !== "custom"
       || typeof value.targetRoot !== "string" || !isAbsolute(value.targetRoot) || resolve(value.targetRoot) !== value.targetRoot
       || typeof value.stagingRoot !== "string" || !isAbsolute(value.stagingRoot) || resolve(value.stagingRoot) !== value.stagingRoot
       || typeof value.bindingGeneration !== "string" || !REVISION.test(value.bindingGeneration) || value.bindingGeneration === "0"
       || !finiteTimestamp(value.updatedAt)) {
       throw new ExtensionLibraryError("CORRUPT", "Extension Library restoring-trash manifest is malformed.");
+    }
+    const copy = value.copy;
+    if (copy !== undefined && (!plainObject(copy) || !exactKeys(copy, ["identity", "verified"]) || typeof copy.verified !== "boolean")) {
+      throw new ExtensionLibraryError("CORRUPT", "Extension Library restore copy receipt is malformed.");
     }
     return {
       format: 1,
@@ -2836,6 +2856,7 @@ function validateTrashManifest(value: unknown): TrashManifest {
       destinationKind: value.destinationKind,
       targetRoot: value.targetRoot,
       stagingRoot: value.stagingRoot,
+      ...(copy === undefined ? {} : { copy: { identity: validateIdentity(copy.identity), verified: copy.verified } }),
       bindingGeneration: value.bindingGeneration,
       updatedAt: value.updatedAt
     };

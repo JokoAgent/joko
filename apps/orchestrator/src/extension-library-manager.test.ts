@@ -544,6 +544,59 @@ describe("ExtensionLibraryManager", () => {
     expect(recreated.bindingGeneration).toBe(3n);
   });
 
+  it.each(["copying across volumes", "moved on the same volume"])(
+    "preserves a replacement at the recorded staging name when recovery was %s", async (interruption) => {
+      const { temporaryPath, manager } = await fixture();
+      const owner = { authority, assertAuthorityCurrent: currentAuthority() };
+      const session = await manager.openSession({ ...owner, connectionId: "trash-owner",
+        surfaceId: `extension_surface_${"1".repeat(32)}`, surfaceExpiresAt: Date.now() + 60_000 });
+      await manager.write(session.sessionId, "trash-owner", { path: "note.txt", bytes: Buffer.from("original") });
+      const trashed = await manager.trashLibrary({ ...owner, confirmation: authority.name });
+      await manager.close();
+
+      const ownerRoot = join(temporaryPath, "owner");
+      const state = JSON.parse(await readFile(join(ownerRoot, "library-state.json"), "utf8")) as {
+        trash: Array<{ root: string; source: { generation: string } }>;
+      };
+      const record = state.trash[0]!;
+      const destination = join(temporaryPath, "destination");
+      await mkdir(destination);
+      const targetRoot = join(destination, EXTENSION_ID);
+      const stagingRoot = join(destination, `.joko-library-restore-${EXTENSION_ID}-${trashed.trashId.slice(-32)}`);
+      const isCopy = interruption === "copying across volumes";
+      let copy: { identity: Awaited<ReturnType<typeof copyExtensionLibrary>>["identity"]; verified: boolean } | undefined;
+      if (isCopy) {
+        const source = new ExtensionLibraryVault({ root: record.root, extensionId: EXTENSION_ID, freeBytes: async () => undefined });
+        await source.open({ create: false });
+        const staged = await copyExtensionLibrary({ source, targetRoot: stagingRoot, extensionId: EXTENSION_ID, freeBytes: async () => undefined });
+        copy = { identity: staged.identity, verified: false };
+      } else {
+        await rename(record.root, stagingRoot);
+      }
+      const displaced = join(temporaryPath, "displaced");
+      await rename(stagingRoot, displaced);
+      const replacement = new ExtensionLibraryVault({ root: stagingRoot, extensionId: EXTENSION_ID, freeBytes: async () => undefined });
+      await replacement.open();
+      await replacement.write({ path: "note.txt", bytes: Buffer.from("different") });
+      await writeFile(join(ownerRoot, "trash", trashed.trashId, "trash.json"), JSON.stringify({
+        format: 1, phase: "restoring", record, destinationKind: "custom", targetRoot, stagingRoot,
+        bindingGeneration: (BigInt(record.source.generation) + 1n).toString(10), updatedAt: Date.now(), copy
+      }));
+
+      const recovered = new ExtensionLibraryManager({ rootDirectory: ownerRoot, freeBytes: async () => undefined });
+      cleanups.push(() => recovered.close().catch(() => undefined));
+      await recovered.initialize();
+      if (isCopy) {
+        expect(recovered.listTrash(EXTENSION_ID)).toEqual([trashed]);
+        await expect(readFile(join(record.root, "note.txt"), "utf8")).resolves.toBe("original");
+      } else {
+        await expect(recovered.overview(owner)).resolves.toMatchObject({ state: "unavailable", reason: "state_corrupt" });
+      }
+      await expect(readFile(join(targetRoot, "note.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(join(stagingRoot, "note.txt"), "utf8")).resolves.toBe("different");
+      await expect(readFile(join(displaced, "note.txt"), "utf8")).resolves.toBe("original");
+    });
+
   it("recovers restore and purge crashes without losing the only verified Library copy", async () => {
     const { temporaryPath, manager } = await fixture();
     const ownerRoot = join(temporaryPath, "owner");
