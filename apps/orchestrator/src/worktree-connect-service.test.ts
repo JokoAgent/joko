@@ -1,7 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
-import type { OperationalStore } from "@joko/store";
+import { OperationalStore } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
@@ -16,9 +16,10 @@ describe("WorktreeService removal preview", () => {
       state: "waiting" as const, reason: "in_use" as const, failures: 0, nextAttemptAt: 0 };
     const controlRecycle = vi.fn(async () => record);
     const listRecycleStatus = vi.fn(() => [record]);
-    const authenticate = vi.fn();
+    const authenticate = vi.fn(() => ({ connectionId: "owner", authKeyDigest: "digest" }));
+    const authorizeConnection = vi.fn();
     const service = createWorktreeConnectService({ controlRecycle, listRecycleStatus } as unknown as SessionWorktreeCoordinator,
-      {} as OperationalStore, authenticate);
+      { authorizeConnection } as unknown as OperationalStore, authenticate);
     const context = { signal } as HandlerContext;
     const listed = await service.listWorktreeRecycleStatus(create(contract.ListWorktreeRecycleStatusRequestSchema), context);
     expect(listed.records).toMatchObject([{ id, generation, state: contract.WorktreeRecycleState.WAITING,
@@ -26,7 +27,8 @@ describe("WorktreeService removal preview", () => {
     await expect(service.controlWorktreeRecycle(create(contract.ControlWorktreeRecycleRequestSchema, {
       id, generation, action: contract.WorktreeRecycleAction.RETRY
     }), context)).resolves.toMatchObject({ record: { id, generation } });
-    expect(controlRecycle).toHaveBeenCalledExactlyOnceWith({ id, generation, action: "retry" }, { signal });
+    expect(controlRecycle).toHaveBeenCalledExactlyOnceWith({ id, generation, action: "retry" }, { signal }, expect.any(Function));
+    expect(authorizeConnection).toHaveBeenCalledWith("owner", "digest");
     controlRecycle.mockRejectedValueOnce(new SessionWorktreeCoordinatorError("SESSION_CONFLICT"));
     await expect(service.controlWorktreeRecycle(create(contract.ControlWorktreeRecycleRequestSchema, {
       id, generation, action: contract.WorktreeRecycleAction.KEEP
@@ -40,6 +42,34 @@ describe("WorktreeService removal preview", () => {
     expect(listRecycleStatus).toHaveBeenCalledOnce();
     expect(controlRecycle).toHaveBeenCalledTimes(2);
   });
+
+  it.each([contract.WorktreeRecycleAction.KEEP, contract.WorktreeRecycleAction.RETRY])(
+    "rejects an originally authenticated recycle action after the queued connection is revoked (%s)", async action => {
+      const store = new OperationalStore(":memory:");
+      try {
+        const owner = store.createConnection({ id: "owner", name: "Owner", authKeyDigest: "digest" });
+        let start!: () => void;
+        const entered = new Promise<void>(resolve => { start = resolve; });
+        let resume!: () => void;
+        const queued = new Promise<void>(resolve => { resume = resolve; });
+        const effect = vi.fn();
+        const controlRecycle: SessionWorktreeCoordinator["controlRecycle"] = async (_input, _options, assertCurrent) => {
+          start(); await queued; assertCurrent?.(); effect(); return undefined;
+        };
+        const service = createWorktreeConnectService({ controlRecycle } as unknown as SessionWorktreeCoordinator, store, () => {
+          const current = store.authorizeConnection(owner.id, owner.authKeyDigest);
+          return { connectionId: current.id, authKeyDigest: current.authKeyDigest };
+        });
+        const request = service.controlWorktreeRecycle(create(contract.ControlWorktreeRecycleRequestSchema, {
+          id: "a".repeat(24), generation: "11111111-1111-4111-8111-111111111111", action
+        }), { signal: new AbortController().signal } as HandlerContext);
+        const rejected = expect(request).rejects.toMatchObject({ code: Code.Unauthenticated });
+        await entered; store.revokeConnection(owner.id); resume();
+        await rejected;
+        expect(effect).not.toHaveBeenCalled();
+      } finally { store.close(); }
+    }
+  );
 
   it("rejects missing identity, arbitrary paths and unknown recycle actions before the Owner", async () => {
     const controlRecycle = vi.fn();
