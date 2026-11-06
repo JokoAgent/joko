@@ -5,6 +5,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
@@ -280,26 +281,68 @@ describe("managed Pi subagent extension", () => {
     }
   });
 
-  it("forks only an immutable bounded user/assistant text snapshot", () => {
-    const snapshot = parentSnapshotHelper()({
-      sessionManager: {
-        getBranch: () => [{
-          type: "message",
-          message: { role: "user", content: [{ type: "text", text: `keep sk-${"a".repeat(20)} ${"u".repeat(20_000)}` }] }
-        }, {
-          type: "message",
-          message: { role: "assistant", content: [{ type: "image", data: "ignored" }, { type: "text", text: "a".repeat(20_000) }] }
-        }, {
-          type: "message",
-          message: { role: "tool", content: [{ type: "text", text: "must-not-copy" }] }
-        }]
-      }
+  it("forks the published Pi projection after successive compactions and a branch change", () => {
+    const sessionManager = SessionManager.inMemory();
+    sessionManager.appendMessage({ role: "user", content: "Old raw instructions", timestamp: 1 });
+    const firstKept = sessionManager.appendMessage({ role: "user", content: "Only kept by the first compaction", timestamp: 2 });
+    sessionManager.appendCompaction("Old summary", firstKept, 42_000);
+    const branchFrom = sessionManager.appendMessage({ role: "user", content: "Start the branch", timestamp: 3 });
+    sessionManager.appendMessage({ role: "user", content: "Abandoned branch body", timestamp: 4 });
+    const branchSummary = sessionManager.branchWithSummary(branchFrom, "Current branch summary");
+    sessionManager.appendCustomMessageEntry("fixture", "Active custom context", false);
+    const secret = `sk-${"a".repeat(20)}`;
+    sessionManager.appendMessage({ role: "toolResult", toolCallId: "search-one", toolName: "grep", isError: false, timestamp: 5,
+      content: [{ type: "text", text: `Current search result ${secret}` }], details: { unused: "Tool details outside the prompt" }
     });
-    expect(snapshot).toHaveLength(32_000);
-    expect(snapshot).toContain("USER:\nkeep [REDACTED]");
-    expect(snapshot).toContain("ASSISTANT:\n");
-    expect(snapshot).not.toContain("must-not-copy");
-    expect(snapshot).not.toContain(`sk-${"a".repeat(20)}`);
+    sessionManager.appendCompaction("Current compaction summary", branchSummary, 52_000);
+    sessionManager.appendMessage({ role: "user", timestamp: 6, content: [
+      { type: "text", text: "Use only the current v2 constraint" },
+      { type: "image", data: "fixture-image-bytes", mimeType: "image/png" }
+    ] });
+
+    const [task] = prepareTaskContextsHelper()({ sessionManager }, [{ task: "Summarize the constraint" }], "fork");
+    const prompt = task!.promptTask!;
+    expect(prompt).toContain("Current compaction summary");
+    expect(prompt).toContain("Current branch summary");
+    expect(prompt).toContain("Active custom context");
+    expect(prompt).toContain("TOOLRESULT (grep):\nCurrent search result [REDACTED]");
+    expect(prompt).toContain("Use only the current v2 constraint[Image omitted from text snapshot]");
+    expect(prompt.endsWith("\n\nAssignment:\nSummarize the constraint")).toBe(true);
+    expect(prompt.indexOf("Current branch summary")).toBeLessThan(prompt.indexOf("Current search result"));
+    for (const omitted of ["Old raw instructions", "Only kept by the first compaction", "Old summary", "Abandoned branch body",
+      "Tool details outside the prompt", "fixture-image-bytes", secret]) expect(prompt).not.toContain(omitted);
+  });
+
+  it.each([false, true])("keeps the latest user constraints and whole assignment at the fork budget limit (long user input: %s)", (long) => {
+    const sessionManager = SessionManager.inMemory();
+    const firstKept = sessionManager.appendMessage({ role: "user", content: "Earlier message 0:", timestamp: 1 });
+    for (let index = 1; index < 100; index += 1) {
+      sessionManager.appendMessage({ role: "user", content: `Earlier message ${index}: ${"x".repeat(400)}`, timestamp: index + 1 });
+    }
+    sessionManager.appendCompaction("Most recent compressed constraints", firstKept, 68_000);
+    const start = "当前约束开头";
+    const end = "Only v2 applies now";
+    sessionManager.appendMessage({ role: "user", content: `${start} ${long ? "😀".repeat(10_000) : ""} ${end}`, timestamp: 101 });
+    const assignment = "A".repeat(31_997) + "END";
+    const prepare = prepareTaskContextsHelper();
+    const [task, sibling] = prepare({ sessionManager }, [{ task: assignment }, { task: "Short assignment" }], "fork");
+    const prompt = task!.promptTask!;
+    expect(prompt.length).toBeLessThanOrEqual(64_000);
+    expect(prompt.endsWith(`\n\nAssignment:\n${assignment}`)).toBe(true);
+    expect(prompt).toContain(start);
+    expect(prompt).toContain(end);
+    expect(prompt).toContain("Most recent compressed constraints");
+    expect(prompt.includes("[… middle omitted …]")).toBe(long);
+    expect(prompt).not.toContain("Earlier message 0:");
+    expect(Buffer.from(prompt, "utf8").toString("utf8")).toBe(prompt);
+    expect(sibling!.promptTask!.split("\n\nAssignment:\n")[0]).toBe(prompt.split("\n\nAssignment:\n")[0]);
+  });
+
+  it("uses no parent context for fresh and reports unavailable native fork context", () => {
+    const prepare = prepareTaskContextsHelper();
+    const context = { sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content: "Raw branch" } }] } };
+    expect(prepare(context, [{ task: "Inspect" }], "fresh")).toEqual([{ task: "Inspect", contextMode: "fresh" }]);
+    expect(() => prepare(context, [{ task: "Inspect" }], "fork")).toThrow("Retry with context:fresh");
   });
 
   it("requires an authoritative linked worktree when isolation is requested", () => {
@@ -510,16 +553,21 @@ function foregroundApprovalHelpers(): {
   return Function(body)() as ReturnType<typeof foregroundApprovalHelpers>;
 }
 
-function parentSnapshotHelper(): (context: Record<string, unknown>) => string {
+function prepareTaskContextsHelper(): (
+  context: Record<string, unknown>,
+  tasks: readonly { readonly task: string }[],
+  mode: "fresh" | "fork"
+) => readonly { readonly task: string; readonly contextMode: string; readonly promptTask?: string }[] {
   const start = MANAGED_SUBAGENT_SOURCE.indexOf("function clampText");
   const end = MANAGED_SUBAGENT_SOURCE.indexOf("\n\nfunction collectCredentialValues", start);
   expect(start).toBeGreaterThanOrEqual(0);
   expect(end).toBeGreaterThan(start);
   const body = [
+    "const MAX_TASK_CHARS = 32000;",
     "const MAX_PARENT_CONTEXT_CHARS = 32000;",
     "const inheritedRedactionValues = [];",
     MANAGED_SUBAGENT_SOURCE.slice(start, end),
-    "return parentContextSnapshot;"
+    "return prepareSubagentTaskContexts;"
   ].join("\n\n");
   return Function("relative", "sep", "isAbsolute", "resolve", "realpathSync", "spawnSync", body)(
     relative,
@@ -528,7 +576,7 @@ function parentSnapshotHelper(): (context: Record<string, unknown>) => string {
     resolve,
     (value: string) => value,
     () => ({ status: 1, stdout: "" })
-  ) as (context: Record<string, unknown>) => string;
+  ) as ReturnType<typeof prepareTaskContextsHelper>;
 }
 
 function resumeSessionValidationHelper(): (

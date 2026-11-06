@@ -633,26 +633,73 @@ function enforceIsolation(input) {
   }
 }
 
-function parentContextSnapshot(ctx) {
+function parentContextSnapshot(ctx, maximum) {
+  let messages;
   try {
-    const branch = ctx && ctx.sessionManager && typeof ctx.sessionManager.getBranch === "function"
-      ? ctx.sessionManager.getBranch()
-      : [];
-    const sections = [];
-    for (const entry of Array.isArray(branch) ? branch : []) {
-      if (!entry || entry.type !== "message" || !entry.message) continue;
-      const role = entry.message.role;
-      if (role !== "user" && role !== "assistant") continue;
-      const content = Array.isArray(entry.message.content) ? entry.message.content : [];
-      const text = content.map(function (block) {
-        return block && block.type === "text" && typeof block.text === "string" ? block.text : "";
-      }).join("").trim();
-      if (text) sections.push(String(role).toUpperCase() + ":\n" + text);
+    messages = ctx?.sessionManager?.buildSessionContext().messages;
+  } catch {}
+  if (!Array.isArray(messages)) throw new Error("Pi could not project the parent context. Retry with context:fresh.");
+
+  const sections = messages.flatMap(function (message, index) {
+    if (!message || typeof message.role !== "string" || message.role === "system") return [];
+    const content = message.content;
+    const text = typeof content === "string" ? content : Array.isArray(content)
+      ? content.map(function (block) {
+          if (block?.type === "text" && typeof block.text === "string") return block.text;
+          if (block?.type === "image") return "[Image omitted from text snapshot]";
+          if (block?.type === "toolCall" && typeof block.name === "string") return "[Tool call: " + block.name + "]";
+          return "";
+        }).join("") : typeof message.summary === "string" ? message.summary : "";
+    if (!text.trim()) return [];
+    const label = message.role.toUpperCase() + (typeof message.toolName === "string" && message.toolName
+      ? " (" + message.toolName + ")" : "");
+    return [{ index: index, role: message.role, text: redact(label + ":\n" + text.trim()) }];
+  });
+  const latestUser = sections.findLast(function (section) { return section.role === "user"; });
+  const latestSummary = sections.findLast(function (section) {
+    return section.role === "compactionSummary" || section.role === "branchSummary";
+  });
+  const selected = new Map();
+  let budget = maximum;
+  function keep(section, limit) {
+    if (!section || selected.has(section.index) || budget < 3) return;
+    const size = Math.min(limit, budget - 2);
+    let text = section.text;
+    if (text.length > size) {
+      if (section.role === "user" && size > 80) {
+        const omission = "\n[… middle omitted …]\n";
+        const half = Math.floor((size - omission.length) / 2);
+        text = text.slice(0, half).replace(/[\uD800-\uDBFF]$/u, "") + omission
+          + text.slice(-half).replace(/^[\uDC00-\uDFFF]/u, "");
+      } else {
+        text = text.slice(0, size - 1).replace(/[\uD800-\uDBFF]$/u, "") + "…";
+      }
     }
-    return clampText(sections.join("\n\n"), MAX_PARENT_CONTEXT_CHARS);
-  } catch {
-    return "";
+    selected.set(section.index, text);
+    budget -= text.length + 2;
   }
+  keep(latestUser, 16000);
+  keep(latestSummary, 8000);
+  for (let index = sections.length - 1; index >= 0 && budget > 2; index -= 1) {
+    const section = sections[index];
+    keep(section, section.role === "toolResult" ? 4000 : 8000);
+  }
+  return [...selected.entries()].sort(function (left, right) { return left[0] - right[0]; })
+    .map(function (entry) { return entry[1]; }).join("\n\n");
+}
+
+function prepareSubagentTaskContexts(ctx, tasks, contextMode) {
+  if (contextMode === "fresh") return tasks.map(function (task) { return { ...task, contextMode: contextMode }; });
+  const heading = "Parent task snapshot (immutable):\n\n";
+  const separator = "\n\nAssignment:\n";
+  const assignments = tasks.map(function (task) { return clampText(task.task, MAX_TASK_CHARS); });
+  const assignmentLength = Math.max(...assignments.map(function (text) { return text.length; }));
+  const snapshot = parentContextSnapshot(ctx, Math.min(MAX_PARENT_CONTEXT_CHARS,
+    MAX_TASK_CHARS + MAX_PARENT_CONTEXT_CHARS - heading.length - separator.length - assignmentLength));
+  return tasks.map(function (task, index) {
+    return { ...task, contextMode: contextMode,
+      ...(snapshot ? { promptTask: heading + snapshot + separator + assignments[index] } : {}) };
+  });
 }
 
 function collectCredentialValues(value, key, output) {
@@ -2803,16 +2850,7 @@ export default function jokoManagedSubagent(pi) {
       enforceIsolation(params && typeof params === "object" ? params : {});
       const normalizedTasks = normalizeTasks(params);
       const contextMode = params && params.context === "fork" ? "fork" : "fresh";
-      const snapshot = contextMode === "fork" ? parentContextSnapshot(ctx) : "";
-      const tasks = normalizedTasks.map(function (task) {
-        return Object.assign({}, task, {
-          contextMode: contextMode,
-          ...(snapshot ? { promptTask: clampText(
-            "Parent task snapshot (immutable):\n\n" + snapshot + "\n\nAssignment:\n" + task.task,
-            MAX_TASK_CHARS + MAX_PARENT_CONTEXT_CHARS
-          ) } : {})
-        });
-      });
+      const tasks = prepareSubagentTaskContexts(ctx, normalizedTasks, contextMode);
       const routes = tasks.map(function (task) { return routeFromContext(ctx, task); });
       const timeout = timeoutMs(params);
       const background = !!(params && params.background === true);
