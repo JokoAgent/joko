@@ -310,7 +310,7 @@ async function runNativeScenario(): Promise<void> {
   }
 
   await beginStep("open-task-header");
-  await tap("Open task " + taskName);
+  await openFixtureTask();
   const screen = (await adb("shell", "wm", "size")).match(/(?:Physical|Override) size: (\d+)x(\d+)/gu)?.at(-1)
     ?.match(/(\d+)x(\d+)/u);
   if (!screen) throw new Error("The isolated native viewport was unavailable.");
@@ -431,7 +431,7 @@ async function runNativeScenario(): Promise<void> {
   await launch();
   await tap("Saved nodes");
   await tap("Connect", true);
-  await tap("Open task " + taskName);
+  await openFixtureTask();
   await waitNode((node) => node.text === taskName, "restored native task title");
   await scrollToNode((node) => node.text?.includes(prompt) === true, "persisted native task input");
   await completeStep();
@@ -704,6 +704,26 @@ async function scrollToNode(predicate: (node: AndroidUiNode) => boolean, label: 
 
 async function tap(label: string, scroll = false, leadingText = false): Promise<void> {
   await interaction("tap", () => tapSurface(label, scroll, leadingText));
+}
+
+async function openFixtureTask(): Promise<void> {
+  let previousBounds: string | undefined;
+  const task = await waitFor(async () => {
+    const items = await nodes();
+    const addPartner = items.find((item) => item.enabled && item.clickable && item.contentDescription === "Create Partner or group");
+    const row = items.find((item) => item.enabled && item.clickable && item.contentDescription === "Open task " + taskName);
+    // The roster above the task is populated after pairing and can move the row.
+    if (!addPartner || !row || row.bounds.y1 < addPartner.bounds.y2
+      || row.bounds.x1 >= row.bounds.x2 || row.bounds.y1 >= row.bounds.y2) {
+      previousBounds = undefined;
+      return undefined;
+    }
+    const bounds = JSON.stringify(row.bounds);
+    const stable = bounds === previousBounds;
+    previousBounds = bounds;
+    return stable ? row : undefined;
+  }, (row) => row !== undefined, "stable Home task row below the Partner roster", 25_000);
+  await interaction("tap", () => tapNode(task!));
 }
 
 async function tapSurface(label: string, scroll: boolean, leadingText: boolean): Promise<void> {
