@@ -17,6 +17,7 @@ export interface PiProcessSpec {
   readonly cwd: string;
   readonly env: Readonly<NodeJS.ProcessEnv>;
   readonly remoteWorkspace?: RemoteWorkspaceBinding;
+  readonly assertStartupCurrent?: () => void;
 }
 
 export interface PiProcessHandle {

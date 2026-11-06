@@ -202,9 +202,9 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     this.#navigationRoot = join(options.authorityRoot, "navigation");
   }
 
-  readonly create: PiProcessFactory = async (spec) => {
+  readonly create: PiProcessFactory = async ({ assertStartupCurrent, ...spec }) => {
     if (spec.remoteWorkspace === undefined) return this.#localFactory(spec);
-    return this.#createRemote(spec);
+    return this.#createRemote(spec, assertStartupCurrent);
   };
 
   readonly navigationOwner: PiRemoteNavigationOwner = {
@@ -456,14 +456,16 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     authority.assertCurrent();
   }
 
-  async #createRemote(spec: PiProcessSpec): Promise<PiProcessHandle> {
+  async #createRemote(spec: PiProcessSpec, assertStartupCurrent?: () => void): Promise<PiProcessHandle> {
     const binding = spec.remoteWorkspace;
     if (binding === undefined) throw new Error("Remote Pi requires a remote workspace binding.");
     const targetId = requiredEnvironment(spec.env, "JOKO_PI_TARGET_ID");
+    assertStartupCurrent?.();
     const initialAuthority = await this.#remoteExecution.workspace(binding);
+    const startupAuthority = fencePiStartup(initialAuthority, assertStartupCurrent);
     const targetPaths = remotePlatformPaths(initialAuthority.pathStyle);
     const remoteNodeExecutable = remoteNodeExecutableFor(binding);
-    const files = initialAuthority.files;
+    const files = startupAuthority.files;
     const canonicalWorkspace = await files.realpath(binding.workspaceRoot);
     if (canonicalWorkspace !== binding.workspaceRoot) throw new Error("Remote workspace root is not canonical.");
     if ((await files.stat(canonicalWorkspace)).kind !== "directory") {
@@ -692,14 +694,15 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       remoteRuntime,
       assets: compatibilityAssets
     });
-    if (existingAuthority === undefined) await stageRemoteRuntime(initialAuthority, binding, stagingPlans);
+    if (existingAuthority === undefined) await stageRemoteRuntime(startupAuthority, binding, stagingPlans);
     const sourcePath = targetPaths.join(managedRoot, `broker-${REMOTE_PI_BROKER_SOURCE_SHA256}.mjs`);
-    const openAttachment = async (selectedAuthority: RemoteWorkspaceAuthority): Promise<RemoteBridgeAttachment> => {
-      selectedAuthority.assertCurrent();
+    const openAttachment = async (selectedAuthority: RemoteWorkspaceAuthority, assertBeforeStartup?: () => void): Promise<RemoteBridgeAttachment> => {
+      const effectAuthority = fencePiStartup(selectedAuthority, assertBeforeStartup);
+      effectAuthority.assertCurrent();
       if (selectedAuthority.pathStyle !== initialAuthority.pathStyle) {
         throw new Error("Remote Pi target path style changed during execution.");
       }
-      const selectedFiles = selectedAuthority.files;
+      const selectedFiles = effectAuthority.files;
       await provisionRemoteBroker(selectedFiles, managedRoot, selectedAuthority.pathStyle);
       await ensureRemotePrivateDirectory(selectedFiles, remoteRuntime, selectedAuthority.pathStyle);
       await ensureRemotePrivateDirectory(selectedFiles, remoteSessions, selectedAuthority.pathStyle);
@@ -716,7 +719,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       const bridgeOptions: OpenRemoteBrokerBridgeOptions = {
         processes: selectedAuthority.processes,
         forwarding: selectedAuthority.forwarding,
-        files: selectedFiles,
+        files: selectedAuthority.files,
         controlCwd,
         managedRoot,
         sourcePath,
@@ -741,6 +744,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
         localEnvironment: spec.env,
         pathMap,
         authorityStore: this.#authorityStore,
+        ...(assertBeforeStartup === undefined ? {} : { assertBeforeStartup: effectAuthority.assertCurrent }),
         ...(currentNativeAuthReservationToken === undefined ? {} : { currentNativeAuthReservationToken }),
         ...(previous === undefined ? {} : { previousAuthority: previous })
       };
@@ -752,6 +756,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
           error.authorityVerified !== true || previous === undefined
         ) throw error;
         if (error.reason === "launch_mismatch") {
+          effectAuthority.assertCurrent();
           await requestRemoteBrokerKill({
             processes: selectedAuthority.processes,
             sourcePath,
@@ -765,13 +770,13 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
           });
         } else if (error.reason !== "child_absent") throw error;
         await this.#authorityStore.remove(identity);
-        await stageRemoteRuntime(selectedAuthority, binding, stagingPlans);
+        await stageRemoteRuntime(effectAuthority, binding, stagingPlans);
         await refreshRuntimeFiles(selectedFiles, spec.env, pathMap);
         const { previousAuthority: _previousAuthority, ...freshBridgeOptions } = bridgeOptions;
         return openRemoteBrokerBridge(freshBridgeOptions);
       }
     };
-    const initialAttachment = await openAttachment(initialAuthority);
+    const initialAttachment = await openAttachment(initialAuthority, assertStartupCurrent);
     return new MappedRemotePiProcess({
       initialAttachment,
       reattach: async () => {
@@ -785,6 +790,24 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       pathMap
     });
   }
+}
+
+function fencePiStartup(authority: RemoteWorkspaceAuthority, assertStartupCurrent?: () => void): RemoteWorkspaceAuthority {
+  if (assertStartupCurrent === undefined) return authority;
+  const files = authority.files;
+  const assertCurrent = (): void => { assertStartupCurrent(); authority.assertCurrent(); };
+  return {
+    ...authority,
+    assertCurrent,
+    files: {
+      realpath: files.realpath.bind(files), stat: files.stat.bind(files), list: files.list.bind(files), read: files.read.bind(files),
+      async write(request) { assertCurrent(); await files.write(request); },
+      async mkdir(path, options) { assertCurrent(); await files.mkdir(path, options); },
+      async rename(source, destination, signal) { assertCurrent(); await files.rename(source, destination, signal); },
+      async remove(path, options) { assertCurrent(); await files.remove(path, options); }
+    },
+    processes: { async open(request) { assertCurrent(); return authority.processes.open(request); } }
+  };
 }
 
 class RemotePiManagedDurableStore implements PiManagedDurableStore {
@@ -1176,6 +1199,7 @@ interface OpenRemoteBrokerBridgeOptions {
   readonly authorityStore: RemotePiAuthorityStore;
   readonly currentNativeAuthReservationToken?: string;
   readonly previousAuthority?: RemoteAuthorityRecord;
+  readonly assertBeforeStartup?: () => void;
 }
 
 async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): Promise<RemoteBridgeAttachment> {
@@ -1194,6 +1218,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
         throw new Error("Managed tool bridge must use a service-node loopback endpoint.");
       }
       const localPort = Number(endpoint.port || (endpoint.protocol === "https:" ? 443 : 80));
+      options.assertBeforeStartup?.();
       reverseForward = await options.forwarding.listen({
         localDestinationHost: normalizeLoopback(endpoint.hostname),
         localDestinationPort: localPort
@@ -1223,6 +1248,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
     }
 
     const terminalFence = randomUUID();
+    options.assertBeforeStartup?.();
     remoteProcess = await processes.open({
       executable: options.nodeExecutable,
       args: [
@@ -1271,6 +1297,7 @@ async function openRemoteBrokerBridge(options: OpenRemoteBrokerBridgeOptions): P
       remoteProcess.kill("SIGKILL");
       throw new Error("Remote Pi launch configuration exceeded its bounded broker envelope.");
     }
+    options.assertBeforeStartup?.();
     remoteProcess.stdin.write(bootstrapLine);
     const control = await readRemoteAuthorityControl(remoteProcess.stdout);
     if (!control.ok) {

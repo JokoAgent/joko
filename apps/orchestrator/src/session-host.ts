@@ -11671,6 +11671,12 @@ export class SessionHost {
         this.#store.setSetting("service", sessionId, PRIVATE_CREATION_RECEIPT_KEY, { version: 1, operationId: claim.operation.id, phase: "prepared" } satisfies PrivateCreationReceipt);
         input.assertServiceScope(); await input.beforeNativeCreation(sessionId, runtimeTarget); input.assertServiceScope();
       }
+      const creationAuthority = authorized && runtimeTarget.remoteWorkspace?.kind === "ssh" ? {
+        assertNativeCreationCurrent: () => {
+          this.#assertOpen();
+          this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+        }
+      } : {};
       let context = { ...this.provisionalContext(
         sessionId,
         runtimeTarget,
@@ -11764,7 +11770,7 @@ export class SessionHost {
               if (provisionalReadiness !== undefined && "connection" in input && this.assertProvisionalCreationReady(input) !== provisionalReadiness) {
                 throw new StoreError("Draft runtime approval changed before native startup.");
               }
-              binding = await adapter.createSession({ target: runtimeTarget, name: input.title,
+              binding = await adapter.createSession({ target: runtimeTarget, name: input.title, ...creationAuthority,
                 ...(!attaching && routedInput.providerId !== undefined ? { providerId: routedInput.providerId } : {}),
                 ...(!attaching && routedInput.modelId !== undefined ? { modelId: routedInput.modelId } : {}),
                 ...(!attaching && routedInput.effort !== undefined ? { effort: routedInput.effort } : {}),

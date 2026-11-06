@@ -1001,6 +1001,7 @@ export class PiBackendAdapter implements
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
     if (input.fastMode === "ultrafast") throw piError("PI_ULTRAFAST_UNSUPPORTED", "Ultrafast requires the Codex runtime", "provision");
     await this.validateTarget(input.target);
+    input.assertNativeCreationCurrent?.();
     const runtimePolicy = input.runtimePolicy ?? "standard";
     if (runtimePolicy !== (context.runtimePolicy ?? "standard")) {
       throw piError("PI_RUNTIME_POLICY_MISMATCH", "Create input and host context runtime policies differ", "provision");
@@ -1052,7 +1053,7 @@ export class PiBackendAdapter implements
       : undefined;
     // A parented new_session starts by resuming the parent JSONL, avoiding the
     // otherwise unavoidable throwaway fresh JSONL before the RPC transition.
-    let runtime = await this.#startRuntime(attachedBinding ?? parentBinding, profile, context);
+    let runtime = await this.#startRuntime(attachedBinding ?? parentBinding, profile, context, input.assertNativeCreationCurrent);
     if (
       start.kind === "new"
       && start.parentNativeReference === undefined
@@ -4821,7 +4822,8 @@ export class PiBackendAdapter implements
     return this.#startRuntime(binding, profile, context);
   }
 
-  async #startRuntime(binding: NativeSessionBinding | undefined, profile: SessionSpawnProfile, context: AdapterContext): Promise<PiRuntime> {
+  async #startRuntime(binding: NativeSessionBinding | undefined, profile: SessionSpawnProfile, context: AdapterContext,
+    assertStartupCurrent?: () => void): Promise<PiRuntime> {
     const pending = this.#runtimeStarts.get(context.sessionId);
     if (pending) {
       const runtime = await pending;
@@ -4836,7 +4838,7 @@ export class PiBackendAdapter implements
     this.#assertNotDisposed();
     await this.#requireCompatibility();
     const managedGeneration = this.#managedGeneration;
-    const start = this.#spawnRuntime(binding, profile, context, managedGeneration)
+    const start = this.#spawnRuntime(binding, profile, context, managedGeneration, assertStartupCurrent)
       .finally(() => this.#runtimeStarts.delete(context.sessionId));
     this.#runtimeStarts.set(context.sessionId, start);
     return start;
@@ -4846,7 +4848,8 @@ export class PiBackendAdapter implements
     binding: NativeSessionBinding | undefined,
     profile: SessionSpawnProfile,
     context: AdapterContext,
-    managedGeneration: PiManagedGeneration
+    managedGeneration: PiManagedGeneration,
+    assertStartupCurrent?: () => void
   ): Promise<PiRuntime> {
     this.#retainManagedGeneration(managedGeneration);
     const options = managedGeneration.options;
@@ -5190,6 +5193,7 @@ export class PiBackendAdapter implements
         agentHome: preparedAgentHome.path, environment: env });
       if (remoteHome?.discardNativeAuth) preparedAgentHome = { path: preparedAgentHome.path, redactValues: [] };
       if (hosted) assertHostedExecution(hosted);
+      assertStartupCurrent?.();
       const process = await this.#processFactory({
         command: this.#command,
         args,
@@ -5197,7 +5201,8 @@ export class PiBackendAdapter implements
         env: remoteHome?.environment ?? env,
         ...(context.target.remoteWorkspace === undefined
           ? {}
-          : { remoteWorkspace: context.target.remoteWorkspace })
+          : { remoteWorkspace: context.target.remoteWorkspace }),
+        ...(assertStartupCurrent === undefined ? {} : { assertStartupCurrent })
       });
       if (context.target.remoteWorkspace === undefined && process.pid !== undefined) {
         const result = await (options.applyProcessPriority ?? applyNewProcessPriority)(
