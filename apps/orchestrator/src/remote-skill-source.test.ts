@@ -177,6 +177,52 @@ describe("registered project Skill source", () => {
     } finally { await f.cleanup(); }
   });
 
+  it("collects superseded unapproved captures after their last lease and recovers abandoned copies at startup", async () => {
+    const f = await fixture();
+    const input = { backendId: "native", targetId: "project", kinds: ["skill"] as const };
+    try {
+      const [first] = await f.manager.discoverProjectResources(input);
+      const review = await f.manager.acquireSkillContent({ resourceId: first!.id, expectedResourceVersion: first!.versionNumber });
+      f.files.file(`${skillPath}/SKILL.md`, skillBody + "Second source revision.\n");
+      const prepared = await f.manager.prepareDiscoverProjectResources(input);
+      await expect(f.manager.completePreparedMutation(prepared, finalize => f.store.transaction(store => {
+        finalize(store);
+        throw new Error("Rejected catalog transaction");
+      }))).rejects.toThrow("Rejected catalog transaction");
+      await review.assertCurrent();
+      expect(await readdir(f.managedRoot)).toHaveLength(1);
+
+      const [second] = await f.manager.discoverProjectResources(input);
+      expect(second).toMatchObject({ id: first!.id, state: "awaiting_approval" });
+      expect(await readFile(review.entryFilePath, "utf8")).toBe(skillBody);
+      await expect(review.assertCurrent()).rejects.toThrow("authority changed");
+      await review.release();
+      await expect(readFile(review.entryFilePath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(f.managedRoot)).toHaveLength(1);
+      await f.manager.remove(first!.id);
+      expect(await readdir(f.managedRoot)).toEqual([]);
+
+      const [current] = await f.manager.discoverProjectResources(input);
+      const { candidates: [abandoned] } = await f.owner.discover("project");
+      const unknown = join(f.managedRoot, "12345678-1234-4234-8234-123456789abc");
+      await mkdir(unknown);
+      await writeFile(join(unknown, "external.txt"), "unrecognized directory");
+      f.store.close();
+      const reopened = new OperationalStore(f.database);
+      try {
+        const owner = new RemoteSkillSourceOwner({ store: reopened, managedRoot: f.managedRoot,
+          captureSkillSourceAuthority: (id, signal) => f.remote.captureSkillSourceAuthority(id, signal) });
+        const manager = new PiResourceManager({ store: reopened, managedRoot: join(f.root, "resources"), remoteProjectSkills: owner });
+        await manager.initialize();
+        await expect(readFile(join(abandoned!.localPath, "SKILL.md"))).rejects.toMatchObject({ code: "ENOENT" });
+        const reopenedReview = await manager.acquireSkillContent({ resourceId: current!.id, expectedResourceVersion: current!.versionNumber });
+        expect(await readFile(reopenedReview.entryFilePath, "utf8")).toContain("Second source revision.");
+        await reopenedReview.release();
+        expect(await readFile(join(unknown, "external.txt"), "utf8")).toBe("unrecognized directory");
+      } finally { reopened.close(); }
+    } finally { await f.cleanup(); }
+  });
+
   it("fences prepared approval and leased seeds on exact file authority, registration, trust and execution changes", async () => {
     const f = await fixture();
     try {
