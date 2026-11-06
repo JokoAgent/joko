@@ -63,7 +63,7 @@ describe("Partner independent Session tasks", () => {
     group.endExecution(); expect(tools.includeForSession(session.id, session.targetId)).toBe(false);
     expect(() => f.tasks.check(group.sessionId, task.id)).toThrow();
     const artifact = await f.artifacts.ingestBytes(new TextEncoder().encode("Group report"), { fileName: "group-report.txt", mimeType: "text/plain", expiresAt: Date.now() + 60_000 });
-    f.store.transaction(store => store.adoptSessionArtifact({ sessionId: task.sessionId!, blob: store.getArtifact(artifact.id).blob }));
+    f.store.transaction(store => store.adoptSessionArtifact({ sessionId: task.sessionId!, runId: task.runId!, blob: store.getArtifact(artifact.id).blob }));
     const text = "Full independent result. ".repeat(1200); await f.primary.complete(task.sessionId!, text);
     await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", deliveredExecution: 1 }));
     const terminal = group.messages().filter(message => message.task?.status === "completed" || message.kind === "message");
@@ -89,7 +89,7 @@ describe("Partner independent Session tasks", () => {
     const room = group.host.storage.get(group.room.id);
     group.host.storage.manage({ operationId: "archive", roomId: room.id, actorId: group.actor.ownerId, expectedRevision: room.revision, action: "archive", targetId: "", value: "", throughSequence: 0 });
     const artifact = await f.artifacts.ingestBytes(new TextEncoder().encode("Private fallback file"), { fileName: "fallback.txt", mimeType: "text/plain", expiresAt: Date.now() + 60_000 });
-    f.store.transaction(store => store.adoptSessionArtifact({ sessionId: task.sessionId!, blob: store.getArtifact(artifact.id).blob }));
+    f.store.transaction(store => store.adoptSessionArtifact({ sessionId: task.sessionId!, runId: task.runId!, blob: store.getArtifact(artifact.id).blob }));
     group.endExecution(); await f.primary.complete(task.sessionId!, "Retained fallback result");
     await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", groupFallback: true, deliveredExecution: 1 }));
     expect(f.tasks.view(f.tasks.list(f.partner.id)[0]!)).toMatchObject({ completion_destination: "private" });
@@ -189,6 +189,56 @@ describe("Partner independent Session tasks", () => {
     expect(() => new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now)).toThrow();
     f.store.setSetting("service", "partner.session-tasks", task.id, current);
   });
+  it("waits for a Host-owned continuation of the original Run", async () => {
+    const f = await fixture(), task = await f.tasks.start(f.parent, "task:continued-result", { instruction: "Complete the report" }, () => undefined);
+    const sessionId = task.sessionId!;
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.runId === task.runId)).toBe(true));
+    const continuation = f.host.enqueueServiceInput({ operationId: "task:host-continuation", sessionId, parentRunId: task.runId!, source: "system",
+      prompt: { text: "Continue the report", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await f.primary.complete(sessionId, "Preparation complete");
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.runId === continuation.runId)).toBe(true));
+    expect((await f.tasks.check(f.parent, task.id)).deliveredExecution).toBeUndefined();
+    await f.primary.complete(sessionId, "Completed report");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", result: "Completed report", deliveredExecution: 1 }));
+  });
+
+  it.each(["during", "after"] as const)("keeps the original execution result when an ordinary Run produces outputs %s settlement", async timing => {
+    const f = await fixture(), task = await f.tasks.start(f.parent, "task:original-result", { instruction: "Return the original report" }, () => undefined);
+    const sessionId = task.sessionId!;
+    const contextFor = async (runId: string) => {
+      await vi.waitFor(() => expect(f.primary.inputs.some(row => row.context.runId === runId)).toBe(true));
+      return f.primary.inputs.find(row => row.context.runId === runId)!.context;
+    };
+    const original = await contextFor(task.runId!);
+    await original.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original report" }] });
+    if (timing === "after") {
+      await original.emit({ type: "done", outcome: "completed" });
+      await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBe(1));
+    }
+
+    const connection = f.store.createConnection({ id: "result-owner", name: "Owner", authKeyDigest: "result-key" });
+    const later = f.host.enqueueInput({ sessionId, connection, operationId: "task:ordinary-followup", prompt: {
+      text: "Read my separate image", images: [], files: [], mentions: [], disposition: timing === "during" ? "follow_up" : "prompt"
+    } }).value;
+    const ordinary = await contextFor(later.runId);
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aW8sAAAAASUVORK5CYII=", "base64");
+    const blob = await f.artifacts.ingestBytes(png, { fileName: "ordinary.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 });
+    f.store.transaction(store => store.adoptSessionArtifact({ sessionId, runId: later.runId, blob: store.getArtifact(blob.id).blob }));
+    await ordinary.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Separate user reply" }] });
+    if (timing === "during") await original.emit({ type: "done", outcome: "completed" });
+    await ordinary.emit({ type: "done", outcome: "completed" });
+
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBe(1));
+    const checked = f.tasks.view(await f.tasks.check(f.parent, task.id));
+    expect(checked).toMatchObject({ status: "completed", result: "Original report", artifacts: [] });
+    expect(f.store.listArtifacts({ sessionId, runId: later.runId }).map(item => item.blob.id)).toEqual([blob.id]);
+    const results = f.store.listQueueItems({ sessionId: f.parent });
+    expect(results).toHaveLength(1);
+    expect(results[0]!.body.text).toContain("Original report");
+    expect(results[0]!.body.text).not.toContain("Separate user reply");
+    expect(results[0]!.body.text).not.toContain(blob.id);
+  });
+
   it("creates one visible task, freezes a cross-Backend preference and returns adopted artifacts once", async () => {
     const f = await fixture(), selected = await f.partners.updatePartner(f.partner.id, f.partner.revision, { taskModelOverride: f.route });
     const created = await f.tasks.start(f.parent, "task:first", { instruction: "Produce the report", title: "Report", workingDir: f.project }, () => undefined);
@@ -202,7 +252,7 @@ describe("Partner independent Session tasks", () => {
     await expect(f.tasks.start(f.parent, "task:first", { instruction: "Different request" }, () => undefined)).rejects.toThrow("different request");
     await vi.waitFor(() => expect(f.secondary.inputs).toHaveLength(1));
     const artifact = await f.artifacts.ingestBytes(new TextEncoder().encode("Report"), { fileName: "report.txt", mimeType: "text/plain", expiresAt: Date.now() + 60_000 });
-    f.store.transaction(store => store.adoptSessionArtifact({ sessionId: child.id, blob: store.getArtifact(artifact.id).blob }));
+    f.store.transaction(store => store.adoptSessionArtifact({ sessionId: child.id, runId: created.runId!, blob: store.getArtifact(artifact.id).blob }));
     await f.secondary.complete(child.id, "Report ready.");
     await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", result: "Report ready.", deliveredExecution: 1 }));
     expect(sessionTaskActivity(f.store, f.store.getSession(child.id))).toMatchObject({ completionNotification: "teammate", completedReplySummary: "Report ready." });

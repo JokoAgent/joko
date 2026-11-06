@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
-import { redactSecrets, type PromptInput, type TargetDescriptor } from "@joko/core";
+import { redactSecrets, type PromptInput, type RunDescriptor, type TargetDescriptor } from "@joko/core";
 import { NotFoundError, type OperationalStore, type PartnerModelRouteRecord, type PartnerProfileRecord, type QueueItemRecord } from "@joko/store";
 import type { PartnerManager } from "./partner-manager.js";
 import type { SessionHost, InteractionDecisionSubmission } from "./session-host.js";
@@ -234,7 +234,7 @@ export class PartnerSessionTaskManager {
     const queue = session === undefined ? [] : this.store.listQueueItems({ sessionId: session.id, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 500 })
       .filter(item => this.#queueOrigin(item) === callerSessionId).map(item => ({ id: item.id, state: item.state, message: item.body.text.slice(0, 4_000), revision: item.revision.toString() }));
     const interactions = session === undefined ? [] : this.store.listInteractions({ sessionId: session.id, status: "open" });
-    const artifacts = session === undefined ? [] : this.store.listArtifacts({ sessionId: session.id, limit: 100 }).filter(item => item.deletedAt === undefined)
+    const artifacts = session === undefined ? [] : this.store.listArtifacts({ sessionId: session.id, runIds: this.#executionRuns(task).ids, limit: 100 })
       .map(item => ({ id: item.blob.id, name: item.blob.fileName ?? "Artifact", mimeType: item.blob.mimeType, byteSize: item.blob.byteLength }));
     return { task_id: task.id, session_id: task.sessionId, title: task.title, status: task.status, control: task.control,
       completion_destination: task.group && !task.groupFallback ? "group" : "private",
@@ -396,17 +396,17 @@ export class PartnerSessionTaskManager {
       task = this.#read(id);
     }
     if (task.status === "unknown" && (!task.sessionId || !task.runId)) { this.#recoverCreation(task); task = this.#read(id); }
-    if (task.status === "unknown" && task.runId && this.store.getRun(task.runId).descriptor.state !== "dispatch_unknown"
-      && this.store.getRun(task.runId).descriptor.error?.stateMayHaveChanged !== true) {
-      task = { ...task, status: "queued" }; this.#save(task);
+    if (task.status === "unknown" && task.runId) {
+      const latest = this.#executionRuns(task).leaves.at(-1);
+      if (latest && latest.state !== "dispatch_unknown" && latest.error?.stateMayHaveChanged !== true) {
+        task = { ...task, status: "queued" }; this.#save(task);
+      }
     }
     if (!task.sessionId || task.status === "preparing" || task.status === "unknown") {
       if (task.status === "unknown") this.groupPublisher?.skipProgress(task.id);
       else if (task.group && !isActive(task.status)) await this.#deliver(task);
       this.#arm(this.#read(id)); return this.#read(id);
     }
-    const runs = this.store.listRuns({ sessionId: task.sessionId, activeOnly: true, limit: 500 });
-    const latest = this.store.listRuns({ sessionId: task.sessionId, limit: 1 })[0]?.descriptor;
     for (const interaction of interactions) {
       try {
         if (task.group && !task.groupFallback && this.groupPublisher) {
@@ -421,11 +421,13 @@ export class PartnerSessionTaskManager {
       } catch { /* The interaction stays visible in its task; it can be returned after the requester recovers. */ }
     }
     if (task.control === "active" && isActive(task.status)) {
-      const status: PartnerSessionTaskStatus = runs.some(run => run.descriptor.state === "dispatch_unknown") || latest?.state === "dispatch_unknown" || latest?.error?.stateMayHaveChanged === true ? "unknown"
-        : runs.some(run => run.descriptor.state === "waiting") ? "waiting" : runs.some(run => ["running", "retrying"].includes(run.descriptor.state)) ? "running"
+      const execution = this.#executionRuns(task), latest = execution.leaves.at(-1);
+      const runs = execution.leaves.filter(run => run.state !== "completed" && run.state !== "aborted" && run.state !== "failed");
+      const status: PartnerSessionTaskStatus = runs.some(run => run.state === "dispatch_unknown") || latest?.error?.stateMayHaveChanged === true ? "unknown"
+        : runs.some(run => run.state === "waiting") ? "waiting" : runs.some(run => run.state === "running" || run.state === "retrying") ? "running"
         : runs.length ? "queued" : latest?.state === "completed" ? "completed" : latest?.state === "aborted" ? "cancelled" : latest?.state === "failed" ? "failed" : task.status;
       if (status !== task.status) {
-        task = { ...task, status, updatedAt: this.now(), ...(status === "completed" ? { result: this.#result(task.sessionId!, task.group !== undefined) } : {}),
+        task = { ...task, status, updatedAt: this.now(), ...(status === "completed" ? { result: this.#result(task.sessionId!, execution.ids, task.group !== undefined) } : {}),
           ...(status === "failed" ? { error: redactSecrets(latest?.error?.message ?? "The task failed.").slice(0, 4_000) } : {}) };
         this.#save(task);
       }
@@ -445,14 +447,15 @@ export class PartnerSessionTaskManager {
         if (task.sessionId && task.runId) persistSessionTaskActivity(this.store, task.sessionId, { runId: task.runId, completionNotification: "none" });
         return;
       }
+      const runIds = this.#executionRuns(task).ids;
       if (task.group && !task.groupFallback && this.groupPublisher) {
-        const delivered = await this.groupPublisher.terminal(task);
+        const delivered = await this.groupPublisher.terminal(task, runIds);
         if (delivered === "retry") { this.#arm(task); return; }
         if (delivered === "delivered") { this.#save({ ...task, deliveredExecution: task.execution, updatedAt: this.now() }); return; }
         task = { ...task, groupFallback: true }; this.#save(task);
       }
       if (task.group && task.groupFallback && this.groupPublisher) {
-        const delivery = this.groupPublisher.privateResult(task);
+        const delivery = this.groupPublisher.privateResult(task, runIds);
         if (delivery.delivered) { this.#save({ ...task, deliveredExecution: task.execution, updatedAt: this.now() }); return; }
         if (delivery.failed) return;
         if (!delivery.ready) { this.#arm(task); return; }
@@ -464,7 +467,7 @@ export class PartnerSessionTaskManager {
         if (task.sessionId && task.runId) persistSessionTaskActivity(this.store, task.sessionId, { runId: task.runId, completionNotification: "none" });
         return;
       }
-      const artifacts = task.sessionId ? this.store.listArtifacts({ sessionId: task.sessionId, limit: 100 }).filter(item => item.deletedAt === undefined)
+      const artifacts = task.sessionId ? this.store.listArtifacts({ sessionId: task.sessionId, runIds, limit: 100 })
         .map(item => ({ id: item.blob.id, name: item.blob.fileName ?? "Artifact", mimeType: item.blob.mimeType })) : [];
       const payload = { taskId: task.id, sessionId: task.sessionId, title: task.title, status: task.status, result: task.result, error: task.error, artifacts };
       this.host.enqueueServiceInput({ operationId: `${task.id}:result:${task.execution}`, sessionId: parent.id, source: "system",
@@ -498,8 +501,27 @@ export class PartnerSessionTaskManager {
       this.groupPublisher!.deferPrivate(deliveryId); return "retry";
     }
   }
-  #result(sessionId: string, full = false) {
-    const event = this.store.listEvents({ sessionId, order: "desc", limit: 500 }).find(event => event.payload.type === "message_complete" && event.payload.role === "assistant");
+  #executionRuns(task: PartnerSessionTaskRecord): { readonly ids: readonly string[]; readonly leaves: readonly RunDescriptor[] } {
+    const ids = new Set<string>(), leaves: RunDescriptor[] = [];
+    for (const runId of task.executionRunIds) {
+      let run = this.store.getRun(runId).descriptor;
+      if (run.sessionId !== task.sessionId) throw changed();
+      while (!ids.has(run.id)) {
+        ids.add(run.id);
+        const next = this.store.findRunByParentId(run.id)?.descriptor;
+        // Host recovery and plan continuation retain the original execution.
+        // An ordinary retry or follow-up belongs to the user's separate input.
+        if (next?.source !== "system" || next.sessionId !== run.sessionId) {
+          leaves.push(run);
+          break;
+        }
+        run = next;
+      }
+    }
+    return { ids: [...ids], leaves };
+  }
+  #result(sessionId: string, runIds: readonly string[], full: boolean) {
+    const event = this.store.findLatestAssistantReplyForRuns(sessionId, runIds);
     const text = event?.payload.type === "message_complete" ? redactSecrets(event.payload.blocks.filter(block => block.kind === "text").map(block => block.text).join("\n")) : "";
     return full ? text : text.slice(0, 12_000);
   }

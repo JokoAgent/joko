@@ -348,6 +348,7 @@ type ArtifactKindFilter = "file" | "image" | "export" | "tool_result" | "diagnos
 type ArtifactListOptions = {
   readonly sessionId?: string;
   readonly runId?: string;
+  readonly runIds?: readonly string[];
   readonly kind?: ArtifactKindFilter;
   readonly includeDeleted?: boolean;
   readonly includeCleared?: boolean;
@@ -607,6 +608,10 @@ function artifactSqlFilter(options: ArtifactListOptions): SqlFilter {
   if (options.runId !== undefined) {
     clauses.push("artifact.run_id = ?");
     params.push(options.runId);
+  }
+  if (options.runIds !== undefined) {
+    clauses.push("artifact.run_id IN (SELECT value FROM json_each(?))");
+    params.push(serializeJson(options.runIds));
   }
   if (options.kind !== undefined) {
     clauses.push(`${ARTIFACT_KIND_SQL} = ?`);

@@ -57,9 +57,9 @@ export class PartnerSessionTaskGroupPublisher {
     return this.#deliver(this.#ensure(task, "interaction", `interaction:${hash(JSON.stringify([interaction.id, interaction.generation]))}`,
       "waiting", question, kind));
   }
-  async terminal(task: PartnerSessionTaskRecord): Promise<GroupTaskDeliveryResult> {
+  async terminal(task: PartnerSessionTaskRecord, runIds: readonly string[]): Promise<GroupTaskDeliveryResult> {
     this.skipProgress(task.id);
-    return this.#deliver(this.#ensure(task, "terminal", `result:${task.execution}`, task.status, redactSecrets(task.result ?? task.error ?? "")));
+    return this.#deliver(this.#ensure(task, "terminal", `result:${task.execution}`, task.status, redactSecrets(task.result ?? task.error ?? ""), "", runIds));
   }
   async retryEarlierResults(task: PartnerSessionTaskRecord) {
     const pending = this.store.listSettings("service", SCOPE).map(row => readDelivery(row.value));
@@ -68,9 +68,9 @@ export class PartnerSessionTaskGroupPublisher {
       .filter(job => job.taskId === task.id && job.execution < task.execution && job.kind === "terminal" && job.state === "fallback" && job.nextAt <= this.now())
       .map(deliverySnapshot);
   }
-  privateResult(task: PartnerSessionTaskRecord) {
+  privateResult(task: PartnerSessionTaskRecord, runIds: readonly string[]) {
     this.skipProgress(task.id);
-    const job = this.#ensure(task, "terminal", `result:${task.execution}`, task.status, redactSecrets(task.result ?? task.error ?? ""));
+    const job = this.#ensure(task, "terminal", `result:${task.execution}`, task.status, redactSecrets(task.result ?? task.error ?? ""), "", runIds);
     if (job.state === "private") return { ...deliverySnapshot(job), delivered: true, ready: true, failed: false };
     if (job.state === "failed") return { ...deliverySnapshot(job), delivered: false, ready: false, failed: true };
     this.#save({ ...job, state: "fallback" }); return { ...deliverySnapshot(job), delivered: false, ready: job.nextAt <= this.now(), failed: false };
@@ -123,14 +123,14 @@ export class PartnerSessionTaskGroupPublisher {
         && (!active || job.execution !== task.execution || job.kind === "interaction" && !current.has(job.id))) this.#save({ ...job, state: "skipped" });
     }
   }
-  #ensure(task: PartnerSessionTaskRecord, kind: Delivery["kind"], suffix: string, status: string, text: string, interactionKind = ""): Delivery {
+  #ensure(task: PartnerSessionTaskRecord, kind: Delivery["kind"], suffix: string, status: string, text: string, interactionKind = "", runIds: readonly string[] = []): Delivery {
     if (!task.group) throw new Error("The task has no group origin.");
     const id = deliveryId(task.id, suffix), old = this.store.findSetting("service", SCOPE, id);
     if (old) return readDelivery(old.value);
     const files: SavedAttachment[] = [];
     if (kind === "terminal" && task.sessionId) {
       for (let offset = 0; ; offset += 100) {
-        const page = this.store.listArtifacts({ sessionId: task.sessionId, limit: 100, offset });
+        const page = this.store.listArtifacts({ sessionId: task.sessionId, runIds, limit: 100, offset });
         for (const artifact of page) if (artifact.deletedAt === undefined) files.push({ blob: artifact.blob,
           ...(artifact.blob.byteLength < 1 || artifact.blob.byteLength > MAX_FILE ? { skipped: "The file is empty or exceeds the room file limit." } : {}) });
         if (page.length < 100) break;
