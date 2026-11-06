@@ -2028,12 +2028,18 @@ export class ExtensionLibraryManager {
 
   async #recoverDefaultBindings(): Promise<void> {
     let changed = false;
+    const graceByRoot = new Map(this.#state.grace.map(record => [record.root, record]));
     for (const entry of await readdir(this.#dataDirectory, { withFileTypes: true })) {
+      const root = join(this.#dataDirectory, entry.name);
+      const grace = graceByRoot.get(root);
+      if (grace !== undefined) {
+        await assertExtensionLibraryRootIdentity(root, grace.identity);
+        continue;
+      }
       if (!entry.isDirectory() || entry.isSymbolicLink() || !EXTENSION_ID.test(entry.name)) {
         throw new ExtensionLibraryError("CORRUPT", "Extension Library data root contains an unknown entry.");
       }
       if (this.#binding(entry.name) !== undefined) continue;
-      const root = join(this.#dataDirectory, entry.name);
       const vault = this.#createVault(root, entry.name);
       const status = await vault.open({ create: false });
       if (status.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Untracked default Extension Library is corrupt.");
