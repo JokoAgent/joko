@@ -260,6 +260,16 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
     expect(store.getSession(sessionId).descriptor.worktree?.state).toBe("preserved");
     expect(workspaces.listRegistrations().some((entry) => entry.id === binding.workspaceId)).toBe(false);
 
+    const retired = store.createConnection({ id: "retiring-restore", name: "Retiring device", authKeyDigest: "retiring-digest" });
+    let checks = 0;
+    await expect(worktrees.restore(sessionId, { assertCurrent: () => {
+      if (++checks === 2) store.revokeConnection(retired.id);
+      store.authorizeConnection(retired.id, retired.authKeyDigest);
+    } })).rejects.toMatchObject({ name: "AuthorizationError" });
+    await expect(lstat(binding.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(store.getSession(sessionId).descriptor).toMatchObject({ archived: true, worktree: { state: "preserved" } });
+    expect(workspaces.listRegistrations().some(entry => entry.id === binding.workspaceId)).toBe(false);
+
     await worktrees.restore(sessionId);
     store.updateSession(sessionId, { archived: false });
     const restored = store.getSession(sessionId);

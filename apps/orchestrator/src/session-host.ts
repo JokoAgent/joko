@@ -5113,8 +5113,10 @@ export class SessionHost {
           ...(remotePlan === undefined ? {} : { remoteWorktreePlan: remotePlan })
         });
         if (remotePlan !== undefined) {
-          derivedWorktree = await this.#worktrees!.acquirePlannedRemoteDerivation(remotePlan);
+          const assertCurrent = () => { this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest); };
+          derivedWorktree = await this.#worktrees!.acquirePlannedRemoteDerivation(remotePlan, assertCurrent);
           acquiredDerivedWorktree = derivedWorktree;
+          assertCurrent();
           this.#store.attachNativeSessionDerivationWorktree({
             operationId: claim.operation.id,
             expectedRevision: prepared.revision,
@@ -5123,6 +5125,7 @@ export class SessionHost {
           this.assertActiveBackendSideEffectLease(sideEffectLease);
           this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
           await this.#worktrees!.assertActiveRemoteWorktree(sessionId, derivedWorktree);
+          assertCurrent();
         }
       }
       const derivation: NativeSessionDerivation = {
