@@ -12,7 +12,7 @@ import ssh2, {
   type SFTPWrapper
 } from "ssh2";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RemoteSshError } from "./errors.js";
+import { isRemoteFileMissing, RemoteSshError } from "./errors.js";
 import { SSH_UNICODE_CORPUS } from "./i18n/unicode.test-fixture.js";
 import { Ssh2ResolvedAgentAuthConnector, type Ssh2ResolvedAgentAuthConnectorOptions } from "./ssh2-connector.js";
 import type { RemoteTerminalExit, RemoteTerminalHandle } from "./types.js";
@@ -311,10 +311,12 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
       path: "/workspace/nested/note.txt",
       maximumBytes: 64
     })).toString("utf8")).toBe("remote content");
-    await expect(files.read({
+    const oversized = await files.read({
       path: "/workspace/nested/note.txt",
       maximumBytes: 4
-    })).rejects.toMatchObject({ code: "FILE_TRANSFER_FAILED" });
+    }).catch((error: unknown) => error);
+    expect(oversized).toMatchObject({ code: "FILE_TRANSFER_FAILED" });
+    expect(isRemoteFileMissing(oversized)).toBe(false);
     expect(Buffer.from(await files.read({
       path: "/workspace/nested/note.txt",
       maximumBytes: 4,
@@ -327,7 +329,9 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
 
     await files.rename("/workspace/nested/note.txt", "/workspace/nested/renamed.txt");
     await files.remove("/workspace", { recursive: true });
-    await expect(files.stat("/workspace")).rejects.toMatchObject({ code: "FILE_TRANSFER_FAILED" });
+    const missing = await files.stat("/workspace").catch((error: unknown) => error);
+    expect(missing).toMatchObject({ code: "FILE_TRANSFER_FAILED", details: { sftpStatus: 2 } });
+    expect(isRemoteFileMissing(missing)).toBe(true);
     await connection.close();
   });
 });

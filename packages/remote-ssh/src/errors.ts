@@ -86,6 +86,12 @@ export function isRemoteSshError(value: unknown): value is RemoteSshError {
   return value instanceof RemoteSshError;
 }
 
+/** File ports may use Node errno or the sanitized SSH_FX_NO_SUCH_FILE status. */
+export function isRemoteFileMissing(value: unknown): boolean {
+  if (isRemoteSshError(value)) return value.code === "FILE_TRANSFER_FAILED" && value.details?.["sftpStatus"] === 2;
+  return typeof value === "object" && value !== null && "code" in value && (value.code === "ENOENT" || value.code === 2);
+}
+
 export function safeRemoteSshError(error: unknown): RemoteSshError {
   if (isRemoteSshError(error)) return error;
   return new RemoteSshError(

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { posix, win32 } from "node:path";
 import type { CodexNativeExecutionInput, CodexNativeExecutionOptions, CodexHostedExecServerLease } from "@joko/adapter-codex";
 import { redactSecrets, type AdapterContext, type NativeToolAuthorizationRequest } from "@joko/core";
-import type { RemoteReverseForwardHandle } from "@joko/remote-ssh";
+import { isRemoteFileMissing, type RemoteReverseForwardHandle } from "@joko/remote-ssh";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 import { NotFoundError, type OperationalStore } from "@joko/store";
 import { terminalEnvironment } from "@joko/tool-terminal";
@@ -80,7 +80,7 @@ async function openNativeExecServer(options: NativeCodexExecutionOptions, input:
         return paths.join(resolved, ...rest.reverse());
       } catch (error) {
         assertCurrent(); signal.throwIfAborted();
-        if (!missing(error)) throw error;
+        if (!isRemoteFileMissing(error)) throw error;
         const parent = paths.dirname(current);
         if (parent === current) throw error;
         rest.push(paths.basename(current)); current = parent;
@@ -210,8 +210,4 @@ function nativeRequest(action: HostedAgentCodexAction, path: string, signal: Abo
   if (action.kind === "network") return { toolName: "WebFetch", input: { url: action.url, method: action.method }, signal };
   return action.kind === "exec" ? { toolName: "bash", input: { command: action.command, cwd: path }, signal }
     : { toolName: action.kind, input: { path, ...(action.scope === "tree" ? { recursive: true } : {}) }, signal };
-}
-
-function missing(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && (error.code === "ENOENT" || error.code === 2);
 }
