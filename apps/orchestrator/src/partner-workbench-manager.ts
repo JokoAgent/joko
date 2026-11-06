@@ -6,7 +6,7 @@ import { basename, extname, isAbsolute, relative, resolve, win32 } from "node:pa
 import { buildPartnerWorkbenchDigest, boundNativeSessionPreview, derivePartnerWorkbenchTaskState, derivePartnerWorkbenchAutomationState,
   partnerWorkbenchGroup, PARTNER_WORKBENCH_RECENT_WINDOW_MS, redactSecrets,
   type NativeSessionCatalogEntry, type PartnerWorkbenchState, type SessionDescriptor, type TargetDescriptor,
-  type PartnerWorkbenchTask, type PartnerWorkbenchDetail, type PartnerWorkbenchJudgment, type PartnerWorkbenchProjectBrief,
+  type PartnerWorkbenchTask, type PartnerWorkbenchDetail, type PartnerWorkbenchJudgment, type PartnerWorkbenchProject, type PartnerWorkbenchProjectBrief,
   type PartnerWorkbenchProjectOption, type PartnerWorkbenchTranscriptItem, type PartnerWorkbenchArtifact, type PromptInput } from "@joko/core";
 import type { OperationalStore, PartnerProfileRecord, PartnerWorkbenchStore, PartnerStore, PersistedEvent } from "@joko/store";
 import { parseCodeHostPullRequestReference, type CodeHostProvider, type CodeHostSessionAuthorizationPort } from "@joko/code-host";
@@ -25,7 +25,10 @@ import type { PartnerHomeWorkbench } from "./partner-home-workbench.js";
 import type { PartnerHomeLocation } from "./partner-home-owner.js";
 import {
   checkPartnerWorkbenchProject,
+  currentPartnerWorkbenchProjectRoot,
   findPartnerWorkbenchProject,
+  inspectPartnerWorkbenchProject,
+  PartnerWorkbenchProjectError,
   partnerWorkbenchProjectForDirectory,
   validatePartnerWorkbenchReference,
   type PartnerWorkbenchProjectEnvironment
@@ -107,6 +110,13 @@ interface OwnedPartnerWorkbench {
   readonly stamp: PartnerWorkbenchOwner;
 }
 
+interface ResolvedWorkbenchGrant {
+  readonly project: string;
+  readonly path: string;
+  readonly addedAt: number;
+  readonly current?: () => boolean;
+}
+
 /** Partner identity and its durable grant are shared by the user surface and
  * runtime tools. A selected client row cannot confer project access. */
 export class PartnerWorkbenchManager {
@@ -128,8 +138,8 @@ export class PartnerWorkbenchManager {
   readonly #homeChanging: (partnerId: string) => boolean;
   readonly #environment: PartnerWorkbenchProjectEnvironment;
   readonly #grants = new Map<string, PartnerWorkbenchState>();
-  readonly #resolvedGrants = new Map<string, readonly { readonly project: string; readonly path: string; readonly addedAt: number }[]>();
-  readonly #referenceWorkspaces = new Map<string, { readonly partnerId: string; readonly project: string }>();
+  readonly #resolvedGrants = new Map<string, readonly ResolvedWorkbenchGrant[]>();
+  readonly #referenceWorkspaces = new Map<string, { readonly partnerId: string; readonly project: string; readonly approval?: PartnerWorkbenchProject }>();
   readonly #sources = new Map<string, ReadonlyMap<string, TaskSource>>();
   readonly #continuations = new Map<string, { readonly operationId: string; readonly message: string; readonly result: Promise<{ readonly sessionId: string; readonly runId: string; readonly status: "queued" | "started" }> }>();
 
@@ -210,21 +220,24 @@ export class PartnerWorkbenchManager {
 
   async addProject(owner: PartnerWorkbenchOwner, expectedRevision: bigint, rawPath: string): Promise<PartnerWorkbenchStateView & { readonly acceptedProject: string }> {
     this.#assertOwner(owner);
-    const path = await this.#checkProject(owner, rawPath);
+    const local = this.#remote(owner) ? undefined : await inspectPartnerWorkbenchProject(rawPath, this.#environment);
+    const path = local?.path ?? await this.#checkProject(owner, rawPath);
     const previous = await this.#workbenches.read(owner.partnerId);
-    const existing = await this.#findProject(owner, path, previous.projects.map((project) => project.path));
+    const existing = await this.#findProject(owner, path, previous.projects);
+    const acceptedProject = existing ?? path;
     this.#assertOwner(owner);
-    const state = await this.#workbenches.addProject(owner.partnerId, expectedRevision, existing ?? path);
+    if (local) this.#localProjectRoot({ path: acceptedProject, addedAt: 0, localIdentity: local.identity });
+    const state = await this.#workbenches.addProject(owner.partnerId, expectedRevision, acceptedProject, local?.identity);
     this.#assertOwner(owner);
     await this.#installGrant(owner, state, true);
     this.#publish(owner);
-    return { ...await this.#view(owner, state), acceptedProject: existing ?? path };
+    return { ...await this.#view(owner, state), acceptedProject };
   }
 
   async removeProject(owner: PartnerWorkbenchOwner, expectedRevision: bigint, rawPath: string): Promise<PartnerWorkbenchStateView> {
     this.#assertOwner(owner);
     const previous = await this.#workbenches.read(owner.partnerId);
-    const path = await this.#findProject(owner, rawPath, previous.projects.map((project) => project.path));
+    const path = await this.#findProject(owner, rawPath, previous.projects);
     this.#assertOwner(owner);
     if (path === undefined) throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project is no longer in this workbench.");
     const state = await this.#workbenches.removeProject(owner.partnerId, expectedRevision, path);
@@ -310,7 +323,8 @@ export class PartnerWorkbenchManager {
       if (!metadata.isFile() || !before.isFile() || before.isSymbolicLink() || metadata.dev !== before.dev || metadata.ino !== before.ino) throw invalid("The document is unavailable.");
       const bytes = Buffer.alloc(Math.min(metadata.size, 16_384));
       const read = await handle.read(bytes, 0, bytes.length, 0);
-      await this.resolveReference(owner, path);
+      const current = await this.resolveReference(owner, path);
+      if (current.value !== reference.value || current.workspaceId !== reference.workspaceId) throw projectChanged();
       const after = await lstat(reference.value);
       const observed = await handle.stat();
       if (!after.isFile() || after.isSymbolicLink() || after.dev !== metadata.dev || after.ino !== metadata.ino
@@ -338,17 +352,22 @@ export class PartnerWorkbenchManager {
     if (validated === undefined) throw invalid("The reference is outside the current project scope.");
     if (validated.startsWith("https://")) return { kind: "https", value: validated };
     const project = partnerWorkbenchProjectForDirectory(validated, state.projects.map((item) => item.path), this.#environment.caseInsensitive)!;
+    const approval = state.projects.find((item) => item.path === project)!;
     await this.#requireProject(owner, state, project);
-    const [actual, actualProject] = await Promise.all([realpath(validated), realpath(project)]);
+    const actualProject = this.#localProjectRoot(approval);
+    const actual = await realpath(validated);
     if (partnerWorkbenchProjectForDirectory(actual, [actualProject], this.#environment.caseInsensitive) === undefined) throw invalid("The reference resolves outside the handed-over project.");
-    await this.#assertScopeAfter(owner, project);
+    await this.#assertScopeAfter(owner, project, approval);
     const metadata = await lstat(actual);
     if (!metadata.isFile() && !metadata.isDirectory() || metadata.isSymbolicLink()) throw invalid("The reference is not a regular project file or directory.");
     const workspaceId = `partner-workbench-read:${createHash("sha256").update(owner.partnerId).update("\0").update(actualProject).digest("hex").slice(0, 32)}`;
-    await this.#workspaces.register({ id: workspaceId, root: actualProject, displayName: basename(project), trusted: true });
-    const referenceScope = { partnerId: owner.partnerId, project };
+    const registration = await this.#workspaces.register({ id: workspaceId, root: actualProject, displayName: basename(project), trusted: true });
+    const referenceScope = { partnerId: owner.partnerId, project, approval };
     this.#referenceWorkspaces.set(workspaceId, referenceScope);
-    try { await this.#assertScopeAfter(owner, project); }
+    try {
+      if (registration.root !== actualProject) throw projectChanged();
+      await this.#assertScopeAfter(owner, project, approval);
+    }
     catch (error) {
       if (this.#referenceWorkspaces.get(workspaceId) === referenceScope) { this.#workspaces.unregister(workspaceId); this.#referenceWorkspaces.delete(workspaceId); }
       throw error;
@@ -526,7 +545,8 @@ export class PartnerWorkbenchManager {
       }
       if (JSON.stringify(next) !== JSON.stringify(record)) this.#store.setSetting("service", BACKGROUND_SCOPE, record.operationId, next);
       if (next.mode === "adopt" && next.sessionId !== undefined && currentState.judgments.some((item) => item.taskId === next.sourceTaskId)) {
-        this.#assertScope(owner, next.project);
+        try { this.#assertScope(owner, next.project); }
+        catch (error) { if (error instanceof PartnerWorkbenchProjectError) continue; throw error; }
         currentState = await this.#workbenches.rekeyJudgment(owner.partnerId, currentState.revision, next.sourceTaskId, `task:${next.sessionId}`);
         this.#publish(owner);
       }
@@ -550,7 +570,10 @@ export class PartnerWorkbenchManager {
     }
     const path = await checkPartnerWorkbenchProject(directory, this.#environment);
     if (partnerWorkbenchProjectForDirectory(path, [project], this.#environment.caseInsensitive) === undefined) throw invalid("The native task's directory is outside this project.");
-    const [actualPath, actualProject] = await Promise.all([realpath(path), realpath(project)]);
+    const approval = this.#grants.get(owner.partnerId)?.projects.find((item) => item.path === project);
+    if (!approval) throw projectChanged();
+    const actualProject = this.#localProjectRoot(approval);
+    const actualPath = await realpath(path);
     if (partnerWorkbenchProjectForDirectory(actualPath, [actualProject], this.#environment.caseInsensitive) === undefined) throw invalid("The native task's directory resolves outside this project.");
     this.#assertScope(owner, project);
     const existing = this.#store.listTargets(backendId).find((target) => target.descriptor.remoteWorkspace === undefined && target.descriptor.trusted
@@ -575,7 +598,7 @@ export class PartnerWorkbenchManager {
   }
 
   async #requireProject(owner: PartnerWorkbenchOwner, state: PartnerWorkbenchState, raw: string): Promise<string> {
-    const project = await this.#findProject(owner, raw, state.projects.map((item) => item.path));
+    const project = await this.#findProject(owner, raw, state.projects);
     if (project === undefined) throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project grant was withdrawn. Reload this workbench.");
     await this.#checkProject(owner, project);
     this.#assertScope(owner, project);
@@ -583,8 +606,17 @@ export class PartnerWorkbenchManager {
   }
 
   #assertScope(owner: PartnerWorkbenchOwner, project: string): void {
-    this.#assertOwner(owner);
-    if (project !== "" && !this.#grants.get(owner.partnerId)?.projects.some((item) => item.path === project)) throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project grant was withdrawn. Reload this workbench.");
+    const { target } = this.#assertOwner(owner);
+    if (project === "") return;
+    const approval = this.#grants.get(owner.partnerId)?.projects.find((item) => item.path === project);
+    if (!approval) throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project grant was withdrawn. Reload this workbench.");
+    if (!target.remoteWorkspace) this.#localProjectRoot(approval);
+  }
+
+  #localProjectRoot(approval: PartnerWorkbenchProject): string {
+    const root = currentPartnerWorkbenchProjectRoot(approval, this.#environment.caseInsensitive);
+    if (!root) throw projectChanged();
+    return root;
   }
 
   #remote(owner: PartnerWorkbenchOwner): TargetDescriptor | undefined {
@@ -595,11 +627,11 @@ export class PartnerWorkbenchManager {
     const remote = this.#remote(owner);
     return remote ? this.#remoteProjects!.check(remote, value, () => { this.#assertOwner(owner); }) : checkPartnerWorkbenchProject(value, this.#environment);
   }
-  async #findProject(owner: PartnerWorkbenchOwner, value: string, projects: readonly string[]): Promise<string | undefined> {
+  async #findProject(owner: PartnerWorkbenchOwner, value: string, projects: readonly PartnerWorkbenchProject[]): Promise<string | undefined> {
     const remote = this.#remote(owner); if (!remote) return findPartnerWorkbenchProject(value, projects, this.#environment);
     const normalized = this.#remoteProjects!.normalize(remote, value), paths = this.#remoteProjects!.paths(remote);
     const key = (item: string) => paths === win32 ? item.toLowerCase() : item;
-    return projects.find(item => key(item) === key(normalized));
+    return projects.find(item => key(item.path) === key(normalized))?.path;
   }
   #projectFor(owner: PartnerWorkbenchOwner, value: string, projects: readonly string[]): string | undefined {
     const remote = this.#remote(owner);
@@ -610,11 +642,16 @@ export class PartnerWorkbenchManager {
     return remote ? binding?.kind === "device_peer" && remote.remoteWorkspace?.kind === "device_peer"
       && binding.controllerDeviceId === remote.remoteWorkspace.controllerDeviceId && binding.targetDeviceId === remote.remoteWorkspace.targetDeviceId : binding === undefined;
   }
-  async #assertScopeAfter(owner: PartnerWorkbenchOwner, project: string): Promise<void> {
+  async #assertScopeAfter(owner: PartnerWorkbenchOwner, project: string, approval?: PartnerWorkbenchProject): Promise<void> {
     const current = await this.#workbenches.read(owner.partnerId);
     this.#assertOwner(owner);
-    if (project !== "" && !current.projects.some((item) => item.path === project)) throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project grant was withdrawn. Reload this workbench.");
+    if (project !== "" && !current.projects.some((item) => item.path === project)) {
+      throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project grant was withdrawn. Reload this workbench.");
+    }
+    if (approval && !current.projects.some((item) => sameProjectApproval(item, approval))) throw projectChanged();
     if (this.#grants.get(owner.partnerId)?.revision !== current.revision) await this.#installGrant(owner, current, false);
+    if (approval && !this.#grants.get(owner.partnerId)?.projects.some((item) => sameProjectApproval(item, approval))) throw projectChanged();
+    this.#assertScope(owner, project);
   }
 
   async #installGrant(owner: PartnerWorkbenchOwner, state: PartnerWorkbenchState, refresh: boolean): Promise<void> {
@@ -623,7 +660,8 @@ export class PartnerWorkbenchManager {
     if (previous !== undefined && previous.revision > state.revision) return;
     this.#grants.set(owner.partnerId, state);
     for (const [id, reference] of this.#referenceWorkspaces) {
-      if (reference.partnerId === owner.partnerId && !state.projects.some((project) => project.path === reference.project)) {
+      if (reference.partnerId === owner.partnerId && !state.projects.some((project) => project.path === reference.project
+        && (!reference.approval || sameProjectApproval(project, reference.approval)))) {
         this.#workspaces.unregister(id); this.#referenceWorkspaces.delete(id);
       }
     }
@@ -633,15 +671,26 @@ export class PartnerWorkbenchManager {
     const current = (): boolean => {
       try { const profile = this.#partners.getPartner(owner.partnerId); return profile.lifecycle === "active" && profile.initializationState === "ready" && profile.homeTargetId === owner.targetId; } catch { return false; }
     };
-    this.#host.extraDirectories.replaceWorkbenchGrant({ targetId: owner.targetId, revision: state.revision,
-      directories: previousDirectories.map((entry) => ({ path: entry.path, addedAt: entry.addedAt })), current });
-    const directories = await Promise.all(state.projects.map(async (project) => {
-      try { const path = await this.#checkProject(owner, project.path); return { project: project.path, path: this.#remote(owner) ? path : await realpath(path), addedAt: project.addedAt }; } catch { return undefined; }
+    this.#host.extraDirectories.replaceWorkbenchGrant({ targetId: owner.targetId, revision: state.revision, directories: previousDirectories, current });
+    const remote = this.#remote(owner);
+    const directories = await Promise.all(state.projects.map(async (project): Promise<ResolvedWorkbenchGrant | undefined> => {
+      try {
+        const path = await this.#checkProject(owner, project.path);
+        if (remote) return { project: project.path, path, addedAt: project.addedAt };
+        const root = this.#localProjectRoot(project);
+        return { project: project.path, path: root, addedAt: project.addedAt,
+          current: () => currentPartnerWorkbenchProjectRoot(project, this.#environment.caseInsensitive) === root };
+      } catch { return undefined; }
     }));
     this.#assertOwner(owner);
     if (this.#grants.get(owner.partnerId) !== state) return;
-    const resolved = directories.filter((item): item is { project: string; path: string; addedAt: number } => item !== undefined);
+    const resolved = directories.filter((item): item is ResolvedWorkbenchGrant => item !== undefined);
     this.#resolvedGrants.set(owner.partnerId, resolved);
+    for (const [id, reference] of this.#referenceWorkspaces) {
+      if (reference.partnerId === owner.partnerId && reference.approval && !resolved.some((item) => item.project === reference.project)) {
+        this.#workspaces.unregister(id); this.#referenceWorkspaces.delete(id);
+      }
+    }
     this.#host.extraDirectories.replaceWorkbenchGrant({ targetId: owner.targetId, revision: state.revision, directories: resolved, current });
     if (refresh) await this.#host.refreshTargetExtraDirectories(owner.targetId);
   }
@@ -906,9 +955,12 @@ export class PartnerWorkbenchManager {
   }
 
   async #view(owner: PartnerWorkbenchOwner, state: PartnerWorkbenchState): Promise<PartnerWorkbenchStateView> {
+    const remote = this.#remote(owner);
     const projects = await Promise.all(state.projects.map(async (project): Promise<PartnerWorkbenchProjectView> => ({
-      ...project, name: basename(project.path) || project.path,
-      exists: await this.#checkProject(owner, project.path).then(() => true).catch(() => false)
+      path: project.path, addedAt: project.addedAt, name: basename(project.path) || project.path,
+      exists: await this.#checkProject(owner, project.path)
+        .then(() => !!remote || currentPartnerWorkbenchProjectRoot(project, this.#environment.caseInsensitive) !== undefined)
+        .catch(() => false)
     })));
     this.#assertOwner(owner);
     const collected = await this.#collect(owner, state, projects);
@@ -923,7 +975,8 @@ export class PartnerWorkbenchManager {
         judgment, digest: { purpose: judgment.next, recent: [] } };
     }));
     this.#sources.set(owner.partnerId, sources);
-    return { owner, state, projects: [...projects, ...foreign.flatMap(computer => computer.projects.map(project => ({ ...project,
+    return { owner, state, projects: [...projects, ...foreign.flatMap(computer => computer.projects.map(project => ({
+      path: project.path, addedAt: project.addedAt,
       name: project.path.split(/[\\/]/u).filter(Boolean).at(-1) ?? project.path, exists: false, readOnly: true,
       sourceComputerId: computer.deviceId, sourceComputerName: computer.deviceName })))], ...collected, tasks: [...collected.tasks, ...carried] };
   }
@@ -955,6 +1008,15 @@ export class PartnerWorkbenchManager {
 }
 
 function unavailable(): PartnerWorkbenchError { return new PartnerWorkbenchError("WORKBENCH_UNAVAILABLE", "An active local partner canonical task is required."); }
+function projectChanged(): PartnerWorkbenchProjectError {
+  return new PartnerWorkbenchProjectError("PROJECT_UNAVAILABLE", "The handed-over directory changed. Hand it over again to grant its current location.");
+}
+function sameProjectApproval(left: PartnerWorkbenchProject, right: PartnerWorkbenchProject): boolean {
+  return left.path === right.path && left.addedAt === right.addedAt
+    && left.localIdentity?.root === right.localIdentity?.root
+    && left.localIdentity?.device === right.localIdentity?.device
+    && left.localIdentity?.inode === right.localIdentity?.inode;
+}
 function invalid(message: string): PartnerWorkbenchError { return new PartnerWorkbenchError("WORKBENCH_INVALID", message); }
 function taskMissing(): PartnerWorkbenchError { return new PartnerWorkbenchError("WORKBENCH_TASK_NOT_FOUND", "The task is no longer available in this workbench scope."); }
 function prompt(text: string): PromptInput { return { text, images: [], files: [], mentions: [], disposition: "prompt" }; }

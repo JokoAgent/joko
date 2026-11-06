@@ -1,5 +1,7 @@
-import { stat, realpath } from "node:fs/promises";
+import { lstatSync, realpathSync } from "node:fs";
+import { lstat, stat, realpath } from "node:fs/promises";
 import { isAbsolute, join, parse, relative, resolve } from "node:path";
+import type { PartnerWorkbenchLocalProjectIdentity, PartnerWorkbenchProject } from "@joko/core";
 
 export class PartnerWorkbenchProjectError extends Error {
   constructor(readonly code: "PROJECT_PATH_INVALID" | "PROJECT_UNAVAILABLE", message: string) {
@@ -17,20 +19,32 @@ export interface PartnerWorkbenchProjectEnvironment {
 /** A project grant admits a specific existing directory. Both its literal and
  * resolved identities must stay outside the host's protected data scopes. */
 export async function checkPartnerWorkbenchProject(raw: string, env: PartnerWorkbenchProjectEnvironment): Promise<string> {
+  return (await inspectPartnerWorkbenchProject(raw, env)).path;
+}
+
+export async function inspectPartnerWorkbenchProject(raw: string, env: PartnerWorkbenchProjectEnvironment): Promise<{
+  readonly path: string;
+  readonly identity: PartnerWorkbenchLocalProjectIdentity;
+}> {
   const expanded = expandProjectPath(raw, env.homeDirectory);
   if (!isAbsolute(expanded)) throw new PartnerWorkbenchProjectError("PROJECT_PATH_INVALID", "An absolute project directory is required.");
   const path = resolve(expanded);
-  let actual: string;
+  let identity: PartnerWorkbenchLocalProjectIdentity;
   try {
-    if (!(await stat(path)).isDirectory()) throw new Error("Not a directory.");
-    actual = await realpath(path);
+    const before = await stat(path, { bigint: true });
+    const root = await realpath(path);
+    const metadata = await lstat(root, { bigint: true });
+    if (!before.isDirectory() || !metadata.isDirectory() || metadata.dev !== before.dev || metadata.ino !== before.ino) {
+      throw new Error("The project directory changed.");
+    }
+    identity = { root, device: metadata.dev.toString(), inode: metadata.ino.toString() };
   } catch {
     throw new PartnerWorkbenchProjectError("PROJECT_UNAVAILABLE", "The project directory is unavailable.");
   }
   const home = resolve(env.homeDirectory);
   const data = resolve(env.managedDataDirectory);
   const [actualHome, actualData] = await Promise.all([realpath(home).catch(() => home), realpath(data).catch(() => data)]);
-  for (const candidate of [path, actual]) {
+  for (const candidate of [path, identity.root]) {
     if (parse(candidate).root === candidate || same(candidate, home, env.caseInsensitive) || same(candidate, actualHome, env.caseInsensitive)) {
       throw new PartnerWorkbenchProjectError("PROJECT_PATH_INVALID", "Choose a specific project instead of a disk root or home directory.");
     }
@@ -38,24 +52,37 @@ export async function checkPartnerWorkbenchProject(raw: string, env: PartnerWork
       throw new PartnerWorkbenchProjectError("PROJECT_PATH_INVALID", "Managed application data cannot be granted as a project.");
     }
   }
-  return path;
+  return { path, identity };
+}
+
+export function currentPartnerWorkbenchProjectRoot(project: PartnerWorkbenchProject, caseInsensitive: boolean): string | undefined {
+  try {
+    const root = realpathSync(project.path);
+    const approved = project.localIdentity;
+    // A legacy path carries no authority for a different resolved directory.
+    if (approved ? !same(root, approved.root, caseInsensitive) : root !== project.path) return undefined;
+    const metadata = lstatSync(root, { bigint: true });
+    if (!metadata.isDirectory() || (approved && (metadata.dev.toString() !== approved.device
+      || metadata.ino.toString() !== approved.inode))) return undefined;
+    return root;
+  } catch { return undefined; }
 }
 
 export async function findPartnerWorkbenchProject(
   raw: string,
-  projects: readonly string[],
+  projects: readonly PartnerWorkbenchProject[],
   env: Pick<PartnerWorkbenchProjectEnvironment, "homeDirectory" | "caseInsensitive">
 ): Promise<string | undefined> {
   const expanded = expandProjectPath(raw, env.homeDirectory);
   if (!isAbsolute(expanded)) return undefined;
   const path = resolve(expanded);
-  const literal = projects.find((project) => same(resolve(project), path, env.caseInsensitive));
-  if (literal !== undefined) return literal;
+  const literal = projects.find((project) => same(resolve(project.path), path, env.caseInsensitive));
+  if (literal !== undefined) return literal.path;
   const actual = await realpath(path).catch(() => undefined);
   if (actual === undefined) return undefined;
   for (const project of projects) {
-    const actualProject = await realpath(project).catch(() => undefined);
-    if (actualProject !== undefined && same(actualProject, actual, env.caseInsensitive)) return project;
+    const actualProject = currentPartnerWorkbenchProjectRoot(project, env.caseInsensitive);
+    if (actualProject !== undefined && same(actualProject, actual, env.caseInsensitive)) return project.path;
   }
   return undefined;
 }
