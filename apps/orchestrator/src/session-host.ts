@@ -17491,8 +17491,7 @@ function contextRebuildInput(
     listAllVisibleSessionEvents(store, sessionId),
     binding,
     retained,
-    pending.reason === "message_deletion" && retained === undefined
-      ? store.getDeletedNativeHistoryParents(sessionId, binding.opaqueRef) : undefined
+    pending.reason === "message_deletion" ? store.getDeletedNativeHistoryParents(sessionId, binding.opaqueRef) : undefined
   ).filter(event => !excluded?.has(event.id));
   const sourceBoundary = pending.sourceInputPending
     ? activeTimeline.findIndex((event) =>
