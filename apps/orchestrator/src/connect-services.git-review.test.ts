@@ -129,7 +129,9 @@ describe("Connect Git Review contracts", () => {
       });
       const { diff } = await services.workspace.getWorkspaceDiff(workspace, context() as never);
       expect(diff?.files).toMatchObject([{ relativePath: path, oldRelativePath: path, binary }]);
-      expect(diff!.files[0]!.hunks).toHaveLength(binary ? 0 : 1);
+      const file = diff?.files?.[0];
+      if (diff === undefined || file === undefined) throw new Error("Git Review did not return the expected file diff.");
+      expect(file.hunks).toHaveLength(binary ? 0 : 1);
 
       const result = await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
         operationId: "stage-review-path",
@@ -138,11 +140,11 @@ describe("Connect Git Review contracts", () => {
           payload: { case: "applyWorkspaceDiffHunk", value: create(contract.ApplyWorkspaceDiffHunkMutationSchema, {
             workspaceId: workspace.workspaceId, source: workspace.source,
             action: contract.WorkspaceDiffAction.STAGE, target: contract.WorkspaceDiffTarget.FILE,
-            relativePath: diff!.files[0]!.relativePath, expectedRepositoryRevision: diff!.repositoryRevision
+            relativePath: file.relativePath, expectedRepositoryRevision: diff.repositoryRevision
           }) }
         })
       }), context() as never);
-      expect(result.operation?.result?.payload.case).toBe("acknowledgement");
+      expect(result.operation?.result?.payload?.case).toBe("acknowledgement");
       expect(git("diff", "--cached", "--name-only", "-z")).toBe(`${path}\0`);
       expect(git("diff", "--name-only", "-z")).toBe("");
     } finally {
