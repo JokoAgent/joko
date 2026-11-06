@@ -1,11 +1,22 @@
-import { link, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, realpath, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { workspaceEntryAbsentRevision } from "@joko/contracts";
+import { OperationalStore } from "@joko/store";
 
 import { WorkspaceService } from "./workspace-service.js";
+
+const io = vi.hoisted(() => ({ beforeLstat: undefined as ((path: unknown) => Promise<void>) | undefined }));
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, lstat: async (...args: unknown[]) => {
+    await io.beforeLstat?.(args[0]);
+    return Reflect.apply(actual.lstat, undefined, args);
+  } };
+});
+afterEach(() => { io.beforeLstat = undefined; });
 
 describe("WorkspaceService entry mutations", () => {
   it("creates only canonical, previously absent files and directories", async () => {
@@ -92,6 +103,59 @@ describe("WorkspaceService entry mutations", () => {
     expect(await readFile(join(root, "duplicate", "a.txt"), "utf8")).toBe("alpha");
     expect(await readFile(join(root, "duplicate", "nested", "b.txt"), "utf8")).toBe("beta");
     expect(await readFile(join(root, "source", "nested", "b.txt"), "utf8")).toBe("beta");
+  });
+
+  it.each(["file", "directory"] as const)("keeps a concurrently substituted %s when a copy fails", async kind => {
+    const { root, service } = await fixture("copy-replaced");
+    const directory = await realpath(root);
+    const source = join(directory, "source.txt"), destination = join(directory, "copy.txt");
+    const moved = join(directory, "original-copy.txt");
+    const replacement = kind === "file" ? destination : join(destination, "keep.txt");
+    await writeFile(source, "Original source");
+    const revision = (await listed(service, "source.txt")).revision;
+    io.beforeLstat = async path => {
+      if (path !== source || !await stat(destination).then(() => true, () => false)) return;
+      io.beforeLstat = undefined;
+      await rename(destination, moved);
+      if (kind === "directory") await mkdir(destination);
+      await writeFile(replacement, "Independent replacement");
+      await writeFile(source, "Source changed before the final check");
+    };
+
+    await expect(service.copyEntry("workspace", { sourcePath: "source.txt", destinationPath: "copy.txt", expectedRevision: revision }))
+      .rejects.toMatchObject({ code: "WORKSPACE_ENTRY_EFFECT_FAILED", publicError: { stateMayHaveChanged: true } });
+    expect(await readFile(replacement, "utf8")).toBe("Independent replacement");
+    expect(await readFile(moved, "utf8")).toBe("Original source");
+  });
+
+  it("does not delete a second file after its connection is revoked while waiting for the workspace lock", async () => {
+    const { root, service } = await fixture("delete-revoked");
+    const directory = await realpath(root), firstPath = join(directory, "first.txt"), secondPath = join(directory, "second.txt");
+    await writeFile(firstPath, "Remove first");
+    await writeFile(secondPath, "Keep second");
+    const first = await listed(service, "first.txt"), second = await listed(service, "second.txt");
+    const store = new OperationalStore(":memory:");
+    const owner = store.createConnection({ id: "retiring-owner", name: "Retiring owner", authKeyDigest: "digest" });
+    let started!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    io.beforeLstat = async path => {
+      if (path !== firstPath) return;
+      io.beforeLstat = undefined;
+      started(); await hold;
+    };
+    const deletingFirst = service.deleteEntry("workspace", { path: first.path, expectedRevision: first.revision, confirmRecursive: false });
+    try {
+      await entered;
+      const deletingSecond = service.deleteEntry("workspace", { path: second.path, expectedRevision: second.revision, confirmRecursive: false },
+        () => { store.authorizeConnection(owner.id, owner.authKeyDigest); });
+      const denied = expect(deletingSecond).rejects.toMatchObject({ name: "AuthorizationError" });
+      store.revokeConnection(owner.id);
+      release();
+      await deletingFirst; await denied;
+      await expect(stat(firstPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(secondPath, "utf8")).toBe("Keep second");
+    } finally { release(); store.close(); }
   });
 
   it("rejects symlink and hardlink trees before copy, move, or delete", async () => {

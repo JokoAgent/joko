@@ -1024,7 +1024,8 @@ export class WorkspaceService {
       readonly path: string;
       readonly expectedRevision: string;
       readonly confirmRecursive: boolean;
-    }
+    },
+    assertCurrent?: () => void
   ): Promise<void> {
     if (this.#isRemote(workspaceId)) {
       return this.#remoteInvoke(workspaceId, "deleteEntry", [input]);
@@ -1033,6 +1034,7 @@ export class WorkspaceService {
     const canonicalPath = canonicalWorkspaceMutationPath(input.path);
     requireWorkspaceEntryRevision(input.expectedRevision);
     return this.#serializeWorkspaceFileMutation(`${workspace.root}\0*`, async () => {
+      assertCurrent?.();
       const source = await this.#resolveWorkspaceMutationEntry(workspace, canonicalPath);
       assertWorkspaceEntryRevision(source.info, input.expectedRevision);
       if (source.info.isDirectory() && !input.confirmRecursive) {
@@ -1043,6 +1045,10 @@ export class WorkspaceService {
       assertSameWorkspaceMutationEntry(source, current, input.expectedRevision);
       await this.#validateWorkspaceMutationTree(current.absolute);
       const tombstonePath = resolve(dirname(source.absolute), `.joko-entry-delete-${randomUUID()}.tmp`);
+      if (this.requireWorkspace(workspaceId) !== workspace) {
+        throw new WorkspaceEntryMutationError("The workspace changed before the entry could be deleted.", "stale");
+      }
+      assertCurrent?.();
       try {
         await rename(source.absolute, tombstonePath);
       } catch (error) {
@@ -1098,47 +1104,59 @@ export class WorkspaceService {
       };
       await this.#validateWorkspaceMutationTree(source.absolute, budget);
       const destination = await this.#resolveWorkspaceMutationDestination(workspace, destinationPath);
-      let destinationCreated = false;
-      try {
-        if (source.info.isDirectory()) {
-          await mkdir(destination.absolute, { recursive: false, mode: source.info.mode & 0o777 });
-          destinationCreated = true;
-          await this.#copyWorkspaceMutationDirectory(source.absolute, destination.absolute, budget);
-        } else {
-          await this.#copyWorkspaceMutationFile(
-            source.absolute,
-            destination.absolute,
-            source.info,
-            () => { destinationCreated = true; }
-          );
+      const created: { directory?: Stats; file?: FileHandle } = {};
+      const verifyDestination = async (): Promise<Stats> => {
+        const owned = created.file === undefined ? created.directory : await created.file.stat();
+        if (owned === undefined) throw new WorkspaceEntryMutationError("The workspace copy destination could not be identified.", "stale");
+        await this.#assertWorkspaceMutationDestinationStillSafe(workspace, destination, owned);
+        const current = await lstat(destination.absolute);
+        assertSafeWorkspaceMutationInfo(current);
+        if (!sameFilesystemIdentity(owned, current)) {
+          throw new WorkspaceEntryMutationError("The workspace copy destination changed.", "stale");
         }
-        const current = await this.#resolveWorkspaceMutationEntry(workspace, sourcePath);
-        assertSameWorkspaceMutationEntry(source, current, input.expectedRevision);
-      } catch (error) {
-        if (destinationCreated) {
-          try {
-            const currentDestination = await this.#resolveWorkspaceMutationEntry(workspace, destinationPath);
-            await this.#assertWorkspaceMutationDestinationStillSafe(workspace, destination, currentDestination.info);
-            await this.#validateWorkspaceMutationTree(currentDestination.absolute);
-            await rm(currentDestination.absolute, { recursive: true, force: true });
-          } catch (cleanupError) {
-            throw workspaceEntryPostEffectError("The incomplete workspace copy could not be cleaned up safely.", cleanupError);
+        return current;
+      };
+      try {
+        try {
+          if (source.info.isDirectory()) {
+            await mkdir(destination.absolute, { recursive: false, mode: source.info.mode & 0o777 });
+            const directory = await lstat(destination.absolute).catch((error: unknown) => {
+              throw workspaceEntryPostEffectError("The created workspace directory could not be identified.", error);
+            });
+            if (!directory.isDirectory() || directory.isSymbolicLink()) {
+              throw new WorkspaceEntryMutationError("The created workspace directory changed.", "stale", { stateMayHaveChanged: true });
+            }
+            created.directory = directory;
+            await this.#copyWorkspaceMutationDirectory(source.absolute, destination.absolute, budget);
+          } else {
+            await this.#copyWorkspaceMutationFile(source.absolute, destination.absolute, source.info, handle => { created.file = handle; });
           }
+          const current = await this.#resolveWorkspaceMutationEntry(workspace, sourcePath);
+          assertSameWorkspaceMutationEntry(source, current, input.expectedRevision);
+        } catch (error) {
+          if (created.directory !== undefined || created.file !== undefined) {
+            try {
+              await verifyDestination();
+              await this.#validateWorkspaceMutationTree(destination.absolute);
+              const current = await verifyDestination();
+              await rm(destination.absolute, { recursive: current.isDirectory(), force: false });
+            } catch (cleanupError) {
+              throw workspaceEntryPostEffectError("The incomplete workspace copy could not be cleaned up safely.", cleanupError);
+            }
+          }
+          if (error instanceof WorkspaceEntryMutationError) throw error;
+          if (filesystemEntryExists(error)) throw new WorkspaceEntryMutationError("The workspace destination already exists.", "conflict");
+          throw new WorkspaceEntryMutationError("The workspace entry could not be copied.", "effect_failed", { cause: error });
         }
-        if (error instanceof WorkspaceEntryMutationError) throw error;
-        if (filesystemEntryExists(error)) {
-          throw new WorkspaceEntryMutationError("The workspace destination already exists.", "conflict");
+        try {
+          const copied = await verifyDestination();
+          return { entry: workspaceMutationEntry(destinationPath, copied) };
+        } catch (error) {
+          throw workspaceEntryPostEffectError("The copied workspace entry could not be identity-fenced.", error);
         }
-        throw new WorkspaceEntryMutationError("The workspace entry could not be copied.", "effect_failed", { cause: error });
+      } finally {
+        await created.file?.close().catch(() => undefined);
       }
-      let copied: WorkspaceResolvedMutationEntry;
-      try {
-        copied = await this.#resolveWorkspaceMutationEntry(workspace, destinationPath);
-        await this.#assertWorkspaceMutationDestinationStillSafe(workspace, destination, copied.info);
-      } catch (error) {
-        throw workspaceEntryPostEffectError("The copied workspace entry could not be identity-fenced.", error);
-      }
-      return { entry: workspaceMutationEntry(destinationPath, copied.info) };
     });
   }
 
@@ -3152,7 +3170,7 @@ export class WorkspaceService {
     source: string,
     destination: string,
     expected: Stats,
-    onDestinationCreated?: () => void
+    retainDestination?: (handle: FileHandle) => void
   ): Promise<void> {
     assertSafeWorkspaceMutationInfo(expected);
     const sourceHandle = await open(source, "r");
@@ -3163,7 +3181,7 @@ export class WorkspaceService {
         throw new WorkspaceEntryMutationError("The workspace copy source changed while it was being opened.", "stale");
       }
       destinationHandle = await open(destination, "wx", expected.mode & 0o777);
-      onDestinationCreated?.();
+      retainDestination?.(destinationHandle);
       const buffer = Buffer.alloc(64 * 1024);
       let position = 0;
       while (position < expected.size) {
@@ -3179,7 +3197,7 @@ export class WorkspaceService {
         throw new WorkspaceEntryMutationError("The workspace copy source changed while it was being copied.", "stale");
       }
     } finally {
-      await destinationHandle?.close().catch(() => undefined);
+      if (retainDestination === undefined) await destinationHandle?.close().catch(() => undefined);
       await sourceHandle.close().catch(() => undefined);
     }
   }
