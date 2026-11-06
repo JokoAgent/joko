@@ -172,6 +172,22 @@ describe("mobile Extension catalog pagination", () => {
     expect(catalog).toEqual({ revision: 0n, recoveredFromCorruption: false, extensions: [] });
   });
 
+  it("collects an installed package and an available package only in the unfiltered catalog", async () => {
+    const available = create(ExtensionCatalogEntrySchema, { ...fixture(2, "Calendar"),
+      source: ExtensionCatalogSource.MARKET, installed: false, installState: ExtensionInstallState.AVAILABLE,
+      enabled: false, sidebarVisible: false, useSupported: false,
+      owner: { kind: { case: "source", value: { sourceId: `extension_source_${"a".repeat(32)}`, sourceRevision: { value: 1n },
+        entryId: `extension_source_entry_${"b".repeat(32)}`, contentRevision: `sha256:${"c".repeat(64)}` } } },
+      setup: { state: ExtensionSetupState.NOT_REQUIRED, revision: { value: 0n } }
+    });
+    const readPage = async () => ({ revision: 3n, recoveredFromCorruption: false, extensions: [fixture(1), available], nextPageToken: "", totalSize: 2 });
+    const signal = new AbortController().signal;
+    await expect(collectMobileExtensionCatalog(readPage, signal, "all")).resolves.toMatchObject({ extensions: [
+      { name: "Calendar", installed: false, owner: { kind: "source" } }, { name: "Review Mail", installed: true }
+    ] });
+    await expect(collectMobileExtensionCatalog(readPage, signal)).rejects.toThrow(/installed Extension catalog entry/u);
+  });
+
   it("rejects duplicate identities, cyclic tokens, and inconsistent totals", async () => {
     await expect(collectMobileExtensionCatalog(async () => ({
       revision: 3n,
@@ -179,7 +195,7 @@ describe("mobile Extension catalog pagination", () => {
       extensions: [fixture(1), fixture(1)],
       nextPageToken: "",
       totalSize: 2
-    }), new AbortController().signal)).rejects.toThrow(/installed Extension catalog entry/u);
+    }), new AbortController().signal)).rejects.toThrow(/duplicate Extension catalog entry/u);
 
     await expect(collectMobileExtensionCatalog(async (pageToken) => pageToken === ""
       ? page(fixture(1), { revision: 3n, nextPageToken: "next", totalSize: 2 })

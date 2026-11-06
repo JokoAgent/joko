@@ -224,6 +224,25 @@ afterEach(() => {
 });
 
 describe("MobileExtensionsScreen", () => {
+  it.each([false, true])("adopts a successful uninstall with an available package remaining when browsing is %s", async (browse) => {
+    const available = { ...calendar, installed: false, installState: "available" as const };
+    const active = transport("owner-package", catalog([mail]));
+    active.browse = vi.fn(async () => catalog([mail, available]));
+    active.removePackage = vi.fn(async () => catalog([available]));
+    await render(active);
+    if (browse) await press("Browse available Extensions");
+    expect(container.textContent?.includes(available.name)).toBe(browse);
+    await press("View Mail");
+    await press("Remove package");
+    const buttons = native.alert.mock.calls[0]![2] as Array<{ onPress?: () => void }>;
+    await act(async () => buttons[1]!.onPress?.());
+
+    expect(active.removePackage).toHaveBeenCalledExactlyOnceWith(mail, expect.any(AbortSignal));
+    expect(container.textContent).not.toContain("Remove package");
+    expect(container.textContent).not.toContain(mail.name);
+    expect(container.textContent?.includes(available.name)).toBe(browse);
+  });
+
   it("browses, searches, and loads authoritative Extension detail", async () => {
     const active = transport();
     await render(active);

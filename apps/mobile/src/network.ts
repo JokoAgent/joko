@@ -2368,7 +2368,7 @@ export const mobileNetwork: MobileNetwork = {
       }
       return { revision: response.catalogRevision.value, recoveredFromCorruption: response.recoveredFromCorruption,
         extensions: response.extensions, nextPageToken: response.page.nextPageToken, totalSize: Number(total) };
-    }, signal ?? new AbortController().signal);
+    }, signal ?? new AbortController().signal, "all");
   },
   async getExtensionPackagePreview(credential, expected, backendId, signal) {
     const response = await createClient(ExtensionService, credentialTransport(credential)).getExtensionPackagePreview({

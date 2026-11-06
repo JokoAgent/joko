@@ -566,7 +566,11 @@ export function MobileExtensionsScreen({
               testID="extensions.settings.open" />}
             {transport && <MobileExtensionPackages extension={extension} transport={transport} colors={colors} locale={locale}
               disabled={selectedBusy || mutation !== undefined || pending.length > 0}
-              onChanged={catalog => { setDirectory({ ownerKey, status: "ready", refreshing: false, catalog }); closeDetail(); }} />}
+              onChanged={catalog => {
+                const visible = browseAvailable ? catalog : { ...catalog, extensions: catalog.extensions.filter(item => item.installed) };
+                setDirectory({ ownerKey, status: "ready", refreshing: false, catalog: visible });
+                closeDetail();
+              }} />}
             <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
               <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale,
                 extension.enabled ? "extension.enabled" : "extension.disabled")}</Text>
