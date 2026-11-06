@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
@@ -27,6 +28,42 @@ afterEach(() => {
 });
 
 describe("OperationalStore visible message search", () => {
+  it("recovers a persisted parent learned after a live native message and keeps the preceding reply searchable on reopen", () => {
+    const database = createDatabase();
+    const store = database.open();
+    seedFixture(store);
+    const session = store.getSession("session-a").descriptor;
+    const fingerprint = `sha256:${createHash("sha256").update(session.binding.opaqueRef).digest("hex")}`;
+    const append = (id: string, payload: EventPayload, fields: Record<string, string | boolean> = {}) => store.appendEvent({
+      id, backendId: session.backendId, targetId: session.targetId, sessionId: session.id, generation: session.binding.generation,
+      traceId: `history-index:${id}`, payload,
+      metadata: { namespace: "test.native_history", fields: { ...fields, [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: fingerprint } }
+    });
+    append("older-reply", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "original archive witness" }],
+      nativeHistory: { identity: { entryId: "older" } } }, { nativeHydration: true });
+    const live = append("later-live", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "later answer" }],
+      nativeHistory: { identity: { entryId: "later" } } }, { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true });
+    append("later-marker", { type: "native_session_changed", opaqueRef: session.binding.opaqueRef, leafId: "later" });
+    append("later-hydrated", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "later answer" }],
+      nativeHistory: { identity: { entryId: "later", parentEntryId: "older" } } }, { nativeHydration: true });
+    const visible = (current: OperationalStore) => current.listEvents({ sessionId: session.id, activeNativeTimeline: true })
+      .filter(event => event.payload.type === "message_complete").map(event => event.id);
+    expect(visible(store)).toEqual(["older-reply", "later-hydrated"]);
+    store.close();
+
+    // Recreate the previous derived index while retaining all durable events.
+    const previous = new DatabaseSync(database.filePath);
+    try {
+      previous.prepare("UPDATE native_history_canonical_identities SET event_cursor = ?, parent_entry_id = NULL WHERE session_id = ? AND entry_id = 'later'")
+        .run(live.globalCursor, session.id);
+      previous.prepare("DELETE FROM native_history_active_entries WHERE session_id = ? AND entry_id = 'older'").run(session.id);
+    } finally { previous.close(); }
+    const recovered = database.open();
+    expect(visible(recovered)).toEqual(["older-reply", "later-hydrated"]);
+    expect(recovered.searchSessionMessages({ scope: { sessionId: session.id }, query: "archive witness" }).matches.map(match => match.eventId))
+      .toEqual(["older-reply"]);
+  });
+
   it("keeps private control prompts out of search, human activity and public message operations", () => {
     const fixture = createFixture();
     const partnerPrivateOrigin = { messageId: "private", threadId: "thread", senderPartnerId: "sender", recipientPartnerId: "recipient", senderDisplayName: "Sender" };

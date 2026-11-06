@@ -3679,6 +3679,7 @@ export class SessionHost {
       messageDeletionAdmission();
     }
     let prepared: MessageDeletionPlan | undefined;
+    let retainedEventCursors: readonly bigint[] | undefined;
     const assertPrecondition = (store: OperationalStore): void => {
       input.precondition?.(store);
       const adapter = this.assertMessageDeletionSupported(input.sessionId);
@@ -3692,6 +3693,7 @@ export class SessionHost {
           reason: "message_deletion", latestDeletionOperationId: input.operationId, sourceInputPending: false, replaySafe: false
         }, new Set(current.deletedEventIds));
         assertMessageDeletionHandoffBound(remaining.handoff);
+        retainedEventCursors = remaining.retainedEventCursors;
       }
     };
     try {
@@ -3715,6 +3717,7 @@ export class SessionHost {
             requestedEventId: prepared.requestedEventId,
             deletedEventIds: prepared.deletedEventIds,
             operationId: input.operationId,
+            ...(retainedEventCursors === undefined ? {} : { retainContextEventCursors: retainedEventCursors }),
             traceId: `message-delete:${input.operationId}`
           });
           return input.result(committed.deletedEventIds);
@@ -17482,10 +17485,14 @@ function contextRebuildInput(
   pending: Pick<PendingContextRebuild, "reason" | "latestDeletionOperationId" | "sourceInputPending" | "sourceRunId" | "replaySafe">,
   excluded?: ReadonlySet<string>
 ): ContextRebuildInput & { readonly retainedEventCursors: readonly bigint[] } {
+  const binding = store.getSession(sessionId).descriptor.binding;
+  const retained = store.getRetainedSessionContextCursors(sessionId);
   const activeTimeline = activeNativeTimeline(
     listAllVisibleSessionEvents(store, sessionId),
-    store.getSession(sessionId).descriptor.binding,
-    store.getRetainedSessionContextCursors(sessionId)
+    binding,
+    retained,
+    pending.reason === "message_deletion" && retained === undefined
+      ? store.getDeletedNativeHistoryParents(sessionId, binding.opaqueRef) : undefined
   ).filter(event => !excluded?.has(event.id));
   const sourceBoundary = pending.sourceInputPending
     ? activeTimeline.findIndex((event) =>
