@@ -85,6 +85,11 @@ const MAXIMUM_DIAGNOSTIC_READ_LIMIT = 100;
 const MAXIMUM_INLINE_BINARY_BYTES = 10 * 1024 * 1024;
 const MAXIMUM_UNIFIED_RESULT_BYTES = 200_000;
 
+interface RemoteBrowserDirectoryScope {
+  readonly proof: string;
+  readonly pageIds: readonly string[];
+}
+
 const unifiedActions = [
   "doctor", "status", "setBackend", "start", "stop", "profiles", "tabs", "open", "focus", "close",
   "snapshot", "screenshot", "navigate", "console", "pdf", "upload", "dialog", "act",
@@ -504,11 +509,12 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     name: string,
     arguments_: Readonly<Record<string, unknown>>,
     signal?: AbortSignal,
-    context?: BridgeToolCallContext
+    context?: BridgeToolCallContext,
+    directoryPages?: ReadonlySet<string>
   ): Promise<McpCallResult> {
     const task = this.#tail.then(
-      () => this.#executeWithContext(name, arguments_, signal, context),
-      () => this.#executeWithContext(name, arguments_, signal, context)
+      () => this.#executeWithContext(name, arguments_, signal, context, directoryPages),
+      () => this.#executeWithContext(name, arguments_, signal, context, directoryPages)
     );
     this.#tail = task.then(() => undefined, () => undefined);
     return task;
@@ -518,7 +524,8 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     name: string,
     arguments_: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
-    context: BridgeToolCallContext | undefined
+    context: BridgeToolCallContext | undefined,
+    directoryPages?: ReadonlySet<string>
   ): Promise<McpCallResult> {
     this.#activeContext = context;
     this.#activePageIds = new Set<string>();
@@ -533,7 +540,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         !/^sha256:[a-f0-9]{64}$/u.test(context.requestBodyHash ?? "")
       )) throw new Error("Browser bridge request authority is invalid.");
       this.#assertSessionContext();
-      let result = await this.#execute(name, arguments_, signal);
+      let result = await this.#execute(name, arguments_, signal, directoryPages);
       signal?.throwIfAborted();
       this.#assertSessionContext();
       for (const pageId of this.#activePageIds) this.#assertPageContext(pageId);
@@ -562,7 +569,8 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   async #execute(
     name: string,
     input: Readonly<Record<string, unknown>>,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    directoryPages?: ReadonlySet<string>
   ): Promise<McpCallResult> {
     signal?.throwIfAborted();
     assertKnownArguments(name, input);
@@ -620,7 +628,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         }
       }
       case "browser":
-        return this.#executeUnified(input, signal);
+        return this.#executeUnified(input, signal, directoryPages);
       case "list_pages":
         return this.#withLease(async () => textResult({ pages: (await this.#listVisiblePages()).map(publicPage) }));
       case "open_page": {
@@ -812,7 +820,8 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
 
   async #executeUnified(
     input: Readonly<Record<string, unknown>>,
-    signal: AbortSignal | undefined
+    signal: AbortSignal | undefined,
+    directoryPages?: ReadonlySet<string>
   ): Promise<McpCallResult> {
     signal?.throwIfAborted();
     const action = requiredEnum(input, "action", unifiedActions);
@@ -867,7 +876,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           generation: this.#browser.generation,
           target: this.#browser.targetMode,
           proxy: this.#browser.proxyState(),
-          pages: this.#browser.running ? (await this.#listVisiblePages()).map(publicPage) : []
+          pages: this.#browser.running ? (await this.#listVisiblePages(directoryPages)).map(publicPage) : []
         });
       case "setBackend": {
         const requested = requiredEnum(input, "backend", ["external", "sidebar"] as const);
@@ -910,7 +919,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           }))
         });
       case "tabs":
-        return this.#result(action, { tabs: (await this.#listVisiblePages()).map(publicPage) });
+        return this.#result(action, { tabs: (await this.#listVisiblePages(directoryPages)).map(publicPage) });
       case "open": {
         const candidate = optionalString(input, "url", 8_192);
         const label = optionalString(input, "label", 256);
@@ -1322,7 +1331,11 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
     }
 
-    const result = await route.call({ action, arguments: copyRemoteArguments(input) }, signal);
+    const directory = context !== undefined && (action === "tabs" || action === "status") ? {
+      proof: randomUUID(), pageIds: this.#ownedRemotePages(remoteProviderId, generation).map(page => page.pageId)
+    } satisfies RemoteBrowserDirectoryScope : undefined;
+    const arguments_ = copyRemoteArguments(input);
+    const result = await route.call({ action, arguments: directory === undefined ? arguments_ : { ...arguments_, directoryScope: directory } }, signal);
     this.#assertRemoteRoute(route, generation);
     signal?.throwIfAborted(); this.#assertSessionContext();
     if (context !== undefined) {
@@ -1343,9 +1356,9 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         recipeTask!.remoteVerified.set(recipeKey, { site: verification["site"], digest: verification["digest"], epoch: recipeEpoch });
       }
     }
-    const projected = context === undefined
+    const projected = context === undefined || !result.ok
       ? result.data
-      : this.#projectRemoteOwnedData(action, result.data, remoteProviderId, generation);
+      : this.#projectRemoteOwnedData(action, result.data, remoteProviderId, generation, directory);
     return this.#remoteResult(action, nodeId, generation, route, result, projected);
   }
 
@@ -1381,12 +1394,20 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     action: BrowserAutomationAction,
     data: unknown,
     browserProviderId: string,
-    browserGeneration: number
+    browserGeneration: number,
+    scope?: RemoteBrowserDirectoryScope
   ): unknown {
-    if (!isRecord(data)) return data;
     const listKey = action === "tabs" ? "tabs" : action === "status" ? "pages" : undefined;
     if (listKey !== undefined) {
-      const candidates = Array.isArray(data[listKey]) ? data[listKey] : [];
+      const verified = scope !== undefined && isRecord(data) && data["directoryProof"] === scope.proof;
+      const directory = verified && isRecord(data) ? data["directory"] : data;
+      if (!isRecord(directory)) throw new Error("Remote Browser page directory could not be verified.");
+      const candidates = directory[listKey];
+      if (!Array.isArray(candidates)) {
+        if (!verified || scope === undefined) throw new Error("Remote Browser page directory could not be verified.");
+        for (const id of scope.pageIds) this.#assertRemotePageContext(browserProviderId, id, browserGeneration);
+        return directory;
+      }
       const visible = candidates.filter((candidate) => {
         if (!isRecord(candidate) || typeof candidate["id"] !== "string") return false;
         try {
@@ -1396,23 +1417,24 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           return false;
         }
       });
-      return { ...data, [listKey]: visible };
+      return action === "tabs" ? { tabs: visible } : { running: directory["running"], generation: directory["generation"],
+        target: directory["target"], proxy: directory["proxy"], pages: visible };
     }
-    if (action === "doctor") {
-      return { ...data, pageCount: this.#ownedRemotePageCount(browserProviderId, browserGeneration) };
+    if (action === "doctor" && isRecord(data)) {
+      return { ...data, pageCount: this.#ownedRemotePages(browserProviderId, browserGeneration).length };
     }
     return data;
   }
 
-  #ownedRemotePageCount(browserProviderId: string, browserGeneration: number): number {
+  #ownedRemotePages(browserProviderId: string, browserGeneration: number): readonly RecoverableBrowserPageRecord[] {
     const context = this.#activeContext;
-    if (context === undefined || this.#state === undefined) return 0;
+    if (context === undefined || this.#state === undefined) return [];
     return this.#state.recoverablePages(browserProviderId, new Set()).filter((page) =>
       page.generation === browserGeneration &&
       page.sessionId === context.sessionId &&
       page.targetId === context.targetId &&
       page.bindingGeneration === context.generation
-    ).length;
+    );
   }
 
   async #remoteResult(
@@ -1945,11 +1967,16 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     return { id: `pi-browser:${this.generation}`, documentId, assertCurrent };
   }
 
-  async #listVisiblePages(): Promise<readonly BrowserPageState[]> {
+  async #listVisiblePages(directoryPages?: ReadonlySet<string>): Promise<readonly BrowserPageState[]> {
     const context = this.#activeContext;
     const generation = this.#browser.generation;
     this.#assertSessionContext();
-    const pages = await this.#browser.listPages();
+    const all = await this.#browser.listPages();
+    const pages = directoryPages === undefined ? all : all.filter(page => directoryPages.has(page.id));
+    if (directoryPages !== undefined) {
+      if (this.#browser.generation !== generation) throw new Error("Browser page authority changed during enumeration.");
+      for (const page of pages) this.#activePageIds.add(page.id);
+    }
     if (context === undefined) return pages;
     if (this.#state === undefined || this.#browser.generation !== generation) {
       throw new Error("Browser page authority changed during enumeration.");

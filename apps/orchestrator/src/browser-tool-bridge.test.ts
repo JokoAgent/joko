@@ -1,4 +1,4 @@
-import { BrowserPageGuardError, type BrowserLease, type BrowserProvider, type BrowserRemoteNodeRouter } from "@joko/tool-browser";
+import { BrowserPageGuardError, type BrowserLease, type BrowserPageState, type BrowserProvider, type BrowserRemoteNodeRoute, type BrowserRemoteNodeRouter } from "@joko/tool-browser";
 import { runInNewContext } from "node:vm";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -208,6 +208,67 @@ describe("BrowserToolBridgeProvider", () => {
     const page = await parent.bridge.callTool("browser", full.read);
     expect((page.structuredContent as any).data.result.text).toContain("remote result"); expect(child.browser.evaluatePage).toHaveBeenCalledOnce();
   });
+
+  it("filters the remote page directory before making a summary or retaining a readable result", async () => {
+    const store = browserBridgeAuthorityStore(), state = new OperationalBrowserState(store);
+    const child = fixture(), pages: BrowserPageState[] = [];
+    vi.mocked(child.browser.listPages).mockImplementation(async () => [...pages]);
+    vi.mocked(child.browser.createPage).mockImplementation(async (_lease, url) => {
+      const id = `node-page-${pages.length}`, address = url!;
+      const title = new URL(address).hostname === "private-b.example.test" ? `B private page ${id} `.repeat(65) : "A ordinary page";
+      const page = { id, url: address, title, state: "ready" as const };
+      pages.push(page);
+      return page;
+    });
+    const executor = new BrowserAutomationNodeExecutor({ nodeId: "directory-node", displayName: "Directory node", generation: 4,
+      bridge: child.bridge, artifacts: {} as ArtifactStore });
+    let acceptScope = true;
+    const route: BrowserRemoteNodeRoute = { id: "directory-node", generation: 4, available: true, capabilities: BROWSER_AUTOMATION_NODE_CAPABILITIES,
+      call: ({ action, arguments: args }, signal) => {
+        const { directoryScope: _ignored, ...unscoped } = args;
+        return executor.execute({ nodeId: "directory-node", expectedGeneration: 4, action, arguments: acceptScope ? args : unscoped }, signal);
+      } };
+    const parent = fixture({ resolve: () => route, list: () => [route] }, undefined, { state });
+    let request = 0;
+    const call = (owner: "a" | "b", args: Readonly<Record<string, unknown>>) => {
+      const identity = (++request).toString(16).padStart(64, "0");
+      return parent.bridge.callTool("browser", { target: "node", node: route.id, ...args }, undefined, {
+        ...browserBridgeContext("a", `session-${owner}`, `target-${owner}`, 1, 6),
+        requestIdentity: identity, effectIdentity: identity, requestBodyHash: `sha256:${identity}`
+      });
+    };
+    try {
+      for (let index = 0; index < 20; index++) await call("b", { action: "open", url: `https://private-b.example.test/${index}` });
+      for (const action of ["tabs", "status"]) {
+        const empty = await call("a", { action });
+        expect((empty.structuredContent as any).data.result).toMatchObject(action === "tabs" ? { tabs: [] } : { pages: [] });
+        expect(JSON.stringify(empty)).not.toMatch(/private-b|fullResult|summary/u);
+      }
+      await call("a", { action: "open", url: "https://public-a.example.test/" });
+      const own = await call("a", { action: "tabs" });
+      expect((own.structuredContent as any).data.result.tabs).toMatchObject([{ id: "node-page-20", title: "A ordinary page" }]);
+      expect(JSON.stringify(own)).not.toContain("private-b");
+      const other = await call("b", { action: "tabs" });
+      const summary = (other.structuredContent as any).data.result;
+      expect(summary).toMatchObject({ truncated: true, summary: { tabs: { count: 20 } } });
+      expect(JSON.stringify(other)).not.toContain("public-a");
+      const read = summary.fullResult.read;
+      expect(read).toMatchObject({ targetId: "node-page-0", target: "node", node: route.id });
+      expect((await call("a", { ...read, targetId: "node-page-20" })).isError).toBe(true);
+      let offset: number | null = 0, original = "";
+      while (offset !== null) {
+        const page = await call("b", { ...read, offset });
+        expect(page.isError).toBe(false);
+        const chunk = (page.structuredContent as any).data.result;
+        original += chunk.text; offset = chunk.nextOffset;
+      }
+      expect(JSON.parse(original).data.tabs.map((page: BrowserPageState) => page.id)).toEqual(pages.slice(0, 20).map(page => page.id));
+      expect(original).not.toContain("public-a");
+      acceptScope = false;
+      await expect(call("a", { action: "tabs" })).rejects.toThrow(/could not be verified/u);
+    } finally { store.close(); }
+  });
+
   it("retains a large nested Browser result and reads every segment without repeating its original action", async () => {
     const { bridge, browser } = fixture();
     const original = "- button Continue 🙂\n".repeat(2_000);
