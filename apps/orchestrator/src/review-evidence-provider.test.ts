@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
@@ -15,12 +16,40 @@ import { ArtifactStore as RealArtifactStore } from "./artifact-store.js";
 import { buildReviewEvidence } from "./review-evidence.js";
 import { DurableReviewEvidenceProvider, ReviewEvidenceCaptureError } from "./review-evidence-provider.js";
 import type { WorkspaceChangeSetService } from "./workspace-change-set.js";
-import type { WorkspaceService } from "./workspace-service.js";
+import { WorkspaceService } from "./workspace-service.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => cleanups.splice(0).reverse().forEach((cleanup) => cleanup()));
 
 describe("DurableReviewEvidenceProvider", () => {
+  it("captures the text diff and file fingerprint for a real Git C-quoted path", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: fixture.root, windowsHide: true, encoding: "utf8" });
+    const file = "报告.txt";
+    try {
+      git("init", "--quiet");
+      git("config", "core.autocrlf", "false");
+      git("config", "core.quotePath", "true");
+      writeWorkspaceFile(fixture.root, file, "old\n");
+      git("add", "--", file);
+      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "-m", "base");
+      writeWorkspaceFile(fixture.root, file, "new\n");
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      const capture = await providerFor(fixture.store, workspaces, []).capture(request());
+      expect(capture.workspaceEvidence?.diffs).toEqual([{
+        relativePath: file, source: "unstaged", status: "modified", additions: 1, deletions: 1,
+        patch: expect.stringMatching(/^diff --git "a\/\\[0-7]{3}.*\n[\s\S]*\n-old\n\+new\n$/u)
+      }]);
+      expect(capture.workspace.files).toEqual([{
+        relativePath: file, byteLength: 4, sha256: createHash("sha256").update("new\n").digest("hex")
+      }]);
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
   it("fingerprints only reviewed paths so unrelated workspace edits do not stale Review", async () => {
     const fixture = setup();
     writeWorkspaceFile(fixture.root, "src/a.ts", "export const a = 1;\n");
@@ -339,7 +368,7 @@ function setup(targetId = "workspace") {
 
 function providerFor(
   store: OperationalStore,
-  workspaces: ReturnType<typeof workspaceStub>,
+  workspaces: WorkspaceService | ReturnType<typeof workspaceStub>,
   changeSets: readonly unknown[],
   artifacts: ArtifactStore = {} as ArtifactStore,
   pdfText?: (data: Uint8Array, maxChars: number) => Promise<PdfTextWorkerResult>
