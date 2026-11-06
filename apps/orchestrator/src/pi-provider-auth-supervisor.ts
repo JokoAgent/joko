@@ -146,6 +146,13 @@ export class PiProviderAuthFlowCapacityError extends Error {
   }
 }
 
+export class PiProviderAuthCredentialCommitStartedError extends Error {
+  constructor() {
+    super("The Provider credential is being saved or has already been accepted and cannot be cancelled.");
+    this.name = "PiProviderAuthCredentialCommitStartedError";
+  }
+}
+
 export type PiProviderAuthPromptKind = "text" | "secret" | "manual_code" | "select";
 
 export interface PiProviderAuthPromptOption {
@@ -210,6 +217,7 @@ interface ActiveFlow {
   readonly announcement: Deferred<ProviderLoginFlow>;
   readonly providerActivationVersion?: bigint;
   timer: NodeJS.Timeout;
+  credentialCommitStarted?: boolean;
   pendingPrompt?: ActivePrompt;
   completion?: Promise<void>;
 }
@@ -571,16 +579,17 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
     const active = this.#active.get(flowId);
     if (active === undefined) throw new Error("Provider login flow is not active.");
     const current = this.#requireFlow(flowId);
-    if (current.state !== "starting" && current.state !== "pending") {
+    if (!providerAuthFlowInFlight(current) || active.controller.signal.aborted) {
       throw new Error("Provider login flow is not active.");
     }
+    if (active.credentialCommitStarted) throw new PiProviderAuthCredentialCommitStartedError();
     this.#updateFlow(flowId, {
       state: "cancelled",
       pendingPrompt: undefined,
       error: "Provider login was cancelled."
     });
-    this.#providers.setNativeAuthenticationState(current.providerId, "error", "Provider login was cancelled.");
     active.controller.abort(new FlowCancelledError());
+    this.#providers.setNativeAuthenticationState(current.providerId, "error", "Provider login was cancelled.");
     return cloneFlow(this.#requireFlow(flowId));
   }
 
@@ -592,6 +601,8 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
     if (this.#closed || this.#shuttingDown) return;
     this.#shuttingDown = true;
     for (const active of this.#active.values()) {
+      const flow = this.#flows.get(active.id);
+      if (flow === undefined || !providerAuthFlowInFlight(flow)) continue;
       this.#recoveryRequired.add(active.id);
       this.#updateFlow(active.id, {
         state: "outcome_unknown",
@@ -612,32 +623,38 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
 
   async #runLogin(active: ActiveFlow, runtime: PiProviderAuthRuntime): Promise<void> {
     const initial = this.#requireFlow(active.id);
+    const signal = active.controller.signal;
     try {
       const returned = validateCredential(await runtime.login(initial.providerId, initial.method === "api_key" ? "api_key" : "oauth", {
-        signal: active.controller.signal,
-        prompt: (prompt) => this.#answerPrompt(active, prompt, active.controller.signal),
+        signal,
+        prompt: (prompt) => this.#answerPrompt(active, prompt, signal),
         notify: (event) => this.#handleAuthEvent(active, event)
       }));
-      const stored = await this.#credentials.read(initial.providerId);
+      const stored = await this.#credentials.read(initial.providerId, { signal });
       if (stored === undefined) {
         const persisted = await this.#credentials.modify(
           initial.providerId,
           async () => returned,
-          { signal: active.controller.signal }
+          { signal }
         );
         if (persisted === undefined) throw new Error("Provider login did not persist its credential.");
       }
+      signal.throwIfAborted();
+      active.credentialCommitStarted = true;
       await this.#providers.activateAuthenticatedProvider(initial.providerId, active.providerActivationVersion);
+      signal.throwIfAborted();
       clearProviderRateLimit(this.#store, this.#backendId, initial.providerId);
       await this.#refreshGenerationSafely(initial.providerId);
+      signal.throwIfAborted();
       this.#providers.setNativeAuthenticationState(initial.providerId, "authenticated");
       this.#updateFlow(active.id, { state: "completed", error: undefined });
       if (!active.announcement.settled) active.announcement.resolve(toPublicFlow(this.#requireFlow(active.id)));
     } catch (error) {
-      const interrupted = error instanceof FlowInterruptedError || active.controller.signal.reason instanceof FlowInterruptedError;
-      const cancelled = error instanceof FlowCancelledError || active.controller.signal.reason instanceof FlowCancelledError;
-      const timedOut = error instanceof FlowTimedOutError || active.controller.signal.reason instanceof FlowTimedOutError;
       const stored = await this.#credentials.read(initial.providerId).catch(() => undefined);
+      if (signal.reason instanceof FlowCancelledError) return;
+      const interrupted = error instanceof FlowInterruptedError || signal.reason instanceof FlowInterruptedError;
+      const cancelled = error instanceof FlowCancelledError;
+      const timedOut = error instanceof FlowTimedOutError || signal.reason instanceof FlowTimedOutError;
       if (interrupted) {
         this.#updateFlow(active.id, {
           state: "outcome_unknown",
@@ -728,6 +745,7 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
   }
 
   #handleAuthEvent(active: ActiveFlow, event: PiAuthEvent): void {
+    if (active.controller.signal.aborted || this.#active.get(active.id) !== active) return;
     if (event.type === "info" || event.type === "progress") return;
     const current = this.#requireFlow(active.id);
     if (event.type === "auth_url") {
@@ -796,6 +814,13 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
         if (next === undefined) return current;
         const valid = validateCredential(next);
         const serializedCredential = serializeCredential(valid);
+        // Pi passes the login signal to its credential store before the native login returns.
+        if (options?.signal !== undefined) {
+          const active = [...this.#active.values()].find((flow) => flow.controller.signal === options.signal);
+          if (active !== undefined && this.#requireFlow(active.id).providerId === providerId) {
+            active.credentialCommitStarted = true;
+          }
+        }
         await this.#providers.writeNativeCredential({
           providerId,
           serializedCredential,

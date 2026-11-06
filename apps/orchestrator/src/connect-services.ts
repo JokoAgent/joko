@@ -224,12 +224,13 @@ import {
   type ExtensionSourceManager
 } from "./extension-source-manager.js";
 import type { HistoryMaintenanceJob, HistoryMaintenanceResult, HistoryRetention } from "./history-maintenance.js";
-import type {
-  PiProviderAuthFlowRecord,
-  PiProviderAuthPromptAnswer,
-  PiProviderAuthPromptKind,
-  PiProviderAuthPromptRecord,
-  PiProviderAuthSupervisor
+import {
+  PiProviderAuthCredentialCommitStartedError,
+  type PiProviderAuthFlowRecord,
+  type PiProviderAuthPromptAnswer,
+  type PiProviderAuthPromptKind,
+  type PiProviderAuthPromptRecord,
+  type PiProviderAuthSupervisor
 } from "./pi-provider-auth-supervisor.js";
 import {
   clearProviderRateLimit,
@@ -4415,7 +4416,10 @@ export function createConnectServices(application: OrchestratorApplication, proj
       }
       try {
         return { loginFlow: mapProviderLoginFlow(flowId, supervisor.cancel(flow.opaqueFlowId)) };
-      } catch {
+      } catch (error) {
+        if (error instanceof PiProviderAuthCredentialCommitStartedError) {
+          throw new ConnectError(error.message, Code.FailedPrecondition);
+        }
         throw new ConnectError("Provider login flow is no longer active.", Code.FailedPrecondition);
       }
     }
