@@ -194,8 +194,14 @@ import {
 const execFileAsync = promisify(execFile);
 type PiCompatibilityOutcome =
   | { readonly status: "compatible"; readonly report: PiCompatibilityReport }
-  | { readonly status: "incompatible"; readonly diagnostic: string; readonly cause: unknown };
-const DEFAULT_EXECUTABLE_COMPATIBILITY_CACHE = new Map<string, Promise<PiCompatibilityOutcome>>();
+  | { readonly status: "incompatible" | "unavailable"; readonly diagnostic: string; readonly cause: PiAdapterError };
+const DEFAULT_EXECUTABLE_COMPATIBILITY_CACHE = new Map<string, Promise<PiCompatibilityReport>>();
+const PI_INCOMPATIBLE_PROBE_RESULTS = new Set([
+  "PI_COMPATIBILITY_STATE_INVALID",
+  "PI_COMPATIBILITY_COMMANDS_INVALID",
+  "PI_COMPATIBILITY_BRIDGE_INCOMPLETE",
+  "PI_COMPATIBILITY_LIFECYCLE_INVALID"
+]);
 const INLINE_USER_SHELL_OUTPUT_LIMIT = 256 * 1024;
 const MAXIMUM_PI_TREE_PREVIEW_CHARACTERS = 200;
 const PI_STANDARD_RPC_TIMEOUT_MS = 30_000;
@@ -881,8 +887,8 @@ export class PiBackendAdapter implements
     ) || (this.#options.nativeAuthenticatedProviderIds?.length ?? 0) > 0;
     const diagnostics: string[] = [];
     if (probe.error) diagnostics.push(probe.error);
-    if (compatibility.status === "incompatible") diagnostics.push(compatibility.diagnostic);
-    else diagnostics.push(...compatibility.report.diagnostics);
+    if (compatibility.status === "compatible") diagnostics.push(...compatibility.report.diagnostics);
+    else diagnostics.push(compatibility.diagnostic);
     if ((this.#options.providers ?? []).length === 0) diagnostics.push("No managed provider catalog is configured.");
     if (!this.#options.readBlob) diagnostics.push("Image BlobRef resolution is unavailable until readBlob is configured.");
     return {
@@ -891,7 +897,7 @@ export class PiBackendAdapter implements
       instanceGeneration: 0,
       displayName: "Pi",
       version: probe.version ?? "unknown",
-      health: compatibility.status === "incompatible"
+      health: compatibility.status !== "compatible"
         ? "unavailable"
         : probe.error !== undefined || compatibility.report.unsupportedCommands.length > 0
           ? "degraded"
@@ -4747,17 +4753,15 @@ export class PiBackendAdapter implements
   }
 
   async #probeCompatibility(): Promise<PiCompatibilityOutcome> {
-    this.#compatibilityProbe ??= (async () => {
+    const probe = this.#compatibilityProbe ??= (async (): Promise<PiCompatibilityOutcome> => {
       const environment = this.#baseEnvironment();
       const proxySecrets = credentialedProxySecrets(environment);
       try {
         const identity = await canonicalPiExecutableIdentity(this.#command, this.#commandArgs, environment);
         const cache = this.#usesDefaultProcessFactory || this.#usesBundledCommand
           ? DEFAULT_EXECUTABLE_COMPATIBILITY_CACHE
-          : new Map<string, Promise<PiCompatibilityOutcome>>();
-        const cached = cache.get(identity);
-        if (cached !== undefined) return cached;
-        const pending = probePiExecutable({
+          : undefined;
+        const pending = cache?.get(identity) ?? probePiExecutable({
           command: this.#command,
           commandArgs: this.#commandArgs,
           // An injected factory is an in-memory runtime seam, not executable
@@ -4768,40 +4772,45 @@ export class PiBackendAdapter implements
           shutdownTimeoutMs: this.#options.shutdownTimeoutMs,
           maxRecordBytes: this.#options.maxRecordBytes,
           redactValues: proxySecrets.values
-        }).then((report): PiCompatibilityOutcome => ({ status: "compatible", report }))
-          .catch((error): PiCompatibilityOutcome => {
-            const failure = asPiError(error, {
-              code: "PI_EXECUTABLE_INCOMPATIBLE",
-              phase: "probe",
-              recovery: "Install a compatible executable before probing again."
-            }, proxySecrets.values);
-            return {
-              status: "incompatible",
-              diagnostic: `PI_EXECUTABLE_INCOMPATIBLE: ${failure.publicError.message}`,
-              cause: failure
-            };
-          });
-        cache.set(identity, pending);
-        return pending;
+        });
+        cache?.set(identity, pending);
+        try {
+          return { status: "compatible", report: await pending };
+        } catch (error) {
+          if (cache !== undefined && cache.get(identity) === pending) cache.delete(identity);
+          throw error;
+        }
       } catch (error) {
         const failure = asPiError(error, {
-          code: "PI_EXECUTABLE_INCOMPATIBLE",
+          code: "PI_EXECUTABLE_PROBE_UNAVAILABLE",
           phase: "probe",
-          recovery: "Install a compatible executable before probing again."
+          retryable: true,
+          recovery: "Restore the service environment and retry the Pi compatibility probe."
         }, proxySecrets.values);
+        const incompatible = PI_INCOMPATIBLE_PROBE_RESULTS.has(failure.publicError.code);
+        const code = incompatible ? "PI_EXECUTABLE_INCOMPATIBLE" : "PI_EXECUTABLE_PROBE_UNAVAILABLE";
         return {
-          status: "incompatible",
-          diagnostic: `PI_EXECUTABLE_INCOMPATIBLE: ${failure.publicError.message}`,
+          status: incompatible ? "incompatible" : "unavailable",
+          diagnostic: `${code}: ${failure.publicError.message}`,
           cause: failure
         };
       }
     })();
-    return this.#compatibilityProbe;
+    const outcome = await probe;
+    if (outcome.status === "unavailable" && this.#compatibilityProbe === probe) this.#compatibilityProbe = undefined;
+    return outcome;
   }
 
   async #requireCompatibility(): Promise<PiCompatibilityReport> {
     const outcome = await this.#probeCompatibility();
     if (outcome.status === "compatible") return outcome.report;
+    if (outcome.status === "unavailable") {
+      throw piError("PI_EXECUTABLE_PROBE_UNAVAILABLE", "The Pi compatibility probe could not be completed", "probe", {
+        retryable: true,
+        recovery: "Restore the service environment and retry; no replacement product Session was created.",
+        cause: outcome.cause
+      });
+    }
     throw piError("PI_EXECUTABLE_INCOMPATIBLE", "The configured Pi executable failed its typed RPC compatibility probe", "probe", {
       retryable: false,
       stateMayHaveChanged: false,
@@ -6710,6 +6719,11 @@ export class PiBackendAdapter implements
   }
 
   #capabilities(compatibility: PiCompatibilityOutcome): ReadonlyMap<string, Capability> {
+    const probeFailureDetail = compatibility.status === "incompatible"
+      ? "The configured Pi executable failed its typed RPC compatibility probe"
+      : compatibility.status === "unavailable"
+        ? "The Pi compatibility probe could not be completed. Retry after restoring the service environment."
+        : undefined;
     const supported = new Set<KnownCapability>(compatibility.status === "compatible" ? [
       "session.preview",
       "session.discovery",
@@ -6806,22 +6820,20 @@ export class PiBackendAdapter implements
           {
             key,
             supported: false,
-            reason: processSupervisorMissing
+            reason: processSupervisorMissing || compatibility.status === "unavailable"
               ? "platform_limited"
               : compatibility.status === "incompatible" || optionalCommand !== undefined || upstreamMissing
                 ? "upstream_missing"
                 : "not_implemented",
-            detail: compatibility.status === "incompatible"
-              ? "The configured Pi executable failed its typed RPC compatibility probe"
-              : processSupervisorMissing
+            detail: probeFailureDetail ?? (processSupervisorMissing
                 ? "OS process identity supervision is unavailable for this process factory"
-              : optionalCommand !== undefined
-                ? `The installed Pi RPC does not expose compatible ${optionalCommand} responses`
-                : key === "model.fast_mode"
-              ? "No model in the current installed Pi catalog explicitly supports Fast Mode"
-              : upstreamMissing
-                ? "The installed Pi RPC does not advertise this capability"
-                : "Owned by another Orchestrator provider or not configured"
+                : optionalCommand !== undefined
+                  ? `The installed Pi RPC does not expose compatible ${optionalCommand} responses`
+                  : key === "model.fast_mode"
+                    ? "No model in the current installed Pi catalog explicitly supports Fast Mode"
+                    : upstreamMissing
+                      ? "The installed Pi RPC does not advertise this capability"
+                      : "Owned by another Orchestrator provider or not configured")
           }
         ];
       });
