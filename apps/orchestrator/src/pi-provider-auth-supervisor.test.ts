@@ -14,6 +14,7 @@ import {
 } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import {
+  PiProviderAuthCredentialCommitStartedError,
   PiProviderAuthSupervisor,
   nativeThinkingLevels,
   supportsProviderAccountUsage,
@@ -947,7 +948,63 @@ describe("PiProviderAuthSupervisor", () => {
     expect(credentials.list({ providerId })).toEqual([]);
     expect(providers.get("managed-runtime", providerId).authenticationState).toBe("error");
     await supervisor.close();
+    expect(supervisor.getFlow(flow.opaqueFlowId)).toMatchObject({ state: "cancelled" });
     store.close();
+  });
+
+  it.each(["completed", "refresh failed", "shutdown"] as const)("rejects cancellation after credential acceptance when synchronization is %s", async (outcome) => {
+    const { store, providers, providerId, credentials } = await fixture();
+    const credentialStored = deferred<void>();
+    const allowNativeReturn = deferred<void>();
+    const generationStarted = deferred<void>();
+    const allowGeneration = deferred<void>();
+    let runtime!: FakePiRuntime;
+    const supervisor = await PiProviderAuthSupervisor.create({
+      store,
+      backendId: "managed-runtime",
+      providers,
+      now: () => NOW,
+      refreshPiGeneration: async () => {
+        generationStarted.resolve();
+        await allowGeneration.promise;
+        if (outcome === "refresh failed") throw new Error("generation refresh failed");
+      },
+      runtimeFactory: async (credentialStore) => (runtime = new FakePiRuntime({
+        ...credentialStore,
+        async modify(...args) {
+          const stored = await credentialStore.modify(...args);
+          credentialStored.resolve();
+          await allowNativeReturn.promise;
+          return stored;
+        }
+      }, providerId))
+    });
+    try {
+      const { opaqueFlowId } = await supervisor.beginLogin(providerId, "device_code");
+      runtime.completeLogin();
+      await credentialStored.promise;
+      expect(credentials.list({ providerId })).toHaveLength(1);
+      expect(() => supervisor.cancel(opaqueFlowId)).toThrow(PiProviderAuthCredentialCommitStartedError);
+      allowNativeReturn.resolve();
+      await generationStarted.promise;
+      expect(supervisor.getFlow(opaqueFlowId)).toMatchObject({ state: "pending" });
+      expect(() => supervisor.cancel(opaqueFlowId)).toThrow(PiProviderAuthCredentialCommitStartedError);
+      if (outcome === "shutdown") supervisor.beginShutdown();
+      allowGeneration.resolve();
+
+      const expectedState = outcome === "completed" ? "completed" : "outcome_unknown";
+      await expectFlowState(supervisor, opaqueFlowId, expectedState);
+      await supervisor.close();
+      expect(supervisor.getFlow(opaqueFlowId)).toMatchObject({ state: expectedState });
+      expect(credentials.list({ providerId })).toHaveLength(1);
+      expect(providers.get("managed-runtime", providerId).authenticationState)
+        .toBe(outcome === "completed" ? "authenticated" : "error");
+    } finally {
+      allowNativeReturn.resolve();
+      allowGeneration.resolve();
+      await supervisor.close();
+      store.close();
+    }
   });
 
   it("times out a pending native flow and leaves the vault untouched", async () => {
