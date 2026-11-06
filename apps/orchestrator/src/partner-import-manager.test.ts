@@ -185,6 +185,65 @@ describe("native import service and owning effects", () => {
       }
     }, 20_000);
 
+  it("masks native Discord credentials in imported knowledge even when connection entries were omitted", async () => {
+    const f = await fixture({ resourceFiles: 20 });
+    const root = join(f.root, ".openclaw"), workspace = join(root, "workspace");
+    const direct = "fixture-discord-channel-credential-abcdef", override = "fixture-discord-account-credential-123456";
+    const referenced = "fixture-discord-env-credential-987654", publicNote = "Public Discord label fixture";
+    await mkdir(join(workspace, "skills", "records"), { recursive: true });
+    await writeFile(join(root, "openclaw.json"), JSON.stringify({
+      agents: { entries: [{ id: "main", default: true, name: `Analyst ${direct}` }, { id: "other" }] },
+      channels: { discord: { token: direct, accounts: { inherited: {}, separate: { token: override },
+        environment: { token: { source: "env", id: "BOT_NAME" } } }, metadata: { token: publicNote } } },
+      bindings: [{ agentId: "other", match: { channel: "discord", accountId: "separate" } }]
+    }));
+    await writeFile(join(root, ".env"), `BOT_NAME=${referenced}\n`);
+    await writeFile(join(workspace, "SOUL.md"), `Analyst notes. ${direct} ${publicNote}`);
+    await writeFile(join(workspace, "MEMORY.md"), `Retained records. ${override} ${referenced} ${publicNote}`);
+    await writeFile(join(workspace, "skills", "records", "SKILL.md"), `---\nname: Records\ndescription: Verify ${referenced}\n---\nUse records. ${direct} ${override} ${publicNote}\n`);
+    const writeMemory = f.memory.write.bind(f.memory);
+    let failMemory = true;
+    vi.spyOn(f.memory, "write").mockImplementation((target, input) => {
+      if (failMemory && input.body.includes("Retained records.")) throw new Error("Fixture memory unavailable.");
+      return writeMemory(target, input);
+    });
+    const signal = new AbortController().signal;
+    const source = (await f.api.sources(signal)).find((entry) => entry.name.startsWith("Analyst ["))!;
+    const preview = await f.api.preview(source.id, signal);
+    expect(preview.name).not.toContain(direct);
+    const skillEntry = preview.entries.find((entry) => entry.category === PartnerImportCategory.SKILLS);
+    expect(skillEntry?.description).toContain("Verify");
+    expect(skillEntry?.description).not.toContain(referenced);
+    const selection = { previewId: preview.id, requestId: "owner_import_discord_0001", name: "Redaction fixture",
+      entryIds: preview.entries.filter((entry) => entry.category !== PartnerImportCategory.CONNECTIONS).map((entry) => entry.id), takeover: false, deferSetup: true };
+    await f.api.start(selection, signal);
+    const saved = await f.imports.waitForRequest(selection.requestId);
+    expect(saved.checks).toContainEqual(expect.objectContaining({ status: "needs-attention", message: "MEMORY_WRITE_FAILED" }));
+    const partner = f.partners.getPartner(saved.partnerId);
+    const skill = f.resources.listPartnerSkills(partner.id, partner.homeTargetId)[0]!;
+    const skillOwner = new PartnerSkillsManager(f.partners, f.profiles, f.store, f.resources, new SkillMutationCoordinator());
+    const published = await skillOwner.read(partner.id, skill.resource.id, signal);
+    expect(partner.identitySource).toContain(publicNote);
+    expect(published.skill.body).toContain(publicNote);
+    for (const token of [direct, override, referenced]) expect(JSON.stringify([preview, partner.identitySource, published.skill])).not.toContain(token);
+
+    // Simulate a retained checkpoint created before source credential masking.
+    await f.storage.environment.update(partner.id, () => {}, (environment) => {
+      const pending = environment.pendingImport!;
+      const snapshot = JSON.parse(pending.snapshotJson) as Record<string, unknown>;
+      delete snapshot.publicationRedactions;
+      pending.snapshotJson = JSON.stringify(snapshot);
+      environment.contentRedactions = {};
+    });
+    failMemory = false;
+    await f.api.retry(selection.requestId, false, signal);
+    expect((await f.imports.waitForRequest(selection.requestId)).status).toBe("complete");
+    const body = f.memory.list(partner.homeTargetId).find((entry) => entry.body.includes("Retained records."))!.body;
+    expect(body).toContain(publicNote);
+    expect(body).not.toContain(override);
+    expect(body).not.toContain(referenced);
+  }, 20_000);
+
   it("retries failed package knowledge without replaying edited, removed or disabled Skills", async () => {
     const f = await fixture({ resourceFiles: 20 });
     const signal = new AbortController().signal;

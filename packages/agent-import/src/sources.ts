@@ -1,4 +1,4 @@
-import { markImportEnvironmentChoices, previewImportRedactions, resolveImportEnvironmentDependencies } from './environmentSelection.js';
+import { markImportEnvironmentChoices, previewImportRedactions, resolveImportEnvironmentDependencies, resolveImportReferences } from './environmentSelection.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import JSON5 from 'json5';
@@ -152,6 +152,22 @@ function scalarEnv(value: unknown): Record<string, string> {
     /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(entry[0]) && !['__proto__', 'prototype', 'constructor'].includes(entry[0]) && typeof entry[1] === 'string'));
 }
 
+function openClawDiscordRedactions(source: ImportSource, values: Record<string, unknown>, env: Record<string, string>): Record<string, string> {
+  if (source.kind !== 'openclaw') return {};
+  const discord = object(object(values.channels).discord);
+  const configured = [discord.token, ...Object.values(object(discord.accounts)).map(account => object(account).token)];
+  const tokens = new Set<string>();
+  for (const value of configured) {
+    const reference = object(value);
+    const raw = typeof value === 'string' ? value.trim()
+      : reference.source === 'env' && typeof reference.id === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(reference.id)
+        ? `\${${reference.id}}` : '';
+    const token = resolveImportReferences(raw, env, true);
+    if (typeof token === 'string' && token.trim() && !/\$\{[A-Za-z_][A-Za-z0-9_]*\}/.test(token)) tokens.add(token.trim());
+  }
+  return Object.fromEntries([...tokens].map((token, index) => [`openclaw_discord_credential_${index}`, token]));
+}
+
 async function connections(items: ImportItem[], source: ImportSource, values: Record<string, unknown>, deps: SourceReaderDeps, budget: ImportReadBudget, readText = optionalText) {
   const dotenv = parseEnv(await readText(source.root, path.join(source.root, '.env'), budget) ?? '');
   const envConfig = object(values.env);
@@ -217,6 +233,7 @@ async function connections(items: ImportItem[], source: ImportSource, values: Re
         ...(apiKey && variable ? {} : { issues: ['NATIVE_AUTH_REFRESH_REQUIRED'] }) }, ...(apiKey && variable ? { env: { [variable]: apiKey } } : {}), credential: { format: 'native-auth', value: { source: source.kind, file: name, profile: id, value: profile } } });
     }
   }
+  return env;
 }
 
 function scalarEnvHeaders(value: unknown): Record<string, string> {
@@ -255,9 +272,9 @@ export function createImportSourceReader(deps: SourceReaderDeps, budget = create
         env: scalarEnv(settings.env), ...(typeof settings.apiKey === 'string'
           ? { credential: { format: 'source-tools', value: { apiKey: settings.apiKey } } } : {}) });
     }
-    await connections(items, source, values, deps, budget, readText);
+    const env = await connections(items, source, values, deps, budget, readText);
     sourceConfiguration(items, source, values);
-    return previewImportRedactions(items);
+    return { ...previewImportRedactions(items), ...openClawDiscordRedactions(source, values, env) };
   };
   return { readText: (root: string, file: string) => readText(root, file, budget), readConfig, readRedactions, readName: async (source: ImportSource) => redactEnvironmentValues(source.name, await readRedactions(source)) };
 }
@@ -332,7 +349,7 @@ export async function inspectImportSource(source: ImportSource, deps: SourceRead
     item.envDependencies = { names: Object.keys(item.env), entries: [] };
     delete item.env;
   }
-  await connections(items, source, values, deps, budget);
+  const connectionEnvironment = await connections(items, source, values, deps, budget);
   if (source.kind === 'hermes' && (await directories(source.root)).includes('scripts')) {
     for (const file of await readImportTree(path.join(source.root, 'scripts'), undefined, budget)) items.push({ view: { id: entryId('script', file.name), category: 'connections', name: `scripts/${file.name}`, selected: true }, asset: { name: `scripts/${file.name}`, bytes: file.bytes, executable: file.executable } });
   }
@@ -359,7 +376,9 @@ export async function inspectImportSource(source: ImportSource, deps: SourceRead
   }
   markImportEnvironmentChoices(items);
   const resolved = resolveImportEnvironmentDependencies(items, items.filter(item => item.view.selected));
+  const discord = openClawDiscordRedactions(source, values, connectionEnvironment);
   deps.assertOwner();
   return { source, items: resolved.map((item, sourceIndex) => ({ ...item, sourceIndex })),
+    ...(Object.keys(discord).length === 0 ? {} : { publicationRedactions: { ...previewImportRedactions(resolved), ...discord } }),
     ...(avatarImageBase64 ? { avatarImageBase64 } : {}), fingerprint: await snapshotFingerprintAsync(resolved, deps.assertOwner) };
 }
