@@ -176,9 +176,11 @@ describe("mobile Extension catalog pagination", () => {
     const available = create(ExtensionCatalogEntrySchema, { ...fixture(2, "Calendar"),
       source: ExtensionCatalogSource.MARKET, installed: false, installState: ExtensionInstallState.AVAILABLE,
       enabled: false, sidebarVisible: false, useSupported: false,
-      owner: { kind: { case: "source", value: { sourceId: `extension_source_${"a".repeat(32)}`, sourceRevision: { value: 1n },
-        entryId: `extension_source_entry_${"b".repeat(32)}`, contentRevision: `sha256:${"c".repeat(64)}` } } },
-      setup: { state: ExtensionSetupState.NOT_REQUIRED, revision: { value: 0n } }
+      owner: create(ExtensionOwnerSchema, { kind: { case: "source", value: {
+        sourceId: `extension_source_${"a".repeat(32)}`, sourceRevision: { value: 1n },
+        entryId: `extension_source_entry_${"b".repeat(32)}`, contentRevision: `sha256:${"c".repeat(64)}`
+      } } }),
+      setup: create(ExtensionSetupDescriptorSchema, { state: ExtensionSetupState.NOT_REQUIRED, revision: { value: 0n } })
     });
     const readPage = async () => ({ revision: 3n, recoveredFromCorruption: false, extensions: [fixture(1), available], nextPageToken: "", totalSize: 2 });
     const signal = new AbortController().signal;
