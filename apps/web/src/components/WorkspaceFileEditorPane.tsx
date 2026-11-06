@@ -84,6 +84,7 @@ export interface WorkspaceFileEditorPaneProps {
   readonly suppressInitialScrollRestore?: boolean;
   readonly markdownImageLabels?: WorkspaceMarkdownImageLabels;
   readonly markdownImageResolver?: WorkspaceMarkdownImageResolver;
+  readonly saveDisabled?: boolean;
   readonly onSave: (draft: WorkspaceFileSaveDraft) => Promise<WorkspaceFileSaveResult>;
   readonly onSelectionChange?: (selection: WorkspaceEditorSelection | undefined) => void;
   readonly onSearchStateChange?: (state: WorkspaceEditorSearchState) => void;
@@ -115,6 +116,7 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
   suppressInitialScrollRestore,
   markdownImageLabels,
   markdownImageResolver,
+  saveDisabled = false,
   onSave,
   onSelectionChange,
   onSearchStateChange,
@@ -171,7 +173,7 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
   }, [file.path, file.revision, file.text, onExternalConflict, onTextChange]);
 
   const save = useCallback(async (): Promise<boolean> => {
-    if (savingRef.current) return false;
+    if (saveDisabled || savingRef.current) return false;
     const currentBaseline = baselineRef.current;
     const currentText = editorTextRef.current;
     const draft = prepareWorkspaceFileSave(currentBaseline, currentText);
@@ -208,7 +210,7 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
       savingRef.current = false;
       setSaving(false);
     }
-  }, [labels.externalChange, labels.saveFailed, onSave, onTextChange]);
+  }, [labels.externalChange, labels.saveFailed, onSave, onTextChange, saveDisabled]);
 
   const discardLocalChanges = useCallback((): void => {
     const next = incomingConflict ?? baselineRef.current;
@@ -223,14 +225,14 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
   }, [incomingConflict, onTextChange]);
 
   const overwriteIncoming = useCallback(async (): Promise<void> => {
-    if (incomingConflict === undefined) return;
+    if (saveDisabled || incomingConflict === undefined) return;
     baselineRef.current = incomingConflict;
     setBaseline(incomingConflict);
     setIncomingConflict(undefined);
     setConflictDismissed(false);
     setSaveError(undefined);
     await save();
-  }, [incomingConflict, save]);
+  }, [incomingConflict, save, saveDisabled]);
 
   useImperativeHandle(forwardedRef, () => ({
     isDirty: () => workspaceFileEditorDirty(baselineRef.current, editorTextRef.current),
@@ -299,10 +301,10 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
   ]);
 
   useEffect(() => {
-    if (!markdown || !dirty || saving || incomingConflict !== undefined || saveError !== undefined) return;
+    if (saveDisabled || !markdown || !dirty || saving || incomingConflict !== undefined || saveError !== undefined) return;
     const timer = window.setTimeout(() => { void save(); }, 900);
     return () => window.clearTimeout(timer);
-  }, [dirty, editorText, incomingConflict, markdown, save, saveError, saving]);
+  }, [dirty, editorText, incomingConflict, markdown, save, saveDisabled, saveError, saving]);
 
   useEffect(() => {
     if (menuPosition === undefined) return;
@@ -379,7 +381,7 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
       {incomingConflict !== undefined && <div>
         <Button tone="ghost" onClick={() => { setConflictDismissed(true); setSaveError(undefined); }}>{labels.keepEditing}</Button>
         <Button tone="secondary" onClick={discardLocalChanges}><RotateCcw aria-hidden="true" />{labels.reloadDisk}</Button>
-        <Button tone="danger" onClick={() => { void overwriteIncoming(); }}><Save aria-hidden="true" />{labels.overwriteDisk}</Button>
+        <Button tone="danger" disabled={saveDisabled} onClick={() => { void overwriteIncoming(); }}><Save aria-hidden="true" />{labels.overwriteDisk}</Button>
       </div>}
     </div>}
     <WorkspaceTextEditor
@@ -426,7 +428,7 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
             <Table2 aria-hidden="true" />
             <span>{labels.insertTable}</span>
           </button>
-        : <button type="button" role="menuitem" disabled={!dirty || saving} onClick={() => {
+        : <button type="button" role="menuitem" disabled={saveDisabled || !dirty || saving} onClick={() => {
             setMenuPosition(undefined);
             menuInsertionPointRef.current = undefined;
             void save();
