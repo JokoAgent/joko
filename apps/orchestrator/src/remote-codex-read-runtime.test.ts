@@ -184,6 +184,19 @@ describe("RemoteCodexRuntimeResolver", () => {
     expect(fixture.capture).toHaveBeenCalledOnce();
   });
 
+  it("drains a daemon version response already buffered with exit status before the SSH handle is adopted", async () => {
+    const fixture = createFixture({ daemonVersionBeforeOpen: true });
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    await runtime.host.ensureStarted();
+    await expect(runtime.host.request("thread/list", { cwd: "/srv/project-real", limit: 100, useStateDbOnly: true }))
+      .resolves.toMatchObject({ value: { data: [], nextCursor: null } });
+    expect(fixture.processes.requests.slice(1).map(request => request.args.join(" "))).toEqual([
+      "app-server daemon version",
+      "app-server proxy --sock /home/test/.joko/runtime/v1/codex-home/app-server-control/app-server-control.sock"
+    ]);
+  });
+
   it("fences exact Target and SSH authority revisions and never surfaces remote stderr", async () => {
     const fixture = createFixture({ probeVersion: "codex-cli 9.9.9", stderr: "private-fixture-secret" });
     cleanups.push(() => fixture.resolver.forceShutdown());
@@ -299,6 +312,7 @@ interface FixtureOptions {
   readonly peerWin32?: boolean;
   readonly peerPosix?: boolean;
   readonly daemonInitiallyReady?: boolean;
+  readonly daemonVersionBeforeOpen?: boolean;
   readonly probeVersion?: string;
   readonly stderr?: string;
   readonly disconnectOnMethod?: string;
@@ -393,6 +407,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
   readonly requests: RemoteProcessStartRequest[] = [];
   readonly clientMessages: Array<{ readonly method: string; readonly id?: number }> = [];
   #daemonReady: boolean;
+  readonly #daemonVersionBeforeOpen: boolean;
   readonly #probeVersion: string;
   readonly #stderr: string;
   readonly #disconnectOnMethod: string | undefined;
@@ -402,6 +417,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
 
   constructor(options: FixtureOptions) {
     this.#daemonReady = options.daemonInitiallyReady ?? true;
+    this.#daemonVersionBeforeOpen = options.daemonVersionBeforeOpen === true;
     this.#probeVersion = options.probeVersion ?? "codex-cli 0.159.2";
     this.#stderr = options.stderr ?? "";
     this.#disconnectOnMethod = options.disconnectOnMethod;
@@ -441,7 +457,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
     if (command === "exec-server --listen stdio://") return new FakeRemoteProcess();
     if (command === "app-server daemon version") {
       const processHandle = new FakeRemoteProcess();
-      setImmediate(() => {
+      const version = () => {
         if (!this.#daemonReady) {
           if (this.#stderr.length > 0) processHandle.stderr.write(this.#stderr);
           processHandle.finish(1);
@@ -453,7 +469,9 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
             : `${request.env?.CODEX_HOME ?? "/home/test/.joko/runtime/v1/codex-home"}/app-server-control/app-server-control.sock`
         }));
         processHandle.finish(0);
-      });
+      };
+      if (this.#daemonVersionBeforeOpen) version();
+      else setImmediate(version);
       return processHandle;
     }
     if (command === "app-server daemon bootstrap --remote-control") {
