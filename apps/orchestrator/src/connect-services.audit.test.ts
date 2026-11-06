@@ -49,7 +49,7 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
     browserActivity: [],
     close: async () => undefined,
     ...overrides,
-    connections: { fence: () => undefined, ...(overrides.connections as object ?? {}) },
+    connections: { fence: () => undefined, onRevoked: () => () => undefined, ...(overrides.connections as object ?? {}) },
     sessionHost: {
       sideChatSourceAllowed: () => false,
       getSessionRuntimeControl: () => ({
