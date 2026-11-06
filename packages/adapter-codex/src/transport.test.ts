@@ -376,6 +376,33 @@ describe("StdioJsonRpcTransport", () => {
     await transport.close();
   });
 
+  it("settles a complete terminal record received after local process exit before reporting disconnect", async () => {
+    const first = `${JSON.stringify({ method: "item/completed", params: { threadId: "thread" } })}\n`;
+    const terminal = `${JSON.stringify({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed" } } })}\n`;
+    const helper = `process.stdin.once('end', () => setTimeout(() => process.stdout.write(${JSON.stringify(terminal.slice(32))}), 25));
+      process.stdin.resume(); process.stderr.write('ready');`;
+    const child = `const { spawn } = require('node:child_process');
+      const helper = spawn(process.execPath, ['-e', ${JSON.stringify(helper)}], { stdio: ['pipe', 'inherit', 'pipe'] });
+      helper.stderr.once('data', () => {
+        helper.stderr.destroy(); helper.stdin.unref?.(); helper.unref();
+        process.stdout.write(${JSON.stringify(first + terminal.slice(0, 32))}, () => process.exit(7));
+      });`;
+    const transport = new StdioJsonRpcTransport({ command: process.execPath, args: ["-e", child] });
+    const delivered: string[] = [];
+    let exited!: () => void;
+    const disconnected = new Promise<void>(resolve => { exited = resolve; });
+    try {
+      await transport.start({ onNotification: async ({ method }) => {
+        await new Promise(resolve => setTimeout(resolve, 40));
+        delivered.push(method);
+        if (method === "turn/completed") expect(() => transport.notify("write-after-exit")).toThrow();
+      }, onRequest: () => undefined, onExit: fault => { delivered.push(fault.code); exited(); } });
+      await disconnected;
+      expect(delivered).toEqual(["item/completed", "turn/completed", "process_exited"]);
+      expect(transport.running).toBe(false);
+    } finally { await transport.forceClose(); }
+  });
+
   it("serializes asynchronous notification handlers in wire order", async () => {
     const delivered: number[] = [];
     let release: (() => void) | undefined;
