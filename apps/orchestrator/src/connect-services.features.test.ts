@@ -20,7 +20,8 @@ import { ArtifactStore } from "./artifact-store.js";
 import { BrowserSettingsController } from "./browser-settings.js";
 import { createConnectServices, registerConnectServices } from "./connect-services.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
-import { ProviderAuthUnsupportedError } from "./credential-manager.js";
+import { ProviderAuthUnsupportedError, type CredentialManager } from "./credential-manager.js";
+import { McpRouter } from "./mcp-router.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
@@ -71,6 +72,13 @@ function stubApplication(overrides: Record<string, unknown>): OrchestratorApplic
     ...overrides,
     sessionHost
   } as unknown as OrchestratorApplication;
+}
+
+function mcpSaveRequest(connectionId: string, operationId: string, serverId: string, server: contract.McpServerInput) {
+  return create(contract.SubmitOperationRequestSchema, {
+    connectionId, operationId,
+    mutation: { payload: { case: "upsertMcpServer", value: { mcpServerId: serverId, server, expectedRevision: { value: 0n } } } }
+  });
 }
 
 function completedRecord(id: string, kind: string, body: unknown, response: unknown): OperationRecord<unknown> {
@@ -1881,7 +1889,7 @@ describe("Connect typed feature boundaries", () => {
         { target: "environment", name: "MCP_TOKEN", credentialReferenceId: "credential-reference-mcp" },
         { target: "environment", name: "MCP_TENANT", credentialReferenceId: "credential-reference-tenant" }
       ]
-    }), 0n);
+    }), 0n, expect.any(Function));
     expect(refreshPiGeneration).toHaveBeenCalledTimes(2);
 
     const settingsResponse = await invoke<{ settings?: contract.SettingsSnapshot }>(services.settings.getSettings, {});
@@ -1944,7 +1952,7 @@ describe("Connect typed feature boundaries", () => {
         transport: configCase === "sse" ? "sse" : "streamable_http",
         endpoint: "https://mcp.example.test/events",
         credentialBindings: [{ target: "header", name: "Authorization", credentialReferenceId: "credential-reference-mcp" }]
-      }), 4n);
+      }), 4n, expect.any(Function));
       const saved = await invoke<{ servers: contract.McpServerDescriptor[] }>(services.tool.listMcpServers, {});
       expect(saved.servers[0]).toMatchObject({ transport, transportConfig: { case: configCase, value: { endpoint: "https://mcp.example.test/events" } } });
       const calls = mcpUpsert.mock.calls.length;
@@ -2276,6 +2284,109 @@ describe("Connect typed feature boundaries", () => {
     });
     expect(add).not.toHaveBeenCalled();
     expect(refreshTargetExtraDirectories).not.toHaveBeenCalled();
+  });
+
+  it("blocks a queued MCP save and its credential-bearing connection after device revocation", async () => {
+    const store = new OperationalStore(":memory:");
+    const host = new SessionHost(store, {} as never, []);
+    const connections = new ConnectionManager(store);
+    const keeper = store.createConnection({ id: "mcp-keeper", name: "Keeper", authKeyDigest: digestAuthKey("mcp-keeper-key") });
+    const revoked = store.createConnection({ id: "mcp-revoked", name: "Revoked", authKeyDigest: digestAuthKey("mcp-revoked-key") });
+    const resolveCredential = vi.fn(() => "Bearer isolated-test-value");
+    const credentials = { resolve: resolveCredential } as unknown as CredentialManager;
+    const router = new McpRouter({ store, credentials });
+    let enter!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { enter = resolve; });
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const posts: string[] = [];
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (init?.method !== "POST") return new Response(null, { status: 405 });
+      const path = new URL(String(input)).pathname;
+      posts.push(path);
+      const message = JSON.parse(String(init.body)) as { id?: number; method: string; params?: { protocolVersion: string } };
+      if (message.method !== "initialize") return new Response(null, { status: 202 });
+      if (path === "/held") { enter(); await held; }
+      return Response.json({ jsonrpc: "2.0", id: message.id, result: {
+        protocolVersion: message.params?.protocolVersion, capabilities: {}, serverInfo: { name: "test", version: "1" }
+      } });
+    });
+    await router.initialize();
+    const services = createConnectServices(stubApplication({ store, connections, mcpRouter: router, sessionHost: { mutate: host.mutate.bind(host) } }));
+    const submit = (connectionId: string, serverId: string, bindCredential: boolean) => invoke<contract.SubmitOperationResponse>(
+      services.operation.submitOperation, mcpSaveRequest(connectionId, `save-${serverId}`, serverId, create(contract.McpServerInputSchema, {
+        enabled: true, transport: contract.McpTransport.HTTPS_STREAMABLE_HTTP,
+        transportConfig: { case: "streamableHttp", value: { endpoint: `http://127.0.0.1:9999/${serverId}` } },
+        credentialBindings: bindCredential ? [{ target: contract.McpCredentialTarget.HEADER, targetName: "Authorization", credentialReferenceId: "cred_isolated_test" }] : []
+      })), { requestHeader: new Headers({ authorization: `Bearer ${connectionId}-key` }) });
+    const first = submit(keeper.id, "held", false);
+    try {
+      await Promise.race([started, first.then(() => { throw new Error("The first MCP server did not reach initialization."); })]);
+      const second = submit(revoked.id, "denied", true);
+      expect(store.getOperation("save-denied").status).toBe("started");
+      connections.revokeDevice(revoked.deviceId);
+      release();
+      await expect(first).resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+      await expect(second).resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED } });
+      expect(router.list().map((server) => server.id)).toEqual(["held"]);
+      expect(store.getSetting("service", "orchestrator", "mcp_catalog").value).toMatchObject({ servers: [{ input: { id: "held" } }] });
+      expect(posts).not.toContain("/denied");
+      expect(resolveCredential).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await first.catch(() => undefined);
+      await router.dispose();
+      await host.dispose();
+      store.close();
+      fetch.mockRestore();
+    }
+  });
+
+  it("rejects command-line credentials before MCP persistence and hides previously saved arguments", async () => {
+    const store = new OperationalStore(":memory:");
+    const host = new SessionHost(store, {} as never, []);
+    store.createConnection(connection);
+    const secret = "isolated-argv-value";
+    const argv = ["server.mjs", "--token", secret];
+    const legacy = mcpSaveRequest(connection.id, "legacy-mcp-save", "legacy", create(contract.McpServerInputSchema, {
+      transport: contract.McpTransport.STDIO, enabled: true,
+      transportConfig: { case: "stdio", value: { command: "node", arguments: argv } }
+    }));
+    store.setSetting("service", "orchestrator", "mcp_catalog", { format: 1, lastGeneration: 1, servers: [{
+      generation: 1, version: "1", updatedAt: 1,
+      input: { id: "legacy", displayName: "Legacy", enabled: true, transport: "stdio", credentialBindings: [], command: "node", args: argv }
+    }] });
+    store.runOperation({ id: legacy.operationId, kind: "upsertMcpServer", body: legacy.mutation }, () => ({ accepted: true, resultCase: "mcpServer", entityId: "legacy" }));
+    const connect = vi.fn(async () => { throw new Error("No server should start."); });
+    const router = new McpRouter({ store, credentials: {} as CredentialManager, clientFactory: { connect } });
+    try {
+      await router.initialize();
+      const services = createConnectServices(stubApplication({ store, mcpRouter: router, sessionHost: { mutate: host.mutate.bind(host) } }));
+      for (const [index, args] of [argv, [`--api-key=${secret}`], [`Authorization: Bearer ${secret}`]].entries()) {
+        const unsafe = mcpSaveRequest(connection.id, `unsafe-mcp-${index}`, `unsafe-${index}`, create(contract.McpServerInputSchema, {
+          transport: contract.McpTransport.STDIO, enabled: false,
+          transportConfig: { case: "stdio", value: { command: "node", arguments: args } }
+        }));
+        await expect(invoke(services.operation.submitOperation, unsafe)).rejects.toMatchObject({ code: Code.InvalidArgument });
+        expect(store.findOperation(unsafe.operationId)).toBeUndefined();
+      }
+      const listed = await invoke<contract.ListMcpServersResponse>(services.tool.listMcpServers, {});
+      expect(listed.servers).toMatchObject([{ mcpServerId: "legacy", state: contract.McpServerState.ERROR,
+        transportConfig: { case: "stdio", value: { arguments: [] } } }]);
+      const operation = await invoke<contract.GetOperationResponse>(services.operation.getOperation, { operationId: legacy.operationId });
+      expect(operation.operation?.mutation?.payload).toMatchObject({ case: "upsertMcpServer", value: {
+        server: { transportConfig: { case: "stdio", value: { arguments: [] } } }
+      } });
+      const safeArgs = ["server.mjs", "--token-file", "fixture path"];
+      await router.upsert({ id: "legacy", displayName: "Repaired", enabled: false,
+        transport: "stdio", credentialBindings: [], command: "node", args: safeArgs }, 1n);
+      expect(router.get("legacy").configuration).toMatchObject({ arguments: safeArgs });
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      await router.dispose();
+      await host.dispose();
+      store.close();
+    }
   });
 
   it("returns typed Browser transfers for upload and list RPCs", async () => {

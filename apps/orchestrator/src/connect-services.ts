@@ -241,12 +241,14 @@ import {
 } from "./provider-account-usage.js";
 import type { ProviderAccountBalanceProvider, AccountBalanceResult } from "./provider-account-balance.js";
 import { SessionContextBudgetError, type SessionContextBudgetCoordinator, type SessionContextBudgetView } from "./session-context-budget.js";
-import type {
-  McpCredentialBinding as NativeMcpCredentialBinding,
-  McpRouter,
-  McpServerDescriptor as NativeMcpServerDescriptor,
-  McpServerInput as NativeMcpServerInput,
-  McpServerState as NativeMcpServerState
+import {
+  MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR,
+  mcpStdioArgumentsContainCredential,
+  type McpCredentialBinding as NativeMcpCredentialBinding,
+  type McpRouter,
+  type McpServerDescriptor as NativeMcpServerDescriptor,
+  type McpServerInput as NativeMcpServerInput,
+  type McpServerState as NativeMcpServerState
 } from "./mcp-router.js";
 import {
   fromProtoEventCursor,
@@ -6574,13 +6576,27 @@ export function toProtoOperation(
       actor: { $typeName: "joko.v1.ActorRef" as const, kind: contract.ActorKind.TASK_PARTICIPANT,
         id: sharedAuthor.memberId, displayName: sharedAuthor.displayName }
     }),
-    mutation,
+    mutation: publicOperationMutation(mutation),
     result,
     state: rejected ? contract.OperationState.FAILED : base.state,
     error: record.status === "failed"
       ? mapErrorToProto(record.error)
       : outcome.unsupportedReason === undefined ? base.error : unsupportedError(record.kind, outcome.unsupportedReason)
   });
+}
+
+function publicOperationMutation(mutation: contract.OperationMutation): contract.OperationMutation {
+  const payload = mutation.payload;
+  if (payload.case !== "upsertMcpServer") return mutation;
+  const server = payload.value.server;
+  if (server?.transportConfig.case !== "stdio" || !mcpStdioArgumentsContainCredential(server.transportConfig.value.arguments)) return mutation;
+  return {
+    ...mutation,
+    payload: { case: "upsertMcpServer", value: { ...payload.value, server: {
+      ...server,
+      transportConfig: { case: "stdio", value: { ...server.transportConfig.value, arguments: [] } }
+    } } }
+  };
 }
 
 function operationResult(
@@ -13298,6 +13314,7 @@ function nativeMcpServerInput(id: string, input: contract.McpServerInput): Nativ
     if (input.transportConfig.case !== "stdio") throw invalidArgument("server.stdio transport_config is required for STDIO");
     const config = input.transportConfig.value;
     if (config.command.trim() === "") throw invalidArgument("server.stdio.command is required");
+    if (mcpStdioArgumentsContainCredential(config.arguments)) throw invalidArgument(MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR);
     const environment: Record<string, string> = {};
     for (const variable of config.environment) {
       if (variable.name.trim() === "") throw invalidArgument("server.stdio.environment.name is required");
@@ -20923,12 +20940,14 @@ async function dispatchMutation(
       const input = nativeMcpServerInput(payload.value.mcpServerId, payload.value.server);
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
       const expectedVersion = fromProtoRevision(payload.value.expectedRevision, "upsert_mcp_server.expected_revision");
+      const assertCurrent = () => { dependencies.connections.fence(connection); };
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
         accepted: true,
         resultCase: "mcpServer",
         entityId: input.id
       }, async () => {
-        await dependencies.mcpRouter!.upsert(input, expectedVersion);
+        await dependencies.mcpRouter!.upsert(input, expectedVersion, assertCurrent);
+        assertCurrent();
         await dependencies.refreshPiGeneration?.();
       });
     }

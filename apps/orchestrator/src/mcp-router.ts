@@ -39,6 +39,7 @@ import type { McpAppCapture, McpAppCaptureInput } from "./mcp-apps/manager.js";
 import type { McpModelChannel } from "./mcp-apps/server-proxy.js";
 
 export const MCP_BRIDGE_RESPONSE_MAXIMUM_BYTES = 2 * 1024 * 1024;
+export const MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR = "MCP command arguments cannot contain credentials. Use an environment credential binding.";
 const MCP_BRIDGE_INLINE_RESULT_MAXIMUM_BYTES = 512 * 1024;
 const MCP_BRIDGE_PREVIEW_MAXIMUM_BYTES = 128 * 1024;
 
@@ -198,6 +199,7 @@ export interface McpClientFactoryInput {
   readonly config: McpServerInput;
   readonly generation: number;
   readonly credentials: Readonly<Record<string, string>>;
+  readonly assertCurrent?: () => void;
   readonly onClose: () => void;
   readonly onError: (error: Error) => void;
 }
@@ -644,14 +646,13 @@ export class McpRouter {
         await validateServerInput(server.input);
         if (this.#servers.has(server.input.id)) throw new Error("MCP catalog contains duplicate server IDs.");
         this.#servers.set(server.input.id, server);
-        this.#states.set(server.input.id, {
-          state: server.input.enabled ? "disconnected" : "disabled",
-          generation: server.generation
-        });
+        this.#states.set(server.input.id, unsafeStdioArguments(server.input)
+          ? { state: "error", generation: server.generation, error: MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR }
+          : { state: server.input.enabled ? "disconnected" : "disabled", generation: server.generation });
       }
     }
     this.#initialized = true;
-    await Promise.all([...this.#servers.values()].filter((server) => server.input.enabled).map(async (server) => {
+    await Promise.all([...this.#servers.values()].filter((server) => server.input.enabled && this.#states.get(server.input.id)?.state !== "error").map(async (server) => {
       try { await this.#start(server); } catch { /* State retains the redacted error. */ }
     }));
   }
@@ -746,11 +747,13 @@ export class McpRouter {
     })).sort((a, b) => a.id.localeCompare(b.id, "en"));
   }
 
-  async upsert(input: McpServerInput, expectedVersion?: bigint): Promise<McpServerDescriptor> {
+  async upsert(input: McpServerInput, expectedVersion?: bigint, assertCurrent?: () => void): Promise<McpServerDescriptor> {
     this.#assertInitialized();
+    if (unsafeStdioArguments(input)) throw new Error(MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR);
     await validateServerInput(input);
     if (this.#bridgeToolProviders.has(input.id)) throw new Error("MCP server ID is reserved by a service Tool Provider.");
     return this.#mutate(async () => {
+      assertCurrent?.();
       const existing = this.#servers.get(input.id);
       if (expectedVersion !== undefined && existing !== undefined && BigInt(existing.version) !== expectedVersion) {
         throw new Error("MCP server changed concurrently.");
@@ -779,9 +782,10 @@ export class McpRouter {
         throw error;
       }
       if (input.enabled) {
-        try { await this.#start(next); } catch { /* return durable error state */ }
+        try { await this.#start(next, assertCurrent); } catch { /* return durable error state */ }
       }
       await this.#retireUnused(input.id);
+      assertCurrent?.();
       return this.#descriptor(next);
     });
   }
@@ -791,6 +795,7 @@ export class McpRouter {
     return this.#mutate(async () => {
       const current = this.#requireServer(serverId);
       if (!current.input.enabled) throw new Error("Disabled MCP server cannot be restarted.");
+      if (unsafeStdioArguments(current.input)) throw new Error(MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR);
       const next: StoredMcpServer = {
         ...current,
         generation: ++this.#lastGeneration,
@@ -2424,26 +2429,32 @@ export class McpRouter {
     };
   }
 
-  async #start(server: StoredMcpServer): Promise<void> {
+  async #start(server: StoredMcpServer, assertCurrent?: () => void): Promise<void> {
     this.#states.set(server.input.id, { state: "starting", generation: server.generation });
     const credentials: Record<string, string> = {};
     let connection: McpClientConnection | undefined;
+    let startupAuthority = assertCurrent;
     try {
+      assertCurrent?.();
       await validateServerInput(server.input);
+      assertCurrent?.();
       for (const binding of server.input.credentialBindings) credentials[`${binding.target}:${binding.name}`] = this.#credentials.resolve(binding.credentialReferenceId);
       let runtime: Runtime | undefined;
       connection = await this.#factory.connect({
         config: server.input,
         generation: server.generation,
         credentials,
+        ...(assertCurrent === undefined ? {} : { assertCurrent: () => startupAuthority?.() }),
         onClose: () => this.#runtimeClosed(server.input.id, server.generation),
         onError: (error) => this.#runtimeErrored(server.input.id, server.generation, error)
       });
       const tools = await discoverAllTools(
         connection,
         server.input.id,
-        this.#toolDiscoveryPolicy
+        this.#toolDiscoveryPolicy,
+        assertCurrent
       );
+      assertCurrent?.();
       const duplicate = duplicateToolName(tools);
       if (duplicate !== undefined) throw new Error(`MCP server advertised duplicate tool '${duplicate}'.`);
       runtime = { serverId: server.input.id, generation: server.generation, connection, tools, state: "connected" };
@@ -2469,6 +2480,9 @@ export class McpRouter {
         });
       }
       throw new Error("MCP server failed to start.", { cause: new Error(message) });
+    } finally {
+      // An adopted runtime belongs to the service, independently of the device that saved it.
+      startupAuthority = undefined;
     }
   }
 
@@ -2510,7 +2524,7 @@ export class McpRouter {
         ? {
           case: "stdio",
           command: server.input.command,
-          arguments: [...(server.input.args ?? [])],
+          arguments: unsafeStdioArguments(server.input) ? [] : [...(server.input.args ?? [])],
           workingDirectory: server.input.cwd ?? "",
           environment: { ...(server.input.environment ?? {}) }
         }
@@ -2696,6 +2710,7 @@ export class SdkMcpClientFactory implements McpClientFactory {
         if (target.origin !== endpoint.origin || target.username !== "" || target.password !== "" || target.hash !== "") {
           throw new Error("MCP request destination is outside its configured origin.");
         }
+        input.assertCurrent?.();
         return nativeFetch(url, { ...init, redirect: "error" });
       };
       const options = { requestInit: { headers, redirect: "error" as const }, fetch };
@@ -2705,6 +2720,7 @@ export class SdkMcpClientFactory implements McpClientFactory {
     }
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
+      input.assertCurrent?.();
       await Promise.race([
         client.connect(transport),
         new Promise<never>((_resolve, reject) => {
@@ -2836,7 +2852,8 @@ function normalizeTool(serverId: string, tool: McpListedTool): McpToolDescriptor
 async function discoverAllTools(
   connection: McpClientConnection,
   serverId: string,
-  policy: McpToolDiscoveryPolicy
+  policy: McpToolDiscoveryPolicy,
+  assertCurrent?: () => void
 ): Promise<readonly McpToolDescriptor[]> {
   const controller = new AbortController();
   const timeoutError = new McpToolDiscoveryError("timed_out", "MCP tool discovery timed out.");
@@ -2849,6 +2866,7 @@ async function discoverAllTools(
   let catalogBytes = 2;
   try {
     for (;;) {
+      assertCurrent?.();
       throwIfDiscoveryAborted(controller.signal);
       if (pageCount >= policy.maximumPages) {
         throw new McpToolDiscoveryError("page_limit", "MCP tool discovery exceeded the page limit.");
@@ -2950,6 +2968,15 @@ function isSecretName(name: string): boolean {
 
 function looksSecretValue(value: string): boolean {
   return value.length > 80 && /^[A-Za-z0-9_+/=-]+$/u.test(value);
+}
+
+export function mcpStdioArgumentsContainCredential(args: readonly string[]): boolean {
+  return args.some((arg) => /^--?(?:(?:access|refresh|bearer|auth)[_-]?token|token|api[_-]?key|client[_-]?secret|authorization|password|secret|cookie|credential)(?:$|[=:])/iu.test(arg.trim())
+    || redactSecrets(arg) !== arg);
+}
+
+function unsafeStdioArguments(input: McpServerInput): boolean {
+  return input.transport === "stdio" && mcpStdioArgumentsContainCredential(input.args ?? []);
 }
 
 function safeEndpointDisplay(raw: string): string {
