@@ -609,6 +609,17 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
+function mcpBusinessFailure(content: unknown, details: unknown): string {
+  const envelope = details as { jokoMcpBridge?: { truncated?: boolean } } | null | undefined;
+  // Pi keeps only the thrown message. A partial preview must not be saved as the complete error.
+  if (envelope?.jokoMcpBridge?.truncated === true || !Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type: "text"; text: string } => part?.type === "text" && typeof part.text === "string" && part.text.trim() !== "")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
 export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void> {
   // Resolve the public helper with ESM conditions from the active published
   // runtime, using its own extension loader dependency.
@@ -1115,10 +1126,12 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
           });
           if (!response.ok) throw new Error("MCP bridge request failed with status " + response.status);
           const body = await readBoundedJson(response) as { content?: unknown; details?: unknown; isError?: boolean; error?: string; errorCode?: McpBridgeErrorCode } | null;
+          signal?.throwIfAborted();
           if (!body || typeof body !== "object") throw new Error("MCP bridge returned an invalid JSON body");
           if (body.isError) {
             const code = body.errorCode;
-            const failure = new Error((code ? "[" + code + "] " : "") + (body.error || "MCP tool failed")) as Error & { code?: McpBridgeErrorCode; details?: unknown };
+            const message = body.error || (code ? "" : mcpBusinessFailure(body.content, body.details)) || "MCP tool failed";
+            const failure = new Error((code ? "[" + code + "] " : "") + message) as Error & { code?: McpBridgeErrorCode; details?: unknown };
             if (code) failure.code = code;
             if (body.details !== undefined) failure.details = body.details;
             throw failure;
