@@ -68,6 +68,7 @@ describe("Device control Connect surface", () => {
     let authenticated = owner;
     const services = createConnectServices(stubApplication(store, {
       authenticate: () => authenticated,
+      fence: manager.fence.bind(manager),
       requestPairing: manager.requestPairing.bind(manager),
       completePairing: manager.completePairing.bind(manager),
       openPairingWindow: manager.openPairingWindow.bind(manager),
