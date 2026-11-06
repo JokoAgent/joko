@@ -9284,6 +9284,19 @@ export class OperationalStore {
     return value;
   }
 
+  findLatestAssistantReplyForRuns(sessionId: string, runIds: readonly string[]): PersistedEvent | undefined {
+    this.assertOpen();
+    if (runIds.length === 0) return undefined;
+    const row = this.database.prepare(`SELECT event.* FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.session_id = ? AND event.run_id IN (SELECT value FROM json_each(?))
+        AND tombstone.event_id IS NULL
+        AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
+      ORDER BY event.global_cursor DESC LIMIT 1`).get(sessionId, serializeJson(runIds)) as Row | undefined;
+    return row === undefined ? undefined : eventFromRow(row);
+  }
+
   findRun(id: string): StoredRun | undefined {
     this.assertOpen();
     const row = this.database.prepare("SELECT * FROM runs WHERE id = ?").get(id) as Row | undefined;

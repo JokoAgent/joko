@@ -1378,7 +1378,7 @@ export class PartnerManager {
         delegationId: current.id,
         expectedRevision: current.revision,
         status,
-        ...(status === "completed" ? { resultSummary: this.#delegationResult(current.childSessionId) } : {}),
+        ...(status === "completed" ? { resultSummary: this.#delegationResult(current.childSessionId, run.id) } : {}),
         ...(status === "failed" ? {
           errorText: run.error?.message ?? "The delegated task failed."
         } : {})
@@ -1406,8 +1406,8 @@ export class PartnerManager {
     };
   }
 
-  #delegationResult(sessionId: string): string {
-    const event = this.#latestAssistantReply(sessionId);
+  #delegationResult(sessionId: string, runId: string): string {
+    const event = this.#operationalStore.findLatestAssistantReplyForRuns(sessionId, [runId]);
     if (event?.payload.type !== "message_complete") return "The delegated task completed without a text summary.";
     const text = event.payload.blocks
       .filter((block): block is Extract<(typeof event.payload.blocks)[number], { readonly kind: "text" }> => block.kind === "text")
