@@ -7,6 +7,7 @@ import { join, posix as remotePath, win32, type PlatformPath } from "node:path";
 import { PassThrough } from "node:stream";
 
 import {
+  createPiAdapter,
   MANAGED_SUBAGENT_NODE_ENV,
   MANAGED_SUBAGENT_RUNNER_FILE_NAME,
   type PiProcessHandle,
@@ -24,14 +25,17 @@ import type {
   RemoteProcessStartRequest,
   RemoteSshTransportLease
 } from "@joko/remote-ssh";
-import type { OperationalStore } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { OperationalStore, OperationPreviouslyFailedError } from "@joko/store";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { ArtifactStore } from "./artifact-store.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import { REMOTE_PI_BROKER_SOURCE_SHA256 } from "./remote-pi-broker-source.js";
 import type { RemoteWorkspaceAuthority } from "./remote-execution-router.js";
 import { RemotePiProcessFactory } from "./remote-pi-process.js";
+import { SessionHost } from "./session-host.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -47,6 +51,62 @@ afterEach(async () => {
 });
 
 describe("RemotePiProcessFactory", () => {
+  it.each([1, 2])("leaves SSH runtime files untouched when the original Owner is revoked during workspace preflight %s", async (preflight) => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-remote-pi-create-authority-"));
+    temporaryDirectories.push(directory);
+    const files = new PiMemoryRemoteFiles();
+    await files.mkdir("/workspace", { recursive: true });
+    await files.mkdir("/home/maker", { recursive: true });
+    const open = vi.fn(async () => { throw new Error("The retired creation reached SSH process startup."); });
+    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false };
+    const registry = { transports: async () => ({ host: {}, lease: { capabilities, files, processes: { open } } }) } as unknown as RemoteHostRegistry;
+    const factory = remoteFactory(registry, join(directory, "authority"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"),
+      repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
+    const adapter = createPiAdapter({ agentHome: join(directory, "agent-home"), sessionRoot: join(directory, "sessions"),
+      versionProbe: async () => "pi 99.1.0", includeManagedSubagentTools: () => false,
+      providers: [{ id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true,
+        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }] }],
+      validateRemoteWorkspace: (target, signal) => factory.validate(target.remoteWorkspace!, signal), processFactory: factory.create });
+    const host = new SessionHost(store, artifacts, [adapter]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let pending: Promise<unknown> | undefined;
+    try {
+      await artifacts.initialize();
+      await host.initialize();
+      const target = { id: TEST_REMOTE_WORKSPACE.hostTargetId, backendId: "pi", workspaceRoot: "/workspace",
+        displayName: "Remote project", remoteWorkspace: TEST_REMOTE_WORKSPACE, managed: true, trusted: true };
+      await host.registerTarget(target);
+      const connection = store.createConnection({ id: "original-owner", name: "Original", authKeyDigest: "original-digest" });
+      const healthy = store.createConnection({ id: "other-owner", name: "Other", authKeyDigest: "other-digest" });
+      const stat = files.stat.bind(files);
+      const reached = vi.fn();
+      let workspaceReads = 0;
+      vi.spyOn(files, "stat").mockImplementation(async (path) => {
+        const result = await stat(path);
+        if (path === "/workspace" && ++workspaceReads === preflight) { reached(); await gate; }
+        return result;
+      });
+      const mkdirRemote = vi.spyOn(files, "mkdir"), writeRemote = vi.spyOn(files, "write");
+      const operationId = "revoked-ssh-pi-create";
+      const creation = host.createSession({ operationId, connection, targetId: target.id, title: "Remote task",
+        providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask", planMode: false });
+      pending = creation.catch(() => undefined);
+      await vi.waitFor(() => expect(reached).toHaveBeenCalledOnce());
+      store.revokeDevice(connection.deviceId);
+      release();
+      await expect(creation).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+      expect(store.getOperation(operationId).status).toBe("failed");
+      expect(store.listSessions()).toEqual([]);
+      expect(mkdirRemote).not.toHaveBeenCalled();
+      expect(writeRemote).not.toHaveBeenCalled();
+      expect(open).not.toHaveBeenCalled();
+      expect(store.authorizeConnection(healthy.id, healthy.authKeyDigest).id).toBe(healthy.id);
+    } finally { release(); await pending; await host.dispose(); store.close(); }
+  });
+
   it.each(["cleanup", "unknown", "adopt"] as const)("keeps the exact remote navigation receipt across restart for %s", async (outcome) => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-navigation-"));
     temporaryDirectories.push(fixture);

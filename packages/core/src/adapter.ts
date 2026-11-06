@@ -173,6 +173,8 @@ export type InteractionDecision =
 
 export interface CreateNativeSessionInput {
   readonly target: TargetDescriptor;
+  /** Original Owner authorization during a remote native creation. */
+  readonly assertNativeCreationCurrent?: () => void;
   readonly name?: string;
   readonly providerId?: string;
   readonly modelId?: string;
