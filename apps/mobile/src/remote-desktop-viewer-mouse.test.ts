@@ -10,11 +10,11 @@ const scope = window as unknown as {
 };
 let stop: (() => void) | undefined;
 afterEach(() => {
-  stop?.(); stop = undefined; vi.useRealTimers(); vi.unstubAllGlobals();
+  stop?.(); stop = undefined; vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks();
   document.documentElement.innerHTML = "<head></head><body></body>";
 });
 
-function viewer(nativeControls = false) {
+function viewer(nativeControls = false, desktop = { width: 800, height: 600 }, viewport = { width: 800, height: 600 }, integerScroll = false) {
   vi.useFakeTimers();
   let resized!: () => void;
   vi.stubGlobal("ResizeObserver", class { constructor(callback: () => void) { resized = callback; } observe() {} disconnect() {} });
@@ -23,13 +23,13 @@ function viewer(nativeControls = false) {
   const html = remoteDesktopViewerHtml("#111111", "#eeeeee", nativeControls);
   document.documentElement.innerHTML = html;
   const stage = document.getElementById("stage")!, rail = document.getElementById("mouse-buttons")!;
-  Object.defineProperties(stage, { clientWidth: { value: 800 }, clientHeight: { value: 600 } });
+  Object.defineProperties(stage, { clientWidth: { value: viewport.width }, clientHeight: { value: viewport.height } });
   for (const element of [stage, ...Array.from(rail.querySelectorAll("button"))]) {
     Object.assign(element, { setPointerCapture: vi.fn() });
   }
   new Function(html.match(/<script>([\s\S]*?)<\/script>/u)![1]!)();
   const receive = (value: object) => scope.__jokoRemoteDesktop.receive(value);
-  receive({ type: "init", epoch: "current-mouse", width: 800, height: 600, webrtc: false, sequenceBase: 100, sequenceLimit: 10_000 });
+  receive({ type: "init", epoch: "current-mouse", ...desktop, integerScroll, webrtc: false, sequenceBase: 100, sequenceLimit: 10_000 });
   receive({ type: "control", enabled: true, controlGeneration: 1 });
   const config = (enabled: boolean, native = nativeControls) => receive({ type: "mouseButtons", epoch: "current-mouse", enabled, nativeControls: native, labels });
   config(true);
@@ -89,6 +89,23 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[2]).toMatchObject({ events: [{ kind: "button", button: 2, down: false, x: .6, y: .6 }] });
   });
 
+  it("releases a held remote button on view-only entry while its original relay ACK is outstanding", async () => {
+    const value = viewer();
+    value.pointer(value.stage, "pointerdown");
+    await vi.advanceTimersByTimeAsync(400);
+    value.pointer(value.stage, "pointerup");
+    expect(value.packets()).toHaveLength(1);
+    expect(value.packets()[0]).toMatchObject({ sequence: 101, events: [{ kind: "button", button: 0, down: true }] });
+
+    value.receive({ type: "releaseInput" });
+    value.receive({ type: "control", enabled: false, release: true });
+    expect(value.packets()).toHaveLength(2);
+    expect(value.packets()[1]).toMatchObject({ sequence: 102, events: [{ kind: "release" }] });
+    value.receive({ type: "ack", epoch: "current-mouse", sequence: 101 });
+    await vi.advanceTimersByTimeAsync(66);
+    expect(value.packets()).toHaveLength(2);
+  });
+
   it("does not click after moving away and back to the same touch point", async () => {
     const value = viewer();
     value.config(false);
@@ -106,6 +123,140 @@ describe("actual floating mouse controls viewer", () => {
       { kind: "button", button: 0, down: true, x: .5, y: .5 },
       { kind: "button", button: 0, down: false, x: .5, y: .5 }
     ] });
+  });
+
+  it("aims a two-finger touch scroll inside the picture before sending any wheel input", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1600, height: 900 });
+    value.config(false);
+    value.pointer(value.stage, "pointerdown");
+    value.pointer(value.stage, "pointerup");
+    value.ack();
+
+    const scroll = async (from: number, to: number) => {
+      value.pointer(value.stage, "pointerdown", 8, 200, from);
+      value.pointer(value.stage, "pointerdown", 9, 400, from);
+      value.pointer(value.stage, "pointermove", 8, 200, to);
+      value.pointer(value.stage, "pointermove", 9, 400, to);
+      await vi.advanceTimersByTimeAsync(66);
+      value.pointer(value.stage, "pointerup", 8, 200, to);
+      value.pointer(value.stage, "pointerup", 9, 400, to);
+    };
+    await scroll(25, 45);
+    expect(value.packets()).toHaveLength(1);
+
+    await scroll(140, 160);
+    expect(value.packets()).toHaveLength(2);
+    expect(value.packets()[1]?.events).toEqual([
+      { kind: "move", x: .375, y: 85 / 450 },
+      { kind: "scroll", dx: 0, dy: -20 }
+    ]);
+  });
+
+  it.each([true, false])("preserves fractional two-finger wheel travel with integer scrolling=%s", async integerScroll => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 }, integerScroll);
+    const pair = [{ id: 8, x: 100, y: 300 }, { id: 9, x: 200, y: 300 }];
+    for (const point of pair) value.pointer(value.stage, "pointerdown", point.id, point.x, point.y);
+    for (const point of pair) {
+      point.y -= 10;
+      value.pointer(value.stage, "pointermove", point.id, point.x, point.y);
+    }
+    await vi.advanceTimersByTimeAsync(33);
+    expect(value.packets()[0]?.events.at(-1)).toEqual({ kind: "scroll", dx: 0, dy: 10 });
+    value.ack();
+
+    for (let step = 0; step < 40; step++) {
+      const point = pair[step % 2]!;
+      point.y -= 1;
+      value.pointer(value.stage, "pointermove", point.id, point.x, point.y);
+      await vi.advanceTimersByTimeAsync(33);
+      const expected = integerScroll ? Math.floor((step + 1) / 2) : step + 1;
+      expect(value.packets()).toHaveLength(1 + expected);
+      if (!integerScroll || step % 2 === 1) value.ack();
+    }
+
+    expect(value.packets().slice(1).flatMap(packet => packet.events))
+      .toEqual(Array.from({ length: integerScroll ? 20 : 40 }, () => ({ kind: "scroll", dx: 0, dy: integerScroll ? 1 : .5 })));
+  });
+
+  it.each([80, 280])("keeps the picture point under an off-center pinch at x=%s", async midpoint => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
+    const image = document.getElementById("image")!;
+    value.pointer(value.stage, "pointerdown", 8, midpoint - 20, 300);
+    value.pointer(value.stage, "pointerdown", 9, midpoint + 20, 300);
+    value.pointer(value.stage, "pointermove", 8, midpoint - 40, 300);
+    value.pointer(value.stage, "pointermove", 9, midpoint + 40, 300);
+    await vi.advanceTimersByTimeAsync(17);
+    expect(image.style.width).toBe("720px");
+    expect(Number.parseFloat(image.style.left)).toBeCloseTo(-midpoint);
+    expect(value.packets()).toHaveLength(0);
+  });
+
+  it("recenters a fitted picture after a view-only drag ends", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
+    value.receive({ type: "control", enabled: false });
+    value.receive({ type: "mode", mode: "pan" });
+    const image = document.getElementById("image")!;
+    expect(image.style.top).toBe("198.75px");
+
+    value.pointer(value.stage, "pointerdown", 8, 180, 220);
+    value.pointer(value.stage, "pointermove", 8, 180, 520);
+    expect(Number.parseFloat(image.style.top)).toBeGreaterThan(198.75);
+    value.pointer(value.stage, "pointerup", 8, 180, 520);
+
+    expect(image.style.top).toBe("198.75px");
+    expect(image.style.height).toBe("202.5px");
+    expect(value.packets()).toHaveLength(0);
+  });
+
+  it("applies a queued pinch frame before removing the first released pointer", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
+    const image = document.getElementById("image")!;
+    value.pointer(value.stage, "pointerdown", 8, 160, 300);
+    value.pointer(value.stage, "pointerdown", 9, 200, 300);
+    value.pointer(value.stage, "pointermove", 8, 140, 300);
+    value.pointer(value.stage, "pointermove", 9, 220, 300);
+    await vi.advanceTimersByTimeAsync(17);
+    expect(image.style.width).toBe("720px");
+
+    value.pointer(value.stage, "pointermove", 8, 128, 300);
+    value.pointer(value.stage, "pointermove", 9, 232, 300);
+    value.pointer(value.stage, "pointerup", 8, 128, 300);
+    value.pointer(value.stage, "pointerup", 9, 232, 300);
+    await vi.advanceTimersByTimeAsync(17);
+    expect(Number.parseFloat(image.style.width)).toBeCloseTo(936);
+    expect(value.packets()).toHaveLength(0);
+  });
+
+  it("starts pinching from the sustained span after a two-finger touch scroll", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
+    const image = document.getElementById("image")!;
+    value.pointer(value.stage, "pointerdown", 8, 140, 300);
+    value.pointer(value.stage, "pointerdown", 9, 180, 300);
+    const move = (left: number, right: number) => {
+      value.pointer(value.stage, "pointermove", 8, left, 300);
+      value.pointer(value.stage, "pointermove", 9, right, 300);
+    };
+    move(160, 200);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(value.packets()[0]?.events).toEqual([
+      { kind: "move", x: .5, y: .5 },
+      { kind: "scroll", dx: -20, dy: 0 }
+    ]);
+    value.ack();
+
+    move(145, 215);
+    await vi.advanceTimersByTimeAsync(80);
+    expect(image.style.width).toBe("360px");
+    move(128, 232);
+    await vi.advanceTimersByTimeAsync(17);
+    expect(Number.parseFloat(image.style.width)).toBeCloseTo(360 * 104 / 70);
+    expect(value.packets()).toHaveLength(1);
   });
 
   it("uses bounded displacement ticks and skips ACK time without accumulating a scroll backlog", async () => {
@@ -152,6 +303,29 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[2]).toMatchObject({ events: [{ kind: "scroll", dx: 0, dy: 120 }] });
     value.ack(); value.button("wheel").dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 0 }));
     expect(value.packets()[3]).toMatchObject({ events: [{ kind: "button", button: 1, down: true }, { kind: "button", button: 1, down: false }] });
+  });
+
+  it("sends the focused phone keyboard character and keeps physical keys available after blur", async () => {
+    const value = viewer();
+    value.receive({ type: "keyboard", enabled: true });
+    const keyboard = document.querySelector("textarea")!;
+    expect(document.activeElement).toBe(keyboard);
+    const key = (type: string) => new KeyboardEvent(type, { code: "KeyY", key: "z", bubbles: true, cancelable: true });
+    const down = key("keydown");
+    keyboard.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(false);
+    keyboard.value = "z";
+    keyboard.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+    keyboard.dispatchEvent(key("keyup"));
+    await vi.advanceTimersByTimeAsync(33);
+    expect(value.packets()[0]?.events).toEqual([{ kind: "text", text: "z" }]);
+    value.ack();
+
+    value.receive({ type: "keyboard", enabled: false });
+    document.dispatchEvent(key("keydown"));
+    document.dispatchEvent(key("keyup"));
+    await vi.advanceTimersByTimeAsync(33);
+    expect(value.packets()[1]?.events).toEqual([{ kind: "key", code: "KeyY", down: true }, { kind: "key", code: "KeyY", down: false }]);
   });
 
   it.each(["hide", "blur", "resize"] as const)("clears held buttons and wheel on %s without bypassing input ACK", async reason => {

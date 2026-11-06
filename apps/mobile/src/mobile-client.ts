@@ -290,12 +290,14 @@ import {
   assertMobileCatalogMentionDraft,
   assertMobileCatalogMentionDraftCatalog,
   createMobileCatalogMentionControls,
+  mobileCatalogMentionKinds,
   projectMobileArtifactMentionCatalog,
   projectMobileResourceMentionCatalog,
   type MobileArtifactMentionCandidate,
   type MobileCatalogMentionCandidate,
   type MobileCatalogMentionCatalog,
   type MobileCatalogMentionControls,
+  type MobileCatalogMentionPolicy,
   type MobileResourceMentionCandidate
 } from "./mobile-catalog-mentions";
 import {
@@ -655,7 +657,7 @@ interface MobileImageGalleryLease {
         readonly kind: "timeline";
         readonly eventId: string;
         readonly pageId: string;
-        readonly windowKey: string;
+      readonly groupKey: string;
       }
     | {
         readonly kind: "markdown";
@@ -682,7 +684,8 @@ interface MobileTimelinePreviewLease {
   readonly profileId: string;
   readonly sessionId: string;
   readonly taskAuthorityKey: string;
-  readonly windowKey: string;
+  readonly sourceKey: string;
+  readonly joinedSource?: MobileJoinedTaskSource;
   readonly artifact?: MobileTimelinePreviewArtifact;
   readonly extensionCard?: { readonly id: string; readonly html: string; readonly uri: string };
   media?: MobileMediaPreviewLease;
@@ -851,6 +854,7 @@ const textOnlyIncomingSharePolicy: MobileAttachmentControls["policy"] = {
   imageMediaTypes: [],
   fileMediaTypes: []
 };
+const savedHomeCacheReadBudgetMs = 2_000;
 
 function confirmedMobileDeviceName(operation: Operation, deviceId: string, connectionId: string): Device {
   const confirmed = operation.result?.payload.case === "device" ? operation.result.payload.value : undefined;
@@ -937,7 +941,7 @@ export class MobileClient {
           if (!this.#connectionAttemptCurrent(generation, controller)) return;
           combined.throwIfAborted();
           this.#profiles = upsertProfile(this.#profiles, profileFromCredential(credential));
-          if (automatic !== undefined) {
+          if (!draft.entryId && automatic !== undefined) {
             await this.storage.saveAutomaticProfile(automatic ? credential.profileId : undefined);
             if (!this.#connectionAttemptCurrent(generation, controller)) return;
             combined.throwIfAborted();
@@ -4908,13 +4912,20 @@ export class MobileClient {
         selection = await this.storage.loadSelection(profileId);
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
         if (!preserveActiveConnection && this.offlineCache) {
+          const cacheRead = new AbortController();
+          const abortCacheRead = () => cacheRead.abort();
+          const cacheDeadline = setTimeout(abortCacheRead, savedHomeCacheReadBudgetMs);
+          controller.signal.addEventListener("abort", abortCacheRead, { once: true });
           try {
-            cached = await this.offlineCache.load(profile, selection);
+            cached = await this.offlineCache.load(profile, selection, cacheRead.signal);
             if (!this.#connectionAttemptCurrent(generation, controller)) return;
             if (cached) this.#showOfflineProjection(profile, cached, selection, "connecting");
           } catch (error) {
-            cacheLoadWarning = message(error);
             if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            if (!cacheRead.signal.aborted) cacheLoadWarning = message(error);
+          } finally {
+            clearTimeout(cacheDeadline);
+            controller.signal.removeEventListener("abort", abortCacheRead);
           }
         }
         // Public identity proof must precede the protected credential read.
@@ -4977,16 +4988,6 @@ export class MobileClient {
         const detail = selected ? await this.network.readSession(credential, selected, controller.signal) : undefined;
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
         if (selected !== selection) await this.storage.saveSelection(profileId, selected);
-        let preferenceError: string | undefined;
-        if (automatic !== undefined) {
-          try {
-            await this.storage.saveAutomaticProfile(automatic ? profileId : undefined);
-            this.#automaticProfileId = automatic ? profileId : undefined;
-          } catch (error) {
-            preferenceError = `Connected, but the automatic-entry preference could not be saved: ${message(error)}`;
-          }
-        }
-        preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
         if (savedEntries && entryOwner) {
           const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
           await this.storage.writeConnectionEntries?.(profile, next);
@@ -4997,6 +4998,18 @@ export class MobileClient {
           this.#set({ connectionEntries: { profileId, entries: entryApi.connectionEntryViews(next, profile, this.connectionEntrySupported), returnToPreferred: next.returnToPreferred,
             ...(resolved?.entry.id !== next.preferredId ? { notice: 'Using a prepared backup. Your preferred entrance has not changed.' } : {}) } });
         }
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        let preferenceError: string | undefined;
+        if (automatic !== undefined) {
+          try {
+            await this.storage.saveAutomaticProfile(automatic ? profileId : undefined);
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            this.#automaticProfileId = automatic ? profileId : undefined;
+          } catch (error) {
+            preferenceError = `Connected, but the automatic-entry preference could not be saved: ${message(error)}`;
+          }
+        }
+        preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
         entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt);
         await this.#adoptConnection(generation, controller, credential, node, owner, selected, detail, preferenceError);
       } catch (error) {
@@ -5790,6 +5803,13 @@ export class MobileClient {
       error: `${error}${cleanupError ?? ""}` });
   }
 
+  async #invalidateRevokedOwnerRead(error: unknown, epoch: number, credential: PairedCredential): Promise<boolean> {
+    if (!isRevoked(error) || !this.#current(epoch) || this.#joinedTask
+      || this.#credential !== credential || this.#activeProfileId !== credential.profileId) return false;
+    await this.#invalidateCredential(epoch, credential.profileId, "This Joko connection was revoked.");
+    return true;
+  }
+
   #schedule(): void {
     if (!this.#foreground || this.#disposed || !this.#credential) return;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
@@ -5844,8 +5864,7 @@ export class MobileClient {
         }
         if (!event.eventId || !cursor || !cursor.opaqueToken || cursor.generation !== this.#streamGeneration
           || cursor.sequence > (this.#streamSequence ?? 0n) + 1n
-          || event.payload?.kind.case === "projectionInvalidated"
-          || event.payload?.kind.case === "taskTagCatalogChanged") {
+          || event.payload?.kind.case === "projectionInvalidated") {
           this.#clearHistory();
           void this.refresh();
           return;
@@ -5993,6 +6012,21 @@ export class MobileClient {
     await write;
   }
 
+  async #retireUndispatchedSettingsReceipt(pending: PendingOperation): Promise<void> {
+    const retained = (item: PendingOperation) => item.operationId !== pending.operationId || item.connectionId !== pending.connectionId
+      || item.taskJoinId !== pending.taskJoinId || item.kind !== pending.kind;
+    const write = this.#pendingWrite.then(async () => {
+      const remaining = this.#allPending.filter(retained);
+      if (remaining.length !== this.#allPending.length) {
+        await this.storage.savePending(remaining);
+        this.#allPending = remaining;
+      }
+      this.#set({ pending: this.#state.pending.filter(retained), saved: this.#savedViews() });
+    });
+    this.#pendingWrite = write.then(() => undefined, () => undefined);
+    await write;
+  }
+
   async select(sessionId?: string): Promise<void> {
     if (this.#partnerRosterNavigation?.sessionId !== sessionId) this.#partnerRosterNavigation = undefined;
     if (sessionId !== undefined && !this.#state.owner?.sessions.some((session) => session.sessionId === sessionId)) {
@@ -6057,6 +6091,7 @@ export class MobileClient {
     const credential = this.#credential;
     const owner = this.#state.owner;
     const profileId = this.#activeProfileId;
+    const epoch = this.#epoch;
     if (!credential || !owner || !profileId || this.#state.status !== "connected" || !this.#foreground) {
       this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "error",
         homeSearchSessionIds: [], homeSearchError: "Reconnect to search task messages." });
@@ -6082,6 +6117,7 @@ export class MobileClient {
       const sessionIds = [...new Set(matches.map((match) => match.sessionId).filter((sessionId) => visible.has(sessionId)))];
       this.#set({ homeSearchStatus: "ready", homeSearchSessionIds: sessionIds, homeSearchError: undefined });
     } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
         || profileId !== this.#activeProfileId) return;
       this.#set({ homeSearchStatus: "error", homeSearchSessionIds: [], homeSearchError: message(error) });
@@ -7591,7 +7627,7 @@ export class MobileClient {
     if (!source || !taskAuthorityKey || !card || !/^joko-media:\/\/blobs\/[a-f0-9]{64}\.(png|jpg|jpeg|gif|webp|glb)$/u.test(uri)) throw new Error("Extension media unavailable.");
     this.#cancelTimelinePreviewLease(); const controller = new AbortController();
     const lease: MobileTimelinePreviewLease = { controller, profileId: credential.profileId, sessionId, taskAuthorityKey,
-      windowKey: mobileTimelinePreviewWindowKey(this.#timelineEvents()), extensionCard: { id: cardId, html: card.html, uri } };
+      sourceKey: mobileTimelinePreviewWindowKey(this.#timelineEvents()), extensionCard: { id: cardId, html: card.html, uri } };
     this.#timelinePreview = lease;
     const base = { title: card.extensionName, sourceLabel: card.extensionName, revisionKey: `${cardId}:${uri}`, mediaType: "application/octet-stream", byteSize: 0n };
     this.#set({ timelinePreview: { ...base, kind: "loading" } });
@@ -7643,7 +7679,8 @@ export class MobileClient {
       profileId: credential.profileId,
       sessionId,
       taskAuthorityKey,
-      windowKey: mobileTimelinePreviewWindowKey(events),
+      sourceKey: mobileTimelinePreviewWindowKey([source.event]),
+      ...(this.#joinedTask === undefined ? {} : { joinedSource: this.#joinedTask.source }),
       artifact: source.artifact
     };
     this.#timelinePreview = lease;
@@ -8301,7 +8338,8 @@ export class MobileClient {
   }
 
   conversationShareOwnerKey(): string | undefined {
-    if (!this.#taskAuthorityKey()) return undefined;
+    const taskAuthorityKey = this.#taskAuthorityKey();
+    if (!taskAuthorityKey || this.#joinedTask) return taskAuthorityKey;
     const credential = this.#credential!;
     const owner = this.#state.owner!;
     const session = this.#selectedSession()!;
@@ -8313,6 +8351,7 @@ export class MobileClient {
   }
 
   markdownResourceOwnerKey(): string | undefined {
+    if (this.#joinedTask) return undefined;
     const owner = this.conversationShareOwnerKey();
     const authority = resolveMobileWorkspaceAuthority(this.#state.owner, this.#state.detail, this.#state.selectedId);
     if (!owner || !authority || !this.taskWorkspacePathPasteControls()) return undefined;
@@ -8417,7 +8456,7 @@ export class MobileClient {
   filesHtmlResourceOwnerKey(preview: Extract<MobileFilePreview, { kind: "text" }>): string | undefined {
     const timeline = this.#timelinePreview;
     if (this.#state.timelinePreview === preview && timeline && this.#timelinePreviewLeaseCurrent(timeline)) {
-      return JSON.stringify(["timeline", timeline.taskAuthorityKey, timeline.windowKey, preview.sourceLabel, preview.revisionKey]);
+      return JSON.stringify(["timeline", timeline.taskAuthorityKey, timeline.sourceKey, preview.sourceLabel, preview.revisionKey]);
     }
     const owner = this.filesAuthorityKey();
     return owner && this.#state.files.open && this.#state.files.status === "ready" && this.#state.files.preview === preview
@@ -8971,7 +9010,7 @@ export class MobileClient {
         kind: "timeline",
         eventId,
         pageId,
-        windowKey: mobileTimelineGalleryWindowKey(events)
+        groupKey: timelineGalleryGroupKey(events, pages)
       },
       operationInFlight: false
     };
@@ -9133,10 +9172,6 @@ export class MobileClient {
         || !this.imageGalleryCurrent(leaseId)) {
         throw new Error("The cached gallery preview source changed.");
       }
-      if (lease.source.kind === "timeline" && (mobileTimelineGalleryWindowKey(this.#timelineEvents()) !== lease.source.windowKey
-        || !timelineGalleryPagesForSelection(this.#timelineEvents(), lease.source.eventId, lease.source.pageId).some((current) => sameMobileImageGalleryPage(current, page)))) {
-        throw new Error("The cached Timeline gallery preview changed.");
-      }
     } }, signal);
     if (preview) { lease.previewLeaseIds ??= new Set(); lease.previewLeaseIds.add(preview.leaseId); }
     return preview;
@@ -9158,7 +9193,7 @@ export class MobileClient {
       return pages.length === lease.pages.length && pages.every((page, index) => sameMobileImageGalleryPage(page, lease.pages[index]!));
     }
     const events = this.#timelineEvents(); const pages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
-    return mobileTimelineGalleryWindowKey(events) === source.windowKey && pages.length === lease.pages.length
+    return pages.length === lease.pages.length && timelineGalleryGroupKey(events, pages) === source.groupKey
       && pages.every((page, index) => sameMobileImageGalleryPage(page, lease.pages[index]!));
   }
 
@@ -9350,6 +9385,7 @@ export class MobileClient {
         await this.#persistOfflineProjection(epoch, credential, this.#state.node, this.#state.owner, this.#state.detail);
       }
     } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
       throw error;
     } finally {
@@ -9372,6 +9408,7 @@ export class MobileClient {
       if (!events.some((event) => event.eventId === eventId)) throw new Error("The selected event is no longer in task history.");
       this.#set({ window: events, older: [], before: events[0]!.cursor, historyEnd: false });
     } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
       throw error;
     } finally {
@@ -10478,11 +10515,12 @@ export class MobileClient {
       }
       assertMobileWorkspacePathPasteResolutions(latestPathControls, sendDraft, resolutions);
     }
-    if (sendDraft.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+    const catalogKinds = mobileCatalogMentionKinds(sendDraft);
+    if (catalogKinds.resources || catalogKinds.artifacts) {
       if (!currentCatalogMentionControls || currentCatalogMentionControls.surfaceOwnerKey !== catalogMentionOwnerKey) {
         throw new Error("The catalog reference owner changed while the structured draft was being saved. Review the retained draft before sending.");
       }
-      const catalog = await this.listTaskCatalogMentionCatalog(currentCatalogMentionControls.surfaceOwnerKey);
+      const catalog = await this.#readCurrentCatalogMentions(currentCatalogMentionControls.surfaceOwnerKey, catalogKinds);
       if (!isCurrent()) return false;
       if (this.#taskAuthorityKey() !== authorityKey
         || this.taskCatalogMentionControls()?.surfaceOwnerKey !== currentCatalogMentionControls.surfaceOwnerKey) {
@@ -10906,15 +10944,11 @@ export class MobileClient {
       assertMobileWorkspacePathPasteResolutions(before.paths!, input, resolutions);
     }
     let catalog: MobileCatalogMentionCatalog | undefined;
-    if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+    const catalogKinds = mobileCatalogMentionKinds(input);
+    if (catalogKinds.resources || catalogKinds.artifacts) {
       const catalogControls = before.catalog!;
-      const [resources, artifacts] = await Promise.all([
-        catalogControls.policy.resources ? this.network.listSessionResources(credential, record.sessionId, signal) : undefined,
-        catalogControls.policy.artifacts ? this.network.listArtifactReferenceCatalog(credential, record.sessionId, BigInt(record.runtimeGeneration), signal) : undefined
-      ]);
+      catalog = await this.#readCatalogMentions(credential, catalogControls, catalogKinds, signal);
       assertCurrent();
-      catalog = { ...(resources === undefined ? {} : { resources: projectMobileResourceMentionCatalog(catalogControls, resources) }),
-        ...(artifacts === undefined ? {} : { artifacts: projectMobileArtifactMentionCatalog(catalogControls, artifacts.artifacts, artifacts.revision) }) };
       assertMobileCatalogMentionDraftCatalog(catalogControls, catalog, input);
     }
     for (const candidate of [...input.attachments]) {
@@ -12280,35 +12314,51 @@ export class MobileClient {
     expectedSurfaceOwnerKey: string,
     signal?: AbortSignal
   ): Promise<MobileCatalogMentionCatalog> {
+    return this.#readCurrentCatalogMentions(expectedSurfaceOwnerKey, undefined, signal);
+  }
+
+  async #readCurrentCatalogMentions(
+    expectedSurfaceOwnerKey: string,
+    kinds: MobileCatalogMentionPolicy | undefined,
+    signal?: AbortSignal
+  ): Promise<MobileCatalogMentionCatalog> {
     const context = this.#catalogMentionContext(expectedSurfaceOwnerKey);
-    const [resources, artifacts] = await Promise.all([
-      context.controls.policy.resources
-        ? this.network.listSessionResources(context.credential, context.controls.sessionId, signal)
-        : Promise.resolve(undefined),
-      context.controls.policy.artifacts
-        ? this.network.listArtifactReferenceCatalog(
-            context.credential,
-            context.controls.sessionId,
-            BigInt(context.controls.runtimeGeneration),
-            signal
-          )
-        : Promise.resolve(undefined)
-    ]);
+    const catalog = await this.#readCatalogMentions(context.credential, context.controls, kinds ?? context.controls.policy, signal, kinds === undefined);
     const current = this.#catalogMentionContext(expectedSurfaceOwnerKey);
-    if (current.controls.surfaceOwnerKey !== context.controls.surfaceOwnerKey) {
+    if (current.credential !== context.credential) {
       throw new Error("The catalog reference owner changed while its candidates were loading.");
     }
+    return catalog;
+  }
+
+  async #readCatalogMentions(
+    credential: PairedCredential,
+    controls: MobileCatalogMentionControls,
+    kinds: MobileCatalogMentionPolicy,
+    signal?: AbortSignal,
+    allowPartial = false
+  ): Promise<MobileCatalogMentionCatalog> {
+    const handleFailure = (error: unknown) => {
+      signal?.throwIfAborted();
+      if (!allowPartial || isRevoked(error) || (error as { code?: number })?.code === Code.PermissionDenied) throw error;
+      return { error };
+    };
+    const [resourceResult, artifactResult] = await Promise.all([
+      kinds.resources ? this.network.listSessionResources(credential, controls.sessionId, signal)
+        .then(rows => ({ value: projectMobileResourceMentionCatalog(controls, rows) }), handleFailure) : undefined,
+      kinds.artifacts ? this.network.listArtifactReferenceCatalog(credential, controls.sessionId, BigInt(controls.runtimeGeneration), signal)
+        .then(rows => ({ value: projectMobileArtifactMentionCatalog(controls, rows.artifacts, rows.revision) }), handleFailure) : undefined
+    ]);
+    signal?.throwIfAborted();
+    const resources = resourceResult && "value" in resourceResult ? resourceResult.value : undefined;
+    const artifacts = artifactResult && "value" in artifactResult ? artifactResult.value : undefined;
+    if (resourceResult && "error" in resourceResult && artifacts === undefined) throw resourceResult.error;
+    if (artifactResult && "error" in artifactResult && resources === undefined) throw artifactResult.error;
     return {
-      ...(resources === undefined ? {} : {
-        resources: projectMobileResourceMentionCatalog(context.controls, resources)
-      }),
-      ...(artifacts === undefined ? {} : {
-        artifacts: projectMobileArtifactMentionCatalog(
-          context.controls,
-          artifacts.artifacts,
-          artifacts.revision
-        )
-      })
+      ...(resources === undefined ? {} : { resources }),
+      ...(artifacts === undefined ? {} : { artifacts }),
+      ...(resourceResult && "error" in resourceResult ? { unavailable: "resource" as const } : {}),
+      ...(artifactResult && "error" in artifactResult ? { unavailable: "artifact" as const } : {})
     };
   }
 
@@ -12571,7 +12621,8 @@ export class MobileClient {
       || value.kind === "artifact" && !context.controls.policy.artifacts) {
       throw new Error(`This Backend no longer supports ${value.kind === "resource" ? "Resource" : "Artifact"} references.`);
     }
-    const catalog = await this.listTaskCatalogMentionCatalog(expectedSurfaceOwnerKey, signal);
+    const catalog = await this.#readCurrentCatalogMentions(expectedSurfaceOwnerKey,
+      { resources: value.kind === "resource", artifacts: value.kind === "artifact" }, signal);
     return assertMobileCatalogMentionCandidate(
       this.#catalogMentionContext(expectedSurfaceOwnerKey).controls,
       catalog,
@@ -13740,6 +13791,16 @@ export class MobileClient {
     return this.#joinedTask ? all.filter(item => ["permission", "question", "planReview"].includes(item.request.case ?? "")) : all;
   }
 
+  captureTaskInteractionResolver(): (displayed: Interaction, submission: MobileInteractionSubmission) => Promise<boolean> {
+    const epoch = this.#epoch;
+    return async (displayed, submission) => {
+      if (!this.#current(epoch) || this.#state.status !== "connected") return false;
+      const current = this.taskInteractions().find(item => item.interactionId === displayed.interactionId);
+      if (current === undefined || !equals(InteractionSchema, current, displayed)) return false;
+      return this.resolveInteraction(displayed.interactionId, submission);
+    };
+  }
+
   async resolveInteraction(interactionId: string, submission: MobileInteractionSubmission): Promise<boolean> {
     const interaction = this.#interactionContext(interactionId);
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
@@ -14033,6 +14094,15 @@ export class MobileClient {
     }));
   }
 
+  homeTaskTagSourceKey(sessionId: string): string | undefined {
+    const owner = this.#partnerPrivateAuthorityKey(this.#state);
+    if (!owner || this.#joinedTask) return undefined;
+    const session = this.#state.owner?.sessions.find(candidate => candidate.sessionId === sessionId);
+    if (!session) return undefined;
+    return JSON.stringify([owner, this.#epoch, session.sessionId, session.backendId, session.targetId,
+      session.nativeBinding?.runtimeGeneration.toString()]);
+  }
+
   async previewTaskTagDeletion(taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreview> {
     return this.network.previewTaskTagDeletion(this.#ready(), taskTagId, signal);
   }
@@ -14060,10 +14130,13 @@ export class MobileClient {
       throw new Error("A previous task-tag change is still pending.");
     }
     this.#ready();
+    const epoch = this.#epoch;
     const action = this.#claimMutation();
     try {
-      const result = await this.#submitTerminal(mutation, { kind: "task-tag", sessionId });
-      return result.accepted && result.definitive;
+      const result = await this.#submitTerminal(mutation, { kind: "task-tag", sessionId }, undefined, true, false);
+      const changed = result.accepted && result.definitive;
+      if (changed && this.#current(epoch)) await this.refresh();
+      return changed;
     } finally { this.#releaseMutation(action); }
   }
 
@@ -15071,20 +15144,14 @@ export class MobileClient {
       if (pages.length !== lease.pages.length || pages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
         throw new Error("The pending images changed or left the task queue.");
       }
-    } else {
-      const events = this.#timelineEvents();
-      if (mobileTimelineGalleryWindowKey(events) !== source.windowKey) {
-        throw new Error("The Timeline source window changed while the gallery was open.");
-      }
-      const currentPages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
-      if (currentPages.length !== lease.pages.length
-        || currentPages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
-        throw new Error("The durable Timeline images changed while the gallery was open.");
-      }
+    } else if (!this.imageGalleryCurrent(lease.leaseId)) {
+      throw new Error("The durable Timeline images changed while the gallery was open.");
     }
     const snapshot = await this.composerDrafts!.readSnapshot(lease.identity);
     signal?.throwIfAborted();
-    if (this.#imageGallery !== lease) throw new Error("The image gallery was closed before the operation completed.");
+    if (this.#imageGallery !== lease || (source.kind === "timeline" && !this.imageGalleryCurrent(lease.leaseId))) {
+      throw new Error("The image gallery source changed before the operation completed.");
+    }
     const current = normalizeMobileComposerDraft(snapshot.draft ?? {
       text: "", mentions: [], atoms: [], slashCommands: [], attachments: []
     });
@@ -15675,7 +15742,7 @@ export class MobileClient {
     if (!catalogControls?.policy.artifacts) {
       throw new Error("This Backend cannot add the selected Generated file as an attachment or typed reference.");
     }
-    const catalog = await this.listTaskCatalogMentionCatalog(catalogControls.surfaceOwnerKey, signal);
+    const catalog = await this.#readCurrentCatalogMentions(catalogControls.surfaceOwnerKey, { resources: false, artifacts: true }, signal);
     assertCurrent();
     const matches = (catalog.artifacts?.items ?? []).filter((candidate) => candidate.artifactId === artifact.artifactId
       && candidate.sourceSessionId === artifact.sessionId);
@@ -15835,14 +15902,17 @@ export class MobileClient {
   #timelinePreviewSourceCurrent(lease: MobileTimelinePreviewLease, state: MobileState): boolean {
     if (state.status !== "connected" || state.activeProfileId !== lease.profileId
       || state.selectedId !== lease.sessionId) return false;
+    const joined = state.taskSource?.kind === "joined" ? state.taskSource : undefined;
+    if (joined !== lease.joinedSource) return false;
     const events = mobileStateTimelineEvents(state);
-    if (mobileTimelinePreviewWindowKey(events) !== lease.windowKey) return false;
-    if (lease.extensionCard) return this.#extensionCardSource(state, lease.extensionCard.id)?.html === lease.extensionCard.html;
+    if (lease.extensionCard) return mobileTimelinePreviewWindowKey(events) === lease.sourceKey
+      && this.#extensionCardSource(state, lease.extensionCard.id)?.html === lease.extensionCard.html;
     if (!lease.artifact) return false;
     const source = resolveMobileTimelinePreviewArtifact(events, lease.artifact);
     return source !== undefined
       && source.event.identity?.sessionId === lease.sessionId
-      && source.event.cursor?.generation === state.owner?.generation
+      && source.event.cursor?.generation === (joined ? state.detail?.generation : state.owner?.generation)
+      && mobileTimelinePreviewWindowKey([source.event]) === lease.sourceKey
       && sameMobileTimelinePreviewArtifact(source.artifact, lease.artifact);
   }
   #extensionCardSource(state: MobileState, cardId: string) {
@@ -16485,14 +16555,22 @@ export class MobileClient {
     const before = this.#state.pending;
     const next = [...before, pending];
     this.#set({ pending: next, ...(markBusy ? { busy: true } : {}), error: undefined });
+    let persisted: boolean;
     try {
-      if (!await this.#persistPending(next, epoch)) return { accepted: false, definitive: false };
+      persisted = await this.#persistPending(next, epoch);
     } catch (error) {
       if (this.#current(epoch)) this.#set({ pending: before, ...(markBusy ? { busy: false } : {}) });
       throw error;
     }
     let operation: Operation;
-    if (!requestCurrent() || authority?.beforeDispatch?.() === false) return { accepted: false, definitive: false };
+    if (!persisted || !requestCurrent() || authority?.beforeDispatch?.() === false) {
+      if (pending.kind === "extension-settings-routing" || pending.kind === "extension-settings-credential-clear"
+        || pending.kind === "extension-settings-directory") {
+        await this.#retireUndispatchedSettingsReceipt(pending);
+        return { accepted: false, definitive: true };
+      }
+      return { accepted: false, definitive: false };
+    }
     const operationSignal = authority === undefined ? this.#abort?.signal
       : this.#abort === undefined ? authority.signal : AbortSignal.any([this.#abort.signal, authority.signal]);
     try {
@@ -17404,6 +17482,11 @@ function timelineGalleryPagesForSelection(
     return mobileTimelineGalleryPages(sources[0]!).filter((page) => page.pageId === image.pageId);
   });
   return pages.length === images.length ? pages : [];
+}
+
+function timelineGalleryGroupKey(events: readonly Event[], pages: readonly MobileImageGalleryPage[]): string {
+  const sources = new Set(pages.flatMap(page => "eventId" in page.source ? [page.source.eventId] : []));
+  return mobileTimelineGalleryWindowKey(events.filter(event => sources.has(event.eventId)));
 }
 
 function historyInvalidated(event: Event): boolean {

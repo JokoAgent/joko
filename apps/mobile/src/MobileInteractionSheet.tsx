@@ -177,7 +177,7 @@ export function MobileInteractionSheet({
   };
 
   const settle = async (submission: MobileInteractionSubmission): Promise<void> => {
-    if (disabled) return;
+    if (disabled || !visible || !mountedRef.current || authorityRef.current !== authorityKey) return;
     const currentAuthorityKey = authorityKey;
     setSettling(true);
     onError("");

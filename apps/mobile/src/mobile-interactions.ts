@@ -1,4 +1,5 @@
 import { create } from "@bufbuild/protobuf";
+import { containsRecognizedCredential } from "@joko/core/errors";
 import {
   BrowserPermissionAction,
   CompositeArgumentKind,
@@ -34,6 +35,15 @@ export type MobileQuestionAnswerDraft =
   | { readonly kind: "boolean"; readonly value: boolean };
 
 export type MobileQuestionAnswers = Readonly<Record<string, MobileQuestionAnswerDraft>>;
+
+export function mobileQuestionAnswerContainsCredential(answer: MobileQuestionAnswerDraft): boolean {
+  switch (answer.kind) {
+    case "text": return containsRecognizedCredential(answer.value);
+    case "single": return answer.selection.kind === "other" && containsRecognizedCredential(answer.selection.text);
+    case "multiple": return answer.otherText !== undefined && containsRecognizedCredential(answer.otherText);
+    case "boolean": return false;
+  }
+}
 
 export type MobileInteractionDraft =
   | { readonly kind: "question"; readonly fieldIndex: number; readonly answers: MobileQuestionAnswers }
@@ -129,6 +139,7 @@ export function mobileQuestionFieldError(
   validateQuestionFieldDeclaration(field);
   const label = field.label || field.fieldId;
   if (answer === undefined) return field.required ? mobileMessage(locale, "interaction.field.required", { label }) : undefined;
+  if (mobileQuestionAnswerContainsCredential(answer)) return mobileMessage(locale, "interaction.field.credential", { label });
   if (field.input.case === "text") {
     if (answer.kind !== "text") return mobileMessage(locale, "interaction.field.text", { label });
     return field.required && answer.value.trim() === ""

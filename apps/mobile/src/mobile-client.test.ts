@@ -7,19 +7,22 @@ import type { MobileCollaborationRpc } from "./mobile-collaboration";
 import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
 import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemoryKind, ReadPartnerMemoryResponseSchema, UpdatePartnerMemoryResponseSchema, DeletePartnerMemoryResponseSchema,
   GetPartnerMemoryPreferencesResponseSchema, UpdatePartnerMemoryPreferencesResponseSchema } from "@joko/contracts";
-import { Code } from "@connectrpc/connect";
-import { ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
+import { ConnectionService, DeviceAuthorizationState } from "@joko/contracts";
+import { formatDeviceInvitation, type DeviceAuthorizationDraft } from "@joko/connection-transport/device-authorization";
+import type { SavedConnectionEntries } from "@joko/connection-transport/entries";
 import { EndpointTrustError, rememberEndpointTransport, reportEndpointTrustFailure } from "@joko/connection-transport/trust";
-import { ActorKind, JoinedTaskShareSchema, TaskShareMethod, TaskShareSnapshotSchema, TaskShareEventBatchSchema, type TaskSharingApi } from "@joko/contracts";
+import { ActorKind, JoinedTaskShareSchema, TaskShareMethod, TaskShareSnapshotSchema, TaskShareEventBatchSchema,
+  EventPayloadSchema, TaskShareAttachmentResultSchema, type TaskSharingApi } from "@joko/contracts";
 import { PartnerGroupSummarySchema, PartnerGroupMemberSchema, ListPartnerGroupsResponseSchema, GetPartnerGroupResponseSchema,
   GetPartnerGroupCreationResponseSchema, RetirePartnerGroupCreationResponseSchema, PartnerGroupMemberStatus, type PartnerGroupApi } from "@joko/contracts";
 import { DevicePeerDescriptorSchema, RemoteDesktopControlStateSchema, type RemoteDesktopControlState } from "@joko/contracts";
 import { ExtensionTaskPreferencesSchema, ExtensionTaskServiceGetPreferencesResponseSchema, ExtensionTaskServiceUpdatePreferencesResponseSchema, ExtensionTaskServiceRetryWriteAccessResponseSchema } from "@joko/contracts";
-import { ExtensionAuthorizationPhase, ExtensionOAuthFlowSchema, type ExtensionSettingsHost } from "@joko/contracts";
+import { ExtensionAuthorizationPhase, ExtensionMainViewSurfaceSchema, ExtensionOAuthFlowSchema, type ExtensionSettingsHost } from "@joko/contracts";
 import { rebalanceSuggestionFixture } from "./test/provider-group-rebalance";
 import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
 import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import sharp from "sharp";
 import {
   AuthenticationState, ProviderAccountUsageSnapshotSchema,
@@ -44,7 +47,7 @@ import {
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
   SessionContextStateSchema, SessionDerivationKind, SessionDerivationOriginSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  SessionWorktreeSchema, TargetState, TaskTagColor, TaskTagDeletePreviewSchema, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
+  SessionWorktreeSchema, TargetState, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreviewSchema, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -971,7 +974,8 @@ function memoryOfflineCache(now: () => number = () => 1_500) {
   let sequence = 0;
   return {
     cache: new MobileOfflineCache(driver, now, () => `cache-${++sequence}`),
-    values
+    values,
+    driver
   };
 }
 
@@ -1850,8 +1854,86 @@ describe("mobile current task delegated reads", () => {
 const clients: MobileClient[] = [];
 vi.mock('@joko/connection-transport/entries', async original => {
   const entries = await original<typeof import('@joko/connection-transport/entries')>();
-  return { ...entries, resolvePreparedConnection: vi.fn(entries.resolvePreparedConnection) };
+  return { ...entries, prepareSelectedConnectionEntry: vi.fn(entries.prepareSelectedConnectionEntry),
+    resolvePreparedConnection: vi.fn(entries.resolvePreparedConnection) };
 });
+describe('automatic entry after device approval', () => {
+  it.each(['directory', 'preferred entrance'] as const)('waits for the chosen entrance after a %s failure and restart', async failure => {
+    const invitation = { origin: 'https://approval-bootstrap.example', serverId: node.serverId,
+      endpointPublicKey: `ed25519:${'f'.repeat(64)}`, invitationId: randomUUID(), invitationSecret: 'a'.repeat(64), expiresAt: Date.now() + 60_000 };
+    const selected = { id: 'chosen', origin: 'https://approval-chosen.example', provider: 'direct', name: 'Chosen', kind: 'https' as const, published: true, prepared: true };
+    const server = { ...node, endpointPublicKey: invitation.endpointPublicKey };
+    const expiresAt = { seconds: BigInt(Math.floor(invitation.expiresAt / 1_000)), nanos: 0 };
+    const memory = memoryStorage(), network = fakeNetwork();
+    let draft: DeviceAuthorizationDraft | undefined, savedEntries: SavedConnectionEntries | undefined, failOnce = true;
+    memory.storage.readDeviceAuthorization = async () => draft;
+    memory.storage.writeDeviceAuthorization = async next => { draft = next; };
+    memory.storage.readDeviceTransportRequest = async () => undefined;
+    memory.storage.readConnectionEntries = async () => savedEntries;
+    memory.storage.writeConnectionEntries = async (_profile, next) => {
+      if (failure === 'preferred entrance' && next.preferredId === selected.id && failOnce) {
+        failOnce = false;
+        throw new Error('Cannot save chosen entrance');
+      }
+      savedEntries = next;
+    };
+    const claim = vi.fn();
+    const transport = createRouterTransport(router => router.service(ConnectionService, {
+      getServerInfo: () => ({ server }),
+      requestDeviceAuthorization: request => {
+        expect(request.entryId).toBe(selected.id);
+        return { authorization: { invitationId: invitation.invitationId, requestId: request.requestId, expiresAt,
+          userCode: 'ABCD-EFGH', deviceName: request.deviceName, state: DeviceAuthorizationState.APPROVED } };
+      },
+      claimDeviceAuthorization: request => {
+        claim(request.requestId);
+        return { authorization: { invitationId: invitation.invitationId, requestId: request.requestId,
+          connection: { ...connection, displayName: 'Phone' }, state: DeviceAuthorizationState.CLAIMED } };
+      }
+    }));
+    network.deviceAuthorizationTransport = () => transport;
+    const entries = await import('@joko/connection-transport/entries');
+    const prepare = vi.mocked(entries.prepareSelectedConnectionEntry).mockImplementation(async (_owner, saved, id, _active, _auth, storage) => {
+      expect(id).toBe(selected.id);
+      const next = { ...saved, entries: [...saved.entries.filter(entry => entry.id !== selected.id), selected] };
+      await storage.write(next);
+      return { entryId: selected.id, saved: next };
+    });
+    if (failure === 'directory') prepare.mockRejectedValueOnce(new ConnectError('Cannot read entrance directory', Code.Unavailable));
+    const resolve = vi.mocked(entries.resolvePreparedConnection).mockImplementation(async (_owner, saved, readAuthKey, supported, _signal, id) => {
+      const [entry] = entries.connectionEntryCandidates(saved, supported, id);
+      const authKey = await readAuthKey();
+      if (!entry || !authKey) throw new Error('No prepared entrance or credential');
+      return { entry, authKey, failures: [], saved };
+    });
+    try {
+      const app = client(network, memory.storage, undefined, undefined, randomUUID);
+      await app.start();
+      const request = await app.deviceAuthorization.start(formatDeviceInvitation(invitation), 'Phone', undefined, selected.id);
+      await expect(app.deviceAuthorization.finish(undefined, true)).rejects.toThrow(failure === 'directory' ? 'Cannot read entrance directory' : 'Cannot save chosen entrance');
+      expect(memory.key()?.origin).toBe(invitation.origin);
+      expect(draft?.requestId).toBe(request.requestId);
+      expect(memory.storage.saveAutomaticProfile).not.toHaveBeenCalled();
+
+      const restarted = client(network, memory.storage, undefined, undefined, randomUUID);
+      vi.spyOn(restarted, 'refreshConnectionEntries').mockResolvedValue(undefined);
+      await restarted.start();
+      expect(restarted.state.status).toBe('unpaired');
+      expect(network.readOwner).toHaveBeenCalledTimes(failure === 'directory' ? 1 : 2);
+      await restarted.deviceAuthorization.finish(undefined, true);
+      expect(claim.mock.calls).toEqual([[request.requestId], [request.requestId]]);
+      expect(savedEntries?.preferredId).toBe(selected.id);
+      expect(memory.automaticProfile()).toBe(credential.profileId);
+      expect(draft).toBeUndefined();
+
+      const cold = client(network, memory.storage);
+      vi.spyOn(cold, 'refreshConnectionEntries').mockResolvedValue(undefined);
+      await cold.start();
+      expect(cold.state).toMatchObject({ status: 'connected', origin: selected.origin, activeProfileId: credential.profileId });
+    } finally { prepare.mockRestore(); resolve.mockRestore(); }
+  });
+});
+
 describe('prepared connection entrance cancellation', () => {
   it.each([Code.Unavailable, Code.Unauthenticated])('ends automatic startup after entrance preflight rejects (%s)', async code => {
     const entries = await import('@joko/connection-transport/entries');
@@ -2051,6 +2133,50 @@ describe("shared task source on the native task client", () => {
     expect(instance.state.taskSource?.kind).toBe("own");
     expect(instance.state.detail?.server?.serverId).toBe(credential.serverId);
     expect(instance.taskDraftProfileId()).toBe(credential.profileId);
+  });
+  it("opens and shares images from a joined task whose Target exists only on the host node", async () => {
+    const value = sharedFixture(), network = fakeNetwork(), instance = client(network, memoryStorage(credential).storage);
+    const bytes = galleryPngBytes(5, 4);
+    const message = timelineGalleryEvent(bytes);
+    message.cursor!.generation = value.detail.generation;
+    if (message.payload?.kind.case !== "messageCompleted") throw new Error("Expected shared message fixture.");
+    const blocks = message.payload.kind.value.blocks;
+    const blob = blocks.find(block => block.content.case === "image")!.content;
+    if (blob.case !== "image") throw new Error("Expected shared image fixture.");
+    blob.value.blob!.sha256Hex = sha256Hex(bytes);
+    message.payload.kind.value.blocks = blocks.filter(block => block.content.case === "text" || block.content === blob);
+    value.detail.sessions[0]!.targetId = "source-only-target";
+    value.detail.targets = [];
+    value.detail.timeline = [message];
+    value.detail.resumeCursor = message.cursor;
+    const invoke = vi.fn(async (joinId: string, method: TaskShareMethod) => {
+      expect(joinId).toBe(value.joined.joinId);
+      expect(method).toBe(TaskShareMethod.LIST_SESSION_TIMELINE);
+      return { events: [message] };
+    });
+    const transfer = vi.fn(async (_request: Parameters<TaskSharingApi["transfer"]>[0]) => create(TaskShareAttachmentResultSchema, {
+      blob: blob.value.blob, offset: BigInt(bytes.length), data: bytes, complete: true
+    }));
+    await instance.start();
+    vi.spyOn(instance, "taskSharingApi").mockReturnValue({ ...value.api, invoke, transfer } as unknown as TaskSharingApi);
+    await instance.openJoinedTask(value.joined);
+    expect(instance.state.owner?.targets.some(target => target.targetId === "source-only-target")).toBe(false);
+    expect(instance.conversationShareOwnerKey()).toContain(value.joined.joinId);
+    expect(instance.markdownResourceOwnerKey()).toBeUndefined();
+
+    const selected = timelineRows(instance.state.detail!.timeline)[0]!;
+    const signal = new AbortController().signal;
+    const prepared = await instance.prepareConversationShare([selected.id], signal);
+    expect(prepared.messages[0]?.images?.size).toBe(1);
+    expect(transfer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ joinId: value.joined.joinId,
+      transfer: { action: { case: "read", value: expect.objectContaining({ blobId: blob.value.blob!.blobId }) } }
+    }), expect.any(AbortSignal));
+    await instance.revalidateConversationShare(prepared.leaseId, signal);
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(network.downloadBlob).not.toHaveBeenCalled();
+    expect(network.readAround).not.toHaveBeenCalled();
+    await instance.select("session");
+    expect(() => instance.assertConversationShareCurrent(prepared.leaseId)).toThrow();
   });
   it("retains an unknown guest input and checks only its signed original receipt without ordinary dispatch", async () => {
     const value = sharedFixture(), network = fakeNetwork(), saved = memoryStorage(credential), instance = client(network, saved.storage);
@@ -3106,6 +3232,50 @@ describe("mobile Extension catalog authority", () => {
     await expect(pending).rejects.toThrow(/owner changed|cancelled/u);
     expect(saved.pending()).toEqual([expect.objectContaining({ operationId: "package-late", extensionResourceId: "resource-1", state: "unknown" })]);
     expect(network.listExtensions).not.toHaveBeenCalled();
+  });
+
+  it.each(["before", "after"] as const)("keeps a routing receipt only when author settings close %s dispatch", async timing => {
+    const f = mobileSettingsOAuthFixture(), saved = memoryStorage(credential);
+    if (f.surface.owner.kind !== "resource") throw new Error("Settings require an installed Resource.");
+    const openSettings = vi.fn(async () => ({ surface: create(ExtensionMainViewSurfaceSchema, {
+      surfaceId: f.surface.surfaceId, extensionId: f.surface.extensionId,
+      owner: { resourceId: f.surface.owner.resourceId, discoveredRevision: f.surface.owner.discoveredRevision,
+        resourceVersion: { value: f.surface.owner.resourceRevision } }, endpoint: new URL(f.surface.url).pathname,
+      backendId: f.surface.backendId, backendRevision: { value: f.surface.backendRevision }, backendGeneration: BigInt(f.surface.backendGeneration),
+      expiresAt: { seconds: BigInt(Math.floor(f.surface.expiresAt / 1000)), nanos: f.surface.expiresAt % 1000 * 1_000_000 },
+      title: f.surface.title, settings: true, mobileSettings: true
+    }) }));
+    f.network.extensionSettingsApi = vi.fn(() => ({ openExtensionSettings: openSettings }) as unknown as ReturnType<NonNullable<MobileNetwork["extensionSettingsApi"]>>);
+    const app = client(f.network, saved.storage, undefined, undefined, () => "original-routing-write");
+    await app.start();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = vi.fn(), signal = new AbortController();
+    if (timing === "before") {
+      const persist = saved.storage.savePending;
+      vi.mocked(persist).mockImplementationOnce(async items => { entered(); await gate; await persist(items); });
+    } else {
+      vi.mocked(f.network.submit).mockImplementationOnce(async () => { entered(); await gate; throw new Error("Original result lost."); });
+    }
+    const write = app.extensionCatalogTransport()!.callSettings!(f.surface,
+      { kind: "routing.set", revision: "4", dataJson: '{"folder":"inbox"}' }, f.host, signal.signal);
+    try {
+      await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+      signal.abort(); release();
+      await expect(write).rejects.toThrow();
+      const reopen = app.extensionCatalogTransport()!.openSettings!(f.extension, new AbortController().signal);
+      if (timing === "before") {
+        expect(f.network.submit).not.toHaveBeenCalled();
+        expect(saved.pending()).toEqual([]); expect(app.state.pending).toEqual([]);
+        await expect(reopen).resolves.toMatchObject({ surfaceId: f.surface.surfaceId, purpose: "settings" });
+        expect(openSettings).toHaveBeenCalledOnce();
+      } else {
+        expect(f.network.submit).toHaveBeenCalledOnce();
+        expect(saved.pending()).toEqual([expect.objectContaining({ operationId: "original-routing-write", state: "unknown" })]);
+        await expect(reopen).rejects.toThrow(/unavailable/u);
+        expect(openSettings).not.toHaveBeenCalled();
+      }
+    } finally { release(); await write.catch(() => undefined); app.dispose(); }
   });
 
   it.each(["replacement", "completed"] as const)("uses a ready projection for credential replacement only after adopting the new attempt %s", async attempt => {
@@ -5516,6 +5686,47 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.objectContaining({ defaultDisplayName: "Joko android" }), expect.any(AbortSignal));
   });
 
+  it("connects after the saved Home read deadline and never adopts the late archived copy", async () => {
+    const staleSession = create(SessionSchema, { ...runtimeSession, archived: true, state: SessionState.ARCHIVED });
+    const offline = memoryOfflineCache();
+    const profile = profileFromCredential(credential);
+    await offline.cache.save(profile, node, offlineOwnerProjection([staleSession]));
+    const manifestKey = [...offline.values.keys()].find((key) => key.endsWith(".manifest"))!;
+    const originalManifest = offline.values.get(manifestKey)!;
+    let releaseManifest!: (value: string) => void;
+    let markReading!: () => void;
+    const reading = new Promise<void>((resolve) => { markReading = resolve; });
+    const lateManifest = new Promise<string>((resolve) => { releaseManifest = resolve; });
+    const getItem = offline.driver.getItem.bind(offline.driver);
+    let holdOriginal = true;
+    vi.spyOn(offline.driver, "getItem").mockImplementation((key) => {
+      if (key !== manifestKey || !holdOriginal) return getItem(key);
+      holdOriginal = false;
+      markReading();
+      return lateManifest;
+    });
+    const network = fakeNetwork();
+    const fresh = offlineOwnerProjection();
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: fresh });
+    vi.mocked(network.readSession).mockResolvedValue(offlineDetailProjection());
+    const app = clientWithOfflineCache(network, memoryStorage(credential).storage, offline.cache);
+    vi.useFakeTimers();
+    const starting = app.start();
+    await reading;
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(network.inspect).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await starting;
+    expect(network.inspect).toHaveBeenCalledOnce();
+    expect(app.state).toMatchObject({ status: "connected", owner: fresh, offlineSnapshotAt: undefined });
+
+    releaseManifest(originalManifest);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.owner?.sessions[0]?.archived).toBe(false);
+    expect((await offline.cache.load(profile))?.owner.sessions[0]?.archived).toBe(false);
+  });
+
   it("restores a current-v1 task copy before anonymous inspection and retries into authoritative online state", async () => {
     const cachedOwner = offlineOwnerProjection();
     const cachedDetail = offlineDetailProjection();
@@ -7866,6 +8077,73 @@ describe("native mobile connection and operation ownership", () => {
 });
 
 describe("mobile Home search and task mutations", () => {
+  it.each(["search", "page", "anchor"] as const)("retires the original profile and its offline history when %s observes revocation", async (read) => {
+    const owner = create(SnapshotSchema, { ...runtimeControlProjection(),
+      connections: [connection, otherConnection], devices: [device, otherDevice] });
+    const detail = offlineDetailProjection();
+    const offline = memoryOfflineCache();
+    const original = profileFromCredential(credential), other = profileFromCredential(otherCredential);
+    await offline.cache.save(other, node, owner, detail);
+    const network = projectedNetwork(owner);
+    vi.mocked(network.readSession).mockResolvedValue(detail);
+    const saved = memoryStorage([credential, otherCredential], credential.profileId);
+    const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+    await app.start();
+    expect((await offline.cache.load(original, "session"))?.detail).toBeDefined();
+    const anchor = event("e7", 7n);
+    vi.mocked(network.readAround).mockResolvedValueOnce([create(EventSchema, {
+      ...anchor, cursor: { ...anchor.cursor!, generation: owner.generation }
+    })]);
+    await app.around("e7");
+    expect(app.state.window?.map((item) => item.eventId)).toEqual(["e7"]);
+
+    const rejection = { code: Code.Unauthenticated };
+    if (read === "search") {
+      vi.mocked(network.searchSessionMessages).mockRejectedValueOnce(new Error("Network unavailable"));
+      await app.searchHome("words", "all");
+      expect(app.state).toMatchObject({ status: "connected", homeSearchStatus: "error", homeSearchError: "Network unavailable" });
+      let reject!: (error: unknown) => void;
+      vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+      const search = app.searchHome("other words", "all");
+      await app.searchHome("", "all");
+      reject(rejection);
+      await search;
+    } else if (read === "page") {
+      vi.mocked(network.readHistory).mockRejectedValueOnce(rejection);
+      await app.older();
+    } else {
+      vi.mocked(network.readAround).mockRejectedValueOnce(rejection);
+      await app.around("e6");
+    }
+
+    expect(app.state).toMatchObject({ status: "revoked", owner: undefined, detail: undefined,
+      window: undefined, older: [], selectedId: undefined, offlineSnapshotAt: undefined, historyBusy: false });
+    expect(saved.key()).toBeUndefined();
+    expect(saved.key(otherCredential.profileId)).toEqual(otherCredential);
+    await expect(offline.cache.load(original, "session")).resolves.toBeUndefined();
+    expect((await offline.cache.load(other, "session"))?.detail).toBeDefined();
+    app.dispose();
+  });
+
+  it("ignores a revoked response from a retired Home search credential", async () => {
+    const network = fakeNetwork();
+    vi.mocked(network.readOwner).mockImplementation(async (current) => current.profileId === otherCredential.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: extendedSnapshot }
+      : { connection, device, snapshot });
+    const saved = memoryStorage([credential, otherCredential], credential.profileId);
+    const app = client(network, saved.storage);
+    await app.start();
+    let reject!: (error: unknown) => void;
+    vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+    const oldSearch = app.searchHome("original words", "all");
+    await app.connectSaved(otherCredential.profileId);
+    reject({ code: Code.Unauthenticated });
+    await oldSearch;
+    expect(app.state).toMatchObject({ status: "connected", activeProfileId: otherCredential.profileId });
+    expect(saved.storage.deleteCredential).not.toHaveBeenCalled();
+    app.dispose();
+  });
+
   it("retires late message-search results when query or owner changes", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);
@@ -7954,6 +8232,10 @@ describe("mobile Home search and task mutations", () => {
     await expect(app.reorderTaskTags("session", ["tag-release", "preset:work"], 6n)).resolves.toBe(true);
     await expect(app.setSessionTaskTag("session", "tag-release", true)).resolves.toBe(true);
     await expect(app.setSessionTaskTag("session", "tag-release", false)).resolves.toBe(true);
+    await app.select();
+    expect(app.state.selectedId).toBeUndefined();
+    expect(app.homeTaskTagSourceKey("session")).toBeTruthy();
+    expect(app.homeTaskTagSourceKey("retired-task")).toBeUndefined();
     const preview = await app.previewTaskTagDeletion("tag-release");
     await expect(app.deleteTaskTag("session", preview)).resolves.toBe(true);
 
@@ -7983,6 +8265,41 @@ describe("mobile Home search and task mutations", () => {
     });
     expect(network.previewTaskTagDeletion).toHaveBeenCalledWith(credential, "tag-release", undefined);
     expect(saved.pending()).toEqual([]);
+  });
+
+  it("adopts a contiguous task-tag catalog event and returns a tag edit conflict without reconnecting", async () => {
+    const network = fakeNetwork();
+    const emit = eventFeed(network);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    const statuses: string[] = [];
+    const unsubscribe = app.subscribe(state => statuses.push(state.status));
+    try {
+      const catalog = create(TaskTagCatalogSchema, { revision: { value: 6n }, taskTags: [{ taskTagId: "tag-release",
+        name: "Release", color: TaskTagColor.ORANGE, revision: { value: 6n } }] });
+      const changed = create(EventSchema, { eventId: "tags-changed", cursor: { opaqueToken: "cursor-11", sequence: 11n, generation: 1n },
+        payload: { kind: { case: "taskTagCatalogChanged", value: { catalog } } } });
+      const current = create(SnapshotSchema, { ...snapshot, taskTagCatalog: catalog, resumeCursor: changed.cursor });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: current });
+      vi.mocked(network.readSession).mockResolvedValue(current);
+      emit(changed);
+      await vi.waitFor(() => expect(app.state.detail?.taskTagCatalog).toEqual(catalog));
+      expect(app.state.owner?.taskTagCatalog).toEqual(catalog);
+      vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+        operationId: "operation-1", connectionId: credential.connectionId, state: OperationState.CONFLICT,
+        error: { code: "REVISION_CONFLICT", message: "The task tag changed on another client." }
+      }));
+
+      await expect(app.updateTaskTag("session", "tag-release", 5n, { name: "Launch" })).resolves.toBe(false);
+
+      expect(app.state.error).toBe("The task tag changed on another client.");
+      expect(app.state.detail?.taskTagCatalog).toEqual(catalog);
+      expect(statuses.length).toBeGreaterThan(0);
+      expect(new Set(statuses)).toEqual(new Set(["connected"]));
+      expect(network.streamOwner).toHaveBeenCalledTimes(1);
+      expect(saved.pending()).toEqual([]);
+    } finally { unsubscribe(); app.dispose(); }
   });
 
   it("persists an unknown task action before dispatch and never resends it", async () => {
@@ -9318,6 +9635,41 @@ describe("native current-task message and Queue actions", () => {
       .rejects.toThrow(/original task/u);
   });
 
+  it("keeps an available Artifact selectable and sendable when the Resource directory is fenced", async () => {
+    const network = projectedNetwork(catalogMentionSnapshot);
+    configureCatalogMentions(network);
+    const listResources = vi.mocked(network.listSessionResources);
+    listResources.mockRejectedValue(Object.assign(new Error("Resource directory fenced"), { code: Code.FailedPrecondition }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, memoryDraftStores());
+    await app.start();
+    const controls = app.taskCatalogMentionControls()!;
+
+    const partial = await app.listTaskCatalogMentionCatalog(controls.surfaceOwnerKey);
+    expect(partial).toMatchObject({ unavailable: "resource", artifacts: { items: [{ artifactId: "artifact-one", sourceSessionId: "related" }] } });
+    expect(partial.resources).toBeUndefined();
+    listResources.mockRejectedValueOnce(Object.assign(new Error("Connection revoked"), { code: Code.Unauthenticated }));
+    await expect(app.listTaskCatalogMentionCatalog(controls.surfaceOwnerKey)).rejects.toMatchObject({ code: Code.Unauthenticated });
+
+    const artifact = partial.artifacts!.items[0]!;
+    const resourceReads = listResources.mock.calls.length;
+    await expect(app.validateTaskCatalogMentionCandidate(controls.surfaceOwnerKey, artifact)).resolves.toEqual(artifact);
+    expect(listResources).toHaveBeenCalledTimes(resourceReads);
+    await expect(app.send(catalogMentionDraft())).rejects.toThrow("Resource directory fenced");
+    expect(network.submit).not.toHaveBeenCalled();
+
+    const text = "Use ";
+    const draft = insertMobileArtifactMention(plainTextMobileComposerDraft(text),
+      { start: text.length, end: text.length }, artifact, "artifact-only-occurrence").draft;
+    await expect(app.send(draft)).resolves.toBe(true);
+    expect(listResources).toHaveBeenCalledTimes(resourceReads + 1);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      payload: { case: "sendInput", value: { input: { parts: [
+        { content: { case: "text", value: draft.text } },
+        { content: { case: "artifactMention", value: { artifactId: "artifact-one", sourceSessionId: "related" } } }
+      ] } } }
+    });
+  });
+
   it("sends exact Resource and source-task Artifact wire identities with body-free receipts", async () => {
     const network = projectedNetwork(catalogMentionSnapshot);
     configureCatalogMentions(network);
@@ -10082,6 +10434,28 @@ describe("native current-task Interaction ownership", () => {
     let value = 0;
     return () => `interaction-operation-${++value}`;
   };
+
+  it("discards a displayed permission decision after adopting a new connection for the same saved node", async () => {
+    const network = projectedNetwork(interactionSnapshot);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+    const original = app.taskInteractions().find(item => item.interactionId === permissionInteraction.interactionId)!;
+    expect(original).toEqual(permissionInteraction);
+    const confirmFromOldView = app.captureTaskInteractionResolver();
+    const allow = { kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE } as const;
+
+    await app.connectSaved(credential.profileId);
+    const current = app.taskInteractions().find(item => item.interactionId === original.interactionId)!;
+    expect(current).toEqual(original);
+    await expect(confirmFromOldView(original, allow)).resolves.toBe(false);
+    expect(saved.storage.savePending).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+
+    await expect(app.captureTaskInteractionResolver()(current, allow)).resolves.toBe(true);
+    expect(network.submit).toHaveBeenCalledOnce();
+    app.dispose();
+  });
 
   it("sorts exact current requests and resolves an advertised decision at revision and generation", async () => {
     const network = projectedNetwork(interactionSnapshot);
@@ -13213,6 +13587,40 @@ describe("native current-task Files ownership", () => {
     expect(app.state.timelinePreview).toBeUndefined();
   });
 
+  it("keeps the current audio preview while a different attachment arrives on the live timeline", async () => {
+    const bytes = new Uint8Array(417);
+    bytes.set([0xff, 0xfb, 0x90, 0x00]);
+    const digest = sha256Hex(bytes);
+    const audio = timelinePreviewEvent("answer.mp3", "audio/mpeg", bytes, digest, "Original audio");
+    const network = projectedNetwork(timelineGallerySnapshot(audio));
+    const publish = eventFeed(network);
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "audio/mpeg" });
+    const media = mediaPreviewFixture(digest);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "original-audio-lease", undefined, undefined, undefined, media.files);
+    await app.start();
+    await app.previewTimelineArtifact(timelineRows(app.state.detail!.timeline)[0]!.artifacts![0]!);
+    const original = app.state.timelinePreview;
+    expect(original).toMatchObject({ kind: "media", mediaKind: "audio", title: "Original audio" });
+
+    const pdf = timelinePreviewEvent("separate.pdf", "application/pdf", previewPdfBytes(), "b".repeat(64));
+    pdf.eventId = "new-file";
+    pdf.cursor!.sequence = audio.cursor!.sequence + 1n;
+    if (pdf.payload?.kind.case !== "messageCompleted") throw new Error("Expected file fixture.");
+    pdf.payload.kind.value.role = MessageRole.USER;
+    pdf.payload.kind.value.messageId = "new-file-message";
+    publish(pdf);
+    await vi.waitFor(() => expect(app.state.live.map(item => item.eventId)).toContain(pdf.eventId));
+    expect(app.state.timelinePreview).toBe(original);
+    expect(media.removed).toEqual([]);
+    expect(network.downloadBlob).toHaveBeenCalledOnce();
+
+    vi.mocked(network.readAround).mockResolvedValue([pdf]);
+    await app.around(pdf.eventId);
+    expect(app.state.timelinePreview).toBeUndefined();
+    await vi.waitFor(() => expect(media.removed).toEqual(["preview-original-audio-lease.mp3"]));
+  });
+
   it.each(timelineFileSources)("cleans a late $kind stage after the exact source window changes", async ({ project }) => {
     const bytes = previewMp4Bytes();
     const event = project(timelinePreviewEvent("late.mp4", "video/mp4", bytes, "e".repeat(64), "Late video"));
@@ -13542,6 +13950,37 @@ describe("native current-task Files ownership", () => {
     expect(fixture.driver.stageBytes).toHaveBeenNthCalledWith(1, credential.profileId, "annotation-source", bytes);
     expect(fixture.driver.stageBytes).toHaveBeenNthCalledWith(2, credential.profileId, "annotation-output", bytes);
     expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("keeps the second image of a current gallery while unrelated live text arrives", async () => {
+    const bytes = galleryPngBytes(5, 4);
+    const images = timelineGalleryEvent(bytes);
+    const network = projectedNetwork(timelineGallerySnapshot(images));
+    const publish = eventFeed(network);
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("original-gallery", "second-image"), undefined, memoryDraftStores());
+    await app.start();
+    const selected = timelineRows(app.state.detail!.timeline)[0]!.images![1]!;
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    expect(gallery).toMatchObject({ initialIndex: 1, pages: [{ pageId: expect.any(String) }, { pageId: selected.pageId }] });
+
+    const delta = event("another-live-reply", images.cursor!.sequence + 1n);
+    delta.payload = create(EventPayloadSchema, { kind: { case: "textDelta", value: { messageId: "another-message", delta: "Still working" } } });
+    publish(delta);
+    await vi.waitFor(() => expect(app.state.live.map(item => item.eventId)).toContain(delta.eventId));
+    expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(true);
+    await expect(app.loadImageGalleryPage(gallery.leaseId, 1)).resolves.toMatchObject({ pageId: selected.pageId, pageIndex: 1 });
+
+    const replacement = clone(EventSchema, images);
+    replacement.eventId = "replacement-image-message";
+    replacement.cursor!.opaqueToken = "replacement-image-cursor";
+    replacement.cursor!.sequence = delta.cursor!.sequence + 1n;
+    if (replacement.payload?.kind.case !== "messageCompleted") throw new Error("Expected image message fixture.");
+    replacement.payload.kind.value.blocks = [{ $typeName: "joko.v1.MessageBlock", content: { case: "text", value: "Images removed" } }];
+    publish(replacement);
+    await vi.waitFor(() => expect(app.state.live.map(item => item.eventId)).toContain(replacement.eventId));
+    expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(false);
   });
 
   it.each([

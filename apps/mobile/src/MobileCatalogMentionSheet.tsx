@@ -90,6 +90,7 @@ export function MobileCatalogMentionSheet({
       if (!mountedRef.current || controller.signal.aborted || !visibleRef.current
         || requestRef.current !== request || controlsRef.current?.surfaceOwnerKey !== ownerKey) return;
       setCatalog(next);
+      setLoadError(next.unavailable === undefined ? undefined : mobileMessage(locale, "mention.catalog.loadError"));
       setQuery("");
       setTimeout(() => searchRef.current?.focus(), 80);
     }).catch((error) => {
@@ -121,6 +122,7 @@ export function MobileCatalogMentionSheet({
       if (!mountedRef.current || controller.signal.aborted || !visibleRef.current
         || requestRef.current !== request || controlsRef.current?.surfaceOwnerKey !== ownerKey) return;
       setCatalog(next);
+      setLoadError(next.unavailable === undefined ? undefined : mobileMessage(locale, "mention.catalog.loadError"));
       setTimeout(() => searchRef.current?.focus(), 120);
     }).catch((error) => {
       if (!mountedRef.current || controller.signal.aborted || requestRef.current !== request

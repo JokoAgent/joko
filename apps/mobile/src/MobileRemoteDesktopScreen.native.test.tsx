@@ -720,7 +720,8 @@ describe("actual Mobile Remote Desktop Screen native composition", () => {
     const init = native.receive.mock.calls.map(call => call[0]).findLast(command => command.type === "init")!;
     expect(init).toMatchObject({ epoch, webrtc: true, audio: true });
     expect(init).not.toHaveProperty("nativeVideo");
-    expect(native.htmlCommands.findLast(command => command.type === "init")).toMatchObject({ epoch, nativeVideo: true });
+    expect(init).not.toHaveProperty("integerScroll");
+    expect(native.htmlCommands.findLast(command => command.type === "init")).toMatchObject({ epoch, nativeVideo: true, integerScroll: true });
     const iframe = document.createElement("iframe"); container.append(iframe);
     iframe.contentDocument!.documentElement.innerHTML = native.webProps!.source.html;
     expect(iframe.contentWindow!.getComputedStyle(iframe.contentDocument!.body).backgroundColor).toBe("rgba(0, 0, 0, 0)");

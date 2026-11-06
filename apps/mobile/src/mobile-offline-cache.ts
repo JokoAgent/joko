@@ -82,15 +82,21 @@ export class MobileOfflineCache {
     private readonly newId: () => string
   ) {}
 
-  load(profile: MobileConnectionProfile, selectedSessionId?: string): Promise<MobileOfflineCacheSnapshot | undefined> {
+  load(profile: MobileConnectionProfile, selectedSessionId?: string, signal?: AbortSignal): Promise<MobileOfflineCacheSnapshot | undefined> {
     assertIdentity(profile);
     if (selectedSessionId !== undefined) assertLocalId(selectedSessionId, "task");
-    return this.#serialized(profile.profileId, async () => {
-      if (await this.storage.getItem(tombstoneKey(profile.profileId)) !== null) {
+    const read = (key: string) => {
+      signal?.throwIfAborted();
+      return waitForCacheRead(this.storage.getItem(key), signal);
+    };
+    const load = this.#serialized(profile.profileId, async () => {
+      if (await read(tombstoneKey(profile.profileId)) !== null) {
+        signal?.throwIfAborted();
         await this.#removeProfileKeys(profile.profileId).catch(() => undefined);
         return undefined;
       }
-      const raw = await this.storage.getItem(manifestKey(profile.profileId));
+      const raw = await read(manifestKey(profile.profileId));
+      signal?.throwIfAborted();
       if (raw === null) {
         await this.#removeUnreferencedDetailKeys(profile.profileId, new Set()).catch(() => undefined);
         return undefined;
@@ -106,8 +112,9 @@ export class MobileOfflineCache {
         if (!entry) return { node: manifest.node, owner, cachedAt: manifest.cachedAt };
         try {
           let detailRaw: string | null;
-          try { detailRaw = await this.storage.getItem(entry.key); }
+          try { detailRaw = await read(entry.key); }
           catch (error) { throw new MobileOfflineCacheReadError(errorMessage(error)); }
+          signal?.throwIfAborted();
           if (detailRaw === null || utf8Size(detailRaw, maximumDetailBytes, "offline task record") !== entry.size) {
             throw new Error("missing detail record");
           }
@@ -135,6 +142,7 @@ export class MobileOfflineCache {
             detailCachedAt: record.cachedAt
           };
         } catch (error) {
+          signal?.throwIfAborted();
           if (error instanceof MobileOfflineCacheReadError) {
             return {
               node: manifest.node,
@@ -154,10 +162,12 @@ export class MobileOfflineCache {
           };
         }
       } catch (error) {
+        signal?.throwIfAborted();
         await this.#removeProfileKeys(profile.profileId).catch(() => undefined);
         throw new Error(`Joko could not use the saved offline content: ${errorMessage(error)}`);
       }
     });
+    return waitForCacheRead(load, signal);
   }
 
   save(
@@ -305,6 +315,18 @@ export class MobileOfflineCache {
     const keys = (await this.storage.getAllKeys()).filter((key) => key.startsWith(prefix) && !retained.has(key));
     if (keys.length > 0) await this.storage.multiRemove(keys);
   }
+}
+
+/** Retire the waiter while allowing a read-only native request to finish on its own. */
+function waitForCacheRead<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    signal.addEventListener("abort", abort, { once: true });
+    pending.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    if (signal.aborted) { cleanup(); abort(); }
+  });
 }
 
 export function mobileOfflineAgeLabel(cachedAt: number, now: number, locale: MobileSupportedLocale): string {

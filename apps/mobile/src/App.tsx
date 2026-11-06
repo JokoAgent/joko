@@ -1574,7 +1574,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     {copyNotice && <Notice text={copyNotice} colors={colors} locale={locale}
       dismissAccessibilityLabel={mobileMessage(locale, "actions.dismissCopyNotice")}
       onDismiss={() => setCopyNotice("")} />}
-    <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete"].includes(item.kind))}
+    <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete", "task-tag"].includes(item.kind))}
       colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
       ListHeaderComponent={onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
@@ -1665,6 +1665,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       </View>
     </Modal>
     <MobileTaskTagsSheet
+      fromHome
       visible={state.status === "connected" && taskTagSessionId !== undefined}
       session={state.owner?.sessions.find((session) => session.sessionId === taskTagSessionId)}
       catalog={state.owner?.taskTagCatalog}
@@ -4014,6 +4015,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const advertisedQueueCapabilities = client.taskQueueCapabilities();
   const queueCapabilities = workerReadOnly ? { ...advertisedQueueCapabilities, edit: false, cancel: false, reorder: false } : advertisedQueueCapabilities;
   const interactions = state.status === "connected" ? client.taskInteractions() : [];
+  const resolveDisplayedInteraction = interactions.length > 0 ? client.captureTaskInteractionResolver() : undefined;
   const inputHandoffApi = state.status === "connected" && !workerReadOnly ? client.taskInputHandoffApi?.() : undefined;
   const runtimeControls = state.status === "connected" ? client.taskRuntimeControls() : undefined;
   useEffect(() => {
@@ -4597,6 +4599,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const voice = useMobileVoiceInput({
     transport: voiceTransport,
     draftOwnerKey: draftIdentityKey,
+    permissionPromptConnection: Platform.OS === "android" && state.taskSource?.kind !== "joined"
+      && (state.status === "connected" || state.status === "connecting") ? state.status : undefined,
     enabled: composerOwnerReady && queueEdit === undefined && interactions.length === 0 && !conversationShare.active
       && state.status === "connected" && !state.busy && !composerOperationPending && !attachmentBusy,
     readDraft: () => composerDraftRef.current,
@@ -6468,7 +6472,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         label: partnerRead.partner.displayName, settingsLabel: mobileMessage(locale, "partnerProfile.open", { name: partnerRead.partner.displayName }),
         disabled: !partnerProfileTransport || state.busy || attachmentBusy || voice.busy,
         onOpen: openRuntimeControls } : undefined}
-      titleAccessory={<MobileTaskTagDots tags={session?.taskTags} locale={locale} dark={colors.dark} />}
+      titleAccessory={<MobileTaskTagDots tags={session?.taskTags} locale={locale} maximum={7} dark={colors.dark} />}
       subtitle={session ? sessionState(session.state, locale) : mobileMessage(locale, "task.loading")}
       navigationLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
       onNavigate={() => { requestTaskHomeNavigation({ kind: "home" }, drawerMounted); }}
@@ -7152,7 +7156,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       busy={state.busy || interactionMutationPending} colors={colors}
       onSelect={setSelectedInteractionId} onMinimize={() => setInteractionVisible(false)}
       onResolve={async (interaction, submission) => {
-        const completed = await client.resolveInteraction(interaction.interactionId, submission);
+        const completed = await resolveDisplayedInteraction?.(interaction, submission) ?? false;
         if (completed) setInteractionVisible(true);
         return completed;
       }}

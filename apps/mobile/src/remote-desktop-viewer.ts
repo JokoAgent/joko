@@ -66,7 +66,9 @@ const VIEWER_SCRIPT = String.raw`
   let deadline=null,disconnectTimer=null,retryTimer=null,stableTimer=null,iceTimer=null;
   let localCandidates=[],localAck=0,remoteAfter=0,remoteComplete=false,remoteSeen=new Set(),icePending=null,exchangeId=0,exchangeUntil=0;
   let seq=0,sequenceLimit=Number.MAX_SAFE_INTEGER,pending=[],sending=false,drag=false,hold=null,start=null,last=null,multi=null,gestureFrame=null;
+  let congestionAt=null,integerScroll=false;
   const pointers=new Map();let cx=.5,cy=.5,composing=false,keyboardEnabled=false;
+  const heldKeyCodes=new Set();
   const heldMouse=new Map(),mouseControlHandlers=new Map();let showMouseButtons=false,nativeMouseControls=false,wheelY=null;
   let nativeTouchpad=null,fitToInsets=false,topInset=0,bottomInset=0,cursorNeedsEntry=true;
   let bgContext=null,bgRects=null,bgAxis='x',bgDpr=1,bgDrawFrame=null,bgLoopFrame=null;
@@ -75,7 +77,18 @@ const VIEWER_SCRIPT = String.raw`
   const clamp=value=>Math.max(0,Math.min(1,value));
   function viewport(){const sw=Math.max(1,stage.clientWidth),sh=Math.max(1,stage.clientHeight),top=fitToInsets?Math.min(sh-1,topInset):0,bottom=fitToInsets?Math.min(sh-top-1,bottomInset):0;return{width:sw,height:Math.max(1,sh-top-bottom),top,bottom};}
   function layout(){const v=viewport(),scale=Math.min(v.width/dw,v.height/dh)*zoom,w=dw*scale,h=dh*scale;return{w,h,x:(v.width-w)/2+panX,y:v.top+(v.height-h)/2+panY};}
-  function boundPan(){const r=layout(),v=viewport(),margin=zoom>1?80:0;const minX=Math.min(0,v.width-r.w)-margin,maxX=Math.max(0,v.width-r.w)+margin;const minY=Math.min(0,v.height-r.h)-margin,maxY=Math.max(0,v.height-r.h)+margin;panX=Math.max(minX,Math.min(maxX,panX));panY=Math.max(minY,Math.min(maxY,panY));}
+  function boundPan(){
+    const r=layout(),v=viewport();
+    if(zoom===1){
+      panX=bounded(panX,0,Math.max(0,v.width-r.w));
+      panY=bounded(panY,0,Math.max(0,v.height-r.h));
+      return;
+    }
+    // Pan offsets start at the centered layout, so half the overflow lies on either side.
+    const travelX=Math.max(0,(r.w-v.width)/2)+80,travelY=Math.max(0,(r.h-v.height)/2)+80;
+    panX=bounded(panX,-travelX,travelX);
+    panY=bounded(panY,-travelY,travelY);
+  }
   function render(){const r=layout();if(nativeMedia&&epoch&&r.w>0&&r.h>0&&[r.x,r.y,r.w,r.h].every(Number.isFinite))post({type:'nativeViewport',x:r.x,y:r.y,width:r.w,height:r.h,fillHeight:false});for(const el of [image,video]){el.style.width=r.w+'px';el.style.height=r.h+'px';el.style.left=r.x+'px';el.style.top=r.y+'px';}if(remoteCursor){cursor.style.width=remoteCursor.width+'px';cursor.style.height=remoteCursor.height+'px';cursor.style.border='0';cursor.style.borderRadius='0';cursor.style.transform='none';cursor.style.left=(r.x+cx*r.w-remoteCursor.hotX)+'px';cursor.style.top=(r.y+cy*r.h-remoteCursor.hotY)+'px';cursor.style.display='block';cursor.style.opacity=(remoteCursor.visible||(control&&localCursorAwake))?'1':'0';}else{cursor.style.opacity='1';cursor.style.width='18px';cursor.style.height='18px';cursor.style.border='';cursor.style.borderRadius='';cursor.style.transform='';cursor.style.left=(r.x+cx*r.w)+'px';cursor.style.top=(r.y+cy*r.h)+'px';cursor.style.display=!cursorOverlay&&control&&(mode==='trackpad'||nativeTouchpad!==null||localCursorAwake)?'block':'none';}paintBackground();}
   function backgroundSegments(vw,vh){const scale=Math.min(vw/dw,vh/dh),w=dw*scale,h=dh*scale;if(w<vw){const centerW=w*.9,centerX=vw/2-centerW/2,sideW=centerX,top=(vh-h)/2;return{axis:'x',rects:[{x:0,y:top,w:sideW,h},{x:centerX,y:top,w:centerW,h},{x:centerX+centerW,y:top,w:sideW,h}]};}if(h<vh){const centerH=h*.9,centerY=vh/2-centerH/2,sideH=centerY,left=(vw-w)/2;return{axis:'y',rects:[{x:left,y:0,w,h:sideH},{x:left,y:centerY,w,h:centerH},{x:left,y:centerY+centerH,w,h:sideH}]};}return null;}
   function stopBackgroundLoop(){if(bgLoopFrame!==null)video.cancelVideoFrameCallback?.(bgLoopFrame);bgLoopFrame=null;}
@@ -95,16 +108,34 @@ const VIEWER_SCRIPT = String.raw`
   function point(p){const r=layout();return{x:clamp((p.x-r.x)/r.w),y:clamp((p.y-r.y)/r.h)};}
   function inside(p){const r=layout();return p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h;}
   function pan(dx,dy){panX+=dx;panY+=dy;cursorNeedsEntry=true;boundPan();render();}
+  function settlePan(){if(zoom===1){panX=0;panY=0;}boundPan();render();}
   const bounded=(value,min,max)=>Math.max(min,Math.min(max,value));
   function cursorViewport(){const v=viewport(),hotX=remoteCursor?.hotX??9,hotY=remoteCursor?.hotY??9,w=remoteCursor?.width??18,h=remoteCursor?.height??18,minX=Math.min(v.width-1,8+hotX),minY=Math.min(v.top+v.height-1,v.top+8+hotY);return{minX,maxX:Math.max(minX,v.width-8-(w-hotX)),minY,maxY:Math.max(minY,v.top+v.height-8-(h-hotY))};}
   function moveTouchpad(dx,dy){const r=layout(),v=cursorViewport(),area=viewport();if(cursorNeedsEntry){cx=clamp((bounded(r.x+cx*r.w,v.minX,v.maxX)-r.x)/r.w);cy=clamp((bounded(r.y+cy*r.h,v.minY,v.maxY)-r.y)/r.h);cursorNeedsEntry=false;}cx=clamp(cx+dx/r.w);cy=clamp(cy+dy/r.h);const x=r.x+cx*r.w,y=r.y+cy*r.h;if(zoom>1||r.w>area.width||r.h>area.height){panX+=bounded(x,v.minX,v.maxX)-x;panY+=bounded(y,v.minY,v.maxY)-y;}queue({kind:'move',x:cx,y:cy});render();}
   function queue(event){if(!control)return;if(event.kind==='key'||event.kind==='text'){localCursorAwake=false;render();}if(event.kind==='move'||event.kind==='button')noteLocalCursorActivity();const tail=pending[pending.length-1];if(event.kind==='move'&&tail?.kind==='move')pending[pending.length-1]=event;else if(event.kind==='scroll'&&tail?.kind==='scroll'){tail.dx=Math.max(-2000,Math.min(2000,tail.dx+event.dx));tail.dy=Math.max(-2000,Math.min(2000,tail.dy+event.dy));}else pending.push(event);if(pending.length>64){pending=[{kind:'release'}];control=false;post({type:'inputOverflow'});}}
-  function flush(){if(!pending.length||sending||controlGeneration<1)return;if(seq>=sequenceLimit){pending=[];control=false;post({type:'inputOverflow'});render();return;}const events=pending.splice(0,64),sequence=++seq;if(pc?.connectionState==='connected'&&dc?.readyState==='open'&&dc.bufferedAmount<16384)dc.send(JSON.stringify({controlGeneration,sequence,events}));else{sending=true;post({type:'input',controlGeneration,sequence,events});}}
+  function flush(releaseViaRelay=false){
+    if(!pending.length){congestionAt=null;return;}
+    if(sending||controlGeneration<1)return;
+    const direct=!releaseViaRelay&&pc?.connectionState==='connected'&&dc?.readyState==='open';
+    const stalled=!releaseViaRelay&&congestionAt!==null&&(!direct||performance.now()-congestionAt>=2000);
+    if(seq>=sequenceLimit||stalled){pending=[];congestionAt=null;control=false;post({type:'inputOverflow'});render();return;}
+    if(direct&&dc.bufferedAmount>=16384){
+      congestionAt??=performance.now();
+      return;
+    }
+    congestionAt=null;
+    const events=pending.splice(0,64),sequence=++seq;
+    if(direct){
+      dc.send(JSON.stringify({controlGeneration,sequence,events}));
+    }else{
+      sending=true;post({type:'input',controlGeneration,sequence,events});
+    }
+  }
   setInterval(()=>{if(wheelY?.moved&&!sending){const offset=Math.max(-24,Math.min(24,wheelY.y-wheelY.start));if(Math.abs(offset)>4)scrollMouse(Math.sign(offset)*(Math.abs(offset)-4)*1.5);}flush();},33);
   function click(button=0){queue({kind:'button',button,down:true,x:cx,y:cy});queue({kind:'button',button,down:false,x:cx,y:cy});flush();}
   function resetWheel(){wheelY=null;wheelGrip.style.transform='translateY(0px)';}
   function updateMouseButtons(){mouseButtons.style.display=showMouseButtons&&control&&!nativeMouseControls?'block':'none';for(const[name,button]of[['left',0],['right',2]])document.getElementById('mouse-'+name).setAttribute('aria-pressed',String(heldMouse.has(button)));}
-  function release(send=true){clearTimeout(hold);if(gestureFrame!==null)cancelAnimationFrame(gestureFrame);gestureFrame=null;if(control&&send){queue({kind:'release'});flush();}nativeTouchpad=null;heldMouse.clear();resetWheel();updateMouseButtons();drag=false;pointers.clear();start=last=multi=null;}
+  function release(send=true){clearTimeout(hold);if(gestureFrame!==null)cancelAnimationFrame(gestureFrame);gestureFrame=null;if(control&&send){queue({kind:'release'});flush();}nativeTouchpad=null;heldMouse.clear();heldKeyCodes.clear();resetWheel();updateMouseButtons();drag=false;pointers.clear();start=last=multi=null;}
   function listenMouse(element,type,handler){element.addEventListener(type,handler);mouseControlHandlers.set(element.id+':'+type,handler);}
   for(const[name,button]of[['left',0],['right',2]]){
     const element=document.getElementById('mouse-'+name);
@@ -122,7 +153,53 @@ const VIEWER_SCRIPT = String.raw`
   listenMouse(wheel,'click',event=>{if(event.detail===0&&control&&showMouseButtons){click(1);flush();}});
   listenMouse(wheel,'keydown',event=>{if(event.key==='ArrowUp'||event.key==='ArrowDown'){event.preventDefault();scrollMouse(event.key==='ArrowUp'?-120:120);}});
   function pair(){const [a,b]=[...pointers.values()];return{x:(a.x+b.x)/2,y:(a.y+b.y)/2,d:Math.hypot(a.x-b.x,a.y-b.y)};}
-  function movePair(){gestureFrame=null;if(pointers.size<2||!multi)return;const next=pair(),span=Math.abs(next.d-multi.d),travel=Math.hypot(next.x-multi.x,next.y-multi.y);if(!multi.kind){if(span>8&&span>travel*.7)multi.kind='pinch';else if(travel>8)multi.kind='scroll';}if(multi.kind==='pinch'){zoom=Math.max(1,Math.min(5,multi.zoom*next.d/Math.max(1,multi.d)));boundPan();render();}else if(multi.kind==='scroll'){const dx=next.x-multi.lastX,dy=next.y-multi.lastY;if(control&&mode!=='pan')queue({kind:'scroll',dx:Math.max(-2000,Math.min(2000,-dx)),dy:Math.max(-2000,Math.min(2000,-dy))});else pan(dx,dy);}multi.lastX=next.x;multi.lastY=next.y;}
+  function movePair(frameTime,finishing=false){
+    gestureFrame=null;
+    if(pointers.size<2||!multi)return;
+    const next=pair(),span=Math.abs(next.d-multi.d),travel=Math.hypot(next.x-multi.x,next.y-multi.y);
+    const pinchMotion=span>8&&span>travel*.7;
+    if(!multi.kind){
+      if(pinchMotion)multi.kind='pinch';
+      else if(travel>8)multi.kind='scroll';
+    }else if(multi.kind==='scroll'){
+      if(!pinchMotion)multi.pinchCandidate=null;
+      else{
+        const candidate = multi.pinchCandidate ??= { at: frameTime, d: next.d, zoom, anchor: point(next) };
+        // Parallel scroll can deliver the two pointer updates in separate frames.
+        if(frameTime-candidate.at<40){
+          if(!finishing)gestureFrame=requestAnimationFrame(movePair);
+          return;
+        }
+        multi.kind='pinch';multi.d=candidate.d;multi.zoom=candidate.zoom;multi.anchor=candidate.anchor;
+      }
+    }
+    if(multi.kind==='pinch'){
+      zoom=bounded(multi.zoom*next.d/Math.max(1,multi.d),1,5);
+      const r=layout();
+      panX+=next.x-(r.x+multi.anchor.x*r.w);
+      panY+=next.y-(r.y+multi.anchor.y*r.h);
+      cursorNeedsEntry=true;boundPan();render();
+    }else if(multi.kind==='scroll'){
+      const dx=next.x-multi.lastX,dy=next.y-multi.lastY;
+      if(control&&mode!=='pan'){
+        if(!multi.aimed&&inside(next)){
+          const target=point(next);cx=target.x;cy=target.y;
+          queue({kind:'move',x:cx,y:cy});render();
+          multi.aimed=true;
+        }
+        if(multi.aimed){
+          let wheelX=-dx,wheelY=-dy;
+          if(integerScroll){
+            const x=multi.scrollRemainderX+wheelX,y=multi.scrollRemainderY+wheelY;
+            wheelX=Math.trunc(x);wheelY=Math.trunc(y);
+            multi.scrollRemainderX=x-wheelX;multi.scrollRemainderY=y-wheelY;
+          }
+          if(wheelX||wheelY)queue({kind:'scroll',dx:bounded(wheelX,-2000,2000),dy:bounded(wheelY,-2000,2000)});
+        }
+      }else pan(dx,dy);
+    }
+    multi.lastX=next.x;multi.lastY=next.y;
+  }
   stage.addEventListener('pointerdown',event=>{
     if(pointers.has(event.pointerId))return;
     event.preventDefault();stage.setPointerCapture(event.pointerId);
@@ -138,7 +215,7 @@ const VIEWER_SCRIPT = String.raw`
       },400);
     }else{
       clearTimeout(hold);if(drag)queue({kind:'release'});drag=false;start=null;
-      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,kind:null};
+      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,anchor:point(p),kind:null,aimed:mode!=='touch',scrollRemainderX:0,scrollRemainderY:0};
     }
   });
   stage.addEventListener('pointermove',event=>{
@@ -158,6 +235,10 @@ const VIEWER_SCRIPT = String.raw`
   function pointerUp(event){
     if(!pointers.has(event.pointerId))return;
     clearTimeout(hold);
+    if(pointers.size>=2&&multi&&gestureFrame!==null){
+      pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+      cancelAnimationFrame(gestureFrame);movePair(performance.now(),true);
+    }
     const wasTap=start&&!start.moved;
     pointers.delete(event.pointerId);
     if(drag){queue({kind:'button',button:0,down:false,x:cx,y:cy});flush();drag=false;}
@@ -165,16 +246,28 @@ const VIEWER_SCRIPT = String.raw`
       if(mode==='touch'){const p=point({x:event.clientX,y:event.clientY});cx=p.x;cy=p.y;}
       click();
     }
-    start=last=multi=null;boundPan();render();
+    start=last=multi=null;settlePan();
   }
-  stage.addEventListener('pointerup',pointerUp);stage.addEventListener('pointercancel',()=>{release();boundPan();render();});
+  stage.addEventListener('pointerup',pointerUp);stage.addEventListener('pointercancel',()=>{release();settlePan();});
   stage.addEventListener('contextmenu',event=>event.preventDefault());stage.addEventListener('selectstart',event=>event.preventDefault());stage.addEventListener('dragstart',event=>event.preventDefault());
   const sentinel='\u200b';function resetKeyboard(){keyboard.value=sentinel;keyboard.setSelectionRange(1,1);}function showKeyboard(enabled){keyboardEnabled=enabled&&control;if(!keyboardEnabled){composing=false;resetKeyboard();keyboard.blur();return;}keyboard.blur();resetKeyboard();keyboard.focus({preventScroll:true});}
   function keyboardKey(code){if(!keyboardEnabled||!control)return;queue({kind:'key',code,down:true});queue({kind:'key',code,down:false});flush();}
   function commitKeyboard(){if(!keyboardEnabled||!control||composing)return;const text=keyboard.value.replace(sentinel,'');if(text){for(let index=0;index<text.length;index+=4096)queue({kind:'text',text:text.slice(index,index+4096)});flush();}resetKeyboard();}
   keyboard.addEventListener('compositionstart',()=>{composing=true;});keyboard.addEventListener('compositionend',()=>{composing=false;commitKeyboard();});keyboard.addEventListener('input',event=>{if(!event.isComposing)commitKeyboard();});keyboard.addEventListener('beforeinput',event=>{if(composing||event.isComposing)return;if(event.inputType==='deleteContentBackward'){event.preventDefault();keyboardKey('Backspace');}else if(event.inputType==='insertLineBreak'||event.inputType==='insertParagraph'){event.preventDefault();keyboardKey('Enter');}});
   const normalizedKey=code=>/^(Shift|Control|Alt|Meta)Right$/.test(code)?code.replace(/Right$/,'Left'):code;
-  document.addEventListener('keydown',event=>{if(mouseButtons.contains(event.target))return;const code=normalizedKey(event.code);if(control&&validKeys.has(code)){event.preventDefault();queue({kind:'key',code,down:true});}});document.addEventListener('keyup',event=>{if(mouseButtons.contains(event.target))return;const code=normalizedKey(event.code);if(control&&validKeys.has(code)){event.preventDefault();queue({kind:'key',code,down:false});}});window.addEventListener('blur',()=>{release();if(epoch)post({type:'mouseControlsRetired'});});new ResizeObserver(()=>{release();if(epoch)post({type:'mouseControlsRetired'});cursorNeedsEntry=true;boundPan();render();}).observe(stage);
+  document.addEventListener('keydown',event=>{
+    const code=normalizedKey(event.code);
+    if(!control||!validKeys.has(code)||mouseButtons.contains(event.target))return;
+    const localText=keyboardEnabled&&document.activeElement===keyboard&&!event.ctrlKey&&!event.metaKey&&!event.altKey
+      &&Array.from(event.key).length===1;
+    if(localText&&!heldKeyCodes.has(event.code))return;
+    event.preventDefault();heldKeyCodes.add(event.code);queue({kind:'key',code,down:true});
+  });
+  document.addEventListener('keyup',event=>{
+    if(!heldKeyCodes.delete(event.code)||!control)return;
+    event.preventDefault();queue({kind:'key',code:normalizedKey(event.code),down:false});
+  });
+  window.addEventListener('blur',()=>{release();if(epoch)post({type:'mouseControlsRetired'});});new ResizeObserver(()=>{release();if(epoch)post({type:'mouseControlsRetired'});cursorNeedsEntry=true;boundPan();render();}).observe(stage);
   function retainFrame(){if(!videoPresented||video.readyState<2||!video.videoWidth||!video.videoHeight)return;const canvas=document.createElement('canvas');try{const scale=Math.min(1,1280/Math.max(video.videoWidth,video.videoHeight));canvas.width=Math.max(1,Math.round(video.videoWidth*scale));canvas.height=Math.max(1,Math.round(video.videoHeight*scale));const context=canvas.getContext('2d');if(context){context.drawImage(video,0,0,canvas.width,canvas.height);image.src=canvas.toDataURL('image/jpeg',.7);}}catch{}finally{canvas.width=canvas.height=0;}}
   function presentationActive(){return video.webkitPresentationMode==='picture-in-picture'||document.pictureInPictureElement===video;}
   function presentationSupported(){try{return video.webkitSupportsPresentationMode?.('picture-in-picture')===true||document.pictureInPictureEnabled===true;}catch{return false;}}
@@ -204,8 +297,8 @@ const VIEWER_SCRIPT = String.raw`
         try{dc.send(wire);}catch{post({type:'channelReply',attemptId,reply:{type:'reply',id:request.id,ok:false,error:'REMOTE_DESKTOP_REQUEST_RESULT_UNKNOWN'}});}break;
       }
       case'init':
-        release();showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();cursorOverlay=message.cursorOverlay===true;resetCursor();pending=[];sending=false;
-        control=false;controlGeneration=0;
+        release();showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();cursorOverlay=message.cursorOverlay===true;resetCursor();pending=[];sending=false;congestionAt=null;
+        control=false;controlGeneration=0;integerScroll=message.integerScroll===true;
         seq=Number.isSafeInteger(message.sequenceBase)&&message.sequenceBase>=0?message.sequenceBase:0;
         sequenceLimit=Number.isSafeInteger(message.sequenceLimit)&&message.sequenceLimit>seq?message.sequenceLimit:Number.MAX_SAFE_INTEGER;
         epoch=message.epoch;dw=message.width;dh=message.height;zoom=1;panX=panY=0;cursorNeedsEntry=true;fitToInsets=false;topInset=bottomInset=0;video.muted=message.audio!==true;retries=0;render();
@@ -263,20 +356,27 @@ const VIEWER_SCRIPT = String.raw`
       }
       case'control':{
         const generation=message.enabled===true&&Number.isSafeInteger(message.controlGeneration)&&message.controlGeneration>0?message.controlGeneration:0;
-        if(generation!==controlGeneration||generation===0){pending=[];release(false);sending=false;}
+        if(generation!==controlGeneration||generation===0){
+          const releaseHost=control&&generation===0&&message.release===true;
+          pending=[];congestionAt=null;release(false);sending=false;
+          if(releaseHost){
+            // The newer release sequence fences the outstanding relay batch.
+            pending=[{kind:'release'}];flush(true);sending=false;
+          }
+        }
         controlGeneration=generation;control=generation>0;if(!control)showKeyboard(false);updateMouseButtons();render();break;
       }
       case'mode':release();mode=message.mode;render();break;
       case'fit':zoom=1;panX=panY=0;cursorNeedsEntry=true;render();break;
       case'keyboard':showKeyboard(message.enabled===true);break;
       case'click':if(message.button===0||message.button===1||message.button===2)click(message.button);break;
-      case'releaseInput':pending=[];release();break;
+      case'releaseInput':pending=[];congestionAt=null;release();break;
       case'events':for(const event of message.events||[])queue(event);flush();break;
       case'ack':if(message.epoch===epoch&&message.sequence===seq)sending=false;break;
       case'videoSettings':video.muted=message.audio!==true;retries=0;if(!nativeMedia)connect();break;
       case'presentation':void setPresentation(message.enabled===true);break;
       case'stop':
-        void setPresentation(false);showKeyboard(false);release();control=false;controlGeneration=0;showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();resetCursor();cursorOverlay=false;pending=[];sending=false;epoch=null;closeRtc(message.preserveFrame===true);render();break;
+        void setPresentation(false);showKeyboard(false);release();control=false;controlGeneration=0;showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();resetCursor();cursorOverlay=false;pending=[];sending=false;congestionAt=null;epoch=null;closeRtc(message.preserveFrame===true);render();break;
     }
   }
   window.__jokoRemoteDesktop={receive};window.addEventListener('message',event=>{try{receive(typeof event.data==='string'?JSON.parse(event.data):event.data);}catch{}});document.addEventListener('message',event=>{try{receive(typeof event.data==='string'?JSON.parse(event.data):event.data);}catch{}});render();post({type:'ready'});

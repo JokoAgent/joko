@@ -3,7 +3,7 @@ import { act, createElement, forwardRef, useEffect, useRef, useState, type Compo
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { SessionSchema, SessionState, SnapshotSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
-  SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema } from "@joko/contracts";
+  SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
@@ -48,6 +48,7 @@ const suggestTaskTitle = vi.fn(async (_key: string, _signal: AbortSignal) => cre
 }));
 const alert = vi.fn();
 const reconcile = vi.fn(async () => {});
+const dismissUnconfirmed = vi.fn(async (_operationId: string) => {});
 const refresh = vi.fn(async () => {});
 const writeClipboard = vi.fn(async () => true);
 const draftValues = new Map<string, string>();
@@ -93,7 +94,7 @@ let learningPartner: typeof profilePartner | undefined;
 let collaborationApi: import("./mobile-collaboration").MobileCollaborationApi | undefined;
 let learningProfileProps: ComponentProps<typeof import("./MobilePartnerProfileSheet").MobilePartnerProfileSheet> | undefined;
 const client = new Proxy({
-  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, refresh,
+  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, dismissUnconfirmed, refresh,
   taskQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
   subscribe: () => () => {}, taskForeground: () => true, taskQueueCapabilities: () => ({}), taskPendingImagePasteCount: () => 0,
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
@@ -250,7 +251,7 @@ beforeEach(async () => {
   headerSourceEpoch = 0;
   vi.useFakeTimers();
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
-  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, refresh,
+  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
   draftFlush.mockReset().mockImplementation(originalDraftFlush);
@@ -313,6 +314,19 @@ async function renderTask(patch: Partial<TaskProps> = {}): Promise<void> {
 async function closeTaskDrawer(): Promise<void> { await act(async () => finishDrawerClose?.()); }
 
 describe("actual Home navigation hosts", () => {
+  it.each(["android", "ios"] as const)("bounds the %s task title dots while retaining all tag names", async platform => {
+    platformOS = platform;
+    const tags = Array.from({ length: 32 }, (_, index) => create(TaskTagSchema, {
+      taskTagId: `tag-${index}`, name: `Tag ${index}`, color: TaskTagColor.BLUE
+    }));
+    state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, sessions: state.detail!.sessions.map(session =>
+      session.sessionId === "current" ? create(SessionSchema, { ...session, taskTags: tags }) : session) }) };
+
+    await renderTask();
+
+    expect(headerProps.titleAccessory).toMatchObject({ props: { maximum: 7, tags } });
+  });
+
   it("offers current-task rename, pin and archive/restore with the exact task and read-only exclusions", async () => {
     await renderTask();
     expect(headerProps.actions.filter(action => ["rename", "pin", "archive", "delete"].includes(action.id)).map(action => action.id))
@@ -501,6 +515,23 @@ describe("actual Home navigation hosts", () => {
     await option(message("common.archive"));
     expect(prepareSessionArchive).toHaveBeenCalledExactlyOnceWith("current");
     expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true, archiveConfirmation);
+  });
+
+  it("opens the original tag operation recovery from Home without selecting a task", async () => {
+    await render({ currentSessionId: undefined, state: { ...state, selectedId: undefined, detail: undefined,
+      pending: [{ operationId: "original-tag-receipt", kind: "task-tag", state: "unknown", connectionId: homeConnectionId, sessionId: "other" }] } });
+    expect(host.textContent).toContain("original-tag-receipt");
+    await press(message("receipt.check"));
+    expect(reconcile).toHaveBeenCalledOnce();
+    await press(message("receipt.verify"));
+    const confirm = (alert.mock.calls.at(-1)?.[2] as { text: string; onPress?: () => void }[])
+      .find(action => action.text === message("receipt.verify"))?.onPress;
+    expect(confirm).toBeDefined();
+    expect(dismissUnconfirmed).not.toHaveBeenCalled();
+    await act(async () => confirm!());
+    expect(dismissUnconfirmed).toHaveBeenCalledExactlyOnceWith("original-tag-receipt");
+    expect(select).not.toHaveBeenCalled();
+    expect(runNavigation).not.toHaveBeenCalled();
   });
 
   it("retires debounced reads on unmount and does not read or navigate while hidden", async () => {

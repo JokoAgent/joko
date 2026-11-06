@@ -682,6 +682,7 @@ const mobileTaskMessageRows = [
   ["interaction.step.pending", "Pending", "待处理", "待處理", "保留中", "대기 중"],
   ["interaction.field.required", "{label} is required.", "{label} 为必填项。", "{label} 為必填項。", "{label} は必須です。", "{label}은(는) 필수입니다."],
   ["interaction.field.text", "{label} requires text.", "{label} 需要文本。", "{label} 需要文字。", "{label} にはテキストが必要です。", "{label}에는 텍스트가 필요합니다."],
+  ["interaction.field.credential", "Remove credentials from {label}.", "请移除「{label}」中的凭据。", "請移除「{label}」中的憑證。", "{label} から認証情報を削除してください。", "{label}에서 인증 정보를 제거하세요."],
   ["interaction.field.boolean", "{label} requires yes or no.", "{label} 需要选择是或否。", "{label} 需要選擇是或否。", "{label} では「はい」か「いいえ」を選択してください。", "{label}에는 예 또는 아니요가 필요합니다."],
   ["interaction.field.oneChoice", "{label} requires one choice.", "{label} 需要选择一项。", "{label} 需要選取一項。", "{label} では1件選択してください。", "{label}에는 하나의 선택이 필요합니다."],
   ["interaction.field.choiceUnavailable", "{label} contains a choice that is no longer available.", "{label} 包含已不可用的选项。", "{label} 包含已無法使用的選項。", "{label} に利用できなくなった選択肢が含まれています。", "{label}에 더 이상 사용할 수 없는 선택 항목이 있습니다."],

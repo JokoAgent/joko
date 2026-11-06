@@ -62,7 +62,7 @@ import type {
   UserShellResult,
   UsageSnapshot
 } from "@joko/core";
-import { JokoError, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
+import { JokoError, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
 import {
   AuthorizationError,
   ensureSideChatHistoryBoundary,
@@ -19426,7 +19426,7 @@ function validatedQuestionAnswer(
       if (field.required && candidate["value"].trim() === "") {
         throw invalidInteractionDecision("Question response is missing required text.");
       }
-      return { kind: "text", value: candidate["value"] };
+      return { kind: "text", value: ordinaryQuestionText(candidate["value"]) };
     }
     case "single": {
       if (!hasExactKeys(candidate, ["kind", "value"]) || typeof candidate["value"] !== "string") {
@@ -19437,7 +19437,7 @@ function validatedQuestionAnswer(
         return { kind: "single", selection: { kind: "choice", choiceId: candidate["value"] } };
       }
       if (candidate["kind"] === "other" && field.allowOther && candidate["value"].trim() !== "") {
-        return { kind: "single", selection: { kind: "other", text: candidate["value"] } };
+        return { kind: "single", selection: { kind: "other", text: ordinaryQuestionText(candidate["value"]) } };
       }
       if (candidate["kind"] === "other" && !field.allowOther) {
         throw invalidInteractionDecision("Question response supplied free text for a field that does not allow it.");
@@ -19474,7 +19474,7 @@ function validatedQuestionAnswer(
       return {
         kind: "multiple",
         choiceIds: [...values],
-        ...(otherText === undefined ? {} : { otherText })
+        ...(otherText === undefined ? {} : { otherText: ordinaryQuestionText(otherText) })
       };
     }
     case "boolean":
@@ -19484,6 +19484,11 @@ function validatedQuestionAnswer(
       }
       return { kind: "boolean", value: candidate["value"] };
   }
+}
+
+function ordinaryQuestionText(value: string): string {
+  if (containsRecognizedCredential(value)) throw invalidInteractionDecision("Remove credentials from the question response.");
+  return value;
 }
 
 function declaredQuestionChoices(
