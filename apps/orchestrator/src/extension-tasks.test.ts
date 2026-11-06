@@ -16,7 +16,7 @@ import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { ExtensionTasks, type ExtensionTaskOwner } from "./extension-tasks.js";
 import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
 import { ExtensionProjectPolicies, extensionProjectForTarget } from "./extension-project-policy.js";
-import { SessionHelperToolProvider } from "./session-helper-tool-provider.js";
+import { SessionHelperToolBridgeProvider } from "./session-helper-tool-provider.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -285,7 +285,7 @@ it("keeps account-wide history closed while an uninstalled plugin's Worker still
   f.store.appendEvent({ id: "outside-worker-history", backendId: leadSession.backendId, targetId: leadSession.targetId,
     sessionId: leadSession.id, generation: leadSession.binding.generation, traceId: "history-fixture",
     payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original account history marker" }] } });
-  const helpers = new SessionHelperToolProvider({ store: f.store, host: () => f.host });
+  const helpers = new SessionHelperToolBridgeProvider({ store: f.store, host: () => f.host });
   const history = () => helpers.callTool("call_tool", { name: "get_chat_history", args: { session_ids: [lead.taskId] } }, undefined,
     { sessionId: workerId, targetId: target.id, generation: live.sessionGeneration! });
   expect(f.tasks.nativeToolAuthorization(workerId)).toBeDefined();
