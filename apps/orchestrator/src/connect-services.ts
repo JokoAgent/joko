@@ -8841,7 +8841,7 @@ function parseWorkspaceDiff(
       if (path !== undefined) {
         if (current !== undefined) files.push(current);
         files.push(create(contract.FileDiffSchema, {
-          relativePath: path, oldRelativePath: path, status: contract.GitFileStatus.CONFLICTED, source
+          relativePath: path, oldRelativePath: path, status: contract.GitFileStatus.CONFLICTED, binary: false, hunks: [], source
         }));
         current = undefined;
         currentHunk = undefined;
