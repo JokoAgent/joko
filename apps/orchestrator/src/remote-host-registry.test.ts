@@ -569,6 +569,64 @@ describe("RemoteHostRegistry host trust", () => {
     expect(closes.every((close) => close.mock.calls.length === 1)).toBe(true);
   });
 
+  it("requires the existing endpoint key before a second alias can authenticate", async () => {
+    const fixture = createFixture();
+    const originalKey = Uint8Array.of(1, 2, 3, 4), otherKey = Uint8Array.of(4, 3, 2, 1);
+    let presented = originalKey;
+    const authenticating = vi.fn();
+    const connector = recordingConnector(async request => {
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: presented });
+      authenticating(request.user);
+      request.onAuthenticating();
+      return { close: async () => undefined };
+    });
+    const registry = fixture.registry({ connector, credentials: { resolve: () => "temporary-auth" } });
+    const original = registry.create(hostCreate({ credentialReferenceId: "agent:original" }));
+    const ready = await registry.test(original.targetId, original.id, original.revision);
+    expect(ready.ok).toBe(true);
+    presented = otherKey;
+    const changed = await registry.test(original.targetId, original.id, ready.host.revision);
+    expect(changed.failure?.code).toBe("host_key_changed");
+
+    const alias = registry.create(hostCreate({ id: "second-alias", user: "other-user", credentialReferenceId: "agent:alias" }));
+    const refused = await registry.connect(alias.targetId, alias.id, alias.revision);
+    expect(refused).toMatchObject({ ok: false, failure: { code: "host_key_changed" } });
+    expect(refused.host.trust).toBeUndefined();
+    expect(registry.get(original.targetId, original.id).trust).toEqual(ready.host.trust);
+    expect(authenticating.mock.calls).toEqual([[original.user]]);
+
+    presented = originalKey;
+    const matched = await registry.connect(alias.targetId, alias.id, refused.host.revision);
+    expect(matched.ok).toBe(true);
+    expect(matched.host.trust?.fingerprint).toBe(sshHostKeyFingerprint(originalKey));
+    expect(authenticating.mock.calls).toEqual([[original.user], [alias.user]]);
+  });
+
+  it("serializes first-use pins from aliases of the same endpoint", async () => {
+    const fixture = createFixture();
+    let arrivals = 0;
+    let release!: () => void;
+    const rendezvous = new Promise<void>((resolve) => { release = resolve; });
+    const authenticating = vi.fn();
+    const connector = recordingConnector(async (request, call) => {
+      if (++arrivals === 2) release();
+      await rendezvous;
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(call + 1) });
+      authenticating(request.user);
+      request.onAuthenticating();
+      return { close: async () => undefined };
+    });
+    const registry = fixture.registry({ connector, credentials: { resolve: () => "temporary-auth" } });
+    const a = registry.create(hostCreate({ credentialReferenceId: "agent:first" }));
+    const b = registry.create(hostCreate({ targetId: "target-b", id: "other-alias", hostname: a.hostname.toUpperCase(),
+      user: "other-user", credentialReferenceId: "agent:second" }));
+    const outcomes = await Promise.all([registry.connect(a.targetId, a.id, a.revision), registry.connect(b.targetId, b.id, b.revision)]);
+    expect(outcomes.filter(outcome => outcome.ok)).toHaveLength(1);
+    expect(outcomes.find(outcome => !outcome.ok)?.failure?.code).toBe("host_key_changed");
+    expect(outcomes.filter(outcome => outcome.host.trust !== undefined)).toHaveLength(1);
+    expect(authenticating).toHaveBeenCalledOnce();
+  });
+
   it("allows one DB-backed first-use pin and fails a concurrent first-use connection closed", async () => {
     const fixture = createFixture();
     let arrivals = 0;

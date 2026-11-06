@@ -156,11 +156,13 @@ export function sshHostKeyFingerprint(key: Uint8Array): string {
 }
 
 export function sshHostKeyPinId(hostname: string, port: number, algorithm: string): string {
+  return `${sshHostKeyEndpointId(hostname, port)}|${validateAlgorithm(algorithm)}`;
+}
+
+export function sshHostKeyEndpointId(hostname: string, port: number): string {
   const acceptedHostname = canonicalSshHostname(hostname);
   const acceptedPort = validatePort(port);
-  const acceptedAlgorithm = validateAlgorithm(algorithm);
-  const endpoint = acceptedHostname.includes(":") ? `[${acceptedHostname}]:${acceptedPort}` : `${acceptedHostname}:${acceptedPort}`;
-  return `${endpoint}|${acceptedAlgorithm}`;
+  return acceptedHostname.includes(":") ? `[${acceptedHostname}]:${acceptedPort}` : `${acceptedHostname}:${acceptedPort}`;
 }
 
 function canonicalSshHostname(value: string): string {
