@@ -4151,7 +4151,7 @@ function validateGitRemoteName(value: string): string {
   return value;
 }
 
-function gitRemoteUrlContainsCredentials(value: string): boolean {
+export function gitRemoteUrlContainsCredentials(value: string): boolean {
   const scheme = /^([a-z][a-z0-9+.-]*):\/\//iu.exec(value)?.[1]?.toLowerCase();
   if (scheme !== undefined) {
     try {
