@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
-import { claudeWorkspaceAuthority, loadClaudeRemoteManagerSource } from "@joko/adapter-claude-code";
+import { claudeInputDispatchFence, claudeWorkspaceAuthority, loadClaudeRemoteManagerSource } from "@joko/adapter-claude-code";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   ClaudeSessionStoreOperationAccess,
@@ -572,6 +572,42 @@ describe("RemoteClaudeRuntimeResolver", () => {
     expect(() => binding.assertCurrent()).toThrow("manager_generation_changed");
   });
 
+  it.each([false, true])("rechecks the exact input before writing to an attached bridge after Skill retirement=%s", async retired => {
+    let allowAttachment!: () => void, allowInput!: () => void;
+    const attachment = new Promise<void>(resolve => { allowAttachment = resolve; });
+    const input = new Promise<void>(resolve => { allowInput = resolve; });
+    const fixture = createFixture({ beforeAttachReply: () => attachment });
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    let current = true;
+    const check = vi.fn(() => { if (!current) throw new Error("Original Skill authority retired."); });
+    const consumed = vi.fn();
+    const message: ClaudeSdkUserMessage = { type: "user", message: { role: "user", content: "expanded original Skill" },
+      parent_tool_use_id: null, origin: { kind: "human" }, uuid: INPUT_ID, [claudeInputDispatchFence]: check };
+    const query = await binding.runtime.query({ ...queryParams(undefined, undefined, false, undefined, {}, []),
+      prompt: (async function* () { await input; consumed(); yield message; })() });
+    try {
+      fixture.processes.disconnectQuery();
+      allowInput();
+      await waitUntil(() => consumed.mock.calls.length === 1 && fixture.processes.attachRequests.length === 1);
+      expect(check).not.toHaveBeenCalled();
+      current = !retired;
+      allowAttachment();
+      const output = query[Symbol.asyncIterator]().next();
+      if (retired) {
+        await expect(output).rejects.toThrow("Original Skill authority retired.");
+        expect(fixture.processes.inputRequests).toHaveLength(0);
+        expect(fixture.processes.inputEffects).toBe(0);
+      } else {
+        await expect(output).resolves.toMatchObject({ done: false, value: { type: "assistant" } });
+        expect(fixture.processes.inputRequests).toMatchObject([{ id: INPUT_ID,
+          params: { message: { uuid: INPUT_ID, message: { content: "expanded original Skill" } } } }]);
+        expect(fixture.processes.inputEffects).toBe(1);
+      }
+      expect(check).toHaveBeenCalledOnce();
+    } finally { allowInput(); allowAttachment(); await binding.runtime.retireQuery(query, 2_000); }
+  });
+
   it("fails closed on a replay gap and fences Target or SSH drift before another manager request", async () => {
     const fixture = createFixture({ replayGapOnce: true });
     cleanups.push(() => fixture.resolver.close());
@@ -783,6 +819,7 @@ describe("RemoteClaudeRuntimeResolver", () => {
 });
 
 interface FixtureOptions {
+  readonly beforeAttachReply?: () => Promise<void>;
   readonly devicePeerWin32?: boolean;
   readonly dropStartResponseOnce?: boolean;
   readonly dropInputResponseOnce?: boolean;
@@ -1065,6 +1102,10 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
       this.#query.attachmentId = crypto.randomUUID();
       const afterSeq = Number(params.afterSeq);
       for (const event of this.#events) if (Number(event.seq) > afterSeq) process.send(event);
+      if (this.#options.beforeAttachReply !== undefined) {
+        void this.#options.beforeAttachReply().then(() => process.respond(frame.id, this.#attachment()));
+        return;
+      }
       return process.respond(frame.id, this.#attachment());
     }
     if (frame.method === "query.input") {

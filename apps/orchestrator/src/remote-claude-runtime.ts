@@ -8,6 +8,7 @@ import { JSONRPCMessageSchema } from "@modelcontextprotocol/sdk/types.js";
 import {
   CLAUDE_AGENT_SDK_VERSION,
   ClaudeSessionStoreError,
+  claudeInputDispatchFence,
   claudeWorkspaceAuthority,
   type ClaudeCanUseToolOptions,
   type ClaudePermissionResult,
@@ -372,6 +373,7 @@ interface RemoteClaudeSdkRuntimeOptions {
 
 class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
   readonly packageVersion = CLAUDE_AGENT_SDK_VERSION;
+  readonly fencesRemoteInputDispatch = true;
   readonly supportsWorkspaceDerivation = true;
   readonly storedSessions: ClaudeSdkStoredSessionRuntime;
   readonly freshContexts: ClaudeSdkFreshContextRuntime;
@@ -1208,6 +1210,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
   }
 
   async #sendInput(message: ClaudeSdkUserMessage): Promise<void> {
+    const beforeWrite = message[claudeInputDispatchFence];
     let previous: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const channel = await this.#ensureChannel();
@@ -1218,7 +1221,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
           attachmentId,
           requestId: message.uuid,
           message
-        }, { id: message.uuid, timeoutMs: REQUEST_TIMEOUT_MS });
+        }, { id: message.uuid, timeoutMs: REQUEST_TIMEOUT_MS, ...(beforeWrite === undefined ? {} : { beforeWrite }) });
         return;
       } catch (error) {
         previous = error;
@@ -1633,7 +1636,7 @@ class RemoteClaudeManagerChannel {
   request(
     method: string,
     params: Readonly<Record<string, unknown>>,
-    options: { readonly id?: string; readonly timeoutMs: number; readonly signal?: AbortSignal }
+    options: { readonly id?: string; readonly timeoutMs: number; readonly signal?: AbortSignal; readonly beforeWrite?: () => void }
   ): Promise<unknown> {
     if (!this.active) return Promise.reject(transportFault("connection_closed"));
     this.#options.assertCurrent();
@@ -1660,7 +1663,11 @@ class RemoteClaudeManagerChannel {
         ...(options.signal === undefined ? {} : { signal: options.signal, abort })
       });
       options.signal?.addEventListener("abort", abort!, { once: true });
-      this.#send({ v: REMOTE_CLAUDE_PROTOCOL_VERSION, kind: "request", id, method, params }).catch((error) => {
+      const beforeWrite = options.beforeWrite;
+      this.#send({ v: REMOTE_CLAUDE_PROTOCOL_VERSION, kind: "request", id, method, params }, beforeWrite === undefined ? undefined : () => {
+        if (!this.#pending.has(id)) throw transportFault("request_cancelled", false);
+        beforeWrite();
+      }).catch((error) => {
         const pending = this.#pending.get(id);
         if (pending === undefined) return;
         this.#pending.delete(id);
@@ -1769,7 +1776,7 @@ class RemoteClaudeManagerChannel {
     this.#fail(transportFault("protocol_error"));
   }
 
-  #send(value: unknown): Promise<void> {
+  #send(value: unknown, beforeWrite?: () => void): Promise<void> {
     if (!this.active) return Promise.reject(transportFault("connection_closed"));
     let bytes: Buffer;
     try { bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8"); }
@@ -1777,6 +1784,7 @@ class RemoteClaudeManagerChannel {
     if (bytes.byteLength > MAXIMUM_LINE_BYTES) return Promise.reject(runtimeFault("frame_too_large", false));
     const operation = this.#writeTail.then(async () => {
       this.#options.assertCurrent();
+      beforeWrite?.();
       await writeProcessBytes(this.#process, bytes);
     });
     this.#writeTail = operation.catch(() => undefined);
