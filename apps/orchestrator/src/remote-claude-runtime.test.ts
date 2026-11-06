@@ -159,7 +159,11 @@ describe("RemoteClaudeRuntimeResolver", () => {
     ]);
     expect(fixture.processes.freshRequests[0]?.params.identity).toEqual(identity);
     expect(fixture.processes.freshRequests[6]?.params).toEqual({ authority, input: current, proof });
-    expect(fixture.processes.requests.filter((request) => request.executable === "/bin/sh")).toHaveLength(1);
+    const shell = fixture.processes.requests.filter((request) => request.executable === "/bin/sh");
+    expect(shell).toHaveLength(2);
+    expect(shell[0]?.args[2]).not.toBe("joko-claude-admission");
+    expect(shell[1]).toMatchObject({ cwd: "/srv/project", args: ["-c", expect.any(String), "joko-claude-admission",
+      "/home/test/.joko/runtime/v1/claude-code/.joko-runtime-ready-v1", expect.any(String)] });
     for (const route of fixture.processes.requests.filter((request) => request.executable !== "/bin/sh")) {
       expect(route).toMatchObject({
         executable: "/home/test/.joko/runtime/v1/claude-code/current/node/bin/node", cwd: "/srv/project"

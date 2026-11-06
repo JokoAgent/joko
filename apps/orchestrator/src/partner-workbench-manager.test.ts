@@ -399,9 +399,14 @@ async function fixture(additionalAdapters: readonly FakeBackendAdapter[] = [], o
   mkdirSync(managed); mkdirSync(project); mkdirSync(home);
   const store = new OperationalStore(join(managed, "operational.db")); const partnerStore = new PartnerStore(join(managed, "partners.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(managed, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
-  const adapter = new CatalogAdapter(PROFILE); const host = new SessionHost(store, artifacts, [adapter, ...additionalAdapters]); await host.initialize();
+  let partners: PartnerManager | undefined;
+  const adapter = new CatalogAdapter(PROFILE);
+  const host = new SessionHost(store, artifacts, [adapter, ...additionalAdapters], {
+    partnerSessionRetiring: id => partnerStore.isPartnerSessionRetiring(id) || partners?.isRoutineSessionRetiring(id) === true
+  });
+  await host.initialize();
   const homesRoot = join(managed, "partner-homes"); const workspace = { register: vi.fn(async (input: { id: string; root: string; displayName: string; trusted: boolean }) => input), unregister: vi.fn() };
-  const partners = new PartnerManager({ store: partnerStore, operationalStore: store, sessionHost: host, workspaceService: workspace, homesRoot });
+  partners = new PartnerManager({ store: partnerStore, operationalStore: store, sessionHost: host, workspaceService: workspace, homesRoot });
   const partner = await partners.createPartner({ requestId: "creation-request-workbench", expectedDirectoryRevision: partnerStore.directoryState().revision, displayName: "Aster", avatar: "orbit", identitySource: "You help with ongoing projects.", templateId: "general", usesDirectoryDefaults: false,
     capabilities: { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
   const sessionTasks = new PartnerSessionTaskManager(store, partners, host, workspace, managed); await sessionTasks.initialize();

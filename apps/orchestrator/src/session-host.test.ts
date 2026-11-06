@@ -15139,7 +15139,7 @@ describe("SessionHost", () => {
 
     const { host: restarted } = await open();
     expect(store.getRun(admitted.runId).descriptor.state).toBe("dispatch_unknown");
-    await restarted.getTree(sessionId);
+    await restarted.inspect(sessionId);
     const expected = suffix === "different turn" ? "dispatch_unknown" : "failed";
     expect(store.getQueueItem(admitted.queueItemId).state).toBe(expected);
     expect(store.getRun(admitted.runId).descriptor.state).toBe(expected);
@@ -16742,7 +16742,7 @@ class HostServiceRecoveryProcess extends EventEmitter implements PiProcessHandle
         }
       }
     });
-    if (options.recovering) {
+    if (this.serviceRecovery !== undefined) {
       queueMicrotask(() => {
         this.#send({ type: "response", id: "old-service-request", command: "prompt", success: true });
         this.#send({ type: "message_start", message: { role: "assistant", content: [] } });

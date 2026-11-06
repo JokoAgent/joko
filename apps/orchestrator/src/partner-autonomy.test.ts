@@ -26,8 +26,12 @@ async function fixture(permissionMode: "ask" | "bypassPermissions" = "ask") {
   await artifacts.initialize(); const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE,
     capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
       ? { ...capability, options: PI_LIKE_PROFILE.permissionModes } : capability) });
-  const host = new SessionHost(store, artifacts, [adapter]); await host.initialize();
-  const partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host, homesRoot: join(directory, "homes"),
+  let partners: PartnerManager | undefined;
+  const host = new SessionHost(store, artifacts, [adapter], {
+    partnerSessionRetiring: id => profiles.isPartnerSessionRetiring(id) || partners?.isRoutineSessionRetiring(id) === true
+  });
+  await host.initialize();
+  partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host, homesRoot: join(directory, "homes"),
     workspaceService: { register: async input => input, unregister: () => undefined } });
   const created = await partners.createPartner({ requestId: "autonomy-owner-create", expectedDirectoryRevision: profiles.directoryState().revision,
     displayName: "Ada", avatar: "orbit", identitySource: "Help review the owner's work.", templateId: "general", usesDirectoryDefaults: false,
@@ -95,7 +99,7 @@ describe("Partner task observation", () => {
 
   it("scopes a live Full Access follow-up helper to its own delegated task", async () => {
     const f = await fixture("bypassPermissions");
-    const worker = await f.partners.createPartner({ requestId: "autonomy-worker", expectedDirectoryRevision: f.profiles.directoryState().revision,
+    const worker = await f.partners.createPartner({ requestId: "autonomy-worker-test", expectedDirectoryRevision: f.profiles.directoryState().revision,
       displayName: "Worker", avatar: "orbit", identitySource: "Work on assigned tasks.", templateId: "general",
       usesDirectoryDefaults: false, capabilities: f.partner.capabilities });
     let failedDelegation = false;

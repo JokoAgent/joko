@@ -86,6 +86,7 @@ function fixture(
     readConsoleMessages,
     readHttpRequestSummaries,
     resolvePageId: vi.fn((targetId?: string) => targetId ?? "page-1"),
+    uploadDocumentId: vi.fn(() => "original-browser-document"),
     resolveElementSelector: vi.fn((_pageId: string, target: { selector?: string; ref?: string; query?: { role?: string } }) =>
       target.selector ?? (target.ref === undefined ? `role=${target.query?.role ?? "button"}` : `ref=${target.ref}`)),
     focusPage: vi.fn(async () => ({ id: "page-1", url: "https://example.test/", title: "Example", state: "ready" as const })),
@@ -1171,7 +1172,7 @@ describe("BrowserToolBridgeProvider", () => {
     });
     expect(get).toHaveBeenCalledWith("artifact-1");
     expect(upload).toHaveBeenCalledWith(expect.objectContaining({ id: "artifact-1" }), "page-1", "input[type=file]", {
-      id: "pi-browser:6"
+      id: "pi-browser:6", documentId: "original-browser-document", assertCurrent: expect.any(Function)
     });
     expect(JSON.stringify(uploaded)).not.toContain("D:\\private");
     expect(JSON.stringify(uploaded)).toContain("transfer-1");
