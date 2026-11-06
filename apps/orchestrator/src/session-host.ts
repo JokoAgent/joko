@@ -32,6 +32,7 @@ import type {
   NativeSessionForkResult,
   NativeSessionNavigationResult,
   NativeHistoryProjection,
+  AcceptedNativeTurnOutcome,
   NativeSessionState,
   NativeSessionStart,
   MessageAutomationOrigin,
@@ -354,11 +355,14 @@ interface NativeDispatchRecoveryJournal {
   readonly entries: readonly NativeDispatchRecoveryBaseline[];
 }
 
-interface NativeDispatchRecoveryCompletion {
+interface NativeDispatchHistoryOwnership {
   readonly baseline: NativeDispatchRecoveryBaseline;
-  readonly outcome: "completed" | "aborted" | "failed";
+  readonly outcome: AcceptedNativeTurnOutcome;
   readonly nativeEntryIds: ReadonlySet<string>;
+  readonly codexTurnId?: string;
 }
+
+type NativeDispatchRecoveryCompletion = NativeDispatchHistoryOwnership & { readonly outcome: Exclude<AcceptedNativeTurnOutcome, "in_progress"> };
 
 interface ReviewRuntimeFlight {
   readonly accepted: Promise<void>;
@@ -14615,6 +14619,26 @@ export class SessionHost {
       ...(binding === undefined ? {} : { binding }),
       ...(operationId === undefined ? {} : { operationId }),
       signal,
+      ...(runId !== undefined && attemptId !== undefined && runtimePolicy === undefined
+        && target.remoteWorkspace?.kind === "ssh" && backend.adapterKind === "codex"
+        && this.#store.findRun(runId)?.descriptor.source === "user" ? {
+          observeAcceptedNativeTurn: async (nativeTurnId: string) => {
+            const state = (): QueueItemRecord["state"] | undefined => {
+              if (this.#disposed || this.#store.getBackend(target.backendId).descriptor.instanceGeneration !== backendInstanceGeneration) return undefined;
+              const session = this.#store.getSession(sessionId).descriptor, run = this.#store.findRun(runId)?.descriptor;
+              const item = this.#store.findQueueItemByRunId(sessionId, runId);
+              return session.binding.generation === generation && session.binding.opaqueRef === binding?.opaqueRef
+                && !session.archived && session.deletedAt === undefined
+                && run?.source === "user" && run.activeAttemptId === attemptId
+                && item?.attemptId === attemptId && item.operationId === operationId ? item.state : undefined;
+            };
+            const before = state();
+            if (before === "dispatching") return undefined;
+            if (before !== "backend_accepted") return "retired";
+            const observed = await this.synchronizeNativeHistory(sessionId, {}, { runId, attemptId, nativeTurnId });
+            return state() === "backend_accepted" ? observed : "retired";
+          }
+        } : {}),
       ...(this.#partnerLearning === undefined || runtimePolicy === "review_read_only" || runId === undefined || attemptId === undefined
         ? {} : { capturePartnerLearningTurn: (input: { readonly nativeOccurrence: string; readonly nativeTurnId?: string }) =>
           this.capturePartnerLearningTurn(context, runId, attemptId, input) }),
@@ -16047,10 +16071,11 @@ export class SessionHost {
 
   private synchronizeNativeHistory(
     sessionId: string,
-    allowance: BackendSideEffectAdmissionAllowance = {}
-  ): Promise<void> {
+    allowance: BackendSideEffectAdmissionAllowance = {},
+    confirmation?: { readonly runId: string; readonly attemptId: string; readonly nativeTurnId: string }
+  ): Promise<AcceptedNativeTurnOutcome | undefined> {
     const active = this.#active.get(sessionId);
-    if (active?.adapter.getNativeHistoryProjection === undefined) return Promise.resolve();
+    if (active?.adapter.getNativeHistoryProjection === undefined) return Promise.resolve(undefined);
     let lease: ActiveBackendSideEffectLease;
     try {
       lease = this.beginActiveBackendSideEffect(sessionId, active, undefined, allowance);
@@ -16059,7 +16084,7 @@ export class SessionHost {
     }
     const previous = this.#nativeHistoryTails.get(sessionId) ?? Promise.resolve();
     const operation = previous.catch(() => undefined).then(async () => {
-      if (this.#disposed) return;
+      if (this.#disposed) return undefined;
       this.assertActiveBackendSideEffectLease(lease);
       const stored = lease.stored;
       const history = await active.adapter.getNativeHistoryProjection!(lease.context);
@@ -16089,6 +16114,7 @@ export class SessionHost {
               : candidateRecovery!.outcome === "aborted" ? "aborted" : "failed"
           )
         : undefined;
+      let confirmed: AcceptedNativeTurnOutcome | undefined;
       const recovered = this.#store.transaction((store) => {
         const journal = nativeDispatchRecoveryJournal(store.findSetting(
           "session",
@@ -16101,10 +16127,14 @@ export class SessionHost {
           ? undefined
           : nativeDispatchRecoveryIsCompleted(store, current.descriptor, baseline, history);
         const acceptedOwners = journal?.entries.flatMap((entry) => {
-          const ownership = nativeDispatchHistoryOwnership(store, current.descriptor, entry, history, "accepted");
+          const ownership = nativeDispatchHistoryOwnership(store, current.descriptor, entry, history, "accepted", confirmation?.nativeTurnId);
           return ownership === undefined ? [] : [ownership];
         }) ?? [];
         const historyOwner = recovered ?? (acceptedOwners.length === 1 ? acceptedOwners[0] : undefined);
+        if (confirmation !== undefined && recovered === undefined && historyOwner !== undefined
+          && historyOwner.baseline.runId === confirmation.runId && historyOwner.baseline.attemptId === confirmation.attemptId
+          && historyOwner.codexTurnId === confirmation.nativeTurnId) confirmed = historyOwner.outcome;
+        if (confirmation !== undefined && (confirmed === undefined || confirmed === "in_progress")) return undefined;
         this.appendNativeHistory(
           store,
           current.descriptor,
@@ -16189,6 +16219,7 @@ export class SessionHost {
         void this.reconcileScheduledWorktrees();
         void this.drain(sessionId);
       }
+      return confirmed;
     }).finally(() => lease.release());
     const tail = operation.then(() => undefined, () => undefined);
     this.#nativeHistoryTails.set(sessionId, tail);
@@ -18107,7 +18138,8 @@ function nativeDispatchRecoveryIsCompleted(
   baseline: NativeDispatchRecoveryBaseline,
   history: NativeHistoryProjection
 ): NativeDispatchRecoveryCompletion | undefined {
-  return nativeDispatchHistoryOwnership(store, session, baseline, history, "recovery");
+  const ownership = nativeDispatchHistoryOwnership(store, session, baseline, history, "recovery");
+  return ownership === undefined || ownership.outcome === "in_progress" ? undefined : { ...ownership, outcome: ownership.outcome };
 }
 
 function nativeDispatchHistoryOwnership(
@@ -18115,8 +18147,9 @@ function nativeDispatchHistoryOwnership(
   session: SessionDescriptor,
   baseline: NativeDispatchRecoveryBaseline,
   history: NativeHistoryProjection,
-  mode: "recovery" | "accepted"
-): NativeDispatchRecoveryCompletion | undefined {
+  mode: "recovery" | "accepted",
+  expectedCodexTurnId?: string
+): NativeDispatchHistoryOwnership | undefined {
   const lineage = history.activeLineage;
   if (
     (mode === "recovery" ? session.binding.generation <= baseline.generation
@@ -18153,7 +18186,6 @@ function nativeDispatchHistoryOwnership(
     || (mode === "recovery" ? attempt.descriptor.endedAt === undefined : attempt.descriptor.endedAt !== undefined)) return undefined;
 
   const suffixLineage = lineage.slice(baseline.lineageCount);
-  if (suffixLineage.length < 2) return undefined;
   let expectedParent = baseline.activeEntryId;
   const suffixIds = new Set<string>();
   for (const entry of suffixLineage) {
@@ -18181,7 +18213,22 @@ function nativeDispatchHistoryOwnership(
   const terminalEvents = eventsByEntry.get(suffixLineage.at(-1)!.entryId) ?? [];
   const terminalAssistantMessages = terminalEvents.filter((event) =>
     event.payload.type === "message_complete" && event.payload.role === "assistant");
-  if (terminalAssistantMessages.length !== 1) return undefined;
+  const turnId = userMessages[0]!.metadata?.fields["turnId"];
+  const codexTurnStatus = (key: string, state: string): boolean =>
+    typeof turnId === "string" && turnId !== ""
+    && terminalEvents.some(event => event.projectionKind === "turn_status" && event.contentIndex === 0
+      && event.payload.type === "status" && event.payload.key === key && event.metadata?.fields["turnStatus"] === state)
+    && [...eventsByEntry.values()].every(events => events.every(event =>
+      event.metadata?.namespace === "codex.native_history" && event.metadata.fields["turnId"] === turnId));
+  if (expectedCodexTurnId !== undefined && turnId === expectedCodexTurnId) {
+    if (codexTurnStatus("native_turn_in_progress", "inProgress")) return { baseline, outcome: "in_progress", nativeEntryIds: suffixIds, codexTurnId: turnId };
+    if (codexTurnStatus("native_turn_failed", "failed")) return { baseline, outcome: "failed", nativeEntryIds: suffixIds, codexTurnId: turnId };
+    if (codexTurnStatus("native_turn_interrupted", "interrupted")) return { baseline, outcome: "aborted", nativeEntryIds: suffixIds, codexTurnId: turnId };
+  }
+  if (mode === "recovery" && terminalAssistantMessages.length === 0 && codexTurnStatus("native_turn_failed", "failed")) {
+    return { baseline, outcome: "failed", nativeEntryIds: suffixIds };
+  }
+  if (suffixLineage.length < 2 || terminalAssistantMessages.length !== 1) return undefined;
   const terminalOutcome = terminalAssistantMessages[0]!.metadata?.fields["nativeTerminalOutcome"];
   if (terminalOutcome !== "completed" && terminalOutcome !== "aborted" && terminalOutcome !== "failed") {
     return undefined;
@@ -18189,7 +18236,8 @@ function nativeDispatchHistoryOwnership(
   return {
     baseline,
     outcome: terminalOutcome,
-    nativeEntryIds: suffixIds
+    nativeEntryIds: suffixIds,
+    ...(typeof turnId === "string" && terminalOutcome === "completed" && codexTurnStatus("native_turn_completed", "completed") ? { codexTurnId: turnId } : {})
   };
 }
 

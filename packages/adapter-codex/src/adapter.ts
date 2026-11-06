@@ -3,6 +3,7 @@ import type { Dirent, Stats } from "node:fs";
 import { mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join, normalize, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   CAPABILITIES,
   catalogModelReferencePricing,
@@ -24,6 +25,7 @@ import {
   MEMORY_NATIVE_LIVE_LOCAL_OPTION,
   MEMORY_NATIVE_RESET_LOCAL_OPTION,
   type AdapterContext,
+  type AcceptedNativeTurnOutcome,
   type PartnerLearningTurnHandle,
   type PartnerLearningToolAuthority,
   type BackendDescriptor,
@@ -4686,8 +4688,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         onDisconnect: async (fault) => {
           if (!this.#matchesCallbackFence(runtime, input.hostGeneration) || runtime.disconnectTerminalEmitted) return;
           const activeYieldClaim = runtime.yieldContinuation;
+          const activeTurnId = runtime.state.activeTurnId;
           const ownsRootTerminal = activeYieldClaim === undefined
-            ? runtime.yieldTerminalOwner === undefined
+            ? runtime.yieldTerminalOwner === undefined && (runtimeHasProductWork(runtime) || runtime.pendingTurnStart !== undefined)
             : claimYieldProductTerminal(runtime, activeYieldClaim);
           runtime.dispatchLifetime.abort();
           this.#cancelYieldContinuation(runtime);
@@ -4697,9 +4700,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           runtime.smartRoute = undefined;
           runtime.disconnectTerminalEmitted = true;
           this.#cancelPendingServerRequests(runtime);
-          runtime.state.activeTurnId = undefined;
           const context = runtime.activeTurnContext ?? runtime.context;
           const emit = runtime.partnerLearningTurn?.emit ?? context.emit;
+          const observe = activeYieldClaim === undefined && activeTurnId !== undefined && fault.code === "process_exited"
+            && context.observeAcceptedNativeTurn !== undefined
+            ? () => context.observeAcceptedNativeTurn!(activeTurnId).catch(() => undefined) : undefined;
+          if (observe === undefined) runtime.state.activeTurnId = undefined;
           await this.#emitNativeTaskPayloads(
             runtime,
             runtime.nativeTasks.terminateActive("failed", {
@@ -4716,25 +4722,31 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             false
           );
           if (ownsRootTerminal && this.#matchesCallbackFence(runtime, input.hostGeneration)) {
-            await emit({
-              type: "error",
-              error: {
-                code: "CODEX_APP_SERVER_DISCONNECTED",
-                message: "The Codex app-server disconnected during the native Session.",
-                phase: "stream",
-                retryable: true,
-                stateMayHaveChanged: fault.stateMayHaveChanged,
-                recovery: "Reconnect and resume the native thread before sending additional work."
-              },
-              terminal: true
-            }, { namespace: "codex.app_server", fields: { state: "disconnected" } });
-            if (this.#matchesCallbackFence(runtime, input.hostGeneration)) {
-              await emit({ type: "done", outcome: "failed" }, {
-                namespace: "codex.app_server",
-                fields: { state: "disconnected" }
-              });
+            const current = () => this.#matchesCallbackFence(runtime, input.hostGeneration);
+            const settle = async (outcome: AcceptedNativeTurnOutcome | "retired" | undefined) => {
+              if (!current() || outcome === "in_progress") return;
+              runtime.state.activeTurnId = undefined;
+              if (outcome === "retired") return;
+              const metadata = { namespace: "codex.app_server", fields: { state: outcome === undefined ? "disconnected" : "reconciled" } };
+              if (outcome === undefined || outcome === "failed") await emit({ type: "error", terminal: true, error: {
+                code: outcome === undefined ? "CODEX_APP_SERVER_DISCONNECTED" : "CODEX_NATIVE_TURN_FAILED",
+                message: outcome === undefined ? "The Codex app-server disconnected during the native Session."
+                  : "The original Codex turn failed on the remote Host.",
+                phase: "stream", retryable: true, stateMayHaveChanged: outcome === "failed" || fault.stateMayHaveChanged,
+                recovery: outcome === undefined ? "Reconnect and resume the native thread before sending additional work."
+                  : "Inspect the original native turn before sending additional work."
+              } }, metadata);
+              if (current()) await emit({ type: "done", outcome: outcome ?? "failed" }, metadata);
+            };
+            const observed = await observe?.();
+            if (observed === "in_progress" && observe !== undefined) {
+              // Keep the original accepted Run in its queue position while
+              // observing the same native turn through the read-only route.
+              void observeDisconnectedTurn(observe, current, context.signal).then(settle).catch(() => undefined);
+            } else {
+              await settle(observed);
             }
-          }
+          } else runtime.state.activeTurnId = undefined;
           this.#settleCompaction(runtime, adapterError({
             code: "CODEX_COMPACTION_INTERRUPTED",
             message: "The Codex app-server disconnected during native compaction.",
@@ -8397,6 +8409,22 @@ function stateFromRuntime(runtime: SessionRuntime, thread?: NativeThread): Nativ
     planMode: runtime.planMode,
     ...(runtime.state.usage === undefined ? {} : { usage: runtime.state.usage })
   };
+}
+
+async function observeDisconnectedTurn(
+  observe: () => Promise<AcceptedNativeTurnOutcome | "retired" | undefined>,
+  current: () => boolean,
+  signal: AbortSignal
+): Promise<AcceptedNativeTurnOutcome | "retired"> {
+  let interval = 1_000;
+  while (current() && !signal.aborted) {
+    await delay(interval, undefined, { signal, ref: false });
+    if (!current()) break;
+    const observed = await observe();
+    if (observed !== undefined && observed !== "in_progress") return observed;
+    interval = Math.min(interval * 2, 15_000);
+  }
+  return "retired";
 }
 
 function runtimeHasProductWork(runtime: SessionRuntime): boolean {
