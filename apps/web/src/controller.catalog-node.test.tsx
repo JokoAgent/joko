@@ -3,9 +3,9 @@ import { act, type Ref } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAppController, type AppController } from "./controller.js";
-import { createOrchestratorGateway, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
+import { createOrchestratorGateway, GatewayError, probeOrchestratorOrigin, type GatewayCallbacks, type OrchestratorGateway } from "./gateway.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
-import { emptySnapshot, type AppSnapshot, type ConnectionProfile, type ModelPriceOverrideView, type ModelView } from "./model.js";
+import { emptySnapshot, type AppSnapshot, type ConnectionProfile, type MachineCacheView, type ModelPriceOverrideView, type ModelView } from "./model.js";
 import { registerCatalogNavigationLeave } from "./catalog-navigation-leave.js";
 import { ModelPriceOverrideDialog } from "./components/ModelPriceOverrideDialog.js";
 import { translate } from "./i18n.js";
@@ -107,6 +107,45 @@ it("preserves the current catalog when the other node is offline and rejects an 
   expect(view.app()!.state.activeProfile?.id).toBe(a.id);
 });
 
+it("keeps an already authorized machine refresh retired after the live connection rejects its credential", async () => {
+  const view = await mount();
+  await act(async () => view.app()!.refreshMachines());
+  const originalCache = view.caches.get(b.id);
+  expect(originalCache?.sessions).toMatchObject([{ name: "Private task", taskTags: [{ name: "Private tag" }] }]);
+  const probe = view.probe.getMockImplementation()!;
+  view.probe.mockImplementation(async origin => {
+    if (origin === b.origin) throw new Error("offline");
+    return probe(origin);
+  });
+  await act(async () => view.app()!.refreshMachines());
+  expect(view.app()!.state.machinePresenceByProfile[b.id]).toBe("offline");
+  expect(view.caches.get(b.id)).toBe(originalCache);
+  view.probe.mockImplementation(probe);
+  const started = deferred(), finish = deferred();
+  view.holdRefresh(b.id, async () => { started.resolve(); await finish.promise; });
+  let refresh!: Promise<void>;
+  await act(async () => { refresh = view.app()!.refreshMachines(); await started.promise; });
+  let previousWrites: number;
+  try {
+    const stream = view.liveCallbacks.get(b.id)!;
+    await act(async () => {
+      await stream.onAuthenticationInvalidated!(new GatewayError("The connection is revoked.", { code: "unauthenticated" }));
+    });
+    expect(view.deleteAuthKey).toHaveBeenCalledWith(b.id);
+    expect(view.deleteMachineCache).toHaveBeenCalledWith(b.id);
+    expect(view.app()!.state.machinePresenceByProfile[b.id]).toBe("accessDenied");
+    previousWrites = view.saveMachineCache.mock.calls.filter(([cache]) => cache.profileId === b.id).length;
+  } finally {
+    await act(async () => { finish.resolve(); await refresh; });
+  }
+  expect(view.saveMachineCache.mock.calls.filter(([cache]) => cache.profileId === b.id)).toHaveLength(previousWrites);
+  expect(view.caches.has(b.id)).toBe(false);
+  expect(view.app()!.state.machineCaches.some(cache => cache.profileId === b.id)).toBe(false);
+  expect(view.app()!.state.machinePresenceByProfile[b.id]).toBe("accessDenied");
+  expect(view.app()!.state.activeProfile?.id).toBe(a.id);
+  expect(view.caches.has(c.id)).toBe(true);
+});
+
 it("discards a late catalog probe after navigation and lets the latest explicit node selection win", async () => {
   const view = await mount();
   const release = deferred(); view.hold(b.id, release.promise);
@@ -190,21 +229,31 @@ async function mount(connectFirst = true, showPrice = false, showEditor = false)
   const getPrice = vi.fn(async () => price()), savePrice = vi.fn(async () => price()), closePrice = vi.fn();
   let emit = () => {};
   const held = new Map<string, Promise<void>>();
+  const refreshGates = new Map<string, () => Promise<void>>();
+  const liveCallbacks = new Map<string, GatewayCallbacks>();
+  const caches = new Map<string, MachineCacheView>();
+  const saveMachineCache = vi.fn(async (cache: MachineCacheView) => { caches.set(cache.profileId, cache); });
+  const deleteMachineCache = vi.fn(async (id: string) => { caches.delete(id); });
+  const deletedKeys = new Set<string>();
+  const deleteAuthKey = vi.fn(async (id: string) => { deletedKeys.add(id); });
   const probe = vi.mocked(probeOrchestratorOrigin).mockImplementation(async origin => identity([a, b, c].find(value => value.origin === origin)!));
-  const auth = vi.fn(async (_owner: ConnectionProfile) => "private-test-bearer");
+  const auth = vi.fn(async (owner: ConnectionProfile) => deletedKeys.has(owner.id) ? undefined : "private-test-bearer");
   vi.spyOn(LocalState, "open").mockResolvedValue({ listProfiles: async () => [a, b, c], listMachineCaches: async () => [],
     readPreferences: async () => DEFAULT_UI_PREFERENCES, readAuthKey: auth, saveProfile: async () => undefined, deleteProfile,
     loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
-    saveMachineCache: async () => undefined, deleteMachineCache: async () => undefined,
+    saveMachineCache, deleteMachineCache, deleteAuthKey,
     mutatePreferences: async (update: (value: typeof DEFAULT_UI_PREFERENCES) => typeof DEFAULT_UI_PREFERENCES) => update(DEFAULT_UI_PREFERENCES)
   } as unknown as LocalState);
   vi.mocked(createOrchestratorGateway).mockImplementation((owner, _key, callbacks) => {
     const value = owner!, active = callbacks.onExtensionUiEffect !== undefined;
+    if (callbacks.onLiveSnapshot !== undefined) liveCallbacks.set(value.id, callbacks);
     if (active) emit = () => callbacks.onSnapshot?.({ ...snapshot(value), models: [{ ...priceModel }] });
     return { connect: async () => {
+      const captured = snapshot(value);
       if (!active && callbacks.onSnapshot) await held.get(value.id);
+      if (!active && callbacks.onLiveSnapshot === undefined) await refreshGates.get(value.id)?.();
       if (active) activeConnections.push(value.id);
-      callbacks.onSnapshot?.(snapshot(value)); callbacks.onState?.("connected");
+      callbacks.onSnapshot?.(captured); callbacks.onState?.("connected");
     }, disconnect: () => { if (active) retiredProfiles.push(value.id); }, taskSharingApi: () => undefined,
     inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined,
     refresh: async () => callbacks.onSnapshot?.(snapshot(value)),
@@ -224,7 +273,9 @@ async function mount(connectFirst = true, showPrice = false, showEditor = false)
   await act(async () => { root!.render(<Probe />); await settle(); });
   await vi.waitFor(() => expect(app?.state.ready).toBe(true));
   if (connectFirst) await act(async () => { await app!.connect(a); await settle(); });
-  return { app: () => app, actions, probe, auth, activeConnections, retiredProfiles, saveDocument, deleteProfile, hold: (id: string, promise: Promise<void>) => held.set(id, promise), emit: () => emit(), getPrice, savePrice, closePrice };
+  return { app: () => app, actions, probe, auth, activeConnections, retiredProfiles, saveDocument, deleteProfile,
+    hold: (id: string, promise: Promise<void>) => held.set(id, promise), holdRefresh: (id: string, gate: () => Promise<void>) => refreshGates.set(id, gate),
+    liveCallbacks, caches, saveMachineCache, deleteMachineCache, deleteAuthKey, emit: () => emit(), getPrice, savePrice, closePrice };
 }
 const priceModel: ModelView = { backendId: "backend", providerId: "provider", providerName: "Provider", modelId: "model", name: "Model", available: true,
   supportsImages: false, inputModalities: ["text"], outputModalities: ["text"], supportsFast: false, efforts: [], currencyCode: "USD",
@@ -234,6 +285,10 @@ function price(): ModelPriceOverrideView { return { backendId: priceModel.backen
 function profile(id: string): ConnectionProfile { return { id: `connection-${id}`, serverId: `node-${id}`, deviceId: `device-${id}`, origin: `https://${id}.example`, name: id.toUpperCase() }; }
 function identity(owner: ConnectionProfile) { return { serverId: owner.serverId, displayName: owner.name, version: "1", apiVersion: "1", pairingEnabled: true }; }
 function snapshot(owner: ConnectionProfile): AppSnapshot { return { ...emptySnapshot(), generation: 1n,
+  sessions: owner.id !== b.id ? [] : [{ id: "private-task", name: "Private task", targetId: "project-b", backendId: "backend",
+    generation: 1n, state: "idle", pinned: false, archived: false, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1,
+    taskTags: [{ id: "private-tag", name: "Private tag", color: "blue", nameCustomized: true, sortOrder: 0, revision: 1n,
+      associationRevision: 1n, createdAt: 1, updatedAt: 1 }] }],
   remoteConnections: [{ id: owner.id, deviceId: owner.deviceId, name: owner.name, state: "connected" }],
   devices: [{ id: owner.deviceId, name: owner.name, defaultDisplayName: owner.name, revision: 1n, kind: "web", platform: "web", appVersion: "1", revoked: false, remoteControlEnabled: false, presence: "online" }] }; }
 function deferred() { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; }

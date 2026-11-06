@@ -443,6 +443,7 @@ export function useAppController(): AppController {
   const entryLastSwitchRef = useRef(0);
   const managedRetryRef = useRef(false);
   const machineRefreshGenerationRef = useRef(0);
+  const machineCacheAuthorityRef = useRef(new Map<string, MachineCacheAuthority>());
   const machineRefreshPromiseRef = useRef<Promise<void> | undefined>(undefined);
   const machineFailureBackoffRef = useRef(new Map<string, { readonly failures: number; readonly retryAt: number; readonly profileKey?: string }>());
   const machineSwitchIntentRef = useRef(0);
@@ -1687,6 +1688,8 @@ export function useAppController(): AppController {
         await local.saveProfile(connectedProfile, connectedAuthKey);
       }
       if (gatewayGenerationRef.current !== generation) return;
+      forgottenProfilesRef.current.delete(connectedProfile.id);
+      machineCacheAuthorityRef.current.set(connectedProfile.id, { profileKey: remoteMachineProfileKey(connectedProfile), revoked: false });
       setState((current) => ({
         ...current,
         profiles: profiles ?? [...current.profiles.filter((profile) => profile.id !== connectedProfile.id), connectedProfile],
@@ -2048,22 +2051,68 @@ export function useAppController(): AppController {
     void openSourcePartner(partnerSourceKey(profile), route.partnerId, route.preparation ? "preparation" : "settings").catch(error => setState(current => ({ ...current, error: messageOf(error) })));
   }, [state.ready, state.route, state.activeProfile?.id, state.connectionState, openSourcePartner]);
 
+  const machineCacheRevoked = useCallback((profile: ConnectionProfile): boolean => {
+    const authority = machineCacheAuthorityRef.current.get(profile.id);
+    return profile.managedLocal !== true && authority?.revoked === true && authority.profileKey === remoteMachineProfileKey(profile);
+  }, []);
+
+  const currentMachineCacheOwner = useCallback((profile: ConnectionProfile, authority: MachineCacheAuthority | undefined): boolean => {
+    const profileKey = remoteMachineProfileKey(profile);
+    return machineCacheAuthorityRef.current.get(profile.id) === authority
+      && !forgottenProfilesRef.current.has(profile.id)
+      && profilesRef.current.some(candidate => remoteMachineProfileKey(candidate) === profileKey);
+  }, []);
+
+  const revokeMachineCache = useCallback(async (profile: ConnectionProfile, local: LocalState): Promise<void> => {
+    const profileKey = remoteMachineProfileKey(profile);
+    const retired = { profileKey, revoked: true };
+    machineCacheAuthorityRef.current.set(profile.id, retired);
+    const binding = remoteMachineGatewaysRef.current.get(profile.id);
+    if (binding?.profileKey === profileKey) {
+      remoteMachineGatewaysRef.current.delete(profile.id);
+      if (binding.retryTimer !== undefined) window.clearTimeout(binding.retryTimer);
+      if (binding.activityTimer !== undefined) window.clearTimeout(binding.activityTimer);
+      binding.gateway?.disconnect();
+    }
+    setState(current => machineCacheAuthorityRef.current.get(profile.id) === retired ? ({
+      ...current,
+      machineCaches: current.machineCaches.filter(cache => cache.profileId !== profile.id),
+      nativeTaskStatusLiveSources: current.nativeTaskStatusLiveSources?.filter(source => source.profile.id !== profile.id),
+      machinePresenceByProfile: { ...current.machinePresenceByProfile, [profile.id]: "accessDenied" }
+    }) : current);
+    await Promise.all([
+      local.deleteMachineCache(profile.id),
+      ...(shouldDeleteInvalidatedConnectionCredential(profile) ? [local.deleteAuthKey(profile.id)] : [])
+    ]);
+  }, []);
+
   const loadMachineSnapshot = useCallback(async (profile: ConnectionProfile): Promise<AppSnapshot> => {
+    const authority = machineCacheAuthorityRef.current.get(profile.id);
+    const current = (): boolean => currentMachineCacheOwner(profile, authority);
+    const assertCurrent = (): void => {
+      if (machineCacheRevoked(profile)) throw new MachineAccessDeniedError("This machine no longer accepts the saved connection. Pair it again.");
+      if (!current()) throw new MachineSnapshotRetiredError("The saved machine changed while reading its task directory.");
+    };
+    assertCurrent();
     if (profile.id === activeProfileRef.current?.id && connectionStateRef.current === "connected") return snapshotRef.current;
-    await requireLocal(localRef.current).loadEndpointTransport(profile);
+    const local = requireLocal(localRef.current);
+    await local.loadEndpointTransport(profile);
+    assertCurrent();
     rememberEndpointTrust(profile);
     const identity = await probeOrchestratorOrigin(profile.origin);
+    assertCurrent();
     if (identity.serverId !== profile.serverId) {
-      await requireLocal(localRef.current).deleteMachineCache(profile.id);
-      setState((current) => ({
-        ...current,
-        machineCaches: current.machineCaches.filter((cache) => cache.profileId !== profile.id),
-        machinePresenceByProfile: { ...current.machinePresenceByProfile, [profile.id]: "identityMismatch" }
-      }));
+      await local.deleteMachineCache(profile.id);
+      assertCurrent();
+      setState((value) => current() ? ({
+        ...value,
+        machineCaches: value.machineCaches.filter((cache) => cache.profileId !== profile.id),
+        machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "identityMismatch" }
+      }) : value);
       throw new MachineIdentityError("This address now belongs to a different Joko node. Pair it again before switching machines.");
     }
-    const local = requireLocal(localRef.current);
     const authKey = await local.readAuthKey(profile);
+    assertCurrent();
     if (authKey === undefined) throw new Error("The saved connection secret is unavailable. Pair this device again.");
     let captured: AppSnapshot | undefined;
     let invalidated: GatewayError | undefined;
@@ -2075,33 +2124,31 @@ export function useAppController(): AppController {
       await transient.connect();
       if (invalidated) throw invalidated;
     } catch (error) {
+      assertCurrent();
       if (isEndpointTrustError(error)) {
         machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
         throw error;
       }
       if (invalidated) {
-        await local.deleteMachineCache(profile.id);
-        setState((current) => ({
-          ...current,
-          machineCaches: current.machineCaches.filter((cache) => cache.profileId !== profile.id),
-          machinePresenceByProfile: { ...current.machinePresenceByProfile, [profile.id]: "accessDenied" }
-        }));
+        await revokeMachineCache(profile, local);
         throw new MachineAccessDeniedError("This machine no longer accepts the saved connection. Pair it again.");
       }
       throw error;
     } finally {
       transient.disconnect();
     }
+    assertCurrent();
     if (captured === undefined) throw new Error("The machine returned no authoritative task snapshot.");
     const cache = machineCacheFromSnapshot(profile, captured);
     await local.saveMachineCache(cache);
-    setState((current) => ({
-      ...current,
-      machineCaches: upsertMachineCache(current.machineCaches, cache),
-      machinePresenceByProfile: { ...current.machinePresenceByProfile, [profile.id]: "online" }
-    }));
+    assertCurrent();
+    setState((value) => current() ? ({
+      ...value,
+      machineCaches: upsertMachineCache(value.machineCaches, cache),
+      machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "online" }
+    }) : value);
     return captured;
-  }, []);
+  }, [currentMachineCacheOwner, machineCacheRevoked, revokeMachineCache]);
 
   const runMachineRefresh = useCallback((manual: boolean): Promise<void> => {
     const inFlight = machineRefreshPromiseRef.current;
@@ -2109,6 +2156,9 @@ export function useAppController(): AppController {
     const refresh = (async (): Promise<void> => {
       const generation = ++machineRefreshGenerationRef.current;
       const profiles = [...profilesRef.current];
+      const owners = new Map(profiles.map(profile => [profile.id, {
+        profile, authority: machineCacheAuthorityRef.current.get(profile.id)
+      }] as const));
       const active = activeProfileRef.current;
       const selected = new Set(selectedMachineProfileIds(preferencesRef.current.machineSelection, profiles));
       if (manual) {
@@ -2118,13 +2168,15 @@ export function useAppController(): AppController {
             ...current.machinePresenceByProfile,
             ...Object.fromEntries(profiles.map((profile) => [
               profile.id,
-              profile.id === active?.id && connectionStateRef.current === "connected" ? "current" : "checking"
+              machineCacheRevoked(profile) ? "accessDenied"
+                : profile.id === active?.id && connectionStateRef.current === "connected" ? "current" : "checking"
             ] as const))
           }
         }));
       }
       const local = requireLocal(localRef.current);
-      const results = await Promise.all(profiles.map(async (profile): Promise<readonly [string, MachinePresenceView] | undefined> => {
+      const results = await Promise.all([...owners.values()].map(async ({ profile, authority }): Promise<readonly [string, MachinePresenceView] | undefined> => {
+        if (machineCacheRevoked(profile)) return [profile.id, "accessDenied"];
         if (profile.id === active?.id && connectionStateRef.current === "connected") return [profile.id, "current"];
         let backoff = machineFailureBackoffRef.current.get(profile.id);
         if (backoff?.profileKey !== undefined && backoff.profileKey !== remoteMachineProfileKey(profile)) {
@@ -2133,13 +2185,17 @@ export function useAppController(): AppController {
         if (!manual && backoff !== undefined && backoff.retryAt > Date.now()) return undefined;
         try {
           await local.loadEndpointTransport(profile);
+          if (!currentMachineCacheOwner(profile, authority)) return undefined;
           rememberEndpointTrust(profile);
           const identity = await probeOrchestratorOrigin(profile.origin);
+          if (!currentMachineCacheOwner(profile, authority)) return undefined;
           machineFailureBackoffRef.current.delete(profile.id);
           if (identity.serverId !== profile.serverId) {
             await local.deleteMachineCache(profile.id);
             if (machineRefreshGenerationRef.current === generation) {
-              setState((current) => ({ ...current, machineCaches: current.machineCaches.filter((cache) => cache.profileId !== profile.id) }));
+              setState((current) => currentMachineCacheOwner(profile, authority) ? ({
+                ...current, machineCaches: current.machineCaches.filter((cache) => cache.profileId !== profile.id)
+              }) : current);
             }
             return [profile.id, "identityMismatch"];
           }
@@ -2149,10 +2205,12 @@ export function useAppController(): AppController {
             return [profile.id, "online"];
           } catch (error) {
             if (error instanceof MachineAccessDeniedError) return [profile.id, "accessDenied"];
+            if (error instanceof MachineSnapshotRetiredError) return undefined;
             if (error instanceof MachineIdentityError || isEndpointTrustError(error)) return [profile.id, "identityMismatch"];
             return [profile.id, "online"];
           }
         } catch (error) {
+          if (!currentMachineCacheOwner(profile, authority)) return undefined;
           if (isEndpointTrustError(error)) {
             machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
             return [profile.id, "identityMismatch"];
@@ -2171,7 +2229,11 @@ export function useAppController(): AppController {
         ...current,
         machinePresenceByProfile: {
           ...current.machinePresenceByProfile,
-          ...Object.fromEntries(results.filter((entry): entry is readonly [string, MachinePresenceView] => entry !== undefined))
+          ...Object.fromEntries(results.flatMap((entry): ReadonlyArray<readonly [string, MachinePresenceView]> => {
+            if (entry === undefined) return [];
+            const owner = owners.get(entry[0]);
+            return owner !== undefined && currentMachineCacheOwner(owner.profile, owner.authority) ? [entry] : [];
+          }))
         }
       }));
     })();
@@ -2182,7 +2244,7 @@ export function useAppController(): AppController {
       if (machineRefreshPromiseRef.current === refresh) machineRefreshPromiseRef.current = undefined;
     });
     return refresh;
-  }, [loadMachineSnapshot]);
+  }, [currentMachineCacheOwner, loadMachineSnapshot, machineCacheRevoked]);
 
   const refreshMachines = useCallback((): Promise<void> => runMachineRefresh(true), [runMachineRefresh]);
 
@@ -2403,10 +2465,11 @@ export function useAppController(): AppController {
       setState(value => ({ ...value, nativeTaskStatusLiveSources: value.nativeTaskStatusLiveSources?.filter(source => source.profile.id !== profileId) }));
     }
     for (const profile of desired.values()) {
-      if (remoteMachineGatewaysRef.current.has(profile.id)) continue;
+      if (remoteMachineGatewaysRef.current.has(profile.id) || machineCacheRevoked(profile)) continue;
       const blocked = machineFailureBackoffRef.current.get(profile.id);
       if (blocked?.retryAt === Infinity && blocked.profileKey === remoteMachineProfileKey(profile)) continue;
       const epoch = ++remoteMachineGatewayEpochRef.current;
+      const cacheAuthority = machineCacheAuthorityRef.current.get(profile.id);
       const binding = {
         epoch,
         profileKey: remoteMachineProfileKey(profile),
@@ -2423,22 +2486,20 @@ export function useAppController(): AppController {
       remoteMachineGatewaysRef.current.set(profile.id, binding);
       const current = (): boolean => {
         const registered = remoteMachineGatewaysRef.current.get(profile.id);
-        const savedProfile = profilesRef.current.find((candidate) => candidate.id === profile.id);
         return registered === binding
           && registered.epoch === epoch
           && registered.profileKey === binding.profileKey
-          && savedProfile !== undefined
-          && remoteMachineProfileKey(savedProfile) === binding.profileKey;
+          && currentMachineCacheOwner(profile, cacheAuthority);
       };
       let streamEpoch = epoch;
       const publishActivity = (): void => {
         if (!current()) return;
         binding.liveEpoch = binding.connected && binding.snapshot ? streamEpoch : undefined;
-        setState(value => ({ ...value, nativeTaskStatusLiveSources: [
+        setState(value => current() ? ({ ...value, nativeTaskStatusLiveSources: [
           ...(value.nativeTaskStatusLiveSources ?? []).filter(source => source.profile.id !== profile.id),
           ...(binding.connected && binding.snapshot ? [{ profile, epoch: streamEpoch, snapshot: binding.snapshot, partners: binding.partners,
             artworkByPartnerId: binding.artworkByPartnerId }] : [])
-        ] }));
+        ] }) : value);
       };
       let partnersPending = false, partnersDirty = false, partnersReadAt = 0;
       const artworkRequests = new Map<string, { readonly identity: string; readonly retryAt: number }>();
@@ -2532,19 +2593,19 @@ export function useAppController(): AppController {
               if (!current() || binding.gateway !== gateway) return;
               if (connectionState === "connected") {
                 binding.failures = 0;
-                setState((value) => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "online" } }));
+                setState((value) => current() && binding.gateway === gateway ? ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "online" } }) : value);
               } else if (connectionState === "offline") {
-                setState((value) => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "offline" } }));
+                setState((value) => current() && binding.gateway === gateway ? ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "offline" } }) : value);
               }
             },
             onSnapshot: (snapshot) => {
               if (!current() || binding.gateway !== gateway) return;
               const cache = machineCacheFromSnapshot(profile, snapshot);
-              setState((value) => ({
+              setState((value) => current() && binding.gateway === gateway ? ({
                 ...value,
                 machineCaches: upsertMachineCache(value.machineCaches, cache),
                 machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "online" }
-              }));
+              }) : value);
               void local.saveMachineCache(cache).catch(() => undefined);
             },
             onLiveSnapshot: (snapshot) => {
@@ -2560,15 +2621,18 @@ export function useAppController(): AppController {
               if (!current() || binding.gateway !== gateway || !error.offline) return;
               binding.connected = false;
               publishActivity();
-              setState((value) => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "offline" } }));
+              setState((value) => current() && binding.gateway === gateway ? ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "offline" } }) : value);
             },
             onAuthenticationInvalidated: async (error) => {
               if (!current() || binding.gateway !== gateway) return;
               binding.connected = false;
               publishActivity();
               const trustFailed = isEndpointTrustError(error);
-              if (trustFailed) machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
-              if (!trustFailed && shouldDeleteInvalidatedConnectionCredential(profile)) await local.deleteAuthKey(profile.id);
+              if (!trustFailed) {
+                await revokeMachineCache(profile, local);
+                return;
+              }
+              machineFailureBackoffRef.current.set(profile.id, { failures: 0, retryAt: Infinity, profileKey: remoteMachineProfileKey(profile) });
               await local.deleteMachineCache(profile.id);
               if (!current()) return;
               gateway.disconnect();
@@ -2576,7 +2640,7 @@ export function useAppController(): AppController {
               setState((value) => ({
                 ...value,
                 machineCaches: value.machineCaches.filter((cache) => cache.profileId !== profile.id),
-                machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: trustFailed ? "identityMismatch" : "accessDenied" }
+                machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "identityMismatch" }
               }));
             }
           });
@@ -2604,7 +2668,7 @@ export function useAppController(): AppController {
       };
       void connectGateway();
     }
-  }, [state.activeProfile?.id, state.preferences.machineSelection, state.profiles, state.ready]);
+  }, [currentMachineCacheOwner, machineCacheRevoked, revokeMachineCache, state.activeProfile?.id, state.preferences.machineSelection, state.profiles, state.ready]);
 
   useEffect(() => {
     const route = state.route;
@@ -4352,6 +4416,11 @@ function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineC
   return [...caches.filter((candidate) => candidate.profileId !== cache.profileId), cache];
 }
 
+interface MachineCacheAuthority {
+  readonly profileKey: string;
+  readonly revoked: boolean;
+}
+
 function remoteMachineProfileKey(profile: ConnectionProfile): string {
   return `${profile.id}\u0000${profile.origin}\u0000${profile.serverId}\u0000${profile.endpointPublicKey ?? ''}\u0000${profile.transportKind ?? 'https'}`;
 }
@@ -4435,6 +4504,7 @@ function throwIfRemoteSearchAborted(signal: AbortSignal | undefined): void {
 
 class MachineIdentityError extends Error {}
 class MachineAccessDeniedError extends Error {}
+class MachineSnapshotRetiredError extends Error {}
 
 export function machineRetryDelayMs(profileId: string, failures: number): number {
   const base = Math.min(120_000, 2_000 * (2 ** Math.min(6, Math.max(0, failures - 1))));
