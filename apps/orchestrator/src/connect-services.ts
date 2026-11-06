@@ -17760,7 +17760,8 @@ async function dispatchMutation(
     }
     case "abortRun": {
       const run = dependencies.store.getRun(payload.value.runId);
-      return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.abort(run.descriptor.sessionId, run.descriptor.id));
+      return ackOperation(dependencies, operationId, connection, mutation, payload.case,
+        () => host.abort(run.descriptor.sessionId, run.descriptor.id, () => { dependencies.connections.fence(connection); }));
     }
     case "terminateRuntimeProcess": {
       const backendId = strictRuntimeProcessIdentity(payload.value.backendId, "terminate_runtime_process.backend_id");
@@ -17957,7 +17958,8 @@ async function dispatchMutation(
     }
     case "abortRetry": {
       const run = dependencies.store.getRun(payload.value.runId);
-      return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.abortRetry!(run.descriptor.sessionId));
+      return ackOperation(dependencies, operationId, connection, mutation, payload.case,
+        () => host.abortRetry!(run.descriptor.sessionId, run.descriptor.id, () => { dependencies.connections.fence(connection); }));
     }
     case "setQueueItemEditLock": {
       const current = dependencies.store.getQueueItem(payload.value.queueItemId);

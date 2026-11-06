@@ -5050,6 +5050,43 @@ describe("SessionHost", () => {
     ]);
   });
 
+  it("rejects original Stop and AbortRetry after a newer Run owns the same task", async () => {
+    const adapter = new SingleSettlementFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "run-control-owner-session", connection: fixture.connection,
+      targetId: "target-one", title: "Run control owner", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const enqueue = (text: string) => fixture.host.enqueueInput({ operationId: `run-control-${text}`, connection: fixture.connection,
+      sessionId, prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    const first = enqueue("original");
+    await eventually(() => fixture.store.getQueueItem(first.queueItemId).state === "backend_accepted");
+    let release!: () => void;
+    const delayed = new Promise<void>((resolve) => { release = resolve; });
+    const abort = vi.spyOn(adapter, "abort").mockImplementationOnce(async (context) => {
+      await delayed;
+      context.assertRunControlCurrent?.();
+    });
+    const abortRetry = vi.spyOn(adapter, "abortRetry").mockImplementation(async (context) => { context.assertRunControlCurrent?.(); });
+    const stale = { publicError: { code: "RUN_CONTROL_TARGET_CHANGED", stateMayHaveChanged: false } };
+    const pending = expect(fixture.host.abort(sessionId, first.runId)).rejects.toMatchObject(stale);
+    let next: ReturnType<typeof enqueue>;
+    try {
+      await eventually(() => abort.mock.calls.length === 1);
+      await adapter.settle(sessionId);
+      await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
+      next = enqueue("current");
+      await eventually(() => fixture.store.getQueueItem(next.queueItemId).state === "backend_accepted");
+    } finally { release(); await pending; }
+    await expect(fixture.host.abort(sessionId, first.runId)).rejects.toMatchObject(stale);
+    await expect(fixture.host.abortRetry(sessionId, first.runId)).rejects.toMatchObject(stale);
+    expect(abort).toHaveBeenCalledOnce();
+    expect(abortRetry).not.toHaveBeenCalled();
+    expect(fixture.store.getRun(next.runId).descriptor.state).toBe("running");
+    await fixture.host.abortRetry(sessionId, next.runId);
+    expect(abortRetry).toHaveBeenCalledOnce();
+    await fixture.host.abort(sessionId, next.runId);
+    await eventually(() => fixture.store.getRun(next.runId).descriptor.state === "aborted");
+  });
+
   it("keeps an uncertain joined dispatch fenced while settling the known prompt and follow-up", async () => {
     const adapter = new SingleSettlementFakeAdapter();
     const fixture = await createFixture(adapter);
@@ -7172,7 +7209,7 @@ describe("SessionHost", () => {
     expect(adapter.abortCalls).toBe(1);
     expect(fixture.host.isSessionActive(targetSessionId)).toBe(false);
     await expect(fixture.host.abort(targetSessionId, owned.value.runId)).rejects.toMatchObject({
-      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+      publicError: { code: "RUN_CONTROL_TARGET_CHANGED", stateMayHaveChanged: false }
     });
 
     adapter.holdNativeAcceptance = false;

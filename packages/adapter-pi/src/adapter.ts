@@ -1677,6 +1677,7 @@ export class PiBackendAdapter implements
       // A preceding fork/switch can replace the native binding while this
       // operation is queued. Re-apply the caller's complete generation and
       // binding fence at the actual dispatch boundary.
+      context.assertRunControlCurrent?.();
       this.#touchRuntime(runtime, context);
       return operation();
     });
@@ -1730,8 +1731,8 @@ export class PiBackendAdapter implements
   }
 
   async abort(context: AdapterContext): Promise<void> {
+    context.assertRunControlCurrent?.();
     const runtime = this.#runtime(context);
-    runtime.abortRequested = true;
     await this.#runExclusiveSessionMutation(runtime, context, async () => {
       const clearResponse = await runtime.transport.request(
         { type: "clear_queue" },
@@ -1742,6 +1743,11 @@ export class PiBackendAdapter implements
         }
       );
       validateClearedPiQueue(clearResponse);
+      try { context.assertRunControlCurrent?.(); }
+      catch (cause) { throw piError("PI_ABORT_TARGET_CHANGED_AFTER_QUEUE_CLEAR", "The original Run retired after Pi cleared its native queue", "dispatch", {
+        stateMayHaveChanged: true, recovery: "Refresh the original Run and the task queue before retrying.", cause
+      }); }
+      runtime.abortRequested = true;
       await runtime.transport.request(
         { type: "abort" },
         {
@@ -2561,6 +2567,7 @@ export class PiBackendAdapter implements
 
   async abortRetry(context: AdapterContext): Promise<void> {
     this.#assertReviewOperationAllowed(context, "change retry state");
+    context.assertRunControlCurrent?.();
     await this.#runtime(context).transport.request({ type: "abort_retry" }, { signal: context.signal });
   }
 

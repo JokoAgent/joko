@@ -3431,6 +3431,30 @@ describe("PiBackendAdapter", () => {
     }
   });
 
+  it("does not send a Pi interrupt once the original Run retires during queue clearing", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-run-control-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-run-control-workspace-"));
+    let scripted!: ScriptedPiProcess;
+    const adapter = createPiAdapter({ agentHome, sessionRoot: agentHome, versionProbe: async () => "pi 99.1.0-run-control",
+      processFactory: (spec) => { scripted = new ScriptedPiProcess(spec); return scripted as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "run-control-target", backendId: "pi", displayName: "Run control", workspaceRoot: workspace,
+      managed: true, trusted: true };
+    const context = makeContext(target, []);
+    try {
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, context);
+      const requested = { ...context, binding, assertRunControlCurrent: () => {
+        if (scripted.commands.some((command) => command.type === "clear_queue")) throw new Error("Run retired.");
+      } };
+      await expect(adapter.abort(requested)).rejects.toMatchObject({ publicError: {
+        code: "PI_ABORT_TARGET_CHANGED_AFTER_QUEUE_CLEAR", stateMayHaveChanged: true } });
+      await expect(adapter.abortRetry(requested)).rejects.toThrow("Run retired.");
+      const commands = scripted.commands.map((command) => command.type);
+      expect(commands).toContain("clear_queue");
+      expect(commands).not.toContain("abort");
+      expect(commands).not.toContain("abort_retry");
+    } finally { await adapter.dispose(); }
+  });
+
   it("classifies a silent prompt acceptance timeout without relying on error copy", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-prompt-deadline-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-prompt-deadline-workspace-"));

@@ -70,6 +70,8 @@ export interface AdapterContext {
   readonly operationId?: string;
   /** Original durable input owner, minted by SessionHost rather than native callers. */
   readonly inputQueueItemId?: QueueItemId;
+  /** Private authority of the requested Run and Attempt for an interrupt. */
+  readonly assertRunControlCurrent?: () => void;
   /** Reads a disconnected, already admitted native turn through its original durable receipt. */
   readonly observeAcceptedNativeTurn?: (nativeTurnId: string) => Promise<AcceptedNativeTurnOutcome | "retired" | undefined>;
   /** Private authority for one user-owned dispatch. A Backend may recover a
