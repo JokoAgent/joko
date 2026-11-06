@@ -22,7 +22,7 @@ describe("host CLI credential source", () => {
     expect(command).toHaveBeenCalledOnce();
     expect(command).toHaveBeenCalledWith(
       "/opt/homebrew/bin/gh",
-      ["auth", "token"],
+      ["auth", "token", "--hostname", "github.com"],
       { timeoutMs: 3_000, maximumOutputBytes: 16 * 1024 }
     );
   });

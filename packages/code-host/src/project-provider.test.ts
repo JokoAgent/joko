@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import { GhCliTokenSource, type GhCliCommand } from "./gh-cli-token-source.js";
 import { CodeHostProjectProvider } from "./project-provider.js";
 
 it("uses the configured memory lease and projects only this repository's own work without credential content", async () => {
@@ -28,4 +29,22 @@ it("makes no unconfigured outbound read and retires a response after grant withd
   const provider = new CodeHostProjectProvider({ credentials: { readCredential: async () => ({ token: "fixture-token", generation: 1 }), isCurrent: () => true },
     fetch: vi.fn(async () => { live = false; return Response.json({ login: "fixture-owner" }); }) });
   await expect(provider.read("owner/project", () => { if (!live) throw new Error("Grant withdrawn"); })).rejects.toThrow("Grant withdrawn");
+});
+
+it("does not read the public API when the CLI is signed in only to an enterprise host", async () => {
+  const command = vi.fn<GhCliCommand>(async (_file, args) => {
+    const hostname = args[args.indexOf("--hostname") + 1];
+    if (hostname === "github.com") throw new Error("No token found for github.com");
+    return new TextEncoder().encode("enterprise-fixture-token\n");
+  });
+  const fetch = vi.fn();
+  const provider = new CodeHostProjectProvider({
+    credentials: new GhCliTokenSource({ command, platform: "linux", exists: () => false }),
+    fetch
+  });
+  expect(await provider.read("owner/project", () => undefined)).toEqual({
+    pullRequests: [], issues: [], unavailable: "no_credential"
+  });
+  expect(command).toHaveBeenCalledExactlyOnceWith("gh", ["auth", "token", "--hostname", "github.com"], expect.anything());
+  expect(fetch).not.toHaveBeenCalled();
 });
