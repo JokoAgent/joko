@@ -47,6 +47,7 @@ interface MobilePreviewBase {
   readonly title: string;
   readonly fileName?: string;
   readonly sourceLabel: string;
+  readonly workspacePath?: string;
   readonly mediaType: string;
   readonly byteSize: bigint;
   readonly revisionKey: string;
