@@ -2621,7 +2621,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         context.signal.throwIfAborted();
         const target = dependencies.store.getTarget(targetId);
         assertTargetWorkspacePreparationAuthority(target, expectedRevision);
-        await registerTargetWorkspace(dependencies, target);
+        await registerTargetWorkspace(dependencies, target, { reuseExistingSsh: true });
         context.signal.throwIfAborted();
         dependencies.connections.fence(connection);
         const current = dependencies.store.getTarget(targetId);
@@ -9142,10 +9142,22 @@ function assertTargetWorkspacePreparationAuthority(target: StoredTarget, expecte
 
 async function registerTargetWorkspace(
   dependencies: ConnectServiceDependencies,
-  target: StoredTarget
+  target: StoredTarget,
+  options?: { readonly reuseExistingSsh: boolean }
 ): Promise<WorkspaceRegistration> {
   try {
-    return await dependencies.workspaceService.register(targetWorkspaceRegistration(target));
+    const requested = targetWorkspaceRegistration(target);
+    const binding = requested.remote?.binding;
+    if (options?.reuseExistingSsh && binding?.kind === "ssh") {
+      const current = dependencies.workspaceService.listRegistrations().find(workspace => workspace.id === requested.id);
+      const currentRemote = current?.remote;
+      const currentBinding = currentRemote?.binding;
+      if (current !== undefined && currentRemote?.targetId === target.descriptor.id && currentBinding?.kind === "ssh"
+        && current.trusted === requested.trusted && current.root === requested.root && current.displayName === requested.displayName
+        && currentBinding.hostTargetId === binding.hostTargetId && currentBinding.hostId === binding.hostId
+        && currentBinding.workspaceRoot === binding.workspaceRoot) return current;
+    }
+    return await dependencies.workspaceService.register(requested);
   } catch {
     throw new ConnectError(
       target.descriptor.remoteWorkspace === undefined
