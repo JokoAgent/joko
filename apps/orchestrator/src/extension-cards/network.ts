@@ -162,11 +162,11 @@ export class ExtensionNetwork {
         for (const part of parts) { bytes.set(part, offset); offset += part.byteLength; }
         preparedBody = bytes.buffer; authorHeaders.set("content-type", `multipart/form-data; boundary=${boundary}`);
       }
-      const originalUrl = url;
+      let retryUrl = url, retryMethod = method;
       for (let attempt = 0; attempt < 2; attempt++) {
-        let currentMethod: string = method, body: string | ArrayBuffer | undefined = preparedBody, usedExchange = false;
+        let currentMethod = retryMethod, body = retryMethod === method ? preparedBody : undefined, usedExchange = false;
         const usedOAuth = new Map<string, string>();
-        url = originalUrl;
+        url = retryUrl;
         let response: Response | undefined;
         for (let hop = 0; hop <= 3; hop++) {
           current();
@@ -210,9 +210,16 @@ export class ExtensionNetwork {
         }
         if (!response) throw new Error();
         if (response.status === 401 && (usedExchange || usedOAuth.size > 0) && attempt === 0) {
-          await response.body?.cancel();
           for (const [key, id] of usedOAuth) this.options.oauth?.invalidate(scope.extensionId, key, id);
-          this.retire(scope.authorityKey); continue;
+          this.retire(scope.authorityKey);
+          if (currentMethod === "GET" || currentMethod === "HEAD") {
+            // A receipt read can follow a committed write. Refresh only the
+            // exact read hop so the original upload is never sent twice.
+            await response.body?.cancel();
+            retryUrl = url;
+            retryMethod = currentMethod;
+            continue;
+          }
         }
         const contentType = (response.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
         const textual = contentType.startsWith("text/") || ["application/json", "application/xml", "application/x-www-form-urlencoded", "application/javascript"].includes(contentType) || contentType.endsWith("+json") || contentType.endsWith("+xml");

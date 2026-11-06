@@ -87,6 +87,22 @@ it("keeps exchanged credentials inside the host, escapes templates and exchanges
   network.retire("first-installation"); await network.request(scope({ declaration: exchanged }), { url: "https://api.example.test/data" }); expect(exchanges).toBe(2);
 });
 
+it.each(["GET", "POST"] as const)("limits automatic credential refresh after a %s rejection to safe reads", async method => {
+  const exchanged = parseExtensionNetwork({ hosts: ["api.example.test"], secrets: [{ key: "key", label: "Key",
+    inject: { header: "Authorization", format: "Bearer {value}" },
+    exchange: { url: "https://api.example.test/token", bodyFormat: '{"key":"{value}"}', tokenPath: "token" }
+  }] });
+  let tokens = 0;
+  const fetchMock = vi.fn<typeof fetch>(async (input, init) => new URL(String(input)).pathname === "/token"
+    ? Response.json({ token: `fixture-token-${++tokens}` })
+    : new Headers(init?.headers).get("authorization") === "Bearer fixture-token-2"
+      ? text("refreshed") : text("unauthorized", { status: 401 }));
+  const network = new ExtensionNetwork({ fetch: fetchMock, resolveCredential: () => "private-key", redact: value => value });
+  await expect(network.request(scope({ declaration: exchanged }), { url: "https://api.example.test/action", method }))
+    .resolves.toMatchObject(method === "GET" ? { ok: true, status: 200, body: "refreshed" } : { ok: true, status: 401, body: "unauthorized" });
+  expect(fetchMock).toHaveBeenCalledTimes(method === "GET" ? 4 : 2);
+});
+
 it("cancels response delivery after a task or source changes and does not expose transport errors", async () => {
   let current = true, cancelled = false;
   const fetchMock = vi.fn<typeof fetch>(async () => { current = false; return new Response(new ReadableStream({ cancel() { cancelled = true; } })); });
