@@ -266,7 +266,9 @@ export async function transferPartnerImport(snapshot: ImportSnapshot, selection:
     const issue = item.view.dependsOn?.some(id => !selected.has(id)) ? 'AUTOMATION_DEPENDENCY_NOT_SELECTED' : item.view.issues?.[0];
     check(item.view.id, issue ? 'needs-attention' : 'copied', issue);
   }
-  receipt.result.canonicalSessionId = await deps.createConversation(partnerId);
+  const sessionId = await deps.createConversation(partnerId);
+  if (sessionId === undefined) delete receipt.result.canonicalSessionId;
+  else receipt.result.canonicalSessionId = sessionId;
   await save();
   const byId = new Map(items.map(item => [item.view.id, item]));
   const missingDependency = (id: string, visited = new Set<string>()): boolean => {
