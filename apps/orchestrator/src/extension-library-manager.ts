@@ -2856,7 +2856,7 @@ function validateTrashManifest(value: unknown): TrashManifest {
       destinationKind: value.destinationKind,
       targetRoot: value.targetRoot,
       stagingRoot: value.stagingRoot,
-      ...(copy === undefined ? {} : { copy: { identity: validateIdentity(copy.identity), verified: copy.verified } }),
+      ...(copy === undefined ? {} : { copy: { identity: validateIdentity(copy.identity), verified: copy.verified === true } }),
       bindingGeneration: value.bindingGeneration,
       updatedAt: value.updatedAt
     };
