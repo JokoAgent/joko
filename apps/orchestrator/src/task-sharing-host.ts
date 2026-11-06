@@ -51,10 +51,15 @@ export class TaskSharingHost {
       return share.shareId;
     });
     if (!invitation) throw new ConnectError("Create a new invitation explicitly.", Code.FailedPrecondition);
+    const parsed = this.invitation(invitation), current = this.shares.get(result.value);
+    if (!this.shares.invitationMatches(current, safeGeneration(parsed.shareGeneration), hash(parsed.inviteSecret))) {
+      this.#invitationReplies.delete(input.operationId);
+      throw new ConnectError("The invitation is no longer available. Create a new invitation explicitly.", Code.FailedPrecondition);
+    }
     this.#invitationReplies.set(input.operationId, invitation);
     // Invitations are private, short-lived replies rather than durable receipts.
     setTimeout(() => this.#invitationReplies.delete(input.operationId), 60_000).unref();
-    return { share: this.get(result.value), invitation };
+    return { share: this.publicShare(current), invitation };
   }
   remove(input: { readonly operationId: string; readonly shareId: string; readonly memberId: string; readonly memberGeneration: bigint }): contract.TaskShare {
     const result = this.options.store.runOperation({ id: input.operationId, kind: "task_share_remove", body: input }, () => {
@@ -94,7 +99,7 @@ export class TaskSharingHost {
   }
   previewInvitation(invitation: string): contract.TaskShare {
     const parsed = this.invitation(invitation), share = this.shares.active(parsed.shareId);
-    if (BigInt(share.shareGeneration) !== parsed.shareGeneration || share.invitationSha256Hex !== hash(parsed.inviteSecret)) throw denied("The task invitation is no longer available.");
+    if (!this.shares.invitationMatches(share, safeGeneration(parsed.shareGeneration), hash(parsed.inviteSecret))) throw denied("The task invitation is no longer available.");
     this.options.authorizeShare?.(share.shareId, share.sessionId);
     return this.publicShare(share);
   }

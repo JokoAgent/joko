@@ -62,14 +62,27 @@ export class TaskShareStore {
     });
   }
   setInvitation(shareId: string, invitationSha256Hex: string): TaskShareRecord {
-    return this.store.transaction(() => this.save({ ...this.active(shareId), invitationSha256Hex: digest(invitationSha256Hex) }));
+    return this.store.transaction(() => {
+      const share = this.save({ ...this.active(shareId), invitationSha256Hex: digest(invitationSha256Hex) });
+      if (share.members.some(member => member.status !== "active")) {
+        this.store.setSetting("service", SCOPE, `invite:${shareId}`, share.invitationSha256Hex);
+      }
+      return share;
+    });
+  }
+  invitationMatches(share: TaskShareRecord, generation: number, invitationSha256Hex: string): boolean {
+    if (share.status !== "active" || share.shareGeneration !== generation || share.invitationSha256Hex !== invitationSha256Hex) return false;
+    // Older records did not record whether the current link was issued after
+    // a retirement. Require a fresh issue once when that history is ambiguous.
+    return share.members.every(member => member.status === "active")
+      || this.store.findSetting<string>("service", SCOPE, `invite:${share.shareId}`)?.value === invitationSha256Hex;
   }
   join(input: { readonly shareId: string; readonly shareGeneration: number; readonly invitationSha256Hex: string;
     readonly memberId: string; readonly intentId: string; readonly credentialSha256Hex: string;
     readonly displayName: string; readonly homeServerId: string; readonly homeDeviceId: string }): { share: TaskShareRecord; member: TaskShareMemberRecord } {
     return this.store.transaction(() => {
       const share = this.active(input.shareId);
-      if (share.shareGeneration !== input.shareGeneration || share.invitationSha256Hex !== digest(input.invitationSha256Hex)) throw new StoreError("The task invitation is no longer available.");
+      if (!this.invitationMatches(share, input.shareGeneration, digest(input.invitationSha256Hex))) throw new StoreError("The task invitation is no longer available.");
       const credential = digest(input.credentialSha256Hex);
       const previous = share.members.find(member => member.joinIntentId === input.intentId && member.homeServerId === input.homeServerId);
       if (previous !== undefined) {
@@ -103,6 +116,9 @@ export class TaskShareStore {
       const share = this.active(shareId), member = share.members.find(row => row.memberId === memberId);
       if (!member) throw new StoreError("The task participant does not exist.");
       if (member.status !== "active") return share;
+      // Retire the published link in the same transaction. Other active
+      // members keep their own credentials and generations.
+      this.store.deleteSetting("service", SCOPE, `invite:${shareId}`);
       return this.save({ ...share, members: share.members.map(row => row === member ? { ...row, memberGeneration: row.memberGeneration + 1, status } : row) });
     });
   }
