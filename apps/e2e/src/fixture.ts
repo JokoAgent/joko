@@ -356,7 +356,7 @@ export class OrchestratorE2eFixture {
     const historyMaintenance = new HistoryMaintenance({
       store,
       activeSessions: {
-        prepare: (sessionIds) => sessionHost.prepareHistoryMaintenanceBindings(sessionIds),
+        prepare: (sessionIds, assertCurrent) => sessionHost.prepareHistoryMaintenanceBindings(sessionIds, assertCurrent),
         recover: (request) => sessionHost.recoverHistoryMaintenanceBinding(request),
         discard: (replacements) => sessionHost.discardHistoryMaintenanceBindings(replacements),
         finalize: (replacements) => sessionHost.finalizeHistoryMaintenanceBindings(replacements),
