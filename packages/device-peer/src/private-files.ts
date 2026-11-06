@@ -188,7 +188,7 @@ export async function streamUserSelectedFile(
   destination: UserSelectedFileDestination,
   expectedBytes: number,
   source: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
-  assertCurrent?: () => void
+  assertCurrent?: () => void | Promise<void>
 ): Promise<UserSelectedFileReceipt> {
   const writer = fileURLToPath(new URL("./selected-file-writer.js", import.meta.url));
   const child = spawn(process.execPath, [writer], {
@@ -200,12 +200,33 @@ export async function streamUserSelectedFile(
   const input = child.stdin!;
   let result: { readonly receipt: UserSelectedFileReceipt } | { readonly error: string } | undefined;
   let spawned = false;
+  let ready!: (value: boolean) => void;
+  const stage = new Promise<boolean>((resolve) => { ready = resolve; });
+  let disconnectedByParent = false;
+  let exited = false;
+  let finish!: () => void;
   const closed = new Promise<void>((done) => {
-    child.on("error", () => undefined);
+    finish = () => { ready(false); done(); };
+    child.on("error", () => { if (!spawned) finish(); });
     child.once("spawn", () => { spawned = true; });
-    child.on("message", (message) => { result = message as typeof result; });
-    child.once("close", () => done());
+    child.on("message", (message) => {
+      if (message === "ready") ready(true);
+      else result = message as typeof result;
+    });
+    child.once("exit", () => {
+      exited = true;
+      if (disconnectedByParent) finish();
+    });
+    child.once("close", finish);
   });
+  const disconnect = (): void => {
+    if (!child.connected) return;
+    // Parent-side IPC closure can suppress ChildProcess's "close" event.
+    // Wait for actual exit so the writer can remove its own staged file.
+    disconnectedByParent = true;
+    child.disconnect();
+    if (exited) finish();
+  };
   let sentPublishMarker = false;
   let sourceError: unknown;
   async function* chunks() {
@@ -217,19 +238,24 @@ export async function streamUserSelectedFile(
         yield bytes;
       }
       if (received !== expectedBytes) throw new Error("The save source changed size.");
-      assertCurrent?.();
     } catch (error) {
       sourceError = error;
       throw error;
     }
-    sentPublishMarker = true;
-    yield Buffer.from([1]);
   }
   try {
     child.send({ destination, expectedBytes }, (error) => { if (error !== null) input.destroy(error); });
     await pipeline(Readable.from(chunks(), { objectMode: false }), input);
+    if (await stage) {
+      try { await assertCurrent?.(); } catch (error) { sourceError = error; throw error; }
+      if (child.connected) {
+        sentPublishMarker = true;
+        child.send("publish", (error) => { if (error !== null) disconnect(); });
+      }
+    }
   } catch {
     input.destroy();
+    disconnect();
   }
   await closed;
   if (result !== undefined && "receipt" in result) return result.receipt;

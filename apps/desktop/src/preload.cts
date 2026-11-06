@@ -15,6 +15,7 @@ import type {
   DesktopExtensionLibraryLocationSelection,
   DesktopExtensionLibraryRevealRequest,
   DesktopExtensionLibrarySaveSelection,
+  DesktopExtensionLibrarySaveSource,
   DesktopDeepLinkNavigation,
   DesktopDeepLinkSettingsSection,
   DesktopFile,
@@ -501,9 +502,10 @@ const desktopApi = Object.freeze({
       return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryBeginSave, request)
         .then(parseDesktopExtensionLibrarySaveSelection);
     },
-    commitSave: (request: DesktopExtensionLibraryCommitSaveRequest): Promise<number> => {
+    commitSave: (request: DesktopExtensionLibraryCommitSaveRequest, source: DesktopExtensionLibrarySaveSource): Promise<number> => {
       if (!isDesktopExtensionLibraryCommitSaveRequest(request)) return Promise.reject(new TypeError("Extension Library save commit is invalid."));
-      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryCommitSave, request).then(parseExtensionLibraryByteCount);
+      if (typeof source?.read !== "function" || typeof source?.verify !== "function") return Promise.reject(new TypeError("Extension Library save source is invalid."));
+      return commitExtensionLibrarySave(request, source);
     },
     cancelSave: (ticketId: string): Promise<void> => {
       if (!EXTENSION_LIBRARY_SAVE_TICKET.test(ticketId)) return Promise.reject(new TypeError("Extension Library save ticket is invalid."));
@@ -2175,10 +2177,56 @@ function isDesktopExtensionLibraryBeginSaveRequest(value: unknown): value is Des
 }
 
 function isDesktopExtensionLibraryCommitSaveRequest(value: unknown): value is DesktopExtensionLibraryCommitSaveRequest {
-  if (!exactRecord(value, ["extensionId", "ticketId", "root", "path"])) return false;
+  const keys = ["extensionId", "ticketId", "totalBytes"];
+  if (!(exactRecord(value, keys) || exactRecord(value, [...keys, "localRoot"]))) return false;
   return isDesktopExtensionId(value["extensionId"])
     && typeof value["ticketId"] === "string" && EXTENSION_LIBRARY_SAVE_TICKET.test(value["ticketId"])
-    && isBoundedHostPath(value["root"]) && isPortableExtensionLibraryPath(value["path"]);
+    && typeof value["totalBytes"] === "number" && Number.isSafeInteger(value["totalBytes"])
+    && value["totalBytes"] >= 0 && value["totalBytes"] <= 8 * 1024 * 1024 * 1024
+    && (value["localRoot"] === undefined || isBoundedHostPath(value["localRoot"]));
+}
+
+function commitExtensionLibrarySave(request: DesktopExtensionLibraryCommitSaveRequest, source: DesktopExtensionLibrarySaveSource): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const { port1, port2 } = new MessageChannel();
+    let sourceError: unknown;
+    let closed = false;
+    const close = () => { closed = true; port1.close(); };
+    const fail = () => { close(); reject(sourceError ?? new Error("Extension Library save failed.")); };
+    port1.addEventListener("close", fail, { once: true });
+    port1.addEventListener("message", (event) => {
+      const { data } = event as Event & { readonly data: unknown };
+      if (data === "failed") { fail(); return; }
+      if (exactRecord(data, ["bytes"])) {
+        if (data["bytes"] !== request.totalBytes) { fail(); return; }
+        close();
+        resolve(request.totalBytes);
+        return;
+      }
+      void (async () => {
+        if (exactRecord(data, ["kind"]) && data["kind"] === "verify") {
+          await source.verify();
+          if (!closed) port1.postMessage("verified");
+          return;
+        }
+        if (!exactRecord(data, ["kind", "offset", "length"]) || data["kind"] !== "read"
+          || typeof data["offset"] !== "number" || !Number.isSafeInteger(data["offset"]) || data["offset"] < 0
+          || typeof data["length"] !== "number" || !Number.isSafeInteger(data["length"]) || data["length"] < 1
+          || data["length"] > 1024 * 1024 || data["offset"] + data["length"] > request.totalBytes) {
+          throw new Error("Extension Library save chunk request is invalid.");
+        }
+        const bytes = await source.read(data["offset"], data["length"]);
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength !== data["length"]) throw new Error("Extension Library save chunk is invalid.");
+        if (!closed) port1.postMessage({ offset: data["offset"], bytes });
+      })().catch((error: unknown) => {
+        sourceError = error;
+        try { if (!closed) port1.postMessage("failed"); } catch { fail(); }
+      });
+    });
+    port1.start();
+    try { ipcRenderer.postMessage(DESKTOP_CHANNELS.extensionLibraryCommitSave, request, [port2]); }
+    catch (error) { sourceError = error; port2.close(); fail(); }
+  });
 }
 
 function isDesktopExtensionLibraryClipboardRequest(value: unknown): value is DesktopExtensionLibraryClipboardRequest {

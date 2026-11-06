@@ -46,6 +46,7 @@ async function save({ destination, expectedBytes }: SaveRequest): Promise<UserSe
     await handle.close();
     handle = undefined;
 
+    await awaitPublish();
     await assertSelectedDirectory(destination);
     if (!sameStableFile(complete, await lstat(temporary))) throw new Error("The staged file changed before publication.");
     if (destination.existing === undefined) {
@@ -84,23 +85,35 @@ async function assertSelectedDirectory(destination: UserSelectedFileDestination)
 
 async function receiveFile(handle: Awaited<ReturnType<typeof open>>, expectedBytes: number): Promise<void> {
   let received = 0;
-  let publish = false;
   for await (const input of process.stdin) {
     const chunk = Buffer.from(input);
-    const bytes = Math.min(chunk.length, expectedBytes - received);
-    if (publish || (bytes < chunk.length && (chunk.length !== bytes + 1 || chunk[bytes] !== 1))) {
-      throw new Error("Invalid native save input.");
-    }
+    if (chunk.length > expectedBytes - received) throw new Error("Invalid native save input.");
     let offset = 0;
-    while (offset < bytes) {
-      const result = await handle.write(chunk, offset, bytes - offset);
+    while (offset < chunk.length) {
+      const result = await handle.write(chunk, offset, chunk.length - offset);
       if (result.bytesWritten === 0) throw new Error("Native save stopped making progress.");
       offset += result.bytesWritten;
     }
-    received += bytes;
-    publish = bytes < chunk.length;
+    received += chunk.length;
   }
-  if (!publish || received !== expectedBytes) throw new Error("Native save was cancelled before publication.");
+  if (received !== expectedBytes) throw new Error("Native save was cancelled before publication.");
+}
+
+function awaitPublish(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const finish = (allowed: boolean): void => {
+      process.off("message", receive);
+      process.off("disconnect", retire);
+      if (allowed) resolve();
+      else reject(new Error("Native save was cancelled before publication."));
+    };
+    const receive = (message: unknown) => finish(message === "publish");
+    const retire = () => finish(false);
+    if (!process.connected) { retire(); return; }
+    process.once("message", receive);
+    process.once("disconnect", retire);
+    process.send?.("ready", (error) => { if (error !== null) retire(); });
+  });
 }
 
 function changed(): UserSelectedFileSaveError {

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import {
   lstat,
@@ -92,6 +92,7 @@ export interface ExtensionLibraryEntry {
   readonly kind: "file" | "directory";
   readonly bytes: number;
   readonly modifiedAt: number;
+  readonly sourceTag?: string;
 }
 
 export interface ExtensionLibraryReadResult {
@@ -165,6 +166,7 @@ export class ExtensionLibraryVault {
   readonly #now: () => number;
   readonly #freeBytes: (root: string) => Promise<number | undefined>;
   readonly #limits: ExtensionLibraryLimits;
+  readonly #sourceTagKey = randomBytes(32);
   readonly #beforeFilesystemMutation: NonNullable<ExtensionLibraryVaultOptions["beforeFilesystemMutation"]>;
   #metadata?: StoredLibraryMetadata;
   #rootIdentity?: ExtensionLibraryRootStat;
@@ -363,7 +365,7 @@ export class ExtensionLibraryVault {
     return this.open({ create: true });
   }
 
-  async read(input: { readonly path: string; readonly offset?: number; readonly length?: number }): Promise<ExtensionLibraryReadResult> {
+  async read(input: { readonly path: string; readonly offset?: number; readonly length?: number; readonly sourceTag?: string }): Promise<ExtensionLibraryReadResult> {
     await this.#requireReady(false);
     const relativePath = validateExtensionLibraryPath(input.path, this.#limits);
     const target = await this.#resolveExisting(relativePath, "file");
@@ -383,6 +385,7 @@ export class ExtensionLibraryVault {
       handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       const opened = await handle.stat({ bigint: true });
       if (!sameFile(before, opened)) throw new ExtensionLibraryError("CONFLICT", "Library file changed while it was opened.");
+      if (input.sourceTag !== undefined && this.#sourceTag(relativePath, opened) !== input.sourceTag) throw saveSourceChanged();
       const bytes = Buffer.alloc(length);
       let consumed = 0;
       while (consumed < length) {
@@ -459,7 +462,7 @@ export class ExtensionLibraryVault {
     }
   }
 
-  async stat(path: string): Promise<ExtensionLibraryEntry> {
+  async stat(path: string, expectedSourceTag?: string): Promise<ExtensionLibraryEntry> {
     await this.#requireReady(false);
     const relativePath = validateExtensionLibraryPath(path, this.#limits);
     const target = await this.#resolveExisting(relativePath);
@@ -467,12 +470,26 @@ export class ExtensionLibraryVault {
     if (value.isSymbolicLink() || !value.isFile() && !value.isDirectory()) {
       throw new ExtensionLibraryError("PATH_INVALID", "Library entry is not a regular file or directory.");
     }
+    let sourceTag: string | undefined;
+    if (expectedSourceTag !== undefined) {
+      if (!value.isFile()) throw saveSourceChanged();
+      await this.#resolveExisting(relativePath, "file");
+      if (!sameFile(value, await lstat(target, { bigint: true }))) throw saveSourceChanged();
+      sourceTag = this.#sourceTag(relativePath, value);
+      if (expectedSourceTag !== "*" && expectedSourceTag !== sourceTag) throw saveSourceChanged();
+    }
     return {
       path: relativePath,
       kind: value.isDirectory() ? "directory" : "file",
       bytes: value.isFile() ? safeNumber(value.size) : 0,
-      modifiedAt: safeNumber(value.mtimeMs)
+      modifiedAt: safeNumber(value.mtimeMs),
+      ...(sourceTag === undefined ? {} : { sourceTag })
     };
+  }
+
+  #sourceTag(path: string, file: BigIntStats): string {
+    const identity = [file.dev, file.ino, file.birthtimeNs, file.size, file.mtimeNs, file.ctimeNs];
+    return `"${createHmac("sha256", this.#sourceTagKey).update(`${path}\0${identity.join(":")}`).digest("hex")}"`;
   }
 
   async list(input: {
@@ -1305,6 +1322,10 @@ function sameEntrySnapshot(left: BigIntStats, right: BigIntStats): boolean {
 
 function sameFile(left: BigIntStats, right: BigIntStats): boolean {
   return left.isFile() && right.isFile() && sameEntrySnapshot(left, right);
+}
+
+function saveSourceChanged(): ExtensionLibraryError {
+  return new ExtensionLibraryError("CONFLICT", "Extension Library save source changed.");
 }
 
 function inside(root: string, target: string): boolean {

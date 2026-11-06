@@ -1,15 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { constants, type Stats } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { lstat, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { crc32 } from "node:zlib";
+import type { MessagePortMain } from "electron";
 
 import {
   isDesktopExtensionId,
   type DesktopExtensionLibraryBeginSaveRequest,
   type DesktopExtensionLibraryClipboardRequest,
   type DesktopExtensionLibraryCommitSaveRequest,
-  type DesktopExtensionLibraryRevealRequest
+  type DesktopExtensionLibraryRevealRequest,
+  type DesktopExtensionLibrarySaveSource
 } from "./channels.js";
 import { sameFileIdentity, sameStableFile, streamUserSelectedFile, type UserSelectedFileDestination, type UserSelectedFileReceipt } from "@joko/device-peer/private-files";
 
@@ -126,12 +128,15 @@ export function parseExtensionLibraryBeginSaveRequest(value: unknown): DesktopEx
 }
 
 export function parseExtensionLibraryCommitSaveRequest(value: unknown): DesktopExtensionLibraryCommitSaveRequest {
-  if (!exact(value, ["extensionId", "ticketId", "root", "path"]) || !isDesktopExtensionId(value.extensionId)
+  const keys = ["extensionId", "ticketId", "totalBytes"];
+  if (!(exact(value, keys) || exact(value, [...keys, "localRoot"])) || !isDesktopExtensionId(value.extensionId)
     || typeof value.ticketId !== "string" || !SAVE_TICKET.test(value.ticketId)
-    || !normalizedAbsolute(value.root) || portablePath(value.path) === undefined) {
+    || typeof value.totalBytes !== "number" || !validSaveSize(value.totalBytes)
+    || value.localRoot !== undefined && !normalizedAbsolute(value.localRoot)) {
     throw invalid("Extension Library save commit request is invalid.");
   }
-  return { extensionId: value.extensionId, ticketId: value.ticketId, root: value.root, path: value.path as string };
+  return { extensionId: value.extensionId, ticketId: value.ticketId, totalBytes: value.totalBytes,
+    ...(value.localRoot === undefined ? {} : { localRoot: value.localRoot }) };
 }
 
 export function parseExtensionLibraryClipboardRequest(value: unknown): DesktopExtensionLibraryClipboardRequest {
@@ -166,52 +171,69 @@ export async function resolveVerifiedExtensionLibraryFile(root: string, path: st
   return { absolutePath: candidate, bytes: after.size };
 }
 
-/** Copies a verified Library file to a user-selected path without exposing that path to the frame. */
-export async function atomicCopyExtensionLibraryFile(
-  root: string,
-  path: string,
+/** Stage bytes from the authenticated source, then ask it to authorize publication. */
+export async function saveExtensionLibraryFile(
+  request: Pick<DesktopExtensionLibraryCommitSaveRequest, "totalBytes" | "localRoot">,
   destination: UserSelectedFileDestination,
-  maximumBytes = EXTENSION_LIBRARY_NATIVE_SAVE_MAXIMUM_BYTES,
+  source: DesktopExtensionLibrarySaveSource,
   assertCurrent?: () => void
 ): Promise<UserSelectedFileReceipt> {
-  if (!normalizedAbsolute(destination.path) || !Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+  if (!normalizedAbsolute(destination.path) || !validSaveSize(request.totalBytes)) {
     throw invalid("Extension Library save destination is invalid.");
   }
-  const source = await resolveVerifiedExtensionLibraryFile(root, path);
-  if (inside(root, destination.path)) throw invalid("Extension Library save destination cannot be inside the active Library.");
-  if (source.bytes > maximumBytes) throw new ExtensionLibraryGestureError("INVALID_REQUEST", "Extension Library file exceeds the native save limit.");
-  return await streamUserSelectedFile(destination, source.bytes, readStableLibraryFile(source, maximumBytes), assertCurrent);
+  if (request.localRoot !== undefined && (!normalizedAbsolute(request.localRoot) || inside(request.localRoot, destination.path))) {
+    throw invalid("Extension Library save destination cannot be inside the active Library.");
+  }
+  async function* chunks() {
+    for (let offset = 0; offset < request.totalBytes;) {
+      assertCurrent?.();
+      const length = Math.min(1024 * 1024, request.totalBytes - offset);
+      const bytes = await source.read(offset, length);
+      assertCurrent?.();
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength !== length) throw invalid("Extension Library save chunk is invalid.");
+      yield bytes;
+      offset += length;
+    }
+  }
+  return streamUserSelectedFile(destination, request.totalBytes, chunks(), async () => {
+    assertCurrent?.();
+    await source.verify();
+    assertCurrent?.();
+  });
 }
 
-async function* readStableLibraryFile(source: { readonly absolutePath: string; readonly bytes: number }, maximumBytes: number) {
-  const before = await lstat(source.absolutePath);
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  const sourceHandle = await open(source.absolutePath, constants.O_RDONLY | noFollow);
-  try {
-    const opened = await sourceHandle.stat();
-    assertRegular(opened);
-    if (!sameStableFile(before, opened) || opened.size !== source.bytes || opened.size > maximumBytes) {
-      throw new ExtensionLibraryGestureError("STALE", "Extension Library file changed before save.");
+export function extensionLibrarySavePortSource(port: MessagePortMain): DesktopExtensionLibrarySaveSource {
+  const request = (message: object): Promise<unknown> => new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      port.off("close", unavailable);
+      port.off("message", receive);
+    };
+    const unavailable = () => { cleanup(); reject(new ExtensionLibraryGestureError("STALE", "Extension Library save source is unavailable.")); };
+    const receive = (event: { readonly data: unknown }) => { cleanup(); resolve(event.data); };
+    const timer = setTimeout(unavailable, 30_000);
+    port.once("close", unavailable);
+    port.once("message", receive);
+    try { port.postMessage(message); } catch { unavailable(); }
+  });
+  return {
+    read: async (offset, length) => {
+      const result = await request({ kind: "read", offset, length });
+      if (!exact(result, ["offset", "bytes"]) || result.offset !== offset || !(result.bytes instanceof Uint8Array)) {
+        throw new ExtensionLibraryGestureError("STALE", "Extension Library save source is unavailable.");
+      }
+      return result.bytes;
+    },
+    verify: async () => {
+      if (await request({ kind: "verify" }) !== "verified") {
+        throw new ExtensionLibraryGestureError("STALE", "Extension Library save source is unavailable.");
+      }
     }
-    let offset = 0;
-    while (offset < opened.size) {
-      const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, opened.size - offset));
-      const read = await sourceHandle.read(buffer, 0, buffer.byteLength, offset);
-      if (read.bytesRead === 0) break;
-      offset += read.bytesRead;
-      yield buffer.subarray(0, read.bytesRead);
-    }
-    const sentinel = Buffer.alloc(1);
-    const extra = await sourceHandle.read(sentinel, 0, 1, offset);
-    const openedAfter = await sourceHandle.stat();
-    const pathAfter = await lstat(source.absolutePath);
-    if (offset !== opened.size || extra.bytesRead !== 0 || !sameStableFile(opened, openedAfter)
-      || !sameStableFile(openedAfter, pathAfter) || !samePath(await realpath(source.absolutePath), source.absolutePath)) {
-      throw new ExtensionLibraryGestureError("STALE", "Extension Library file changed during save.");
-    }
-  } finally {
-    await sourceHandle.close();
-  }
+  };
+}
+
+function validSaveSize(bytes: number): boolean {
+  return Number.isSafeInteger(bytes) && bytes >= 0 && bytes <= EXTENSION_LIBRARY_NATIVE_SAVE_MAXIMUM_BYTES;
 }
 
 export function isPng(bytes: Uint8Array): boolean {
