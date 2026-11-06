@@ -135,13 +135,12 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[3]).toMatchObject({ events: [{ kind: "button", button: 1, down: true }, { kind: "button", button: 1, down: false }] });
   });
 
-  it.each(["hide", "blur", "resize", "control"] as const)("clears held buttons and wheel on %s without bypassing input ACK", async reason => {
+  it.each(["hide", "blur", "resize"] as const)("clears held buttons and wheel on %s without bypassing input ACK", async reason => {
     const value = viewer(); value.pointer(value.button("left"), "pointerdown");
     value.pointer(value.button("wheel"), "pointerdown", 9, 0, 100); value.pointer(value.button("wheel"), "pointermove", 9, 0, 124);
     if (reason === "hide") value.config(false);
     else if (reason === "blur") window.dispatchEvent(new Event("blur"));
-    else if (reason === "resize") value.resized();
-    else value.receive({ type: "control", enabled: false });
+    else value.resized();
     expect(value.button("left").getAttribute("aria-pressed")).toBe("false");
     expect(value.grip.style.transform).toBe("translateY(0px)");
     if (reason === "blur" || reason === "resize") expect(value.posted.find(message => message.type === "mouseControlsRetired"))
@@ -151,6 +150,24 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[1]).toMatchObject({ events: reason === "hide"
       ? [{ kind: "button", button: 0, down: false }] : [{ kind: "release" }] });
     value.ack(); await vi.advanceTimersByTimeAsync(99); expect(value.packets()).toHaveLength(2);
+  });
+
+  it.each([true, false])("drops retired mouse input with an outstanding ACK of %s", async outstanding => {
+    const value = viewer();
+    value.pointer(value.button("left"), "pointerdown");
+    value.pointer(value.button("wheel"), "pointerdown", 9, 0, 100);
+    value.pointer(value.button("wheel"), "pointermove", 9, 0, 124);
+    if (!outstanding) value.ack();
+    value.receive({ type: "control", enabled: false });
+    expect(value.button("left").getAttribute("aria-pressed")).toBe("false");
+    expect(value.grip.style.transform).toBe("translateY(0px)");
+    value.receive({ type: "control", enabled: true, controlGeneration: 3 });
+    value.ack();
+    value.pointer(value.button("left"), "pointerup");
+    await vi.advanceTimersByTimeAsync(165);
+    expect(value.packets()).toHaveLength(1);
+    value.pointer(value.button("left"), "pointerdown", 8);
+    expect(value.packets()[1]).toMatchObject({ controlGeneration: 3, events: [{ kind: "button", button: 0, down: true }] });
   });
 
   it("uses the same native mouse math with original epochs and rejects retired or malformed commands", async () => {
