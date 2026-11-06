@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { rm } from "node:fs/promises";
+import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -32,7 +32,7 @@ const serialize = (value: unknown): string => JSON.stringify(value, (_key, item:
 const profile = "/home/test/.joko/runtime/v1/codex-home";
 
 describe("registered remote project Skill input composition", () => {
-  it("dispatches the approved remote mount after durable Queue admission and keeps the Run through repeated project selection", async () => {
+  it.each(["idle", "active"] as const)("keeps the Run through repeated project selection and handles its %s mount on shutdown", async (shutdownState) => {
     const root = await mkdtemp(join(tmpdir(), "joko-remote-skill-chain-"));
     const database = join(root, "store.db");
     const store = new OperationalStore(database);
@@ -73,6 +73,7 @@ describe("registered remote project Skill input composition", () => {
     const challenge = connections.issuePairing("Remote Skill client");
     const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Remote Skill client" });
     let sessionId = "", resourceId = "", mountedPath = "", queueId = "";
+    let finalQueueState = "";
     let server: Awaited<ReturnType<typeof createPublicServer>> | undefined;
     try {
       await host.initialize(); await resources.initialize();
@@ -165,8 +166,17 @@ describe("registered remote project Skill input composition", () => {
         targetId: target.id, expectedTargetRevision: { value: store.getTarget(target.id).revision }
       });
       expect(selected.workspace?.workspaceId).toBe("remote-workspace");
-      await daemon.fake.completeTurn(store.getSession(sessionId).descriptor.binding.nativeSessionId!);
-      await expect.poll(() => store.getQueueItem(queueId).state, { timeout: 10_000 }).toBe("completed");
+      if (shutdownState === "idle") {
+        await daemon.fake.completeTurn(store.getSession(sessionId).descriptor.binding.nativeSessionId!);
+        await expect.poll(() => store.getQueueItem(queueId).state, { timeout: 10_000 }).toBe("completed");
+      }
+      const releasesBeforeShutdown = daemon.messages.filter(message => message.method === "thread/unsubscribe").length;
+      await host.dispose();
+      const releasesAfterShutdown = daemon.messages.filter(message => message.method === "thread/unsubscribe").length;
+      expect(releasesAfterShutdown - releasesBeforeShutdown).toBe(shutdownState === "idle" ? 1 : 0);
+      expect(files.entries.has(mountedPath)).toBe(shutdownState === "active");
+      expect(await readdir(join(root, "mount-journals"))).toHaveLength(shutdownState === "idle" ? 0 : 1);
+      finalQueueState = store.getQueueItem(queueId).state;
     } finally {
       await server?.close(); await host.dispose(); await adapter.dispose(); await resolver.shutdown(); await workspaceService.close();
       await localHost.shutdown();
@@ -174,7 +184,7 @@ describe("registered remote project Skill input composition", () => {
     }
     const reopened = new OperationalStore(database);
     try {
-      expect(reopened.getQueueItem(queueId).state).toBe("completed");
+      expect(reopened.getQueueItem(queueId).state).toBe(finalQueueState);
       expect(reopened.getQueueItem(queueId).body.mentions[0]?.reference).toBe(resourceId);
       expect(serialize(reopened.listEvents({ sessionId }))).not.toContain(mountedPath);
     } finally { reopened.close(); await rm(root, { recursive: true, force: true }); }

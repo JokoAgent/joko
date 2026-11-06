@@ -329,11 +329,13 @@ export class AppServerHost {
     await this.#drainDescendant(childThreadId, subscriber);
   }
 
-  async releaseUnboundThread(threadId: string, expectedHostGeneration: number): Promise<void> {
+  async releaseUnboundThread(threadId: string, expectedHostGeneration: number, beforeDispatch?: () => void): Promise<void> {
     this.#rememberDetachedThread(threadId);
     this.#discardBuffered(threadId);
     if (!this.isActiveGeneration(expectedHostGeneration)) return;
-    const response = await this.request("thread/unsubscribe", { threadId }, { timeoutMs: 5_000 });
+    const response = await this.request("thread/unsubscribe", { threadId }, {
+      timeoutMs: 5_000, ...(beforeDispatch === undefined ? {} : { beforeDispatch })
+    });
     const value = response.value;
     if (value === null || typeof value !== "object" || Array.isArray(value)
       || !["notLoaded", "notSubscribed", "unsubscribed"].includes(String(value["status"]))) {
