@@ -1218,6 +1218,7 @@ export async function createOrchestratorApplication(
   const makerMemory = new MakerMemoryController({
     store,
     targetPreferences: partnerMemoryPreferences,
+    partnerProfiles: partnerStore,
     onSettingsChanged: () => refreshPiGenerationImpl()
   });
   const unregisterMakerMemoryBridge = mcpRouter.registerBridgeToolProvider(

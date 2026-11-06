@@ -6,7 +6,8 @@ import type {
   MakerMemoryEntry,
   MakerMemoryKind,
   MakerMemorySearchHit,
-  OperationalStore
+  OperationalStore,
+  PartnerStore
 } from "@joko/store";
 
 import type {
@@ -67,6 +68,7 @@ export class MakerMemoryController {
   readonly #scopeId: string;
   readonly #onSettingsChanged: () => Promise<void>;
   readonly #targetPreferences: PartnerMemoryPreferences | undefined;
+  readonly #partnerProfiles: Pick<PartnerStore, "findPartnerByHomeTarget"> | undefined;
   #generation = 1;
   #entriesRefresh?: ReturnType<typeof setTimeout>;
 
@@ -75,11 +77,13 @@ export class MakerMemoryController {
     readonly scopeId?: string;
     readonly onSettingsChanged?: () => Promise<void>;
     readonly targetPreferences?: PartnerMemoryPreferences;
+    readonly partnerProfiles?: Pick<PartnerStore, "findPartnerByHomeTarget">;
   }) {
     this.#store = input.store;
     this.#scopeId = input.scopeId ?? "orchestrator";
     this.#onSettingsChanged = input.onSettingsChanged ?? (() => Promise.resolve());
     this.#targetPreferences = input.targetPreferences;
+    this.#partnerProfiles = input.partnerProfiles;
     const stored = this.#store.findSetting<unknown>("service", this.#scopeId, MAKER_MEMORY_SETTING_KEY);
     if (stored !== undefined) validateStoredSettings(stored.value);
   }
@@ -102,7 +106,12 @@ export class MakerMemoryController {
   get available(): boolean {
     return this.settings().makerEnabled;
   }
-  enabledForTarget(targetId: string): boolean { return this.settings().makerEnabled && (this.#targetPreferences?.enabled(targetId) ?? true); }
+  enabledForTarget(targetId: string): boolean {
+    const generalEnabled = this.available;
+    const partner = generalEnabled ? undefined : this.#partnerProfiles?.findPartnerByHomeTarget(targetId);
+    return (generalEnabled || partner?.lifecycle === "active" && partner.initializationState === "ready")
+      && this.targetMemoryEnabled(targetId);
+  }
   targetMemoryEnabled(targetId: string): boolean { return this.#targetPreferences?.enabled(targetId) ?? true; }
 
   settings(): StoredMemorySettings {
@@ -264,7 +273,7 @@ export class MakerMemoryController {
     readonly body: string;
     readonly mode?: "create" | "update" | "append";
   }, onSaved?: (store: OperationalStore, entry: MakerMemoryEntry, created: boolean) => void): MakerMemoryEntry {
-    if (!this.settings().makerEnabled) throw new Error("Maker Memory is disabled.");
+    if (!this.available && !this.enabledForTarget(targetId)) throw new Error("Maker Memory is disabled.");
     return this.#store.transaction(store => {
       const prior = store.findMakerMemoryEntry(targetId, input.kind, input.name);
       const entry = store.putMakerMemoryEntry({
@@ -312,6 +321,7 @@ export const MAKER_MEMORY_TOOLS: readonly McpToolDescriptor[] = [
 export class MakerMemoryBridgeProvider implements BridgeToolProvider {
   readonly id = MAKER_MEMORY_PROVIDER_ID;
   readonly tools = MAKER_MEMORY_TOOLS;
+  readonly available = true;
   readonly #memory: MakerMemoryController;
 
   constructor(memory: MakerMemoryController) {
@@ -319,7 +329,6 @@ export class MakerMemoryBridgeProvider implements BridgeToolProvider {
   }
 
   get generation(): number { return this.#memory.generation; }
-  get available(): boolean { return this.#memory.available; }
   includeForTarget(targetId: string): boolean { return this.#memory.enabledForTarget(targetId); }
 
   async callTool(
