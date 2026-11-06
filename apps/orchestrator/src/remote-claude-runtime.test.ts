@@ -28,6 +28,7 @@ import type { RemoteHostRecord, StoredTarget } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { RemoteClaudeRuntimeResolver } from "./remote-claude-runtime.js";
+import { uninstallRemoteClaude } from "./remote-claude-installation.js";
 import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
@@ -45,6 +46,39 @@ afterEach(async () => {
 });
 
 describe("RemoteClaudeRuntimeResolver", () => {
+  it("blocks a new SSH Query after uninstall while the original Query stays usable", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    const original = await binding.runtime.query(queryParams(undefined, undefined, false, undefined, {}, []));
+    const assertCurrent = () => binding.assertCurrent();
+    await expect(uninstallRemoteClaude(fixture.processes, assertCurrent)).resolves.toMatchObject({ state: "not_installed" });
+
+    expect(await fixture.resolver.resolve(fixture.target)).toBe(binding);
+    await expect(binding.runtime.query(queryParams(undefined, undefined, false, undefined, { sessionId: FORK_ID }, [])))
+      .rejects.toMatchObject({ code: "runtime_unavailable", stateMayHaveChanged: false });
+    expect(fixture.processes.queryStartEffects).toBe(1);
+    await expect(original.initializationResult()).resolves.toBeDefined();
+    await binding.runtime.retireQuery(original, 2_000);
+  });
+
+  it.each([false, true])("validates a prepared target before registry adoption (Device peer=%s)", async devicePeerWin32 => {
+    const fixture = createFixture({ devicePeerWin32 });
+    cleanups.push(() => fixture.resolver.close());
+    const target = { ...fixture.target, id: "prepared-target", trusted: false };
+    let current = true;
+    const assertCurrent = () => { if (!current) throw new Error("Prepared authority retired"); };
+    await expect(fixture.resolver.validateRegistration(target, assertCurrent)).resolves.toBeUndefined();
+    expect(fixture.readTarget).not.toHaveBeenCalled();
+    expect(fixture.capture).toHaveBeenCalledExactlyOnceWith(target.remoteWorkspace, undefined);
+    expect(fixture.processes.requests).toHaveLength(devicePeerWin32 ? 0 : 1);
+    expect(fixture.processes.frames).toEqual([]);
+    current = false;
+    await expect(fixture.resolver.validateRegistration(target, assertCurrent)).rejects.toThrow("Prepared authority retired");
+    expect(fixture.capture).toHaveBeenCalledOnce();
+    await expect(fixture.resolver.resolve(target)).rejects.toThrow();
+  });
+
   it("keeps standard MCP frames on the original Query connection and retires them before reconnect", async () => {
     const fixture = createFixture(); cleanups.push(() => fixture.resolver.close());
     const binding = await fixture.resolver.resolve(fixture.target);
@@ -880,9 +914,10 @@ function createFixture(options: FixtureOptions = {}) {
     assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); },
     assertForwardingCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH forwarding authority changed"); }
   }));
+  const readTarget = vi.fn(() => fixture.stored);
   const resolver = new RemoteClaudeRuntimeResolver({
     storeGeneration: options.storeGeneration ?? 7,
-    store: { getTarget: () => fixture.stored },
+    store: { getTarget: readTarget },
     remoteExecution: { processes: fixture.capture } as unknown as Pick<RemoteExecutionRouter, "processes">,
     authorizeDerivedWorkspace: async () => {
       if (options.rejectDerivedAuthorization === true) throw new Error("Remote checkout is not owned");
@@ -892,7 +927,7 @@ function createFixture(options: FixtureOptions = {}) {
       };
     }
   });
-  return Object.assign(fixture, { resolver });
+  return Object.assign(fixture, { resolver, readTarget });
 }
 
 class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
@@ -906,6 +941,7 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
   readonly freshResponses = new Map<string, unknown>();
   readonly storeReservationAcks: Array<{ readonly ok: boolean; readonly value: unknown }> = [];
   queryStartEffects = 0;
+  #runtimeAdmitted = true;
   inputEffects = 0;
   retireEffects = 0;
   ownedRetireEffects = 0;
@@ -930,8 +966,15 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     if (request.executable === "/bin/sh") {
       return new FixtureProcess(undefined, (process) => {
         queueMicrotask(() => {
-          process.stdout.write(probeOutput());
-          process.finish(0);
+          if (request.args[2] === "joko-claude-admission") {
+            process.finish(this.#runtimeAdmitted ? 0 : 1);
+          } else if (request.args[1]?.includes('rm -f "$root/.joko-runtime-ready-v1"')) {
+            this.#runtimeAdmitted = false;
+            process.finish(0);
+          } else {
+            process.stdout.write(probeOutput(this.#runtimeAdmitted));
+            process.finish(0);
+          }
         });
       });
     }
@@ -1374,7 +1417,7 @@ function freshIdentity(target: TargetDescriptor, workspaceRoot: string): ClaudeF
   };
 }
 
-function probeOutput(): Buffer {
+function probeOutput(admitted: boolean): Buffer {
   const root = "/home/test/.joko/runtime/v1/claude-code";
   return Buffer.from([
     "/srv/project",
@@ -1385,7 +1428,7 @@ function probeOutput(): Buffer {
     `${root}/run/manager.sock`,
     "0.3.292",
     "2.1.292",
-    "ready",
+    admitted ? "ready" : "not_installed",
     ""
   ].join("\0"), "utf8");
 }

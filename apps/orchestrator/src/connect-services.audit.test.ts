@@ -2918,7 +2918,7 @@ describe("Connect security and protocol audit", () => {
     expect(files.mkdir).toHaveBeenCalledOnce();
     expect(validateTarget).toHaveBeenCalledWith(expect.objectContaining({ remoteWorkspace: {
       kind: "ssh", hostTargetId: sourceDescriptor.id, hostId: "build-box", workspaceRoot: "/srv/new"
-    } }));
+    } }), expect.any(Function));
     expect(upsertTarget).toHaveBeenCalledOnce();
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ root: "/srv/new", remote: {
       targetId: created?.descriptor.id,
@@ -3112,7 +3112,7 @@ describe("Connect security and protocol audit", () => {
       controllerDeviceId: connection.deviceId,
       targetDeviceId: identity.targetDeviceId,
       workspaceRoot: "C:\\work\\new"
-    } }));
+    } }), expect.any(Function));
     expect(upsertTarget).toHaveBeenCalledOnce();
     expect(persistedOperation?.body).toEqual({
       version: 1,

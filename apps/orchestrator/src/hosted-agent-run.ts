@@ -54,6 +54,10 @@ export interface HostedAgentRunOptions {
     readonly nativeOwner: { readonly sessionId: string; readonly targetId: string; readonly generation: number; readonly backendInstanceGeneration: number } }) => BackendAdapter | Promise<BackendAdapter>;
 }
 interface CallReceipt { readonly digest: string; readonly result: Promise<unknown>; settled: boolean }
+const READ_ONLY_HOSTED_CALLS = new Set<HostedAgentCall["kind"]>([
+  "state", "commands", "resources", "tools", "tree", "history", "background_output"
+]);
+const MAXIMUM_OBSERVATION_RECEIPTS = 64;
 export class HostedAgentCleanupError extends Error {
   constructor(readonly run: HostedAgentRun) { super("Hosted Agent native cleanup could not be confirmed."); }
 }
@@ -80,6 +84,7 @@ export class HostedAgentRun {
   #claimed = false;
   #nativeCleaned = false;
   readonly #receipts = new Map<string, CallReceipt>();
+  readonly #observations = new Map<string, CallReceipt>();
   readonly #expiredCalls = new Set<string>();
   #adapter?: BackendAdapter;
   #context?: AdapterContext;
@@ -161,19 +166,22 @@ export class HostedAgentRun {
     if (!id || id.length > 512 || /[\0\r\n]/u.test(id)) throw new Error("Hosted Agent call identity is invalid.");
     const serialized = JSON.stringify(command);
     if (Buffer.byteLength(serialized) > 64 * 1024 * 1024) throw new Error("Hosted Agent call exceeds its limit.");
-    const digest = createHash("sha256").update(serialized).digest("hex"), existing = this.#receipts.get(id);
+    const digest = createHash("sha256").update(serialized).digest("hex"), existing = this.#receipts.get(id) ?? this.#observations.get(id);
     if (existing) { if (existing.digest !== digest) throw new Error("Hosted Agent call identity conflicts."); return existing.result; }
     if (this.#expiredCalls.has(id)) throw new Error("Hosted Agent call receipt expired; the native operation was not repeated.");
+    const observation = READ_ONLY_HOSTED_CALLS.has(command.kind);
+    const receipts = observation ? this.#observations : this.#receipts;
     // Preserve the exact pending result before calling into a native SDK. No
     // retry or uncertain-response path dispatches the same command a second time.
-    if (this.#receipts.size >= 256) {
-      const completed = [...this.#receipts].find(([, value]) => value.settled);
-      if (!completed || this.#expiredCalls.size >= 65_536) throw new Error("Hosted Agent call receipt capacity is exhausted.");
-      this.#receipts.delete(completed[0]); this.#expiredCalls.add(completed[0]);
+    if (receipts.size >= (observation ? MAXIMUM_OBSERVATION_RECEIPTS : 256)) {
+      const completed = [...receipts].find(([, value]) => value.settled);
+      if (!completed || !observation && this.#expiredCalls.size >= 65_536) throw new Error("Hosted Agent call receipt capacity is exhausted.");
+      receipts.delete(completed[0]);
+      if (!observation) this.#expiredCalls.add(completed[0]);
     }
     const input = JSON.parse(serialized) as HostedAgentCall;
-    const result = Promise.resolve().then(() => this.#invokeOnce(id, digest, input)).finally(() => { const current = this.#receipts.get(id); if (current) current.settled = true; });
-    this.#receipts.set(id, { digest, result, settled: false }); void result.catch(() => {}); return result;
+    const result = Promise.resolve().then(() => this.#invokeOnce(id, digest, input)).finally(() => { const current = receipts.get(id); if (current) current.settled = true; });
+    receipts.set(id, { digest, result, settled: false }); void result.catch(() => {}); return result;
   }
   close(): Promise<void> {
     return this.#closing ??= (async () => {
@@ -193,7 +201,7 @@ export class HostedAgentRun {
     })().catch(error => { this.#purging = undefined; throw error; });
   }
   /** The connection owner calls this after the final cursor was drained. */
-  disposeExchange(): void { this.exchange.close(); this.#receipts.clear(); this.#expiredCalls.clear(); }
+  disposeExchange(): void { this.exchange.close(); this.#receipts.clear(); this.#observations.clear(); this.#expiredCalls.clear(); }
 
   async #start(): Promise<void> {
     try {
@@ -473,7 +481,7 @@ export class HostedAgentRun {
   async #invokeOnce(id: string, digest: string, command: HostedAgentCall): Promise<unknown> {
     if (command.kind === "idle_release_status") return this.#idleReleaseStatus(command.releaseCallId);
     this.#assertCurrent();
-    if (["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind)) return this.#invoke(id, command);
+    if (READ_ONLY_HOSTED_CALLS.has(command.kind) || command.kind === "dispatch_during_compaction") return this.#invoke(id, command);
     const prior = this.#options.store.call(this.id, id);
     if (prior) {
       if (prior.digest !== digest) throw new Error("Hosted Agent durable call identity conflicts.");
@@ -497,7 +505,7 @@ export class HostedAgentRun {
   async #invoke(id: string, command: HostedAgentCall): Promise<unknown> {
     this.#assertCurrent();
     if (this.#navigating) throw new Error("Native history navigation is in progress.");
-    const adapter = this.#adapter!, observation = ["state", "commands", "resources", "tools", "tree", "history", "dispatch_during_compaction", "background_output"].includes(command.kind);
+    const adapter = this.#adapter!, observation = READ_ONLY_HOSTED_CALLS.has(command.kind) || command.kind === "dispatch_during_compaction";
     const context = this.#operationContext(observation ? this.#options.runId : id);
     switch (command.kind) {
       case "derive": return this.#derive(id, command, context);
@@ -620,7 +628,8 @@ export class HostedAgentRun {
   #idleBusy(id: string): boolean {
     return !!this.#activeProvider || !!this.#shellOperationId || this.#navigating || this.#toolOwners.size > 0
       || this.#backgroundRegistrations.size > 0 || this.#backgroundResumes.size > 0 || this.#activeBackground.size > 0
-      || this.exchange.pendingRequests > 0 || [...this.#receipts].some(([call, receipt]) => call !== id && !receipt.settled);
+      || this.exchange.pendingRequests > 0
+      || [...this.#receipts, ...this.#observations].some(([call, receipt]) => call !== id && !receipt.settled);
   }
   async #releaseIdle(id: string, idleMinutes: number, context: AdapterContext): Promise<boolean> {
     if (!Number.isSafeInteger(idleMinutes) || idleMinutes < 1 || idleMinutes > 120) throw new Error("Native idle release threshold is invalid.");

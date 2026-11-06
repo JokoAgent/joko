@@ -89,6 +89,27 @@ export class RemoteClaudeInstallationError extends Error {
   }
 }
 
+export async function isRemoteClaudeInstallationAdmitted(
+  processes: RemoteProcessTransportPort,
+  installation: RemoteClaudeInstallationProbe,
+  assertCurrent: () => void,
+  signal: AbortSignal
+): Promise<boolean> {
+  assertCurrent();
+  const result = await runRemoteCommand(processes, {
+    executable: "/bin/sh",
+    args: ["-c", 'test -f "$1" && test ! -L "$1" && test "$(cat "$1")" = "$2"',
+      "joko-claude-admission", remotePath.join(installation.runtimeRoot, ".joko-runtime-ready-v1"),
+      sentinelValue(installation.managerSha256)],
+    cwd: installation.workspaceRoot,
+    timeoutMs: PROBE_TIMEOUT_MS,
+    signal
+  });
+  assertCurrent();
+  signal.throwIfAborted();
+  return result.exitCode === 0;
+}
+
 export async function probeRemoteClaudeInstallation(
   processes: RemoteProcessTransportPort,
   workspaceRoot: string,

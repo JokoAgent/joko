@@ -534,7 +534,8 @@ export interface BackendAdapter {
   describe(): Promise<BackendDescriptor>;
   /** Optional native-account inference; never borrows a product Session or its tools. */
   inferNativeText?(input: NativeTextInferenceInput): Promise<string>;
-  validateTarget(target: TargetDescriptor): Promise<void>;
+  /** A prepared remote registration has a live source but no stored Target yet. */
+  validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void>;
   /** Resolve and validate an opaque native reference without starting a runtime. */
   resolveNativeSessionReference?(
     nativeReference: string,

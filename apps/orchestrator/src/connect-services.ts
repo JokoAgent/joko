@@ -1106,7 +1106,7 @@ interface PageSlice<T> {
 }
 
 type ExtendedSessionHost = SessionHost & {
-  validateTarget(target: import("@joko/core").TargetDescriptor): Promise<void>;
+  validateTarget(target: import("@joko/core").TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void>;
   listNativeSessions(targetId: string): Promise<readonly import("@joko/core").NativeSessionCandidate[]>;
   scanNativeSessionCatalog(backendId: string, force?: boolean): Promise<import("@joko/core").NativeSessionCatalogResult>;
   scanNativeSessionCatalogSnapshot(backendId: string, force?: boolean): Promise<{
@@ -16411,7 +16411,7 @@ async function dispatchMutation(
               trusted: false,
               remoteWorkspace: binding
             };
-            await host.validateTarget(descriptor);
+            await host.validateTarget(descriptor, () => authority.assertCurrent(["files", "process"]));
             authority.assertCurrent(["files", "process"]);
             await dependencies.workspaceService.register({
               id: workspaceId,
@@ -16510,7 +16510,7 @@ async function dispatchMutation(
               workspaceRoot: localRoot, managed: false, trusted: false,
               remoteWorkspace: { kind: "ssh", hostTargetId: sourceTargetId, hostId, workspaceRoot: canonical }
             };
-            await host.validateTarget(descriptor);
+            await host.validateTarget(descriptor, () => { dependencies.connections.fence(connection); authority.assertCurrent(); });
             authority.assertCurrent();
             await dependencies.workspaceService.register({
               id: workspaceId, root: canonical, displayName: descriptor.displayName, trusted: false,

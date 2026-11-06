@@ -182,6 +182,8 @@ export interface CodexRemoteRuntime {
   readonly executionDomain: string;
   /** Synchronous target/host/transport generation fence. */
   readonly assertCurrent: () => void;
+  /** Rechecks installation admission when opening or discovering native sessions. */
+  readonly assertNewSessionAdmitted?: (signal?: AbortSignal) => Promise<void>;
   /** Uses the exact installed executable and transport authority of this runtime. */
   readonly openExecServerProcess?: (signal: AbortSignal) => Promise<CodexNativeProcess>;
   /** Owner-private, Target-bound standard MCP route factory. */
@@ -232,6 +234,7 @@ export interface CodexMcpOpenInput extends CodexMcpSessionInput {
 }
 
 export interface CodexRemoteRuntimePort {
+  validateRegistration?(target: TargetDescriptor, assertCurrent: () => void): Promise<void>;
   resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteRuntime>;
   shutdown(): Promise<void>;
   forceShutdown?(): Promise<void>;
@@ -424,6 +427,7 @@ interface CodexReadScope {
   readonly profileKey: string;
   readonly remote: boolean;
   readonly pathStyle: "posix" | "win32";
+  readonly assertNewSessionAdmitted?: CodexRemoteRuntime["assertNewSessionAdmitted"];
   readonly openExecServerProcess?: CodexRemoteRuntime["openExecServerProcess"];
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
@@ -1100,12 +1104,20 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
   }
 
-  async validateTarget(target: TargetDescriptor): Promise<void> {
+  async validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void> {
     // Registering a local Target validates only its path authority. A missing
     // optional Codex executable must not prevent the Orchestrator from
     // starting; the first runtime-bearing operation performs the audited
     // smart-generation handshake and can retry after installation.
-    await this.#readScope(target, undefined, false);
+    if (target.remoteWorkspace !== undefined && assertPreparedRemoteCurrent !== undefined) {
+      this.#assertOpen();
+      this.#assertTargetBackend(target);
+      validatedRemoteCodexPathStyle(target);
+      if (!this.#remoteRuntimes?.validateRegistration) throw remoteTargetUnsupported();
+      await this.#remoteRuntimes.validateRegistration(target, assertPreparedRemoteCurrent);
+      return;
+    }
+    await this.#readScope(target, undefined, { startLocalHost: false });
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
@@ -1120,7 +1132,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (input.target.remoteWorkspace !== undefined && input.nativeStart?.kind !== "attach") {
       throw remoteMutationUnsupported("create or fork a native Session");
     }
-    const scope = await this.#readScope(input.target, context.signal);
+    const scope = await this.#readScope(input.target, context.signal, { requireNewSessionAdmission: true });
     if (input.nativeStart?.kind === "attach") {
       const binding = bindingFromReference(input.nativeStart.nativeReference, context.generation);
       const resumed = await this.#resumeSession(binding, context, true);
@@ -1640,7 +1652,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async listNativeSessions(target: TargetDescriptor): Promise<readonly NativeSessionCandidate[]> {
-    const scope = await this.#readScope(target);
+    const scope = await this.#readScope(target, undefined, { requireNewSessionAdmission: true });
     const cwd = scope.workspaceRoot;
     const candidates: NativeSessionCandidate[] = [];
     const nativeIds = new Set<string>();
@@ -1678,13 +1690,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             modifiedAt: Math.max(0, Math.trunc((thread.updatedAt ?? thread.createdAt ?? 0) * 1_000)),
             state: thread.status?.["type"] === "systemError" ? "error" : "ready"
           });
-          if (candidates.length >= this.#maximumDiscoveredThreads) {
-            scope.assertCurrent();
-            return candidates;
-          }
+          if (candidates.length >= this.#maximumDiscoveredThreads) break;
         }
+        if (candidates.length >= this.#maximumDiscoveredThreads) break;
         cursor = nextPaginationCursor(page.nextCursor, seenCursors, "CODEX_THREAD_PAGINATION_INVALID", "native Session discovery");
       } while (cursor !== undefined);
+      await scope.assertNewSessionAdmitted?.();
       scope.assertCurrent();
       return candidates;
     } catch (error) {
@@ -3218,17 +3229,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #readScope(
     target: TargetDescriptor,
     signal?: AbortSignal,
-    startLocalHost = true
+    options?: { readonly startLocalHost?: boolean; readonly requireNewSessionAdmission?: boolean }
   ): Promise<CodexReadScope> {
     this.#assertOpen();
-    if (target.backendId !== this.id) {
-      throw adapterError({
-        code: "CODEX_TARGET_BACKEND_MISMATCH",
-        message: "The selected Target belongs to another Backend instance.",
-        phase: "provision",
-        recovery: "Choose a Target owned by this Codex Backend instance."
-      });
-    }
+    this.#assertTargetBackend(target);
     if (target.remoteWorkspace === undefined) {
       this.#hosted?.assertCurrent();
       if (!isAbsolute(target.workspaceRoot)) {
@@ -3249,7 +3253,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           recovery: "Restore the Target workspace and retry."
         });
       }
-      const hostGeneration = startLocalHost ? await this.#ensureLocalHostStarted() : undefined;
+      const hostGeneration = options?.startLocalHost === false ? undefined : await this.#ensureLocalHostStarted();
       return {
         host: this.#host,
         ...(hostGeneration === undefined ? {} : { hostGeneration }),
@@ -3270,28 +3274,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         }
       };
     }
-    const pathStyle = remoteWorkspacePathStyle(target.remoteWorkspace);
-    if (!validRemoteWorkspaceIdentity(target.remoteWorkspace)
-      || pathStyle === undefined
-      || !isNormalizedAbsoluteRemotePath(target.remoteWorkspace.workspaceRoot, pathStyle)
-      || (target.workspaceRoot === target.remoteWorkspace.workspaceRoot
-        ? !isNormalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)
-        : !isNormalizedAbsoluteLocalPath(target.workspaceRoot))) {
-      throw adapterError({
-        code: "CODEX_REMOTE_TARGET_PATH_INVALID",
-        message: "The remote Target workspace binding must contain an exact execution identity and canonical native paths.",
-        phase: "provision",
-        recovery: "Repair the remote Target workspace binding."
-      });
-    }
-    if (this.#remoteRuntimes === undefined) {
-      throw adapterError({
-        code: "CODEX_REMOTE_TARGET_UNSUPPORTED",
-        message: "This Codex Backend instance does not provide a remote app-server transport.",
-        phase: "provision",
-        recovery: "Configure the remote Codex runtime before opening this Target."
-      });
-    }
+    const pathStyle = validatedRemoteCodexPathStyle(target);
+    if (this.#remoteRuntimes === undefined) throw remoteTargetUnsupported();
     try {
       if (signal?.aborted) throw remoteRuntimeCancelled();
       const runtime = await this.#remoteRuntimes.resolve(target, signal);
@@ -3302,6 +3286,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         throw new ProtocolShapeError("remote Codex runtime scope is invalid");
       }
       runtime.assertCurrent();
+      if (options?.requireNewSessionAdmission) await runtime.assertNewSessionAdmitted?.(signal);
       const hostGeneration = await runtime.host.ensureStarted();
       runtime.assertCurrent();
       if (!runtime.host.isActiveGeneration(hostGeneration)
@@ -3320,6 +3305,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         profileKey: runtime.profileKey,
         remote: true,
         pathStyle,
+        ...(runtime.assertNewSessionAdmitted === undefined ? {} : { assertNewSessionAdmitted: runtime.assertNewSessionAdmitted }),
         ...(runtime.openExecServerProcess === undefined ? {} : { openExecServerProcess: runtime.openExecServerProcess }),
         ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
         ...(target.remoteWorkspace.kind === "ssh" && runtime.prepareNativeSkills !== undefined
@@ -6269,6 +6255,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  #assertTargetBackend(target: TargetDescriptor): void {
+    if (target.backendId === this.id) return;
+    throw adapterError({ code: "CODEX_TARGET_BACKEND_MISMATCH", message: "The selected Target belongs to another Backend instance.",
+      phase: "provision", recovery: "Choose a Target owned by this Codex Backend instance." });
+  }
+
   #assertBackendContext(context: AdapterContext): void {
     if (this.#hosted) this.#hosted.assertContext(context);
     else if (context.hostedExecution) throw new TypeError("The selected native Adapter has no hosted executor.");
@@ -7813,6 +7805,27 @@ function isNormalizedAbsoluteLocalPath(value: string): boolean {
     && !/[\u0000-\u001f\u007f]/u.test(value)
     && isAbsolute(value)
     && normalize(value) === value;
+}
+
+function validatedRemoteCodexPathStyle(target: TargetDescriptor): "posix" | "win32" {
+  const binding = target.remoteWorkspace;
+  const pathStyle = remoteWorkspacePathStyle(binding);
+  if (binding === undefined || !validRemoteWorkspaceIdentity(binding) || pathStyle === undefined
+    || !isNormalizedAbsoluteRemotePath(binding.workspaceRoot, pathStyle)
+    || (target.workspaceRoot === binding.workspaceRoot
+      ? !isNormalizedAbsoluteRemotePath(target.workspaceRoot, pathStyle)
+      : !isNormalizedAbsoluteLocalPath(target.workspaceRoot))) {
+    throw adapterError({ code: "CODEX_REMOTE_TARGET_PATH_INVALID",
+      message: "The remote Target workspace binding must contain an exact execution identity and canonical native paths.",
+      phase: "provision", recovery: "Repair the remote Target workspace binding." });
+  }
+  return pathStyle;
+}
+
+function remoteTargetUnsupported() {
+  return adapterError({ code: "CODEX_REMOTE_TARGET_UNSUPPORTED",
+    message: "This Codex Backend instance does not provide a remote app-server transport.",
+    phase: "provision", recovery: "Configure the remote Codex runtime before opening this Target." });
 }
 
 function remoteWorkspacePathStyle(
