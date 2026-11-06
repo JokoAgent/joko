@@ -24,7 +24,11 @@ async function fixture() {
   const origin: PartnerSessionTaskGroupOrigin = { version: 1, roomId: room.id, joinId: "", hostServerId: "task-home", actorId: actor.id,
     ownerId: actor.ownerId, sourceMessageId: "source-message", accessRevision: "1", fallbackSessionId: "original-private" };
   let now = Date.now(); const bytes = new Map<string, Uint8Array>(); let files: BlobRef[] = [];
-  vi.spyOn(store, "listArtifacts").mockImplementation(options => files.slice(options?.offset ?? 0, (options?.offset ?? 0) + (options?.limit ?? 500)).map(blob => ({ blob } as ArtifactRecord)));
+  vi.spyOn(store, "listArtifacts").mockImplementation(options => {
+    if (options?.sessionId !== "task-session" || options.runIds?.length !== 1 || options.runIds[0] !== "task-run") return [];
+    const offset = options.offset ?? 0;
+    return files.slice(offset, offset + (options.limit ?? 500)).map(blob => ({ blob } as ArtifactRecord));
+  });
   const port: PartnerSessionTaskGroupPort = { capture: vi.fn(() => { throw new Error("Completed tasks must not revive an execution lease."); }), homeServerId: () => "task-home",
     publish: async (_origin, request) => host.publish(request, origin.ownerId),
     media: async (_origin, request, signal) => host.media(request, origin.ownerId, { signal, assertCurrent() { signal.throwIfAborted(); } }),
@@ -48,15 +52,15 @@ it("persists multipart terminal output, adopts every valid file and recovers a l
   const original = f.port.publish; let lost = false;
   f.port.publish = async (...args) => { const result = await original(...args); if (!lost) { lost = true; throw new ConnectError("Reply lost", Code.Unavailable); } return result; };
   const text = "Result line. ".repeat(4200), ended = { ...f.task, status: "completed" as const, result: text };
-  const first = f.publisher(); expect(await first.terminal(ended)).toBe("retry"); expect(f.messages()).toHaveLength(1); first.close();
-  f.advance(1001); const recovered = f.publisher(); expect(await recovered.terminal(ended)).toBe("delivered");
+  const first = f.publisher(); expect(await first.terminal(ended, ended.executionRunIds)).toBe("retry"); expect(f.messages()).toHaveLength(1); first.close();
+  f.advance(1001); const recovered = f.publisher(); expect(await recovered.terminal(ended, ended.executionRunIds)).toBe("delivered");
   expect(f.messages()).toHaveLength(3); expect(f.messages().map(message => message.text).join("")).toBe(text);
   expect(f.messages().map(message => message.attachments.length)).toEqual([20, 5, 0]); expect(f.messages().filter(message => message.task)).toHaveLength(1);
   expect(f.messages()[0]?.task).toMatchObject({ title: f.task.title, status: "completed", sessionId: f.task.sessionId, execution: 1 });
   expect(JSON.stringify(f.messages())).not.toContain(f.task.objective); expect(f.host.storage.executions(f.room.id)).toEqual([]); expect(f.store.listQueueItems()).toEqual([]);
   const saved = f.store.listSettings("service", "partner.session-task-group-deliveries")[0]!.value as { files: { skipped?: string }[] };
   expect(saved.files.filter(file => file.skipped)).toHaveLength(3); expect(f.port.capture).not.toHaveBeenCalled();
-  expect(await recovered.terminal(ended)).toBe("delivered"); expect(f.messages()).toHaveLength(3); recovered.close();
+  expect(await recovered.terminal(ended, ended.executionRunIds)).toBe("delivered"); expect(f.messages()).toHaveLength(3); recovered.close();
 });
 
 it("resumes a chunk whose successful receipt was lost from the room's actual persisted offset", async () => {
@@ -65,8 +69,8 @@ it("resumes a chunk whose successful receipt was lost from the room's actual per
   f.port.media = async (...args) => { const result = await media(...args); if (args[1].action === "write") { writes.push(args[1].offset);
     if (!lost) { lost = true; throw new ConnectError("Reply lost", Code.Unavailable); } } return result; };
   const ended = { ...f.task, status: "completed" as const, result: "Ready" }, first = f.publisher();
-  expect(await first.terminal(ended)).toBe("retry"); first.close(); f.advance(1001);
-  const recovered = f.publisher(); expect(await recovered.terminal(ended)).toBe("delivered");
+  expect(await first.terminal(ended, ended.executionRunIds)).toBe("retry"); first.close(); f.advance(1001);
+  const recovered = f.publisher(); expect(await recovered.terminal(ended, ended.executionRunIds)).toBe("delivered");
   expect(writes).toEqual([0n, 262144n, 524288n]); expect(f.messages()).toHaveLength(1); expect(f.messages()[0]?.attachments[0]?.sizeBytes).toBe(600000); recovered.close();
 });
 
@@ -79,7 +83,7 @@ it("skips a server-refused file, sanitizes approval cards and never sends a dela
   expect(await publisher.interaction(f.task, { id: "approval", generation: 1, payload: { id: "approval", kind: "permission", title: "Read secret", toolName: "PRIVATE_TOOL", summary: "PRIVATE_PARAMETERS", risk: "high", choices: ["allow"] } })).toBe("delivered");
   expect(JSON.stringify(f.messages())).not.toContain("PRIVATE_TOOL"); expect(JSON.stringify(f.messages())).not.toContain("PRIVATE_PARAMETERS");
   expect(f.messages()[0]?.task).toMatchObject({ interactionKind: "permission", question: "" });
-  expect(await publisher.terminal({ ...f.task, status: "timed-out", error: "The original time budget ended." })).toBe("delivered");
+  expect(await publisher.terminal({ ...f.task, status: "timed-out", error: "The original time budget ended." }, f.task.executionRunIds)).toBe("delivered");
   expect(f.messages().map(message => message.task?.status)).toEqual(["waiting", "timed-out"]); expect(f.messages()[1]?.attachments).toHaveLength(1);
   expect(publisher.nextAttempt(f.task.id)).toBeUndefined(); publisher.close();
 });
@@ -101,17 +105,17 @@ it("retries the original task file after its begin request stops immediately aft
     } catch { throw new ConnectError("The original upload request disconnected.", Code.Unavailable); }
   };
   const completed = { ...f.task, status: "completed" as const, result: "Finished" };
-  const first = f.publisher(); expect(await first.terminal(completed)).toBe("retry"); first.close();
+  const first = f.publisher(); expect(await first.terminal(completed, completed.executionRunIds)).toBe("retry"); first.close();
   expect(f.messages()).toEqual([]);
   f.advance(1001);
   const recovered = f.publisher();
   try {
-    expect(await recovered.terminal(completed)).toBe("delivered");
+    expect(await recovered.terminal(completed, completed.executionRunIds)).toBe("delivered");
     const attachment = f.messages()[0]!.attachments[0]!;
     expect(f.messages()).toHaveLength(1);
     expect(attachment.name).toBe("report.txt");
     expect(await readFile(join(f.host.options.mediaDirectory, f.room.id, attachment.id.replace(":", "-")), "utf8")).toBe("complete result");
-    expect(await recovered.terminal(completed)).toBe("delivered");
+    expect(await recovered.terminal(completed, completed.executionRunIds)).toBe("delivered");
     expect(f.messages()).toHaveLength(1);
   } finally { recovered.close(); }
 });
@@ -121,7 +125,7 @@ it("returns a definitive archived-room refusal for private fallback, including a
   expect(await publisher.running(f.task)).toBe("delivered");
   const room = f.host.storage.get(f.room.id);
   f.host.storage.manage({ operationId: "archive-room", roomId: room.id, actorId: f.origin.ownerId, expectedRevision: room.revision, action: "archive", targetId: "", value: "", throughSequence: 0 });
-  expect(await publisher.terminal({ ...f.task, status: "completed", result: "Completed result" })).toBe("fallback");
+  expect(await publisher.terminal({ ...f.task, status: "completed", result: "Completed result" }, f.task.executionRunIds)).toBe("fallback");
   expect(f.messages()).toHaveLength(1); expect(f.messages()[0]?.task?.status).toBe("running"); publisher.close();
 });
 
