@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import { CODEX_PROJECT_SKILL_ROOTS } from "@joko/adapter-codex";
 import { isRemoteFileMissing, type RemoteFileStat } from "@joko/remote-ssh";
 import type { OperationalStore } from "@joko/store";
 import { isSensitiveSkillPath } from "./skill-content-policy.js";
 import type { RemoteSkillSourceAuthority } from "./remote-workspace-service.js";
+
+const CAPTURE_GENERATION_NAME = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 
 /** Source provenance is service-private; no remote path is a public acquisition. */
 export interface StoredRemoteProjectSkillSource {
@@ -174,6 +176,16 @@ export class RemoteSkillSourceOwner {
     await this.#removeGeneration(source.generationId);
   }
 
+  /** Only the startup owner can sweep unreferenced captures, before a scan can stage new ones. */
+  async recoverLocalGenerations(referenced: ReadonlySet<string>): Promise<void> {
+    const root = await optionalLstat(this.#root);
+    if (!root?.isDirectory() || root.isSymbolicLink() || await realpath(this.#root) !== this.#root) return;
+    for (const entry of await readdir(this.#root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !CAPTURE_GENERATION_NAME.test(entry.name) || referenced.has(entry.name)) continue;
+      await this.#removeGeneration(entry.name).catch(() => undefined);
+    }
+  }
+
   async #authority(targetId: string, signal?: AbortSignal): Promise<{ readonly authority: RemoteSkillSourceAuthority; readonly assertCurrent: () => void }> {
     signal?.throwIfAborted();
     const target = this.#store.getTarget(targetId);
@@ -214,9 +226,17 @@ export class RemoteSkillSourceOwner {
   async #removeGeneration(id: string): Promise<void> {
     if (!/^[a-f0-9-]{36}$/u.test(id)) throw unavailable();
     const container = join(this.#root, id);
-    const info = await lstat(container).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+    const info = await optionalLstat(container);
     if (info === undefined) return;
-    if (info.isSymbolicLink() || !info.isDirectory() || await realpath(this.#root) !== this.#root || await realpath(container) !== container) throw unavailable();
+    const root = await optionalLstat(this.#root);
+    if (!root?.isDirectory() || root.isSymbolicLink() || !info.isDirectory() || info.isSymbolicLink()
+      || await realpath(this.#root) !== this.#root || await realpath(container) !== container) throw unavailable();
+    const contents = await readdir(container, { withFileTypes: true });
+    if (contents.some(entry => entry.name !== "payload" || !entry.isDirectory())) throw unavailable();
+    const currentRoot = await lstat(this.#root, { bigint: true });
+    const current = await lstat(container, { bigint: true });
+    if (root.dev !== currentRoot.dev || root.ino !== currentRoot.ino || root.birthtimeNs !== currentRoot.birthtimeNs
+      || info.dev !== current.dev || info.ino !== current.ino || info.birthtimeNs !== current.birthtimeNs) throw unavailable();
     await rm(container, { recursive: true });
   }
 
@@ -273,6 +293,10 @@ export class RemoteSkillSourceOwner {
     authority.assertFilesCurrent(); signal?.throwIfAborted();
     return { incarnation: digest([authority.rootRegistrationId, authority.executionIdentity, source, rootBefore]), revision: digest(manifest) };
   }
+}
+
+async function optionalLstat(path: string) {
+  return lstat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
 }
 
 export function remoteProjectSkillSourceIdentity(source: StoredRemoteProjectSkillSource): string {
