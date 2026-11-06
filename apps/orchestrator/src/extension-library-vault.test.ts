@@ -4,7 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, rmdir, symlink, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   EXTENSION_LIBRARY_LIMITS,
@@ -16,8 +16,25 @@ import {
 
 const EXTENSION_ID = `extension_${"a".repeat(32)}`;
 const cleanups: Array<() => Promise<void>> = [];
+const filesystem = vi.hoisted(() => ({ beforeMove: undefined as ((source: unknown, target: unknown) => Promise<void>) | undefined }));
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    link: async (...args: unknown[]) => {
+      await filesystem.beforeMove?.(args[0], args[1]);
+      return Reflect.apply(actual.link, undefined, args);
+    },
+    rename: async (...args: unknown[]) => {
+      await filesystem.beforeMove?.(args[0], args[1]);
+      return Reflect.apply(actual.rename, undefined, args);
+    }
+  };
+});
 
 afterEach(async () => {
+  filesystem.beforeMove = undefined;
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -36,6 +53,25 @@ async function fixture(options: { readonly freeBytes?: number; readonly limits?:
 }
 
 describe("ExtensionLibraryVault", () => {
+  it("preserves a concurrent destination at the native no-overwrite move boundary", async () => {
+    const { root, vault } = await fixture();
+    await vault.open();
+    await vault.write({ path: "source.txt", bytes: Buffer.from("original") });
+    const source = join(root, "source.txt");
+    const destination = join(root, "target.txt");
+    filesystem.beforeMove = async (from, to) => {
+      if (from !== source || to !== destination) return;
+      filesystem.beforeMove = undefined;
+      await writeFile(destination, "concurrent file", { flag: "wx" });
+    };
+
+    await expect(vault.rename({ from: "source.txt", to: "target.txt" })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(readFile(source, "utf8")).resolves.toBe("original");
+    await expect(readFile(destination, "utf8")).resolves.toBe("concurrent file");
+    await expect(vault.rename({ from: "source.txt", to: "target.txt", overwrite: true })).resolves.toBeDefined();
+    await expect(readFile(destination, "utf8")).resolves.toBe("original");
+  });
+
   it.each(["success", "ledger failure"])("enforces a peer's file count before publishing after %s", async outcome => {
     const limits = { maximumFiles: 2 }, { root, vault } = await fixture({ limits });
     await vault.open();
