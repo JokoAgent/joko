@@ -14,7 +14,7 @@ import {
   type NativeThreadItem,
   type NativeTurn
 } from "./protocol.js";
-import { safeIdentifier, safeJson, safePath, safeText, toolIdentity } from "./translator.js";
+import { mcpToolCallErrorMessage, mcpToolCallFailed, safeIdentifier, safeJson, safePath, safeText, toolIdentity } from "./translator.js";
 import { CODEX_FILE_CHANGE_FALLBACK, projectCodexFileChanges } from "./file-change.js";
 import {
   extractAliveYieldCellsFromCodexItem,
@@ -347,12 +347,8 @@ function toolOutput(item: NativeThreadItem, status: string): string {
       return safeTextValue(item["aggregatedOutput"], `Command ${historyIdentifier(status)}.`, 256 * 1024);
     case "fileChange":
       return fileChangeSummary(item);
-    case "mcpToolCall": {
-      const error = isJsonObject(item["error"]) && typeof item["error"]["message"] === "string"
-        ? safeText(item["error"]["message"], 256 * 1024)
-        : undefined;
-      return error ?? safeMcpResult(item["result"]) ?? `MCP tool ${historyIdentifier(status)}.`;
-    }
+    case "mcpToolCall":
+      return mcpToolCallErrorMessage(item) ?? safeMcpResult(item["result"]) ?? `MCP tool ${historyIdentifier(status)}.`;
     case "dynamicToolCall":
       return safeStructuredOutput(item["contentItems"]);
     case "collabAgentToolCall":
@@ -363,8 +359,8 @@ function toolOutput(item: NativeThreadItem, status: string): string {
 }
 
 function toolFailed(item: NativeThreadItem, status: string): boolean {
+  if (item.type === "mcpToolCall") return mcpToolCallFailed(item, status);
   if (status === "failed" || status === "declined" || status === "interrupted") return true;
-  if (item.type === "mcpToolCall") return item["error"] !== null && item["error"] !== undefined;
   if (item.type === "dynamicToolCall") return item["success"] === false;
   return false;
 }

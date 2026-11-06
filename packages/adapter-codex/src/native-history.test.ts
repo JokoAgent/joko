@@ -1,8 +1,40 @@
 import { describe, expect, it } from "vitest";
 import { codexNativeDispatchFingerprint, projectCodexNativeHistory } from "./native-history.js";
-import type { JsonObject, NativeThread } from "./protocol.js";
+import type { JsonObject, NativeThread, NativeThreadItem } from "./protocol.js";
+import { CodexEventTranslator, createTranslatorState } from "./translator.js";
 
 describe("Codex native history projection", () => {
+  it.each<{ title: string; native: JsonObject; output: string; isError: boolean; historyIsError?: boolean }>([
+    { title: "MCP business failure", native: { status: "failed", error: null, result: { content: [{ type: "text", text: "The record is locked." }] } },
+      output: "The record is locked.", isError: true },
+    { title: "MCP success", native: { status: "completed", error: null, result: { content: [{ type: "text", text: "Found the record." }] } },
+      output: "Found the record.", isError: false },
+    { title: "MCP transport failure", native: { status: "failed", error: { message: "Disconnected with password=fixture-secret" }, result: null },
+      output: "Disconnected with password=[REDACTED]", isError: true },
+    { title: "MCP interrupted call", native: { status: "interrupted", error: null, result: { content: [{ type: "text", text: "Interrupted." }] } },
+      output: "Interrupted.", isError: true },
+    { title: "MCP error from an older notification", native: { error: { message: "Connection unavailable." } },
+      output: "Connection unavailable.", isError: true },
+    { title: "MCP result from an older notification", native: { result: { content: [{ type: "text", text: "Found the record." }] } },
+      output: "Found the record.", isError: false, historyIsError: true },
+  ])("preserves the live and reopened state for $title", ({ native, output, isError, historyIsError = isError }) => {
+    const item: NativeThreadItem = { id: "lookup", type: "mcpToolCall", server: "records", tool: "lookup", ...native };
+    const translator = new CodexEventTranslator();
+    const state = createTranslatorState("thread");
+    translator.translate("turn/started", { threadId: "thread", turn: { id: "turn", status: "inProgress", items: [] } }, state);
+    const notification = { threadId: "thread", turnId: "turn", item };
+    translator.translate("item/started", notification, state);
+    const live = translator.translate("item/completed", notification, state);
+    expect(live).toMatchObject([{ type: "tool_result", name: "records/lookup", callId: "lookup", isError, output: expect.stringContaining(output) }]);
+    expect(state.activeTurnId).toBe("turn");
+
+    const thread: NativeThread = { id: "thread", turns: [{ id: "turn", status: "completed", items: [item] }] };
+    const history = projectCodexNativeHistory(thread, { maximumEvents: 10 });
+    expect(history.events.find((event) => event.projectionKind === "tool_result")?.payload).toMatchObject({
+      type: "tool_result", name: "records/lookup", callId: "lookup", isError: historyIsError, output: expect.stringContaining(output),
+    });
+  });
+
   it("matches outgoing native input with persisted schema defaults while preserving image bytes, text spans and ordering", () => {
     const outgoing: JsonObject[] = [{ type: "text", text: "Source input", text_elements: [] }, { type: "image", url: "data:image/png;base64,AA==" }];
     const persisted: JsonObject[] = [{ text_elements: [], text: "Source input", type: "text" }, { detail: null, url: "data:image/png;base64,AA==", type: "image" }];
