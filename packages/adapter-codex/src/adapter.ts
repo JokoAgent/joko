@@ -303,6 +303,7 @@ interface SessionRuntime {
   readonly openExecServerProcess?: CodexRemoteRuntime["openExecServerProcess"];
   readonly nativeAuthenticationAdmission: number | undefined;
   readonly assertExecutionCurrent: () => void;
+  readonly assertRemoteShutdownCurrent?: () => void;
   managedRoute: ManagedProviderRouteBinding | undefined;
   smartRoute: ManagedProviderSmartRoutingBinding | undefined;
   managedOperation: { readonly id: string; lease?: ManagedProviderOperationLease } | undefined;
@@ -434,6 +435,7 @@ interface CodexReadScope {
   readonly openExecServerProcess?: CodexRemoteRuntime["openExecServerProcess"];
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
+  readonly assertRemoteShutdownCurrent?: () => void;
   readonly assertAuthorityCurrent: () => void;
   readonly assertCurrent: () => void;
 }
@@ -3097,6 +3099,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #disposeRuntimes(): Promise<void> {
     const runtimes = [...this.#sessions.values()];
+    const idleMounts = new Set(runtimes.filter(runtime => runtime.assertRemoteShutdownCurrent !== undefined
+      && runtime.nativeSkills !== undefined && !runtimeHasProductWork(runtime)
+      && runtime.pendingTurnStart === undefined && runtime.compaction === undefined
+      && !runtime.nativeTasks.hasActiveTasks() && runtime.pendingServerRequests.size === 0 && runtime.pendingMcpCalls.size === 0
+      && !runtime.routeUnknown && !runtime.rewindUnknown));
     for (const runtime of runtimes) runtime.dispatchLifetime.abort();
     await Promise.allSettled(runtimes.map((runtime) => this.#emitNativeTaskPayloads(
       runtime,
@@ -3118,11 +3125,35 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }));
       this.#cancelPendingServerRequests(runtime);
     }
-    await Promise.allSettled(runtimes.map((runtime) => this.#releaseRuntimeSubscription(runtime, false)));
+    await Promise.allSettled(runtimes.map(async runtime => {
+      const assertCurrent = idleMounts.has(runtime) ? runtime.assertRemoteShutdownCurrent : undefined;
+      const unsubscribe = assertCurrent !== undefined && await this.#confirmIdleRemoteThread(runtime, assertCurrent);
+      await this.#releaseRuntimeSubscription(runtime, unsubscribe, assertCurrent);
+    }));
     await Promise.all([
       ...(this.#ownsHost ? [this.#host.shutdown()] : []),
       ...(this.#remoteRuntimes === undefined ? [] : [this.#remoteRuntimes.shutdown()])
     ]);
+  }
+
+  async #confirmIdleRemoteThread(runtime: SessionRuntime, assertAuthority: () => void): Promise<boolean> {
+    const assertCurrent = (): void => {
+      assertAuthority();
+      if (!runtime.host.isActiveGeneration(runtime.hostGeneration)) throw remoteRuntimeStale();
+    };
+    try {
+      assertCurrent();
+      const response = await runtime.host.request("thread/read", { threadId: runtime.threadId, includeTurns: false },
+        { timeoutMs: 5_000, beforeDispatch: assertCurrent });
+      assertCurrent();
+      if (response.hostGeneration !== runtime.hostGeneration) return false;
+      const thread = parseThreadResult(response.value);
+      await assertNativeThreadTarget(thread, runtime.threadId, runtime.targetWorkspaceRoot, "probe", true);
+      assertCurrent();
+      return thread.status?.["type"] === "idle";
+    } catch {
+      return false;
+    }
   }
 
   async #forceDisposeRuntimes(): Promise<void> {
@@ -3332,7 +3363,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         ...(runtime.openExecServerProcess === undefined ? {} : { openExecServerProcess: runtime.openExecServerProcess }),
         ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
         ...(target.remoteWorkspace.kind === "ssh" && runtime.prepareNativeSkills !== undefined
-          ? { prepareNativeSkills: runtime.prepareNativeSkills } : {}),
+          ? { prepareNativeSkills: runtime.prepareNativeSkills, assertRemoteShutdownCurrent: () => runtime.assertCurrent() } : {}),
         assertAuthorityCurrent: () => {
           this.#assertOpen();
           try {
@@ -3411,6 +3442,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         : nativeRuntimePathStyle(runtime.host),
       ...(!runtime.remote && this.#localMcpBridge !== undefined ? { openMcpBridge: this.#localMcpBridge } : {}),
       ...(runtime.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: runtime.prepareNativeSkills }),
+      ...(runtime.assertRemoteShutdownCurrent === undefined ? {} : { assertRemoteShutdownCurrent: runtime.assertRemoteShutdownCurrent }),
       ...(runtime.openExecServerProcess === undefined ? {} : { openExecServerProcess: runtime.openExecServerProcess }),
       assertAuthorityCurrent,
       assertCurrent: () => {
@@ -4437,6 +4469,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ...(input.scope.openExecServerProcess === undefined ? {} : { openExecServerProcess: input.scope.openExecServerProcess }),
       nativeAuthenticationAdmission: input.nativeAuthenticationAdmission,
       assertExecutionCurrent: input.scope.assertAuthorityCurrent,
+      ...(input.scope.assertRemoteShutdownCurrent === undefined ? {} : { assertRemoteShutdownCurrent: input.scope.assertRemoteShutdownCurrent }),
       managedRoute: input.managedRoute,
       smartRoute: input.smartRoute,
       managedOperation: undefined,
@@ -5299,7 +5332,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return claim;
   }
 
-  async #releaseRuntimeSubscription(runtime: SessionRuntime, unsubscribe: boolean): Promise<void> {
+  async #releaseRuntimeSubscription(
+    runtime: SessionRuntime,
+    unsubscribe: boolean,
+    assertAuthority = runtime.assertExecutionCurrent
+  ): Promise<void> {
     this.#cancelYieldContinuation(runtime);
     this.#releaseManagedOperation(runtime);
     runtime.managedRoute?.dispose();
@@ -5320,11 +5357,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         await subscription.release({ unsubscribe: unsubscribe && !(runtime.remote && runtime.nativeSkills !== undefined) });
       }
       if (unsubscribe && runtime.remote && runtime.nativeSkills !== undefined) {
-        runtime.assertExecutionCurrent();
-        if (!runtime.host.isActiveGeneration(runtime.hostGeneration)) throw remoteRuntimeStale();
-        await runtime.host.releaseUnboundThread(runtime.threadId, runtime.hostGeneration);
-        runtime.assertExecutionCurrent();
-        if (!runtime.host.isActiveGeneration(runtime.hostGeneration)) throw remoteRuntimeStale();
+        const assertCurrent = (): void => {
+          assertAuthority();
+          if (!runtime.host.isActiveGeneration(runtime.hostGeneration)) throw remoteRuntimeStale();
+        };
+        assertCurrent();
+        await runtime.host.releaseUnboundThread(runtime.threadId, runtime.hostGeneration, assertCurrent);
+        assertCurrent();
         this.#releasedRemoteSkillSnapshots.add(runtime.nativeSkills);
       }
     } finally {
