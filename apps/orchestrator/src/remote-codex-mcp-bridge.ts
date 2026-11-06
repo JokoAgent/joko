@@ -101,6 +101,7 @@ export class CodexMcpBridgeManager {
       sessionId: input.sessionId,
       targetId: input.targetId,
       expectedPiGeneration: input.generation,
+      publishCompleteOutput: authority === undefined,
       ttlMs: this.#grantTtlMs,
       ...(this.#includeToolPolicy === undefined ? {} : {
         includeToolPolicy: (policyId) => this.#includeToolPolicy!(input.sessionId, input.targetId, policyId)
