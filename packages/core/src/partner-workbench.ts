@@ -17,6 +17,14 @@ export type PartnerWorkbenchGroup = "waiting" | "running" | "todo" | "done";
 export interface PartnerWorkbenchProject {
   readonly path: string;
   readonly addedAt: number;
+  /** Private filesystem identity on the computer that granted this project. */
+  readonly localIdentity?: PartnerWorkbenchLocalProjectIdentity;
+}
+
+export interface PartnerWorkbenchLocalProjectIdentity {
+  readonly root: string;
+  readonly device: string;
+  readonly inode: string;
 }
 
 export interface PartnerWorkbenchJudgment {

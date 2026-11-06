@@ -566,8 +566,19 @@ describe("workspace, artifact, and capability boundaries", () => {
           expectedRevision: workspaceEntryAbsentRevision
         })
       } });
-      expect((await submit(paired.clients.operation, paired.connectionId, createDirectory)).state).toBe(OperationState.SUCCEEDED);
-      await nextWorkspacePath(watcher, "notes");
+      const directoryReceipt = await submit(paired.clients.operation, paired.connectionId, createDirectory);
+      expect(directoryReceipt.state).toBe(OperationState.SUCCEEDED);
+      await nextWorkspacePath(watcher, "notes", "createWorkspaceEntry directory", {
+        workspaceId,
+        verify: async (signal) => {
+          expect((await paired.clients.operation.getOperation({ operationId: directoryReceipt.operationId }, { signal })).operation)
+            .toEqual(directoryReceipt);
+          const refreshed = await paired.clients.workspace.listWorkspaceEntries({ workspaceId }, { signal });
+          expect(refreshed.entries.filter((entry) => entry.relativePath === "notes")).toHaveLength(1);
+          expect((await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" }, { signal })).entries)
+            .toEqual([]);
+        }
+      });
       const createFile = create(OperationMutationSchema, { payload: {
         case: "createWorkspaceEntry", value: create(CreateWorkspaceEntryMutationSchema, {
           workspaceId, relativePath: "notes/checklist.txt", kind: WorkspaceEntryCreateKind.FILE,
@@ -575,10 +586,22 @@ describe("workspace, artifact, and capability boundaries", () => {
         })
       } });
       const createId = randomUUID();
-      expect((await submit(paired.clients.operation, paired.connectionId, createFile, createId)).state).toBe(OperationState.SUCCEEDED);
+      const fileReceipt = await submit(paired.clients.operation, paired.connectionId, createFile, createId);
+      expect(fileReceipt.state).toBe(OperationState.SUCCEEDED);
       expect((await submit(paired.clients.operation, paired.connectionId, createFile, createId)).state).toBe(OperationState.SUCCEEDED);
       expect(fixture.application.store.getOperation(createId).status).toBe("completed");
-      await nextWorkspacePath(watcher, "notes/checklist.txt");
+      await nextWorkspacePath(watcher, "notes/checklist.txt", "createWorkspaceEntry file", {
+        workspaceId,
+        verify: async (signal) => {
+          expect((await paired.clients.operation.getOperation({ operationId: createId }, { signal })).operation).toEqual(fileReceipt);
+          const refreshed = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" }, { signal });
+          expect(refreshed.entries.map((entry) => entry.relativePath)).toEqual(["notes/checklist.txt"]);
+          const read = await paired.clients.workspace.readWorkspaceFile({
+            workspaceId, relativePath: "notes/checklist.txt", expectedRevision: refreshed.entries[0]!.revision
+          }, { signal });
+          expect(read.preview?.content).toMatchObject({ case: "text", value: { utf8Text: "" } });
+        }
+      });
       const listed = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" });
       const file = listed.entries.find((entry) => entry.relativePath === "notes/checklist.txt");
       expect(file?.revision?.opaqueRevision).not.toBe("");
@@ -590,7 +613,16 @@ describe("workspace, artifact, and capability boundaries", () => {
       });
       expect(saved.newRevision?.opaqueRevision).not.toBe(initialRevision.opaqueRevision);
       expect(saved.entry?.relativePath).toBe(file!.relativePath);
-      await nextWorkspacePath(watcher, file!.relativePath);
+      await nextWorkspacePath(watcher, file!.relativePath, "writeWorkspaceTextFile", {
+        workspaceId,
+        verify: async (signal) => {
+          const read = await paired.clients.workspace.readWorkspaceFile({
+            workspaceId, relativePath: file!.relativePath, expectedRevision: saved.newRevision
+          }, { signal });
+          expect(read.preview?.entry?.revision?.sha256Hex).toBe(sha256(Buffer.from(contents)));
+          expect(read.preview?.content).toMatchObject({ case: "text", value: { utf8Text: contents } });
+        }
+      });
       await expect(paired.clients.workspace.writeWorkspaceTextFile({
         workspaceId, relativePath: file!.relativePath, utf8Text: "stale overwrite\n", expectedRevision: initialRevision
       })).rejects.toMatchObject({ code: Code.Aborted });
@@ -664,7 +696,15 @@ describe("workspace, artifact, and capability boundaries", () => {
         "base64"
       );
       await writeFile(join(fixture.workspaceDirectory, imagePath), imageBytes);
-      await nextWorkspacePath(watcher, imagePath);
+      await nextWorkspacePath(watcher, imagePath, "external image write", {
+        workspaceId,
+        verify: async (signal) => {
+          const read = await paired.clients.workspace.readWorkspaceFile({ workspaceId, relativePath: imagePath }, { signal });
+          expect(read.preview?.content).toMatchObject({ case: "image", value: {
+            blob: { mediaType: "image/png", sha256Hex: sha256(imageBytes) }
+          } });
+        }
+      });
       const imageListing = await paired.clients.workspace.listWorkspaceEntries({ workspaceId, parentRelativePath: "notes" });
       const imageRevision = imageListing.entries.find((entry) => entry.relativePath === imagePath)!.revision;
       const imagePreview = await paired.clients.workspace.readWorkspaceFile({
@@ -783,8 +823,21 @@ describe("workspace, artifact, and capability boundaries", () => {
       const unsafeDelete = await submit(paired.clients.operation, paired.connectionId, deleteDirectory(false));
       expect(unsafeDelete.state).toBe(OperationState.FAILED);
       expect(unsafeDelete.error?.code).toBe("WORKSPACE_ENTRY_UNSAFE");
-      expect((await submit(paired.clients.operation, paired.connectionId, deleteDirectory(true))).state).toBe(OperationState.SUCCEEDED);
-      await nextWorkspacePath(watcher, "notes");
+      const directoryDeleteReceipt = await submit(paired.clients.operation, paired.connectionId, deleteDirectory(true));
+      expect(directoryDeleteReceipt.state).toBe(OperationState.SUCCEEDED);
+      await nextWorkspacePath(watcher, "notes", "deleteWorkspaceEntry directory", {
+        workspaceId,
+        verify: async (signal) => {
+          expect((await paired.clients.operation.getOperation({ operationId: directoryDeleteReceipt.operationId }, { signal })).operation)
+            .toEqual(directoryDeleteReceipt);
+          expect((await paired.clients.operation.getOperation({ operationId: unsafeDelete.operationId }, { signal })).operation)
+            .toEqual(unsafeDelete);
+          const refreshed = await paired.clients.workspace.listWorkspaceEntries({ workspaceId }, { signal });
+          expect(refreshed.entries.filter((entry) => entry.relativePath === "notes")).toEqual([]);
+          const refreshedIndex = await paired.clients.workspace.listWorkspaceFiles({ workspaceId }, { signal });
+          expect(refreshedIndex.relativePaths.some((path) => path === "notes" || path.startsWith("notes/"))).toBe(false);
+        }
+      });
       const reconnected = fixture.clients(paired.authKey);
       expect((await reconnected.workspace.listWorkspaceFiles({ workspaceId })).relativePaths).not.toContain("notes/moved.txt");
       expect((await reconnected.workspace.listWorkspaceFiles({ workspaceId })).relativePaths).not.toContain(imagePath);

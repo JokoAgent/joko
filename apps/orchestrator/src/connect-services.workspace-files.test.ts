@@ -353,7 +353,8 @@ describe("Connect formal Workspace Files contracts", () => {
       requireBlob: true
     }), context());
 
-    expect(preview).toHaveBeenCalledWith("workspace-files", "notes/complete.txt", 1);
+    expect(preview).toHaveBeenCalledWith("workspace-files", "notes/complete.txt", 1, undefined,
+      expect.objectContaining({ signal: expect.any(AbortSignal), assertCurrent: expect.any(Function) }));
     expect(materializeFile).toHaveBeenCalledWith(
       "workspace-files",
       "notes/complete.txt",

@@ -37,7 +37,7 @@ interface PersistedExtraDirectory {
 export class ExtraDirectoryManager {
   readonly #workbenchGrants = new Map<string, {
     readonly revision: bigint;
-    readonly records: readonly ExtraDirectoryRecord[];
+    readonly records: readonly { readonly record: ExtraDirectoryRecord; readonly current: (() => boolean) | undefined }[];
     readonly current: () => boolean;
   }>();
   constructor(private readonly store: OperationalStore) {}
@@ -48,19 +48,20 @@ export class ExtraDirectoryManager {
   replaceWorkbenchGrant(input: {
     readonly targetId: string;
     readonly revision: bigint;
-    readonly directories: readonly { readonly path: string; readonly addedAt: number }[];
+    readonly directories: readonly { readonly path: string; readonly addedAt: number; readonly current?: () => boolean }[];
     readonly current: () => boolean;
   }): void {
     if (input.directories.length > 50) throw directoryError("WORKBENCH_DIRECTORY_LIMIT", "The workbench project limit was exceeded.", "Refresh its durable state.");
     const previous = this.#workbenchGrants.get(input.targetId);
     if (previous !== undefined && previous.revision > input.revision) return;
     const target = this.store.getTarget(input.targetId);
-    const records = input.directories.map((directory): ExtraDirectoryRecord => {
+    const records = input.directories.map((directory) => {
       const binding = target.descriptor.remoteWorkspace;
       const paths = binding?.kind === "device_peer" ? binding.workspaceRoot.startsWith("/") ? posix : win32 : undefined;
       if (paths ? !paths.isAbsolute(directory.path) || paths.normalize(directory.path) !== directory.path : !isAbsolute(directory.path) || resolve(directory.path) !== directory.path) throw directoryError("WORKBENCH_DIRECTORY_INVALID", "The workbench project path is invalid.", "Choose a canonical project directory.");
-      return { id: stableDirectoryId(input.targetId, directory.path), workspaceId: workspaceIdForTarget(target), targetId: input.targetId,
+      const record: ExtraDirectoryRecord = { id: stableDirectoryId(input.targetId, directory.path), workspaceId: workspaceIdForTarget(target), targetId: input.targetId,
         path: directory.path, access: "read_write", approved: true, approvedAt: directory.addedAt, updatedAt: directory.addedAt, revision: input.revision };
+      return { record, current: directory.current };
     });
     this.#workbenchGrants.set(input.targetId, { revision: input.revision, records, current: input.current });
   }
@@ -138,7 +139,7 @@ export class ExtraDirectoryManager {
     const byId = new Map(this.#ordinary().map((entry) => [entry.id, entry]));
     for (const grant of this.#workbenchGrants.values()) {
       if (!grant.current()) continue;
-      for (const entry of grant.records) byId.set(entry.id, entry);
+      for (const { record, current } of grant.records) if (!current || current()) byId.set(record.id, record);
     }
     return [...byId.values()].sort((left, right) => left.workspaceId.localeCompare(right.workspaceId) || left.path.localeCompare(right.path));
   }
@@ -156,7 +157,7 @@ export class ExtraDirectoryManager {
     const grant = this.#workbenchGrants.get(targetId);
     if (!grant?.current()) return ordinary;
     const byId = new Map(ordinary.map((entry) => [entry.id, entry]));
-    for (const entry of grant.records) byId.set(entry.id, entry);
+    for (const { record, current } of grant.records) if (!current || current()) byId.set(record.id, record);
     return [...byId.values()].sort((left, right) => left.path.localeCompare(right.path));
   }
 
@@ -169,7 +170,7 @@ export class ExtraDirectoryManager {
       if (entry && samePath(entry.path, directory.path) && entry.access === directory.access) {
         // A Workbench revision covers the whole project list. Its per-project
         // approval time remains stable when a different project changes.
-        const sameApproval = workbench?.includes(entry)
+        const sameApproval = workbench?.some(({ record }) => record === entry)
           ? "approvedAt" in directory && entry.approvedAt === directory.approvedAt
           : "revision" in directory && entry.revision === directory.revision;
         if (sameApproval) continue;

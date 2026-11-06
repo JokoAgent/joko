@@ -70,7 +70,8 @@ import {
   MobileRemoteClipboardError,
   parseMobileRemoteClipboardItem,
   serializeMobileRemoteClipboardItem,
-  type MobileRemoteClipboardSystem
+  type MobileRemoteClipboardSystem,
+  type MobileRemoteClipboardWriteOutcome
 } from "./mobile-remote-desktop-clipboard";
 import {
   MOBILE_REMOTE_DESKTOP_DEFAULT_VIDEO_SETTINGS,
@@ -280,7 +281,7 @@ export type MobileRemoteDesktopViewerCommand = Readonly<Record<string, unknown>>
 
 interface ClipboardOperation {
   readonly sync: boolean;
-  effectStarted?: boolean;
+  writeOutcome?: MobileRemoteClipboardWriteOutcome | "unknown";
   readonly sequence: number;
   readonly request: AbortController;
   readonly ownerSignal: AbortSignal;
@@ -3778,7 +3779,7 @@ export class MobileRemoteDesktopController {
       };
       const content = (action: RemoteDesktopClipboardContentRequest["action"], version?: string, inline = false) =>
         call(() => {
-          if (action.case === "commit" || action.case === "paste") captured.operation.effectStarted = true;
+          if (action.case === "commit" || action.case === "paste") captured.operation.writeOutcome = "unknown";
           return this.transport.clipboardContent(scope.host, create(RemoteDesktopClipboardContentRequestSchema, {
           leaseId: scope.leaseId, controlGeneration: scope.controlGeneration, sync: true, syncGeneration,
           version, inline, action
@@ -3798,8 +3799,10 @@ export class MobileRemoteDesktopController {
         readLocal: () => call(async () => serializeMobileRemoteClipboardItem(await this.clipboard!.readPortable(check))),
         writeLocal: (json, version) => call(() => {
           const item = parseMobileRemoteClipboardItem(json);
-          captured.operation.effectStarted = true;
-          return this.clipboard!.writeExpected(item, version, check);
+          captured.operation.writeOutcome = "unknown";
+          return this.clipboard!.writeExpected(item, version, check, outcome => {
+            captured.operation.writeOutcome = outcome;
+          });
         }),
         remote: {
           version: () => call(async () => (await this.transport.clipboardVersion(scope.host,
@@ -3852,7 +3855,7 @@ export class MobileRemoteDesktopController {
       this.#set({ ...this.#snapshot, clipboardSyncActive: false, clipboardSyncNotice: failure.reason === "outcome-unknown" ? "unknown" : failure.notice });
     } finally {
       if (context) {
-        if (context.operation.retired && context.operation.effectStarted && this.#clipboardSyncBaseline === baseline) {
+        if (context.operation.retired && context.operation.writeOutcome === "unknown" && this.#clipboardSyncBaseline === baseline) {
           // Unknown native completion is reconciled by a new no-write baseline,
           // never by replaying the consumed commit or captured inline payload.
           this.#clipboardSyncBaseline = { local: "", remote: "" };
