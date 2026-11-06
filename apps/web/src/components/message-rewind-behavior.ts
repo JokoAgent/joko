@@ -1,7 +1,7 @@
 import type { CapabilityView, NativeNavigationTargetView, TargetView, TimelineItemView, WorkspaceChangeSetView } from "../model.js";
 import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 
-export function canRewindToSessionStart(capability: CapabilityView | undefined, target: TargetView | undefined): boolean {
+export function sessionCapabilitySupportsTarget(capability: CapabilityView | undefined, target: TargetView | undefined): boolean {
   if (capability?.supported !== true) return false;
   if (capability.options.length === 0) return true;
   return capability.options.length === 1 && capability.options[0] === "service_node_only"

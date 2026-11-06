@@ -7698,7 +7698,10 @@ function capabilityManifest(
     "interaction.plan_review"
   ]);
   if (workspaceDerivationSupported) supported.add("workspace.derive");
-  if (freshContextSupported) supported.add("session.rewind_to_start");
+  if (freshContextSupported) {
+    supported.add("session.rewind_to_start");
+    supported.add("session.message_delete");
+  }
   if (inputResolvers.readBlob !== undefined) supported.add("input.image");
   if (inputResolvers.resolveFile !== undefined) supported.add("input.file");
   if (textResourcesSupported) { supported.add("runtime.resources"); supported.add("runtime.commands"); }
@@ -7727,7 +7730,8 @@ function capabilityManifest(
   return new Map(CAPABILITIES.map((key): [string, Capability] => {
     const implemented = supported.has(key);
     const available = key === "session.catalog" || key === "session.preview" || (installed && implemented);
-    const options = key === "session.rewind_to_start" && freshContextSupported && !remoteFreshContextSupported
+    const options = key === "session.message_delete" && freshContextSupported
+      || key === "session.rewind_to_start" && freshContextSupported && !remoteFreshContextSupported
       ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION]
       : key === "provider.login" && supportsLogin
       ? ["oauth_browser"]

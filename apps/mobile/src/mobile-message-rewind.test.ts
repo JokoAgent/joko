@@ -4,7 +4,7 @@ import { BackendDescriptorSchema, BackgroundTaskState, CapabilitySupport, EventS
   WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { assertMobileWorkspaceRewindPreview, mobileMessageChangeSet, mobileMessageRewindIdle,
-  mobileRewindToStartSupported, resolveMobileMessageRewindSource } from "./mobile-message-rewind";
+  mobileScopedSessionCapability, resolveMobileMessageRewindSource } from "./mobile-message-rewind";
 
 const event = create(EventSchema, { eventId: "complete", cursor: { generation: 1n, sequence: 2n },
   identity: { sessionId: "task", runId: "run" }, payload: { kind: { case: "messageCompleted", value: {
@@ -43,10 +43,10 @@ describe("native message rewind boundaries and checkpoints", () => {
   it("respects typed service-node-only support and idle work, then rejects ambiguous, foreign or malformed previews", () => {
     const backend = create(BackendDescriptorSchema, { capabilities: { capabilities: [{ name: "session.rewind_to_start",
       support: CapabilitySupport.SUPPORTED, options: { kind: { case: "session", value: { serviceNodeOnly: true } } } }] } });
-    expect(mobileRewindToStartSupported(backend, create(TargetSchema, { location: { kind: { case: "serviceNode", value: {} } } }))).toBe(true);
-    expect(mobileRewindToStartSupported(backend, create(TargetSchema, { location: { kind: { case: "sshHost", value: { hostId: "host" } } } }))).toBe(false);
+    expect(mobileScopedSessionCapability(backend, "session.rewind_to_start", create(TargetSchema, { location: { kind: { case: "serviceNode", value: {} } } }))).toBe(true);
+    expect(mobileScopedSessionCapability(backend, "session.rewind_to_start", create(TargetSchema, { location: { kind: { case: "sshHost", value: { hostId: "host" } } } }))).toBe(false);
     backend.capabilities!.capabilities.push(backend.capabilities!.capabilities[0]!);
-    expect(mobileRewindToStartSupported(backend, create(TargetSchema))).toBe(false);
+    expect(mobileScopedSessionCapability(backend, "session.rewind_to_start", create(TargetSchema))).toBe(false);
     const session = create(SessionSchema, { sessionId: "task", state: SessionState.IDLE });
     const detail = create(SnapshotSchema);
     expect(mobileMessageRewindIdle(session, detail)).toBe(true);

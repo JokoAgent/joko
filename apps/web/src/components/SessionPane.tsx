@@ -59,7 +59,7 @@ import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent,
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, type MessageForkTarget } from "./message-actions.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
-import { canEditVisibleUserMessage, canRewindToSessionStart, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId } from "./message-rewind-behavior.js";
+import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId, sessionCapabilitySupportsTarget } from "./message-rewind-behavior.js";
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
@@ -814,14 +814,17 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const queuedMessageWork = queue.some((item) => item.sessionId === session.id && !["completed", "cancelled", "failed"].includes(item.state));
   const messageActionsIdle = session.state === "idle" && !queuedMessageWork;
   const messageRewindSupported = !reviewReadOnly && !sideChatRuntimeReadOnly && messageActionsIdle && backend?.capabilities.get("session.rewind")?.supported === true;
-  const messageDeleteSupported = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("session.message_delete")?.supported === true;
+  const messageDeleteSupported = !reviewReadOnly && !sideChatRuntimeReadOnly && sessionCapabilitySupportsTarget(
+    backend?.capabilities.get("session.message_delete"),
+    controller.state.snapshot.targets.find(candidate => candidate.id === session.targetId)
+  );
   const messageDeleteBlockedReason = messageActionsIdle && activeCompaction === undefined && interaction === undefined
     ? undefined
     : t("timeline.deleteMessageBusy");
   const currentMessageFork = messageFork?.sessionId === session.id ? messageFork : undefined;
   const currentMessageDelete = messageDelete?.sessionId === session.id ? messageDelete : undefined;
   const latestVisibleUserMessage = lastVisibleUserMessage(visibleTimeline);
-  const rewindToStartSupported = canRewindToSessionStart(
+  const rewindToStartSupported = sessionCapabilitySupportsTarget(
     backend?.capabilities.get("session.rewind_to_start"),
     controller.state.snapshot.targets.find((candidate) => candidate.id === session.targetId)
   );
@@ -1392,7 +1395,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           return;
         }
         if (
-          latestBackend?.capabilities.get("session.message_delete")?.supported !== true
+          !sessionCapabilitySupportsTarget(latestBackend?.capabilities.get("session.message_delete"),
+            latestSnapshot.targets.find(candidate => candidate.id === latestSession.targetId))
           || latestTarget?.messageId !== pending.messageId
           || latestTarget.eventId !== pending.eventId
         ) {
@@ -1663,7 +1667,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const activeSession = snapshot.sessions.find((candidate) => candidate.id === sourceSessionId);
       const activeBackend = activeSession === undefined ? undefined : snapshot.backends.find((candidate) => candidate.id === activeSession.backendId);
       const activeTarget = activeSession === undefined ? undefined : snapshot.targets.find((candidate) => candidate.id === activeSession.targetId);
-      const activeStartSupported = canRewindToSessionStart(activeBackend?.capabilities.get("session.rewind_to_start"), activeTarget);
+      const activeStartSupported = sessionCapabilitySupportsTarget(activeBackend?.capabilities.get("session.rewind_to_start"), activeTarget);
       const activeTimeline = snapshot.timelineBySession.get(sourceSessionId) ?? [];
       const activeUser = lastVisibleUserMessage(activeTimeline.filter((candidate) => !hidesFromTimelineHistory(candidate)));
       const queuedWork = snapshot.queue.some((candidate) => candidate.sessionId === sourceSessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
@@ -1836,7 +1840,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     if (latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
     const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
     if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
-      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, canRewindToSessionStart(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
+      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, sessionCapabilitySupportsTarget(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
       throw new Error(t("timeline.rewindStale"));
     }
     await rewind.navigate(rewind.sessionId, rewind.target, { expectedGeneration: rewind.generation });

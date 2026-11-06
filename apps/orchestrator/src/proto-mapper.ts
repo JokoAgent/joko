@@ -213,7 +213,8 @@ import {
 } from "@joko/contracts";
 import * as contract from "@joko/contracts";
 import type { CodeHostSessionReferenceProjection } from "@joko/code-host";
-import { assertAudioArtifactMetadata, nativeStartScopeOptionsAreValid, redactSecrets, sanitizePublicError, SESSION_REWIND_SERVICE_NODE_ONLY_OPTION, type AudioArtifactMetadata } from "@joko/core";
+import { assertAudioArtifactMetadata, NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, nativeStartScopeOptionsAreValid, redactSecrets, sanitizePublicError, SESSION_REWIND_SERVICE_NODE_ONLY_OPTION, type AudioArtifactMetadata } from "@joko/core";
+import { nativeBindingFingerprint } from "./native-state-observation.js";
 import { validatedProviderCredentialSurfaces } from "./provider-credential-surface.js";
 import {
   PROJECT_AUTOMATION_CONFIG_PATH,
@@ -3059,7 +3060,11 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         delta: payload.delta,
         hidden: false
       }));
-    case "message_complete":
+    case "message_complete": {
+      const fingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
+      const retiredNativeContext = context.session !== undefined && typeof fingerprint === "string"
+        && fingerprint !== nativeBindingFingerprint(context.session.descriptor.binding.opaqueRef);
+      const nativeIdentity = retiredNativeContext ? undefined : toProtoNativeMessageIdentity(payload.nativeHistory?.identity);
       if (payload.modelSubstitution !== undefined && (payload.role !== "assistant" || !validModelSubstitution(payload.modelSubstitution))
         || payload.role !== "assistant" && (payload.usageIsEstimate !== undefined || payload.turnUsage !== undefined)) {
         throw new ProtoMappingError("invalid_argument", "event.payload.message_completed", "Only assistant completions may carry valid model and accounting facts.");
@@ -3097,7 +3102,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
                 scheduleName: payload.automationOrigin.scheduleName ?? "",
                 runId: payload.automationOrigin.runId ?? event.runId ?? ""
               }),
-          nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
+          nativeIdentity,
           automaticContinuation: payload.automaticContinuation !== undefined,
           runtimeRecoveryId: payload.automaticContinuation?.recoveryId ?? "",
           inputHandoffContinuation: payload.inputHandoffContinuation === undefined ? undefined
@@ -3131,12 +3136,13 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
           ? toProtoRunUsageSummary(context.run.descriptor.usage)
           : payload.turnUsage === undefined ? undefined : toProtoMessageTurnUsage(payload.turnUsage, event),
         stopReason: "",
-        nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
+        nativeIdentity,
         partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
           : message<contract.PartnerPrivateMessageOrigin>("joko.v1.PartnerPrivateMessageOrigin", payload.partnerPrivateOrigin),
         learning: context.learning === undefined ? undefined : toProtoLearningFeedback(context.learning),
         ...toProtoMessageGenerationTiming(payload)
       }));
+    }
     case "runtime_recovery":
       return protoPayload("runtimeRecoveryChanged", message<RuntimeRecoveryChangedEvent>("joko.v1.RuntimeRecoveryChangedEvent", {
         recoveryId: payload.recoveryId,
@@ -4753,11 +4759,12 @@ function providerApi(api: ProviderModel["api"]): ProviderApiCompatibility {
 }
 
 export function toProtoCapability(capability: Capability): ProtoCapability {
-  const scopeInvalid = capability.key === "session.rewind_to_start" && !nativeStartScopeOptionsAreValid(capability);
+  const scopeInvalid = (capability.key === "session.rewind_to_start" || capability.key === "session.message_delete")
+    && !nativeStartScopeOptionsAreValid(capability);
   return message<ProtoCapability>("joko.v1.Capability", {
     name: capability.key,
     support: capability.supported && !scopeInvalid ? CapabilitySupport.SUPPORTED : capabilitySupport(capability.reason),
-    reason: scopeInvalid ? "Native start navigation has an invalid Target scope." : capability.detail ?? capability.reason ?? "",
+    reason: scopeInvalid ? "Session capability has an invalid Target scope." : capability.detail ?? capability.reason ?? "",
     options: toProtoCapabilityOptions(capability)
   });
 }
@@ -4796,7 +4803,8 @@ function capabilityReason(support: CapabilitySupport): Capability["reason"] | un
 
 function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | undefined {
   let kind: CapabilityOptions["kind"];
-  if (capability.key === "session.rewind_to_start") {
+  if (capability.key === "session.rewind_to_start"
+    || (capability.key === "session.message_delete" && capability.options?.includes(SESSION_REWIND_SERVICE_NODE_ONLY_OPTION))) {
     if (!nativeStartScopeOptionsAreValid(capability)) return undefined;
     kind = {
       case: "session",
@@ -4807,7 +4815,7 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         createsNewNativeSession: false,
         supportsDetach: false,
         supportsNaming: false,
-        supportsDelete: false,
+        supportsDelete: capability.key === "session.message_delete" && capability.supported,
         serviceNodeOnly: capability.options?.includes(SESSION_REWIND_SERVICE_NODE_ONLY_OPTION) === true
       }
     };

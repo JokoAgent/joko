@@ -79,7 +79,7 @@ import { mobileDeviceNameSource, validMobileDeviceName, type MobileDeviceNameSou
 import { resolveMobileMessageForkSource, type MobileMessageForkSource } from "./mobile-message-fork";
 import {
   assertMobileWorkspaceRewindPreview, mobileMessageChangeSet, mobileMessageRewindIdle, mobileRewindCapability,
-  mobileRewindToStartSupported, mobileWorkspaceRewindExpiresAt, resolveMobileMessageRewindSource,
+  mobileScopedSessionCapability, mobileWorkspaceRewindExpiresAt, resolveMobileMessageRewindSource,
   type MobileMessageRewindControls, type MobileMessageRewindPreview, type MobileMessageRewindResult
 } from "./mobile-message-rewind";
 import {
@@ -11115,9 +11115,10 @@ export class MobileClient {
     if (this.#joinedTask) return false;
     const session = this.#selectedSession();
     const backend = this.#selectedBackend(session);
+    const target = this.#state.owner?.targets.find(candidate => candidate.targetId === session?.targetId);
     return this.#state.status === "connected" && this.#foreground
       && session?.state === SessionState.IDLE
-      && backendSupports(backend, capabilityNames.sessionMessageDelete)
+      && backend !== undefined && mobileScopedSessionCapability(backend, capabilityNames.sessionMessageDelete, target)
       && this.#activeQueueItems(session.sessionId).length === 0
       && this.#completedMessageEvent(eventId) !== undefined;
   }
@@ -13069,7 +13070,7 @@ export class MobileClient {
     const target = owner.targets.find((value) => value.targetId === session.targetId)!;
     const events = this.#state.window ?? [...this.#state.older, ...detail.timeline, ...this.#state.live];
     const source = resolveMobileMessageRewindSource(events, session.sessionId, eventId, owner.generation,
-      mobileRewindToStartSupported(backend, target));
+      mobileScopedSessionCapability(backend, "session.rewind_to_start", target));
     if (!source || !timelineRows(events).some((row) => row.id === source.messageId && row.eventId === eventId && row.completed && row.kind === "user")) return undefined;
     const workspaceId = session.localWorkspace?.workspaceId || session.worktree?.workspaceId || target.workspaceId;
     const workspaces = owner.workspaces.filter((value) => value.workspaceId === workspaceId && value.targetId === session.targetId);
