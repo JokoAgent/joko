@@ -1,4 +1,4 @@
-import { mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fork } from "node:child_process";
@@ -6,6 +6,7 @@ import { fork } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ExtensionLibrarySqlCore,
   ExtensionLibrarySqlService,
   type ExtensionLibrarySqlLimits,
   validateExtensionLibrarySql
@@ -14,8 +15,18 @@ import { ExtensionLibraryVault } from "./extension-library-vault.js";
 
 const EXTENSION_ID = `extension_${"b".repeat(32)}`;
 const cleanups: Array<() => Promise<void>> = [];
+const filesystem = vi.hoisted(() => ({ beforeIdentity: undefined as ((path: unknown) => Promise<void>) | undefined }));
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, lstat: async (...args: unknown[]) => {
+    await filesystem.beforeIdentity?.(args[0]);
+    return Reflect.apply(actual.lstat, undefined, args);
+  } };
+});
 
 afterEach(async () => {
+  filesystem.beforeIdentity = undefined;
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -154,6 +165,28 @@ describe("ExtensionLibrarySqlService", () => {
     await expect(service.execute(opened.handleId, "SELECT * FROM values_table"))
       .rejects.toMatchObject({ code: "CONFLICT" });
     await expect(service.close(opened.handleId)).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("keeps a replacement file when the SQLite reservation loses its path", async () => {
+    const { root, vault } = await fixture();
+    const core = new ExtensionLibrarySqlCore(vault);
+    const database = join(root, "reserved.sqlite");
+    const displaced = join(root, "displaced.sqlite");
+    filesystem.beforeIdentity = async (path) => {
+      if (path !== database) return;
+      try { await rename(database, displaced); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      filesystem.beforeIdentity = undefined;
+      await writeFile(database, "replacement data");
+    };
+    try {
+      await expect(core.open({ path: "reserved.sqlite", create: true })).rejects.toMatchObject({ code: "CONFLICT" });
+      await expect(readFile(database, "utf8")).resolves.toBe("replacement data");
+      await expect(readFile(displaced)).resolves.toEqual(Buffer.alloc(0));
+    } finally { await core.closeAll(); }
   });
 
   it("keeps the host event loop responsive and retires a connection owner when its worker exceeds the deadline", async () => {
