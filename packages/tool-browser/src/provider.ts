@@ -246,6 +246,7 @@ export interface BrowserActivity {
 
 export interface BrowserPageState {
   readonly id: string;
+  readonly documentId?: string;
   readonly url: string;
   readonly title: string;
   readonly state: "ready" | "loading" | "closed" | "crashed";
@@ -486,6 +487,7 @@ export class BrowserProvider {
   #pageIds = new WeakMap<Page, string>();
   #nextPageId = 1;
   readonly #pageStates = new WeakMap<Page, BrowserPageState["state"]>();
+  readonly #pageDocuments = new WeakMap<Page, string>();
   readonly #consoleMessages = new WeakMap<Page, BrowserConsoleMessageSnapshot[]>();
   readonly #httpRequestSummaries = new WeakMap<Page, BrowserHttpRequestSummary[]>();
   readonly #dialogs = new WeakMap<Page, Map<string, Dialog>>();
@@ -1512,6 +1514,38 @@ export class BrowserProvider {
     return Promise.all(this.allPages().map((page) => this.pageState(page)));
   }
 
+  uploadDocumentId(pageId: string): string | undefined {
+    return this.documentIdForPage(this.requirePageNow(validatePublicPageId(pageId)));
+  }
+
+  async uploadFiles(
+    pageId: string,
+    owner: BrowserLeaseFence | BrowserTakeoverFence,
+    action: Extract<BrowserAction, { type: "upload" }>,
+    guard: { readonly documentId: string; readonly assertCurrent: () => void; readonly markDispatched: () => void }
+  ): Promise<void> {
+    const safePageId = validatePublicPageId(pageId);
+    const { selector, paths } = validateBrowserUploadAction(action);
+    if ("takeoverId" in owner) {
+      const takeover = copyTakeoverFence(owner);
+      if (takeover.pageId !== safePageId) throw new BrowserTakeoverConflictError("Browser upload belongs to a different page.");
+      await this.runHumanTakeoverOperation(takeover, (page) => this.setFileInput(page, selector, paths, guard.documentId, () => {
+        this.assertHumanTakeover(takeover);
+        guard.assertCurrent();
+      }, guard.markDispatched), guard.assertCurrent);
+      return;
+    }
+    const lease = copyAgentFence(owner);
+    await this.withAgentControl(lease, async () => {
+      const page = this.requirePageNow(safePageId);
+      await this.setFileInput(page, selector, paths, guard.documentId, () => {
+        this.#leases.assert(lease);
+        guard.assertCurrent();
+      }, guard.markDispatched);
+      await this.emit({ at: Date.now(), type: "action", pageId: safePageId, detail: "upload" });
+    });
+  }
+
   createPage(lease: BrowserLeaseFence, url?: string, label?: string): Promise<BrowserPageState> {
     const fence = copyAgentFence(lease);
     return this.withAgentControl(fence, async () => {
@@ -1658,12 +1692,9 @@ export class BrowserProvider {
         await page.locator(safeAction.selector).selectOption(safeAction.values ?? safeAction.value ?? []);
         break;
       case "upload":
-        if (this.#options.canUpload?.() === false) {
-          throw new Error("Browser uploads are disabled by the active host policy.");
-        }
-        await page.locator(safeAction.selector).setInputFiles(
-          await Promise.all(safeAction.paths.map((path) => this.safeUploadPath(path)))
-        );
+        await this.setFileInput(page, safeAction.selector, safeAction.paths, this.documentIdForPage(page), () => {
+          this.#leases.assert(fence);
+        });
         break;
       case "back":
         await page.goBack({ waitUntil: "domcontentloaded" });
@@ -2066,6 +2097,7 @@ export class BrowserProvider {
   private bindPage(page: Page): void {
     const pageId = this.idFor(page);
     const generation = this.#generation;
+    this.#pageDocuments.set(page, randomUUID());
     if (!this.#consoleMessages.has(page)) this.#consoleMessages.set(page, []);
     if (!this.#httpRequestSummaries.has(page)) this.#httpRequestSummaries.set(page, []);
     if (!this.#dialogs.has(page)) this.#dialogs.set(page, new Map());
@@ -2084,6 +2116,7 @@ export class BrowserProvider {
     });
     page.on("framenavigated", (frame) => {
       if (frame === page.mainFrame()) {
+        this.#pageDocuments.set(page, randomUUID());
         this.#pageStates.set(page, "loading");
         this.fenceHumanCommentLedgerForNavigation(page);
       }
@@ -2260,18 +2293,55 @@ export class BrowserProvider {
 
   private async pageState(page: Page): Promise<BrowserPageState> {
     const navigation = await browserNavigationAvailability(page);
+    const documentId = this.documentIdForPage(page);
     const currentUrl = page.url();
-    const contentReadable = browserPageContentIsReadable(currentUrl);
+    const title = browserPageContentIsReadable(currentUrl)
+      ? truncatePublicText(sanitizeConsoleMessageText(await page.title().catch(() => "")), MAXIMUM_PUBLIC_TITLE_LENGTH)
+      : "";
     return {
       id: this.idFor(page),
+      ...(documentId !== undefined && this.documentIdForPage(page) === documentId ? { documentId } : {}),
       url: sanitizeBrowserUrlForDisplay(currentUrl),
-      title: contentReadable
-        ? truncatePublicText(sanitizeConsoleMessageText(await page.title().catch(() => "")), MAXIMUM_PUBLIC_TITLE_LENGTH)
-        : "",
+      title,
       state: page.isClosed() ? "closed" : this.#pageStates.get(page) ?? "ready",
       canGoBack: navigation.canGoBack,
       canGoForward: navigation.canGoForward
     };
+  }
+
+  private documentIdForPage(page: Page): string | undefined {
+    if (page.isClosed() || this.#pageStates.get(page) === "crashed" || !browserPageContentIsReadable(page.url())) return undefined;
+    return this.#pageDocuments.get(page);
+  }
+
+  private async setFileInput(
+    page: Page,
+    selector: string,
+    paths: readonly string[],
+    documentId: string | undefined,
+    assertCurrent: () => void,
+    markDispatched?: () => void
+  ): Promise<void> {
+    const assertUploadCurrent = () => {
+      assertCurrent();
+      if (documentId === undefined || this.documentIdForPage(page) !== documentId) {
+        throw new BrowserTakeoverConflictError("The original Browser upload document is no longer current.");
+      }
+      if (this.#options.canUpload?.() === false) throw new Error("Browser uploads are disabled by the active host policy.");
+    };
+    assertUploadCurrent();
+    const files = await Promise.all(paths.map((path) => this.safeUploadPath(path)));
+    assertUploadCurrent();
+    // Wait for the input before dispatch, then use its exact DOM handle across navigation.
+    const input = await page.locator(selector).elementHandle();
+    try {
+      assertUploadCurrent();
+      markDispatched?.();
+      await input.setInputFiles(files);
+      assertCurrent();
+    } finally {
+      await input.dispose().catch(() => undefined);
+    }
   }
 
   private async emit(activity: BrowserActivity): Promise<void> {
@@ -2493,16 +2563,8 @@ function validateAndCopyBrowserAction(action: BrowserAction): BrowserAction {
       })
       };
     }
-  case "upload": {
-    if (!Array.isArray(action.paths) || action.paths.length > MAXIMUM_UPLOAD_PATHS) {
-      throw new RangeError(`Browser upload accepts at most ${MAXIMUM_UPLOAD_PATHS} paths.`);
-    }
-    return {
-      type: action.type,
-      selector: validateSelector(action.selector),
-      paths: action.paths.map((path) => validateBoundedString(path, "Browser upload path", MAXIMUM_PATH_LENGTH))
-    };
-  }
+  case "upload":
+    return validateBrowserUploadAction(action);
   case "back":
   case "forward":
   case "reload":
@@ -2510,6 +2572,17 @@ function validateAndCopyBrowserAction(action: BrowserAction): BrowserAction {
   default:
     throw new TypeError("Browser action type is invalid.");
   }
+}
+
+function validateBrowserUploadAction(action: Extract<BrowserAction, { type: "upload" }>): typeof action {
+  if (!Array.isArray(action.paths) || action.paths.length > MAXIMUM_UPLOAD_PATHS) {
+    throw new RangeError(`Browser upload accepts at most ${MAXIMUM_UPLOAD_PATHS} paths.`);
+  }
+  return {
+    type: "upload",
+    selector: validateSelector(action.selector),
+    paths: action.paths.map((path) => validateBoundedString(path, "Browser upload path", MAXIMUM_PATH_LENGTH))
+  };
 }
 
 function validateSelector(value: string): string {

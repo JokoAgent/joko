@@ -34,7 +34,7 @@ import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-builtin-catalog.js";
 import { BROWSER_RECIPE_AUTHOR_RULES, BROWSER_WORKFLOW_RULES } from "./browser-rules.js";
 import { hasSecretPages, isSecretPage } from "./input-handoff/secretTaint.js";
-import type { BrowserTransferCoordinator } from "./browser-transfers.js";
+import type { BrowserTransferConnection, BrowserTransferCoordinator } from "./browser-transfers.js";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 import type {
   BrowserBridgeEffectAuthority,
@@ -785,13 +785,11 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
       case "upload_artifact": {
         const pageId = requiredString(input, "page_id", 512);
-        this.#assertPageContext(pageId);
+        const uploadOwner = this.#uploadOwner(pageId, signal);
         const selector = agentSelector(input);
         const artifactId = requiredString(input, "artifact_id", 512);
         const artifact = await this.#artifacts.get(artifactId);
-        const transfer = await this.#transfers.upload(artifact, pageId, selector, {
-          id: `pi-browser:${this.generation}`
-        });
+        const transfer = await this.#transfers.upload(artifact, pageId, selector, uploadOwner);
         this.#assertPageContext(pageId);
         return textResult({ transfer: publicTransfer(transfer) });
       }
@@ -1002,13 +1000,14 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
       case "upload": {
         const pageId = this.#unifiedPageId(input);
+        const uploadOwner = this.#uploadOwner(pageId, signal);
         const artifactIds = requiredStringArray(input, "paths", 16, 512);
         const selector = this.#browser.resolveElementSelector(pageId, unifiedElementTarget(input, "inputRef"));
         const uploaded = [];
         for (const artifactId of artifactIds) {
           signal?.throwIfAborted();
           const artifact = await this.#artifacts.get(artifactId);
-          const transfer = await this.#transfers.upload(artifact, pageId, selector, { id: `pi-browser:${this.generation}` });
+          const transfer = await this.#transfers.upload(artifact, pageId, selector, uploadOwner);
           uploaded.push(publicTransfer(transfer));
         }
         this.#assertPageContext(pageId);
@@ -1930,6 +1929,20 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     });
     this.#activePageIds.add(pageId);
     return page;
+  }
+
+  #uploadOwner(pageId: string, signal: AbortSignal | undefined): BrowserTransferConnection {
+    const context = this.#activeContext;
+    const assertCurrent = () => {
+      signal?.throwIfAborted();
+      if (this.#activeContext !== context) throw new Error("The Browser tool invocation has retired.");
+      context?.assertCurrent?.();
+      this.#assertPageContext(pageId);
+    };
+    assertCurrent();
+    const documentId = this.#browser.uploadDocumentId(pageId);
+    if (documentId === undefined) throw new Error("The Browser upload document is unavailable.");
+    return { id: `pi-browser:${this.generation}`, documentId, assertCurrent };
   }
 
   async #listVisiblePages(): Promise<readonly BrowserPageState[]> {

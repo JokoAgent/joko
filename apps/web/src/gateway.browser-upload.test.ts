@@ -83,7 +83,7 @@ describe("browser file upload gateway", () => {
     );
     await gateway.connect();
 
-    await gateway.uploadBrowserFile("browser-1", "page-1", new File(["hello"], "proof.txt", { type: "text/plain" }));
+    await gateway.uploadBrowserFile("browser-1", "page-1", "original-document", new File(["hello"], "proof.txt", { type: "text/plain" }));
 
     expect(calls).toEqual(["begin", "put", "complete", "submit"]);
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4318/v1/blob-uploads/ticket-1", expect.objectContaining({
@@ -96,6 +96,7 @@ describe("browser file upload gateway", () => {
       value: {
         browserProviderId: "browser-1",
         pageId: "page-1",
+        documentId: "original-document",
         inputHint: "input[type=file]",
         blob: { blobId: "blob-1", fileName: "proof.txt" }
       }
@@ -149,7 +150,7 @@ describe("browser file upload gateway", () => {
       "test-only-auth", {}, () => transport
     );
     await gateway.connect();
-    const action = gateway.uploadBrowserFile("browser", "page", file);
+    const action = gateway.uploadBrowserFile("browser", "page", "original-document", file);
     const outcome = action.then(() => undefined, (error: unknown) => error);
     await started;
     const admittedCalls = [...calls];

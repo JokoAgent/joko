@@ -245,8 +245,8 @@ function BrowserToolCard({ source, allowUploads, selected, captured, sessions, c
       <header><div><StatusDot state={browser.state} label={browser.state} /><span><h2>{browser.name}</h2><p>{t("browser.generation", { generation: browser.generation.toString() })}</p></span></div><div className="browser-provider__status"><Pill tone={browser.state === "ready" ? "success" : browser.state === "error" ? "danger" : "warning"}>{browser.state}</Pill>{browser.takeover !== undefined && <Pill tone={browser.takeover.state === "active" ? "accent" : "warning"}>{t("browser.takeoverState", { state: browser.takeover.state })}</Pill>}</div></header>
       <div className="browser-provider__layout">
         <BrowserPageRail browser={browser} selectedPageId={page?.id} sessions={sessions} controller={controller} t={t} runAction={runAction} onSelect={onSelect} />
-        {page?.recoverable === true ? <BrowserLostPageCard page={page} t={t} /> : <BrowserCanvas browser={browser} page={page} allowUploads={allowUploads} screenshotBlobId={page === undefined ? undefined : captured[browserPageKey(browser.id, page.id)] ?? page.screenshotBlobId} targets={commentTargets} locale={locale} t={t} controller={controller} runAction={runAction} onCapture={onCapture} onStoreCapture={onStoreCapture} onUpload={(browserId, pageId, file) => {
-          runAction(`browser-upload:${browserPageKey(browserId, pageId)}`, () => controller.uploadBrowserFile(browserId, pageId, file));
+        {page?.recoverable === true ? <BrowserLostPageCard page={page} t={t} /> : <BrowserCanvas browser={browser} page={page} allowUploads={allowUploads} screenshotBlobId={page === undefined ? undefined : captured[browserPageKey(browser.id, page.id)] ?? page.screenshotBlobId} targets={commentTargets} locale={locale} t={t} controller={controller} runAction={runAction} onCapture={onCapture} onStoreCapture={onStoreCapture} onUpload={(browserId, pageId, documentId, file) => {
+          runAction(`browser-upload:${browserPageKey(browserId, pageId)}`, () => controller.uploadBrowserFile(browserId, pageId, documentId, file));
         }} onAction={async (browserId, pageId, action) => {
           const blobId = await controller.performBrowserTakeoverAction(browserId, pageId, action);
           onStoreCapture(browserId, pageId, blobId);
@@ -271,13 +271,14 @@ type BrowserCommentSelectionInputView =
   | Omit<Extract<BrowserCommentInspectionInputView, { readonly intent: "element" }>, "markerNumber">
   | Omit<Extract<BrowserCommentInspectionInputView, { readonly intent: "region" }>, "markerNumber">;
 
-export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, targets, locale, t, controller, runAction, onCapture, onStoreCapture, onUpload, onAction }: { readonly browser: BrowserView; readonly page?: BrowserPageView; readonly allowUploads: boolean; readonly screenshotBlobId?: string; readonly targets: readonly BrowserCommentDraftTarget[]; readonly locale: string; readonly t: Translator; readonly controller: AppController; readonly runAction: RunAction; readonly onCapture: (browserId: string, pageId: string) => void; readonly onStoreCapture: (browserId: string, pageId: string, blobId: string) => void; readonly onUpload: (browserId: string, pageId: string, file: File) => void; readonly onAction: (browserId: string, pageId: string, action: BrowserTakeoverActionView) => Promise<void> }): JSX.Element {
+export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, targets, locale, t, controller, runAction, onCapture, onStoreCapture, onUpload, onAction }: { readonly browser: BrowserView; readonly page?: BrowserPageView; readonly allowUploads: boolean; readonly screenshotBlobId?: string; readonly targets: readonly BrowserCommentDraftTarget[]; readonly locale: string; readonly t: Translator; readonly controller: AppController; readonly runAction: RunAction; readonly onCapture: (browserId: string, pageId: string) => void; readonly onStoreCapture: (browserId: string, pageId: string, blobId: string) => void; readonly onUpload: (browserId: string, pageId: string, documentId: string, file: File) => void; readonly onAction: (browserId: string, pageId: string, action: BrowserTakeoverActionView) => Promise<void> }): JSX.Element {
   const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (page === undefined || rootRef.current === null) return;
     return registerWorkspaceHtmlPreviewSurface(browser.id, page.id, rootRef.current);
   }, [browser.id, page?.id]);
   const uploadInput = useRef<HTMLInputElement>(null);
+  const uploadIntent = useRef<{ browserId: string; pageId: string; documentId: string; connectionId: string; serverId: string } | undefined>(undefined);
   const chromeRef = useRef<BrowserChromeHandle>(null);
   const navigationGenerationRef = useRef(0);
   const commentEpochRef = useRef(0);
@@ -661,7 +662,29 @@ export function BrowserCanvas({ browser, page, allowUploads, screenshotBlobId, t
       if (draftTarget?.kind === "newSession") controller.navigate({ kind: "newSession" });
     }}>{t("browser.commentOpenTask")}</Button>
   </section>}
-  <div className="browser-canvas__takeover"><Pill tone={commentMode ? "accent" : ownsPageTakeover ? "accent" : "neutral"}>{commentMode ? t("browser.commentModeTitle") : ownsPageTakeover ? t("browser.remoteControlActive") : browser.takeover?.state === "active" ? t("browser.remoteControlUnavailable") : t("browser.remoteControlInactive")}</Pill>{browser.takeover?.state === "active" && browser.takeover.pageId !== page.id && <span>{t("browser.takeoverOtherPage")}</span>}</div><div className="browser-canvas__footer"><span>{page.lastActivityAt === undefined ? t("browser.noActivity") : t("browser.activeAgo", { time: formatRelativeTime(page.lastActivityAt, locale) })}</span><input ref={uploadInput} className="sr-only" type="file" tabIndex={-1} aria-hidden="true" onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file !== undefined) onUpload(browser.id, page.id, file); }} /><Button disabled={!allowUploads} title={allowUploads ? t("browser.uploadHelp") : t("browser.uploadDisabled")} onClick={() => uploadInput.current?.click()}><Upload aria-hidden="true" />{t("browser.upload")}</Button>{!takeoverLive && <Button tone="primary" onClick={() => runAction(`browser-takeover:${browserPageKey(browser.id, page.id)}`, () => controller.beginBrowserTakeover(browser.id, page.id))}><Play aria-hidden="true" />{t("browser.takeover")}</Button>}</div></div>;
+  <div className="browser-canvas__takeover"><Pill tone={commentMode ? "accent" : ownsPageTakeover ? "accent" : "neutral"}>{commentMode ? t("browser.commentModeTitle") : ownsPageTakeover ? t("browser.remoteControlActive") : browser.takeover?.state === "active" ? t("browser.remoteControlUnavailable") : t("browser.remoteControlInactive")}</Pill>{browser.takeover?.state === "active" && browser.takeover.pageId !== page.id && <span>{t("browser.takeoverOtherPage")}</span>}</div>
+  <div className="browser-canvas__footer">
+    <span>{page.lastActivityAt === undefined ? t("browser.noActivity") : t("browser.activeAgo", { time: formatRelativeTime(page.lastActivityAt, locale) })}</span>
+    <input ref={uploadInput} className="sr-only" type="file" tabIndex={-1} aria-hidden="true" onChange={(event) => {
+      const file = event.currentTarget.files?.[0];
+      event.currentTarget.value = "";
+      const intent = uploadIntent.current;
+      uploadIntent.current = undefined;
+      const profile = controller.state.activeProfile;
+      if (file !== undefined && intent !== undefined && profile?.id === intent.connectionId && profile.serverId === intent.serverId) {
+        onUpload(intent.browserId, intent.pageId, intent.documentId, file);
+      }
+    }} />
+    <Button disabled={!allowUploads || page.documentId === undefined}
+      title={!allowUploads ? t("browser.uploadDisabled") : page.documentId === undefined ? t("browser.uploadPageUnavailable") : t("browser.uploadHelp")}
+      onClick={() => {
+        const profile = controller.state.activeProfile;
+        if (profile === undefined || page.documentId === undefined) return;
+        uploadIntent.current = { browserId: browser.id, pageId: page.id, documentId: page.documentId, connectionId: profile.id, serverId: profile.serverId };
+        uploadInput.current?.click();
+      }}><Upload aria-hidden="true" />{t("browser.upload")}</Button>
+    {!takeoverLive && <Button tone="primary" onClick={() => runAction(`browser-takeover:${browserPageKey(browser.id, page.id)}`, () => controller.beginBrowserTakeover(browser.id, page.id))}><Play aria-hidden="true" />{t("browser.takeover")}</Button>}
+  </div></div>;
 }
 
 function RemoteBrowserCanvas({ browserId, blobId, page, enabled, commentMode, commentTarget, commentMarker, commentPlacements, overlay, getUrl, t, runAction, onCommentTarget, onCommentExit, onAction }: { readonly browserId: string; readonly blobId: string; readonly page: BrowserPageView; readonly enabled: boolean; readonly commentMode: boolean; readonly commentTarget?: BrowserCommentTargetView; readonly commentMarker?: number; readonly commentPlacements: readonly BrowserCommentPlacementView[]; readonly overlay?: ReactNode; readonly getUrl: (blobId: string) => Promise<string>; readonly t: Translator; readonly runAction: RunAction; readonly onCommentTarget: (target: BrowserCommentTargetView, immediate: boolean) => void; readonly onCommentExit: () => void; readonly onAction: (action: BrowserTakeoverActionView) => Promise<void> }): JSX.Element {

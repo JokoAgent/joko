@@ -64,6 +64,13 @@ class PrimitiveLocator {
     this.page.operations.push({ kind: "upload", selector: this.selector, paths: [...paths] });
   }
 
+  async elementHandle(): Promise<PrimitiveLocator> {
+    await this.page.waitForFileInput?.();
+    return this;
+  }
+
+  async dispose(): Promise<void> {}
+
   async waitFor(): Promise<void> {
     this.page.operations.push({ kind: "waitFor", selector: this.selector });
   }
@@ -87,6 +94,7 @@ class PrimitivePage extends EventEmitter {
   lastScreenshotOptions: unknown;
   screenshotGate: Promise<void> | undefined;
   screenshotStarted: (() => void) | undefined;
+  waitForFileInput: (() => Promise<void>) | undefined;
   #closed = false;
   #url = "about:blank";
 
@@ -218,7 +226,7 @@ interface PrimitiveFixture {
 
 async function primitiveFixture(
   limits: Pick<BrowserProviderOptions,
-    "maximumScreenshotBytes" | "maximumPdfBytes" | "maximumConsoleMessages" | "maximumHttpRequestSummaries"> = {}
+    "maximumScreenshotBytes" | "maximumPdfBytes" | "maximumConsoleMessages" | "maximumHttpRequestSummaries" | "canUpload"> = {}
 ): Promise<PrimitiveFixture> {
   const root = await mkdtemp(join(tmpdir(), "joko-browser-primitives-"));
   const context = new PrimitiveContext();
@@ -306,6 +314,87 @@ describe("BrowserProvider action primitives", () => {
       await value.cleanup();
     }
   });
+
+  it.each(["task", "policy", "document"] as const)("rechecks the original %s after the file input wait", async (retired) => {
+    let allowed = true;
+    let taskActive = true;
+    const value = await primitiveFixture({ canUpload: () => allowed });
+    let enter!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { enter = resolve; });
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const path = join(value.root, "upload.txt");
+      await writeFile(path, "private upload");
+      const page = value.context.page;
+      page.waitForFileInput = () => { enter(); return held; };
+      const documentId = value.provider.uploadDocumentId(value.pageId)!;
+      if (retired === "policy") await value.provider.releaseAgentLease(value.lease);
+      const owner = retired === "policy" ? await value.provider.beginHumanTakeover({
+        providerId: value.provider.id, pageId: value.pageId, generation: value.provider.generation, owner: "human"
+      }) : value.lease;
+      let dispatched = false;
+      const upload = value.provider.uploadFiles(value.pageId, owner, { type: "upload", selector: "#file", paths: [path] }, {
+        documentId,
+        assertCurrent: () => { if (!taskActive) throw new Error("Task retired"); },
+        markDispatched: () => { dispatched = true; }
+      });
+      const error = upload.then(() => undefined, (cause: unknown) => cause);
+      await Promise.race([waiting, error.then((cause) => { throw new Error("Upload did not wait for its file input", { cause }); })]);
+      if (retired === "task") taskActive = false;
+      if (retired === "policy") allowed = false;
+      if (retired === "document") {
+        page.forceUrl("https://replacement.example.test/");
+        page.emit("framenavigated", page.mainFrame());
+        expect(value.provider.uploadDocumentId(value.pageId)).not.toBe(documentId);
+      }
+      release();
+      expect(await error).toMatchObject({ message: expect.stringMatching(/Task retired|active host policy|upload document/u) });
+      expect(dispatched).toBe(false);
+      expect(page.operations).toEqual([]);
+    } finally {
+      release();
+      await value.cleanup();
+    }
+  });
+
+  it.skipIf(process.env.JOKO_BROWSER_EXECUTABLE === undefined)("keeps a selected file out of a replacement Chromium document", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-browser-upload-document-"));
+    const provider = new BrowserProvider({
+      executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, targetMode: "sidebar",
+      profileDirectories: { sidebar: join(root, "sidebar"), external: join(root, "external") },
+      downloadDirectory: join(root, "downloads"), uploadRoots: [root]
+    });
+    try {
+      await provider.start();
+      const [initial] = await provider.listPages();
+      if (initial === undefined) throw new Error("Chromium did not expose a Browser page.");
+      const pageId = initial.id;
+      const takeover = await provider.beginHumanTakeover({ providerId: provider.id, pageId, generation: provider.generation, owner: "owner" });
+      const page = await provider.runHumanTakeoverOperation(takeover, async (nativePage) => nativePage);
+      await page.route(/^https:\/\/(first|replacement)\.example\.test\//u, (route) => route.fulfill({
+        contentType: "text/html", body: '<!doctype html><input id="file" type="file">'
+      }));
+      await page.goto("https://first.example.test/");
+      const originalDocument = provider.uploadDocumentId(pageId)!;
+      const path = join(root, "upload.txt");
+      await writeFile(path, "private upload contents");
+      await page.goto("https://replacement.example.test/");
+      const replacementDocument = provider.uploadDocumentId(pageId)!;
+      expect(replacementDocument).not.toBe(originalDocument);
+      const upload = (documentId: string) => provider.uploadFiles(pageId, takeover, { type: "upload", selector: "#file", paths: [path] }, {
+        documentId, assertCurrent: () => undefined, markDispatched: () => undefined
+      });
+      const selected = () => page.locator("#file").evaluate((element) => (element as HTMLInputElement).files?.[0]?.text());
+      await expect(upload(originalDocument)).rejects.toThrow(/upload document/u);
+      await expect(selected()).resolves.toBeUndefined();
+      await expect(upload(replacementDocument)).resolves.toBeUndefined();
+      await expect(selected()).resolves.toBe("private upload contents");
+    } finally {
+      await provider.stop().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("rejects unsafe URLs and out-of-bound action inputs before dispatch", async () => {
     const value = await primitiveFixture();

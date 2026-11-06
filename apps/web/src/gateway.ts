@@ -4260,13 +4260,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     throw new GatewayError("Browser transfers exceeded the safe pagination limit.");
   }
 
-  async uploadBrowserFile(browserId: string, pageId: string, file: File, inputHint = "input[type=file]"): Promise<void> {
+  async uploadBrowserFile(browserId: string, pageId: string, documentId: string, file: File, inputHint = "input[type=file]"): Promise<void> {
     const scope = this.captureActionScope();
     const blob = await this.uploadAttachment(file, scope);
     scope.signal.throwIfAborted();
     await this.submit({
       case: "uploadBrowserFile",
-      value: { browserProviderId: browserId, pageId, blob, inputHint }
+      value: { browserProviderId: browserId, pageId, documentId, blob, inputHint }
     }, true, [], scope.signal);
   }
 
@@ -16320,6 +16320,7 @@ function mapBrowser(browser: BrowserProvider): BrowserView {
 function mapBrowserPage(page: BrowserPage): BrowserPageView {
   return {
     id: page.pageId,
+    ...(page.documentId === "" ? {} : { documentId: page.documentId }),
     ...(page.sessionId.length === 0 ? {} : { sessionId: page.sessionId }),
     title: page.title || "Untitled page",
     url: page.url,

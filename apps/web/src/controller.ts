@@ -3794,7 +3794,7 @@ export function useAppController(): AppController {
     updateBrowserCommentDesign: (browserId, pageId, command) => gateway().updateBrowserCommentDesign(browserId, pageId, command),
     listBrowserActivity: (browserId, pageId) => gateway().listBrowserActivity(browserId, pageId),
     listBrowserTransfers: (browserId, pageId) => gateway().listBrowserTransfers(browserId, pageId),
-    uploadBrowserFile: (browserId, pageId, file, inputHint) => gateway().uploadBrowserFile(browserId, pageId, file, inputHint),
+    uploadBrowserFile: (browserId, pageId, documentId, file, inputHint) => gateway().uploadBrowserFile(browserId, pageId, documentId, file, inputHint),
     approveResource: async (resourceId, discoveredRevision) => catalogGateway().approveResource(resourceId, discoveredRevision),
     discoverProjectResources: async (targetId) => catalogGateway().discoverProjectResources(targetId),
     addResource: async (draft) => catalogGateway().addResource(draft),

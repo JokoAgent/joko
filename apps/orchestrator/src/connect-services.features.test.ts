@@ -2298,7 +2298,8 @@ describe("Connect typed feature boundaries", () => {
       startedAt: 1_000,
       expiresAt: 61_000
     };
-    const browser = { id: "browser", generation: 7, currentHumanTakeover: () => takeover };
+    let documentId = "original-document";
+    const browser = { id: "browser", generation: 7, currentHumanTakeover: () => takeover, uploadDocumentId: () => documentId };
     const browserState = {
       findRecoverablePage: () => ({
         browserProviderId: "browser",
@@ -2323,6 +2324,7 @@ describe("Connect typed feature boundaries", () => {
         payload: { case: "uploadBrowserFile", value: create(contract.UploadBrowserFileMutationSchema, {
           browserProviderId: "browser",
           pageId: "page-1",
+          documentId: "original-document",
           inputHint: "input[type=file]",
           blob: create(contract.BlobRefSchema, {
             blobId: "blob-1",
@@ -2341,9 +2343,15 @@ describe("Connect typed feature boundaries", () => {
     ));
     expect(upload).toHaveBeenCalledWith(expect.objectContaining({ id: "blob-1" }), "page-1", "input[type=file]", {
       id: connection.id,
+      documentId: "original-document",
+      assertCurrent: expect.any(Function),
       humanTakeover: takeover
     });
     expect(submitted.operation?.result?.payload.case).toBe("browserTransfer");
+    documentId = "replacement-document";
+    await expect(invoke(services.operation.submitOperation, { ...request, operationId: "late-browser-upload" }))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(upload).toHaveBeenCalledOnce();
     const listed = await invoke<{ transfers: contract.BrowserTransfer[]; page?: contract.PageInfo }>(services.browser.listBrowserTransfers, {
       browserProviderId: "browser", pageId: "page-1", direction: contract.TransferDirection.UPLOAD
     });
