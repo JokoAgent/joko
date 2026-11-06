@@ -18692,7 +18692,7 @@ async function dispatchMutation(
           path: payload.value.relativePath,
           expectedRevision: payload.value.expectedRevision,
           confirmRecursive: payload.value.confirmRecursive
-        })
+        }, () => { dependencies.connections.fence(connection); })
       );
     case "copyWorkspaceEntry":
       return workspaceEntryEffectOperation(
