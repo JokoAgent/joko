@@ -14818,6 +14818,57 @@ describe("SessionHost", () => {
     await eventually(() => store.getRun(importedQueued.value.runId).descriptor.state === "completed");
   });
 
+  it.each(["user only", "reasoning", "different turn"] as const)("recovers an SSH Codex failed turn without an assistant reply (%s)", { timeout: 20_000 }, async suffix => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-remote-codex-terminal-"));
+    const store = new OperationalStore(join(directory, "store.db"));
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
+    const remote = new FakeCodexAppServer(), hosts: SessionHost[] = [];
+    cleanups.push(async () => {
+      for (const host of hosts.reverse()) await host.dispose().catch(() => undefined);
+      store.close(); rmSync(directory, { recursive: true, force: true });
+    });
+    await artifacts.initialize();
+    const open = async () => {
+      const local = new FakeCodexAppServer();
+      const localHost = new CodexAppServerHost({ transportFactory: () => local.createTransport() });
+      const remoteHost = new CodexAppServerHost({ transportFactory: () => remote.createTransport() });
+      const adapter = new CodexBackendAdapter({ id: "codex-terminal", instanceGeneration: 7, host: localHost, profileDirectory: directory,
+        remoteRuntimes: { resolve: async () => ({ host: remoteHost, workspaceRoot: "/srv/project", profileKey: "b".repeat(64),
+          executionDomain: "ssh-codex-terminal-fixture", assertCurrent: () => undefined }), shutdown: () => remoteHost.shutdown() } });
+      const host = new SessionHost(store, artifacts, [adapter], { backendDescriptors: [await adapter.describe()] });
+      hosts.push(host); await host.initialize(); return { host, adapter };
+    };
+    const { host, adapter } = await open();
+    const target = { id: "codex-terminal-target", backendId: adapter.id, displayName: "Remote project", workspaceRoot: directory, managed: false, trusted: true,
+      remoteWorkspace: { kind: "ssh" as const, hostTargetId: "codex-terminal-target", hostId: "remote-host", workspaceRoot: "/srv/project" } };
+    await host.registerTarget(target);
+    const threadId = remote.seedThread("/srv/project");
+    const nativeReference = (await adapter.listNativeSessions(target))[0]!.nativeReference;
+    const connection = store.createConnection({ id: "codex-terminal-owner", name: "Owner", authKeyDigest: "fixture" });
+    const sessionId = (await host.createSession({ operationId: "codex-terminal-create", connection, targetId: target.id, title: "Recover terminal state",
+      fastMode: false, permissionMode: "ask", planMode: false, nativeStart: { kind: "attach", nativeReference } })).value.sessionId;
+    const admitted = host.enqueueInput({ operationId: "codex-terminal-input", connection, sessionId,
+      prompt: { text: "Persist the original user input", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await eventually(() => store.getQueueItem(admitted.queueItemId).state === "backend_accepted");
+    const thread = remote.threads.get(threadId)!, turn = thread.turns.at(-1)!;
+    turn["status"] = "failed";
+    thread.status = { type: "idle" };
+    if (suffix === "reasoning") {
+      const items = turn["items"];
+      if (!Array.isArray(items)) throw new Error("The fixture turn has no native items.");
+      turn["items"] = [...items, { type: "reasoning", id: "retained-reasoning", summary: ["Stopped before writing an answer"], content: [] }];
+    }
+    if (suffix === "different turn") thread.turns.push({ id: "unrelated-terminal-turn", status: "failed", items: [], error: null });
+
+    const { host: restarted } = await open();
+    expect(store.getRun(admitted.runId).descriptor.state).toBe("dispatch_unknown");
+    await restarted.getTree(sessionId);
+    const expected = suffix === "different turn" ? "dispatch_unknown" : "failed";
+    expect(store.getQueueItem(admitted.queueItemId).state).toBe(expected);
+    expect(store.getRun(admitted.runId).descriptor.state).toBe(expected);
+    expect(remote.transport?.requests.filter(request => request.method === "turn/start")).toEqual([]);
+  });
+
   it("reconciles remote Codex text acceptance and terminal receipts with the durable Queue, Run, Attempt, and Operation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-remote-codex-dispatch-host-"));
     const store = new OperationalStore(join(directory, "store.db"));
