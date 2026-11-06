@@ -1,4 +1,3 @@
-export * from "./artifact-cleaner.js";
 export * from "./curated-catalog.js";
 export * from "./errors.js";
 export * from "./installer.js";

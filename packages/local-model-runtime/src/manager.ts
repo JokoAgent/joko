@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { totalmem } from "node:os";
 
-import { ManagedSidecarArtifactCleaner, type CancelledPullArtifactCleaner } from "./artifact-cleaner.js";
 import { curatedModelsForHost, modelPreflight, recommendedModelsForHost } from "./curated-catalog.js";
 import { LocalRuntimeError, publicRuntimeError, pullError } from "./errors.js";
 import { installManagedRuntime, runtimeInstallPreflight } from "./installer.js";
@@ -31,7 +30,6 @@ interface ActivePull {
   readonly owner: RuntimeOwnerGeneration;
   readonly name: string;
   readonly abort: AbortController;
-  readonly digests: Set<string>;
   readonly promise: Promise<void>;
   checkpointTail: Promise<void>;
   stopReason: "pause" | "cancel" | undefined;
@@ -45,7 +43,6 @@ export interface LocalModelRuntimeManagerOptions {
   readonly dataRoot: string;
   readonly currentOwner: () => RuntimeOwnerGeneration | undefined;
   readonly pausedPulls?: PausedPullRepository;
-  readonly artifactCleaner?: CancelledPullArtifactCleaner;
   readonly installer?: RuntimeInstaller;
   readonly installLeases?: RuntimeInstallLeaseRepository;
   readonly platform?: NodeJS.Platform;
@@ -60,7 +57,6 @@ export interface LocalModelRuntimeManagerOptions {
 
 export class LocalModelRuntimeManager {
   private readonly pausedPulls: PausedPullRepository;
-  private readonly artifactCleaner: CancelledPullArtifactCleaner;
   private readonly installer: RuntimeInstaller;
   private readonly platform: NodeJS.Platform;
   private readonly arch: NodeJS.Architecture;
@@ -73,7 +69,6 @@ export class LocalModelRuntimeManager {
 
   constructor(private readonly options: LocalModelRuntimeManagerOptions) {
     this.pausedPulls = options.pausedPulls ?? new MemoryPausedPullRepository();
-    this.artifactCleaner = options.artifactCleaner ?? new ManagedSidecarArtifactCleaner(options.dataRoot);
     this.installer = options.installer ?? installManagedRuntime;
     this.platform = options.platform ?? process.platform;
     this.arch = options.arch ?? process.arch;
@@ -308,13 +303,11 @@ export class LocalModelRuntimeManager {
       return existing.promise;
     }
     const abort = new AbortController();
-    const digests = new Set<string>();
     const initial: ModelPullProgress = { name, phase: "starting", status: "starting", done: false };
     const active: ActivePull = {
       owner,
       name,
       abort,
-      digests,
       promise: Promise.resolve(),
       checkpointTail: Promise.resolve(),
       stopReason: undefined,
@@ -322,7 +315,7 @@ export class LocalModelRuntimeManager {
       progress: initial
     };
     this.activePullsByName.set(key, active);
-    const promise = this.runPull({ owner, name, key, abort, digests, getActive: () => active })
+    const promise = this.runPull({ owner, name, abort, getActive: () => active })
       .finally(() => {
         if (this.activePullsByName.get(key) === active) this.activePullsByName.delete(key);
       });
@@ -340,11 +333,12 @@ export class LocalModelRuntimeManager {
   }
 
   async cancel(owner: RuntimeOwnerGeneration, name: string): Promise<void> {
-    const stopped = await this.stopPull(owner, name, "cancel");
-    if (!stopped) {
-      const normalized = normalizeOllamaModelName(name);
-      const record = await this.pausedPulls.remove(owner, normalized);
-      await this.cleanupCancelled(owner, normalized, record?.digests ?? []);
+    this.assertOwner(owner);
+    const normalized = normalizeOllamaModelName(name);
+    if (this.activePullsByName.has(canonicalModelName(normalized))) {
+      await this.stopPull(owner, normalized, "cancel");
+    } else {
+      await this.pausedPulls.remove(owner, normalized);
     }
   }
 
@@ -380,12 +374,11 @@ export class LocalModelRuntimeManager {
   private async runPull(input: {
     readonly owner: RuntimeOwnerGeneration;
     readonly name: string;
-    readonly key: string;
     readonly abort: AbortController;
-    readonly digests: Set<string>;
     readonly getActive: () => ActivePull;
   }): Promise<void> {
-    const { owner, name, abort, digests } = input;
+    const { owner, name, abort } = input;
+    const digests = new Set<string>();
     this.audit(owner, "model_pull", "started", name);
     const layers = new Map<string, { readonly completed: number; readonly total: number }>();
     const speed = createTransferSpeedTracker();
@@ -449,8 +442,10 @@ export class LocalModelRuntimeManager {
         if (reason === "pause") await checkpoint(stopped, true);
         else {
           await active.checkpointTail;
+          this.assertOwner(owner);
+          // Ollama owns the shared blob cache. A progress digest identifies
+          // content and can also belong to an installed or concurrent model.
           await this.pausedPulls.remove(owner, name);
-          await this.cleanupCancelled(owner, name, [...digests]);
         }
         this.audit(owner, "model_pull", "cancelled", name, "OPERATION_CANCELLED");
         throw new LocalRuntimeError("OPERATION_CANCELLED", reason === "pause" ? "The model pull was paused." : "The model pull was cancelled.");
@@ -464,37 +459,15 @@ export class LocalModelRuntimeManager {
     }
   }
 
-  private async stopPull(owner: RuntimeOwnerGeneration, requestedName: string, reason: "pause" | "cancel"): Promise<boolean> {
+  private async stopPull(owner: RuntimeOwnerGeneration, requestedName: string, reason: "pause" | "cancel"): Promise<void> {
     this.assertOwner(owner);
     const name = normalizeOllamaModelName(requestedName);
     const active = this.activePullsByName.get(canonicalModelName(name));
-    if (active === undefined) return false;
+    if (active === undefined) return;
     if (!sameOwner(active.owner, owner)) throw new LocalRuntimeError("PULL_BUSY", "The model pull belongs to another runtime owner.");
     active.stopReason = reason;
     active.abort.abort();
     await active.promise.catch(() => undefined);
-    return true;
-  }
-
-  private async cleanupCancelled(owner: RuntimeOwnerGeneration, name: string, digests: readonly string[]): Promise<void> {
-    let installed = true;
-    try {
-      const tags = await this.options.client.tags();
-      installed = tags.some((tag) => modelNamesEqual(tag.name, name));
-    } catch {
-      installed = true;
-    }
-    if (!installed) await this.options.client.delete(name).catch(() => undefined);
-    const keepDigests = new Set<string>();
-    for (const active of this.activePullsByName.values()) {
-      if (modelNamesEqual(active.name, name)) continue;
-      for (const digest of active.digests) keepDigests.add(digest);
-    }
-    for (const paused of await this.pausedPulls.list(owner)) {
-      if (modelNamesEqual(paused.name, name)) continue;
-      for (const digest of paused.digests) keepDigests.add(digest);
-    }
-    await this.artifactCleaner.cleanup({ digests, keepDigests });
   }
 
   private async syncInstalled(owner: RuntimeOwnerGeneration): Promise<void> {
