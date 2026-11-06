@@ -98,13 +98,19 @@ public class JokoRemotePresentationModule: Module {
       return String(UIPasteboard.general.changeCount)
     }.runOnQueue(.main)
 
-    AsyncFunction("syncClipboard") { (json: String, version: String) -> String in
-      try RemoteClipboard.foreground()
-      guard String(UIPasteboard.general.changeCount) == version else {
-        throw RemoteClipboard.failure("REMOTE_DESKTOP_CLIPBOARD_CHANGED")
+    AsyncFunction("syncClipboard") { (json: String, version: String, promise: Promise) in
+      do {
+        try RemoteClipboard.foreground()
+        guard String(UIPasteboard.general.changeCount) == version else {
+          throw RemoteClipboard.failure("REMOTE_DESKTOP_CLIPBOARD_CHANGED")
+        }
+        try RemoteClipboard.write(json, expectedVersion: version)
+        promise.resolve(String(UIPasteboard.general.changeCount))
+      } catch {
+        let failure = error as NSError
+        let code = failure.domain == "JokoClipboard" ? failure.localizedDescription : "REMOTE_DESKTOP_CLIPBOARD_FAILED"
+        promise.reject(code, code)
       }
-      try RemoteClipboard.write(json, expectedVersion: version)
-      return String(UIPasteboard.general.changeCount)
     }.runOnQueue(.main)
 
     AsyncFunction("readClipboard") { () -> String in

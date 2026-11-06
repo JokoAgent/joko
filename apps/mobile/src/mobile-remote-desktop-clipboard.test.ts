@@ -101,6 +101,31 @@ describe("Mobile Remote Desktop clipboard", () => {
     await expect(system.version(() => undefined)).rejects.toMatchObject({ code: "unsupported" });
   });
 
+  it("reports a native expected-write result even when the original viewer retires before adoption", async () => {
+    const native = {
+      readClipboard: vi.fn(async () => '{"text":"native"}'), writeClipboard: vi.fn(async () => undefined),
+      clipboardVersion: vi.fn(async () => "1"), syncClipboard: vi.fn(async () => "2")
+    };
+    const system = createMobileRemoteClipboardSystem(native, legacy());
+    const report = vi.fn();
+    native.syncClipboard.mockRejectedValueOnce({ code: "REMOTE_DESKTOP_CLIPBOARD_RETIRED" });
+    await expect(system.writeExpected({ text: "native" }, "1", () => undefined, report)).rejects.toMatchObject({ code: "retired" });
+    expect(report).toHaveBeenCalledExactlyOnceWith("not-written");
+
+    report.mockClear();
+    let current = true;
+    native.syncClipboard.mockImplementationOnce(async () => { current = false; return "2"; });
+    await expect(system.writeExpected({ text: "native" }, "1", () => {
+      if (!current) throw new Error("Viewer retired.");
+    }, report)).rejects.toThrow("Viewer retired.");
+    expect(report).toHaveBeenCalledExactlyOnceWith("written");
+
+    report.mockClear();
+    native.syncClipboard.mockRejectedValueOnce(new Error("Native response lost."));
+    await expect(system.writeExpected({ text: "native" }, "1", () => undefined, report)).rejects.toMatchObject({ code: "failed" });
+    expect(report).not.toHaveBeenCalled();
+  });
+
   it("rechecks the caller fence around every native effect", async () => {
     const native = {
       readClipboard: vi.fn(async () => JSON.stringify({ text: "private" })),

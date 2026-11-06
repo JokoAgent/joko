@@ -977,7 +977,7 @@ async function syncFixture(enabled = true) {
   await controller.open();
   await vi.advanceTimersByTimeAsync(0);
   return { ...value, controller, clipboard, version, readPortable, writeExpected, disk, storage, preferences, identity,
-    local: (text: string) => { localItem = { text }; localCounter += 1; },
+    local: (text: string) => { localItem = { text }; return `${epoch}:${++localCounter}`; },
     remote: (text: string) => { remoteItem = { text }; remoteCounter += 1; },
     localItem: () => localItem, remoteItem: () => remoteItem };
 }
@@ -1092,6 +1092,61 @@ describe("Mobile clipboard sync lifecycle and effect authority", () => {
     const latest = h.clipboardVersion.mock.calls.at(-1)![1];
     expect(latest.controlGeneration).toBe(2n);
     expect(latest.syncGeneration).toBe(syncGeneration);
+    await h.controller.close();
+  });
+
+  it.each([true, false])("reconciles a retired native write from an exact rejection (receipt=%s)", async known => {
+    vi.useFakeTimers();
+    const h = await syncFixture();
+    let rejectWrite!: () => void;
+    h.writeExpected.mockImplementationOnce((_item, _expected, check, report) => {
+      check();
+      return new Promise((_resolve, reject) => {
+        rejectWrite = () => {
+          if (known) report?.("not-written");
+          reject(known ? new MobileRemoteClipboardError("retired") : new Error("Native response lost."));
+        };
+      });
+    });
+    h.remote("H1 while connected");
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(h.writeExpected).toHaveBeenCalledOnce();
+    h.controller.setInteractive(false);
+    rejectWrite();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.localItem()).toEqual({ text: "phone initial" });
+
+    h.controller.setInteractive(true);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(h.controller.snapshot.clipboardSyncActive).toBe(true);
+    expect(h.writeExpected).toHaveBeenCalledTimes(known ? 2 : 1);
+    expect(h.localItem()).toEqual({ text: known ? "H1 while connected" : "phone initial" });
+    await h.controller.close();
+  });
+
+  it("detects a two-sided conflict after a confirmed phone write retires before adoption", async () => {
+    vi.useFakeTimers();
+    const h = await syncFixture();
+    let finishWrite!: () => void;
+    h.writeExpected.mockImplementationOnce((item, _expected, check, report) => {
+      check();
+      const version = h.local(item.text!);
+      return new Promise(resolve => { finishWrite = () => { report?.("written"); resolve(version); }; });
+    });
+    h.remote("H1 written to phone");
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(h.localItem()).toEqual({ text: "H1 written to phone" });
+    h.controller.setInteractive(false);
+    finishWrite();
+    await vi.advanceTimersByTimeAsync(0);
+    h.remote("H2 copied while inactive");
+
+    h.controller.setInteractive(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.controller.snapshot.clipboardSyncNotice).toBe("conflict");
+    expect(h.writeExpected).toHaveBeenCalledOnce();
+    expect(h.localItem()).toEqual({ text: "H1 written to phone" });
+    expect(h.remoteItem()).toEqual({ text: "H2 copied while inactive" });
     await h.controller.close();
   });
 

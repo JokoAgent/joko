@@ -25,11 +25,14 @@ export class MobileRemoteClipboardError extends Error {
   }
 }
 
+export type MobileRemoteClipboardWriteOutcome = "not-written" | "written";
+
 export interface MobileRemoteClipboardSystem {
   readonly richAvailable: boolean;
   readonly syncAvailable: boolean;
   version(check: () => void): Promise<string>;
-  writeExpected(item: MobileRemoteClipboardItem, version: string, check: () => void): Promise<string>;
+  writeExpected(item: MobileRemoteClipboardItem, version: string, check: () => void,
+    report?: (outcome: MobileRemoteClipboardWriteOutcome) => void): Promise<string>;
   readPortable(check: () => void): Promise<MobileRemoteClipboardItem>;
   writePortable(item: MobileRemoteClipboardItem, check: () => void): Promise<void>;
   readLegacyText(check: () => void): Promise<string>;
@@ -69,16 +72,26 @@ export function createMobileRemoteClipboardSystem(
       check();
       return assertClipboardVersion(version);
     },
-    async writeExpected(item: MobileRemoteClipboardItem, version: string, check: () => void): Promise<string> {
+    async writeExpected(item: MobileRemoteClipboardItem, version: string, check: () => void,
+      report?: (outcome: MobileRemoteClipboardWriteOutcome) => void): Promise<string> {
       if (!syncAvailable) throw new MobileRemoteClipboardError("unavailable");
       const json = serializeMobileRemoteClipboardItem(item);
       assertClipboardVersion(version);
       check();
       let written: string;
       try { written = await native!.syncClipboard!(json, version); }
-      catch (error) { throw normalizeMobileRemoteClipboardError(error); }
+      catch (error) {
+        if (error !== null && typeof error === "object" && "code" in error
+          && (error.code === "REMOTE_DESKTOP_CLIPBOARD_RETIRED" || error.code === "REMOTE_DESKTOP_CLIPBOARD_CHANGED"
+            || error.code === "REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED" || error.code === "REMOTE_DESKTOP_CLIPBOARD_TOO_LONG")) {
+          report?.("not-written");
+        }
+        throw normalizeMobileRemoteClipboardError(error);
+      }
+      const receipt = assertClipboardVersion(written);
+      report?.("written");
       check();
-      return assertClipboardVersion(written);
+      return receipt;
     },
     async readPortable(check: () => void): Promise<MobileRemoteClipboardItem> {
       if (!richAvailable) throw new MobileRemoteClipboardError("unavailable");
