@@ -210,8 +210,11 @@ export function WorkspaceFilesRoute({
   }, []);
   const selectedPathResult = useMemo(() => safeWorkspacePath(route.file), [route.file]);
   const selectedPath = selectedPathResult.path;
-  const previewOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+  const profile = controller.state.activeProfile;
+  const previewOwnerKey = JSON.stringify([profile?.serverId, profile?.id,
     controller.state.connectionGeneration, workspace.id, workspace.targetId, workspace.serverPath, workspace.remoteWorkspace]);
+  const fileIndexCacheKey = profile === undefined ? undefined : JSON.stringify([profile.serverId, profile.deviceId, profile.id,
+    workspace.id, workspace.targetId, workspace.serverPath, workspace.remoteWorkspace, workspace.trusted]);
   const selectedPreviewState = previewState.ownerKey === previewOwnerKey && previewState.workspaceId === workspace.id && previewState.path === selectedPath
     ? previewState : undefined;
   const selectedPreview = selectedPreviewState?.preview ?? (selectedPath === undefined ? undefined : controller.peekWorkspaceFile?.(workspace.id, selectedPath));
@@ -506,7 +509,7 @@ export function WorkspaceFilesRoute({
   ): Promise<WorkspaceFilesFileIndexPage> => {
     if (workspaceId !== workspace.id) throw new Error("The workspace changed while files were indexing.");
     return await controllerRef.current.listWorkspaceFiles(workspaceId, signal);
-  }, [workspace.id]);
+  }, [previewOwnerKey, workspace.id]);
 
   // The sidebar also retires its current search when a rebind changes the read owner.
   const searchWorkspace = useCallback((request: WorkspaceFilesSearchRequest, signal: AbortSignal): AsyncIterable<WorkspaceFilesSearchEvent> => {
@@ -813,6 +816,7 @@ export function WorkspaceFilesRoute({
           className="workspace-files-shell-sidebar__body"
           workspaceId={workspace.id}
           workspaceRevision={workspace.revision}
+          fileIndexCacheKey={fileIndexCacheKey}
           workspaceDisplayName={target.name || workspace.name}
           selectedPath={selectedPath}
           activeTargetId={target.id}
