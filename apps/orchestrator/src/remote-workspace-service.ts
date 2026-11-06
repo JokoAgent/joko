@@ -27,6 +27,7 @@ import {
   WorkspaceTextFileWriteError,
   fileHash,
   gitRemoteUrlContainsCredentials,
+  isSafeGitRevision,
   isUnmergedGitStatus,
   selectDiffFilePatch,
   selectDiffHunkPatch,
@@ -936,9 +937,18 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     }
     const before = await repositoryRevision(processes, registration.root);
     if (before !== input.expectedRepositoryRevision) throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
+    const assertIdle = async () => {
+      if (await gitOperationInProgress(processes, transports.files, pathApi(registration), registration.root)) {
+        throw new WorkspaceGitReviewError("Git Review cannot commit while another Git operation is in progress.", "unsupported");
+      }
+    };
     await requireRemoteGitRoot(registration, transports);
-    if (input.includeUnstaged === true) await runRemote(processes, "git", ["add", "-A", "--", ":/"], registration.root, 120_000, 4 * 1024 * 1024);
+    if (input.includeUnstaged === true) {
+      await assertIdle();
+      await runRemote(processes, "git", ["add", "-A", "--", ":/"], registration.root, 120_000, 4 * 1024 * 1024);
+    }
     await requireRemoteGitRoot(registration, transports);
+    await assertIdle();
     await runRemote(processes, "git", ["commit", "-F", "-"], registration.root, 120_000, 4 * 1024 * 1024, input.message);
     const headRevision = (await runRemote(processes, "git", ["rev-parse", "HEAD"], registration.root, 20_000, 1024 * 1024)).stdout.trim();
     return { previousRepositoryRevision: before, repositoryRevision: await repositoryRevision(processes, registration.root), headRevision };
@@ -951,6 +961,12 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   ): Promise<WorkspaceGitPushResult> {
     const processes = transports.processes;
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(input.remote)) throw new WorkspaceGitReviewError("Remote name is invalid.", "invalid");
+    if (!input.remoteRef.startsWith("refs/heads/") || input.remoteRef.length > 300 || !isSafeGitRevision(input.remoteRef, false)) {
+      throw new WorkspaceGitReviewError("A fully qualified branch destination is required.", "invalid");
+    }
+    const checked = await runRemote(processes, "git", ["check-ref-format", input.remoteRef], registration.root, 10_000,
+      1024 * 1024, undefined, new Set([0, 1, 128]));
+    if (checked.exitCode !== 0) throw new WorkspaceGitReviewError("The push destination ref is invalid.", "invalid");
     const before = await repositoryRevision(processes, registration.root);
     const head = (await runRemote(processes, "git", ["rev-parse", "HEAD"], registration.root, 20_000, 1024 * 1024)).stdout.trim();
     if (before !== input.expectedRepositoryRevision || head !== input.expectedHeadRevision) throw new WorkspaceGitReviewError("Remote branch is stale.", "stale");
