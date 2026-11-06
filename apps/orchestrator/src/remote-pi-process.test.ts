@@ -684,7 +684,7 @@ describe("RemotePiProcessFactory", () => {
     await terminal;
   });
 
-  it("reattaches after an unexpected SSH bridge exit and publishes the remote terminal once", async () => {
+  it.each(["bridge exit", "lost output acknowledgement", "verified child absence"] as const)("resolves %s against the original remote child", async (loss) => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-reconnect-"));
     temporaryDirectories.push(fixture);
     const runtime = join(fixture, "runtime");
@@ -701,7 +701,10 @@ describe("RemotePiProcessFactory", () => {
     const files = new PiMemoryRemoteFiles();
     await files.mkdir("/workspace", { recursive: true });
     await files.mkdir("/home/maker", { recursive: true });
-    const bridges = [new ManualRemoteProcess(), new ManualRemoteProcess()];
+    const bridges = [
+      new ManualRemoteProcess(),
+      new ManualRemoteProcess(loss === "verified child absence" ? { recoveryRejection: "child_absent" } : {})
+    ];
     const requests: RemoteProcessStartRequest[] = [];
     let transportCall = 0;
     let forwardCloseCount = 0;
@@ -755,15 +758,24 @@ describe("RemotePiProcessFactory", () => {
     });
 
     const output: string[] = [];
+    let exits = 0;
+    const terminal = new Promise<[number | null, NodeJS.Signals | null]>((resolveExit) => {
+      mapped.on("exit", (code, signal) => {
+        exits += 1;
+        resolveExit([code, signal]);
+      });
+    });
     mapped.stdout.on("data", (chunk: Buffer | string) => output.push(String(chunk)));
     bridges[0]!.stdout.write(testFrame(2, 1, Buffer.from('{"phase":"before"}\n')));
     const splitLine = Buffer.from(`${JSON.stringify({ phase: MULTILINGUAL_FIXTURES.splitPhase })}\n`, "utf8");
     const splitAt = splitLine.indexOf(Buffer.from(MULTILINGUAL_FIXTURES.splitCharacter, "utf8")) + 1;
-    bridges[0]!.stdout.write(testFrame(2, 2, splitLine.subarray(0, splitAt)));
     mapped.stdin.write('{"type":"uncertain"}\n');
     await waitUntil(() => bridges[0]!.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 1));
     const uncertainFirst = bridges[0]!.input.find((entry, index) => index > 0 && decodeTestFrame(entry).type === 1)!;
-    bridges[0]!.complete(75);
+    await waitUntil(() => bridges[0]!.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 6));
+    if (loss === "lost output acknowledgement") bridges[0]!.stdin.end();
+    bridges[0]!.stdout.write(testFrame(2, 2, splitLine.subarray(0, splitAt)));
+    if (loss !== "lost output acknowledgement") bridges[0]!.complete(75);
     await waitUntil(() => bridges[1]!.input.length > 0);
     const firstBootstrap = JSON.parse(bridges[0]!.input[0]!.toString("utf8")) as {
       launchHash: string;
@@ -772,9 +784,21 @@ describe("RemotePiProcessFactory", () => {
     const secondBootstrap = JSON.parse(bridges[1]!.input[0]!.toString("utf8")) as {
       launchHash: string;
       relay: { port: number };
+      outputCursor: number;
+      authority: { recovery: { processStartIdentity: string; epoch: number } };
     };
     expect(secondBootstrap.launchHash).toBe(firstBootstrap.launchHash);
     expect(secondBootstrap.relay.port).not.toBe(firstBootstrap.relay.port);
+    expect(secondBootstrap.outputCursor).toBe(2);
+    expect(secondBootstrap.authority.recovery).toMatchObject({ processStartIdentity: "c".repeat(64), epoch: 1 });
+    if (loss === "verified child absence") {
+      expect(await terminal).toEqual([null, null]);
+      expect(exits).toBe(1);
+      expect(requests.map((request) => request.args[1])).toEqual(["bridge", "bridge"]);
+      expect(forwardCloseCount).toBe(2);
+      return;
+    }
+    expect(exits).toBe(0);
 
     await waitUntil(() => bridges[1]!.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 1));
     const uncertainReplay = bridges[1]!.input.find((entry, index) => index > 0 && decodeTestFrame(entry).type === 1)!;
@@ -789,13 +813,6 @@ describe("RemotePiProcessFactory", () => {
     expect(decodeTestFrame(continued).content.toString("utf8")).toBe('{"type":"continue"}\n');
     bridges[1]!.stdout.write(testFrame(7, 2));
 
-    let exits = 0;
-    const terminal = new Promise<[number | null, NodeJS.Signals | null]>((resolveExit) => {
-      mapped.on("exit", (code, signal) => {
-        exits += 1;
-        resolveExit([code, signal]);
-      });
-    });
     bridges[1]!.stdout.write(testFrame(4, 4, terminalContent(0, null)));
     bridges[1]!.complete(0);
     expect(await terminal).toEqual([0, null]);
@@ -1272,10 +1289,11 @@ describe("RemotePiProcessFactory", () => {
   });
 
   it.each([
-    ["an output sequence gap", () => testFrame(2, 2, Buffer.from("skipped\n"))],
-    ["a forged input acknowledgement", () => testFrame(7, 1)],
-    ["an oversized frame declaration", () => oversizedTestFrameHeader()]
-  ])("fails the attachment closed on %s", async (_label, maliciousFrame) => {
+    ["an output sequence gap", () => testFrame(2, 2, Buffer.from("skipped\n")), true],
+    ["a forged input acknowledgement", () => testFrame(7, 1), true],
+    ["an oversized frame declaration", () => oversizedTestFrameHeader(), true],
+    ["a sequence gap with unconfirmed termination", () => testFrame(2, 2, Buffer.from("skipped\n")), false]
+  ] as const)("fails the attachment closed on %s", async (_label, maliciousFrame, confirmKill) => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-invalid-frame-"));
     temporaryDirectories.push(fixture);
     const runtime = join(fixture, "runtime");
@@ -1290,11 +1308,13 @@ describe("RemotePiProcessFactory", () => {
     await files.mkdir("/workspace", { recursive: true });
     await files.mkdir("/home/maker", { recursive: true });
     const first = new SignalOnlyRemoteProcess();
-    const auxiliary = new ManualRemoteProcess();
+    const second = new SignalOnlyRemoteProcess();
+    const auxiliary = new ManualRemoteProcess({ completeKill: confirmKill });
     let transportCall = 0;
+    let reattachedKillRequests = 0;
     const registry = {
       transports: async () => {
-        transportCall += 1;
+        const currentBridge = transportCall++ === 0 ? first : second;
         return {
           host: {},
           lease: {
@@ -1307,7 +1327,12 @@ describe("RemotePiProcessFactory", () => {
             },
             files,
             processes: {
-              open: async (request) => request.args[1] === "kill" ? auxiliary : first
+              open: async (request) => {
+                if (request.args[1] !== "kill") return currentBridge;
+                if (currentBridge === first) return auxiliary;
+                reattachedKillRequests += 1;
+                throw new Error("The reattached broker control connection is unavailable.");
+              }
             }
           } satisfies RemoteSshTransportLease
         };
@@ -1328,13 +1353,29 @@ describe("RemotePiProcessFactory", () => {
       },
       remoteWorkspace: { kind: "ssh", hostTargetId: "target-a", hostId: "host-a", workspaceRoot: "/workspace" }
     });
+    const observedExit = vi.fn();
     const terminal = new Promise<[number | null, NodeJS.Signals | null]>((resolveExit) => {
-      mapped.once("exit", (code, signal) => resolveExit([code, signal]));
+      mapped.once("exit", (code, signal) => { observedExit(); resolveExit([code, signal]); });
     });
     first.stdout.write(maliciousFrame());
-    expect(await terminal).toEqual([1, null]);
+    if (confirmKill) {
+      expect(await terminal).toEqual([null, null]);
+      expect(transportCall).toBe(1);
+    } else {
+      await waitUntil(() => auxiliary.input.length > 0);
+      expect(observedExit).not.toHaveBeenCalled();
+      auxiliary.complete(1);
+      await waitUntil(() => reattachedKillRequests > 0);
+      expect(transportCall).toBe(2);
+      expect(observedExit).not.toHaveBeenCalled();
+      expect(JSON.parse(second.input[0]!.toString("utf8"))).toMatchObject({
+        authority: { recovery: { processStartIdentity: "c".repeat(64), epoch: 1 } }
+      });
+      second.stdout.write(testFrame(4, 1, terminalContent(0, null)));
+      second.complete(0);
+      expect(await terminal).toEqual([0, null]);
+    }
     expect(first.signals).toContain("SIGKILL");
-    expect(transportCall).toBe(1);
   });
 });
 
@@ -1645,6 +1686,7 @@ class ManualRemoteProcess extends EventEmitter implements RemoteProcessHandle {
     readonly recoveryRejection?: "child_absent" | "launch_mismatch";
     readonly clockOffsetMs?: number;
     readonly authorityCommitGate?: Promise<void>;
+    readonly completeKill?: boolean;
   } = {}) {
     super();
     this.#authorityCommitGate = authorityState.authorityCommitGate;
@@ -1668,7 +1710,7 @@ class ManualRemoteProcess extends EventEmitter implements RemoteProcessHandle {
       const value = JSON.parse(this.#controlPending.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
       this.#bootstrapped = true;
       if (value.action === "kill") {
-        queueMicrotask(() => this.complete(0));
+        if (authorityState.completeKill !== false) queueMicrotask(() => this.complete(0));
         return;
       }
       if (value.action !== "ensure") return;
@@ -1677,7 +1719,7 @@ class ManualRemoteProcess extends EventEmitter implements RemoteProcessHandle {
       const generation = Number(requested.runtimeGeneration);
       const outputCursor = Number(value.outputCursor ?? 0);
       const recovering = recovery !== undefined && generation === Number(recovery.runtimeGeneration) + 1;
-      if (recovering && authorityState.recoveryRejection !== undefined) {
+      if (recovery !== undefined && authorityState.recoveryRejection !== undefined) {
         this.stdout.write(testControlFrame(8, {
           ok: false,
           recoveryRejected: true,
