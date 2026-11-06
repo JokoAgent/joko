@@ -1173,7 +1173,7 @@ interface RemoteBridgeAttachment {
   readonly process: RemoteProcessHandle;
   readonly processes: RemoteProcessTransportPort;
   readonly files: RemoteFileTransportPort;
-  readonly watchers: readonly FSWatcher[];
+  readonly watchers: readonly Pick<FSWatcher, "close">[];
   readonly reverseForward?: RemoteReverseForwardHandle;
   readonly brokerSourcePath: string;
   readonly brokerRoot: string;
@@ -2967,20 +2967,28 @@ function watchRuntimeFiles(
   environment: Readonly<NodeJS.ProcessEnv>,
   pathMap: ReadonlyMap<string, string>,
   childRuntimeGeneration: number
-): readonly FSWatcher[] {
+): readonly Pick<FSWatcher, "close">[] {
   const paths = [
     environment["JOKO_PI_CONTROL_FILE"],
     environment["JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE"]
   ].filter((value): value is string => value !== undefined);
   return paths.map((local) => {
     const remote = rewriteLocalPath(local, pathMap);
+    const name = basename(local);
+    const lifetime = new AbortController();
     let tail = Promise.resolve();
-    return watch(local, { persistent: false }, () => {
+    // The control writer atomically replaces the file, so follow its name in the parent directory.
+    const watcher = watch(dirname(local), { persistent: false, signal: lifetime.signal }, (_event, filename) => {
+      if (filename !== null && filename !== name) return;
       tail = tail.then(async () => {
+        if (lifetime.signal.aborted) return;
         const content = await runtimeControlContent(local, childRuntimeGeneration);
-        await files.write({ path: remote, content, mode: 0o600, atomic: true });
+        lifetime.signal.throwIfAborted();
+        await files.write({ path: remote, content, mode: 0o600, atomic: true, signal: lifetime.signal });
       }).catch(() => undefined);
     });
+    watcher.once("error", () => lifetime.abort());
+    return { close: () => lifetime.abort() };
   });
 }
 

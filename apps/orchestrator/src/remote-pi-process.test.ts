@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
-import { link, mkdir, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join, posix as remotePath, win32, type PlatformPath } from "node:path";
@@ -296,6 +296,7 @@ describe("RemotePiProcessFactory", () => {
     await mkdir(sessions, { recursive: true });
     await mkdir(managedRunRoot, { recursive: true });
     const control = join(runtime, "control.json");
+    const retryControl = join(runtime, "silent-encrypted-retry.json");
     const descriptor = join(runtime, "mcp.json");
     const cli = join(fixture, "pi-cli.mjs");
     const managedSupport = join(runtime, "managed-support");
@@ -304,6 +305,7 @@ describe("RemotePiProcessFactory", () => {
     await mkdir(managedSupport, { recursive: true });
     await Promise.all([
       writeFile(control, JSON.stringify({ generation: 1 }), { mode: 0o600 }),
+      writeFile(retryControl, JSON.stringify({ format: 1, generation: 1, enabled: false }), { mode: 0o600 }),
       writeFile(descriptor, JSON.stringify({ endpoint: "http://127.0.0.1:39471/rpc" }), { mode: 0o600 }),
       writeFile(cli, "export {};", { mode: 0o600 }),
       writeFile(managedExtension, "export const extension = true;\n", { mode: 0o600 }),
@@ -377,6 +379,7 @@ describe("RemotePiProcessFactory", () => {
         JOKO_PI_GENERATION: "1",
         JOKO_PI_MCP_TOKEN: "bridge-token-a",
         JOKO_PI_CONTROL_FILE: control,
+        JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE: retryControl,
         JOKO_PI_MCP_DESCRIPTOR_FILE: descriptor,
         PI_CODING_AGENT_SESSION_DIR: sessions,
         JOKO_PI_SUBAGENT_RUN_ROOT: managedRunRoot,
@@ -457,6 +460,17 @@ describe("RemotePiProcessFactory", () => {
     expect(files.allText()).not.toContain(nativeAuthReservationToken);
 
     const remoteControl = bootstrap.env.JOKO_PI_CONTROL_FILE!;
+    const remoteRetryControl = bootstrap.env.JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE!;
+    expect(JSON.parse(files.text(remoteRetryControl))).toMatchObject({ format: 1, generation: 1, enabled: false });
+    for (const [index, enabled] of [true, false, true].entries()) {
+      const temporary = `${retryControl}.${index}.tmp`;
+      await writeFile(temporary, JSON.stringify({ format: 1, generation: 1, enabled }), { mode: 0o600 });
+      await rename(temporary, retryControl);
+      await waitUntil(() => JSON.parse(files.text(remoteRetryControl)).enabled === enabled);
+      expect(JSON.parse(files.text(remoteRetryControl))).toEqual({ format: 1, generation: 1, enabled });
+    }
+    expect(await files.stat(remoteRetryControl)).toMatchObject({ mode: 0o600 });
+    expect(scopes).toEqual([["target-a", "host-a"]]);
     mapped.stdin.write(`${JSON.stringify({ control })}\n`);
     await waitUntil(() => remoteProcess.input.some((entry, index) => index > 0 && decodeTestFrame(entry).type === 1));
     const inbound = remoteProcess.input.find((entry, index) => index > 0 && decodeTestFrame(entry).type === 1)!;
