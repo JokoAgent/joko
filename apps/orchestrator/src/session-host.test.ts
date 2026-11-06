@@ -14906,16 +14906,28 @@ describe("SessionHost", () => {
     const source = store.getSession(sessionId).descriptor.binding;
     const submit = (host: SessionHost, operationId: string, text: string) => host.enqueueInput({ operationId, connection, sessionId,
       prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
-    for (const [index, reply] of ["Retain this answer", "Erase this answer"].entries()) {
+    const originalReplies = ["Retain this answer", "Erase this answer"];
+    const assistantReplies = (activeNativeTimeline: boolean) => store.listEvents({ sessionId, activeNativeTimeline })
+      .flatMap(event => event.payload.type === "message_complete" && event.payload.role === "assistant"
+        ? [{ ...event, payload: event.payload }] : []);
+    for (const [index, reply] of originalReplies.entries()) {
       const queued = submit(first.host, `codex-delete-original-${index}`, `Original request ${index}`);
       await eventually(() => store.getQueueItem(queued.queueItemId).state === "backend_accepted");
       await fake.completeTurn(source.nativeSessionId!, reply);
       await eventually(() => store.getRun(queued.runId).descriptor.state === "completed");
+      expect(fake.threads.get(source.nativeSessionId!)?.turns[index]).toMatchObject({ status: "completed",
+        items: expect.arrayContaining([expect.objectContaining({ type: "agentMessage", text: reply })]) });
     }
     await first.host.inspect(sessionId);
-    const replies = store.listEvents({ sessionId, activeNativeTimeline: true }).filter(event =>
-      event.payload.type === "message_complete" && event.payload.role === "assistant");
-    expect(replies).toHaveLength(2);
+    await vi.waitFor(() => {
+      expect(assistantReplies(true).map(event => event.payload.blocks), JSON.stringify({
+        marker: store.findLatestNativeSessionChange(sessionId)?.payload,
+        durable: assistantReplies(false).map(event => ({ blocks: event.payload.blocks, identity: event.payload.nativeHistory?.identity })),
+        diagnostics: store.listDiagnostics({ limit: 5 }).map(({ code, component, message }) => ({ code, component, message }))
+      }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value))
+        .toEqual(originalReplies.map(text => [{ kind: "text", text }]));
+    });
+    const replies = assistantReplies(true);
     const [kept, erased] = replies;
     if (kept?.payload.type !== "message_complete" || erased === undefined) throw new Error("Expected both original replies.");
     const identity = kept.payload.nativeHistory?.identity;
