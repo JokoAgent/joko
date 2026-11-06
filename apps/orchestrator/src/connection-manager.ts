@@ -654,7 +654,7 @@ function normalizeCode(value: string): string {
   return normalized.length === 8 ? `${normalized.slice(0, 4)}-${normalized.slice(4)}` : value.trim().toUpperCase();
 }
 
-function parseBearer(value: string | undefined): string | undefined {
+export function parseBearer(value: string | undefined): string | undefined {
   return /^Bearer\s+([^\s]+)$/iu.exec(value ?? "")?.[1];
 }
 

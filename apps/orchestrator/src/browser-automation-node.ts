@@ -157,6 +157,11 @@ export class BrowserAutomationNodeExecutor {
     if (arguments_["action"] !== request.action || arguments_["target"] !== undefined || arguments_["node"] !== undefined) {
       throw new Error("Browser automation action arguments do not match the authenticated route.");
     }
+    const directoryScope = parseDirectoryScope(request.action, arguments_["directoryScope"]);
+    if (directoryScope !== undefined) {
+      const { directoryScope: _privateScope, ...toolArguments } = arguments_;
+      arguments_ = toolArguments;
+    }
     const inputArtifacts = request.inputArtifacts ?? [];
     if (request.action === "upload") {
       arguments_ = reuseLocalArtifacts
@@ -165,11 +170,16 @@ export class BrowserAutomationNodeExecutor {
     } else if (inputArtifacts.length !== 0) {
       throw new Error("Browser automation input artifacts require the upload action.");
     }
-    const result = await this.#bridge.callTool("browser", arguments_, signal);
+    const result = directoryScope === undefined
+      ? await this.#bridge.callTool("browser", arguments_, signal)
+      : await this.#bridge.callTool("browser", arguments_, signal, undefined, directoryScope.pages);
     if (this.project().generation !== before.generation) {
       throw new Error("Browser automation node was fenced during execution.");
     }
-    return this.#toRemoteResult(request.action, result);
+    const outcome = await this.#toRemoteResult(request.action, result);
+    return directoryScope !== undefined && outcome.ok
+      ? { ...outcome, data: { directoryProof: directoryScope.proof, directory: outcome.data } }
+      : outcome;
   }
 
   async #ingestInputArtifacts(
@@ -243,6 +253,16 @@ export class BrowserAutomationNodeExecutor {
     }
     return { ok: true, data };
   }
+}
+
+function parseDirectoryScope(action: BrowserAutomationAction, value: unknown): { readonly proof: string; readonly pages: ReadonlySet<string> } | undefined {
+  if (value === undefined) return undefined;
+  if (action !== "tabs" && action !== "status" || !isRecord(value) || Object.keys(value).sort().join(",") !== "pageIds,proof"
+    || typeof value["proof"] !== "string" || !/^[a-f0-9-]{36}$/u.test(value["proof"]) || !Array.isArray(value["pageIds"])) {
+    throw new Error("Browser automation page directory scope is invalid.");
+  }
+  const pages = value["pageIds"].length === 0 ? [] : stringArray(value["pageIds"], 1_000, 512, "Browser automation page directory IDs");
+  return { proof: value["proof"], pages: new Set(pages) };
 }
 
 export interface BrowserAutomationNodeRpcClient {

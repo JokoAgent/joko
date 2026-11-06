@@ -3306,6 +3306,7 @@ export async function createOrchestratorApplication(
         state: browserState,
         enabledForNewSessions: (targetId) => configuredSettings.enabled(targetId),
         remoteNodes: browserNodeRouter,
+        localNodeId: serverId,
         userKnowledge,
         setBackend: async (mode, assertCurrent) => {
           const selected = await configuredSettings.setAutomationTarget(mode, assertCurrent);
