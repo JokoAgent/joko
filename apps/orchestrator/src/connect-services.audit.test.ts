@@ -3314,7 +3314,7 @@ describe("Connect security and protocol audit", () => {
     const fence = vi.fn();
     const services = createConnectServices(stubApplication({
       store: { getTarget: () => target },
-      workspaces: { register },
+      workspaces: { register, listRegistrations: () => [] },
       connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }), fence }
     }));
 

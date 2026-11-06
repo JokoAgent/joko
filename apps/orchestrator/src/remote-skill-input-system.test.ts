@@ -26,12 +26,13 @@ import { PiResourceManager } from "./resource-manager.js";
 import { createPublicServer } from "./server.js";
 import { SessionHost } from "./session-host.js";
 import { mkdtemp } from "./test-paths.js";
+import { WorkspaceService } from "./workspace-service.js";
 
 const serialize = (value: unknown): string => JSON.stringify(value, (_key, item: unknown) => typeof item === "bigint" ? item.toString() : item);
 const profile = "/home/test/.joko/runtime/v1/codex-home";
 
 describe("registered remote project Skill input composition", () => {
-  it("approves a complete remote project package through authenticated operations and dispatches its exact native mount after durable Queue admission", async () => {
+  it("dispatches the approved remote mount after durable Queue admission and keeps the Run through repeated project selection", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-remote-skill-chain-"));
     const database = join(root, "store.db");
     const store = new OperationalStore(database);
@@ -54,6 +55,7 @@ describe("registered remote project Skill input composition", () => {
       assertCurrent: assertLease, assertFilesCurrent: assertLease, assertForwardingCurrent: assertLease });
     const router = new RemoteExecutionRouter({ hosts: { captureProcessAuthority: capture, captureTransportAuthority: capture }, peers: {} as DevicePeerOwner });
     const workspaces = new RemoteWorkspaceService(router);
+    const workspaceService = new WorkspaceService({ remoteDelegate: workspaces });
     const sourceOwner = new RemoteSkillSourceOwner({ store, managedRoot: join(root, "source-generations"),
       captureSkillSourceAuthority: (workspaceId, signal) => workspaces.captureSkillSourceAuthority(workspaceId, signal) });
     const resources = new PiResourceManager({ store, managedRoot: join(root, "resources"), remoteProjectSkills: sourceOwner });
@@ -78,13 +80,13 @@ describe("registered remote project Skill input composition", () => {
       const target = { id: "remote-target", backendId: adapter.id, displayName: "Remote project", workspaceRoot: root,
         managed: false, trusted: true, remoteWorkspace: binding };
       store.upsertTarget(target, { workspaceId: "remote-workspace" });
-      await workspaces.register({ id: "remote-workspace", root: binding.workspaceRoot, displayName: "Remote project", trusted: true,
+      await workspaceService.register({ id: "remote-workspace", root: binding.workspaceRoot, displayName: "Remote project", trusted: true,
         remote: { targetId: "remote-target", binding } });
       await resolver.resolve(target);
       await host.registerTarget(target, { workspaceId: "remote-workspace" });
       server = await createPublicServer({ config: { publicOrigin: "http://127.0.0.1", allowInsecureLoopback: true, allowInsecureLan: false,
         corsOrigins: [], webDirectory: join(root, "no-web"), dataDirectory: root }, store, connections, sessionHost: host,
-        piResources: resources, artifacts: {}, blobTransfers: {}, artifactRepository: {}, workspaces: {}, workspaceChanges: {}, scheduler: {},
+        piResources: resources, artifacts: {}, blobTransfers: {}, artifactRepository: {}, workspaces: workspaceService, workspaceChanges: {}, scheduler: {},
         adapters: [adapter], browserActivity: [], restartBackend: async () => undefined } as unknown as OrchestratorApplication);
       server.log.level = "silent";
       const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
@@ -158,10 +160,15 @@ describe("registered remote project Skill input composition", () => {
       for (const publicValue of [loaded, queue, store.listEvents({ sessionId }), store.getSession(sessionId)]) {
         expect(serialize(publicValue)).not.toContain(privateBody); expect(serialize(publicValue)).not.toContain(mountedPath);
       }
+      const targets = createClient(contract.TargetService, transport);
+      const selected = await targets.prepareTargetWorkspace({
+        targetId: target.id, expectedTargetRevision: { value: store.getTarget(target.id).revision }
+      });
+      expect(selected.workspace?.workspaceId).toBe("remote-workspace");
       await daemon.fake.completeTurn(store.getSession(sessionId).descriptor.binding.nativeSessionId!);
       await expect.poll(() => store.getQueueItem(queueId).state, { timeout: 10_000 }).toBe("completed");
     } finally {
-      await server?.close(); await host.dispose(); await adapter.dispose(); await resolver.shutdown(); await workspaces.close();
+      await server?.close(); await host.dispose(); await adapter.dispose(); await resolver.shutdown(); await workspaceService.close();
       await localHost.shutdown();
       leaseCurrent = false; store.close();
     }
