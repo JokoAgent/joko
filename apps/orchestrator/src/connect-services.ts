@@ -14994,7 +14994,8 @@ function mapBrowserPage(
     canGoForward: item.canGoForward ?? false,
     recoverable: false,
     lastKnownGeneration: BigInt(generation),
-    sessionId: owner?.sessionId ?? ""
+    sessionId: owner?.sessionId ?? "",
+    documentId: item.documentId ?? ""
   });
 }
 
@@ -15015,7 +15016,8 @@ function mapRecoverableBrowserPage(item: RecoverableBrowserPageRecord): contract
     canGoForward: false,
     recoverable: true,
     lastKnownGeneration: BigInt(item.generation),
-    sessionId: item.sessionId
+    sessionId: item.sessionId,
+    documentId: ""
   });
 }
 
@@ -19638,7 +19640,7 @@ async function dispatchMutation(
         resultCase: "acknowledgement",
         entityId: BROWSER_PROVIDER_ID
       }, async () => {
-        await dependencies.browserSettings!.apply(patch);
+        await dependencies.browserSettings!.apply(patch, () => { dependencies.connections.fence(connection); });
       });
     }
     case "updateVoiceInputServiceSettings": {
@@ -20843,57 +20845,60 @@ async function dispatchMutation(
     case "abortUserShell":
       return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.abortUserShell(payload.value.sessionId));
     case "uploadBrowserFile": {
-      if (dependencies.browserTransfers === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser file transfer is not configured.");
-      if (dependencies.browserProvider === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser Provider is not configured.");
-      if (payload.value.browserProviderId !== dependencies.browserTransfers.browserProviderId) {
+      const transfers = dependencies.browserTransfers;
+      const browser = dependencies.browserProvider;
+      if (transfers === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser file transfer is not configured.");
+      if (browser === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser Provider is not configured.");
+      if (payload.value.browserProviderId !== transfers.browserProviderId) {
         throw new ConnectError("Browser Provider not found.", Code.NotFound);
       }
-      if (dependencies.browserSettings?.uploadAllowed() === false) {
-        throw new ConnectError("Browser uploads are disabled by owner policy.", Code.FailedPrecondition);
-      }
+      const assertUploadsAllowed = () => {
+        if (dependencies.browserSettings?.uploadAllowed() === false) {
+          throw new ConnectError("Browser uploads are disabled by owner policy.", Code.FailedPrecondition);
+        }
+      };
+      assertUploadsAllowed();
       if (payload.value.blob === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "A typed Browser upload Blob is required.");
       const blob = fromProtoBlobRef(payload.value.blob);
-      const pageOwner = requireActiveBrowserPageAuthority(
-        dependencies.browserState,
-        dependencies.browserProvider.id,
-        payload.value.pageId,
-        dependencies.browserProvider.generation
-      );
+      const { pageId, documentId, inputHint } = payload.value;
+      requireOpaqueTakeoverId(documentId, "Browser document ID");
+      const generation = browser.generation;
+      const pageOwner = requireActiveBrowserPageAuthority(dependencies.browserState, browser.id, pageId, generation);
+      const assertPageCurrent = () => {
+        if (browser.generation !== generation) throw new BrowserTakeoverConflictError("Browser upload generation is no longer current.");
+        requireActiveBrowserPageAuthority(dependencies.browserState, browser.id, pageId, generation, pageOwner);
+      };
+      const assertEffectCurrent = () => {
+        dependencies.connections.fence(connection);
+        assertPageCurrent();
+        assertUploadsAllowed();
+      };
+      if (browser.uploadDocumentId(pageId) !== documentId) {
+        throw new ConnectError("The Browser page navigated after the file picker opened. Select the file again for the current page.", Code.FailedPrecondition);
+      }
       let transfer: contract.BrowserTransfer | undefined;
       return presented(await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
-        precondition: () => {
-          requireActiveBrowserPageAuthority(
-            dependencies.browserState,
-            dependencies.browserProvider!.id,
-            payload.value.pageId,
-            dependencies.browserProvider!.generation,
-            pageOwner
-          );
-        },
+        precondition: assertPageCurrent,
         effect: async () => {
-          const takeover = dependencies.browserProvider?.currentHumanTakeover();
+          const takeover = browser.currentHumanTakeover();
           const humanTakeover = takeover !== undefined
-            && takeover.providerId === dependencies.browserTransfers!.browserProviderId
-            && takeover.pageId === payload.value.pageId
+            && takeover.providerId === transfers.browserProviderId
+            && takeover.pageId === pageId
             && takeover.owner === connection.id
-            && takeover.generation === dependencies.browserProvider!.generation
+            && takeover.generation === generation
               ? takeover
               : undefined;
-          transfer = await dependencies.browserTransfers!.upload(blob, payload.value.pageId, payload.value.inputHint, {
+          transfer = await transfers.upload(blob, pageId, inputHint, {
             id: connection.id,
+            documentId,
+            assertCurrent: assertEffectCurrent,
             ...(humanTakeover === undefined ? {} : { humanTakeover })
           });
-          requireActiveBrowserPageAuthority(
-            dependencies.browserState,
-            dependencies.browserProvider!.id,
-            payload.value.pageId,
-            dependencies.browserProvider!.generation,
-            pageOwner
-          );
+          assertEffectCurrent();
           dependencies.browserTransferOperations.set(operationId, transfer.browserTransferId);
         },
         commit: () => {
@@ -22621,6 +22626,13 @@ async function dispatchMutation(
         current.pageId,
         current.generation
       );
+      const assertPageCurrent = () => {
+        requireActiveBrowserPageAuthority(dependencies.browserState, current.providerId, current.pageId, current.generation, pageOwner);
+      };
+      const assertEffectCurrent = () => {
+        dependencies.connections.fence(connection);
+        assertPageCurrent();
+      };
       let updatedPage: NativeBrowserPage | undefined;
       const execution = await host.mutate({
         operationId,
@@ -22629,24 +22641,12 @@ async function dispatchMutation(
         body: mutation,
         precondition: () => {
           dependencies.browserProvider!.assertHumanTakeover(current);
-          requireActiveBrowserPageAuthority(
-            dependencies.browserState,
-            current.providerId,
-            current.pageId,
-            current.generation,
-            pageOwner
-          );
+          assertPageCurrent();
         },
         effect: async () => {
-          await dependencies.browserProvider!.performHumanTakeoverAction(current, input);
+          await dependencies.browserProvider!.performHumanTakeoverAction(current, input, assertEffectCurrent);
           updatedPage = (await dependencies.browserProvider!.listPages()).find((page) => page.id === current.pageId);
-          requireActiveBrowserPageAuthority(
-            dependencies.browserState,
-            current.providerId,
-            current.pageId,
-            current.generation,
-            pageOwner
-          );
+          assertEffectCurrent();
         },
         commit: () => {
           const projection = updatedPage === undefined ? undefined : durableBrowserPageProjection(updatedPage);

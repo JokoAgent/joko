@@ -1867,7 +1867,7 @@ export function VisualHarness(): JSX.Element {
         record(`browser-action:${browserId}:${pageId}:${action.kind}`);
         return "visual-blob:assets/preview.png";
       },
-      uploadBrowserFile: async (browserId: string, pageId: string, file: File): Promise<void> => {
+      uploadBrowserFile: async (browserId: string, pageId: string, _documentId: string, file: File): Promise<void> => {
         record(`browser-upload:${browserId}:${pageId}:${file.name}`);
       },
       listBrowserActivity: async () => [{
@@ -4392,6 +4392,7 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
             },
             pages: [{
               id: "visual-page",
+              documentId: "visual-document",
               sessionId: "session-1",
               title: "Joko Browser fixture",
               url: "https://example.test/docs",

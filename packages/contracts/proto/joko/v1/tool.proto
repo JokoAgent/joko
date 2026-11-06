@@ -389,6 +389,8 @@ message BrowserPage {
   // automation/tool pages that are intentionally not projected in a Session
   // Inspector.
   string session_id = 15;
+  // Identity of the live main-frame document. Empty when the page is unavailable.
+  string document_id = 16;
 }
 
 enum BrowserCommentTargetKind {

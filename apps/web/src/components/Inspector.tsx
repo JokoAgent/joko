@@ -3079,8 +3079,8 @@ export function BrowserPanel({ controller, browsers, browserSettings, session, c
             runAction={runAction}
             onCapture={capture}
             onStoreCapture={storeCapture}
-            onUpload={(browserId, pageId, file) => {
-              runAction(`browser-upload:${browserPageKey(browserId, pageId)}`, () => controller.uploadBrowserFile(browserId, pageId, file));
+            onUpload={(browserId, pageId, documentId, file) => {
+              runAction(`browser-upload:${browserPageKey(browserId, pageId)}`, () => controller.uploadBrowserFile(browserId, pageId, documentId, file));
             }}
             onAction={async (browserId, pageId, action) => {
               storeCapture(browserId, pageId, await controller.performBrowserTakeoverAction(browserId, pageId, action));

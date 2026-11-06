@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController, BrowserInspectorFocusRequest } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import type { BrowserView, SessionView } from "../model.js";
+import type { BrowserSettingsView, BrowserView, SessionView } from "../model.js";
 import { BrowserPanel } from "./Inspector.js";
 
 const roots: Root[] = [];
@@ -71,6 +71,40 @@ describe("Inspector Browser panel", () => {
 
     expect(host.querySelector(".browser-provider-card strong")?.textContent).toBe("First Provider");
     expect(host.querySelector(".browser-chrome__omnibox button")?.textContent).toBe("https://page-a.example.test/");
+  });
+
+  it("keeps a picker result bound to the document the user opened it from", async () => {
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    roots.push(root);
+    const source = browser("browser-a", "Provider", "page-a", "Page");
+    const uploadBrowserFile = vi.fn(async () => undefined);
+    const controller = {
+      state: { preferences: DEFAULT_UI_PREFERENCES, activeProfile: { id: "connection-one", serverId: "server-one" } },
+      releaseArtifactUrl: vi.fn(),
+      uploadBrowserFile
+    } as unknown as AppController;
+    const settings: BrowserSettingsView = {
+      browserProviderId: source.id, targetSettings: [], backendHealth: { active: true, status: "ready", canRecover: true },
+      profileDisplayName: "Browser", takeoverTimeoutSeconds: 60, allowUploads: true, allowDownloads: true,
+      automationTarget: "sidebar", support: "supported", supportReason: "", detectedBrowser: "Chromium"
+    };
+    const render = (documentId: string) => act(async () => root.render(<BrowserPanel
+      controller={controller} browsers={[{ ...source, pages: [{ ...source.pages[0]!, documentId }] }]}
+      browserSettings={[settings]} session={session} commentSessions={[]} locale="en" t={(key) => key}
+      runAction={(_key, action) => { void action(); }}
+    />));
+
+    await render("original-document");
+    const upload = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "browser.upload");
+    expect(upload?.disabled).toBe(false);
+    await act(async () => upload?.click());
+    await render("replacement-document");
+    const file = new File(["private"], "proof.txt");
+    const input = host.querySelector<HTMLInputElement>("input[type=file]")!;
+    Object.defineProperty(input, "files", { value: [file] });
+    await act(async () => input.dispatchEvent(new Event("change", { bubbles: true })));
+    expect(uploadBrowserFile).toHaveBeenCalledWith(source.id, "page-a", "original-document", file);
   });
 
   it("uses the real Browser canvas for address, pointer, keyboard, and text input", async () => {

@@ -709,9 +709,18 @@ describe("BrowserToolBridgeProvider", () => {
     expect(BUILTIN_BROWSER_SITE_GUIDES).toHaveLength(56);
     const { bridge, actions, browser } = fixture();
     const discovery = await bridge.callTool("browser", { action: "siteguide" });
-    const discoveryData = discovery.structuredContent?.["data"] as { sites?: readonly unknown[] } | undefined;
-    expect(discoveryData?.sites).toHaveLength(56);
-    expect(JSON.stringify(discovery)).toContain("arxiv-search");
+    const digest = discovery.structuredContent?.["data"] as { truncated: boolean; fullResult: { read: Readonly<Record<string, unknown>> } };
+    expect(digest.truncated).toBe(true);
+    let offset: number | null = 0, retained = "";
+    for (let segment = 0; offset !== null && segment < 32; segment++) {
+      const page = await bridge.callTool("browser", { ...digest.fullResult.read, offset });
+      expect(page.isError).toBe(false);
+      const data = page.structuredContent?.["data"] as { text: string; nextOffset: number | null };
+      retained += data.text; offset = data.nextOffset;
+    }
+    expect(offset).toBeNull();
+    expect(JSON.parse(retained).data.sites).toHaveLength(56);
+    expect(retained).toContain("arxiv-search");
     const guide = await bridge.callTool("browser", { action: "siteguide", site: "arxiv.org" });
     expect(guide.structuredContent).toMatchObject({
       ok: true,
@@ -924,7 +933,13 @@ describe("BrowserToolBridgeProvider", () => {
   it("binds remote trial receipts to their originating caller before forwarding an explicit save", async () => {
     const child = fixture(); const recipeDraft = exampleReadRecipe();
     const executor = new BrowserAutomationNodeExecutor({ nodeId: "node-one", displayName: "Node", generation: 4, bridge: child.bridge, artifacts: {} as ArtifactStore });
-    const call = vi.fn((request: { action: any; arguments: Readonly<Record<string, unknown>> }, signal?: AbortSignal) => executor.execute({ nodeId: "node-one", expectedGeneration: 4, ...request }, signal));
+    const call = vi.fn(async (request: { action: any; arguments: Readonly<Record<string, unknown>> }, signal?: AbortSignal) => {
+      const result = await executor.execute({ nodeId: "node-one", expectedGeneration: 4, ...request }, signal);
+      if (request.action === "recipe") expect(result.data).toMatchObject({ verification: {
+        id: recipeDraft.id, site: "example.test", digest: expect.stringMatching(/^[a-f0-9]{64}$/u)
+      } });
+      return result;
+    });
     const route = { id: "node-one", generation: 4, available: true, capabilities: BROWSER_AUTOMATION_NODE_CAPABILITIES, call };
     const router = { resolve: () => route, list: () => [route] };
     const one = fixture(router), other = fixture(router);
@@ -934,6 +949,8 @@ describe("BrowserToolBridgeProvider", () => {
       .toMatchObject({ data: { result: { verified: true } } });
     const calls = call.mock.calls.length;
     await expect(other.bridge.callTool("browser", { ...remote, action: "saveRecipe", recipeDraft })).rejects.toThrow(/in this task/u);
+    await expect(one.bridge.callTool("browser", { ...remote, action: "saveRecipe",
+      recipeDraft: { ...recipeDraft, description: "Changed after the validated trial" } })).rejects.toThrow(/unchanged/u);
     expect(call).toHaveBeenCalledTimes(calls);
     expect((await one.bridge.callTool("browser", { ...remote, action: "saveRecipe", recipeDraft })).isError).toBe(false);
     expect(child.knowledge.recipes?.[0]).toMatchObject({ validation: { state: "active" } });

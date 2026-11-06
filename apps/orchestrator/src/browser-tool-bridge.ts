@@ -34,7 +34,7 @@ import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-builtin-catalog.js";
 import { BROWSER_RECIPE_AUTHOR_RULES, BROWSER_WORKFLOW_RULES } from "./browser-rules.js";
 import { hasSecretPages, isSecretPage } from "./input-handoff/secretTaint.js";
-import type { BrowserTransferCoordinator } from "./browser-transfers.js";
+import type { BrowserTransferConnection, BrowserTransferCoordinator } from "./browser-transfers.js";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 import type {
   BrowserBridgeEffectAuthority,
@@ -785,13 +785,11 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
       case "upload_artifact": {
         const pageId = requiredString(input, "page_id", 512);
-        this.#assertPageContext(pageId);
+        const uploadOwner = this.#uploadOwner(pageId, signal);
         const selector = agentSelector(input);
         const artifactId = requiredString(input, "artifact_id", 512);
         const artifact = await this.#artifacts.get(artifactId);
-        const transfer = await this.#transfers.upload(artifact, pageId, selector, {
-          id: `pi-browser:${this.generation}`
-        });
+        const transfer = await this.#transfers.upload(artifact, pageId, selector, uploadOwner);
         this.#assertPageContext(pageId);
         return textResult({ transfer: publicTransfer(transfer) });
       }
@@ -1002,13 +1000,14 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
       case "upload": {
         const pageId = this.#unifiedPageId(input);
+        const uploadOwner = this.#uploadOwner(pageId, signal);
         const artifactIds = requiredStringArray(input, "paths", 16, 512);
         const selector = this.#browser.resolveElementSelector(pageId, unifiedElementTarget(input, "inputRef"));
         const uploaded = [];
         for (const artifactId of artifactIds) {
           signal?.throwIfAborted();
           const artifact = await this.#artifacts.get(artifactId);
-          const transfer = await this.#transfers.upload(artifact, pageId, selector, { id: `pi-browser:${this.generation}` });
+          const transfer = await this.#transfers.upload(artifact, pageId, selector, uploadOwner);
           uploaded.push(publicTransfer(transfer));
         }
         this.#assertPageContext(pageId);
@@ -1708,10 +1707,10 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       recipe: recipe.id,
       provenance: draft === undefined ? this.#recipeProvenance(recipe.id) : "user",
       steps: completed,
-      ...(verifying ? { verified, ...(verified ? { verification: { id: recipe.id, site, digest: createHash("sha256").update(JSON.stringify(authored)).digest("hex") } } : {}),
+      ...(verifying ? { verified,
         message: "Execution does not save or activate a recipe. Use saveRecipe with the unchanged draft." } : {}),
       ...(recipe.output === undefined ? {} : { output: resolveRecipeOutput(recipe.output, vars) })
-    });
+    }, verified ? { id: recipe.id, site: site!, digest: createHash("sha256").update(JSON.stringify(authored)).digest("hex") } : undefined);
   }
 
   async #suspendRecipe(recipe: BrowserRecipe, expectedRecipe: string | null, signal?: AbortSignal): Promise<string | undefined> {
@@ -1932,6 +1931,20 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     return page;
   }
 
+  #uploadOwner(pageId: string, signal: AbortSignal | undefined): BrowserTransferConnection {
+    const context = this.#activeContext;
+    const assertCurrent = () => {
+      signal?.throwIfAborted();
+      if (this.#activeContext !== context) throw new Error("The Browser tool invocation has retired.");
+      context?.assertCurrent?.();
+      this.#assertPageContext(pageId);
+    };
+    assertCurrent();
+    const documentId = this.#browser.uploadDocumentId(pageId);
+    if (documentId === undefined) throw new Error("The Browser upload document is unavailable.");
+    return { id: `pi-browser:${this.generation}`, documentId, assertCurrent };
+  }
+
   async #listVisiblePages(): Promise<readonly BrowserPageState[]> {
     const context = this.#activeContext;
     const generation = this.#browser.generation;
@@ -2070,11 +2083,18 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     if (epoch !== this.#resultEpoch) { this.#results.clear(); this.#recipeTasks.clear(); this.#resultEpoch = epoch; }
     return epoch;
   }
-  #mixedResult(action: string, data: unknown, extraContent: readonly unknown[]): McpCallResult {
-    const payload = { ok: true, action, data: action === "readResult" ? data : sanitizePublicPayload(data, 0) };
-    return { content: [{ type: "text", text: JSON.stringify(payload) }, ...extraContent], structuredContent: payload, isError: false };
+  #mixedResult(action: string, data: unknown, extraContent: readonly unknown[],
+    recipeVerification?: { readonly id: string; readonly site: string; readonly digest: string }): McpCallResult {
+    const publicData = action === "readResult" ? data : sanitizePublicPayload(data, 0);
+    // This receipt is computed by the host after a successful guarded trial.
+    // Its digest is protocol metadata, not opaque page text to redact.
+    const payload = { ok: true, action, data: recipeVerification === undefined ? publicData
+      : { ...publicData as Readonly<Record<string, unknown>>, verification: recipeVerification } };
+    return { content: [{ type: "text", text: serializeBrowserPayload(payload) }, ...extraContent], structuredContent: payload, isError: false };
   }
-  #result(action: string, data: unknown): McpCallResult { return this.#mixedResult(action, data, []); }
+  #result(action: string, data: unknown, recipeVerification?: { readonly id: string; readonly site: string; readonly digest: string }): McpCallResult {
+    return this.#mixedResult(action, data, [], recipeVerification);
+  }
 
   async #closeOwnedPage(pageId: string, result: () => McpCallResult): Promise<McpCallResult> {
     this.#assertPageContext(pageId);
@@ -2088,11 +2108,18 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   }
 }
 
+function serializeBrowserPayload(value: unknown): string {
+  // Durable receipts canonicalize object keys. Produce the same text before
+  // persistence and on replay so an acknowledged effect keeps its exact reply.
+  return JSON.stringify(value, (_key, item: unknown) => isRecord(item)
+    ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) : item);
+}
+
 function boundedBrowserResult(payload: { readonly ok: true; readonly action: string; readonly data: unknown }, extraContent: readonly unknown[], retained?: { readonly cache: BrowserResultCache; readonly source: BrowserResultSource }): McpCallResult {
   const action = payload.action;
   const digest = retained?.cache.digest(payload, retained.source);
   if (digest) return { content: [{ type: "text", text: JSON.stringify(digest) }, ...extraContent], structuredContent: digest, isError: !digest.ok };
-  const serialized = JSON.stringify(payload);
+  const serialized = serializeBrowserPayload(payload);
   if (Buffer.byteLength(serialized, "utf8") > MAXIMUM_UNIFIED_RESULT_BYTES) {
     const byteSize = Buffer.byteLength(serialized, "utf8");
     let previewCharacters = Math.min(serialized.length, Math.floor(MAXIMUM_UNIFIED_RESULT_BYTES / 2));

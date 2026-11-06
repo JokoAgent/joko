@@ -2962,6 +2962,7 @@ export type BrowserTakeoverActionView =
 
 export interface BrowserPageView {
   readonly id: string;
+  readonly documentId?: string;
   /** Owning Session for human-opened pages; absent for global tool pages. */
   readonly sessionId?: string;
   readonly title: string;
@@ -6351,7 +6352,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   updateBrowserCommentDesign(browserId: string, pageId: string, command: BrowserCommentDesignCommandView): Promise<readonly BrowserCommentPlacementView[]>;
   listBrowserActivity(browserId: string, pageId: string): Promise<readonly BrowserActivityView[]>;
   listBrowserTransfers(browserId: string, pageId: string): Promise<readonly BrowserTransferView[]>;
-  uploadBrowserFile(browserId: string, pageId: string, file: File, inputHint?: string): Promise<void>;
+  uploadBrowserFile(browserId: string, pageId: string, documentId: string, file: File, inputHint?: string): Promise<void>;
   approveResource(resourceId: string, discoveredRevision: string): Promise<void>;
   discoverProjectResources(targetId: string): Promise<void>;
   addResource(draft: ResourceDraft): Promise<void>;

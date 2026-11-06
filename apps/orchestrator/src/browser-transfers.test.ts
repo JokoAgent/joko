@@ -1,6 +1,6 @@
 import type { BlobRef } from "@joko/core";
 import * as contract from "@joko/contracts";
-import type { BrowserAction, BrowserLease, BrowserLeaseFence, BrowserPageState, BrowserTakeover, BrowserTakeoverFence } from "@joko/tool-browser";
+import type { BrowserAction, BrowserLease, BrowserLeaseFence, BrowserTakeover } from "@joko/tool-browser";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ArtifactRecord } from "./artifact-store.js";
@@ -19,6 +19,8 @@ const sourceBlob: BlobRef = {
   mimeType: "text/plain",
   fileName: "upload.txt"
 };
+
+const uploadOwner = (id: string) => ({ id, documentId: "document-one", assertCurrent: () => undefined });
 
 class FakeArtifacts implements BrowserTransferArtifactStore {
   readonly calls: string[] = [];
@@ -78,44 +80,30 @@ class FakeProvider implements BrowserTransferProvider {
     this.calls.push(`release:${lease.id}:${lease.generation}`);
   }
 
-  async act(pageId: string, lease: BrowserLeaseFence, action: BrowserAction): Promise<BrowserPageState> {
-    this.calls.push(`act:${pageId}:${lease.id}:${lease.generation}`);
-    this.actions.push(action);
+  readonly uploadFiles: BrowserTransferProvider["uploadFiles"] = async (pageId, owner, action, guard) => {
+    guard.assertCurrent();
+    if ("takeoverId" in owner) {
+      const current = this.takeover;
+      if (current === undefined || current.providerId !== owner.providerId || current.pageId !== pageId
+        || current.generation !== owner.generation || current.owner !== owner.owner || current.takeoverId !== owner.takeoverId) {
+        throw new Error("Takeover fence is stale");
+      }
+      this.calls.push(`human:${owner.pageId}:${owner.takeoverId}:${owner.generation}`);
+      this.humanUploads.push({ selector: action.selector, files: [...action.paths] });
+    } else {
+      this.calls.push(`act:${pageId}:${owner.id}:${owner.generation}`);
+      this.actions.push(action);
+    }
+    guard.markDispatched();
     this.activeActions += 1;
     this.maximumActiveActions = Math.max(this.maximumActiveActions, this.activeActions);
     try {
       await this.actionGate;
       if (this.failAction) throw new Error("Playwright failed near D:\\private\\profile");
-      return { id: pageId, url: "https://example.test/", title: "Upload", state: "ready" };
     } finally {
       this.activeActions -= 1;
     }
-  }
-
-  currentHumanTakeover(): BrowserTakeover | undefined {
-    return this.takeover;
-  }
-
-  async runHumanTakeoverOperation<T>(
-    takeover: BrowserTakeoverFence,
-    operation: (page: { setInputFiles(selector: string, files: string[]): Promise<void> }) => Promise<T>
-  ): Promise<T> {
-    const current = this.takeover;
-    if (
-      current === undefined
-      || current.providerId !== takeover.providerId
-      || current.pageId !== takeover.pageId
-      || current.generation !== takeover.generation
-      || current.owner !== takeover.owner
-      || current.takeoverId !== takeover.takeoverId
-    ) throw new Error("Takeover fence is stale");
-    this.calls.push(`human:${takeover.pageId}:${takeover.takeoverId}:${takeover.generation}`);
-    return operation({
-      setInputFiles: async (selector, files) => {
-        this.humanUploads.push({ selector, files: [...files] });
-      }
-    });
-  }
+  };
 
   async recover(): Promise<void> {
     this.calls.push(`recover:${this.generation}`);
@@ -148,7 +136,7 @@ describe("BrowserTransferCoordinator", () => {
       onActivityTransition
     });
 
-    const transfer = await transfers.upload(sourceBlob, "page-1", "input[type=file]", { id: "connection-1" });
+    const transfer = await transfers.upload(sourceBlob, "page-1", "input[type=file]", uploadOwner("connection-1"));
 
     expect(transfer.state).toBe(contract.BrowserTransferState.COMPLETED);
     expect(transfer.direction).toBe(contract.TransferDirection.UPLOAD);
@@ -175,7 +163,7 @@ describe("BrowserTransferCoordinator", () => {
     provider.failAction = true;
     const transfers = new BrowserTransferCoordinator({ artifacts, provider });
 
-    const transfer = await transfers.upload(sourceBlob, "page-1", "#private-file", { id: "connection-1" });
+    const transfer = await transfers.upload(sourceBlob, "page-1", "#private-file", uploadOwner("connection-1"));
 
     expect(transfer.state).toBe(contract.BrowserTransferState.FAILED);
     expect(transfer.error?.code).toBe("BROWSER_UPLOAD_FAILED");
@@ -202,7 +190,7 @@ describe("BrowserTransferCoordinator", () => {
     const transfers = new BrowserTransferCoordinator({ artifacts, provider });
 
     const transfer = await transfers.upload(sourceBlob, "page-1", "#human-file", {
-      id: "connection-1",
+      ...uploadOwner("connection-1"),
       humanTakeover: provider.takeover!
     });
 
@@ -230,7 +218,7 @@ describe("BrowserTransferCoordinator", () => {
     const transfers = new BrowserTransferCoordinator({ artifacts: new FakeArtifacts(), provider });
 
     const transfer = await transfers.upload(sourceBlob, "page-1", "#human-file", {
-      id: "connection-1",
+      ...uploadOwner("connection-1"),
       humanTakeover: provider.takeover!
     });
 
@@ -247,8 +235,8 @@ describe("BrowserTransferCoordinator", () => {
     provider.actionGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
     const transfers = new BrowserTransferCoordinator({ artifacts, provider });
 
-    const first = transfers.upload(sourceBlob, "page-1", "#one", { id: "connection-1" });
-    const second = transfers.upload(sourceBlob, "page-2", "#two", { id: "connection-2" });
+    const first = transfers.upload(sourceBlob, "page-1", "#one", uploadOwner("connection-1"));
+    const second = transfers.upload(sourceBlob, "page-2", "#two", uploadOwner("connection-2"));
     await vi.waitFor(() => expect(provider.actions).toHaveLength(1));
     expect(transfers.list({ state: contract.BrowserTransferState.PENDING })).toHaveLength(1);
     releaseFirst();
@@ -263,6 +251,39 @@ describe("BrowserTransferCoordinator", () => {
     expect(provider.calls.filter((item) => item.startsWith("release:"))).toHaveLength(2);
   });
 
+  it.each(["agent", "human"] as const)("rejects a retired %s upload before its first effect or lease", async (mode) => {
+    const provider = new FakeProvider();
+    const artifacts = new FakeArtifacts();
+    let releaseFirst!: () => void;
+    provider.actionGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const transfers = new BrowserTransferCoordinator({ artifacts, provider });
+    if (mode === "human") provider.takeover = {
+      providerId: "browser", pageId: "page-1", generation: 7, owner: "connection-2",
+      takeoverId: "takeover-1", startedAt: 1_000, expiresAt: 61_000
+    };
+    const first = transfers.upload(sourceBlob, "page-1", "#one", uploadOwner("connection-1"));
+    let active = true;
+    const queued = transfers.upload(sourceBlob, "page-1", "#two", {
+      ...uploadOwner("connection-2"), humanTakeover: provider.takeover,
+      assertCurrent: () => { if (!active) throw new Error("original authority retired"); }
+    });
+    try {
+      await vi.waitFor(() => expect(provider.actions).toHaveLength(1));
+      expect(transfers.list({ state: contract.BrowserTransferState.PENDING })).toHaveLength(1);
+      active = false;
+    } finally {
+      releaseFirst();
+    }
+    await expect(first).resolves.toMatchObject({ state: contract.BrowserTransferState.COMPLETED });
+    await expect(queued).resolves.toMatchObject({
+      state: contract.BrowserTransferState.FAILED,
+      error: { code: "BROWSER_UPLOAD_AUTHORITY_RETIRED", stateMayHaveChanged: false }
+    });
+    expect(artifacts.calls).toEqual(["resolve:blob-source"]);
+    expect(provider.calls).toEqual(["acquire:connection-1:7", "act:page-1:lease-1:7", "release:lease-1:7"]);
+    expect(provider.humanUploads).toEqual([]);
+  });
+
   it("fences running and queued transfers across recovery", async () => {
     const artifacts = new FakeArtifacts();
     const provider = new FakeProvider();
@@ -270,8 +291,8 @@ describe("BrowserTransferCoordinator", () => {
     provider.actionGate = new Promise<void>((resolve) => { finishAction = resolve; });
     const transfers = new BrowserTransferCoordinator({ artifacts, provider });
 
-    const running = transfers.upload(sourceBlob, "page-1", "#one", { id: "connection-1" });
-    const queued = transfers.upload(sourceBlob, "page-2", "#two", { id: "connection-2" });
+    const running = transfers.upload(sourceBlob, "page-1", "#one", uploadOwner("connection-1"));
+    const queued = transfers.upload(sourceBlob, "page-2", "#two", uploadOwner("connection-2"));
     await vi.waitFor(() => expect(provider.actions).toHaveLength(1));
     await transfers.recover();
     finishAction();

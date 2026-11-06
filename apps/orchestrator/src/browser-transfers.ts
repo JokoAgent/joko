@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
 import type { BlobRef } from "@joko/core";
-import type { BrowserAction, BrowserLease, BrowserLeaseFence, BrowserPageState, BrowserTakeoverFence } from "@joko/tool-browser";
+import type { BrowserLease, BrowserLeaseFence, BrowserProvider, BrowserTakeoverFence } from "@joko/tool-browser";
 
 import type { ArtifactRecord } from "./artifact-store.js";
 import { toProtoTimestamp } from "./proto-mapper.js";
@@ -13,24 +13,12 @@ export interface BrowserTransferArtifactStore {
   ingestPath(sourcePath: string, options?: { fileName?: string; mimeType?: string; expiresAt?: number }): Promise<ArtifactRecord>;
 }
 
-export interface BrowserTransferProvider {
-  readonly generation: number;
-  acquireAgentLease(owner: string, ttlMs?: number): BrowserLease;
-  releaseAgentLease(lease: BrowserLeaseFence): Promise<void>;
-  act(pageId: string, lease: BrowserLeaseFence, action: BrowserAction): Promise<BrowserPageState>;
-  runHumanTakeoverOperation<T>(
-    takeover: BrowserTakeoverFence,
-    operation: (page: BrowserTakeoverUploadPage) => Promise<T>
-  ): Promise<T>;
-  recover(): Promise<void>;
-}
-
-interface BrowserTakeoverUploadPage {
-  setInputFiles(selector: string, files: string[]): Promise<void>;
-}
+export type BrowserTransferProvider = Pick<BrowserProvider, "generation" | "acquireAgentLease" | "releaseAgentLease" | "uploadFiles" | "recover">;
 
 export interface BrowserTransferConnection {
   readonly id: string;
+  readonly documentId: string;
+  readonly assertCurrent: () => void;
   readonly humanTakeover?: BrowserTakeoverFence;
 }
 
@@ -115,6 +103,8 @@ class BrowserGenerationFencedError extends Error {
     this.name = "BrowserGenerationFencedError";
   }
 }
+
+class BrowserUploadAuthorityError extends Error {}
 
 /**
  * Owns process-local BrowserTransfer state while materialized blobs/artifacts
@@ -302,44 +292,56 @@ export class BrowserTransferCoordinator {
     if (isTerminal(record.state)) return this.present(record);
     let phase: "input_validation" | "blob_resolution" | "lease" | "browser_action" = "input_validation";
     let lease: BrowserLease | undefined;
+    const assertCurrent = () => {
+      if (isTerminal(record.state) || record.generation !== this.#provider.generation) throw new BrowserGenerationFencedError();
+      try { connection.assertCurrent(); }
+      catch { throw new BrowserUploadAuthorityError(); }
+    };
     try {
       validatePageId(record.pageId);
       validateInputSelector(inputSelector);
       validateConnection(connection);
+      assertCurrent();
       phase = "blob_resolution";
       const path = await this.#artifacts.resolveBlobPath(record.blob!);
-      if (record.generation !== this.#provider.generation) throw new BrowserGenerationFencedError();
-      record.state = contract.BrowserTransferState.RUNNING;
-      record.startedAt = this.#now();
-      this.persist(record);
-      phase = "browser_action";
-      if (isOwnedTakeoverPage(connection.humanTakeover, record, connection)) {
-        await this.#provider.runHumanTakeoverOperation(connection.humanTakeover, (page) =>
-          page.setInputFiles(inputSelector, [path])
-        );
-      } else {
+      assertCurrent();
+      let owner: BrowserTakeoverFence | BrowserLeaseFence;
+      if (isOwnedTakeoverPage(connection.humanTakeover, record, connection)) owner = connection.humanTakeover;
+      else {
         phase = "lease";
         lease = this.#provider.acquireAgentLease(connection.id, this.#agentLeaseTtlMs);
         if (lease.generation !== record.generation) throw new BrowserGenerationFencedError();
-        phase = "browser_action";
-        await this.#provider.act(record.pageId, lease, {
-          type: "upload",
-          selector: inputSelector,
-          paths: [path]
-        });
+        owner = lease;
       }
-      if (!isTerminal(record.state)) {
-        record.state = contract.BrowserTransferState.COMPLETED;
-        record.completedAt = this.#now();
-        this.persist(record);
-        this.pruneRetained();
-      }
+      phase = "browser_action";
+      await this.#provider.uploadFiles(record.pageId, owner, { type: "upload", selector: inputSelector, paths: [path] }, {
+        documentId: connection.documentId,
+        assertCurrent,
+        markDispatched: () => {
+          record.state = contract.BrowserTransferState.RUNNING;
+          record.startedAt = this.#now();
+          this.persist(record);
+        }
+      });
+      assertCurrent();
+      record.state = contract.BrowserTransferState.COMPLETED;
+      record.completedAt = this.#now();
+      this.persist(record);
+      this.pruneRetained();
     } catch (error) {
       if (!isTerminal(record.state)) {
+        const dispatched = record.startedAt !== undefined;
         if (error instanceof BrowserGenerationFencedError) {
-          this.fail(record, generationFencedError(false));
+          this.fail(record, generationFencedError(dispatched));
+        } else if (error instanceof BrowserUploadAuthorityError) {
+          this.fail(record, {
+            code: "BROWSER_UPLOAD_AUTHORITY_RETIRED",
+            phase: "authorization",
+            message: "The Browser upload's original connection, task, or host policy is no longer active.",
+            stateMayHaveChanged: dispatched
+          });
         } else {
-          this.fail(record, uploadErrorForPhase(phase));
+          this.fail(record, uploadErrorForPhase(phase, dispatched));
         }
       }
     } finally {
@@ -526,6 +528,7 @@ function validateInputSelector(selector: string): void {
 
 function validateConnection(connection: BrowserTransferConnection): void {
   if (connection.id.trim() === "" || connection.id.length > 512) throw new Error("An authenticated connection ID is required.");
+  if (connection.documentId.trim() === "" || connection.documentId.length > 128) throw new Error("An original Browser document ID is required.");
 }
 
 function validateDownloadName(fileName: string): void {
@@ -555,7 +558,7 @@ function generationFencedError(stateMayHaveChanged: boolean): TransferError {
   };
 }
 
-function uploadErrorForPhase(phase: "input_validation" | "blob_resolution" | "lease" | "browser_action"): TransferError {
+function uploadErrorForPhase(phase: "input_validation" | "blob_resolution" | "lease" | "browser_action", dispatched: boolean): TransferError {
   switch (phase) {
     case "input_validation":
       return {
@@ -583,7 +586,7 @@ function uploadErrorForPhase(phase: "input_validation" | "blob_resolution" | "le
         code: "BROWSER_UPLOAD_FAILED",
         phase,
         message: "The browser file-input action failed; the page may need to be refreshed before retrying.",
-        stateMayHaveChanged: true
+        stateMayHaveChanged: dispatched
       };
   }
 }

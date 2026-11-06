@@ -1402,6 +1402,8 @@ message UploadBrowserFileMutation {
   string page_id = 2;
   BlobRef blob = 3;
   string input_hint = 4;
+  // Captured from the live page when the user opens the file picker.
+  string document_id = 5;
 }
 
 message UpsertMcpServerMutation {

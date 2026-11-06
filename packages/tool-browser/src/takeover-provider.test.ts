@@ -754,6 +754,34 @@ describe("BrowserProvider human takeover fences", () => {
     }
   });
 
+  it("never dispatches a queued takeover navigation after the caller loses authorization", async () => {
+    const value = await fixture();
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const takeover = await begin(value.provider);
+      const current = value.provider.runHumanTakeoverOperation(takeover, () => { enter(); return held; });
+      await entered;
+      let authorized = true;
+      const navigate = { type: "navigate", url: "https://example.test/next" } as const;
+      const pending = value.provider.performHumanTakeoverAction(takeover, navigate, () => {
+        if (!authorized) throw new Error("Original connection revoked");
+      });
+      const rejected = expect(pending).rejects.toThrow("Original connection revoked");
+      authorized = false;
+      release();
+      await current;
+      await rejected;
+      expect(value.humanInputs).toEqual([]);
+      expect((await value.provider.listPages())[0]?.url).toBe("https://example.test/");
+    } finally {
+      release();
+      await value.cleanup();
+    }
+  });
+
   it("makes a begin queued after recovery fail its stale generation fence", async () => {
     const value = await fixture();
     try {
