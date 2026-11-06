@@ -95,6 +95,7 @@ import type {
   StoredSession
 } from "@joko/store";
 import type { PendingRuntimeHandoff, RuntimeHandoffSource } from "@joko/store";
+import type { ImportProbeAction } from "@joko/agent-import";
 import { assertPersonalDevelopmentInput, readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { buildSessionHandoffText, sessionHandoffMessages } from "./session-handoff-text.js";
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
@@ -15287,23 +15288,54 @@ export class SessionHost {
     if (!(decision.kind === "confirmed" && decision.confirmed || decision.kind === "selected" && decision.value === "allow_once")) throw new StoreError("Plugin task write access was not approved.");
   }
 
-  async authorizeImportProbe(sessionId: string, summary: string, signal: AbortSignal, assertCurrent: () => void): Promise<void> {
-    assertCurrent(); signal.throwIfAborted();
-    const stored = this.#store.getSession(sessionId); const target = this.targetForSession(stored);
+  async authorizeImportProbe(sessionId: string, action: ImportProbeAction, signal: AbortSignal, assertOwner: () => void): Promise<() => void> {
+    assertOwner(); signal.throwIfAborted();
+    const session = this.#store.getSession(sessionId);
+    const stored = session.descriptor;
+    const original = this.#store.getTarget(stored.targetId);
+    const target = this.targetForSession(session);
+    const backendGeneration = this.#store.getBackend(stored.backendId).descriptor.instanceGeneration;
+    const workspaceAuthority = artifactWorkspaceAuthority(original.descriptor, target, stored.worktree);
     const policy = policySnapshotFor(this.#store, target);
-    const decision = decideToolCall({ name: "mcp_call", args: { provider: "joko_imported_connections", operation: "read_evidence" } }, {
-      mode: stored.descriptor.permissionMode, workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
-      explicitAllowTools: new Set(), explicitDenyTools: new Set(), policySnapshot: policy,
-    });
-    if (decision.action === "deny") throw new StoreError("Import verification was denied by target policy.");
-    if (decision.action === "allow") return;
-    const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding);
+    const assertCurrent = () => {
+      this.#assertOpen(); assertOwner(); signal.throwIfAborted();
+      const current = this.#store.getSession(sessionId);
+      const registered = this.#store.getTarget(current.descriptor.targetId);
+      const effective = this.targetForSession(current);
+      if (current.descriptor.archived || current.descriptor.deletedAt !== undefined || !registered.descriptor.trusted
+        || current.descriptor.targetId !== stored.targetId || current.descriptor.backendId !== stored.backendId
+        || current.descriptor.permissionMode !== stored.permissionMode || current.descriptor.planMode !== stored.planMode
+        || current.descriptor.binding.generation !== stored.binding.generation
+        || current.descriptor.binding.opaqueRef !== stored.binding.opaqueRef
+        || current.descriptor.binding.nativeSessionId !== stored.binding.nativeSessionId
+        || registered.revision !== original.revision
+        || artifactWorkspaceAuthority(registered.descriptor, effective, current.descriptor.worktree) !== workspaceAuthority
+        || this.#store.getBackend(stored.backendId).descriptor.instanceGeneration !== backendGeneration
+        || policySnapshotFor(this.#store, effective).generation !== policy.generation) {
+        throw new StoreError("Import verification authority changed.");
+      }
+    };
+    assertCurrent();
+    const risk = policyRiskForToolRisk("ambiguous");
+    const rules = [evaluateOrderedPolicyRules(policy, { subjectKind: "resource", toolName: "mcp_call", risk })];
+    if (action.kind === "mcp") {
+      rules.push(evaluateOrderedPolicyRules(policy, { subjectKind: "mcp", toolProviderId: action.connection, toolName: action.tool, risk }),
+        evaluateOrderedPolicyRules(policy, { subjectKind: "mcp", toolProviderId: "joko_imported_connections", toolName: "call_tool", risk }));
+    }
+    if (rules.some((rule) => rule?.action === "deny")) throw new StoreError("Import verification was denied by target policy.");
+    const decision = rules.find((rule) => rule?.action === "ask") ?? rules.find((rule) => rule?.action === "allow")
+      ?? decideToolCall({ name: "mcp_call", args: action.arguments }, {
+        mode: stored.permissionMode, workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
+        explicitAllowTools: new Set(), explicitDenyTools: new Set()
+      });
+    if (decision.action === "allow") return assertCurrent;
+    const context = this.makeContext(sessionId, target, stored.binding.generation, stored.binding);
     const answer = await context.requestInteraction({ id: `import-probe-${randomUUID()}`, kind: "permission", title: "Verify imported data access?",
-      toolName: "joko_imported_connections", summary: summary.slice(0, 8000), risk: "medium", choices: ["allow_once", "deny_once"] }, { signal });
-    assertCurrent(); signal.throwIfAborted();
-    if (policySnapshotFor(this.#store, this.targetForSession(this.#store.getSession(sessionId))).generation !== policy.generation
-      || this.#store.getSession(sessionId).descriptor.binding.generation !== stored.descriptor.binding.generation) throw new StoreError("Import verification owner changed.");
+      toolName: action.kind === "mcp" ? `${action.connection}/${action.tool}` : "joko_imported_connections",
+      summary: redactSecrets(JSON.stringify(action)).slice(0, 8000), risk: "medium", choices: ["allow_once", "deny_once"] }, { signal });
+    assertCurrent();
     if (!(answer.kind === "confirmed" && answer.confirmed || answer.kind === "selected" && answer.value === "allow_once")) throw new StoreError("Import verification was not approved.");
+    return assertCurrent;
   }
 
   /** A safe service result is committed once and published by the Store's existing event stream. */
