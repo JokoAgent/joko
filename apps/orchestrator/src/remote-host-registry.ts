@@ -186,8 +186,9 @@ export class RemoteHostRegistry {
     return this.#store.getTarget(targetId).revision;
   }
 
-  async refresh(targetId: string): Promise<RemoteHostRecord[]> {
+  async refresh(targetId: string, assertCurrent?: () => void): Promise<RemoteHostRecord[]> {
     this.assertOpen();
+    assertCurrent?.();
     const target = boundedIdentity(targetId, "target ID", 256);
     // Validate the exact target before touching the service-owned file port.
     this.#store.getTarget(target);
@@ -199,13 +200,15 @@ export class RemoteHostRegistry {
       .catch(() => [])
       .then(async () => {
         this.assertOpen();
+        assertCurrent?.();
         const imported = await this.#sshConfig!.importHosts({
           ownerId: this.#ownerId,
           targetId: target,
           defaultUser: this.#defaultSshUser!
         });
         this.assertOpen();
-        return this.reconcileSshConfig(target, imported);
+        assertCurrent?.();
+        return this.reconcileSshConfig(target, imported, assertCurrent);
       });
     this.#refreshes.set(target, operation);
     try {
@@ -272,18 +275,20 @@ export class RemoteHostRegistry {
     targetId: string,
     id: string,
     expectedRevision: bigint,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    assertCurrent?: () => void
   ): Promise<RemoteHostConnectionOutcome> {
-    return this.runConnectionTest(targetId, id, expectedRevision, false, signal);
+    return this.runConnectionTest(targetId, id, expectedRevision, false, signal, assertCurrent);
   }
 
   async test(
     targetId: string,
     id: string,
     expectedRevision: bigint,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    assertCurrent?: () => void
   ): Promise<RemoteHostConnectionOutcome> {
-    return this.runConnectionTest(targetId, id, expectedRevision, true, signal);
+    return this.runConnectionTest(targetId, id, expectedRevision, true, signal, assertCurrent);
   }
 
   startAutoConnect(): Promise<void> {
@@ -480,7 +485,8 @@ export class RemoteHostRegistry {
 
   private reconcileSshConfig(
     targetId: string,
-    imported: readonly RemoteSshConfigHost[]
+    imported: readonly RemoteSshConfigHost[],
+    assertCurrent?: () => void
   ): RemoteHostRecord[] {
     const accepted = validateImportedCatalog(imported, this.#ownerId, targetId);
     const existing = this.list(targetId);
@@ -507,6 +513,7 @@ export class RemoteHostRegistry {
 
     for (const current of existing) {
       if (current.source !== "ssh_config" || importedById.has(current.id)) continue;
+      assertCurrent?.();
       const deleted = this.#store.deleteRemoteHost({
         ownerId: current.ownerId,
         targetId: current.targetId,
@@ -521,6 +528,7 @@ export class RemoteHostRegistry {
       let current = currentById.get(importedHost.id);
       if (current?.source === "manual") continue;
       if (current === undefined) {
+        assertCurrent?.();
         const created = this.#store.createRemoteHost({
           ownerId: this.#ownerId,
           targetId,
@@ -535,6 +543,7 @@ export class RemoteHostRegistry {
         continue;
       }
       if (!routingChanged(current, importedHost)) continue;
+      assertCurrent?.();
       this.retireController(current.targetId, current.id);
       if (
         current.trust !== undefined &&
@@ -549,6 +558,7 @@ export class RemoteHostRegistry {
         });
         this.publish({ kind: "upserted", host: current });
       }
+      assertCurrent?.();
       const updated = this.#store.updateRemoteHost({
         ownerId: current.ownerId,
         targetId: current.targetId,
@@ -570,9 +580,11 @@ export class RemoteHostRegistry {
     id: string,
     expectedRevision: bigint,
     fresh: boolean,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    assertCurrent?: () => void
   ): Promise<RemoteHostConnectionOutcome> {
     this.assertOpen();
+    assertCurrent?.();
     let host = this.get(targetId, id);
     assertRevision(host, expectedRevision);
     if (authenticationIsIncomplete(host)) {
@@ -582,9 +594,14 @@ export class RemoteHostRegistry {
     const managed = this.controllerFor(host);
     if (fresh && host.status.state === "ready") {
       await managed.controller.disconnect(scopeOf(host));
+      assertCurrent?.();
       host = this.get(targetId, id);
     }
-    const result = await managed.controller.test(scopeOf(host), { ...(signal === undefined ? {} : { signal }) });
+    const result = await managed.controller.test(scopeOf(host), {
+      ...(signal === undefined ? {} : { signal }),
+      ...(assertCurrent === undefined ? {} : { assertCurrent })
+    });
+    assertCurrent?.();
     this.persistSnapshot(result.snapshot);
     const authoritative = this.get(targetId, id);
     return Object.freeze({
