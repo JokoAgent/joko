@@ -269,7 +269,7 @@ import { PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-p
 import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { PartnerRoutineStore } from "@joko/store";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
-import { PartnerAutonomyManager } from "./partner-autonomy.js";
+import { canSendFollowUpTaskMessage, PartnerAutonomyManager } from "./partner-autonomy.js";
 import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
 import { PartnerMessagingRuntime, PartnerMessagingTools } from './partner-messaging.js';
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
@@ -1166,6 +1166,7 @@ export async function createOrchestratorApplication(
       store,
       host: () => sessionHostForHelperTools,
       messageSearch: () => messageSearchForHelperTools,
+      canSendTaskMessage: (caller, targetSessionId) => canSendFollowUpTaskMessage(partnerStore, caller, targetSessionId),
       taskSenderPartner: sessionId => {
         const link = partnerStore.getSessionLink(sessionId);
         if (link?.role !== "canonical" && link?.role !== "routine") return undefined;
