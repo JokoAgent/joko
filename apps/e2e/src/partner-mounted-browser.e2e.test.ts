@@ -152,7 +152,13 @@ describe("mounted Partner collaboration product chain", () => {
     expect(routines).toHaveLength(importedRoutines.length + builtin.length);
     expect(fixture.application.store.listRuns({ sessionId: row.canonicalSessionId! })).toHaveLength(0);
     const welcomeId = `import-message-${createHash("sha256").update(JSON.stringify([row.canonicalSessionId, `package-welcome-${saved.requestId}`])).digest("hex")}`;
-    await waitFor(async () => fixture!.application.store.findEvent(welcomeId), event => event !== undefined, "the once-only package opening");
+    await waitFor(async () => {
+      const event = fixture!.application.store.findEvent(welcomeId);
+      if (event !== undefined) return { eventId: event.id };
+      const receipt = await fixture!.application.partnerImports!.waitForRequest(saved.requestId);
+      return { status: receipt.status, canonicalSessionId: receipt.canonicalSessionId,
+        checks: receipt.checks.map(({ entryId, status, message }) => ({ entryId, status, message })) };
+    }, observation => observation.eventId === welcomeId, "the once-only package opening", 15_000);
     await fixture.application.partnerImports!.recover(); await fixture.application.partnerImports!.recover();
     expect(fixture.application.store.listEvents({ sessionId: row.canonicalSessionId!, limit: 100 }).filter(event => event.id === welcomeId)).toHaveLength(1);
     const configuredWorkspace = page.getByRole("dialog");
