@@ -24,14 +24,12 @@ export async function copyExtensionLibrary(input: {
   readonly now?: () => number;
   readonly freeBytes?: (root: string) => Promise<number | undefined>;
   readonly onTargetCreated?: (identity: ExtensionLibraryRootIdentity) => Promise<void>;
-}): Promise<{ readonly vault: ExtensionLibraryVault; readonly result: ExtensionLibraryTransferResult }> {
+}): Promise<{ readonly vault: ExtensionLibraryVault; readonly identity: ExtensionLibraryRootIdentity; readonly result: ExtensionLibraryTransferResult }> {
   const source = await input.source.snapshot();
   await mkdir(input.targetRoot, { recursive: false, mode: 0o700 });
-  if (input.onTargetCreated !== undefined) {
-    const targetIdentity = await captureExtensionLibraryRootIdentity(input.targetRoot);
-    await input.onTargetCreated(targetIdentity);
-    await assertExtensionLibraryRootIdentity(input.targetRoot, targetIdentity);
-  }
+  const identity = await captureExtensionLibraryRootIdentity(input.targetRoot);
+  await input.onTargetCreated?.(identity);
+  await assertExtensionLibraryRootIdentity(input.targetRoot, identity);
   const targetVault = new ExtensionLibraryVault({
     root: input.targetRoot,
     extensionId: input.extensionId,
@@ -75,7 +73,8 @@ export async function copyExtensionLibrary(input: {
   await targetVault.reconcileUsage();
   const target = await targetVault.snapshot();
   assertEquivalentTrees(source.entries, target.entries);
-  return { vault: targetVault, result: { files: source.files, bytes: source.bytes, entries: source.entries } };
+  await assertExtensionLibraryRootIdentity(input.targetRoot, identity);
+  return { vault: targetVault, identity, result: { files: source.files, bytes: source.bytes, entries: source.entries } };
 }
 
 export async function moveOrCopyExtensionLibrary(input: {
@@ -86,6 +85,7 @@ export async function moveOrCopyExtensionLibrary(input: {
   readonly rename?: (from: string, to: string) => Promise<void>;
   readonly now?: () => number;
   readonly freeBytes?: (root: string) => Promise<number | undefined>;
+  readonly recordCopy?: (identity: ExtensionLibraryRootIdentity, verified: boolean) => Promise<void>;
 }): Promise<{ readonly copied: boolean; readonly result: ExtensionLibraryTransferResult }> {
   const snapshot = await input.source.snapshot();
   try {
@@ -99,13 +99,17 @@ export async function moveOrCopyExtensionLibrary(input: {
   } catch (error) {
     if (!crossDevice(error)) throw error;
   }
+  const recordCopy = input.recordCopy;
   const copied = await copyExtensionLibrary({
     source: input.source,
     targetRoot: input.targetRoot,
     extensionId: input.extensionId,
     now: input.now,
-    freeBytes: input.freeBytes
+    freeBytes: input.freeBytes,
+    ...(recordCopy === undefined ? {} : { onTargetCreated: (identity) => recordCopy(identity, false) })
   });
+  await recordCopy?.(copied.identity, true);
+  await assertExtensionLibraryRootIdentity(input.targetRoot, copied.identity);
   await assertExtensionLibraryRootIdentity(input.source.root, input.sourceIdentity);
   await removeExtensionLibraryRoot(input.source.root, input.sourceIdentity);
   return { copied: true, result: copied.result };
