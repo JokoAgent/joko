@@ -7541,7 +7541,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "files.verifyingGallery")}</Text>
     </View>}
-    {files.watchStatus === "error" && files.watchError
+    {files.watchError
       && <Banner text={mobileMessage(locale, "files.watchUnavailable", { error: files.watchError })} colors={colors} />}
 
     <MobileFilesToolbar colors={colors} locale={locale} location={files.location.kind}
