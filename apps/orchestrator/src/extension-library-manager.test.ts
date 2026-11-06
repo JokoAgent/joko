@@ -476,6 +476,11 @@ describe("ExtensionLibraryManager", () => {
       if (replaced === "unchanged") {
         await expect(recovered.overview(owner)).resolves.toMatchObject({ state: "ready", location: { path: target, generation: 2n } });
         await expect(readFile(join(target, "note.txt"), "utf8")).resolves.toBe("original");
+        const [grace] = recovered.listGrace(EXTENSION_ID);
+        expect(grace).toBeDefined();
+        const savedGrace = (await readdir(join(temporaryPath, "owner", "data"))).find(name => name.endsWith(grace!.graceId.slice(-32)));
+        expect(savedGrace).toBeDefined();
+        await expect(readFile(join(temporaryPath, "owner", "data", savedGrace!, "note.txt"), "utf8")).resolves.toBe("original");
         return;
       }
       await expect(recovered.overview(owner)).resolves.toMatchObject({ state: "unavailable", reason: "state_corrupt" });
