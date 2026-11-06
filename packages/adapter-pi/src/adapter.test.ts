@@ -8071,30 +8071,38 @@ describe("managed resource precedence", () => {
     } finally { await adapter.dispose(); }
   });
 
-  it("does not trust a custom executable that only returns a semantic version", async () => {
+  it("does not trust a custom executable with a semantic version and an invalid RPC state", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-workspace-"));
-    const command = join(agentHome, "custom-pi.exe");
-    await writeFile(command, "not a compatible RPC executable\n", { mode: 0o700 });
-    let spawns = 0;
+    const script = join(agentHome, "invalid-state-pi.mjs");
+    const marker = join(agentHome, "probe-spawns.log");
+    await writeFile(script, [
+      'import { appendFileSync } from "node:fs";',
+      'import { createInterface } from "node:readline";',
+      'if (process.argv.includes("--version")) {',
+      '  process.stdout.write("pi 99.99.99\\n");',
+      '} else {',
+      '  appendFileSync(process.argv[2], "spawn\\n");',
+      '  for await (const line of createInterface({ input: process.stdin })) {',
+      '    const { id, type: command } = JSON.parse(line);',
+      '    process.stdout.write(JSON.stringify({ type: "response", id, command, success: true, data: { version: "99.99.99" } }) + "\\n");',
+      '  }',
+      '}'
+    ].join("\n"));
     const adapter = createPiAdapter({
       agentHome,
       sessionRoot: agentHome,
-      command,
-      versionProbe: async () => "pi 99.99.99",
-      startupTimeoutMs: 250,
-      shutdownTimeoutMs: 250,
+      command: process.execPath,
+      commandArgs: [script, marker],
+      startupTimeoutMs: 2_000,
+      shutdownTimeoutMs: 1_000,
       providers: [{
         id: "local",
         baseUrl: "http://127.0.0.1:11434/v1",
         api: "openai-completions",
         keyless: true,
         models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }]
-      }],
-      processFactory: (spec) => {
-        spawns += 1;
-        return new ScriptedPiProcess(spec) as unknown as PiProcessHandle;
-      }
+      }]
     });
     const target: TargetDescriptor = {
       id: "custom-compatibility-target",
@@ -8123,7 +8131,7 @@ describe("managed resource precedence", () => {
         fastMode: false,
         permissionMode: "ask"
       }, context)).rejects.toMatchObject({ publicError: { code: "PI_EXECUTABLE_INCOMPATIBLE" } });
-      expect(spawns).toBe(1);
+      expect((await readFile(marker, "utf8")).trim()).toBe("spawn");
     } finally {
       await adapter.dispose();
     }
