@@ -429,10 +429,11 @@ describe("RemoteHostService", () => {
       request.onAuthenticating();
       return { close: async () => undefined };
     });
-    const fixture = createFixture({ connector: { connect }, resolve: () => EPHEMERAL_SECRET });
+    const capabilities = { commandExecution: false, processStreaming: false, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false };
+    const fixture = createFixture({ connector: { capabilities, connect }, resolve: () => EPHEMERAL_SECRET });
     const owners = pairedOwners(fixture);
     const host = fixture.registry.create({ targetId: "target-a", id: "first-key", hostname: "first.example.test",
-      user: "maker", credentialReferenceId: "agent:first-key" });
+      user: "maker", source: "manual", credentialReferenceId: "agent:first-key" });
     const { service, original, observer } = owners;
     const fields = { targetId: host.targetId, hostId: host.id, expectedRevision: toProtoRevision(host.revision) };
     const pending = stage === "handshake"
@@ -517,7 +518,7 @@ describe("RemoteHostService", () => {
       return { capabilities, processes: { open }, close: async () => undefined };
     } }, resolve: () => EPHEMERAL_SECRET });
     const host = fixture.registry.create({ targetId: "target-a", id: "runtime-box", hostname: "runtime.example.test",
-      user: "maker", credentialReferenceId: "agent:runtime" });
+      user: "maker", source: "manual", credentialReferenceId: "agent:runtime" });
     const connected = await fixture.registry.connect(host.targetId, host.id, host.revision);
     expect(connected.ok).toBe(true);
     const runtime = new RemoteBackendRuntimeSetupManager({ store: fixture.store, registry: fixture.registry,
@@ -533,7 +534,9 @@ describe("RemoteHostService", () => {
     await expect(original.next()).resolves.toMatchObject({ done: false });
     const observed = (async () => {
       const events: contract.InstallRemoteBackendRuntimeResponse[] = [];
-      for await (const event of owners.service.installRemoteBackendRuntime(request, owners.observer)) events.push(event);
+      for await (const event of owners.service.installRemoteBackendRuntime(request, owners.observer)) {
+        events.push(create(contract.InstallRemoteBackendRuntimeResponseSchema, event));
+      }
       return events;
     })();
     await vi.waitFor(() => expect(waiting).toHaveBeenCalledOnce());
