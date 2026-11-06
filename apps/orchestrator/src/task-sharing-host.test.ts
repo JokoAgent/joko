@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create, toBinary } from "@bufbuild/protobuf";
+import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import { afterEach, expect, it, vi } from "vitest";
@@ -13,6 +14,7 @@ import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { TaskSharingReads } from "./task-sharing-reads.js";
 import type { ConnectServiceDependencies } from "./connect-services.js";
 import { createTaskSharingRuntime } from "./task-sharing-runtime.js";
+import { createTaskSharingGuestConnectService } from "./task-sharing-connect-service.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -37,7 +39,7 @@ async function fixture(origin: string | (() => string) = "http://127.0.0.1:4327"
     return { ...joined, secret, lease: host.authenticate(`TaskShareGuest ${secret}`) };
   };
   cleanups.push(() => { host.close(); store.close(); rmSync(directory, { recursive: true, force: true }); });
-  return { store, artifacts, host, prepare, member, share };
+  return { store, artifacts, host, prepare, member, share, invitation };
 }
 const signal = () => new AbortController().signal;
 it("uses the current entrance for new invitations and preserves the exact original private operation reply", async () => {
@@ -120,6 +122,31 @@ it("replays only an exact durable member receipt and denies it immediately after
   expect(member.lease.signal.aborted).toBe(true);
   await expect(f.host.invoke(member.lease, contract.TaskShareMethod.SUBMIT_OPERATION, request, signal())).rejects.toThrow();
   expect(f.prepare).toHaveBeenCalledTimes(1);
+});
+it.each(["removed", "left"] as const)("requires a fresh invitation after a participant is %s", async status => {
+  const f = await fixture(), original = f.member("a"), retained = f.member("b");
+  const guest = createClient(contract.TaskSharingGuestService, createRouterTransport(router =>
+    router.service(contract.TaskSharingGuestService, createTaskSharingGuestConnectService(f.host))));
+  await expect(guest.inspectTaskShareInvitation({ invitation: f.invitation })).resolves.toMatchObject({ share: { shareId: f.share.shareId } });
+  if (status === "removed") f.host.remove({ operationId: "remove-original", shareId: f.share.shareId,
+    memberId: original.member.memberId, memberGeneration: original.member.memberGeneration });
+  else f.host.leave(original.lease, "leave-original-invitation");
+  expect(original.lease.signal.aborted).toBe(true);
+  expect(() => f.host.invite({ operationId: "invite", shareId: f.share.shareId })).toThrow(/new invitation/u);
+  const freshSecret = "c".repeat(43);
+  const rejoin = { intentId: "fresh-join-same-device", displayName: "Member A", homeServerId: "home", homeDeviceId: "device-a",
+    credentialSha256Hex: createHash("sha256").update(freshSecret).digest("hex") };
+  await expect(guest.inspectTaskShareInvitation({ invitation: f.invitation })).rejects.toMatchObject({ code: Code.PermissionDenied });
+  await expect(guest.acceptTaskShareJoin({ ...rejoin, invitation: f.invitation })).rejects.toMatchObject({ code: Code.PermissionDenied });
+  expect(f.host.get(f.share.shareId).members).toHaveLength(2);
+  expect(() => f.host.authenticate(`TaskShareGuest ${freshSecret}`)).toThrow(/unavailable/u);
+  await expect(f.host.readSnapshot(retained.lease, signal())).resolves.toMatchObject({ scope: { kind: { case: "session" } } });
+  const fresh = f.host.invite({ operationId: "fresh-invite", shareId: f.share.shareId });
+  expect(fresh.share.shareGeneration).toBe(f.share.shareGeneration);
+  await expect(guest.acceptTaskShareJoin({ ...rejoin, invitation: fresh.invitation })).resolves.toMatchObject({ member: { status: "active" } });
+  const lease = f.host.authenticate(`TaskShareGuest ${freshSecret}`);
+  expect(lease.scope.memberId).not.toBe(original.lease.scope.memberId);
+  await expect(f.host.readSnapshot(lease, signal())).resolves.toMatchObject({ scope: { kind: { case: "session" } } });
 });
 it("rolls failed synchronous admission back and never repeats an admitted unknown effect", async () => {
   const f = await fixture(), member = f.member("a");

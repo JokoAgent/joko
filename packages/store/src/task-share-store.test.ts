@@ -31,6 +31,9 @@ it("retains exact membership across restart and fences revoked members before re
   f.reopen(); expect(f.shares().authorize(proof).member.memberId).toBe(proof.memberId);
   expect(f.shares().receipt(proof, "request", { value: 1 })?.responseHex).toBe("01");
   f.shares().remove("share", proof.memberId);
+  f.reopen();
+  const retired = f.shares().get("share");
+  expect(f.shares().invitationMatches(retired, 1, "a".repeat(64))).toBe(false);
   expect(() => f.shares().receipt(proof, "request", { value: 1 })).toThrow(/revoked/);
   expect(f.store.listConnections()).toHaveLength(0);
 });
