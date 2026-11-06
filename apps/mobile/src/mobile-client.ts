@@ -655,7 +655,7 @@ interface MobileImageGalleryLease {
         readonly kind: "timeline";
         readonly eventId: string;
         readonly pageId: string;
-        readonly windowKey: string;
+      readonly groupKey: string;
       }
     | {
         readonly kind: "markdown";
@@ -682,7 +682,8 @@ interface MobileTimelinePreviewLease {
   readonly profileId: string;
   readonly sessionId: string;
   readonly taskAuthorityKey: string;
-  readonly windowKey: string;
+  readonly sourceKey: string;
+  readonly joinedSource?: MobileJoinedTaskSource;
   readonly artifact?: MobileTimelinePreviewArtifact;
   readonly extensionCard?: { readonly id: string; readonly html: string; readonly uri: string };
   media?: MobileMediaPreviewLease;
@@ -7591,7 +7592,7 @@ export class MobileClient {
     if (!source || !taskAuthorityKey || !card || !/^joko-media:\/\/blobs\/[a-f0-9]{64}\.(png|jpg|jpeg|gif|webp|glb)$/u.test(uri)) throw new Error("Extension media unavailable.");
     this.#cancelTimelinePreviewLease(); const controller = new AbortController();
     const lease: MobileTimelinePreviewLease = { controller, profileId: credential.profileId, sessionId, taskAuthorityKey,
-      windowKey: mobileTimelinePreviewWindowKey(this.#timelineEvents()), extensionCard: { id: cardId, html: card.html, uri } };
+      sourceKey: mobileTimelinePreviewWindowKey(this.#timelineEvents()), extensionCard: { id: cardId, html: card.html, uri } };
     this.#timelinePreview = lease;
     const base = { title: card.extensionName, sourceLabel: card.extensionName, revisionKey: `${cardId}:${uri}`, mediaType: "application/octet-stream", byteSize: 0n };
     this.#set({ timelinePreview: { ...base, kind: "loading" } });
@@ -7643,7 +7644,8 @@ export class MobileClient {
       profileId: credential.profileId,
       sessionId,
       taskAuthorityKey,
-      windowKey: mobileTimelinePreviewWindowKey(events),
+      sourceKey: mobileTimelinePreviewWindowKey([source.event]),
+      ...(this.#joinedTask === undefined ? {} : { joinedSource: this.#joinedTask.source }),
       artifact: source.artifact
     };
     this.#timelinePreview = lease;
@@ -8301,7 +8303,8 @@ export class MobileClient {
   }
 
   conversationShareOwnerKey(): string | undefined {
-    if (!this.#taskAuthorityKey()) return undefined;
+    const taskAuthorityKey = this.#taskAuthorityKey();
+    if (!taskAuthorityKey || this.#joinedTask) return taskAuthorityKey;
     const credential = this.#credential!;
     const owner = this.#state.owner!;
     const session = this.#selectedSession()!;
@@ -8313,6 +8316,7 @@ export class MobileClient {
   }
 
   markdownResourceOwnerKey(): string | undefined {
+    if (this.#joinedTask) return undefined;
     const owner = this.conversationShareOwnerKey();
     const authority = resolveMobileWorkspaceAuthority(this.#state.owner, this.#state.detail, this.#state.selectedId);
     if (!owner || !authority || !this.taskWorkspacePathPasteControls()) return undefined;
@@ -8971,7 +8975,7 @@ export class MobileClient {
         kind: "timeline",
         eventId,
         pageId,
-        windowKey: mobileTimelineGalleryWindowKey(events)
+        groupKey: timelineGalleryGroupKey(events, pages)
       },
       operationInFlight: false
     };
@@ -9133,10 +9137,6 @@ export class MobileClient {
         || !this.imageGalleryCurrent(leaseId)) {
         throw new Error("The cached gallery preview source changed.");
       }
-      if (lease.source.kind === "timeline" && (mobileTimelineGalleryWindowKey(this.#timelineEvents()) !== lease.source.windowKey
-        || !timelineGalleryPagesForSelection(this.#timelineEvents(), lease.source.eventId, lease.source.pageId).some((current) => sameMobileImageGalleryPage(current, page)))) {
-        throw new Error("The cached Timeline gallery preview changed.");
-      }
     } }, signal);
     if (preview) { lease.previewLeaseIds ??= new Set(); lease.previewLeaseIds.add(preview.leaseId); }
     return preview;
@@ -9158,7 +9158,7 @@ export class MobileClient {
       return pages.length === lease.pages.length && pages.every((page, index) => sameMobileImageGalleryPage(page, lease.pages[index]!));
     }
     const events = this.#timelineEvents(); const pages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
-    return mobileTimelineGalleryWindowKey(events) === source.windowKey && pages.length === lease.pages.length
+    return pages.length === lease.pages.length && timelineGalleryGroupKey(events, pages) === source.groupKey
       && pages.every((page, index) => sameMobileImageGalleryPage(page, lease.pages[index]!));
   }
 
@@ -15071,20 +15071,14 @@ export class MobileClient {
       if (pages.length !== lease.pages.length || pages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
         throw new Error("The pending images changed or left the task queue.");
       }
-    } else {
-      const events = this.#timelineEvents();
-      if (mobileTimelineGalleryWindowKey(events) !== source.windowKey) {
-        throw new Error("The Timeline source window changed while the gallery was open.");
-      }
-      const currentPages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
-      if (currentPages.length !== lease.pages.length
-        || currentPages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
-        throw new Error("The durable Timeline images changed while the gallery was open.");
-      }
+    } else if (!this.imageGalleryCurrent(lease.leaseId)) {
+      throw new Error("The durable Timeline images changed while the gallery was open.");
     }
     const snapshot = await this.composerDrafts!.readSnapshot(lease.identity);
     signal?.throwIfAborted();
-    if (this.#imageGallery !== lease) throw new Error("The image gallery was closed before the operation completed.");
+    if (this.#imageGallery !== lease || (source.kind === "timeline" && !this.imageGalleryCurrent(lease.leaseId))) {
+      throw new Error("The image gallery source changed before the operation completed.");
+    }
     const current = normalizeMobileComposerDraft(snapshot.draft ?? {
       text: "", mentions: [], atoms: [], slashCommands: [], attachments: []
     });
@@ -15835,14 +15829,17 @@ export class MobileClient {
   #timelinePreviewSourceCurrent(lease: MobileTimelinePreviewLease, state: MobileState): boolean {
     if (state.status !== "connected" || state.activeProfileId !== lease.profileId
       || state.selectedId !== lease.sessionId) return false;
+    const joined = state.taskSource?.kind === "joined" ? state.taskSource : undefined;
+    if (joined !== lease.joinedSource) return false;
     const events = mobileStateTimelineEvents(state);
-    if (mobileTimelinePreviewWindowKey(events) !== lease.windowKey) return false;
-    if (lease.extensionCard) return this.#extensionCardSource(state, lease.extensionCard.id)?.html === lease.extensionCard.html;
+    if (lease.extensionCard) return mobileTimelinePreviewWindowKey(events) === lease.sourceKey
+      && this.#extensionCardSource(state, lease.extensionCard.id)?.html === lease.extensionCard.html;
     if (!lease.artifact) return false;
     const source = resolveMobileTimelinePreviewArtifact(events, lease.artifact);
     return source !== undefined
       && source.event.identity?.sessionId === lease.sessionId
-      && source.event.cursor?.generation === state.owner?.generation
+      && source.event.cursor?.generation === (joined ? state.detail?.generation : state.owner?.generation)
+      && mobileTimelinePreviewWindowKey([source.event]) === lease.sourceKey
       && sameMobileTimelinePreviewArtifact(source.artifact, lease.artifact);
   }
   #extensionCardSource(state: MobileState, cardId: string) {
@@ -17404,6 +17401,11 @@ function timelineGalleryPagesForSelection(
     return mobileTimelineGalleryPages(sources[0]!).filter((page) => page.pageId === image.pageId);
   });
   return pages.length === images.length ? pages : [];
+}
+
+function timelineGalleryGroupKey(events: readonly Event[], pages: readonly MobileImageGalleryPage[]): string {
+  const sources = new Set(pages.flatMap(page => "eventId" in page.source ? [page.source.eventId] : []));
+  return mobileTimelineGalleryWindowKey(events.filter(event => sources.has(event.eventId)));
 }
 
 function historyInvalidated(event: Event): boolean {
