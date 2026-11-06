@@ -177,6 +177,23 @@ export function evaluateOrderedPolicyRules(
   return selected === undefined ? undefined : { action: selected.effect, ruleId: selected.id };
 }
 
+/** A recursive file tool can reach policy paths below its starting directory. */
+export function workspaceSubtreePolicyObservations(
+  snapshot: PolicySnapshot,
+  observation: PolicyObservation,
+  directory: string,
+  subjectKind: "file_read" | "file_write",
+  pathStyle?: "posix" | "win32"
+): readonly PolicyObservation[] {
+  const paths = pathStyle === "posix" ? posix : pathStyle === "win32" ? win32 : { resolve };
+  const root = paths.resolve(snapshot.workspaceRoot, directory);
+  return snapshot.rules.flatMap((rule) => {
+    const prefix = rule.workspaceRelativePathPrefix;
+    return prefix !== undefined && rule.subjectKind === subjectKind && isWithin(paths.resolve(snapshot.workspaceRoot, prefix), root, pathStyle)
+      ? [{ ...observation, subjectKind, workspaceRelativePath: prefix }] : [];
+  });
+}
+
 export function policyObservationForToolCall(
   call: ToolCall,
   context: Pick<PolicyContext, "workspaceRoot" | "extraReadOnlyRoots" | "pathStyle">,
