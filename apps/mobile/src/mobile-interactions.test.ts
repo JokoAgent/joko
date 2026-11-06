@@ -107,6 +107,22 @@ describe("mobile interactions", () => {
     ] } });
   });
 
+  it("refuses recognized credentials in every free-text question answer", () => {
+    const credential = "Bearer synthetic-question-credential-abcdef";
+    const cases = [
+      [text, { kind: "text", value: credential }],
+      [single, { kind: "single", selection: { kind: "other", text: credential } }],
+      [multiple, { kind: "multiple", choiceIds: ["web"], otherText: credential }]
+    ] as const;
+    for (const [field, answer] of cases) {
+      const interaction = questionInteraction("question", [field]);
+      const answers = { [field.fieldId]: answer };
+      expect(mobileQuestionCanSubmit(interaction, answers)).toBe(false);
+      expect(() => createMobileInteractionResolution(interaction, { kind: "question", answers }, "connection"))
+        .toThrow(/Remove credentials/u);
+    }
+  });
+
   it("fails closed on invalid declarations, unknown answers, bounds, and unadvertised decisions", () => {
     const missingOther = create(QuestionFieldSchema, {
       fieldId: "choice", label: "Choice",

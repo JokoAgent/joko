@@ -1,6 +1,6 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { Interaction } from "@joko/contracts";
-import type { MobileInteractionDraft, MobileQuestionAnswerDraft } from "./mobile-interactions";
+import { mobileQuestionAnswerContainsCredential, type MobileInteractionDraft, type MobileQuestionAnswerDraft } from "./mobile-interactions";
 
 export interface MobileInteractionDraftIdentity {
   readonly profileId: string;
@@ -61,9 +61,14 @@ export class MobileInteractionDraftStore {
     if (newer !== undefined) return cloneDraft(newer);
     if (this.#cleared.has(key) || stored === null) return null;
     try {
-      const draft = readRecord(stored, exact);
+      const saved = readRecord(stored, exact);
+      const draft = storableDraft(saved);
       this.#memory.set(key, draft);
       this.#identities.set(key, exact);
+      if (draft !== saved) {
+        this.#dirty.add(key);
+        void this.#persistIfCurrent(exact, draft, serializeRecord(exact, draft)).catch(() => undefined);
+      }
       return cloneDraft(draft);
     } catch (cause) {
       const error = storageError("read", cause);
@@ -228,10 +233,23 @@ function serializeRecord(identity: MobileInteractionDraftIdentity, draft: Mobile
       generation: identity.generation.toString(10),
       revision: identity.revision.toString(10)
     },
-    draft
+    draft: storableDraft(draft)
   });
   if (serialized.length > maximumStoredCharacters) throw new Error("The local Joko request draft is too large.");
   return serialized;
+}
+
+function storableDraft(draft: MobileInteractionDraft): MobileInteractionDraft {
+  if (draft.kind === "plan") return draft;
+  const answers = { ...draft.answers };
+  let changed = false;
+  for (const [fieldId, answer] of Object.entries(draft.answers)) {
+    if (!mobileQuestionAnswerContainsCredential(answer)) continue;
+    if (answer.kind === "multiple") answers[fieldId] = { kind: "multiple", choiceIds: answer.choiceIds };
+    else delete answers[fieldId];
+    changed = true;
+  }
+  return changed ? { ...draft, answers } : draft;
 }
 
 function readRecord(serialized: string, identity: MobileInteractionDraftIdentity): MobileInteractionDraft {

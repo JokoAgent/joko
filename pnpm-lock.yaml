@@ -254,6 +254,9 @@ importers:
       '@joko/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@joko/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@joko/remote-desktop-sync':
         specifier: workspace:*
         version: link:../../packages/remote-desktop-sync

@@ -46,6 +46,10 @@ export function redactSecrets(value: string): string {
   return json ?? redactPlainTextSecrets(value);
 }
 
+export function containsRecognizedCredential(value: string): boolean {
+  return redactSecrets(value) !== value;
+}
+
 function redactPlainTextSecrets(value: string): string {
   let redacted = value;
   redacted = redacted.replace(
