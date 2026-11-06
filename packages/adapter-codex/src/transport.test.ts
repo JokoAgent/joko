@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,8 @@ import { describe, expect, it, vi } from "vitest";
 import { StdioJsonRpcTransport, type JsonRpcRecordChannelHandlers, type JsonRpcRecordWriteAdmission } from "./transport.js";
 import { AppServerHost } from "./host.js";
 import { TransportFault } from "./errors.js";
+
+vi.mock(import("node:child_process"), { spy: true });
 
 const fixture = fileURLToPath(new URL("./fixtures/fake-app-server.mjs", import.meta.url));
 
@@ -374,6 +377,72 @@ describe("StdioJsonRpcTransport", () => {
     await expect(transport.request("oversize", {})).rejects.toMatchObject({ code: "buffer_overflow" });
     expect(exits).toEqual(["buffer_overflow"]);
     await transport.close();
+  });
+
+  it("settles a complete terminal record received after local process exit before reporting disconnect", async () => {
+    const first = `${JSON.stringify({ method: "item/completed", params: { threadId: "thread" } })}\n`;
+    const terminal = `${JSON.stringify({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed" } } })}\n`;
+    const prefix = first + terminal.slice(0, 32);
+    const prefixBytes = Buffer.byteLength(prefix);
+    const child = `process.stdin.once('data', () => {
+      process.stdout.write(${JSON.stringify(terminal.slice(32))}, () => process.exit(7));
+    });
+    setTimeout(() => process.exit(8), 4_000).unref();
+    process.stdout.write(${JSON.stringify(prefix)});`;
+    const { spawn: realSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const prefixRead = Promise.withResolvers<void>();
+    const terminalRead = Promise.withResolvers<void>();
+    let childExited = false;
+    const spawnSpy = vi.mocked(spawn).mockImplementationOnce((command, args, options) => {
+      const childProcess = realSpawn(command, args, options);
+      const stdout = childProcess.stdout;
+      if (stdout === null) throw new Error("The Codex exit fixture requires a stdout pipe.");
+      let received = 0;
+      const readPrefix = (chunk: Buffer): void => {
+        received += chunk.byteLength;
+        if (received < prefixBytes) return;
+        stdout.off("data", readPrefix);
+        // Read the remaining bytes from the same pipe after the real exit event.
+        stdout.pause();
+        prefixRead.resolve();
+      };
+      stdout.on("data", readPrefix);
+      childProcess.once("exit", () => {
+        childExited = true;
+        stdout.resume();
+      });
+      return childProcess;
+    });
+    const transport = new StdioJsonRpcTransport({ command: process.execPath, args: ["-e", child] });
+    const delivered: string[] = [];
+    const disconnected = Promise.withResolvers<void>();
+    try {
+      await transport.start({
+        onNotificationObserved: ({ method }) => {
+          if (method !== "turn/completed") return;
+          expect(childExited).toBe(true);
+          terminalRead.resolve();
+        },
+        onNotification: async ({ method }) => {
+          if (method === "item/completed") await terminalRead.promise;
+          delivered.push(method);
+          if (method === "turn/completed") expect(() => transport.notify("write-after-exit")).toThrow();
+        },
+        onRequest: () => undefined,
+        onExit: fault => { delivered.push(fault.code); disconnected.resolve(); }
+      });
+      await Promise.race([prefixRead.promise, disconnected.promise.then(() => {
+        throw new Error("The Codex fixture exited before the stdout prefix was read.");
+      })]);
+      await transport.notify("fixture/finish");
+      await disconnected.promise;
+      expect(delivered).toEqual(["item/completed", "turn/completed", "process_exited"]);
+      expect(transport.running).toBe(false);
+    } finally {
+      spawnSpy.mockReset();
+      terminalRead.resolve();
+      await transport.forceClose();
+    }
   });
 
   it("serializes asynchronous notification handlers in wire order", async () => {

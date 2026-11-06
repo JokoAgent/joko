@@ -115,6 +115,7 @@ const DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_BYTES = 20 * 1024 * 1024;
 const DEFAULT_TOMBSTONE_TTL_MS = 120_000;
 const DEFAULT_MAX_TOMBSTONES = 2_048;
+const LOCAL_EXIT_DRAIN_MS = 1_000;
 const CODEX_RUNTIME_ENVIRONMENT_KEYS = Object.freeze([
   "CODEX_HOME",
   "CODEX_API_KEY",
@@ -149,6 +150,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
   #closing = false;
   #closingChild: ChildProcessWithoutNullStreams | undefined;
   #processLease: DurableProcessLease | undefined;
+  #localExitTimer: NodeJS.Timeout | undefined;
   #exitDelivered = false;
 
   constructor(options: StdioJsonRpcTransportOptions = {}) {
@@ -267,23 +269,35 @@ export class StdioJsonRpcTransport implements RpcTransport {
       throw new TransportFault("spawn_failed", "The Codex app-server process could not be started.");
     }
     this.#child = child;
-    child.stdout.on("data", (chunk: Buffer | string) => this.#acceptChunk(chunk));
+    let outputFinished = false;
+    child.stdout.on("data", (chunk: Buffer | string) => { if (!outputFinished) this.#acceptChunk(chunk); });
     // stderr may contain environment-specific paths, prompts, or credentials.
     // Drain it to avoid child backpressure but never retain or surface it.
     child.stderr.on("data", () => undefined);
     child.on("error", () => {
       this.#fail(new TransportFault("spawn_failed", "The Codex app-server process could not be started."));
     });
-    child.on("exit", () => {
+    const finishExit = (): void => this.#fail(new TransportFault(
+      "process_exited", "The Codex app-server process exited before shutdown completed.", { stateMayHaveChanged: true }
+    ));
+    const finishOutput = (): void => {
+      if (outputFinished || this.#child !== child || this.#closing) return;
+      outputFinished = true;
+      clearTimeout(this.#localExitTimer);
+      this.#localExitTimer = setTimeout(finishExit, LOCAL_EXIT_DRAIN_MS);
+      this.#localExitTimer.unref?.();
+      // Complete records already accepted from stdout keep the original
+      // subscriber until its ordered notification handlers have settled.
+      void this.#inboundTail.then(finishExit);
+    };
+    child.once("exit", () => {
       const lease = this.#processLease;
       if (lease !== undefined) void this.#processOwner?.releaseAfterExit(lease).catch(() => undefined);
-      if (this.#closing) return;
-      this.#fail(new TransportFault(
-        "process_exited",
-        "The Codex app-server process exited before shutdown completed.",
-        { stateMayHaveChanged: true }
-      ));
+      if (this.#child !== child || this.#closing) return;
+      this.#localExitTimer = setTimeout(finishOutput, LOCAL_EXIT_DRAIN_MS);
+      this.#localExitTimer.unref?.();
     });
+    child.once("close", finishOutput);
     if (child.pid === undefined) throw new TransportFault("spawn_failed", "The Codex app-server process has no PID.");
     try {
       this.#processLease = this.#processOwner?.claimSync(child.pid);
@@ -441,6 +455,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
     if (child === undefined) return;
     child.stdin.end();
     if (child.exitCode !== null || child.signalCode !== null) {
+      child.stdout.destroy(); child.stderr.destroy();
       if (this.#closingChild === child) this.#closingChild = undefined;
       await this.#releaseProcessOwner(child);
       return;
@@ -474,6 +489,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
     const child = this.#beginClose(true);
     if (child === undefined) return;
     if (child.exitCode !== null || child.signalCode !== null) {
+      child.stdout.destroy(); child.stderr.destroy();
       if (this.#closingChild === child) this.#closingChild = undefined;
       await this.#releaseProcessOwner(child);
       return;
@@ -484,6 +500,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
   #beginClose(force: boolean): ChildProcessWithoutNullStreams | undefined {
     if (this.#closing) return force ? this.#closingChild : undefined;
     this.#closing = true;
+    clearTimeout(this.#localExitTimer);
     const child = this.#child;
     this.#child = undefined;
     this.#closingChild = child;
@@ -539,7 +556,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
 
   #requireWriter(): ChildProcessWithoutNullStreams | JsonRpcRecordChannel {
     const writer = this.#channel ?? this.#child;
-    if (!this.running || writer === undefined) {
+    if (!this.running || writer === undefined || this.#localChildExited()) {
       throw new TransportFault("not_started", "The Codex app-server transport is not running.");
     }
     return writer;
@@ -572,11 +589,11 @@ export class StdioJsonRpcTransport implements RpcTransport {
         });
         return;
       }
-      if (writer !== this.#child || !this.running) {
+      if (writer !== this.#child || !this.running || this.#localChildExited()) {
         throw new TransportFault("closed", "The Codex transport was closed before write.");
       }
       if (beforeWrite !== undefined && await beforeWrite() === false) return;
-      if (!this.running || this.#closing || writer !== (this.#channel ?? this.#child)) {
+      if (!this.running || writer !== this.#child || this.#localChildExited()) {
         throw new TransportFault("closed", "The Codex transport changed during write preparation.");
       }
       if (finalBeforeWrite?.() === false) return;
@@ -716,8 +733,9 @@ export class StdioJsonRpcTransport implements RpcTransport {
 
   #dispatchServerRequest(request: RpcServerRequest, byteLength: number): boolean {
     if (!this.#reserveInboundHandler(byteLength)) return false;
-    void Promise.resolve().then(() => this.#handlers?.onRequest(request))
+    void Promise.resolve().then(() => { if (!this.#localChildExited()) return this.#handlers?.onRequest(request); })
       .catch((error: unknown) => {
+        if (this.#localChildExited()) return;
         this.#fail(error instanceof TransportFault
           ? error
           : new TransportFault("protocol_violation", "A Codex server request could not be routed safely."));
@@ -775,18 +793,28 @@ export class StdioJsonRpcTransport implements RpcTransport {
   #fail(fault: TransportFault): void {
     if (this.#fatal || this.#closing) return;
     this.#fatal = true;
+    clearTimeout(this.#localExitTimer);
     const child = this.#child;
     const channel = this.#channel;
+    const childExited = this.#localChildExited();
     this.#child = undefined;
     this.#channel = undefined;
     this.#rejectPending(fault);
-    if (child !== undefined && child.exitCode === null && child.signalCode === null) child.kill();
+    if (child !== undefined) {
+      if (childExited) { child.stdout.destroy(); child.stderr.destroy(); }
+      else child.kill();
+    }
     if (channel !== undefined) {
       void (channel.forceClose?.() ?? channel.close()).catch(() => undefined);
     }
     if (this.#exitDelivered) return;
     this.#exitDelivered = true;
     void Promise.resolve(this.#handlers?.onExit(fault)).catch(() => undefined);
+  }
+
+  #localChildExited(): boolean {
+    const child = this.#child;
+    return child !== undefined && (child.exitCode !== null || child.signalCode !== null);
   }
 }
 
