@@ -89,6 +89,45 @@ it("uploads directory snapshots and downloads owned files through the network br
   }
   expect(await network.request({ ...networkScope, readOnly: true }, { url: "https://files.example.test/file", as: "file", saveTo })).toMatchObject({ ok: false }); expect(fetchMock).toHaveBeenCalledTimes(3);
 }));
+it("refreshes the original directory upload receipt without posting the directory again", async () => fixture(async (root, files, workspace) => {
+  await writeFile(join(root, "input.txt"), "one directory upload");
+  const deposit = await files.prepare(scope, { dir: join(root, "input.txt") }, workspace, () => {});
+  const declaration = parseExtensionNetwork({ hosts: ["files.example.test"], secrets: [{ key: "key", label: "Key",
+    inject: { header: "Authorization", format: "Bearer {value}" },
+    exchange: { url: "https://files.example.test/token", bodyFormat: '{"key":"{value}"}', tokenPath: "token" }
+  }] });
+  let exchanges = 0;
+  const objects: string[] = [], receiptReads: string[] = [];
+  const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/token") return Response.json({ token: `temporary-fixture-${++exchanges}` });
+    const authorization = new Headers(init?.headers).get("authorization");
+    if (path === "/warm") return Response.json({ ok: true });
+    if (path === "/deploy") {
+      expect(init?.method).toBe("POST");
+      expect(Buffer.from(init?.body as ArrayBuffer).toString()).toContain("one directory upload");
+      const id = `object-${objects.length + 1}`;
+      objects.push(id);
+      return new Response(null, { status: 303, headers: { location: `/receipt/${id}` } });
+    }
+    expect(init?.method).toBe("GET");
+    expect(init?.body).toBeUndefined();
+    expect(new Headers(init?.headers).has("content-type")).toBe(false);
+    receiptReads.push(path);
+    if (authorization === "Bearer temporary-fixture-1") return Response.json({ unauthorized: true }, { status: 401 });
+    expect(authorization).toBe("Bearer temporary-fixture-2");
+    return Response.json({ id: path.split("/").at(-1) });
+  });
+  const network = new ExtensionNetwork({ files, fetch: fetchMock, redact: value => value, resolveCredential: () => "root-fixture" });
+  const networkScope: ExtensionNetworkScope = { ...scope, declaration, task: scope, readOnly: false,
+    signal: new AbortController().signal, assertCurrent: () => {} };
+  await expect(network.request(networkScope, { url: "https://files.example.test/warm" })).resolves.toMatchObject({ ok: true });
+  await expect(network.request(networkScope, { url: "https://files.example.test/deploy", method: "POST",
+    uploadDir: { token: receipt(deposit, "dir_deposit").token } })).resolves.toMatchObject({ ok: true, status: 200, body: '{"id":"object-1"}' });
+  expect(objects).toEqual(["object-1"]);
+  expect(receiptReads).toEqual(["/receipt/object-1", "/receipt/object-1"]);
+  expect(exchanges).toBe(2);
+}));
 it("uses the exact remote transport and exclusive target write, keeps remote paths out of receipts and never retries a lost write acknowledgement", async () => {
   const entries = new Map<string, Uint8Array>([["/work/input.txt", Buffer.from("remote input")], ["/work/report.bin", Buffer.from("existing")]]);
   let current = true, failWrite = false;
