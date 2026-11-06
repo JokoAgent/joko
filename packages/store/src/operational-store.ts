@@ -17646,26 +17646,22 @@ export class OperationalStore {
     if (scope === "curated" && backendId !== undefined) {
       throw new StoreError("Curated Maker Memory reset does not accept a Backend ID.");
     }
-    const normalizedBackendId = scope === "digest"
-      ? makerMemoryBackendId(backendId ?? "")
-      : undefined;
-    const targets = scope === "curated"
-      ? this.database.prepare("SELECT count(DISTINCT target_id) AS count FROM maker_memory_entries WHERE kind <> 'digest'").get() as Row
-      : this.database.prepare("SELECT count(DISTINCT target_id) AS count FROM maker_memory_entries WHERE kind = 'digest' AND backend_id = ?")
-        .get(normalizedBackendId!) as Row;
+    const params = scope === "digest" ? [makerMemoryBackendId(backendId ?? "")] : [];
+    const kindFilter = scope === "digest" ? "kind = 'digest' AND backend_id = ?" : "kind <> 'digest'";
+    // Include retired Homes in the exclusion: their digests stay with their original Targets.
+    const filter = `${kindFilter} AND target_id NOT IN (
+      SELECT id FROM targets WHERE json_extract(metadata_json, '$.kind') = 'partner_home'
+    )`;
     return this.write(() => {
-      const ftsResult = scope === "curated"
-        ? this.database.prepare("DELETE FROM maker_memory_fts WHERE kind <> 'digest'").run()
-        : this.database.prepare(`
-            DELETE FROM maker_memory_fts WHERE entry_id IN (
-              SELECT id FROM maker_memory_entries WHERE kind = 'digest' AND backend_id = ?
-            )
-          `).run(normalizedBackendId!);
-      const result = scope === "curated"
-        ? this.database.prepare("DELETE FROM maker_memory_entries WHERE kind <> 'digest'").run()
-        : this.database.prepare("DELETE FROM maker_memory_entries WHERE kind = 'digest' AND backend_id = ?")
-          .run(normalizedBackendId!);
-      void ftsResult;
+      const targets = this.database.prepare(`
+        SELECT count(DISTINCT target_id) AS count FROM maker_memory_entries WHERE ${filter}
+      `).get(...params) as Row;
+      this.database.prepare(`
+        DELETE FROM maker_memory_fts WHERE entry_id IN (
+          SELECT id FROM maker_memory_entries WHERE ${filter}
+        )
+      `).run(...params);
+      const result = this.database.prepare(`DELETE FROM maker_memory_entries WHERE ${filter}`).run(...params);
       return { removedEntries: Number(result.changes), removedTargets: numberValue(targets["count"]) };
     });
   }

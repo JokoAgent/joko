@@ -16,6 +16,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
+import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
 import { SessionHost } from "./session-host.js";
 
 const owner = {
@@ -28,6 +29,87 @@ const owner = {
 };
 
 describe("Connect Maker Memory owner and reset scopes", () => {
+  it("clears ordinary curated memory and digests while retaining Partner Home memory across restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-scoped-memory-reset-"));
+    const database = join(root, "orchestrator.db");
+    let store = new OperationalStore(database);
+    let memory = new MakerMemoryController({ store });
+    let host = new SessionHost(store, {} as never, []);
+    const backendId = "pi";
+    const writeCurated = (targetId: string) => memory.write(targetId, {
+      kind: "project", name: "preference", title: "Preference", description: "Stable preference",
+      body: "Keep reports concise."
+    });
+    const submit = (operationId: string, scope: contract.MemoryResetScope, resetBackendId?: string) => {
+      const services = createConnectServices(stubApplication({
+        store, makerMemory: memory, sessionHost: host,
+        connections: { authenticate: () => store.getConnection(owner.id) }
+      }));
+      return submitReset<contract.SubmitOperationResponse>(services.operation.submitOperation, {
+        operationId, connectionId: owner.id, scope, ...(resetBackendId === undefined ? {} : { backendId: resetBackendId })
+      });
+    };
+
+    try {
+      store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+      store.upsertBackend({
+        id: backendId, displayName: "Pi", version: "test", adapterKind: "pi", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "not_required",
+        capabilities: new Map([["memory.compaction_digest", { key: "memory.compaction_digest", supported: true }]]),
+        models: [], tools: [], diagnostics: []
+      });
+      for (const targetId of ["workspace", "partner-home"]) {
+        const partnerHome = targetId === "partner-home";
+        store.upsertTarget({ id: targetId, backendId, displayName: targetId, workspaceRoot: join(root, targetId),
+          trusted: true, managed: partnerHome }, partnerHome ? { kind: "partner_home", partnerId: "partner" } : {});
+        writeCurated(targetId);
+        expect(memory.writeCompactionDigest({
+          backendId, targetId, sessionId: `session-${targetId}`, reason: "auto", summary: "Compassneedle stays aligned."
+        })).toBe(true);
+      }
+      const partnerCurated = memory.list("partner-home")[0]!;
+      const partnerDigest = memory.search("partner-home", "Compassneedle", "digest")[0]!;
+
+      const curated = await submit("clear-curated", contract.MemoryResetScope.CURATED);
+      expect(curated.operation?.result?.payload).toMatchObject({
+        case: "memoryReset", value: { removedEntries: 1n, removedTargets: 1n }
+      });
+      expect(memory.search("workspace", "concise")).toEqual([]);
+      expect(memory.search("workspace", "Compassneedle", "digest")).toHaveLength(1);
+      const digests = await submit("clear-digests", contract.MemoryResetScope.BACKEND, backendId);
+      expect(digests.operation?.result?.payload).toMatchObject({
+        case: "memoryReset", value: { removedEntries: 1n, removedTargets: 1n }
+      });
+      expect(memory.search("workspace", "Compassneedle", "digest")).toEqual([]);
+
+      await host.dispose();
+      memory.dispose();
+      store.close();
+      store = new OperationalStore(database);
+      memory = new MakerMemoryController({ store });
+      host = new SessionHost(store, {} as never, []);
+      const bridge = new MakerMemoryBridgeProvider(memory);
+      const context = { targetId: "partner-home", sessionId: "session-partner-home", generation: 1 };
+      for (const [entry, query] of [[partnerCurated, "concise"], [partnerDigest, "Compassneedle"]] as const) {
+        await expect(bridge.callTool("memory_search", { query }, undefined, context)).resolves.toMatchObject({
+          structuredContent: { hits: [expect.objectContaining({ id: entry.id })] }
+        });
+        await expect(bridge.callTool("memory_read", { entry_id: entry.id }, undefined, context)).resolves.toMatchObject({
+          structuredContent: { entry: { id: entry.id, type: entry.kind } }
+        });
+      }
+      const lateEntry = writeCurated("workspace");
+      const replay = await submit("clear-curated", contract.MemoryResetScope.CURATED);
+      expect(replay.operation?.result?.payload).toEqual(curated.operation?.result?.payload);
+      expect(memory.read("workspace", lateEntry.id)).toEqual(lateEntry);
+    } finally {
+      await host.dispose();
+      memory.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("authenticates the owner and treats Backend scope as a capability, not a Pi ID", async () => {
     const reset = vi.fn((scope: "curated" | "backend", backendId?: string) =>
       scope === "curated"
