@@ -135,9 +135,9 @@ export interface WorkspaceFilesDocumentActions {
   readonly createFile?: (input: { readonly workspaceId: string; readonly parentPath: string; readonly path: string }) => Promise<void>;
   readonly createDirectory?: (input: { readonly workspaceId: string; readonly parentPath: string; readonly path: string }) => Promise<void>;
   /** False means the formal document host cancelled at its dirty-leave gate. */
-  readonly rename?: (input: { readonly workspaceId: string; readonly fromPath: string; readonly toPath: string; readonly kind: WorkspaceFilesEntryView["kind"] }) => Promise<void | boolean>;
+  readonly rename?: (input: { readonly workspaceId: string; readonly fromPath: string; readonly toPath: string; readonly kind: WorkspaceFilesEntryView["kind"]; readonly expectedRevision: string }) => Promise<void | boolean>;
   /** False means the formal document host cancelled at its dirty-leave gate. */
-  readonly delete?: (input: { readonly workspaceId: string; readonly path: string; readonly kind: WorkspaceFilesEntryView["kind"] }) => Promise<void | boolean>;
+  readonly delete?: (input: { readonly workspaceId: string; readonly path: string; readonly kind: WorkspaceFilesEntryView["kind"]; readonly expectedRevision: string }) => Promise<void | boolean>;
   readonly copyRelativePath?: (input: { readonly workspaceId: string; readonly path: string }) => Promise<void>;
 }
 
@@ -614,19 +614,21 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
       if (active.kind === "createFile") await selectFile(path);
       return;
     }
+    const expectedRevision = active.entry.revision;
+    if (!expectedRevision) throw new Error("The selected workspace entry has no revision.");
     if (active.kind === "rename") {
       if (!canDocumentAction(documentActions, "rename") || documentActions.rename === undefined) throw new Error("Rename is unavailable.");
       const name = canonicalWorkspaceBasename(rawName?.trim() ?? "");
       const toPath = joinWorkspacePath(workspacePathParent(active.entry.path), name);
       if (toPath === active.entry.path) return;
-      const accepted = await documentActions.rename({ workspaceId, fromPath: active.entry.path, toPath, kind: active.entry.kind });
+      const accepted = await documentActions.rename({ workspaceId, fromPath: active.entry.path, toPath, kind: active.entry.kind, expectedRevision });
       if (accepted === false) return;
       fileIndex.invalidate();
       await tree.afterRename(active.entry.path, toPath, active.entry.kind === "directory");
       return;
     }
     if (!canDocumentAction(documentActions, "delete") || documentActions.delete === undefined) throw new Error("Delete is unavailable.");
-    const accepted = await documentActions.delete({ workspaceId, path: active.entry.path, kind: active.entry.kind });
+    const accepted = await documentActions.delete({ workspaceId, path: active.entry.path, kind: active.entry.kind, expectedRevision });
     if (accepted === false) return;
     fileIndex.invalidate();
     await tree.afterDelete(active.entry.path, active.entry.kind === "directory");
@@ -1664,8 +1666,8 @@ function WorkspaceFilesContextMenu({ state, actions, labels, onClose, onOperatio
   if ((entry === undefined || entry.kind === "directory") && canDocumentAction(actions, "createFile")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="create-file" onClick={() => onOperation({ kind: "createFile", parentPath, ownerDocument: state.ownerDocument })}><FilePlus aria-hidden="true" />{labels.newFile}</button>);
   if ((entry === undefined || entry.kind === "directory") && canDocumentAction(actions, "createDirectory")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="create-directory" onClick={() => onOperation({ kind: "createDirectory", parentPath, ownerDocument: state.ownerDocument })}><FolderPlus aria-hidden="true" />{labels.newFolder}</button>);
   if (entry !== undefined && canDocumentAction(actions, "copyRelativePath")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="copy" onClick={() => onCopy(entry)}><Clipboard aria-hidden="true" />{labels.copyRelativePath}</button>);
-  if (entry !== undefined && canDocumentAction(actions, "rename")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="rename" onClick={() => onOperation({ kind: "rename", entry, ownerDocument: state.ownerDocument })}><Pencil aria-hidden="true" />{labels.rename}</button>);
-  if (entry?.kind === "file" && canDocumentAction(actions, "delete")) items.push(<button type="button" role="menuitem" tabIndex={-1} className="is-danger" key="delete" onClick={() => onOperation({ kind: "delete", entry, ownerDocument: state.ownerDocument })}><Trash2 aria-hidden="true" />{labels.delete}</button>);
+  if (entry !== undefined && canDocumentAction(actions, "rename")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="rename" disabled={!entry.revision} onClick={() => onOperation({ kind: "rename", entry, ownerDocument: state.ownerDocument })}><Pencil aria-hidden="true" />{labels.rename}</button>);
+  if (entry?.kind === "file" && canDocumentAction(actions, "delete")) items.push(<button type="button" role="menuitem" tabIndex={-1} className="is-danger" key="delete" disabled={!entry.revision} onClick={() => onOperation({ kind: "delete", entry, ownerDocument: state.ownerDocument })}><Trash2 aria-hidden="true" />{labels.delete}</button>);
   return <div
     ref={ref}
     className="workspace-files-context-menu"
