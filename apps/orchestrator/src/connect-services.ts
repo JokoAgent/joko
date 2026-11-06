@@ -128,6 +128,7 @@ import {
 import type { ArtifactRecord, ArtifactRepository, ArtifactStore } from "./artifact-store.js";
 import { ImageThumbnailRenderer, ThumbnailSourceError } from "./image-thumbnail.js";
 import { readWorkspaceHtmlSnapshot } from "./workspace-html-snapshot.js";
+import { readGitConflictPatchPath, readGitPatchPaths } from "./git-patch-paths.js";
 import {
   ArtifactMaintenanceScanChangedError,
   ArtifactMaintenanceScanExpiredError,
@@ -418,7 +419,7 @@ import {
   WorkspaceSearchError,
   WorkspaceTextFileWriteError
 } from "./workspace-service.js";
-import type { GitState, WorkspaceEntryListingPolicy, WorkspaceEntryRecord, WorkspaceFilePreview, WorkspaceGitImageSide, WorkspaceGitPushResult, WorkspaceGitReviewSource, WorkspaceRegistration, WorkspaceSearchResult, WorkspaceService as NativeWorkspaceService } from "./workspace-service.js";
+import type { GitState, WorkspaceEntryListingPolicy, WorkspaceEntryRecord, WorkspaceFilePreview, WorkspaceGitCommitResult, WorkspaceGitImageSide, WorkspaceGitPushResult, WorkspaceGitReviewSource, WorkspaceRegistration, WorkspaceSearchResult, WorkspaceService as NativeWorkspaceService } from "./workspace-service.js";
 import type { WorkspaceFileChangeRecord, WorkspaceFileChangeScope } from "./workspace-change-stream.js";
 import { moveManagedWorkspaceToTrash } from "./managed-workspace-trash.js";
 import type { DiscoveredNodeRecord } from "./lan-discovery.js";
@@ -1041,6 +1042,7 @@ interface OperationOutcome {
     readonly dialogueRewound: boolean;
     readonly filesRewound: boolean;
   };
+  readonly workspaceGitCommit?: Pick<WorkspaceGitCommitResult, "repositoryRevision" | "headRevision">;
   readonly workspaceGitPush?: {
     readonly kind: "pushed" | "needs_force";
     readonly remote: string;
@@ -6683,6 +6685,12 @@ function operationResult(
     };
     return create(contract.OperationResultSchema, { payload });
   }
+  if (outcome.accepted && outcome.workspaceGitCommit !== undefined) {
+    return create(contract.OperationResultSchema, { payload: {
+      case: "workspaceGitCommit",
+      value: create(contract.WorkspaceGitCommitResultSchema, outcome.workspaceGitCommit)
+    } });
+  }
   if (outcome.accepted && outcome.workspaceGitPush !== undefined) {
     const push = outcome.workspaceGitPush;
     payload = {
@@ -7153,6 +7161,9 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
   if (typeof response["accepted"] === "boolean") {
     const rewind = asRecord(response["workspaceRewind"]);
     const login = asRecord(response["providerLogin"]);
+    const gitCommit = asRecord(response["workspaceGitCommit"]);
+    const commitRepositoryRevision = stringValue(gitCommit["repositoryRevision"]);
+    const commitHeadRevision = stringValue(gitCommit["headRevision"]);
     const gitPush = asRecord(response["workspaceGitPush"]);
     const scheduleDeletion = asRecord(response["scheduleDeletion"]);
     return {
@@ -7190,6 +7201,9 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
           ...(stringValue(login["userCode"]) === undefined ? {} : { userCode: stringValue(login["userCode"]) }),
           ...(typeof login["expiresAt"] !== "number" ? {} : { expiresAt: login["expiresAt"] })
         }
+      }),
+      ...(commitRepositoryRevision === undefined || commitHeadRevision === undefined ? {} : {
+        workspaceGitCommit: { repositoryRevision: commitRepositoryRevision, headRevision: commitHeadRevision }
       }),
       ...(gitPush["kind"] !== "pushed" && gitPush["kind"] !== "needs_force" ? {} : {
         workspaceGitPush: {
@@ -8712,10 +8726,12 @@ function parseWorkspaceDiff(
   let currentHunk: contract.DiffHunk | undefined;
   let oldLine = 0;
   let newLine = 0;
-  for (const line of raw.split(/\r?\n/u)) {
+  const lines = raw.split(/\r?\n/u);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
     if (line.startsWith("diff --git ")) {
       if (current !== undefined) files.push(current);
-      const paths = parseGitDiffHeader(line);
+      const paths = readGitPatchPaths(lines, index);
       current = create(contract.FileDiffSchema, {
         relativePath: paths?.path ?? "",
         oldRelativePath: paths?.oldPath ?? "",
@@ -8727,13 +8743,22 @@ function parseWorkspaceDiff(
       currentHunk = undefined;
       continue;
     }
+    if (line.startsWith("diff --")) {
+      const path = readGitConflictPatchPath(line);
+      if (path !== undefined) {
+        if (current !== undefined) files.push(current);
+        files.push(create(contract.FileDiffSchema, {
+          relativePath: path, oldRelativePath: path, status: contract.GitFileStatus.CONFLICTED, binary: false, hunks: [], source
+        }));
+        current = undefined;
+        currentHunk = undefined;
+        continue;
+      }
+    }
     if (current === undefined) continue;
     if (line.startsWith("new file mode")) current.status = contract.GitFileStatus.ADDED;
     else if (line.startsWith("deleted file mode")) current.status = contract.GitFileStatus.DELETED;
-    else if (line.startsWith("rename from ")) {
-      current.status = contract.GitFileStatus.RENAMED;
-      current.oldRelativePath = decodeGitPathToken(line.slice("rename from ".length));
-    } else if (line.startsWith("rename to ")) current.relativePath = decodeGitPathToken(line.slice("rename to ".length));
+    else if (line.startsWith("rename from ")) current.status = contract.GitFileStatus.RENAMED;
     else if (line.startsWith("Binary files ") || line.startsWith("GIT binary patch")) current.binary = true;
     else if (line.startsWith("@@")) {
       const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@\s?(.*)$/u.exec(line);
@@ -8767,76 +8792,6 @@ function parseWorkspaceDiff(
   }
   if (current !== undefined) files.push(current);
   return create(contract.WorkspaceDiffSchema, { workspaceId, files, truncated: false });
-}
-
-function parseGitDiffHeader(line: string): { readonly oldPath: string; readonly path: string } | undefined {
-  if (!line.startsWith("diff --git ")) return undefined;
-  const tokens = tokenizeGitHeader(line.slice("diff --git ".length));
-  if (tokens.length !== 2 || !tokens[0]!.startsWith("a/") || !tokens[1]!.startsWith("b/")) return undefined;
-  return { oldPath: tokens[0]!.slice(2), path: tokens[1]!.slice(2) };
-}
-
-function tokenizeGitHeader(value: string): string[] {
-  const tokens: string[] = [];
-  let offset = 0;
-  while (offset < value.length) {
-    while (value[offset] === " ") offset += 1;
-    if (offset >= value.length) break;
-    if (value[offset] !== '"') {
-      const end = value.indexOf(" ", offset);
-      tokens.push(value.slice(offset, end < 0 ? value.length : end));
-      offset = end < 0 ? value.length : end + 1;
-      continue;
-    }
-    const start = offset;
-    offset += 1;
-    let escaped = false;
-    while (offset < value.length) {
-      const character = value[offset]!;
-      offset += 1;
-      if (escaped) {
-        escaped = false;
-      } else if (character === "\\") {
-        escaped = true;
-      } else if (character === '"') {
-        break;
-      }
-    }
-    tokens.push(decodeGitPathToken(value.slice(start, offset)));
-  }
-  return tokens;
-}
-
-function decodeGitPathToken(value: string): string {
-  if (!value.startsWith('"') || !value.endsWith('"')) return value;
-  const bytes: number[] = [];
-  const content = value.slice(1, -1);
-  for (let offset = 0; offset < content.length; offset += 1) {
-    const character = content[offset]!;
-    if (character !== "\\") {
-      bytes.push(...Buffer.from(character, "utf8"));
-      continue;
-    }
-    const escaped = content[++offset];
-    if (escaped === undefined) return "";
-    const octal = /^[0-7]$/u.test(escaped)
-      ? /^([0-7]{1,3})/u.exec(content.slice(offset))?.[1]
-      : undefined;
-    if (octal !== undefined) {
-      bytes.push(Number.parseInt(octal, 8));
-      offset += octal.length - 1;
-      continue;
-    }
-    const mapped = escaped === "n" ? 0x0a
-      : escaped === "r" ? 0x0d
-        : escaped === "t" ? 0x09
-          : escaped === "b" ? 0x08
-            : escaped === "f" ? 0x0c
-              : escaped === "v" ? 0x0b
-                : escaped.charCodeAt(0);
-    bytes.push(mapped);
-  }
-  return Buffer.from(bytes).toString("utf8");
 }
 
 function directArtifactBlob(
@@ -18811,18 +18766,33 @@ async function dispatchMutation(
         return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Backend does not support workspace.diff.commit.");
       }
       assertWorkspaceGitWriteIdle(dependencies.store, payload.value.workspaceId, target.descriptor.id);
-      return ackOperation(dependencies, operationId, connection, mutation, payload.case, async () => {
-        try {
-          assertWorkspaceGitWriteIdle(dependencies.store, payload.value.workspaceId, target.descriptor.id);
-          await dependencies.workspaceService.commitGitReview(payload.value.workspaceId, {
-            message: payload.value.message,
-            expectedRepositoryRevision: payload.value.expectedRepositoryRevision,
-            includeUnstaged: payload.value.includeUnstaged
-          });
-        } catch (error) {
-          throw workspaceGitConnectError(error);
+      let commitResult: WorkspaceGitCommitResult | undefined;
+      return presented(await host.mutate({
+        operationId,
+        connection,
+        kind: payload.case,
+        body: mutation,
+        effect: async () => {
+          try {
+            assertWorkspaceGitWriteIdle(dependencies.store, payload.value.workspaceId, target.descriptor.id);
+            commitResult = await dependencies.workspaceService.commitGitReview(payload.value.workspaceId, {
+              message: payload.value.message,
+              expectedRepositoryRevision: payload.value.expectedRepositoryRevision,
+              includeUnstaged: payload.value.includeUnstaged
+            });
+          } catch (error) {
+            throw workspaceGitConnectError(error);
+          }
+        },
+        commit: () => {
+          if (commitResult === undefined) throw new ConnectError("Workspace commit did not produce a durable result.", Code.Internal);
+          return {
+            accepted: true,
+            resultCase: "workspaceGitCommit",
+            workspaceGitCommit: { repositoryRevision: commitResult.repositoryRevision, headRevision: commitResult.headRevision }
+          } satisfies OperationOutcome;
         }
-      });
+      }));
     }
     case "pushWorkspaceBranch": {
       const target = targetForWorkspace(dependencies.store, payload.value.workspaceId);

@@ -39,7 +39,7 @@ class LocalRemoteProcess extends EventEmitter implements RemoteProcessHandle {
   kill(signal: NodeJS.Signals | number = "SIGTERM") { return this.#child.kill(signal); }
 }
 
-async function fixture() {
+async function fixture(options: { readonly ssh?: boolean; readonly beforeProcess?: (request: RemoteProcessStartRequest) => Promise<void> } = {}) {
   const base = await mkdtemp(join(tmpdir(), "joko-remote-workspace-"));
   await mkdir(join(base, "repo")); await mkdir(join(base, "outside"));
   const root = await realpath(join(base, "repo")), outside = await realpath(join(base, "outside"));
@@ -48,11 +48,14 @@ async function fixture() {
   let retired = false;
   const processes: RemoteProcessTransportPort = { open: async request => {
     requests.push(request);
+    if (options.beforeProcess !== undefined) await options.beforeProcess(request);
     const child = new LocalRemoteProcess(request); handles.add(child); child.once("exit", () => handles.delete(child)); return child;
   } };
-  const binding = { kind: "device_peer", controllerDeviceId: "controller", targetDeviceId: "peer", workspaceRoot: root } as const;
+  const binding = options.ssh
+    ? { kind: "ssh", hostTargetId: "target", hostId: "host-a", workspaceRoot: root } as const
+    : { kind: "device_peer", controllerDeviceId: "controller", targetDeviceId: "peer", workspaceRoot: root } as const;
   const assertCurrent = () => { if (retired) throw new Error("Route retired."); };
-  const authority = () => ({ kind: "device_peer" as const, binding, executionIdentity: "peer", authorityIdentity: "peer-route-1",
+  const authority = () => ({ kind: binding.kind, binding, executionIdentity: "peer", authorityIdentity: "peer-route-1",
     pathStyle: process.platform === "win32" ? "win32" as const : "posix" as const, files, processes,
     assertCurrent, assertFilesCurrent: assertCurrent, assertForwardingCurrent: () => undefined });
   const router = { workspace: async () => authority(), files: async () => authority() } as unknown as RemoteExecutionRouter;
@@ -69,6 +72,94 @@ async function fixture() {
     await rm(base, { recursive: true, force: true });
   } };
 }
+
+it.skipIf(process.platform === "win32")("rejects every configured SSH push URL before publishing to any destination", { timeout: 30_000 }, async () => {
+  const f = await fixture({ ssh: true, beforeProcess: async request => {
+    if (request.args[0] === "push") throw new Error("Unexpected SSH push.");
+  } });
+  try {
+    await f.git("commit", "--allow-empty", "-m", "base");
+    await f.git("remote", "add", "origin", f.outside);
+    await f.git("remote", "set-url", "--push", "--add", "origin", f.outside);
+    await f.git("remote", "set-url", "--push", "--add", "origin", "https://fixture:private@example.invalid/project.git");
+    const diff = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    await expect(f.workspaces.pushGitReview("workspace", { remote: "origin", remoteRef: "refs/heads/main",
+      expectedRepositoryRevision: diff.repositoryRevision, expectedHeadRevision: diff.headRevision! }))
+      .rejects.toMatchObject({ kind: "unsupported" });
+    expect(f.requests.some(request => request.args.join(" ") === "remote get-url --push --all origin")).toBe(true);
+    expect(f.requests.some(request => request.args[0] === "push")).toBe(false);
+  } finally { await f.close(); }
+});
+
+it.skipIf(process.platform === "win32")("pushes the reviewed SSH commit when the branch advances immediately before Git starts", { timeout: 30_000 }, async () => {
+  let advance: (() => Promise<void>) | undefined;
+  const f = await fixture({ ssh: true, beforeProcess: async request => {
+    if (request.args[0] === "push") await advance?.();
+  } });
+  try {
+    await f.git("init", "--bare", "--quiet", f.outside);
+    await f.git("remote", "add", "origin", f.outside);
+    await f.git("commit", "--allow-empty", "-m", "reviewed");
+    const reviewed = await f.git("rev-parse", "HEAD");
+    await f.git("commit", "--allow-empty", "-m", "newer");
+    const newer = await f.git("rev-parse", "HEAD");
+    await f.git("update-ref", "refs/heads/main", reviewed, newer);
+    const diff = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    advance = async () => { await f.git("update-ref", "refs/heads/main", newer, reviewed); };
+    await expect(f.workspaces.pushGitReview("workspace", { remote: "origin", remoteRef: "refs/heads/main",
+      expectedRepositoryRevision: diff.repositoryRevision, expectedHeadRevision: reviewed }))
+      .resolves.toMatchObject({ kind: "pushed", headRevision: reviewed });
+    expect(await f.git("rev-parse", "HEAD")).toBe(newer);
+    expect(await f.git("--git-dir", f.outside, "rev-parse", "refs/heads/main")).toBe(reviewed);
+  } finally { await f.close(); }
+});
+
+it.skipIf(process.platform === "win32")("rejects a tag on the SSH branch push entry point", { timeout: 30_000 }, async () => {
+  const f = await fixture({ ssh: true });
+  try {
+    await f.git("init", "--bare", "--quiet", f.outside);
+    await f.git("remote", "add", "origin", f.outside);
+    await f.git("commit", "--allow-empty", "-m", "base");
+    const { repositoryRevision, headRevision } = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    const input = { remote: "origin", expectedRepositoryRevision: repositoryRevision, expectedHeadRevision: headRevision! };
+    await expect(f.workspaces.pushGitReview("workspace", { ...input, remoteRef: "refs/tags/unexpected" }))
+      .rejects.toMatchObject({ kind: "invalid" });
+    expect(f.requests.some(request => request.args[0] === "push")).toBe(false);
+    expect(await f.git("--git-dir", f.outside, "tag", "--list")).toBe("");
+    await expect(f.workspaces.pushGitReview("workspace", { ...input, remoteRef: "refs/heads/main" }))
+      .resolves.toMatchObject({ kind: "pushed", headRevision });
+    expect(await f.git("--git-dir", f.outside, "rev-parse", "refs/heads/main")).toBe(headRevision);
+  } finally { await f.close(); }
+});
+
+it.skipIf(process.platform === "win32")("keeps an independent paused SSH merge from Review Commit", { timeout: 30_000 }, async () => {
+  const f = await fixture({ ssh: true });
+  try {
+    await f.git("commit", "--allow-empty", "-m", "base");
+    await f.git("switch", "-c", "other");
+    await f.git("commit", "--allow-empty", "-m", "other branch");
+    const other = await f.git("rev-parse", "HEAD");
+    await f.git("switch", "main");
+    await f.git("commit", "--allow-empty", "-m", "main branch");
+    const head = await f.git("rev-parse", "HEAD");
+    await f.git("merge", "--no-commit", "other");
+    const review = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    for (const includeUnstaged of [false, true]) {
+      await expect(f.workspaces.commitGitReview("workspace", { message: "Review commit", expectedRepositoryRevision: review.repositoryRevision, includeUnstaged }))
+        .rejects.toMatchObject({ kind: "unsupported" });
+    }
+    expect(await f.git("rev-parse", "HEAD")).toBe(head);
+    expect(await f.git("rev-parse", "MERGE_HEAD")).toBe(other);
+    expect(f.requests.some(request => ["add", "commit"].includes(request.args[0] ?? ""))).toBe(false);
+
+    await f.git("merge", "--abort");
+    await writeFile(join(f.root, "note.txt"), "A new review change");
+    const ready = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    await expect(f.workspaces.commitGitReview("workspace", { message: "Review commit", expectedRepositoryRevision: ready.repositoryRevision, includeUnstaged: true }))
+      .resolves.toMatchObject({ headRevision: expect.stringMatching(/^[a-f0-9]{40}$/u) });
+    expect(await f.git("log", "-1", "--format=%s")).toBe("Review commit");
+  } finally { await f.close(); }
+});
 
 it("rejects every remote mutation through an intermediate link before delegating its effect", async () => {
   const f = await fixture();

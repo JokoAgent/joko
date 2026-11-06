@@ -1323,13 +1323,14 @@ export class WorkspaceService {
         continue;
       }
       if (record.length < 4) continue;
-      const unmerged = isUnmergedGitStatus(record.slice(0, 2));
+      const status = record.slice(0, 2);
+      const unmerged = isUnmergedGitStatus(status);
       const change = {
         path: record.slice(3),
         index: unmerged ? "U" : record[0]!,
         worktree: unmerged ? "U" : record[1]!
       };
-      if (record[0] === "R" || record[0] === "C") {
+      if (/[RC]/u.test(status)) {
         const originalPath = records[++index];
         changes.push(originalPath === undefined ? change : { ...change, originalPath });
       } else {
@@ -1622,10 +1623,11 @@ export class WorkspaceService {
         raw = await this.#readUntrackedDiff(workspace, [path], input.ignoreWhitespace === true);
       }
       const filePatch = selectDiffFilePatch(raw);
-      const patch = input.target === "hunk" ? selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1) : filePatch;
+      const reverse = input.action !== "stage";
+      const patch = input.target === "hunk" ? selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1, reverse) : filePatch;
       const applyArgs = ["apply", "--whitespace=nowarn"];
       if (input.action !== "revert") applyArgs.push("--cached");
-      if (input.action === "unstage" || input.action === "revert") applyArgs.push("--reverse");
+      if (reverse) applyArgs.push("--reverse");
       if (input.ignoreWhitespace === true) applyArgs.push("--ignore-space-change");
       try {
         // `git apply` validates the complete patch before updating either the
@@ -1731,7 +1733,7 @@ export class WorkspaceService {
             "--porcelain",
             `--force-with-lease=${remoteRef}:${expectedRemoteOid}`,
             remote,
-            `HEAD:${remoteRef}`
+            `${headRevision}:${remoteRef}`
           ],
           workspace.root,
           120_000,
@@ -1748,9 +1750,10 @@ export class WorkspaceService {
         if ((input.expectedRemoteOid ?? "").trim() !== "") {
           throw new WorkspaceGitReviewError("A remote lease revision is only valid with force-with-lease confirmation.", "invalid");
         }
+        const setUpstream = await this.#readConfiguredGitUpstream(workspace, branch) === undefined;
         const pushed = await runProcess(
           this.#gitExecutable,
-          ["push", "--porcelain", ...(await this.#readConfiguredGitUpstream(workspace, branch) === undefined ? ["--set-upstream"] : []), remote, `HEAD:${remoteRef}`],
+          ["push", "--porcelain", remote, `${headRevision}:${remoteRef}`],
           workspace.root,
           120_000,
           4 * 1024 * 1024,
@@ -1776,10 +1779,10 @@ export class WorkspaceService {
             behind: Math.max(counts.behind, 1)
           };
         }
+        if (setUpstream) await this.#recordReviewPushUpstream(workspace, branch, headRevision, remote, remoteRef);
       }
       const after = await this.#readGitDiff(workspaceId, [], {});
-      const afterHead = await this.#requireHeadRevision(workspace);
-      return { kind: "pushed", repositoryRevision: after.repositoryRevision, headRevision: afterHead, remote, remoteRef };
+      return { kind: "pushed", repositoryRevision: after.repositoryRevision, headRevision, remote, remoteRef };
     });
   }
 
@@ -2035,6 +2038,34 @@ export class WorkspaceService {
     ]);
     if (remote === undefined || mergeRef === undefined) return undefined;
     return { remote, remoteRef: mergeRef.startsWith("refs/heads/") ? mergeRef : `refs/heads/${mergeRef}` };
+  }
+
+  async #recordReviewPushUpstream(workspace: WorkspaceRegistration, branch: string, head: string, remote: string, remoteRef: string): Promise<void> {
+    try {
+      const current = await runProcess(this.#gitExecutable, ["rev-parse", "--verify", `refs/heads/${branch}`], workspace.root,
+        10_000, 1024 * 1024, new Set([0, 1, 128]));
+      if (current.exitCode !== 0 || current.stdout.trim() !== head || await this.#readConfiguredGitUpstream(workspace, branch) !== undefined) return;
+
+      // Pushing an object ID has no local branch for Git's --set-upstream.
+      // The push already succeeded, so local tracking is a follow-up effect.
+      const remoteKey = `branch.${branch}.remote`;
+      const mergeKey = `branch.${branch}.merge`;
+      const previous = await runProcess(this.#gitExecutable, ["config", "--local", "--get", remoteKey], workspace.root,
+        10_000, 1024 * 1024, new Set([0, 1]));
+      await runProcess(this.#gitExecutable, ["config", "--local", "--replace-all", remoteKey, remote], workspace.root, 10_000, 1024 * 1024);
+      try {
+        await runProcess(this.#gitExecutable, ["config", "--local", "--replace-all", mergeKey, remoteRef],
+          workspace.root, 10_000, 1024 * 1024);
+      } catch {
+        if (await this.#readGitConfigValue(workspace, mergeKey) === remoteRef || await this.#readGitConfigValue(workspace, remoteKey) !== remote) return;
+        const restore = previous.exitCode === 0 ? ["--replace-all", remoteKey, previous.stdout.trim()] : ["--unset-all", remoteKey];
+        await runProcess(this.#gitExecutable, ["config", "--local", ...restore], workspace.root, 10_000, 1024 * 1024);
+        return;
+      }
+      const rebase = await this.#readGitConfigValue(workspace, "branch.autoSetupRebase");
+      if (rebase === "remote" || rebase === "always") await runProcess(this.#gitExecutable,
+        ["config", "--local", "--replace-all", `branch.${branch}.rebase`, "true"], workspace.root, 10_000, 1024 * 1024);
+    } catch { /* The confirmed remote push receipt is authoritative. */ }
   }
 
   async #readDefaultGitPushTarget(workspace: WorkspaceRegistration): Promise<WorkspaceGitPushTarget | undefined> {
@@ -2545,7 +2576,7 @@ export class WorkspaceService {
   }
 
   async #tryResolveGitCommit(workspace: WorkspaceRegistration, value: string, label: "base" | "head" | "source"): Promise<string | undefined> {
-    if (!isSafeGitRevision(value, label === "head")) {
+    if (!isSafeGitRevision(value, label !== "base")) {
       throw new WorkspaceGitReviewError(`The ${label} ref is invalid.`, "invalid");
     }
     if (value !== "HEAD" && !/^[0-9a-f]{40,64}$/iu.test(value)) {
@@ -4108,7 +4139,7 @@ function validateGitRemoteName(value: string): string {
   return value;
 }
 
-function gitRemoteUrlContainsCredentials(value: string): boolean {
+export function gitRemoteUrlContainsCredentials(value: string): boolean {
   const scheme = /^([a-z][a-z0-9+.-]*):\/\//iu.exec(value)?.[1]?.toLowerCase();
   if (scheme !== undefined) {
     try {
@@ -4188,18 +4219,16 @@ function uniquePaths(oldPath: string | undefined, path: string): readonly string
 }
 
 export function selectDiffFilePatch(raw: string): string {
-  const normalized = raw.replace(/\r\n/gu, "\n");
-  const fileCount = normalized.split("\n").filter((line) => line.startsWith("diff --git ")).length;
+  const fileCount = raw.split("\n").filter((line) => line.startsWith("diff --git ")).length;
   if (fileCount !== 1) {
     throw new WorkspaceGitReviewError("The selected file diff is stale or ambiguous.", "stale");
   }
-  return normalized.endsWith("\n") ? normalized : `${normalized}\n`;
+  return raw.endsWith("\n") ? raw : `${raw}\n`;
 }
 
-export function selectDiffHunkPatch(raw: string, hunkIndex: number): string {
-  const normalized = raw.replace(/\r\n/gu, "\n");
+export function selectDiffHunkPatch(raw: string, hunkIndex: number, reverse = false): string {
   const fileStarts: number[] = [];
-  const lines = normalized.split("\n");
+  const lines = raw.split("\n");
   for (let index = 0; index < lines.length; index += 1) {
     if (lines[index]?.startsWith("diff --git ") === true) fileStarts.push(index);
   }
@@ -4215,6 +4244,15 @@ export function selectDiffHunkPatch(raw: string, hunkIndex: number): string {
   const selectedEnd = hunkStarts[hunkIndex + 1] ?? lines.length;
   const header = lines.slice(fileStarts[0], hunkStarts[0]);
   const selected = lines.slice(selectedStart, selectedEnd);
+  const range = /^@@ -(\d+)(,\d+)? \+(\d+)(,\d+)?( @@.*)$/su.exec(selected[0]!);
+  if (range === null) throw new WorkspaceGitReviewError("The selected hunk is stale.", "stale");
+  const [, oldStart, oldCount = "", newStart, newCount = "", heading] = range;
+  // An isolated hunk has no earlier edits. Keep the applied preimage position
+  // and rebase the other side. Empty ranges count the line before the hunk.
+  const oldOffset = oldCount === ",0" ? 0 : 1;
+  const newOffset = newCount === ",0" ? 0 : 1;
+  const start = reverse ? Number(newStart) - newOffset : Number(oldStart) - oldOffset;
+  selected[0] = `@@ -${start + oldOffset}${oldCount} +${start + newOffset}${newCount}${heading}`;
   while (selected.at(-1) === "") selected.pop();
   return `${[...header, ...selected].join("\n")}\n`;
 }

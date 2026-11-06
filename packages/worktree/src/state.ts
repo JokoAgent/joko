@@ -74,7 +74,7 @@ interface PersistedWorktreeState {
 export class WorktreeStateStore {
   readonly root: string;
   readonly statePath: string;
-  readonly #entries = new Map<string, ManagedWorktreeEntry>();
+  #entries = new Map<string, ManagedWorktreeEntry>();
 
   private constructor(root: string, state: PersistedWorktreeState) {
     this.root = root;
@@ -129,41 +129,31 @@ export class WorktreeStateStore {
     return this.#entries.get(id);
   }
 
-  async set(entry: ManagedWorktreeEntry, control: WorktreeOperationControl): Promise<void> {
+  async set(entry: ManagedWorktreeEntry, control: WorktreeOperationControl, assertCurrent?: () => void): Promise<void> {
     control.check();
+    assertCurrent?.();
     const accepted = validateEntry(entry);
-    const previous = this.#entries.get(accepted.id);
-    this.#entries.set(accepted.id, freezeEntry(accepted));
-    try {
-      await this.persist(control);
-    } catch (error) {
-      if (previous === undefined) this.#entries.delete(accepted.id);
-      else this.#entries.set(previous.id, previous);
-      throw error;
-    }
+    const next = new Map(this.#entries);
+    next.set(accepted.id, freezeEntry(accepted));
+    await this.persist(control, next, assertCurrent);
   }
 
   async delete(id: string, control: WorktreeOperationControl): Promise<void> {
     control.check();
-    const previous = this.#entries.get(id);
-    if (previous === undefined) return;
-    this.#entries.delete(id);
-    try {
-      await this.persist(control);
-    } catch (error) {
-      this.#entries.set(id, previous);
-      throw error;
-    }
+    if (!this.#entries.has(id)) return;
+    const next = new Map(this.#entries);
+    next.delete(id);
+    await this.persist(control, next);
   }
 
-  private async persist(control: WorktreeOperationControl): Promise<void> {
+  private async persist(control: WorktreeOperationControl, next = this.#entries, assertCurrent?: () => void): Promise<void> {
     control.check();
     await validateOrdinaryDirectory(
       this.root,
       "STORAGE_UNSAFE",
       "The worktree storage root changed unsafely."
     );
-    const state: PersistedWorktreeState = { format: 1, entries: this.entries() };
+    const state: PersistedWorktreeState = { format: 1, entries: [...next.values()].sort((left, right) => left.createdAt - right.createdAt) };
     const serialized = `${JSON.stringify(state)}\n`;
     if (Buffer.byteLength(serialized, "utf8") > MAXIMUM_STATE_BYTES) {
       throw new WorktreeServiceError("STATE_CORRUPT", "The worktree state exceeds its safe limit.");
@@ -179,8 +169,10 @@ export class WorktreeStateStore {
         await handle.close();
       }
       control.check();
+      assertCurrent?.();
       await rename(temporary, this.statePath);
       renamed = true;
+      this.#entries = next;
     } catch (error) {
       await rm(temporary, { force: true }).catch(() => undefined);
       throw error;

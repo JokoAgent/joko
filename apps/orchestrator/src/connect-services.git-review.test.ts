@@ -1,11 +1,17 @@
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { operationBodyHash, type OperationRecord } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 import type { OrchestratorApplication } from "./application.js";
-import { createConnectServices } from "./connect-services.js";
+import { createConnectServices, outcomeFromRecord } from "./connect-services.js";
+import { mkdtemp } from "./test-paths.js";
+import { WORKSPACE_TEXT_FILE_MAXIMUM_BYTES, WorkspaceService } from "./workspace-service.js";
 
 const connection = {
   id: "connection-git-review",
@@ -37,7 +43,7 @@ function completedRecord(id: string, kind: string, body: unknown, response: unkn
 }
 
 function application(input: {
-  readonly workspaces: Record<string, unknown>;
+  readonly workspaces: WorkspaceService | Record<string, unknown>;
   readonly capabilities?: readonly string[];
   readonly trace?: string[];
   readonly ingestBytes?: (bytes: Uint8Array, options?: object) => Promise<object>;
@@ -100,6 +106,90 @@ function application(input: {
 }
 
 describe("Connect Git Review contracts", () => {
+  it.each([
+    { path: "space name.txt", binary: false },
+    { path: "preview-🧪.bin", binary: true }
+  ])("shows and stages the original filename for $path", async ({ path, binary }) => {
+    const root = await mkdtemp(join(tmpdir(), "joko-connect-review-path-"));
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+    try {
+      git("init", "--quiet");
+      git("config", "core.autocrlf", "false");
+      if (!binary) {
+        await writeFile(join(root, path), "old\n");
+        git("add", "--", path);
+      }
+      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "--allow-empty", "-m", "base");
+      await writeFile(join(root, path), binary ? Buffer.alloc(WORKSPACE_TEXT_FILE_MAXIMUM_BYTES + 1) : "new\n");
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces, capabilities: ["workspace.diff", "workspace.diff.sources", "workspace.diff.stage"] }));
+      const workspace = create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED
+      });
+      const { diff } = await services.workspace.getWorkspaceDiff(workspace, context() as never);
+      expect(diff?.files).toMatchObject([{ relativePath: path, oldRelativePath: path, binary }]);
+      const file = diff?.files?.[0];
+      if (diff === undefined || file === undefined) throw new Error("Git Review did not return the expected file diff.");
+      expect(file.hunks).toHaveLength(binary ? 0 : 1);
+
+      const result = await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+        operationId: "stage-review-path",
+        connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, {
+          payload: { case: "applyWorkspaceDiffHunk", value: create(contract.ApplyWorkspaceDiffHunkMutationSchema, {
+            workspaceId: workspace.workspaceId, source: workspace.source,
+            action: contract.WorkspaceDiffAction.STAGE, target: contract.WorkspaceDiffTarget.FILE,
+            relativePath: file.relativePath, expectedRepositoryRevision: diff.repositoryRevision
+          }) }
+        })
+      }), context() as never);
+      expect(result.operation?.result?.payload?.case).toBe("acknowledgement");
+      expect(git("diff", "--cached", "--name-only", "-z")).toBe(`${path}\0`);
+      expect(git("diff", "--name-only", "-z")).toBe("");
+    } finally {
+      await workspaces.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("lists the conflicted file in a real combined diff without treating it as an ordinary hunk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-connect-review-conflict-"));
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+    const path = "conflict.txt";
+    try {
+      git("init", "--quiet", "-b", "main");
+      git("config", "user.name", "Review Test");
+      git("config", "user.email", "review@example.test");
+      git("config", "core.autocrlf", "false");
+      await writeFile(join(root, path), "base\n");
+      git("add", "--", path);
+      git("commit", "--quiet", "-m", "base");
+      git("switch", "--quiet", "-c", "other");
+      await writeFile(join(root, path), "other\n");
+      git("commit", "--quiet", "-am", "other");
+      git("switch", "--quiet", "main");
+      await writeFile(join(root, path), "main\n");
+      git("commit", "--quiet", "-am", "main");
+      expect(spawnSync("git", ["merge", "other"], { cwd: root, windowsHide: true }).status).toBe(1);
+      expect(git("diff", "--binary")).toContain(`diff --cc ${path}\n`);
+
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces }));
+      const { diff } = await services.workspace.getWorkspaceDiff(create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED
+      }), context() as never);
+      expect(diff?.files).toMatchObject([{
+        relativePath: path, status: contract.GitFileStatus.CONFLICTED, source: contract.GitDiffSource.UNSTAGED, hunks: []
+      }]);
+      await expect(workspaces.gitState("workspace-review")).resolves.toMatchObject({ unmerged: true, operationInProgress: true });
+    } finally {
+      await workspaces.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("keeps commit, branch, staged, and unstaged sources typed and rejects change-set sources as Git layers", async () => {
     const gitReviewDiff = vi.fn(async () => ({
       index: "",
@@ -253,12 +343,18 @@ describe("Connect Git Review contracts", () => {
         })
       }
     });
-    await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+    const committed = await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
       operationId: "operation-review-commit",
       connectionId: connection.id,
       mutation: commitMutation
     }), context() as never);
     expect(trace.slice(0, 2)).toEqual(["claimed", "commit-effect"]);
+    expect(committed.operation?.result?.payload).toMatchObject({
+      case: "workspaceGitCommit", value: { repositoryRevision: "new", headRevision: "a".repeat(40) }
+    });
+    expect(outcomeFromRecord(completedRecord("operation-review-commit", "commitWorkspaceDiff", commitMutation, {
+      accepted: true, resultCase: "workspaceGitCommit", workspaceGitCommit: { repositoryRevision: "new", headRevision: "a".repeat(40) }
+    })).workspaceGitCommit).toEqual({ repositoryRevision: "new", headRevision: "a".repeat(40) });
 
     const pushMutation = create(contract.OperationMutationSchema, {
       payload: {

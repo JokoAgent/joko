@@ -105,6 +105,23 @@ it("reports missing remotes and duplicate branch checkouts without fetching or c
   expect(await f.sync()).toMatchObject({ updated: 0, status: { blocked: "multiple-checkouts" } });
   expect(await git(f.local, "rev-parse", "HEAD")).toBe(f.original); expect(await git(f.checkout, "rev-parse", "HEAD")).toBe(f.original);
 });
+it("leaves both branches at their original commits when the checkout switches after the final status read", { timeout: 40_000 }, async () => {
+  const f = await fixture();
+  await git(f.local, "branch", "other-branch", f.original);
+  const next = await f.advance();
+  let fetchedChecks = 0;
+  const result = await f.sync("refs/heads/main", () => {
+    const observed = execFileSync("git", ["rev-parse", "refs/remotes/origin/main"], { cwd: f.local, windowsHide: true, encoding: "utf8" }).trim();
+    // Fetch, fetched observation, ancestry, then the final full status read.
+    if (observed === next && ++fetchedChecks === 4) {
+      execFileSync("git", ["checkout", "other-branch"], { cwd: f.local, windowsHide: true, stdio: "ignore" });
+    }
+  });
+  expect(result).toMatchObject({ updated: 0, status: { blocked: "changed" } });
+  expect(await git(f.local, "symbolic-ref", "HEAD")).toBe("refs/heads/other-branch");
+  expect((await git(f.local, "rev-parse", "refs/heads/main", "refs/heads/other-branch")).split(/\r?\n/u)).toEqual([f.original, f.original]);
+  expect(await readFile(join(f.local, "tracked.txt"), "utf8")).toMatch(/^initial\r?\n$/u);
+});
 it("allows continuing Git progress within its operation deadline and retires a stalled child", { timeout: 40_000 }, async () => {
   const f = await fixture(), progress = join(f.root, "progress.cjs"), stalled = join(f.root, "stalled.cjs");
   await writeFile(progress, "process.stdout.write('started\\n'); let count=0; const timer=setInterval(()=>{process.stdout.write('progress\\n');if(++count===6){clearInterval(timer);process.stdout.write('complete\\n');}},500);\n");

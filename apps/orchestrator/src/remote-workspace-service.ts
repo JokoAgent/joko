@@ -26,6 +26,8 @@ import {
   WorkspaceSearchError,
   WorkspaceTextFileWriteError,
   fileHash,
+  gitRemoteUrlContainsCredentials,
+  isSafeGitRevision,
   isUnmergedGitStatus,
   selectDiffFilePatch,
   selectDiffHunkPatch,
@@ -894,10 +896,11 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         raw = await this.#readUntrackedDiff(registration, transports, [path], input.ignoreWhitespace === true);
       }
       const filePatch = selectDiffFilePatch(raw);
-      const patch = input.target === "file" ? filePatch : selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1);
+      const reverse = input.action !== "stage";
+      const patch = input.target === "file" ? filePatch : selectDiffHunkPatch(filePatch, input.hunkIndex ?? -1, reverse);
       const args = ["apply", "--whitespace=nowarn"];
       if (input.action !== "revert") args.push("--cached");
-      if (input.action === "unstage" || input.action === "revert") args.push("--reverse");
+      if (reverse) args.push("--reverse");
       if (input.ignoreWhitespace) args.push("--ignore-space-change");
       if (await repositoryRevision(processes, registration.root) !== current) throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
       await requireRemoteGitRoot(registration, transports);
@@ -931,9 +934,18 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     }
     const before = await repositoryRevision(processes, registration.root);
     if (before !== input.expectedRepositoryRevision) throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
+    const assertIdle = async () => {
+      if (await gitOperationInProgress(processes, transports.files, pathApi(registration), registration.root)) {
+        throw new WorkspaceGitReviewError("Git Review cannot commit while another Git operation is in progress.", "unsupported");
+      }
+    };
     await requireRemoteGitRoot(registration, transports);
-    if (input.includeUnstaged === true) await runRemote(processes, "git", ["add", "-A", "--", ":/"], registration.root, 120_000, 4 * 1024 * 1024);
+    if (input.includeUnstaged === true) {
+      await assertIdle();
+      await runRemote(processes, "git", ["add", "-A", "--", ":/"], registration.root, 120_000, 4 * 1024 * 1024);
+    }
     await requireRemoteGitRoot(registration, transports);
+    await assertIdle();
     await runRemote(processes, "git", ["commit", "-F", "-"], registration.root, 120_000, 4 * 1024 * 1024, input.message);
     const headRevision = (await runRemote(processes, "git", ["rev-parse", "HEAD"], registration.root, 20_000, 1024 * 1024)).stdout.trim();
     return { previousRepositoryRevision: before, repositoryRevision: await repositoryRevision(processes, registration.root), headRevision };
@@ -946,17 +958,27 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   ): Promise<WorkspaceGitPushResult> {
     const processes = transports.processes;
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(input.remote)) throw new WorkspaceGitReviewError("Remote name is invalid.", "invalid");
+    if (!input.remoteRef.startsWith("refs/heads/") || input.remoteRef.length > 300 || !isSafeGitRevision(input.remoteRef, false)) {
+      throw new WorkspaceGitReviewError("A fully qualified branch destination is required.", "invalid");
+    }
+    const checked = await runRemote(processes, "git", ["check-ref-format", input.remoteRef], registration.root, 10_000,
+      1024 * 1024, undefined, new Set([0, 1, 128]));
+    if (checked.exitCode !== 0) throw new WorkspaceGitReviewError("The push destination ref is invalid.", "invalid");
     const before = await repositoryRevision(processes, registration.root);
     const head = (await runRemote(processes, "git", ["rev-parse", "HEAD"], registration.root, 20_000, 1024 * 1024)).stdout.trim();
     if (before !== input.expectedRepositoryRevision || head !== input.expectedHeadRevision) throw new WorkspaceGitReviewError("Remote branch is stale.", "stale");
-    const url = (await runRemote(processes, "git", ["remote", "get-url", input.remote], registration.root, 20_000, 1024 * 1024)).stdout.trim();
-    if (gitUrlContainsCredential(url)) throw new WorkspaceGitReviewError("Remote URL contains embedded credentials.", "unsupported");
+    const destinations = (await runRemote(processes, "git", ["remote", "get-url", "--push", "--all", input.remote],
+      registration.root, 20_000, 2 * 1024 * 1024)).stdout.split(/\r?\n/u).map(value => value.trim()).filter(Boolean);
+    if (destinations.length === 0) throw new WorkspaceGitReviewError("The selected push remote has no destination.", "invalid");
+    if (destinations.some(gitRemoteUrlContainsCredentials)) {
+      throw new WorkspaceGitReviewError("Credential-bearing remote URLs are not supported by Review push.", "unsupported");
+    }
     const args = ["push"];
     if (input.confirmForceWithLease === true) {
       if (!immutableRevision(input.expectedRemoteOid ?? "")) throw new WorkspaceGitReviewError("Remote lease is invalid.", "invalid");
       args.push(`--force-with-lease=${input.remoteRef}:${input.expectedRemoteOid}`);
     }
-    args.push(input.remote, `HEAD:${input.remoteRef}`);
+    args.push(input.remote, `${head}:${input.remoteRef}`);
     await requireRemoteGitRoot(registration, transports);
     await runRemote(processes, "git", args, registration.root, 120_000, 4 * 1024 * 1024);
     return { kind: "pushed", repositoryRevision: await repositoryRevision(processes, registration.root), headRevision: head, remote: input.remote, remoteRef: input.remoteRef };
@@ -1422,13 +1444,4 @@ function mutableGitSource(source: WorkspaceGitHunkMutation["source"]): "unstaged
   if (source === "index" || source === "staged") return "staged";
   if (source === "workingTree" || source === "unstaged") return "unstaged";
   throw new WorkspaceGitReviewError("Only staged or unstaged remote diffs can be changed.", "invalid");
-}
-
-
-
-function gitUrlContainsCredential(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.password !== "" || ((url.protocol === "http:" || url.protocol === "https:") && url.username !== "");
-  } catch { return /^[^@/\\:]+:[^@/\\]+@/u.test(value); }
 }

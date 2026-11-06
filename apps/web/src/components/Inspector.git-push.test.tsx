@@ -23,18 +23,18 @@ const workspace: WorkspaceView = { id: "workspace", targetId: "target", name: "P
   trusted: true, branch: "feature/local", head: diff.headRevision, dirty: false, entries: [] };
 
 describe("Inspector Git push destinations", () => {
-  it("shows the exact upstream and re-reads an untouched automatic destination before pushing", async () => {
+  it("pushes to the displayed upstream even when a fresh repository read reports a different default", async () => {
     const view = await mount();
     expect(view.inputs().map((input) => input.value)).toEqual(["team/upstream", "refs/heads/published/topic"]);
     view.api.getWorkspaceDiff.mockResolvedValueOnce({ ...diff, pushTarget: { remote: "publish/next", remoteRef: "refs/heads/next-topic", hasUpstream: true } });
     await view.push();
     expect(view.api.pushWorkspaceBranch).toHaveBeenCalledExactlyOnceWith("workspace", {
-      remote: "publish/next", remoteRef: "refs/heads/next-topic", expectedRepositoryRevision: "repository-1",
+      remote: "team/upstream", remoteRef: "refs/heads/published/topic", expectedRepositoryRevision: "repository-1",
       expectedHeadRevision: "a".repeat(40), confirmForceWithLease: false
     });
   });
 
-  it("keeps an explicit destination and force confirmation bound to the original remote, ref and OID", async () => {
+  it("keeps the force confirmation bound to its original remote, ref, remote OID and local HEAD", async () => {
     const view = await mount();
     await view.edit("publish/manual", "refs/heads/manual-topic");
     view.api.pushWorkspaceBranch.mockResolvedValueOnce({ outcome: "needsForce", remote: "publish/manual", remoteRef: "refs/heads/manual-topic",
@@ -42,6 +42,7 @@ describe("Inspector Git push destinations", () => {
     await view.push();
     expect(view.api.pushWorkspaceBranch).toHaveBeenCalledWith("workspace", expect.objectContaining({ remote: "publish/manual", remoteRef: "refs/heads/manual-topic", confirmForceWithLease: false }));
     await view.edit("different/remote", "refs/heads/different-topic");
+    view.api.getWorkspaceDiff.mockResolvedValue({ ...diff, repositoryRevision: "repository-2", headRevision: "c".repeat(40) });
     await act(async () => button(document.body, "workspace.reviewPushForceConfirm").click());
     await view.flush();
     expect(view.api.pushWorkspaceBranch).toHaveBeenLastCalledWith("workspace", {
@@ -49,6 +50,28 @@ describe("Inspector Git push destinations", () => {
       expectedHeadRevision: "a".repeat(40), confirmForceWithLease: true, expectedRemoteOid: "b".repeat(40)
     });
     expect(view.inputs().map((input) => input.value)).toEqual(["different/remote", "refs/heads/different-topic"]);
+  });
+
+  it("pushes only the commit receipt and the destination shown when Commit and push was clicked", async () => {
+    const view = await mount(diff, true);
+    const committedHead = "c".repeat(40);
+    view.api.commitWorkspaceDiff.mockResolvedValue({ repositoryRevision: "committed-revision", headRevision: committedHead });
+    view.api.getWorkspaceDiff.mockResolvedValueOnce(diff).mockResolvedValue({ ...diff,
+      repositoryRevision: "later-revision", headRevision: "d".repeat(40),
+      pushTarget: { remote: "other/remote", remoteRef: "refs/heads/new-target", hasUpstream: true }
+    });
+    const message = view.host.querySelector("textarea")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(message, "Review changes");
+      message.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => button(view.host, "workspace.reviewCommitAndPush").click());
+    await view.flush();
+    expect(view.api.commitWorkspaceDiff).toHaveBeenCalledOnce();
+    expect(view.api.pushWorkspaceBranch).toHaveBeenCalledExactlyOnceWith("workspace", {
+      remote: pushTarget.remote, remoteRef: pushTarget.remoteRef,
+      expectedRepositoryRevision: "committed-revision", expectedHeadRevision: committedHead, confirmForceWithLease: false
+    });
   });
 
   it("leaves an unavailable automatic target empty and keeps an explicit target after a failed push", async () => {
@@ -64,10 +87,11 @@ describe("Inspector Git push destinations", () => {
   });
 });
 
-async function mount(initial = diff) {
+async function mount(initial = diff, canCommitDiff = false) {
   const api = {
     getWorkspaceDiff: vi.fn<AppController["getWorkspaceDiff"]>(async () => initial),
     listWorkspaceChangeSets: vi.fn(async () => []),
+    commitWorkspaceDiff: vi.fn<AppController["commitWorkspaceDiff"]>(async () => undefined),
     pushWorkspaceBranch: vi.fn<AppController["pushWorkspaceBranch"]>(async () => ({ outcome: "pushed", remote: pushTarget.remote, remoteRef: pushTarget.remoteRef,
       repositoryRevision: "repository-1", headRevision: "a".repeat(40), ahead: 0, behind: 0 } satisfies WorkspaceGitPushResultView)),
     releaseArtifactUrl: vi.fn()
@@ -76,7 +100,7 @@ async function mount(initial = diff) {
   const root = createRoot(host); roots.push(root);
   const pending: Promise<void>[] = [];
   await act(async () => root.render(<ChangesPanel controller={api as unknown as AppController} session={session} workspace={workspace}
-    canDiff canPushDiff canCommitDiff={false} canDiffImagePreview={false} canStageDiff={false} canUnstageDiff={false} canRevertDiff={false} canRewind={false}
+    canDiff canPushDiff canCommitDiff={canCommitDiff} canDiffImagePreview={false} canStageDiff={false} canUnstageDiff={false} canRevertDiff={false} canRewind={false}
     t={(key) => key} runAction={(_key, action) => { pending.push(action().catch(() => undefined)); }} />));
   const flush = () => act(async () => { await Promise.all(pending); });
   return { api, host, flush,

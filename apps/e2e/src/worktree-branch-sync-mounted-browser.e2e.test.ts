@@ -16,6 +16,8 @@ const git = async (cwd: string, ...args: string[]) => (await execute("git", args
 
 mountedIt("updates the selected branch through the production page and recovers its lost admission ACK without a second update", { timeout: 90_000 }, async () => {
   fixture = await OrchestratorE2eFixture.start({ webDirectory, profiles: [PI_LIKE_PROFILE] });
+  const projectTarget = fixture.application.store.getTarget(fixture.targetId()).descriptor;
+  await fixture.application.sessionHost.registerTarget({ ...projectTarget, managed: false }, { workspaceId: "workspace-main" });
   const repository = fixture.workspaceDirectory, remote = join(fixture.rootDirectory, "branch-remote.git"), publisher = join(fixture.rootDirectory, "branch-publisher");
   await git(repository, "init", "-b", "main"); await git(repository, "config", "user.name", "Branch owner"); await git(repository, "config", "user.email", "branch@example.test");
   await writeFile(join(repository, "tracked.txt"), "initial\n"); await writeFile(join(repository, "other.txt"), "initial local\n");

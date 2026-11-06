@@ -1,4 +1,5 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,12 +16,72 @@ import { ArtifactStore as RealArtifactStore } from "./artifact-store.js";
 import { buildReviewEvidence } from "./review-evidence.js";
 import { DurableReviewEvidenceProvider, ReviewEvidenceCaptureError } from "./review-evidence-provider.js";
 import type { WorkspaceChangeSetService } from "./workspace-change-set.js";
-import type { WorkspaceService } from "./workspace-service.js";
+import { WorkspaceService } from "./workspace-service.js";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => cleanups.splice(0).reverse().forEach((cleanup) => cleanup()));
 
 describe("DurableReviewEvidenceProvider", () => {
+  it("captures the text diff and file fingerprint for a real Git C-quoted path", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    const file = "报告.txt";
+    try {
+      const git = initWorkspaceRepository(fixture.root);
+      git("config", "core.quotePath", "true");
+      writeWorkspaceFile(fixture.root, file, "old\n");
+      git("add", "--", file);
+      git("commit", "--quiet", "-m", "base");
+      writeWorkspaceFile(fixture.root, file, "new\n");
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      const capture = await providerFor(fixture.store, workspaces, []).capture(request());
+      expect(capture.workspaceEvidence?.diffs).toEqual([{
+        relativePath: file, source: "unstaged", status: "modified", additions: 1, deletions: 1,
+        patch: expect.stringMatching(/^diff --git "a\/\\[0-7]{3}.*\n[\s\S]*\n-old\n\+new\n$/u)
+      }]);
+      expect(capture.workspace.files).toEqual([{
+        relativePath: file, byteLength: 4, sha256: createHash("sha256").update("new\n").digest("hex")
+      }]);
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
+  it("captures a worktree rename without treating its old name as another status record", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    const originalPath = "MM_archive";
+    const file = "renamed.txt";
+    try {
+      const git = initWorkspaceRepository(fixture.root);
+      git("config", "status.renames", "true");
+      writeWorkspaceFile(fixture.root, originalPath, "renamed file\n");
+      writeWorkspaceFile(fixture.root, "archive/keep.txt", "keep\n");
+      git("add", "--", originalPath, "archive/keep.txt");
+      git("commit", "--quiet", "-m", "base");
+      renameSync(path.join(fixture.root, originalPath), path.join(fixture.root, file));
+      git("add", "-N", "--", file);
+      expect(git("status", "--porcelain=v1", "-z")).toBe(` R ${file}\0${originalPath}\0`);
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      await expect(workspaces.gitState("workspace")).resolves.toMatchObject({
+        changes: [{ path: file, originalPath, index: " ", worktree: "R" }]
+      });
+      const capture = await providerFor(fixture.store, workspaces, []).capture(request());
+      expect(capture.workspace.files).toEqual(expect.arrayContaining([
+        expect.objectContaining({ relativePath: file, byteLength: 13 }),
+        expect.objectContaining({ relativePath: originalPath, byteLength: 0 })
+      ]));
+      expect(capture.workspace.files).toHaveLength(2);
+      expect(capture.workspaceEvidence?.diffs).toMatchObject([
+        { relativePath: file, oldRelativePath: originalPath, source: "unstaged", status: "renamed" }
+      ]);
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
   it("fingerprints only reviewed paths so unrelated workspace edits do not stale Review", async () => {
     const fixture = setup();
     writeWorkspaceFile(fixture.root, "src/a.ts", "export const a = 1;\n");
@@ -337,9 +398,18 @@ function setup(targetId = "workspace") {
   return { store, root, directory };
 }
 
+function initWorkspaceRepository(root: string) {
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+  git("init", "--quiet");
+  git("config", "core.autocrlf", "false");
+  git("config", "user.name", "Review Test");
+  git("config", "user.email", "review@example.test");
+  return git;
+}
+
 function providerFor(
   store: OperationalStore,
-  workspaces: ReturnType<typeof workspaceStub>,
+  workspaces: WorkspaceService | ReturnType<typeof workspaceStub>,
   changeSets: readonly unknown[],
   artifacts: ArtifactStore = {} as ArtifactStore,
   pdfText?: (data: Uint8Array, maxChars: number) => Promise<PdfTextWorkerResult>

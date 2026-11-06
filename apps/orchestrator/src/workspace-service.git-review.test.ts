@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +28,36 @@ async function initializedRepository(prefix: string): Promise<string> {
 }
 
 describe("WorkspaceService Git Review backend", () => {
+  it.skipIf(process.platform === "win32").each([false, true])("pushes the confirmed local object after HEAD advances just before Git with lease=%s", async force => {
+    const root = await initializedRepository("joko-review-push-frozen-head-");
+    const bare = await mkdtemp(join(tmpdir(), "joko-review-push-frozen-remote-"));
+    let service: WorkspaceService | undefined;
+    try {
+      await git(root, "branch", "-m", "topic");
+      await git(bare, "init", "--bare", "--quiet");
+      await git(root, "remote", "add", "origin", bare);
+      await git(root, "commit", "--allow-empty", "-m", "remote base");
+      const remoteOid = await git(root, "rev-parse", "HEAD");
+      await git(root, "push", "--quiet", "origin", "HEAD:refs/heads/topic");
+      await git(root, "commit", "--allow-empty", "-m", "reviewed");
+      const reviewed = await git(root, "rev-parse", "HEAD");
+      await git(root, "commit", "--allow-empty", "-m", "newer");
+      const newer = await git(root, "rev-parse", "HEAD");
+      await git(root, "update-ref", "refs/heads/topic", reviewed, newer);
+      const wrapper = join(bare, "git-before-push.sh");
+      await writeFile(wrapper, `#!/bin/sh\nif [ "$1" = "push" ]; then\n  git update-ref refs/heads/topic ${newer} ${reviewed} || exit 1\nfi\nexec git "$@"\n`, { mode: 0o700 });
+      service = new WorkspaceService({ gitExecutable: wrapper });
+      await service.register({ id: "frozen-head", root, displayName: "Frozen head", trusted: true });
+      const diff = await service.gitReviewDiff("frozen-head", { source: "unstaged" });
+      await expect(service.pushGitReview("frozen-head", { remote: "origin", remoteRef: "refs/heads/topic",
+        expectedRepositoryRevision: diff.repositoryRevision, expectedHeadRevision: reviewed,
+        ...(force ? { confirmForceWithLease: true, expectedRemoteOid: remoteOid } : {}) }))
+        .resolves.toMatchObject({ kind: "pushed", headRevision: reviewed });
+      expect(await git(root, "rev-parse", "HEAD")).toBe(newer);
+      expect(await git(bare, "rev-parse", "refs/heads/topic")).toBe(reviewed);
+    } finally { await service?.close(); await Promise.all([rm(root, { recursive: true, force: true }), rm(bare, { recursive: true, force: true })]); }
+  }, 30_000);
+
   it("resolves and pushes the exact configured upstream when remote and branch names contain slashes", async () => {
     const root = await initializedRepository("joko-review-push-upstream-");
     await git(root, "branch", "-m", "feature/local");
@@ -72,6 +102,7 @@ describe("WorkspaceService Git Review backend", () => {
     }
     if (choice !== "origin") await git(root, "config", "remote.pushDefault", "publish/default");
     if (choice === "branch") await git(root, "config", "branch.feature/local.pushRemote", "publish/branch");
+    if (choice === "default") await git(root, "config", "branch.autoSetupRebase", "remote");
     const remote = choice === "branch" ? "publish/branch" : choice === "default" ? "publish/default" : "origin";
     const service = new WorkspaceService();
     await service.register({ id: "first-push", root, displayName: "First push", trusted: true });
@@ -82,6 +113,7 @@ describe("WorkspaceService Git Review backend", () => {
     });
     expect(await git(root, "config", "--get", "branch.feature/local.remote")).toBe(remote);
     expect(await git(root, "config", "--get", "branch.feature/local.merge")).toBe("refs/heads/feature/local");
+    if (choice === "default") expect(await git(root, "config", "--get", "branch.feature/local.rebase")).toBe("true");
     expect(await git(destinations.get(remote)!, "rev-parse", "refs/heads/feature/local")).toBe(diff.headRevision);
     expect((await service.gitReviewDiff("first-push", { source: "unstaged" })).pushTarget?.hasUpstream).toBe(true);
   }, 30_000);
@@ -264,6 +296,8 @@ describe("WorkspaceService Git Review backend", () => {
     expect(unstaged.workingTree).toContain("+unstaged");
     expect(commit).toMatchObject({ source: "commit", sourceRevision: head, baseRevision: base, headRevision: head });
     expect(commit.comparison).toContain("+head");
+    await expect(service.gitReviewDiff("sources", { source: "commit", sourceRevision: "HEAD" })).resolves.toEqual(commit);
+    await expect(service.gitReviewDiff("sources", { source: "commit", sourceRevision: "HEAD^" })).rejects.toMatchObject({ kind: "invalid" });
     expect(branch).toMatchObject({ source: "branch", sourceRevision: base, requestedBaseRef: "base-branch", resolvedBaseRef: "base-branch", baseRevision: base, headRevision: head, mergeBaseRevision: base });
     expect(filtered.repositoryRevision).toBe(branch.repositoryRevision);
 
@@ -437,6 +471,73 @@ describe("WorkspaceService Git Review backend", () => {
     expect(await readFile(join(root, other), "utf8")).toBe("keep this sibling\n");
   }, 20_000);
 
+  it.each(["file", "hunk"] as const)("keeps tracked CRLF bytes when staging a %s", async target => {
+    const root = await initializedRepository("joko-review-crlf-");
+    const service = new WorkspaceService();
+    const path = "crlf.txt";
+    try {
+      await writeFile(join(root, path), "before\r\nold\r\nafter\r\n");
+      await git(root, "add", "--", path);
+      await git(root, "commit", "--quiet", "-m", "base");
+      const updated = "before\r\nnew\r\nafter\r\n";
+      await writeFile(join(root, path), updated);
+      await service.register({ id: "crlf", root, displayName: "CRLF", trusted: true });
+      const diff = await service.gitReviewDiff("crlf", { source: "unstaged" });
+      expect(diff.workingTree).toContain("-old\r\n+new\r\n");
+      await service.applyGitDiff("crlf", {
+        action: "stage", source: "unstaged", path, target, hunkIndex: 0,
+        expectedRepositoryRevision: diff.repositoryRevision
+      });
+      expect((await execFileAsync("git", ["show", `:${path}`], { cwd: root, windowsHide: true })).stdout).toBe(updated);
+      expect(await readFile(join(root, path), "utf8")).toBe(updated);
+    } finally {
+      await service.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.each(["stage", "unstage", "revert"] as const)("uses the selected hunk's preimage position for %s", async action => {
+    const root = await initializedRepository("joko-review-hunk-position-");
+    const service = new WorkspaceService();
+    const path = "blocks.txt";
+    const lines = (count: number, prefix: string) => Array.from({ length: count }, (_, index) => `${prefix}${index + 1}`);
+    const contents = (value: readonly string[]) => `${value.join("\n")}\n`;
+    try {
+      const block = ["c1", "c2", "c3", "old", "c4", "c5", "c6"];
+      const baseline = [...lines(19, "p"), ...block, ...lines(5, "sep"), ...block, ...lines(12, "q")];
+      if (action !== "stage") baseline.splice(7, block.length, "c1", "c2", "c3", "new", "c4", "c5", "c6");
+      await writeFile(join(root, path), contents(baseline));
+      await git(root, "config", "diff.context", "3");
+      await git(root, "config", "diff.interHunkContext", "0");
+      await git(root, "add", "--", path);
+      await git(root, "commit", "--quiet", "-m", "base");
+      const changed = [...lines(12, "inserted"), ...baseline];
+      changed[34] = "new";
+      await writeFile(join(root, path), contents(changed));
+      if (action === "unstage") await git(root, "add", "--", path);
+      await service.register({ id: "hunk-position", root, displayName: "Hunk position", trusted: true });
+      const source = action === "unstage" ? "staged" : "unstaged";
+      const diff = await service.gitReviewDiff("hunk-position", { source });
+      const patch = source === "staged" ? diff.index : diff.workingTree;
+      expect(patch.match(/^@@ /gmu)).toHaveLength(2);
+      expect(patch).toContain("@@ -20,7 +32,7 @@");
+      await service.applyGitDiff("hunk-position", {
+        action, source, path, target: "hunk", hunkIndex: 1,
+        expectedRepositoryRevision: diff.repositoryRevision, confirmRevert: action === "revert"
+      });
+
+      const partial = [...(action === "stage" ? baseline : changed)];
+      if (action === "stage") partial[22] = "new";
+      else partial[34] = "old";
+      expect((await execFileAsync("git", ["show", `:${path}`], { cwd: root, windowsHide: true })).stdout)
+        .toBe(contents(action === "revert" ? baseline : partial));
+      expect(await readFile(join(root, path), "utf8")).toBe(contents(action === "revert" ? partial : changed));
+    } finally {
+      await service.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("bounds commit messages and performs only explicit non-force pushes", async () => {
     const root = await initializedRepository("joko-review-effects-");
     await writeFile(join(root, "commit.txt"), "base\n", "utf8");
@@ -473,6 +574,14 @@ describe("WorkspaceService Git Review backend", () => {
       expectedHeadRevision: committed.headRevision
     })).resolves.toMatchObject({ kind: "pushed", remote: "origin", remoteRef: "refs/heads/review" });
     expect(await git(bare, "rev-parse", "refs/heads/review")).toBe(committed.headRevision);
+    await git(root, "commit", "--quiet", "--allow-empty", "-m", "independent next commit");
+    const advancedHead = await git(root, "rev-parse", "HEAD");
+    await expect(service.pushGitReview("effects", {
+      remote: "origin", remoteRef: "refs/heads/review",
+      expectedRepositoryRevision: committed.repositoryRevision, expectedHeadRevision: committed.headRevision
+    })).rejects.toMatchObject({ kind: "stale" });
+    expect(await git(bare, "rev-parse", "refs/heads/review")).toBe(committed.headRevision);
+    await git(root, "update-ref", "HEAD", committed.headRevision, advancedHead);
 
     const other = await mkdtemp(join(tmpdir(), "joko-review-other-"));
     await git(tmpdir(), "clone", "--quiet", "--branch", "review", bare, other);
@@ -502,6 +611,15 @@ describe("WorkspaceService Git Review backend", () => {
       behind: 1
     });
     if (needsForce.kind !== "needs_force") throw new Error("Expected force-with-lease confirmation.");
+    await git(root, "commit", "--quiet", "--allow-empty", "-m", "commit after force confirmation");
+    const newHead = await git(root, "rev-parse", "HEAD");
+    await expect(service.pushGitReview("effects", {
+      remote: needsForce.remote, remoteRef: needsForce.remoteRef,
+      expectedRepositoryRevision: needsForce.repositoryRevision, expectedHeadRevision: needsForce.headRevision,
+      confirmForceWithLease: true, expectedRemoteOid: needsForce.remoteOid
+    })).rejects.toMatchObject({ kind: "stale" });
+    expect(await git(bare, "rev-parse", "refs/heads/review")).toBe(remoteOid);
+    await git(root, "update-ref", "HEAD", divergedHead, newHead);
     await expect(service.pushGitReview("effects", {
       remote: "origin",
       remoteRef: "refs/heads/review",
