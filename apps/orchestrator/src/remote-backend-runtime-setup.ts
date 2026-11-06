@@ -99,13 +99,17 @@ interface ProviderContext {
   readonly assertCurrent: () => void;
 }
 
+interface ProviderInstallContext extends ProviderContext {
+  readonly beginEffect: () => void;
+}
+
 export interface RemoteBackendRuntimeSetupProvider {
   readonly backendId: string;
   readonly displayName: string;
   readonly expectedVersion: string;
   probe(context: ProviderContext, signal?: AbortSignal): Promise<ProviderProbe>;
   install(
-    context: ProviderContext,
+    context: ProviderInstallContext,
     reinstall: boolean,
     signal: AbortSignal,
     onPhase: (phase: Exclude<RemoteBackendRuntimeInstallPhase, "failed" | "outcome_unknown">) => void
@@ -138,6 +142,7 @@ interface InstallFlight {
   readonly input: RemoteBackendRuntimeInstallInput;
   readonly fingerprint: string;
   readonly admission: Admission;
+  readonly assertRequestCurrent?: () => void;
   readonly controller: AbortController;
   readonly events: RemoteBackendRuntimeInstallEvent[];
   readonly listeners: Set<() => void>;
@@ -221,8 +226,9 @@ export class RemoteBackendRuntimeSetupManager {
     }
   }
 
-  install(input: RemoteBackendRuntimeInstallInput, signal?: AbortSignal): AsyncIterable<RemoteBackendRuntimeInstallEvent> {
+  install(input: RemoteBackendRuntimeInstallInput, signal?: AbortSignal, assertRequestCurrent?: () => void): AsyncIterable<RemoteBackendRuntimeInstallEvent> {
     this.#assertOpen();
+    assertSetupRequestCurrent(assertRequestCurrent);
     const fingerprint = installFingerprint(input);
     let flight = this.#installRequests.get(input.requestId);
     if (flight !== undefined) {
@@ -237,6 +243,7 @@ export class RemoteBackendRuntimeSetupManager {
         input: Object.freeze({ ...input }),
         fingerprint,
         admission,
+        ...(assertRequestCurrent === undefined ? {} : { assertRequestCurrent }),
         controller,
         events: [],
         listeners: new Set<() => void>(),
@@ -251,8 +258,9 @@ export class RemoteBackendRuntimeSetupManager {
     return this.#observe(flight, signal);
   }
 
-  async uninstall(input: RemoteBackendRuntimeMutationInput): Promise<RemoteBackendRuntimeSnapshot> {
+  async uninstall(input: RemoteBackendRuntimeMutationInput, assertRequestCurrent?: () => void): Promise<RemoteBackendRuntimeSnapshot> {
     this.#assertOpen();
+    assertSetupRequestCurrent(assertRequestCurrent);
     const fingerprint = mutationFingerprint(input);
     let request = this.#uninstallRequests.get(input.requestId);
     if (request !== undefined) {
@@ -270,7 +278,7 @@ export class RemoteBackendRuntimeSetupManager {
       controller,
       terminal: false
     } as Omit<UninstallRequest, "result"> & { result?: Promise<RemoteBackendRuntimeSnapshot> };
-    mutable.result = this.#runUninstall(admission, controller.signal).finally(() => {
+    mutable.result = this.#runUninstall(admission, controller.signal, assertRequestCurrent).finally(() => {
       mutable.terminal = true;
       if (this.#activeUninstalls.get(admission.resourceKey) === mutable) this.#activeUninstalls.delete(admission.resourceKey);
       this.#pruneRequests();
@@ -299,16 +307,16 @@ export class RemoteBackendRuntimeSetupManager {
     let effectStarted = false;
     try {
       this.#emit(flight, "probing", this.#snapshot(flight.admission, "probing"));
-      captured = await this.#capture(flight.admission, flight.controller.signal);
+      captured = await this.#capture(flight.admission, flight.controller.signal, flight.assertRequestCurrent);
+      const original = captured.context;
       const probe = await captured.provider.probe(captured.context, flight.controller.signal);
       captured.context.assertCurrent();
       if (probe.state === "ready" && !flight.input.reinstall) {
         this.#emit(flight, "complete", this.#fromProbe(captured, probe));
         return;
       }
-      effectStarted = true;
       const installed = await captured.provider.install(
-        captured.context,
+        { ...original, beginEffect: () => { original.assertCurrent(); effectStarted = true; } },
         flight.input.reinstall,
         flight.controller.signal,
         (phase) => {
@@ -349,11 +357,11 @@ export class RemoteBackendRuntimeSetupManager {
     }
   }
 
-  async #runUninstall(admission: Admission, signal: AbortSignal): Promise<RemoteBackendRuntimeSnapshot> {
+  async #runUninstall(admission: Admission, signal: AbortSignal, assertRequestCurrent?: () => void): Promise<RemoteBackendRuntimeSnapshot> {
     let captured: CapturedAdmission | undefined;
     let effectStarted = false;
     try {
-      captured = await this.#capture(admission, signal);
+      captured = await this.#capture(admission, signal, assertRequestCurrent);
       effectStarted = true;
       const probe = await captured.provider.uninstall(captured.context, signal);
       captured.context.assertCurrent();
@@ -437,8 +445,9 @@ export class RemoteBackendRuntimeSetupManager {
     return Object.freeze({ target, host, provider, resourceKey: runtimeResourceKey(provider, host) });
   }
 
-  async #capture(admission: Admission, signal?: AbortSignal): Promise<CapturedAdmission> {
+  async #capture(admission: Admission, signal?: AbortSignal, assertRequestCurrent?: () => void): Promise<CapturedAdmission> {
     if (signal?.aborted) throw new RemoteBackendRuntimeSetupError("aborted", "The remote Backend runtime request was cancelled.");
+    assertSetupRequestCurrent(assertRequestCurrent);
     const authority = await this.#registry.captureProcessAuthority(
       admission.target.descriptor.id,
       admission.host.id,
@@ -448,6 +457,7 @@ export class RemoteBackendRuntimeSetupManager {
     if (authority.hostRevision !== admission.host.revision || processes === undefined) throw authorityFault();
     const assertCurrent = (): void => {
       this.#assertOpen();
+      assertSetupRequestCurrent(assertRequestCurrent);
       const target = this.#store.getTarget(admission.target.descriptor.id);
       if (target.revision !== admission.target.revision
         || target.descriptor.backendId !== admission.provider.backendId
@@ -523,6 +533,7 @@ export function createRemoteCodexRuntimeSetupProvider(backendId: string): Remote
     install: async (context, reinstall, signal, onPhase) => setupProbe(await installRemoteCodex(context.processes, {
       reinstall,
       assertCurrent: context.assertCurrent,
+      beginEffect: context.beginEffect,
       signal,
       onPhase: (phase: RemoteCodexInstallPhase) => onPhase(phase)
     })),
@@ -540,6 +551,7 @@ export function createRemoteClaudeRuntimeSetupProvider(backendId: string): Remot
     install: async (context, reinstall, signal, onPhase) => setupProbe(await installRemoteClaude(context.processes, {
       reinstall,
       assertCurrent: context.assertCurrent,
+      beginEffect: context.beginEffect,
       signal,
       onPhase: (phase: RemoteClaudeInstallPhase) => onPhase(phase)
     })),
@@ -586,6 +598,11 @@ function requestReuseFault(): RemoteBackendRuntimeSetupError {
 
 function authorityFault(): RemoteBackendRuntimeSetupError {
   return new RemoteBackendRuntimeSetupError("authority_changed", "Remote Backend runtime authority changed; refresh before retrying.");
+}
+
+function assertSetupRequestCurrent(assertRequestCurrent: (() => void) | undefined): void {
+  try { assertRequestCurrent?.(); }
+  catch { throw authorityFault(); }
 }
 
 function runtimeFailureCode(
