@@ -94,11 +94,12 @@ describe("mounted Pi compaction product chain", () => {
       })
     ));
     const compactSessionId = await createSession("Mounted compact outcomes");
+    let observedSessionId = compactSessionId;
     failureState = async () => {
-      const { session } = await manager.clients.session.getSession({ sessionId: compactSessionId });
-      return { state: session?.state, compacting: session?.contextState?.compacting,
+      const { session } = await manager.clients.session.getSession({ sessionId: observedSessionId });
+      return { sessionId: observedSessionId, state: session?.state, compacting: session?.contextState?.compacting,
         usedTokens: session?.context?.usedTokens.toString(),
-        compactions: fixture!.application.store.listEvents({ sessionId: compactSessionId })
+        compactions: fixture!.application.store.listEvents({ sessionId: observedSessionId })
           .flatMap((event) => event.payload.type === "compaction"
             ? [{ state: event.payload.state, reason: event.payload.reason }] : []).slice(-8) };
     };
@@ -222,14 +223,26 @@ describe("mounted Pi compaction product chain", () => {
     await navigateMountedTask(page, compactSessionId, "Mounted compact outcomes");
     await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
 
+    observedSessionId = failingSessionId;
     await send(failingSessionId, "First turn for a genuine Provider failure.");
     await send(failingSessionId, "Second turn for a genuine Provider failure.");
     await navigateMountedTask(page, failingSessionId, "Mounted compact failure");
     const failingTrigger = page.getByRole("button", { name: "Click to compact context" });
     await failingTrigger.waitFor({ state: "visible" });
+    await page.evaluate(() => {
+      document.addEventListener("click", (event) => {
+        const button = event.target instanceof Element ? event.target.closest("button") : null;
+        document.documentElement.dataset.compactionClickTarget = button?.getAttribute("aria-label") ?? button?.textContent?.trim() ?? "";
+      }, { capture: true, once: true });
+    });
     failSummary = true;
     await failingTrigger.click();
-    await confirmation.getByRole("button", { name: "Compact", exact: true }).click();
+    await confirmation.getByRole("button", { name: "Compact", exact: true }).click().catch(async (cause: unknown) => {
+      throw new Error(`Could not confirm manual compaction: ${JSON.stringify({
+        clickTarget: await page.locator("html").getAttribute("data-compaction-click-target"),
+        browserErrors: errors
+      })}`, { cause });
+    });
     const failure = page.locator(".compact-action-feedback--failure");
     await failure.waitFor({ state: "visible", timeout: 30_000 }).catch(async (error: unknown) => {
       throw new Error(`Mounted Pi failure feedback was absent: ${JSON.stringify({
@@ -252,6 +265,7 @@ describe("mounted Pi compaction product chain", () => {
     await settleBrowserErrors();
     errors.splice(0);
 
+    observedSessionId = compactSessionId;
     const authKey = manager.authKey;
     usagePhase = "service-stop";
     await fixture.close({ removeRoot: false });
