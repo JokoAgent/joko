@@ -519,7 +519,13 @@ export class ExtensionLibrarySqlCore {
     } catch (error) {
       if (registeredHandleId !== undefined) this.#handles.delete(registeredHandleId);
       database?.close();
-      if (reserved !== undefined) await unlink(absolutePath).catch(() => undefined);
+      if (reserved !== undefined) {
+        try {
+          const currentPath = await this.#vault.resolveDatabasePath(input.path);
+          await assertDatabaseIdentity(currentPath, reserved);
+          await unlink(currentPath);
+        } catch { /* The reservation is unavailable or no longer owns this name. */ }
+      }
       throw sqlFailure(error);
     }
   }
