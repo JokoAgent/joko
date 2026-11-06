@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type DragEvent, type JSX } from "react";
 import { createPortal } from "react-dom";
-import { Maximize2, Minus, MoreHorizontal, PanelRight, Plus, Square, SquareArrowOutUpRight, X } from "lucide-react";
+import { Maximize2, Minus, MoreHorizontal, PanelRight, PanelRightClose, Plus, Square, SquareArrowOutUpRight, X } from "lucide-react";
 import { Inspector, type InspectorProps } from "./Inspector.js";
 import { InspectorDock, InspectorTabContribution, moveInspectorMount, type InspectorDockTab } from "./inspector-layout-context.js";
 import { INSPECTOR_EDGES, INSPECTOR_EXTENSION_OPEN_EVENT, INSPECTOR_TAB_DRAG_TYPE, inspectorDropEdge, inspectorExtensionIdentity,
@@ -355,6 +355,8 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
   const group = (place: string, tabs: readonly InspectorDockTab[], edge?: InspectorEdge, entry?: TabWindow): JSX.Element => <DockGroup
     key={place} {...{ dock, place, tabs, edge, entry, t, activate, drop, canDetach }}
     onMove={(key, side, before) => guardedPlacement([key], () => move(key, side, before))} onWindow={(keys, target, before) => guardedPlacement(keys, () => createWindow(keys, target, before))} onClose={keys => { void closeTabs(keys); }}
+    onCollapse={entry === undefined && open && session !== undefined
+      && (tabs.length === 0 || tabs.some(tab => tab.sessionId === session.id)) ? props.onClose : undefined}
     onMerge={entry === undefined ? undefined : () => guardedPlacement(entry.order, () => returnWindow(entry))}
     onAdd={action => { const nativeOwner = dock.sessionOwners.get(entry?.sessionId ?? session?.id ?? "");
       if (nativeOwner === undefined) return;
@@ -409,27 +411,36 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
   </div>;
 }
 
-function DockGroup({ dock, place, tabs, edge, entry, t, activate, drop, canDetach, onMove, onWindow, onClose, onMerge, onAdd, actions, windows, onDragStart, onDragEnd, shortcutOverrides, onResize }: {
+function DockGroup({ dock, place, tabs, edge, entry, t, activate, drop, canDetach, onMove, onWindow, onClose, onCollapse, onMerge, onAdd, actions, windows, onDragStart, onDragEnd, shortcutOverrides, onResize }: {
   readonly dock: InspectorDock; readonly place: string; readonly tabs: readonly InspectorDockTab[]; readonly edge?: InspectorEdge; readonly entry?: TabWindow; readonly t: Translator;
   readonly activate: (tab: InspectorDockTab, place: string) => void; readonly drop: (event: DragEvent, edge?: InspectorEdge, windowId?: string, before?: string) => void;
   readonly canDetach: boolean; readonly onMove: (key: string, edge: InspectorEdge, before?: string) => void; readonly onWindow: (keys: readonly string[], target?: string, before?: string) => void;
-  readonly onClose: (keys: readonly string[]) => void; readonly onMerge?: () => void; readonly onAdd: (action: () => void) => void;
+  readonly onClose: (keys: readonly string[]) => void; readonly onCollapse?: () => void;
+  readonly onMerge?: () => void; readonly onAdd: (action: () => void) => void;
   readonly actions: readonly { readonly id: string; readonly label: string; readonly disabled?: boolean; readonly run: () => void }[]; readonly windows: readonly TabWindow[];
   readonly onDragStart: (event: DragEvent, key: string) => void; readonly onDragEnd: (event: DragEvent) => void;
   readonly shortcutOverrides?: AppShortcutOverrides;
   readonly onResize: (edge: InspectorEdge, size: number) => void;
 }): JSX.Element {
   const body = useRef<HTMLDivElement>(null), root = useRef<HTMLElement>(null);
+  const addTrigger = useRef<HTMLButtonElement>(null), actionsTrigger = useRef<HTMLButtonElement>(null);
   const resizeCleanup = useRef<(() => void) | undefined>(undefined);
   useEffect(() => () => resizeCleanup.current?.(), []);
   const [menu, setMenu] = useState(false), [adding, setAdding] = useState(false), [maximized, setMaximized] = useState(false);
-  const selected = dock.selected.get(place), active = tabs.find(tab => tab.key === selected) ?? tabs[0];
+  const selected = dock.selected.get(place), active = tabs.find(tab => tab.key === selected) ?? tabs.find(tab => tab.preferred) ?? tabs[0];
   useEffect(() => {
     if (!menu && !adding) return;
     const owner = entry?.host.window.document ?? document;
     const clicked = (event: MouseEvent): void => { const node = event.target as Node | null; if (node && !root.current?.querySelector(".inspector-menu:has([aria-expanded='true'])")?.contains(node)) { setMenu(false); setAdding(false); } };
     const key = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") { setMenu(false); setAdding(false); return; }
+      if (event.key === "Escape") {
+        if (root.current?.contains(owner.activeElement)) {
+          event.preventDefault();
+          (adding ? addTrigger : actionsTrigger).current?.focus();
+        }
+        setMenu(false); setAdding(false);
+        return;
+      }
       if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
       const buttons = [...(root.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [])];
       if (!buttons.length) return;
@@ -491,9 +502,9 @@ function DockGroup({ dock, place, tabs, edge, entry, t, activate, drop, canDetac
           <IconButton className="inspector-tab__close" label={t("inspector.closeNamedTab", { name: tab.label })} onClick={() => onClose([tab.key])}><X /></IconButton>
         </div>)}
       </div>
-      {actions.length > 0 && <div className="inspector-menu"><IconButton label={t("inspector.addTab")} aria-haspopup="menu" aria-expanded={adding} onClick={() => { setAdding(!adding); setMenu(false); }}><Plus /></IconButton>
+      {actions.length > 0 && <div className="inspector-menu"><IconButton buttonRef={addTrigger} label={t("inspector.addTab")} aria-haspopup="menu" aria-expanded={adding} onClick={() => { setAdding(!adding); setMenu(false); }}><Plus /></IconButton>
         {adding && <div className="inspector-menu__popover" role="menu">{actions.map(action => <button type="button" role="menuitem" key={action.id} disabled={action.disabled} onClick={() => { setAdding(false); onAdd(action.run); }}>{action.label}</button>)}</div>}</div>}
-      <div className="inspector-menu"><IconButton label={t("a11y.inspectorTabActions")} aria-haspopup="menu" aria-expanded={menu} onClick={() => { setMenu(!menu); setAdding(false); }}><MoreHorizontal /></IconButton>
+      <div className="inspector-menu"><IconButton buttonRef={actionsTrigger} label={t("a11y.inspectorTabActions")} aria-haspopup="menu" aria-expanded={menu} onClick={() => { setMenu(!menu); setAdding(false); }}><MoreHorizontal /></IconButton>
         {menu && <div className="inspector-menu__popover inspector-menu__popover--right" role="menu">
           {active !== undefined && INSPECTOR_EDGES.map(side => <button type="button" role="menuitem" key={side} onClick={() => { setMenu(false); onMove(active.key, side); }}>{t(`inspector.group.${side}`)}</button>)}
           {canDetach && active !== undefined && <button type="button" role="menuitem" onClick={() => { setMenu(false); onWindow([active.key]); }}><SquareArrowOutUpRight />{t("inspector.detachTab")}</button>}
@@ -505,6 +516,7 @@ function DockGroup({ dock, place, tabs, edge, entry, t, activate, drop, canDetac
           <button type="button" role="menuitem" onClick={() => { setMenu(false); onClose(tabs.map(tab => tab.key)); }}>{t("inspector.closeAllTabs")}</button>
         </div>}
       </div>
+      {onCollapse !== undefined && <IconButton label={t("a11y.closeInspector")} onClick={onCollapse}><PanelRightClose aria-hidden="true" /></IconButton>}
     </header>
     <div className="inspector-dock-group__body" ref={body} />
     {edge !== undefined && !maximized && <div className="inspector-dock-resize" role="separator" tabIndex={0} aria-label={t("a11y.resizeInspector")}

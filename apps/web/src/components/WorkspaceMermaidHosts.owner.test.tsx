@@ -61,7 +61,11 @@ it("routes real editor widgets only to their containing host, replaces themed re
   const textarea = doc.querySelector<HTMLTextAreaElement>("textarea")!;
   const setValue = Object.getOwnPropertyDescriptor(doc.defaultView!.HTMLTextAreaElement.prototype, "value")!.set!;
   await act(async () => { setValue.call(textarea, "graph LR; User-->Draft"); textarea.dispatchEvent(new doc.defaultView!.Event("input", { bubbles: true })); });
+  const backdrop = textarea.closest(".modal-layer")!;
+  await act(async () => backdrop.dispatchEvent(new doc.defaultView!.MouseEvent("mousedown", { bubbles: true })));
+  expect(textarea.isConnected).toBe(true);
   expect(textarea.value).toBe("graph LR; User-->Draft");
+  expect(view.state.doc.toString()).toContain("A-->B");
   await act(async () => view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "```mermaid\ngraph LR; New-->Source\n```" } }));
   expect(renders[0]!.signal.aborted).toBe(true);
   expect(textarea.isConnected).toBe(true);
