@@ -3,10 +3,11 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient, createRouterTransport, type HandlerContext } from "@connectrpc/connect";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalStore, PartnerStore, PartnerRoutineStore, partnerHomeDirectoryName } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
-import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema } from "@joko/contracts";
+import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema,
+  DeletePartnerMemoryRequestSchema, DeletePartnerSkillRequestSchema, UpdatePartnerMemoryRequestSchema, UpdatePartnerSkillRequestSchema } from "@joko/contracts";
 import { readImportTree, createImportBudget } from "@joko/agent-import";
 import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
@@ -21,6 +22,9 @@ import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerI
 import { createPartnerImportConnectService } from "./partner-import-connect-service.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { SessionHost } from "./session-host.js";
+import { PartnerMemoryManager } from "./partner-memory.js";
+import { PartnerSkillsManager } from "./partner-skills.js";
+import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 
 const secret = "fixture-import-secret-abcdef012345"; const cleanups: Array<() => Promise<void>> = [];
 const backendProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
@@ -91,7 +95,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
   const service = createPartnerImportConnectService(imports, () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; });
   const api = createPartnerImportApi({ ownerKey: "device-a:sheet", controllerId: "sheet", assertCurrent: () => {}, newRequestId: () => "owner_import_request_0001",
     rpc: createClient(PartnerImportService, createRouterTransport(router => { router.service(PartnerImportService, service); })) });
-  cleanups.push(async () => { await imports.close(); await routines.stop(); await scheduler.stop(); await host.dispose(); profiles.close(); store.close();
+  cleanups.push(async () => { await imports.close(); await routines.stop(); await scheduler.stop(); await host.dispose(); memory.dispose(); profiles.close(); store.close();
     if (dirname(resolve(root)) !== resolve(tmpdir()) || !basename(root).startsWith("joko-import-owner-")) throw new Error("Unsafe fixture cleanup"); await rm(root, { recursive: true, force: true }); });
   return { root, native, store, profiles, artifacts, host, storage, resources, memory, partners, routines, imports, service, api, context, manifest,
     authenticate: (value: string) => { authenticated = value; } };
@@ -108,6 +112,79 @@ function observedImportEffect<Args extends unknown[], Result>(phase: string, act
   };
 }
 describe("native import service and owning effects", () => {
+  it("retries failed package knowledge without replaying edited, removed or disabled Skills", async () => {
+    const f = await fixture({ resourceFiles: 20 });
+    const signal = new AbortController().signal;
+    await f.memory.update({ makerEnabled: false });
+    const entry = (await f.api.packages!("en", signal)).find(row => row.packageId === "engineer-bot")!;
+    const admitted = await f.api.invitePackage!(entry, "en", signal);
+    const partial = await f.imports.waitForRequest(admitted.requestId);
+    expect(partial).toMatchObject({ saved: true, status: "needs-attention", canonicalSessionId: expect.any(String) });
+    const partner = f.partners.getPartner(partial.partnerId);
+    const manager = new PartnerSkillsManager(f.partners, f.profiles, f.store, f.resources, new SkillMutationCoordinator());
+    const published = f.resources.listPartnerSkills(partner.id, partner.homeTargetId);
+    expect(published).toHaveLength(3);
+    const edited = published.find(item => item.slug.startsWith("engineer-bot-ops-"))!;
+    const [deleted, disabled] = published.filter(item => item !== edited);
+    await f.memory.update({ makerEnabled: true });
+
+    const priorEdit = await manager.read(partner.id, edited.resource.id, signal);
+    const editedBody = "Keep the owner's revised instructions.";
+    await manager.update(create(UpdatePartnerSkillRequestSchema, {
+      partnerId: partner.id, skillId: edited.resource.id, expectedPartnerRevision: priorEdit.owner.revision,
+      expectedRevision: priorEdit.skill.summary!.revision, expectedContentRevision: priorEdit.skill.summary!.contentRevision,
+      name: priorEdit.skill.summary!.name, description: priorEdit.skill.summary!.description, body: editedBody
+    }), signal);
+    const priorDelete = await manager.read(partner.id, deleted!.resource.id, signal);
+    await manager.remove(create(DeletePartnerSkillRequestSchema, {
+      partnerId: partner.id, skillId: deleted!.resource.id, expectedPartnerRevision: priorDelete.owner.revision,
+      expectedRevision: priorDelete.skill.summary!.revision, expectedContentRevision: priorDelete.skill.summary!.contentRevision
+    }), signal);
+    await f.resources.setEnabled(disabled!.resource.id, false);
+
+    await f.api.retry(partial.requestId, false, signal);
+    const complete = await f.imports.waitForRequest(partial.requestId);
+    expect(complete).toMatchObject({ saved: true, status: "complete", canonicalSessionId: partial.canonicalSessionId });
+    expect(complete.checks.some(check => check.status === "needs-attention")).toBe(false);
+    expect(f.storage.readReceipt(partial.requestId)?.checkpointCleared).toBe(true);
+    expect((await manager.read(partner.id, edited.resource.id, signal)).skill.body).toBe(editedBody);
+    expect(f.resources.get(deleted!.resource.id).state).toBe("removed");
+    const home = f.store.getTarget(partner.homeTargetId).descriptor.workspaceRoot;
+    await expect(readFile(join(home, deleted!.relativeFilePath))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(f.resources.get(disabled!.resource.id)).toMatchObject({ state: "disabled", enabled: false });
+    expect(f.memory.list(partner.homeTargetId).filter(item => item.kind === "reference")).toHaveLength(1);
+  }, 20_000);
+
+  it.each(["edit", "delete"] as const)("finishes a failed package routine after the owner chooses to %s completed knowledge", async action => {
+    const f = await fixture({ resourceFiles: 20 });
+    const signal = new AbortController().signal;
+    const install = vi.spyOn(f.routines, "installPackage").mockRejectedValueOnce(new Error("Fixture routine write failed"));
+    const entry = (await f.api.packages!("en", signal)).find(row => row.packageId === "engineer-bot")!;
+    const admitted = await f.api.invitePackage!(entry, "en", signal);
+    const partial = await f.imports.waitForRequest(admitted.requestId);
+    expect(partial).toMatchObject({ saved: true, status: "needs-attention", canonicalSessionId: expect.any(String) });
+    const partner = f.partners.getPartner(partial.partnerId);
+    expect(f.routines.list(partner.id)).toEqual([]);
+    const memory = f.memory.list(partner.homeTargetId).find(item => item.kind === "reference")!;
+    const manager = new PartnerMemoryManager(f.partners, f.store, f.memory);
+    const source = { partnerId: partner.id, entryId: memory.id, expectedPartnerRevision: { value: partner.revision }, expectedRevision: { value: memory.revision } };
+    const editedBody = "Keep the owner's revised method.";
+    if (action === "delete") manager.remove(create(DeletePartnerMemoryRequestSchema, source));
+    else manager.update(create(UpdatePartnerMemoryRequestSchema, { ...source, title: memory.title, body: editedBody }));
+
+    await f.api.retry(partial.requestId, false, signal);
+    const complete = await f.imports.waitForRequest(partial.requestId);
+    expect(complete.status).toBe("complete");
+    expect(complete.savedEntryIds).toContain("routine-pr-watch");
+    expect(f.storage.readReceipt(partial.requestId)?.checkpointCleared).toBe(true);
+    expect(f.routines.list(partner.id)).toMatchObject([{ enabled: false }]);
+    expect(install).toHaveBeenCalledTimes(2);
+    expect(install.mock.calls[1]?.[2]).toBe(install.mock.calls[0]?.[2]);
+    expect(f.memory.list(partner.homeTargetId).filter(item => item.kind === "reference")).toMatchObject(
+      action === "delete" ? [] : [{ id: memory.id, body: editedBody }]
+    );
+  }, 20_000);
+
   it("saves a complete package without a model and projects its saved files only after an explicit real model selection", async () => {
     const f = await fixture({ resourceFiles: 20, noDefaults: true }); const signal = new AbortController().signal;
     const entry = (await f.api.packages!("en", signal)).find(row => row.packageId === "engineer-bot")!;

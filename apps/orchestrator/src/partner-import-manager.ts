@@ -140,7 +140,7 @@ export class PartnerImportManager {
     const task = this.options.runPass(partnerId, async () => {
       const assertOwner = () => { this.#assert(); if (this.#deletedPartners.has(partnerId)) throw new AgentImportError("IMPORT_CANCELLED"); };
       assertOwner(); const receipt = this.options.storage.listReceipts().find(row => row.result.partnerId === partnerId && row.nativePackage && row.result.saved && !row.cancelled);
-      if (!receipt || receipt.checkpointCleared) return receipt?.result;
+      if (!receipt || receipt.checkpointCleared || receipt.result.canonicalSessionId !== undefined) return receipt?.result;
       const pending = (await this.options.storage.environment.read(partnerId, assertOwner))?.pendingImport;
       if (!pending) throw new AgentImportError("IMPORT_INTERRUPTED");
       const snapshot = await deserializeImportSnapshotAsync(pending.snapshotJson, assertOwner);
@@ -228,7 +228,7 @@ export class PartnerImportManager {
     const receipt = this.options.storage.readReceipt(requestId);
     if (!receipt) throw new AgentImportError("IMPORT_RECEIPT_MISSING");
     if (receipt.cancelled) return this.#present(receipt.result);
-    if (receipt.nativePackage && receipt.result.saved && !receipt.checkpointCleared) {
+    if (receipt.nativePackage && receipt.result.saved && receipt.result.canonicalSessionId === undefined && !receipt.checkpointCleared) {
       const activated = await this.activatePackage(receipt.result.partnerId); assertController();
       if (activated) return this.#present(activated);
     }
