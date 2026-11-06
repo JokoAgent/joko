@@ -22,6 +22,44 @@ afterEach(() => {
 });
 
 describe("DevicePeerOwner", () => {
+  it("cancels an accepted rename when its bound controller device is revoked", async () => {
+    const fixture = setup(), connections = new ConnectionManager(fixture.store);
+    const owner = new DevicePeerOwner({ store: fixture.store,
+      onDeviceRevoked: (id, listener) => connections.onDeviceRevoked(id, listener) });
+    let release!: () => void;
+    const beforeRename = new Promise<void>(resolve => { release = resolve; });
+    let observeAcceptance!: () => void;
+    const accepted = new Promise<void>(resolve => { observeAcceptance = resolve; });
+    let renameSignal: AbortSignal | undefined;
+    let writes = 0;
+    const harness = createInProcessDevicePeerHarness({ targetDeviceId: fixture.target.deviceId, capabilities: ["files"],
+      agent: { async handle(_frame, signal) {
+        renameSignal = signal;
+        observeAcceptance();
+        await beforeRename;
+        signal.throwIfAborted();
+        writes += 1;
+        return { outcome: "completed", value: undefined };
+      } } });
+    owner.registerRoute(fixture.target, harness.transport);
+    const authority = owner.captureBinding(fixture.controller.deviceId, fixture.target.deviceId, ["files"]);
+    const result = owner.dispatch(authority, { requestId: "original-rename", capability: "files", effectKind: "side_effect", action: "renameFile",
+      payload: { sourcePath: "C:\\work\\old.txt", destinationPath: "C:\\work\\new.txt" } });
+    try {
+      await accepted;
+      expect(harness.acceptedRequests).toHaveLength(1);
+      expect(renameSignal?.aborted).toBe(false);
+      connections.revokeDevice(fixture.controller.deviceId);
+      await expect(result).resolves.toMatchObject({ outcome: "outcome_unknown" });
+      expect(renameSignal?.aborted).toBe(true);
+      expect(harness.aborts).toMatchObject([{ requestId: "original-rename" }]);
+      release();
+      await Promise.resolve();
+      expect(writes).toBe(0);
+      expect(fixture.store.getDevice(fixture.target.deviceId).state).toBe("active");
+    } finally { release(); owner.shutdown(); }
+  });
+
   it("binds local Desktop proof to private bootstrap, exact live route generation and revocable connection", () => {
     const fixture = setup(), connections = new ConnectionManager(fixture.store);
     const owner = new DevicePeerOwner({ store: fixture.store, localDesktopHostConnection: connection => connections.isLocalDesktopHostConnection(connection) });
