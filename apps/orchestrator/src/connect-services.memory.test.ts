@@ -67,7 +67,7 @@ describe("Connect Maker Memory owner and reset scopes", () => {
           backendId, targetId, sessionId: `session-${targetId}`, reason: "auto", summary: "Compassneedle stays aligned."
         })).toBe(true);
       }
-      const partnerCurated = memory.list("partner-home")[0]!;
+      const partnerCurated = memory.search("partner-home", "concise", "project")[0]!;
       const partnerDigest = memory.search("partner-home", "Compassneedle", "digest")[0]!;
 
       const curated = await submit("clear-curated", contract.MemoryResetScope.CURATED);
