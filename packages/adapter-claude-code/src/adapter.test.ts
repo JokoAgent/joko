@@ -30,6 +30,7 @@ import type { ClaudeMcpBridgePort, ClaudeMcpRuntimeLease } from "./mcp-bridge.js
 import type { ClaudeManagedChildWorkspaceInput } from "./managed-child-workspace.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import { ClaudeFreshContextOwner } from "./fresh-context-owner.js";
+import { PartialMessageBuffer, SafeProjection } from "./projection.js";
 import {
   CLAUDE_AGENT_SDK_VERSION,
   type ClaudeRemoteRuntimePort,
@@ -4763,6 +4764,22 @@ describe("ClaudeCodeAdapter", () => {
     expect(active.events.filter(event => event.type === "message_complete")).toHaveLength(interrupted ? 0 : 1);
     expect(active.events.at(-1)).toEqual({ type: "done", outcome: interrupted ? "failed" : "completed" });
     await adapter.dispose();
+  });
+
+  test.each([
+    { fragments: ["Example ", "sensitive ", "pair. "], secret: "sensitive pair", redacted: "Example [REDACTED]. " },
+    { fragments: ["Example Bear", "er \t", "abcdefghijklmnop "], secret: "unused", redacted: "Example Bearer \t[REDACTED] " }
+  ])("keeps a potentially sensitive split phrase private until full Claude block projection", ({ fragments, secret, redacted }) => {
+    const buffer = new PartialMessageBuffer("fixture");
+    const projection = new SafeProjection([], () => [secret]);
+    const live = fragments.flatMap(text => {
+      const delta = buffer.accept({ event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } } }, projection);
+      return delta === undefined ? [] : [delta.delta];
+    });
+    expect(live).toEqual(["Example "]);
+    expect(buffer.interruptedPlainText(projection)).toEqual([]);
+    const tail = buffer.accept({ event: { type: "content_block_stop", index: 0 } }, projection);
+    expect(live.join("") + tail?.delta).toBe(redacted);
   });
 
   test("retires a native stream that exceeds the per-message content-block limit", async () => {

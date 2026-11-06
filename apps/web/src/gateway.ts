@@ -1,5 +1,6 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
+import { assistantStreamAttempt, isClaudeStreamBlock } from "@joko/contracts";
 import { executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
   parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationKind } from "./extension-settings-operation.js";
@@ -12352,9 +12353,11 @@ function projectTimelineEvent(
     }
     case "textDelta": {
       const contentIndex = kind.value.contentIndex;
+      const streamAttempt = isClaudeStreamBlock(kind.value.messageId) ? assistantStreamAttempt(event) : undefined;
       const existing = items.find((item) =>
         item.kind === "assistant"
         && isProjectedMessageItem(item, kind.value.messageId)
+        && (streamAttempt === undefined || item.assistantStreamAttempt === streamAttempt)
       );
       const textBlocks = [...(existing?.messageTextBlocks
         ?? (existing?.text === undefined || existing.text.length === 0
@@ -12379,8 +12382,10 @@ function projectTimelineEvent(
         createdAt: existing?.createdAt ?? createdAt,
         text: textBlocks.map((block) => block.text).join(""),
         messageTextBlocks: textBlocks,
+        ...(streamAttempt === undefined ? {} : { assistantStreamAttempt: streamAttempt }),
         streaming: true
-      });
+      }, (item) => item.id === kind.value.messageId
+        && (streamAttempt === undefined || item.assistantStreamAttempt === streamAttempt));
       break;
     }
     case "thinkingDelta": {
@@ -12777,6 +12782,10 @@ function projectTimelineEvent(
     case "recoverableError":
     case "terminalError": {
       const error = kind.value.error;
+      const streamAttempt = kind.case === "terminalError" ? assistantStreamAttempt(event) : undefined;
+      if (streamAttempt !== undefined) for (const [index, item] of items.entries()) {
+        if (item.assistantStreamAttempt === streamAttempt && item.streaming) items[index] = { ...item, streaming: false };
+      }
       replaceOrAppend({
         id: event.eventId,
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),
@@ -12849,9 +12858,13 @@ function reconcileCompletedAssistantMessage(
     throw new GatewayError("Orchestrator returned invalid model substitution metadata.");
   }
   const learning = projectPartnerLearningFeedback(completed.learning);
+  const streamAttempt = completed.nativeIdentity === undefined && completed.blocks.some(block => block.content.case === "text")
+    ? assistantStreamAttempt(event) : undefined;
+  const belongsToMessage = (item: TimelineItemView): boolean => isProjectedMessageItem(item, messageId)
+    || (streamAttempt !== undefined && item.assistantStreamAttempt === streamAttempt && item.streaming === true);
   const existingContent = items.filter((item) =>
     (item.kind === "assistant" || item.kind === "thinking")
-    && isProjectedMessageItem(item, messageId)
+    && belongsToMessage(item)
   );
   const finalToolCallIds = new Set(completed.blocks.flatMap((block) =>
     block.content.case === "toolCall" || block.content.case === "toolResult"
@@ -13019,7 +13032,7 @@ function reconcileCompletedAssistantMessage(
   finalItems.sort((left, right) => left.contentIndex - right.contentIndex);
 
   const removableIndexes = items.flatMap((item, index) =>
-    ((item.kind === "assistant" || item.kind === "thinking") && isProjectedMessageItem(item, messageId))
+    ((item.kind === "assistant" || item.kind === "thinking") && belongsToMessage(item))
       || finalToolCallIds.has(item.id) && (item.kind === "tool" || item.kind === "toolResult")
       ? [index]
       : []
