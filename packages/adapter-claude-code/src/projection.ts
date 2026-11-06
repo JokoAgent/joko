@@ -39,6 +39,7 @@ export interface ProjectedToolCall {
 export interface ProjectedToolResult {
   readonly callId: string;
   readonly output: string;
+  readonly readCompleteText?: () => string | undefined;
   readonly isError: boolean;
   readonly block: MessageBlock;
 }
@@ -72,9 +73,13 @@ export class SafeProjection {
 
   text(value: unknown, maximum = MAX_DISPLAY_TEXT): string {
     if (typeof value !== "string") return "";
+    return bound(this.#redactText(value), maximum);
+  }
+
+  #redactText(value: string): string {
     let projected = redactSecrets(value);
     for (const secret of this.#redactions()) projected = projected.split(secret).join("[REDACTED]");
-    return bound(projected, maximum);
+    return projected;
   }
 
   canPublishPlainPrefix(value: string): boolean {
@@ -146,7 +151,7 @@ export class SafeProjection {
     return { blocks, toolCalls };
   }
 
-  user(message: unknown): ProjectedUserContent {
+  user(message: unknown, completeTextCapacity?: (nativeCallId: string) => number | undefined): ProjectedUserContent {
     const envelope = record(message);
     const nativeMessage = record(envelope?.["message"]);
     const content = Array.isArray(nativeMessage?.["content"]) ? nativeMessage["content"] : [];
@@ -157,11 +162,16 @@ export class SafeProjection {
     for (const rawBlock of content) {
       const block = record(rawBlock);
       if (stringValue(block?.["type"]) !== "tool_result") continue;
-      const callId = this.identifier(block?.["tool_use_id"], opaqueId("tool-result", rawBlock));
-      const output = this.toolResultContent(block?.["content"]);
+      const nativeCallId = stringValue(block?.["tool_use_id"]);
+      const callId = this.identifier(nativeCallId, opaqueId("tool-result", rawBlock));
+      const value = block?.["content"];
+      const output = this.toolResultContent(value);
       const isError = block?.["is_error"] === true;
+      const capacity = !isError && nativeCallId !== undefined && output.endsWith(TRUNCATION_MARKER)
+        ? completeTextCapacity?.(nativeCallId) : undefined;
+      const readCompleteText = capacity === undefined ? undefined : () => this.#completeToolResultText(value, capacity);
       const projectedBlock: MessageBlock = { kind: "tool_result", callId, output, isError };
-      toolResults.push({ callId, output, isError, block: projectedBlock });
+      toolResults.push({ callId, output, ...(readCompleteText === undefined ? {} : { readCompleteText }), isError, block: projectedBlock });
     }
     return { toolResults };
   }
@@ -205,6 +215,26 @@ export class SafeProjection {
     }
     if (value.length > MAX_NATIVE_CONTENT_BLOCKS) fragments.push("[Truncated]");
     return bound(fragments.join("\n"), MAX_TOOL_TEXT);
+  }
+
+  #completeToolResultText(value: unknown, capacity: number): string | undefined {
+    if (typeof value !== "string" && (!Array.isArray(value) || value.length > MAX_NATIVE_CONTENT_BLOCKS)) return undefined;
+    const parts = typeof value === "string" ? [value] : value.flatMap((rawPart) => {
+      const part = record(rawPart);
+      return part?.["type"] === "text" && typeof part["text"] === "string" ? [part["text"]] : [];
+    });
+    const fragments: string[] = [];
+    let byteLength = 0;
+    for (const part of parts) {
+      if (part === "") continue;
+      if (Buffer.byteLength(part, "utf8") > capacity) return undefined;
+      const text = this.#redactText(part);
+      byteLength += Buffer.byteLength(text, "utf8") + (fragments.length === 0 ? 0 : 1);
+      if (byteLength > capacity) return undefined;
+      fragments.push(text);
+    }
+    const text = fragments.join("\n");
+    return text.length > MAX_TOOL_TEXT ? text : undefined;
   }
 }
 
