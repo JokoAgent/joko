@@ -14906,9 +14906,19 @@ export class SessionHost {
           return current;
         };
         assertArtifactAuthority(this.#store);
-        const artifact = await this.#artifactStore.ingestPath(sourcePath, { ...options, expiresAt: Date.now() + 10 * 60_000 });
+        const { openFile, ...metadata } = options ?? {};
+        const staging = { ...metadata, expiresAt: Date.now() + 10 * 60_000 };
+        const artifact = openFile === undefined
+          ? await this.#artifactStore.ingestPath(sourcePath, staging)
+          : await this.#artifactStore.ingestFileHandle(openFile.handle, {
+            ...staging, expectedSize: openFile.expectedSize, signal,
+            beforeFinalize: async () => {
+              await openFile.assertCurrent();
+              assertArtifactAuthority(this.#store);
+            }
+          });
         let localSource: Awaited<ReturnType<typeof validateLocalArtifactSource>> | undefined;
-        if (target.remoteWorkspace === undefined) {
+        if (openFile === undefined && target.remoteWorkspace === undefined) {
           try {
             const validated = await validateLocalArtifactSource({
               workspaceRoot: target.workspaceRoot,

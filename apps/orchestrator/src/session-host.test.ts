@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
@@ -3724,6 +3725,33 @@ describe("SessionHost", () => {
 
     exportSession.mockResolvedValue({ ...artifact, id: "missing-export-artifact" });
     await expect(fixture.host.exportSession(sessionId)).rejects.toThrow("Artifact does not exist or has expired.");
+  });
+
+  it("adopts a staged Session export from its original handle after checking its owner", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({ operationId: "create-staged-export", connection: fixture.connection,
+      targetId: "target-one", title: "Staged export", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const exported = Buffer.from("<!doctype html><title>Staged export</title>");
+    const sourcePath = join(fixture.directory, "staged-export.html");
+    const misleadingPath = join(fixture.directory, "other-export.html");
+    writeFileSync(sourcePath, exported);
+    writeFileSync(misleadingPath, "different contents");
+    let current = false;
+    const assertCurrent = vi.fn(async () => { if (!current) throw new Error("Staged export source retired."); });
+    vi.spyOn(fixture.adapter, "exportSession").mockImplementation(async (context) => {
+      const handle = await open(sourcePath, "r");
+      try {
+        return await context.storeArtifact(misleadingPath, { fileName: "staged-export.html", mimeType: "text/html",
+          openFile: { handle, expectedSize: exported.length, assertCurrent } });
+      } finally { await handle.close(); }
+    });
+    await expect(fixture.host.exportSession(sessionId)).rejects.toThrow("Staged export source retired.");
+    expect(fixture.store.listEvents({ sessionId, limit: 100 }).filter((event) => event.payload.type === "artifact")).toHaveLength(0);
+    current = true;
+    const blob = await fixture.host.exportSession(sessionId);
+    expect(blob.sha256).toBe(createHash("sha256").update(exported).digest("hex"));
+    expect(fixture.store.hasArtifactSource(blob.id)).toBe(false);
+    expect(assertCurrent).toHaveBeenCalledTimes(2);
   });
 
   it("captures only the first exact local Backend source and revalidates it on every reveal", async () => {

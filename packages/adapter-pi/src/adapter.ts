@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { type BigIntStats } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, rmdir, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2565,7 +2566,9 @@ export class PiBackendAdapter implements
 
   async exportSession(context: AdapterContext): Promise<BlobRef> {
     this.#assertReviewOperationAllowed(context, "export native history");
-    const response = await this.#runtime(context).transport.request({ type: "export_html" }, { signal: context.signal });
+    const runtime = this.#runtime(context);
+    if (context.target.remoteWorkspace === undefined) return this.#exportLocalSession(runtime, context);
+    const response = await runtime.transport.request({ type: "export_html" }, { signal: context.signal });
     const data = responseData(response);
     if (!isRecord(data) || typeof data.path !== "string") throw piError("PI_EXPORT_INVALID_RESPONSE", "Pi export_html returned no path", "dispatch");
     const exportPath = isAbsolute(data.path) ? resolve(data.path) : resolve(context.target.workspaceRoot, data.path);
@@ -2587,6 +2590,69 @@ export class PiBackendAdapter implements
         retryable: true,
         recovery: "Retry artifact ingestion while the Pi export path is still available."
       });
+    }
+  }
+
+  async #exportLocalSession(runtime: PiRuntime, context: AdapterContext): Promise<BlobRef> {
+    const parent = runtime.artifactDirectory;
+    const unsafe = () => piError("PI_EXPORT_FILE_UNSAFE", "The private Pi export destination changed", "dispatch", {
+      recovery: "Retry the export after resuming the task."
+    });
+    const parentIdentity = await lstat(parent, { bigint: true });
+    if (!parentIdentity.isDirectory() || !samePath(await realpath(parent), parent)) throw unsafe();
+    context.signal.throwIfAborted();
+    const directory = await mkdtemp(join(parent, "html-export-"));
+    const path = join(directory, "session.html");
+    let directoryIdentity: BigIntStats | undefined;
+    let file: FileHandle | undefined;
+    let fileIdentity: BigIntStats | undefined;
+    const directoryCurrent = async (): Promise<boolean> => {
+      if (directoryIdentity === undefined || !samePath(await realpath(directory), directory)) return false;
+      const [currentParent, currentDirectory] = await Promise.all([
+        lstat(parent, { bigint: true }), lstat(directory, { bigint: true })
+      ]);
+      return currentParent.isDirectory() && samePiExportObject(parentIdentity, currentParent)
+        && currentDirectory.isDirectory() && samePiExportObject(directoryIdentity, currentDirectory);
+    };
+    const assertCurrent = async (expected: BigIntStats): Promise<void> => {
+      const current = await lstat(path, { bigint: true }).catch(() => undefined);
+      if (!await directoryCurrent().catch(() => false) || !current?.isFile() || current.nlink !== 1n
+        || !samePiExportObject(expected, current) || current.size !== expected.size
+        || current.mtimeNs !== expected.mtimeNs || current.ctimeNs !== expected.ctimeNs) throw unsafe();
+      context.signal.throwIfAborted();
+    };
+    try {
+      directoryIdentity = await lstat(directory, { bigint: true });
+      if (!await directoryCurrent().catch(() => false)) throw unsafe();
+      file = await open(path, "wx+", 0o600);
+      fileIdentity = await file.stat({ bigint: true });
+      await assertCurrent(fileIdentity);
+      const response = await runtime.transport.request({ type: "export_html", outputPath: path }, { signal: context.signal });
+      const data = responseData(response);
+      if (!isRecord(data) || data.path !== path) {
+        throw piError("PI_EXPORT_INVALID_RESPONSE", "Pi did not acknowledge the requested export destination", "dispatch");
+      }
+      const exported = await file.stat({ bigint: true });
+      await assertCurrent(exported);
+      if (exported.size <= 0n || exported.size > BigInt(requireArtifactCapacity(context))) {
+        throw piError("PI_EXPORT_FILE_SIZE_INVALID", "Pi export is empty or exceeds the Artifact size limit", "dispatch");
+      }
+      try {
+        return await context.storeArtifact(path, {
+          fileName: `pi-${context.sessionId}.html`, mimeType: "text/html",
+          openFile: { handle: file, expectedSize: Number(exported.size), assertCurrent: () => assertCurrent(exported) }
+        });
+      } catch (error) {
+        throw asPiError(error, { code: "PI_EXPORT_STORE_FAILED", phase: "dispatch", retryable: true,
+          recovery: "Retry the Session export." });
+      }
+    } finally {
+      if (await directoryCurrent().catch(() => false)) {
+        const current = await lstat(path, { bigint: true }).catch(() => undefined);
+        if (fileIdentity && current?.isFile() && samePiExportObject(fileIdentity, current)) await unlink(path).catch(() => undefined);
+      }
+      await file?.close().catch(() => undefined);
+      if (await directoryCurrent().catch(() => false)) await rmdir(directory).catch(() => undefined);
     }
   }
 
@@ -8825,6 +8891,10 @@ function samePath(left: string, right: string): boolean {
   const normalizedLeft = resolve(left);
   const normalizedRight = resolve(right);
   return process.platform === "win32" ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase() : normalizedLeft === normalizedRight;
+}
+
+function samePiExportObject(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 function inactiveContinuationError(disposition: "steer" | "follow_up") {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -52,6 +52,7 @@ interface ScriptedPiProcessOptions {
   readonly runtimeToolCatalog?: unknown;
   readonly runtimeToolCatalogStatuses?: readonly unknown[];
   readonly responseDelayMsByCommand?: Readonly<Record<string, number>>;
+  readonly htmlExportReceipt?: (path: string) => string;
   readonly omitResponsesFor?: readonly string[];
   readonly failResponsesFor?: readonly string[];
   readonly clearQueueResponseData?: unknown;
@@ -499,9 +500,10 @@ class ScriptedPiProcess extends EventEmitter {
         this.#success(command, { summary: "summary", firstKeptEntryId: "entry-1", tokensBefore: 80, estimatedTokensAfter: 20 });
         return;
       case "export_html": {
-        const path = join(this.spec.cwd, "export.html");
+        const outputPath = typeof command.outputPath === "string" ? command.outputPath : undefined;
+        const path = outputPath ?? join(this.spec.cwd, "export.html");
         writeFileSync(path, "<html></html>");
-        this.#success(command, { path: "export.html" });
+        this.#success(command, { path: this.options.htmlExportReceipt?.(path) ?? outputPath ?? "export.html" });
         return;
       }
       case "bash": {
@@ -3250,6 +3252,43 @@ describe("PiBackendAdapter", () => {
     } finally {
       await adapter.dispose().catch(() => undefined);
     }
+  });
+
+  it.each(["different receipt", "cancelled", "native failure",
+    ...(process.platform === "win32" ? [] : ["replaced directory"] as const)] as const)("does not adopt a Pi HTML export after %s", async (failure) => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-export-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-export-workspace-"));
+    const abort = new AbortController();
+    let destination: string | undefined;
+    const adapter = createPiAdapter({ agentHome, sessionRoot: agentHome, versionProbe: async () => "pi 99.1.0-export",
+      processFactory: (spec) => new ScriptedPiProcess(spec, {
+        failResponsesFor: failure === "native failure" ? ["export_html"] : [],
+        htmlExportReceipt: (path) => {
+          destination = path;
+          if (failure === "different receipt") return join(workspace, "another.html");
+          if (failure === "cancelled") abort.abort();
+          if (failure === "replaced directory") {
+            renameSync(dirname(path), `${dirname(path)}-original`);
+            mkdirSync(dirname(path));
+            writeFileSync(path, "unowned replacement");
+          }
+          return path;
+        }
+      }) as unknown as PiProcessHandle });
+    const target: TargetDescriptor = { id: "export-target", backendId: "pi", displayName: "Export", workspaceRoot: workspace,
+      managed: true, trusted: false };
+    const storeArtifact = vi.fn();
+    const context = { ...makeContext(target, []), storeArtifact };
+    try {
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, context);
+      const workspaceBefore = await readdir(workspace);
+      await expect(adapter.exportSession({ ...context, signal: abort.signal, binding })).rejects.toThrow();
+      expect(storeArtifact).not.toHaveBeenCalled();
+      expect(destination).toBeDefined();
+      expect(await readdir(workspace)).toEqual(workspaceBefore);
+      if (failure === "replaced directory") await expect(readFile(destination!, "utf8")).resolves.toBe("unowned replacement");
+      else await expect(access(dirname(destination!))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await adapter.dispose(); }
   });
 
   it("reports a typed incomplete user Bash result one byte above host Artifact capacity", async () => {
