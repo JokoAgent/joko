@@ -130,6 +130,7 @@ export class PiRpcTransport {
   #sequence = 0;
   #expectedExit = false;
   #terminating = false;
+  #terminationAttempt: Promise<PiProcessExit> | undefined;
   #closed = false;
   #fatalError: PiAdapterError | undefined;
   #protocolKillTimer: NodeJS.Timeout | undefined;
@@ -180,13 +181,19 @@ export class PiRpcTransport {
     this.#process.stderr.on("data", (chunk: Buffer | string) => this.#captureStderr(chunk));
     this.#process.stderr.on("error", () => undefined);
     this.#process.stdin.on("error", () => undefined);
-    this.#process.once("error", (error) => {
+    this.#process.on("error", (error) => {
+      if (this.#closed) return;
+      const syscall = (error as NodeJS.ErrnoException).syscall;
+      const spawnFailure = typeof syscall === "string" && (syscall === "spawn" || syscall.startsWith("spawn "));
+      // Node can emit a kill error synchronously and leave the process alive.
+      // Keep listening through both signals and await the actual exit.
+      if (syscall === "kill" || (this.#terminating && !spawnFailure)) return;
       this.#fatalError ??= asPiError(error, {
-          code: "PI_PROCESS_SPAWN_FAILED",
-          phase: "spawn",
-          retryable: true,
-          recovery: "Verify the installed Pi executable, RPC compatibility, and service account PATH."
-        }, this.#redactValues);
+        code: "PI_PROCESS_SPAWN_FAILED",
+        phase: "spawn",
+        retryable: true,
+        recovery: "Verify the installed Pi executable, RPC compatibility, and service account PATH."
+      }, this.#redactValues);
       this.#rejectAll(this.#fatalError);
       queueMicrotask(() => this.#finishExit(this.#process.exitCode, this.#process.signalCode));
     });
@@ -341,19 +348,26 @@ export class PiRpcTransport {
     if (!Number.isFinite(graceMs) || graceMs < 0) {
       throw piError("PI_INVALID_SHUTDOWN_TIMEOUT", "Pi shutdown timeout must be a finite non-negative number", "shutdown");
     }
+    if (this.#terminationAttempt !== undefined) return this.#terminationAttempt;
     this.#expectedExit = true;
     this.#terminating = true;
+    const attempt = Promise.resolve().then(() => this.#awaitTermination(graceMs));
+    this.#terminationAttempt = attempt;
+    try {
+      return await attempt;
+    } finally {
+      this.#terminationAttempt = undefined;
+    }
+  }
+
+  async #awaitTermination(graceMs: number): Promise<PiProcessExit> {
+    if (this.#closed) return this.#exitPromise;
     this.#process.stdin.end();
+    let signalFailure: unknown;
     try {
       this.#process.kill("SIGTERM");
     } catch (error) {
-      throw asPiError(error, {
-        code: "PI_PROCESS_TERMINATE_FAILED",
-        phase: "shutdown",
-        retryable: true,
-        stateMayHaveChanged: true,
-        recovery: "Inspect the service-node process and terminate the fenced Pi runtime before retrying."
-      }, this.#redactValues);
+      signalFailure = error;
     }
 
     if (await settlesWithin(this.#exitPromise, graceMs)) return this.#exitPromise;
@@ -361,13 +375,7 @@ export class PiRpcTransport {
     try {
       this.#process.kill("SIGKILL");
     } catch (error) {
-      throw asPiError(error, {
-        code: "PI_PROCESS_KILL_FAILED",
-        phase: "shutdown",
-        retryable: true,
-        stateMayHaveChanged: true,
-        recovery: "Inspect and terminate the fenced Pi process manually; do not start another generation yet."
-      }, this.#redactValues);
+      signalFailure = error;
     }
     const confirmationMs = Math.max(25, Math.min(graceMs, 5_000));
     if (await settlesWithin(this.#exitPromise, confirmationMs)) return this.#exitPromise;
@@ -375,7 +383,10 @@ export class PiRpcTransport {
     const error = piError("PI_PROCESS_KILL_UNCONFIRMED", "Pi did not confirm exit after SIGKILL", "shutdown", {
       retryable: true,
       stateMayHaveChanged: true,
-      recovery: "Keep the generation fenced and inspect the service-node process before starting a replacement runtime."
+      recovery: "Keep the generation fenced and inspect the service-node process before starting a replacement runtime.",
+      ...(signalFailure === undefined ? {} : { cause: asPiError(signalFailure, {
+        code: "PI_PROCESS_SIGNAL_FAILED", phase: "shutdown"
+      }, this.#redactValues) })
     });
     this.#fatalError = error;
     this.#rejectAll(error);

@@ -704,7 +704,11 @@ describe("PiBackendAdapter", () => {
       providers: [{ id: "local", api: "openai-completions", baseUrl: "http://127.0.0.1:1234/v1", models: [{ id: "test-model", contextWindow: 32_768 }] }],
       processFactory: spec => {
         const child = new ScriptedPiProcess(spec), original = child.kill.bind(child);
-        child.kill = signal => permitExit ? original(signal) : true;
+        child.kill = signal => {
+          if (permitExit) return original(signal);
+          child.emit("error", Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill" }));
+          return false;
+        };
         if (processes.length > 0) child.sessionId = processes[0]!.sessionId;
         processes.push(child); return child as unknown as PiProcessHandle;
       } });
@@ -712,11 +716,16 @@ describe("PiBackendAdapter", () => {
     const base = { ...makeContext(target, []), resolveModelWorkingContext: () => budget };
     try {
       const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, base), bound = { ...base, binding };
+      const oldHome = processes[0]!.spec.env["PI_CODING_AGENT_DIR"]!;
       budget = 20_000; await expect(adapter.refreshModelWorkingContext(bound)).rejects.toBeDefined();
+      await expect(adapter.closeSession(binding, bound)).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
+      await expect(access(join(oldHome, "settings.json"))).resolves.toBeUndefined();
+      expect(processes[0]!.exitCode).toBeNull();
       expect(processes).toHaveLength(1);
       await expect(adapter.send({ text: "retained", images: [], files: [], mentions: [], disposition: "steer" }, bound)).rejects.toMatchObject({ publicError: { code: "PI_WORKING_CONTEXT_UNCONFIRMED" } });
       permitExit = true; budget = 12_000; await adapter.refreshModelWorkingContext(bound);
       expect(processes).toHaveLength(2); expect(processes[1]!.sessionFile).toBe(binding.opaqueRef);
+      await expect(access(oldHome)).rejects.toMatchObject({ code: "ENOENT" });
     } finally { permitExit = true; await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
   });
   it("isolates explicit skills for an empty shelf while retaining the native policy bridge", async () => {

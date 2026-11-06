@@ -3717,6 +3717,56 @@ describe("SessionHost", () => {
     expect(fixture.store.getBackend(adapter.id).descriptor.instanceGeneration).toBe(current.instanceGeneration);
   });
 
+  it("keeps the previous Pi task owned until a retried Backend replacement confirms exit", async () => {
+    const previous = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const replacement = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const fixture = await createFixture(previous);
+    const { sessionId } = (await fixture.host.createSession({
+      operationId: "create-pi-unconfirmed-retirement",
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Pi retirement confirmation",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value;
+    const originalBinding = fixture.store.getSession(sessionId).descriptor.binding;
+    const current = fixture.store.getBackend(previous.id).descriptor;
+    const close = vi.spyOn(previous, "closeSession").mockRejectedValueOnce(new JokoError({
+      code: "PI_PROCESS_KILL_UNCONFIRMED", message: "Pi did not confirm exit", phase: "shutdown",
+      retryable: true, stateMayHaveChanged: true, recovery: "Confirm the prior process exit and retry."
+    }));
+    const resumePrevious = vi.spyOn(previous, "resumeSession");
+    const replace = () => {
+      const { generation } = fixture.store.reserveBackendInstanceGeneration({ backendId: previous.id, adapterKind: current.adapterKind });
+      return fixture.host.replaceBackendInstance({
+        backendId: previous.id,
+        expectedCurrentGeneration: current.instanceGeneration,
+        perform: async (hooks) => {
+          await hooks.preparePrevious(replacement, generation);
+          const publication = fixture.store.publishBackendInstanceDescriptor({
+            descriptor: { ...current, instanceGeneration: generation },
+            expectedCurrentGeneration: current.instanceGeneration
+          });
+          if (publication.status !== "published") throw new Error("Fixture publication lost its generation fence.");
+          hooks.activateCurrent();
+        }
+      });
+    };
+
+    await expect(replace()).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
+    expect(fixture.host.currentAdapter(previous.id)).toBe(previous);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(fixture.store.getBackend(previous.id).descriptor.instanceGeneration).toBe(current.instanceGeneration);
+    expect(resumePrevious).not.toHaveBeenCalled();
+
+    await replace();
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(fixture.host.currentAdapter(previous.id)).toBe(replacement);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
+  });
+
   it("returns only a durable, identity-matching Session export BlobRef", async () => {
     const fixture = await createFixture();
     const sessionId = (await fixture.host.createSession({
