@@ -23,7 +23,7 @@ describe("WorkspaceFilesRoute leave gate", () => {
     const view = { ...workspace(), id: "workspace-local" };
     const index = (path: string) => ({ paths: [path], truncated: false, revision: path });
     const listA = vi.fn<AppController["listWorkspaceFiles"]>(async () => index("a-only.md"));
-    let finishB!: (index: ReturnType<typeof index>) => void;
+    let finishB!: (result: ReturnType<typeof index>) => void;
     const listB = vi.fn<AppController["listWorkspaceFiles"]>(() => new Promise(resolve => { finishB = resolve; }));
     const owner = (serverId: string, listWorkspaceFiles: AppController["listWorkspaceFiles"]): AppController => {
       const base = controller();
