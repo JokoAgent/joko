@@ -7241,6 +7241,7 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
     const commitHeadRevision = stringValue(gitCommit["headRevision"]);
     const gitPush = asRecord(response["workspaceGitPush"]);
     const scheduleDeletion = asRecord(response["scheduleDeletion"]);
+    const memoryReset = response["memoryReset"];
     return {
       accepted: response["accepted"],
       ...(response["pickedDirectory"] === undefined ? {} : { pickedDirectory: pickedExtensionDirectoryFromRecord(response["pickedDirectory"]) }),
@@ -7256,6 +7257,9 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
       ...(Object.keys(scheduleDeletion).length === 0 ? {} : {
         scheduleDeletion: scheduleDeletionOutcomeFromRecord(scheduleDeletion)
       }),
+      ...(record.kind === "resetMemory" && memoryReset !== null && typeof memoryReset === "object" && !Array.isArray(memoryReset)
+        ? { memoryReset: validateNativeMemoryResetResult(memoryReset as NativeMemoryResetResult) }
+        : {}),
       ...(Object.keys(rewind).length === 0 ? {} : {
         workspaceRewind: {
           workspaceId: stringValue(rewind["workspaceId"]) ?? "",
