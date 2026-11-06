@@ -86,7 +86,7 @@ export interface RemoteWorkspaceDelegate {
   register(input: WorkspaceRegistration): Promise<WorkspaceRegistration>;
   unregister(id: string): void;
   watchChanges(scope: WorkspaceFileChangeScope, signal?: AbortSignal): AsyncGenerator<WorkspaceFileChangeRecord>;
-  invoke<Result>(workspaceId: string, method: string, args: readonly unknown[]): Promise<Result>;
+  invoke<Result>(workspaceId: string, method: string, args: readonly unknown[], request?: WorkspaceFileRequestAuthority): Promise<Result>;
   stream<Result>(workspaceId: string, method: string, args: readonly unknown[]): AsyncGenerator<Result>;
   close(): Promise<void>;
 }
@@ -130,6 +130,11 @@ export interface WorkspacePreviewAuthority {
   readonly identity: string;
   readonly assertCurrent: () => void;
   readonly preview: (path: string, maximumBytes?: number, maximumFileBytes?: number, signal?: AbortSignal) => Promise<WorkspaceFilePreview>;
+}
+
+export interface WorkspaceFileRequestAuthority {
+  readonly signal: AbortSignal;
+  readonly assertCurrent: () => void;
 }
 
 export type WorkspaceFilePreviewErrorCode =
@@ -654,12 +659,15 @@ export class WorkspaceService {
     } };
   }
 
-  async preview(workspaceId: string, path: string, maximumBytes = 2 * 1024 * 1024, maximumFileBytes?: number): Promise<WorkspaceFilePreview> {
+  async preview(workspaceId: string, path: string, maximumBytes = 2 * 1024 * 1024, maximumFileBytes?: number,
+    request?: WorkspaceFileRequestAuthority): Promise<WorkspaceFilePreview> {
+    request?.assertCurrent();
     if (this.#isRemote(workspaceId)) {
-      return this.#remoteInvoke(workspaceId, "preview", maximumFileBytes === undefined ? [path, maximumBytes] : [path, maximumBytes, maximumFileBytes]);
+      return this.#remoteInvoke(workspaceId, "preview", maximumFileBytes === undefined ? [path, maximumBytes] : [path, maximumBytes, maximumFileBytes], request);
     }
     const workspace = this.requireWorkspace(workspaceId);
     const resolved = await this.#resolveWorkspacePreviewFile(workspace, path);
+    request?.assertCurrent();
     const observedRevision = metadataFileRevision(resolved.info);
     if (maximumFileBytes !== undefined && (!Number.isSafeInteger(maximumFileBytes) || maximumFileBytes < 1 || resolved.info.size > maximumFileBytes)) {
       throw new WorkspaceFilePreviewError("The file exceeds the complete preview budget.", "unsupported");
@@ -684,7 +692,8 @@ export class WorkspaceService {
           truncated: false
         };
       }
-      const snapshot = await this.#readWorkspacePreviewSnapshot(workspace, resolved, resolved.info.size);
+      const snapshot = await this.#readWorkspacePreviewSnapshot(workspace, resolved, resolved.info.size, request);
+      request?.assertCurrent();
       return {
         entry: workspaceFileEntry(resolved.path, snapshot.info, workspaceFileContentRevision(snapshot.bytes)),
         observedRevision: metadataFileRevision(snapshot.info),
@@ -706,7 +715,8 @@ export class WorkspaceService {
     const readLength = resolved.info.size <= WORKSPACE_TEXT_FILE_MAXIMUM_BYTES
       ? resolved.info.size
       : Math.min(resolved.info.size, visibleMaximum);
-    const snapshot = await this.#readWorkspacePreviewSnapshot(workspace, resolved, readLength);
+    const snapshot = await this.#readWorkspacePreviewSnapshot(workspace, resolved, readLength, request);
+    request?.assertCurrent();
     const content = snapshot.bytes;
     const entry = workspaceFileEntry(
       resolved.path,
@@ -849,9 +859,10 @@ export class WorkspaceService {
     }
   }
 
-  async writeTextFile(workspaceId: string, input: WorkspaceTextFileWriteInput): Promise<WorkspaceTextFileWriteResult> {
+  async writeTextFile(workspaceId: string, input: WorkspaceTextFileWriteInput, request?: WorkspaceFileRequestAuthority): Promise<WorkspaceTextFileWriteResult> {
+    request?.assertCurrent();
     if (this.#isRemote(workspaceId)) {
-      return this.#remoteInvoke(workspaceId, "writeTextFile", [input]);
+      return this.#remoteInvoke(workspaceId, "writeTextFile", [input], request);
     }
     const workspace = this.requireWorkspace(workspaceId);
     const canonicalPath = canonicalWorkspaceRelativePath(input.path);
@@ -864,17 +875,24 @@ export class WorkspaceService {
     }
 
     return this.#serializeWorkspaceFileMutation(`${workspace.root}\0*`, async () => {
+      const assertCurrent = (): void => {
+        request?.assertCurrent();
+        if (this.#workspaces.get(workspaceId) !== workspace) throw new WorkspaceTextFileWriteError("The workspace changed before saving.", "stale");
+      };
+      assertCurrent();
       const before = await this.#readWorkspaceTextSnapshot(workspace, canonicalPath);
       if (before.revision !== input.expectedRevision) {
         throw new WorkspaceTextFileWriteError("Workspace file changed; read it again before saving.", "stale");
       }
 
+      assertCurrent();
       const temporaryPath = resolve(dirname(before.absolute), `.joko-write-${randomUUID()}.tmp`);
       try {
         let stagedInfo: Stats | undefined;
         try {
           const handle = await open(temporaryPath, "wx", before.info.mode & 0o777);
           try {
+            assertCurrent();
             await handle.writeFile(bytes);
             await handle.chmod(before.info.mode & 0o777);
             await handle.sync();
@@ -883,6 +901,7 @@ export class WorkspaceService {
             await handle.close();
           }
         } catch (error) {
+          assertCurrent();
           if (error instanceof WorkspaceTextFileWriteError) throw error;
           throw new WorkspaceTextFileWriteError("Workspace text could not be staged safely.", "write_failed");
         }
@@ -897,11 +916,13 @@ export class WorkspaceService {
           throw new WorkspaceTextFileWriteError("Workspace file changed; read it again before saving.", "stale");
         }
 
+        assertCurrent();
         try {
           await this.#commitWorkspaceTextFile(temporaryPath, before.absolute);
         } catch {
           throw new WorkspaceTextFileWriteError("Workspace text could not be committed safely.", "write_failed");
         }
+        assertCurrent();
 
         if (stagedInfo === undefined) {
           throw new WorkspaceTextFileWriteError("Workspace text staging did not produce file metadata.", "write_failed");
@@ -2788,7 +2809,8 @@ export class WorkspaceService {
   async #readWorkspacePreviewSnapshot(
     workspace: WorkspaceRegistration,
     resolved: WorkspaceResolvedPreviewFile,
-    maximumBytes: number
+    maximumBytes: number,
+    request?: WorkspaceFileRequestAuthority
   ): Promise<{ readonly info: Stats; readonly bytes: Buffer }> {
     let handle: FileHandle;
     try {
@@ -2804,6 +2826,7 @@ export class WorkspaceService {
       if (!sameFileState(before, resolved.info)) {
         throw new WorkspaceFilePreviewError("Workspace preview file changed while it was being opened.", "stale");
       }
+      request?.assertCurrent();
       const bytes = await readFileHandlePrefix(handle, maximumBytes);
       await this.#afterWorkspacePreviewRead?.({ workspaceId: workspace.id, path: resolved.path });
       const after = await handle.stat();
@@ -2823,6 +2846,7 @@ export class WorkspaceService {
       }
       return { info: current.info, bytes };
     } catch (error) {
+      request?.assertCurrent();
       if (error instanceof WorkspaceFilePreviewError) throw error;
       throw new WorkspaceFilePreviewError("Workspace preview file could not be read safely.", "read_failed");
     } finally {
@@ -3232,9 +3256,10 @@ export class WorkspaceService {
     return this.#workspaces.get(id)?.remote !== undefined;
   }
 
-  async #remoteInvoke<Result>(id: string, method: string, args: readonly unknown[]): Promise<Result> {
+  async #remoteInvoke<Result>(id: string, method: string, args: readonly unknown[], request?: WorkspaceFileRequestAuthority): Promise<Result> {
     if (this.#remoteDelegate === undefined) throw new Error("Remote workspace files are unavailable.");
-    return this.#remoteDelegate.invoke<Result>(id, method, args);
+    return request === undefined ? this.#remoteDelegate.invoke<Result>(id, method, args)
+      : this.#remoteDelegate.invoke<Result>(id, method, args, request);
   }
 
   private requireWorkspace(id: string): WorkspaceRegistration {

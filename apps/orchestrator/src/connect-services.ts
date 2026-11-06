@@ -3435,7 +3435,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       };
     },
     readWorkspaceFile: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
       if (request.requireBlob && request.maximumBytes === 0n) {
         throw invalidArgument("A positive complete-file byte limit is required for Blob materialization.");
       }
@@ -3444,41 +3444,47 @@ export function createConnectServices(application: OrchestratorApplication, proj
       }
       const maximum = safeByteCount(request.maximumBytes, 2 * 1024 * 1024);
       const start = safeByteCount(request.startByte, 0);
-      const preview = await dependencies.workspaceService.preview(
-        request.workspaceId,
-        request.relativePath,
-        request.requireBlob ? 1 : start + maximum
-      );
-      if (request.expectedRevision !== undefined && request.expectedRevision.opaqueRevision !== ""
-        && request.expectedRevision.opaqueRevision !== preview.entry.revision
-        && request.expectedRevision.opaqueRevision !== preview.observedRevision) {
-        throw new ConnectError("Workspace file revision changed.", Code.Aborted);
-      }
-      let materialized: ArtifactRecord | undefined;
-      if (request.requireBlob || preview.bytes === undefined && preview.text === undefined) {
-        if ((request.requireBlob && preview.entry.size > maximum)
-          || preview.entry.size > dependencies.artifactStore.maximumBlobBytes) {
-          throw new ConnectError("Workspace file exceeds the configured Blob download limit.", Code.ResourceExhausted);
-        }
-        materialized = await dependencies.workspaceService.materializeFile(
-          request.workspaceId,
-          request.relativePath,
-          preview.entry.revision,
-          (handle, options) => dependencies.artifactStore.ingestFileHandle(handle, {
-            ...options,
-            fileName: basename(preview.entry.path),
-            mimeType: preview.mediaType,
-            expiresAt: Date.now() + 5 * 60 * 1000
-          }),
-          context.signal
+      const owner = captureWorkspaceFileRequest(dependencies.connections, connection, context.signal);
+      try {
+        const preview = await dependencies.workspaceService.preview(
+          request.workspaceId, request.relativePath, request.requireBlob ? 1 : start + maximum, undefined, owner
         );
-      }
-      return { preview: await mapFilePreview(dependencies.artifactStore, request.workspaceId, preview, start, maximum, materialized) };
+        owner.assertCurrent();
+        if (request.expectedRevision !== undefined && request.expectedRevision.opaqueRevision !== ""
+          && request.expectedRevision.opaqueRevision !== preview.entry.revision
+          && request.expectedRevision.opaqueRevision !== preview.observedRevision) {
+          throw new ConnectError("Workspace file revision changed.", Code.Aborted);
+        }
+        let materialized: ArtifactRecord | undefined;
+        if (request.requireBlob || preview.bytes === undefined && preview.text === undefined) {
+          if ((request.requireBlob && preview.entry.size > maximum)
+            || preview.entry.size > dependencies.artifactStore.maximumBlobBytes) {
+            throw new ConnectError("Workspace file exceeds the configured Blob download limit.", Code.ResourceExhausted);
+          }
+          materialized = await dependencies.workspaceService.materializeFile(
+            request.workspaceId,
+            request.relativePath,
+            preview.entry.revision,
+            (handle, options) => dependencies.artifactStore.ingestFileHandle(handle, {
+              ...options,
+              fileName: basename(preview.entry.path),
+              mimeType: preview.mediaType,
+              expiresAt: Date.now() + 5 * 60 * 1000
+            }),
+            owner.signal
+          );
+          owner.assertCurrent();
+        }
+        const result = await mapFilePreview(dependencies.artifactStore, request.workspaceId, preview, start, maximum, materialized);
+        owner.assertCurrent();
+        return { preview: result };
+      } catch (error) { owner.assertCurrent(); throw error; }
+      finally { owner.dispose(); }
     },
     readWorkspaceHtmlSnapshot: async (request, context) => {
       const connection = authenticate(context);
       if (request.file === undefined) throw invalidArgument("An HTML workspace reference is required.");
-      const owner = captureHtmlConnectionRead(dependencies.connections, connection);
+      const owner = captureConnectionRevocation(dependencies.connections, connection);
       try {
         const snapshot = await readWorkspaceHtmlSnapshot({
           store: dependencies.store, workspaces: dependencies.workspaceService, sessionId: request.sessionId,
@@ -3488,7 +3494,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
       } finally { owner.dispose(); }
     },
     writeWorkspaceTextFile: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
+      const owner = captureWorkspaceFileRequest(dependencies.connections, connection, context.signal);
       try {
         const target = targetForWorkspace(dependencies.store, request.workspaceId);
         if (target === undefined) {
@@ -3502,15 +3509,17 @@ export function createConnectServices(application: OrchestratorApplication, proj
           path: request.relativePath,
           text: request.utf8Text,
           expectedRevision: request.expectedRevision?.opaqueRevision ?? ""
-        });
+        }, owner);
+        owner.assertCurrent();
         return {
           entry: mapWorkspaceEntry(request.workspaceId, result.entry, result.mediaType),
           previousRevision: preserveFileRevision(request.expectedRevision, result.previousRevision),
           newRevision: fileRevision(result.entry)
         };
       } catch (error) {
+        owner.assertCurrent();
         throw workspaceTextFileConnectError(error);
-      }
+      } finally { owner.dispose(); }
     },
     searchWorkspace: async (request, context) => {
       authenticate(context);
@@ -22466,7 +22475,7 @@ async function dispatchMutation(
             requireActiveBrowserSessionAuthority(dependencies.browserState, requestedPageOwner);
             requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
           };
-          const htmlOwner = htmlSource === undefined ? undefined : captureHtmlConnectionRead(dependencies.connections, connection);
+          const htmlOwner = htmlSource === undefined ? undefined : captureConnectionRevocation(dependencies.connections, connection);
           releaseOpenedReadOwner = htmlOwner?.dispose;
           let pageOwnsRead = false;
           try {
@@ -24308,13 +24317,23 @@ function submittedExtensionResult(
   }
 }
 
-function captureHtmlConnectionRead(connections: ConnectionManager, connection: ConnectionRecord): { readonly signal: AbortSignal; readonly dispose: () => void } {
+function captureConnectionRevocation(connections: ConnectionManager, connection: ConnectionRecord): { readonly signal: AbortSignal; readonly dispose: () => void } {
   const abort = new AbortController();
   const unsubscribe = connections.onRevoked(connection.id, () => abort.abort());
   let disposed = false;
   const dispose = (): void => { if (disposed) return; disposed = true; unsubscribe(); abort.abort(); };
   try { connections.fence(connection); } catch (error) { dispose(); throw error; }
   return { signal: abort.signal, dispose };
+}
+
+function captureWorkspaceFileRequest(connections: ConnectionManager, connection: ConnectionRecord, requestSignal: AbortSignal) {
+  const owner = captureConnectionRevocation(connections, connection);
+  const signal = AbortSignal.any([owner.signal, requestSignal]);
+  const assertCurrent = (): void => {
+    try { connections.fence(connection); } catch (error) { throw toConnectError(error); }
+    if (signal.aborted) throw new ConnectError("The workspace file request was cancelled.", Code.Canceled);
+  };
+  return { signal, assertCurrent, dispose: owner.dispose };
 }
 
 function toProtoSessionResource(
