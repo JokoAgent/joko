@@ -608,6 +608,12 @@ export class ScheduleCoordinator {
       return { runId, status: "skipped" };
     }
 
+    if (extension.executionMode === "script" && this.#store.getTarget(schedule.targetId).descriptor.remoteWorkspace !== undefined) {
+      this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
+        ...(nextRunAt === undefined ? {} : { nextRunAt }), status: "failed",
+        detail: { reason: "Script Schedules require a project on this node.", costAttribution: "zero" } });
+      return { runId, status: "failed" };
+    }
     if (schedule.sessionMode !== "fresh" && schedule.sessionId !== undefined) {
       const session = this.#store.findSession(schedule.sessionId);
       if (session && session.descriptor.deletedAt === undefined
@@ -929,12 +935,18 @@ export class ScheduleCoordinator {
         throw new Error("The Schedule occurrence is no longer active.");
       }
       const current = this.#store.getTarget(runningSchedule.targetId);
+      if (current.descriptor.remoteWorkspace !== undefined || executionTarget.remoteWorkspace !== undefined) {
+        throw new Error("Script Schedules require a project on this node.");
+      }
       if (current.revision !== target.revision || current.descriptor.workspaceRoot !== target.descriptor.workspaceRoot || !current.descriptor.trusted) {
         throw new Error("The Schedule workspace changed or is no longer trusted.");
       }
       if (runningSchedule.sessionMode === "bound") this.requireUsableSession(runningSchedule, runningSchedule.sessionId);
-      if (isolated && this.#host.scheduledExecutionTarget(runningSchedule.sessionId!).workspaceRoot !== executionTarget.workspaceRoot) {
-        throw new Error("The Schedule task workspace changed.");
+      if (isolated) {
+        const effective = this.#host.scheduledExecutionTarget(runningSchedule.sessionId!);
+        if (effective.remoteWorkspace !== undefined || effective.workspaceRoot !== executionTarget.workspaceRoot) {
+          throw new Error("The Schedule task workspace changed.");
+        }
       }
     };
     try {

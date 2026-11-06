@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
@@ -10598,6 +10598,25 @@ describe("SessionHost", () => {
     expect(outcome).toMatchObject({ status: "success", sessionId: boundId }); expect(f.store.listSessions()).toHaveLength(2);
     expect(f.store.getSession(boundId).descriptor).toMatchObject({ providerId: "vision", modelId: "multimodal", permissionMode: "auto", planMode: true });
     expect(f.store.listQueueItems({ sessionId: boundId })).toHaveLength(1); expect(() => retained!.assertCurrent()).toThrow();
+  });
+
+  it("fails a saved SSH script Schedule before any local fallback effect", async () => {
+    const f = await createFixture();
+    const local = f.store.getTarget("target-one").descriptor;
+    f.store.upsertTarget({ ...local, remoteWorkspace: { kind: "ssh", hostTargetId: local.id, hostId: "remote-host", workspaceRoot: "/remote/project" } });
+    const marker = join(local.workspaceRoot, "wrong-node-effect");
+    seedScriptSchedule(f, "legacy-ssh-script");
+    const executeScript = vi.fn(async (input: ScheduleScriptInput) => {
+      writeFileSync(join(input.cwd, "wrong-node-effect"), "script ran");
+      throw new Error("The local fallback ran.");
+    });
+    const coordinator = new ScheduleCoordinator(f.store, f.host, { executeScript });
+    cleanups.push(() => coordinator.stop());
+    const result = await coordinator.runNowWithResult("legacy-ssh-script", "explicit-ssh-script-fire");
+    expect(result.status).toBe("failed");
+    expect(executeScript).not.toHaveBeenCalled();
+    expect(existsSync(marker)).toBe(false);
+    expect(f.store.findScheduleRunByRunId(result.runId)).toMatchObject({ status: "failed", detail: { reason: "Script Schedules require a project on this node." } });
   });
 
   it("closes a late native creation after script cancellation without adopting or queueing it", async () => {
