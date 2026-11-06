@@ -14781,8 +14781,13 @@ describe("native current-task Files ownership", () => {
       vi.mocked(network.watchWorkspace).mockImplementation(async function* (_credential, _workspace, signal) {
         while (!signal.aborted) {
           if (queued.length === 0) await new Promise<void>((resolve) => {
-            wake = resolve;
-            signal.addEventListener("abort", resolve, { once: true });
+            const resume = () => {
+              signal.removeEventListener("abort", resume);
+              wake = undefined;
+              resolve();
+            };
+            wake = resume;
+            signal.addEventListener("abort", resume, { once: true });
           });
           if (signal.aborted) return;
           const change = queued.shift();
