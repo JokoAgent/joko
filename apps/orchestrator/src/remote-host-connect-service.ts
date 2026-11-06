@@ -57,23 +57,26 @@ export function createRemoteHostConnectService(
     };
     return { connectionId, assertCurrent };
   };
-  const connectWithOwner = async (
-    context: HandlerContext,
-    connect: (signal: AbortSignal, assertCurrent: () => void) => Promise<RemoteHostConnectionOutcome>
-  ): Promise<RemoteHostConnectionOutcome> => {
-    const owner = captureOwner(context);
+  const observeOwner = (context: HandlerContext, owner: ReturnType<typeof captureOwner>) => {
     const revocation = new AbortController();
     const stop = onRevoked?.(owner.connectionId, () => revocation.abort(revokedRemoteHostOwner()));
-    const signal = AbortSignal.any([context.signal, revocation.signal]);
+    const signal = stop === undefined ? context.signal : AbortSignal.any([context.signal, revocation.signal]);
     const assertCurrent = (): void => {
       revocation.signal.throwIfAborted();
       owner.assertCurrent();
     };
+    return { signal, assertCurrent, close: () => stop?.() };
+  };
+  const connectWithOwner = async (
+    context: HandlerContext,
+    connect: (signal: AbortSignal, assertCurrent: () => void) => Promise<RemoteHostConnectionOutcome>
+  ): Promise<RemoteHostConnectionOutcome> => {
+    const observation = observeOwner(context, captureOwner(context));
     try {
-      const result = await connect(signal, assertCurrent);
-      assertCurrent();
+      const result = await connect(observation.signal, observation.assertCurrent);
+      observation.assertCurrent();
       return result;
-    } finally { stop?.(); }
+    } finally { observation.close(); }
   };
   return {
     getRemoteHostCapabilities: async (request, context) => remoteHostRpc(async () => {
@@ -462,30 +465,38 @@ export function createRemoteHostConnectService(
 
     installRemoteBackendRuntime: async function* (request, context) {
       try {
-        authenticate(context);
-        const events = requireRuntimeSetup(runtimeSetup).install({
-          requestId: publicIdentity(request.requestId, "request_id"),
-          targetId: publicIdentity(request.targetId, "target_id"),
-          hostId: publicHostAlias(request.hostId),
-          expectedTargetRevision: fromProtoRevision(request.expectedTargetRevision, "expected_target_revision"),
-          expectedHostRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision"),
-          reinstall: request.reinstall
-        }, context.signal);
-        for await (const event of events) yield toProtoRemoteBackendRuntimeInstallEvent(event);
+        const owner = captureOwner(context);
+        const observation = observeOwner(context, owner);
+        try {
+          const events = requireRuntimeSetup(runtimeSetup).install({
+            requestId: publicIdentity(request.requestId, "request_id"),
+            targetId: publicIdentity(request.targetId, "target_id"),
+            hostId: publicHostAlias(request.hostId),
+            expectedTargetRevision: fromProtoRevision(request.expectedTargetRevision, "expected_target_revision"),
+            expectedHostRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision"),
+            reinstall: request.reinstall
+          }, observation.signal, owner.assertCurrent);
+          for await (const event of events) {
+            observation.assertCurrent();
+            yield toProtoRemoteBackendRuntimeInstallEvent(event);
+          }
+          observation.assertCurrent();
+        } finally { observation.close(); }
       } catch (error) {
         throw remoteHostConnectError(error);
       }
     },
 
     uninstallRemoteBackendRuntime: async (request, context) => remoteHostRpc(async () => {
-      authenticate(context);
+      const owner = captureOwner(context);
       const runtime = await requireRuntimeSetup(runtimeSetup).uninstall({
         requestId: publicIdentity(request.requestId, "request_id"),
         targetId: publicIdentity(request.targetId, "target_id"),
         hostId: publicHostAlias(request.hostId),
         expectedTargetRevision: fromProtoRevision(request.expectedTargetRevision, "expected_target_revision"),
         expectedHostRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision")
-      });
+      }, owner.assertCurrent);
+      owner.assertCurrent();
       return create(contract.UninstallRemoteBackendRuntimeResponseSchema, {
         runtime: toProtoRemoteBackendRuntime(runtime)
       });

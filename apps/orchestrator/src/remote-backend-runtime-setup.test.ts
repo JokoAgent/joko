@@ -36,7 +36,8 @@ describe("RemoteBackendRuntimeSetupManager", () => {
     const gate = new Promise<void>((resolve) => { finish = resolve; });
     const fixture = setupFixture({
       probe: vi.fn(async () => ({ state: "not_installed" as const })),
-      install: vi.fn(async (_context, _reinstall, signal, onPhase) => {
+      install: vi.fn<RemoteBackendRuntimeSetupProvider["install"]>(async (context, _reinstall, signal, onPhase) => {
+        context.beginEffect();
         onPhase("downloading");
         await gate;
         expect(signal.aborted).toBe(false);
@@ -62,7 +63,8 @@ describe("RemoteBackendRuntimeSetupManager", () => {
   it("reports unknown rather than success when SSH authority changes after the remote effect", async () => {
     const fixture = setupFixture({
       probe: vi.fn(async () => ({ state: "not_installed" as const })),
-      install: vi.fn(async (_context, _reinstall, _signal, onPhase) => {
+      install: vi.fn<RemoteBackendRuntimeSetupProvider["install"]>(async (context, _reinstall, _signal, onPhase) => {
+        context.beginEffect();
         onPhase("installing");
         fixture.authorityCurrent = false;
         return { state: "ready" as const, installedVersion: "1.2.3" };
@@ -83,7 +85,8 @@ describe("RemoteBackendRuntimeSetupManager", () => {
       .mockRejectedValueOnce(new Error("probe unavailable"));
     const fixture = setupFixture({
       probe,
-      install: vi.fn(async () => {
+      install: vi.fn<RemoteBackendRuntimeSetupProvider["install"]>(async (context) => {
+        context.beginEffect();
         throw new RemoteCodexInstallationError("command_failed", "bounded", { stateMayHaveChanged: true });
       })
     });
@@ -102,7 +105,8 @@ describe("RemoteBackendRuntimeSetupManager", () => {
       .mockResolvedValueOnce({ state: "ready" as const, installedVersion: "1.2.3" });
     const fixture = setupFixture({
       probe,
-      install: vi.fn(async () => {
+      install: vi.fn<RemoteBackendRuntimeSetupProvider["install"]>(async (context) => {
+        context.beginEffect();
         throw new RemoteCodexInstallationError("command_failed", "bounded", { stateMayHaveChanged: true });
       })
     });
@@ -164,7 +168,8 @@ function setupFixture(overrides: Partial<RemoteBackendRuntimeSetupProvider> = {}
     displayName: "Fixture Runtime",
     expectedVersion: "1.2.3",
     probe: vi.fn(async () => ({ state: "ready" as const, installedVersion: "1.2.3" })),
-    install: vi.fn(async (_context, _reinstall, _signal, onPhase) => {
+    install: vi.fn<RemoteBackendRuntimeSetupProvider["install"]>(async (context, _reinstall, _signal, onPhase) => {
+      context.beginEffect();
       onPhase("validating");
       return { state: "ready" as const, installedVersion: "1.2.3" };
     }),

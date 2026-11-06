@@ -1,7 +1,9 @@
+import { EventEmitter } from "node:events";
 import { rmSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough, Writable } from "node:stream";
 
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext } from "@connectrpc/connect";
@@ -10,6 +12,8 @@ import {
   AgentAuthConnectorFailure,
   RemoteSshError,
   parseSshConfig,
+  type RemoteProcessHandle,
+  type RemoteProcessTransportPort,
   type SshConfigFilePort
 } from "@joko/remote-ssh";
 import { OperationalStore } from "@joko/store";
@@ -17,10 +21,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { toProtoRevision } from "./proto-mapper.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
-import type {
-  RemoteBackendRuntimeInstallEvent,
+import {
+  createRemoteCodexRuntimeSetupProvider,
   RemoteBackendRuntimeSetupManager,
-  RemoteBackendRuntimeSnapshot
+  type RemoteBackendRuntimeInstallEvent,
+  type RemoteBackendRuntimeSnapshot
 } from "./remote-backend-runtime-setup.js";
 import { createRemoteHostConnectService } from "./remote-host-connect-service.js";
 import {
@@ -475,6 +480,75 @@ describe("RemoteHostService", () => {
     await expect(refresh("new-refresh", owners.observer)).resolves.toMatchObject({ hosts: [{ hostId: "new-project" }] });
   });
 
+  it.each(["probe", "launch"] as const)("keeps a revoked installer from dispatching its script during %s", async (stage) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = vi.fn();
+    const installBytes = vi.fn();
+    const kill = vi.fn(() => true);
+    const probeOutput = Buffer.from(["/srv/project", "/home/test/.joko/runtime/v1/codex-home",
+      "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex", "codex-cli 9.9.9", "not_installed", ""].join("\0"));
+    const open = vi.fn<RemoteProcessTransportPort["open"]>(async (request) => {
+      const probe = request.args[0] === "-c";
+      if (!probe && stage === "launch") { waiting(); await gate; }
+      const handle = Object.assign(new EventEmitter(), {
+        pid: 42, exitCode: null as number | null, signalCode: null,
+        stdout: new PassThrough(), stderr: new PassThrough(), kill
+      });
+      const stdin = new Writable({
+        write(chunk, _encoding, callback) { if (!probe) installBytes(chunk); callback(); },
+        final(callback) {
+          const finish = () => {
+            if (probe) handle.stdout.write(probeOutput);
+            handle.exitCode = 0;
+            handle.emit("exit", 0, null);
+          };
+          if (probe && stage === "probe") { waiting(); void gate.then(finish); }
+          else queueMicrotask(finish);
+          callback();
+        }
+      });
+      return Object.assign(handle, { stdin }) satisfies RemoteProcessHandle;
+    });
+    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false };
+    const fixture = createFixture({ connector: { capabilities, async connect(request) {
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(2, 4, 6, 8) });
+      request.onAuthenticating();
+      return { capabilities, processes: { open }, close: async () => undefined };
+    } }, resolve: () => EPHEMERAL_SECRET });
+    const host = fixture.registry.create({ targetId: "target-a", id: "runtime-box", hostname: "runtime.example.test",
+      user: "maker", credentialReferenceId: "agent:runtime" });
+    const connected = await fixture.registry.connect(host.targetId, host.id, host.revision);
+    expect(connected.ok).toBe(true);
+    const runtime = new RemoteBackendRuntimeSetupManager({ store: fixture.store, registry: fixture.registry,
+      providers: [createRemoteCodexRuntimeSetupProvider("pi")], now: fixture.now });
+    cleanups.push(() => runtime.close());
+    const owners = pairedOwners(fixture, runtime);
+    const request = create(contract.InstallRemoteBackendRuntimeRequestSchema, {
+      requestId: "original-install", targetId: host.targetId, hostId: host.id,
+      expectedTargetRevision: toProtoRevision(fixture.registry.targetRevision(host.targetId)),
+      expectedHostRevision: toProtoRevision(connected.host.revision), reinstall: false
+    });
+    const original = owners.service.installRemoteBackendRuntime(request, owners.original)[Symbol.asyncIterator]();
+    await expect(original.next()).resolves.toMatchObject({ done: false });
+    const observed = (async () => {
+      const events: contract.InstallRemoteBackendRuntimeResponse[] = [];
+      for await (const event of owners.service.installRemoteBackendRuntime(request, owners.observer)) events.push(event);
+      return events;
+    })();
+    await vi.waitFor(() => expect(waiting).toHaveBeenCalledOnce());
+    const denied = expect(original.next()).rejects.toSatisfy(connectCode(Code.Unauthenticated));
+    owners.manager.revokeDevice(owners.originalDeviceId);
+    release();
+    await denied;
+    const events = await observed;
+    expect(events.at(-1)?.runtime).toMatchObject({ state: contract.RemoteBackendRuntimeState.FAILED,
+      failure: { code: contract.RemoteBackendRuntimeFailureCode.AUTHORITY_CHANGED } });
+    expect(open.mock.calls.map(([input]) => input.args[0])).toEqual(stage === "probe" ? ["-c"] : ["-c", "-s"]);
+    expect(installBytes).not.toHaveBeenCalled();
+    expect(kill).toHaveBeenCalledTimes(stage === "probe" ? 0 : 1);
+  });
+
   it("streams an initial snapshot and ordered target-local changes until authorization is revoked", async () => {
     const fixture = createFixture();
     let revoke = (): void => undefined;
@@ -648,7 +722,7 @@ describe("RemoteHostService", () => {
       expectedTargetRevision: targetRevision,
       expectedHostRevision: hostRecord.revision,
       reinstall: false
-    }, installSignal);
+    }, installSignal, expect.any(Function));
     expect(streamed.map((event) => [event.sequence, event.phase, event.runtime?.state])).toEqual([
       [1n, contract.RemoteBackendRuntimeInstallPhase.DOWNLOADING, contract.RemoteBackendRuntimeState.INSTALLING],
       [2n, contract.RemoteBackendRuntimeInstallPhase.COMPLETE, contract.RemoteBackendRuntimeState.READY]
@@ -667,7 +741,7 @@ describe("RemoteHostService", () => {
       hostId: "build-box",
       expectedTargetRevision: targetRevision,
       expectedHostRevision: hostRecord.revision
-    });
+    }, expect.any(Function));
     expect(uninstalled.runtime?.state).toBe(contract.RemoteBackendRuntimeState.NOT_INSTALLED);
     expect(safeJson({ probed, streamed, uninstalled })).not.toContain("backendId");
   });
@@ -804,7 +878,7 @@ function createFixture(options: {
   return { store, registry, now };
 }
 
-function pairedOwners(fixture: Fixture) {
+function pairedOwners(fixture: Fixture, runtimeSetup?: RemoteBackendRuntimeSetupManager) {
   const manager = new ConnectionManager(fixture.store);
   const pair = (name: string) => {
     const key = `remote-host-${name}-key`;
@@ -816,7 +890,7 @@ function pairedOwners(fixture: Fixture) {
   const service = createRemoteHostConnectService(fixture.registry, (caller) => {
     try { return { connectionId: manager.authenticate(caller.requestHeader.get("authorization") ?? undefined).id }; }
     catch { throw new ConnectError("The original connection was revoked.", Code.Unauthenticated); }
-  }, (connectionId, listener) => manager.onRevoked(connectionId, listener), fixture.now);
+  }, (connectionId, listener) => manager.onRevoked(connectionId, listener), fixture.now, runtimeSetup);
   return { manager, service, original: original.caller, observer: observer.caller, originalDeviceId: original.connection.deviceId };
 }
 

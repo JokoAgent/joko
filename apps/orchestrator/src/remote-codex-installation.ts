@@ -191,6 +191,7 @@ export async function installRemoteCodex(
   options: {
     readonly reinstall: boolean;
     readonly assertCurrent: () => void;
+    readonly beginEffect?: () => void;
     readonly signal?: AbortSignal;
     readonly onPhase?: (phase: RemoteCodexInstallPhase) => void;
   }
@@ -218,6 +219,7 @@ export async function installRemoteCodex(
     args: ["-s", "--", options.reinstall ? "1" : "0"],
     cwd: "/",
     input: INSTALL_SCRIPT,
+    beforeInput: options.beginEffect ?? options.assertCurrent,
     timeoutMs: INSTALL_TIMEOUT_MS,
     signal: options.signal,
     onStdout: acceptOutput
@@ -258,6 +260,7 @@ interface RemoteCommandInput {
   readonly args: readonly string[];
   readonly cwd: string;
   readonly input?: string | Buffer;
+  readonly beforeInput?: () => void;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
   readonly onStdout?: (chunk: Buffer) => void;
@@ -299,7 +302,7 @@ async function runRemoteCommand(
       handle.stderr.removeListener("error", onStreamError);
       handle.stdin.removeListener("error", onStreamError);
     };
-    const fail = (error: RemoteCodexInstallationError): void => {
+    const fail = (error: unknown): void => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -336,6 +339,9 @@ async function runRemoteCommand(
       cleanup();
       resolve(Object.freeze({ stdout: Buffer.concat(chunks, bytes), exitCode }));
     });
+    if (input.signal?.aborted) { abort(); return; }
+    try { input.beforeInput?.(); }
+    catch (error) { fail(error); return; }
     try {
       handle.stdin.end(input.input);
     } catch {
