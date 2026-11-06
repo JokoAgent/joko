@@ -4610,7 +4610,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (!turn.stopping && !turn.context.signal.aborted && !turn.mcpCallCancellation.signal.aborted) {
         await this.#emit(runtime, turn, { type: "error", terminal: false, error: {
           code: "CLAUDE_MCP_COMPLETE_OUTPUT_UNAVAILABLE", message: "The complete MCP result file could not be saved.",
-          phase: "stream", retryable: false, stateMayHaveChanged: false
+          phase: "stream", retryable: false, stateMayHaveChanged: false,
+          recovery: "Review the inline MCP result in this turn."
         } });
       }
       return undefined;
