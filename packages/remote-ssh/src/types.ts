@@ -354,6 +354,7 @@ export class AgentAuthConnectorFailure extends Error {
 export interface RemoteSshTestOptions {
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
+  readonly assertCurrent?: () => void;
 }
 
 export interface RemoteSshTestSuccess {

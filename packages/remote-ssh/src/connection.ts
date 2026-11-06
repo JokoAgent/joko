@@ -80,6 +80,7 @@ export class RemoteSshConnectionController {
 
   async test(scope: RemoteSshOwnerScope, options: RemoteSshTestOptions = {}): Promise<RemoteSshTestResult> {
     this.assertScope(scope);
+    options.assertCurrent?.();
     if (this.#status === "ready" && this.#connection !== undefined) {
       return Object.freeze({ ok: true, snapshot: this.currentSnapshot() });
     }
@@ -95,7 +96,7 @@ export class RemoteSshConnectionController {
       controller.abort();
     }, timeoutMs);
     timer.unref?.();
-    const operation = this.runTest(generation, controller.signal, () => timedOut)
+    const operation = this.runTest(generation, controller.signal, () => timedOut, options.assertCurrent)
       .finally(() => {
         clearTimeout(timer);
         detachExternalAbort();
@@ -257,7 +258,8 @@ export class RemoteSshConnectionController {
   private async runTest(
     generation: number,
     signal: AbortSignal,
-    timedOut: () => boolean
+    timedOut: () => boolean,
+    assertCurrent?: () => void
   ): Promise<RemoteSshTestResult> {
     this.#error = undefined;
     this.setStatus("connecting");
@@ -289,12 +291,16 @@ export class RemoteSshConnectionController {
           return Promise.reject(abortError(false));
         }
         verificationAttempted = true;
-        const verification = Promise.resolve().then(() => this.#hostKeyVerifier.verify({
+        const verification = Promise.resolve().then(() => {
+          if (this.#generation !== generation || signal.aborted) throw abortError(timedOut());
+          assertCurrent?.();
+          return this.#hostKeyVerifier.verify({
             hostname: this.#host.hostname,
             port: this.#host.port,
             algorithm: presented.algorithm,
             key: presented.key
-          }))
+          });
+        })
           .then(() => undefined)
           .catch((error: unknown) => {
             verificationFailure = normalizeHostKeyFailure(error);
@@ -347,6 +353,7 @@ export class RemoteSshConnectionController {
         await safeClose(connection);
         throw abortError(timedOut());
       }
+      assertCurrent?.();
       this.#connection = connection;
       this.setStatus("ready");
       this.safeLog("info", "SSH connection test succeeded.", { hostId: this.#host.id });
