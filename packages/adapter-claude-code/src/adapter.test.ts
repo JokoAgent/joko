@@ -4736,6 +4736,35 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.closeSession(binding, contextFor(binding).context);
   });
 
+  test.each([false, true])("publishes ordinary prose before a Claude block stops (stream ends early=%s)", async interrupted => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const active = contextFor(binding, { operationId: "live-prose" });
+    await adapter.send(textPrompt("Report the sample counts"), active.context);
+    const query = runtime.queries[0]!;
+    const nativeId = binding.nativeSessionId!;
+    const publishedText = () => active.events.flatMap(event => event.type === "text_delta" ? [event.delta] : []).join("");
+    query.push(streamEvent(nativeId, { type: "message_start", message: { id: "prose" } }));
+    query.push(streamEvent(nativeId, { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+    query.push(streamEvent(nativeId, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "The sample " } }));
+    await eventually(() => publishedText() === "The sample ");
+    query.push(streamEvent(nativeId, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "counts are 17, 24, and 31." } }));
+    await eventually(() => publishedText() === "The sample counts are 17, 24, and ");
+
+    if (interrupted) {
+      query.close();
+    } else {
+      query.push(streamEvent(nativeId, { type: "content_block_stop", index: 0 }));
+      query.push(resultMessage(nativeId, { result: "The sample counts are 17, 24, and 31.", totalCostUsd: 0 }));
+    }
+    await eventually(() => active.events.some(event => event.type === "done"));
+    expect(publishedText()).toBe("The sample counts are 17, 24, and 31.");
+    expect(active.events.filter(event => event.type === "message_complete")).toHaveLength(interrupted ? 0 : 1);
+    expect(active.events.at(-1)).toEqual({ type: "done", outcome: interrupted ? "failed" : "completed" });
+    await adapter.dispose();
+  });
+
   test("retires a native stream that exceeds the per-message content-block limit", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime);

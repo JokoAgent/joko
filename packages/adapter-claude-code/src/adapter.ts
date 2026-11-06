@@ -1971,7 +1971,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       seenParentMessageIds: new Set(),
       seenToolStarts: new Set(),
       seenToolResults: new Set(),
-      stream: new PartialMessageBuffer(),
+      stream: new PartialMessageBuffer(operationUuid(operationId)),
       steers: new Map(),
       stopping: false,
       inputConsumed: false,
@@ -4872,6 +4872,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           await turn.eventsReady.promise;
           await this.#settleNativeRetry(runtime, turn, "unknown");
           await this.#settleSteers(runtime, turn, "failed", publicError);
+          if (turn.nativeIdentityConfirmed && !(cause instanceof JokoError) && !(cause instanceof ProjectionLimitError)) {
+            for (const { blockId, delta, contentIndex } of turn.stream.interruptedPlainText(this.#projection)) {
+              await this.#emit(runtime, turn, { type: "text_delta", blockId, delta, contentIndex });
+            }
+          }
           await this.#emit(runtime, turn, { type: "error", error: publicError, terminal: true });
           await this.#emit(runtime, turn, { type: "done", outcome: "failed" });
         }

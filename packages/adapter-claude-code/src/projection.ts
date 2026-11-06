@@ -16,6 +16,11 @@ const MAX_IDENTIFIER = 512;
 const MAX_NATIVE_CONTENT_BLOCKS = 256;
 const MAX_PENDING_STREAM_BLOCKS = 256;
 const TRUNCATION_MARKER = "\n[Truncated]";
+// Complex syntax waits for the full redactor. Only text before an unambiguous
+// delimiter can be published while the next SDK fragment is still unknown.
+const PLAIN_TEXT_PREFIX = /^[\p{L}\p{M}\p{N}\p{Zs}\t\r\n.,;!?，。！？、；…]*/u;
+const PLAIN_TEXT_BOUNDARY = /[\p{Zs}\t\r\n,;!?，。！？、；…\p{Script=Han}]/u;
+const PLAIN_TEXT_BOUNDARIES = new RegExp(PLAIN_TEXT_BOUNDARY, "gu");
 
 export class ProjectionLimitError extends Error {
   constructor(message: string) {
@@ -61,23 +66,33 @@ export class SafeProjection {
   readonly #dynamicRedactValues: (() => readonly string[]) | undefined;
 
   constructor(redactValues: readonly string[], dynamicRedactValues?: () => readonly string[]) {
-    this.#redactValues = [...redactValues]
-      .filter((value) => value.length > 0)
-      .sort((left, right) => right.length - left.length);
+    this.#redactValues = [...redactValues];
     this.#dynamicRedactValues = dynamicRedactValues;
   }
 
   text(value: unknown, maximum = MAX_DISPLAY_TEXT): string {
     if (typeof value !== "string") return "";
     let projected = redactSecrets(value);
-    const redactions = [
-      ...this.#redactValues,
-      ...(this.#dynamicRedactValues?.() ?? [])
-    ].sort((left, right) => right.length - left.length);
-    for (const secret of redactions) {
-      if (secret.length > 0) projected = projected.split(secret).join("[REDACTED]");
-    }
+    for (const secret of this.#redactions()) projected = projected.split(secret).join("[REDACTED]");
     return bound(projected, maximum);
+  }
+
+  canPublishPlainPrefix(value: string): boolean {
+    if (redactSecrets(value) !== value) return false;
+    for (const secret of this.#redactions()) {
+      if (value.includes(secret)) return false;
+      const maximumOverlap = Math.min(value.length, secret.length - 1);
+      for (let length = 1; length <= maximumOverlap; length += 1) {
+        if (value.endsWith(secret.slice(0, length))) return false;
+      }
+    }
+    return true;
+  }
+
+  #redactions(): string[] {
+    return [...this.#redactValues, ...(this.#dynamicRedactValues?.() ?? [])]
+      .filter((value) => value.length > 0)
+      .sort((left, right) => right.length - left.length);
   }
 
   identifier(value: unknown, fallback: string): string {
@@ -196,19 +211,24 @@ export class SafeProjection {
 interface PendingStreamBlock {
   readonly kind: "text" | "thinking";
   value: string;
+  published: number;
   truncated: boolean;
+}
+
+interface ProjectedStreamDelta {
+  readonly kind: PendingStreamBlock["kind"];
+  readonly blockId: string;
+  readonly contentIndex: number;
+  readonly delta: string;
 }
 
 export class PartialMessageBuffer {
   #epoch = 0;
   readonly #blocks = new Map<number, PendingStreamBlock>();
 
-  accept(eventEnvelope: unknown, projection: SafeProjection): {
-    readonly kind: "text" | "thinking";
-    readonly blockId: string;
-    readonly contentIndex: number;
-    readonly delta: string;
-  } | undefined {
+  constructor(private readonly turnIdentity: string) {}
+
+  accept(eventEnvelope: unknown, projection: SafeProjection): ProjectedStreamDelta | undefined {
     const envelope = record(eventEnvelope);
     const event = record(envelope?.["event"]);
     const type = stringValue(event?.["type"]);
@@ -224,6 +244,7 @@ export class PartialMessageBuffer {
       const blockType = stringValue(contentBlock?.["type"]);
       if (blockType === "text") {
         this.#setBlock(index, "text", stringValue(contentBlock?.["text"]) ?? "");
+        return this.#plainDelta(index, projection);
       } else if (blockType === "thinking") {
         this.#setBlock(index, "thinking", stringValue(contentBlock?.["thinking"]) ?? "");
       }
@@ -245,17 +266,49 @@ export class PartialMessageBuffer {
       } else {
         appendStreamFragment(pending, fragment);
       }
-      return undefined;
+      return PLAIN_TEXT_BOUNDARY.test(fragment) ? this.#plainDelta(index, projection) : undefined;
     }
     if (type !== "content_block_stop") return undefined;
     const pending = this.#blocks.get(index);
     this.#blocks.delete(index);
     if (pending === undefined) return undefined;
-    const delta = projection.text(pending.truncated ? `${pending.value}${TRUNCATION_MARKER}` : pending.value);
+    const projected = projection.text(pending.truncated ? `${pending.value}${TRUNCATION_MARKER}` : pending.value);
+    if (!projected.startsWith(pending.value.slice(0, pending.published))) return undefined;
+    return this.#delta(index, pending.kind, projected.slice(pending.published));
+  }
+
+  interruptedPlainText(projection: SafeProjection): ProjectedStreamDelta[] {
+    return [...this.#blocks.keys()].sort((left, right) => left - right).flatMap((index) => {
+      const delta = this.#plainDelta(index, projection, true);
+      return delta === undefined ? [] : [delta];
+    });
+  }
+
+  #plainDelta(index: number, projection: SafeProjection, interrupted = false): ProjectedStreamDelta | undefined {
+    const pending = this.#blocks.get(index);
+    if (pending?.kind !== "text" || pending.truncated) return undefined;
+    const tail = pending.value.slice(pending.published);
+    let plain = PLAIN_TEXT_PREFIX.exec(tail)?.[0] ?? "";
+    // Bearer credentials can start after any amount of whitespace, across
+    // fragment boundaries. Keep the marker and all following text together.
+    const bearer = /\bBearer(?=\s|$)/iu.exec(plain);
+    if (bearer !== null) plain = plain.slice(0, bearer.index);
+    let boundary = interrupted && plain === tail ? plain.length : 0;
+    if (boundary === 0) {
+      for (const delimiter of plain.matchAll(PLAIN_TEXT_BOUNDARIES)) boundary = delimiter.index + delimiter[0].length;
+    }
+    const prefix = plain.slice(0, boundary);
+    if (prefix.length === 0 || (pending.published === 0 && prefix.trim() === "")
+      || !projection.canPublishPlainPrefix(prefix)) return undefined;
+    pending.published += prefix.length;
+    return this.#delta(index, pending.kind, prefix);
+  }
+
+  #delta(index: number, kind: PendingStreamBlock["kind"], delta: string): ProjectedStreamDelta | undefined {
     if (delta.length === 0) return undefined;
     return {
-      kind: pending.kind,
-      blockId: `claude-block-${this.#epoch}-${index}`,
+      kind,
+      blockId: `claude-block-${this.turnIdentity}-${this.#epoch}-${index}`,
       contentIndex: index,
       delta
     };
@@ -274,6 +327,7 @@ export class PartialMessageBuffer {
     this.#blocks.set(index, {
       kind,
       value: initialValue.slice(0, maximum),
+      published: 0,
       truncated: initialValue.length > maximum
     });
   }
