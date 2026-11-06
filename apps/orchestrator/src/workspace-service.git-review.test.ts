@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +28,36 @@ async function initializedRepository(prefix: string): Promise<string> {
 }
 
 describe("WorkspaceService Git Review backend", () => {
+  it.skipIf(process.platform === "win32").each([false, true])("pushes the confirmed local object after HEAD advances just before Git with lease=%s", async force => {
+    const root = await initializedRepository("joko-review-push-frozen-head-");
+    const bare = await mkdtemp(join(tmpdir(), "joko-review-push-frozen-remote-"));
+    let service: WorkspaceService | undefined;
+    try {
+      await git(root, "branch", "-m", "topic");
+      await git(bare, "init", "--bare", "--quiet");
+      await git(root, "remote", "add", "origin", bare);
+      await git(root, "commit", "--allow-empty", "-m", "remote base");
+      const remoteOid = await git(root, "rev-parse", "HEAD");
+      await git(root, "push", "--quiet", "origin", "HEAD:refs/heads/topic");
+      await git(root, "commit", "--allow-empty", "-m", "reviewed");
+      const reviewed = await git(root, "rev-parse", "HEAD");
+      await git(root, "commit", "--allow-empty", "-m", "newer");
+      const newer = await git(root, "rev-parse", "HEAD");
+      await git(root, "update-ref", "refs/heads/topic", reviewed, newer);
+      const wrapper = join(bare, "git-before-push.sh");
+      await writeFile(wrapper, `#!/bin/sh\nif [ "$1" = "push" ]; then\n  git update-ref refs/heads/topic ${newer} ${reviewed} || exit 1\nfi\nexec git "$@"\n`, { mode: 0o700 });
+      service = new WorkspaceService({ gitExecutable: wrapper });
+      await service.register({ id: "frozen-head", root, displayName: "Frozen head", trusted: true });
+      const diff = await service.gitReviewDiff("frozen-head", { source: "unstaged" });
+      await expect(service.pushGitReview("frozen-head", { remote: "origin", remoteRef: "refs/heads/topic",
+        expectedRepositoryRevision: diff.repositoryRevision, expectedHeadRevision: reviewed,
+        ...(force ? { confirmForceWithLease: true, expectedRemoteOid: remoteOid } : {}) }))
+        .resolves.toMatchObject({ kind: "pushed", headRevision: reviewed });
+      expect(await git(root, "rev-parse", "HEAD")).toBe(newer);
+      expect(await git(bare, "rev-parse", "refs/heads/topic")).toBe(reviewed);
+    } finally { await service?.close(); await Promise.all([rm(root, { recursive: true, force: true }), rm(bare, { recursive: true, force: true })]); }
+  }, 30_000);
+
   it("resolves and pushes the exact configured upstream when remote and branch names contain slashes", async () => {
     const root = await initializedRepository("joko-review-push-upstream-");
     await git(root, "branch", "-m", "feature/local");
@@ -72,6 +102,7 @@ describe("WorkspaceService Git Review backend", () => {
     }
     if (choice !== "origin") await git(root, "config", "remote.pushDefault", "publish/default");
     if (choice === "branch") await git(root, "config", "branch.feature/local.pushRemote", "publish/branch");
+    if (choice === "default") await git(root, "config", "branch.autoSetupRebase", "remote");
     const remote = choice === "branch" ? "publish/branch" : choice === "default" ? "publish/default" : "origin";
     const service = new WorkspaceService();
     await service.register({ id: "first-push", root, displayName: "First push", trusted: true });
@@ -82,6 +113,7 @@ describe("WorkspaceService Git Review backend", () => {
     });
     expect(await git(root, "config", "--get", "branch.feature/local.remote")).toBe(remote);
     expect(await git(root, "config", "--get", "branch.feature/local.merge")).toBe("refs/heads/feature/local");
+    if (choice === "default") expect(await git(root, "config", "--get", "branch.feature/local.rebase")).toBe("true");
     expect(await git(destinations.get(remote)!, "rev-parse", "refs/heads/feature/local")).toBe(diff.headRevision);
     expect((await service.gitReviewDiff("first-push", { source: "unstaged" })).pushTarget?.hasUpstream).toBe(true);
   }, 30_000);

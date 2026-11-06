@@ -1770,7 +1770,7 @@ export class WorkspaceService {
             "--porcelain",
             `--force-with-lease=${remoteRef}:${expectedRemoteOid}`,
             remote,
-            `HEAD:${remoteRef}`
+            `${headRevision}:${remoteRef}`
           ],
           workspace.root,
           120_000,
@@ -1787,9 +1787,10 @@ export class WorkspaceService {
         if ((input.expectedRemoteOid ?? "").trim() !== "") {
           throw new WorkspaceGitReviewError("A remote lease revision is only valid with force-with-lease confirmation.", "invalid");
         }
+        const setUpstream = await this.#readConfiguredGitUpstream(workspace, branch) === undefined;
         const pushed = await runProcess(
           this.#gitExecutable,
-          ["push", "--porcelain", ...(await this.#readConfiguredGitUpstream(workspace, branch) === undefined ? ["--set-upstream"] : []), remote, `HEAD:${remoteRef}`],
+          ["push", "--porcelain", remote, `${headRevision}:${remoteRef}`],
           workspace.root,
           120_000,
           4 * 1024 * 1024,
@@ -1815,10 +1816,10 @@ export class WorkspaceService {
             behind: Math.max(counts.behind, 1)
           };
         }
+        if (setUpstream) await this.#recordReviewPushUpstream(workspace, branch, headRevision, remote, remoteRef);
       }
       const after = await this.#readGitDiff(workspaceId, [], {});
-      const afterHead = await this.#requireHeadRevision(workspace);
-      return { kind: "pushed", repositoryRevision: after.repositoryRevision, headRevision: afterHead, remote, remoteRef };
+      return { kind: "pushed", repositoryRevision: after.repositoryRevision, headRevision, remote, remoteRef };
     });
   }
 
@@ -2074,6 +2075,34 @@ export class WorkspaceService {
     ]);
     if (remote === undefined || mergeRef === undefined) return undefined;
     return { remote, remoteRef: mergeRef.startsWith("refs/heads/") ? mergeRef : `refs/heads/${mergeRef}` };
+  }
+
+  async #recordReviewPushUpstream(workspace: WorkspaceRegistration, branch: string, head: string, remote: string, remoteRef: string): Promise<void> {
+    try {
+      const current = await runProcess(this.#gitExecutable, ["rev-parse", "--verify", `refs/heads/${branch}`], workspace.root,
+        10_000, 1024 * 1024, new Set([0, 1, 128]));
+      if (current.exitCode !== 0 || current.stdout.trim() !== head || await this.#readConfiguredGitUpstream(workspace, branch) !== undefined) return;
+
+      // Pushing an object ID has no local branch for Git's --set-upstream.
+      // The push already succeeded, so local tracking is a follow-up effect.
+      const remoteKey = `branch.${branch}.remote`;
+      const mergeKey = `branch.${branch}.merge`;
+      const previous = await runProcess(this.#gitExecutable, ["config", "--local", "--get", remoteKey], workspace.root,
+        10_000, 1024 * 1024, new Set([0, 1]));
+      await runProcess(this.#gitExecutable, ["config", "--local", "--replace-all", remoteKey, remote], workspace.root, 10_000, 1024 * 1024);
+      try {
+        await runProcess(this.#gitExecutable, ["config", "--local", "--replace-all", mergeKey, remoteRef],
+          workspace.root, 10_000, 1024 * 1024);
+      } catch {
+        if (await this.#readGitConfigValue(workspace, mergeKey) === remoteRef || await this.#readGitConfigValue(workspace, remoteKey) !== remote) return;
+        const restore = previous.exitCode === 0 ? ["--replace-all", remoteKey, previous.stdout.trim()] : ["--unset-all", remoteKey];
+        await runProcess(this.#gitExecutable, ["config", "--local", ...restore], workspace.root, 10_000, 1024 * 1024);
+        return;
+      }
+      const rebase = await this.#readGitConfigValue(workspace, "branch.autoSetupRebase");
+      if (rebase === "remote" || rebase === "always") await runProcess(this.#gitExecutable,
+        ["config", "--local", "--replace-all", `branch.${branch}.rebase`, "true"], workspace.root, 10_000, 1024 * 1024);
+    } catch { /* The confirmed remote push receipt is authoritative. */ }
   }
 
   async #readDefaultGitPushTarget(workspace: WorkspaceRegistration): Promise<WorkspaceGitPushTarget | undefined> {
