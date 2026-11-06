@@ -112,7 +112,8 @@ export class PartnerTodoTools implements BridgeToolProvider {
   async callTool(name: string, input: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext) {
     try {
       const link = this.manager.profiles.getSessionLink(context.sessionId), session = this.manager.store.getSession(context.sessionId).descriptor;
-      if (!link || link.role !== "canonical" && link.role !== "topic") throw new Error("This task cannot edit a Partner's affair ledger.");
+      const routineRead = name === "todo_list" && link?.role === "routine";
+      if (!link || link.role !== "canonical" && link.role !== "topic" && !routineRead) throw new Error("This task cannot access this Partner's affair ledger operation.");
       const profile = this.manager.owner(link.partnerId, true), backend = this.manager.store.getBackend(session.backendId).descriptor;
       const assertCurrent = () => {
         signal?.throwIfAborted(); context.assertCurrent?.();
@@ -120,6 +121,7 @@ export class PartnerTodoTools implements BridgeToolProvider {
         if (context.providerGeneration !== undefined && context.providerGeneration !== this.generation || current.targetId !== context.targetId
           || current.targetId !== profile.homeTargetId || current.binding.generation !== context.generation || current.archived || current.deletedAt !== undefined
           || current.binding.opaqueRef !== session.binding.opaqueRef || this.manager.store.getBackend(session.backendId).descriptor.instanceGeneration !== backend.instanceGeneration) throw new Error("The Todo tool owner changed.");
+        if (routineRead && this.manager.partners.runtimeCaller(context.sessionId).id !== profile.id) throw new Error("The Todo tool owner changed.");
         this.manager.owner(profile.id, true, profile.revision);
       };
       assertCurrent(); let value: unknown;

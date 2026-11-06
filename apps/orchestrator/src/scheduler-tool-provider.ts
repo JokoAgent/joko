@@ -343,6 +343,7 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
           if (schedule.kind !== "manual" && nextRunAt === undefined) {
             throw new SchedulerToolError("INVALID_STATE", "This one-shot schedule has expired and cannot be resumed.");
           }
+          this.#assertScriptWorkspace(safeScheduleExtensions(schedule.executionSnapshot), schedule.targetId);
           const resumed = this.#store.upsertSchedule(copySchedule(schedule, {
             enabled: true,
             nextRunAt,
@@ -422,6 +423,12 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
     return schedule;
   }
 
+  #assertScriptWorkspace(extension: ScheduleExtensionSnapshot, targetId: string): void {
+    if (extension.executionMode === "script" && this.#store.getTarget(targetId).descriptor.remoteWorkspace !== undefined) {
+      throw new SchedulerToolError("INVALID_PARAMS", "Script schedules require a project on this node.");
+    }
+  }
+
   async #create(input: Readonly<Record<string, unknown>>, caller: SessionDescriptor): Promise<ScheduleRecord> {
     assertKeys(input, Object.keys(CREATE_PROPERTIES));
     validateAgentKind(input["agentKind"], caller.backendId);
@@ -438,6 +445,7 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
       ? ""
       : requiredText(input, "prompt", 262_144));
     assertExecutionCompatibility(extension, scheduleWorktreeConfiguration(executionSnapshot), binding, prompt);
+    this.#assertScriptWorkspace(extension, caller.targetId);
     return this.#store.upsertSchedule({
       id: randomUUID(),
       backendId: caller.backendId,
@@ -485,12 +493,14 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
     const prompt = hasOwn(input, "prompt")
       ? promptInput(requiredText(input, "prompt", 262_144))
       : current.prompt;
+    const extension = safeScheduleExtensions(executionSnapshot);
     assertExecutionCompatibility(
-      safeScheduleExtensions(executionSnapshot),
+      extension,
       scheduleWorktreeConfiguration(executionSnapshot),
       binding,
       prompt
     );
+    this.#assertScriptWorkspace(extension, current.targetId);
     return this.#store.upsertSchedule({
       id: current.id,
       backendId: current.backendId,

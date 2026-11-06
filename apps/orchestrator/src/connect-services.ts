@@ -18266,13 +18266,14 @@ async function dispatchMutation(
       if (payload.value.schedule === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Schedule input is required.");
       const id = stableId("schedule", operationId);
       const candidate = scheduleInput(id, payload.value.schedule, (dependencies.now ?? Date.now)());
-      await validateScheduleWorktreeEligibility(dependencies, candidate);
+      await validateScheduleWorkspaceEligibility(dependencies, candidate);
       const execution = await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
         commit: (store) => {
+          assertScriptScheduleWorkspace(store, candidate);
           store.upsertSchedule(candidate);
           return { accepted: true, resultCase: "schedule", entityId: id } satisfies OperationOutcome;
         }
@@ -18290,7 +18291,7 @@ async function dispatchMutation(
             ...parsed,
             executionSnapshot: withScheduleProjectAutomationOrigin(parsed.executionSnapshot, projectOrigin)
           };
-      await validateScheduleWorktreeEligibility(dependencies, candidate);
+      await validateScheduleWorkspaceEligibility(dependencies, candidate);
       if (projectOrigin !== undefined) {
         if (candidate.targetId !== projectOrigin.targetId) {
           throw invalidArgument("Project Schedules cannot move to another Target.");
@@ -18302,6 +18303,7 @@ async function dispatchMutation(
         kind: payload.case,
         body: mutation,
         commit: (store) => {
+          assertScriptScheduleWorkspace(store, candidate);
           store.upsertSchedule({
             ...candidate,
             expectedRevision: existing.revision
@@ -18535,7 +18537,7 @@ async function dispatchMutation(
         throw invalidArgument("The Schedule has no future occurrence and cannot be re-enabled.");
       }
       if (payload.value.enabled) {
-        await validateScheduleWorktreeEligibility(dependencies, { ...schedule, enabled: true });
+        await validateScheduleWorkspaceEligibility(dependencies, { ...schedule, enabled: true });
       }
       const execution = await host.mutate({
         operationId,
@@ -18543,6 +18545,7 @@ async function dispatchMutation(
         kind: payload.case,
         body: mutation,
         commit: (store) => {
+          if (payload.value.enabled) assertScriptScheduleWorkspace(store, schedule);
           store.upsertSchedule({
             ...schedule,
             enabled: payload.value.enabled,
@@ -18598,7 +18601,7 @@ async function dispatchMutation(
           configId
         })
       };
-      await validateScheduleWorktreeEligibility(dependencies, candidate);
+      await validateScheduleWorkspaceEligibility(dependencies, candidate);
       const linkedOccurrences = collectStoreOffsetPages((offset, limit) =>
         dependencies.store.listScheduleRuns(current.id, limit, offset));
       const execution = await dependencies.projectAutomations.upsertWithCommit(
@@ -23869,10 +23872,18 @@ function personalScheduleCopy(
   };
 }
 
-async function validateScheduleWorktreeEligibility(
+function assertScriptScheduleWorkspace(store: OperationalStore, schedule: Pick<ScheduleRecord, "targetId" | "executionSnapshot">): void {
+  if (scheduleExtensionSnapshot(schedule.executionSnapshot).executionMode === "script"
+    && store.getTarget(schedule.targetId).descriptor.remoteWorkspace !== undefined) {
+    throw invalidArgument("Script Schedules require a project on this node.");
+  }
+}
+
+async function validateScheduleWorkspaceEligibility(
   dependencies: ConnectServiceDependencies,
   schedule: Pick<ScheduleRecord, "targetId" | "sessionMode" | "sessionId" | "enabled" | "executionSnapshot">
 ): Promise<void> {
+  assertScriptScheduleWorkspace(dependencies.store, schedule);
   const hook = scheduleExtensionSnapshot(schedule.executionSnapshot).preRunHook;
   if (hook !== undefined) {
     const target = dependencies.store.getTarget(schedule.targetId).descriptor;

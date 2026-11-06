@@ -110,7 +110,7 @@ interface OwnedPartnerWorkbench {
 /** Partner identity and its durable grant are shared by the user surface and
  * runtime tools. A selected client row cannot confer project access. */
 export class PartnerWorkbenchManager {
-  readonly #partners: Pick<PartnerManager, "getPartner" | "canonicalCaller" | "listPartners" | "listDelegations" | "getDelegation" | "resolveTaskModel">;
+  readonly #partners: Pick<PartnerManager, "getPartner" | "canonicalCaller" | "runtimeCaller" | "listPartners" | "listDelegations" | "getDelegation" | "resolveTaskModel">;
   readonly #partnerStore: Pick<PartnerStore, "getSessionLink">;
   readonly #store: OperationalStore;
   readonly #host: Pick<SessionHost, "extraDirectories" | "refreshTargetExtraDirectories" | "scanNativeSessionPreviews" | "readNativeSessionPreview"
@@ -134,7 +134,7 @@ export class PartnerWorkbenchManager {
   readonly #continuations = new Map<string, { readonly operationId: string; readonly message: string; readonly result: Promise<{ readonly sessionId: string; readonly runId: string; readonly status: "queued" | "started" }> }>();
 
   constructor(options: {
-    readonly partners: Pick<PartnerManager, "getPartner" | "canonicalCaller" | "listPartners" | "listDelegations" | "getDelegation" | "resolveTaskModel">;
+    readonly partners: Pick<PartnerManager, "getPartner" | "canonicalCaller" | "runtimeCaller" | "listPartners" | "listDelegations" | "getDelegation" | "resolveTaskModel">;
     readonly partnerStore: Pick<PartnerStore, "getSessionLink">;
     readonly store: OperationalStore;
     readonly host: Pick<SessionHost, "extraDirectories" | "refreshTargetExtraDirectories" | "scanNativeSessionPreviews" | "readNativeSessionPreview"
@@ -193,8 +193,8 @@ export class PartnerWorkbenchManager {
     }
   }
 
-  ownerForCaller(sessionId: string): PartnerWorkbenchOwner {
-    const partner = this.#partners.canonicalCaller(sessionId);
+  ownerForCaller(sessionId: string, access: "overview" | "canonical"): PartnerWorkbenchOwner {
+    const partner = access === "overview" ? this.#partners.runtimeCaller(sessionId) : this.#partners.canonicalCaller(sessionId);
     return this.#owner(partner.id).stamp;
   }
 
