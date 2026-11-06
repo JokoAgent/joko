@@ -10,7 +10,8 @@ import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemor
 import { Code } from "@connectrpc/connect";
 import { ConnectError } from "@connectrpc/connect";
 import { EndpointTrustError, rememberEndpointTransport, reportEndpointTrustFailure } from "@joko/connection-transport/trust";
-import { ActorKind, JoinedTaskShareSchema, TaskShareMethod, TaskShareSnapshotSchema, TaskShareEventBatchSchema, type TaskSharingApi } from "@joko/contracts";
+import { ActorKind, JoinedTaskShareSchema, TaskShareMethod, TaskShareSnapshotSchema, TaskShareEventBatchSchema,
+  EventPayloadSchema, TaskShareAttachmentResultSchema, type TaskSharingApi } from "@joko/contracts";
 import { PartnerGroupSummarySchema, PartnerGroupMemberSchema, ListPartnerGroupsResponseSchema, GetPartnerGroupResponseSchema,
   GetPartnerGroupCreationResponseSchema, RetirePartnerGroupCreationResponseSchema, PartnerGroupMemberStatus, type PartnerGroupApi } from "@joko/contracts";
 import { DevicePeerDescriptorSchema, RemoteDesktopControlStateSchema, type RemoteDesktopControlState } from "@joko/contracts";
@@ -2051,6 +2052,50 @@ describe("shared task source on the native task client", () => {
     expect(instance.state.taskSource?.kind).toBe("own");
     expect(instance.state.detail?.server?.serverId).toBe(credential.serverId);
     expect(instance.taskDraftProfileId()).toBe(credential.profileId);
+  });
+  it("opens and shares images from a joined task whose Target exists only on the host node", async () => {
+    const value = sharedFixture(), network = fakeNetwork(), instance = client(network, memoryStorage(credential).storage);
+    const bytes = galleryPngBytes(5, 4);
+    const message = timelineGalleryEvent(bytes);
+    message.cursor!.generation = value.detail.generation;
+    if (message.payload?.kind.case !== "messageCompleted") throw new Error("Expected shared message fixture.");
+    const blocks = message.payload.kind.value.blocks;
+    const blob = blocks.find(block => block.content.case === "image")!.content;
+    if (blob.case !== "image") throw new Error("Expected shared image fixture.");
+    blob.value.blob!.sha256Hex = sha256Hex(bytes);
+    message.payload.kind.value.blocks = blocks.filter(block => block.content.case === "text" || block.content === blob);
+    value.detail.sessions[0]!.targetId = "source-only-target";
+    value.detail.targets = [];
+    value.detail.timeline = [message];
+    value.detail.resumeCursor = message.cursor;
+    const invoke = vi.fn(async (joinId: string, method: TaskShareMethod) => {
+      expect(joinId).toBe(value.joined.joinId);
+      expect(method).toBe(TaskShareMethod.LIST_SESSION_TIMELINE);
+      return { events: [message] };
+    });
+    const transfer = vi.fn(async (_request: Parameters<TaskSharingApi["transfer"]>[0]) => create(TaskShareAttachmentResultSchema, {
+      blob: blob.value.blob, offset: BigInt(bytes.length), data: bytes, complete: true
+    }));
+    await instance.start();
+    vi.spyOn(instance, "taskSharingApi").mockReturnValue({ ...value.api, invoke, transfer } as unknown as TaskSharingApi);
+    await instance.openJoinedTask(value.joined);
+    expect(instance.state.owner?.targets.some(target => target.targetId === "source-only-target")).toBe(false);
+    expect(instance.conversationShareOwnerKey()).toContain(value.joined.joinId);
+    expect(instance.markdownResourceOwnerKey()).toBeUndefined();
+
+    const selected = timelineRows(instance.state.detail!.timeline)[0]!;
+    const signal = new AbortController().signal;
+    const prepared = await instance.prepareConversationShare([selected.id], signal);
+    expect(prepared.messages[0]?.images?.size).toBe(1);
+    expect(transfer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ joinId: value.joined.joinId,
+      transfer: { action: { case: "read", value: expect.objectContaining({ blobId: blob.value.blob!.blobId }) } }
+    }), expect.any(AbortSignal));
+    await instance.revalidateConversationShare(prepared.leaseId, signal);
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(network.downloadBlob).not.toHaveBeenCalled();
+    expect(network.readAround).not.toHaveBeenCalled();
+    await instance.select("session");
+    expect(() => instance.assertConversationShareCurrent(prepared.leaseId)).toThrow();
   });
   it("retains an unknown guest input and checks only its signed original receipt without ordinary dispatch", async () => {
     const value = sharedFixture(), network = fakeNetwork(), saved = memoryStorage(credential), instance = client(network, saved.storage);
@@ -13213,6 +13258,40 @@ describe("native current-task Files ownership", () => {
     expect(app.state.timelinePreview).toBeUndefined();
   });
 
+  it("keeps the current audio preview while a different attachment arrives on the live timeline", async () => {
+    const bytes = new Uint8Array(417);
+    bytes.set([0xff, 0xfb, 0x90, 0x00]);
+    const digest = sha256Hex(bytes);
+    const audio = timelinePreviewEvent("answer.mp3", "audio/mpeg", bytes, digest, "Original audio");
+    const network = projectedNetwork(timelineGallerySnapshot(audio));
+    const publish = eventFeed(network);
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "audio/mpeg" });
+    const media = mediaPreviewFixture(digest);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      () => "original-audio-lease", undefined, undefined, undefined, media.files);
+    await app.start();
+    await app.previewTimelineArtifact(timelineRows(app.state.detail!.timeline)[0]!.artifacts![0]!);
+    const original = app.state.timelinePreview;
+    expect(original).toMatchObject({ kind: "media", mediaKind: "audio", title: "Original audio" });
+
+    const pdf = timelinePreviewEvent("separate.pdf", "application/pdf", previewPdfBytes(), "b".repeat(64));
+    pdf.eventId = "new-file";
+    pdf.cursor!.sequence = audio.cursor!.sequence + 1n;
+    if (pdf.payload?.kind.case !== "messageCompleted") throw new Error("Expected file fixture.");
+    pdf.payload.kind.value.role = MessageRole.USER;
+    pdf.payload.kind.value.messageId = "new-file-message";
+    publish(pdf);
+    await vi.waitFor(() => expect(app.state.live.map(item => item.eventId)).toContain(pdf.eventId));
+    expect(app.state.timelinePreview).toBe(original);
+    expect(media.removed).toEqual([]);
+    expect(network.downloadBlob).toHaveBeenCalledOnce();
+
+    vi.mocked(network.readAround).mockResolvedValue([pdf]);
+    await app.around(pdf.eventId);
+    expect(app.state.timelinePreview).toBeUndefined();
+    await vi.waitFor(() => expect(media.removed).toEqual(["preview-original-audio-lease.mp3"]));
+  });
+
   it.each(timelineFileSources)("cleans a late $kind stage after the exact source window changes", async ({ project }) => {
     const bytes = previewMp4Bytes();
     const event = project(timelinePreviewEvent("late.mp4", "video/mp4", bytes, "e".repeat(64), "Late video"));
@@ -13542,6 +13621,37 @@ describe("native current-task Files ownership", () => {
     expect(fixture.driver.stageBytes).toHaveBeenNthCalledWith(1, credential.profileId, "annotation-source", bytes);
     expect(fixture.driver.stageBytes).toHaveBeenNthCalledWith(2, credential.profileId, "annotation-output", bytes);
     expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("keeps the second image of a current gallery while unrelated live text arrives", async () => {
+    const bytes = galleryPngBytes(5, 4);
+    const images = timelineGalleryEvent(bytes);
+    const network = projectedNetwork(timelineGallerySnapshot(images));
+    const publish = eventFeed(network);
+    vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("original-gallery", "second-image"), undefined, memoryDraftStores());
+    await app.start();
+    const selected = timelineRows(app.state.detail!.timeline)[0]!.images![1]!;
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    expect(gallery).toMatchObject({ initialIndex: 1, pages: [{ pageId: expect.any(String) }, { pageId: selected.pageId }] });
+
+    const delta = event("another-live-reply", images.cursor!.sequence + 1n);
+    delta.payload = create(EventPayloadSchema, { kind: { case: "textDelta", value: { messageId: "another-message", delta: "Still working" } } });
+    publish(delta);
+    await vi.waitFor(() => expect(app.state.live.map(item => item.eventId)).toContain(delta.eventId));
+    expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(true);
+    await expect(app.loadImageGalleryPage(gallery.leaseId, 1)).resolves.toMatchObject({ pageId: selected.pageId, pageIndex: 1 });
+
+    const replacement = clone(EventSchema, images);
+    replacement.eventId = "replacement-image-message";
+    replacement.cursor!.opaqueToken = "replacement-image-cursor";
+    replacement.cursor!.sequence = delta.cursor!.sequence + 1n;
+    if (replacement.payload?.kind.case !== "messageCompleted") throw new Error("Expected image message fixture.");
+    replacement.payload.kind.value.blocks = [{ $typeName: "joko.v1.MessageBlock", content: { case: "text", value: "Images removed" } }];
+    publish(replacement);
+    await vi.waitFor(() => expect(app.state.live.map(item => item.eventId)).toContain(replacement.eventId));
+    expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(false);
   });
 
   it.each([
