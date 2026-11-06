@@ -1,8 +1,9 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
+import { ClaudeCodeAdapter } from "@joko/adapter-claude-code";
 import * as contract from "@joko/contracts";
 import {
   JokoError,
@@ -16,6 +17,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
 import { SessionHost } from "./session-host.js";
 
@@ -529,6 +531,56 @@ describe("Connect Maker Memory owner and reset scopes", () => {
     });
   });
 
+  it("blocks the queued Claude profile reset after the original device is revoked", async () => {
+    const root = await mkdtemp(join(await realpath(tmpdir()), "joko-claude-memory-revocation-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const profile = join(root, "profile");
+    const adapter = new ClaudeCodeAdapter({ instanceGeneration: 1, environment: { CLAUDE_CONFIG_DIR: profile },
+      resolveNativeMemoryEnabled: () => true });
+    store.upsertBackend({
+      id: adapter.id, displayName: "Claude Code", version: "test", adapterKind: "claude-code", instanceGeneration: 1,
+      health: "healthy", installationState: "installed", authenticationState: "authenticated", models: [], tools: [],
+      diagnostics: [], capabilities: new Map([["memory.native", { key: "memory.native", supported: true,
+        options: [MEMORY_NATIVE_RESET_LOCAL_OPTION] }]])
+    });
+    const host = new SessionHost(store, {} as never, [adapter]);
+    const connections = new ConnectionManager(store);
+    try {
+      const memory = join(profile, "projects", "workspace", "memory");
+      await mkdir(memory, { recursive: true });
+      const entry = join(memory, "MEMORY.md");
+      await writeFile(entry, "Preserve the original memory.");
+      const key = "original-claude-memory-owner";
+      const observerKey = "current-claude-memory-owner";
+      const original = store.createConnection({ id: "original", name: "Original", authKeyDigest: digestAuthKey(key) });
+      const observer = store.createConnection({ id: "observer", name: "Observer", authKeyDigest: digestAuthKey(observerKey) });
+      const services = createConnectServices(stubApplication({ store, sessionHost: host, connections, adapters: [adapter],
+        makerMemory: new MakerMemoryController({ store }) }));
+      const scan = adapter.readNativeMemoryStatus();
+      await Promise.resolve();
+      const input = { operationId: "claude-memory-revoked", connectionId: original.id, backendId: adapter.id,
+        scope: contract.MemoryResetScope.BACKEND, key };
+      const reset = submitReset<contract.SubmitOperationResponse>(services.operation.submitOperation, input);
+      expect(store.getOperation(input.operationId).status).toBe("started");
+      connections.revokeDevice(original.deviceId);
+      await expect(scan).resolves.toMatchObject({ entryCount: 1 });
+      await expect(reset).resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED,
+        error: { code: "CLAUDE_NATIVE_MEMORY_RESET_AUTHORIZATION_RETIRED", stateMayHaveChanged: false } } });
+      expect(store.getOperation(input.operationId).status).toBe("failed");
+      await expect(readFile(entry, "utf8")).resolves.toBe("Preserve the original memory.");
+      await expect(submitReset(services.operation.submitOperation, { ...input, operationId: "claude-memory-current",
+        connectionId: observer.id, key: observerKey })).resolves.toMatchObject({ operation: {
+        result: { payload: { case: "memoryReset", value: { removedEntries: 1n, removedTargets: 1n } } }
+      } });
+      await expect(adapter.readNativeMemoryStatus()).resolves.toMatchObject({ entryCount: 0 });
+    } finally {
+      await host.dispose();
+      await adapter.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("durably replays native reset success and unknown failure without repeating the destructive effect", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-native-memory-reset-"));
     const store = new OperationalStore(join(root, "orchestrator.db"));
@@ -712,8 +764,8 @@ describe("Connect Maker Memory owner and reset scopes", () => {
   });
 });
 
-function context(): unknown {
-  return { requestHeader: new Headers({ authorization: "Bearer memory-test" }), signal: new AbortController().signal };
+function context(key = "memory-test"): unknown {
+  return { requestHeader: new Headers({ authorization: `Bearer ${key}` }), signal: new AbortController().signal };
 }
 
 function stubApplication(overrides: Record<string, unknown>): OrchestratorApplication {
@@ -779,6 +831,7 @@ async function submitReset<T = unknown>(handler: unknown, input: {
   readonly connectionId: string;
   readonly scope: contract.MemoryResetScope;
   readonly backendId?: string;
+  readonly key?: string;
 }): Promise<T> {
   if (typeof handler !== "function") throw new Error("submitOperation handler is missing");
   return await (handler as (request: unknown, value: unknown) => Promise<T>)({
@@ -794,7 +847,7 @@ async function submitReset<T = unknown>(handler: unknown, input: {
         })
       }
     })
-  }, context());
+  }, context(input.key));
 }
 
 async function submitMemoryUpdate<T = unknown>(handler: unknown, input: {

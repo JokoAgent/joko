@@ -645,7 +645,7 @@ export interface BackendAdapter {
   /** Read content-free status from the Backend-native memory owned by this local runtime. */
   readNativeMemoryStatus?(signal?: AbortSignal): Promise<NativeMemoryStatus>;
   /** Destructively reset only the Backend-native memory owned by this local runtime. */
-  resetNativeMemory?(): Promise<NativeMemoryResetResult>;
+  resetNativeMemory?(assertCurrent?: () => void): Promise<NativeMemoryResetResult>;
   /** Update the capability owner's default for runtimes created later. */
   configureSilentEncryptedRetry?(enabled: boolean): Promise<void>;
   /** Capability-gated transport recovery for Responses reasoning ciphertext. */
