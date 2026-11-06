@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -83,7 +84,7 @@ import {
 import { parseCurrentResourceUsageEventPayload } from "./resource-usage-shape.js";
 import { parseCurrentTaskTagEventPayload } from "./task-tag-shape.js";
 import { learningIdentity, learningReceipt, learningReceipts, learningSource, mergeLearningReceipts, type PartnerLearningTurnRecord } from "./partner-learning-shape.js";
-import { configureDatabase, initializeDatabase, SCHEMA_VERSION } from "./schema.js";
+import { acquireOperationalWriterLease, configureDatabase, initializeDatabase, SCHEMA_VERSION } from "./schema.js";
 import {
   projectResourceUsageStream,
   readResourceUsageReport,
@@ -694,6 +695,7 @@ interface NativeMessageSearchVisibility {
 
 export class OperationalStore {
   private database: DatabaseSync;
+  private writerLease: DatabaseSync | undefined;
   private readonly now: () => number;
   private readonly idFactory: () => string;
   private readonly suppressSessionNotifications: OperationalStoreOptions["suppressSessionNotifications"];
@@ -710,11 +712,21 @@ export class OperationalStore {
   private messageVectorAvailable: boolean;
 
   constructor(readonly filePath: string, options: OperationalStoreOptions = {}) {
-    if (filePath !== ":memory:" && !filePath.startsWith("file:")) {
-      mkdirSync(path.dirname(path.resolve(filePath)), { recursive: true });
-      recoverInterruptedHistoryMaintenance(path.resolve(filePath));
+    try {
+      if (filePath !== ":memory:" && !filePath.startsWith("file:")) {
+        const resolved = path.resolve(filePath);
+        const directory = path.dirname(resolved);
+        mkdirSync(directory, { recursive: true });
+        const leasePath = path.join(realpathSync(directory), `${path.basename(resolved)}.writer-lease`);
+        this.writerLease = acquireOperationalWriterLease(leasePath);
+        restrictMaintenanceFile(leasePath);
+        recoverInterruptedHistoryMaintenance(resolved);
+      }
+      this.database = new DatabaseSync(filePath, { allowExtension: true });
+    } catch (error) {
+      this.releaseWriterLease();
+      throw error;
     }
-    this.database = new DatabaseSync(filePath, { allowExtension: true });
     this.now = options.now ?? Date.now;
     this.idFactory = options.idFactory ?? randomUUID;
     this.suppressSessionNotifications = options.suppressSessionNotifications;
@@ -761,22 +773,27 @@ export class OperationalStore {
         }
       }
     } catch (error) {
-      this.database.close();
       this.closed = true;
+      try { this.database.close(); } finally { this.releaseWriterLease(); }
       throw error;
     }
     this.messageVectorAvailable = messageVectorAvailable;
   }
 
   close(): void {
-    if (this.closed) return;
+    if (this.closed) { this.releaseWriterLease(); return; }
     if (this.transactionFrames.length !== 0) {
       throw new StoreError("Cannot close the operational store during a transaction.");
     }
     this.closed = true;
     this.subscribers.clear();
     this.operationSubscribers.clear();
-    this.database.close();
+    try { this.database.close(); } finally { this.releaseWriterLease(); }
+  }
+
+  private releaseWriterLease(): void {
+    this.writerLease?.close();
+    this.writerLease = undefined;
   }
 
   inspectHistoryMaintenance(input: {
