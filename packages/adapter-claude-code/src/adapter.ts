@@ -3506,12 +3506,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     });
   }
 
-  async resetNativeMemory(): Promise<NativeMemoryResetResult> {
+  async resetNativeMemory(assertCurrent?: () => void): Promise<NativeMemoryResetResult> {
     if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
     return this.#withNativeMemoryOperation(async () => {
       this.#assertUsable();
       try {
-        const result = await resetClaudeNativeMemory(this.#nativeMemoryConfigDirectory);
+        const result = await resetClaudeNativeMemory(this.#nativeMemoryConfigDirectory, undefined, assertCurrent);
         return result;
       } catch (error) {
         throw nativeMemoryFilesystemError(error, "reset");
@@ -8035,6 +8035,20 @@ function invalidForkBoundary(): JokoError {
 function nativeMemoryFilesystemError(error: unknown, operation: "status" | "reset"): JokoError {
   if (error instanceof JokoError) return error;
   const filesystem = error instanceof ClaudeNativeMemoryFilesystemError ? error : undefined;
+  if (filesystem?.failure === "authorization_retired") {
+    return claudeCodeError(
+      "CLAUDE_NATIVE_MEMORY_RESET_AUTHORIZATION_RETIRED",
+      "The connection that authorized the Claude native memory reset is no longer active.",
+      "memory_reset",
+      {
+        retryable: false,
+        stateMayHaveChanged: filesystem.stateMayHaveChanged,
+        recovery: filesystem.stateMayHaveChanged
+          ? "Inspect local native memory state before explicitly issuing another reset."
+          : "Use an active connection and explicitly confirm a new reset."
+      }
+    );
+  }
   const unsafe = filesystem?.failure === "unsafe_path" || filesystem?.failure === "changed";
   return claudeCodeError(
     unsafe ? "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE" : operation === "status"

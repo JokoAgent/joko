@@ -17,6 +17,7 @@ export type ClaudeNativeMemoryFilesystemFailure =
   | "unsafe_path"
   | "unavailable"
   | "changed"
+  | "authorization_retired"
   | "remove_failed";
 
 export class ClaudeNativeMemoryFilesystemError extends Error {
@@ -69,8 +70,14 @@ export async function scanClaudeNativeMemory(
 
 export async function resetClaudeNativeMemory(
   configDirectory: string,
-  fileSystem: ClaudeNativeMemoryFileSystem = nodeFileSystem
+  fileSystem: ClaudeNativeMemoryFileSystem = nodeFileSystem,
+  assertCurrent?: () => void
 ): Promise<ClaudeNativeMemoryResetResult> {
+  const assertAuthorized = (): void => {
+    try { assertCurrent?.(); }
+    catch { throw new ClaudeNativeMemoryFilesystemError("authorization_retired", false); }
+  };
+  assertAuthorized();
   const inventory = await inventoryClaudeNativeMemory(configDirectory, undefined, fileSystem);
   let removedEntries = 0;
   let removedTargets = 0;
@@ -80,6 +87,7 @@ export async function resetClaudeNativeMemory(
       if (!sameFilesystemIdentity(current, candidate.metadata)) {
         throw new ClaudeNativeMemoryFilesystemError("changed", false);
       }
+      assertAuthorized();
       await fileSystem.rm(candidate.path);
       removedEntries = safeSum(removedEntries, candidate.entryCount);
       removedTargets = safeSum(removedTargets, 1);

@@ -19728,7 +19728,9 @@ async function dispatchMutation(
                     recovery: "Refresh Backend settings before explicitly issuing a new reset operation."
                   });
                 }
-                const result = validateNativeMemoryResetResult(await adapter.resetNativeMemory());
+                const result = validateNativeMemoryResetResult(await adapter.resetNativeMemory(() => {
+                  dependencies.connections.fence(connection);
+                }));
                 if (adapter.readNativeMemoryStatus !== undefined) {
                   try {
                     const status = validateNativeMemoryStatus(await adapter.readNativeMemoryStatus());
