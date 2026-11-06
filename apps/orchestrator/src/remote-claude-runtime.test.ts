@@ -1103,7 +1103,8 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
       const afterSeq = Number(params.afterSeq);
       for (const event of this.#events) if (Number(event.seq) > afterSeq) process.send(event);
       if (this.#options.beforeAttachReply !== undefined) {
-        void this.#options.beforeAttachReply().then(() => process.respond(frame.id, this.#attachment()));
+        const requestId = frame.id;
+        void this.#options.beforeAttachReply().then(() => process.respond(requestId, this.#attachment()));
         return;
       }
       return process.respond(frame.id, this.#attachment());
