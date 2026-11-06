@@ -391,6 +391,8 @@ import {
 import {
   atomicWritePrivateFile,
   atomicWriteUserSelectedFile,
+  captureUserSelectedFile,
+  type UserSelectedFileReceipt,
   deletePrivateFile,
   readPrivateFile,
   readRegularFileSnapshot
@@ -8101,6 +8103,23 @@ function requireDesktopUpdateService(): DesktopUpdateService {
   return desktopUpdateService;
 }
 
+function reportNativeSaveFinalization(owner: BrowserWindow | undefined, receipt: UserSelectedFileReceipt): void {
+  if (!receipt.directorySyncFailed && !receipt.temporaryCleanupFailed) return;
+  const chinese = applicationMenuLocale === "zh-CN";
+  const details = [
+    ...(receipt.directorySyncFailed ? [chinese ? "Joko 无法确认目标目录的最后一次同步。" : "Joko could not confirm the final directory sync."] : []),
+    ...(receipt.temporaryCleanupFailed ? [chinese ? "Joko 无法清理此次保存的临时文件。" : "Joko could not clean up the temporary file used for this save."] : [])
+  ];
+  const options: MessageBoxOptions = {
+    type: "warning",
+    message: chinese ? "文件已保存" : "File saved",
+    detail: details.join("\n")
+  };
+  void Promise.resolve().then(() => owner === undefined || owner.isDestroyed()
+    ? dialog.showMessageBox(options)
+    : dialog.showMessageBox(owner, options)).catch(() => undefined);
+}
+
 async function stopManagedOrchestratorForUpdateApply(): Promise<void> {
   try {
     await stopManagedOrchestratorForCompleteExit();
@@ -8542,18 +8561,23 @@ function registerIpc(): void {
     }
     if (selection.canceled || selection.filePath === undefined) return { cancelled: true as const };
     assertTrustedIpcSender(event);
+    const destination = await captureUserSelectedFile(resolve(selection.filePath));
+    assertTrustedIpcSender(event);
     trackExtensionLibraryGestureScope(event.sender);
     return {
       cancelled: false as const,
-      ticketId: extensionLibraryGestures.issueSaveTicket(event.sender, request.extensionId, resolve(selection.filePath))
+      ticketId: extensionLibraryGestures.issueSaveTicket(event.sender, request.extensionId, destination)
     };
   });
   ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryCommitSave, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
+    const owner = BrowserWindow.fromWebContents(event.sender) ?? undefined;
     if (parameters.length !== 1) throw new TypeError("Extension Library save commit requires one request.");
     const request = parseExtensionLibraryCommitSaveRequest(parameters[0]);
     const destination = extensionLibraryGestures.takeSaveTicket(event.sender, request.extensionId, request.ticketId);
-    return atomicCopyExtensionLibraryFile(request.root, request.path, destination);
+    const receipt = await atomicCopyExtensionLibraryFile(request.root, request.path, destination, undefined, () => { assertTrustedIpcSender(event); });
+    reportNativeSaveFinalization(owner, receipt);
+    return receipt.bytes;
   });
   ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryCancelSave, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -9371,7 +9395,10 @@ function registerIpc(): void {
         })}`);
       }
       if (selection.canceled || selection.filePath === undefined) return false;
-      await atomicWriteUserSelectedFile(selection.filePath, request.bytes, MAXIMUM_NATIVE_FILE_BYTES);
+      assertTrustedIpcSender(event);
+      const destination = await captureUserSelectedFile(selection.filePath);
+      const receipt = await atomicWriteUserSelectedFile(destination, request.bytes, MAXIMUM_NATIVE_FILE_BYTES, () => { assertTrustedIpcSender(event); });
+      reportNativeSaveFinalization(owner, receipt);
       if (externalPackagedE2e) recordPackagedSmokeProgress("native_file_save_completed");
       return true;
     } catch (error) {
