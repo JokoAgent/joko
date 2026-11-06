@@ -6,9 +6,11 @@ import type { ExtensionMainViewSurface } from "./extension-main-view-manager.js"
 import { checkExtensionSecretCandidate } from "./extension-secret-check.js";
 
 const MAXIMUM_BYTES = 64 * 1024;
-function routingData(raw: string, redact: (value: string) => string): Record<string, unknown> {
-  if (Buffer.byteLength(raw) > MAXIMUM_BYTES || redact(raw) !== raw) throw new Error("Plugin parameters must be bounded and contain no credentials.");
-  const value = JSON.parse(raw) as unknown;
+function routingData(raw: string, credentials: CredentialManager): Record<string, unknown> {
+  const invalid = () => new Error("Plugin parameters must be bounded and contain no credentials.");
+  if (Buffer.byteLength(raw) > MAXIMUM_BYTES) throw invalid();
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw invalid(); }
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Plugin parameters must be an object.");
   let remaining = 8_192;
   const visit = (value: unknown, depth: number) => {
@@ -20,7 +22,15 @@ function routingData(raw: string, redact: (value: string) => string): Record<str
       }
     }
   };
-  visit(value, 0); return value as Record<string, unknown>;
+  visit(value, 0);
+  // The original JSON enters the Operation body. Inspect escaped string tokens
+  // even when the decoded object discarded a duplicate key's value.
+  const texts = [raw];
+  for (const [token] of raw.matchAll(/"(?:[^"\\]|\\.)*"/gu)) {
+    if (token.includes("\\")) texts.push(JSON.parse(token) as string);
+  }
+  if (credentials.containsCredentialText(texts)) throw invalid();
+  return value as Record<string, unknown>;
 }
 
 /** Settings and runtime share their original encrypted routing-data owner. */
@@ -44,19 +54,19 @@ export class ExtensionSettingsManager {
     if (!record) return { revision: "0", dataJson: "{}" };
     const stored = JSON.parse(this.options.vault.open(record.value, surface.extensionId)) as { version?: unknown; data?: unknown };
     if (stored.version !== 1) throw new Error("Plugin parameters are unavailable.");
-    const raw = JSON.stringify(stored.data); routingData(raw, value => this.options.credentials.redactText(value));
+    const raw = JSON.stringify(stored.data); routingData(raw, this.options.credentials);
     return { revision: record.revision.toString(), dataJson: raw };
   }
 
   write(surface: ExtensionMainViewSurface, expectedRevision: string, raw: string): void {
     this.#assertSurface(surface);
     if (this.read(surface).revision !== expectedRevision) throw new Error("Plugin parameters changed. Reload before saving.");
-    const data = routingData(raw, value => this.options.credentials.redactText(value));
+    const data = routingData(raw, this.options.credentials);
     this.options.store.setSetting("service", "extension-runtime-kv", surface.extensionId,
       this.options.vault.seal(JSON.stringify({ version: 1, data }), surface.extensionId));
   }
 
-  validateRoutingData(raw: string): void { routingData(raw, value => this.options.credentials.redactText(value)); }
+  validateRoutingData(raw: string): void { routingData(raw, this.options.credentials); }
 
   #secret(surface: ExtensionMainViewSurface, key: string) {
     this.#assertSurface(surface);

@@ -6621,6 +6621,9 @@ export function toProtoOperation(
 
 function publicOperationMutation(mutation: contract.OperationMutation): contract.OperationMutation {
   const payload = mutation.payload;
+  if (payload.case === "setExtensionSettingsRoutingData") {
+    return { ...mutation, payload: { case: payload.case, value: { ...payload.value, dataJson: "" } } };
+  }
   if (payload.case === "resolveInteraction") {
     const resolution = payload.value.resolution;
     if (resolution?.decision.case === "question") {

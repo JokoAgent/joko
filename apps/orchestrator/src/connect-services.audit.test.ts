@@ -21,6 +21,10 @@ import {
   registerConnectServices
 } from "./connect-services.js";
 import { ConnectionAuthenticationError, ConnectionManager, digestAuthKey } from "./connection-manager.js";
+import { CredentialManager } from "./credential-manager.js";
+import { CredentialVault } from "./credential-vault.js";
+import { ExtensionCatalogManager } from "./extension-catalog.js";
+import { ExtensionSettingsManager } from "./extension-settings.js";
 import { SessionHost } from "./session-host.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
@@ -126,6 +130,53 @@ async function invoke(handler: unknown, request: unknown, handlerContext: unknow
   }
   return await result;
 }
+
+it("rejects escaped settings credentials before claiming an operation and hides earlier routing data from receipts", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "joko-settings-credentials-"));
+  const store = new OperationalStore(":memory:");
+  cleanups.push(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  const vault = await CredentialVault.open(join(directory, "vault.key"));
+  const credentials = new CredentialManager({ vault, storagePath: join(directory, "credentials.json") });
+  await credentials.initialize();
+  const catalog = new ExtensionCatalogManager({ store, credentials });
+  catalog.initialize();
+  const manager = new ExtensionSettingsManager({ store, vault, credentials, catalog, fetch });
+  const bearer = "settings-test-owner-bearer";
+  const connection = store.createConnection({ id: "settings-test-connection", name: "Settings owner", authKeyDigest: digestAuthKey(bearer) });
+  const secret = 'fixture"header-secret';
+  const ticket = credentials.createUploadTicket({ kind: "header_secret", maximumBytes: 128, connectionId: connection.id });
+  credentials.upload(ticket.credentialUploadTicketId, secret, connection.id);
+  await credentials.commitNewManagedUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId,
+    connectionId: connection.id, kind: "header_secret", displayName: "Settings fixture", onReserved: () => undefined });
+  const connections = new ConnectionManager(store), mutate = vi.fn();
+  const services = createConnectServices(stubApplication({ store, extensionSettings: manager,
+    extensionMainViews: { getSurface: async () => ({ extensionId: "settings-extension", authority: { settings: { html: "index.html" } } }) },
+    connections: { authenticate: connections.authenticate.bind(connections) }, sessionHost: { mutate } }));
+  const rpc = { signal: new AbortController().signal, requestHeader: new Headers({ authorization: `Bearer ${bearer}` }) };
+  const dataJson = JSON.stringify({ route: [{ value: `prefix ${secret}` }] });
+  const mutation = create(contract.OperationMutationSchema, { payload: { case: "setExtensionSettingsRoutingData", value: {
+    extensionId: "settings-extension", surfaceId: "settings-surface", expectedRevision: { value: 1n }, expectedRoutingRevision: "0", dataJson
+  } } });
+  const rejected = "settings-operation-rejected";
+  await expect(invoke(services.operation.submitOperation, { operationId: rejected, connectionId: connection.id, mutation }, rpc))
+    .rejects.toThrow(/contain no credentials/u);
+  expect(mutate).not.toHaveBeenCalled();
+  expect(store.findOperation(rejected)).toBeUndefined();
+  expect(() => manager.validateRoutingData(`{"route":${JSON.stringify(secret)},"route":"ordinary"}`)).toThrow(/contain no credentials/u);
+  expect(() => manager.validateRoutingData(JSON.stringify({ [secret]: "ordinary" }))).toThrow(/contain no credentials/u);
+  expect(() => manager.validateRoutingData('{"route":"ordinary \\"quoted\\" text"}')).not.toThrow();
+
+  const earlier = "settings-operation-earlier";
+  store.runAuthorizedOperation(connection.id, connection.authKeyDigest, { id: earlier, kind: "setExtensionSettingsRoutingData", body: mutation },
+    () => ({ accepted: true, resultCase: "acknowledgement" }));
+  const publicReceipt = { operationId: earlier, state: contract.OperationState.SUCCEEDED,
+    mutation: { payload: { case: "setExtensionSettingsRoutingData", value: { extensionId: "settings-extension", dataJson: "" } } } };
+  await expect(invoke(services.operation.getOperation, { operationId: earlier }, rpc)).resolves.toMatchObject({ operation: publicReceipt });
+  await expect(invoke(services.operation.listOperations, { state: contract.OperationState.SUCCEEDED, sessionId: "", targetId: "" }, rpc))
+    .resolves.toMatchObject({ operations: [publicReceipt] });
+  await expect(invoke(services.operation.submitOperation, { operationId: earlier, connectionId: connection.id, mutation }, rpc))
+    .resolves.toMatchObject({ operation: publicReceipt });
+});
 
 function providerConfiguration(provider: {
   readonly backendId: string;
