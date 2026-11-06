@@ -82,6 +82,7 @@ describe("Inspector Browser panel", () => {
     const controller = {
       state: { preferences: DEFAULT_UI_PREFERENCES, activeProfile: { id: "connection-one", serverId: "server-one" } },
       releaseArtifactUrl: vi.fn(),
+      updateBrowserCommentDesign: vi.fn(async () => undefined),
       uploadBrowserFile
     } as unknown as AppController;
     const settings: BrowserSettingsView = {
