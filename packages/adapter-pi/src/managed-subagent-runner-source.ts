@@ -4,7 +4,20 @@
  * bounded state through a private atomic-file protocol.
  */
 
+import {
+  MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS,
+  MAXIMUM_POLICY_DECISION_TITLE_BYTES,
+  POLICY_DECISION_REQUEST_PREFIX
+} from "./policy-decision-bridge.js";
+
 export const MANAGED_SUBAGENT_RUNNER_FILE_NAME = "joko-managed-subagent-runner.cjs";
+export const MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS = {
+  requestPrefix: POLICY_DECISION_REQUEST_PREFIX,
+  replyCharacters: MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS,
+  // A reply can carry 16,000 UTF-16 code units. Nested JSON can take
+  // seven bytes per unit after escaping, before the control's identity fields.
+  controlFileBytes: 128 * 1024
+} as const;
 
 export const MANAGED_SUBAGENT_RUNNER_SOURCE = String.raw`"use strict";
 
@@ -17,7 +30,10 @@ const FORMAT = 1;
 const MAX_JSON_BYTES = 512 * 1024;
 const MAX_RESULT_BYTES = 256 * 1024;
 const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024;
-const MAX_POLICY_DECISION_TITLE_BYTES = 9 * 1024;
+const POLICY_DECISION_REQUEST_PREFIX = ${JSON.stringify(POLICY_DECISION_REQUEST_PREFIX)};
+const MAX_POLICY_DECISION_TITLE_BYTES = ${MAXIMUM_POLICY_DECISION_TITLE_BYTES};
+const MAX_POLICY_DECISION_REPLY_CHARACTERS = ${MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS};
+const MAX_APPROVAL_CONTROL_BYTES = ${MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.controlFileBytes};
 const HEARTBEAT_MS = 2000;
 const NATIVE_AUTH_VALIDATE_INTERVAL_MS = 5000;
 const NATIVE_AUTH_REQUEST_TIMEOUT_MS = 5000;
@@ -898,7 +914,7 @@ async function main() {
     const rawTitle = redact(typeof event.title === "string" ? event.title : "");
     const title = truncateUtf8(
       rawTitle,
-      method === "input" && rawTitle.startsWith("joko:policy-decision/v1/")
+      method === "input" && rawTitle.startsWith(POLICY_DECISION_REQUEST_PREFIX)
         ? MAX_POLICY_DECISION_TITLE_BYTES
         : 1024
     );
@@ -912,7 +928,7 @@ async function main() {
         requestedAt: Date.now()
       };
     }
-    if (method === "input" && (title.startsWith("joko:command-gate/v1/") || title.startsWith("joko:policy-decision/v1/"))) {
+    if (method === "input" && (title.startsWith("joko:command-gate/v1/") || title.startsWith(POLICY_DECISION_REQUEST_PREFIX))) {
       return {
         id: id,
         childId: config.childId,
@@ -995,7 +1011,7 @@ async function main() {
         type: "joko.subagent.approval_requested",
         approvalId: approval.id,
         method: approval.method,
-        title: approval.title,
+        title: approval.title.startsWith(POLICY_DECISION_REQUEST_PREFIX) ? undefined : approval.title,
         at: approval.requestedAt
       });
       flushStatus();
@@ -1106,6 +1122,11 @@ async function main() {
       if (!pendingApproval || pendingApproval.id !== control.approvalId || pendingApproval.childId !== control.childId) {
         throw new Error("approval request is no longer pending");
       }
+      const policyRequest = pendingApproval.method === "input" && pendingApproval.title.startsWith(POLICY_DECISION_REQUEST_PREFIX);
+      if (!policyRequest && Buffer.byteLength(JSON.stringify(control)) > 64 * 1024) {
+        throw new Error("approval control exceeds its bounded envelope");
+      }
+      const maximumReply = policyRequest ? MAX_POLICY_DECISION_REPLY_CHARACTERS : 1024;
       let response;
       if (pendingApproval.method === "confirm") {
         response = {
@@ -1113,7 +1134,7 @@ async function main() {
           id: pendingApproval.id,
           confirmed: control.confirmed === true
         };
-      } else if (pendingApproval.method === "input" && typeof control.value === "string" && control.value.length <= 1024) {
+      } else if (pendingApproval.method === "input" && typeof control.value === "string" && control.value.length <= maximumReply) {
         response = { type: "extension_ui_response", id: pendingApproval.id, value: control.value };
       } else {
         response = { type: "extension_ui_response", id: pendingApproval.id, cancelled: true };
@@ -1145,7 +1166,7 @@ async function main() {
       try { control = readJson(controlPath, 64 * 1024); } catch (failure) {
         if (!failure || failure.code !== "ENOENT") return;
       }
-      try { approvalControl = readJson(approvalControlPath, 64 * 1024); } catch (failure) {
+      try { approvalControl = readJson(approvalControlPath, MAX_APPROVAL_CONTROL_BYTES); } catch (failure) {
         if (!failure || failure.code !== "ENOENT") return;
       }
       if (control && control.action === "stop") {

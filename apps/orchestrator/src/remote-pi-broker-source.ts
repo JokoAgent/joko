@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS } from "@joko/adapter-pi";
+
 export const REMOTE_PI_BROKER_PROTOCOL_VERSION = 1;
 export const REMOTE_PI_BROKER_SOURCE = String.raw`
 import { execFile, spawn } from "node:child_process";
@@ -38,6 +40,10 @@ const MANAGED_ARTIFACT_CHUNK_BYTES = 256 * 1024;
 const MANAGED_ARTIFACT_SNAPSHOT_TTL_MS = 15 * 60_000;
 const MANAGED_DELETION_RECEIPT_TTL_MS = 24 * 60 * 60_000;
 const MAX_MANAGED_RUNS = 256;
+const MAX_MANAGED_CONTROL_FILE_BYTES = 64 * 1024;
+const MAX_MANAGED_APPROVAL_CONTROL_BYTES = ${MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.controlFileBytes};
+const MAX_POLICY_DECISION_REPLY_CHARACTERS = ${MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.replyCharacters};
+const POLICY_DECISION_REQUEST_PREFIX = ${JSON.stringify(MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.requestPrefix)};
 const DISABLED_MANAGED_RUNNER_DIGEST = "0".repeat(64);
 const FRAME_STDIN = 1;
 const FRAME_STDOUT = 2;
@@ -2051,8 +2057,8 @@ async function inspectManagedRun(session, sessionId, runId) {
     privateRegularFile(ownerPath, 512 * 1024),
     optionalPrivateRegularFile(claimPath, 64 * 1024),
     privateRegularFile(runnerScript, 512 * 1024),
-    optionalPrivateRegularFile(join(runDirectory, "control.json"), 64 * 1024),
-    optionalPrivateRegularFile(join(runDirectory, "approval-control.json"), 64 * 1024),
+    optionalPrivateRegularFile(join(runDirectory, "control.json"), MAX_MANAGED_CONTROL_FILE_BYTES),
+    optionalPrivateRegularFile(join(runDirectory, "approval-control.json"), MAX_MANAGED_APPROVAL_CONTROL_BYTES),
     optionalPrivateRegularFileSnapshot(join(runDirectory, "transcript.jsonl"), 50 * 1024 * 1024),
     optionalPrivateRegularFileSnapshot(join(runDirectory, "result.json"), 512 * 1024)
   ]);
@@ -2396,6 +2402,7 @@ function validateManagedControlValue(snapshot, sessionId, kind, value) {
     || value.productSessionId !== sessionId || value.productGeneration !== snapshot.config.productGeneration
     || value.taskId !== snapshot.config.taskId || !Number.isFinite(value.requestedAt)
   ) fail();
+  let maximumBytes = MAX_MANAGED_CONTROL_FILE_BYTES;
   if (kind === "control") {
     if (!["stop", "steer", "follow_up"].includes(value.action)) fail();
     if (value.action === "stop") {
@@ -2409,17 +2416,20 @@ function validateManagedControlValue(snapshot, sessionId, kind, value) {
       || pendingApproval.id !== value.approvalId || pendingApproval.childId !== value.childId
       || typeof value.approvalId !== "string" || value.approvalId.length < 1 || value.approvalId.length > 512
       || !(value.confirmed === true || value.confirmed === false || typeof value.value === "string" || value.cancelled === true)
-      || typeof value.value === "string" && value.value.length > 1024
     ) fail();
+    const policyRequest = pendingApproval.method === "input" && typeof pendingApproval.title === "string"
+      && pendingApproval.title.startsWith(POLICY_DECISION_REQUEST_PREFIX);
+    if (typeof value.value === "string" && value.value.length > (policyRequest ? MAX_POLICY_DECISION_REPLY_CHARACTERS : 1024)) fail();
+    if (policyRequest) maximumBytes = MAX_MANAGED_APPROVAL_CONTROL_BYTES;
   }
-  if (Buffer.byteLength(JSON.stringify(value)) > 64 * 1024) fail();
-  return structuredClone(value);
+  return { control: structuredClone(value), maximumBytes };
 }
 async function previousManagedControlSequence(snapshot, sessionId, kind) {
   const path = join(snapshot.runDirectory, kind === "control" ? "control.json" : "approval-control.json");
   let bytes;
-  try { bytes = await privateRegularFile(path, 64 * 1024); }
-  catch (error) {
+  try {
+    bytes = await privateRegularFile(path, kind === "approval" ? MAX_MANAGED_APPROVAL_CONTROL_BYTES : MAX_MANAGED_CONTROL_FILE_BYTES);
+  } catch (error) {
     if (error && error.code === "ENOENT") return 0;
     throw error;
   }
@@ -2445,7 +2455,7 @@ async function writeManagedControl(session, value) {
     || launchHash(value.expectedControlRevision) !== snapshot.controlRevision
     || !["control", "approval"].includes(value.kind)
   ) fail();
-  const requestedControl = validateManagedControlValue(snapshot, value.sessionId, value.kind, value.value);
+  const { control: requestedControl, maximumBytes } = validateManagedControlValue(snapshot, value.sessionId, value.kind, value.value);
   const previousSequence = await previousManagedControlSequence(
     snapshot,
     value.sessionId,
@@ -2457,6 +2467,7 @@ async function writeManagedControl(session, value) {
     ...requestedControl,
     seq: Math.max(previousSequence + 1, Date.now())
   };
+  if (Buffer.byteLength(JSON.stringify(control)) > maximumBytes) fail();
   await atomicJson(join(snapshot.runDirectory, value.kind === "control" ? "control.json" : "approval-control.json"), control);
   const refreshed = await inspectManagedRun(session, value.sessionId, value.runId);
   const receipt = digestBytes(Buffer.from(JSON.stringify([

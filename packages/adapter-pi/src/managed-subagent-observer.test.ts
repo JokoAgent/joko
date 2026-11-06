@@ -14,7 +14,12 @@ import {
   ManagedSubagentObserver,
   writeManagedSubagentDurableControl
 } from "./managed-subagent-observer.js";
-import { encodePolicyDecisionRequest } from "./policy-decision-bridge.js";
+import {
+  encodePolicyDecisionRequest,
+  MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS,
+  MAXIMUM_POLICY_DECISION_TITLE_BYTES,
+  POLICY_DECISION_REQUEST_PREFIX
+} from "./policy-decision-bridge.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("managed Subagent public observation", () => {
@@ -565,21 +570,28 @@ describe("managed Subagent public observation", () => {
     const sessionId = `session-${randomUUID()}`;
     const currentTaskId = "policy-call:current";
     const staleTaskId = "policy-call:stale";
-    const observation = {
-      subjectKind: "browser" as const,
-      risk: "high" as const,
-      toolProviderId: "browser",
-      toolName: "navigate"
-    };
+    const observation = { subjectKind: "command" as const, risk: "medium" as const, toolName: "bash" };
+    const request = (command: string) => encodePolicyDecisionRequest({
+      policyGeneration: 7,
+      observation,
+      toolCall: { toolName: "bash", input: { command } }
+    });
+    const emptyCommand = "printf '%s' ''";
+    const overhead = Buffer.from(request(emptyCommand).slice(POLICY_DECISION_REQUEST_PREFIX.length), "base64url").byteLength;
+    const command = `printf '%s' '${"x".repeat(MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS * 3 / 4 - overhead)}'`;
+    const title = request(command);
+    expect(Buffer.byteLength(title)).toBe(MAXIMUM_POLICY_DECISION_TITLE_BYTES);
     const currentApprovalId = `policy-${randomUUID()}`;
     const staleApprovalId = `policy-${randomUUID()}`;
-    const [current, stale] = await Promise.all([
+    const malformedTaskId = "policy-call:malformed";
+    const malformedApprovalId = `policy-${randomUUID()}`;
+    const [current, stale, malformed] = await Promise.all([
       physicalRun(root, sessionId, currentTaskId, 6, 1, [], undefined, "running", {
         pendingApproval: {
           id: currentApprovalId,
           childId: `${currentTaskId}:child`,
           method: "input",
-          title: encodePolicyDecisionRequest({ policyGeneration: 7, observation }),
+          title,
           placeholder: "",
           requestedAt: Date.now()
         }
@@ -593,6 +605,9 @@ describe("managed Subagent public observation", () => {
           placeholder: "",
           requestedAt: Date.now()
         }
+      }),
+      physicalRun(root, sessionId, malformedTaskId, 6, 1, [], undefined, "running", {
+        pendingApproval: { id: malformedApprovalId, childId: `${malformedTaskId}:child`, method: "input", title: `${title}a` }
       })
     ]);
     const base = context(sessionId, 6, []);
@@ -607,11 +622,10 @@ describe("managed Subagent public observation", () => {
           targetId: base.target.id,
           workspaceRoot: base.target.workspaceRoot,
           rules: [{
-            id: "deny-browser-navigation",
+            id: "deny-shell-command",
             effect: "deny",
-            subjectKind: "browser",
-            toolProviderId: "browser",
-            toolName: "navigate",
+            subjectKind: "command",
+            toolName: "bash",
             ceiling: "critical",
             priority: 1,
             order: 0
@@ -632,7 +646,58 @@ describe("managed Subagent public observation", () => {
     )) as Record<string, unknown>;
     expect(currentControl).toMatchObject({ approvalId: currentApprovalId, value: "deny" });
     expect(staleControl).toMatchObject({ approvalId: staleApprovalId, value: "stale" });
+    expect(JSON.parse(await readFile(join(root, managedSubagentSessionKey(sessionId), malformed.runId, "approval-control.json"), "utf8")))
+      .toMatchObject({ approvalId: malformedApprovalId, cancelled: true });
     observer.stop();
+  });
+
+  it("replays a complete policy reply for a short request from the private delivery journal", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-subagent-policy-replay-"));
+    const root = join(directory, "subagent-runs");
+    const sessionId = `session-${randomUUID()}`;
+    const taskId = "policy-call:owner-reply";
+    const approvalId = `policy-${randomUUID()}`;
+    const ownerText = `主人😀${"\u0001".repeat(15_996)}`;
+    const readOwnerUserInstructions = vi.fn(() => [ownerText]);
+    const events: EventPayload[] = [];
+    const base = context(sessionId, 6, events);
+    const options = {
+      root, policyGeneration: 7,
+      context: { ...base, nativeToolAuthorization: {
+        required: true,
+        capture: () => "current",
+        assertCurrent() {},
+        review: async () => ({ verdict: "default" as const }),
+        readOwnerUserInstructions
+      } }
+    };
+    const observer = new ManagedSubagentObserver(options);
+    const restarted = new ManagedSubagentObserver(options);
+    try {
+      const physical = await physicalRun(root, sessionId, taskId, 6, 1, [], undefined, "running", {
+        pendingApproval: { id: approvalId, childId: `${taskId}:child`, method: "input",
+          title: encodePolicyDecisionRequest({ policyGeneration: 7,
+            observation: { subjectKind: "command", risk: "medium", toolName: "bash" },
+            toolCall: { toolName: "bash", input: { command: "pwd" } }
+          })
+        }
+      });
+      await observer.refresh();
+      observer.stop();
+      const controlPath = join(root, managedSubagentSessionKey(sessionId), physical.runId, "approval-control.json");
+      const first = await readFile(controlPath, "utf8");
+      expect(Buffer.byteLength(first)).toBeGreaterThan(64 * 1024);
+      expect(JSON.parse(first)).toMatchObject({ approvalId, value: JSON.stringify({ decision: "default", ownerUserInstructions: [ownerText] }) });
+      await rm(controlPath);
+      await restarted.refresh();
+      expect(readOwnerUserInstructions).toHaveBeenCalledTimes(1);
+      expect(await readFile(controlPath, "utf8")).toBe(first);
+      expect(JSON.stringify(events)).not.toContain("主人😀");
+    } finally {
+      observer.stop();
+      restarted.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("blocks recursive Pi child reads that cover denied paths while retaining scoped reads", async () => {

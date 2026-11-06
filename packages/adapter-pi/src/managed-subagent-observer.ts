@@ -19,7 +19,14 @@ import { evaluateOrderedPolicyRules, policyObservationForToolCall, workspaceSubt
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 
 import { handleCommandGateExtensionRequest } from "./command-gate-bridge.js";
-import { handlePolicyDecisionExtensionRequest, type PolicyDecisionRequest, type PolicyDecisionResult } from "./policy-decision-bridge.js";
+import {
+  handlePolicyDecisionExtensionRequest,
+  MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS,
+  MAXIMUM_POLICY_DECISION_TITLE_BYTES,
+  POLICY_DECISION_REQUEST_PREFIX,
+  type PolicyDecisionRequest,
+  type PolicyDecisionResult
+} from "./policy-decision-bridge.js";
 import { redactManagedSecrets } from "./errors.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./managed-durable-store.js";
@@ -418,6 +425,8 @@ export class ManagedSubagentObserver {
   ): Promise<void> {
     if (this.#stopped || delivery.runId !== projection.latest.runId || delivery.childId !== pending.childId
         || delivery.approvalId !== pending.id) return;
+    if (delivery.response.value !== undefined && delivery.response.value.length > 1024
+        && (pending.method !== "input" || !pending.title.startsWith(POLICY_DECISION_REQUEST_PREFIX))) return;
     const config = projection.latest.config;
     const value = {
       format: FORMAT,
@@ -1651,14 +1660,16 @@ function pendingApprovalOf(projection: LogicalProjection, redactValues: readonly
   const id = optionalString(value["id"], 512, redactValues);
   const childId = optionalString(value["childId"], 512, redactValues);
   const method = value["method"];
-  const title = optionalString(value["title"], 1024, redactValues);
+  const rawTitle = value["title"];
+  const policyRequest = method === "input" && typeof rawTitle === "string" && rawTitle.startsWith(POLICY_DECISION_REQUEST_PREFIX);
+  const title = optionalString(rawTitle, policyRequest ? MAXIMUM_POLICY_DECISION_TITLE_BYTES : 1024, redactValues);
   const expectedChildId = requiredString(projection.latest.config["childId"], 512);
   if (id === undefined || childId !== expectedChildId || (method !== "confirm" && method !== "input") || title === undefined) {
     return undefined;
   }
   if (method === "confirm" && !title.startsWith("joko:permission:")) return undefined;
   if (method === "input" && !title.startsWith("joko:command-gate/v1/")
-      && !title.startsWith("joko:policy-decision/v1/")) return undefined;
+      && !title.startsWith(POLICY_DECISION_REQUEST_PREFIX)) return undefined;
   return {
     id,
     childId,
@@ -1812,9 +1823,10 @@ function isApprovalDelivery(value: unknown): value is ApprovalDelivery {
   const response = value["response"];
   const fields = [response["confirmed"] !== undefined, response["value"] !== undefined, response["cancelled"] !== undefined]
     .filter(Boolean).length;
-  return fields === 1
+  return fields === 1 && Object.keys(response).length === 1
     && (response["confirmed"] === undefined || typeof response["confirmed"] === "boolean")
-    && (response["value"] === undefined || typeof response["value"] === "string" && response["value"].length <= 1024)
+    && (response["value"] === undefined || typeof response["value"] === "string"
+      && response["value"].length <= MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS)
     && (response["cancelled"] === undefined || response["cancelled"] === true);
 }
 

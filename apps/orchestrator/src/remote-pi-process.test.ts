@@ -521,16 +521,26 @@ describe("RemotePiProcessFactory", () => {
       maxBytes: 1024
     });
     expect(Buffer.from(tail.content).toString("utf8")).toBe("entry\n");
-    await store!.writeControl({
+    const controlScope = {
       sessionId: productSessionId,
       runId: scan.runs[0]!.runId,
       runnerInstanceId: scan.runs[0]!.runnerInstanceId,
       launchToken: scan.runs[0]!.launchToken,
       runnerScriptSha256: scan.runs[0]!.runnerScriptSha256,
-      expectedControlRevision: scan.runs[0]!.controlRevision,
+      expectedControlRevision: scan.runs[0]!.controlRevision
+    };
+    await store!.writeControl({
+      ...controlScope,
       kind: "control",
       value: { format: 1, action: "stop" }
     });
+    const approvalValue = { format: 1, action: "approval",
+      value: JSON.stringify({ decision: "default", ownerUserInstructions: [`主人😀${"\u0001".repeat(15_996)}`] }) };
+    expect(Buffer.byteLength(JSON.stringify(approvalValue))).toBeGreaterThan(64 * 1024);
+    await store!.writeControl({ ...controlScope, kind: "approval", value: approvalValue });
+    expect(managedStoreOperations.at(-1)).toMatchObject({ kind: "approval", value: approvalValue });
+    await expect(store!.writeControl({ ...controlScope, kind: "control", value: approvalValue }))
+      .rejects.toThrow("control value is invalid");
     await store!.dispose();
 
     const restartedFactory = remoteFactory(registry, authorityRoot);
@@ -589,7 +599,7 @@ describe("RemotePiProcessFactory", () => {
     expect(finalizedAuthority).not.toHaveProperty("currentBearer");
     expect(JSON.stringify(finalizedAuthority)).not.toContain(nativeAuthReservationToken);
     expect(managedStoreOperations.map((value) => value.operation)).toEqual([
-      "scan", "read-tail", "write-control", "scan", "stop-remove-session",
+      "scan", "read-tail", "write-control", "write-control", "scan", "stop-remove-session",
       "finalize-deletion", "finalize-deletion"
     ]);
     expect(managedStoreOperations.every((value) =>
