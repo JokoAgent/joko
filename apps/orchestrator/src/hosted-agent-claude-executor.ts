@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { posix, win32 } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { runInNewContext } from "node:vm";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import sharp from "sharp";
@@ -7,6 +8,11 @@ import { claudeHostedToolDefinitions } from "@joko/adapter-claude-code";
 import { HostedAgentExecutorError } from "./hosted-agent-executor.js";
 
 type Result = { readonly content: readonly Record<string, unknown>[]; readonly isError: boolean };
+const MAX_ACTIVE_BACKGROUND_COMMANDS = 16;
+const MAX_BACKGROUND_COMMANDS = 256;
+const MAX_BACKGROUND_OUTPUT_PAGE_BYTES = 4 * 1024 * 1024;
+const MAX_UNREAD_COMMAND_BYTES = 8 * 1024 * 1024;
+const MAX_UNREAD_BACKGROUND_BYTES = 64 * 1024 * 1024;
 export interface HostedAgentClaudeAuthorization {
   readonly webFetch?: (input: Readonly<Record<string, unknown>>, signal: AbortSignal) => Promise<Result>;
   readonly readPdf?: (bytes: Buffer, pages: string | undefined, signal: AbortSignal) => Promise<Result>;
@@ -36,8 +42,10 @@ interface Job {
   readonly scope: Scope;
   readonly abort: AbortController;
   readonly settled: Promise<void>;
+  readonly decoder: StringDecoder;
   text: string;
-  consumed: number;
+  unreadBytes: number;
+  receivedOutput: boolean;
   complete: boolean;
   exitCode?: number | null;
   truncated: boolean;
@@ -61,6 +69,7 @@ export class HostedAgentClaudeExecutor {
     new AjvJsonSchemaValidator().getValidator<Record<string, unknown>>(definition.inputSchema)]));
   readonly #paths: typeof posix | typeof win32;
   #cwd: string;
+  #unreadBackgroundBytes = 0;
   constructor(options: HostedAgentClaudeExecutorOptions) {
     this.#options = options; this.#cwd = options.workspaceRoot;
     this.#paths = /^[A-Za-z]:|^\\\\/u.test(options.workspaceRoot) ? win32 : posix;
@@ -104,6 +113,7 @@ export class HostedAgentClaudeExecutor {
     this.#lifetime.abort(); for (const job of this.#jobs.values()) job.abort.abort();
     await Promise.allSettled([...this.#jobs.values()].map(job => job.settled));
     this.#scopes.clear(); this.#reads.clear(); this.#jobs.clear(); this.#seen.clear();
+    this.#unreadBackgroundBytes = 0;
   }
   async #begin(callId: string, name: string, input: Record<string, unknown>, authorization: HostedAgentClaudeAuthorization, signal: AbortSignal): Promise<Scope> {
     const scope: Scope = { callId, name, input, authorization, sequence: 0, dispatched: false };
@@ -182,8 +192,9 @@ export class HostedAgentClaudeExecutor {
         return result(shellText(response), response.exitCode !== 0 || response.aborted === true || response.timedOut === true);
       }
       case "BashOutput": {
-        const job = this.#jobs.get(String(scope.input.bash_id))!;
-        const fresh = job.text.slice(job.consumed); job.consumed = job.text.length;
+        const job = this.#jobs.get(String(scope.input.bash_id));
+        if (!job) throw new HostedAgentExecutorError("NOT_FOUND");
+        const fresh = job.unreadBytes <= MAX_BACKGROUND_OUTPUT_PAGE_BYTES ? job.text : utf8Prefix(job.text, MAX_BACKGROUND_OUTPUT_PAGE_BYTES);
         let text = fresh;
         if (typeof scope.input.filter === "string") {
           if (scope.input.filter.length > 4096) return result("The output filter exceeds its limit.", true);
@@ -192,10 +203,19 @@ export class HostedAgentClaudeExecutor {
               { pattern: scope.input.filter, content: fresh }, { timeout: 200 }) as string;
           } catch { return result("The output filter is invalid or exceeded its execution limit.", true); }
         }
-        return result(`Status: ${job.complete ? "completed" : "running"}${job.complete ? ` (exit ${String(job.exitCode ?? "unknown")})` : ""}\n${text}${job.truncated ? "\nOutput exceeded its retained limit." : ""}`);
+        const consumedBytes = Buffer.byteLength(fresh, "utf8");
+        job.text = job.text.slice(fresh.length);
+        job.unreadBytes -= consumedBytes;
+        this.#unreadBackgroundBytes -= consumedBytes;
+        const status = job.complete ? `completed (exit ${String(job.exitCode ?? "unknown")})` : "running";
+        const remaining = job.unreadBytes > 0 ? "\nMore output is available. Use BashOutput to continue reading." : "";
+        const limit = job.truncated ? "\nOutput exceeded its retained limit." : "";
+        return result(`Status: ${status}\n${text}${remaining}${limit}`);
       }
       case "KillShell": {
-        const job = this.#jobs.get(String(scope.input.shell_id))!; job.abort.abort(); await job.settled;
+        const job = this.#jobs.get(String(scope.input.shell_id));
+        if (!job) throw new HostedAgentExecutorError("NOT_FOUND");
+        job.abort.abort(); await job.settled;
         return result(`Stopped background command ${job.id}.`);
       }
       case "WebFetch": return scope.authorization.webFetch!(scope.input, signal);
@@ -243,27 +263,63 @@ export class HostedAgentClaudeExecutor {
     return result(`The file ${path} has been ${previous ? "updated" : "created"} successfully.`);
   }
   #background(scope: Scope): Result {
-    if ([...this.#jobs.values()].filter(job => !job.complete).length >= 16 || this.#jobs.size >= 256) return result("Too many background commands. Stop a running command first.", true);
+    if ([...this.#jobs.values()].filter(job => !job.complete).length >= MAX_ACTIVE_BACKGROUND_COMMANDS
+      || (this.#jobs.size >= MAX_BACKGROUND_COMMANDS && !this.#retireCompletedJob())) {
+      return result("Too many background commands. Stop a running command first.", true);
+    }
     const abort = new AbortController(), signal = AbortSignal.any([abort.signal, this.#lifetime.signal, this.#options.signal]);
     const id = "shell-" + randomUUID(); let job!: Job;
     const settled = Promise.resolve().then(async () => {
-      const response = await this.#primitive(scope, "exec.run", { command: scope.command!, cwd: scope.cwd!, timeout: scope.timeout! }, signal, {
-        captureCwd: true, background: true, onOutput: bytes => {
-          this.#assertCurrent(signal);
-          const available = 4 * 1024 * 1024 - job.text.length;
-          if (available > 0) job.text += bytes.toString("utf8").slice(0, available);
-          if (bytes.byteLength > available) job.truncated = true;
+      let stopped = false;
+      try {
+        const response = await this.#primitive(scope, "exec.run", { command: scope.command!, cwd: scope.cwd!, timeout: scope.timeout! }, signal, {
+          captureCwd: true, background: true, onOutput: bytes => {
+            this.#assertCurrent(signal);
+            job.receivedOutput ||= bytes.byteLength > 0;
+            this.#appendBackgroundOutput(job, job.decoder.write(bytes));
+          }
+        });
+        if (!job.receivedOutput && typeof response.output === "string") {
+          this.#appendBackgroundOutput(job, job.decoder.write(Buffer.from(response.output, "base64")));
         }
-      });
-      if (!job.text && typeof response.output === "string") job.text = Buffer.from(response.output, "base64").toString("utf8").slice(0, 4 * 1024 * 1024);
-      job.exitCode = typeof response.exitCode === "number" || response.exitCode === null ? response.exitCode : undefined;
-    }).catch(() => { job.text += "\nThe task command stopped or its execution authority changed."; })
-      .finally(async () => { job.complete = true;
+        job.exitCode = typeof response.exitCode === "number" || response.exitCode === null ? response.exitCode : undefined;
+      } catch { stopped = true; }
+      finally {
+        this.#appendBackgroundOutput(job, job.decoder.end());
+        if (stopped) this.#appendBackgroundOutput(job, "\nThe task command stopped or its execution authority changed.");
         const callId = `${scope.callId}:native`;
-        await scope.authorization.execute({ format: 1, callId, requestId: `${callId}:${++scope.sequence}`, operation: "tool.end", payload: {} }, this.#options.signal).catch(() => undefined); });
-    job = { id, scope, abort, settled, text: "", consumed: 0, complete: false, truncated: false };
+        await scope.authorization.execute({ format: 1, callId, requestId: `${callId}:${++scope.sequence}`, operation: "tool.end", payload: {} }, this.#options.signal).catch(() => undefined);
+        job.complete = true;
+      }
+    });
+    job = { id, scope, abort, settled, decoder: new StringDecoder("utf8"), text: "", unreadBytes: 0,
+      receivedOutput: false, complete: false, truncated: false };
     scope.background = job; this.#jobs.set(id, job);
     return result(`Command running in background with ID: ${id}. Use BashOutput to read new output and KillShell to stop it.`);
+  }
+  #appendBackgroundOutput(job: Job, text: string): void {
+    if (text === "") return;
+    const available = Math.min(MAX_UNREAD_COMMAND_BYTES - job.unreadBytes, MAX_UNREAD_BACKGROUND_BYTES - this.#unreadBackgroundBytes);
+    const retained = utf8Prefix(text, available);
+    const bytes = Buffer.byteLength(retained, "utf8");
+    job.text += retained;
+    job.unreadBytes += bytes;
+    this.#unreadBackgroundBytes += bytes;
+    if (retained.length < text.length) job.truncated = true;
+  }
+  #retireCompletedJob(): boolean {
+    let oldest: Job | undefined;
+    for (const job of this.#jobs.values()) {
+      if (!job.complete) continue;
+      oldest ??= job;
+      if (job.unreadBytes === 0) { oldest = job; break; }
+    }
+    if (oldest === undefined) return false;
+    this.#jobs.delete(oldest.id);
+    this.#unreadBackgroundBytes -= oldest.unreadBytes;
+    oldest.unreadBytes = 0;
+    oldest.text = "";
+    return true;
   }
   #adoptCwd(value: unknown): void { if (typeof value === "string" && this.#paths.isAbsolute(value) && value.length <= 16_384 && !value.includes("\0")) this.#cwd = value; }
   #remember(path: string, sha256: string): void { if (this.#reads.size >= 4096) this.#reads.delete(this.#reads.keys().next().value!); this.#reads.set(this.#key(path), sha256); }
@@ -274,6 +330,14 @@ export class HostedAgentClaudeExecutor {
 function record(value: unknown): Record<string, unknown> | undefined { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
 function text(value: unknown, maximum: number): string { if (typeof value !== "string" || !value || value.length > maximum || value.includes("\0")) throw new HostedAgentExecutorError("INVALID_REQUEST"); return value; }
 function result(text: string, isError = false): Result { return { content: [{ type: "text", text }], isError }; }
+function utf8Prefix(value: string, maximumBytes: number): string {
+  if (maximumBytes <= 0) return "";
+  if (Buffer.byteLength(value, "utf8") <= maximumBytes) return value;
+  const bytes = Buffer.from(value, "utf8");
+  let end = maximumBytes;
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+}
 function decodeText(bytes: Buffer): string { const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); if (text.includes("\0")) throw new HostedAgentExecutorError("INVALID_REQUEST"); return text; }
 function shellText(response: Record<string, unknown>): string {
   const output = typeof response.output === "string" ? Buffer.from(response.output, "base64").toString("utf8") : "";
