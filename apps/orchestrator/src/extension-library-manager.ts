@@ -288,6 +288,7 @@ interface ActiveStream {
   readonly sessionId: string;
   readonly path: string;
   readonly temporaryPath: string;
+  readonly temporaryIdentity: BigIntStats;
   readonly totalBytes: number;
   readonly expectedSha256?: string;
   readonly ifNotExists: boolean;
@@ -689,6 +690,10 @@ export class ExtensionLibraryManager {
       await session.vault.assertWritable(Math.min(input.totalBytes, session.vault.limits.maximumWriteBytes));
       const temporaryPath = await session.vault.allocateTemporaryPath(".stream");
       const handle = await open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+      const temporaryIdentity = await handle.stat({ bigint: true }).catch(async (error: unknown) => {
+        await handle.close().catch(() => undefined);
+        throw error;
+      });
       const streamId = `library_stream_${randomUUID().replaceAll("-", "")}`;
       const expiresAt = this.#now() + session.vault.limits.streamIdleMilliseconds;
       this.#streams.set(streamId, {
@@ -696,6 +701,7 @@ export class ExtensionLibraryManager {
         sessionId,
         path: input.path,
         temporaryPath,
+        temporaryIdentity,
         totalBytes: input.totalBytes,
         ...(input.sha256 === undefined ? {} : { expectedSha256: input.sha256 }),
         ifNotExists: input.ifNotExists === true,
@@ -748,6 +754,7 @@ export class ExtensionLibraryManager {
       try {
         const result = await session.vault.commitStagedWrite({
           temporaryPath: stream.temporaryPath,
+          temporaryIdentity: stream.temporaryIdentity,
           path: stream.path,
           bytes: stream.receivedBytes,
           sha256: digest,
@@ -1427,7 +1434,7 @@ export class ExtensionLibraryManager {
     this.#streams.delete(stream.streamId);
     await stream.handle?.close().catch(() => undefined);
     stream.handle = undefined;
-    await session.vault.discardTemporaryPath(stream.temporaryPath, ".stream").catch(() => undefined);
+    await session.vault.discardTemporaryPath(stream.temporaryPath, ".stream", stream.temporaryIdentity).catch(() => undefined);
   }
 
   async #destroySession(session: ActiveSession): Promise<void> {
