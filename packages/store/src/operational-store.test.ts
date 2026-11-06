@@ -705,8 +705,10 @@ describe("OperationalStore", () => {
       } catch (error) { console.log(error.name); }
       finally { store?.close(); }
     `;
-    const openInChild = () => spawnSync(process.execPath, ["--input-type=module", "--eval", childSource,
-      new URL("../dist/index.js", import.meta.url).href, filePath], { encoding: "utf8", timeout: 10_000 });
+    const openInChild = () => spawnSync(process.execPath, [
+      "--import", import.meta.resolve("tsx"), "--input-type=module", "--eval", childSource,
+      new URL("./index.ts", import.meta.url).href, filePath
+    ], { encoding: "utf8", timeout: 10_000, windowsHide: true });
     const rename = vi.mocked(renameSync), original = rename.getMockImplementation()!;
     let competing: ReturnType<typeof openInChild> | undefined;
     rename.mockImplementation((source, destination) => {
@@ -724,7 +726,7 @@ describe("OperationalStore", () => {
     const reopened = openInChild();
     expect(reopened.status, reopened.stderr).toBe(0);
     expect(reopened.stdout.trim()).toBe("New primary");
-  });
+  }, 25_000);
 
   it("rejects a maintenance replacement after a concurrent durable write", async () => {
     const fixture = createFixture();
