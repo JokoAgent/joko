@@ -845,12 +845,31 @@ export class McpRouter {
   appServerConfig(serverId: string): AppServerConfig | undefined {
     const server = this.#servers.get(serverId);
     if (server === undefined || !server.input.enabled || server.input.transport === "stdio") return;
+    const assertCredentialsCurrent = this.#captureHeaderAuthority(server.input);
     const headers: Record<string, string> = {};
     for (const binding of server.input.credentialBindings) {
       if (binding.target !== "header") return;
       headers[binding.name] = this.#credentials.resolve(binding.credentialReferenceId);
     }
-    return { id: serverId, url: server.input.endpoint, transport: server.input.transport === "sse" ? "sse" : "http", headers };
+    return { id: serverId, url: server.input.endpoint, transport: server.input.transport === "sse" ? "sse" : "http", headers,
+      ...(assertCredentialsCurrent === undefined ? {} : { assertCredentialsCurrent }) };
+  }
+
+  #captureHeaderAuthority(input: McpServerInput): (() => void) | undefined {
+    const generations = new Map<string, string>();
+    for (const binding of input.credentialBindings) {
+      if (binding.target !== "header") continue;
+      const current = this.#credentials.find(binding.credentialReferenceId);
+      if (current?.configured !== true) throw new Error("An MCP header credential is unavailable.");
+      generations.set(binding.credentialReferenceId, current.generation);
+    }
+    if (generations.size === 0) return undefined;
+    return () => {
+      for (const [reference, generation] of generations) {
+        const current = this.#credentials.find(reference);
+        if (current?.configured !== true || current.generation !== generation) throw new Error("The original MCP header credential retired.");
+      }
+    };
   }
 
   /** The native peer negotiates its own callbacks. A model channel borrows only
@@ -2438,13 +2457,16 @@ export class McpRouter {
       assertCurrent?.();
       await validateServerInput(server.input);
       assertCurrent?.();
+      const assertHeadersCurrent = this.#captureHeaderAuthority(server.input);
       for (const binding of server.input.credentialBindings) credentials[`${binding.target}:${binding.name}`] = this.#credentials.resolve(binding.credentialReferenceId);
       let runtime: Runtime | undefined;
       connection = await this.#factory.connect({
         config: server.input,
         generation: server.generation,
         credentials,
-        ...(assertCurrent === undefined ? {} : { assertCurrent: () => startupAuthority?.() }),
+        ...(assertCurrent === undefined && assertHeadersCurrent === undefined ? {} : {
+          assertCurrent: () => { startupAuthority?.(); assertHeadersCurrent?.(); }
+        }),
         onClose: () => this.#runtimeClosed(server.input.id, server.generation),
         onError: (error) => this.#runtimeErrored(server.input.id, server.generation, error)
       });
@@ -2737,7 +2759,8 @@ export class SdkMcpClientFactory implements McpClientFactory {
     if (input.config.transport !== "stdio") {
       const headers = Object.fromEntries(input.config.credentialBindings.map(binding => [binding.name, input.credentials[`header:${binding.name}`]!]));
       appConnection = new AppConnection({ id: input.config.id, url: input.config.endpoint,
-        transport: input.config.transport === "sse" ? "sse" : "http", headers }, undefined, client);
+        transport: input.config.transport === "sse" ? "sse" : "http", headers,
+        ...(input.assertCurrent === undefined ? {} : { assertCredentialsCurrent: input.assertCurrent }) }, undefined, client);
     }
     return {
       ...(appConnection === undefined ? {} : { appConnection }),
