@@ -14916,7 +14916,7 @@ describe("SessionHost", () => {
     await eventually(() => store.getRun(importedQueued.value.runId).descriptor.state === "completed");
   });
 
-  it.each(["user only", "reasoning", "different turn", "accepted completion"] as const)("settles SSH Codex only with exact original native terminal evidence (%s)", { timeout: 20_000 }, async suffix => {
+  it.each(["user only", "reasoning", "different turn", "accepted completion", "accepted still running"] as const)("settles SSH Codex only with exact original native terminal evidence (%s)", { timeout: 20_000 }, async suffix => {
     const directory = mkdtempSync(join(tmpdir(), "joko-remote-codex-terminal-"));
     const store = new OperationalStore(join(directory, "store.db"));
     const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
@@ -14949,15 +14949,25 @@ describe("SessionHost", () => {
       prompt: { text: "Persist the original user input", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
     await eventually(() => store.getQueueItem(admitted.queueItemId).state === "backend_accepted");
     const thread = remote.threads.get(threadId)!, turn = thread.turns.at(-1)!;
-    thread.status = { type: "idle" };
-    if (suffix === "accepted completion") {
+    if (suffix === "accepted completion" || suffix === "accepted still running") {
+      const originalProxy = remote.transport!;
+      const next = suffix === "accepted still running" ? host.enqueueInput({ operationId: "codex-terminal-next", connection, sessionId,
+        prompt: { text: "Next queued input", images: [], files: [], mentions: [], disposition: "prompt" } }).value : undefined;
+      if (next !== undefined) {
+        expect(turn["status"]).toBe("inProgress");
+        await originalProxy.exit();
+        expect(remote.transport).not.toBe(originalProxy);
+        expect(store.getQueueItem(admitted.queueItemId).state).toBe("backend_accepted");
+        expect(store.getQueueItem(next.queueItemId).state).toBe("accepted");
+        expect(remote.transport?.requests.filter(request => request.method === "turn/start")).toEqual([]);
+      }
       const items = turn["items"];
       if (!Array.isArray(items)) throw new Error("The fixture turn has no native items.");
       turn["items"] = [...items, { type: "agentMessage", id: "retained-completion", text: "Original native result", phase: null, memoryCitation: null, delivery: null }];
       turn["status"] = "completed";
-      const originalProxy = remote.transport!;
-      await originalProxy.exit();
-      await eventually(() => store.getQueueItem(admitted.queueItemId).state === "completed");
+      thread.status = { type: "idle" };
+      if (next === undefined) await originalProxy.exit();
+      await eventually(() => store.getQueueItem(admitted.queueItemId).state === "completed", 8_000);
       const run = store.getRun(admitted.runId).descriptor;
       expect(run).toMatchObject({ state: "completed", activeAttemptId: admitted.attemptId });
       expect(store.getAttempt(admitted.attemptId).descriptor.error).toBeUndefined();
@@ -14966,9 +14976,18 @@ describe("SessionHost", () => {
         && event.payload.blocks.some(block => block.kind === "text" && block.text === "Original native result"))).toBe(true);
       expect(events.some(event => event.payload.type === "error" && event.payload.error.code === "CODEX_APP_SERVER_DISCONNECTED")).toBe(false);
       expect(remote.transport).not.toBe(originalProxy);
-      expect(remote.transport?.requests.filter(request => request.method === "turn/start")).toEqual([]);
+      if (next === undefined) expect(remote.transport?.requests.filter(request => request.method === "turn/start")).toEqual([]);
+      else {
+        await eventually(() => store.getQueueItem(next.queueItemId).state === "backend_accepted");
+        expect(remote.transport?.requests.filter(request => request.method === "turn/start").map(request => request.params)).toEqual([
+          expect.objectContaining({ threadId, input: [{ type: "text", text: "Next queued input", text_elements: [] }] })
+        ]);
+        await remote.completeTurn(threadId, "Next native result");
+        await eventually(() => store.getQueueItem(next.queueItemId).state === "completed");
+      }
       return;
     }
+    thread.status = { type: "idle" };
     turn["status"] = "failed";
     if (suffix === "reasoning") {
       const items = turn["items"];
