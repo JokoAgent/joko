@@ -6,6 +6,7 @@ import {
   useEffect,
   useId,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -1318,7 +1319,7 @@ function useWorkspaceSearch(input: {
     }
   }, [input.caseSensitive, input.query, input.rootRef, input.searchWorkspace, input.workspaceId]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     abortRef.current?.abort();
     generationRef.current += 1;
     if (input.query.trim() === "") {
