@@ -4,6 +4,7 @@ import {
   RemoteSshError,
   SshKeyError,
   TofuSshHostKeyVerifier,
+  sshHostKeyEndpointId,
   sshHostKeyPinId,
   type AgentAuthConnection,
   type AgentAuthConnectorPort,
@@ -848,6 +849,7 @@ class OperationalHostKeyPinStore implements SshHostKeyPinStorePort {
     }
     if (current.trust !== undefined) {
       if (current.trust.algorithm === algorithm && current.trust.fingerprint === request.fingerprint) {
+        this.assertEndpointTrust(current, algorithm, request.fingerprint);
         const initiallyTrusted = this.#options.initialTrust?.algorithm === algorithm &&
           this.#options.initialTrust.fingerprint === request.fingerprint;
         const pinnedByThisConnection = this.#acceptedPin?.algorithm === algorithm &&
@@ -864,14 +866,17 @@ class OperationalHostKeyPinStore implements SshHostKeyPinStorePort {
       throw new RemoteSshError("HOST_KEY_CHANGED", "The remote host key changed. Connection was refused.", false);
     }
     try {
-      const pinned = this.#options.store.pinRemoteHostTrust({
-        ownerId: current.ownerId,
-        targetId: current.targetId,
-        id: current.id,
-        expectedRevision: current.revision,
-        algorithm,
-        fingerprint: request.fingerprint,
-        pinnedAt: Math.max(current.createdAt, this.#options.now())
+      const pinned = this.#options.store.transaction((store) => {
+        this.assertEndpointTrust(current, algorithm, request.fingerprint);
+        return store.pinRemoteHostTrust({
+          ownerId: current.ownerId,
+          targetId: current.targetId,
+          id: current.id,
+          expectedRevision: current.revision,
+          algorithm,
+          fingerprint: request.fingerprint,
+          pinnedAt: Math.max(current.createdAt, this.#options.now())
+        });
       });
       this.#acceptedPin = Object.freeze({ algorithm, fingerprint: request.fingerprint });
       this.#options.onChange(pinned);
@@ -880,9 +885,27 @@ class OperationalHostKeyPinStore implements SshHostKeyPinStorePort {
       throw hostKeyStoreFailure(error);
     }
   }
+
+  private assertEndpointTrust(current: RemoteHostRecord, algorithm: string, fingerprint: string): void {
+    const endpoint = sshHostKeyEndpointId(current.hostname, current.port);
+    for (const candidate of this.#options.store.listRemoteHosts(current.ownerId)) {
+      const pin = candidate.trust;
+      if (pin === undefined || candidate.port !== current.port || pin.algorithm === algorithm && pin.fingerprint === fingerprint) continue;
+      let candidateEndpoint: string;
+      try { candidateEndpoint = sshHostKeyEndpointId(candidate.hostname, candidate.port); }
+      catch (error) {
+        if (error instanceof RemoteSshError && error.code === "HOST_KEY_INVALID") continue;
+        throw error;
+      }
+      if (candidateEndpoint === endpoint) {
+        throw new RemoteSshError("HOST_KEY_CHANGED", "The remote host key changed. Connection was refused.", false);
+      }
+    }
+  }
 }
 
 function hostKeyStoreFailure(error: unknown): RemoteSshError {
+  if (error instanceof RemoteSshError) return error;
   if (error instanceof RevisionConflictError) {
     return new RemoteSshError("HOST_KEY_CONFLICT", "Concurrent host key trust could not be established safely.", false);
   }
