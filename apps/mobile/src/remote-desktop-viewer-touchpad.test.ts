@@ -100,7 +100,9 @@ describe("actual Fold relative touchpad and media viewport", () => {
       value.touch("end", 1, { tap: true });
       expect(value.packets().flatMap(packet => packet.events).some(event => event.kind === "button")).toBe(false);
       if (boundary !== "stop") {
-        value.ack(); value.touch("start", 2); value.touch("end", 1, { tap: true }); value.touch("move", 2, { dx: 20, dy: 0 });
+        if (boundary === "control") expect(value.packets()).toHaveLength(0);
+        else { expect(value.packets().at(-1)?.events).toEqual([{ kind: "release" }]); value.ack(); }
+        value.touch("start", 2); value.touch("end", 1, { tap: true }); value.touch("move", 2, { dx: 20, dy: 0 });
         await vi.advanceTimersByTimeAsync(33);
         expect(value.packets().at(-1)!.events).toEqual([expect.objectContaining({ kind: "move" })]);
       }
