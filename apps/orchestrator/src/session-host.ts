@@ -10454,6 +10454,7 @@ export class SessionHost {
               retired = true;
             } catch (error) {
               if (!(error instanceof BackendRetirementTimeoutError)) {
+                if (error instanceof JokoError && error.publicError.code === "PI_PROCESS_KILL_UNCONFIRMED") throw error;
                 // A completed close rejection may already have retired native
                 // state. Preserve the prior fail-closed restoration behavior.
                 retired = true;

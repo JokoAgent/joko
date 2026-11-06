@@ -380,7 +380,9 @@ describe("PiRpcTransport", () => {
       generation: 2,
       redactValues: [credentialedProxy, "proxy-passphrase"]
     });
-    process.emit("error", new Error(`spawn through ${credentialedProxy} with proxy-passphrase failed`));
+    process.emit("error", Object.assign(new Error(`spawn through ${credentialedProxy} with proxy-passphrase failed`), {
+      code: "ENOENT", syscall: "spawn fixture"
+    }));
 
     const exit = await transport.waitForExit();
     expect(exit).toMatchObject({
@@ -392,6 +394,52 @@ describe("PiRpcTransport", () => {
     expect(exit.error?.publicError.message).not.toContain("proxy-passphrase");
     expect(exit.error?.cause).toBeUndefined();
     expect(transport.closed).toBe(true);
+  });
+
+  it("keeps a denied process fenced through both signals and allows a later exit confirmation", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeProcess();
+      const kill = vi.fn((_signal?: NodeJS.Signals | number) => {
+        process.emit("error", Object.assign(new Error("kill EPERM"), { code: "EPERM", syscall: "kill" }));
+        return false;
+      });
+      process.kill = kill;
+      const transport = new PiRpcTransport({ process: process as unknown as PiProcessHandle, generation: 4 });
+      const onExit = vi.fn();
+      transport.onExit(onExit);
+
+      const first = expect(transport.terminate(10)).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
+      const second = expect(transport.terminate(10)).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
+      await vi.advanceTimersByTimeAsync(40);
+      await Promise.all([first, second]);
+      expect(kill.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
+      expect(transport.closed).toBe(true);
+      expect(onExit).not.toHaveBeenCalled();
+
+      const retry = transport.terminate(10);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(kill.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"], ["SIGTERM"]]);
+      process.exitCode = 0;
+      process.emit("exit", 0, null);
+      await expect(retry).resolves.toMatchObject({ code: 0, expected: true });
+      expect(onExit).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for normal exit after a thrown termination signal failure", async () => {
+    const process = new FakeProcess();
+    const kill = vi.fn((_signal?: NodeJS.Signals | number): boolean => { throw new Error("signal unavailable"); });
+    process.kill = kill;
+    const transport = new PiRpcTransport({ process: process as unknown as PiProcessHandle, generation: 4 });
+    const stop = transport.terminate(250);
+    await new Promise((resolve) => setImmediate(resolve));
+    process.exitCode = 0;
+    process.emit("exit", 0, null);
+    await expect(stop).resolves.toMatchObject({ code: 0, expected: true, error: undefined });
+    expect(kill.mock.calls).toEqual([["SIGTERM"]]);
   });
 
   it("keeps an unconfirmed forced kill fenced without pretending the process exited", async () => {

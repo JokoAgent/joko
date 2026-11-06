@@ -161,11 +161,16 @@ export async function probePiExecutable(options: PiCompatibilityProbeOptions): P
       redactValues: options.redactValues
     });
   } finally {
-    if (transport !== undefined) {
-      await transport.terminate(options.shutdownTimeoutMs ?? 2_000).catch(() => undefined);
+    const removeProbeDirectory = () => rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }).catch(() => undefined);
+    try {
+      await transport?.terminate(options.shutdownTimeoutMs ?? 2_000);
+    } catch (error) {
+      void transport?.waitForExit().then(removeProbeDirectory);
+      throw error;
+    } finally {
+      if (server !== undefined) await closeServer(server).catch(() => undefined);
     }
-    if (server !== undefined) await closeServer(server).catch(() => undefined);
-    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }).catch(() => undefined);
+    await removeProbeDirectory();
   }
 }
 
