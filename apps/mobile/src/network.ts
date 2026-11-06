@@ -269,7 +269,7 @@ export interface MobileNetwork {
   setRemoteDesktopPresentation?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     enabled: boolean, signal?: AbortSignal): Promise<RemoteDesktopControlState>;
   sendRemoteDesktopInput?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
-    sequence: bigint, events: readonly RemoteDesktopInputEvent[], signal?: AbortSignal): Promise<void>;
+    controlGeneration: bigint, sequence: bigint, events: readonly RemoteDesktopInputEvent[], signal?: AbortSignal): Promise<void>;
   getRemoteDesktopIceConfiguration?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     signal?: AbortSignal): Promise<readonly RemoteDesktopIceServer[]>;
   createRemoteDesktopOffer?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
@@ -1889,9 +1889,9 @@ export const mobileNetwork: MobileNetwork = {
     }
     return response.result;
   },
-  async sendRemoteDesktopInput(credential, peer, leaseId, sequence, events, signal) {
+  async sendRemoteDesktopInput(credential, peer, leaseId, controlGeneration, sequence, events, signal) {
     const response = await createClient(RemoteDesktopService, credentialTransport(credential))
-      .sendRemoteDesktopInput({ peer, leaseId, sequence, events: [...events] }, options(signal));
+      .sendRemoteDesktopInput({ peer, leaseId, controlGeneration, sequence, events: [...events] }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
   },
   async getRemoteDesktopIceConfiguration(credential, peer, leaseId, signal) {

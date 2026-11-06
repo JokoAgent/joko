@@ -675,6 +675,7 @@ describe("Node Device peer Remote Desktop host ownership", () => {
       case: "sendRemoteDesktopInput",
       value: create(DevicePeerSendRemoteDesktopInputActionSchema, {
         leaseId: "lease-1",
+        controlGeneration: 1n,
         sequence: 0n
       })
     }, DevicePeerEffectKind.SIDE_EFFECT);
@@ -708,6 +709,7 @@ describe("Node Device peer Remote Desktop host ownership", () => {
       case: "sendRemoteDesktopInput",
       value: create(DevicePeerSendRemoteDesktopInputActionSchema, {
         leaseId: "lease-1",
+        controlGeneration: 1n,
         sequence: 1n,
         events: Array.from({ length: 2 }, () => create(RemoteDesktopInputEventSchema, {
           event: {
@@ -1711,6 +1713,7 @@ function remoteDesktopCommands(): readonly {
         case: "sendRemoteDesktopInput",
         value: create(DevicePeerSendRemoteDesktopInputActionSchema, {
           leaseId: "lease-1",
+          controlGeneration: 7n,
           sequence: 1n,
           events: [create(RemoteDesktopInputEventSchema, {
             event: {

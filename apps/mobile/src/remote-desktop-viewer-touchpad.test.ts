@@ -32,7 +32,7 @@ function viewer(fitToInsets = false, topInset = 0, bottomInset = 0, desktop = { 
   const configure = (fit: boolean, top: number, bottom: number, extra: object = {}) => receive({
     type: "viewport", epoch: "fold-current", fitToInsets: fit, topInset: top, bottomInset: bottom, ...extra });
   configure(fitToInsets, topInset, bottomInset);
-  receive({ type: "control", enabled: true });
+  receive({ type: "control", enabled: true, controlGeneration: 1 });
   receive({ type: "mouseButtons", epoch: "fold-current", enabled: false, nativeControls: true,
     labels: { left: "Left", right: "Right", wheel: "Wheel" } });
   const touch = (event: string, id = 1, fields: object = {}) => receive({ type: "nativeTouchpad", epoch: "fold-current", id, event, ...fields });
@@ -94,7 +94,7 @@ describe("actual Fold relative touchpad and media viewport", () => {
       if (boundary === "blur") window.dispatchEvent(new Event("blur"));
       if (boundary === "resize") value.resized();
       if (boundary === "layout") value.configure(true, 100, 200);
-      if (boundary === "control") { value.receive({ type: "control", enabled: false }); value.receive({ type: "control", enabled: true }); }
+      if (boundary === "control") { value.receive({ type: "control", enabled: false }); value.receive({ type: "control", enabled: true, controlGeneration: 2 }); }
       if (boundary === "mode") value.receive({ type: "mode", mode: "trackpad" });
       if (boundary === "stop") value.receive({ type: "stop" });
       value.touch("end", 1, { tap: true });

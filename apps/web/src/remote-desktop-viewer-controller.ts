@@ -91,7 +91,7 @@ export class DesktopRemoteDesktopViewerController {
   #opening = false;
   #lastControlRequest = 0;
   #connectionDeadline?: ReturnType<typeof setTimeout>;
-  #runtimeControl = false;
+  #runtimeControlGeneration = 0;
   #retryTimer?: ReturnType<typeof setTimeout>;
   #retryDelay = 1000;
   #readyGeneration = -1;
@@ -186,7 +186,7 @@ export class DesktopRemoteDesktopViewerController {
     this.#framePending = false; this.#heartbeatPending = false; this.#awaitingFrame = false; this.#opening = false;
     this.#runtimeEpoch = undefined; this.#restartMedia = false;
     this.#runtime?.receive({ type: "stop" });
-    this.#runtimeControl = false;
+    this.#runtimeControlGeneration = 0;
     this.#hostMuteAuthority = undefined; this.#hostMuteOperation++; this.#hostMuteAttempted = false;
     this.#hostMuteSaving = false; this.#hostMuteSaveRetry = undefined;
     this.#privacyAuthority = undefined; this.#privacyOperation++; this.#privacyAttempt = undefined;
@@ -242,7 +242,7 @@ export class DesktopRemoteDesktopViewerController {
     this.#connectionDeadline = setTimeout(() => {
       this.#connectionDeadline = undefined;
       if (this.current(epoch) && !this.#snapshot.ready) {
-        this.releaseInput(); this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControl = false;
+        this.releaseInput(); this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControlGeneration = 0;
         this.publish({ status: "error", error: "connection", controlling: false });
         this.syncPrivacyScreen();
         this.syncHostMute();
@@ -300,7 +300,7 @@ export class DesktopRemoteDesktopViewerController {
     this.#runtimeEpoch = `${lease.leaseId}:${this.#sequenceBase}`;
     this.#restartMedia = false;
     this.#awaitingFrame = false; this.#attempt = undefined;
-    this.#runtimeControl = false;
+    this.#runtimeControlGeneration = 0;
     this.publish({ status: this.#snapshot.status === "capture-pending" ? "capture-pending" : "connecting" }); this.armConnectionDeadline();
     this.#runtime.receive({ type: "init", epoch: this.#runtimeEpoch, width: lease.display.width, height: lease.display.height,
       inputSequenceBase: this.#sequenceBase, fillHeight: false, webrtcVideo: caps.webrtcVideo,
@@ -314,9 +314,11 @@ export class DesktopRemoteDesktopViewerController {
     this.syncHostMute();
     const enabled = this.#snapshot.ready && this.#snapshot.controlling && !this.#snapshot.controlPending &&
       !this.#snapshot.settingsBusy && !this.#snapshot.closing && document.hasFocus();
-    if (enabled === this.#runtimeControl) return;
-    this.#runtimeControl = enabled;
-    this.#runtime.receive({ type: "control", enabled });
+    const observed = enabled ? Number(this.#snapshot.lease?.controlGeneration) : 0;
+    const generation = Number.isSafeInteger(observed) && observed > 0 ? observed : 0;
+    if (generation === this.#runtimeControlGeneration) return;
+    this.#runtimeControlGeneration = generation;
+    this.#runtime.receive(generation > 0 ? { type: "control", enabled: true, controlGeneration: generation } : { type: "control", enabled: false });
   }
   private privacyAuthority(): string | undefined {
     const { lease, controlling, caps, closing, closeNotice } = this.#snapshot;
@@ -552,7 +554,7 @@ export class DesktopRemoteDesktopViewerController {
       this.releaseInput(); this.publish({ lease: undefined, ready: false, controlling: false, status: "reconnecting", media: "none" });
       this.syncPrivacyScreen();
       this.syncHostMute();
-      this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControl = false;
+      this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControlGeneration = 0;
       const epoch = this.#epoch;
       this.#retryTimer = setTimeout(() => { this.#retryTimer = undefined;
         if (this.current(epoch)) void this.connect(displayId, { resume: true, wantsControl: this.#wantedControl }); }, this.#retryDelay);
@@ -563,7 +565,7 @@ export class DesktopRemoteDesktopViewerController {
       this.releaseInput(); this.publish({ status: "reconnecting", ready: false, controlling: false });
       this.syncPrivacyScreen();
       this.syncHostMute();
-      this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControl = false;
+      this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControlGeneration = 0;
       this.armConnectionDeadline();
       return;
     }
@@ -609,14 +611,19 @@ export class DesktopRemoteDesktopViewerController {
     } else if (type === "clipboard" && (message["action"] === "copy" || message["action"] === "paste")) {
       void this.clipboard(message["action"]);
     } else if (type === "input" && this.#snapshot.ready && this.#snapshot.controlling && !this.#snapshot.controlPending) {
-      const sequence = message["sequence"], events = message["events"];
-      if (!Number.isSafeInteger(sequence) || (sequence as number) <= this.#sequenceBase || !Array.isArray(events) || events.length > 64) return;
+      const sequence = message["sequence"], events = message["events"], generation = message["controlGeneration"];
+      if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
+        || BigInt(generation) !== lease.controlGeneration || !Number.isSafeInteger(sequence)
+        || (sequence as number) <= this.#sequenceBase || !Array.isArray(events) || events.length > 64) return;
       const epoch = this.#epoch, runtimeEpoch = this.#runtimeEpoch;
+      const current = () => this.current(epoch) && runtimeEpoch === this.#runtimeEpoch
+        && this.#snapshot.lease?.controlGeneration === lease.controlGeneration;
       try {
         const inputs = events.map(desktopViewerInput);
-        void this.#client?.sendRemoteDesktopInput({ leaseId: lease.leaseId, sequence: BigInt(sequence as number), events: inputs }, this.options())
-          .catch(() => { if (this.current(epoch) && runtimeEpoch === this.#runtimeEpoch) void this.control(false); })
-          .finally(() => { if (this.current(epoch) && runtimeEpoch === this.#runtimeEpoch) this.#runtime.receive({ type: "ack", epoch: runtimeEpoch, sequence }); });
+        void this.#client?.sendRemoteDesktopInput({ leaseId: lease.leaseId, controlGeneration: lease.controlGeneration,
+          sequence: BigInt(sequence as number), events: inputs }, this.options())
+          .catch(() => { if (current()) void this.control(false); })
+          .finally(() => { if (current()) this.#runtime.receive({ type: "ack", epoch: runtimeEpoch, sequence }); });
       } catch { void this.control(false); }
     } else if (type === "inputOverflow") { void this.control(false); }
   }
@@ -744,7 +751,7 @@ export class DesktopRemoteDesktopViewerController {
     if (Object.entries(patch).every(([key, value]) => this.#snapshot.settings[key as keyof DesktopViewerSnapshot["settings"]] === value)) return;
     this.releaseInput(); this.publish({ settings: { ...this.#snapshot.settings, ...patch }, media: "none", ready: false });
     if (this.#offerPending !== undefined) {
-      this.#restartMedia = true; this.#runtimeEpoch = undefined; this.#runtimeControl = false;
+      this.#restartMedia = true; this.#runtimeEpoch = undefined; this.#runtimeControlGeneration = 0;
       this.#runtime.receive({ type: "stop", preserveFrame: true });
     } else this.initMedia();
   }
@@ -765,7 +772,7 @@ export class DesktopRemoteDesktopViewerController {
     const epoch = this.#epoch, generation = this.#scope?.generation;
     const temporary = this.#snapshot.caps?.resolutionRestore === true, restoreControl = this.#snapshot.controlling && this.#wantedControl;
     this.#modePending = true; this.#lastControlRequest++; this.releaseInput();
-    this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeEpoch = undefined; this.#runtimeControl = false;
+    this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeEpoch = undefined; this.#runtimeControlGeneration = 0;
     this.#awaitingFrame = false;
     this.publish({ settingsBusy: true, ready: false, controlling: false, media: "none", modeNotice: undefined });
     this.syncControl();
@@ -814,7 +821,7 @@ export class DesktopRemoteDesktopViewerController {
       (!size && !this.#snapshot.viewerDisplayFitted)) return;
     const epoch = this.#epoch, generation = this.#scope?.generation, restoreControl = this.#wantedControl;
     this.#modePending = true; this.#lastControlRequest++; this.releaseInput();
-    this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeEpoch = undefined; this.#runtimeControl = false;
+    this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeEpoch = undefined; this.#runtimeControlGeneration = 0;
     this.#awaitingFrame = false;
     this.publish({ settingsBusy: true, ready: false, controlling: false, media: "none", modeNotice: undefined }); this.syncControl();
     try {
@@ -885,7 +892,7 @@ export class DesktopRemoteDesktopViewerController {
     try { await this.api.close(scope.generation); }
     catch {
       if (this.current(epoch)) {
-        this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControl = false;
+        this.#runtime.receive({ type: "stop", preserveFrame: true }); this.#runtimeControlGeneration = 0;
         this.publish({ closing: false, controlling: false, ready: false, status: "error", error: undefined,
           closeNotice: lockScreen ? "lock" : "disconnect" });
       }

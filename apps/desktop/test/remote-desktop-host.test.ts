@@ -2,6 +2,7 @@ import {
   RemoteDesktopClipboardContentSchema,
   RemoteDesktopFailureReason,
   RemoteDesktopIceServerSchema,
+  RemoteDesktopInputEventSchema,
   RemoteDesktopLockState,
   RemoteDesktopStartMode,
   RemoteDesktopSystemActionKind,
@@ -598,10 +599,29 @@ describe("Desktop Remote Desktop host", () => {
     await expect(value.host.sendInput({
       ...REQUEST,
       leaseId: "lease-1",
+      controlGeneration: 1n,
       sequence: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
       events: []
     })).rejects.toThrowError("outside the exact integer range");
     expect(value.input.send).not.toHaveBeenCalled();
+  });
+
+  it("keeps the same media lease while dropping retired DataChannel and relay input", async () => {
+    const value = fixture({ enabled: true, platform: "win32" }); hosts.push(value.host);
+    const original = await controlledRequest(value);
+    const acceptRtcInput = vi.mocked(value.media.setInputHandler).mock.calls[0]![0];
+    const oldGeneration = Number(original.controlGeneration);
+    const click = { kind: "button" as const, button: 0 as const, down: true, x: 0.5, y: 0.5 };
+    await value.host.setControl({ ...original, enabled: false });
+    const current = await value.host.setControl({ ...original, enabled: true });
+    expect(current.controlGeneration).toBeGreaterThan(original.controlGeneration);
+    acceptRtcInput(original.leaseId, oldGeneration, 40, [click]);
+    await value.host.sendInput({ ...original, sequence: 41n,
+      events: [create(RemoteDesktopInputEventSchema, { event: { case: "release", value: {} } })] });
+    expect(value.input.send).not.toHaveBeenCalled();
+    acceptRtcInput(original.leaseId, Number(current.controlGeneration), 1, [click]);
+    expect(value.input.send).toHaveBeenCalledExactlyOnceWith([click]);
+    expect(value.host.state).toMatchObject({ leaseId: original.leaseId, controlling: true });
   });
 
   it("invalidates pending async media completion when its executor retires", async () => {

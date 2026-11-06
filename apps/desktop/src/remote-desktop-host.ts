@@ -103,6 +103,7 @@ export interface DesktopRemoteDesktopMediaPort {
   }>;
   setInputHandler(handler: (
     leaseId: string,
+    controlGeneration: number,
     sequence: number,
     events: readonly RemoteDesktopInput[]
   ) => void): () => void;
@@ -500,11 +501,11 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         },
         ...(dependencies.now === undefined ? {} : { now: dependencies.now })
       }) : undefined;
-    this.#stopInputHandler = dependencies.media.setInputHandler((leaseId, sequence, events) => {
+    this.#stopInputHandler = dependencies.media.setInputHandler((leaseId, controlGeneration, sequence, events) => {
       const state = this.#controller.state;
       if (this.#retired || state === undefined || state.lease !== leaseId) return;
       try {
-        this.#controller.input(this.#authority(state.controllerDeviceId), leaseId, sequence, events);
+        this.#controller.input(this.#authority(state.controllerDeviceId), leaseId, controlGeneration, sequence, events);
       } catch {
         // A rejected DataChannel batch is scoped to the current control bit.
         // The generated heartbeat reports the resulting view-only state.
@@ -902,6 +903,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   }
 
   async sendInput(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
     readonly sequence: bigint;
     readonly events: readonly RemoteDesktopInputEvent[];
   }): Promise<void> {
@@ -912,6 +914,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     await this.#request(request, {
       op: "input",
       lease: request.leaseId,
+      controlGeneration: Number(request.controlGeneration),
       sequence: Number(request.sequence),
       events: request.events.map(inputFromContract)
     });

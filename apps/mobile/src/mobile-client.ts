@@ -3674,8 +3674,8 @@ export class MobileClient {
         if (!permitted()) throw new MobileRemoteDesktopAuthorityError();
         return value;
       },
-      input: (host, leaseId, sequence, events, signal) => checked(() =>
-        this.network.sendRemoteDesktopInput!(credential, route(host), leaseId, sequence, events, signal)),
+      input: (host, leaseId, controlGeneration, sequence, events, signal) => checked(() =>
+        this.network.sendRemoteDesktopInput!(credential, route(host), leaseId, controlGeneration, sequence, events, signal)),
       iceConfiguration: (host, leaseId, signal) => checked(() =>
         this.network.getRemoteDesktopIceConfiguration!(credential, route(host), leaseId, signal)),
       offer: (host, leaseId, attemptId, sdp, settings, cursorOverlay, signal) => checked(() =>

@@ -148,7 +148,7 @@ describe("Desktop viewer presentation adapter", () => {
     await f.controller.hostMute(true); await f.controller.privacyScreen(false); await f.controller.lockOnExit(true);
     await f.controller.clipboardSync(true); await f.controller.retryClipboardSync(); await f.controller.close();
     f.controller.settings({ audio: false }); f.controller.keys(["KeyA"]); f.controller.actualSize();
-    f.post({ type: "input", epoch: "retired", sequence: 1, events: [{ kind: "text", text: "input" }] });
+    f.post({ type: "input", epoch: "retired", controlGeneration: 1, sequence: 1, events: [{ kind: "text", text: "input" }] });
     await vi.advanceTimersByTimeAsync(6000); await flush();
     for (const effect of [f.api.request, f.api.clipboard, f.api.credential, f.api.preferences,
       f.api.retryClipboardSync, f.api.close, f.api.resize]) expect(effect).not.toHaveBeenCalled();
@@ -333,7 +333,7 @@ describe("Desktop viewer presentation adapter", () => {
     expect(nextInit).toMatchObject({ width: 1000, height: 700 });
     expect(nextInit.epoch).not.toBe(oldInit.epoch); expect(nextInit.inputSequenceBase).toBeGreaterThan(oldInit.inputSequenceBase);
     runtime.post?.({ type: "framePresented", epoch: oldInit.epoch }); expect(f.controller.snapshot.ready).toBe(false);
-    runtime.post?.({ type: "input", epoch: oldInit.epoch, sequence: oldInit.inputSequenceBase + 1, events: [{ kind: "release" }] }); await flush();
+    runtime.post?.({ type: "input", epoch: oldInit.epoch, controlGeneration: 1, sequence: oldInit.inputSequenceBase + 1, events: [{ kind: "release" }] }); await flush();
     expect(f.inputCalls.some(call => call.name === "sendRemoteDesktopInput")).toBe(false);
     f.post({ type: "framePresented" }); expect(f.controller.snapshot.ready).toBe(true);
   });
@@ -694,7 +694,7 @@ describe("Desktop viewer presentation adapter", () => {
     runtime.post?.({ type: "framePresented", epoch: "old-lease" }); expect(f.controller.snapshot.ready).toBe(false);
     f.post({ type: "framePresented" });
     expect(f.controller.snapshot).toMatchObject({ ready: true, controlling: true, media: "screenshots", status: "live" });
-    expect(runtime.receive).toHaveBeenLastCalledWith({ type: "control", enabled: true });
+    expect(runtime.receive).toHaveBeenLastCalledWith({ type: "control", enabled: true, controlGeneration: 2 });
     await vi.advanceTimersByTimeAsync(3000);
     expect(runtime.receive.mock.calls.filter(([message]) => message.type === "control" && message.enabled === true)).toHaveLength(1);
   });
@@ -705,10 +705,28 @@ describe("Desktop viewer presentation adapter", () => {
     const inits = runtime.receive.mock.calls.filter(([message]) => message.type === "init");
     expect(inits[1]?.[0].inputSequenceBase).toBeGreaterThan(inits[0]?.[0].inputSequenceBase);
     const sequence = inits[1]?.[0].inputSequenceBase + 10;
-    f.post({ type: "input", sequence, events: [{ kind: "text", text: "你好" }, { kind: "release" }] }); await flush();
+    f.post({ type: "input", controlGeneration: 2, sequence, events: [{ kind: "text", text: "你好" }, { kind: "release" }] }); await flush();
     const input = f.inputCalls.find((call) => call.name === "sendRemoteDesktopInput")?.input;
+    expect(input?.["controlGeneration"]).toBe(2n);
     expect(input?.["sequence"]).toBe(BigInt(sequence));
     expect(input?.["events"]).toMatchObject([{ event: { case: "text", value: { text: "你好" } } }, { event: { case: "release" } }]);
+  });
+
+  it("forwards the confirmed control generation on fallback and discards a delayed old viewer packet", async () => {
+    const f = fixture("win32", false, false, false, Promise.resolve(SCOPE), true); await flush();
+    f.post({ type: "framePresented" });
+    f.pendingControl(Promise.resolve({ state: { controlling: false, controlGeneration: 2n } }));
+    await f.controller.control(false);
+    f.pendingControl(Promise.resolve({ state: { controlling: true, controlGeneration: 3n } }));
+    await f.controller.control(true);
+    const base = runtime.receive.mock.calls.find(([message]) => message.type === "init")![0].inputSequenceBase;
+    const events = [{ kind: "button", button: 0, x: 0.5, y: 0.5, down: true }];
+    f.post({ type: "input", controlGeneration: 1, sequence: base + 3, events });
+    f.post({ type: "input", controlGeneration: 3, sequence: base + 4, events });
+    await flush();
+    expect(f.inputCalls.filter(call => call.name === "sendRemoteDesktopInput").map(call => call.input)).toEqual([
+      expect.objectContaining({ leaseId: "lease", controlGeneration: 3n, sequence: BigInt(base + 4) })
+    ]);
   });
 
   it("discards late control results and old media after the native window generation changes", async () => {

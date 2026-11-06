@@ -540,12 +540,14 @@ export class RemoteDesktopController {
   input(
     authority: RemoteDesktopAuthority,
     lease: string,
+    controlGeneration: number,
     sequence: number,
     events: unknown
   ): void {
-    const request = parseRemoteDesktopRequest({ op: "input", lease, sequence, events });
+    const request = parseRemoteDesktopRequest({ op: "input", lease, controlGeneration, sequence, events });
     if (request.op !== "input") throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
     const active = this.#require(authority, lease);
+    if (controlGeneration !== active.controlGeneration) return;
     if (this.#displayModePending) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
     if (!active.controlling) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
     if (sequence <= active.sequence) return;
@@ -556,9 +558,10 @@ export class RemoteDesktopController {
       if (++this.#handoffInputPending > 64) { this.#handoffInputPending--; this.stop(authority); return; }
       this.#handoffInputTail = this.#handoffInputTail.then(async () => {
         await this.#ensureHandoff(active);
-        if (this.#active !== active || !active.controlling) return;
+        if (this.#active !== active || !active.controlling || active.controlGeneration !== controlGeneration) return;
         this.#dependencies.input(request.events, authority);
-      }).catch(() => { if (this.#active === active) this.stop(authority); }).finally(() => { this.#handoffInputPending--; });
+      }).catch(() => { if (this.#active === active && active.controlGeneration === controlGeneration) this.stop(authority); })
+        .finally(() => { this.#handoffInputPending--; });
       return;
     }
     try {
@@ -689,7 +692,7 @@ export class RemoteDesktopController {
         return Object.freeze({ version });
       }
       case "input":
-        this.input(authority, request.lease, request.sequence, request.events);
+        this.input(authority, request.lease, request.controlGeneration, request.sequence, request.events);
         return Object.freeze({ ok: true });
       case "frame":
         if (request.cursorOverlay && !active.cursorOverlay) {
