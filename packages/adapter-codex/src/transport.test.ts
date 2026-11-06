@@ -390,8 +390,10 @@ describe("StdioJsonRpcTransport", () => {
     setTimeout(() => process.exit(8), 4_000).unref();
     process.stdout.write(${JSON.stringify(prefix)});`;
     const { spawn: realSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
-    const prefixRead = Promise.withResolvers<void>();
-    const terminalRead = Promise.withResolvers<void>();
+    let resolvePrefixRead!: () => void;
+    let resolveTerminalRead!: () => void;
+    const prefixRead = new Promise<void>((resolve) => { resolvePrefixRead = resolve; });
+    const terminalRead = new Promise<void>((resolve) => { resolveTerminalRead = resolve; });
     let childExited = false;
     const spawnSpy = vi.mocked(spawn).mockImplementationOnce((command, args, options) => {
       const childProcess = realSpawn(command, args, options);
@@ -404,7 +406,7 @@ describe("StdioJsonRpcTransport", () => {
         stdout.off("data", readPrefix);
         // Read the remaining bytes from the same pipe after the real exit event.
         stdout.pause();
-        prefixRead.resolve();
+        resolvePrefixRead();
       };
       stdout.on("data", readPrefix);
       childProcess.once("exit", () => {
@@ -415,32 +417,33 @@ describe("StdioJsonRpcTransport", () => {
     });
     const transport = new StdioJsonRpcTransport({ command: process.execPath, args: ["-e", child] });
     const delivered: string[] = [];
-    const disconnected = Promise.withResolvers<void>();
+    let resolveDisconnected!: () => void;
+    const disconnected = new Promise<void>((resolve) => { resolveDisconnected = resolve; });
     try {
       await transport.start({
         onNotificationObserved: ({ method }) => {
           if (method !== "turn/completed") return;
           expect(childExited).toBe(true);
-          terminalRead.resolve();
+          resolveTerminalRead();
         },
         onNotification: async ({ method }) => {
-          if (method === "item/completed") await terminalRead.promise;
+          if (method === "item/completed") await terminalRead;
           delivered.push(method);
           if (method === "turn/completed") expect(() => transport.notify("write-after-exit")).toThrow();
         },
         onRequest: () => undefined,
-        onExit: fault => { delivered.push(fault.code); disconnected.resolve(); }
+        onExit: fault => { delivered.push(fault.code); resolveDisconnected(); }
       });
-      await Promise.race([prefixRead.promise, disconnected.promise.then(() => {
+      await Promise.race([prefixRead, disconnected.then(() => {
         throw new Error("The Codex fixture exited before the stdout prefix was read.");
       })]);
       await transport.notify("fixture/finish");
-      await disconnected.promise;
+      await disconnected;
       expect(delivered).toEqual(["item/completed", "turn/completed", "process_exited"]);
       expect(transport.running).toBe(false);
     } finally {
       spawnSpy.mockReset();
-      terminalRead.resolve();
+      resolveTerminalRead();
       await transport.forceClose();
     }
   });

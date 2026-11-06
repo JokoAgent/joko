@@ -202,7 +202,7 @@ function ManagedModelRuntimePanel({
 
     {(runtime.state === "stopped" || runtime.state === "starting") && <div className="managed-model-runtime-start">
       <p>{runtime.capabilities.startupPolicy === "onUse" ? text.onUse : text.stoppedBody}</p>
-      {runtime.capabilities.canStart && runtime.capabilities.startupPolicy !== "onUse" && <Button tone="primary" disabled={pending || runtime.state === "starting"} onClick={() => action("start", () => controller.startManagedModelRuntime(runtime.id))}>
+      {runtime.capabilities.canStart && (runtime.id === "ollama" || runtime.capabilities.startupPolicy !== "onUse") && <Button tone="primary" disabled={pending || runtime.state === "starting"} onClick={() => action("start", () => controller.startManagedModelRuntime(runtime.id))}>
         {runtime.state === "starting" && <LoaderCircle className="managed-model-runtime-spinner" aria-hidden="true" />}{text.start}
       </Button>}
     </div>}

@@ -126,12 +126,16 @@ export class OllamaRuntimeLauncher {
     readonly owner: RuntimeOwnerGeneration;
     readonly currentOwner: () => RuntimeOwnerGeneration | undefined;
     readonly signal?: AbortSignal;
+    readonly assertCurrent?: () => void;
   }): Promise<LocalRuntimeStatus> {
     assertActiveOwner(input.owner, input.currentOwner);
     const current = await this.status(input.owner);
     if (current.state === "ready" || current.state === "port_conflict") return current;
     const target = await this.discover();
     if (target === undefined) return current;
+    assertActiveOwner(input.owner, input.currentOwner);
+    if (input.signal?.aborted) throw new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.");
+    input.assertCurrent?.();
     try {
       if (target.source === "application") {
         await (this.options.openApplication ?? openMacApplication)();

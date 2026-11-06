@@ -3782,6 +3782,7 @@ describe("SessionHost", () => {
     await expect(replace()).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
     expect(fixture.host.currentAdapter(previous.id)).toBe(previous);
     expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
     expect(fixture.store.getBackend(previous.id).descriptor.instanceGeneration).toBe(current.instanceGeneration);
     expect(resumePrevious).not.toHaveBeenCalled();
 
@@ -3789,7 +3790,9 @@ describe("SessionHost", () => {
     expect(close).toHaveBeenCalledTimes(2);
     expect(fixture.host.currentAdapter(previous.id)).toBe(replacement);
     expect(fixture.host.isSessionActive(sessionId)).toBe(true);
-    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual({
+      ...originalBinding, generation: originalBinding.generation + 1
+    });
   });
 
   it("returns only a durable, identity-matching Session export BlobRef", async () => {
@@ -5123,6 +5126,43 @@ describe("SessionHost", () => {
       "cancelled",
       "cancelled"
     ]);
+  });
+
+  it("rejects original Stop and AbortRetry after a newer Run owns the same task", async () => {
+    const adapter = new SingleSettlementFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "run-control-owner-session", connection: fixture.connection,
+      targetId: "target-one", title: "Run control owner", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const enqueue = (text: string) => fixture.host.enqueueInput({ operationId: `run-control-${text}`, connection: fixture.connection,
+      sessionId, prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    const first = enqueue("original");
+    await eventually(() => fixture.store.getQueueItem(first.queueItemId).state === "backend_accepted");
+    let release!: () => void;
+    const delayed = new Promise<void>((resolve) => { release = resolve; });
+    const abort = vi.spyOn(adapter, "abort").mockImplementationOnce(async (context) => {
+      await delayed;
+      context.assertRunControlCurrent?.();
+    });
+    const abortRetry = vi.spyOn(adapter, "abortRetry").mockImplementation(async (context) => { context.assertRunControlCurrent?.(); });
+    const stale = { publicError: { code: "RUN_CONTROL_TARGET_CHANGED", stateMayHaveChanged: false } };
+    const pending = expect(fixture.host.abort(sessionId, first.runId)).rejects.toMatchObject(stale);
+    let next: ReturnType<typeof enqueue>;
+    try {
+      await eventually(() => abort.mock.calls.length === 1);
+      await adapter.settle(sessionId);
+      await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
+      next = enqueue("current");
+      await eventually(() => fixture.store.getQueueItem(next.queueItemId).state === "backend_accepted");
+    } finally { release(); await pending; }
+    await expect(fixture.host.abort(sessionId, first.runId)).rejects.toMatchObject(stale);
+    await expect(fixture.host.abortRetry(sessionId, first.runId)).rejects.toMatchObject(stale);
+    expect(abort).toHaveBeenCalledOnce();
+    expect(abortRetry).not.toHaveBeenCalled();
+    expect(fixture.store.getRun(next.runId).descriptor.state).toBe("running");
+    await fixture.host.abortRetry(sessionId, next.runId);
+    expect(abortRetry).toHaveBeenCalledOnce();
+    await fixture.host.abort(sessionId, next.runId);
+    await eventually(() => fixture.store.getRun(next.runId).descriptor.state === "aborted");
   });
 
   it("keeps an uncertain joined dispatch fenced while settling the known prompt and follow-up", async () => {
@@ -7247,7 +7287,7 @@ describe("SessionHost", () => {
     expect(adapter.abortCalls).toBe(1);
     expect(fixture.host.isSessionActive(targetSessionId)).toBe(false);
     await expect(fixture.host.abort(targetSessionId, owned.value.runId)).rejects.toMatchObject({
-      publicError: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED" }
+      publicError: { code: "RUN_CONTROL_TARGET_CHANGED", stateMayHaveChanged: false }
     });
 
     adapter.holdNativeAcceptance = false;
@@ -15132,7 +15172,7 @@ describe("SessionHost", () => {
 
     const reopened = new OperationalStore(databasePath);
     cleanups.push(() => reopened.close());
-    const second = await openHost(reopened, 8);
+    const second = await openHost(reopened, advanceBackendInstanceGeneration(reopened, first.adapter.id));
     const queued = submit(second.host, "codex-delete-followup", "Next explicit request");
     await eventually(() => reopened.getQueueItem(queued.queueItemId).state === "backend_accepted");
     const current = reopened.getSession(sessionId);
@@ -15145,9 +15185,13 @@ describe("SessionHost", () => {
     const requests = (method: string) => fake.transport!.requests.filter(request => request.method === method);
     expect(requests("thread/start")).toHaveLength(1);
     expect(requests("thread/start")[0]?.params).toMatchObject({ developerInstructions: expect.stringContaining(handoff!) });
-    expect(requests("thread/resume").at(-1)?.params).toMatchObject({ threadId: replacement, developerInstructions: expect.stringContaining(handoff!) });
+    // The first resume attaches the replacement. Permission restoration also
+    // uses thread/resume once the native thread is already loaded.
+    const [attachment] = requests("thread/resume");
+    expect(attachment?.params).toMatchObject({ threadId: replacement, developerInstructions: expect.stringContaining(handoff!) });
     expect(requests("turn/start").map(request => request.params)).toEqual([expect.objectContaining({ threadId: replacement,
       input: [{ type: "text", text: "Next explicit request", text_elements: [] }] })]);
+    expect(fake.transport!.requests.indexOf(attachment!)).toBeLessThan(fake.transport!.requests.indexOf(requests("turn/start")[0]!));
     await fake.completeTurn(replacement, "New answer");
     await eventually(() => reopened.getRun(queued.runId).descriptor.state === "completed");
 
@@ -15330,7 +15374,7 @@ describe("SessionHost", () => {
 
     const { host: restarted } = await open();
     expect(store.getRun(admitted.runId).descriptor.state).toBe("dispatch_unknown");
-    await restarted.getTree(sessionId);
+    await restarted.inspect(sessionId);
     const expected = suffix === "different turn" ? "dispatch_unknown" : "failed";
     expect(store.getQueueItem(admitted.queueItemId).state).toBe(expected);
     expect(store.getRun(admitted.runId).descriptor.state).toBe(expected);
@@ -16933,7 +16977,7 @@ class HostServiceRecoveryProcess extends EventEmitter implements PiProcessHandle
         }
       }
     });
-    if (options.recovering) {
+    if (this.serviceRecovery !== undefined) {
       queueMicrotask(() => {
         this.#send({ type: "response", id: "old-service-request", command: "prompt", success: true });
         this.#send({ type: "message_start", message: { role: "assistant", content: [] } });
