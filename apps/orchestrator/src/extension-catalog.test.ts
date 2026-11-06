@@ -2,9 +2,16 @@ import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
+import * as contract from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
+import type { OrchestratorApplication } from "./application.js";
+import { ArtifactStore } from "./artifact-store.js";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { registerConnectServices } from "./connect-services.js";
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
@@ -15,6 +22,7 @@ import { extensionNetworkCredentialReference } from "./extension-cards/network-m
 import { ExtensionSettingsManager } from "./extension-settings.js";
 import { parseExtensionRuntime } from "./extension-surface-manifest.js";
 import type { ExtensionMainViewSurface } from "./extension-main-view-manager.js";
+import { SessionHost } from "./session-host.js";
 
 const NOW = 1_800_000_000_000;
 
@@ -91,6 +99,79 @@ async function fixture() {
   catalog.initialize();
   return { root, store, credentials, catalog };
 }
+
+it("stops setup revocation after the original device loses authority between credential retirements", async () => {
+  const { root, store, credentials, catalog } = await fixture();
+  const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
+  const host = new SessionHost(store, artifacts, []);
+  try {
+    await artifacts.initialize();
+    await host.initialize();
+    const originalKey = "extension-revoke-original", observerKey = "extension-revoke-observer";
+    const original = store.createConnection({ id: "setup-original", name: "Original", authKeyDigest: digestAuthKey(originalKey) });
+    store.createConnection({ id: "setup-observer", name: "Observer", authKeyDigest: digestAuthKey(observerKey) });
+    const network = { hosts: ["api.example.test"], secrets: ["first", "second"].map(key => ({
+      key, label: key, inject: { header: `X-${key}`, format: "{value}" }
+    })) };
+    const installed = resource({ kind: "package", resourceDetails: [{ ...resource().resourceDetails[0]!, entryPath: "extension.ts",
+      runtime: { html: "ui/runtime/index.html", tools: [{ name: "read", description: "Read", inputSchema: { type: "object" }, readOnly: true }], network }
+    }] });
+    const entry = catalog.reconcile([installed], []).entries[0]!;
+    let setup = catalog.beginSetup(entry.id, entry.revision);
+    const attemptId = setup.setup.attemptId!;
+    for (const field of setup.setup.fields.filter(field => field.kind === "secret")) {
+      const ticket = catalog.beginSetupCredentialUpload({ extensionId: entry.id, attemptId, fieldId: field.id,
+        kind: "header_secret", connectionId: original.id });
+      credentials.upload(ticket.credentialUploadTicketId, `fixture-${field.id}`, original.id);
+      setup = await catalog.commitSetupCredential({ extensionId: entry.id, attemptId, fieldId: field.id,
+        credentialUploadTicketId: ticket.credentialUploadTicketId, connectionId: original.id, expectedRevision: setup.revision });
+    }
+    setup = catalog.submitSetupInteraction({ extensionId: entry.id, attemptId, fieldId: "permission-confirmation", value: true, expectedRevision: setup.revision });
+    const ready = catalog.completeSetup(entry.id, attemptId, setup.revision);
+    expect(ready.setup.state).toBe("ready");
+    const [first, second] = network.secrets.map(secret => extensionNetworkCredentialReference(entry.id, network, secret));
+    const retire = credentials.retireManagedCredential.bind(credentials);
+    let unpause!: () => void, persisted!: () => void;
+    const pending = new Promise<void>(resolve => { unpause = resolve; });
+    const firstRetired = new Promise<void>(resolve => { persisted = resolve; });
+    const calls = vi.spyOn(credentials, "retireManagedCredential").mockImplementation(async (...input) => {
+      const result = await retire(...input);
+      if (input[0] === first) { persisted(); await pending; }
+      return result;
+    });
+    const application = { config: { publicOrigin: "https://orchestrator.example.test" }, store, adapters: [],
+      sessionHost: host, extensionCatalog: catalog, connections: new ConnectionManager(store), piResources: { list: () => [installed] }
+    } as unknown as OrchestratorApplication;
+    const transport = createRouterTransport(router => registerConnectServices(router, application));
+    const operations = createClient(contract.OperationService, transport);
+    const extensions = createClient(contract.ExtensionService, transport);
+    const authorization = (key: string) => ({ headers: { authorization: `Bearer ${key}` } });
+    const submitRevoke = (operationId: string, key: string) => operations.submitOperation({ operationId, mutation: {
+      payload: { case: "revokeExtensionSetup", value: { extensionId: entry.id, expectedRevision: { value: ready.revision } } }
+    } }, authorization(key));
+    const started = submitRevoke("setup-revoke-first-device", originalKey);
+    try {
+      await Promise.race([firstRetired, started.then(() => { throw new Error("Setup revocation finished before the first credential retired."); })]);
+      expect(credentials.find(first!)).toBeUndefined();
+      expect(credentials.resolve(second!)).toBe("fixture-network-secret:second");
+      await expect(operations.submitOperation({ operationId: "setup-revoke-device", mutation: { payload: {
+        case: "revokeDevice", value: { deviceId: original.deviceId }
+      } } }, authorization(observerKey))).resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+    } finally { unpause(); }
+    await expect(started).resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED } });
+    expect(calls.mock.calls.map(([reference]) => reference)).toEqual([first]);
+    expect(credentials.resolve(second!)).toBe("fixture-network-secret:second");
+    await expect(extensions.getExtension({ extensionId: entry.id }, authorization(observerKey))).resolves.toMatchObject({
+      extension: { setup: { fields: expect.arrayContaining([
+        expect.objectContaining({ fieldId: "network-secret:first", configured: false }),
+        expect.objectContaining({ fieldId: "network-secret:second", configured: true })
+      ]) } }
+    });
+    await expect(submitRevoke("setup-revoke-first-device", originalKey)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    await expect(submitRevoke("setup-revoke-second-device", observerKey)).resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+    expect(credentials.find(second!)).toBeUndefined();
+  } finally { await host.dispose(); store.close(); }
+});
 
 function resource(overrides: Partial<PiResourceDescriptor> = {}): PiResourceDescriptor {
   return {
@@ -565,7 +646,7 @@ describe("ExtensionCatalogManager", () => {
       const ready = catalog.completeSetup(entry.id, finalAttempt.setup.attemptId!, confirmed.revision);
       expect(ready.setup.state).toBe("ready");
       expect(() => catalog.completeSetup(entry.id, firstAttempt, ready.revision)).toThrow(/stale/u);
-      await expect(catalog.revokeSetup(entry.id, ready.revision)).resolves.toMatchObject({ setup: { state: "required" } });
+      await expect(catalog.revokeSetup(entry.id, ready.revision, () => undefined)).resolves.toMatchObject({ setup: { state: "required" } });
     } finally {
       store.close();
     }

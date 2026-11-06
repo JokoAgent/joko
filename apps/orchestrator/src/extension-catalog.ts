@@ -598,12 +598,18 @@ export class ExtensionCatalogManager {
     return this.#descriptor(definition);
   }
 
-  async revokeSetup(extensionId: string, expectedRevision: bigint): Promise<ExtensionCatalogDescriptor> {
+  async revokeSetup(extensionId: string, expectedRevision: bigint, assertCurrent: () => void): Promise<ExtensionCatalogDescriptor> {
     const definition = this.#requireDefinition(extensionId);
     const current = this.#requireRecord(extensionId, expectedRevision);
+    const assertSetupCurrent = () => {
+      assertCurrent();
+      this.#requireRecord(extensionId, expectedRevision);
+      if (this.#requireDefinition(extensionId).authorityIdentity !== definition.authorityIdentity) throw new Error("Extension installation changed.");
+    };
     for (const requirement of definition.setupRequirements) {
       const reference = requirement.credentialReferenceId;
       if (reference === undefined) continue;
+      assertSetupCurrent();
       const credential = this.#credentials.find(reference);
       if (credential !== undefined) {
         this.#credentials.reserveManagedSecret({
@@ -614,11 +620,12 @@ export class ExtensionCatalogManager {
         this.#managedCredentialReferences.add(reference);
       }
       if (credential !== undefined || this.#managedCredentialReferences.has(reference)) {
-        const retired = await this.#credentials.retireManagedCredential(reference, credential?.generation);
+        const retired = await this.#credentials.retireManagedCredential(reference, credential?.generation, assertSetupCurrent);
         if (!retired) throw new Error("Setup credential changed concurrently.");
         this.#managedCredentialReferences.delete(reference);
       }
     }
+    assertSetupCurrent();
     this.#replaceRecord({
       ...current,
       authorization: undefined,
