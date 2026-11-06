@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, rmdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -139,6 +139,43 @@ it("rejects every remote mutation through an intermediate link before delegating
     expect(write).not.toHaveBeenCalled(); expect(rename).not.toHaveBeenCalled(); expect(remove).not.toHaveBeenCalled();
     expect(await readFile(join(f.outside, "note.txt"), "utf8")).toBe("Outside bytes");
     await expect(f.workspaces.copyEntry("workspace", { sourcePath: "link", destinationPath: "copy", expectedRevision: revision })).rejects.toBeDefined();
+  } finally { await f.close(); }
+});
+
+it("rejects a recursive Device peer delete when the parent is redirected before the agent executes", async () => {
+  const f = await fixture();
+  try {
+    const parent = join(f.root, "parent"), retained = join(f.root, "retained-parent");
+    await mkdir(join(parent, "tree"), { recursive: true });
+    await mkdir(join(f.outside, "tree"));
+    await writeFile(join(parent, "tree", "marker.txt"), "original project bytes");
+    await writeFile(join(f.outside, "tree", "marker.txt"), "outside bytes");
+    const entry = (await f.workspaces.list("workspace", "parent")).find(item => item.path === "parent/tree");
+    expect(entry?.revision).toBeDefined();
+    const remove = f.files.remove.bind(f.files);
+    vi.spyOn(f.files, "remove").mockImplementationOnce(async (path, options) => {
+      await rename(parent, retained);
+      await symlink(f.outside, parent, process.platform === "win32" ? "junction" : "dir");
+      return remove(path, options);
+    });
+    await expect(f.workspaces.deleteEntry("workspace", { path: "parent/tree", expectedRevision: entry!.revision,
+      confirmRecursive: true })).rejects.toThrow();
+    expect(await readFile(join(retained, "tree", "marker.txt"), "utf8")).toBe("original project bytes");
+    expect(await readFile(join(f.outside, "tree", "marker.txt"), "utf8")).toBe("outside bytes");
+  } finally { await f.close(); }
+});
+
+it("cancels an agent rename while its local path checks are pending", async () => {
+  const f = await fixture();
+  try {
+    const source = join(f.root, "before.txt"), destination = join(f.root, "after.txt");
+    await writeFile(source, "original project bytes");
+    const cancellation = new AbortController();
+    const pending = f.files.rename(source, destination, cancellation.signal);
+    cancellation.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(await readFile(source, "utf8")).toBe("original project bytes");
+    await expect(readFile(destination, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   } finally { await f.close(); }
 });
 

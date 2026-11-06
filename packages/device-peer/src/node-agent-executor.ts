@@ -1750,6 +1750,7 @@ export class LocalDevicePeerFileTransport implements DevicePeerFileTransportPort
     await lstat(source);
     const destinationInfo = await lstat(destination).catch(missingAsUndefined);
     if (destinationInfo?.isSymbolicLink()) throw agentError(DevicePeerFailureCode.CONFLICT, false);
+    signal?.throwIfAborted();
     await rename(source, destination);
   }
 
@@ -1759,9 +1760,10 @@ export class LocalDevicePeerFileTransport implements DevicePeerFileTransportPort
   ): Promise<void> {
     const accepted = localPath(path);
     if (isFilesystemRoot(accepted)) throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
-    await canonicalDirectory(dirname(accepted));
+    const parent = await canonicalDirectory(dirname(accepted));
+    if (!samePath(parent, dirname(accepted))) throw agentError(DevicePeerFailureCode.CONFLICT, false);
     const counter = { value: 0 };
-    await removeEntry(accepted, options.recursive === true, options.signal, 0, counter);
+    await removeEntry(join(parent, basename(accepted)), options.recursive === true, options.signal, 0, counter);
   }
 }
 

@@ -1295,7 +1295,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const nativeMemoryStatuses = new Map<string, NativeMemoryStatusObservation>();
   const nativeMemoryStatusEpochs = new Map<string, bigint>();
   const projectAutomations = new ProjectAutomationConfigController({ store: application.store });
-  const devicePeers = application.devicePeers ?? new DevicePeerOwner({ store: application.store });
+  const devicePeers = application.devicePeers ?? new DevicePeerOwner({ store: application.store,
+    onDeviceRevoked: (deviceId, listener) => application.connections.onDeviceRevoked(deviceId, listener) });
   if (application.devicePeers === undefined) {
     application.registerServiceCleanup?.(() => devicePeers.shutdown());
   }
