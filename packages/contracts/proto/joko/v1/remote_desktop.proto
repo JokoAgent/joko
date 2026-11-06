@@ -205,6 +205,7 @@ message SendRemoteDesktopInputRequest {
   string lease_id = 2;
   uint64 sequence = 3;
   repeated RemoteDesktopInputEvent events = 4;
+  uint64 control_generation = 5;
 }
 
 message SendRemoteDesktopInputResponse {
