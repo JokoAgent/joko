@@ -2677,7 +2677,7 @@ describe("Connect typed feature boundaries", () => {
     const services = createConnectServices(stubApplication({
       store, connections, sessionHost: { mutate: host.mutate.bind(host) }, browser: { id: "browser" }, browserSettings
     }));
-    const submit = (operationId: string, connectionId: string, patch: Partial<contract.BrowserSettingsPatch>) =>
+    const submit = (operationId: string, connectionId: string, patch: Partial<Pick<contract.BrowserSettingsPatch, "automationTarget" | "allowUploads">>) =>
       invoke<contract.SubmitOperationResponse>(services.operation.submitOperation, create(contract.SubmitOperationRequestSchema, {
         operationId, connectionId,
         mutation: { payload: { case: "updateBrowserSettings", value: { patch: { browserProviderId: "browser", ...patch } } } }

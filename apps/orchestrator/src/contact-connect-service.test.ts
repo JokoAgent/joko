@@ -34,6 +34,7 @@ describe("ContactService", () => {
     }), caller);
     expect(created.contact).toMatchObject({ narrative, agentNotes: "First\nSecond" });
     const contactId = created.contact!.summary!.contactId;
+    if (!contactId) throw new Error("The created contact has no identity.");
     const notes = "Use preferred name\n\tConfirm with Alice";
     const update = async (patch: { summary?: string; narrative?: string; agentNotes?: string }) => service.updateContact(
       create(contract.UpdateContactRequestSchema, { contactId, expectedRevision: created.contact!.summary!.revision, patch }), caller

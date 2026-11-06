@@ -1047,15 +1047,18 @@ describe("PartnerManager", () => {
     const { delegation } = await f.manager.startDelegation({ callerSessionId: requester.canonicalSessionId!, targetPartnerId: target.id,
       title: "Original work", objective: "Complete the original objective" });
     const sessionId = delegation.childSessionId!, originalRunId = delegation.runId!;
-    await vi.waitFor(() => expect(send.mock.calls.some(([, context]) => context.runId === originalRunId)).toBe(true));
-    const original = send.mock.calls.find(([, context]) => context.runId === originalRunId)![1];
+    const dispatched = async (queueId: string) => {
+      const match = () => send.mock.calls.find(([, context]) => context.inputQueueItemId === queueId);
+      await vi.waitFor(() => expect(match()).toBeDefined());
+      return match()![1];
+    };
+    const original = await dispatched(f.operationalStore.findQueueItemByRunId(sessionId, originalRunId)!.id);
     await original.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original delegated reply." }] });
     await original.emit({ type: "done", outcome: "completed" });
     const connection = f.operationalStore.createConnection({ id: "delegation-owner", name: "Owner", authKeyDigest: "delegation-key" });
     const user = f.sessionHost.enqueueInput({ operationId: "delegation-child-ordinary", connection, sessionId,
       prompt: { text: "A separate user request", disposition: "prompt", images: [], files: [], mentions: [] } }).value;
-    await vi.waitFor(() => expect(send.mock.calls.some(([, context]) => context.runId === user.runId)).toBe(true));
-    const later = send.mock.calls.find(([, context]) => context.runId === user.runId)![1];
+    const later = await dispatched(user.queueItemId);
     await later.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Unrelated later reply." }] });
     await later.emit({ type: "done", outcome: "completed" });
     expect(f.partnerStore.getDelegation(delegation.id).status).not.toBe("completed");

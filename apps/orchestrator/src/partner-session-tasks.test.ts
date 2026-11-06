@@ -192,11 +192,12 @@ describe("Partner independent Session tasks", () => {
   it("waits for a Host-owned continuation of the original Run", async () => {
     const f = await fixture(), task = await f.tasks.start(f.parent, "task:continued-result", { instruction: "Complete the report" }, () => undefined);
     const sessionId = task.sessionId!;
-    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.runId === task.runId)).toBe(true));
+    const originalQueueId = f.store.findQueueItemByRunId(sessionId, task.runId!)!.id;
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.inputQueueItemId === originalQueueId)).toBe(true));
     const continuation = f.host.enqueueServiceInput({ operationId: "task:host-continuation", sessionId, parentRunId: task.runId!, source: "system",
       prompt: { text: "Continue the report", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
     await f.primary.complete(sessionId, "Preparation complete");
-    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.runId === continuation.runId)).toBe(true));
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.inputQueueItemId === continuation.queueItemId)).toBe(true));
     expect((await f.tasks.check(f.parent, task.id)).deliveredExecution).toBeUndefined();
     await f.primary.complete(sessionId, "Completed report");
     await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", result: "Completed report", deliveredExecution: 1 }));
@@ -206,8 +207,10 @@ describe("Partner independent Session tasks", () => {
     const f = await fixture(), task = await f.tasks.start(f.parent, "task:original-result", { instruction: "Return the original report" }, () => undefined);
     const sessionId = task.sessionId!;
     const contextFor = async (runId: string) => {
-      await vi.waitFor(() => expect(f.primary.inputs.some(row => row.context.runId === runId)).toBe(true));
-      return f.primary.inputs.find(row => row.context.runId === runId)!.context;
+      const queueId = f.store.findQueueItemByRunId(sessionId, runId)!.id;
+      const match = () => f.primary.inputs.find(row => row.context.inputQueueItemId === queueId);
+      await vi.waitFor(() => expect(match()).toBeDefined());
+      return match()!.context;
     };
     const original = await contextFor(task.runId!);
     await original.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original report" }] });
