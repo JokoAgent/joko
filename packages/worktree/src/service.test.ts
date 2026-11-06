@@ -17,7 +17,8 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { EphemeralWorktreeService } from "./service.js";
-import { acquireWorktreeSourceUse } from "./source-use.js";
+import { acquireWorktreeSourceUse, withWorktreeSourceLock } from "./source-use.js";
+import { WorktreeServiceError } from "./errors.js";
 import type { WorktreeErrorCode } from "./errors.js";
 import type { WorktreeResult } from "./types.js";
 
@@ -104,6 +105,28 @@ describe("EphemeralWorktreeService", () => {
       .toMatchObject({ status: "preserved", reason: "in_use", pathRemoved: false });
     const pending = service.listRecycleStatus()[0]!;
     expect(pending).toMatchObject({ id: checkout.lease.id, state: "waiting", reason: "in_use", failures: 0 });
+    const statePath = join(fixture.storageRoot, "state.json");
+    const before = await readFile(statePath, "utf8");
+    let entered!: () => void, releaseLock!: () => void, admitted!: () => void;
+    const locked = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { releaseLock = resolve; });
+    const started = new Promise<void>(resolve => { admitted = resolve; });
+    const lock = withWorktreeSourceLock(checkout.lease.path, async () => { entered(); await held; });
+    await locked;
+    let retired = false;
+    const keep = service.controlRecycle({ id: pending.id, generation: pending.generation, action: "keep" }, undefined, () => {
+      if (retired) throw new WorktreeServiceError("ABORTED", "The test owner retired.");
+      admitted();
+    });
+    await started; retired = true; releaseLock(); await lock;
+    expectFailure(await keep, "ABORTED");
+    let checks = 0;
+    expectFailure(await service.controlRecycle({ id: pending.id, generation: pending.generation, action: "retry" }, undefined, () => {
+      if (++checks === 3) throw new WorktreeServiceError("ABORTED", "The test owner retired before publication.");
+    }), "ABORTED");
+    expect(service.listRecycleStatus()[0]).toEqual(pending);
+    expect(await readFile(statePath, "utf8")).toBe(before);
+    await expect(lstat(checkout.lease.path)).resolves.toBeDefined();
     unwrap(await service.controlRecycle({ id: pending.id, generation: pending.generation, action: "keep" }));
     await source.release({ writerRetired: true });
     service.dispose();

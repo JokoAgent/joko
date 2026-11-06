@@ -564,8 +564,9 @@ export class EphemeralWorktreeService {
       .map(recycleRecord));
   }
 
-  controlRecycle(input: WorktreeRecycleControl, options?: WorktreeCallOptions): Promise<WorktreeResult<WorktreeRecycleRecord>> {
+  controlRecycle(input: WorktreeRecycleControl, options?: WorktreeCallOptions, assertCurrent?: () => void): Promise<WorktreeResult<WorktreeRecycleRecord>> {
     return this.#serialize(options, true, async control => {
+      assertCurrent?.();
       const accepted = validateRecycleControl(input);
       const store = this.#requireStore();
       const candidate = store.get(accepted.id);
@@ -587,7 +588,7 @@ export class EphemeralWorktreeService {
           },
           updatedAt: this.#now()
         };
-        await store.set(next, control);
+        await store.set(next, control, assertCurrent);
         return recycleRecord(next);
       }, control.signal);
     });

@@ -2,7 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { createWorktreeBranchSyncService } from "./worktree-branch-sync-service.js";
-import { NotFoundError, StoreClosedError, type OperationalStore } from "@joko/store";
+import { AuthorizationError, NotFoundError, StoreClosedError, type OperationalStore } from "@joko/store";
 
 import {
   SessionWorktreeCoordinator,
@@ -84,7 +84,7 @@ export function createWorktreeConnectService(
     }),
 
     controlWorktreeRecycle: async (request, context) => worktreeRpc(async () => {
-      authenticate(context);
+      const owner = authenticate(context) as { readonly connectionId?: string; readonly authKeyDigest?: string } | undefined;
       if (request.action !== contract.WorktreeRecycleAction.RETRY && request.action !== contract.WorktreeRecycleAction.KEEP) {
         throw new ConnectError("Worktree recycle action is invalid.", Code.InvalidArgument);
       }
@@ -92,11 +92,17 @@ export function createWorktreeConnectService(
         || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u.test(request.generation)) {
         throw new ConnectError("Worktree recycle identity is invalid.", Code.InvalidArgument);
       }
+      if (!owner?.connectionId || !owner.authKeyDigest) throw new ConnectError("Authentication required.", Code.Unauthenticated);
+      const { connectionId, authKeyDigest } = owner;
+      const assertCurrent = () => { store.authorizeConnection(connectionId, authKeyDigest); };
       const record = await requireCoordinator(coordinator).controlRecycle({
         id: request.id, generation: request.generation,
         action: request.action === contract.WorktreeRecycleAction.KEEP ? "keep" : "retry"
-      }, { signal: context.signal });
-      authenticate(context);
+      }, { signal: context.signal }, assertCurrent).catch((error: unknown) => {
+        assertCurrent();
+        throw error;
+      });
+      assertCurrent();
       return create(contract.ControlWorktreeRecycleResponseSchema, {
         ...(record === undefined ? {} : { record: toProtoRecycleRecord(record) })
       });
@@ -199,6 +205,7 @@ async function worktreeRpc<T>(callback: () => Promise<T>): Promise<T> {
     return await callback();
   } catch (error) {
     if (error instanceof ConnectError) throw error;
+    if (error instanceof AuthorizationError) throw new ConnectError("Authentication required.", Code.Unauthenticated);
     if (error instanceof NotFoundError) throw new ConnectError("The requested object was not found.", Code.NotFound);
     if (error instanceof StoreClosedError) throw new ConnectError("Worktree storage is unavailable.", Code.Unavailable);
     if (error instanceof SessionWorktreeCoordinatorError) {

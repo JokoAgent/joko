@@ -582,13 +582,13 @@ export class SessionWorktreeCoordinator {
     });
   }
 
-  async controlRecycle(input: WorktreeRecycleControl, options?: WorktreeCallOptions): Promise<SessionWorktreeRecycleRecord | undefined> {
+  async controlRecycle(input: WorktreeRecycleControl, options?: WorktreeCallOptions, assertCurrent?: () => void): Promise<SessionWorktreeRecycleRecord | undefined> {
     this.#requireInitialized();
     const record = this.#service.listRecycleStatus().find(candidate => candidate.id === input.id);
     if (record === undefined || this.#recycleSession(record) === undefined) {
       throw new SessionWorktreeCoordinatorError("SOURCE_NOT_FOUND");
     }
-    const controlled = await this.#service.controlRecycle(input, options);
+    const controlled = await this.#service.controlRecycle(input, options, assertCurrent);
     if (!controlled.ok) throw new SessionWorktreeCoordinatorError(controlled.error.code);
     if (input.action === "retry") {
       this.#recycleWake.add(record.lease.sessionId);
