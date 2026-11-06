@@ -25,8 +25,13 @@ export interface RemoteProjectSkillCandidate {
   readonly source: StoredRemoteProjectSkillSource;
   readonly localPath: string;
   readonly name: string;
-  readonly assertCurrent: () => void;
   readonly discard: () => Promise<void>;
+}
+
+interface RemoteProjectSkillDiscovery {
+  readonly candidates: readonly RemoteProjectSkillCandidate[];
+  readonly assertCurrent: () => void;
+  readonly isMissing: (source: StoredRemoteProjectSkillSource) => Promise<boolean>;
 }
 
 export interface RemoteSkillSourceOwnerOptions {
@@ -71,15 +76,15 @@ export class RemoteSkillSourceOwner {
       || this.#store.getBackend(backendId).descriptor.adapterKind !== "codex") throw unavailable();
   }
 
-  async discover(targetId: string, signal?: AbortSignal): Promise<readonly RemoteProjectSkillCandidate[]> {
-    const captured = await this.#authority(targetId, signal);
+  async discover(targetId: string, signal?: AbortSignal): Promise<RemoteProjectSkillDiscovery> {
+    const { authority, assertCurrent } = await this.#authority(targetId, signal);
     const candidates: RemoteProjectSkillCandidate[] = [];
     try {
       for (const projectRoot of CODEX_PROJECT_SKILL_ROOTS) {
-        const root = posix.join(captured.authority.registration.root, projectRoot);
-        if (!await optionalDirectory(captured.authority, root, signal)) continue;
-        const entries = await captured.authority.files.list(root, signal);
-        captured.assertCurrent(); signal?.throwIfAborted();
+        const root = posix.join(authority.registration.root, projectRoot);
+        if (!await optionalDirectory(authority, root, signal)) continue;
+        const entries = await authority.files.list(root, signal);
+        assertCurrent(); signal?.throwIfAborted();
         if (entries.length > 500) throw unavailable();
         if (new Set(entries.map(entry => entry.name)).size !== entries.length) throw unavailable();
         for (const entry of [...entries].sort((a, b) => a.name.localeCompare(b.name, "en"))) {
@@ -87,22 +92,22 @@ export class RemoteSkillSourceOwner {
           if (entry.kind === "file") continue;
           if (entry.kind !== "directory" || isSensitiveSkillPath(entry.name)) throw unavailable();
           const sourcePath = posix.join(root, entry.name);
-          if (!await optionalSkillFile(captured.authority, posix.join(sourcePath, "SKILL.md"), signal)) continue;
+          if (!await optionalSkillFile(authority, posix.join(sourcePath, "SKILL.md"), signal)) continue;
           if (candidates.length >= 500) throw unavailable();
           const generationId = randomUUID();
           const localPath = await this.#generation(generationId);
           try {
-            const observed = await this.#tree(captured.authority, sourcePath, localPath, signal);
-            const confirmed = await this.#tree(captured.authority, sourcePath, undefined, signal);
+            const observed = await this.#tree(authority, sourcePath, localPath, signal);
+            const confirmed = await this.#tree(authority, sourcePath, undefined, signal);
             if (confirmed.incarnation !== observed.incarnation || confirmed.revision !== observed.revision) throw unavailable();
-            captured.assertCurrent(); signal?.throwIfAborted();
+            assertCurrent(); signal?.throwIfAborted();
             const source: StoredRemoteProjectSkillSource = Object.freeze({
-              kind: "remote_project", targetId, workspaceId: captured.authority.registration.id,
-              rootRegistrationId: captured.authority.rootRegistrationId, executionIdentity: captured.authority.executionIdentity,
+              kind: "remote_project", targetId, workspaceId: authority.registration.id,
+              rootRegistrationId: authority.rootRegistrationId, executionIdentity: authority.executionIdentity,
               projectRoot, packageKey: entry.name, sourceIncarnation: observed.incarnation,
               sourceRevision: observed.revision, generationId
             });
-            candidates.push(Object.freeze({ source, localPath, name: entry.name, assertCurrent: captured.assertCurrent,
+            candidates.push(Object.freeze({ source, localPath, name: entry.name,
               discard: () => this.discard(source) }));
           } catch (error) {
             await this.#removeGeneration(generationId);
@@ -110,8 +115,23 @@ export class RemoteSkillSourceOwner {
           }
         }
       }
-      captured.assertCurrent(); signal?.throwIfAborted();
-      return Object.freeze(candidates);
+      assertCurrent(); signal?.throwIfAborted();
+      return Object.freeze({
+        candidates: Object.freeze(candidates),
+        assertCurrent,
+        isMissing: async (source: StoredRemoteProjectSkillSource) => {
+          if (source.targetId !== targetId || source.workspaceId !== authority.registration.id
+            || source.rootRegistrationId !== authority.rootRegistrationId || source.executionIdentity !== authority.executionIdentity) return false;
+          const projectRoot = posix.join(authority.registration.root, source.projectRoot);
+          const packageRoot = posix.join(projectRoot, source.packageKey);
+          const present = await optionalDirectory(authority, projectRoot, signal)
+            && await optionalDirectory(authority, packageRoot, signal)
+            && await optionalSkillFile(authority, posix.join(packageRoot, "SKILL.md"), signal);
+          assertCurrent();
+          signal?.throwIfAborted();
+          return !present;
+        }
+      });
     } catch (error) {
       await Promise.allSettled(candidates.map(candidate => candidate.discard()));
       signal?.throwIfAborted();

@@ -2082,16 +2082,17 @@ export class PiResourceManager {
 
   async #prepareRemoteProjectSkills(backendId: string, targetId: string): Promise<PreparedPiResourceMutation<readonly PiResourceDescriptor[]>> {
     const owner = this.#remoteProjectSkills!;
-    const candidates = await owner.discover(targetId);
+    const beforeScan = new Map([...this.#records].filter(([, record]) => record.backendId === backendId && record.targetId === targetId));
+    const { candidates, assertCurrent, isMissing } = await owner.discover(targetId);
     const entries: PreparedCatalogEntry[] = [], values: PiResourceDescriptor[] = [];
     const retained = new Set<StoredRemoteProjectSkillSource>();
     try {
       for (const candidate of candidates) {
-        candidate.assertCurrent();
+        assertCurrent();
         const inspection = await inspectSkillPackage(candidate.localPath, this.#maximumFiles, this.#maximumBytes);
         const sourceIdentity = remoteProjectSkillSourceIdentity(candidate.source);
         const id = `resource_${createHash("sha256").update(JSON.stringify([backendId, targetId, sourceIdentity])).digest("hex")}`;
-        const previous = this.#records.get(id);
+        const previous = beforeScan.get(id);
         if (previous !== undefined && (previous.source.kind !== "remote_project" || previous.backendId !== backendId
           || previous.targetId !== targetId || previous.scope !== "project" || previous.kind !== "skill" || previous.sourceIdentity !== sourceIdentity)) {
           throw new Error("Remote project Resource identity is already owned.");
@@ -2100,13 +2101,13 @@ export class PiResourceManager {
           && previous.source.sourceIncarnation === candidate.source.sourceIncarnation
           && previous.source.sourceRevision === candidate.source.sourceRevision && previous.discoveredRevision === inspection.revision) {
           await owner.assertLocalGeneration(previous.source);
-          candidate.assertCurrent();
+          assertCurrent();
           await candidate.discard();
           entries.push({ id, expected: previous, next: previous }); values.push(publicResource(previous));
           continue;
         }
         const compatibility = await inspectPiResourceCompatibility("skill", inspection.canonicalPath, { contentFingerprint: inspection.revision });
-        candidate.assertCurrent();
+        assertCurrent();
         const workspaceRoot = this.#store.getTarget(targetId).descriptor.remoteWorkspace!.workspaceRoot;
         const record: StoredResource = {
           id, backendId, targetId, kind: "skill", scope: "project", name: candidate.name,
@@ -2117,10 +2118,16 @@ export class PiResourceManager {
           versionNumber: ((previous === undefined ? 0n : BigInt(previous.versionNumber)) + 1n).toString(), updatedAt: this.#now(),
           source: candidate.source, canonicalPath: candidate.localPath, workspaceRoot
         };
-        this.#remoteSourceGuards.set(record, candidate.assertCurrent);
+        this.#remoteSourceGuards.set(record, assertCurrent);
         entries.push({ id, expected: previous, next: record }); values.push(publicResource(record)); retained.add(candidate.source);
       }
-      const assertCurrent = (): void => { for (const candidate of candidates) candidate.assertCurrent(); };
+      const discoveredIds = new Set(entries.map(({ id }) => id));
+      for (const [id, previous] of beforeScan) {
+        if (previous.source.kind === "remote_project" && previous.state !== "removed"
+          && !discoveredIds.has(id) && await isMissing(previous.source)) {
+          entries.push({ id, expected: previous, next: this.#removedRecord(previous) });
+        }
+      }
       assertCurrent();
       return this.#prepareMutation(entries, Object.freeze(values), assertCurrent, {
         rollback: async () => { await Promise.all(candidates.filter(candidate => retained.has(candidate.source)).map(candidate => candidate.discard())); }
@@ -2414,14 +2421,7 @@ export class PiResourceManager {
       assertExpectedInstalledLocation(this.#managedRoot, current);
       await assertContainedPathIfPresent(this.#managedRoot, current.installedPath, "Installed resource");
     }
-    const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(current);
-    const updated: StoredResource = {
-      ...withoutPendingUpdate,
-      state: "removed",
-      enabled: false,
-      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
-      updatedAt: this.#now()
-    };
+    const updated = this.#removedRecord(current);
     return this.#prepareMutation(
       [{ id: resourceId, expected: current, next: updated }],
       publicResource(updated),
@@ -2437,6 +2437,17 @@ export class PiResourceManager {
 
   async remove(resourceId: string): Promise<PiResourceDescriptor> {
     return this.#completePreparedStandalone(await this.prepareRemove(resourceId));
+  }
+
+  #removedRecord(current: StoredResource): StoredResource {
+    const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(current);
+    return {
+      ...withoutPendingUpdate,
+      state: "removed",
+      enabled: false,
+      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
   }
 
   /** Callback passed directly to PiAdapterOptions.approveProjectSkill. */

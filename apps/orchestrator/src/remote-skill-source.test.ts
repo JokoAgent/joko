@@ -138,6 +138,45 @@ describe("registered project Skill source", () => {
     } finally { await f.cleanup(); }
   });
 
+  it("retires confirmed missing Skills on rediscovery and keeps them out of cold native snapshots", async () => {
+    const f = await fixture();
+    const input = { backendId: "native", targetId: "project", kinds: ["skill"] as const };
+    try {
+      f.files.directory("/workspace/.codex/skills");
+      const [row] = await f.manager.discoverProjectResources(input);
+      await f.manager.approve(row!.id, row!.discoveredRevision, "connection");
+      await f.manager.setEnabled(row!.id, true);
+      const [seed] = await f.manager.runtimeSkillSnapshot("native", "project", new AbortController().signal);
+      for (const path of f.files.entries.keys()) {
+        if (path === skillPath || path.startsWith(`${skillPath}/`)) f.files.entries.delete(path);
+      }
+      const staleScan = await f.manager.prepareDiscoverProjectResources(input);
+      expect(staleScan.revokesRuntimeAuthority).toBe(true);
+      f.revoke();
+      await expect(f.manager.completePreparedMutation(staleScan, finalize => finalize(f.store))).rejects.toThrow("File authority retired");
+      expect(f.manager.get(row!.id)).toMatchObject({ enabled: true });
+      f.reconnect();
+      expect(await f.manager.discoverProjectResources(input)).toEqual([]);
+      expect(f.manager.get(row!.id)).toMatchObject({ state: "removed", enabled: false });
+      expect(() => seed!.assertCurrent()).toThrow();
+
+      f.store.close();
+      const reopened = new OperationalStore(f.database);
+      try {
+        const owner = new RemoteSkillSourceOwner({ store: reopened, managedRoot: f.managedRoot,
+          captureSkillSourceAuthority: (id, signal) => f.remote.captureSkillSourceAuthority(id, signal) });
+        const manager = new PiResourceManager({ store: reopened, managedRoot: join(f.root, "resources"), remoteProjectSkills: owner });
+        await manager.initialize();
+        expect(manager.get(row!.id)).toMatchObject({ state: "removed", enabled: false });
+        expect(await manager.runtimeSkillSnapshot("native", "project", new AbortController().signal)).toEqual([]);
+        f.files.file(`${skillPath}/SKILL.md`, skillBody);
+        const [returned] = await manager.discoverProjectResources(input);
+        expect(returned).toMatchObject({ id: row!.id, state: "awaiting_approval", enabled: false });
+        expect(returned?.approvedAt).toBeUndefined();
+      } finally { reopened.close(); }
+    } finally { await f.cleanup(); }
+  });
+
   it("fences prepared approval and leased seeds on exact file authority, registration, trust and execution changes", async () => {
     const f = await fixture();
     try {
@@ -216,7 +255,7 @@ describe("registered project Skill source", () => {
       await expect(f.owner.discover("project")).rejects.toThrow(); expect(await readdir(f.managedRoot)).toEqual([]);
       const owner = new RemoteSkillSourceOwner({ store: f.store, managedRoot: f.managedRoot,
         captureSkillSourceAuthority: (id, signal) => f.remote.captureSkillSourceAuthority(id, signal) });
-      const [candidate] = await owner.discover("project");
+      const { candidates: [candidate] } = await owner.discover("project");
       expect(() => validateRemoteProjectSkillSource({ ...candidate!.source, authorityIdentity: "ephemeral" } as StoredRemoteProjectSkillSource)).toThrow();
       expect(() => validateRemoteProjectSkillSource({ ...candidate!.source, packageKey: "../other" })).toThrow();
       await candidate!.discard();
