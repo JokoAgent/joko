@@ -26,6 +26,7 @@ import {
   WorkspaceSearchError,
   WorkspaceTextFileWriteError,
   fileHash,
+  gitRemoteUrlContainsCredentials,
   isUnmergedGitStatus,
   selectDiffFilePatch,
   selectDiffHunkPatch,
@@ -953,8 +954,12 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const before = await repositoryRevision(processes, registration.root);
     const head = (await runRemote(processes, "git", ["rev-parse", "HEAD"], registration.root, 20_000, 1024 * 1024)).stdout.trim();
     if (before !== input.expectedRepositoryRevision || head !== input.expectedHeadRevision) throw new WorkspaceGitReviewError("Remote branch is stale.", "stale");
-    const url = (await runRemote(processes, "git", ["remote", "get-url", input.remote], registration.root, 20_000, 1024 * 1024)).stdout.trim();
-    if (gitUrlContainsCredential(url)) throw new WorkspaceGitReviewError("Remote URL contains embedded credentials.", "unsupported");
+    const destinations = (await runRemote(processes, "git", ["remote", "get-url", "--push", "--all", input.remote],
+      registration.root, 20_000, 2 * 1024 * 1024)).stdout.split(/\r?\n/u).map(value => value.trim()).filter(Boolean);
+    if (destinations.length === 0) throw new WorkspaceGitReviewError("The selected push remote has no destination.", "invalid");
+    if (destinations.some(gitRemoteUrlContainsCredentials)) {
+      throw new WorkspaceGitReviewError("Credential-bearing remote URLs are not supported by Review push.", "unsupported");
+    }
     const args = ["push"];
     if (input.confirmForceWithLease === true) {
       if (!immutableRevision(input.expectedRemoteOid ?? "")) throw new WorkspaceGitReviewError("Remote lease is invalid.", "invalid");
@@ -1428,13 +1433,4 @@ function mutableGitSource(source: WorkspaceGitHunkMutation["source"]): "unstaged
   if (source === "index" || source === "staged") return "staged";
   if (source === "workingTree" || source === "unstaged") return "unstaged";
   throw new WorkspaceGitReviewError("Only staged or unstaged remote diffs can be changed.", "invalid");
-}
-
-
-
-function gitUrlContainsCredential(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.password !== "" || ((url.protocol === "http:" || url.protocol === "https:") && url.username !== "");
-  } catch { return /^[^@/\\:]+:[^@/\\]+@/u.test(value); }
 }

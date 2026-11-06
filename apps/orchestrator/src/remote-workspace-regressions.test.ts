@@ -39,7 +39,7 @@ class LocalRemoteProcess extends EventEmitter implements RemoteProcessHandle {
   kill(signal: NodeJS.Signals | number = "SIGTERM") { return this.#child.kill(signal); }
 }
 
-async function fixture() {
+async function fixture(options: { readonly ssh?: boolean; readonly beforeProcess?: (request: RemoteProcessStartRequest) => Promise<void> } = {}) {
   const base = await mkdtemp(join(tmpdir(), "joko-remote-workspace-"));
   await mkdir(join(base, "repo")); await mkdir(join(base, "outside"));
   const root = await realpath(join(base, "repo")), outside = await realpath(join(base, "outside"));
@@ -48,11 +48,14 @@ async function fixture() {
   let retired = false;
   const processes: RemoteProcessTransportPort = { open: async request => {
     requests.push(request);
+    if (options.beforeProcess !== undefined) await options.beforeProcess(request);
     const child = new LocalRemoteProcess(request); handles.add(child); child.once("exit", () => handles.delete(child)); return child;
   } };
-  const binding = { kind: "device_peer", controllerDeviceId: "controller", targetDeviceId: "peer", workspaceRoot: root } as const;
+  const binding = options.ssh
+    ? { kind: "ssh", hostTargetId: "target", hostId: "host-a", workspaceRoot: root } as const
+    : { kind: "device_peer", controllerDeviceId: "controller", targetDeviceId: "peer", workspaceRoot: root } as const;
   const assertCurrent = () => { if (retired) throw new Error("Route retired."); };
-  const authority = () => ({ kind: "device_peer" as const, binding, executionIdentity: "peer", authorityIdentity: "peer-route-1",
+  const authority = () => ({ kind: binding.kind, binding, executionIdentity: "peer", authorityIdentity: "peer-route-1",
     pathStyle: process.platform === "win32" ? "win32" as const : "posix" as const, files, processes,
     assertCurrent, assertFilesCurrent: assertCurrent, assertForwardingCurrent: () => undefined });
   const router = { workspace: async () => authority(), files: async () => authority() } as unknown as RemoteExecutionRouter;
@@ -69,6 +72,24 @@ async function fixture() {
     await rm(base, { recursive: true, force: true });
   } };
 }
+
+it.skipIf(process.platform === "win32")("rejects every configured SSH push URL before publishing to any destination", { timeout: 30_000 }, async () => {
+  const f = await fixture({ ssh: true, beforeProcess: async request => {
+    if (request.args[0] === "push") throw new Error("Unexpected SSH push.");
+  } });
+  try {
+    await f.git("commit", "--allow-empty", "-m", "base");
+    await f.git("remote", "add", "origin", f.outside);
+    await f.git("remote", "set-url", "--push", "--add", "origin", f.outside);
+    await f.git("remote", "set-url", "--push", "--add", "origin", "https://fixture:private@example.invalid/project.git");
+    const diff = await f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    await expect(f.workspaces.pushGitReview("workspace", { remote: "origin", remoteRef: "refs/heads/main",
+      expectedRepositoryRevision: diff.repositoryRevision, expectedHeadRevision: diff.headRevision! }))
+      .rejects.toMatchObject({ kind: "unsupported" });
+    expect(f.requests.some(request => request.args.join(" ") === "remote get-url --push --all origin")).toBe(true);
+    expect(f.requests.some(request => request.args[0] === "push")).toBe(false);
+  } finally { await f.close(); }
+});
 
 it("rejects every remote mutation through an intermediate link before delegating its effect", async () => {
   const f = await fixture();
