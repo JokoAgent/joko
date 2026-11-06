@@ -1499,6 +1499,9 @@ export class BrowserProvider {
         }
       } catch (error) {
         if (navigation && !page.isClosed()) this.#pageStates.set(page, "ready");
+        if (action.type === "textInput" || action.type === "keyPress" && /^[a-z0-9]$/u.test(action.key)) {
+          throw new BrowserTakeoverConflictError("Browser could not confirm the keyboard input.");
+        }
         throw error;
       }
       await this.emit({

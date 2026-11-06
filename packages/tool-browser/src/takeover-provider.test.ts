@@ -312,6 +312,17 @@ async function begin(provider: BrowserProvider, owner = "connection-a") {
 }
 
 describe("BrowserProvider human takeover fences", () => {
+  it("reports an unconfirmed native keyboard effect without the submitted text", async () => {
+    const value = await fixture();
+    try {
+      const takeover = await begin(value.provider);
+      const password = "K7!m2.zW8qD4";
+      value.fakePage.keyboard.insertText = async (text) => { throw new Error(`Native input was ${text}`); };
+      await expect(value.provider.performHumanTakeoverAction(takeover, { type: "textInput", text: password }))
+        .rejects.toThrow(/^Browser could not confirm the keyboard input\.$/u);
+    } finally { await value.cleanup(); }
+  });
+
   it("keeps generation and page identities monotonic after a durable host restart seed", async () => {
     const value = await fixture(false, Date.now, 9);
     try {
