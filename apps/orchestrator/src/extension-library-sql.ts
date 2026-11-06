@@ -8,6 +8,7 @@ import { backup, constants as sqliteConstants, DatabaseSync, type SQLInputValue,
 import {
   ExtensionLibraryError,
   type ExtensionLibraryFailureCode,
+  type ExtensionLibraryRootStat,
   type ExtensionLibraryVault
 } from "./extension-library-vault.js";
 
@@ -83,6 +84,7 @@ export type ExtensionLibrarySqlWorkerReply =
 
 export interface ExtensionLibrarySqlWorkerStartup {
   readonly root: string;
+  readonly rootStat: ExtensionLibraryRootStat;
   readonly extensionId: string;
   readonly limits: ExtensionLibrarySqlLimits;
 }
@@ -187,6 +189,8 @@ export class ExtensionLibrarySqlService {
       operation: "open",
       input
     });
+    try { await this.#vault.assertCurrentRoot(); }
+    catch (error) { this.revoke(); throw error; }
     this.#handles.set(result.handleId, { readonly: result.readonly });
     if (!result.readonly) await this.#vault.reconcileUsage();
     return result;
@@ -331,6 +335,7 @@ export class ExtensionLibrarySqlService {
 
   #ensureWorker(): ChildProcess {
     if (this.#worker !== undefined) return this.#worker;
+    const rootStat = this.#vault.rootStat;
     const sourceRuntime = import.meta.url.endsWith(".ts");
     const url = new URL(sourceRuntime ? "./extension-library-sql-worker.ts" : "./extension-library-sql-worker.js", import.meta.url);
     const options: ForkOptions & { readonly windowsHide: boolean } = {
@@ -348,14 +353,10 @@ export class ExtensionLibrarySqlService {
     this.#worker = worker;
     worker.on("message", (value: unknown) => {
       if (value !== null && typeof value === "object" && "kind" in value && value.kind === "mutation_fence"
-        && "id" in value && Number.isSafeInteger(value.id) && Number(value.id) >= 1) {
+        && "id" in value && typeof value.id === "number" && Number.isSafeInteger(value.id) && value.id >= 1) {
         // The authority flag remains in the owning host. Every child-side
         // filesystem mutation obtains a fresh permit, including after awaits.
-        const allowed = this.#worker === worker && !this.#disposed
-          && Atomics.load(new Int32Array(this.#authorityState), 0) === 0;
-        if (worker.connected) worker.send({ kind: "mutation_fence", id: value.id, allowed }, (error) => {
-          if (error) this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker disconnected."));
-        });
+        void this.#permitMutation(worker, value.id);
         return;
       }
       this.#receive(worker, value);
@@ -368,11 +369,24 @@ export class ExtensionLibrarySqlService {
         code === 0 ? "Library SQL worker exited." : "Library SQL worker exited unexpectedly."
       ));
     });
-    worker.send({ kind: "startup", root: this.#vault.root, extensionId: this.#vault.extensionId,
+    worker.send({ kind: "startup", root: this.#vault.root, rootStat, extensionId: this.#vault.extensionId,
       limits: this.#limits } satisfies ExtensionLibrarySqlWorkerStartup & { kind: "startup" }, (error) => {
       if (error) this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker failed to initialize."));
     });
     return worker;
+  }
+
+  async #permitMutation(worker: ChildProcess, id: number): Promise<void> {
+    try {
+      const rootCurrent = await this.#vault.assertCurrentRoot().then(() => true, () => false);
+      const allowed = rootCurrent && this.#worker === worker && !this.#disposed
+        && Atomics.load(new Int32Array(this.#authorityState), 0) === 0;
+      if (worker.connected) worker.send({ kind: "mutation_fence", id, allowed }, (error) => {
+        if (error) this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker disconnected."));
+      });
+    } catch {
+      this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker disconnected."));
+    }
   }
 
   #receive(worker: ChildProcess, value: unknown): void {

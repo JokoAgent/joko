@@ -140,9 +140,12 @@ const PORTABLE_SEGMENT = /^[A-Za-z0-9_@][A-Za-z0-9_@.+ -]*$/u;
 const WINDOWS_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu;
 const SQLITE_SIDECAR = /\.sqlite-(?:wal|shm|journal)$/iu;
 
+export type ExtensionLibraryRootStat = Pick<BigIntStats, "dev" | "ino" | "birthtimeNs">;
+
 export interface ExtensionLibraryVaultOptions {
   readonly root: string;
   readonly extensionId: string;
+  readonly expectedRootStat?: ExtensionLibraryRootStat;
   readonly now?: () => number;
   readonly freeBytes?: (root: string) => Promise<number | undefined>;
   readonly limits?: Partial<ExtensionLibraryLimits>;
@@ -164,7 +167,7 @@ export class ExtensionLibraryVault {
   readonly #limits: ExtensionLibraryLimits;
   readonly #beforeFilesystemMutation: NonNullable<ExtensionLibraryVaultOptions["beforeFilesystemMutation"]>;
   #metadata?: StoredLibraryMetadata;
-  #rootIdentity?: BigIntStats;
+  #rootIdentity?: ExtensionLibraryRootStat;
   readonly #usage: { current: ExtensionLibraryUsage; needsReconcile: boolean };
   #state: ExtensionLibraryState = "unavailable";
   #reason: ExtensionLibraryStatus["reason"] = "io";
@@ -176,6 +179,7 @@ export class ExtensionLibraryVault {
     if (!EXTENSION_ID.test(options.extensionId)) throw new TypeError("Extension Library identity is invalid.");
     this.#root = resolve(options.root);
     this.#extensionId = options.extensionId;
+    if (options.expectedRootStat !== undefined) this.#rootIdentity = { ...options.expectedRootStat };
     this.#now = options.now ?? Date.now;
     this.#freeBytes = options.freeBytes ?? filesystemFreeBytes;
     this.#limits = Object.freeze({ ...EXTENSION_LIBRARY_LIMITS, ...options.limits });
@@ -197,6 +201,12 @@ export class ExtensionLibraryVault {
 
   get extensionId(): string {
     return this.#extensionId;
+  }
+
+  get rootStat(): ExtensionLibraryRootStat {
+    if (this.#rootIdentity === undefined) throw new ExtensionLibraryError("UNAVAILABLE", "Library root identity is unavailable.");
+    const { dev, ino, birthtimeNs } = this.#rootIdentity;
+    return { dev, ino, birthtimeNs };
   }
 
   get limits(): ExtensionLibraryLimits {
@@ -615,8 +625,10 @@ export class ExtensionLibraryVault {
 
   async reconcileUsage(): Promise<ExtensionLibraryUsage> {
     await this.#requireOpen();
+    await this.#assertRootIdentity();
     this.#usage.needsReconcile = true;
     const tree = await scanTree(this.#root, this.#limits.maximumFiles);
+    await this.#assertRootIdentity();
     this.#usage.current = {
       files: tree.files,
       bytes: tree.bytes,
@@ -670,6 +682,10 @@ export class ExtensionLibraryVault {
   async assertMutationAuthority(operation: "sqlite"): Promise<void> {
     await this.#requireReady(true);
     await this.#beforeFilesystemMutation(operation);
+  }
+
+  async assertCurrentRoot(): Promise<void> {
+    await this.#assertRootIdentity();
   }
 
   async allocateTemporaryPath(suffix: ".sqlite-backup" | ".stream"): Promise<string> {
@@ -853,7 +869,7 @@ export class ExtensionLibraryVault {
       throw new ExtensionLibraryError("UNAVAILABLE", "Extension Library root moved through an alias.");
     }
     if (this.#rootIdentity === undefined) this.#rootIdentity = info;
-    else if (!sameFilesystemObject(this.#rootIdentity, info)) {
+    else if (!sameStatIdentity(this.#rootIdentity, info)) {
       throw new ExtensionLibraryError("UNAVAILABLE", "Extension Library root was replaced.");
     }
   }
@@ -1273,7 +1289,11 @@ async function hashOpenFile(path: string, expected: BigIntStats): Promise<string
 }
 
 function sameFilesystemObject(left: BigIntStats, right: BigIntStats): boolean {
-  if (left.isFile() !== right.isFile() || left.isDirectory() !== right.isDirectory() || left.dev !== right.dev) return false;
+  return left.isFile() === right.isFile() && left.isDirectory() === right.isDirectory() && sameStatIdentity(left, right);
+}
+
+function sameStatIdentity(left: ExtensionLibraryRootStat, right: ExtensionLibraryRootStat): boolean {
+  if (left.dev !== right.dev) return false;
   if (left.ino !== 0n && right.ino !== 0n) return left.ino === right.ino;
   return left.ino === 0n && right.ino === 0n && left.birthtimeNs !== 0n && left.birthtimeNs === right.birthtimeNs;
 }

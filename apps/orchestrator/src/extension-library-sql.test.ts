@@ -1,6 +1,7 @@
+import { renameSync } from "node:fs";
 import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fork } from "node:child_process";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,7 +16,10 @@ import { ExtensionLibraryVault } from "./extension-library-vault.js";
 
 const EXTENSION_ID = `extension_${"b".repeat(32)}`;
 const cleanups: Array<() => Promise<void>> = [];
-const filesystem = vi.hoisted(() => ({ beforeIdentity: undefined as ((path: unknown) => Promise<void>) | undefined }));
+const filesystem = vi.hoisted(() => ({
+  beforeIdentity: undefined as ((path: unknown) => Promise<void>) | undefined,
+  beforeFork: undefined as ((script: unknown) => void) | undefined
+}));
 
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -24,9 +28,17 @@ vi.mock("node:fs/promises", async importOriginal => {
     return Reflect.apply(actual.lstat, undefined, args);
   } };
 });
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, fork: (...args: unknown[]) => {
+    filesystem.beforeFork?.(args[0]);
+    return Reflect.apply(actual.fork, undefined, args);
+  } };
+});
 
 afterEach(async () => {
   filesystem.beforeIdentity = undefined;
+  filesystem.beforeFork = undefined;
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -189,6 +201,28 @@ describe("ExtensionLibrarySqlService", () => {
     } finally { await core.closeAll(); }
   });
 
+  it("does not initialize the first SQL worker on a replacement Library", async () => {
+    const { root, service } = await fixture();
+    const replacementRoot = join(dirname(root), "replacement");
+    const originalRoot = join(dirname(root), "displaced");
+    const replacement = new ExtensionLibraryVault({ root: replacementRoot, extensionId: EXTENSION_ID });
+    expect((await replacement.open()).state).toBe("ready");
+    await writeFile(join(root, "marker.txt"), "original");
+    await writeFile(join(replacementRoot, "marker.txt"), "replacement");
+    filesystem.beforeFork = (script) => {
+      if (!String(script).includes("extension-library-sql-worker")) return;
+      filesystem.beforeFork = undefined;
+      renameSync(root, originalRoot);
+      renameSync(replacementRoot, root);
+    };
+
+    await expect(service.open({ path: "new.sqlite", create: true })).rejects.toMatchObject({ code: "UNAVAILABLE" });
+    await expect(readFile(join(root, "new.sqlite"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(originalRoot, "new.sqlite"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(root, "marker.txt"), "utf8")).resolves.toBe("replacement");
+    await expect(readFile(join(originalRoot, "marker.txt"), "utf8")).resolves.toBe("original");
+  });
+
   it("keeps the host event loop responsive and retires a connection owner when its worker exceeds the deadline", async () => {
     const { service } = await fixture(undefined, 1_000);
     const opened = await service.open({ path: "bounded-worker.sqlite", create: true });
@@ -210,7 +244,8 @@ describe("ExtensionLibrarySqlService", () => {
   });
 
   it("retires a native query process when its owning host dies without running IPC disconnect", async () => {
-    const { root, service } = await fixture();
+    const { root, service, vault } = await fixture();
+    const { dev, ino, birthtimeNs } = vault.rootStat;
     const directory = await mkdtemp(join(tmpdir(), "joko-library-parent-exit-"));
     cleanups.push(() => rm(directory, { recursive: true, force: true }));
     const script = join(directory, "owner.mjs");
@@ -235,7 +270,8 @@ describe("ExtensionLibrarySqlService", () => {
       });
       parser.once('error', error => process.send?.({ kind: 'startup-error', code: error.code }));
       parser.once('exit', () => process.send?.({ kind: 'startup-error', code: 'child-exited' }));
-      parser.send({ kind: 'startup', root: ${JSON.stringify(root)}, extensionId: ${JSON.stringify(EXTENSION_ID)}, limits: ${JSON.stringify(service.limits)} });
+      parser.send({ kind: 'startup', root: ${JSON.stringify(root)}, rootStat: { dev: ${dev}n, ino: ${ino}n, birthtimeNs: ${birthtimeNs}n },
+        extensionId: ${JSON.stringify(EXTENSION_ID)}, limits: ${JSON.stringify(service.limits)} });
       parser.send({ id: 1, operation: 'open', input: { path: 'running.sqlite', create: true } });
     `);
     const host = fork(script, [], { execArgv: [], serialization: "advanced", stdio: ["ignore", "ignore", "ignore", "ipc"],
