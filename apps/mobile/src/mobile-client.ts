@@ -4,7 +4,7 @@ import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionPackageAction } from "@joko/contracts";
 import { projectProviderGroupRebalance, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
-import { executeExtensionSettingsCall } from "@joko/connection-transport";
+import { executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import type { SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
@@ -3384,7 +3384,7 @@ export class MobileClient {
             } });
             requireCurrent(signal);
             if (!result.definitive) throw new Error("Plugin settings result is unknown. Check its original operation; it was not resent.");
-            if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) throw new Error(result.operation?.error?.message || "Plugin settings change was rejected.");
+            if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) throw new ExtensionSettingsRejected("rejected");
           } finally { this.#releaseMutation(action); }
         },
         pickDirectory: async (extension, mutation, signal) => {

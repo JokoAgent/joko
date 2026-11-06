@@ -1,6 +1,6 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
-import { executeExtensionSettingsCall } from "@joko/connection-transport";
+import { executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
   parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationKind } from "./extension-settings-operation.js";
 import { readSessionArchivePreview } from "@joko/contracts";
@@ -5710,6 +5710,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             if (receipt !== undefined) await originalResource(record, active);
             await observeReceipt(record, receipt); terminalConfirmed = receipt !== undefined && receipt.state !== "pending";
             current(); active.throwIfAborted();
+            if (receipt?.state === "failed") throw new ExtensionSettingsRejected("rejected");
           };
         };
         const submitSettings = async (extension: ExtensionCatalogEntryView, payload: MutationPayload, requestSignal = active) => {

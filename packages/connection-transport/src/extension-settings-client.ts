@@ -4,6 +4,17 @@ import { ExtensionAuthorizationPhase, OperationMutationSchema, type ExtensionOAu
   type CredentialUploadTicket, type OperationMutation, type ExtensionNetworkService, type ExtensionService,
   type ExtensionSettingsCall, type ExtensionSettingsHost, type ExtensionPickedDirectoryDeposit } from "@joko/contracts";
 
+/** The host declined before dispatch or the original operation was confirmed rejected. */
+export class ExtensionSettingsRejected extends Error {
+  constructor(reason: "cancelled" | "rejected") {
+    super(reason === "cancelled" ? "The settings change was cancelled." : "The settings change was rejected.");
+    this.name = "ExtensionSettingsRejected";
+  }
+}
+
+export const extensionSettingsReadOnly = (kind: ExtensionSettingsCall["kind"]): boolean =>
+  ["context.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(kind);
+
 export interface ExtensionSettingsProjection {
   readonly extensionId: string; readonly revision: bigint; readonly name: string;
   readonly setup: { readonly state: "notRequired" | "required" | "inProgress" | "ready" | "cancelled" | "failed";
@@ -194,7 +205,9 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
       const result = await client.connections.get({ extensionId: extension.extensionId }, rpc); current(); return result.state;
     }
     case "connections.set": {
-      if (!client.connections || !await host.confirm(extension.name, call.host, signal)) throw new Error("Plugin connection change was cancelled.");
+      if (!client.connections) throw new Error("Plugin connection settings are unavailable.");
+      const accepted = await host.confirm(extension.name, call.host, signal); current();
+      if (!accepted) throw new ExtensionSettingsRejected("cancelled");
       current(); const result = await client.connections.beginCredential({ extensionId: extension.extensionId, expectedRevision: { value: extension.revision }, slotKey: call.key, host: call.host,
         ...(call.label === undefined ? {} : { label: call.label }) }, rpc); current();
       if (!result.ticket) throw new Error("The private plugin connection channel is unavailable.");
@@ -202,7 +215,9 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
       const finished = await client.connections.commitCredential({ extensionId: extension.extensionId, credentialUploadTicketId: id }, rpc); current(); return finished.state;
     }
     case "connections.change": {
-      if (!client.connections || !await host.confirm(extension.name, call.key, signal)) throw new Error("Plugin connection change was cancelled.");
+      if (!client.connections) throw new Error("Plugin connection settings are unavailable.");
+      const accepted = await host.confirm(extension.name, call.key, signal); current();
+      if (!accepted) throw new ExtensionSettingsRejected("cancelled");
       current(); const result = await client.connections.change({ extensionId: extension.extensionId, expectedRevision: { value: extension.revision }, slotKey: call.key,
         action: call.action === "remove" ? { case: "removeConnectionId", value: call.connectionId } : { case: "defaultConnectionId", value: call.connectionId } }, rpc);
       current(); return result.state;

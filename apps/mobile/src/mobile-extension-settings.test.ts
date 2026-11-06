@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { createRequire } from "node:module";
+import { ExtensionSettingsRejected } from "@joko/connection-transport";
 import { EXTENSION_SETTINGS_SDK_SOURCE, type ExtensionSettingsCall } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionSettingsBridge, mobileExtensionSettingsBootstrap } from "./mobile-extension-settings";
@@ -72,6 +73,20 @@ describe("Mobile author settings document bridge", () => {
       expect.objectContaining({ id: "retry", ok: false })
     ]);
     expect(active.replies.filter(value => JSON.parse(value).response.id === "mutation")).toHaveLength(1);
+  });
+
+  it("keeps the current document readable after a definitive connection cancellation", async () => {
+    const active = harness();
+    active.call.mockRejectedValueOnce(new ExtensionSettingsRejected("cancelled"));
+    active.call.mockResolvedValueOnce({ slots: [] });
+    active.send("declined", { kind: "connections.set", key: "api", host: "api.example.com", value: "candidate" });
+    await settle();
+    active.send("read", { kind: "connections.get" }); await settle();
+    expect(active.call.mock.calls.map(call => call[1].kind)).toEqual(["connections.set", "connections.get"]);
+    expect(active.replies.map(value => JSON.parse(value).response)).toMatchObject([
+      { id: "declined", ok: false, message: "The settings change was cancelled." },
+      { id: "read", ok: true, result: { slots: [] } }
+    ]);
   });
 
   it("allows a failed native context read to be retried without authorizing an effect", async () => {

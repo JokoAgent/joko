@@ -1,10 +1,10 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide-react";
-import { createConnectionFetch } from "@joko/connection-transport";
+import { createConnectionFetch, ExtensionSettingsRejected, extensionSettingsReadOnly } from "@joko/connection-transport";
 import { parseExtensionSettingsBridgeRequest, type ExtensionSettingsDirectoryChoice } from "@joko/contracts";
 import { ExtensionSettingsDirectoryDialog } from "./ExtensionSettingsDirectoryDialog.js";
-import type { PendingExtensionSettingsOperation } from "../extension-settings-operation.js";
+import { sameExtensionSettingsOperation, type PendingExtensionSettingsOperation } from "../extension-settings-operation.js";
 import { mountIsolatedSurface } from "../isolated-surface.js";
 import { bindExtensionSurfaceResources } from "../extension-main-view-resource-bridge.js";
 import { bindExtensionViewClose, registerExtensionPageClose } from "../extension-view-lifecycle.js";
@@ -87,8 +87,9 @@ export function ExtensionMainViewPage({
   const settingsChecking = useRef<symbol | undefined>(undefined);
   const [settingsOperationNotice, setSettingsOperationNotice] = useState<"succeeded" | "failed" | "pending" | "unavailable">();
   const [completedDirectoryOperation, setCompletedDirectoryOperation] = useState(false);
+  const settingsResume = useRef<((original: PendingExtensionSettingsOperation) => void) | undefined>(undefined);
   const settingsRecovery = useRef<{ readonly api: ExtensionSettingsApi; readonly owner: string; readonly extensionId: string;
-    readonly signal: AbortSignal; readonly refresh: () => Promise<void> } | undefined>(undefined);
+    readonly signal: AbortSignal; readonly refresh: () => Promise<PendingExtensionSettingsOperation | undefined> } | undefined>(undefined);
 
   useEffect(() => {
     setSettingsOperation(undefined); setSettingsOperationNotice(undefined); setCheckingSettingsOperation(false); setCompletedDirectoryOperation(false); settingsChecking.current = undefined;
@@ -100,7 +101,10 @@ export function ExtensionMainViewPage({
     const refresh = async () => {
       try {
         const original = await api!.pending!(extensionId, abort.signal);
-        if (active && !abort.signal.aborted && liveOwnerRef.current === controllerOwner) setSettingsOperation(original);
+        if (active && !abort.signal.aborted && liveOwnerRef.current === controllerOwner) {
+          setSettingsOperation(original);
+          return original;
+        }
       } catch { if (active && !abort.signal.aborted && liveOwnerRef.current === controllerOwner) setSettingsOperationNotice("unavailable"); }
     };
     const recovery = { api, owner: controllerOwner, extensionId, signal: abort.signal, refresh }; settingsRecovery.current = recovery;
@@ -424,9 +428,17 @@ export function ExtensionMainViewPage({
     if (!settings || state.phase !== "ready" || state.surface.purpose !== "settings" || !frame || !api || !sourceWindow) return;
     const profile = controller.state.activeProfile, seen = new Set<string>(), pending = new Set<AbortController>();
     let closed = false, faulted = false, queue: Promise<unknown> = Promise.resolve();
+    let faultedRouting: PendingExtensionSettingsOperation | undefined;
     const current = () => !closed && liveOwnerRef.current === controllerOwner && frameRef.current === frame && frame.isConnected && surfaceRef.current?.id === state.surface.id
       && controller.state.activeProfile?.id === profile?.id && controller.state.activeProfile?.serverId === profile?.serverId
       && controller.state.activeProfile?.origin === profile?.origin && controller.state.activeProfile?.endpointPublicKey === profile?.endpointPublicKey;
+    const resume = (original: PendingExtensionSettingsOperation) => {
+      if (current() && faultedRouting && sameExtensionSettingsOperation(faultedRouting, original)) {
+        faultedRouting = undefined;
+        faulted = false;
+      }
+    };
+    settingsResume.current = resume;
     const listener = (event: MessageEvent) => {
       if (!current() || ownerDocument.visibilityState === "hidden" || event.source !== frame.contentWindow || event.origin !== "null") return;
       let size: number; try { size = JSON.stringify(event.data).length; } catch { return; }
@@ -434,17 +446,17 @@ export function ExtensionMainViewPage({
       const request = parseExtensionSettingsBridgeRequest(event.data);
       if (!request || seen.has(request.id) || seen.size >= 4096 || pending.size >= 16) return;
       seen.add(request.id);
-      const respond = (ok: boolean, result?: unknown) => {
+      const respond = (ok: boolean, result?: unknown, rejected?: ExtensionSettingsRejected) => {
         if (!current()) return;
         const data = { type: "joko:extension-settings-response", version: 1, id: request.id, ok,
-          ...(ok ? { result } : { message: "Settings request could not be confirmed. Check its original operation before retrying." }) };
+          ...(ok ? { result } : { message: rejected?.message ?? "Settings request could not be confirmed. Check its original operation before retrying." }) };
         if (JSON.stringify(data, (_key, value: unknown) => typeof value === "bigint" ? value.toString(10) : value).length > (request.command.kind === "directory.pick" ? 4 * 1024 * 1024 : 192 * 1024)) throw new Error("Settings response exceeds its limit.");
         frame.contentWindow?.postMessage(data, "*");
       };
       if (faulted) { respond(false); return; }
       const abort = new AbortController(); pending.add(abort);
       const timer = setTimeout(() => abort.abort(), request.command.kind === "oauth.connect" ? 310_000 : request.command.kind === "directory.pick" ? 150_000 : 60_000);
-      let dispatched = false;
+      let dispatched = false, captureRoutingReceipt = false;
       const work = queue.then(async () => {
         abort.signal.throwIfAborted(); if (!current() || faulted) throw new Error("Settings document retired."); dispatched = true;
         return api.call(state.surface, request.command, {
@@ -488,17 +500,30 @@ export function ExtensionMainViewPage({
       });
       const stopped = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(new Error("Settings request retired.")), { once: true }));
       const completion = Promise.race([work, stopped]); queue = completion.catch(() => undefined);
-      void completion.then(result => respond(true, result), () => {
-        if (dispatched && !["context.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(request.command.kind)) faulted = true;
-        respond(false);
+      void completion.then(result => respond(true, result), error => {
+        const rejected = error instanceof ExtensionSettingsRejected ? error : undefined;
+        if (dispatched && !rejected && !extensionSettingsReadOnly(request.command.kind)) {
+          faulted = true;
+          captureRoutingReceipt = request.command.kind === "routing.set";
+        }
+        respond(false, undefined, rejected);
       }).catch(() => { faulted = true; }).finally(() => {
         clearTimeout(timer); abort.abort(); pending.delete(abort);
         const recovery = settingsRecovery.current;
-        if (recovery?.owner === controllerOwner && recovery.owner === liveOwnerRef.current && recovery.extensionId === extensionId && !recovery.signal.aborted) void recovery.refresh();
+        if (recovery?.owner === controllerOwner && recovery.owner === liveOwnerRef.current && recovery.extensionId === extensionId && !recovery.signal.aborted) {
+          void recovery.refresh().then(original => {
+            if (current() && captureRoutingReceipt && original?.kind === "setExtensionSettingsRoutingData") faultedRouting = original;
+          });
+        }
       });
     };
     sourceWindow.addEventListener("message", listener);
-    return () => { closed = true; sourceWindow.removeEventListener("message", listener); for (const abort of pending) abort.abort(); };
+    return () => {
+      closed = true;
+      if (settingsResume.current === resume) settingsResume.current = undefined;
+      sourceWindow.removeEventListener("message", listener);
+      for (const abort of pending) abort.abort();
+    };
   }, [controller, frameRevision, ownerDocument, settings, state]);
 
   const extension = "extension" in state ? state.extension : undefined;
@@ -511,9 +536,11 @@ export function ExtensionMainViewPage({
     const original = settingsOperation, recovery = settingsRecovery.current;
     if (!original || !recovery?.api.checkOriginal || settingsChecking.current || recovery.signal.aborted
       || recovery.owner !== liveOwnerRef.current || recovery.extensionId !== extensionId || ownerDocument.visibilityState === "hidden") return;
+    const resume = settingsResume.current;
     const attempt = Symbol("original-settings-receipt"); settingsChecking.current = attempt; setCheckingSettingsOperation(true);
     void recovery.api.checkOriginal(original, recovery.signal).then(async receipt => {
       if (settingsRecovery.current !== recovery || recovery.signal.aborted || recovery.owner !== liveOwnerRef.current) return;
+      if (receipt.state !== "pending") resume?.(original);
       setSettingsOperationNotice(receipt.state); setCompletedDirectoryOperation(receipt.state === "succeeded" && original.kind === "pickExtensionDirectory"); await recovery.refresh();
     }).catch(() => {
       if (settingsRecovery.current === recovery && !recovery.signal.aborted && recovery.owner === liveOwnerRef.current) setSettingsOperationNotice("unavailable");
