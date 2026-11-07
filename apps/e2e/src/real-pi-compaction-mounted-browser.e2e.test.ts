@@ -164,7 +164,9 @@ describe("mounted Pi compaction product chain", () => {
     await page.getByLabel("Device name").fill("Mounted Pi compact Web");
     await page.locator("form.pair-form button[type=submit]").click();
 
-    const trigger = page.getByRole("button", { name: "Click to compact context" });
+    const compactTrigger = (sessionId: string) => page.locator(`.session-pane[data-input-session-id='${sessionId}']`)
+      .getByRole("button", { name: "Click to compact context" });
+    const trigger = compactTrigger(compactSessionId);
     try {
       await trigger.waitFor({ state: "visible", timeout: 30_000 });
     } catch (error) {
@@ -227,12 +229,16 @@ describe("mounted Pi compaction product chain", () => {
     await send(failingSessionId, "First turn for a genuine Provider failure.");
     await send(failingSessionId, "Second turn for a genuine Provider failure.");
     await navigateMountedTask(page, failingSessionId, "Mounted compact failure");
-    const failingTrigger = page.getByRole("button", { name: "Click to compact context" });
+    const failingTrigger = compactTrigger(failingSessionId);
     await failingTrigger.waitFor({ state: "visible" });
     await page.evaluate(() => {
       document.addEventListener("click", (event) => {
-        const button = event.target instanceof Element ? event.target.closest("button") : null;
-        document.documentElement.dataset.compactionClickTarget = button?.getAttribute("aria-label") ?? button?.textContent?.trim() ?? "";
+        const target = event.target instanceof Element ? event.target : undefined;
+        const owner = target?.closest<HTMLElement>(".session-pane");
+        document.documentElement.dataset.compactionClickTarget = JSON.stringify({
+          element: target?.tagName, button: target?.closest("button")?.getAttribute("aria-label"),
+          sessionId: owner?.dataset.inputSessionId, generation: owner?.dataset.inputSessionGeneration
+        });
       }, { capture: true, once: true });
     });
     failSummary = true;
