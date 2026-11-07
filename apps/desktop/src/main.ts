@@ -401,13 +401,15 @@ import { materializeDesktopDeepLinkNavigation } from "./portable-deep-link-mater
 import { DesktopTaskSharingInvitationBuffer } from "./task-sharing-invitation.js";
 import { verifyPackagedSmokeTaskSharing } from "./packaged-smoke-task-sharing.js";
 import {
-  atomicCopyExtensionLibraryFile,
   ExtensionLibraryGestureCoordinator,
+  ExtensionLibraryGestureError,
+  extensionLibrarySavePortSource,
   parseExtensionLibraryBeginSaveRequest,
   parseExtensionLibraryClipboardRequest,
   parseExtensionLibraryCommitSaveRequest,
   parseExtensionLibraryRevealRequest,
-  resolveVerifiedExtensionLibraryFile
+  resolveVerifiedExtensionLibraryFile,
+  saveExtensionLibraryFile
 } from "./extension-library-gestures.js";
 import { installSelectionContextMenu, setSelectionContextMenuLocale } from "./selection-context-menu.js";
 import { NativeFileClipboard, type NativeFileActionScope } from "./native-file-clipboard.js";
@@ -8571,15 +8573,31 @@ function registerIpc(): void {
       ticketId: extensionLibraryGestures.issueSaveTicket(event.sender, request.extensionId, destination)
     };
   });
-  ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryCommitSave, async (event, ...parameters: unknown[]) => {
-    assertTrustedIpcSender(event);
-    const owner = BrowserWindow.fromWebContents(event.sender) ?? undefined;
-    if (parameters.length !== 1) throw new TypeError("Extension Library save commit requires one request.");
-    const request = parseExtensionLibraryCommitSaveRequest(parameters[0]);
-    const destination = extensionLibraryGestures.takeSaveTicket(event.sender, request.extensionId, request.ticketId);
-    const receipt = await atomicCopyExtensionLibraryFile(request.root, request.path, destination, undefined, () => { assertTrustedIpcSender(event); });
-    reportNativeSaveFinalization(owner, receipt);
-    return receipt.bytes;
+  ipcMain.on(DESKTOP_CHANNELS.extensionLibraryCommitSave, (event, ...parameters: unknown[]) => {
+    const [port] = event.ports;
+    if (port === undefined || event.ports.length !== 1) {
+      for (const extra of event.ports) extra.close();
+      return;
+    }
+    let open = true;
+    port.once("close", () => { open = false; });
+    const assertCurrent = () => {
+      if (!open) throw new Error("Extension Library save bridge was closed.");
+      assertTrustedIpcSender(event);
+    };
+    void (async () => {
+      assertCurrent();
+      const owner = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+      if (parameters.length !== 1) throw new TypeError("Extension Library save commit requires one request.");
+      const request = parseExtensionLibraryCommitSaveRequest(parameters[0]);
+      const destination = extensionLibraryGestures.takeSaveTicket(event.sender, request.extensionId, request.ticketId);
+      port.start();
+      const receipt = await saveExtensionLibraryFile(request, destination, extensionLibrarySavePortSource(port), assertCurrent);
+      reportNativeSaveFinalization(owner, receipt);
+      if (open) port.postMessage({ bytes: receipt.bytes });
+    })().catch(() => {
+      if (open) port.postMessage("failed");
+    }).finally(() => port.close()).catch(() => undefined);
   });
   ipcMain.handle(DESKTOP_CHANNELS.extensionLibraryCancelSave, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -8592,7 +8610,12 @@ function registerIpc(): void {
     assertFocusedTrustedIpcSender(event);
     if (parameters.length !== 1) throw new TypeError("Extension Library clipboard write requires one request.");
     const request = parseExtensionLibraryClipboardRequest(parameters[0]);
-    extensionLibraryGestures.attempt(request.extensionId, "clipboardWrite");
+    try {
+      extensionLibraryGestures.attempt(request.extensionId, "clipboardWrite");
+    } catch (error) {
+      if (error instanceof ExtensionLibraryGestureError && error.code === "RATE_LIMITED") return error.code;
+      throw error;
+    }
     const image = nativeImage.createFromBuffer(Buffer.from(request.bytes));
     if (image.isEmpty()) throw new TypeError("Extension Library clipboard PNG could not be decoded.");
     assertFocusedTrustedIpcSender(event);

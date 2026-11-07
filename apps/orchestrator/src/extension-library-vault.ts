@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import {
   lstat,
@@ -69,6 +69,13 @@ export class ExtensionLibraryError extends Error {
   }
 }
 
+export class ExtensionLibraryOrphanMarkerWriteError extends Error {
+  constructor(cause: unknown) {
+    super("Extension Library orphan marker could not be staged.", { cause });
+    this.name = "ExtensionLibraryOrphanMarkerWriteError";
+  }
+}
+
 export type ExtensionLibraryState = "ready" | "read_only" | "unavailable";
 
 export interface ExtensionLibraryUsage {
@@ -92,6 +99,7 @@ export interface ExtensionLibraryEntry {
   readonly kind: "file" | "directory";
   readonly bytes: number;
   readonly modifiedAt: number;
+  readonly sourceTag?: string;
 }
 
 export interface ExtensionLibraryReadResult {
@@ -165,6 +173,7 @@ export class ExtensionLibraryVault {
   readonly #now: () => number;
   readonly #freeBytes: (root: string) => Promise<number | undefined>;
   readonly #limits: ExtensionLibraryLimits;
+  readonly #sourceTagKey = randomBytes(32);
   readonly #beforeFilesystemMutation: NonNullable<ExtensionLibraryVaultOptions["beforeFilesystemMutation"]>;
   #metadata?: StoredLibraryMetadata;
   #rootIdentity?: ExtensionLibraryRootStat;
@@ -363,7 +372,7 @@ export class ExtensionLibraryVault {
     return this.open({ create: true });
   }
 
-  async read(input: { readonly path: string; readonly offset?: number; readonly length?: number }): Promise<ExtensionLibraryReadResult> {
+  async read(input: { readonly path: string; readonly offset?: number; readonly length?: number; readonly sourceTag?: string }): Promise<ExtensionLibraryReadResult> {
     await this.#requireReady(false);
     const relativePath = validateExtensionLibraryPath(input.path, this.#limits);
     const target = await this.#resolveExisting(relativePath, "file");
@@ -383,6 +392,7 @@ export class ExtensionLibraryVault {
       handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       const opened = await handle.stat({ bigint: true });
       if (!sameFile(before, opened)) throw new ExtensionLibraryError("CONFLICT", "Library file changed while it was opened.");
+      if (input.sourceTag !== undefined && this.#sourceTag(relativePath, opened) !== input.sourceTag) throw saveSourceChanged();
       const bytes = Buffer.alloc(length);
       let consumed = 0;
       while (consumed < length) {
@@ -459,7 +469,7 @@ export class ExtensionLibraryVault {
     }
   }
 
-  async stat(path: string): Promise<ExtensionLibraryEntry> {
+  async stat(path: string, expectedSourceTag?: string): Promise<ExtensionLibraryEntry> {
     await this.#requireReady(false);
     const relativePath = validateExtensionLibraryPath(path, this.#limits);
     const target = await this.#resolveExisting(relativePath);
@@ -467,12 +477,26 @@ export class ExtensionLibraryVault {
     if (value.isSymbolicLink() || !value.isFile() && !value.isDirectory()) {
       throw new ExtensionLibraryError("PATH_INVALID", "Library entry is not a regular file or directory.");
     }
+    let sourceTag: string | undefined;
+    if (expectedSourceTag !== undefined) {
+      if (!value.isFile()) throw saveSourceChanged();
+      await this.#resolveExisting(relativePath, "file");
+      if (!sameFile(value, await lstat(target, { bigint: true }))) throw saveSourceChanged();
+      sourceTag = this.#sourceTag(relativePath, value);
+      if (expectedSourceTag !== "*" && expectedSourceTag !== sourceTag) throw saveSourceChanged();
+    }
     return {
       path: relativePath,
       kind: value.isDirectory() ? "directory" : "file",
       bytes: value.isFile() ? safeNumber(value.size) : 0,
-      modifiedAt: safeNumber(value.mtimeMs)
+      modifiedAt: safeNumber(value.mtimeMs),
+      ...(sourceTag === undefined ? {} : { sourceTag })
     };
+  }
+
+  #sourceTag(path: string, file: BigIntStats): string {
+    const identity = [file.dev, file.ino, file.birthtimeNs, file.size, file.mtimeNs, file.ctimeNs];
+    return `"${createHmac("sha256", this.#sourceTagKey).update(`${path}\0${identity.join(":")}`).digest("hex")}"`;
   }
 
   async list(input: {
@@ -785,6 +809,10 @@ export class ExtensionLibraryVault {
       || !sameFilesystemObject(input.before, after)) {
       throw new ExtensionLibraryError("CONFLICT", "Library staged write could not be identity-fenced into place.");
     }
+    // Linking and renaming can change ctime. The bytes verified before publication retain their mtime.
+    if (after.mtimeNs !== input.before.mtimeNs) {
+      throw new ExtensionLibraryError("CONFLICT", "Library staged content changed during publication.");
+    }
     await this.reconcileUsage();
     return { path: relativePath, bytes: input.bytes, sha256: input.sha256 };
   }
@@ -810,12 +838,12 @@ export class ExtensionLibraryVault {
     const path = join(this.#hostRoot(), METADATA_FILE);
     const previous = join(this.#hostRoot(), METADATA_PREVIOUS_FILE);
     await mkdir(this.#hostRoot(), { recursive: true });
-    try {
-      await atomicBytes(previous, await readBoundedRegularFile(path));
-    } catch (error) {
+    const current = await readBoundedRegularFile(path).catch((error: unknown) => {
       if (!isMissing(error)) throw error;
-    }
-    await atomicJson(path, metadata);
+      return undefined;
+    });
+    if (current !== undefined) await atomicBytes(previous, current, orphanMarkerStagingFailure);
+    await atomicJson(path, metadata, orphanMarkerStagingFailure);
     this.#metadata = metadata;
   }
 
@@ -1074,18 +1102,28 @@ async function pathKind(path: string): Promise<"missing" | "file" | "directory" 
   }
 }
 
-async function atomicJson(path: string, value: unknown): Promise<void> {
-  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"));
+function orphanMarkerStagingFailure(error: unknown): unknown {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EIO" || code === "ENOSPC" || code === "EDQUOT" || code === "EACCES" || code === "EPERM" || code === "EROFS"
+    ? new ExtensionLibraryOrphanMarkerWriteError(error) : error;
 }
 
-async function atomicBytes(path: string, bytes: Uint8Array): Promise<void> {
+async function atomicJson(path: string, value: unknown, stagingFailure?: (error: unknown) => unknown): Promise<void> {
+  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"), stagingFailure);
+}
+
+async function atomicBytes(path: string, bytes: Uint8Array, stagingFailure?: (error: unknown) => unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${randomUUID()}.tmp`;
   let handle: FileHandle | undefined;
   try {
-    handle = await open(temporary, "wx", 0o600);
-    await handle.writeFile(bytes);
-    await handle.sync();
+    try {
+      handle = await open(temporary, "wx", 0o600);
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } catch (error) {
+      throw stagingFailure ? stagingFailure(error) : error;
+    }
     await handle.close();
     handle = undefined;
     await rename(temporary, path);
@@ -1305,6 +1343,10 @@ function sameEntrySnapshot(left: BigIntStats, right: BigIntStats): boolean {
 
 function sameFile(left: BigIntStats, right: BigIntStats): boolean {
   return left.isFile() && right.isFile() && sameEntrySnapshot(left, right);
+}
+
+function saveSourceChanged(): ExtensionLibraryError {
+  return new ExtensionLibraryError("CONFLICT", "Extension Library save source changed.");
 }
 
 function inside(root: string, target: string): boolean {

@@ -54,7 +54,7 @@ it("keeps background recovery available when the preferences form is opted out",
   expect(f.container.querySelector("form")).toBeNull(); expect(f.container.textContent).toContain("Background review");
   const actions = [...f.container.querySelectorAll("button")];
   await act(async () => { actions.find(button => button.textContent === translate("en", "extensions.tasks.open"))!.click(); });
-  expect(f.controller.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "background" });
+  expect(f.controller.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "background", backgroundExtensionId: "plugin" });
   await act(async () => { actions.find(button => button.textContent === translate("en", "extensions.tasks.reveal"))!.click(); });
   expect(f.api.revealTask).toHaveBeenCalledWith({ extensionId: "plugin", taskId: "background" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
 });

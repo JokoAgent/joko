@@ -9,8 +9,10 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import type {
   ExtensionCatalogEntryView,
+  ExtensionLibraryCallView,
   ExtensionLibraryOverviewView,
   ExtensionLibrarySessionView,
+  ExtensionLibrarySourceMatch,
   ExtensionMainViewSurfaceView,
   ExtensionSettingsApi
 } from "../model.js";
@@ -249,6 +251,26 @@ describe("Extension main view", () => {
     expect(closeExtensionMainView).toHaveBeenCalledWith(surface.id);
   });
 
+  it("keeps the mounted document when the foreground probe extends its lease", async () => {
+    const extension = readyExtension(EXTENSION_A, "Review"), surface = mainViewSurface(extension);
+    const intervals = vi.spyOn(window, "setInterval");
+    const read = vi.fn(async () => ({ ...surface, expiresAt: surface.expiresAt + 15_000 }));
+    const close = vi.fn(async () => true);
+    const rendered = await renderMainView(controllerFor({ getExtension: vi.fn(async () => catalog(extension)),
+      openExtensionMainView: vi.fn(async () => surface), getExtensionMainViewSurface: read, closeExtensionMainView: close }), EXTENSION_A);
+    const frame = required(rendered.container.querySelector("iframe"));
+    const tick = intervals.mock.calls.find(([, delay]) => delay === 15_000)?.[0];
+    if (typeof tick !== "function") throw new Error("Expected a foreground surface probe.");
+    await act(async () => { tick(); });
+    expect(read).toHaveBeenCalledExactlyOnceWith(surface.id, expect.any(AbortSignal), true);
+    expect(rendered.container.querySelector("iframe")).toBe(frame);
+    expect(close).not.toHaveBeenCalled();
+
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(async () => { tick(); });
+    expect(read).toHaveBeenCalledOnce();
+  });
+
   it("closes a surface returned after its route request became stale", async () => {
     const extensionA = readyExtension(EXTENSION_A, "Review");
     const extensionB = readyExtension(EXTENSION_B, "Build");
@@ -414,9 +436,14 @@ describe("Extension main view", () => {
   it("keeps reveal, save, and PNG clipboard gestures in the trusted parent and returns no host path", async () => {
     const reveal = vi.fn(async () => true);
     const beginSave = vi.fn(async () => ({ cancelled: false as const, ticketId: `extension_library_save_${"c".repeat(32)}` }));
-    const commitSave = vi.fn(async () => 21);
+    const sourceBytes = new TextEncoder().encode("bytes from other node");
+    const commitSave = vi.fn<NonNullable<Window["jokoDesktop"]>["extensionLibraries"]["commitSave"]>(async (request, source) => {
+      expect(await source.read(0, request.totalBytes)).toEqual(sourceBytes);
+      await source.verify();
+      return request.totalBytes;
+    });
     const cancelSave = vi.fn(async () => undefined);
-    const clipboardWrite = vi.fn(async () => 4);
+    const clipboardWrite = vi.fn<NonNullable<Window["jokoDesktop"]>["extensionLibraries"]["clipboardWrite"]>(async request => request.bytes.byteLength);
     Object.defineProperty(window, "jokoDesktop", {
       configurable: true,
       value: {
@@ -426,10 +453,18 @@ describe("Extension main view", () => {
     });
     const extension = { ...readyExtension(EXTENSION_A, "Review"), library: { schemaVersion: 1 as const } };
     const surface = mainViewSurface(extension);
-    const callExtensionLibrary = vi.fn(async (_sessionId: string, call: { kind: string; path?: string }) => ({
-      kind: "stat" as const,
-      entry: { path: call.path!, kind: "file" as const, bytes: 21n, modifiedAt: 1_800_000_000_000 }
-    }));
+    let authorityCurrent = true;
+    const tag = `"${"a".repeat(64)}"`;
+    const callExtensionLibrary = vi.fn(async (_sessionId: string, call: ExtensionLibraryCallView, _signal?: AbortSignal, source?: ExtensionLibrarySourceMatch) => {
+      if (source?.tag === "*") source.capture?.(tag);
+      else if (source !== undefined) {
+        expect(source.tag).toBe(tag);
+        if (!authorityCurrent) throw new ConnectError("Original Library was disabled.", Code.FailedPrecondition);
+      }
+      if (call.kind === "read") return { kind: "read" as const, path: call.path, content: sourceBytes, sha256: "f".repeat(64) };
+      if (call.kind !== "stat") throw new Error("Unexpected Library operation.");
+      return { kind: "stat" as const, entry: { path: call.path, kind: "file" as const, bytes: BigInt(sourceBytes.length), modifiedAt: 1_800_000_000_000 } };
+    });
     const controller = controllerFor({
       getExtension: vi.fn(async () => catalog(extension)),
       openExtensionMainView: vi.fn(async () => surface),
@@ -459,7 +494,7 @@ describe("Extension main view", () => {
     dispatchBridge(frame, "capabilities-native", { kind: "capabilities" });
     dispatchBridge(frame, "reveal-native", { kind: "reveal", path: "exports/art.png" });
     dispatchBridge(frame, "save-native", { kind: "saveAs", path: "exports/art.png", name: "drawing.png" });
-    dispatchBridge(frame, "clipboard-native", { kind: "clipboardWrite", content: new Uint8Array([1, 2, 3, 4]) });
+    dispatchBridge(frame, "clipboard-native", { kind: "clipboardWrite", content: new Uint8Array(18_000_000) });
     await settle();
     await settle();
 
@@ -473,21 +508,47 @@ describe("Extension main view", () => {
       path: "exports/art.png"
     });
     expect(beginSave).toHaveBeenCalledWith({ extensionId: extension.id, name: "drawing.png" });
-    expect(commitSave).toHaveBeenCalledWith(expect.objectContaining({
+    expect(commitSave).toHaveBeenCalledWith({
       extensionId: extension.id,
-      root: "D:\\private\\library",
-      path: "exports/art.png"
-    }));
-    expect(clipboardWrite).toHaveBeenCalledWith({ extensionId: extension.id, bytes: new Uint8Array([1, 2, 3, 4]) });
+      ticketId: `extension_library_save_${"c".repeat(32)}`,
+      totalBytes: sourceBytes.length
+    }, { read: expect.any(Function), verify: expect.any(Function) });
+    expect(callExtensionLibrary).toHaveBeenCalledWith(expect.any(String),
+      { kind: "read", path: "exports/art.png", offset: 0n, length: BigInt(sourceBytes.length) }, expect.any(AbortSignal), { tag });
+    expect(clipboardWrite).toHaveBeenCalledOnce();
+    expect(clipboardWrite.mock.calls[0]?.[0].extensionId).toBe(extension.id);
+    expect(clipboardWrite.mock.calls[0]?.[0].bytes.byteLength).toBe(18_000_000);
     expect(cancelSave).not.toHaveBeenCalled();
     expect(postedResponse(postMessage, "reveal-native")).toMatchObject({ ok: true, result: { path: "exports/art.png" } });
     expect(postedResponse(postMessage, "save-native")).toMatchObject({
-      ok: true, result: { cancelled: false, path: "exports/art.png", bytes: 21 }
+      ok: true, result: { cancelled: false, path: "exports/art.png", bytes: sourceBytes.length }
     });
-    expect(postedResponse(postMessage, "clipboard-native")).toMatchObject({ ok: true, result: { bytes: 4 } });
+    expect(postedResponse(postMessage, "clipboard-native")).toMatchObject({ ok: true, result: { bytes: 18_000_000 } });
     for (const id of ["reveal-native", "save-native", "clipboard-native"]) {
       expect(JSON.stringify(postedResponse(postMessage, id))).not.toContain("private");
     }
+
+    dispatchBridge(frame, "clipboard-too-large", { kind: "clipboardWrite", content: new Uint8Array(20_000_001) });
+    expect(postedResponse(postMessage, "clipboard-too-large")).toMatchObject({ ok: false, error: { code: "TOO_LARGE" } });
+    expect(clipboardWrite).toHaveBeenCalledOnce();
+
+    clipboardWrite.mockRejectedValueOnce({ code: "RATE_LIMITED" });
+    dispatchBridge(frame, "clipboard-rate", { kind: "clipboardWrite", content: new Uint8Array([1, 2, 3, 4]) });
+    await settle();
+    expect(clipboardWrite).toHaveBeenCalledTimes(2);
+    expect(postedResponse(postMessage, "clipboard-rate")).toMatchObject({ ok: false, error: { code: "RATE_LIMITED" } });
+
+    commitSave.mockImplementationOnce(async (request, source) => {
+      await source.read(0, request.totalBytes);
+      authorityCurrent = false;
+      await source.verify();
+      throw new Error("A revoked save must fail verification.");
+    });
+    dispatchBridge(frame, "save-revoked", { kind: "saveAs", path: "exports/art.png" });
+    await settle();
+    await settle();
+    expect(postedResponse(postMessage, "save-revoked")).toMatchObject({ ok: false, error: { code: "UNAVAILABLE" } });
+    expect(cancelSave).toHaveBeenCalledTimes(1);
   });
 });
 

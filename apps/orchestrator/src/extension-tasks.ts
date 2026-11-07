@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, realpath } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
+import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import type { OperationalStore, QueueItemRecord, StoredSession, StoredRun } from "@joko/store";
-import type { ExtensionCatalogManager } from "./extension-catalog.js";
+import { resourceExtensionIds, type ExtensionCatalogManager } from "./extension-catalog.js";
+import type { PiResourceDescriptor } from "./resource-manager.js";
 import type { ExtensionProjectPolicies } from "./extension-project-policy.js";
 import type { SessionHost } from "./session-host.js";
 import type { AppDefaultModelCoordinator } from "./app-default-model.js";
@@ -284,13 +285,22 @@ export class ExtensionTasks {
     return value.version === 1 && !value.revoked && value.sessionId === setting.key ? [value] : [];
   }); }
   #run(owner: ExtensionTaskOwner, runId: string) {
-    this.#assert(owner); const receipt = inputReceipt(this.options.store, runId);
+    const store = this.options.store;
+    this.#assert(owner); const receipt = inputReceipt(store, runId);
     if (!receipt || receipt.revoked || receipt.extensionId !== owner.extensionId || receipt.installation !== owner.installation) return failure("RUN_NOT_FOUND", "This plugin does not own that input.");
     this.#own(owner, receipt.sessionId);
-    const run = this.options.store.getRun(runId).descriptor, queue = this.options.store.findQueueItemByRunId(receipt.sessionId, runId, { includeCleared: true }) ?? this.options.store.getQueueItem(receipt.queueItemId);
+    let run = store.getRun(runId).descriptor;
     if (run.sessionId !== receipt.sessionId) return failure("RUN_NOT_FOUND", "The input does not belong to this task.");
-    return { receipt: { ...receipt, runId, queueItemId: queue.id }, value: { runId, taskId: receipt.sessionId, status: run.state, queueState: queue.state,
-      acceptedAt: run.createdAt, ...(run.endedAt ? { completedAt: run.endedAt } : {}), ...(run.error ? { error: run.error } : {}),
+    const acceptedAt = run.createdAt;
+    let queue = store.findQueueItemByRunId(receipt.sessionId, runId, { includeCleared: true }) ?? store.getQueueItem(receipt.queueItemId);
+    while (run.state === "failed" && queue.runId === run.id) {
+      const { child } = this.options.host.providerGroupContinuation(queue);
+      if (child === undefined) break;
+      queue = child;
+      run = store.getRun(child.runId).descriptor;
+    }
+    return { receipt: { ...receipt, runId: run.id, queueItemId: queue.id }, value: { runId, taskId: receipt.sessionId, status: run.state, queueState: queue.state,
+      acceptedAt, ...(run.endedAt ? { completedAt: run.endedAt } : {}), ...(run.error ? { error: run.error } : {}),
       usage: run.usage ?? { status: "unavailable", reason: "Per-input usage is not available." } } };
   }
   assertQueueCurrent(item: QueueItemRecord): void {
@@ -348,14 +358,30 @@ export class ExtensionTasks {
   /** Called in the same Resource removal transaction, before ownership is revoked. */
   uninstall(store: OperationalStore, resourceId: string): void {
     for (const receipt of this.#all().filter(receipt => receipt.resourceId === resourceId)) {
-      this.#hidden(receipt.sessionId!, false);
-      for (const goal of store.listCollaborationGoals({ leadSessionId: receipt.sessionId! })) {
-        for (const worker of store.listCollaborationWorkers({ goalId: goal.id, includeArchived: true })) if (worker.sessionId) this.#hidden(worker.sessionId, false);
-      }
-      store.setSetting("service", TASKS, receipt.sessionId!, { ...receipt, revoked: true });
+      this.#retireTask(store, receipt);
     }
     const installation = store.findSetting<{ readonly version: 1; readonly id: string }>("service", INSTALLATIONS, resourceId)?.value;
     if (installation) store.setSetting("service", INSTALLATIONS, resourceId, { ...installation, active: false });
+  }
+  reconcilePackageTasks(store: OperationalStore, resources: readonly PiResourceDescriptor[]): void {
+    const installed = new Map(resources.filter(resource => resource.kind === "package"
+      && ["installed", "loaded", "disabled", "update_available"].includes(resource.state))
+      .map(resource => [resource.id, resourceExtensionIds(resource)] as const));
+    if (installed.size === 0) return;
+    for (const receipt of this.#all()) {
+      const current = installed.get(receipt.resourceId);
+      if (!receipt.revoked && current && !current.has(receipt.extensionId)) this.#retireTask(store, receipt);
+    }
+  }
+  #retireTask(store: OperationalStore, receipt: TaskReceipt): void {
+    const sessionId = receipt.sessionId!;
+    if (store.findSession(sessionId)) this.#hidden(sessionId, false);
+    for (const goal of store.listCollaborationGoals({ leadSessionId: sessionId })) {
+      for (const worker of store.listCollaborationWorkers({ goalId: goal.id, includeArchived: true })) {
+        if (worker.sessionId && store.findSession(worker.sessionId)) this.#hidden(worker.sessionId, false);
+      }
+    }
+    store.setSetting("service", TASKS, sessionId, { ...receipt, revoked: true });
   }
   async retryWriteAccess(extensionId: string, taskId: string, signal: AbortSignal, assertCurrent: () => void) {
     assertCurrent(); signal.throwIfAborted();
@@ -381,34 +407,24 @@ export class ExtensionTasks {
     const previous = this.#writeAttempts.get(key);
     if (previous?.pending || previous && !explicit) return { granted: false, task: this.#view(task) };
     if ([...this.#writeAttempts.values()].some(value => value.pending)) failure("TASK_BUSY", "Another plugin permission request is already pending.");
-    const assertCurrent = () => { if (taskScope(this.#own(owner, task.descriptor.id)) !== scope || hash(this.preferences(owner.extensionId).config) !== stamp) failure("STALE_REVISION", "Task configuration or plugin permission preferences changed."); };
+    const assertCurrent = () => {
+      if (taskScope(this.#own(owner, task.descriptor.id)) !== scope || hash(this.preferences(owner.extensionId).config) !== stamp
+        || this.options.store.getBackend(backend.id).descriptor.instanceGeneration !== backend.instanceGeneration) {
+        failure("STALE_REVISION", "Task configuration or plugin permission preferences changed.");
+      }
+    };
     const attempt = { extensionId: owner.extensionId, taskId: task.descriptor.id, installation: owner.installation, mode: mode as "acceptEdits" | "auto", pending: true };
     this.#writeAttempts.set(key, attempt);
     try {
     try { await this.options.host.authorizeExtensionTaskWrite(task.descriptor.id, owner.signal, assertCurrent, mode); }
     catch { this.#assert(owner); return { granted: false, task: this.#view(this.#own(owner, task.descriptor.id)) }; }
     assertCurrent();
-    try {
-      await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: mode }, { requireNativeObservation: true });
-      assertCurrent(); this.options.host.assertSessionLifecycleIdle(task.descriptor.id);
-      this.options.store.transaction(store => {
-        assertCurrent(); const current = this.#own(owner, task.descriptor.id);
-        if (current.descriptor.planMode) failure("PERMISSION_DENIED", "Plan mode changed during plugin permission approval.");
-        store.updateSession(task.descriptor.id, { permissionMode: mode });
-        store.setSetting("service", PREFS, owner.extensionId, { ...initial.config, permissionMode: mode === "auto" || initial.config.permissionMode === "ask" ? mode : initial.config.permissionMode });
-      });
-    } catch (error) {
-      const current = this.options.store.findSession(task.descriptor.id)?.descriptor;
-      if (current && !current.archived && current.deletedAt === undefined && current.backendId === backend.id
-        && hash(current.binding) === hash(task.descriptor.binding)
-        && this.options.store.getBackend(backend.id).descriptor.instanceGeneration === backend.instanceGeneration) {
-        // The durable mode may still be unchanged even though the native
-        // setter already ran. Reconcile it on this binding explicitly.
-        await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: current.permissionMode },
-          { reconcileNativePolicy: true }).catch(() => undefined);
-      }
-      throw error;
-    }
+    await this.options.host.applyApprovedExtensionTaskWrite(task.descriptor.id, mode, assertCurrent, store => {
+      assertCurrent(); const current = this.#own(owner, task.descriptor.id);
+      if (current.descriptor.planMode) failure("PERMISSION_DENIED", "Plan mode changed during plugin permission approval.");
+      store.updateSession(task.descriptor.id, { permissionMode: mode });
+      store.setSetting("service", PREFS, owner.extensionId, { ...initial.config, permissionMode: mode === "auto" || initial.config.permissionMode === "ask" ? mode : initial.config.permissionMode });
+    });
     this.#writeAttempts.delete(key); return { granted: true, task: this.#view(this.#own(owner, task.descriptor.id)) };
     } finally { attempt.pending = false; }
   }
@@ -452,16 +468,42 @@ export class ExtensionTasks {
         }
         const route = this.#resolve(owner, request.route), preferences = this.preferences(owner.extensionId), stamp = hash(preferences.config);
         let targetId = target?.targetId ?? preferences.config.targetId;
+        const isolatedDirectory = request.isolatedWorkspace === true && targetId === undefined;
+        let directoryIdentity: { readonly path: string; readonly dev: number; readonly ino: number } | undefined;
         if (!targetId) {
-          const root = join(this.options.rootDirectory, hash([owner.extensionId, route.backendId]));
+          const directoryKey = isolatedDirectory ? `isolated-${hash([operationId, route.backendId])}` : hash([owner.extensionId, route.backendId]);
+          let parent = this.options.rootDirectory;
+          if (isolatedDirectory) {
+            await mkdir(parent, { recursive: true, mode: 0o700 });
+            parent = await realpath(parent);
+          }
+          const root = join(parent, directoryKey);
           await mkdir(root, { recursive: true, mode: 0o700 }); this.#assert(owner, hidden);
           const workspaceRoot = await realpath(root);
-          targetId = `extension-target-${hash([owner.extensionId, route.backendId])}`;
+          if (isolatedDirectory) {
+            const info = await lstat(root);
+            if (!info.isDirectory() || info.isSymbolicLink() || workspaceRoot !== root || (await readdir(root)).length > 0) {
+              return failure("PERMISSION_DENIED", "The isolated task requires an empty managed directory.");
+            }
+            directoryIdentity = { path: workspaceRoot, dev: info.dev, ino: info.ino };
+          }
+          targetId = `extension-target-${directoryKey}`;
           if (!this.options.store.listTargets().some(target => target.descriptor.id === targetId)) await this.options.host.registerTarget({ id: targetId, backendId: route.backendId,
             displayName: this.options.catalog.get(owner.extensionId).name, workspaceRoot, managed: true, trusted: true });
         }
         this.#target(targetId, route.backendId);
-        const current = () => { target?.assertCurrent(); this.#assert(owner, hidden); this.#target(targetId!, route.backendId);
+        const current = () => { target?.assertCurrent(); this.#assert(owner, hidden); const registered = this.#target(targetId!, route.backendId);
+          if (directoryIdentity !== undefined) {
+            let sameDirectory = false;
+            try {
+              const info = lstatSync(directoryIdentity.path);
+              sameDirectory = info.isDirectory() && info.dev === directoryIdentity.dev && info.ino === directoryIdentity.ino
+                && realpathSync(directoryIdentity.path) === directoryIdentity.path;
+            } catch { /* An unavailable directory cannot be adopted. */ }
+            if (!sameDirectory || !registered.descriptor.managed || registered.descriptor.workspaceRoot !== directoryIdentity.path) {
+              failure("STALE_REVISION", "The isolated task directory changed.");
+            }
+          }
           if (this.options.projects?.enabledForTarget(owner.extensionId, targetId!) === false) failure("PERMISSION_DENIED", "Plugin is disabled for this project.");
           if (stamp !== hash(this.preferences(owner.extensionId).config)) failure("STALE_REVISION", "Plugin task settings changed during creation."); this.#route(route); };
         current();
@@ -469,7 +511,7 @@ export class ExtensionTasks {
         this.options.store.setSetting("service", TASKS, operationId, receipt);
         const created = await this.options.host.createServiceSession({ operationId, serviceKind: "extension", targetId, title, ...route,
           permissionMode: preferences.config.permissionMode, planMode: false, hidden, assertServiceScope: current,
-          ...(request.isolatedWorkspace ? { worktree: { refreshRemote: false } } : {}),
+          ...(request.isolatedWorkspace === true && !isolatedDirectory ? { worktree: { refreshRemote: false } } : {}),
           onExtensionAdmitted: (store, session) => {
             current(); const adopted = { ...receipt, sessionId: session.descriptor.id };
             store.setSetting("service", TASKS, operationId, adopted); store.setSetting("service", TASKS, session.descriptor.id, adopted);
@@ -484,13 +526,16 @@ export class ExtensionTasks {
       }
       if (kind === "getRun") return this.#run(owner, text(request.runId)).value;
       if (kind === "cancel") {
-        const run = this.#run(owner, text(request.runId)); const queue = this.options.store.getQueueItem(run.receipt.queueItemId);
+        const runId = text(request.runId);
+        const run = this.#run(owner, runId); const queue = this.options.store.getQueueItem(run.receipt.queueItemId);
         if (["completed", "failed", "aborted"].includes(run.value.status)) return run.value;
         this.#assert(owner);
         if (queue.state === "accepted") this.options.store.cancelQueueItem({ queueItemId: queue.id, expectedRevision: queue.revision, traceId: `extension-cancel:${queue.id}` });
-        else if (["dispatching", "backend_accepted"].includes(queue.state)) await this.options.host.abort(queue.sessionId, queue.runId, () => { this.#assert(owner); this.#run(owner, queue.runId); });
+        else if (["dispatching", "backend_accepted"].includes(queue.state)) await this.options.host.abort(queue.sessionId, queue.runId, () => {
+          if (this.#run(owner, runId).receipt.runId !== queue.runId) failure("STALE_REVISION", "The plugin input's active execution changed before cancellation.");
+        });
         else if (queue.state === "dispatch_unknown") failure("RECONCILING", "The input dispatch result is unknown.");
-        return this.#run(owner, run.value.runId).value;
+        return this.#run(owner, runId).value;
       }
       const task = this.#own(owner, text(request.taskId));
       if (["setTeamPlan", "startTeam", "getTeam", "releaseWorker"].includes(kind)) {
@@ -533,12 +578,25 @@ export class ExtensionTasks {
           const plan: TeamPlan = { concurrency: Number(value.concurrency), task: text(value.task, 8000), items, scope, preferences: preferenceStamp, directories, coordinatorRoute };
           this.options.store.setSetting("service", PLANS, task.descriptor.id, { version: 1, fingerprint, plan }); return { ok: true };
         }
-        if (kind === "getTeam") return goal ? teams.getTree(goal.id) : { team: null };
+        if (kind === "getTeam") {
+          if (!goal) return { team: null };
+          const tree = teams.getTree(goal.id);
+          const completedRuns = new Map<string, string>();
+          for (const { dispatch, queueItem } of tree.queue) {
+            if (queueItem?.state === "completed") completedRuns.set(queueItem.runId, dispatch.workerId);
+          }
+          return { ...tree, workers: tree.workers.map(worker => {
+            if (!worker.sessionId || worker.runtimeReleased || (worker.status !== "idle" && worker.status !== "completed")) return worker;
+            const run = this.options.store.listRuns({ sessionId: worker.sessionId, limit: 1 })[0]?.descriptor;
+            return run?.state === "completed" && run.endedAt !== undefined && completedRuns.get(run.id) === worker.id
+              ? { ...worker, completedAt: run.endedAt } : worker;
+          }) };
+        }
         if (kind === "startTeam") {
           if (task.descriptor.permissionMode !== "auto" || this.preferences(owner.extensionId).config.permissionMode !== "auto" || task.descriptor.planMode) failure("PERMISSION_DENIED", "Task teams require explicitly approved Auto permission.");
           if (goal) return teams.getTree(goal.id);
           const plan = this.options.store.findSetting<{ readonly plan: TeamPlan }>("service", PLANS, task.descriptor.id)?.value?.plan;
-          return teams.createGoal({ operationId: `extension-team-${hash([owner.installation, task.descriptor.id])}`, leadSessionId: task.descriptor.id, expectedSessionGeneration: task.descriptor.binding.generation,
+          return teams.createGoal({ operationId: extensionTeamOperationId(owner.installation, task.descriptor.id), leadSessionId: task.descriptor.id, expectedSessionGeneration: task.descriptor.binding.generation,
             title: task.descriptor.title, objective: plan?.task ?? task.descriptor.title, maximumWorkers: plan?.concurrency ?? 128 });
         }
         const worker = this.options.store.getCollaborationWorker(text(request.workerId));
@@ -642,10 +700,10 @@ export function isExtensionTaskControlled(store: OperationalStore, sessionId: st
  * a model cannot turn plugin Auto permission into arbitrary worker routes. */
 export function assertExtensionWorkerPlan(store: OperationalStore, leadSessionId: string, input: {
   readonly label: string; readonly assignment: string; readonly parentWorkerId?: string;
-  readonly existingWorkerId?: string;
+  readonly existingWorkerId?: string; readonly goalId?: string;
   readonly route: { readonly targetId: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode: boolean | "ultrafast"; readonly permissionMode: string; readonly planMode: boolean };
-}): void {
-  if (!isExtensionTaskControlled(store, leadSessionId)) return;
+}): boolean {
+  if (!isExtensionTaskControlled(store, leadSessionId)) return false;
   const receipt = store.findSetting<TaskReceipt>("service", TASKS, leadSessionId)?.value;
   const config = receipt ? store.findSetting<ExtensionTaskPreferences>("service", PREFS, receipt.extensionId)?.value : undefined;
   const registered = store.findSetting<{ readonly plan: TeamPlan; readonly settledLabels?: readonly string[] }>("service", PLANS, leadSessionId)?.value, plan = registered?.plan;
@@ -658,8 +716,8 @@ export function assertExtensionWorkerPlan(store: OperationalStore, leadSessionId
   if (!receipt || receipt.revoked || !target.descriptor.trusted || target.descriptor.remoteWorkspace || !store.getTarget(lead.descriptor.targetId).descriptor.trusted
     || !within && (!extra?.descriptor.trusted || extra.descriptor.remoteWorkspace || realpathSync(extra.descriptor.workspaceRoot) !== directory)
     || !model || !modelRoutingEnabled(store, backend.id, model.providerId, model.modelId) || input.route.effort && !model.thinkingLevels.includes(input.route.effort)
-    || input.route.fastMode && (input.route.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true) || input.route.permissionMode !== "auto" || input.route.planMode || config?.permissionMode !== "auto") failure("PERMISSION_DENIED", "The worker request exceeds the plugin's directory, model or permission policy.");
-  if (!plan) return;
+    || input.route.fastMode && (input.route.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true) || input.route.permissionMode !== "auto" || input.route.planMode || config?.permissionMode !== "auto") return failure("PERMISSION_DENIED", "The worker request exceeds the plugin's directory, model or permission policy.");
+  if (!plan) return false;
   if (!item || registered?.settledLabels?.includes(input.label) || item.targetId !== input.route.targetId
     || target.descriptor.backendId !== item.route.backendId || input.route.providerId !== item.route.providerId || input.route.modelId !== item.route.modelId
     || input.route.effort !== item.route.effort || input.route.fastMode !== item.route.fastMode || input.route.permissionMode !== "auto" || input.route.planMode
@@ -670,5 +728,12 @@ export function assertExtensionWorkerPlan(store: OperationalStore, leadSessionId
         || realpathSync(directory.targetId === lead.descriptor.targetId && lead.descriptor.worktree ? lead.descriptor.worktree.path : approved.descriptor.workspaceRoot) !== directory.root;
     })) failure("PERMISSION_DENIED", "The worker request does not match the plugin's registered task plan and permission policy.");
   const goal = store.findActiveCollaborationGoalByLeadSession(leadSessionId);
-  if (goal && store.listCollaborationWorkers({ goalId: goal.id }).filter(worker => worker.id !== input.existingWorkerId && !worker.runtimeReleased && !["archived", "stopped"].includes(worker.status)).length >= plan!.concurrency) failure("TASK_BUSY", "The registered plugin team concurrency is exhausted.");
+  if (goal && store.listCollaborationWorkers({ goalId: goal.id }).filter(worker => worker.id !== input.existingWorkerId && !worker.runtimeReleased && !["archived", "stopped"].includes(worker.status)).length >= plan.concurrency) failure("TASK_BUSY", "The registered plugin team concurrency is exhausted.");
+  if (!goal || goal.id !== input.goalId || input.existingWorkerId !== undefined || goal.maximumWorkers !== plan.concurrency) return false;
+  const creation = store.findOperation<{ readonly goalId: string }>(extensionTeamOperationId(receipt.installation, leadSessionId));
+  return creation?.kind === "create_collaboration_goal" && creation.status === "completed" && creation.response?.goalId === goal.id;
+}
+
+function extensionTeamOperationId(installation: string, leadSessionId: string): string {
+  return `extension-team-${hash([installation, leadSessionId])}`;
 }

@@ -2,7 +2,7 @@
 import { act, type Ref } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { useAppController, type AppController } from "./controller.js";
+import { extensionBackgroundTaskForRoute, useAppController, type AppController } from "./controller.js";
 import { createOrchestratorGateway, GatewayError, probeOrchestratorOrigin, type GatewayCallbacks, type OrchestratorGateway } from "./gateway.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
 import { emptySnapshot, type AppSnapshot, type ConnectionProfile, type MachineCacheView, type ModelPriceOverrideView, type ModelView } from "./model.js";
@@ -93,6 +93,36 @@ it("adopts a verified catalog node and keeps identical plugin, resource and mark
     expect(call).toThrow("catalog node connection is no longer current");
   }
   expect(view.actions).toHaveLength(3);
+});
+
+it("keeps an explicitly opened hidden task outside the Owner directory and retires a late read on navigation", async () => {
+  const view = await mount();
+  const backgroundExtensionId = `extension_${"1".repeat(32)}`;
+  const task = { session: { ...snapshot(b).sessions[0]!, id: "background", name: "Plugin background task", hidden: true }, cursor: 1n };
+  const route = { kind: "session" as const, sessionId: task.session.id, backgroundExtensionId };
+  view.readBackgroundTask.mockResolvedValueOnce(task);
+  await act(async () => view.app()!.navigate(route));
+  await vi.waitFor(() => expect(extensionBackgroundTaskForRoute(view.app()!.state)?.view).toEqual(task));
+  expect(view.app()!.state.route).toEqual({ ...route, profileId: a.id });
+  expect(view.readBackgroundTask).toHaveBeenCalledWith(backgroundExtensionId, task.session.id, expect.any(AbortSignal));
+  expect(view.app()!.state.snapshot.sessions).toEqual([]);
+  expect(view.caches.get(a.id)?.sessions).toEqual([]);
+
+  const refreshed = { ...task, session: { ...task.session, name: "Updated background task" } };
+  view.readBackgroundTask.mockResolvedValueOnce(refreshed);
+  await act(async () => view.emit());
+  expect(extensionBackgroundTaskForRoute(view.app()!.state)?.view).toEqual(refreshed);
+  expect(view.app()!.state.snapshot.sessions).toEqual([]);
+
+  const pending = deferred();
+  view.readBackgroundTask.mockImplementationOnce(async () => { await pending.promise; return task; });
+  await act(async () => view.emit());
+  const signal = view.readBackgroundTask.mock.calls.at(-1)![2];
+  await act(async () => view.app()!.navigate({ kind: "settings" }, { replace: true }));
+  expect(signal.aborted).toBe(true);
+  await act(async () => pending.resolve());
+  expect(view.app()!.state.route).toEqual({ kind: "settings" });
+  expect(view.app()!.state.extensionBackgroundTask).toBeUndefined();
 });
 
 it("preserves the current catalog when the other node is offline and rejects an identity change before bearer access", async () => {
@@ -227,6 +257,7 @@ async function mount(connectFirst = true, showPrice = false, showEditor = false)
   const actions: string[] = [], activeConnections: string[] = [], retiredProfiles: string[] = [];
   const saveDocument = vi.fn(async () => ({ revision: "r2" })), deleteProfile = vi.fn(async () => undefined);
   const getPrice = vi.fn(async () => price()), savePrice = vi.fn(async () => price()), closePrice = vi.fn();
+  const readBackgroundTask = vi.fn<OrchestratorGateway["readExtensionBackgroundTask"]>(async () => { throw new Error("Unexpected background task read."); });
   let emit = () => {};
   const held = new Map<string, Promise<void>>();
   const refreshGates = new Map<string, () => Promise<void>>();
@@ -247,7 +278,7 @@ async function mount(connectFirst = true, showPrice = false, showEditor = false)
   vi.mocked(createOrchestratorGateway).mockImplementation((owner, _key, callbacks) => {
     const value = owner!, active = callbacks.onExtensionUiEffect !== undefined;
     if (callbacks.onLiveSnapshot !== undefined) liveCallbacks.set(value.id, callbacks);
-    if (active) emit = () => callbacks.onSnapshot?.({ ...snapshot(value), models: [{ ...priceModel }] });
+    if (active) emit = () => callbacks.onSnapshot?.({ ...snapshot(value), models: [{ ...priceModel }] }, true);
     return { connect: async () => {
       const captured = snapshot(value);
       if (!active && callbacks.onSnapshot) await held.get(value.id);
@@ -257,7 +288,7 @@ async function mount(connectFirst = true, showPrice = false, showEditor = false)
     }, disconnect: () => { if (active) retiredProfiles.push(value.id); }, taskSharingApi: () => undefined,
     inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined,
     refresh: async () => callbacks.onSnapshot?.(snapshot(value)),
-    getModelPriceOverride: getPrice, setModelPriceOverride: savePrice, resetModelPriceOverride: getPrice,
+    getModelPriceOverride: getPrice, setModelPriceOverride: savePrice, resetModelPriceOverride: getPrice, readExtensionBackgroundTask: readBackgroundTask,
     listPartners: async () => ({ partners: [], directory: { revision: 1n, templates: [], avatarPresets: [], activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 1 } }),
     setResourceEnabled: async (id: string) => { actions.push(`${value.serverId}:resource:${id}`); },
     setExtensionEnabled: async (id: string) => { actions.push(`${value.serverId}:extension:${id}`); },
@@ -275,7 +306,7 @@ async function mount(connectFirst = true, showPrice = false, showEditor = false)
   if (connectFirst) await act(async () => { await app!.connect(a); await settle(); });
   return { app: () => app, actions, probe, auth, activeConnections, retiredProfiles, saveDocument, deleteProfile,
     hold: (id: string, promise: Promise<void>) => held.set(id, promise), holdRefresh: (id: string, gate: () => Promise<void>) => refreshGates.set(id, gate),
-    liveCallbacks, caches, saveMachineCache, deleteMachineCache, deleteAuthKey, emit: () => emit(), getPrice, savePrice, closePrice };
+    liveCallbacks, caches, saveMachineCache, deleteMachineCache, deleteAuthKey, emit: () => emit(), getPrice, savePrice, closePrice, readBackgroundTask };
 }
 const priceModel: ModelView = { backendId: "backend", providerId: "provider", providerName: "Provider", modelId: "model", name: "Model", available: true,
   supportsImages: false, inputModalities: ["text"], outputModalities: ["text"], supportsFast: false, efforts: [], currencyCode: "USD",

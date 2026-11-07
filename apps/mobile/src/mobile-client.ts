@@ -4,7 +4,7 @@ import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionPackageAction } from "@joko/contracts";
 import { projectProviderGroupRebalance, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
-import { executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
+import { executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionLibraryFileMatch } from "@joko/connection-transport";
 import type { SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
@@ -148,6 +148,7 @@ import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
   mobileExtensionOwnerKey,
+  mobileExtensionTaskTarget,
   projectMobileExtensionMainViewSurface,
   sameMobileExtensionMainViewSurface,
   type MobileExtension,
@@ -2959,9 +2960,12 @@ export class MobileClient {
     };
     const probeMainView = (
       expected: MobileExtensionMainViewSurface,
-      signal: AbortSignal
+      signal: AbortSignal,
+      keepAlive?: true
     ): Promise<MobileExtensionMainViewSurface> => owned(signal, async (current) => {
-      const surface = await this.network.getExtensionMainViewSurface(context.credential, expected.surfaceId, current);
+      const surface = await (keepAlive && expected.purpose === undefined
+        ? this.network.getExtensionMainViewSurface(context.credential, expected.surfaceId, current, true)
+        : this.network.getExtensionMainViewSurface(context.credential, expected.surfaceId, current));
       requireCurrent(current);
       if (!sameMobileExtensionMainViewSurface(expected, surface) || surface.expiresAt <= Date.now()) {
         throw new Error("The Extension main-view surface changed or expired.");
@@ -3046,7 +3050,7 @@ export class MobileClient {
     };
     const callLibrary = async (
       expected: MobileExtension, surface: MobileExtensionMainViewSurface, session: MobileExtensionLibrarySession,
-      call: MobileExtensionLibraryCall, signal: AbortSignal
+      call: MobileExtensionLibraryCall, signal: AbortSignal, source?: ExtensionLibraryFileMatch
     ): Promise<MobileExtensionLibraryCallResult> => {
       try {
         return await owned(signal, async (current) => {
@@ -3058,7 +3062,8 @@ export class MobileClient {
           await requireLibrarySurface(expected, surface, current);
           requireCurrent(current);
           if (libraryLeases.get(session) !== lease) throw new Error("The Extension Library session was closed.");
-          const result = await this.network.callExtensionLibrary(context.credential, session.id, call, current);
+          const result = await (source === undefined ? this.network.callExtensionLibrary(context.credential, session.id, call, current)
+            : this.network.callExtensionLibrary(context.credential, session.id, call, current, source));
           requireCurrent(current);
           if (libraryLeases.get(session) !== lease) throw new Error("The Extension Library call result was retired.");
           return result;
@@ -3480,15 +3485,48 @@ export class MobileClient {
         await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
         if (!api || preferences.extensionId !== expected.extensionId) throw new Error("Plugin task preferences are unavailable.");
         const result = await api.updatePreferences({ extensionId: expected.extensionId, expectedRevision: preferences.revision, model, permissionMode,
-          targetId: preferences.targetId }, { signal: current }); requireCurrent(current);
+          targetId: mobileExtensionTaskTarget(preferences, model) }, { signal: current }); requireCurrent(current);
         if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin preference owner changed."); return result.preferences;
       }),
-      retryTaskWriteAccess: (expected, taskId, signal) => owned(signal, async current => {
-        await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
-        if (!api) throw new Error("Plugin task permissions are unavailable.");
-        const result = await api.retryWriteAccess({ extensionId: expected.extensionId, taskId }, { signal: current }); requireCurrent(current);
-        if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin permission owner changed."); return result.preferences;
-      }),
+      retryTaskWriteAccess: (expected, taskId, signal) => {
+        let priorInteractionIds: ReadonlySet<string> | undefined;
+        const interaction = (): Interaction | undefined => {
+          const prior = priorInteractionIds;
+          if (prior === undefined || signal.aborted || !isCurrent()) return;
+          const matches = pendingMobileInteractions(this.#state.owner, taskId).filter(candidate => {
+            if (prior.has(candidate.interactionId) || candidate.request.case !== "permission") return false;
+            const subject = candidate.request.value.subject?.kind;
+            return subject?.case === "customTool" && subject.value.toolId === "plugin_managed_task";
+          });
+          return matches.length === 1 ? matches[0] : undefined;
+        };
+        const settle = async (displayed: Interaction, effect: (exact: Interaction) => Promise<boolean>): Promise<boolean> => {
+          const exact = interaction();
+          if (exact === undefined || !equals(InteractionSchema, exact, displayed)) return false;
+          const settled = await effect(exact);
+          if (settled) priorInteractionIds = undefined;
+          return settled;
+        };
+        const result = owned(signal, async current => {
+          await readExactDetail(expected, current);
+          const api = this.network.extensionTaskApi?.(context.credential);
+          if (!api) throw new Error("Plugin task permissions are unavailable.");
+          priorInteractionIds = new Set(this.#state.owner?.interactions.map(item => item.interactionId));
+          try {
+            const result = await api.retryWriteAccess({ extensionId: expected.extensionId, taskId }, { signal: current });
+            requireCurrent(current);
+            if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin permission owner changed.");
+            return { preferences: result.preferences, granted: result.granted };
+          } finally {
+            priorInteractionIds = undefined;
+          }
+        });
+        // The approval stream and its receipt belong to this live connection.
+        // A forced refresh here would retire the RPC waiting for the decision.
+        return { result, interaction,
+          resolve: (displayed, submission) => settle(displayed, exact => this.#resolvePendingInteraction(exact, submission, false)),
+          dismiss: displayed => settle(displayed, exact => this.#dismissPendingInteraction(exact, false)) };
+      },
       detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current, false)),
       setEnabled: (expected, enabled, signal) => mutate(expected, "enabled", enabled, signal),
       setSidebarVisible: (expected, visible, signal) => mutate(expected, "sidebar", visible, signal),
@@ -13833,7 +13871,10 @@ export class MobileClient {
   }
 
   async resolveInteraction(interactionId: string, submission: MobileInteractionSubmission): Promise<boolean> {
-    const interaction = this.#interactionContext(interactionId);
+    return this.#resolvePendingInteraction(this.#interactionContext(interactionId), submission);
+  }
+
+  async #resolvePendingInteraction(interaction: Interaction, submission: MobileInteractionSubmission, refreshAfter = true): Promise<boolean> {
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
     const credential = this.#ready();
     const resolution = createMobileInteractionResolution(interaction, submission, credential.connectionId);
@@ -13848,13 +13889,16 @@ export class MobileClient {
           resolution
         }) }
       }), { kind: "interaction-resolve", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
-        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, !concurrentUserShell);
+        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, refreshAfter && !concurrentUserShell);
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
 
   async dismissInteraction(interactionId: string): Promise<boolean> {
-    const interaction = this.#interactionContext(interactionId);
+    return this.#dismissPendingInteraction(this.#interactionContext(interactionId));
+  }
+
+  async #dismissPendingInteraction(interaction: Interaction, refreshAfter = true): Promise<boolean> {
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
     this.#ready();
     const concurrentUserShell = this.#userShellFlight?.sessionId === interaction.sessionId;
@@ -13868,7 +13912,7 @@ export class MobileClient {
           reason: "Dismissed by user on mobile"
         }) }
       }), { kind: "interaction-dismiss", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
-        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, !concurrentUserShell);
+        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, refreshAfter && !concurrentUserShell);
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }

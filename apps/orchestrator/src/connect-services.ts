@@ -4814,7 +4814,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       if (!dependencies.extensionCatalog!.get(surface.authority.extensionId).enabled) {
         throw new ConnectError("The plugin is unavailable.", Code.FailedPrecondition);
       }
-      return { models: localExtensionSettingsAgentModels(dependencies) };
+      return { models: localExtensionSettingsAgentModels(dependencies, application.providerGroups) };
     },
     beginExtensionSecretCheck: async (request, context) => {
       const connection = authenticate(context);
@@ -4843,13 +4843,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     getExtensionMainViewSurface: async (request, context) => {
       const connection = authenticate(context);
-      if (dependencies.extensionMainViews === undefined) {
+      const views = dependencies.extensionMainViews;
+      if (views === undefined) {
         throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
       }
-      const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.getSurface(
-        nonBlankRequest(request.surfaceId, "surface_id"),
-        connection.id
-      ));
+      const surfaceId = nonBlankRequest(request.surfaceId, "surface_id");
+      const renew = context.requestHeader.get(contract.EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER) === "1";
+      const surface = await extensionMainViewEffect(() => renew
+        ? views.getSurface(surfaceId, connection.id, "visible", context.signal)
+        : views.getSurface(surfaceId, connection.id));
       return { surface: mapExtensionMainViewSurface(surface) };
     },
     closeExtensionMainView: async (request, context) => {
@@ -5044,14 +5046,24 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const connection = authenticate(context);
       const manager = requireExtensionLibraryManager(dependencies);
       if (request.call === undefined || request.call.operation.case === undefined) throw invalidArgument("call.operation is required");
-      return {
-        result: await extensionLibraryEffect(() => dispatchExtensionLibraryCall(
-          manager,
-          nonBlankRequest(request.sessionId, "session_id"),
-          connection.id,
-          request.call!
-        ))
-      };
+      const match = context.requestHeader.get("if-match");
+      const operation = request.call.operation.case;
+      if (match !== null && (!(operation === "stat" || operation === "read")
+        || (operation !== "stat" || match !== "*") && !/^"[a-f0-9]{64}"$/u.test(match))) {
+        throw invalidArgument("Library file match is invalid.");
+      }
+      const result = await extensionLibraryEffect(() => dispatchExtensionLibraryCall(
+        manager,
+        nonBlankRequest(request.sessionId, "session_id"),
+        connection.id,
+        request.call!,
+        match === null ? undefined : { match, set: tag => context.responseHeader.set("etag", tag) }
+      ));
+      if (match !== null) {
+        context.signal.throwIfAborted();
+        dependencies.connections.fence(connection);
+      }
+      return { result };
     },
     closeExtensionLibrary: async (request, context) => {
       const connection = authenticate(context);
@@ -11405,14 +11417,17 @@ async function requireExtensionSettingsSurface(dependencies: ConnectServiceDepen
   return surface;
 }
 
-function localExtensionSettingsAgentModels(dependencies: ConnectServiceDependencies): contract.ExtensionSettingsAgentModel[] {
+function localExtensionSettingsAgentModels(dependencies: ConnectServiceDependencies, providerGroups: OrchestratorApplication["providerGroups"]): contract.ExtensionSettingsAgentModel[] {
+  const sourceCatalog = { store: dependencies.store,
+    ...(dependencies.hostedAgentSources === undefined ? {} : { hostedAgentSources: dependencies.hostedAgentSources }),
+    ...(providerGroups === undefined ? {} : { providerGroups }) };
   return dependencies.store.listBackends().flatMap(({ descriptor: backend }) => {
     const agent = backend.adapterKind === "claude-agent-sdk-stdio" ? "claude-code" : backend.adapterKind;
     if (agent !== "codex" && agent !== "claude-code" && agent !== "pi") return [];
     return dependencies.sessionHost.listSelectableTaskModels(backend.id).flatMap(model => {
       const outputs = model.declaredOutputModalities;
       if (outputs?.length && !outputs.some(output => output.toLowerCase() === "text")) return [];
-      const source = projectModelSource(dependencies, toProtoModelDescriptor(backend.id, model));
+      const source = projectModelSource(sourceCatalog, toProtoModelDescriptor(backend.id, model));
       if (!source.available || source.source?.kind !== contract.ModelSourceKind.LOCAL || source.source.grouped) return [];
       const efforts = backend.capabilities.get("model.effort")?.supported === true ? [...model.thinkingLevels] : [];
       return [create(contract.ExtensionSettingsAgentModelSchema, {
@@ -12701,7 +12716,8 @@ async function dispatchExtensionLibraryCall(
   manager: ExtensionLibraryManager,
   sessionId: string,
   connectionId: string,
-  call: contract.ExtensionLibraryCall
+  call: contract.ExtensionLibraryCall,
+  source?: { readonly match: string; readonly set: (tag: string) => void }
 ): Promise<contract.ExtensionLibraryCallResult> {
   const operation = call.operation;
   switch (operation.case) {
@@ -12709,8 +12725,10 @@ async function dispatchExtensionLibraryCall(
       const value = await manager.read(sessionId, connectionId, {
         path: operation.value.path,
         ...(operation.value.offset === undefined ? {} : { offset: safeLibraryNumber(operation.value.offset, "read.offset") }),
-        ...(operation.value.length === undefined ? {} : { length: safeLibraryNumber(operation.value.length, "read.length") })
+        ...(operation.value.length === undefined ? {} : { length: safeLibraryNumber(operation.value.length, "read.length") }),
+        ...(source === undefined ? {} : { sourceTag: source.match })
       });
+      source?.set(source.match);
       return create(contract.ExtensionLibraryCallResultSchema, {
         result: { case: "read", value: create(contract.ExtensionLibraryReadResultSchema, {
           path: value.path,
@@ -12728,7 +12746,8 @@ async function dispatchExtensionLibraryCall(
       return libraryWriteCallResult(value);
     }
     case "stat": {
-      const value = await manager.stat(sessionId, connectionId, operation.value.path);
+      const value = await manager.stat(sessionId, connectionId, operation.value.path, source?.match);
+      if (value.sourceTag !== undefined) source?.set(value.sourceTag);
       return create(contract.ExtensionLibraryCallResultSchema, {
         result: { case: "stat", value: mapExtensionLibraryEntry(value) }
       });

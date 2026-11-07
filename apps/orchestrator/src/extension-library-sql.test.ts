@@ -66,12 +66,18 @@ describe("ExtensionLibrarySqlService", () => {
     await expect(service.execute(opened.handleId, "SELECT id, body FROM notes ORDER BY id")).resolves.toMatchObject({
       rows: [{ id: 1n, body: "PRAGMA ATTACH is inert in a value" }, { id: 2n, body: Uint8Array.from(Buffer.from("blob")) }]
     });
+    await expect(service.execute(opened.handleId, "SELECT CASE WHEN 1 = 1 THEN 'yes' ELSE 'no' END AS result", [])).resolves.toMatchObject({
+      rows: [{ result: "yes" }]
+    });
 
     for (const sql of [
       "SELECT 1; DROP TABLE notes",
+      "SELECT CASE WHEN 1 THEN 1 END; END TRANSACTION",
       "PRAGMA user_version",
       "ATTACH DATABASE 'outside.sqlite' AS outside",
       "BEGIN",
+      "COMMIT",
+      "END TRANSACTION",
       "CREATE TRIGGER forbidden AFTER INSERT ON notes BEGIN SELECT 1; END",
       "CREATE VIRTUAL TABLE forbidden USING fts5(body)",
       "SELECT load_extension('anything')"

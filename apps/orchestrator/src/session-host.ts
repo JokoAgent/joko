@@ -240,7 +240,7 @@ interface ActiveBackendSideEffectLease {
   readonly release: () => void;
 }
 
-function samePartnerPolicyBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
+function samePolicyBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
   return left.nativeSessionId === right.nativeSessionId && left.generation === right.generation && left.opaqueRef === right.opaqueRef;
 }
 
@@ -383,6 +383,11 @@ interface ReviewWorktreeReference {
   readonly sourceSessionId: string;
   readonly path: string;
   readonly authority: string;
+}
+
+interface ExtensionTargetSteerFallback {
+  readonly requeue: (item: QueueItemRecord, error: PublicError) => boolean;
+  readonly assertCurrent: (item: QueueItemRecord) => void;
 }
 
 interface DispatchPreparation {
@@ -945,6 +950,7 @@ export class SessionHost {
   #messagingQueueGuard: ((item: QueueItemRecord) => void) | undefined;
   #messagingToolReview: ((item: QueueItemRecord, request: import('@joko/core').NativeToolAuthorizationRequest) => import('@joko/core').NativeToolAuthorizationDecision) | undefined;
   #extensionTaskQueueGuard?: (item: QueueItemRecord) => void;
+  #extensionTargetSteerFallback?: ExtensionTargetSteerFallback;
   #extensionNativeToolAuthorization?: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined;
   readonly #resolveMcpAppModelContext: ((sessionId: string) => Promise<McpAppModelContext>) | undefined;
   readonly #pendingDispatchAcceptances = new Map<string, PendingDispatchAcceptance>();
@@ -1046,6 +1052,7 @@ export class SessionHost {
   readonly #partnerPolicyRetirements = new Map<string, {
     readonly active: ActiveSession; readonly stored: StoredSession; readonly assertOwner: () => void;
   }>();
+  readonly #extensionPermissionUpdates = new Set<string>();
   readonly #partnerPauseFlights = new Map<string, Promise<void>>();
   readonly #partnerTargetRetired: (targetId: string) => boolean;
   readonly #resolveServiceRuntimePrompt: ((session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>) | undefined;
@@ -4486,10 +4493,10 @@ export class SessionHost {
   async retirePartnerPolicyRuntime(sessionId: string, expectedBinding: NativeSessionBinding, assertOwner: () => void): Promise<void> {
     this.#assertOpen(); assertOwner();
     const stored = this.#store.getSession(sessionId);
-    if (!samePartnerPolicyBinding(stored.descriptor.binding, expectedBinding)) throw new StoreError("The permission cleanup binding changed.");
+    if (!samePolicyBinding(stored.descriptor.binding, expectedBinding)) throw new StoreError("The permission cleanup binding changed.");
     const existing = this.#partnerPolicyRetirements.get(sessionId);
     if (existing !== undefined) {
-      if (!samePartnerPolicyBinding(existing.stored.descriptor.binding, expectedBinding)) throw new StoreError("The original permission cleanup is still pending.");
+      if (!samePolicyBinding(existing.stored.descriptor.binding, expectedBinding)) throw new StoreError("The original permission cleanup is still pending.");
     } else {
       const active = this.#active.get(sessionId);
       if (active === undefined) return;
@@ -4507,7 +4514,7 @@ export class SessionHost {
       const current = this.#store.getSession(sessionId);
       if (this.#active.get(sessionId) !== held.active || this.#adapters.get(current.descriptor.backendId) !== held.active.adapter
         || this.#adapterGenerations.get(current.descriptor.backendId) !== held.active.backendInstanceGeneration
-        || !samePartnerPolicyBinding(current.descriptor.binding, held.stored.descriptor.binding)) {
+        || !samePolicyBinding(current.descriptor.binding, held.stored.descriptor.binding)) {
         throw new StoreError("The original permission cleanup owner changed.");
       }
     };
@@ -6397,6 +6404,18 @@ export class SessionHost {
         && (held.kind === "active-turn" || !this.#providerGroups || held.resumeAt !== undefined && held.resumeAt > Date.now());
     });
   }
+  providerGroupContinuation(source: QueueItemRecord): { readonly claimed: boolean; readonly child?: QueueItemRecord } {
+    const { sessionId, runId } = source;
+    const continuationId = stableId("provider-group-continue", `${sessionId}:${runId}`);
+    const operation = this.#store.findOperation(continuationId);
+    if (operation?.kind !== "service_send_input" || operation.status !== "completed") return { claimed: operation !== undefined };
+    const child = this.#store.findQueueItemByRunId(sessionId, stableId("run", continuationId), { includeCleared: true });
+    if (child?.operationId !== continuationId || child.body.automaticContinuation?.sourceRunId !== runId
+      || this.#store.getRun(child.runId).descriptor.parentRunId !== runId
+      || JSON.stringify(child.body.messagingOrigin ?? null) !== JSON.stringify(source.body.messagingOrigin ?? null)) return { claimed: true };
+    return { claimed: true, child };
+  }
+
   #restoreProviderGroupRecoveries(onlySessionId?: string): void {
     if (!this.#providerGroups || this.#disposed) return;
     for (const session of this.#store.listSessions({ includeArchived: true, includeDeleted: true })) {
@@ -6405,14 +6424,10 @@ export class SessionHost {
         const runId = setting.key.slice("provider.group-error:".length), held = this.#heldProviderGroupRecovery(sessionId, runId);
         if (!held) continue;
         const run = this.#store.getRun(runId).descriptor, queue = this.#store.getQueueItem(held.queueItemId);
-        const continuationId = stableId("provider-group-continue", `${sessionId}:${runId}`), continuation = this.#store.findOperation(continuationId);
-        const child = this.#store.findQueueItemByRunId(sessionId, stableId("run", continuationId), { includeCleared: true });
-        const continued = continuation?.kind === "service_send_input" && continuation.status === "completed" && child?.operationId === continuationId
-          && child.body.automaticContinuation?.sourceRunId === runId && this.#store.getRun(child.runId).descriptor.parentRunId === runId
-          && JSON.stringify(child.body.messagingOrigin ?? null) === JSON.stringify(queue.body.messagingOrigin ?? null);
-        if (continuation || run.state === "completed" || run.state === "aborted" || !this.#providerGroupRecoverySourceCurrent(held)) {
+        const continuation = this.providerGroupContinuation(queue);
+        if (continuation.claimed || run.state === "completed" || run.state === "aborted" || !this.#providerGroupRecoverySourceCurrent(held)) {
           this.#store.deleteSetting("session", sessionId, setting.key); this.#cancelProviderGroupWait(sessionId);
-          if (!continued && run.state === "failed") this.#publishHeldProviderGroupError(sessionId, runId, held.payload.error);
+          if (continuation.child === undefined && run.state === "failed") this.#publishHeldProviderGroupError(sessionId, runId, held.payload.error);
           if (queue.body.messagingOrigin && run.state !== "completed") void this.notifyServiceRunSettled(sessionId, runId, run.state === "aborted" ? "aborted" : "failed");
           void this.drain(sessionId); continue;
         }
@@ -9212,12 +9227,12 @@ export class SessionHost {
     }).length === 0;
   }
 
-  private canEnterSessionArchive(sessionId: string, allowHeldAcceptedQueue = false): boolean {
+  private canEnterSessionArchive(sessionId: string, allowHeldAcceptedQueue = false, allowedActiveEffects = 0): boolean {
     if (
       this.#activating.has(sessionId)
       || this.#messageDeletionLocks.has(sessionId)
       || this.#sessionResetLocks.has(sessionId)
-      || (this.#activeEffects.get(sessionId) ?? 0) > 0
+      || (this.#activeEffects.get(sessionId) ?? 0) > allowedActiveEffects
       || this.#reaping.has(sessionId)
       || this.#runSilenceRecoveries.has(sessionId)
       || this.#draining.has(sessionId)
@@ -13910,6 +13925,7 @@ export class SessionHost {
       || this.#hasHeldProviderGroupRecovery(sessionId)
       || this.#runSilenceRecoveries.has(sessionId)
       || this.#runtimeRestartFences.has(sessionId)
+      || this.#extensionPermissionUpdates.has(sessionId)
       || this.#disposed
       || this.#partnerSessionRestarting(sessionId)
       || this.#partnerSessionPaused(sessionId)
@@ -14298,6 +14314,7 @@ export class SessionHost {
                 stored.descriptor.binding.generation,
                 partnerPolicy
               );
+              this.#extensionTargetSteerFallback?.assertCurrent(item);
               this.assertQueueProviderAuthentication(item, stored);
               return this.persistNativeDispatchRecoveryBaseline(
                 item,
@@ -14440,6 +14457,14 @@ export class SessionHost {
           const uncertain = failure.stateMayHaveChanged;
           this.#providerGroups?.service.turnSettled(sessionId, false);
           this.#providerGroups?.reporter.leasesChanged();
+          if (dispatchPreparation.phase === "sending" && item.disposition === "steer"
+            && error instanceof JokoError && failure.code === "PI_STEER_REQUIRES_ACTIVE_RUN" && !uncertain
+            && this.#extensionTargetSteerFallback !== undefined
+            && this.#store.transaction(store => {
+              if (!this.#extensionTargetSteerFallback?.requeue(item, failure)) return false;
+              removeNativeDispatchRecoveryEntry(store, sessionId, run.descriptor.id);
+              return true;
+            })) continue;
           const groupRecovery = !uncertain && this.#providerGroupMayHandleRun(sessionId, run.descriptor.id, failure);
           if (uncertain) {
             const active = this.#active.get(sessionId);
@@ -15410,7 +15435,11 @@ export class SessionHost {
     });
   }
 
-  setExtensionTaskQueueGuard(guard: (item: QueueItemRecord) => void): void { this.#extensionTaskQueueGuard = guard; }
+  setExtensionTaskQueueGuard(guard: (item: QueueItemRecord) => void,
+    steerFallback?: ExtensionTargetSteerFallback): void {
+    this.#extensionTaskQueueGuard = guard;
+    this.#extensionTargetSteerFallback = steerFallback;
+  }
   setExtensionNativeToolAuthorization(factory: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined): void { this.#extensionNativeToolAuthorization = factory; }
   setPartnerHomeInputGuard(guard: (sessionId: string) => void): void { this.#partnerHomeInputGuard = guard; }
   setMessagingQueueGuard(guard: (item: QueueItemRecord) => void,
@@ -15474,6 +15503,61 @@ export class SessionHost {
         : "This lets this unstarted task accept file edits. Commands and external actions still require confirmation. The plugin's task permission preference is updated if needed.", risk: "high", choices: ["allow_once", "deny_once"] }, { signal });
     assertCurrent(); signal.throwIfAborted(); this.assertSessionLifecycleIdle(sessionId);
     if (!(decision.kind === "confirmed" && decision.confirmed || decision.kind === "selected" && decision.value === "allow_once")) throw new StoreError("Plugin task write access was not approved.");
+  }
+
+  /** Holds dispatch until the approved policy is committed or the original native policy is safe to use. */
+  async applyApprovedExtensionTaskWrite(sessionId: string, mode: "acceptEdits" | "auto", assertCurrent: () => void,
+    commit: (store: OperationalStore) => void): Promise<void> {
+    await this.#withSessionRuntimeControlLock(sessionId, async () => {
+      assertCurrent(); this.assertSessionLifecycleIdle(sessionId);
+      this.#extensionPermissionUpdates.add(sessionId);
+      try {
+        const active = await this.activate(sessionId);
+        assertCurrent(); this.assertSessionLifecycleIdle(sessionId);
+        const backend = this.#store.getBackend(active.adapter.id).descriptor;
+        const modes = backend.capabilities.get("permission.modes");
+        if (backend.capabilities.get("permission.change")?.supported !== true || modes?.supported !== true || !modes.options?.includes(mode)) {
+          throw new StoreError("The task's native Backend does not support the approved permission mode.");
+        }
+        const lease = this.beginActiveBackendSideEffect(sessionId, active);
+        const binding = lease.stored.descriptor.binding;
+        const currentBinding = () => {
+          const current = this.assertActiveBackendSideEffectLease(lease).descriptor;
+          if (!samePolicyBinding(current.binding, binding)) throw new StoreError("The permission runtime binding changed.");
+          return current;
+        };
+        try {
+          await active.adapter.setPermissionMode(mode, lease.context);
+          currentBinding();
+          const observed = await this.refreshNativeStateObservation(sessionId, active);
+          currentBinding(); assertCurrent();
+          if (observed.permissionMode !== mode) throw new StoreError("The Backend did not confirm the approved permission mode.");
+          if (!this.canEnterSessionArchive(sessionId, false, 1)) throw new StoreError("Wait for the task to be idle before changing write access.");
+          this.persistRuntimeUsage(sessionId, observed.binding.generation, observed.usage, false, observed.providerId, observed.modelId);
+          this.#store.transaction(commit);
+        } catch (error) {
+          let durableMode: PermissionMode;
+          try { durableMode = currentBinding().permissionMode; } catch { throw error; }
+          try {
+            await active.adapter.setPermissionMode(durableMode, lease.context);
+            currentBinding();
+            const restored = await this.refreshNativeStateObservation(sessionId, active);
+            if (restored.permissionMode !== durableMode || currentBinding().permissionMode !== durableMode) {
+              throw new StoreError("The Backend did not confirm the durable permission mode.");
+            }
+          } catch (restoreError) {
+            this.recordFailure("extension_permission_restore", restoreError);
+            try { currentBinding(); await active.adapter.closeSession(binding, lease.context); }
+            catch (closeError) { this.recordFailure("extension_permission_runtime_close", closeError); }
+            finally { this.deleteActiveSession(sessionId, active); }
+          }
+          throw error;
+        } finally { lease.release(); }
+      } finally {
+        this.#extensionPermissionUpdates.delete(sessionId);
+        void this.drain(sessionId);
+      }
+    });
   }
 
   async authorizeImportProbe(sessionId: string, action: ImportProbeAction, signal: AbortSignal, assertOwner: () => void): Promise<() => void> {

@@ -1131,7 +1131,13 @@ export async function createOrchestratorApplication(
   await extensionPackagePublisher.initialize();
   const extensionLibraries = new ExtensionLibraryManager({
     rootDirectory: join(config.dataDirectory, "extension-libraries"),
-    managedRoots: [config.dataDirectory]
+    managedRoots: [config.dataDirectory],
+    onOrphanMarkerWriteFailure: action => store.appendDiagnostic({
+      severity: "warning",
+      component: "extension-library",
+      code: action === "mark" ? "EXTENSION_LIBRARY_ORPHAN_MARK_FAILED" : "EXTENSION_LIBRARY_ORPHAN_CLEAR_FAILED",
+      message: action === "mark" ? "The Library could not be marked after plugin removal." : "The Library orphan marker could not be cleared."
+    })
   });
   await extensionLibraries.initialize();
   const stopExtensionLibraryAuthorityNotifications = extensionCatalog.onAuthorityChanged((extensionIds) => {
@@ -2599,10 +2605,15 @@ export async function createOrchestratorApplication(
       adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter ? [adapter] : []; }) }) });
   const extensionTargets = new ExtensionTargets({ store, host: sessionHost, tasks: extensionTasks, catalog: extensionCatalog, projects: extensionProjects,
     partners, artifacts, redact: value => credentials.redactText(value) });
-  sessionHost.setExtensionTaskQueueGuard(item => { if (!extensionTargets.assertQueueCurrent(item)) extensionTasks.assertQueueCurrent(item); });
+  sessionHost.setExtensionTaskQueueGuard(item => { if (!extensionTargets.assertQueueCurrent(item)) extensionTasks.assertQueueCurrent(item); }, {
+    requeue: (item, error) => extensionTargets.requeueInactiveSteer(item, error),
+    assertCurrent: item => extensionTargets.assertSteerFallbackCurrent(item)
+  });
   sessionHost.setExtensionNativeToolAuthorization(sessionId => partnerNetwork?.nativeToolAuthorization(sessionId) ?? extensionTasks.nativeToolAuthorization(sessionId));
   mcpRouter.setNativeToolAdmission((...args) => sessionHost.authorizeNativeBridgeTool(...args));
   piResources.setExtensionTaskRemoval((transaction, resourceId) => extensionTasks.uninstall(transaction, resourceId));
+  piResources.setExtensionTaskPackageChange((transaction, resource) => extensionTasks.reconcilePackageTasks(transaction, [resource]));
+  store.transaction(transaction => extensionTasks.reconcilePackageTasks(transaction, piResources.list({ kind: "package" })));
   const extensionCardMedia = new ExtensionCardMedia({ store, vault: credentialVault, artifacts, transfers: blobTransfers });
   const extensionCards = new ExtensionCardsManager({ store, vault: credentialVault,
     assertProject: (extensionId, sessionId) => extensionProjects.assertEnabledForSession(extensionId, sessionId),

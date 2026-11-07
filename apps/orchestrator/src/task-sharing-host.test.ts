@@ -140,13 +140,19 @@ it.each(["removed", "left"] as const)("requires a fresh invitation after a parti
   await expect(guest.acceptTaskShareJoin({ ...rejoin, invitation: f.invitation })).rejects.toMatchObject({ code: Code.PermissionDenied });
   expect(f.host.get(f.share.shareId).members).toHaveLength(2);
   expect(() => f.host.authenticate(`TaskShareGuest ${freshSecret}`)).toThrow(/unavailable/u);
-  await expect(f.host.readSnapshot(retained.lease, signal())).resolves.toMatchObject({ scope: { kind: { case: "session" } } });
+  await expect(f.host.readSnapshot(retained.lease, signal())).resolves.toMatchObject({
+    member: { memberId: retained.member.memberId, status: "active" },
+    snapshot: { scope: { kind: { case: "session", value: { sessionId: f.share.sessionId } } } }
+  });
   const fresh = f.host.invite({ operationId: "fresh-invite", shareId: f.share.shareId });
   expect(fresh.share.shareGeneration).toBe(f.share.shareGeneration);
   await expect(guest.acceptTaskShareJoin({ ...rejoin, invitation: fresh.invitation })).resolves.toMatchObject({ member: { status: "active" } });
   const lease = f.host.authenticate(`TaskShareGuest ${freshSecret}`);
   expect(lease.scope.memberId).not.toBe(original.lease.scope.memberId);
-  await expect(f.host.readSnapshot(lease, signal())).resolves.toMatchObject({ scope: { kind: { case: "session" } } });
+  await expect(f.host.readSnapshot(lease, signal())).resolves.toMatchObject({
+    member: { memberId: lease.scope.memberId, status: "active" },
+    snapshot: { scope: { kind: { case: "session", value: { sessionId: f.share.sessionId } } } }
+  });
 });
 it("rolls failed synchronous admission back and never repeats an admitted unknown effect", async () => {
   const f = await fixture(), member = f.member("a");

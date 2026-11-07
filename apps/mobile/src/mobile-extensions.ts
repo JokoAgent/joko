@@ -5,8 +5,12 @@ import {
   ExtensionSetupFieldKind,
   ExtensionSetupState,
   type ExtensionCatalogEntry,
-  type ExtensionMainViewSurface
+  type ExtensionMainViewSurface,
+  type ExtensionTaskPreferences,
+  type ExtensionTaskRoute,
+  type Interaction
 } from "@joko/contracts";
+import type { ExtensionLibraryFileMatch } from "@joko/connection-transport";
 import type {
   MobileExtensionLibraryLocationValidation,
   MobileExtensionLibraryMutation,
@@ -14,6 +18,7 @@ import type {
 } from "./mobile-extension-library";
 import type { MobileExtensionLibraryOverview } from "./mobile-extension-library";
 import type { MobileExtensionLibraryCall, MobileExtensionLibraryCallResult, MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
+import type { MobileInteractionSubmission } from "./mobile-interactions";
 
 const EXTENSION_ID = /^extension_[a-f0-9]{32}$/u;
 const SOURCE_ID = /^extension_source_[a-f0-9]{32}$/u;
@@ -27,6 +32,20 @@ const FORBIDDEN_RECOMMENDATION_LABEL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\
 const FORBIDDEN_RECOMMENDATION_PROMPT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 const MAXIMUM_CATALOG_ENTRIES = 10_000;
 const MAXIMUM_CATALOG_PAGES = 10_000;
+
+export function mobileExtensionTaskTarget(preferences: ExtensionTaskPreferences, model: ExtensionTaskRoute | undefined): string | undefined {
+  const targetId = preferences.targetId;
+  if (model === undefined || targetId === undefined) return targetId;
+  const directoryBackend = preferences.directories.find(directory => directory.targetId === targetId)?.backendId ?? preferences.model?.backendId;
+  return directoryBackend !== undefined && model.backendId !== directoryBackend ? undefined : targetId;
+}
+
+export interface MobileExtensionTaskWriteRetry {
+  readonly result: Promise<{ readonly preferences: ExtensionTaskPreferences; readonly granted: boolean }>;
+  interaction(): Interaction | undefined;
+  resolve(displayed: Interaction, submission: MobileInteractionSubmission): Promise<boolean>;
+  dismiss(displayed: Interaction): Promise<boolean>;
+}
 
 export type MobileExtensionOwner =
   | {
@@ -193,7 +212,7 @@ export interface MobileExtensionTransport {
     allowSourceReplacement: boolean, signal: AbortSignal): Promise<MobileExtensionCatalog>;
   removePackage?(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionCatalog>;
   getTaskPreferences?(expected: MobileExtension, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
-  retryTaskWriteAccess?(expected: MobileExtension, taskId: string, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
+  retryTaskWriteAccess?(expected: MobileExtension, taskId: string, signal: AbortSignal): MobileExtensionTaskWriteRetry;
   setTaskPreferences?(expected: MobileExtension, preferences: import("@joko/contracts").ExtensionTaskPreferences, model: import("@joko/contracts").ExtensionTaskRoute | undefined,
     permissionMode: import("@joko/contracts").PermissionMode, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
   readonly ownerKey: string;
@@ -228,12 +247,12 @@ export interface MobileExtensionTransport {
     signal: AbortSignal
   ): Promise<MobileExtensionUseResult>;
   openMainView(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
-  probeMainView(expected: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
+  probeMainView(expected: MobileExtensionMainViewSurface, signal: AbortSignal, keepAlive?: true): Promise<MobileExtensionMainViewSurface>;
   readMainViewResource(expected: MobileExtensionMainViewSurface, url: string, kind: MobileExtensionResourceKind, signal: AbortSignal, text?: string): Promise<MobileExtensionMainViewResource>;
   closeMainView(expected: MobileExtensionMainViewSurface): Promise<boolean>;
   openLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionLibrarySession>;
   callLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, session: MobileExtensionLibrarySession,
-    call: MobileExtensionLibraryCall, signal: AbortSignal): Promise<MobileExtensionLibraryCallResult>;
+    call: MobileExtensionLibraryCall, signal: AbortSignal, source?: ExtensionLibraryFileMatch): Promise<MobileExtensionLibraryCallResult>;
   closeLibrary(session: MobileExtensionLibrarySession): Promise<boolean>;
   libraryStatus(expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionLibraryOverview>;
   loadLibrary(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionLibrarySnapshot>;
@@ -378,7 +397,7 @@ export function sameMobileExtensionMainViewSurface(
     && left.owner.resourceRevision === right.owner.resourceRevision
     && left.backendId === right.backendId && left.backendRevision === right.backendRevision
     && left.backendGeneration === right.backendGeneration && left.url === right.url
-    && left.title === right.title && left.icon === right.icon && left.expiresAt === right.expiresAt
+    && left.title === right.title && left.icon === right.icon && (left.purpose === undefined || left.expiresAt === right.expiresAt)
     && left.purpose === right.purpose && left.mobileSettings === right.mobileSettings;
 }
 

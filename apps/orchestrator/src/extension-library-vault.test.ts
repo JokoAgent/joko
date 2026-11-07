@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, rmdir, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -94,6 +94,27 @@ describe("ExtensionLibraryVault", () => {
     await expect(lstat(join(root, "c.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     await peer.delete("b.txt");
     await expect(vault.write({ path: "c.txt", bytes: Buffer.from("c"), ifNotExists: true })).resolves.toMatchObject({ path: "c.txt", bytes: 1 });
+  });
+
+  it("rejects the old staged digest when the same inode changes at the publication boundary", async () => {
+    const { root, vault } = await fixture();
+    await vault.open();
+    const path = "published.txt", target = join(root, path), temporary = await vault.allocateTemporaryPath(".stream");
+    const verified = Buffer.from("verified"), changed = Buffer.from("Verified");
+    await writeFile(temporary, verified);
+    const identity = await lstat(temporary, { bigint: true });
+    filesystem.beforeMove = async (from, to) => {
+      if (from !== temporary || to !== target) return;
+      filesystem.beforeMove = undefined;
+      await writeFile(temporary, changed);
+      await utimes(temporary, new Date(1_700_000_000_000), new Date(1_700_000_000_000));
+    };
+
+    await expect(vault.commitStagedWrite({ temporaryPath: temporary, temporaryIdentity: identity, path,
+      bytes: verified.byteLength, sha256: createHash("sha256").update(verified).digest("hex"), ifNotExists: true }))
+      .rejects.toMatchObject({ code: "CONFLICT", message: "Library staged content changed during publication." });
+    await expect(vault.read({ path })).resolves.toEqual({ path, bytes: changed, sha256: createHash("sha256").update(changed).digest("hex") });
+    await expect(vault.status()).resolves.toMatchObject({ usage: { files: 1, bytes: changed.byteLength } });
   });
 
   it("opens an empty strict-v1 root and rebuilds a damaged usage ledger without treating metadata damage as empty", async () => {

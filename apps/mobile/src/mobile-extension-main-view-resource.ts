@@ -5,6 +5,8 @@ import type { PairedCredential } from "./network";
 export const MOBILE_EXTENSION_RESOURCE_MAXIMUM_BYTES = 256 * 1024 * 1024;
 export const MOBILE_EXTENSION_STYLE_MAXIMUM_BYTES = 16 * 1024 * 1024;
 
+export class MobileExtensionMainViewResourceNotFound extends Error {}
+
 /** Public locators and one-use surface tokens remain inside the pinned channel. */
 export async function readMobileExtensionMainViewResource(credential: PairedCredential,
   surface: MobileExtensionMainViewSurface, candidate: string, kind: MobileExtensionResourceKind, signal?: AbortSignal, text?: string
@@ -42,6 +44,7 @@ export async function readMobileExtensionMainViewResource(credential: PairedCred
       signal: transfer, redirect: "error", cache: "no-store"
     });
     transfer.throwIfAborted();
+    if (kind === "media" && response.status === 404) throw new MobileExtensionMainViewResourceNotFound("The Extension media resource was not found.");
     const mimeType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
     const length = response.headers.get("content-length")?.trim();
     const expectedMime = kind === "document" ? mimeType === "text/html" : kind === "media" ? mimeType !== undefined && /^(?:image|audio|video)\/[a-z0-9.+-]+$/u.test(mimeType)

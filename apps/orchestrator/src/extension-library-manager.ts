@@ -34,6 +34,7 @@ import {
 import {
   EXTENSION_LIBRARY_LIMITS,
   ExtensionLibraryError,
+  ExtensionLibraryOrphanMarkerWriteError,
   ExtensionLibraryVault,
   filesystemFreeBytes,
   type ExtensionLibraryEntry,
@@ -65,6 +66,7 @@ export interface ExtensionLibraryManagerOptions {
   readonly maximumSessions?: number;
   readonly renameDirectory?: (from: string, to: string) => Promise<void>;
   readonly copyLibrary?: typeof copyExtensionLibrary;
+  readonly onOrphanMarkerWriteFailure?: (action: "mark" | "clear") => void;
 }
 
 export interface ExtensionLibrarySessionDescriptor {
@@ -333,6 +335,7 @@ export class ExtensionLibraryManager {
   readonly #maximumSessions: number;
   readonly #renameDirectory: (from: string, to: string) => Promise<void>;
   readonly #copyLibrary: typeof copyExtensionLibrary;
+  readonly #onOrphanMarkerWriteFailure: ExtensionLibraryManagerOptions["onOrphanMarkerWriteFailure"];
   readonly #sessions = new Map<string, ActiveSession>();
   readonly #streams = new Map<string, ActiveStream>();
   #state: StoredManagerState = emptyState();
@@ -357,6 +360,7 @@ export class ExtensionLibraryManager {
     this.#maximumSessions = positiveInteger(options.maximumSessions ?? DEFAULT_MAXIMUM_SESSIONS, "Library session limit");
     this.#renameDirectory = options.renameDirectory ?? rename;
     this.#copyLibrary = options.copyLibrary ?? copyExtensionLibrary;
+    this.#onOrphanMarkerWriteFailure = options.onOrphanMarkerWriteFailure;
   }
 
   async initialize(): Promise<void> {
@@ -501,7 +505,10 @@ export class ExtensionLibraryManager {
       if (status.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Extension Library metadata is unavailable.");
       const migrating = this.#hasOperation(input.authority.extensionId);
       if (migrating) vault.setReadonly(true);
-      else await vault.clearOrphaned();
+      else if (!await this.#updateOrphanMarker("clear", () => vault.clearOrphaned())) {
+        const stillBound = await this.#resolveBinding(binding);
+        if (!stillBound.ok) throw unavailableBinding(stillBound.reason);
+      }
       const sessionId = `library_session_${randomUUID().replaceAll("-", "")}`;
       await input.assertAuthorityCurrent();
       if (input.surfaceExpiresAt <= this.#now()) throw new ExtensionLibraryError("UNAVAILABLE", "Library surface expired while opening.");
@@ -647,16 +654,24 @@ export class ExtensionLibraryManager {
     };
   }
 
-  async read(sessionId: string, connectionId: string, input: { readonly path: string; readonly offset?: number; readonly length?: number }): Promise<ExtensionLibraryReadResult> {
-    return this.#withSession(sessionId, connectionId, false, (session) => session.vault.read(input));
+  async read(sessionId: string, connectionId: string, input: { readonly path: string; readonly offset?: number; readonly length?: number; readonly sourceTag?: string }): Promise<ExtensionLibraryReadResult> {
+    return this.#withSession(sessionId, connectionId, false, async (session) => {
+      const result = await session.vault.read(input);
+      if (input.sourceTag !== undefined) await this.#requireSession(sessionId, connectionId);
+      return result;
+    });
   }
 
   async write(sessionId: string, connectionId: string, input: { readonly path: string; readonly bytes: Uint8Array; readonly ifNotExists?: boolean }): Promise<ExtensionLibraryWriteResult> {
     return this.#withSession(sessionId, connectionId, true, (session) => session.vault.write(input));
   }
 
-  async stat(sessionId: string, connectionId: string, path: string): Promise<ExtensionLibraryEntry> {
-    return this.#withSession(sessionId, connectionId, false, (session) => session.vault.stat(path));
+  async stat(sessionId: string, connectionId: string, path: string, sourceTag?: string): Promise<ExtensionLibraryEntry> {
+    return this.#withSession(sessionId, connectionId, false, async (session) => {
+      const result = await session.vault.stat(path, sourceTag);
+      if (sourceTag !== undefined) await this.#requireSession(sessionId, connectionId);
+      return result;
+    });
   }
 
   async list(sessionId: string, connectionId: string, input: { readonly path?: string; readonly recursive?: boolean; readonly limit?: number; readonly cursor?: string }): Promise<{ readonly entries: readonly ExtensionLibraryEntry[]; readonly nextCursor?: string }> {
@@ -1420,6 +1435,7 @@ export class ExtensionLibraryManager {
         throw new Error("binding changed");
       }
       await assertExtensionLibraryRootIdentity(current.root, current.identity);
+      if (Atomics.load(new Int32Array(session.authorityState), 0) !== 0) throw new Error("authority retired");
     } catch (error) {
       await this.#destroySession(session);
       throw new ExtensionLibraryError("UNAVAILABLE", "Extension Library session authority was revoked.", { cause: error });
@@ -1693,7 +1709,18 @@ export class ExtensionLibraryManager {
     if (binding === undefined || !(await this.#resolveBinding(binding)).ok) return;
     const vault = this.#createVault(binding.root, extensionId);
     const status = await vault.open({ create: false });
-    if (status.state !== "unavailable") await vault.markOrphaned(orphanedName);
+    if (status.state !== "unavailable") await this.#updateOrphanMarker("mark", () => vault.markOrphaned(orphanedName));
+  }
+
+  async #updateOrphanMarker(action: "mark" | "clear", write: () => Promise<void>): Promise<boolean> {
+    try {
+      await write();
+      return true;
+    } catch (error) {
+      if (!(error instanceof ExtensionLibraryOrphanMarkerWriteError)) throw error;
+      try { this.#onOrphanMarkerWriteFailure?.(action); } catch { /* A diagnostic cannot own the Library operation. */ }
+      return false;
+    }
   }
 
   #assertStateTopology(): void {
@@ -2019,12 +2046,18 @@ export class ExtensionLibraryManager {
 
   async #recoverDefaultBindings(): Promise<void> {
     let changed = false;
+    const graceByRoot = new Map(this.#state.grace.map(record => [record.root, record]));
     for (const entry of await readdir(this.#dataDirectory, { withFileTypes: true })) {
+      const root = join(this.#dataDirectory, entry.name);
+      const grace = graceByRoot.get(root);
+      if (grace !== undefined) {
+        await assertExtensionLibraryRootIdentity(root, grace.identity);
+        continue;
+      }
       if (!entry.isDirectory() || entry.isSymbolicLink() || !EXTENSION_ID.test(entry.name)) {
         throw new ExtensionLibraryError("CORRUPT", "Extension Library data root contains an unknown entry.");
       }
       if (this.#binding(entry.name) !== undefined) continue;
-      const root = join(this.#dataDirectory, entry.name);
       const vault = this.#createVault(root, entry.name);
       const status = await vault.open({ create: false });
       if (status.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Untracked default Extension Library is corrupt.");

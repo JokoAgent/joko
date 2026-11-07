@@ -9,7 +9,7 @@ import { readSessionArchivePreview } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { projectProviderGroupRebalance } from "@joko/contracts";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
-import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
+import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import type { McpAppApi } from "./model.js";
 import type { ExtensionProjectView, ExtensionProjectStateView } from "./model.js";
@@ -695,6 +695,7 @@ import type {
   ExtensionLibraryLocationView,
   ExtensionLibraryOverviewView,
   ExtensionLibrarySessionView,
+  ExtensionLibrarySourceMatch,
   ExtensionLibrarySqlResultView,
   ExtensionLibrarySqlValueView,
   ExtensionLibraryTrashEntryView,
@@ -996,7 +997,7 @@ import { ServerAccessService } from '@joko/contracts';
 export interface GatewayCallbacks {
   readonly onState?: (state: GatewayConnectionState, statusMessage?: string) => void;
   /** Projection updates do not establish or restore an Event connection. */
-  readonly onSnapshot?: (snapshot: AppSnapshot) => void;
+  readonly onSnapshot?: (snapshot: AppSnapshot, authoritative?: true) => void;
   /** Authenticated owner snapshot attached to this live stream incarnation; never a snapshot-only probe. */
   readonly onLiveSnapshot?: (snapshot: AppSnapshot | undefined) => void;
   readonly onError?: (error: GatewayError) => void;
@@ -1014,6 +1015,11 @@ export interface OrchestratorIdentity {
   readonly version: string;
   readonly apiVersion: string;
   readonly pairingEnabled: boolean;
+}
+
+export interface ExtensionBackgroundTaskView {
+  readonly session: SessionView;
+  readonly cursor: bigint;
 }
 
 export type ExtensionNotificationKind = "unknown" | "info" | "warning" | "error";
@@ -1061,6 +1067,7 @@ export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage
   taskSharingApi(): TaskSharingApi;
   getSharedTaskRuntimeControl(sessionId: string): Promise<TaskShareRuntimeControl>;
   getSharedTaskBackends(): Promise<readonly BackendView[]>;
+  readExtensionBackgroundTask(extensionId: string, sessionId: string, signal: AbortSignal): Promise<ExtensionBackgroundTaskView>;
   recoverSharedTaskOperations(): Promise<void>;
   setSharedTaskRuntime(sessionId: string, patch: { readonly backendId?: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode?: boolean | "ultrafast" }): Promise<void>;
   connect(options?: { readonly snapshotOnly?: boolean }): Promise<void>;
@@ -2181,7 +2188,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
     this.#rawSnapshot = raw;
     this.#snapshot = mapped;
-    this.#callbacks.onSnapshot?.(mapped);
+    this.#callbacks.onSnapshot?.(mapped, true);
     if (this.#liveSnapshotConnected) this.#callbacks.onLiveSnapshot?.(mapped);
   }
 
@@ -5643,6 +5650,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       retryWriteAccess: async (request, options) => { guard(); const result = await client.retryWriteAccess(request, { ...options, signal: options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal }); guard(); return result; }
     };
   }
+  async readExtensionBackgroundTask(extensionId: string, sessionId: string, signal: AbortSignal): Promise<ExtensionBackgroundTaskView> {
+    const scope = this.captureActionScope(signal), owner = this.#profile, ownerGeneration = this.#snapshot?.generation;
+    if (!owner || this.#taskSharing !== undefined || ownerGeneration === undefined) throw new GatewayError("The plugin task connection is unavailable.");
+    const { tasks } = await createClient(ExtensionTaskService, scope.transport).listBackgroundTasks({ extensionId }, { signal: scope.signal });
+    if (!tasks.some(task => task.taskId === sessionId)) throw new GatewayError("The plugin background task is unavailable.");
+    const { snapshot } = await createClient(EventService, scope.transport).getSnapshot({
+      scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 0 } } }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (this.#transport !== scope.transport || this.#profile !== owner || this.#snapshot?.generation !== ownerGeneration) {
+      throw new GatewayError("The plugin task connection changed.");
+    }
+    const session = snapshot?.sessions[0];
+    const returnedScope = snapshot?.scope?.kind;
+    if (returnedScope?.case !== "session" || returnedScope.value.sessionId !== sessionId
+      || snapshot?.server?.serverId !== owner.serverId || snapshot.sessions.length !== 1 || session?.sessionId !== sessionId
+      || snapshot.resumeCursor?.generation !== snapshot.generation || !session.hidden || session.state === SessionState.CLOSED || !session.nativeBinding?.runtimeGeneration
+      || session.nativeBinding.runtimeGeneration !== snapshot.generation) {
+      throw new GatewayError("The plugin background task is unavailable.");
+    }
+    const mapped = mapSnapshot(snapshot);
+    return { session: mapped.sessions[0]!, cursor: mapped.cursor };
+  }
   extensionSettingsApi(): import("./model.js").ExtensionSettingsApi | undefined {
     if (!this.#transport || !this.#abort || !this.#profile) return;
     const scope = this.captureActionScope(), transport = this.#transport, lifetime = this.#abort, profile = this.#profile;
@@ -6133,12 +6163,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapExtensionMainViewSurface(response.surface);
   }
 
-  async getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView> {
+  async getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal, keepAlive?: true): Promise<ExtensionMainViewSurfaceView> {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ExtensionService, scope.transport).getExtensionMainViewSurface(
       { surfaceId },
-      { signal: scope.signal }
+      { signal: scope.signal, ...(keepAlive ? { headers: { [EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER]: "1" } } : {}) }
     );
+    scope.signal.throwIfAborted();
     if (response.surface === undefined) throw new GatewayError("Orchestrator returned an empty Extension main-view probe.");
     return mapExtensionMainViewSurface(response.surface);
   }
@@ -6371,15 +6402,28 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async callExtensionLibrary(
     sessionId: string,
     call: ExtensionLibraryCallView,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    source?: ExtensionLibrarySourceMatch
   ): Promise<ExtensionLibraryCallResultView> {
     const scope = this.captureActionScope(signal);
+    let tag: string | null = null;
     const response = await createClient(ExtensionService, scope.transport).callExtensionLibrary({
       sessionId,
       call: mapExtensionLibraryCall(call)
-    }, { signal: scope.signal });
+    }, { signal: scope.signal, ...(source === undefined ? {} : {
+      headers: { "if-match": source.tag },
+      onHeader: (headers: Headers) => { tag = headers.get("etag"); }
+    }) });
+    scope.signal.throwIfAborted();
     if (response.result === undefined) throw new GatewayError("Orchestrator returned an empty Extension Library call result.");
-    return mapExtensionLibraryCallResult(response.result);
+    const result = mapExtensionLibraryCallResult(response.result);
+    if (source !== undefined) {
+      if (tag === null || !/^"[a-f0-9]{64}"$/u.test(tag) || source.tag !== "*" && source.tag !== tag) {
+        throw new GatewayError("Orchestrator could not verify the Extension Library save source.");
+      }
+      source.capture?.(tag);
+    }
+    return result;
   }
 
   async closeExtensionLibrary(sessionId: string, signal?: AbortSignal): Promise<boolean> {

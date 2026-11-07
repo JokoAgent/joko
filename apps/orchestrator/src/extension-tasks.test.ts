@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
@@ -14,7 +15,8 @@ import { SessionHost } from "./session-host.js";
 import { SnapshotProjector } from "./snapshot-projector.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { ExtensionTasks, type ExtensionTaskOwner } from "./extension-tasks.js";
-import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
+import { resourceExtensionIds, type ExtensionCatalogDescriptor } from "./extension-catalog.js";
+import { PiResourceManager } from "./resource-manager.js";
 import { ExtensionProjectPolicies, extensionProjectForTarget } from "./extension-project-policy.js";
 import { projectNativeHistory } from "./native-history.js";
 import { SessionHelperToolBridgeProvider } from "./session-helper-tool-provider.js";
@@ -76,6 +78,30 @@ it("checks project exceptions for new plugin tasks and subsequent access to an e
   f.projects.setEnabled(project.id, "connection", f.descriptor(), true, f.projects.state(project.id, "connection").revision);
   expect(await f.request({ kind: "get", taskId: task.taskId })).toMatchObject({ taskId: task.taskId });
 });
+it("creates an isolated plugin task in a fresh managed directory without a Git project", async () => {
+  const f = await fixture();
+  const createNative = vi.spyOn(f.adapter, "createSession");
+  const request = { kind: "create", requestKey: "isolated-first", title: "Isolated task", isolatedWorkspace: true };
+  const first = await f.request(request) as { taskId: string };
+  const firstSession = f.store.getSession(first.taskId).descriptor;
+  const firstTarget = f.store.getTarget(firstSession.targetId).descriptor;
+  expect(firstTarget.managed).toBe(true);
+  expect(firstSession.worktree).toBeUndefined();
+  const managedRoot = await realpath(join(f.root, "tasks"));
+  expect(firstTarget.workspaceRoot).toBe(join(managedRoot, firstTarget.id.slice("extension-target-".length)));
+  expect(await readdir(firstTarget.workspaceRoot)).toEqual([]);
+  await writeFile(join(firstTarget.workspaceRoot, "first-task.txt"), "Only the first task");
+
+  const second = await f.request({ ...request, requestKey: "isolated-second" }) as { taskId: string };
+  const secondSession = f.store.getSession(second.taskId).descriptor;
+  const secondTarget = f.store.getTarget(secondSession.targetId).descriptor;
+  expect(secondSession.worktree).toBeUndefined();
+  expect(secondTarget.workspaceRoot).not.toBe(firstTarget.workspaceRoot);
+  expect(await readdir(secondTarget.workspaceRoot)).toEqual([]);
+  expect(await f.request(request)).toMatchObject({ taskId: first.taskId });
+  expect(createNative.mock.calls.map(([input, context]) => [input.target.workspaceRoot, context.target.workspaceRoot]))
+    .toEqual([[firstTarget.workspaceRoot, firstTarget.workspaceRoot], [secondTarget.workspaceRoot, secondTarget.workspaceRoot]]);
+});
 it("adopts hidden ordinary Sessions atomically, dispatches one durable Run, and replays original input keys", async () => {
   const f = await fixture();
   const observed: boolean[] = [];
@@ -135,6 +161,47 @@ it("reads only the current native branch of a plugin-owned task", async () => {
   expect(await read(before.items[0]!.cursor)).toEqual({ items: [after.items[1]], nextCursor: null });
   expect(f.store.listEvents({ sessionId: taskId }).some(event => event.id === projected[2]!.id)).toBe(true);
 });
+it("keeps the original plugin run ID attached to its durably admitted Provider Group continuation", async () => {
+  const f = await fixture();
+  const task = await f.request({ kind: "create", requestKey: "group-task", title: "Group task" }) as { taskId: string; revision: string };
+  const { taskId } = task;
+  f.adapter.injectFault(taskId, "crash");
+  const input = { kind: "send", taskId, expectedRevision: task.revision, requestKey: "group-input", text: "Run once across a handoff" };
+  const original = await f.request(input) as { runId: string; acceptedAt: number };
+  const receipt = { runId: original.runId, acceptedAt: original.acceptedAt };
+  await vi.waitFor(() => expect(f.store.getRun(original.runId).descriptor.state).toBe("failed"));
+  f.adapter.clearFault(taskId);
+  expect(await f.request({ kind: "getRun", runId: original.runId })).toMatchObject({ status: "failed" });
+
+  const send = vi.spyOn(f.adapter, "send").mockResolvedValue(undefined);
+  const abortRun = vi.spyOn(f.host, "abort");
+  const abort = vi.spyOn(f.adapter, "abort");
+  const stable = (prefix: string, value: string) => `${prefix}-${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
+  const resume = f.host.enqueueServiceInput({ operationId: stable("provider-group-continue", `${taskId}:${original.runId}`),
+    sessionId: taskId, source: "system", parentRunId: original.runId,
+    prompt: { text: "Continue the original task", images: [], files: [], mentions: [], disposition: "prompt",
+      automaticContinuation: { recoveryId: stable("provider-group-recovery", original.runId), sourceRunId: original.runId,
+        attempt: 1, maximumAttempts: 5, sessionTotal: 1 } } });
+  await vi.waitFor(() => expect(f.store.getQueueItem(resume.value.queueItemId).state).toBe("backend_accepted"));
+  f.store.setQueuePaused({ sessionId: taskId, paused: true, reason: "Keep the independent input queued", traceId: "test" });
+  const unrelated = f.host.enqueueServiceInput({ operationId: "unrelated-service-input", sessionId: taskId, source: "system",
+    prompt: { text: "Another input", images: [], files: [], mentions: [], disposition: "prompt" } });
+
+  expect(await f.request({ kind: "getRun", runId: original.runId })).toMatchObject({ ...receipt, status: "running", queueState: "backend_accepted" });
+  expect(await f.request(input)).toMatchObject({ ...receipt, status: "running" });
+  const generation = f.store.getSession(taskId).descriptor.binding.generation;
+  await f.request({ kind: "cancel", runId: original.runId });
+  expect(abortRun).toHaveBeenCalledExactlyOnceWith(taskId, resume.value.runId, expect.any(Function));
+  expect(abort).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    sessionId: taskId, generation, assertRunControlCurrent: expect.any(Function)
+  }));
+  expect(send).toHaveBeenCalledOnce();
+  expect(f.store.getRun(original.runId).descriptor.state).toBe("failed");
+  await vi.waitFor(() => expect(f.store.getRun(resume.value.runId).descriptor.state).toBe("aborted"));
+  expect(f.store.getQueueItem(unrelated.value.queueItemId).state).toBe("accepted");
+  expect(await f.request({ kind: "cancel", runId: original.runId })).toMatchObject({ ...receipt, status: "aborted" });
+  expect(abort).toHaveBeenCalledOnce();
+});
 it("approves explicit Auto through the original host interaction and refuses a changed configuration", async () => {
   const f = await fixture(), task = await f.request({ kind: "create", requestKey: "write", title: "Approved actions", hidden: true }) as { taskId: string };
   await expect(f.request({ kind: "requestWriteAccess", taskId: task.taskId })).rejects.toMatchObject({ code: "UNSUPPORTED_PERMISSION_MODE" });
@@ -189,6 +256,69 @@ it("restores the durable permission on the native task when plugin preferences t
   await rejected;
   expect(setters.mock.calls.map(([mode]) => mode)).toEqual(["auto", "ask"]);
   await expect(f.host.inspect(task.taskId)).resolves.toMatchObject({ permissionMode: "ask", binding: before.binding });
+  expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
+});
+it("retires an unconfirmed permission runtime before dispatching the original queued input", async () => {
+  const f = await fixture();
+  const task = await f.request({ kind: "create", requestKey: "unconfirmed-native-write", title: "Original Ask task" }) as { taskId: string };
+  const before = f.store.getSession(task.taskId).descriptor;
+  const preferences = f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, permissionMode: "auto" }, () => undefined);
+  const inspect = f.adapter.inspectSession.bind(f.adapter), setMode = f.adapter.setPermissionMode.bind(f.adapter);
+  const applying = vi.fn(), restoring = vi.fn();
+  let releaseApply!: () => void, releaseRestore!: () => void;
+  const applyHold = new Promise<void>(resolve => { releaseApply = resolve; });
+  const restoreHold = new Promise<void>(resolve => { releaseRestore = resolve; });
+  vi.spyOn(f.adapter, "inspectSession").mockImplementation(async (...args) => {
+    const state = await inspect(...args);
+    if (state.permissionMode === "auto" && state.binding.generation === before.binding.generation) {
+      applying(); await applyHold;
+    }
+    return state;
+  });
+  vi.spyOn(f.adapter, "setPermissionMode").mockImplementation(async (mode, context) => {
+    if (mode === "ask" && context.generation === before.binding.generation) {
+      restoring(); await restoreHold; throw new Error("Could not restore the original policy.");
+    }
+    return setMode(mode, context);
+  });
+  const close = vi.spyOn(f.adapter, "closeSession");
+  const send = f.adapter.send.bind(f.adapter);
+  let modeAtDispatch: string | undefined;
+  let closedBeforeDispatch = false;
+  const sends = vi.spyOn(f.adapter, "send").mockImplementation(async (input, context) => {
+    closedBeforeDispatch = close.mock.calls.length === 1;
+    modeAtDispatch = (await inspect(context.binding!, context)).permissionMode;
+    await send(input, context);
+  });
+  const connection = f.store.createConnection({ id: "approval-owner", name: "Owner", authKeyDigest: "approval-owner-digest" });
+  const request = f.request({ kind: "requestWriteAccess", taskId: task.taskId, mode: "auto" });
+  const rejected = expect(request).rejects.toMatchObject({ code: "STALE_REVISION" });
+  let queueItemId: string;
+  try {
+    await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: task.taskId, status: "open" })).toHaveLength(1));
+    const approval = f.store.listInteractions({ sessionId: task.taskId, status: "open" })[0]!;
+    f.host.resolveInteraction(approval.id, approval.generation, { kind: "permission", decision: "allow_once" }, "approve-before-restore-failure");
+    await vi.waitFor(() => expect(applying).toHaveBeenCalled());
+    f.tasks.updatePreferences(f.extensionId, preferences.revision, { model: f.route, permissionMode: "ask" }, () => undefined);
+    releaseApply();
+    await vi.waitFor(() => expect(restoring).toHaveBeenCalledOnce());
+    queueItemId = f.host.enqueueInput({ operationId: "queue-during-policy-recovery", sessionId: task.taskId, connection,
+      prompt: { text: "Continue the original task", images: [], files: [], mentions: [], disposition: "prompt" } }).value.queueItemId;
+    expect(f.store.getQueueItem(queueItemId).state).toBe("accepted");
+    expect(sends).not.toHaveBeenCalled();
+  } finally { releaseApply(); releaseRestore(); }
+  await rejected;
+  await vi.waitFor(() => {
+    const item = f.store.getQueueItem(queueItemId);
+    expect(item.state, f.store.getRun(item.runId).descriptor.error?.message).toBe("completed");
+  });
+  expect(sends).toHaveBeenCalledOnce();
+  const [, dispatched] = sends.mock.calls[0]!;
+  expect(dispatched.generation).toBeGreaterThan(before.binding.generation);
+  expect(dispatched.binding?.opaqueRef).toBe(before.binding.opaqueRef);
+  expect(closedBeforeDispatch).toBe(true);
+  expect(close).toHaveBeenCalledExactlyOnceWith(before.binding, expect.objectContaining({ sessionId: task.taskId, generation: before.binding.generation }));
+  expect(modeAtDispatch).toBe("ask");
   expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
 });
 it("supports an unplanned team within its approved task root and refuses an unrelated trusted target", async () => {
@@ -279,6 +409,42 @@ it("creates real hidden team workers only in the approved immutable plan and rev
   expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(2);
   expect(() => f.tasks.assertTeamWorkerCurrent(task.taskId)).toThrow();
 });
+it("returns the completed Worker Run timestamp so a plugin can release its plan slot", async () => {
+  const f = await fixture();
+  f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "auto" }, () => undefined);
+  const { taskId } = await f.request({ kind: "create", requestKey: "release-team", title: "Release team" }) as { taskId: string };
+  const first = { label: "First", workingDir: f.root, route: f.route, task: "Review the first document." };
+  const second = { ...first, label: "Second", task: "Review the second document." };
+  await f.request({ kind: "setTeamPlan", taskId, plan: { concurrency: 1, task: "Review two documents in order", items: [first, second] } });
+  const team = await f.request({ kind: "startTeam", taskId }) as ReturnType<CollaborationGoalManager["getTree"]>;
+  const target = f.store.listTargets().find(value => value.descriptor.id.startsWith("extension-team-target-"))!.descriptor;
+  const route = { ...f.route, targetId: target.id, permissionMode: "auto" as const, planMode: false };
+  const settle = f.store.updateQueueState.bind(f.store);
+  vi.spyOn(f.store, "updateQueueState").mockImplementation(input => {
+    if (input.state !== "completed") return settle(input);
+    const run = f.store.getRun(f.store.getQueueItem(input.queueItemId).runId).descriptor;
+    return settle({ ...input, at: Math.max(input.at ?? Date.now(), run.endedAt! + 1) });
+  });
+  const base = { goalId: team.goal.id, callerLeadSessionId: taskId, route, role: "Reviewer" };
+  const { worker } = await f.teams.createWorker({ ...base, operationId: "first-serial-worker", expectedGoalRevision: team.goal.revision,
+    label: first.label, assignment: first.task });
+  await vi.waitFor(() => expect(f.store.listQueueItems({ sessionId: worker.sessionId! })[0]?.state).toBe("completed"));
+  const endedAt = f.store.listRuns({ sessionId: worker.sessionId!, limit: 1 })[0]!.descriptor.endedAt;
+  const queueCompletedAt = f.store.listQueueItems({ sessionId: worker.sessionId! })[0]!.completedAt;
+  expect(queueCompletedAt).toBeGreaterThan(endedAt!);
+  await expect(f.teams.createWorker({ ...base, operationId: "second-before-release", expectedGoalRevision: f.teams.getTree(team.goal.id).goal.revision,
+    label: second.label, assignment: second.task })).rejects.toMatchObject({ code: "TASK_BUSY" });
+  const read = await f.request({ kind: "getTeam", taskId }) as { workers: readonly { id: string; completedAt?: number }[] };
+  const completedAt = read.workers.find(value => value.id === worker.id)?.completedAt;
+  expect(completedAt).toBe(endedAt);
+  const release = { kind: "releaseWorker", taskId, workerId: worker.id };
+  await expect(f.request({ ...release, completedAt: queueCompletedAt })).rejects.toMatchObject({ code: "STALE_REVISION" });
+  await expect(f.request({ ...release, completedAt })).resolves.toMatchObject({ worker: { id: worker.id, runtimeReleased: true } });
+
+  const current = f.teams.getTree(team.goal.id).goal;
+  await expect(f.teams.createWorker({ ...base, operationId: "second-serial-worker", expectedGoalRevision: current.revision,
+    label: second.label, assignment: second.task })).resolves.toMatchObject({ worker: { label: second.label } });
+});
 it("keeps account-wide history closed while an uninstalled plugin's Worker still runs behind a queued human input", async () => {
   const f = await fixture();
   f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "auto" }, () => undefined);
@@ -344,6 +510,54 @@ it("preserves user takeover after a declaration is removed and reveals before un
   f.store.transaction(store => f.tasks.uninstall(store, "resource")); f.uninstall();
   expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(1);
   f.reinstall(); await expect(f.request({ kind: "get", taskId: task.taskId })).rejects.toThrow();
+});
+it("reveals the retired facet's hidden tasks only when the package replacement commits", async () => {
+  const f = await fixture(), source = join(f.root, "workflow-package");
+  await mkdir(source);
+  const writePackage = async (version: string, entry: string) => {
+    await writeFile(join(source, entry), "export default function workflow() {}\n");
+    await writeFile(join(source, "package.json"), JSON.stringify({ name: "workflow-package", version, type: "module", pi: { extensions: [`./${entry}`] } }));
+  };
+  await writePackage("1.0.0", "worker.js");
+  const resources = new PiResourceManager({ store: f.store, managedRoot: join(f.root, "installed-packages") });
+  await resources.initialize();
+  const discovered = await resources.discoverPackage({ id: "workflow-package", backendId: f.adapter.id, scope: "global", source: { kind: "local", path: source } });
+  await resources.approve(discovered.id, discovered.discoveredRevision, "connection-owner");
+  const installed = await resources.install(discovered.id);
+  const extensionId = [...resourceExtensionIds(installed)][0]!;
+  const tasks = new ExtensionTasks({ ...f.tasks.options, catalog: { get: id => {
+    const current = resources.get(installed.id);
+    if (!resourceExtensionIds(current).has(id)) throw new Error("The installed extension is unavailable.");
+    return { ...f.descriptor(), id, owner: { kind: "resource", resourceId: current.id,
+      discoveredRevision: current.discoveredRevision, resourceVersion: current.versionNumber } };
+  } } });
+  resources.setExtensionTaskPackageChange((transaction, resource) => tasks.reconcilePackageTasks(transaction, [resource]));
+  const owner = { ...f.owner, extensionId, resourceId: installed.id, installation: tasks.installation(extensionId, installed.id) };
+  const request = (value: Record<string, unknown>, identity = owner) => tasks.request(identity, { type: "tasks-request", ...value });
+  const task = await request({ kind: "create", requestKey: "old-work", title: "Old background task", hidden: true }) as { taskId: string };
+  const other = await f.request({ kind: "create", requestKey: "other-work", title: "Unrelated background task", hidden: true }) as { taskId: string };
+  expect(tasks.backgroundTasks(extensionId).map(item => item.taskId)).toEqual([task.taskId]);
+
+  await writePackage("2.0.0", "worker-v2.js");
+  const failed = await resources.prepareUpdate(installed.id, { approvedByConnectionId: "connection-owner" });
+  await expect(resources.completePreparedMutation(failed, finalize => f.store.transaction(store => {
+    finalize(store);
+    throw new Error("Package receipt was rolled back.");
+  }))).rejects.toThrow("Package receipt was rolled back.");
+  expect(tasks.backgroundTasks(extensionId).map(item => item.taskId)).toEqual([task.taskId]);
+  await expect(request({ kind: "get", taskId: task.taskId })).resolves.toMatchObject({ taskId: task.taskId });
+
+  const updated = await resources.update(installed.id, { approvedByConnectionId: "connection-owner" });
+  const replacement = [...resourceExtensionIds(updated)][0]!;
+  expect(updated.id).toBe(installed.id);
+  expect(replacement).toBeDefined();
+  expect(replacement).not.toBe(extensionId);
+  expect(f.store.listSessions({ excludeHidden: true }).map(item => item.descriptor.id)).toEqual([task.taskId]);
+  expect(f.store.getSession(other.taskId).descriptor.hidden).toBe(true);
+  expect(tasks.backgroundTasks(replacement)).toEqual([]);
+  const installation = tasks.installation(replacement, installed.id);
+  expect(installation).toBe(owner.installation);
+  await expect(request({ kind: "get", taskId: task.taskId }, { ...owner, extensionId: replacement, installation })).rejects.toThrow();
 });
 it("rejects another installation, invalid model tuning, stale settings and hidden declaration escalation", async () => {
   const f = await fixture(), prefs = f.tasks.preferences(f.extensionId);

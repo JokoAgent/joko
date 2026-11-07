@@ -1,13 +1,14 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide-react";
-import { createConnectionFetch, ExtensionSettingsRejected, extensionSettingsReadOnly } from "@joko/connection-transport";
+import { createConnectionFetch, ExtensionSettingsRejected, extensionSettingsReadOnly, readExtensionLibraryVideo } from "@joko/connection-transport";
 import { parseExtensionSettingsBridgeRequest, type ExtensionSettingsDirectoryChoice } from "@joko/contracts";
 import { ExtensionSettingsDirectoryDialog } from "./ExtensionSettingsDirectoryDialog.js";
 import { sameExtensionSettingsOperation, type PendingExtensionSettingsOperation } from "../extension-settings-operation.js";
 import { mountIsolatedSurface } from "../isolated-surface.js";
 import { bindExtensionSurfaceResources } from "../extension-main-view-resource-bridge.js";
 import { bindExtensionViewClose, registerExtensionPageClose } from "../extension-view-lifecycle.js";
+import { isLoopbackHostname } from "../connection-origin.js";
 
 import type { AppController } from "../controller.js";
 import type {
@@ -15,6 +16,7 @@ import type {
   ExtensionLibraryCallView,
   ExtensionLibraryCallResultView,
   ExtensionLibrarySessionView,
+  ExtensionLibrarySourceMatch,
   ExtensionMainViewSurfaceView,
   ExtensionSettingsApi
 } from "../model.js";
@@ -73,6 +75,7 @@ export function ExtensionMainViewPage({
   const frameRef = useRef<HTMLIFrameElement>(null);
   const libraryRef = useRef<{ readonly surfaceId: string; readonly extensionRevision: bigint; readonly session: ExtensionLibrarySessionView } | undefined>(undefined);
   const libraryOpeningRef = useRef<{ readonly surfaceId: string; readonly extensionRevision: bigint; readonly promise: Promise<ExtensionLibrarySessionView> } | undefined>(undefined);
+  const libraryVideo = useRef<((path: string, maximumBytes: number, signal: AbortSignal) => Promise<Blob>) | undefined>(undefined);
   const bridgeEpoch = useRef(0);
   const closeGuard = useRef<() => Promise<boolean>>(async () => true);
   const settingsApi = useRef<ExtensionSettingsApi | undefined>(undefined);
@@ -185,24 +188,23 @@ export function ExtensionMainViewPage({
   useEffect(() => {
     if (state.phase !== "ready") return undefined;
     const expected = state.surface;
+    const abort = new AbortController();
+    let probing = false;
     const timer = window.setInterval(() => {
+      if (probing || (!settings && ownerDocument.visibilityState === "hidden")) return;
       const request = requestRevision.current;
-      void controller.getExtensionMainViewSurface(expected.id).then((current) => {
-        if (request !== requestRevision.current || surfaceRef.current?.id !== expected.id) return;
-        if (!sameExtensionMainViewSurface(expected, current)) {
-          releaseSurface(expected);
-          setState({ phase: "revoked", extension: state.extension });
-          setFrameLoaded(false);
-        }
+      probing = true;
+      void controller.getExtensionMainViewSurface(expected.id, abort.signal, settings ? undefined : true).then((current) => {
+        if (!sameExtensionMainViewSurface(expected, current)) throw new Error("Extension main view changed.");
       }).catch(() => {
-        if (request !== requestRevision.current || surfaceRef.current?.id !== expected.id) return;
+        if (abort.signal.aborted || request !== requestRevision.current || surfaceRef.current?.id !== expected.id) return;
         releaseSurface(expected);
         setState({ phase: "revoked", extension: state.extension });
         setFrameLoaded(false);
-      });
+      }).finally(() => { probing = false; });
     }, 15_000);
-    return () => window.clearInterval(timer);
-  }, [controller, releaseSurface, state]);
+    return () => { abort.abort(); window.clearInterval(timer); };
+  }, [controller, ownerDocument, releaseSurface, settings, state]);
 
   const surfaceUrl = useMemo(() => {
     if (state.phase !== "ready") return undefined;
@@ -237,6 +239,10 @@ export function ExtensionMainViewPage({
     try { fetcher = profile === undefined ? undefined : createConnectionFetch(profile); } catch { failed(); return () => abort.abort(); }
     const resourceRoot = new URL(state.surface.endpoint.slice(0, state.surface.endpoint.lastIndexOf("/") + 1), profile?.origin ?? window.location.origin).href;
     const disposeResources = fetcher === undefined ? () => {} : bindExtensionSurfaceResources(frame, { resourceRoot, fetch: fetcher,
+      readLibraryVideo: (path, maximumBytes, signal) => {
+        if (settings || state.extension.library === undefined || !libraryVideo.current) throw new Error("Extension Library video is unavailable.");
+        return libraryVideo.current(path, maximumBytes, signal);
+      },
       signal: abort.signal, current, navigate: url => { if (current()) { closeLibrary(); setFrameLoaded(false); setFrameEndpoint(new URL(url).pathname + new URL(url).hash); setFrameRevision(value => value + 1); } } });
     const document = (async () => {
       if (profile === undefined || new URL(surfaceUrl).origin !== new URL(profile.origin).origin) throw new Error("Extension surface endpoint changed.");
@@ -249,7 +255,7 @@ export function ExtensionMainViewPage({
     })();
     const dispose = mountIsolatedSurface(frame, document, { signal: abort.signal, failed, bootstrapBaseUrl: window.location.href });
     return () => { abort.abort(); disposeResources(); dispose(); };
-  }, [closeLibrary, controller, frameRevision, releaseSurface, state, surfaceUrl, ownerDocument]);
+  }, [closeLibrary, controller, frameRevision, releaseSurface, state, surfaceUrl, ownerDocument, settings]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -269,11 +275,12 @@ export function ExtensionMainViewPage({
     const epoch = ++bridgeEpoch.current;
     const abort = new AbortController();
     const pending = new Set<string>();
+    const profile = controller.state.activeProfile;
     const desktopLibrary = window.jokoDesktop?.capabilities.includes("extension.libraryGestures") === true
       ? window.jokoDesktop.extensionLibraries
       : undefined;
     const current = (): boolean => bridgeEpoch.current === epoch && surfaceRef.current?.id === state.surface.id
-      && frameRef.current === frame && frame.isConnected;
+      && frameRef.current === frame && frame.isConnected && liveOwnerRef.current === controllerOwner && !abort.signal.aborted;
     const ensureLibrary = async (): Promise<ExtensionLibrarySessionView> => {
       const existing = libraryRef.current;
       if (existing?.surfaceId === state.surface.id && existing.extensionRevision === state.extension.revision
@@ -302,10 +309,12 @@ export function ExtensionMainViewPage({
     };
     const callLibrary = async (
       session: ExtensionLibrarySessionView,
-      call: ExtensionLibraryCallView
+      call: ExtensionLibraryCallView,
+      source?: ExtensionLibrarySourceMatch
     ): Promise<ExtensionLibraryCallResultView> => {
       try {
-        return await controller.callExtensionLibrary(session.id, call, abort.signal);
+        return await (source === undefined ? controller.callExtensionLibrary(session.id, call, abort.signal)
+          : controller.callExtensionLibrary(session.id, call, abort.signal, source));
       } catch (error) {
         if (libraryRef.current?.session.id === session.id) {
           libraryRef.current = undefined;
@@ -314,6 +323,18 @@ export function ExtensionMainViewPage({
         throw error;
       }
     };
+    const readVideo = async (path: string, maximumBytes: number, signal: AbortSignal): Promise<Blob> => {
+      const lifetime = AbortSignal.any([signal, abort.signal]);
+      lifetime.throwIfAborted();
+      const session = await ensureLibrary();
+      const result = await readExtensionLibraryVideo(path, maximumBytes, async (call, source) => {
+        if (!current() || libraryRef.current?.session.id !== session.id) throw new Error("Extension Library bridge was revoked.");
+        return callLibrary(session, call, source);
+      }, lifetime);
+      if (!current() || libraryRef.current?.session.id !== session.id) throw new Error("Extension Library bridge was revoked.");
+      return new Blob([...result.chunks], { type: result.mimeType });
+    };
+    libraryVideo.current = readVideo;
     const liveRoot = async (session: ExtensionLibrarySessionView): Promise<string> => {
       const overview = await controller.getExtensionLibraryOverview(state.extension.id, state.extension.revision, abort.signal);
       if (overview.state === "unavailable" || overview.location === undefined
@@ -335,6 +356,10 @@ export function ExtensionMainViewPage({
       if (!current() || event.source !== frame.contentWindow || event.origin !== "null") return;
       const request = parseExtensionLibraryBridgeRequest(event.data);
       if (request === undefined || pending.has(request.id)) return;
+      if (request.command.kind === "oversizedClipboardWrite") {
+        respond(request.id, { ok: false, error: { code: "TOO_LARGE", message: "Extension Library clipboard PNG exceeds the size limit." } });
+        return;
+      }
       pending.add(request.id);
       void (async () => {
         if (request.command.kind === "capabilities") {
@@ -373,28 +398,53 @@ export function ExtensionMainViewPage({
         }
         if (request.command.kind === "saveAs") {
           if (desktopLibrary === undefined) throw new Error("Extension Library native gestures are unavailable.");
-          const stat = await callLibrary(session, { kind: "stat", path: request.command.path });
-          if (stat.kind !== "stat" || stat.entry.kind !== "file") throw new Error("Extension Library save requires a file.");
+          const { path, name } = request.command;
+          let tag: string | undefined;
+          const stat = await callLibrary(session, { kind: "stat", path }, { tag: "*", capture: value => { tag = value; } });
+          if (tag === undefined || stat.kind !== "stat" || stat.entry.kind !== "file" || stat.entry.path !== path) {
+            throw new Error("Extension Library save requires an exact file.");
+          }
+          const source = { tag }, totalBytes = stat.entry.bytes;
+          const local = profile?.managedLocal === true || profile !== undefined
+            && (profile.transportKind === undefined || profile.transportKind === "https")
+            && isLoopbackHostname(new URL(profile.origin).hostname);
+          const localRoot = local ? await liveRoot(session) : undefined;
+          const assertSaveCurrent = () => {
+            if (!current() || libraryRef.current?.session.id !== session.id) throw new Error("Extension Library bridge was revoked.");
+          };
+          assertSaveCurrent();
           const selection = await desktopLibrary.beginSave({
             extensionId: state.extension.id,
-            name: request.command.name ?? request.command.path.split("/").at(-1)!
+            name: name ?? path.split("/").at(-1)!
           });
           if (selection.cancelled) return { cancelled: true };
           let committed = false;
           try {
-            if (!current() || libraryRef.current?.session.id !== session.id) throw new Error("Extension Library bridge was revoked.");
-            const verified = await callLibrary(session, { kind: "stat", path: request.command.path });
-            if (verified.kind !== "stat" || verified.entry.kind !== "file") throw new Error("Extension Library save source changed.");
-            const root = await liveRoot(session);
-            if (!current() || libraryRef.current?.session.id !== session.id) throw new Error("Extension Library bridge was revoked.");
+            assertSaveCurrent();
             const bytes = await desktopLibrary.commitSave({
               extensionId: state.extension.id,
               ticketId: selection.ticketId,
-              root,
-              path: request.command.path
+              totalBytes: Number(totalBytes),
+              ...(localRoot === undefined ? {} : { localRoot })
+            }, {
+              read: async (offset, length) => {
+                assertSaveCurrent();
+                const chunk = await callLibrary(session, { kind: "read", path, offset: BigInt(offset), length: BigInt(length) }, source);
+                assertSaveCurrent();
+                if (chunk.kind !== "read" || chunk.path !== path || chunk.content.byteLength !== length) throw new Error("Extension Library save source changed.");
+                return chunk.content;
+              },
+              verify: async () => {
+                assertSaveCurrent();
+                const verified = await callLibrary(session, { kind: "stat", path }, source);
+                assertSaveCurrent();
+                if (verified.kind !== "stat" || verified.entry.path !== path || verified.entry.kind !== "file" || verified.entry.bytes !== totalBytes) {
+                  throw new Error("Extension Library save source changed.");
+                }
+              }
             });
             committed = true;
-            return { cancelled: false, path: request.command.path, bytes };
+            return { cancelled: false, path, bytes };
           } finally {
             if (!committed) void desktopLibrary.cancelSave(selection.ticketId).catch(() => undefined);
           }
@@ -418,10 +468,11 @@ export function ExtensionMainViewPage({
       bridgeEpoch.current += 1;
       abort.abort();
       pending.clear();
+      if (libraryVideo.current === readVideo) libraryVideo.current = undefined;
       bridgeWindow.removeEventListener("message", onMessage);
       closeLibrary();
     };
-  }, [closeLibrary, controller, frameRevision, state, surfaceUrl, ownerDocument, settings]);
+  }, [closeLibrary, controller, controllerOwner, frameRevision, state, surfaceUrl, ownerDocument, settings]);
 
   useEffect(() => {
     const frame = frameRef.current, api = settingsApi.current, sourceWindow = ownerDocument.defaultView;
@@ -620,6 +671,9 @@ function libraryBridgeFailure(cause: unknown): { readonly code: string; readonly
   if (cause instanceof DOMException && cause.name === "AbortError") {
     return { code: "CANCELLED", message: "Extension Library operation was cancelled." };
   }
+  if (cause && typeof cause === "object" && "code" in cause && cause.code === "RATE_LIMITED") {
+    return { code: "RATE_LIMITED", message: "Extension Library clipboard requests are too frequent." };
+  }
   if (!(cause instanceof ConnectError)) {
     return { code: "INTERNAL", message: "Extension Library operation failed." };
   }
@@ -666,6 +720,7 @@ export function sameExtensionMainViewSurface(left: ExtensionMainViewSurfaceView,
     && left.owner.resourceId === right.owner.resourceId && left.owner.resourceRevision === right.owner.resourceRevision
     && left.owner.discoveredRevision === right.owner.discoveredRevision && left.backendId === right.backendId
     && left.backendRevision === right.backendRevision && left.backendGeneration === right.backendGeneration
-    && left.expiresAt === right.expiresAt && left.title === right.title && left.icon === right.icon
+    && (left.purpose === undefined ? right.expiresAt >= left.expiresAt : left.expiresAt === right.expiresAt)
+    && left.title === right.title && left.icon === right.icon
     && left.purpose === right.purpose && left.mobileSettings === right.mobileSettings;
 }

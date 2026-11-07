@@ -4618,7 +4618,8 @@ export class OperationalStore {
         const goalCount = this.database.prepare(`
           SELECT COUNT(*) AS count FROM collaboration_workers
           WHERE goal_id = ? AND status <> 'archived'
-        `).get(goal.id) as Row;
+            AND (? = 0 OR (runtime_released = 0 AND status <> 'stopped'))
+        `).get(goal.id, input.goalLimitCountsRuntimes === true ? 1 : 0) as Row;
         if (numberValue(goalCount["count"]) >= goal.maximumWorkers) {
           throw new StoreError(`Collaboration Goal ${goal.id} reached its worker limit.`);
         }
@@ -10531,6 +10532,38 @@ export class OperationalStore {
         options.traceId ?? `queue:${id}:dispatching`
       );
       return item;
+    });
+  }
+
+  /** The dispatcher has a definite pre-send rejection for this exact system
+   * steer. Keep the admitted input and record a fresh Attempt for its prompt. */
+  requeueInactiveSteer(claim: QueueItemRecord, error: PublicError): boolean {
+    return this.write(() => {
+      const item = this.getQueueItem(claim.id);
+      if (item.state !== "dispatching" || item.disposition !== "steer"
+        || item.revision !== claim.revision || item.attemptId === undefined
+        || item.attemptId !== claim.attemptId || item.backendInstanceGeneration === undefined) return false;
+      const run = this.getRun(item.runId).descriptor;
+      const attempt = this.getAttempt(item.attemptId).descriptor;
+      const session = this.getSession(item.sessionId);
+      if (run.source !== "system" || run.state !== "queued" || run.activeAttemptId !== attempt.id
+        || attempt.runId !== item.runId || attempt.endedAt !== undefined
+        || attempt.generation !== session.descriptor.binding.generation
+        || attempt.backendInstanceGeneration !== item.backendInstanceGeneration
+        || this.getBackend(session.descriptor.backendId).descriptor.instanceGeneration !== item.backendInstanceGeneration) return false;
+      const body: PromptInput = { ...item.body, disposition: "prompt" };
+      const at = this.now();
+      const attemptId = `attempt-${randomUUID()}`;
+      this.finishAttempt(attempt.id, error, at);
+      this.createAttempt({ id: attemptId, runId: item.runId, ordinal: attempt.ordinal + 1,
+        generation: attempt.generation, startedAt: at });
+      this.database.prepare(`
+        UPDATE queue_items SET state = 'accepted', disposition = 'prompt', attempt_id = ?,
+          backend_instance_generation = NULL, dispatched_at = NULL, body_hash = ?, body_json = ?,
+          updated_at = ?, revision = ? WHERE id = ?
+      `).run(attemptId, operationBodyHash(body), serializeJson(body), at, asSqlInteger(this.requireActiveRevision()), item.id);
+      this.appendQueueEvent(this.getQueueItem(item.id), session, `dispatch:${item.id}:steer-fallback`);
+      return true;
     });
   }
 

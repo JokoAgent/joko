@@ -145,6 +145,30 @@ describe("ExtensionMainViewManager", () => {
       await expect(f.manager.getSurface(other.id, "connection-b")).resolves.toMatchObject({ id: other.id });
     } finally { await f.manager.close(); }
   });
+  it("extends only the current visible surface and keeps its original document alive past the first deadline", async () => {
+    let now = 1_000_000;
+    const revoked = vi.fn(), f = await fixture({ now: () => now, ttlMs: 10_000, onSurfaceRevoked: revoked });
+    try {
+      const first = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
+      const legacy = await f.manager.open({ authority, connectionId: "connection-b", assertAuthorityCurrent: () => undefined });
+      now += 9_000;
+      await expect(f.manager.getSurface(first.id, "connection-b", "visible")).rejects.toMatchObject({ statusCode: 404 });
+      await expect(f.manager.getSurface(first.id, "connection-a", "visible", AbortSignal.abort())).rejects.toMatchObject({ name: "AbortError" });
+      await expect(f.manager.getSurface(first.id, "connection-a")).resolves.toEqual(first);
+      await expect(f.manager.getSurface(legacy.id, "connection-b")).resolves.toEqual(legacy);
+      const renewed = await f.manager.getSurface(first.id, "connection-a", "visible");
+      expect(renewed).toEqual({ ...first, expiresAt: now + 10_000 });
+
+      now = first.expiresAt + 1;
+      const [, surfaceId, token, entry] = /main-views\/([^/]+)\/([^/]+)\/(.+)$/u.exec(first.endpoint)!;
+      await expect(f.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "GET" })).resolves.toMatchObject({ status: 200 });
+      await expect(f.manager.getSurface(legacy.id, "connection-b", "visible")).rejects.toMatchObject({ statusCode: 404 });
+      expect(revoked).toHaveBeenCalledExactlyOnceWith(legacy.id, "connection-b");
+      f.setCurrent(false);
+      await expect(f.manager.getSurface(first.id, "connection-a", "visible")).rejects.toMatchObject({ statusCode: 410 });
+      expect(revoked).toHaveBeenLastCalledWith(first.id, "connection-a");
+    } finally { await f.manager.close(); }
+  });
   it("allows independent surfaces only on the exact declared multiple-view generation", async () => {
     const f = await fixture(), multi = { ...authority, mainView: { ...authority.mainView, open: "sidebar" as const, side: "left" as const, multiple: true as const } };
     f.setSurfaceManifest(multi.mainView);
