@@ -281,6 +281,11 @@ export class ExtensionNetwork {
         current();
         const headers: Record<string, string> = {};
         for (const name of RESPONSE_HEADERS) { const value = response.headers.get(name); if (value !== null) headers[name] = scrub(value); }
+        if (asMedia && response.ok && contentType === "text/plain" && sniffMediaMime(read.bytes, contentType)) {
+          if (read.truncated) return { ok: false, message: "The media response exceeded the 50 MiB limit for text responses." };
+          const media = await this.options.media!.ingest(scope.task!, read.bytes, contentType, current); current();
+          return { ok: true, status: response.status, headers, media: { ...media, bytes: read.bytes.byteLength } };
+        }
         return { ok: true, status: response.status, headers, body: scrub(new TextDecoder().decode(read.bytes)), ...(read.truncated ? { truncated: true } : {}) };
       }
       throw new Error();
