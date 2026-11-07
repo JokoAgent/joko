@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +19,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
-import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import { CredentialManager } from "./credential-manager.js";
+import { CredentialVault } from "./credential-vault.js";
+import { MAKER_MEMORY_PROVIDER_ID, MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import { McpRouter } from "./mcp-router.js";
 import { SessionHost } from "./session-host.js";
 
 const owner = {
@@ -31,6 +35,58 @@ const owner = {
 };
 
 describe("Connect Maker Memory owner and reset scopes", () => {
+  it("keeps two existing curated memory grants when the owner turns off only Pi digests", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-memory-digest-preference-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const host = new SessionHost(store, {} as never, []);
+    const refresh = vi.fn(async () => undefined);
+    const memory = new MakerMemoryController({ store, onSettingsChanged: refresh });
+    const vault = await CredentialVault.open(join(root, "vault.key"));
+    const credentials = new CredentialManager({ vault, storagePath: join(root, "credentials.json") });
+    const router = new McpRouter({ store, credentials });
+    try {
+      await credentials.initialize();
+      await router.initialize();
+      router.registerBridgeToolProvider(new MakerMemoryBridgeProvider(memory));
+      const connection = store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+      store.upsertBackend({
+        id: "pi", displayName: "Pi", version: "test", adapterKind: "pi", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "not_required",
+        capabilities: new Map([["memory.compaction_digest", { key: "memory.compaction_digest", supported: true }]]),
+        models: [], tools: [], diagnostics: []
+      });
+      const targetId = "memory-workspace";
+      store.upsertTarget({ id: targetId, backendId: "pi", displayName: "Workspace", workspaceRoot: root, trusted: true, managed: false });
+      const entry = memory.write(targetId, { kind: "project", name: "report-style", title: "Report style", description: "Stable preference", body: "Keep reports concise." });
+      const readers = ["first", "second"].map(sessionId => {
+        store.createSession({ id: sessionId, backendId: "pi", targetId, title: sessionId, binding: { opaqueRef: sessionId, generation: 1 },
+          pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+        const bridge = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId, targetId, expectedPiGeneration: 1 });
+        return () => router.executeBridgeCall({ authorization: `Bearer ${bridge.mcpBridge.token}`, requestId: randomUUID(), sessionId, targetId,
+          generation: 1, serverId: MAKER_MEMORY_PROVIDER_ID, toolName: "memory_read", arguments: { entry_id: entry.id } });
+      });
+      const readOriginal = async (): Promise<void> => {
+        for (const read of readers) await expect(read()).resolves.toMatchObject({ isError: false,
+          details: { mcpStructuredContent: { entry: { id: entry.id, body: entry.body } } } });
+      };
+      await readOriginal();
+      const services = createConnectServices(stubApplication({ store, makerMemory: memory, sessionHost: host, connections: { authenticate: () => connection } }));
+      await submitMemoryUpdate(services.operation.submitOperation, { operationId: "disable-pi-digests", connectionId: connection.id, backendId: "pi", backendEnabled: false });
+      expect(memory.enabledForBackend("pi")).toBe(false);
+      expect(refresh).toHaveBeenCalledOnce();
+      await readOriginal();
+
+      await submitMemoryUpdate(services.operation.submitOperation, { operationId: "disable-maker", connectionId: connection.id, makerEnabled: false });
+      for (const read of readers) await expect(read()).resolves.toMatchObject({ isError: true });
+    } finally {
+      await router.dispose();
+      await host.dispose();
+      memory.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("clears ordinary curated memory and digests while retaining Partner Home memory across restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-scoped-memory-reset-"));
     const database = join(root, "orchestrator.db");
