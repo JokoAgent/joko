@@ -10,6 +10,7 @@ import {
   DevicePeerWorkspaceLocationSchema,
   DevicePresenceState,
   RemoteDesktopCapabilitiesSchema,
+  RemoteDesktopClipboardContentRequestSchema,
   RemoteDesktopClipboardContentResultSchema,
   RemoteDesktopClipboardTextResultSchema,
   RemoteDesktopClipboardSyncResultSchema,
@@ -3189,6 +3190,33 @@ describe("MobileRemoteDesktopController", () => {
     expect(value.clipboardContent.mock.calls.map((call) => call[1].action.case))
       .toEqual(["begin", "write", "commit", "cancel"]);
     expect(controller.snapshot).toMatchObject({ clipboardBusy: false, clipboardNotice: "failed" });
+    await controller.close();
+  });
+
+  it("preserves an emoji crossing the rich paste chunk boundary through binary Connect", async () => {
+    const value = fixture(true, true);
+    const phone = clipboardFixture(true);
+    const transferId = "123e4567-e89b-12d3-a456-426614174000";
+    const text = "a".repeat(65_526) + "😀b";
+    const json = JSON.stringify({ text });
+    phone.readPortable.mockImplementationOnce(async check => { check(); return { text }; });
+    const received: { offset: number; data: string }[] = [];
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      const { action } = fromBinary(RemoteDesktopClipboardContentRequestSchema, toBinary(RemoteDesktopClipboardContentRequestSchema, request));
+      if (action.case === "begin") {
+        expect(action.value.length).toBe(json.length);
+        return create(RemoteDesktopClipboardContentResultSchema, { transferId });
+      }
+      if (action.case === "write") received.push(action.value);
+      return create(RemoteDesktopClipboardContentResultSchema, {});
+    });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, phone.clipboard);
+    await controller.open();
+    await controller.pasteFromPhone();
+
+    expect(received.map(({ offset, data }) => [offset, data.length])).toEqual([[0, 65_535], [65_535, json.length - 65_535]]);
+    expect(received.map(({ data }) => data).join("")).toBe(json);
+    expect(controller.snapshot.clipboardNotice).toBe("pasted");
     await controller.close();
   });
 

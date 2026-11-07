@@ -86,7 +86,7 @@ import type { MobileRemoteDesktopDisplayModePreferences } from "./mobile-remote-
 import type { MobileRemoteDesktopLockIdentity, MobileRemoteDesktopLockPreferences } from "./mobile-remote-desktop-lock-preference";
 import type { MobileRemoteDesktopClipboardSyncPreferences } from "./mobile-remote-desktop-clipboard-sync-preference";
 import type { MobileRemoteDesktopPrivacyIdentity, MobileRemoteDesktopPrivacyPreferences } from "./mobile-remote-desktop-privacy-preference";
-import { ClipboardSync, ClipboardSyncError, getClipboardSyncFailure,
+import { ClipboardSync, ClipboardSyncError, clipboardChunkEnd, getClipboardSyncFailure,
   type ClipboardSyncBaseline, type LocalClipboardReadCache } from "@joko/remote-desktop-sync";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
@@ -2349,17 +2349,19 @@ export class MobileRemoteDesktopController {
           this.#markClipboardProgress(context);
           transferId = validTransferId(started.transferId) ? started.transferId : undefined;
           if (!transferId) throw new MobileRemoteClipboardError("unsupported");
-          for (let offset = 0; offset < json.length; offset += MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS) {
+          for (let offset = 0; offset < json.length;) {
             this.#assertClipboardCurrent(context);
+            const end = clipboardChunkEnd(json, offset);
             await this.transport.clipboardContent(context.host,
               create(RemoteDesktopClipboardContentRequestSchema, {
                 leaseId: context.lease.leaseId,
                 controlGeneration: context.controlGeneration,
                 action: { case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, {
-                  transferId, offset, data: json.slice(offset, offset + MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS)
+                  transferId, offset, data: json.slice(offset, end)
                 }) }
               }), context.operation.request.signal);
             this.#markClipboardProgress(context);
+            offset = end;
           }
           this.#assertClipboardCurrent(context);
           // Commit atomically consumes the staged item before the host injects

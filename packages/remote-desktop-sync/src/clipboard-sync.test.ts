@@ -156,6 +156,7 @@ describe("clipboard sync", () => {
     });
     await expect(f.sync.tick()).rejects.toMatchObject({ reason: "unknown" });
     expect(f.remote.write.mock.calls.every(([, , data]) => data.length <= CLIPBOARD_SYNC_CHUNK_CHARS)).toBe(true);
+    expect(f.remote.write.mock.calls.map(([, , data]) => Buffer.from(data, "utf8").toString("utf8")).join("")).toBe(f.local());
     await f.sync.tick();
     expect(f.remote.commit).toHaveBeenCalledTimes(1);
     expect(f.remote.paste).toHaveBeenCalledTimes(1); expect(f.transfers.size).toBe(0);

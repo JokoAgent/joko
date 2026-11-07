@@ -3,6 +3,13 @@ import { ClipboardSyncError } from "./clipboard-sync-failure.js";
 export const CLIPBOARD_SYNC_CHUNK_CHARS = 64 * 1_024;
 export const CLIPBOARD_SYNC_MAX_CHARS = 32 * 1_024 * 1_024;
 
+export function clipboardChunkEnd(json: string, offset: number): number {
+  const end = Math.min(json.length, offset + CLIPBOARD_SYNC_CHUNK_CHARS);
+  // Each chunk becomes its own UTF-8 protobuf string. Keep a surrogate pair together.
+  const before = json.charCodeAt(end - 1), after = json.charCodeAt(end);
+  return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff ? end - 1 : end;
+}
+
 export interface ClipboardSyncRemote {
   version(): Promise<string>;
   copy(version: string, inline: boolean): Promise<{ readonly length: number; readonly id?: string; readonly data?: string }>;
@@ -119,9 +126,11 @@ export class ClipboardSync {
         id = await this.deps.remote.begin(json.length, remote);
         this.check();
         if (typeof id !== "string" || !id) throw new ClipboardSyncError("unsupported");
-        for (let offset = 0; offset < json.length; offset += CLIPBOARD_SYNC_CHUNK_CHARS) {
+        for (let offset = 0; offset < json.length;) {
           this.check();
-          await this.deps.remote.write(id, offset, json.slice(offset, offset + CLIPBOARD_SYNC_CHUNK_CHARS));
+          const end = clipboardChunkEnd(json, offset);
+          await this.deps.remote.write(id, offset, json.slice(offset, end));
+          offset = end;
         }
         if ((await this.deps.localVersion()) !== local) throw new ClipboardSyncError("changed");
         this.check();
