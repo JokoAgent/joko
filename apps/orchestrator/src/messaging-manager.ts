@@ -3082,12 +3082,24 @@ export class MessagingManager {
     const request = this.#store.findMessagingInboundRequest(requestId);
     if (!request?.conversationId || !request.runId) return;
     const connection = this.#store.findMessagingConnection(request.connectionId), conversation = this.#store.findMessagingConversation(request.conversationId);
+    const run = this.#store.findRun(request.runId)?.descriptor;
     if (!connection?.enabled || !["telegram", "discord"].includes(connection.channel) || connection.generation !== request.channelGeneration
       || conversation?.status !== "active" || conversation.connectionId !== connection.id || conversation.channelGeneration !== connection.generation
-      || !conversation.sessionId || this.#store.findRun(request.runId)?.descriptor.sessionId !== conversation.sessionId
+      || !conversation.sessionId || run === undefined || run.sessionId !== conversation.sessionId
       || this.#store.getSession(conversation.sessionId).descriptor.binding.generation !== conversation.sessionGeneration
-      || request.attemptId !== undefined && this.#store.getAttempt(request.attemptId).descriptor.generation !== conversation.sessionGeneration
       || delivery && (delivery.connectionId !== connection.id || delivery.channelGeneration !== connection.generation || delivery.conversationId !== conversation.id)) return;
+    const admitted = request.attemptId === undefined ? undefined : this.#store.getAttempt(request.attemptId).descriptor;
+    if (admitted && admitted.generation !== conversation.sessionGeneration) {
+      // Cold activation may renew the original accepted Queue before dispatch.
+      if (conversation.partnerId !== undefined || request.queueItemId === undefined
+        || admitted.runId !== run.id || admitted.endedAt === undefined) return;
+      const queue = this.#store.getQueueItem(request.queueItemId);
+      if (queue.sessionId !== conversation.sessionId || queue.runId !== run.id || queue.operationId !== request.operationId
+        || queue.body.messagingOrigin !== undefined || queue.attemptId === undefined || queue.attemptId !== run.activeAttemptId) return;
+      const attempt = this.#store.getAttempt(queue.attemptId).descriptor;
+      if (attempt.runId !== run.id || attempt.ordinal <= admitted.ordinal || attempt.generation <= admitted.generation
+        || attempt.generation !== conversation.sessionGeneration) return;
+    }
     return { request, connection, conversation };
   }
 
