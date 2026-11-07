@@ -602,7 +602,7 @@ describe("MessagingManager", () => {
   });
 
   it("runs WeChat commands through one peer's durable task and keeps the previous task on /new", async () => {
-    const commands = ["/new", "/permission auto", "/status", "/stop all"];
+    const commands = ["/new", "/permission auto", "/permission AcCePtEdItS", "/permission bypassPermissions", "/status", "/stop all"];
     const batch = weChatDirectBatch();
     const transport = new FakeWeChatTransport({
       ...batch,
@@ -622,7 +622,7 @@ describe("MessagingManager", () => {
       ...PI_LIKE_PROFILE,
       capabilities: [
         ...PI_LIKE_PROFILE.capabilities.map((capability) => capability.key === "permission.modes"
-          ? { key: "permission.modes", supported: true, options: ["ask", "auto", "bypassPermissions"] }
+          ? { key: "permission.modes", supported: true, options: ["ask", "acceptEdits", "auto", "bypassPermissions"] }
           : capability),
         { key: "permission.change", supported: true }
       ]
@@ -656,16 +656,20 @@ describe("MessagingManager", () => {
     const taskIds = fixture.store.listSessions().map((session) => session.descriptor.id);
     expect(taskIds).toContain(conversation.sessionId);
     expect(taskIds).toHaveLength(2);
+    expect(fixture.store.getSession(conversation.sessionId!).descriptor.permissionMode).toBe("acceptEdits");
+    expect(fixture.store.getSession(taskIds.find((id) => id !== conversation.sessionId)!).descriptor.permissionMode).toBe("ask");
     expect(transport.sentText.map((entry) => entry.text)).toEqual([
       expect.stringContaining("new conversation is ready"),
       expect.stringContaining("Permission changed to auto"),
+      "Permission changed to acceptEdits.",
+      expect.stringContaining("Current permission: acceptEdits. Available: ask, acceptEdits, auto, bypassPermissions."),
       expect.stringContaining("pending task"),
       expect.stringContaining("Only the connected account")
     ]);
     expect(transport.sentText.every((entry) => entry.context?.contextToken.startsWith("private-command-")))
       .toBe(true);
     expect(fixture.store.listMessagingInteractions({ connectionId: enabled.id, limit: 20 })
-      .map((interaction) => interaction.status)).toEqual(["completed", "completed", "completed", "completed"]);
+      .map((interaction) => interaction.status)).toEqual(commands.map(() => "completed"));
   });
 
   it("refreshes WeChat typing and persists bounded progress notices until the run settles", async ({ signal, onTestFailed, onTestFinished }) => {
