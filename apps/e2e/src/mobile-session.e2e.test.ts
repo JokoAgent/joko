@@ -587,11 +587,11 @@ describe("native mobile device through the durable product chain", () => {
     changed = await mutateSession(pinMutation(sessionId, true));
     expect(changed.sessions.find((item) => item.sessionId === sessionId)?.pinned).toBe(true);
     changed = await mutateSession(archiveMutation(sessionId, true));
-    expect(changed.sessions.find((item) => item.sessionId === sessionId)?.archived).toBe(true);
+    expect(changed.sessions.find((item) => item.sessionId === sessionId)).toMatchObject({ archived: true, pinned: false });
     expect((await search(SessionMessageSearchSessionStatus.ACTIVE)).matches.some((match) => match.sessionId === sessionId)).toBe(false);
     expect((await search(SessionMessageSearchSessionStatus.ARCHIVED)).matches.some((match) => match.sessionId === sessionId)).toBe(true);
     changed = await mutateSession(archiveMutation(sessionId, false));
-    expect(changed.sessions.find((item) => item.sessionId === sessionId)?.archived).toBe(false);
+    expect(changed.sessions.find((item) => item.sessionId === sessionId)).toMatchObject({ archived: false, pinned: false });
 
     const deleteNative = vi.spyOn(fixture.adapter(), "deleteSession");
     changed = await mutateSession(deleteMutation(sessionId));

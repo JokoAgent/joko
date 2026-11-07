@@ -752,23 +752,28 @@ describe("Sidebar organizer display controls", () => {
     expect(secondChange).not.toHaveBeenCalled();
   });
 
-  it("keeps archived pinned tasks in the independent pinned section", async () => {
-    const rendered = await renderSidebar({ ...DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, status: "archived" }, vi.fn(), {
+  it("shows archived tasks from a pinned project only under the matching status", async () => {
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
       snapshot: {
         ...emptySnapshot(),
         revision: 1n,
         server: { name: "Orchestrator", version: "test", health: "healthy" },
         backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", capabilities: new Map() }],
-        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+        targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: true, archived: false }],
         sessions: [
           { ...session(), id: "archived-pinned", pinned: true, archived: true },
           { ...session(), id: "archived-main", pinned: false, archived: true }
         ]
       }
     });
-    expect(rendered.container.querySelector(".session-section--pinned [data-session-id='archived-pinned']")).not.toBeNull();
+    expect(rendered.container.querySelector("[data-session-id='archived-pinned']")).toBeNull();
+    expect(rendered.container.querySelector("[data-session-id='archived-main']")).toBeNull();
+
+    await rendered.rerender({ ...DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, status: "archived" });
+    expect(rendered.container.querySelector(".session-section--pinned [data-session-id='archived-pinned']")).toBeNull();
     expect(rendered.container.querySelector(".sidebar-main-view [data-session-id='archived-main']")).not.toBeNull();
-    expect(rendered.container.querySelector(".sidebar-main-view [data-session-id='archived-pinned']")).toBeNull();
+    const legacy = required(rendered.container.querySelector(".sidebar-main-view [data-session-id='archived-pinned']"));
+    expect(legacy.querySelector(".session-row__pin")).toBeNull();
   });
 
   it("keeps remote expanded and rail views on the same fail-closed content filters", async () => {
@@ -791,7 +796,7 @@ describe("Sidebar organizer display controls", () => {
           { id: "remote-fresh", name: "Fresh", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: now - 1_000 },
           { id: "remote-old", name: "Old", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: now - 60 * 86_400_000 },
           { id: "remote-pinned", name: "Pinned", state: "idle", pinned: true, archived: false, taskTags: [], lastActivityAt: now - 60 * 86_400_000 },
-          { id: "remote-archived", name: "Archived", state: "idle", pinned: false, archived: true, taskTags: [], lastActivityAt: now - 1_000 }
+          { id: "remote-archived", name: "Archived", state: "idle", pinned: true, archived: true, taskTags: [], lastActivityAt: now - 1_000 }
         ]
       }],
       selection: "all",
@@ -827,6 +832,7 @@ describe("Sidebar organizer display controls", () => {
     await rendered.rerender({ ...DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, status: "all", lastActivity: "all" });
     expect(new Set([...rendered.container.querySelectorAll<HTMLElement>(".session-row--remote [data-session-id]")].map((element) => element.dataset.sessionId)))
       .toEqual(new Set(["remote-fresh", "remote-old", "remote-pinned", "remote-archived"]));
+    expect(rendered.container.querySelector(".session-section--pinned [data-session-id='remote-archived']")).toBeNull();
   });
 
   it("groups by navigation project and exposes the complete project move submenu", async () => {
