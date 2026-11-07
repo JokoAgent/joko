@@ -1168,6 +1168,7 @@ export async function createOrchestratorApplication(
       host: () => sessionHostForHelperTools,
       messageSearch: () => messageSearchForHelperTools,
       canSendTaskMessage: (caller, targetSessionId) => canSendFollowUpTaskMessage(partnerStore, caller, targetSessionId),
+      isPartnerCanonicalTask: sessionId => partnerStore.findPartnerByCanonicalSession(sessionId) !== undefined,
       taskSenderPartner: sessionId => {
         const link = partnerStore.getSessionLink(sessionId);
         if (link?.role !== "canonical" && link?.role !== "routine") return undefined;

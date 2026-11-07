@@ -320,6 +320,10 @@ export class PartnerManager {
     return this.#store.findPartnerByHomeTarget(targetId);
   }
 
+  isCanonicalTask(sessionId: string): boolean {
+    return this.#store.findPartnerByCanonicalSession(sessionId) !== undefined;
+  }
+
   canonicalCaller(sessionId: string): PartnerProfileRecord {
     const partner = this.#store.findPartnerByCanonicalSession(sessionId);
     if (partner === undefined || partner.lifecycle !== "active" || partner.initializationState !== "ready"

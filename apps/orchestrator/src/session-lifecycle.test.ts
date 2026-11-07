@@ -8,6 +8,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import {
   OperationalStore,
+  PartnerStore,
   type ConnectionRecord,
   type OperationExecution
 } from "@joko/store";
@@ -15,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
+import { PartnerManager } from "./partner-manager.js";
 import { savePersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import type { SessionHost } from "./session-host.js";
 
@@ -26,6 +28,40 @@ afterEach(() => {
 });
 
 describe("durable task lifecycle cleanup", () => {
+  it("rejects generic archive before changing the original Partner task or closing its runtime", async () => {
+    const fixture = createFixture();
+    const profiles = new PartnerStore(":memory:");
+    cleanups.push(() => profiles.close());
+    const { worktree: _worktree, ...base } = fixture.store.getSession(fixture.sessionId).descriptor;
+    const session = { ...base, id: "partner-task", binding: { opaqueRef: "native/partner-task", generation: 1 } };
+    fixture.store.createSession(session);
+    const profile = profiles.createPartner({ requestId: "canonical-archive-partner", expectedDirectoryRevision: profiles.directoryState().revision,
+      displayName: "Partner", avatar: "orbit", identitySource: "Manage work through the Partner owner.",
+      homeTargetId: session.targetId, templateId: "general", usesDirectoryDefaults: false, capabilities: {
+        modelChain: [{ backendId: session.backendId, providerId: "provider", modelId: "model", fastMode: false }],
+        permissionMode: "ask", planMode: false
+      } });
+    const linked = profiles.bindCanonicalSession({ partnerId: profile.id, expectedRevision: profile.revision,
+      expectedProfileVersion: profile.profileVersion, sessionId: session.id });
+    const ready = profiles.markReady(profile.id, linked.revision);
+    const partners = new PartnerManager({ store: profiles, operationalStore: fixture.store, sessionHost: fixture.host,
+      homesRoot: join(fixture.directory, "homes"), workspaceService: { register: async input => input, unregister: () => undefined } });
+    const services = servicesFor(fixture, { partners });
+
+    await expect(services.operation.submitOperation(archiveRequest(fixture.connection.id, "denied-partner-archive", session.id), context()))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition, rawMessage: "Use Partner settings to archive this Partner." });
+    expect(fixture.store.findSessionLifecycleCleanup("denied-partner-archive")).toBeUndefined();
+    expect(fixture.prepareSessionLifecycleClose).not.toHaveBeenCalled();
+    expect(fixture.closeIfActive).not.toHaveBeenCalled();
+    expect(fixture.store.getSession(session.id).descriptor).toEqual(session);
+    expect(profiles.getPartner(profile.id)).toEqual(ready);
+
+    fixture.store.updateSession(session.id, { archived: true });
+    const restored = await services.operation.submitOperation(archiveRequest(fixture.connection.id, "restore-partner-task", session.id, false), context());
+    expect(restored.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+    expect(partners.canonicalCaller(session.id)).toEqual(ready);
+  });
+
   it("routes personal deletion through its owner after native retirement while preserving the original delete manifest", async () => {
     const fixture = createFixture(); personalPurpose(fixture);
     const settleSessionLifecycle = vi.fn(async (cleanup: ReturnType<OperationalStore["getSessionLifecycleCleanup"]>) => {
@@ -381,14 +417,14 @@ function deleteRequest(
   });
 }
 
-function archiveRequest(connectionId: string, operationId: string, sessionId: string) {
+function archiveRequest(connectionId: string, operationId: string, sessionId: string, archived = true) {
   return create(contract.SubmitOperationRequestSchema, {
     operationId,
     connectionId,
     mutation: create(contract.OperationMutationSchema, {
       payload: {
         case: "archiveSession",
-        value: create(contract.ArchiveSessionMutationSchema, { sessionId, archived: true })
+        value: create(contract.ArchiveSessionMutationSchema, { sessionId, archived })
       }
     })
   });

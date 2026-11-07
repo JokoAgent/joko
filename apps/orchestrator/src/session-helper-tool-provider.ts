@@ -419,6 +419,7 @@ export interface SessionHelperToolProviderOptions {
   readonly now?: () => number;
   readonly taskSenderPartner?: (sessionId: string) => Pick<TaskMessageOrigin, "senderPartnerId" | "senderPartnerName"> | undefined;
   readonly canSendTaskMessage?: (caller: SessionDescriptor, targetSessionId: string | undefined) => boolean;
+  readonly isPartnerCanonicalTask?: (sessionId: string) => boolean;
 }
 
 interface HistoryMessage {
@@ -475,6 +476,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
   readonly #now: () => number;
   readonly #taskSenderPartner: NonNullable<SessionHelperToolProviderOptions["taskSenderPartner"]>;
   readonly #canSendTaskMessage: NonNullable<SessionHelperToolProviderOptions["canSendTaskMessage"]>;
+  readonly #isPartnerCanonicalTask: NonNullable<SessionHelperToolProviderOptions["isPartnerCanonicalTask"]>;
   readonly #confirmationSecret = randomBytes(32);
 
   constructor(options: SessionHelperToolProviderOptions) {
@@ -484,6 +486,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     this.#now = options.now ?? Date.now;
     this.#taskSenderPartner = options.taskSenderPartner ?? (() => undefined);
     this.#canSendTaskMessage = options.canSendTaskMessage ?? (() => true);
+    this.#isPartnerCanonicalTask = options.isPartnerCanonicalTask ?? (() => false);
     if (SESSION_HELPER_NESTED_TOOLS.length !== 27) {
       throw new Error("The task helper catalog must expose exactly twenty-seven applicable nested tools.");
     }
@@ -1068,6 +1071,9 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
         throw new SessionHelperError("PRECONDITION_FAILED", `Task ${sessionId} is deleted.`);
       }
       this.#assertOwnerControlledTarget(sessionId);
+      if (archived && this.#isPartnerCanonicalTask(sessionId)) {
+        throw new SessionHelperError("PRECONDITION_FAILED", "Use Partner settings to archive this Partner.");
+      }
       return session;
     });
     const changed = this.#store.transaction((store) => current.map((session) =>
