@@ -6817,6 +6817,81 @@ describe("native mobile connection and operation ownership", () => {
       .toBe(phase === "first" ? "Private original first" : "Private original follow-up");
   });
 
+  it.each(["unchanged", "effort changed", "deleted", "deleted after advance", "temporarily absent", "missing receipt after advance"] as const)(
+    "recovers the original creation on the saved node when the task is %s", async condition => {
+      const network = fakeNetwork(), drafts = memoryDraftStores(), identity = { profileId: credential.profileId };
+      const remote = { ...otherCredential, origin: "http://192.168.1.21:4318", serverId: "node-2" };
+      const operationId = "original-task-create";
+      const deleted = condition === "deleted" || condition === "deleted after advance";
+      const missingReceipt = condition === "missing receipt after advance";
+      const absent = deleted || missingReceipt || condition === "temporarily absent";
+      const session = create(SessionSchema, { ...runtimeSession,
+        state: deleted ? SessionState.CLOSED : SessionState.IDLE,
+        model: { ...runtimeSession.model!, effortId: condition === "effort changed" ? "high" : "low" } });
+      const owner = create(SnapshotSchema, { ...runtimeControlProjection(session), sessions: absent ? [] : [session] });
+      const remoteSnapshot = create(SnapshotSchema, { ...snapshot, server: { ...snapshot.server!, serverId: remote.serverId },
+        connections: [otherConnection], devices: [otherDevice], sessions: [] });
+      vi.mocked(network.inspect).mockImplementation(async origin => origin === remote.origin ? { ...node, serverId: remote.serverId } : node);
+      vi.mocked(network.readOwner).mockImplementation(async value => value.serverId === remote.serverId
+        ? { connection: otherConnection, device: otherDevice, snapshot: remoteSnapshot } : { connection, device, snapshot: owner });
+      vi.mocked(network.readSession).mockImplementation(async value => value.serverId === remote.serverId ? remoteSnapshot : runtimeControlProjection(session, true));
+      vi.mocked(network.getOperation).mockImplementation(async (value, id) => !missingReceipt && value.serverId === credential.serverId && id === operationId
+        ? create(OperationSchema, { operationId: id, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+            result: { payload: { case: "session", value: session } } })
+        : undefined);
+      vi.mocked(network.submit).mockImplementation(async (value, id) => create(OperationSchema, {
+        operationId: id, connectionId: value.connectionId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "queueItem", value: create(QueueItemSchema, { queueItemId: id,
+          sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId }) } }
+      }));
+      await drafts.newTask.beginSubmission(identity, { targetId: session.targetId, name: "Original task", input: plainTextMobileComposerDraft("First input") }, {
+        connectionId: credential.connectionId, serverId: credential.serverId, backendId: session.backendId, targetRevision: "3",
+        model: { providerId: "alpha", modelId: "a", effortId: "low", fastMode: false }, createOperationId: operationId
+      });
+      await drafts.newTask.openConversation(identity, operationId);
+      drafts.newTask.saveConversationInput(identity, operationId, plainTextMobileComposerDraft("Unsent follow-up"));
+      await drafts.newTask.queueFollowUp(identity, operationId, "original-follow-up", plainTextMobileComposerDraft("Unsent follow-up"));
+      if (condition === "deleted after advance" || missingReceipt) {
+        await drafts.newTask.advanceToSending(identity, operationId, session.sessionId, 8n);
+      }
+      const storage = memoryStorage([credential, remote], remote.profileId);
+      const app = client(network, storage.storage, undefined, undefined, () => "original-first-send", undefined, drafts);
+      await app.start();
+      expect(app.state.activeProfileId).toBe(remote.profileId);
+      expect(network.getOperation).not.toHaveBeenCalled();
+      await app.connectSaved(credential.profileId);
+      expect(app.state.activeProfileId).toBe(credential.profileId);
+      expect(vi.mocked(network.getOperation).mock.calls.map(([value, id]) => [value.profileId, id]))
+        .toEqual(expect.arrayContaining([[credential.profileId, operationId]]));
+      expect(vi.mocked(network.getOperation).mock.calls.every(([value]) => value.profileId === credential.profileId)).toBe(true);
+      expect(drafts.newTask.readSync({ profileId: remote.profileId })).toBeNull();
+      if (deleted) {
+        expect(drafts.newTask.readSync(identity)).toEqual({ targetId: session.targetId, name: "Original task",
+          input: plainTextMobileComposerDraft("First input\n\nUnsent follow-up") });
+        expect(app.state.error).toContain("was deleted");
+        expect(network.submit).not.toHaveBeenCalled();
+      } else if (absent) {
+        await app.reconcile();
+        expect(drafts.newTask.readSync(identity)?.submission).toMatchObject({ phase: "sending", sessionId: session.sessionId });
+        expect(network.submit).not.toHaveBeenCalled();
+      } else if (condition === "effort changed") {
+        expect(app.state.selectedId).toBe(session.sessionId);
+        expect(drafts.newTask.readSync(identity)).toBeNull();
+        expect(drafts.composer.readSync({ ...identity, sessionId: session.sessionId })?.text).toBe("First input\n\nUnsent follow-up");
+        expect(network.submit).not.toHaveBeenCalled();
+      } else {
+        expect(vi.mocked(network.submit).mock.calls.map(([value, id, mutation]) => [
+          value.profileId, id, mutation.payload.case,
+          mutation.payload.case === "sendInput" ? mutation.payload.value.sessionId : undefined
+        ])).toEqual([
+          [credential.profileId, "original-first-send", "sendInput", session.sessionId],
+          [credential.profileId, "original-follow-up", "sendInput", session.sessionId]
+        ]);
+        expect(drafts.newTask.readSync(identity)).toBeNull();
+      }
+      app.dispose();
+    });
+
   it.each([false, true])("keeps an optimistic local conversation editable before creation resolves and recovers a create failure=%s", async fails => {
     const network = fakeNetwork(), drafts = memoryDraftStores(), identity = { profileId: credential.profileId };
     let request = 0, release!: () => void;

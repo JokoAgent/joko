@@ -749,6 +749,7 @@ export interface MobileNewTaskResult {
   readonly sent: boolean;
   readonly definitive: boolean;
 }
+const newTaskAwaitingSession = "The task was created. Its first message is retained until the new task appears in the authoritative snapshot.";
 
 export type MobileAppCommandOutcome =
   | { readonly kind: "help"; readonly status: "succeeded" }
@@ -9948,18 +9949,32 @@ export class MobileClient {
       return { created: false, sent: false, definitive: true };
     }
     const session = this.#createdNewTaskSession(operation, submission);
-    if (!session) {
+    const hasPreparation = submission.objective !== undefined || submission.collaboration !== undefined;
+    const preparationModelChanged = session && session.state !== SessionState.CLOSED && hasPreparation
+      && submission.model !== null && !sameMobileModelSelection(submission.model, session.model);
+    if (!session || preparationModelChanged) {
       await this.newTaskDrafts.clearSubmission(identity, submission.createOperationId);
       this.#set({ error: "The task creation succeeded without an exact Joko Session result. The first message was not sent; the draft was retained." });
       return { created: false, sent: false, definitive: true };
     }
+    if (session.state === SessionState.CLOSED) {
+      await this.#releaseDeletedNewTask(identity, submission.createOperationId);
+      return { created: true, sent: false, definitive: true };
+    }
     const generation = session.nativeBinding!.runtimeGeneration;
+    const epoch = this.#epoch;
     const sending = await this.newTaskDrafts.advanceToSending(
       identity,
       submission.createOperationId,
       session.sessionId,
       generation
     );
+    const deferred = { sessionId: sending.sessionId, created: true, sent: false, definitive: false };
+    if (!this.#current(epoch)) return deferred;
+    if (!this.#state.owner?.sessions.some(candidate => candidate.sessionId === sending.sessionId)) {
+      this.#set({ error: newTaskAwaitingSession });
+      return deferred;
+    }
     await this.#selectCreatedNewTask(sending);
     return this.#finishNewTaskPreparation(identity, sending);
   }
@@ -10043,14 +10058,19 @@ export class MobileClient {
     }
   }
 
-  #createdNewTaskSession(operation: Operation, submission: MobileNewTaskCreateSubmission): Session | undefined {
+  #createdNewTaskSession(operation: Operation, submission: MobileNewTaskSubmission): Session | undefined {
     const session = operation.result?.payload.case === "session" ? operation.result.payload.value : undefined;
     const generation = session?.nativeBinding?.runtimeGeneration;
-    if (operation.operationId !== submission.createOperationId || operation.connectionId !== submission.connectionId
+    if (operation.state !== OperationState.SUCCEEDED || operation.operationId !== submission.createOperationId || operation.connectionId !== submission.connectionId
       || !session || !session.sessionId || session.backendId !== submission.backendId || session.targetId !== submission.targetId
-      || !generation || generation < 1n
-      || submission.model !== null && !sameMobileModelSelection(submission.model, session.model)) return undefined;
+      || !generation || generation < 1n) return undefined;
     return session;
+  }
+
+  async #releaseDeletedNewTask(identity: MobileNewTaskDraftIdentity, operationId: string): Promise<void> {
+    const epoch = this.#epoch;
+    await this.newTaskDrafts!.clearSubmission(identity, operationId);
+    if (this.#current(epoch)) this.#set({ error: "The created task was deleted. Its unsent messages are back in the new-task draft." });
   }
 
   async #recoverNewTaskComposerDraft(
@@ -10124,7 +10144,7 @@ export class MobileClient {
     }
     const session = this.#state.owner.sessions.find((candidate) => candidate.sessionId === submission.sessionId);
     if (!session) {
-      return { status: "deferred", message: "The task was created. Its first message is retained until the new task appears in the authoritative snapshot." };
+      return { status: "deferred", message: newTaskAwaitingSession };
     }
     const detail = this.#state.detail;
     const detailSession = detail?.sessions.find((candidate) => candidate.sessionId === submission.sessionId);
@@ -16897,6 +16917,7 @@ export class MobileClient {
     try {
       if (submission.phase === "creating") {
         const observed = await this.#observeRetainedNewTaskOperation(submission, epoch);
+        if (!this.#current(epoch)) return;
         if (observed === "not-dispatched") {
           await this.newTaskDrafts.clearSubmission(identity, submission.createOperationId);
           this.#set({ error: "The retained creation had no durable operation receipt and was not dispatched. Its draft is ready to review and retry." });
@@ -16908,6 +16929,20 @@ export class MobileClient {
         return;
       }
       if (submission.sendOperationId === undefined) {
+        if (submission.objectiveRequestId === undefined && !submission.firstInputAccepted
+          && !this.#state.owner?.sessions.some(candidate => candidate.sessionId === submission.sessionId)) {
+          // An absent Session may only be delayed. Check the original create
+          // receipt for a positive tombstone before releasing unsent input.
+          const observed = await this.#observeRetainedNewTaskOperation(submission, epoch);
+          if (!this.#current(epoch) || observed === undefined) return;
+          const session = observed === "not-dispatched" ? undefined : this.#createdNewTaskSession(observed, submission);
+          if (session?.sessionId === submission.sessionId && session.state === SessionState.CLOSED) {
+            await this.#releaseDeletedNewTask(identity, submission.createOperationId);
+          } else {
+            this.#set({ error: newTaskAwaitingSession });
+          }
+          return;
+        }
         await this.#selectCreatedNewTask(submission);
         await this.#finishNewTaskPreparation(identity, submission);
         return;
@@ -16966,7 +17001,7 @@ export class MobileClient {
       return undefined;
     }
     const pending = this.#state.pending.find((item) => item.operationId === operationId)
-      ?? (submission.phase === "creating"
+      ?? (submission.phase === "creating" || submission.sendOperationId === undefined
         ? { operationId, connectionId: submission.connectionId, kind: "create" as const, state: "accepted" as const }
         : { operationId, connectionId: submission.connectionId, kind: "send" as const,
             sessionId: submission.sessionId, state: "accepted" as const });
