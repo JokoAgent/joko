@@ -150,6 +150,8 @@ export class RealPiSystemFixture {
     let publicServer: Awaited<ReturnType<typeof createPublicServer>> | undefined;
     let linkspan: ReturnType<typeof createLinkspanIngress> | undefined;
     let internalServer: Awaited<ReturnType<typeof createInternalServer>> | undefined;
+    let reservedPublic: LoopbackPortReservation | undefined;
+    let reservedInternal: LoopbackPortReservation | undefined;
     let removePairingListener: (() => void) | undefined;
     const providerResponseGate = options.holdProviderResponses === true
       ? new ProviderResponseGate()
@@ -164,6 +166,16 @@ export class RealPiSystemFixture {
       if (options.piSettings !== undefined) {
         await writeFile(piSettingsFile, `${JSON.stringify(options.piSettings)}\n`, { mode: 0o600 });
       }
+      if (options.port !== undefined && (!Number.isInteger(options.port) || options.port < 0 || options.port > 65_535
+        || options.taskSharing === true && options.port === 0)) {
+        throw new Error("The real Pi fixture requires a valid public loopback port.");
+      }
+      // Hold ports named in the service configuration while the fixture's
+      // own Provider chooses its ephemeral port, including across restarts.
+      if ((options.port ?? 0) > 0 || options.taskSharing === true) reservedPublic = await reserveLoopbackPort(options.port ?? 0);
+      if (options.enableInternalServer === true) reservedInternal = await reserveLoopbackPort(options.internalPort ?? 0);
+      const publicPort = reservedPublic?.port ?? 0;
+      const internalPort = reservedInternal?.port ?? options.internalPort ?? 4317;
       providerServer = await startLocalProvider(
         providerRequests,
         providerResponseGate,
@@ -172,14 +184,6 @@ export class RealPiSystemFixture {
         options.providerResponder
       );
       const providerAddress = providerServer.address() as AddressInfo;
-      const internalPort = options.enableInternalServer === true
-        ? options.internalPort ?? await availableLoopbackPort()
-        : options.internalPort ?? 4317;
-      const publicPort = options.port ?? (options.taskSharing === true ? await availableLoopbackPort() : 0);
-      if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535
-        || options.taskSharing === true && publicPort === 0) {
-        throw new Error("The real Pi fixture requires a valid public loopback port.");
-      }
       const provider: PiManagedProvider = {
         id: REAL_PI_PROVIDER_ID,
         baseUrl: `http://127.0.0.1:${providerAddress.port}/v1`,
@@ -271,6 +275,8 @@ export class RealPiSystemFixture {
       if (options.enableInternalServer === true) {
         internalServer = await createInternalServer(application);
         internalServer.log.level = "silent";
+        if (reservedInternal !== undefined) await closeHttpServer(reservedInternal.server);
+        reservedInternal = undefined;
         await internalServer.listen({ host: "127.0.0.1", port: internalPort });
       }
 
@@ -281,6 +287,8 @@ export class RealPiSystemFixture {
       application.connections.openPairingWindow();
       publicServer = await createPublicServer(application);
       publicServer.log.level = "silent";
+      if (reservedPublic !== undefined) await closeHttpServer(reservedPublic.server);
+      reservedPublic = undefined;
       await publicServer.listen({ host: "127.0.0.1", port: publicPort });
       const orchestratorAddress = publicServer.server.address();
       if (orchestratorAddress === null || typeof orchestratorAddress === "string") {
@@ -305,6 +313,8 @@ export class RealPiSystemFixture {
       });
     } catch (error) {
       removePairingListener?.();
+      if (reservedPublic !== undefined) await closeHttpServer(reservedPublic.server).catch(() => undefined);
+      if (reservedInternal !== undefined) await closeHttpServer(reservedInternal.server).catch(() => undefined);
       await linkspan?.close().catch(() => undefined);
       await publicServer?.close().catch(() => undefined);
       await internalServer?.close().catch(() => undefined);
@@ -521,21 +531,25 @@ async function closeHttpServer(server: Server): Promise<void> {
   server.closeAllConnections();
 }
 
-async function availableLoopbackPort(): Promise<number> {
-  const probe = createServer();
+interface LoopbackPortReservation {
+  readonly port: number;
+  readonly server: Server;
+}
+
+async function reserveLoopbackPort(port: number): Promise<LoopbackPortReservation> {
+  const server = createServer();
+  server.on("connection", (socket) => socket.destroy());
   await new Promise<void>((resolvePromise, reject) => {
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      probe.off("error", reject);
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => {
+      server.off("error", reject);
       resolvePromise();
     });
   });
-  const address = probe.address();
+  const address = server.address();
   if (address === null || typeof address === "string") {
-    await closeHttpServer(probe).catch(() => undefined);
-    throw new Error("The internal MCP bridge probe did not expose a TCP port.");
+    await closeHttpServer(server).catch(() => undefined);
+    throw new Error("The real Pi fixture could not reserve its TCP port.");
   }
-  const port = address.port;
-  await closeHttpServer(probe);
-  return port;
+  return { port: address.port, server };
 }
