@@ -67,7 +67,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
       await writeFile(join(destination, "ui/logic/index.html"), '<!doctype html><html><head><script src="./runtime.js"></script></head><body></body></html>');
       await writeFile(join(destination, "ui/logic/runtime.js"), String.raw`
         let writes = 0, sends = 0;
-        const mailReads = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
+        const mailReads = [], settingsNotices = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
         const taskOutcomes = {}, textOutcomes = {};
         let saved = { status: 'read_back', draftId: 'draft-one', fingerprint: 'revision-1', locator: { id: 'draft-one' },
           headers: { from: 'owner@example.test', to: 'reader@example.test', cc: '', bcc: '', subject: 'Review' },
@@ -130,9 +130,10 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
         joko.onHostMessage(async message => {
           if (message.type === 'device-sync-request') await joko.deviceSync.reply(message.requestId, { received: message.data });
           if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
+          if (message.type === 'settings-changed') settingsNotices.push({ event: message, data: await (await fetch('/kv')).json() });
         });
         joko.tools.register('mail', async message => ({ ok: await compose.present(message, account, structuredClone(saved)), result: { shown: true } }));
-        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes, mailReads } }));
+        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes, mailReads, settingsNotices } }));
         joko.tools.register('usage', async message => {
           await window.__jokoExtensionToolAccepted(message.callId, 'forged');
           return { ok: false, result: { nonceVisible: 'usageNonce' in message } };
@@ -163,7 +164,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const startupErrors: string[] = [];
   const syncRequests: unknown[] = [], syncActive = vi.fn(), syncInvalidated = vi.fn();
   const openSurface = surfaces.open.bind(surfaces);
-  vi.spyOn(surfaces, "open").mockImplementation(async input => {
+  const surfaceOpen = vi.spyOn(surfaces, "open").mockImplementation(async input => {
     try { return await openSurface(input); } catch (error) { startupErrors.push(String(error)); throw error; }
   });
   const registration = { id: "target", root, displayName: "Workspace", trusted: true };
@@ -368,6 +369,17 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     expect(chosen.extensionId).toBe(alternateId);
     expect(JSON.parse(chosen.messageJson)).toMatchObject({ subject: "Opened", bodyText: "@sample/alternate-mail" });
     expect((await alternateProvider.callTool("inspect", {}, undefined, context)).structuredContent?.mailReads).toEqual([{ url: mailUrl, markRead: true }]);
+
+    const authority = surfaceOpen.mock.calls.find(([input]) => input.authority.extensionId === id)![0].authority;
+    const updated = { parameter: "saved setting" };
+    store.setSetting("service", "extension-runtime-kv", id, vault.seal(JSON.stringify({ version: 1, data: updated }), id));
+    runtime.notifyRoutingChanged({ ...authority, resourceRevision: authority.resourceRevision + 1n }, () => {});
+    expect(() => runtime!.notifyRoutingChanged(authority, () => { throw new Error("Settings owner retired."); })).toThrow("Settings owner retired.");
+    runtime.notifyRoutingChanged(authority, () => {});
+    await vi.waitFor(async () => expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.settingsNotices)
+      .toEqual([{ event: { type: "settings-changed" }, data: updated }]));
+    expect((await alternateProvider.callTool("inspect", {}, undefined, context)).structuredContent?.settingsNotices).toEqual([]);
+
     alternateEnabled = false; changed?.([alternateId]);
     expect(await mail.previewMail(selected, owner)).toMatchObject({ error: "MAIL_PROVIDER_CHANGED", messageJson: "", readerChoices: [{ displayName: "Fixture mail" }] });
     expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.mailReads).toEqual([{ url: mailUrl, markRead: true }]);

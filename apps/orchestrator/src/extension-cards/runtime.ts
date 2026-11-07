@@ -504,6 +504,21 @@ export class ExtensionCardRuntime {
     await page.evaluate(payload => (window as unknown as { __jokoRuntime: { event(payload: unknown): void } }).__jokoRuntime.event(payload), event);
     current(); return true;
   }
+  notifyRoutingChanged(authority: ExtensionMainViewAuthority, assertCaller: () => void): void {
+    const instance = this.#instances.get(authority.extensionId);
+    if (!instance?.page || instance.page.isClosed()) return;
+    const installed = instance.authority.surface;
+    if (installed.resourceId !== authority.resourceId || installed.resourceRevision !== authority.resourceRevision
+      || installed.discoveredRevision !== authority.discoveredRevision || installed.backendId !== authority.backendId
+      || installed.backendRevision !== authority.backendRevision || installed.backendGeneration !== authority.backendGeneration
+      || installed.packageName !== authority.packageName || installed.packageVersion !== authority.packageVersion
+      || installed.extensionEntry !== authority.extensionEntry) return;
+    assertCaller(); this.#assert(instance);
+    void instance.page.evaluate(() => {
+      const runtime = (window as unknown as { __jokoRuntime: { event(event: { type: string }): void } }).__jokoRuntime;
+      runtime.event({ type: "settings-changed" });
+    }).catch(() => undefined);
+  }
   async #close(instance: Instance): Promise<void> {
     this.#files.retire(instance.authority.key);
     this.#network?.retire(instance.authority.key); instance.callGuards.clear();

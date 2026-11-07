@@ -2,7 +2,7 @@ import type { OperationalStore } from "@joko/store";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault, EncryptedCredential } from "./credential-vault.js";
 import type { ExtensionCatalogManager } from "./extension-catalog.js";
-import type { ExtensionMainViewSurface } from "./extension-main-view-manager.js";
+import type { ExtensionMainViewAuthority, ExtensionMainViewSurface } from "./extension-main-view-manager.js";
 import { checkExtensionSecretCandidate } from "./extension-secret-check.js";
 
 const MAXIMUM_BYTES = 64 * 1024;
@@ -37,7 +37,8 @@ function routingData(raw: string, credentials: CredentialManager): Record<string
 export class ExtensionSettingsManager {
   readonly #checks = new Map<string, number>();
   constructor(private readonly options: { readonly store: OperationalStore; readonly vault: CredentialVault;
-    readonly credentials: CredentialManager; readonly catalog: ExtensionCatalogManager; readonly fetch: typeof fetch }) {}
+    readonly credentials: CredentialManager; readonly catalog: ExtensionCatalogManager; readonly fetch: typeof fetch;
+    readonly notifyRoutingChanged?: (authority: ExtensionMainViewAuthority, assertCurrent: () => void) => void }) {}
 
   #assertSurface(surface: ExtensionMainViewSurface): void {
     if (!surface.authority.settings) throw new Error("This surface does not own plugin settings.");
@@ -67,6 +68,10 @@ export class ExtensionSettingsManager {
   }
 
   validateRoutingData(raw: string): void { routingData(raw, this.options.credentials); }
+
+  routingCommitted(surface: ExtensionMainViewSurface, assertCurrent: () => void): void {
+    this.options.notifyRoutingChanged?.(surface.authority, assertCurrent);
+  }
 
   #secret(surface: ExtensionMainViewSurface, key: string) {
     this.#assertSurface(surface);
