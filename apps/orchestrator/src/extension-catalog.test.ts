@@ -221,7 +221,8 @@ it.each(["sidebar", "setup"] as const)("fences a credential clear against a conc
     const vault = await CredentialVault.open(join(root, "vault.key"));
     const application = { config: { publicOrigin: "https://orchestrator.example.test" }, store, adapters: [], sessionHost: host,
       extensionCatalog: catalog, connections: new ConnectionManager(store), piResources: { list: () => [installed], get: () => installed },
-      extensionSettings: new ExtensionSettingsManager({ store, vault, credentials, catalog }),
+      extensionSettings: new ExtensionSettingsManager({ store, vault, credentials, catalog,
+        fetch: vi.fn(async () => { throw new Error("Credential clear must stay local."); }) }),
       extensionMainViews: { getSurface: async () => surface, isSurfaceCurrent: (id: string, connection: string) => id === surface.id && connection === original.id }
     } as unknown as OrchestratorApplication;
     const transport = createRouterTransport(router => registerConnectServices(router, application));
