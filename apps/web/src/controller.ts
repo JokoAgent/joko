@@ -4124,6 +4124,7 @@ export function useAppController(): AppController {
     getModelWorkingContext: (target, signal) => gateway().getModelWorkingContext(target, signal),
     setModelWorkingContext: (target, observed, tokens, signal) => gateway().setModelWorkingContext(target, observed, tokens, signal),
     resetModelWorkingContext: (target, observed, signal) => gateway().resetModelWorkingContext(target, observed, signal),
+    setModelAutoCompactionThreshold: (target, observed, percent, signal) => gateway().setModelAutoCompactionThreshold(target, observed, percent, signal),
     setManagedModelContext: (runtimeId, target, tokens) => gateway().setManagedModelContext(runtimeId, target, tokens),
     resetManagedModelContext: (runtimeId, target) => gateway().resetManagedModelContext(runtimeId, target),
     startManagedModelRuntime: (runtimeId) => gateway().startManagedModelRuntime(runtimeId),

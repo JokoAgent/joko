@@ -672,8 +672,10 @@ describe("PiBackendAdapter", () => {
   it("uses a process-private working context and compaction reserve while preserving the same binding and public capacity", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-working-context-")); const processes: ScriptedPiProcess[] = [];
     let budget: number | undefined = 16_000;
+    let threshold: number | undefined;
     const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1",
       providers: [{ id: "local", api: "openai-completions", baseUrl: "http://127.0.0.1:1234/v1", models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 2_048 }] }],
+      resolveModelAutoCompactionThreshold: (_context, selection) => selection.providerId === "local" && selection.modelId === "test-model" ? threshold : undefined,
       processFactory: spec => {
         const child = new ScriptedPiProcess(spec);
         const models = JSON.parse(readFileSync(join(spec.env["PI_CODING_AGENT_DIR"]!, "models.json"), "utf8"));
@@ -685,17 +687,24 @@ describe("PiBackendAdapter", () => {
     const base = { ...makeContext(target, []), resolveModelWorkingContext: () => budget };
     try {
       const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, base), bound = { ...base, binding };
-      const privateHome = processes[0]!.spec.env["PI_CODING_AGENT_DIR"]!;
-      expect(JSON.parse(await readFile(join(privateHome, "settings.json"), "utf8")).compaction.reserveTokens).toBe(32_768 - 12_000);
+      const reserve = async () => JSON.parse(await readFile(join(processes.at(-1)!.spec.env["PI_CODING_AGENT_DIR"]!, "settings.json"), "utf8")).compaction.reserveTokens;
+      expect(await reserve()).toBe(32_768 - 12_000);
       expect((await adapter.describe()).models.find(model => model.modelId === "test-model")!.contextWindow).toBe(32_768);
-      budget = 100_000_000; await adapter.refreshModelWorkingContext(bound);
+      threshold = 50;
+      await adapter.refreshModelWorkingContext(bound);
+      expect(await reserve()).toBe(32_768 - 8_000);
       expect(processes[0]!.exitCode).toBe(0);
-      expect(processes[1]!.sessionFile).toBe(binding.opaqueRef);
-      expect(processes[1]!.model.contextWindow).toBe(100_000_000);
+      expect((await adapter.inspectSession(binding, bound)).binding).toEqual(binding);
+      threshold = undefined;
+      await adapter.refreshModelWorkingContext(bound);
+      expect(await reserve()).toBe(32_768 - 12_000);
+      budget = 100_000_000; await adapter.refreshModelWorkingContext(bound);
+      expect(processes.at(-1)!.sessionFile).toBe(binding.opaqueRef);
+      expect(processes.at(-1)!.model.contextWindow).toBe(100_000_000);
       expect((await adapter.inspectSession(binding, bound)).binding).toEqual(binding);
       budget = undefined; await adapter.refreshModelWorkingContext(bound);
-      expect(processes[2]!.model.contextWindow).toBe(32_768);
-      expect(JSON.parse(await readFile(join(processes[2]!.spec.env["PI_CODING_AGENT_DIR"]!, "settings.json"), "utf8")).compaction.reserveTokens).toBe(0);
+      expect(processes.at(-1)!.model.contextWindow).toBe(32_768);
+      expect(await reserve()).toBe(0);
     } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
   });
 

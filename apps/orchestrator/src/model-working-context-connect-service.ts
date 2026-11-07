@@ -36,8 +36,13 @@ export function createModelWorkingContextConnectMethods(
       if (request.expectedRevision === undefined) throw invalid();
       const limit = request.contextWindowTokens === undefined ? undefined : Number(request.contextWindowTokens);
       if (limit !== undefined && (!Number.isSafeInteger(limit) || BigInt(limit) !== request.contextWindowTokens)) throw invalid();
+      const change = request.autoCompactionThresholdChange;
+      if (change?.case === "restoreAutoCompactionThreshold" && !change.value) throw invalid();
+      const autoCompactionThresholdPercent = change?.case === "autoCompactionThresholdPercent" ? change.value
+        : change?.case === "restoreAutoCompactionThreshold" ? null : undefined;
       return owner.set({ ...query(request), operationId: request.operationId, expectedRevision: request.expectedRevision.value,
-        expectedSourceRevision: request.expectedSourceRevision, ...(limit === undefined ? {} : { limit }) }, signal);
+        expectedSourceRevision: request.expectedSourceRevision, ...(limit === undefined ? {} : { limit }),
+        ...(autoCompactionThresholdPercent === undefined ? {} : { autoCompactionThresholdPercent }) }, signal);
     }),
     resetModelWorkingContext: (request, context) => invoke(context, (owner, signal) => {
       if (request.expectedRevision === undefined) throw invalid();
@@ -57,6 +62,8 @@ function mapView(value: ModelWorkingContextView): contract.ModelWorkingContextVi
     effectiveContextWindowTokens: value.effectiveContextWindowTokens === undefined ? undefined : BigInt(value.effectiveContextWindowTokens),
     customized: value.customized, mixed: value.mixed, revision: { value: value.revision }, sourceRevision: value.sourceRevision,
     canConfigure: value.canConfigure, blockedReason: value.blockedReason,
+    autoCompactionThresholdPercent: value.autoCompactionThresholdPercent,
+    defaultAutoCompactionThresholdPercent: value.defaultAutoCompactionThresholdPercent,
     nativeContext: value.nativeContext === undefined ? undefined : {
       contextWindowTokens: value.nativeContext.contextWindowTokens === undefined ? undefined : BigInt(value.nativeContext.contextWindowTokens),
       autoCompactLimitTokens: value.nativeContext.autoCompactLimitTokens === undefined ? undefined : BigInt(value.nativeContext.autoCompactLimitTokens),
