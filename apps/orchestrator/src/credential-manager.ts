@@ -1662,13 +1662,16 @@ export class ProviderCatalogManager {
           modelCount: current.provider.models.length
         };
       }
+      const customPiApi = current.backendId === this.#nativeBackendId && current.kind === "custom_endpoint"
+        ? current.provider.api
+        : undefined;
       const next: ManagedProviderEntry = {
         ...current,
         provider: {
           ...current.provider,
           models: [
             ...current.provider.models,
-            ...additions.map(discoveredManagedModel)
+            ...additions.map(model => discoveredManagedModel(model, customPiApi))
           ]
         },
         version: current.version + 1n,
@@ -2675,8 +2678,12 @@ function assertLeasedNativeCredentialAccount(current: NativePiCredential, next: 
   }
 }
 
-function discoveredManagedModel(model: DiscoveredProviderModel): PiManagedModel {
+function discoveredManagedModel(model: DiscoveredProviderModel, customPiApi: PiManagedProvider["api"]): PiManagedModel {
   const metadata = model.metadata;
+  const defaultVisible = customPiApi !== undefined
+    && (metadata?.nativeApi === undefined || metadata.nativeApi === customPiApi)
+    && (metadata?.inputModalities?.includes("text") ?? true)
+    && (metadata?.outputModalities?.includes("text") ?? true);
   const levels = metadata?.efforts;
   const thinkingLevelMap = levels === undefined ? undefined : Object.fromEntries(
     ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => [level, levels.includes(level) ? level : null]));
@@ -2685,7 +2692,7 @@ function discoveredManagedModel(model: DiscoveredProviderModel): PiManagedModel 
   const modalities = supportsImages === false ? input?.filter(value => value !== "image") ?? ["text" as const]
     : supportsImages === true ? [...new Set([...(input ?? ["text" as const]), "image" as const])] : input;
   const result: PiManagedModel = {
-    id: model.id, name: model.name, defaultVisible: false,
+    id: model.id, name: model.name, defaultVisible,
     contextWindow: model.contextWindow ?? metadata?.contextWindowMax ?? 128_000,
     contextWindowSource: model.contextWindow === undefined ? "estimated" : "declared",
     maxTokens: metadata?.maxOutputTokens ?? 16_384,

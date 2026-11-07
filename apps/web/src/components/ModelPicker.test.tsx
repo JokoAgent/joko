@@ -359,16 +359,21 @@ describe("ModelPicker", () => {
     expect(regularRows).toEqual(["Beta model", "Small", "Large"]);
   });
 
-  it("keeps default-hidden discoveries out of rows and refreshes when opening", async () => {
+  it("honors discovery defaults and a later owner visibility preference in the mounted picker", async () => {
     const onOpen = vi.fn(async () => undefined);
+    const direct = { ...model("provider-b", "Beta", "direct-model", "Direct discovery", [], false, 0, 0), defaultVisible: true };
     await renderPicker(undefined, "owner-one", undefined, false, onOpen, [
       ...models,
+      direct,
       { ...model("provider-b", "Beta", "new-model", "New model", [], false, 0, 0), defaultVisible: false }
     ]);
     await openPicker();
 
     expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(findRow("Direct discovery").textContent).toContain("Direct discovery");
     expect(document.body.textContent).not.toContain("New model");
+    await act(async () => setModelVisible("owner-one", direct.backendId, direct.providerId, direct.modelId, false));
+    expect(document.body.textContent).not.toContain("Direct discovery");
   });
 
   it("shows subscription references as subscription, keeps upstream metered routes priced, reserves Free for known zero-price quotes, and hides unknown pricing", async () => {
