@@ -18,6 +18,7 @@ export const IMAGE_GENERATION_RESPONSE_MAXIMUM_BYTES = 64 * 1024 * 1024;
 const IMAGE_GENERATION_TOOL_NAME = "image_generate";
 const OPENAI_IMAGES_GENERATION_ENDPOINT = "https://api.openai.com/v1/images/generations";
 const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
+const IMAGE_RESULT_STAGING_MS = 10 * 60_000;
 const MAXIMUM_PROMPT_BYTES = 32 * 1024;
 const ASPECT_RATIOS = ["1:1", "3:2", "2:3"] as const;
 
@@ -112,7 +113,7 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     name: string,
     arguments_: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
-    _context: BridgeToolCallContext
+    context: BridgeToolCallContext
   ): Promise<BridgeToolCallResult> {
     this.#refreshSnapshot();
     if (name !== IMAGE_GENERATION_TOOL_NAME || this.#routes.length === 0) {
@@ -136,6 +137,7 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     try {
       apiKey = this.#credentialSurfaces.resolveSecret(route.owner).trim();
       if (apiKey.length === 0) throw new Error("Image generation credential is not configured.");
+      context.acceptDispatchedImageResult?.(() => this.#credentialSurfaces.assertDispatchedCredential(route.owner, route.modelId));
       const generated = await this.#dispatch({
         executionApi: route.owner.surface.executionApi,
         apiKey,
@@ -144,11 +146,13 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
         ...(aspectRatio === undefined ? {} : { aspectRatio }),
         ...(signal === undefined ? {} : { signal })
       });
+      context.assertCurrent?.();
       let blob: BlobRef;
       try {
         blob = await this.#artifacts.ingestBytes(generated.bytes, {
           fileName: `generated-image${extensionForMime(generated.mimeType)}`,
-          mimeType: generated.mimeType
+          mimeType: generated.mimeType,
+          ...(context.acceptDispatchedImageResult === undefined ? {} : { expiresAt: Date.now() + IMAGE_RESULT_STAGING_MS })
         });
       } catch {
         throw new Error("Generated image could not be stored.");

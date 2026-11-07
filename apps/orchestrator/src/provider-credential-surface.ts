@@ -194,6 +194,23 @@ export class ProviderCredentialSurfaceResolver {
     }
   }
 
+  assertDispatchedCredential(input: ConfiguredProviderCredentialSurface, modelId: string): void {
+    const backendId = input.backend.id, providerId = input.provider.providerId;
+    const current = resolveDeclaredProviderCredentialSurface(this.#store, undefined, {
+      backendId, providerId, surfaceId: input.surface.surfaceId
+    });
+    const credential = this.#credentials.find(input.credentialReferenceId);
+    if (current === undefined || current.backend.instanceGeneration !== input.backend.instanceGeneration
+      || current.credentialReferenceId !== input.credentialReferenceId
+      || current.surface.executionApi !== input.surface.executionApi || current.surface.capability !== input.surface.capability
+      || current.surface.kind !== input.surface.kind || !current.surface.models.some(model => model.modelId === modelId)
+      || credential?.configured !== true || credential.generation !== input.credential.generation
+      || credential.providerId !== providerId || credential.kind !== input.surface.kind
+      || !this.#providerEnabled(backendId, providerId)) {
+      throw new Error("The original image generation authority changed.");
+    }
+  }
+
   resolveSecret(input: ConfiguredProviderCredentialSurface): string {
     if (!this.#providerEnabled(input.backend.id, input.provider.providerId)) {
       throw new Error("Provider credential surface is disabled.");
