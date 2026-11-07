@@ -11309,6 +11309,44 @@ describe("SessionHost", () => {
     });
   });
 
+  it("does not dispatch the later fold after a persisted automatic cron Run consumed the earlier one", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-repeated-cron-task", connection: fixture.connection, targetId: "target-one",
+      title: "Repeated cron time", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const earlierAt = Date.UTC(2026, 10, 1, 5, 30);
+    const laterAt = Date.UTC(2026, 10, 1, 6, 30);
+    const followingDay = Date.UTC(2026, 10, 2, 6, 30);
+    const id = "schedule-repeated-cron-time";
+    fixture.store.upsertSchedule({
+      id, backendId: fixture.adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+      name: "Legacy cron", kind: "cron", expression: "30 1 * * *", timezone: "America/New_York", enabled: true,
+      prompt: { text: "Run once at this local time", images: [], files: [], mentions: [], disposition: "prompt" },
+      executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once",
+      nextRunAt: earlierAt, now: earlierAt - 60_000
+    });
+    const first = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => earlierAt });
+    try {
+      await first.tick();
+      const [history] = fixture.store.listScheduleRuns(id);
+      expect(history?.firedAt).toBe(earlierAt);
+      await eventually(() => fixture.store.getRun(history!.runId).descriptor.state === "completed");
+      expect(fixture.store.getSchedule(id).nextRunAt).toBe(laterAt);
+    } finally { first.stop(); }
+
+    const restarted = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => laterAt });
+    try {
+      await restarted.tick();
+      expect(fixture.store.listScheduleRuns(id)).toHaveLength(1);
+      expect(fixture.store.getSchedule(id)).toMatchObject({ lastRunAt: earlierAt, nextRunAt: followingDay });
+
+      await restarted.runNow(id, "manual-after-repeated-cron");
+      expect(fixture.store.listScheduleRuns(id)).toHaveLength(2);
+      expect(fixture.store.getSchedule(id).nextRunAt).toBe(followingDay);
+    } finally { restarted.stop(); }
+  });
+
   it("persists an invalid execution snapshot as failed and advances the due occurrence exactly once", async () => {
     const fixture = await createFixture();
     const sessionId = (await fixture.host.createSession({

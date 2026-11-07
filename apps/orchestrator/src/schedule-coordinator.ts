@@ -30,7 +30,7 @@ import {
   type ScheduleScriptExecutionResult,
   type ScheduleScriptInput
 } from "./schedule-script-runner.js";
-import { nextOccurrence, type ScheduleTiming } from "./scheduler.js";
+import { nextOccurrence, repeatedWallTime, type ScheduleTiming } from "./scheduler.js";
 import {
   SchedulerOccurrenceRecovery,
   type ScheduleOccurrenceReleaseReason
@@ -428,6 +428,25 @@ export class ScheduleCoordinator {
       throw new Error("Schedule deletion is in progress.");
     }
     const scheduledAt = options.scheduledAt ?? schedule.nextRunAt ?? this.#now();
+    if (options.source === "automatic" && schedule.kind === "cron") {
+      const repeated = repeatedWallTime(scheduledAt, schedule.timezone);
+      if (repeated?.later === scheduledAt) {
+        // A schedule can still have an occurrence from before the later-instant
+        // rule. Its exact automatic Run already consumed this wall-clock slot.
+        const earlierRunId = scheduledRunId(occurrenceOperationId(schedule.id, repeated.earlier));
+        const earlier = this.#store.findScheduleRunByRunId(earlierRunId);
+        if (earlier?.scheduleId === schedule.id && earlier.firedAt === repeated.earlier) {
+          const nextRunAt = nextScheduleOccurrence(schedule, scheduledAt);
+          this.#store.upsertSchedule(copyScheduleForCoordinator(schedule, {
+            enabled: nextRunAt !== undefined && schedule.enabled,
+            ...(nextRunAt === undefined ? {} : { nextRunAt }),
+            expectedRevision: schedule.revision,
+            now: this.#now()
+          }));
+          return { runId: earlierRunId, status: "skipped" };
+        }
+      }
+    }
     const operationId = options.operationId ?? occurrenceOperationId(schedule.id, scheduledAt);
     const runtimeRunId = scheduledRunId(operationId);
     if (this.#admittedRuns.has(runtimeRunId)) {
