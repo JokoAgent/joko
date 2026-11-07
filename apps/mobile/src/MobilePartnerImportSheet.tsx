@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { ActivityIndicator, AppState, Modal, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
-import { PartnerImportCategory, PartnerImportStatus, PartnerImportCheckStatus, partnerImportMessages, importCategoryLabel, importCheckLabel, importReasonLabel,
+import { PartnerImportCategory, PartnerImportStatus, PartnerImportCheckStatus, areImportEntriesSelected, partnerImportMessages, importCategoryLabel, importCheckLabel, importReasonLabel,
   type PartnerImportEditor, type PartnerImportResult } from "@joko/contracts";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { MobilePartnerPhotoPicker } from "./MobilePartnerPhotoPicker";
@@ -50,7 +50,8 @@ export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onOp
     accessibilityState={{ checked: mixed ? "mixed" : checked, disabled: locked }} disabled={locked} onPress={() => editor.select(ids, !checked)}
     style={[styles.action, { borderColor: colors.border, backgroundColor: checked || mixed ? colors.brandBackground : colors.surface }, locked && styles.disabled]}>
     <Text style={[styles.body, { color: colors.ink }]}>{checked ? "✓ " : mixed ? "− " : "○ "}{label}</Text></Pressable>;
-  const filtered = entries.filter(entry => entry.category === state.category && `${entry.name} ${entry.description ?? ""}`.toLocaleLowerCase().includes(state.query.toLocaleLowerCase()));
+  const categoryEntries = entries.filter(entry => entry.category === state.category);
+  const filtered = categoryEntries.filter(entry => `${entry.name} ${entry.description ?? ""}`.toLocaleLowerCase().includes(state.query.toLocaleLowerCase()));
   return <Modal visible={visible} animationType="none" presentationStyle="pageSheet" allowSwipeDismissal={false} onDismiss={dismiss}
     onRequestClose={() => { if (!preparing) setVisible(false); }}>
     <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]} edges={["top", "bottom"]}>
@@ -78,7 +79,7 @@ export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onOp
             {state.sources?.length === 0 && body(m.empty)}{state.error && action(m.refresh, () => void editor.load(), state.busy || !foreground)}
           </> : state.category !== undefined ? <>
             {action(m.back, () => editor.filter())}{body(importCategoryLabel(state.category, m))}
-            {checkbox(entries.filter(entry => entry.category === state.category).map(entry => entry.id), entries.filter(entry => entry.category === state.category).every(entry => state.selected.has(entry.id)), m.selectAll)}
+            {checkbox(categoryEntries.map(entry => entry.id), areImportEntriesSelected(categoryEntries, state.selected), m.selectAll)}
             <TextInput accessibilityLabel={m.search} placeholder={m.search} placeholderTextColor={colors.muted} value={state.query} onChangeText={query => editor.filter(state.category, query)}
               style={[styles.input, { borderColor: colors.border, backgroundColor: colors.surface, color: colors.ink }]} />
             {filtered.slice(state.page * 20, (state.page + 1) * 20).map(entry => <View key={entry.id} style={styles.section}>
@@ -96,7 +97,8 @@ export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onOp
             {categories.map(category => {
               const group = entries.filter(entry => entry.category === category); if (!group.length) return null;
               const count = group.filter(entry => state.selected.has(entry.id)).length;
-              return <View key={category} style={styles.section}>{checkbox(group.map(entry => entry.id), count === group.length, importCategoryLabel(category, m), count > 0 && count < group.length)}
+              const checked = areImportEntriesSelected(group, state.selected);
+              return <View key={category} style={styles.section}>{checkbox(group.map(entry => entry.id), checked, importCategoryLabel(category, m), count > 0 && !checked)}
                 {action(`${importCategoryLabel(category, m)} · ${count} / ${group.length} ›`, () => editor.filter(category), locked)}</View>;
             })}
             {entries.some(entry => entry.category === PartnerImportCategory.AUTOMATIONS && state.selected.has(entry.id)) && <View style={styles.row}>

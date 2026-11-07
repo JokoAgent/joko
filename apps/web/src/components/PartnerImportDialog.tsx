@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { PartnerImportEditor, PartnerImportReceipts, PartnerImportCategory, PartnerImportStatus, PartnerImportCheckStatus,
-  partnerImportMessages, importCategoryLabel, importCheckLabel, importReasonLabel, type PartnerImportResult } from "@joko/contracts";
+  areImportEntriesSelected, partnerImportMessages, importCategoryLabel, importCheckLabel, importReasonLabel, type PartnerImportResult } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import type { Translator } from "./types.js";
 import { AvatarPicker } from "./PartnerAvatarPicker.js";
@@ -34,7 +34,8 @@ export function PartnerImportDialog({ controller, ownerKey, foreground, t, onClo
   };
   useEffect(() => { if (foreground && result?.saved && result.canonicalSessionId && !incomplete && !state.busy && result.status !== PartnerImportStatus.RUNNING) void open(); }, [result, state.busy, foreground, incomplete]);
   const entries = state.preview?.entries ?? [];
-  const filtered = entries.filter(entry => entry.category === state.category && `${entry.name} ${entry.description ?? ""}`.toLocaleLowerCase().includes(state.query.toLocaleLowerCase()));
+  const categoryEntries = entries.filter(entry => entry.category === state.category);
+  const filtered = categoryEntries.filter(entry => `${entry.name} ${entry.description ?? ""}`.toLocaleLowerCase().includes(state.query.toLocaleLowerCase()));
   const locked = editor.locked || preparing || !foreground;
   const controls = (page: number, count: number, details = false) => count > 20 && <div className="partner-import__pagination">
     <Button disabled={page === 0} onClick={() => editor.page(page - 1, details)}>{m.previous}</Button><span>{page + 1} / {Math.ceil(count / 20)}</span>
@@ -63,7 +64,7 @@ export function PartnerImportDialog({ controller, ownerKey, foreground, t, onClo
       {state.sources?.length === 0 && <p>{m.empty}</p>}{state.error && <Button disabled={state.busy} onClick={() => void editor.load()}>{m.refresh}</Button>}</div>
       : state.category !== undefined ? <>
         <Button onClick={() => editor.filter()}>{m.back}</Button><h3>{importCategoryLabel(state.category, m)}</h3>
-        <label>{checkbox(entries.filter(entry => entry.category === state.category).map(entry => entry.id), entries.filter(entry => entry.category === state.category).every(entry => state.selected.has(entry.id)), m.selectAll)}{m.selectAll}</label>
+        <label>{checkbox(categoryEntries.map(entry => entry.id), areImportEntriesSelected(categoryEntries, state.selected), m.selectAll)}{m.selectAll}</label>
         <input type="search" aria-label={m.search} value={state.query} onChange={event => editor.filter(state.category, event.target.value)} />
         <div className="partner-import__entries">{filtered.slice(state.page * 20, (state.page + 1) * 20).map(entry => <label key={entry.id}>
           {checkbox([entry.id], state.selected.has(entry.id), entry.name)}<span><strong>{entry.name}</strong>{entry.description && <p>{entry.description}</p>}
@@ -76,7 +77,8 @@ export function PartnerImportDialog({ controller, ownerKey, foreground, t, onClo
         <div className="partner-import__groups">{categories.map(category => {
           const group = entries.filter(entry => entry.category === category); if (!group.length) return null;
           const count = group.filter(entry => state.selected.has(entry.id)).length;
-          return <div key={category}>{checkbox(group.map(entry => entry.id), count === group.length, importCategoryLabel(category, m), count > 0 && count < group.length)}
+          const checked = areImportEntriesSelected(group, state.selected);
+          return <div key={category}>{checkbox(group.map(entry => entry.id), checked, importCategoryLabel(category, m), count > 0 && !checked)}
             <Button disabled={locked} onClick={() => editor.filter(category)}>{importCategoryLabel(category, m)} · {count} / {group.length}</Button></div>;
         })}</div>
         {entries.some(entry => entry.category === PartnerImportCategory.AUTOMATIONS && state.selected.has(entry.id)) && <label>

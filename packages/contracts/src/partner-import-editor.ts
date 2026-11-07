@@ -1,5 +1,5 @@
 import { PartnerImportStatus, PartnerImportCategory, PartnerImportCheckStatus, type PartnerImportResult, type PartnerImportSource } from "./gen/joko/v1/partner_import_pb.js";
-import { defaultImportSelection, importSelectionInput, toggleImportEntry, type PartnerImportApi, type PartnerImportPreview } from "./partner-import.js";
+import { defaultImportSelection, importSelectionInput, toggleImportEntries, type PartnerImportApi, type PartnerImportPreview } from "./partner-import.js";
 
 export interface ImportReceiptStorage {
   getItem(key: string): string | null | Promise<string | null>;
@@ -94,9 +94,7 @@ export class PartnerImportEditor {
   edit(patch: Partial<Pick<PartnerImportEditorState, "name" | "avatarImageBase64" | "takeover">>): void { if (!this.locked) this.#set(patch); }
   select(ids: readonly string[], enabled: boolean): void {
     if (this.locked || !this.state.preview) return;
-    let selected = this.state.selected;
-    for (const id of ids) selected = toggleImportEntry(this.state.preview.entries, selected, id, enabled);
-    this.#set({ selected });
+    this.#set({ selected: toggleImportEntries(this.state.preview.entries, this.state.selected, ids, enabled) });
   }
   filter(category?: PartnerImportCategory, query = ""): void { this.#set({ category, query, page: 0 }); }
   page(page: number, details = false): void { if (Number.isSafeInteger(page) && page >= 0) this.#set(details ? { detailPage: page } : { page }); }
