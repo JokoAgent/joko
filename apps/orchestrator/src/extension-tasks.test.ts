@@ -150,6 +150,7 @@ it("keeps the original plugin run ID attached to its durably admitted Provider G
   expect(await f.request({ kind: "getRun", runId: original.runId })).toMatchObject({ status: "failed" });
 
   const send = vi.spyOn(f.adapter, "send").mockResolvedValue(undefined);
+  const abortRun = vi.spyOn(f.host, "abort");
   const abort = vi.spyOn(f.adapter, "abort");
   const stable = (prefix: string, value: string) => `${prefix}-${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
   const resume = f.host.enqueueServiceInput({ operationId: stable("provider-group-continue", `${taskId}:${original.runId}`),
@@ -164,11 +165,15 @@ it("keeps the original plugin run ID attached to its durably admitted Provider G
 
   expect(await f.request({ kind: "getRun", runId: original.runId })).toMatchObject({ ...receipt, status: "running", queueState: "backend_accepted" });
   expect(await f.request(input)).toMatchObject({ ...receipt, status: "running" });
+  const generation = f.store.getSession(taskId).descriptor.binding.generation;
   await f.request({ kind: "cancel", runId: original.runId });
-  expect(abort).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: resume.value.runId }));
+  expect(abortRun).toHaveBeenCalledExactlyOnceWith(taskId, resume.value.runId, expect.any(Function));
+  expect(abort).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    sessionId: taskId, generation, assertRunControlCurrent: expect.any(Function)
+  }));
   expect(send).toHaveBeenCalledOnce();
   expect(f.store.getRun(original.runId).descriptor.state).toBe("failed");
-  expect(f.store.getRun(resume.value.runId).descriptor.state).toBe("aborted");
+  await vi.waitFor(() => expect(f.store.getRun(resume.value.runId).descriptor.state).toBe("aborted"));
   expect(f.store.getQueueItem(unrelated.value.queueItemId).state).toBe("accepted");
   expect(await f.request({ kind: "cancel", runId: original.runId })).toMatchObject({ ...receipt, status: "aborted" });
   expect(abort).toHaveBeenCalledOnce();
