@@ -44,6 +44,21 @@ describe("executeSchedulePreRunHook", () => {
     expect(result).toMatchObject({ exitCode, status, decision, timedOut: false, aborted: false });
   });
 
+  it.skipIf(process.platform === "win32")("blocks a malformed POSIX command before its exit can count as a skip", async () => {
+    const result = await executeSchedulePreRunHook({ command: "printf 'unterminated", stdinPayload: payload });
+    expect(result).toMatchObject({ status: "failed", decision: "block", exitCode: null, stdout: "",
+      error: "The pre-run hook command has invalid POSIX shell syntax." });
+    expect(result.stderr).not.toBe("");
+  });
+
+  it.skipIf(process.platform === "win32")("rechecks the original authority after the shell syntax check", async () => {
+    let checks = 0;
+    const result = await executeSchedulePreRunHook({ command: "printf must-not-execute", stdinPayload: payload,
+      assertCurrent: () => { if (++checks === 2) throw new Error("Project trust retired during validation"); } });
+    expect(result).toMatchObject({ status: "failed", decision: "block", stdout: "", exitCode: null,
+      spawnError: "Project trust retired during validation" });
+  });
+
   it("passes the structured schedule context on stdin", async () => {
     const source = "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const v=JSON.parse(d);console.log(v.event+':'+v.scheduleId);process.exit(v.scheduleId==='schedule-1'?2:1)})";
     const result = await executeSchedulePreRunHook({ command: nodeEval(source), stdinPayload: payload });

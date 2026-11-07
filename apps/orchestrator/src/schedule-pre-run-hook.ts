@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess, type ExecFileException } from "node:child_process";
 import { homedir } from "node:os";
 
 import { redactSecrets } from "@joko/core";
@@ -6,6 +6,8 @@ import { safeComputerEnvironment } from "@joko/tool-computer";
 
 const OUTPUT_CAP_BYTES = 8 * 1024;
 const FORCE_SETTLE_MS = 1_000;
+const POSIX_SHELL = "/bin/sh";
+const SYNTAX_CHECK_TIMEOUT_MS = 5_000;
 const NODE_ALIAS = /^joko-node\s+/u;
 
 export interface SchedulePreRunHookPayload {
@@ -80,6 +82,8 @@ export async function executeSchedulePreRunHook(
   const timeoutMs = resolveSchedulePreRunHookTimeout(input.timeoutMs);
   const stdin = JSON.stringify(input.stdinPayload);
   const resolved = resolveScheduleHookCommand(command);
+  const cwd = input.cwd?.trim() || homedir();
+  const env = { ...safeComputerEnvironment(process.env), ...resolved.environment };
 
   return new Promise<SchedulePreRunHookResult>((resolve) => {
     const stdout = new BoundedText(OUTPUT_CAP_BYTES);
@@ -90,6 +94,7 @@ export async function executeSchedulePreRunHook(
     let settled = false;
     let timedOut = false;
     let aborted = false;
+    let syntaxError: string | undefined;
 
     const finish = (exitCode: number | null, spawnError?: string): void => {
       if (settled) return;
@@ -111,7 +116,7 @@ export async function executeSchedulePreRunHook(
       const normalizedSpawnError = spawnError === undefined
         ? undefined
         : redactSecrets(spawnError).slice(0, 2_048);
-      const error = normalizedSpawnError ?? (
+      const error = normalizedSpawnError ?? syntaxError ?? (
         timedOut
           ? `Pre-run hook timed out after ${timeoutMs ?? 0}ms.`
           : !aborted && exitCode === null
@@ -146,43 +151,79 @@ export async function executeSchedulePreRunHook(
       terminate();
     };
 
-    try {
-      input.assertCurrent?.();
-      child = spawn(resolved.command, {
-        shell: true,
-        cwd: input.cwd?.trim() || homedir(),
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
-        detached: process.platform !== "win32",
-        env: {
-          ...safeComputerEnvironment(process.env),
-          ...resolved.environment
+    const launch = async (): Promise<void> => {
+      let remainingTimeoutMs = timeoutMs;
+      try {
+        input.assertCurrent?.();
+        if (process.platform !== "win32") {
+          const checkStartedAt = performance.now();
+          const check = await new Promise<{ error: ExecFileException | null; output: string }>(complete => {
+            execFile(POSIX_SHELL, ["-n", "-c", resolved.command], {
+              cwd, env, encoding: "utf8", maxBuffer: OUTPUT_CAP_BYTES,
+              timeout: Math.max(1, Math.min(SYNTAX_CHECK_TIMEOUT_MS, timeoutMs ?? SYNTAX_CHECK_TIMEOUT_MS)),
+              ...(input.signal === undefined ? {} : { signal: input.signal })
+            }, (error, _stdout, output) => complete({ error, output }));
+          });
+          if (input.signal?.aborted === true) {
+            aborted = true;
+            finish(null);
+            return;
+          }
+          if (timeoutMs !== undefined) {
+            remainingTimeoutMs = Math.ceil(timeoutMs - (performance.now() - checkStartedAt));
+            if (remainingTimeoutMs <= 0) {
+              timedOut = true;
+              finish(null);
+              return;
+            }
+          }
+          if (check.error !== null) {
+            stderr.append(check.output);
+            syntaxError = typeof check.error.code === "number"
+              ? "The pre-run hook command has invalid POSIX shell syntax."
+              : "Could not check the pre-run hook command's POSIX shell syntax.";
+            finish(null);
+            return;
+          }
+          input.assertCurrent?.();
         }
-      });
-    } catch (error) {
-      finish(null, error instanceof Error ? error.message : "Pre-run hook could not start.");
-      return;
-    }
+        if (input.signal?.aborted === true) {
+          aborted = true;
+          finish(null);
+          return;
+        }
+        child = spawn(resolved.command, {
+          shell: process.platform === "win32" ? true : POSIX_SHELL,
+          cwd, env,
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "pipe"],
+          detached: process.platform !== "win32"
+        });
+      } catch (error) {
+        finish(null, error instanceof Error ? error.message : "Pre-run hook could not start.");
+        return;
+      }
 
-    if (timeoutMs !== undefined) {
-      timer = setTimeout(() => {
-        timedOut = true;
-        terminate();
-      }, timeoutMs);
-      timer.unref?.();
-    }
-    input.signal?.addEventListener("abort", onAbort, { once: true });
-    if (input.signal?.aborted === true) onAbort();
-    child.stdout?.on("data", (chunk: Buffer | string) => stdout.append(chunk));
-    child.stderr?.on("data", (chunk: Buffer | string) => stderr.append(chunk));
-    child.once("error", (error) => finish(null, error.message));
-    child.once("close", (exitCode) => finish(exitCode));
-    child.stdin?.on("error", () => undefined);
-    try {
-      child.stdin?.end(stdin);
-    } catch {
-      // A gate that exits immediately may close stdin before the payload write.
-    }
+      if (remainingTimeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          timedOut = true;
+          terminate();
+        }, remainingTimeoutMs);
+        timer.unref?.();
+      }
+      input.signal?.addEventListener("abort", onAbort, { once: true });
+      child.stdout?.on("data", (chunk: Buffer | string) => stdout.append(chunk));
+      child.stderr?.on("data", (chunk: Buffer | string) => stderr.append(chunk));
+      child.once("error", (error) => finish(null, error.message));
+      child.once("close", (exitCode) => finish(exitCode));
+      child.stdin?.on("error", () => undefined);
+      try {
+        child.stdin?.end(stdin);
+      } catch {
+        // A gate that exits immediately may close stdin before the payload write.
+      }
+    };
+    void launch();
   });
 }
 
