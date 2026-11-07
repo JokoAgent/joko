@@ -67,6 +67,10 @@ describe("WorkspaceFilesRoute leave gate", () => {
 
   it("reruns an already settled Files search against the rebound workspace", async () => {
     vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("workspace-files-search-results") ? 400 : 24;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(480);
     vi.useFakeTimers();
     const streamWorkspaceSearch = vi.fn<AppController["streamWorkspaceSearch"]>(async function* () {
       yield { kind: "end" as const, truncated: false, totalMatches: 0, totalFiles: 0, revision: "new" };

@@ -43,7 +43,7 @@ afterEach(async () => {
 
 describe("Inspector production trees", () => {
   it("keeps the search query but retires settled matches after a workspace rebind", async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const page = { matches: [], truncated: false, totalFiles: 0, totalMatches: 0, revision: "new" };
     const searchWorkspacePage = vi.fn<AppController["searchWorkspacePage"]>(async () => page).mockResolvedValueOnce({
       ...page, revision: "old", totalFiles: 1, totalMatches: 1,
