@@ -2,7 +2,8 @@
 import { act, createElement, forwardRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { EventSchema, MessageRole, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
+import { EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
+  MessageRole, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
@@ -17,6 +18,14 @@ import { PermissionMode } from "@joko/contracts";
 import type { MobileObjectiveSheetProps } from "./MobileObjectiveSheet";
 import type { MobileTaskHeader } from "./MobileTaskHeader";
 import type { MobileContextSheet } from "./MobileContextSheet";
+import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
+
+type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
+let timelineList: { data: readonly unknown[]; onViewableItemsChanged: TimelineVisibility } | undefined;
+let receiveAppMessage: ((event: { nativeEvent: { data: string } }) => void) | undefined;
+let appBridgeKey = "";
+let MobileMcpAppViewsProvider: typeof import("./MobileMcpAppViews").MobileMcpAppViewsProvider;
+const openSystemLink = vi.fn(async (_url: string) => {});
 
 let input: ComponentProps<typeof MobileComposerRichInput>;
 let palette: ComponentProps<typeof MobileRuntimeCommandPalette>;
@@ -87,31 +96,48 @@ const colors = { background: "#fff", surface: "#fff", ink: "#111", muted: "#666"
 const surface = ({ children }: { children?: ReactNode }) => createElement("div", null, children);
 
 beforeAll(async () => {
-  vi.doMock("react-native-webview", () => ({ WebView: surface }));
+  vi.doMock("react-native-webview", () => ({ WebView: ({ onMessage }: { onMessage?: typeof receiveAppMessage }) => {
+    receiveAppMessage = onMessage;
+    return null;
+  } }));
   vi.stubGlobal("__DEV__", false);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
     View: surface, Text: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
-    FlatList: forwardRef(({ data, renderItem }: { data?: readonly unknown[];
-      renderItem?: (value: { item: unknown; index: number }) => ReactNode }) => createElement("div", null,
-      data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))))), TextInput: forwardRef(() => null),
+    FlatList: forwardRef(({ data, renderItem, onViewableItemsChanged }: { data?: readonly unknown[];
+      renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility }) => {
+      if (onViewableItemsChanged) timelineList = { data: data ?? [], onViewableItemsChanged };
+      return createElement("div", null, data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))));
+    }), TextInput: forwardRef(() => null),
     Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", null, children) : null,
     Pressable: ({ children, onPress, disabled, accessibilityLabel }: { children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean; accessibilityLabel?: string }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel }, typeof children === "function" ? children({ pressed: false }) : children),
     StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1 }, Platform: { OS: "android", select: (value: Record<string, unknown>) => value.android ?? value.default },
     AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) }, BackHandler: { addEventListener: () => ({ remove() {} }) },
     Keyboard: { dismiss() {}, addListener: () => ({ remove() {} }) }, PanResponder: { create: () => ({ panHandlers: {} }) },
     AccessibilityInfo: { announceForAccessibility() {}, setAccessibilityFocus() {}, addEventListener: () => ({ remove() {} }) },
-    Linking: {}, Alert: { alert() {} }, findNodeHandle: () => null, useColorScheme: () => "light", useWindowDimensions: () => ({ width: 390, height: 844, scale: 1, fontScale: 1 })
+    Linking: { openURL: openSystemLink }, Alert: { alert() {} }, findNodeHandle: () => null, useColorScheme: () => "light", useWindowDimensions: () => ({ width: 390, height: 844, scale: 1, fontScale: 1 })
   }));
   vi.doMock("react-native-safe-area-context", () => ({ SafeAreaProvider: surface, SafeAreaView: surface, useSafeAreaInsets: () => ({ top: 0, left: 0, bottom: 0, right: 0 }) }));
   vi.doMock("react-native-svg", () => ({ SvgXml: () => null }));
   vi.doMock("expo-status-bar", () => ({ StatusBar: () => null }));
   vi.doMock("expo-constants", () => ({ default: {} }));
-  vi.doMock("expo-crypto", () => ({ randomUUID: () => "selected-occurrence", getRandomBytes: (count: number) => new Uint8Array(count).fill(1) }));
+  vi.doMock("expo-crypto", () => {
+    let nextByte = 0;
+    return { randomUUID: () => "selected-occurrence", getRandomBytes: (count: number) => new Uint8Array(count).fill(++nextByte) };
+  });
   vi.doMock("expo-clipboard", () => ({}));
   vi.doMock("expo-camera", () => ({ CameraView: () => null, useCameraPermissions: () => [undefined, vi.fn()] }));
   for (const name of ["expo-image-picker", "expo-image-manipulator", "expo-image", "expo-sharing", "expo-file-system", "expo-media-library", "expo-audio", "expo-network", "expo-secure-store", "expo-notifications", "expo-application"]) vi.doMock(name, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => undefined }));
-  vi.doMock("expo-modules-core", () => ({ requireNativeModule: () => ({}), requireOptionalNativeModule: () => ({}), NativeModule: class {}, EventEmitter: class {} }));
+  vi.doMock("expo-modules-core", () => ({ requireNativeModule: () => ({}), requireOptionalNativeModule: () => ({}),
+    requireNativeViewManager: (_module: string, name: string) => ({ surfaceId, children }: { surfaceId: string; children?: ReactNode }) =>
+      createElement("div", { [name === "AppHost" ? "data-app-host" : "data-app-slot"]: surfaceId }, children),
+    NativeModule: class {}, EventEmitter: class {} }));
+  vi.doMock("../modules/joko-mcp-app-surface/src/JokoMcpAppSurfaceModule", () => ({ default: { appHostAvailable: true } }));
+  vi.doMock("./mobile-mcp-app-document", () => ({ prepareMcpAppNativeDocument: async (_document: unknown, bridgeKey: string) => {
+    appBridgeKey = bridgeKey;
+    const uri = "http://127.0.0.1:2/proxy.html";
+    return { source: { uri }, documentUrls: [uri], resourceUrl: "http://127.0.0.1:1/resource.html", close: async () => {} };
+  } }));
   vi.doMock("expo", () => ({ requireOptionalNativeModule: () => null }));
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
   vi.doMock("./storage", () => new Proxy({ mobileComposerDrafts: drafts, mobileLocalePreferences: { snapshot: { effectiveLocale: "en" } },
@@ -156,6 +182,7 @@ beforeAll(async () => {
   vi.doMock("./use-mobile-conversation-share", () => ({ useMobileConversationShare: () => ({ active: false, busy: false, selectedIds: [], enterVisible() {} }) }));
   vi.doMock("./use-mobile-screenshot-selection", () => ({ useMobileScreenshotSelection() {} }));
   ({ TaskScreen } = await import("./App"));
+  ({ MobileMcpAppViewsProvider } = await import("./MobileMcpAppViews"));
 });
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockClear();
@@ -166,8 +193,12 @@ beforeEach(async () => {
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
 afterEach(async () => { await act(async () => root?.unmount()); host?.remove(); });
+function taskScreen() {
+  return createElement(TaskScreen, { colors, state: renderedState, locale: "en", onBack() {}, onHome() {}, onNew() {}, onFiles() {},
+    onOpenPartnerThread: openPrivateThread, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false });
+}
 async function render(assertPalette = true): Promise<void> {
-  await act(async () => root.render(createElement(TaskScreen, { colors, state: renderedState, locale: "en", onBack() {}, onHome() {}, onNew() {}, onFiles() {}, onOpenPartnerThread: openPrivateThread, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false })));
+  await act(async () => root.render(taskScreen()));
   await act(async () => {});
   await act(async () => input.onFocus?.());
   await act(async () => input.onSelectionChange({ start: 3, end: 3 }, input.draft));
@@ -289,4 +320,66 @@ it("opens the actual Task private source pill with a fresh current peer and keep
   expect(offline?.disabled).toBe(true);
   await act(async () => offline!.click());
   expect(openPrivateThread).toHaveBeenCalledOnce(); expect(privateDirectory).toHaveBeenCalledOnce();
+});
+
+it("closes the native App view when a retained timeline card scrolls out and discards its late link grant", async () => {
+  renderedState = { ...state, live: [create(EventSchema, { eventId: "mcp-app", identity: { sessionId: "session" }, cursor: { sequence: 1n },
+    payload: { kind: { case: "mcpAppChanged", value: { card: { sessionId: "session", cardId: "app-card", title: "Retained App" } } } } })] };
+  type Response = Awaited<ReturnType<MobileMcpAppApi["native"]>>;
+  let returnLinks!: (result: Response) => void;
+  let approveLateLink!: (result: Response) => void;
+  let finishTeardown!: () => void;
+  const links = new Promise<Response>(resolve => { returnLinks = resolve; });
+  const lateGrant = new Promise<Response>(resolve => { approveLateLink = resolve; });
+  const teardown = new Promise<void>(resolve => { finishTeardown = resolve; });
+  const pendingPoll = new Promise<Response>(() => {});
+  let nextPoll = links;
+  const grant = create(McpAppNativeServiceOperateResponseSchema, { linkValidForMs: 15_000 });
+  const native = vi.fn<MobileMcpAppApi["native"]>(async request => {
+    if (request.operation === McpAppNativeOperation.OPEN) {
+      return create(McpAppNativeServiceOperateResponseSchema, { document: { viewId: `view-${request.view?.openId}` } });
+    }
+    if (request.operation === McpAppNativeOperation.POLL) {
+      const result = nextPoll;
+      nextPoll = pendingPoll;
+      return result;
+    }
+    if (request.operation === McpAppNativeOperation.AUTHORIZE_LINK) return request.linkId === "late" ? lateGrant : grant;
+    return create(McpAppNativeServiceOperateResponseSchema);
+  });
+  const metadata = vi.fn<MobileMcpAppApi["metadata"]>(async request => {
+    if (request.operation === McpAppOperation.TEARDOWN) await teardown;
+    return create(McpAppServiceOperateResponseSchema);
+  });
+  openSystemLink.mockClear();
+  await act(async () => root.render(createElement(MobileMcpAppViewsProvider, { ownerKey: "profile", bind: () => ({ ownerKey: "profile", native, metadata }), children: taskScreen() })));
+  expect(host.textContent).toContain("Retained App");
+  expect(native).not.toHaveBeenCalled();
+  const item = timelineList!.data[0];
+  const markVisible = (visible: boolean) => act(async () => timelineList!.onViewableItemsChanged({ viewableItems: visible ? [{ item, isViewable: true }] : [] }));
+  await markVisible(true);
+  const firstSlot = host.querySelector("[data-app-slot]")?.getAttribute("data-app-slot");
+  expect(firstSlot).toBeTruthy();
+  const url = "https://example.test/approved";
+  await act(async () => {
+    receiveAppMessage!({ nativeEvent: { data: JSON.stringify({ key: appBridgeKey, message: { jsonrpc: "2.0", method: "ui/notifications/initialized" } }) } });
+    returnLinks(create(McpAppNativeServiceOperateResponseSchema, { eventsJson: JSON.stringify([
+      { seq: 1, openLink: { id: "visible", url } }, { seq: 2, openLink: { id: "late", url } }
+    ]) }));
+  });
+  expect(openSystemLink).toHaveBeenCalledExactlyOnceWith(url);
+  expect(native).toHaveBeenCalledWith(expect.objectContaining({ operation: McpAppNativeOperation.AUTHORIZE_LINK, linkId: "late", url }));
+  await markVisible(false);
+  expect(host.textContent).toContain("Retained App");
+  expect(host.querySelector("[data-app-slot]")).toBeNull();
+  expect(host.querySelector("[data-app-host]")).not.toBeNull();
+  expect(metadata).toHaveBeenCalledWith(expect.objectContaining({ operation: McpAppOperation.TEARDOWN }));
+  await act(async () => approveLateLink(grant));
+  expect(openSystemLink).toHaveBeenCalledOnce();
+  expect(native).toHaveBeenCalledWith(expect.objectContaining({ operation: McpAppNativeOperation.LINK_RESULT, linkId: "late", success: false }));
+  await act(async () => finishTeardown());
+  await markVisible(true);
+  const nextSlot = host.querySelector("[data-app-slot]")?.getAttribute("data-app-slot");
+  expect(nextSlot).toBeTruthy();
+  expect(nextSlot).not.toBe(firstSlot);
 });
