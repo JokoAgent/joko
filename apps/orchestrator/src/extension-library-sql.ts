@@ -104,7 +104,6 @@ const FORBIDDEN_KEYWORDS = new Set([
   "VACUUM",
   "BEGIN",
   "COMMIT",
-  "END",
   "ROLLBACK",
   "SAVEPOINT",
   "RELEASE",
