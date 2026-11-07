@@ -275,6 +275,8 @@ describe("managed Subagent public observation", () => {
     await writeManagedSubagentDurableControl(input);
     await writeManagedSubagentDurableControl(input);
 
+    expect(store.scanTaskIds).toEqual([taskId, taskId, taskId]);
+    expect(store.tailReads).toBe(0);
     expect(store.controls).toHaveLength(1);
     expect(store.controls[0]).toMatchObject({
       kind: "control",
@@ -817,6 +819,8 @@ class DurableStoreFixture implements PiManagedDurableStore {
   }> = [];
   failuresRemaining = 0;
   scanCalls = 0;
+  readonly scanTaskIds: (string | undefined)[] = [];
+  tailReads = 0;
 
   readonly #sessionId: string;
   readonly #taskId: string;
@@ -865,6 +869,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
   async scan(input: {
     readonly sessionId: string;
     readonly sessionKey: string;
+    readonly taskId?: string;
     readonly afterRevision?: string;
     readonly limitBytes: number;
   }): Promise<{
@@ -874,6 +879,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
     readonly runs: readonly PiManagedDurableRunSnapshot[];
   }> {
     this.scanCalls += 1;
+    this.scanTaskIds.push(input.taskId);
     if (this.failuresRemaining > 0) {
       this.failuresRemaining -= 1;
       throw new Error("simulated remote scan failure");
@@ -996,6 +1002,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
     readonly eof: boolean;
     readonly content: Uint8Array;
   }> {
+    this.tailReads += 1;
     expect(input).toMatchObject({
       sessionId: this.#sessionId,
       runId: this.#runId,

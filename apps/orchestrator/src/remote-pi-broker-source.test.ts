@@ -1067,6 +1067,7 @@ async function managedStoreRequest(
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk: string) => { output += chunk; });
   child.stderr.resume();
+  const closed = once(child, "close");
   child.stdin.end(`${JSON.stringify({
     action: "managed-store",
     version: REMOTE_PI_BROKER_PROTOCOL_VERSION,
@@ -1075,7 +1076,7 @@ async function managedStoreRequest(
     authority,
     ...operation
   })}\n`);
-  expect(await processExit(child)).toBe(0);
+  expect((await closed)[0]).toBe(0);
   return JSON.parse(output) as Record<string, unknown>;
 }
 
@@ -2092,6 +2093,118 @@ try {
       }
     },
     30_000
+  );
+
+  it.runIf(process.platform === "linux")(
+    "pages a large managed history at one revision and still controls one live task",
+    async () => {
+      const fixture = await brokerFixture();
+      const target = await upstream();
+      const sessionKey = digest(fixture.productSessionId).slice(0, 40);
+      const sessionRoot = join(fixture.runRoot, sessionKey);
+      const scope = { sessionId: fixture.productSessionId, sessionKey };
+      let bridge: Awaited<ReturnType<typeof startBridge>> | undefined;
+      let runner: Awaited<ReturnType<typeof remoteRunnerFixture>> | undefined;
+      try {
+        bridge = await startBridge(fixture, bootstrap(fixture, 1, "store-paged-bearer-00000000000000000", target.port));
+        runner = await remoteRunnerFixture(fixture, 1, false);
+        const runnerStatusPath = join(runner.runDirectory, "status.json");
+        const runnerStatus = JSON.parse(await readFile(runnerStatusPath, "utf8")) as Record<string, unknown>;
+        await writeFile(runnerStatusPath, JSON.stringify({ ...runnerStatus, heartbeatAt: Date.now() - 60_000 }));
+        const history: string[] = [];
+        for (let index = 1; index <= 110; index += 1) {
+          const runId = `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+          const runDir = join(sessionRoot, runId);
+          const runnerScript = join(runDir, "joko-managed-subagent-runner.cjs");
+          const taskId = `history:${index}`;
+          const task = index % 2 === 0 ? "x".repeat(5_000) : "审计".repeat(834);
+          const common = {
+            format: 1, runId, launchToken: randomUUID(), runnerInstanceId: randomUUID(),
+            runnerScript, runnerScriptSha256: fixture.trustedRunnerScriptSha256,
+            productSessionId: fixture.productSessionId, taskId, childId: `${taskId}:child`
+          };
+          const status = { ...common, task, state: "completed", runnerPid: 0, summary: "original" };
+          await mkdir(runDir, { mode: 0o700 });
+          await Promise.all([
+            writeFile(runnerScript, RUNNER_SOURCE, { mode: 0o600 }),
+            writeFile(join(runDir, "config.json"), JSON.stringify({ ...common, runDir, productGeneration: 1, task }), { mode: 0o600 }),
+            writeFile(join(runDir, "owner.json"), JSON.stringify({ ...common, state: "reserved" }), { mode: 0o600 }),
+            writeFile(join(runDir, "status.json"), JSON.stringify(status), { mode: 0o600 })
+          ]);
+          history.push(runId);
+        }
+        const authority = bridge.authority;
+        const scan = { operation: "scan", ...scope, limitBytes: 1024 * 1024 };
+        const collect = async (first: Record<string, unknown>): Promise<Record<string, unknown>[]> => {
+          const runs: Record<string, unknown>[] = [];
+          let page = first;
+          for (let index = 0; index <= history.length; index += 1) {
+            expect(page["revision"]).toBe(first["revision"]);
+            expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(scan.limitBytes);
+            runs.push(...page["runs"] as Record<string, unknown>[]);
+            if (page["nextPage"] === undefined) return runs;
+            page = await managedStoreRequest(fixture, authority, { ...scan, page: page["nextPage"] });
+          }
+          throw new Error("The managed history scan did not reach its last page.");
+        };
+        const last = history.at(-1)!;
+        const transcriptPath = join(sessionRoot, last, "transcript.jsonl");
+        await writeFile(transcriptPath, '{"type":"history","version":"A"}\n', { mode: 0o600 });
+        const first = await managedStoreRequest(fixture, authority, scan);
+        expect(first["nextPage"]).toMatchObject({ index: 1 });
+        expect((first["runs"] as Record<string, unknown>[]).some((run) => run["runId"] === last)).toBe(false);
+        const changedTranscript = '{"type":"history","version":"B"}\n';
+        await writeFile(transcriptPath, changedTranscript);
+        await managedStoreRejected(fixture, authority, {
+          ...scan, taskId: "remote-runner-task", page: first["nextPage"]
+        });
+        const frozen = await collect(first);
+        expect(frozen.map((run) => run["runId"])).toEqual([...history, runner.runId].sort());
+        expect(first["revision"]).toBe(digest(JSON.stringify([
+          fixture.productSessionId, ...frozen.map((run) => [run["runId"], run["revision"]])
+        ])));
+        const old = frozen.find((run) => run["runId"] === last)!;
+        const changed = await managedStoreRequest(fixture, authority, { ...scan, afterRevision: first["revision"] });
+        expect(changed["revision"]).not.toBe(first["revision"]);
+        const replacement = (await collect(changed)).find((run) => run["runId"] === last)!;
+        expect(replacement["transcriptBytes"]).toBe(old["transcriptBytes"]);
+        expect(replacement["transcriptRevision"]).not.toBe(old["transcriptRevision"]);
+        const tail = await managedStoreRequest(fixture, authority, {
+          operation: "read-tail", sessionId: scope.sessionId, runId: last, runnerInstanceId: replacement["runnerInstanceId"],
+          artifactRevision: replacement["transcriptRevision"], pathKind: "transcript", offset: 0, maxBytes: 1_024
+        });
+        expect(Buffer.from(String(tail["content"]), "base64").toString("utf8")).toBe(changedTranscript);
+        expect(await managedStoreRequest(fixture, authority, { ...scan, afterRevision: changed["revision"] }))
+          .toMatchObject({ revision: changed["revision"], unchanged: true, runs: [] });
+
+        await writeFile(runnerStatusPath, JSON.stringify({ ...runnerStatus, heartbeatAt: Date.now() }));
+        const targetScan = await managedStoreRequest(fixture, authority, { ...scan, taskId: "remote-runner-task", limitBytes: 8192 });
+        const runs = targetScan["runs"] as Record<string, unknown>[];
+        expect(runs).toEqual([expect.objectContaining({ runId: runner.runId, controlSafe: true })]);
+        const control = {
+          format: 1, requestId: randomUUID(), runId: runner.runId, launchToken: runner.launchToken,
+          productSessionId: fixture.productSessionId, productGeneration: 1,
+          taskId: "remote-runner-task", action: "stop", requestedAt: Date.now()
+        };
+        expect(await managedStoreRequest(fixture, authority, {
+          operation: "write-control", sessionId: scope.sessionId, runId: runner.runId, runnerInstanceId: runner.runnerFence,
+          launchToken: runner.launchToken, runnerScriptSha256: fixture.trustedRunnerScriptSha256,
+          expectedControlRevision: runs[0]?.["controlRevision"], kind: "control", value: control
+        })).toMatchObject({ receipt: expect.stringMatching(/^[0-9a-f]{64}$/u) });
+        expect(JSON.parse(await readFile(join(runner.runDirectory, "control.json"), "utf8"))).toMatchObject(control);
+      } finally {
+        if (bridge !== undefined) {
+          await managedStoreRequest(fixture, bridge.authority, { operation: "stop-remove-session", ...scope, timeoutMs: 100 })
+            .catch(() => undefined);
+          bridge.process.kill("SIGKILL");
+        }
+        runner?.process.kill("SIGKILL");
+        await closeServer(target.server);
+        try { await exactKill(await managerPid(fixture), "daemon", fixture.sourcePath); } catch { /* already stopped */ }
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    },
+    60_000
   );
 
   it.runIf(process.platform === "linux")(

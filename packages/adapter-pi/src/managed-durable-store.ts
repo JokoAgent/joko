@@ -27,6 +27,8 @@ export interface PiManagedDurableStore {
   scan(input: {
     readonly sessionId: string;
     readonly sessionKey: string;
+    /** Limits metadata to the physical attempts belonging to one logical task. */
+    readonly taskId?: string;
     readonly afterRevision?: string;
     readonly limitBytes: number;
   }): Promise<{

@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS } from "@joko/adapter-pi";
 
 export const REMOTE_PI_BROKER_PROTOCOL_VERSION = 1;
+export const REMOTE_PI_MANAGED_SCAN_LIMIT_BYTES = 64 * 1024 * 1024;
+
 export const REMOTE_PI_BROKER_SOURCE = String.raw`
 import { execFile, spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -40,6 +42,9 @@ const MANAGED_ARTIFACT_CHUNK_BYTES = 256 * 1024;
 const MANAGED_ARTIFACT_SNAPSHOT_TTL_MS = 15 * 60_000;
 const MANAGED_DELETION_RECEIPT_TTL_MS = 24 * 60 * 60_000;
 const MAX_MANAGED_RUNS = 256;
+const MAX_MANAGED_SCAN_BYTES = ${REMOTE_PI_MANAGED_SCAN_LIMIT_BYTES};
+const MAX_MANAGED_SCAN_SNAPSHOTS = 4;
+const MANAGED_SCAN_SNAPSHOT_TTL_MS = 60_000;
 const MAX_MANAGED_CONTROL_FILE_BYTES = 64 * 1024;
 const MAX_MANAGED_APPROVAL_CONTROL_BYTES = ${MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.controlFileBytes};
 const MAX_POLICY_DECISION_REPLY_CHARACTERS = ${MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.replyCharacters};
@@ -2035,7 +2040,7 @@ async function managedResumeSafety(layout, config, status, runId) {
     return false;
   }
 }
-async function inspectManagedRun(session, sessionId, runId) {
+async function inspectManagedRun(session, sessionId, runId, taskId) {
   if (!exactUuid(runId)) fail();
   const layout = managedSessionLayout(session, sessionId);
   await privateDirectory(layout.runRoot);
@@ -2048,6 +2053,8 @@ async function inspectManagedRun(session, sessionId, runId) {
   const ownerPath = join(runDirectory, "owner.json");
   const claimPath = join(runDirectory, "runner.claim.json");
   const runnerScript = join(runDirectory, "joko-managed-subagent-runner.cjs");
+  const scopedConfig = taskId === undefined ? undefined : await privateRegularFile(configPath, 512 * 1024);
+  if (scopedConfig !== undefined && parsedPrivateRecord(scopedConfig).taskId !== taskId) return undefined;
   const [
     configBytes,
     statusBytes,
@@ -2059,7 +2066,7 @@ async function inspectManagedRun(session, sessionId, runId) {
     transcriptSnapshot,
     resultSnapshot
   ] = await Promise.all([
-    privateRegularFile(configPath, 512 * 1024),
+    scopedConfig ?? privateRegularFile(configPath, 512 * 1024),
     privateRegularFile(statusPath, 512 * 1024),
     privateRegularFile(ownerPath, 512 * 1024),
     optionalPrivateRegularFile(claimPath, 64 * 1024),
@@ -2094,6 +2101,7 @@ async function inspectManagedRun(session, sessionId, runId) {
     || owner.productSessionId !== layout.sessionId || owner.runnerInstanceId !== runnerInstanceId
     || owner.runnerScript !== runnerScript || owner.runnerScriptSha256 !== runnerScriptSha256
     || !["reserved", "running"].includes(owner.state)
+    || taskId !== undefined && (status.taskId !== taskId || owner.taskId !== taskId)
   ) fail();
   if (config.nativeAuthRequired === true) {
     if (
@@ -2270,6 +2278,9 @@ function managedArtifactRevision(session, run, kind, artifact) {
 function attachManagedArtifactRevisions(session, snapshot) {
   snapshot.transcriptRevision = managedArtifactRevision(session, snapshot, "transcript", snapshot.transcriptSnapshot);
   snapshot.resultRevision = managedArtifactRevision(session, snapshot, "result", snapshot.resultSnapshot);
+  snapshot.revision = digestBytes(Buffer.from(JSON.stringify([
+    snapshot.revision, snapshot.transcriptRevision, snapshot.resultRevision
+  ])));
   return snapshot;
 }
 function sameOpenFileIdentity(info, snapshot) {
@@ -2331,11 +2342,42 @@ async function readManagedArtifactSnapshot(snapshot, offset, maximumReadBytes) {
     await handle.close();
   }
 }
+function managedScanResponse(session, limitBytes, revision, unchanged, runs, nextPage) {
+  const response = assertManagedResponseSecretFree(session, {
+    ok: true, revision, unchanged, retryAfterMs: 1_000, runs,
+    ...(nextPage === undefined ? {} : { nextPage })
+  });
+  if (Buffer.byteLength(JSON.stringify(response)) > limitBytes) fail();
+  return response;
+}
+function managedScanPage(session, scanId, scan, index) {
+  const more = index + 1 < scan.pages.length;
+  const response = managedScanResponse(session, scan.limitBytes, scan.revision, false, scan.pages[index],
+    more ? { scanId, index: index + 1 } : undefined);
+  if (more) scan.deadline = performance.now() + MANAGED_SCAN_SNAPSHOT_TTL_MS;
+  else session.managedScanSnapshots.delete(scanId);
+  return response;
+}
 async function scanManagedRuns(session, value) {
   const layout = managedSessionLayout(session, value.sessionId, value.sessionKey);
-  const limitBytes = value.limitBytes;
-  if (!Number.isSafeInteger(limitBytes) || limitBytes < 1 || limitBytes > 1024 * 1024) fail();
+  if (!Number.isSafeInteger(value.limitBytes) || value.limitBytes < 1 || value.limitBytes > MAX_CONTROL_BYTES) fail();
+  const limitBytes = Math.min(MAX_CONTROL_BYTES - 4096, value.limitBytes);
+  const taskId = value.taskId === undefined ? undefined : boundedText(value.taskId, 256);
   const afterRevision = value.afterRevision === undefined ? undefined : launchHash(value.afterRevision);
+  const scans = session.managedScanSnapshots;
+  const now = performance.now();
+  for (const [scanId, scan] of scans) {
+    if (scan.deadline <= now || scan.epoch !== session.authorityEpoch || scan.generation !== session.childGeneration) {
+      scans.delete(scanId);
+    }
+  }
+  if (value.page !== undefined) {
+    const page = value.page;
+    if (!page || !exactUuid(page.scanId) || !Number.isSafeInteger(page.index) || page.index < 1 || afterRevision !== undefined) fail();
+    const scan = scans.get(page.scanId);
+    if (scan === undefined || scan.taskId !== taskId || scan.limitBytes !== limitBytes || page.index >= scan.pages.length) fail();
+    return managedScanPage(session, page.scanId, scan, page.index);
+  }
   await privateDirectory(layout.runRoot);
   let entries;
   try {
@@ -2354,26 +2396,46 @@ async function scanManagedRuns(session, value) {
   }
   runIds.sort();
   const snapshots = [];
+  let bytes = 0;
   for (const runId of runIds) {
-    snapshots.push(attachManagedArtifactRevisions(
-      session,
-      await inspectManagedRun(session, layout.sessionId, runId)
-    ));
+    const inspected = await inspectManagedRun(session, layout.sessionId, runId, taskId);
+    if (inspected === undefined) continue;
+    const run = publicManagedSnapshot(attachManagedArtifactRevisions(session, inspected));
+    const size = Buffer.byteLength(JSON.stringify(run)) + 1;
+    bytes += size;
+    if (bytes > MAX_MANAGED_SCAN_BYTES) fail();
+    snapshots.push({ run, size });
   }
   const revision = digestBytes(Buffer.from(JSON.stringify([
     layout.sessionId,
-    ...snapshots.map((snapshot) => [snapshot.runId, snapshot.revision])
+    ...snapshots.map(({ run }) => [run.runId, run.revision])
   ])));
-  const unchanged = afterRevision === revision;
-  const runs = unchanged ? [] : snapshots.map(publicManagedSnapshot);
-  const response = assertManagedResponseSecretFree(session, {
-    ok: true,
-    revision,
-    unchanged,
-    retryAfterMs: 1_000,
-    runs
-  });
-  if (Buffer.byteLength(JSON.stringify(response)) > Math.min(MAX_CONTROL_BYTES - 4096, limitBytes)) fail();
+  if (afterRevision === revision) return managedScanResponse(session, limitBytes, revision, true, []);
+  const headerBytes = Buffer.byteLength(JSON.stringify({ ok: true, revision, unchanged: false, retryAfterMs: 1_000, runs: [] }));
+  if (headerBytes + Math.max(0, bytes - 1) <= limitBytes) {
+    return managedScanResponse(session, limitBytes, revision, false, snapshots.map(({ run }) => run));
+  }
+  const maximumPageBytes = limitBytes - headerBytes - 128;
+  const pages = [[]];
+  let pageBytes = 0;
+  for (const { run, size } of snapshots) {
+    if (size > maximumPageBytes) fail();
+    if (pageBytes + size > maximumPageBytes) {
+      pages.push([]);
+      pageBytes = 0;
+    }
+    pages.at(-1).push(run);
+    pageBytes += size;
+  }
+  const cachedBytes = [...scans.values()].reduce((sum, scan) => sum + scan.bytes, 0);
+  if (scans.size >= MAX_MANAGED_SCAN_SNAPSHOTS || cachedBytes + bytes > MAX_MANAGED_SCAN_BYTES) fail();
+  const scanId = randomUUID();
+  const scan = {
+    taskId, limitBytes, revision, pages, bytes, epoch: session.authorityEpoch,
+    generation: session.childGeneration, deadline: now + MANAGED_SCAN_SNAPSHOT_TTL_MS
+  };
+  const response = managedScanPage(session, scanId, scan, 0);
+  scans.set(scanId, scan);
   return response;
 }
 async function readManagedTail(session, value) {
@@ -2490,6 +2552,7 @@ async function writeManagedControl(session, value) {
   });
 }
 async function completeManagedRemoval(session, layout, terminalRunIds) {
+  session.managedScanSnapshots.clear();
   if (session.managedRemoval !== undefined) {
     const previous = managedRemovalRecord(session.managedRemoval);
     if (previous.sessionId !== layout.sessionId || previous.sessionKey !== layout.sessionKey) fail();
@@ -3406,6 +3469,7 @@ async function runSessionOwner(root, request, ownerIdentity) {
       inputTail: Promise.resolve(),
       nativeAuthGenerations: new Map(),
       nativeAuthReservations: new Map(),
+      managedScanSnapshots: new Map(),
       managedArtifactSnapshots: new Map(),
       managedArtifactSnapshotChunks: 0,
       managedRemoval: undefined,
