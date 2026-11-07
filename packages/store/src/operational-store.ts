@@ -10426,19 +10426,19 @@ export class OperationalStore {
       }
       const at = options.at ?? this.now();
       const row = this.database.prepare(`
-        SELECT q.id, q.attempt_id FROM queue_items q
+        SELECT q.id, q.attempt_id, q.backend_instance_generation FROM queue_items q
         JOIN queue_controls control ON control.session_id = q.session_id
         JOIN product_sessions session ON session.id = q.session_id
         JOIN backends backend ON backend.id = session.backend_id
         JOIN attempts attempt ON attempt.id = q.attempt_id AND attempt.run_id = q.run_id
-        WHERE q.state = 'accepted' AND q.backend_instance_generation IS NULL
-          AND attempt.backend_instance_generation IS NULL
+        WHERE q.state = 'accepted'
+          AND (q.backend_instance_generation IS NULL OR q.backend_instance_generation = backend.instance_generation)
+          AND attempt.backend_instance_generation IS q.backend_instance_generation
           AND q.session_id = ? AND control.paused = 0
           AND NOT EXISTS (
             SELECT 1 FROM queue_items preceding
             WHERE preceding.session_id = q.session_id
               AND preceding.state = 'accepted'
-              AND preceding.backend_instance_generation IS NULL
               AND (
                 preceding.position < q.position
                 OR (
@@ -10468,37 +10468,39 @@ export class OperationalStore {
       `).get(sessionId, at, at, options.backendInstanceGeneration) as Row | undefined;
       if (row === undefined) return undefined;
       const id = stringValue(row["id"]);
-      const attemptId = stringValue(row["attempt_id"]);
-      const attemptResult = this.database.prepare(`
-        UPDATE attempts
-        SET backend_instance_generation = ?, revision = ?
-        WHERE id = ? AND backend_instance_generation IS NULL
-          AND EXISTS (
-            SELECT 1
-            FROM queue_items queue
-            JOIN product_sessions session ON session.id = queue.session_id
-            JOIN backends backend ON backend.id = session.backend_id
-            WHERE queue.id = ? AND queue.state = 'accepted'
-              AND queue.attempt_id = attempts.id
-              AND queue.run_id = attempts.run_id
-              AND queue.backend_instance_generation IS NULL
-              AND backend.instance_generation = ?
-          )
-      `).run(
-        options.backendInstanceGeneration,
-        asSqlInteger(this.requireActiveRevision()),
-        attemptId,
-        id,
-        options.backendInstanceGeneration
-      );
-      if (attemptResult.changes !== 1) {
-        throw new StoreError("The queue Attempt Backend instance claim lost its authority fence.");
+      if (row["backend_instance_generation"] === null) {
+        const attemptResult = this.database.prepare(`
+          UPDATE attempts
+          SET backend_instance_generation = ?, revision = ?
+          WHERE id = ? AND backend_instance_generation IS NULL
+            AND EXISTS (
+              SELECT 1
+              FROM queue_items queue
+              JOIN product_sessions session ON session.id = queue.session_id
+              JOIN backends backend ON backend.id = session.backend_id
+              WHERE queue.id = ? AND queue.state = 'accepted'
+                AND queue.attempt_id = attempts.id
+                AND queue.run_id = attempts.run_id
+                AND queue.backend_instance_generation IS NULL
+                AND backend.instance_generation = ?
+            )
+        `).run(
+          options.backendInstanceGeneration,
+          asSqlInteger(this.requireActiveRevision()),
+          stringValue(row["attempt_id"]),
+          id,
+          options.backendInstanceGeneration
+        );
+        if (attemptResult.changes !== 1) {
+          throw new StoreError("The queue Attempt Backend instance claim lost its authority fence.");
+        }
       }
       const result = this.database.prepare(`
         UPDATE queue_items
         SET state = 'dispatching', backend_instance_generation = ?,
             dispatched_at = ?, updated_at = ?, revision = ?
-        WHERE id = ? AND state = 'accepted' AND backend_instance_generation IS NULL
+        WHERE id = ? AND state = 'accepted'
+          AND (backend_instance_generation IS NULL OR backend_instance_generation = ?)
           AND EXISTS (
             SELECT 1
             FROM product_sessions session
@@ -10518,6 +10520,7 @@ export class OperationalStore {
         at,
         asSqlInteger(this.requireActiveRevision()),
         id,
+        options.backendInstanceGeneration,
         options.backendInstanceGeneration,
         options.backendInstanceGeneration
       );
@@ -10554,11 +10557,13 @@ export class OperationalStore {
       const at = this.now();
       const attemptId = `attempt-${randomUUID()}`;
       this.finishAttempt(attempt.id, error, at);
+      // The earlier send was rejected, but the Queue's Backend instance
+      // ownership is immutable. Its new Attempt keeps the same owner.
       this.createAttempt({ id: attemptId, runId: item.runId, ordinal: attempt.ordinal + 1,
-        generation: attempt.generation, startedAt: at });
+        generation: attempt.generation, backendInstanceGeneration: item.backendInstanceGeneration, startedAt: at });
       this.database.prepare(`
         UPDATE queue_items SET state = 'accepted', disposition = 'prompt', attempt_id = ?,
-          backend_instance_generation = NULL, dispatched_at = NULL, body_hash = ?, body_json = ?,
+          dispatched_at = NULL, body_hash = ?, body_json = ?,
           updated_at = ?, revision = ? WHERE id = ?
       `).run(attemptId, operationBodyHash(body), serializeJson(body), at, asSqlInteger(this.requireActiveRevision()), item.id);
       this.appendQueueEvent(this.getQueueItem(item.id), session, `dispatch:${item.id}:steer-fallback`);

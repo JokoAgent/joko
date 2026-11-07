@@ -101,12 +101,13 @@ it.each(["completed", "aborted"] as const)("requeues a known inactive target ste
   const request = { kind: "send", requestKey: "settling-steer", target: { kind: "task", id: f.taskId }, text: "Follow this up", delivery: "steer" };
   const result = await f.request(request) as { queueItemId: string; runId: string };
   expect(result).toMatchObject({ delivery: "steer", accepted: true });
+  const backendInstanceGeneration = f.store.getBackend(f.adapter.id).descriptor.instanceGeneration;
   await vi.waitFor(() => expect(f.store.getQueueItem(result.queueItemId)).toMatchObject({
-    state: "accepted", disposition: "prompt", runId: result.runId
+    state: "accepted", disposition: "prompt", runId: result.runId, backendInstanceGeneration
   }));
   const [steer, fallback] = f.store.listAttempts(result.runId);
   expect(steer?.descriptor).toMatchObject({ ordinal: 1, error: { code: "PI_STEER_REQUIRES_ACTIVE_RUN", stateMayHaveChanged: false } });
-  expect(fallback?.descriptor).toMatchObject({ ordinal: 2, generation: steer?.descriptor.generation });
+  expect(fallback?.descriptor).toMatchObject({ ordinal: 2, generation: steer?.descriptor.generation, backendInstanceGeneration });
   expect(f.store.getRun(result.runId).descriptor.activeAttemptId).toBe(fallback?.descriptor.id);
   expect(send.mock.calls.map(([input]) => input.disposition)).toEqual(["prompt", "steer"]);
 
