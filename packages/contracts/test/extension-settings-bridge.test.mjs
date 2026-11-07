@@ -106,6 +106,17 @@ test("fetch uses the settings bridge and checks its routing revision before a wr
   await assert.rejects(current.context.fetch("https://foreign.example/kv"), /ambient/u);
 });
 
+test("a standard same-origin URL enters the bounded settings fetch bridge", async () => {
+  const current = page(), endpoint = new URL("/kv", "https://settings.joko.invalid/author/settings.html");
+  const pending = current.context.fetch(endpoint);
+  assert.equal(current.requests[0]?.command.kind, "routing.get");
+  current.respond(current.requests[0].id, { revision: "8", dataJson: '{"folder":"inbox"}' });
+  assert.deepEqual(await (await pending).json(), { folder: "inbox" });
+  await assert.rejects(current.context.fetch(new URL("/kv", "https://foreign.example/")), /ambient/u);
+  await assert.rejects(current.context.fetch(new URL("/kv?scope=other", endpoint)), /query/u);
+  assert.equal(current.requests.length, 1);
+});
+
 test("fetch does not send a password that becomes escaped in plugin parameters", async () => {
   const current = page(), value = 'fixture"header-secret';
   current.dispatch("input", { target: { type: "password", value } });
