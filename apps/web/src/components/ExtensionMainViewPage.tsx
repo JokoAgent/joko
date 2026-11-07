@@ -340,6 +340,10 @@ export function ExtensionMainViewPage({
       if (!current() || event.source !== frame.contentWindow || event.origin !== "null") return;
       const request = parseExtensionLibraryBridgeRequest(event.data);
       if (request === undefined || pending.has(request.id)) return;
+      if (request.command.kind === "oversizedClipboardWrite") {
+        respond(request.id, { ok: false, error: { code: "TOO_LARGE", message: "Extension Library clipboard PNG exceeds the size limit." } });
+        return;
+      }
       pending.add(request.id);
       void (async () => {
         if (request.command.kind === "capabilities") {
@@ -649,6 +653,9 @@ export function ExtensionMainViewPage({
 function libraryBridgeFailure(cause: unknown): { readonly code: string; readonly message: string } {
   if (cause instanceof DOMException && cause.name === "AbortError") {
     return { code: "CANCELLED", message: "Extension Library operation was cancelled." };
+  }
+  if (cause && typeof cause === "object" && "code" in cause && cause.code === "RATE_LIMITED") {
+    return { code: "RATE_LIMITED", message: "Extension Library clipboard requests are too frequent." };
   }
   if (!(cause instanceof ConnectError)) {
     return { code: "INTERNAL", message: "Extension Library operation failed." };

@@ -1,3 +1,4 @@
+import { EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES } from "@joko/contracts";
 import type { ExtensionLibraryCallView, ExtensionLibrarySqlStatementView, ExtensionLibrarySqlValueView } from "./model.js";
 
 export const EXTENSION_LIBRARY_BRIDGE_REQUEST = "joko:extension-library-request";
@@ -9,6 +10,7 @@ export type ExtensionLibraryBridgeCommand =
   | { readonly kind: "reveal"; readonly path: string }
   | { readonly kind: "saveAs"; readonly path: string; readonly name?: string }
   | { readonly kind: "clipboardWrite"; readonly content: Uint8Array }
+  | { readonly kind: "oversizedClipboardWrite" }
   | { readonly kind: "call"; readonly call: ExtensionLibraryCallView };
 
 export interface ExtensionLibraryBridgeRequest {
@@ -64,7 +66,8 @@ function parseOperation(value: unknown): ExtensionLibraryBridgeCommand | undefin
   }
   if (value.kind === "clipboardWrite") {
     if (!exact(value, ["kind", "content"]) || !(value.content instanceof Uint8Array)
-      || value.content.byteLength === 0 || value.content.byteLength > MAXIMUM_INLINE_BYTES) return undefined;
+      || value.content.byteLength === 0) return undefined;
+    if (value.content.byteLength > EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES) return { kind: "oversizedClipboardWrite" };
     return { kind: "clipboardWrite", content: new Uint8Array(value.content) };
   }
   const call = parseCall(value);

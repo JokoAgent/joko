@@ -402,6 +402,7 @@ import { DesktopTaskSharingInvitationBuffer } from "./task-sharing-invitation.js
 import { verifyPackagedSmokeTaskSharing } from "./packaged-smoke-task-sharing.js";
 import {
   ExtensionLibraryGestureCoordinator,
+  ExtensionLibraryGestureError,
   extensionLibrarySavePortSource,
   parseExtensionLibraryBeginSaveRequest,
   parseExtensionLibraryClipboardRequest,
@@ -8607,7 +8608,12 @@ function registerIpc(): void {
     assertFocusedTrustedIpcSender(event);
     if (parameters.length !== 1) throw new TypeError("Extension Library clipboard write requires one request.");
     const request = parseExtensionLibraryClipboardRequest(parameters[0]);
-    extensionLibraryGestures.attempt(request.extensionId, "clipboardWrite");
+    try {
+      extensionLibraryGestures.attempt(request.extensionId, "clipboardWrite");
+    } catch (error) {
+      if (error instanceof ExtensionLibraryGestureError && error.code === "RATE_LIMITED") return error.code;
+      throw error;
+    }
     const image = nativeImage.createFromBuffer(Buffer.from(request.bytes));
     if (image.isEmpty()) throw new TypeError("Extension Library clipboard PNG could not be decoded.");
     assertFocusedTrustedIpcSender(event);
