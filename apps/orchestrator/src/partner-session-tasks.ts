@@ -15,6 +15,7 @@ import { readPartnerSessionTaskGroupOrigin, type PartnerSessionTaskGroupOrigin, 
 import { partnerTaskContextUsage, suggestPartnerTaskRoute } from "./partner-task-route.js";
 
 const SCOPE = "partner.session-tasks";
+const DEFAULT_RESUME_INPUT = "Continue from the existing task history after the requested pause. Check completed actions; do not replay the original request.";
 function sameComputer(target: TargetDescriptor, home: TargetDescriptor): boolean {
   const child = target.remoteWorkspace, parent = home.remoteWorkspace;
   return parent === undefined ? child === undefined : parent.kind === "device_peer" && child?.kind === "device_peer"
@@ -261,17 +262,8 @@ export class PartnerSessionTaskManager {
       if (!task.sessionId) throw invalid("This task has no confirmed Session.");
       this.#assertTaskSession(task); await this.#assertDirectory(task); assertCaller(); this.#assertTaskSession(task);
       if (input.mode === "resume") {
-        if (task.control !== "paused") throw invalid("Only a confirmed paused task can resume.");
-        const open = this.store.listInteractions({ sessionId: task.sessionId, status: "open" });
-        if (open.length && input.message) throw invalid("Resume without input, then answer the pending interaction.");
-        this.host.restorePartnerQueue({ sessionId: task.sessionId, operationId, ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
-        task = { ...task, control: "active", deadlineAt: task.deadlineAt + Math.max(0, this.now() - task.pauseAt!),
-          pauseAt: undefined, queuePauseRevision: undefined, updatedAt: this.now() };
-        this.#save(task);
-        if (input.message || !open.length && this.store.countQueueItems({ sessionId: task.sessionId!, states: ["accepted"] }) === 0) {
-          this.#enqueue(task, `${operationId}:resume-input`, input.message ?? "Continue from the existing task history after the requested pause. Check completed actions; do not replay the original request.", "prompt", sessionId);
-        }
-        this.host.wakePartnerSession(task.sessionId!); return this.#reconcile(id);
+        this.#resume(task, task.sessionId, sessionId, operationId, input.message, assertCaller);
+        return this.#reconcile(id);
       }
       if (task.control !== "active" || task.status === "unknown") throw invalid("Resume a confirmed pause or resolve the unknown task state before sending input.");
       if (input.decision) {
@@ -309,6 +301,41 @@ export class PartnerSessionTaskManager {
       assertCaller(); this.#enqueue(task, operationId, input.message!, input.mode === "steer" ? "steer" : "prompt", sessionId); return this.#reconcile(id);
     });
   }
+
+  #resume(task: PartnerSessionTaskRecord, childSessionId: string, callerSessionId: string, operationId: string, message: string | undefined, assertCaller: () => void): void {
+    const inputOperationId = `${operationId}:resume-input`;
+    const text = message ?? DEFAULT_RESUME_INPUT;
+    this.store.transaction(store => {
+      store.runOperation({ id: `${operationId}:resume-task`, kind: "partner_task_resume",
+        body: { taskId: task.id, childSessionId, callerSessionId, messageHash: message === undefined ? null : hash(message) } }, () => {
+        assertCaller();
+        const prior = store.findOperation(inputOperationId);
+        if (prior?.status === "completed") {
+          const body = prior.body as { sessionId?: string; originSessionId?: string; prompt?: PromptInput };
+          if (prior.kind !== "service_send_input" || body.sessionId !== childSessionId || body.originSessionId !== callerSessionId
+            || body.prompt?.disposition !== "prompt" || body.prompt.text !== text) throw invalid("This input identity belongs to another message.");
+          return { sessionId: childSessionId };
+        }
+        if (task.control !== "paused") throw invalid("Only a confirmed paused task can resume.");
+        const open = store.listInteractions({ sessionId: childSessionId, status: "open" });
+        if (open.length && message) throw invalid("Resume without input, then answer the pending interaction.");
+
+        // The task stays held while Host admits the input. Publish the input,
+        // queue restoration and resumed task together before waking dispatch.
+        if (message || !open.length && store.countQueueItems({ sessionId: childSessionId, states: ["accepted"] }) === 0) {
+          this.#enqueue(task, inputOperationId, text, "prompt", callerSessionId);
+        }
+        this.host.restorePartnerQueue({ sessionId: childSessionId, operationId,
+          ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
+        const at = this.now();
+        this.#save({ ...this.#read(task.id), control: "active", deadlineAt: task.deadlineAt + Math.max(0, at - task.pauseAt!),
+          pauseAt: undefined, queuePauseRevision: undefined, updatedAt: at });
+        return { sessionId: childSessionId };
+      });
+    });
+    if (this.#read(task.id).control === "active") this.host.wakePartnerSession(childSessionId);
+  }
+
   stop(sessionId: string, id: string, operationId: string, mode: "cancel" | "pause" | "request-stop", assertCaller: () => void) {
     this.#owned(sessionId, id);
     return this.#serial(id, async () => {
