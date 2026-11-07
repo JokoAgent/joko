@@ -511,6 +511,7 @@ import {
 import {
   ProjectAutomationConfigController,
   projectScheduleId,
+  projectScheduleWithRuntimeBinding,
   scheduleProjectAutomationOrigin,
   withoutScheduleProjectAutomationOrigin,
   withScheduleProjectAutomationOrigin
@@ -18508,10 +18509,12 @@ async function dispatchMutation(
       return presented(execution);
     }
     case "updateSchedule": {
-      if (payload.value.schedule === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Schedule input is required.");
+      const input = payload.value.schedule;
+      if (input === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Schedule input is required.");
       const existing = dependencies.store.getSchedule(payload.value.scheduleId);
       const projectOrigin = scheduleProjectAutomationOrigin(existing.executionSnapshot);
-      const parsed = scheduleInput(existing.id, payload.value.schedule, (dependencies.now ?? Date.now)(), existing);
+      const runtimeInput = projectOrigin === undefined ? input : projectScheduleWithRuntimeBinding(input, existing);
+      const parsed = scheduleInput(existing.id, runtimeInput, (dependencies.now ?? Date.now)(), existing);
       const candidate = projectOrigin === undefined
         ? parsed
         : {
@@ -18543,7 +18546,7 @@ async function dispatchMutation(
         : await dependencies.projectAutomations.upsertWithCommit(
             projectOrigin.targetId,
             projectOrigin.configId,
-            payload.value.schedule,
+            create(contract.ScheduleInputSchema, { ...input, sessionId: "" }),
             commit
           );
       return presented(execution);
