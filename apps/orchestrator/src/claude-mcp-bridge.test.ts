@@ -110,7 +110,7 @@ describe("Claude product MCP Router bridge", () => {
     store.createSession({ id: "session-local", backendId: "claude-code", targetId: "target-local", title: "Local",
       binding: { opaqueRef: "native-uuid", generation: 1 }, pinned: false, archived: false,
       permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
-    const original = await router.upsert({ id: "live-http", displayName: "Live HTTP", transport: "http", endpoint: upstream.endpoint,
+    const original = await router.upsert({ id: "live-http", displayName: "Live HTTP", transport: "streamable_http", endpoint: upstream.endpoint,
       enabled: true, credentialBindings: [] });
     expect(original.state).toBe("connected");
     const bridge = createClaudeMcpBridge({ router, includeToolPolicy: () => true, assertSessionCurrent: () => {} });
