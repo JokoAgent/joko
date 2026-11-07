@@ -254,13 +254,14 @@ it("retires an unconfirmed permission runtime before dispatching the original qu
   });
   const close = vi.spyOn(f.adapter, "closeSession");
   const send = f.adapter.send.bind(f.adapter);
+  let modeAtDispatch: string | undefined;
+  let closedBeforeDispatch = false;
   const sends = vi.spyOn(f.adapter, "send").mockImplementation(async (input, context) => {
-    expect(context.generation).toBeGreaterThan(before.binding.generation);
-    expect(context.binding?.opaqueRef).toBe(before.binding.opaqueRef);
-    expect(close).toHaveBeenCalledExactlyOnceWith(before.binding, expect.objectContaining({ sessionId: task.taskId, generation: before.binding.generation }));
-    expect((await inspect(context.binding!, context)).permissionMode).toBe("ask");
+    closedBeforeDispatch = close.mock.calls.length === 1;
+    modeAtDispatch = (await inspect(context.binding!, context)).permissionMode;
     await send(input, context);
   });
+  const connection = f.store.createConnection({ id: "approval-owner", name: "Owner", authKeyDigest: "approval-owner-digest" });
   const request = f.request({ kind: "requestWriteAccess", taskId: task.taskId, mode: "auto" });
   const rejected = expect(request).rejects.toMatchObject({ code: "STALE_REVISION" });
   let queueItemId: string;
@@ -272,14 +273,23 @@ it("retires an unconfirmed permission runtime before dispatching the original qu
     f.tasks.updatePreferences(f.extensionId, preferences.revision, { model: f.route, permissionMode: "ask" }, () => undefined);
     releaseApply();
     await vi.waitFor(() => expect(restoring).toHaveBeenCalledOnce());
-    queueItemId = f.host.enqueueServiceInput({ operationId: "queue-during-policy-recovery", sessionId: task.taskId, source: "system",
+    queueItemId = f.host.enqueueInput({ operationId: "queue-during-policy-recovery", sessionId: task.taskId, connection,
       prompt: { text: "Continue the original task", images: [], files: [], mentions: [], disposition: "prompt" } }).value.queueItemId;
     expect(f.store.getQueueItem(queueItemId).state).toBe("accepted");
     expect(sends).not.toHaveBeenCalled();
   } finally { releaseApply(); releaseRestore(); }
   await rejected;
-  await vi.waitFor(() => expect(f.store.getQueueItem(queueItemId).state).toBe("completed"));
+  await vi.waitFor(() => {
+    const item = f.store.getQueueItem(queueItemId);
+    expect(item.state, f.store.getRun(item.runId).descriptor.error?.message).toBe("completed");
+  });
   expect(sends).toHaveBeenCalledOnce();
+  const [, dispatched] = sends.mock.calls[0]!;
+  expect(dispatched.generation).toBeGreaterThan(before.binding.generation);
+  expect(dispatched.binding?.opaqueRef).toBe(before.binding.opaqueRef);
+  expect(closedBeforeDispatch).toBe(true);
+  expect(close).toHaveBeenCalledExactlyOnceWith(before.binding, expect.objectContaining({ sessionId: task.taskId, generation: before.binding.generation }));
+  expect(modeAtDispatch).toBe("ask");
   expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
 });
 it("supports an unplanned team within its approved task root and refuses an unrelated trusted target", async () => {
