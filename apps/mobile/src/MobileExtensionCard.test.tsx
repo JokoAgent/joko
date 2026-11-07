@@ -54,7 +54,7 @@ it("opens overlapping mail through the chosen native reader and retires its view
     const open = useMobileMailLink();
     return <button onClick={() => void open?.(url)}>Open mail link</button>;
   }
-  const button = (label: string) => [...element.querySelectorAll("button")].find(item => item.textContent === label)!;
+  const button = (label: string) => Array.from(element.querySelectorAll("button")).find(item => item.textContent === label)!;
   await act(async () => root.render(<MobileExtensionMailReaderProvider ownerKey="mail-owner" sessionId="task"
     bind={() => ({ previewMail }) as unknown as MobileExtensionCardApi} colors={colors} locale="en"><Link /></MobileExtensionMailReaderProvider>));
   await act(async () => button("Open mail link").click());
