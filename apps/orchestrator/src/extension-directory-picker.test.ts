@@ -111,7 +111,7 @@ describe("native author settings directory selection", () => {
       declaration: parseExtensionNetwork({ hosts: ["files.example.test", "auth.example.test"], secrets: [{ key: "token", label: "Token",
         inject: { hosts: ["files.example.test"], header: "Authorization", format: "Bearer {value}" },
         exchange: { url: exchange, bodyFormat: '{"key":"{value}"}', tokenPath: "token" } }] }), assertCurrent: () => {} };
-    const request = { url: upload, method: "POST", uploadDir: { token: receipt.token, field: "report" } };
+    const request = { url: upload, method: "POST", uploadDir: { token: receipt.token, fileField: "report" } };
     await expect(network.request({ ...networkScope, task: { ...scope, authorityKey: "retired" } }, request)).resolves.toMatchObject({ ok: false });
     expect(fetch).not.toHaveBeenCalled();
     await expect(network.request(networkScope, request)).resolves.toMatchObject({ ok: false });
@@ -120,7 +120,9 @@ describe("native author settings directory selection", () => {
     expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([exchange, exchange, upload]);
     const sent = fetch.mock.calls[2]![1]!;
     expect(new Headers(sent.headers).get("authorization")).toBe("Bearer fixture-access");
-    expect(Buffer.from(sent.body as ArrayBuffer).toString()).toContain("original report");
+    const multipart = Buffer.from(sent.body as ArrayBuffer).toString();
+    expect(multipart).toContain('name="report"; filename="read.txt"');
+    expect(multipart).toContain("original report");
     await expect(network.request(networkScope, request)).resolves.toMatchObject({ ok: false });
     expect(fetch).toHaveBeenCalledTimes(3);
   }));
