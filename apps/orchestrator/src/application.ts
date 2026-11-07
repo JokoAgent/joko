@@ -1167,6 +1167,7 @@ export async function createOrchestratorApplication(
       host: () => sessionHostForHelperTools,
       messageSearch: () => messageSearchForHelperTools,
       canSendTaskMessage: (caller, targetSessionId) => canSendFollowUpTaskMessage(partnerStore, caller, targetSessionId),
+      isPartnerCanonicalTask: sessionId => partnerStore.findPartnerByCanonicalSession(sessionId) !== undefined,
       taskSenderPartner: sessionId => {
         const link = partnerStore.getSessionLink(sessionId);
         if (link?.role !== "canonical" && link?.role !== "routine") return undefined;
@@ -2338,7 +2339,7 @@ export async function createOrchestratorApplication(
     new PartnerToolBridgeProvider({ store, partners })
   );
   const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches }));
-  partnerTodos = new PartnerTodoManager(store, partnerStore, partners);
+  partnerTodos = new PartnerTodoManager(store, partnerStore, partners, Date.now, () => partnerHomeRuntime);
   const unregisterPartnerTodoTools = mcpRouter.registerBridgeToolProvider(new PartnerTodoTools(partnerTodos));
   const unregisterPartnerMessagingTools = ['telegram', 'discord', 'dingtalk', 'feishu', 'lark', 'wecom', 'wechat', 'slack']
     .map(channel => mcpRouter.registerBridgeToolProvider(new PartnerMessagingTools(partnerMessaging!, channel)));

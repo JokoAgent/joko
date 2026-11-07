@@ -689,6 +689,13 @@ export interface PartnerPrivateMessageView {
   readonly deliveredAt?: number;
 }
 
+export interface PartnerPrivateSentView {
+  readonly messageId: string;
+  readonly threadId: string;
+  readonly recipientPartnerId: string;
+  readonly recipientDisplayName: string;
+}
+
 export interface PartnerPrivateThreadReadStateView {
   readonly threadId: string;
   readonly partnerId: string;
@@ -1606,6 +1613,7 @@ export interface TimelineItemView {
   readonly todoQuote?: { readonly partnerId: string; readonly todoId: string; readonly revision: bigint; readonly title: string };
   readonly extensionCard?: import("@joko/contracts").ExtensionCard;
   readonly mcpApp?: import("@joko/contracts").McpAppCard;
+  readonly partnerTaskReceipt?: import("@joko/contracts").PartnerSessionTaskReceiptView;
   readonly personalDevelopmentReport?: PersonalDevelopmentDoctorRun;
   readonly personalDevelopmentTask?: PersonalDevelopmentTask;
   readonly learning?: PartnerLearningFeedbackView;
@@ -1690,6 +1698,7 @@ export interface TimelineItemView {
     readonly recipientPartnerId: string;
     readonly senderDisplayName: string;
   };
+  readonly partnerPrivateSent?: PartnerPrivateSentView;
   /** Typed accepted-input semantics; absent only for untyped imported history. */
   readonly inputDelivery?: DeliveryMode | "scheduler";
   /** Service-owned continuation prompt; hidden in favor of its recovery activity row. */

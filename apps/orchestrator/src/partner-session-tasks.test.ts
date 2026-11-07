@@ -6,7 +6,7 @@ import { OperationalStore, PartnerStore, PartnerNetworkStore } from "@joko/store
 import type { AdapterContext, PromptInput } from "@joko/core";
 import { projectPiInputSchema } from "@joko/adapter-pi";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createClient, Code, ConnectError } from "@connectrpc/connect";
+import { createClient, createRouterTransport, Code, ConnectError } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import * as contract from "@joko/contracts";
@@ -18,6 +18,7 @@ import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
 import { sessionTaskActivity } from "./session-task-activity.js";
 import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { ConnectionManager } from "./connection-manager.js";
+import { registerConnectServices } from "./connect-services.js";
 import { AppDefaultModelCoordinator } from "./app-default-model.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
@@ -48,6 +49,60 @@ class RecordedAdapter extends FakeBackendAdapter {
   }
 }
 describe("Partner independent Session tasks", () => {
+  it("keeps each execution receipt in the original Owner timeline before attempting the hidden return", async () => {
+    const f = await fixture();
+    const parentGeneration = f.store.getSession(f.parent).descriptor.binding.generation;
+    const receipts = () => f.store.listEvents({ sessionId: f.parent, activeNativeTimeline: true })
+      .flatMap(event => event.payload.type === "partner_session_task_receipt" ? [event.payload.receipt] : []);
+    const nativeEnqueue = f.host.enqueueServiceInput.bind(f.host);
+    const outcomesAtReturn: string[][] = [];
+    vi.spyOn(f.host, "enqueueServiceInput").mockImplementation(input => {
+      if (input.sessionId !== f.parent || !input.operationId.startsWith("task:visible:result:")) return nativeEnqueue(input);
+      outcomesAtReturn.push(receipts().flatMap(receipt => receipt.status === "completed" && receipt.result ? [receipt.result] : []));
+      throw new Error("Original return admission is held in this fixture.");
+    });
+    const task = await f.tasks.start(f.parent, "task:visible", { title: "Independent inspection", instruction: "Read the first result" }, () => undefined);
+    expect(receipts()).toMatchObject([{ taskId: task.id, execution: 1, status: "preparing" }]);
+    await vi.waitFor(() => expect(f.primary.inputs.filter(input => input.context.sessionId === task.sessionId)).toHaveLength(1));
+    await f.primary.complete(task.sessionId!, "First retained result");
+    await vi.waitFor(() => expect(outcomesAtReturn).toContainEqual(["First retained result"]));
+    await f.tasks.message(f.parent, task.id, "task:visible:continue", { mode: "queue", message: "Read the second result" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs.filter(input => input.context.sessionId === task.sessionId)).toHaveLength(2));
+    await f.primary.complete(task.sessionId!, "Second retained result");
+    await vi.waitFor(() => expect(outcomesAtReturn).toContainEqual(["First retained result", "Second retained result"]));
+    expect(f.store.listRuns({ sessionId: f.parent })).toEqual([]);
+    expect(f.store.listEvents({ sessionId: task.sessionId! }).every(event => event.payload.type !== "partner_session_task_receipt")).toBe(true);
+
+    expect(await f.partners.restartPartner({ requestId: "restart-receipt-parent", partnerId: f.partner.id, expectedRevision: f.partner.revision }))
+      .toMatchObject({ phase: "ready" });
+    expect(f.store.getSession(f.parent).descriptor.binding.generation).toBeGreaterThan(parentGeneration);
+    await f.tasks.close();
+    f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now);
+    await f.tasks.initialize();
+    const connections = new ConnectionManager(f.store), challenge = connections.issuePairing("Receipt owner");
+    const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Receipt owner" });
+    const transport = createRouterTransport(router => registerConnectServices(router, { config: { publicOrigin: "http://127.0.0.1" },
+      store: f.store, connections, sessionHost: f.host, adapters: [f.primary, f.secondary] } as unknown as OrchestratorApplication));
+    const client = createClient(contract.SessionService, transport);
+    const timeline: contract.Event[] = [];
+    let beforeCursor: contract.EventCursor | undefined;
+    do {
+      const page = await client.listSessionTimeline({ sessionId: f.parent, beforeCursor, limit: 1 },
+        { headers: { authorization: `Bearer ${paired.authKey}` } });
+      expect(page.events.length).toBeLessThanOrEqual(1);
+      timeline.unshift(...page.events);
+      beforeCursor = page.nextBeforeCursor;
+    } while (beforeCursor !== undefined && timeline.length < 100);
+    expect(beforeCursor).toBeUndefined();
+    expect(timeline.flatMap(event => event.payload?.kind.case === "partnerSessionTaskReceipt" ? [event.payload.kind.value] : []))
+      .toMatchObject([
+        { taskId: task.id, execution: 1, status: contract.PartnerSessionTaskStatus.PREPARING },
+        { taskId: task.id, execution: 1, status: contract.PartnerSessionTaskStatus.COMPLETED, taskSessionId: task.sessionId, result: "First retained result" },
+        { taskId: task.id, execution: 2, status: contract.PartnerSessionTaskStatus.PREPARING },
+        { taskId: task.id, execution: 2, status: contract.PartnerSessionTaskStatus.COMPLETED, taskSessionId: task.sessionId, result: "Second retained result" }
+      ]);
+  });
+
   it("admits the active owner group tool, retains its group parent and returns output after that execution ends without waking either lane", async () => {
     const f = await fixture(), group = await groupFixture(f), tools = new PartnerSessionTaskTools(f.tasks);
     const session = f.store.getSession(group.sessionId).descriptor;
@@ -278,6 +333,49 @@ describe("Partner independent Session tasks", () => {
     await vi.waitFor(() => expect(sessionTaskActivity(f.store, f.store.getSession(task.sessionId!))?.completionNotification).toBe("none"));
     expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
   });
+  it.each(["after ready", "during closing"])("dispatches a result produced %s to the original restarted Partner", async timing => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:restart-return", { instruction: "Prepare the result" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === task.sessionId)).toBe(true));
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
+    const resultId = `${task.id}:result:${task.execution}`;
+    const enqueue = vi.spyOn(f.host, "enqueueServiceInput");
+    const input = { requestId: "restart-result-parent", partnerId: f.partner.id, expectedRevision: f.partner.revision };
+    const finish = () => f.primary.complete(task.sessionId!, "Result from the original execution.");
+    if (timing === "during closing") {
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const restartHost = f.host.restartPartnerSession.bind(f.host);
+      const restart = vi.spyOn(f.host, "restartPartnerSession").mockImplementationOnce(request => restartHost({ ...request,
+        pauseGoal: async () => { await request.pauseGoal(); enter(); await gate; } }));
+      const pending = f.partners.restartPartner(input);
+      try {
+        await entered;
+        await finish();
+        await vi.waitFor(() => expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({ operationId: resultId, sessionId: f.parent })));
+        expect(f.partnerStore.isPartnerSessionRestarting(f.parent)).toBe(true);
+        expect(f.store.findOperation(resultId)).toBeUndefined();
+        expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed" });
+        expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBeUndefined();
+      } finally {
+        release();
+        await pending;
+        restart.mockRestore();
+      }
+      expect(await pending).toMatchObject({ phase: "ready" });
+    } else {
+      expect(await f.partners.restartPartner(input)).toMatchObject({ phase: "ready" });
+      await finish();
+    }
+    expect(f.store.getQueueControl(f.parent)).toMatchObject({ paused: false, resumeOnUserInput: false });
+    await vi.waitFor(() => expect(f.primary.inputs.filter(item => item.context.sessionId === f.parent).map(item => item.input.text))
+      .toEqual([expect.stringContaining("Result from the original execution.")]));
+    expect(f.store.getOperation(resultId)).toMatchObject({ kind: "service_send_input", status: "completed", body: { sessionId: f.parent, originSessionId: task.sessionId } });
+    expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBe(task.execution);
+    expect(await f.partners.restartPartner(input)).toMatchObject({ phase: "ready" });
+    expect(f.store.listQueueItems({ sessionId: f.parent }).map(item => item.operationId)).toEqual([resultId]);
+  });
   it("preserves the pending queue across pause/restart and resumes without replaying the original objective", async () => {
     const f = await fixture(); const created = await f.tasks.start(f.parent, "task:pause", { instruction: "Implement the change", workingDir: f.project }, () => undefined);
     await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === created.sessionId)).toBe(true));
@@ -299,6 +397,142 @@ describe("Partner independent Session tasks", () => {
     f.advance(3_000);
     const resumedAgain = await f.tasks.message(f.parent, created.id, "task:resume-again", { mode: "resume" }, () => undefined);
     expect(resumedAgain.deadlineAt).toBe(created.deadlineAt + 13_000); expect(resumedAgain.pauseAt).toBeUndefined();
+  });
+  it.each(["confirmed close", "newer manual pause", "unrelated abort"])("recovers an interrupted cancellation with %s", async condition => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:cancel-before-restart", { instruction: "Run once" }, () => undefined);
+    const sessionId = task.sessionId!;
+    await vi.waitFor(() => expect(f.store.findQueueItemByRunId(sessionId, task.runId!)?.state).toBe("backend_accepted"));
+    await f.tasks.close();
+
+    // Retain the persisted v1 checkpoint between the Host's close and the
+    // independent task's final write.
+    const operationId = `partner-task-control:${"c".repeat(64)}`;
+    const held = { ...f.tasks.list(f.partner.id)[0]!, control: "cancelling", pauseAt: f.now(), updatedAt: f.now() };
+    f.store.setSetting("service", "partner.session-tasks", task.id, held);
+    const revision = f.host.preparePartnerPauseQueue({ sessionId, operationId, wasQueuePaused: false });
+    f.store.setSetting("service", "partner.session-tasks", task.id, { ...held, queuePauseRevision: revision!.toString() });
+    if (condition === "unrelated abort") {
+      f.store.cancelQueueItem({ queueItemId: f.store.findQueueItemByRunId(sessionId, task.runId!)!.id, traceId: "unrelated-cancel" });
+    } else {
+      await f.host.pausePartnerSession({ sessionId, operationId, assertCurrent: () => undefined, pauseGoal: async () => undefined, cancelQueued: true });
+    }
+    if (condition === "newer manual pause") f.store.setQueuePaused({ sessionId, paused: true, reason: "Manual hold", traceId: "manual-hold" });
+    expect(f.store.getRun(task.runId!).descriptor.state).toBe("aborted");
+    expect(f.store.findOperation(operationId)).toBeUndefined();
+    await f.host.dispose();
+
+    const adapter = new RecordedAdapter(profile);
+    const cold = new SessionHost(f.store, f.artifacts, [adapter], {
+      partnerSessionPaused: id => f.partnerStore.isPartnerSessionPaused(id) || f.tasks.isHeld(id)
+    });
+    const close = vi.spyOn(adapter, "closeSession");
+    f.tasks = new PartnerSessionTaskManager(f.store, f.partners, cold, f.workspaces, f.managed, f.now);
+    cleanups.push(async () => { await f.tasks.close(); await cold.dispose(); });
+    await cold.initialize();
+    await f.tasks.initialize();
+    const checked = await f.tasks.check(f.parent, task.id);
+    expect(close).not.toHaveBeenCalled();
+    expect(adapter.inputs.filter(item => item.context.sessionId === sessionId)).toEqual([]);
+    if (condition === "unrelated abort") {
+      expect(checked).toMatchObject({ control: "cancelling", execution: task.execution });
+      expect(f.store.getQueueControl(sessionId).paused).toBe(true);
+      expect(f.store.findOperation(operationId)).toBeUndefined();
+      expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
+    } else {
+      expect(checked).toMatchObject({ control: "active", status: "cancelled", execution: task.execution, runId: task.runId });
+      expect(f.store.getOperation(operationId)).toMatchObject({ status: "completed", response: { taskId: task.id, sessionId, execution: task.execution, status: "cancelled" } });
+      expect(f.store.getOperation(`${operationId}:resume-queue`).body).toEqual({ sessionId, queuePauseRevision: revision!.toString() });
+      expect(f.store.getQueueControl(sessionId).paused).toBe(condition === "newer manual pause");
+      expect(f.store.listQueueItems({ sessionId: f.parent }).map(item => item.operationId)).toEqual([`${task.id}:result:${task.execution}`]);
+    }
+  });
+
+  it("commits the tool's original cancellation and does not apply its replay to a later execution", async () => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:cancel-execution", { instruction: "Original input" }, () => undefined);
+    const sessionId = task.sessionId!;
+    await vi.waitFor(() => expect(f.store.findQueueItemByRunId(sessionId, task.runId!)?.state).toBe("backend_accepted"));
+    await f.tasks.message(f.parent, task.id, "cancel-pending-input", { mode: "queue", message: "Pending input" }, () => undefined);
+    const effectIdentity = "b".repeat(64);
+    const operationId = `partner-task-control:${effectIdentity}`;
+    const tool = new PartnerSessionTaskTools(f.tasks);
+    const stop = () => {
+      const parent = f.store.getSession(f.parent).descriptor;
+      return tool.callTool("stop_session_task", { task_id: task.id, mode: "cancel" }, undefined, {
+        sessionId: parent.id, targetId: parent.targetId, generation: parent.binding.generation, providerGeneration: 1, effectIdentity
+      });
+    };
+    const stopped = await stop();
+    expect(stopped.isError).toBe(false);
+    expect(JSON.parse(stopped.content[0]!.text)).toMatchObject({ status: "cancelled", control: "active", stop_confirmed: true });
+    const receipt = f.store.getOperation(operationId);
+    expect(receipt).toMatchObject({ status: "completed", response: { taskId: task.id, sessionId, execution: task.execution, status: "cancelled" } });
+    expect(f.store.listQueueItems({ sessionId }).map(item => item.state)).toEqual(["cancelled", "cancelled"]);
+    expect(f.store.getQueueControl(sessionId).paused).toBe(false);
+
+    const next = await f.tasks.message(f.parent, task.id, "cancel-next-execution", { mode: "queue", message: "Start the next execution" }, () => undefined);
+    expect(next.execution).toBe(task.execution + 1);
+    expect((await stop()).isError).toBe(false);
+    expect(f.store.getOperation(operationId)).toEqual(receipt);
+    await vi.waitFor(() => expect(f.primary.inputs.filter(item => item.context.sessionId === sessionId).map(item => item.input.text))
+      .toEqual(["Original input", "Start the next execution"]));
+    expect(f.store.getRun(next.runId!).descriptor.state).not.toBe("aborted");
+  });
+
+  it("rolls back an interrupted task resume and accepts the original keyed message once after recovery", async () => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:resume-rollback", { instruction: "Original task input" }, () => undefined);
+    const parent = f.store.getSession(f.parent).descriptor;
+    const context = { sessionId: parent.id, targetId: parent.targetId, generation: parent.binding.generation, providerGeneration: 1 };
+    const request = { task_id: task.id, mode: "resume", message: "Continue with this exact input.", idempotency_key: "original-resume" };
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === task.sessionId)).toBe(true));
+    const held = await f.tasks.stop(f.parent, task.id, "task:resume-rollback:hold", "pause", () => undefined);
+    expect(held.control).toBe("paused");
+    expect(f.store.getRun(task.runId!).descriptor.state).toBe("aborted");
+    const originalEnqueue = f.host.enqueueServiceInput.bind(f.host);
+    let operationId = "";
+    let interruptedState: unknown;
+    const enqueue = vi.spyOn(f.host, "enqueueServiceInput").mockImplementationOnce(input => {
+      operationId = input.operationId.slice(0, -":resume-input".length);
+      originalEnqueue(input);
+      interruptedState = {
+        inputState: f.store.findOperation(input.operationId)?.status,
+        taskHeld: f.tasks.isHeld(task.sessionId!),
+        queuePaused: f.store.getQueueControl(task.sessionId!).paused,
+        deferDispatch: input.deferDispatch,
+        nativeSends: f.primary.inputs.filter(item => item.context.sessionId === task.sessionId).length
+      };
+      throw new Error("Controlled interruption before the resume transaction commits.");
+    });
+    const call = (args = request) => new PartnerSessionTaskTools(f.tasks).callTool("message_session_task", args, undefined, context);
+    try {
+      await expect(call()).resolves.toMatchObject({ isError: true });
+      expect(enqueue).toHaveBeenCalledOnce();
+    } finally { enqueue.mockRestore(); }
+    expect(interruptedState).toEqual({ inputState: "completed", taskHeld: false, queuePaused: false, deferDispatch: true, nativeSends: 1 });
+    expect(f.store.findOperation(`${operationId}:resume-input`)).toBeUndefined();
+    expect(f.store.findOperation(`${operationId}:resume-queue`)).toBeUndefined();
+    expect(f.store.findOperation(`${operationId}:resume-task`)).toBeUndefined();
+    expect(f.store.getQueueControl(task.sessionId!).paused).toBe(true);
+
+    await f.tasks.close();
+    f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now);
+    await f.tasks.initialize();
+    expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ control: "paused", status: "waiting" });
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toHaveLength(0);
+    const resumed = await call();
+    expect(resumed.isError).toBe(false);
+    const receipt = JSON.parse(resumed.content[0]!.text).message_receipt;
+    expect(receipt?.queued_message_id).toEqual(expect.any(String));
+    expect(f.store.getQueueItem(receipt.queued_message_id).body.text).toBe(request.message);
+    expect(f.store.getQueueControl(task.sessionId!).paused).toBe(false);
+    const replay = await call();
+    expect(replay.isError).toBe(false);
+    expect(JSON.parse(replay.content[0]!.text).message_receipt.queued_message_id).toBe(receipt.queued_message_id);
+    await expect(call({ ...request, message: "Different input with the same key." })).resolves.toMatchObject({ isError: true });
+    await vi.waitFor(() => expect(f.primary.inputs.filter(item => item.context.sessionId === task.sessionId).map(item => item.input.text))
+      .toEqual(["Original task input", request.message]));
   });
   it("uses the owned queue boundary for edits and rejects consuming input and unavailable steer", async () => {
     const f = await fixture(), created = await f.tasks.start(f.parent, "task:queue", { instruction: "Do work" }, () => undefined);
@@ -571,13 +805,15 @@ async function fixture(streamDelayMs = 30_000, appDefaultModel?: () => SessionRu
   const artifacts = new ArtifactStore({ rootDirectory: join(managed, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
   const primary = new RecordedAdapter({ ...profile, streamDelayMs }), secondary = new RecordedAdapter({ ...profile, streamDelayMs, id: "task-secondary" }); let tasks!: PartnerSessionTaskManager;
   const host = new SessionHost(store, artifacts, [primary, secondary], { partnerSessionPaused: sessionId => partnerStore.isPartnerSessionPaused(sessionId) || tasks?.isHeld(sessionId) === true,
+    partnerSessionRestarting: sessionId => partnerStore.isPartnerSessionRestarting(sessionId),
     partnerSessionRetiring: sessionId => partnerStore.isPartnerSessionRetiring(sessionId) || tasks?.isRetiring(sessionId) === true,
     partnerTargetRetired: targetId => partnerStore.isPartnerTargetRetired(targetId),
     serviceSessionRuntimeFallback: input => tasks?.fallback(input) ?? { owned: false } }); await host.initialize();
   const workspaces = { register: vi.fn(async (input: { id: string; root: string; displayName: string; trusted: boolean }) => input), unregister: vi.fn() };
   const partners = new PartnerManager({ store: partnerStore, operationalStore: store, sessionHost: host, workspaceService: workspaces, homesRoot: join(managed, "partner-homes"),
     ...(appDefaultModel === undefined ? {} : { appDefaultModel }),
-    ownedIndependentSessions: partnerId => tasks?.ownedSessions(partnerId) ?? [], forgetIndependentTasks: partnerId => tasks?.forgetPartner(partnerId) });
+    ownedIndependentSessions: partnerId => tasks?.ownedSessions(partnerId) ?? [], forgetIndependentTasks: partnerId => tasks?.forgetPartner(partnerId),
+    resumeIndependentReturns: async partnerId => tasks?.refreshPartner(partnerId) });
   const partner = await partners.createPartner({ requestId: "task-partner-create", expectedDirectoryRevision: partnerStore.directoryState().revision, displayName: "Aster", avatar: "orbit", identitySource: "You help with projects.", templateId: "general", usesDirectoryDefaults: false,
     capabilities: { modelChain: [{ backendId: primary.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
   let now = Date.now(); const clock = () => now;

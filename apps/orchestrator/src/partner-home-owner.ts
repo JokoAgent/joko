@@ -62,9 +62,13 @@ export class PartnerHomeStorage {
       const move = parseMove(row.value); this.#moves.set(move.requestId, move);
     }
   }
-  current(partnerId: string, local: PartnerHomeLocation): PartnerHomeRecord {
+  findCurrent(partnerId: string): PartnerHomeRecord | undefined {
     const value = this.store.findSetting<unknown>(SCOPE, OWNER, CURRENT + identity(partnerId))?.value;
-    if (value !== undefined) return parseHome(value);
+    return value === undefined ? undefined : parseHome(value);
+  }
+  current(partnerId: string, local: PartnerHomeLocation): PartnerHomeRecord {
+    const current = this.findCurrent(partnerId);
+    if (current !== undefined) return current;
     const home: PartnerHomeRecord = { version: 1, partnerId, generation: 1, location: local };
     this.store.setSetting(SCOPE, OWNER, CURRENT + partnerId, home); return copy(home);
   }

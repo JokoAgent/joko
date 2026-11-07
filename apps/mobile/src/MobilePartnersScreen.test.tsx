@@ -143,8 +143,9 @@ afterEach(() => {
 
 describe("MobilePartnersScreen", () => {
   it("navigates directory, threads and detail; only reports messages confirmed visible", () => {
-    render(state());
+    render(state({ partners: [...partners, { ...partners[0]!, partnerId: "paused", displayName: "Cai", lifecycle: "paused" }] }));
     expect(container.textContent).toContain("Partner chats");
+    expect(container.querySelector('button[aria-label="View Cai\'s conversations"]')?.textContent).toContain("Paused");
     press("View Ada's conversations");
     expect(callbacks.onOpenPartner).toHaveBeenCalledWith("alpha");
     expect(container.textContent).toContain("Loading conversations");

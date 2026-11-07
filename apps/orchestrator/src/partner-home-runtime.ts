@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { hostname } from "node:os";
-import type { PermissionMode, TargetDescriptor } from "@joko/core";
+import type { PermissionMode, RemoteWorkspaceBinding, SessionDescriptor, TargetDescriptor } from "@joko/core";
 import { partnerHomeDirectoryName, type ConnectionRecord, type OperationalStore, type PartnerCapabilitiesRecord,
-  type PartnerModelRouteRecord, type PartnerStore } from "@joko/store";
+  type PartnerModelRouteRecord, type PartnerProfileRecord, type PartnerStore, type StoredTarget } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
 import type { DevicePeerOwner, DevicePeerSelectionIdentity } from "./device-peer-owner.js";
 import type { PartnerManager } from "./partner-manager.js";
@@ -112,6 +112,23 @@ export class PartnerHomeRuntimeAdapter implements PartnerHomeRuntime {
     try { this.options.peers.captureBinding(home.location.controllerDeviceId, home.location.deviceId, ["files", "process"]).assertCurrent(); return true; }
     catch { return false; }
   }
+  /** Confirms the recorded Home and the live paired route without dispatching a remote request. */
+  assertDeviceHomeCurrent(profile: PartnerProfileRecord, session: SessionDescriptor, target: StoredTarget): void {
+    this.assertOwner();
+    const home = this.options.storage.findCurrent(profile.id), location = home?.location;
+    const metadata = target.metadata as { kind?: unknown; partnerId?: unknown; workspaceId?: unknown; homeGeneration?: unknown } | null;
+    const link = this.options.profiles.getSessionLink(session.id);
+    if (!home || home.partnerId !== profile.id || location?.kind !== "device" || !target.descriptor.managed
+      || link?.role !== "canonical" || link.partnerId !== profile.id || metadata?.kind !== "partner_home"
+      || metadata.partnerId !== profile.id || metadata.workspaceId !== target.descriptor.id || metadata.homeGeneration !== home.generation
+      || target.descriptor.workspaceRoot !== location.root) {
+      throw new Error("The Partner's execution computer changed.");
+    }
+    const matches = (binding: RemoteWorkspaceBinding | undefined) => binding?.kind === "device_peer"
+      && binding.controllerDeviceId === location.controllerDeviceId && binding.targetDeviceId === location.deviceId && binding.workspaceRoot === location.root;
+    if (!matches(session.remoteWorkspace) || !matches(target.descriptor.remoteWorkspace)) throw new Error("The Partner's execution computer changed.");
+    this.options.peers.captureBinding(location.controllerDeviceId, location.deviceId, ["files", "process", "forwarding"]).assertCurrent();
+  }
   async busy(partnerId: string): Promise<boolean> {
     this.assertOwner();
     return this.options.routines.engine.list(partnerId).some(routine => routine.activity === "running")
@@ -200,6 +217,8 @@ export class PartnerHomeRuntimeAdapter implements PartnerHomeRuntime {
       assertCurrent(); const live = this.options.profiles.getPartner(profile.id);
       if (live.canonicalSessionId !== sessionId) this.options.profiles.moveHome({ partnerId: profile.id, expectedRevision: BigInt(move.partnerRevision),
         sourceSessionId: source.id, targetId, sessionId, capabilities: move.capabilities });
+      else this.options.profiles.retireMovedHomeTopics({ partnerId: profile.id, sourceSessionId: source.id,
+        targetId, sessionId, sourceSessionIds: move.sourceSessionIds });
     }); assertCurrent();
     await this.options.host.rebuildPartnerHomeContext(sessionId, `partner-home:${move.requestId}:context`, assertCurrent); assertCurrent();
     this.options.profiles.markRead(profile.id, restored.readThroughCursor);

@@ -1,9 +1,12 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createClient, createRouterTransport } from "@connectrpc/connect";
-import { PartnerHomeService, PartnerHomeBusyAction, PartnerHomeMovePhase, PermissionMode, encodeModelSpeed } from "@joko/contracts";
+import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
+import { PartnerHomeService, PartnerHomeBusyAction, PartnerHomeMovePhase, PartnerService, PartnerTodoUiAction, PartnerTodoView,
+  PermissionMode, encodeModelSpeed } from "@joko/contracts";
+import { createInProcessDevicePeerHarness } from "@joko/device-peer";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { OperationalStore, PartnerStore, PartnerWorkbenchStore, type PartnerCapabilitiesRecord } from "@joko/store";
 import { ArtifactStore } from "./artifact-store.js";
@@ -20,8 +23,10 @@ import { PartnerHomeProjects } from "./partner-home-projects.js";
 import { PartnerHomeWorkbench } from "./partner-home-workbench.js";
 import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
 import { createPartnerHomeConnectService } from "./partner-home-connect-service.js";
+import { createPartnerTodoConnectMethods } from "./partner-todo-connect-service.js";
+import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
 import type { RemoteExecutionRouter } from "./remote-execution-router.js";
-import type { DevicePeerOwner } from "./device-peer-owner.js";
+import { DevicePeerOwner } from "./device-peer-owner.js";
 import type { PartnerHomeFiles } from "./partner-home-files.js";
 import type { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PiResourceManager } from "./resource-manager.js";
@@ -35,6 +40,13 @@ async function fixture() {
   store.createConnection({ id: "phone-connection", deviceId: "phone", device: { defaultName: "Phone", kind: "mobile", platform: "ios" }, name: "Phone", authKeyDigest: "phone-key-digest" });
   store.createConnection({ id: "computer-connection", deviceId: "computer", device: { defaultName: "Laptop", kind: "desktop", platform: "linux" }, name: "Laptop", authKeyDigest: "computer-key-digest" });
   store.setDeviceRemoteControlEnabled("computer", true); store.setDeviceControlRelation({ controllerDeviceId: "phone", targetDeviceId: "computer", outboundEnabled: true, inboundAllowed: true });
+  const peers = new DevicePeerOwner({ store });
+  const connectPeer = () => {
+    const harness = createInProcessDevicePeerHarness({ targetDeviceId: "computer", capabilities: ["files", "process", "forwarding"],
+      agent: { async handle() { throw new Error("Unexpected remote request from a service-owned ledger."); } } });
+    return { harness, route: peers.registerRoute(store.getConnection("computer-connection"), harness.transport) };
+  };
+  const peer = connectPeer();
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
   const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities.map(item => item.key === "permission.modes"
     ? { ...item, options: ["ask", "auto", "bypassPermissions"] } : item), { key: "runtime.resources", supported: true, options: ["skill"] }] }); let runtime: PartnerHomeRuntimeAdapter | undefined;
@@ -53,8 +65,7 @@ async function fixture() {
     prepareHomeChange: vi.fn(async () => undefined) } as unknown as PartnerRoutineManager;
   const retireWorkbench = vi.fn(() => undefined);
   runtime = new PartnerHomeRuntimeAdapter({ serverId: "authority", store, profiles, partners, host, workspaces, resources,
-    homesRoot, peers: { captureBinding: () => ({ assertCurrent: () => undefined }), list: () => [{ targetDeviceId: "computer", targetDeviceRevision: 1n,
-      relationId: "paired-relation", relationRevision: 1n, routeGeneration: 1, displayName: "Laptop", kind: "desktop", platform: "linux" }] } as unknown as DevicePeerOwner, files,
+    homesRoot, peers, files,
     storage, snapshots: new PartnerHomeSnapshots(join(root, "home-moves")), memoryPreferences, routines, artifacts,
     workbench,
     ownedSessions: () => [], assertOwner: () => undefined, pauseGoal: async () => undefined, readProfileProjection: async () => undefined,
@@ -69,7 +80,7 @@ async function fixture() {
   const homeRpc = createClient(PartnerHomeService, createRouterTransport(router => router.service(PartnerHomeService,
     createPartnerHomeConnectService(owner, runtime, () => store.getConnection("phone-connection")))));
   host.setPartnerHomeInputGuard(sessionId => { if (runtime!.blocksInput(sessionId)) throw new Error("Partner home changed."); });
-  cleanups.push(async () => { await owner.close(); await host.dispose(); profiles.close(); store.close(); await rm(root, { recursive: true, force: true }); });
+  cleanups.push(async () => { await owner.close(); await host.dispose(); peers.shutdown(); profiles.close(); store.close(); await rm(root, { recursive: true, force: true }); });
   const capabilities: PartnerCapabilitiesRecord = { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false };
   const profile = await partners.createPartner({ requestId: "create-home-owner-partner", expectedDirectoryRevision: profiles.directoryState().revision,
     displayName: "Home owner", avatar: "orbit", identitySource: "Help with durable work.", templateId: "general", capabilities, usesDirectoryDefaults: false });
@@ -77,7 +88,7 @@ async function fixture() {
   const projects = new PartnerHomeProjects({ execution: { files: async () => ({ files: { realpath: async (path: string) => path,
     stat: async () => ({ kind: "directory", size: 0, modifiedAt: 1 }) }, assertCurrent: () => undefined }) } as unknown as RemoteExecutionRouter,
     home: targetId => runtime?.executionHome(targetId) });
-  return { root, store, profiles, storage, artifacts, adapter, host, partners, runtime, owner, capabilities, profile, memoryPreferences, resources, files, routines, failures, workspaces, workbenchStore, workbench, projects, homeRpc, retireWorkbench };
+  return { root, store, profiles, storage, artifacts, adapter, host, partners, runtime, owner, capabilities, profile, memoryPreferences, resources, files, routines, failures, workspaces, workbenchStore, workbench, projects, homeRpc, retireWorkbench, peers, peer, connectPeer };
 }
 describe("Partner home native integration", () => {
   it("moves the same profile to a fresh immutable execution owner with visible history, same-byte user media, memory and context", async () => {
@@ -94,8 +105,14 @@ describe("Partner home native integration", () => {
     const append = (id: string, payload: Parameters<OperationalStore["appendEvent"]>[0]["payload"], emittedAt: number) => f.store.appendEvent({
       id, sessionId: original.id, targetId: original.targetId, backendId: original.backendId, generation: original.binding.generation, traceId: id, emittedAt, payload });
     const read = append("visible-user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Keep these notes" }, { kind: "artifact", blob: user, label: "notes.txt" }, { kind: "artifact", blob: missing, label: "removed.txt" }] }, 1000);
-    append("visible-assistant", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Saved." }, { kind: "thinking", text: "Private reasoning", redacted: false }] }, 2000);
+    const topicMessage = append("visible-assistant", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Saved." }, { kind: "thinking", text: "Private reasoning", redacted: false }] }, 2000);
     append("hidden-continuation", { type: "message_complete", role: "user", automaticContinuation: { recoveryId: "hidden-recovery" }, blocks: [{ kind: "text", text: "Hidden recovery prompt" }] }, 3000);
+    const origin = f.store.findVisibleSessionMessageOrigin({ sessionId: original.id, eventId: topicMessage.id })!;
+    const topic = await f.partners.ensureTopic({ operationId: "before-home-change-topic", connection: f.store.getConnection("phone-connection"),
+      partnerId: f.profile.id, expectedRevision: f.profile.revision, assertCurrent: () => undefined,
+      root: { sessionId: original.id, generation: original.binding.generation, eventId: origin.eventId, messageId: origin.messageId } });
+    expect(topic).toMatchObject({ readOnly: false, link: { role: "topic" } });
+    vi.mocked(f.routines.resumePartner).mockImplementation(async partnerId => { f.partners.listSessions(partnerId); });
     f.profiles.markRead(f.profile.id, read.globalCursor);
     const memory = f.store.putMakerMemoryEntry({ targetId: original.targetId, kind: "user", slug: "preference", title: "Preference", description: "Keep a useful preference.", body: "Prefer brief answers." });
     f.memoryPreferences.update(original.targetId, undefined, { enabled: false, userContext: "Work context" });
@@ -136,10 +153,31 @@ describe("Partner home native integration", () => {
     expect((await f.workbenchStore.read(current.id)).projects).toEqual([]);
     expect(f.workbench.foreign(current.id, "computer")[0]!.projects[0]!.path).toBe("/work/original-project");
     expect(f.partners.listSessions(current.id).find(view => view.link.sessionId === original.id)).toMatchObject({ readOnly: true, link: { role: "history" } });
+    expect(f.owner.get(moved.requestId)?.sourceSessionIds).toContain(topic.link.sessionId);
+    expect(f.partners.listSessions(current.id).find(view => view.link.sessionId === topic.link.sessionId)).toMatchObject({
+      available: true, readOnly: true, link: { role: "history", profileVersion: f.profile.profileVersion },
+      session: { targetId: original.targetId, binding: topic.session?.binding }
+    });
+    expect(f.partners.getTopic(topic.link.sessionId)).toBeUndefined();
     expect(() => f.host.enqueueServiceInput({ operationId: "old-machine-must-not-dispatch", sessionId: original.id,
       prompt: { text: "Do not send", images: [], files: [], mentions: [], disposition: "prompt" }, source: "system" })).toThrow(/fenced|home changed/u);
     expect(f.store.findOperation("old-machine-must-not-dispatch")).toBeUndefined();
-    const receipt = await f.owner.retry(moved.requestId); expect(receipt.canonicalSessionId).toBe(session.id);
+    // Recreate the previously persisted committed failure for the same move.
+    const oldDatabase = new DatabaseSync(join(f.root, "partners.db"));
+    try {
+      oldDatabase.prepare(`UPDATE partner_session_links SET role = 'topic', parent_session_id = ?,
+        topic_root_json = ?, topic_operation_id = ? WHERE session_id = ?`)
+        .run(original.id, JSON.stringify(topic.link.topicRoot), topic.link.topicOperationId!, topic.link.sessionId);
+    } finally { oldDatabase.close(); }
+    const committed = f.owner.get(moved.requestId)!;
+    f.storage.save({ ...committed, phase: "needs-attention", sourceFenced: true, failure: "preparation-failed" });
+    expect(() => f.partners.listSessions(current.id)).toThrow("no longer belongs");
+    const createNative = vi.spyOn(f.adapter, "createSession");
+    const receipt = await f.owner.retry(moved.requestId);
+    expect(receipt).toMatchObject({ phase: "ready", canonicalSessionId: session.id });
+    expect(f.profiles.getSessionLink(topic.link.sessionId)?.role).toBe("history");
+    expect(createNative).not.toHaveBeenCalled();
+    expect(rebuild).toHaveBeenCalledOnce();
     expect(f.store.listEvents({ sessionId: session.id }).filter(event => event.payload.type === "message_complete")).toHaveLength(2);
     const updated = await f.partners.updatePartner(current.id, current.revision, { identitySource: "Updated after changing main computer." });
     const prompt = await new PartnerRuntimePromptResolver(f.profiles, f.store, f.memoryPreferences, async () => undefined)
@@ -165,6 +203,62 @@ describe("Partner home native integration", () => {
     expect(f.storage.freezesInput(original.id)).toBe(false);
     expect((await f.owner.retry(input.requestId)).phase).toBe("ready");
     const current = f.profiles.getPartner(f.profile.id); expect(f.store.listEvents({ sessionId: current.canonicalSessionId! }).filter(event => event.payload.type === "message_complete")).toHaveLength(1);
+  });
+  it("keeps the original affair readable after a registered device Home move while fencing writes and revoked routes", async () => {
+    const f = await fixture(), partnerId = f.profile.id;
+    const original = f.store.getSession(f.profile.canonicalSessionId!).descriptor;
+    const todos = new PartnerTodoManager(f.store, f.profiles, f.partners, Date.now, () => f.runtime), tools = new PartnerTodoTools(todos);
+    const auth = () => f.store.authorizeConnection("phone-connection", "phone-key-digest");
+    const rpc = createClient(PartnerService, createRouterTransport(router => router.service(PartnerService, createPartnerTodoConnectMethods(todos, auth))));
+    const todo = todos.patch(partnerId, { key: "owner:report", title: "Review the report", outcome: "A reviewed report" }, "save-original-affair", () => undefined);
+    const ledger = () => f.store.findSetting("service", "partner.todos.v1", partnerId);
+    const before = ledger();
+    const read = () => rpc.listPartnerTodos({ partnerId, view: PartnerTodoView.OPEN });
+    const expectedItem = { id: todo.id, title: todo.title, revision: BigInt(todo.revision) };
+    await expect(read()).resolves.toMatchObject({ total: 1, items: [expectedItem] });
+
+    const catalog = await f.homeRpc.listPartnerHomeTargets({ partnerId });
+    const requestId = "move-with-original-affair";
+    await f.homeRpc.movePartnerHome({ requestId, expectedHome: catalog.home!.identity!, expectedPartnerRevision: { value: f.profile.revision },
+      destination: catalog.targets[1]!.destination!, busyAction: PartnerHomeBusyAction.WAIT,
+      capabilities: { modelChain: f.capabilities.modelChain.map(route => ({ ...route, ...encodeModelSpeed(route.fastMode) })), permissionMode: PermissionMode.ASK } });
+    await vi.waitFor(() => expect(["ready", "needs-attention"]).toContain(f.owner.get(requestId)?.phase));
+    expect(f.failures).toEqual([]);
+    expect(f.owner.get(requestId)?.phase).toBe("ready");
+    const profile = f.profiles.getPartner(partnerId), session = f.store.getSession(profile.canonicalSessionId!).descriptor;
+    await expect(read()).resolves.toMatchObject({ partnerRevision: { value: profile.revision }, total: 1, items: [expectedItem] });
+    const context = { sessionId: session.id, targetId: session.targetId, generation: session.binding.generation,
+      providerGeneration: tools.generation, effectIdentity: "a".repeat(64) };
+    const listTool = () => tools.callTool("todo_list", { view: "open" }, undefined, context);
+    const result = await listTool();
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ items: [{ id: todo.id, title: todo.title, revision: todo.revision }] });
+    await expect(tools.callTool("todo_list", { view: "open" }, undefined, { ...context, sessionId: original.id,
+      targetId: original.targetId, generation: original.binding.generation })).resolves.toMatchObject({ isError: true });
+    await expect(tools.callTool("todo_update", { id: todo.id, expectedRevision: todo.revision, operation: "delete" }, undefined, context)).resolves.toMatchObject({ isError: true });
+    const write = { operationId: "denied-remote-affair-delete", partnerId, expectedPartnerRevision: { value: profile.revision }, todoId: todo.id,
+      expectedRevision: BigInt(todo.revision), action: PartnerTodoUiAction.DELETE };
+    await expect(rpc.updatePartnerTodo(write)).rejects.toMatchObject({ code: Code.PermissionDenied });
+    expect(f.store.findOperation(write.operationId)).toBeUndefined();
+
+    const home = f.owner.current(partnerId), homeKey = `current.${partnerId}`;
+    f.store.deleteSetting("service", "partner-homes", homeKey);
+    await expect(read()).rejects.toThrow();
+    expect(f.storage.findCurrent(partnerId)).toBeUndefined();
+    f.store.setSetting("service", "partner-homes", homeKey, { ...home, generation: home.generation + 1 });
+    await expect(read()).rejects.toThrow();
+    f.store.setSetting("service", "partner-homes", homeKey, home);
+    f.peers.retireRoute(f.peer.route, "connection_closed");
+    await expect(read()).rejects.toThrow();
+    const replacement = f.connectPeer();
+    await expect(read()).resolves.toMatchObject({ total: 1, items: [expectedItem] });
+    f.store.setDeviceControlRelation({ controllerDeviceId: "phone", targetDeviceId: "computer", inboundAllowed: false });
+    expect(auth().id).toBe("phone-connection");
+    await expect(read()).rejects.toThrow();
+    await expect(listTool()).resolves.toMatchObject({ isError: true });
+    expect(ledger()).toEqual(before);
+    expect(f.peer.harness.acceptedRequests).toHaveLength(0);
+    expect(replacement.harness.acceptedRequests).toHaveLength(0);
   });
   it("reuses the durable native context completion after interruption before the Home ready receipt", async () => {
     const f = await fixture(), rebuild = vi.spyOn(f.adapter, "rebuildContext");

@@ -780,6 +780,8 @@ export interface EnqueueServiceInput {
   readonly collaborationReportOrigin?: CollaborationReportOrigin;
   readonly taskMessageOrigin?: TaskMessageOrigin;
   readonly overrides?: TurnExecutionOverrides;
+  /** The service owner will wake dispatch after its enclosing transaction commits. */
+  readonly deferDispatch?: true;
   /** Runs inside the same Store transaction after Queue admission and before
    * dispatch can start. Trusted service owners use this to bind their durable
    * projection to the exact Queue identity. */
@@ -3413,7 +3415,7 @@ export class SessionHost {
         expiry.unref();
         this.#protectedMessagingPrompts.set(queueItemId, { prompt: acceptedPrompt, expiry });
       }
-      void this.drain(input.sessionId);
+      if (input.deferDispatch !== true) void this.drain(input.sessionId);
     }
     return execution;
   }
@@ -10662,7 +10664,8 @@ export class SessionHost {
 
   /** Stops existing handles only; native history and queued input remain durable. */
   async pausePartnerSession(input: { readonly sessionId: string; readonly operationId: string;
-    readonly assertCurrent: () => void; readonly pauseGoal: () => Promise<void>; readonly cancelQueued?: boolean }): Promise<void> {
+    readonly assertCurrent: () => void; readonly pauseGoal: () => Promise<void>; readonly cancelQueued?: boolean;
+    readonly commitStop?: () => void }): Promise<void> {
     this.#assertOpen(); input.assertCurrent();
     if (!this.#partnerSessionPaused(input.sessionId)) throw new StoreError("Partner pause requires its durable owner.");
     if (this.#partnerPauseFlights.has(input.sessionId)) throw new StoreError("The previous Partner shutdown is still settling.");
@@ -10685,6 +10688,7 @@ export class SessionHost {
           store.cancelQueueItem({ queueItemId: item.id, traceId: `${input.operationId}:stopped` });
           if (item.attemptId !== undefined && store.getAttempt(item.attemptId).descriptor.endedAt === undefined) store.finishAttempt(item.attemptId);
         }
+        input.commitStop?.();
       });
     })().finally(() => {
       if (this.#partnerPauseFlights.get(input.sessionId) === task) this.#partnerPauseFlights.delete(input.sessionId);
@@ -10721,9 +10725,9 @@ export class SessionHost {
     } catch { return false; }
   }
 
-  /** Stops only the canonical runtime. Native replacement waits for a new user input. */
+  /** Stops only the owned runtime. Pending input waits for a new user admission. */
   async restartPartnerSession(input: { readonly sessionId: string; readonly operationId: string;
-    readonly assertCurrent: () => void; readonly pauseGoal: () => Promise<void> }): Promise<void> {
+    readonly pauseEmptyQueue: boolean; readonly assertCurrent: () => void; readonly pauseGoal: () => Promise<void> }): Promise<void> {
     this.#assertOpen(); input.assertCurrent();
     if (!this.#partnerSessionRestarting(input.sessionId)) throw new StoreError("Partner restart requires its durable owner.");
     if (this.#runtimeRestartFlights.has(input.sessionId)) throw new StoreError("The previous runtime close is still settling.");
@@ -10733,8 +10737,11 @@ export class SessionHost {
     this.#clearSessionRuntimeRecovery(input.sessionId); this.clearRunSilenceWatchdog(input.sessionId);
     try { this.#store.runOperation({ id: input.operationId, kind: "restart_partner_runtime", body: { sessionId: input.sessionId } }, (store) => {
       const control = store.getQueueControl(input.sessionId);
-      if (!control.paused) store.setQueuePaused({ sessionId: input.sessionId, paused: true,
-        resumeOnUserInput: true, reason: "Runtime restarted; waiting for user input.", traceId: `restart:${input.operationId}` });
+      if (!control.paused && (input.pauseEmptyQueue
+        || store.listQueueItems({ sessionId: input.sessionId, states: ["accepted"], limit: 1 }).length > 0)) {
+        store.setQueuePaused({ sessionId: input.sessionId, paused: true,
+          resumeOnUserInput: true, reason: "Runtime restarted; waiting for user input.", traceId: `restart:${input.operationId}` });
+      }
       return { sessionId: input.sessionId };
     }); } catch (error) { this.#runtimeRestartFences.delete(input.sessionId); throw error; }
     const controller = new AbortController();

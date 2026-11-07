@@ -2,6 +2,7 @@ import { createContext, isValidElement, memo, useCallback, useContext, useEffect
 import type { ComponentProps, CSSProperties, JSX, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { sessionHandoffMessages as handoffMessages } from "@joko/contracts";
+import { partnerSessionTaskMessages, partnerSessionTaskReceiptLabel, type PartnerSessionTaskReceiptView } from "@joko/contracts";
 import { richAnswerText, splitRichAnswer } from "@joko/contracts";
 import { RichAnswer } from "./RichAnswer.js";
 import { RichAnswerMedia } from "./RichAnswerMedia.js";
@@ -83,6 +84,7 @@ import { MessageNavRail } from "./MessageNavRail.js";
 import { PrevMessageJumpChip } from "./PrevMessageJumpChip.js";
 import { MessageUsageMeta } from "./MessageUsageMeta.js";
 import { PartnerLearningFooter } from "./PartnerLearningFooter.js";
+import { PartnerPrivateSentCard } from "./PartnerPrivateSentCard.js";
 import { SubagentInlineCard } from "./SubagentInlineCard.js";
 import {
   PartnerDelegationInlineCard,
@@ -268,15 +270,16 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const planTimelineItems = useMemo(() => projectInlinePlanTimeline(items), [items]);
   const partnerConversation = usePartnerConversation();
   const partnerPresentation = partnerConversation?.kind === "partner";
+  const showPrivateSent = partnerPresentation && partnerConversation.partner?.canonicalSessionId === sessionId;
   const currentPlan = useMemo(() => projectPinnedPlan(items), [items]);
   const renderItems = useMemo(
     () => insertTimelineDerivationOrigin(
-      partnerPresentation ? simplifyPartnerRenderItems(projectTimelineRenderItems(items, { sessionActive }), sessionActive)
+      partnerPresentation ? simplifyPartnerRenderItems(projectTimelineRenderItems(items, { sessionActive }), sessionActive, showPrivateSent)
         : projectTimelineRenderItems(planTimelineItems, { sessionActive }),
       derivationOrigin,
       sessionCreatedAt
     ),
-    [derivationOrigin, items, partnerPresentation, planTimelineItems, sessionActive, sessionCreatedAt]
+    [derivationOrigin, items, partnerPresentation, planTimelineItems, sessionActive, sessionCreatedAt, showPrivateSent]
   );
   const partnerTimeGroups = useMemo(() => partnerPresentation ? partnerTimeGroupStarts(renderItems) : new Map<string, number>(), [partnerPresentation, renderItems]);
   const firstPartnerUnread = partnerPresentation ? firstUnreadPartnerReply(renderItems, partnerConversation.entryReadCursor) : undefined;
@@ -1279,6 +1282,7 @@ function WorkGroupBlock({ sessionId, sessionName, work, retryRunId, locale, redu
 function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, retryRunId, locale, reducedMotion, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editingMessageId, editableMessageId, onEditMessage, onCancelEditMessage, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showMessageActions = true }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly planAnimated?: boolean; readonly retryRunId?: string; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onRetry?: (error: ErrorView) => void; readonly onRecovery?: (error: ErrorView, action: ErrorRecoveryActionView) => void; readonly recoveryContext?: RecoveryActionContext; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void; readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void; readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void; readonly onReobserveReview?: (reviewRunId: string) => Promise<void>; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forkingMessageId?: string; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editingMessageId?: string; readonly editableMessageId?: string; readonly onEditMessage?: (item: TimelineItemView) => void; readonly onCancelEditMessage?: () => void; readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showMessageActions?: boolean }): JSX.Element {
   if (item.mcpApp !== undefined) return <McpAppCard card={item.mcpApp} locale={locale} t={t} />;
   if (item.extensionCard !== undefined) return <ExtensionCard card={item.extensionCard} t={t} />;
+  if (item.partnerTaskReceipt !== undefined) return <PartnerTaskReceiptCard receipt={item.partnerTaskReceipt} createdAt={item.createdAt} locale={locale} />;
   if (item.inlinePlan !== undefined) return <InlinePlanCard plan={item.inlinePlan} animated={planAnimated} t={t} />;
   switch (item.kind) {
     case "user": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="user" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editing={editingMessageId === item.id} editable={editableMessageId === item.id} onEdit={onEditMessage} onCancelEdit={onCancelEditMessage} onMoveEditedMessageToComposer={onMoveEditedMessageToComposer} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
@@ -2013,9 +2017,15 @@ function usePrefersReducedMotion(): boolean {
 export function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const partnerDelegationActions = useContext(TimelinePartnerDelegationContext);
+  const partner = usePartnerConversation();
   const [payloadPreview, setPayloadPreview] = useState<{ readonly sectionId: ToolPayloadSection["id"]; readonly trigger: HTMLButtonElement }>();
   const tool = item.tool;
   if (tool === undefined) return <NoticeBlock item={item} icon={<Wrench />} title={item.title ?? t("timeline.tool")} locale={locale} />;
+  if (item.partnerPrivateSent !== undefined && partner?.kind === "partner" && partner.partner?.canonicalSessionId === partner.sessionId) {
+    const receipt = item.partnerPrivateSent;
+    return <PartnerPrivateSentCard key={JSON.stringify([partner.ownerKey, receipt.messageId, receipt.threadId, receipt.recipientPartnerId])}
+      receipt={receipt} read={partner.readSentPrivateMessage} openThread={partner.openPrivateThread} t={t} />;
+  }
   const partnerDelegation = readPartnerDelegationCardData(tool);
   if (partnerDelegation !== undefined) return <PartnerDelegationInlineCard
     initial={partnerDelegation.delegation}
@@ -2415,6 +2425,24 @@ function formatObjectiveLifecycleElapsed(milliseconds: number): string {
 function NoticeBlock({ item, icon, title, detail, locale, accent = false }: { readonly item: TimelineItemView; readonly icon: JSX.Element; readonly title: string; readonly detail?: string; readonly locale: string; readonly accent?: boolean }): JSX.Element {
   const body = detail ?? item.text;
   return <article className={cx("notice-block", accent && "notice-block--accent")}><span aria-hidden="true">{icon}</span><div><strong>{title}</strong>{body !== undefined && <p>{body}</p>}</div><time>{formatDateTime(item.createdAt, locale)}</time></article>;
+}
+
+function PartnerTaskReceiptCard({ receipt, createdAt, locale }: {
+  readonly receipt: PartnerSessionTaskReceiptView; readonly createdAt: number; readonly locale: string;
+}): JSX.Element {
+  const conversation = usePartnerConversation();
+  const open = conversation?.editable ? conversation.openObservedTask : undefined;
+  const child = receipt.taskSessionId;
+  const summary = receipt.result || receipt.error;
+  return <article className="notice-block partner-task-receipt" data-partner-task-status={receipt.status}>
+    <span aria-hidden="true"><ListChecks /></span>
+    <div><strong>{receipt.title}</strong>
+      <p>{partnerSessionTaskReceiptLabel(locale, receipt.status)} · #{receipt.execution}</p>
+      {summary && <p>{summary}</p>}
+      {child !== undefined && open !== undefined && <Button tone="ghost" onClick={() => open(child)}>{partnerSessionTaskMessages(locale).open}</Button>}
+    </div>
+    <time>{formatDateTime(createdAt, locale)}</time>
+  </article>;
 }
 
 function InteractionAnswerBlock({ item, t }: { readonly item: TimelineItemView; readonly t: Translator }): JSX.Element {

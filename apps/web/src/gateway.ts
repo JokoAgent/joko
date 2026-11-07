@@ -33,6 +33,7 @@ import type { HelpMessageView, HelpAnswerView, HelpFeedbackDraftView, WorktreeRe
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
+import { projectPartnerSessionTaskReceipt } from "@joko/contracts";
 import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi, createPartnerMessagingApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
@@ -42,6 +43,7 @@ import { createPartnerConnectionsApi } from "@joko/contracts";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } from "./partner-avatar.js";
 import { mapPartnerWorkingStatus } from "./partner-working-status.js";
+import { partnerPrivateSentReceipt } from "./partner-private-sent.js";
 import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
 import { createClient, ConnectError, Code, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
 import { StateImpact } from "@joko/contracts";
@@ -12120,6 +12122,7 @@ export function projectSnapshotEvent(
     case "statusStream":
     case "messageCompleted":
     case "partnerLearningChanged":
+    case "partnerSessionTaskReceipt":
     case "mcpAppChanged":
     case "extensionCardChanged":
     case "toolCallStarted":
@@ -12262,6 +12265,7 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
     || kind === "statusStream"
     || kind === "messageCompleted"
     || kind === "partnerLearningChanged"
+    || kind === "partnerSessionTaskReceipt"
     || kind === "mcpAppChanged"
     || kind === "extensionCardChanged"
     || kind === "toolCallStarted"
@@ -12522,6 +12526,8 @@ function projectTimelineEvent(
         result,
         outputMode
       );
+      const privateSent = kind.case === "toolCallCompleted" && call.runId === (event.identity?.runId ?? "")
+        && call.attemptId === (event.identity?.attemptId ?? "") ? partnerPrivateSentReceipt(call, sessionId) : undefined;
       const referencedBlobs = new Set((toolItem.attachments ?? []).map((attachment) => attachment.blobId));
       if (referencedBlobs.size > 0) {
         for (let index = items.length - 1; index >= 0; index -= 1) {
@@ -12529,7 +12535,7 @@ function projectTimelineEvent(
           if (item?.artifact !== undefined && referencedBlobs.has(item.artifact.blobId)) items.splice(index, 1);
         }
       }
-      replaceOrAppend(toolItem);
+      replaceOrAppend(privateSent === undefined ? toolItem : { ...toolItem, partnerPrivateSent: privateSent });
       break;
     }
     case "statusStream": {
@@ -12546,6 +12552,13 @@ function projectTimelineEvent(
         text: kind.value.detail,
         streaming: !kind.value.terminal
       });
+      break;
+    }
+    case "partnerSessionTaskReceipt": {
+      const receipt = projectPartnerSessionTaskReceipt(kind.value);
+      if (receipt === undefined || receipt.taskSessionId === sessionId) changed = false;
+      else replaceOrAppend({ id: event.eventId, sourceEventId: event.eventId, sequence, createdAt, kind: "status",
+        title: receipt.title, text: receipt.result || receipt.error, partnerTaskReceipt: receipt });
       break;
     }
     case "extensionCardChanged": {

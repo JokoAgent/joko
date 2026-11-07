@@ -10,6 +10,7 @@ import "joko/v1/mcp_app.proto";
 import "joko/v1/extension_card.proto";
 import "joko/v1/operation.proto";
 import "joko/v1/objective.proto";
+import "joko/v1/partner.proto";
 import "joko/v1/pi.proto";
 import "joko/v1/runtime.proto";
 import "joko/v1/review.proto";
@@ -99,7 +100,20 @@ message EventPayload {
     PartnerLearningChangedEvent partner_learning_changed = 78;
     McpAppChangedEvent mcp_app_changed = 79;
     ExtensionCardChangedEvent extension_card_changed = 80;
+    PartnerSessionTaskReceiptEvent partner_session_task_receipt = 81;
   }
+}
+
+// Owner-visible receipt in the original requesting Session's timeline.
+message PartnerSessionTaskReceiptEvent {
+  string task_id = 1;
+  uint32 execution = 2;
+  string title = 3;
+  // Preparing anchors the request. Each confirmed terminal state has its own receipt.
+  PartnerSessionTaskStatus status = 4;
+  optional string task_session_id = 5;
+  optional string result = 6;
+  optional string error = 7;
 }
 
 message McpAppChangedEvent {

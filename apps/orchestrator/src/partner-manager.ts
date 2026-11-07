@@ -320,6 +320,10 @@ export class PartnerManager {
     return this.#store.findPartnerByHomeTarget(targetId);
   }
 
+  isCanonicalTask(sessionId: string): boolean {
+    return this.#store.findPartnerByCanonicalSession(sessionId) !== undefined;
+  }
+
   canonicalCaller(sessionId: string): PartnerProfileRecord {
     const partner = this.#store.findPartnerByCanonicalSession(sessionId);
     if (partner === undefined || partner.lifecycle !== "active" || partner.initializationState !== "ready"
@@ -1072,11 +1076,13 @@ export class PartnerManager {
     };
     try {
       assertCurrent();
-      await this.#sessionHost.restartPartnerSession({ sessionId: restart.sessionId, operationId, assertCurrent,
+      await this.#sessionHost.restartPartnerSession({ sessionId: restart.sessionId, operationId, pauseEmptyQueue: false, assertCurrent,
         pauseGoal: () => this.#pauseGoal?.(restart.sessionId, `${operationId}:goal`) ?? Promise.resolve() });
       assertCurrent();
-      return this.#store.settlePartnerRestart(restart.requestId, true);
     } catch { return this.#store.settlePartnerRestart(restart.requestId, false); }
+    const ready = this.#store.settlePartnerRestart(restart.requestId, true);
+    void this.#resumeIndependentReturns?.(restart.partnerId).catch(() => undefined);
+    return ready;
   }
 
   listPendingDeletions(): readonly PartnerDeletionRecord[] { return this.#store.listPendingPartnerDeletions(); }

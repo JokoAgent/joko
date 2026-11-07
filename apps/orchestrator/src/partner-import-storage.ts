@@ -46,7 +46,9 @@ export class PartnerImportStorage {
   readReceipt(requestId: string): ImportReceipt | undefined {
     const value = this.store.findSetting<unknown>(SCOPE_TYPE, SCOPE_ID, receiptKey(requestId))?.value;
     if (value === undefined) return undefined;
-    validateImportReceipt(value); if (value.result.requestId !== requestId) throw new AgentImportError("IMPORT_RECEIPT_INVALID"); return value;
+    const receipt = readStoredReceipt(value);
+    if (receipt.result.requestId !== requestId) throw new AgentImportError("IMPORT_RECEIPT_INVALID");
+    return receipt;
   }
   saveReceipt(receipt: ImportReceipt): number {
     validateImportReceipt(receipt);
@@ -56,10 +58,17 @@ export class PartnerImportStorage {
   listReceipts(): ImportReceipt[] {
     const result: ImportReceipt[] = [];
     for (const setting of this.store.listSettingsByKeyPrefix(SCOPE_TYPE, SCOPE_ID, RECEIPT_PREFIX)) {
-      validateImportReceipt(setting.value); result.push(setting.value);
+      result.push(readStoredReceipt(setting.value));
     }
     return result;
   }
+}
+
+function readStoredReceipt(value: unknown): ImportReceipt {
+  validateImportReceipt(value);
+  // The Store represented an explicitly undefined optional field as JSON null.
+  if (value.result.canonicalSessionId === null) delete value.result.canonicalSessionId;
+  return value;
 }
 
 function receiptKey(id: string): string {

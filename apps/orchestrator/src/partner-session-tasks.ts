@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
-import { redactSecrets, type PromptInput, type RunDescriptor, type TargetDescriptor } from "@joko/core";
+import { redactSecrets, type PartnerSessionTaskReceipt, type PromptInput, type RunDescriptor, type TargetDescriptor } from "@joko/core";
 import { NotFoundError, type OperationalStore, type PartnerModelRouteRecord, type PartnerProfileRecord, type QueueItemRecord } from "@joko/store";
 import type { PartnerManager } from "./partner-manager.js";
 import type { SessionHost, InteractionDecisionSubmission } from "./session-host.js";
@@ -15,6 +15,9 @@ import { readPartnerSessionTaskGroupOrigin, type PartnerSessionTaskGroupOrigin, 
 import { partnerTaskContextUsage, suggestPartnerTaskRoute } from "./partner-task-route.js";
 
 const SCOPE = "partner.session-tasks";
+const DEFAULT_RESUME_INPUT = "Continue from the existing task history after the requested pause. Check completed actions; do not replay the original request.";
+const CANCEL_OPERATION = "partner_task_cancel";
+const STOP_UNCONFIRMED = "Task shutdown is still unconfirmed. Input remains held; inspect or retry stopping the same task.";
 function sameComputer(target: TargetDescriptor, home: TargetDescriptor): boolean {
   const child = target.remoteWorkspace, parent = home.remoteWorkspace;
   return parent === undefined ? child === undefined : parent.kind === "device_peer" && child?.kind === "device_peer"
@@ -22,6 +25,7 @@ function sameComputer(target: TargetDescriptor, home: TargetDescriptor): boolean
 }
 const activeStates = ["preparing", "queued", "running", "waiting"] as const;
 export type PartnerSessionTaskStatus = typeof activeStates[number] | "completed" | "failed" | "cancelled" | "timed-out" | "unknown";
+type CancellationStatus = "cancelled" | "timed-out";
 export interface TaskModelSelection { readonly id: string; readonly effort?: string; readonly fastMode?: boolean | "ultrafast" }
 export interface StartPartnerSessionTask {
   readonly instruction: string; readonly title?: string; readonly workingDir?: string; readonly useWorktree?: boolean;
@@ -65,6 +69,7 @@ export class PartnerSessionTaskManager {
       // Creation with a lost receipt may already have touched the native runtime.
       // Observe its durable operation; never replay native creation or input here.
       if (record.status === "preparing") this.#recoverCreation(record);
+      if (record.control === "cancelling") this.#recoverCancellation(record, row.revision);
     }
     this.#unsubscribe = this.store.subscribe(event => {
       const id = event.sessionId === undefined ? undefined : this.#sessions.get(event.sessionId);
@@ -195,7 +200,10 @@ export class PartnerSessionTaskManager {
         ...(caller.group ? { group: { version: 1, roomId: caller.group.roomId, joinId: caller.group.joinId, hostServerId: caller.group.hostServerId,
           actorId: caller.group.actorId, ownerId: caller.group.ownerId, sourceMessageId: caller.group.sourceMessageId, accessRevision: caller.group.accessRevision,
           fallbackSessionId: profile.canonicalSessionId! } } : {}) };
-      this.#save(task);
+      this.store.transaction(() => {
+        this.#save(task);
+        this.#recordTaskReceipt(task);
+      });
       try {
         const binding = remote === undefined ? undefined : { ...remote, workspaceRoot: actual };
         await this.workspaces.register({ id: targetId, root: actual, displayName: basename(directory), trusted: true,
@@ -261,17 +269,8 @@ export class PartnerSessionTaskManager {
       if (!task.sessionId) throw invalid("This task has no confirmed Session.");
       this.#assertTaskSession(task); await this.#assertDirectory(task); assertCaller(); this.#assertTaskSession(task);
       if (input.mode === "resume") {
-        if (task.control !== "paused") throw invalid("Only a confirmed paused task can resume.");
-        const open = this.store.listInteractions({ sessionId: task.sessionId, status: "open" });
-        if (open.length && input.message) throw invalid("Resume without input, then answer the pending interaction.");
-        this.host.restorePartnerQueue({ sessionId: task.sessionId, operationId, ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
-        task = { ...task, control: "active", deadlineAt: task.deadlineAt + Math.max(0, this.now() - task.pauseAt!),
-          pauseAt: undefined, queuePauseRevision: undefined, updatedAt: this.now() };
-        this.#save(task);
-        if (input.message || !open.length && this.store.countQueueItems({ sessionId: task.sessionId!, states: ["accepted"] }) === 0) {
-          this.#enqueue(task, `${operationId}:resume-input`, input.message ?? "Continue from the existing task history after the requested pause. Check completed actions; do not replay the original request.", "prompt", sessionId);
-        }
-        this.host.wakePartnerSession(task.sessionId!); return this.#reconcile(id);
+        this.#resume(task, task.sessionId, sessionId, operationId, input.message, assertCaller);
+        return this.#reconcile(id);
       }
       if (task.control !== "active" || task.status === "unknown") throw invalid("Resume a confirmed pause or resolve the unknown task state before sending input.");
       if (input.decision) {
@@ -309,10 +308,64 @@ export class PartnerSessionTaskManager {
       assertCaller(); this.#enqueue(task, operationId, input.message!, input.mode === "steer" ? "steer" : "prompt", sessionId); return this.#reconcile(id);
     });
   }
+
+  #resume(task: PartnerSessionTaskRecord, childSessionId: string, callerSessionId: string, operationId: string, message: string | undefined, assertCaller: () => void): void {
+    const inputOperationId = `${operationId}:resume-input`;
+    const text = message ?? DEFAULT_RESUME_INPUT;
+    this.store.transaction(store => {
+      store.runOperation({ id: `${operationId}:resume-task`, kind: "partner_task_resume",
+        body: { taskId: task.id, childSessionId, callerSessionId, messageHash: message === undefined ? null : hash(message) } }, () => {
+        assertCaller();
+        const prior = store.findOperation(inputOperationId);
+        if (prior?.status === "completed") {
+          const body = prior.body as { sessionId?: string; originSessionId?: string; prompt?: PromptInput };
+          if (prior.kind !== "service_send_input" || body.sessionId !== childSessionId || body.originSessionId !== callerSessionId
+            || body.prompt?.disposition !== "prompt" || body.prompt.text !== text) throw invalid("This input identity belongs to another message.");
+          return { sessionId: childSessionId };
+        }
+        if (task.control !== "paused") throw invalid("Only a confirmed paused task can resume.");
+        const open = store.listInteractions({ sessionId: childSessionId, status: "open" });
+        if (open.length && message) throw invalid("Resume without input, then answer the pending interaction.");
+
+        const needsInput = Boolean(message) || !open.length && store.countQueueItems({ sessionId: childSessionId, states: ["accepted"] }) === 0;
+        // Restore the original pause while the task still owns it. Admit the
+        // continuation after the same transaction makes the task active.
+        this.host.restorePartnerQueue({ sessionId: childSessionId, operationId,
+          ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
+        const at = this.now();
+        const resumed: PartnerSessionTaskRecord = { ...task, control: "active", deadlineAt: task.deadlineAt + Math.max(0, at - task.pauseAt!),
+          pauseAt: undefined, queuePauseRevision: undefined, updatedAt: at };
+        this.#save(resumed);
+        if (needsInput) this.#enqueue(resumed, inputOperationId, text, "prompt", callerSessionId, { deferDispatch: true });
+        return { sessionId: childSessionId };
+      });
+    });
+    const current = this.#read(task.id);
+    if (current.control === "active") {
+      this.#arm(current);
+      this.host.wakePartnerSession(childSessionId);
+    }
+  }
+
   stop(sessionId: string, id: string, operationId: string, mode: "cancel" | "pause" | "request-stop", assertCaller: () => void) {
     this.#owned(sessionId, id);
     return this.#serial(id, async () => {
-      assertCaller(); let task = await this.#reconcile(id); this.#assertTaskSession(task);
+      assertCaller();
+      const owned = this.#owned(sessionId, id);
+      const prior = this.store.findOperation(operationId);
+      if (prior?.kind === CANCEL_OPERATION) {
+        const body = prior.body as { taskId: string; sessionId: string; status: CancellationStatus };
+        if (mode !== "cancel" || body.taskId !== id || body.sessionId !== owned.sessionId || body.status !== "cancelled") {
+          throw invalid("This stop identity belongs to another task control.");
+        }
+        return this.#reconcile(id);
+      }
+      const queuePause = mode === "cancel" ? this.store.findOperation(`${operationId}:queue`) : undefined;
+      if (queuePause?.kind === "pause_partner_queue") {
+        if ((queuePause.body as { sessionId: string }).sessionId !== owned.sessionId) throw invalid("This stop identity belongs to another task.");
+        return this.#reconcile(id);
+      }
+      const task = await this.#reconcile(id); this.#assertTaskSession(task);
       if (!isActive(task.status) && task.status !== "unknown" && task.control === "active") return task;
       if (mode === "request-stop") {
         if (task.control !== "active") return task;
@@ -326,7 +379,9 @@ export class PartnerSessionTaskManager {
         } catch { throw new PartnerSessionTaskError("STOP_UNCONFIRMED", "The stop request is unconfirmed. Inspect the same execution before another control action."); }
         return this.#reconcile(id);
       }
-      task = await this.#hold(task, operationId, mode === "pause" ? "paused" : "cancelled", assertCaller); return task;
+      if (mode === "cancel") return this.#cancel(task, operationId, "cancelled", assertCaller);
+      if (task.control === "cancelling") return task;
+      return this.#pause(task, operationId, assertCaller);
     });
   }
   inspectRoute(sessionId: string, id: string) {
@@ -359,30 +414,125 @@ export class PartnerSessionTaskManager {
       assertCaller(); return result;
     });
   }
-  async #hold(task: PartnerSessionTaskRecord, operationId: string, terminal: "paused" | "cancelled" | "timed-out", assertCurrent: () => void) {
-    if (!task.sessionId) throw invalid("The task Session is unconfirmed.");
-    const wasPaused = this.store.getQueueControl(task.sessionId).paused;
-    task = { ...task, control: terminal === "paused" ? "pausing" : "cancelling", pauseAt: task.pauseAt ?? this.now(), updatedAt: this.now() }; this.#save(task);
-    const revision = this.host.preparePartnerPauseQueue({ sessionId: task.sessionId!, operationId, wasQueuePaused: wasPaused });
-    if (revision !== undefined) { task = { ...task, queuePauseRevision: revision.toString() }; this.#save(task); }
+  #holdQueue(task: PartnerSessionTaskRecord, sessionId: string, operationId: string, control: "pausing" | "cancelling") {
+    const wasQueuePaused = this.store.getQueueControl(sessionId).paused;
+    const held = { ...task, control, pauseAt: task.pauseAt ?? this.now(), updatedAt: this.now() };
+    this.#save(held);
+    const revision = this.host.preparePartnerPauseQueue({ sessionId, operationId, wasQueuePaused });
+    if (revision !== undefined) this.#save({ ...held, queuePauseRevision: revision.toString() });
+  }
+  async #pause(task: PartnerSessionTaskRecord, operationId: string, assertCurrent: () => void) {
+    const { sessionId } = task;
+    if (!sessionId) throw invalid("The task Session is unconfirmed.");
+    this.store.transaction(() => { assertCurrent(); this.#holdQueue(task, sessionId, operationId, "pausing"); });
     try {
       // Waiting on an exact open decision is already an input boundary. Keep
       // that native resolver alive for a reversible pause instead of dismissing it.
-      const waitingOnly = terminal === "paused" && this.store.listInteractions({ sessionId: task.sessionId!, status: "open" }).length > 0;
-      if (!waitingOnly) await this.host.pausePartnerSession({ sessionId: task.sessionId!, operationId, assertCurrent, pauseGoal: async () => undefined, cancelQueued: terminal !== "paused" });
-      assertCurrent(); task = this.#read(task.id);
-      if (terminal !== "paused") this.host.restorePartnerQueue({ sessionId: task.sessionId!, operationId, ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
-      task = { ...task, control: terminal === "paused" ? "paused" : "active", status: terminal === "paused" ? "waiting" : terminal,
-        error: terminal === "timed-out" ? "This execution reached its original time budget." : undefined, updatedAt: this.now() };
-      this.#save(task); this.#arm(task); if (terminal !== "paused") await this.#deliver(task); return this.#read(task.id);
-    } catch { task = { ...this.#read(task.id), error: "Task shutdown is still unconfirmed. Input remains held; inspect or retry stopping the same task.", updatedAt: this.now() }; this.#save(task); return task; }
+      const waitingOnly = this.store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0;
+      if (!waitingOnly) await this.host.pausePartnerSession({ sessionId, operationId, assertCurrent, pauseGoal: async () => undefined });
+      assertCurrent();
+      task = { ...this.#read(task.id), control: "paused", status: "waiting", error: undefined, updatedAt: this.now() };
+      this.#save(task);
+      this.#arm(task);
+      return task;
+    } catch {
+      task = { ...this.#read(task.id), error: STOP_UNCONFIRMED, updatedAt: this.now() };
+      this.#save(task);
+      return task;
+    }
   }
-  #enqueue(task: PartnerSessionTaskRecord, operationId: string, text: string, disposition: PromptInput["disposition"] = "prompt", callerSessionId = task.parentSessionId) {
+  async #cancel(task: PartnerSessionTaskRecord, operationId: string, status: CancellationStatus, assertCurrent: () => void) {
+    const { sessionId, execution } = task;
+    if (!sessionId) throw invalid("The task Session is unconfirmed.");
+    const receipt = { taskId: task.id, sessionId, execution, status };
+    const assertOwner = () => { assertCurrent(); this.#assertTaskSession(task); };
+    const claim = this.store.claimDeferredEffectOperation({
+      id: operationId, kind: CANCEL_OPERATION, body: receipt
+    }, () => {
+      assertOwner();
+      this.#holdQueue(task, sessionId, operationId, "cancelling");
+    });
+    if (!claim.claimed) return this.#read(task.id);
+    try {
+      await this.host.pausePartnerSession({ sessionId, operationId, assertCurrent: assertOwner, pauseGoal: async () => undefined, cancelQueued: true,
+        commitStop: () => {
+          this.store.completeDeferredEffectOperation(operationId, claim.operation.bodyHash, () => {
+            this.#finishCancellation(this.#read(task.id), sessionId, operationId, status);
+            return receipt;
+          });
+        } });
+    } catch {
+      this.store.transaction(() => {
+        this.store.failEffectOperation(operationId, claim.operation.bodyHash, new Error(STOP_UNCONFIRMED));
+        this.#save({ ...this.#read(task.id), error: STOP_UNCONFIRMED, updatedAt: this.now() });
+      });
+      return this.#read(task.id);
+    }
+    await this.#deliver(this.#read(task.id));
+    const settled = this.#read(task.id);
+    this.#arm(settled);
+    return settled;
+  }
+  #finishCancellation(task: PartnerSessionTaskRecord, sessionId: string, operationId: string, status: CancellationStatus) {
+    this.host.restorePartnerQueue({ sessionId, operationId,
+      ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
+    this.#save({ ...task, control: "active", status, pauseAt: undefined, queuePauseRevision: undefined,
+      error: status === "timed-out" ? "This execution reached its original time budget." : undefined, updatedAt: this.now() });
+  }
+  #recoverCancellation(task: PartnerSessionTaskRecord, intentRevision: bigint) {
+    const { sessionId } = task;
+    if (!sessionId) return;
+    try { this.#assertTaskSession(task); } catch { return; }
+    if (this.host.isSessionActive(sessionId) || this.store.listRuns({ sessionId, activeOnly: true, limit: 1 }).length
+      || this.store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length) return;
+    const aborted = new Set(this.#executionRuns(task).leaves.filter(run => run.state === "aborted").map(run => run.id));
+    if (aborted.size === 0) return;
+    const generation = this.store.getSession(sessionId).descriptor.binding.generation;
+    const deadlineId = `${task.id}:deadline:${task.execution}`;
+    // A terminal Run alone could come from an interrupt. The original Host
+    // shutdown writes its own Queue cancellation and Run events in one commit.
+    let beforeCursor: bigint | undefined;
+    for (;;) {
+      const events = this.store.listEvents({ sessionId, order: "desc", limit: 100, ...(beforeCursor === undefined ? {} : { beforeCursor }) });
+      if (events.length === 0) return;
+      for (const event of events) {
+        if (event.revision <= intentRevision) return;
+        if (event.payload.type !== "run_state" || event.payload.state !== "aborted" || event.generation !== generation
+          || event.runId === undefined || !aborted.has(event.runId) || !event.traceId.endsWith(":stopped")) continue;
+        const operationId = event.traceId.slice(0, -":stopped".length);
+        if (operationId !== deadlineId && !/^partner-task-control:[a-f0-9]{64}$/u.test(operationId)) continue;
+        const queue = this.store.findQueueItemByRunId(sessionId, event.runId);
+        if (queue?.state !== "cancelled" || queue.revision !== event.revision || queue.operationId !== event.operationId) continue;
+        const pause = this.store.findOperation<{ revision?: string }>(`${operationId}:queue`);
+        const body = pause?.body as { sessionId: string; wasQueuePaused: boolean } | undefined;
+        if (pause?.kind !== "pause_partner_queue" || pause.status !== "completed" || body?.sessionId !== sessionId
+          || pause.revision >= event.revision || this.store.findOperation(operationId)) continue;
+        if (body.wasQueuePaused === true) {
+          if (pause.revision <= intentRevision) continue;
+        } else if (body.wasQueuePaused !== false || pause.response?.revision === undefined || pause.response.revision !== task.queuePauseRevision) {
+          continue;
+        }
+        const status = operationId === deadlineId ? "timed-out" : "cancelled";
+        const receipt = { taskId: task.id, sessionId, execution: task.execution, status };
+        this.store.runOperation({ id: operationId, kind: CANCEL_OPERATION, body: receipt }, () => {
+          this.#finishCancellation(task, sessionId, operationId, status);
+          return receipt;
+        });
+        return;
+      }
+      beforeCursor = events.at(-1)!.globalCursor;
+    }
+  }
+  #enqueue(task: PartnerSessionTaskRecord, operationId: string, text: string, disposition: PromptInput["disposition"] = "prompt",
+    callerSessionId = task.parentSessionId, options: { readonly deferDispatch?: true } = {}) {
     this.#assertTaskSession(task);
-    this.host.enqueueServiceInput({ operationId, sessionId: task.sessionId!, source: "system", originSessionId: callerSessionId, prompt: prompt(text, disposition),
-      onAdmitted: (_store, receipt) => this.#save({ ...task, runId: receipt.runId,
-        executionRunIds: [...new Set([...task.executionRunIds, receipt.runId])], status: "queued", updatedAt: this.now() }) });
-    this.#arm(this.#read(task.id));
+    this.host.enqueueServiceInput({ operationId, sessionId: task.sessionId!, source: "system", originSessionId: callerSessionId, prompt: prompt(text, disposition), ...options,
+      onAdmitted: (_store, receipt) => {
+        if (this.#read(task.id).execution !== task.execution) this.#recordTaskReceipt(task);
+        this.#save({ ...task, runId: receipt.runId,
+          executionRunIds: [...new Set([...task.executionRunIds, receipt.runId])], status: "queued", updatedAt: this.now() });
+      } });
+    if (options.deferDispatch !== true) this.#arm(this.#read(task.id));
   }
   async #reconcile(id: string): Promise<PartnerSessionTaskRecord> {
     let task = this.#read(id);
@@ -405,6 +555,7 @@ export class PartnerSessionTaskManager {
     if (!task.sessionId || task.status === "preparing" || task.status === "unknown") {
       if (task.status === "unknown") this.groupPublisher?.skipProgress(task.id);
       else if (task.group && !isActive(task.status)) await this.#deliver(task);
+      else if (!isActive(task.status)) this.#recordTaskReceipt(task, true);
       this.#arm(this.#read(id)); return this.#read(id);
     }
     for (const interaction of interactions) {
@@ -436,7 +587,7 @@ export class PartnerSessionTaskManager {
       if (await this.groupPublisher.running(task) === "fallback") { task = { ...task, groupFallback: true }; this.#save(task); }
     }
     if (task.control !== "active") { this.#arm(task); return task; }
-    if (isActive(task.status) && task.deadlineAt <= this.now()) return this.#hold(task, `${task.id}:deadline:${task.execution}`, "timed-out", () => this.#assertTaskSession(task));
+    if (isActive(task.status) && task.deadlineAt <= this.now()) return this.#cancel(task, `${task.id}:deadline:${task.execution}`, "timed-out", () => undefined);
     if (!isActive(task.status) && task.status !== "unknown") await this.#deliver(task); this.#arm(this.#read(id)); return this.#read(id);
   }
   async #deliver(task: PartnerSessionTaskRecord) {
@@ -447,6 +598,7 @@ export class PartnerSessionTaskManager {
         if (task.sessionId && task.runId) persistSessionTaskActivity(this.store, task.sessionId, { runId: task.runId, completionNotification: "none" });
         return;
       }
+      if (!task.group) this.#recordTaskReceipt(task, true);
       const runIds = this.#executionRuns(task).ids;
       if (task.group && !task.groupFallback && this.groupPublisher) {
         const delivered = await this.groupPublisher.terminal(task, runIds);
@@ -479,6 +631,28 @@ export class PartnerSessionTaskManager {
       }
       // An uncertain admission retains its exact durable return identity.
     }
+  }
+
+  #recordTaskReceipt(task: PartnerSessionTaskRecord, includeOutcome = false): void {
+    if (task.group) return;
+    const profile = this.partners.getPartner(task.partnerId);
+    const parent = this.store.findSession(task.parentSessionId)?.descriptor;
+    if (parent === undefined || profile.lifecycle !== "active" || profile.canonicalSessionId !== parent.id
+      || profile.homeTargetId !== parent.targetId || parent.archived || parent.deletedAt !== undefined
+      || !this.store.getTarget(parent.targetId).descriptor.trusted) return;
+    const common = { taskId: task.id, execution: task.execution, title: task.title };
+    const write = (receipt: PartnerSessionTaskReceipt): void => {
+      const phase = receipt.status === "preparing" ? "request" : "outcome";
+      const id = `partner-task-receipt:${hash(JSON.stringify([parent.id, task.id, task.execution, phase]))}`;
+      this.store.recordPartnerSessionTaskReceipt(id, parent.id, receipt);
+    };
+    this.store.transaction(() => {
+      write({ ...common, status: "preparing" });
+      const { status } = task;
+      if (includeOutcome && (status === "completed" || status === "failed" || status === "cancelled" || status === "timed-out")) {
+        write({ ...common, status, taskSessionId: task.sessionId, result: task.result, error: task.error });
+      }
+    });
   }
   #returnGroupPrivate(task: PartnerSessionTaskRecord, deliveryId: string, sessionId: string): "delivered" | "retry" | "failed" {
     const assertDestination = () => {
