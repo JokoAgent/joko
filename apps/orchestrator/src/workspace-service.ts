@@ -1526,13 +1526,13 @@ export class WorkspaceService {
     if (input.source === "unstaged") {
       bytes = await this.#readWorktreeFilePrefix(workspace, path, maximumBytes + 1);
     } else if (input.source === "staged") {
-      const oid = await this.#readIndexBlobOid(workspace, path);
+      const oid = await this.#readIndexObjectOid(workspace, path);
       if (oid === undefined) throw new WorkspaceGitReviewError("The selected Review file is unavailable.", "unsupported");
       bytes = await this.#readGitBlobPrefix(workspace, oid, maximumBytes + 1);
     } else {
       const treeish = input.source === "commit" ? before.headRevision : before.headRevision;
       if (treeish === undefined) throw new WorkspaceGitReviewError("The selected Review file is unavailable.", "unsupported");
-      const oid = await this.#readTreeBlobOid(workspace, treeish, path);
+      const oid = await this.#readTreeObjectOid(workspace, treeish, path);
       if (oid === undefined) throw new WorkspaceGitReviewError("The selected Review file is unavailable.", "unsupported");
       bytes = await this.#readGitBlobPrefix(workspace, oid, maximumBytes + 1);
     }
@@ -2145,7 +2145,41 @@ export class WorkspaceService {
     }
   }
 
-  async #readIndexBlobOid(workspace: WorkspaceRegistration, path: string): Promise<string | undefined> {
+  /** Reads the three object identities for a clean, initialized staged submodule update. */
+  async readStagedGitlink(workspaceId: string, relativePath: string, parentHead: string): Promise<{
+    readonly headOid: string; readonly indexOid: string; readonly checkoutOid: string;
+  }> {
+    await this.#gitMutationTail;
+    const workspace = this.requireWorkspace(workspaceId);
+    if (!workspace.trusted || workspace.remote !== undefined) throw new WorkspaceGitReviewError("This workspace cannot read a local submodule.", "unsupported");
+    await this.#requireGitRoot(workspace);
+    const path = canonicalGitRelativePath(relativePath);
+    const subRoot = resolve(workspace.root, ...path.split("/"));
+    if (!(await lstat(subRoot)).isDirectory() || await realpath(subRoot) !== subRoot) {
+      throw new WorkspaceGitReviewError("The selected submodule directory is unavailable.", "unsupported");
+    }
+    const [headOid, indexOid] = await Promise.all([
+      this.#readTreeObjectOid(workspace, parentHead, path, "commit"),
+      this.#readIndexObjectOid(workspace, path, "commit")
+    ]);
+    if (!headOid || !indexOid || headOid === indexOid) throw new WorkspaceGitReviewError("The selected submodule update is unavailable.", "unsupported");
+    const git = async (cwd: string, args: readonly string[]) => (await runProcess(this.#gitExecutable, args, cwd, 10_000, 2 * 1024 * 1024)).stdout.trim();
+    const parentGitDir = await realpath(await git(workspace.root, ["rev-parse", "--absolute-git-dir"]));
+    const subGitDir = await realpath(await git(subRoot, ["rev-parse", "--absolute-git-dir"]));
+    if (!isWithin(subGitDir, resolve(parentGitDir, "modules"))
+      || await realpath(await git(subRoot, ["rev-parse", "--show-toplevel"])) !== subRoot) {
+      throw new WorkspaceGitReviewError("The selected directory is not an initialized submodule of this workspace.", "unsupported");
+    }
+    const readCheckout = () => git(subRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
+    const checkoutOid = await readCheckout();
+    const status = await git(subRoot, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=none"]);
+    if (status !== "" || checkoutOid !== indexOid || await readCheckout() !== checkoutOid) {
+      throw new WorkspaceGitReviewError("The selected submodule checkout does not match the staged commit.", "stale");
+    }
+    return { headOid, indexOid, checkoutOid };
+  }
+
+  async #readIndexObjectOid(workspace: WorkspaceRegistration, path: string, type: "blob" | "commit" = "blob"): Promise<string | undefined> {
     const result = await runProcess(
       this.#gitExecutable,
       ["ls-files", "--stage", "-z", "--", literalGitPathspec(path)],
@@ -2159,15 +2193,16 @@ export class WorkspaceService {
     const tab = records[0]!.indexOf("\t");
     const fields = records[0]!.slice(0, tab).trim().split(/\s+/u);
     const listedPath = tab < 0 ? "" : records[0]!.slice(tab + 1);
-    if (fields.length !== 3 || fields[2] !== "0" || !isRegularGitMode(fields[0] ?? "") || listedPath !== path) {
-      throw new WorkspaceGitReviewError("The selected index entry is not a regular file.", "unsupported");
+    const validMode = type === "blob" ? isRegularGitMode(fields[0] ?? "") : fields[0] === "160000";
+    if (fields.length !== 3 || fields[2] !== "0" || !validMode || listedPath !== path) {
+      throw new WorkspaceGitReviewError(type === "blob" ? "The selected index entry is not a regular file." : "The selected index entry is not a submodule.", "unsupported");
     }
     const oid = fields[1] ?? "";
     if (!isImmutableGitObjectId(oid)) throw new WorkspaceGitReviewError("The selected index object is invalid.", "unsupported");
     return oid;
   }
 
-  async #readTreeBlobOid(workspace: WorkspaceRegistration, treeish: string, path: string): Promise<string | undefined> {
+  async #readTreeObjectOid(workspace: WorkspaceRegistration, treeish: string, path: string, type: "blob" | "commit" = "blob"): Promise<string | undefined> {
     if (!isImmutableGitObjectId(treeish)) throw new WorkspaceGitReviewError("An immutable tree revision is required.", "invalid");
     const result = await runProcess(
       this.#gitExecutable,
@@ -2182,8 +2217,9 @@ export class WorkspaceService {
     const tab = records[0]!.indexOf("\t");
     const fields = records[0]!.slice(0, tab).trim().split(/\s+/u);
     const listedPath = tab < 0 ? "" : records[0]!.slice(tab + 1);
-    if (fields.length !== 3 || fields[1] !== "blob" || !isRegularGitMode(fields[0] ?? "") || listedPath !== path) {
-      throw new WorkspaceGitReviewError("The selected tree entry is not a regular file.", "unsupported");
+    const validMode = type === "blob" ? isRegularGitMode(fields[0] ?? "") : fields[0] === "160000";
+    if (fields.length !== 3 || fields[1] !== type || !validMode || listedPath !== path) {
+      throw new WorkspaceGitReviewError(type === "blob" ? "The selected tree entry is not a regular file." : "The selected tree entry is not a submodule.", "unsupported");
     }
     const oid = fields[2] ?? "";
     if (!isImmutableGitObjectId(oid)) throw new WorkspaceGitReviewError("The selected tree object is invalid.", "unsupported");
@@ -2228,14 +2264,14 @@ export class WorkspaceService {
   async #readIndexImageSide(workspace: WorkspaceRegistration, path: string): Promise<WorkspaceGitImageSide> {
     const mediaType = imageMediaType(path);
     if (mediaType === undefined) return missingImageSide(path);
-    const oid = await this.#readIndexBlobOid(workspace, path);
+    const oid = await this.#readIndexObjectOid(workspace, path);
     return oid === undefined ? missingImageSide(path, mediaType) : this.#readGitImageBlob(workspace, oid, path);
   }
 
   async #readTreeImageSide(workspace: WorkspaceRegistration, treeish: string, path: string): Promise<WorkspaceGitImageSide> {
     const mediaType = imageMediaType(path);
     if (mediaType === undefined) return missingImageSide(path);
-    const oid = await this.#readTreeBlobOid(workspace, treeish, path);
+    const oid = await this.#readTreeObjectOid(workspace, treeish, path);
     return oid === undefined ? missingImageSide(path, mediaType) : this.#readGitImageBlob(workspace, oid, path);
   }
 

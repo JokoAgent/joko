@@ -48,6 +48,53 @@ describe("DurableReviewEvidenceProvider", () => {
     }
   }, 30_000);
 
+  it("captures a clean staged submodule update by Git identity", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    const childSource = path.join(fixture.directory, "submodule-source");
+    try {
+      mkdirSync(childSource);
+      const childGit = initWorkspaceRepository(childSource);
+      writeWorkspaceFile(childSource, "version.txt", "one\n");
+      childGit("add", "--", "version.txt");
+      childGit("commit", "--quiet", "-m", "first child commit");
+      const headOid = childGit("rev-parse", "HEAD").trim();
+
+      const git = initWorkspaceRepository(fixture.root);
+      git("config", "diff.submodule", "short");
+      git("-c", "protocol.file.allow=always", "submodule", "add", "--quiet", "--", childSource, "lib");
+      git("commit", "--quiet", "-m", "add submodule");
+      writeWorkspaceFile(childSource, "version.txt", "two\n");
+      childGit("commit", "--quiet", "-am", "second child commit");
+      const indexOid = childGit("rev-parse", "HEAD").trim();
+      git("-c", "protocol.file.allow=always", "-C", "lib", "fetch", "--quiet", "--no-tags", "origin", "HEAD");
+      git("-C", "lib", "checkout", "--quiet", "--detach", indexOid);
+      git("add", "--", "lib");
+      expect(git("status", "--porcelain=v1", "-z")).toBe("M  lib\0");
+      expect(git("-C", "lib", "status", "--porcelain=v1", "-z")).toBe("");
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      const provider = providerFor(fixture.store, workspaces, []);
+      const capture = await provider.capture(request());
+      expect(capture.workspaceEvidence?.diffs).toMatchObject([
+        { relativePath: "lib", source: "staged", status: "modified", patch: expect.stringContaining(`-Subproject commit ${headOid}\n+Subproject commit ${indexOid}`) }
+      ]);
+      expect(capture.workspace.files).toEqual([{
+        relativePath: "lib", byteLength: 0,
+        sha256: createHash("sha256").update(JSON.stringify(["gitlink", "lib", headOid, indexOid, indexOid])).digest("hex")
+      }]);
+      expect(buildReviewEvidence(await provider.capture(request(), "reobserve")).freshness).toEqual(buildReviewEvidence(capture).freshness);
+
+      // Parent configuration can hide a dirty checkout from the parent status.
+      git("config", "submodule.lib.ignore", "dirty");
+      writeWorkspaceFile(fixture.root, "lib/version.txt", "dirty\n");
+      expect(git("status", "--porcelain=v1", "-z")).toBe("M  lib\0");
+      await expect(provider.capture(request())).rejects.toMatchObject({ code: "artifact-unavailable" });
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
   it("captures a worktree rename without treating its old name as another status record", async () => {
     const fixture = setup();
     const workspaces = new WorkspaceService();
