@@ -123,7 +123,7 @@ export interface MobileVoicePcmChunk {
 
 export interface MobileVoiceCaptureRuntime {
   isAvailable(): boolean;
-  ensurePermission(signal: AbortSignal): Promise<MobileVoicePermission>;
+  ensurePermission(signal: AbortSignal, onPrompt?: () => void): Promise<MobileVoicePermission>;
   start(
     onChunk: (chunk: MobileVoicePcmChunk) => void,
     onError: (error: Error) => void,
