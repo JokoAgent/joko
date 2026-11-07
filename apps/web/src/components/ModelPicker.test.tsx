@@ -81,6 +81,42 @@ describe("ModelPicker", () => {
     expect(document.querySelector('[role="alert"]')?.textContent).toContain("could not be saved");
   });
 
+  it.each(["before receipt", "before focus frame", "before composer frame", "never"] as const)("preserves focus ownership when sidebar search is focused %s", async timing => {
+    vi.useFakeTimers();
+    try {
+      let complete!: () => void;
+      const onSelect = vi.fn(() => new Promise<void>(resolve => { complete = resolve; }));
+      const container = document.createElement("div");
+      const sidebar = document.createElement("input");
+      const composer = document.createElement("textarea");
+      document.body.append(sidebar, composer, container);
+      const root = createRoot(container);
+      roots.push(root);
+      const onSelectionFocus = vi.fn((canRestoreFocus: () => boolean) => {
+        window.requestAnimationFrame(() => { if (canRestoreFocus()) composer.focus(); });
+      });
+      await act(async () => root.render(<ModelPicker models={models} ownerId="owner-one" value={undefined} useMorphPopover
+        t={(key, values) => translate("en", key, values)} onSelect={onSelect} onSelectionFocus={onSelectionFocus} />));
+      await openPicker();
+      await act(async () => vi.advanceTimersByTimeAsync(300));
+      const pickerSearch = required(document.querySelector<HTMLInputElement>(".model-picker__header input"));
+      expect(document.activeElement).toBe(pickerSearch);
+      await act(async () => findRow("Small").click());
+      expect(onSelect).toHaveBeenCalledOnce();
+      if (timing === "before receipt") await act(async () => sidebar.focus());
+      await act(async () => complete());
+      if (timing === "before focus frame") await act(async () => sidebar.focus());
+      if (timing === "before composer frame") {
+        act(() => { vi.advanceTimersToNextFrame(); });
+        expect(onSelectionFocus).toHaveBeenCalledOnce();
+        await act(async () => sidebar.focus());
+      }
+      await act(async () => vi.advanceTimersByTimeAsync(300));
+      expect(document.activeElement).toBe(timing === "never" ? composer : sidebar);
+      expect(onSelectionFocus).toHaveBeenCalledTimes(timing === "never" || timing === "before composer frame" ? 1 : 0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it.each([false, true])("shows the exact group member quota after the group owner routes to another Backend (member=%s)", async member => {
     const usage = { group: { backendId: member ? "group-owner" : "backend-picker", providerId: "provider-a" },
       ...(member ? { memberRoute: { backendId: "backend-picker", providerId: "provider-a" } } : {}),
@@ -323,16 +359,21 @@ describe("ModelPicker", () => {
     expect(regularRows).toEqual(["Beta model", "Small", "Large"]);
   });
 
-  it("keeps default-hidden discoveries out of rows and refreshes when opening", async () => {
+  it("honors discovery defaults and a later owner visibility preference in the mounted picker", async () => {
     const onOpen = vi.fn(async () => undefined);
+    const direct = { ...model("provider-b", "Beta", "direct-model", "Direct discovery", [], false, 0, 0), defaultVisible: true };
     await renderPicker(undefined, "owner-one", undefined, false, onOpen, [
       ...models,
+      direct,
       { ...model("provider-b", "Beta", "new-model", "New model", [], false, 0, 0), defaultVisible: false }
     ]);
     await openPicker();
 
     expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(findRow("Direct discovery").textContent).toContain("Direct discovery");
     expect(document.body.textContent).not.toContain("New model");
+    await act(async () => setModelVisible("owner-one", direct.backendId, direct.providerId, direct.modelId, false));
+    expect(document.body.textContent).not.toContain("Direct discovery");
   });
 
   it("shows subscription references as subscription, keeps upstream metered routes priced, reserves Free for known zero-price quotes, and hides unknown pricing", async () => {

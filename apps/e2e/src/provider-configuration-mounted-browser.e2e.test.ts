@@ -215,8 +215,9 @@ describe("mounted Provider configuration", () => {
 async function routeFixtureDiscovery(context: BrowserContext, baseUrl: string): Promise<void> {
   // The page's opportunistic local-node discovery must reach this controlled
   // node instead of depending on a daemon installed on the CI runner.
-  await context.route(/^http:\/\/(?:127\.0\.0\.1|localhost):4318\/joko\.v1\.ConnectionService\/GetServerInfo$/u, async route => {
-    const response = await route.fetch({ url: new URL("/joko.v1.ConnectionService/GetServerInfo", baseUrl).href, maxRetries: 0 });
+  await context.route(/^http:\/\/(?:127\.0\.0\.1|localhost):4318\/joko\.v1\.ConnectionService\/(?:GetServerInfo|ListDiscoveredNodes)$/u, async route => {
+    const { pathname } = new URL(route.request().url());
+    const response = await route.fetch({ url: new URL(pathname, baseUrl).href, maxRetries: 0 });
     await route.fulfill({ response });
   });
 }

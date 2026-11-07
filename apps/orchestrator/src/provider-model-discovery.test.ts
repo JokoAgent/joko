@@ -104,6 +104,34 @@ describe("Provider model discovery", () => {
     }, request as typeof fetch)).resolves.toEqual([{ id: "custom-model", name: "custom-model" }]);
   });
 
+  it("honors an explicit same-origin Google catalog and an owner-configured Google key header", async () => {
+    const baseUrl = "https://google-proxy.example.test/service/v1beta/";
+    const modelsEndpoint = "https://google-proxy.example.test/catalog";
+    const request = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("x-goog-api-key")).toBe("configured-key");
+      expect(new Headers(init?.headers).has("authorization")).toBe(false);
+      return Response.json({ models: [{ name: "models/new-model", supportedGenerationMethods: ["generateContent"] }] });
+    });
+    const spec = { api: "google-generative-ai", baseUrl, headers: { "X-Goog-API-Key": "configured-key" } };
+    await expect(fetchProviderModels({ ...spec, modelsEndpoint }, request as typeof fetch))
+      .resolves.toEqual([{ id: "new-model", name: "new-model" }]);
+    expect(request).toHaveBeenCalledExactlyOnceWith(modelsEndpoint, expect.objectContaining({ method: "GET", redirect: "error" }));
+    await expect(fetchProviderModels({ ...spec, modelsEndpoint: "https://different.example.test/catalog" }, request as typeof fetch))
+      .rejects.toMatchObject({ code: "unavailable" });
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it("bounds Anthropic pagination to the original catalog, deadline and unique cursors", async () => {
+    const modelsEndpoint = "https://api.example.test/model-catalog";
+    const cursor = "https://unrelated.example.test/v1/models";
+    const request = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      Response.json({ data: [{ id: "listed-model" }], has_more: true, last_id: cursor }));
+    await expect(fetchProviderModels({ baseUrl: "https://api.example.test/v1", modelsEndpoint,
+      api: "anthropic-messages", apiKey: "test-key" }, request as typeof fetch)).rejects.toMatchObject({ code: "invalid_response" });
+    expect(request.mock.calls.map(([url]) => url)).toEqual([modelsEndpoint, `${modelsEndpoint}?after_id=${encodeURIComponent(cursor)}`]);
+    expect(request.mock.calls[0]?.[1]?.signal).toBe(request.mock.calls[1]?.[1]?.signal);
+  });
+
   it("cancels an oversized streaming response without buffering the remaining upstream body", async () => {
     const cancel = vi.fn();
     let pulls = 0;

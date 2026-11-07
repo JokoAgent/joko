@@ -42,15 +42,18 @@ export class ProviderModelDiscoveryError extends Error {
 
 const DISCOVERY_TIMEOUT_MS = 10_000;
 const MAXIMUM_RESPONSE_BYTES = 1024 * 1024;
+const MAXIMUM_DISCOVERY_PAGES = 100;
+const MAXIMUM_DISCOVERED_MODELS = 10_000;
 
-export function deriveProviderModelsUrl(baseUrl: string): string {
+export function deriveProviderModelsUrl(baseUrl: string, api?: string): string {
   const url = new URL(baseUrl);
   url.hash = "";
   let pathname = url.pathname;
   while (pathname.length > 1 && pathname.endsWith("/")) pathname = pathname.slice(0, -1);
-  url.pathname = /\/v\d+$/iu.test(pathname)
-    ? `${pathname}/models`
-    : `${pathname === "/" ? "" : pathname}/v1/models`;
+  const basePath = pathname === "/" ? "" : pathname;
+  url.pathname = api === "google-generative-ai" || /\/v\d+$/iu.test(pathname)
+    ? `${basePath}/models`
+    : `${basePath}/v1/models`;
   return url.toString();
 }
 
@@ -92,7 +95,7 @@ export function parseProviderModels(value: unknown, sourceUrl?: string): readonl
     const name = typeof google?.["displayName"] === "string" && validLabel(google["displayName"]) ? google["displayName"]
       : typeof record?.["display_name"] === "string" && validLabel(record["display_name"])
       ? record["display_name"]
-      : typeof record?.["name"] === "string" && validLabel(record["name"])
+      : google === undefined && typeof record?.["name"] === "string" && validLabel(record["name"])
         ? record["name"]
         : id;
     const rawWindow = record === undefined
@@ -176,22 +179,64 @@ export async function fetchProviderModels(
   const baseUrl = safeDiscoveryBaseUrl(spec.baseUrl);
   if (baseUrl === undefined) throw new ProviderModelDiscoveryError("unsafe_endpoint");
   const headers = discoveryHeaders(spec);
-  if (!hasAuthentication(headers) && baseUrl.protocol !== "http:") {
+  const authenticated = hasAuthentication(headers, spec.api);
+  if (!authenticated && baseUrl.protocol !== "http:") {
     throw new ProviderModelDiscoveryError("unsafe_endpoint");
   }
-  if (!hasAuthentication(headers) && !isLoopback(baseUrl.hostname)) {
+  if (!authenticated && !isLoopback(baseUrl.hostname)) {
     throw new ProviderModelDiscoveryError("unsafe_endpoint");
   }
-  let response: Response, sourceUrl: string;
+  let endpoint: URL;
   try {
-    const endpoint = spec.modelsEndpoint === undefined ? new URL(deriveProviderModelsUrl(baseUrl.toString())) : new URL(spec.modelsEndpoint);
+    endpoint = spec.modelsEndpoint === undefined ? new URL(deriveProviderModelsUrl(baseUrl.toString(), spec.api)) : new URL(spec.modelsEndpoint);
     if (endpoint.origin !== baseUrl.origin || endpoint.username !== "" || endpoint.password !== "" || endpoint.hash !== "" || endpoint.search !== "") throw new Error("Model catalog authority differs.");
-    sourceUrl = endpoint.toString();
-    response = await fetchImpl(endpoint.toString(), {
+  } catch {
+    throw new ProviderModelDiscoveryError("unavailable");
+  }
+  const sourceUrl = endpoint.toString();
+  const signal = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+  const first = await fetchModelPage(sourceUrl, headers, signal, fetchImpl);
+  const firstModels = parseProviderModels(first, sourceUrl);
+  if (spec.api !== "anthropic-messages" || !isRecord(first) || first["has_more"] !== true) {
+    if (firstModels.length === 0) throw new ProviderModelDiscoveryError("invalid_response");
+    return firstModels;
+  }
+  if (!Array.isArray(first["data"])) throw new ProviderModelDiscoveryError("invalid_response");
+
+  const models = new Map(firstModels.map(model => [model.id, model]));
+  const seenCursors = new Set<string>();
+  let page = first;
+  for (let count = 1; count < MAXIMUM_DISCOVERY_PAGES; count += 1) {
+    const cursor = page["last_id"];
+    if (!validIdentity(cursor) || seenCursors.has(cursor) || models.size > MAXIMUM_DISCOVERED_MODELS) {
+      throw new ProviderModelDiscoveryError("invalid_response");
+    }
+    seenCursors.add(cursor);
+    const next = new URL(endpoint);
+    next.searchParams.set("after_id", cursor);
+    const value = await fetchModelPage(next.toString(), headers, signal, fetchImpl);
+    if (!isRecord(value) || !Array.isArray(value["data"]) || typeof value["has_more"] !== "boolean") {
+      throw new ProviderModelDiscoveryError("invalid_response");
+    }
+    for (const model of parseProviderModels(value, sourceUrl)) if (!models.has(model.id)) models.set(model.id, model);
+    if (!value["has_more"]) {
+      if (models.size === 0 || models.size > MAXIMUM_DISCOVERED_MODELS) throw new ProviderModelDiscoveryError("invalid_response");
+      return [...models.values()];
+    }
+    page = value;
+  }
+  throw new ProviderModelDiscoveryError("invalid_response");
+}
+
+async function fetchModelPage(url: string, headers: Readonly<Record<string, string>>, signal: AbortSignal, fetchImpl: typeof fetch): Promise<unknown> {
+  let response: Response;
+  try {
+    signal.throwIfAborted();
+    response = await fetchImpl(url, {
       method: "GET",
       headers,
       redirect: "error",
-      signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS)
+      signal
     });
   } catch {
     throw new ProviderModelDiscoveryError("unavailable");
@@ -210,15 +255,11 @@ export async function fetchProviderModels(
   } catch {
     throw new ProviderModelDiscoveryError("invalid_response");
   }
-  let value: unknown;
   try {
-    value = JSON.parse(body) as unknown;
+    return JSON.parse(body) as unknown;
   } catch {
     throw new ProviderModelDiscoveryError("invalid_response");
   }
-  const models = parseProviderModels(value, sourceUrl);
-  if (models.length === 0) throw new ProviderModelDiscoveryError("invalid_response");
-  return models;
 }
 
 async function readBoundedResponse(response: Response): Promise<string> {
@@ -260,6 +301,8 @@ function discoveryHeaders(spec: ProviderModelDiscoverySpec): Record<string, stri
       result["x-api-key"] = spec.apiKey;
       result["authorization"] = `Bearer ${spec.apiKey}`;
     }
+  } else if (spec.api === "google-generative-ai") {
+    if (spec.apiKey !== undefined) result["x-goog-api-key"] = spec.apiKey;
   } else if (spec.apiKey !== undefined) {
     result["authorization"] = `Bearer ${spec.apiKey}`;
   }
@@ -281,8 +324,9 @@ function safeDiscoveryBaseUrl(raw: string): URL | undefined {
   return url.protocol === "http:" && isLoopback(url.hostname) ? url : undefined;
 }
 
-function hasAuthentication(headers: Readonly<Record<string, string>>): boolean {
-  return Object.keys(headers).some((name) => name === "authorization" || name === "x-api-key");
+function hasAuthentication(headers: Readonly<Record<string, string>>, api: string | undefined): boolean {
+  return Object.keys(headers).some((name) => name === "authorization" || name === "x-api-key"
+    || api === "google-generative-ai" && name === "x-goog-api-key");
 }
 
 function isLoopback(hostname: string): boolean {

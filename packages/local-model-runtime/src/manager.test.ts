@@ -1,7 +1,10 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import type { CancelledPullArtifactCleaner } from "./artifact-cleaner.js";
 import { LocalRuntimeError } from "./errors.js";
+import { runtimeRoot } from "./installer.js";
 import { LocalModelRuntimeManager } from "./manager.js";
 import { MemoryPausedPullRepository } from "./paused-pulls.js";
 import type { OllamaModelDetails, OllamaPullEvent, OllamaTag, RuntimeOwnerGeneration } from "./types.js";
@@ -136,21 +139,41 @@ describe("LocalModelRuntimeManager", () => {
     await expect(manager.paused(owner)).resolves.toEqual([]);
   });
 
-  it("cancels a partial, deletes only an uninstalled model and preserves digests used elsewhere", async () => {
-    const cleaner: CancelledPullArtifactCleaner = { cleanup: vi.fn(async () => undefined) };
-    const { owner, client, manager } = fixture({ artifactCleaner: cleaner });
-    const first = manager.pull(owner, "model-a");
-    const second = manager.pull(owner, "model-b");
-    await vi.waitFor(() => expect(client.pulls.size).toBe(2));
+  it.each(["active", "paused"] as const)("cancels a %s pull while preserving Ollama's shared model files", async (phase) => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "joko-ollama-cancel-"));
+    const { owner, client, manager } = fixture({ dataRoot });
     const shared = `sha256:${"ef".repeat(32)}`;
-    client.pulls.get("model-a")!.emit({ status: "downloading", digest: shared, completed: 1, total: 10 });
-    client.pulls.get("model-b")!.emit({ status: "downloading", digest: shared, completed: 1, total: 10 });
-    await manager.cancel(owner, "model-a");
-    await expect(first).rejects.toMatchObject({ code: "OPERATION_CANCELLED" });
-    expect(client.deleted).toContain("model-a");
-    expect(cleaner.cleanup).toHaveBeenCalledWith({ digests: [shared], keepDigests: new Set([shared]) });
-    await manager.cancel(owner, "model-b");
-    await second.catch(() => undefined);
+    const models = join(runtimeRoot(dataRoot), "models");
+    const blob = join(models, "blobs", shared.replace(":", "-"));
+    const partial = `${blob}-partial`;
+    const manifest = join(models, "manifests", "registry.ollama.ai", "library", "installed", "latest");
+    try {
+      await mkdir(dirname(blob), { recursive: true });
+      await mkdir(dirname(manifest), { recursive: true });
+      const installedManifest = JSON.stringify({ config: { digest: shared }, layers: [{ digest: shared }] });
+      await writeFile(manifest, installedManifest);
+      await writeFile(blob, "installed weight");
+      await writeFile(partial, "Ollama checkpoint");
+      client.installed.push({ name: "installed" });
+
+      const pulling = manager.pull(owner, "cancelled-model");
+      const cancelled = expect(pulling).rejects.toMatchObject({ code: "OPERATION_CANCELLED" });
+      await vi.waitFor(() => expect(client.pulls.has("cancelled-model")).toBe(true));
+      client.pulls.get("cancelled-model")!.emit({ status: "downloading", digest: shared, completed: 1, total: 10 });
+      if (phase === "paused") {
+        await manager.pause(owner, "cancelled-model");
+        await expect(manager.paused(owner)).resolves.toHaveLength(1);
+      }
+      await manager.cancel(owner, "cancelled-model");
+      await cancelled;
+
+      await expect(manager.paused(owner)).resolves.toEqual([]);
+      expect(manager.activePulls(owner)).toEqual([]);
+      expect(client.deleted).toEqual([]);
+      await expect(readFile(blob, "utf8")).resolves.toBe("installed weight");
+      await expect(readFile(partial, "utf8")).resolves.toBe("Ollama checkpoint");
+      await expect(readFile(manifest, "utf8")).resolves.toBe(installedManifest);
+    } finally { await rm(dataRoot, { recursive: true, force: true }); }
   });
 
   it("reports busy instead of deleting an in-flight model", async () => {

@@ -449,7 +449,7 @@ describe("ProviderCatalogManager", () => {
     store.close();
   });
 
-  it("adds only newly discovered models and keeps them hidden by default", async () => {
+  it.each(["openai-responses", "google-generative-ai", "anthropic-messages"] as const)("shows newly discovered direct Pi text models from %s by default", async api => {
     const { credentials, store } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
     providers.initialize();
@@ -461,14 +461,17 @@ describe("ProviderCatalogManager", () => {
       displayName: "Discovery key",
       kind: "api_key"
     });
+    const google = api === "google-generative-ai";
+    const origin = google ? "https://generativelanguage.googleapis.com" : "https://models.example.test";
+    const baseUrl = `${origin}/${google ? "v1beta" : "v1"}`;
     await providers.upsert({
-      backendId: "pi", credentialOrigin: "https://models.example.test",
+      backendId: "pi", credentialOrigin: origin,
       provider: {
         id: "discoverable",
-        baseUrl: "https://models.example.test/v1",
-        api: "openai-responses",
+        baseUrl,
+        api,
         apiKeyEnv: "DISCOVERY_API_KEY",
-        models: [{ id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000 }]
+        models: [{ id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000, defaultVisible: false }]
       },
       displayName: "Discoverable",
       kind: "custom_endpoint",
@@ -478,13 +481,40 @@ describe("ProviderCatalogManager", () => {
       supportsLogout: true,
       supportsRefresh: false
     });
-    const request = async (_url: string | URL | Request, init?: RequestInit) => {
-      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer discovery-secret-value");
+    let rejectNextPage = api === "anthropic-messages";
+    const request = async (url: string | URL | Request, init?: RequestInit) => {
+      expect(init?.redirect).toBe("error");
+      const headers = new Headers(init?.headers);
+      if (google) {
+        expect(url).toBe(`${baseUrl}/models`);
+        expect(headers.has("authorization")).toBe(false);
+        expect(headers.get("x-goog-api-key")).toBe("discovery-secret-value");
+        return Response.json({ models: [
+          { name: "models/kept", displayName: "Renamed upstream", supportedGenerationMethods: ["generateContent"] },
+          { name: "models/new-model", displayName: "New model", supportedGenerationMethods: ["generateContent"], inputTokenLimit: 1_000_000 }
+        ] });
+      }
+      expect(headers.get("authorization")).toBe("Bearer discovery-secret-value");
+      if (api === "anthropic-messages") {
+        expect(headers.get("x-api-key")).toBe("discovery-secret-value");
+        expect(headers.get("anthropic-version")).toBe("2023-06-01");
+        if (url === `${baseUrl}/models`) return Response.json({ data: [{ id: "kept", name: "Renamed upstream" }], has_more: true, last_id: "kept" });
+        expect(url).toBe(`${baseUrl}/models?after_id=kept`);
+        if (rejectNextPage) return new Response(null, { status: 503 });
+        return Response.json({ data: [{ id: "new-model", name: "New model", context_window: 1_000_000 }], has_more: false, last_id: "new-model" });
+      }
+      expect(url).toBe(`${baseUrl}/models`);
       return new Response(JSON.stringify({ data: [
         { id: "kept", name: "Renamed upstream" },
         { id: "new-model", name: "New model", context_window: 1_000_000 }
       ] }), { status: 200 });
     };
+
+    if (rejectNextPage) {
+      await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).rejects.toMatchObject({ code: "unavailable" });
+      expect(providers.get("pi", "discoverable").provider.models.map(model => model.id)).toEqual(["kept"]);
+      rejectNextPage = false;
+    }
 
     await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toEqual({
       providerId: "discoverable",
@@ -493,8 +523,8 @@ describe("ProviderCatalogManager", () => {
     });
     expect(providers.get("pi", "discoverable")).toMatchObject({ supportsModelRefresh: true });
     expect(providers.get("pi", "discoverable").provider.models).toEqual([
-      { id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000 },
-      { id: "new-model", name: "New model", contextWindow: 1_000_000, maxTokens: 16_384, defaultVisible: false,
+      { id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000, defaultVisible: false },
+      { id: "new-model", name: "New model", contextWindow: 1_000_000, maxTokens: 16_384, defaultVisible: true,
         contextWindowSource: "declared", maxOutputTokensSource: "estimated" }
     ]);
     await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toMatchObject({

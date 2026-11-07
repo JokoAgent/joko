@@ -69,7 +69,7 @@ export interface ModelPickerProps {
   readonly t: Translator;
   readonly onSelect: (value: ModelPickerSelection | undefined) => void | Promise<void>;
   /** Called after a committed selection so an adjacent composer can reclaim focus. */
-  readonly onSelectionFocus?: () => void;
+  readonly onSelectionFocus?: (canRestoreFocus: () => boolean) => void;
   readonly onOpen?: () => void | Promise<void>;
   /** Opens the capability-owned Provider recovery surface when no route remains. */
   readonly onConnectSource?: () => void;
@@ -337,8 +337,19 @@ export function ModelPicker({
       close();
       return;
     }
+    const trigger = triggerRef.current;
+    const canRestoreFocus = (): boolean => {
+      if (!trigger?.isConnected || triggerRef.current !== trigger || favoriteOwnerRef.current !== ownerId) return false;
+      const document = trigger.ownerDocument;
+      const active = document.activeElement;
+      return active === null || active === document.body || trigger.contains(active)
+        || panelRef.current?.contains(active) === true || configFlyoutRef.current?.contains(active) === true;
+    };
+    const restoreFocus = canRestoreFocus();
     close(false);
-    window.requestAnimationFrame(onSelectionFocus);
+    if (restoreFocus) trigger?.ownerDocument.defaultView?.requestAnimationFrame(() => {
+      if (canRestoreFocus()) onSelectionFocus(canRestoreFocus);
+    });
   };
 
   useLayoutEffect(() => {

@@ -1220,12 +1220,14 @@ export function useAppController(): AppController {
     if (gatewayGenerationRef.current === generation) projectEntries(profile, saved);
   }), [projectEntries]);
 
-  const adoptConnectionUnlocked = useCallback(async (profile: ConnectionProfile, options: ConnectionSelectionOptions | undefined, entryAttempt: AbortController): Promise<boolean> => {
+  const adoptConnectionUnlocked = useCallback(async (profile: ConnectionProfile, options: ConnectionSelectionOptions | undefined, entryAttempt: AbortController, returnToPreferred: boolean): Promise<boolean> => {
     if (entryAttempt.signal.aborted || forgottenProfilesRef.current.has(profile.id)) return false;
     startupManagedLocalAutoPendingRef.current = false;
     const originalGeneration = gatewayGenerationRef.current;
     const local = requireLocal(localRef.current);
     let savedEntries = profile.endpointPublicKey ? await local.readConnectionEntries?.(profile) : undefined;
+    if (returnToPreferred && (!savedEntries?.returnToPreferred || savedEntries.preferredId !== options?.entryId
+      || activeProfileRef.current !== profile || connectionStateRef.current !== 'connected')) return false;
     const resolved = savedEntries ? await resolvePreparedConnection(webEntryOwner(profile), savedEntries,
       () => local.readAuthKey(profile), webEntrySupported, entryAttempt.signal, options?.entryId, async next => {
         entryAttempt.signal.throwIfAborted(); if (gatewayGenerationRef.current !== originalGeneration) throw new Error('The node connection changed.');
@@ -1333,12 +1335,12 @@ export function useAppController(): AppController {
     }
     return gatewayGenerationRef.current === generation && (connectionStateRef.current as GatewayConnectionState) === "connected";
   }, [beginGatewayTransition, bindGateway, commitAutomaticConnectionChoice, projectEntries, refreshConnectionEntries]);
-  const adoptConnection = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions): Promise<boolean> => {
+  const adoptConnection = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions, returnToPreferred = false): Promise<boolean> => {
     entryAttemptRef.current?.abort();
     const attempt = new AbortController(); entryAttemptRef.current = attempt;
     const local = requireLocal(localRef.current);
-    try { return await (local.withConnectionEntryLock ? local.withConnectionEntryLock(profile.id, () => adoptConnectionUnlocked(profile, options, attempt))
-      : adoptConnectionUnlocked(profile, options, attempt)); }
+    try { return await (local.withConnectionEntryLock ? local.withConnectionEntryLock(profile.id, () => adoptConnectionUnlocked(profile, options, attempt, returnToPreferred))
+      : adoptConnectionUnlocked(profile, options, attempt, returnToPreferred)); }
     catch (error) {
       if (attempt.signal.aborted) return false;
       let failure = error;
@@ -1456,9 +1458,10 @@ export function useAppController(): AppController {
   useEffect(() => {
     if (!state.activeProfile?.endpointPublicKey) return;
     let busy = false, stopped = false, stableSince = 0, refreshedAt = Date.now();
+    const isForeground = () => document.visibilityState !== 'hidden';
     const check = async () => {
       const profile = activeProfileRef.current;
-      if (busy || stopped || entryAttemptRef.current || connectionLeaveRef.current || !profile?.endpointPublicKey || explicitDisconnectRef.current || document.visibilityState === 'hidden') return;
+      if (busy || stopped || entryAttemptRef.current || connectionLeaveRef.current || !profile?.endpointPublicKey || explicitDisconnectRef.current || !isForeground()) return;
       busy = true;
       let probedEntry: SavedConnectionEntries['entries'][number] | undefined;
       try {
@@ -1475,9 +1478,10 @@ export function useAppController(): AppController {
           || Date.now() - entryLastSwitchRef.current < 60_000) { stableSince = 0; return; }
         probedEntry = preferred;
         await verifyConnectionEntry(webEntryOwner(profile), preferred, AbortSignal.timeout(6_000));
-        if (stopped || activeProfileRef.current !== profile) return;
+        if (stopped || activeProfileRef.current !== profile || entryAttemptRef.current || connectionLeaveRef.current
+          || connectionStateRef.current !== 'connected' || !isForeground()) { stableSince = 0; return; }
         stableSince ||= Date.now();
-        if (Date.now() - stableSince >= 30_000) await adoptConnection(profile, { entryId: preferred.id });
+        if (Date.now() - stableSince >= 30_000 && !await adoptConnection(profile, { entryId: preferred.id }, true)) stableSince = 0;
       } catch (error) {
         stableSince = 0;
         if (!stopped && isEndpointTrustError(error)) {
